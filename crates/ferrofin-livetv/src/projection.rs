@@ -326,6 +326,7 @@ pub fn program_entity(
         is_repeat: row.is_repeat,
         index_number: row.episode_number.map(i64::from),
         parent_index_number: row.season_number.map(i64::from),
+        sort_name: Some(item_sort_name(&row.title)),
         external_id: row.external_id.clone(),
         external_series_id: row.external_series_id.clone(),
         // `SeriesName = info.Name` for an episode (not projected on the DTO,
@@ -387,6 +388,77 @@ fn join_multi(values: &[String]) -> Option<String> {
 #[must_use]
 pub fn db_guid(id: Uuid) -> String {
     ferrofin_db::store::guid_to_db(id)
+}
+
+/// Port of `BaseItem.CreateSortName` with the default server configuration
+/// (`SortRemoveWords` the/a/an, `SortRemoveCharacters`, `SortReplaceCharacters`)
+/// plus `ModifySortChunks`: digit runs pad to 10 with leading zeros, so
+/// "Parity Show 02" sorts as "parity show 0000000002". Guide rows never pass
+/// through the scanner, so the key is derived here.
+///
+/// (`ferrofin-core`'s scan carries an older `create_sort_name` that diverges
+/// from C#: it runs the character passes before the word pass, strips only a
+/// leading article, and has no diacritic tail. The two should converge on
+/// this port — the scan's is the side that is wrong.)
+#[must_use]
+pub fn item_sort_name(name: &str) -> String {
+    let mut sortable = name.trim().to_lowercase();
+    for word in ["the", "a", "an"] {
+        // Remove from beginning if a space follows…
+        let prefix = format!("{word} ");
+        if let Some(rest) = sortable.strip_prefix(&prefix) {
+            sortable = rest.to_owned();
+        }
+        // …from the middle if surrounded by spaces…
+        sortable = sortable.replace(&format!(" {word} "), " ");
+        // …and from the end if preceded by a space.
+        let suffix = format!(" {word}");
+        if let Some(rest) = sortable.strip_suffix(&suffix) {
+            sortable = rest.to_owned();
+        }
+    }
+    for ch in [",", "&", "-", "{", "}", "'"] {
+        sortable = sortable.replace(ch, "");
+    }
+    for ch in [".", "+", "%"] {
+        sortable = sortable.replace(ch, " ");
+    }
+    modify_sort_chunks(&sortable)
+}
+
+/// Port of `BaseItem.ModifySortChunks`: each digit run shorter than ten
+/// characters is left-padded with zeros to ten, then the result is stripped of
+/// diacritics. (C# `char.IsDigit` covers the Unicode Nd category; ASCII digits
+/// cover every value a guide feed carries. Its final ICU `Transliterated()`
+/// step — which romanizes a title still non-ASCII after the strip, e.g.
+/// Cyrillic — is not ported: it would pull an ICU dependency in for a sort key
+/// no Latin-script guide needs.)
+fn modify_sort_chunks(name: &str) -> String {
+    fn flush(chunk: &mut String, digit_chunk: bool, out: &mut String) {
+        if digit_chunk && chunk.len() < 10 {
+            for _ in 0..(10 - chunk.len()) {
+                out.push('0');
+            }
+        }
+        out.push_str(chunk);
+        chunk.clear();
+    }
+    let mut out = String::with_capacity(name.len() + 9);
+    let mut chunk = String::new();
+    let mut digit_chunk = false;
+    for ch in name.chars() {
+        let is_digit = ch.is_ascii_digit();
+        if !chunk.is_empty() && is_digit != digit_chunk {
+            flush(&mut chunk, digit_chunk, &mut out);
+        }
+        digit_chunk = is_digit;
+        chunk.push(ch);
+    }
+    flush(&mut chunk, digit_chunk, &mut out);
+    // C# ends `ModifySortChunks` with `RemoveDiacritics()`; the shared port
+    // in `ferrofin-util` is the one carrying upstream's transliterated test
+    // oracle, so the guide uses it rather than a second fold table.
+    ferrofin_util::string_extensions::remove_diacritics(&out)
 }
 
 #[cfg(test)]
@@ -511,6 +583,36 @@ mod tests {
             entity.parent_id.as_deref(),
             Some(db_guid(LIVE_TV_FOLDER_ID).as_str())
         );
+    }
+
+    #[test]
+    fn item_sort_name_pads_digit_runs_and_strips_articles() {
+        // C# ModifySortChunks pads digit runs to 10 (the oracle programme
+        // "Parity Show 02 on parity1" sorts as this exact key).
+        assert_eq!(
+            item_sort_name("Parity Show 02 on parity1"),
+            "parity show 0000000002 on parity0000000001"
+        );
+        assert_eq!(item_sort_name("The 4400"), "0000004400");
+        // SortRemoveCharacters and SortReplaceCharacters.
+        assert_eq!(item_sort_name("Mr. & Mrs-Smith"), "mr   mrssmith");
+        assert_eq!(item_sort_name("A Team"), "team");
+        // RemoveDiacritics runs last, so an accented title sorts as ASCII.
+        assert_eq!(item_sort_name("Café Größe"), "cafe grosse");
+    }
+
+    // The upstream xUnit oracle, transliterated verbatim
+    // (`Jellyfin.Controller.Tests/Entities/BaseItemTests.cs`
+    // `BaseItem_ModifySortChunks_Valid`).
+    #[rstest::rstest]
+    #[case("", "")]
+    #[case("1", "0000000001")]
+    #[case("t", "t")]
+    #[case("test", "test")]
+    #[case("test1", "test0000000001")]
+    #[case("1test 2", "0000000001test 0000000002")]
+    fn modify_sort_chunks_matches_the_upstream_oracle(#[case] input: &str, #[case] expected: &str) {
+        assert_eq!(modify_sort_chunks(input), expected);
     }
 
     #[test]

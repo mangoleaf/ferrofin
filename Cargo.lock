@@ -1299,6 +1299,7 @@ dependencies = [
  "ferrofin-db",
  "ferrofin-model",
  "ferrofin-traits",
+ "ferrofin-util",
  "quick-xml",
  "reqwest",
  "rstest",

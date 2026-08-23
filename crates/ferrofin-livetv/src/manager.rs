@@ -658,22 +658,37 @@ impl LiveTvManager for FerrofinLiveTvManager {
     async fn get_programs(
         &self,
         query: &InternalItemsQuery,
-        _options: &DtoOptions,
+        options: &DtoOptions,
     ) -> Result<QueryResult<BaseItemDto>, ServiceError> {
-        // Every filter is pushed into SQL. It used to read the whole guide
-        // (`SELECT … ORDER BY StartDate` with no WHERE and no LIMIT) and filter
-        // channels in Rust, so a client asking for two hours of thirty channels
-        // was served the entire week for every channel — tens of megabytes of
-        // JSON per request, and `Limit` had no effect at all.
+        // Every filter is pushed into SQL (a guide week is tens of megabytes;
+        // `Limit` must reach the query). The rows then project through the DTO
+        // service exactly like `LiveTvManager.GetPrograms`: `RemoveFields` on
+        // the list path, then the programme/recording post-passes.
+        // `SeriesTimerId` scopes the guide to one series timer's airings by the
+        // timer's `SeriesId`. Ferrofin's stored `SeriesTimerInfoDto` carries no
+        // series id, so the scope can never be built — and upstream is explicit
+        // about that case: "Better to return nothing than every program in the
+        // database" (`LiveTvManager.GetPrograms`), which is exactly what
+        // returning the unscoped guide would do.
+        if query
+            .series_timer_id
+            .as_deref()
+            .is_some_and(|id| !id.trim().is_empty())
+        {
+            return Ok(QueryResult::default());
+        }
+
+        // One clock for both the row query and the count query: an
+        // `isAiring`/`hasAired` request must not see a programme flip state
+        // between them and report a total the page cannot contain.
         let now = Utc::now();
         let start_index = query.start_index.unwrap_or(0);
-
-        let mut qb: QueryBuilder<'_, Sqlite> = QueryBuilder::new(PROGRAM_SELECT);
-        push_program_filters(&mut qb, query, now);
-        push_program_order(&mut qb, &query.order_by);
-        push_program_paging(&mut qb, query.limit, start_index);
-        let rows = qb.build().fetch_all(self.db.pool()).await.map_err(db_err)?;
-        let items: Vec<BaseItemDto> = rows.iter().map(|r| self.program_dto(r)).collect();
+        let rows = self.query_program_rows(query, now).await?;
+        let mut list_options = options.clone();
+        remove_fields(&mut list_options);
+        let items = self
+            .program_dtos(&rows, &list_options, query.user.as_ref())
+            .await?;
 
         // Same rule as the item repository: the count is only bought when
         // paging actually truncated the result.
@@ -696,24 +711,22 @@ impl LiveTvManager for FerrofinLiveTvManager {
     async fn get_program(
         &self,
         id: Uuid,
-        _user: Option<&UserEntity>,
-        _options: &DtoOptions,
+        user: Option<&UserEntity>,
+        options: &DtoOptions,
     ) -> Result<Option<BaseItemDto>, ServiceError> {
-        let row = sqlx::query(
-            r#"SELECT p."Id",p."ChannelId",p."StartDate",p."EndDate",p."Title",p."EpisodeTitle",
-                      p."Overview",p."Genres",p."ProductionYear",p."OfficialRating",p."IsNew",
-                      p."IsRepeat",p."IsPremiere",p."IsMovie",p."IsSeries",p."IsNews",p."IsKids",
-                      p."IsSports",p."IsLive",p."ExternalId",p."ExternalSeriesId",
-                      p."SeasonNumber",p."EpisodeNumber",c."Name" AS "ChannelName"
-               FROM "FerrofinLiveTvPrograms" p
-               JOIN "FerrofinLiveTvChannels" c ON c."Id" = p."ChannelId"
-               WHERE p."Id" = ?1"#,
-        )
-        .bind(guid_to_db(id))
-        .fetch_optional(self.db.pool())
-        .await
-        .map_err(db_err)?;
-        Ok(row.map(|r| self.program_dto(&r)))
+        // Port of `LiveTvManager.GetProgram(id, ct, user)`: the single
+        // programme keeps every requested field (no `RemoveFields` anywhere on
+        // this path) and still gets the programme/recording post-passes.
+        let rows = self
+            .query_program_rows(
+                &InternalItemsQuery {
+                    item_ids: vec![id],
+                    ..InternalItemsQuery::default()
+                },
+                Utc::now(),
+            )
+            .await?;
+        Ok(self.program_dtos(&rows, options, user).await?.pop())
     }
 
     async fn reset_tuner(&self, _id: &str) -> Result<(), ServiceError> {
@@ -973,7 +986,7 @@ impl FerrofinLiveTvManager {
             user: user.cloned(),
             ..InternalItemsQuery::default()
         };
-        let program_rows = self.query_program_rows(&query).await?;
+        let program_rows = self.query_program_rows(&query, now).await?;
         // Both list and single paths strip the four fields for the programme
         // DTOs (`AddChannelInfo` calls `RemoveFields` before projecting them).
         let mut program_options = options.clone();
@@ -1003,8 +1016,8 @@ impl FerrofinLiveTvManager {
     async fn query_program_rows(
         &self,
         query: &InternalItemsQuery,
+        now: DateTime<Utc>,
     ) -> Result<Vec<GuideProgramRow>, ServiceError> {
-        let now = Utc::now();
         let start_index = query.start_index.unwrap_or(0);
         let mut qb: QueryBuilder<'_, Sqlite> = QueryBuilder::new(PROGRAM_SELECT);
         push_program_filters(&mut qb, query, now);
@@ -1128,61 +1141,6 @@ impl FerrofinLiveTvManager {
         Ok(())
     }
 
-    /// Maps a program row (joined to its channel) to a `BaseItemDto`.
-    ///
-    /// `Type` is `"Program"` (`LiveTvProgram.GetClientTypeName`), and the flags,
-    /// run time and episode numbers are what `GuideManager.GetProgram` +
-    /// `LiveTvManager.AddInfoToProgramDto` put on the item.
-    fn program_dto(&self, r: &sqlx::sqlite::SqliteRow) -> BaseItemDto {
-        let id = Uuid::parse_str(&r.get::<String, _>("Id")).unwrap_or_default();
-        let channel_id = Uuid::parse_str(&r.get::<String, _>("ChannelId")).ok();
-        let genres: Option<Vec<String>> = r
-            .get::<Option<String>, _>("Genres")
-            .and_then(|g| serde_json::from_str(&g).ok());
-        let start_date = parse_dt(r.get::<String, _>("StartDate").as_str());
-        let end_date = r
-            .get::<Option<String>, _>("EndDate")
-            .as_deref()
-            .and_then(parse_dt);
-        // `RunTimeTicks = (EndDate - StartDate).Ticks`.
-        let run_time_ticks = match (start_date, end_date) {
-            (Some(start), Some(end)) => Some((end - start).num_milliseconds() * 10_000),
-            _ => None,
-        };
-        // `dto.IsNews |= program.IsNews` on a `bool?` that starts null: a false
-        // flag stays null and is never written, so only true flags appear.
-        let flag =
-            |column: &str| -> Option<bool> { (r.get::<i32, _>(column) != 0).then_some(true) };
-        BaseItemDto {
-            id,
-            server_id: Some(self.server_id.clone()),
-            name: Some(r.get::<String, _>("Title")),
-            type_: BaseItemKind::Program,
-            channel_id,
-            media_type: MediaType::Unknown,
-            episode_title: r.get::<Option<String>, _>("EpisodeTitle"),
-            overview: r.get::<Option<String>, _>("Overview"),
-            genres,
-            production_year: r.get::<Option<i32>, _>("ProductionYear"),
-            official_rating: r.get::<Option<String>, _>("OfficialRating"),
-            start_date,
-            end_date,
-            run_time_ticks,
-            is_repeat: flag("IsRepeat"),
-            is_premiere: flag("IsPremiere"),
-            is_movie: flag("IsMovie"),
-            is_series: flag("IsSeries"),
-            is_news: flag("IsNews"),
-            is_kids: flag("IsKids"),
-            is_sports: flag("IsSports"),
-            is_live: flag("IsLive"),
-            index_number: r.get::<Option<i32>, _>("EpisodeNumber"),
-            parent_index_number: r.get::<Option<i32>, _>("SeasonNumber"),
-            channel_name: r.get::<Option<String>, _>("ChannelName"),
-            ..BaseItemDto::default()
-        }
-    }
-
     /// Maps a recording row to a `BaseItemDto` (`Type = "Recording"`).
     fn recording_dto(&self, r: &sqlx::sqlite::SqliteRow) -> BaseItemDto {
         let id = Uuid::parse_str(&r.get::<String, _>("Id")).unwrap_or_default();
@@ -1258,10 +1216,11 @@ fn push_separator(qb: &mut QueryBuilder<'_, Sqlite>, first: &mut bool) {
 /// genre scope.
 ///
 /// The classification flags (`IsMovie`/`IsSeries`/`IsNews`/`IsKids`/`IsSports`)
-/// match the columns the guide refresh derives per listings provider. Filters
-/// whose backing data the guide cache does not hold are deliberately not faked:
-/// `GenreIds` needs genre identity rows and `SeriesTimerId` the timer↔program
-/// link.
+/// match the columns the guide refresh derives per listings provider.
+/// `GenreIds` is deliberately not faked — it needs genre identity rows the
+/// guide cache does not hold — and `SeriesTimerId` never reaches this builder:
+/// `get_programs` answers it with the empty result upstream returns when the
+/// series-timer scope cannot be built.
 fn push_program_filters(
     qb: &mut QueryBuilder<'_, Sqlite>,
     query: &InternalItemsQuery,
@@ -1269,6 +1228,16 @@ fn push_program_filters(
 ) {
     let mut first = true;
     let now_db = datetime_to_db(now);
+
+    if !query.item_ids.is_empty() {
+        push_separator(qb, &mut first);
+        qb.push(r#"p."Id" IN ("#);
+        let mut list = qb.separated(",");
+        for id in &query.item_ids {
+            list.push_bind(guid_to_db(*id));
+        }
+        qb.push(")");
+    }
 
     if !query.channel_ids.is_empty() {
         push_separator(qb, &mut first);
@@ -1526,12 +1495,30 @@ mod tests {
                 .map(|item| BaseItemDto {
                     id: Uuid::parse_str(&item.id).unwrap_or_default(),
                     name: item.name.clone(),
+                    // `GetClientTypeName`, as the real projection maps it.
+                    type_: if item.type_.ends_with("LiveTvChannel") {
+                        ferrofin_model::data::BaseItemKind::TvChannel
+                    } else {
+                        ferrofin_model::data::BaseItemKind::Program
+                    },
                     channel_id: item
                         .channel_id
                         .as_deref()
                         .and_then(|s| Uuid::parse_str(s).ok()),
                     end_date: item.end_date,
                     run_time_ticks: item.run_time_ticks,
+                    index_number: item.index_number.and_then(|n| i32::try_from(n).ok()),
+                    parent_index_number: item
+                        .parent_index_number
+                        .and_then(|n| i32::try_from(n).ok()),
+                    production_year: item.production_year.and_then(|y| i32::try_from(y).ok()),
+                    official_rating: item.official_rating.clone(),
+                    genres: options.contains_field(ItemFields::Genres).then(|| {
+                        item.genres
+                            .as_deref()
+                            .map(|g| g.split('|').map(str::to_owned).collect())
+                            .unwrap_or_default()
+                    }),
                     overview: options
                         .contains_field(ItemFields::Overview)
                         .then(|| item.overview.clone())
@@ -2710,5 +2697,208 @@ mod tests {
             .total_record_count,
             2
         );
+    }
+
+    // ---- Programme projection (plan B) ------------------------------------
+
+    /// The list path strips the four detail fields and only sends
+    /// `ChannelName`/`ChannelNumber`/`MediaType` when the `ChannelInfo` field
+    /// was requested (Jellyfin sends none of them on a default list).
+    #[tokio::test]
+    async fn program_list_gates_channel_info_on_the_field() {
+        let mgr = manager_with_relative_guide().await;
+
+        // Default list options: no fields at all (the handler's
+        // `program_dto_options` starts empty like C# `DtoOptions{Fields}`).
+        let bare = DtoOptions {
+            fields: Vec::new(),
+            ..DtoOptions::default()
+        };
+        let plain = mgr
+            .get_programs(&InternalItemsQuery::default(), &bare)
+            .await
+            .expect("programs");
+        let now_playing = plain
+            .items
+            .iter()
+            .find(|p| p.name.as_deref() == Some("Now Playing"))
+            .expect("now playing");
+        assert_eq!(now_playing.channel_name, None, "ChannelInfo not requested");
+        assert_eq!(now_playing.channel_number, None);
+        assert_eq!(now_playing.overview, None, "Overview is field-gated");
+        assert!(now_playing.start_date.is_some());
+        assert!(now_playing.run_time_ticks.is_some());
+
+        // All-fields list: ChannelInfo is in the set, but RemoveFields still
+        // strips Etag/CanDelete/CanDownload/DisplayPreferencesId.
+        let all = mgr
+            .get_programs(&InternalItemsQuery::default(), &DtoOptions::default())
+            .await
+            .expect("programs all");
+        let with_info = all
+            .items
+            .iter()
+            .find(|p| p.name.as_deref() == Some("Now Playing"))
+            .expect("now playing");
+        assert_eq!(with_info.channel_name.as_deref(), Some("Channel One"));
+        assert_eq!(with_info.channel_number.as_deref(), Some("1"));
+        assert_eq!(
+            with_info.media_type,
+            ferrofin_model::data::MediaType::Video,
+            "ChannelInfo substitutes the channel's media type"
+        );
+        assert_eq!(with_info.etag, None, "Etag is stripped on the list path");
+    }
+
+    /// The single programme keeps every requested field — no `RemoveFields` on
+    /// `GetProgram` — and an unknown id is `None`.
+    #[tokio::test]
+    async fn single_program_keeps_detail_fields() {
+        let mgr = manager_with_relative_guide().await;
+        let id = mgr
+            .get_programs(&InternalItemsQuery::default(), &DtoOptions::default())
+            .await
+            .expect("programs")
+            .items
+            .into_iter()
+            .find(|p| p.name.as_deref() == Some("Two Now"))
+            .expect("two now")
+            .id;
+
+        let program = mgr
+            .get_program(id, None, &DtoOptions::default())
+            .await
+            .expect("get")
+            .expect("some");
+        assert_eq!(program.etag.as_deref(), Some("fake-etag"));
+        assert_eq!(program.channel_name.as_deref(), Some("Channel Two"));
+        assert_eq!(program.is_news, Some(true), "News category classifies");
+
+        assert!(
+            mgr.get_program(Uuid::new_v4(), None, &DtoOptions::default())
+                .await
+                .expect("get")
+                .is_none()
+        );
+    }
+
+    /// `seriesTimerId` cannot be scoped (Ferrofin's series timers carry no
+    /// series id), so upstream's "better to return nothing than every program
+    /// in the database" branch applies — but a blank value must NOT blank the
+    /// guide, or an empty `?seriesTimerId=` query param would.
+    #[tokio::test]
+    async fn series_timer_scope_returns_nothing_and_ignores_a_blank_value() {
+        let mgr = manager_with_relative_guide().await;
+        let scoped = mgr
+            .get_programs(
+                &InternalItemsQuery {
+                    series_timer_id: Some("st-x".to_owned()),
+                    ..InternalItemsQuery::default()
+                },
+                &DtoOptions::default(),
+            )
+            .await
+            .expect("scoped");
+        assert!(scoped.items.is_empty());
+        assert_eq!(scoped.total_record_count, 0);
+        assert_eq!(scoped.start_index, 0);
+
+        for blank in ["", "   "] {
+            let unscoped = mgr
+                .get_programs(
+                    &InternalItemsQuery {
+                        series_timer_id: Some(blank.to_owned()),
+                        ..InternalItemsQuery::default()
+                    },
+                    &DtoOptions::default(),
+                )
+                .await
+                .expect("blank");
+            assert_eq!(
+                unscoped.items.len(),
+                4,
+                "a blank seriesTimerId must not blank the guide ({blank:?})"
+            );
+        }
+    }
+
+    /// `AddRecordingInfo`: a timer whose `ProgramId` matches the programme's
+    /// `ExternalId` links `TimerId`/`Status`/`SeriesTimerId`; a cancelled
+    /// timer stays invisible.
+    #[tokio::test]
+    async fn program_dtos_link_their_recording_timer() {
+        use ferrofin_model::live_tv::{BaseTimerInfoDto, RecordingStatus, TimerInfoDto};
+        let mgr = manager_with_relative_guide().await;
+
+        // The guide row's ExternalId is `{channelId}_{start:O}`; read it back
+        // from the stored rows rather than re-deriving it here.
+        let rows = mgr
+            .query_program_rows(&InternalItemsQuery::default(), chrono::Utc::now())
+            .await
+            .expect("rows");
+        let target = rows
+            .iter()
+            .find(|r| r.title == "Now Playing")
+            .expect("now playing row");
+        let external_id = target.external_id.clone().expect("external id");
+
+        let timer_id = mgr
+            .create_timer(TimerInfoDto {
+                status: RecordingStatus::New,
+                series_timer_id: Some("st-9".to_owned()),
+                base: BaseTimerInfoDto {
+                    channel_id: Uuid::parse_str(&target.channel_id).expect("guid"),
+                    program_id: Some(external_id.clone()),
+                    start_date: parse_dt("2026-07-25T06:00:00Z").unwrap(),
+                    end_date: parse_dt("2026-07-25T07:00:00Z").unwrap(),
+                    ..BaseTimerInfoDto::default()
+                },
+                ..TimerInfoDto::default()
+            })
+            .await
+            .expect("timer");
+
+        let programs = mgr
+            .get_programs(&InternalItemsQuery::default(), &DtoOptions::default())
+            .await
+            .expect("programs");
+        let linked = programs
+            .items
+            .iter()
+            .find(|p| p.name.as_deref() == Some("Now Playing"))
+            .expect("linked");
+        assert_eq!(linked.timer_id.as_deref(), Some(timer_id.as_str()));
+        assert_eq!(linked.status.as_deref(), Some("New"));
+        assert_eq!(linked.series_timer_id.as_deref(), Some("st-9"));
+        let unlinked = programs
+            .items
+            .iter()
+            .find(|p| p.name.as_deref() == Some("Aired"))
+            .expect("unlinked");
+        assert_eq!(unlinked.timer_id, None);
+        assert_eq!(unlinked.status, None);
+
+        // A cancelled timer keeps its SeriesTimerId link but drops
+        // TimerId/Status (upstream's `!= Cancelled && != Error` gate).
+        let mut cancelled = mgr
+            .get_timer(&timer_id)
+            .await
+            .expect("get timer")
+            .expect("timer");
+        cancelled.status = RecordingStatus::Cancelled;
+        mgr.update_timer(&timer_id, cancelled)
+            .await
+            .expect("update");
+        let programs = mgr
+            .get_programs(&InternalItemsQuery::default(), &DtoOptions::default())
+            .await
+            .expect("programs");
+        let after = programs
+            .items
+            .iter()
+            .find(|p| p.name.as_deref() == Some("Now Playing"))
+            .expect("after");
+        assert_eq!(after.timer_id, None);
+        assert_eq!(after.status, None);
     }
 }

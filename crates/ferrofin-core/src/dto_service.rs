@@ -1452,7 +1452,10 @@ impl FerrofinDtoService {
         }
 
         // Chapters — [] when requested but there are none (matches Jellyfin).
-        if options.contains_field(ItemFields::Chapters) {
+        // C# assigns them only inside its `item is Video` branch, so every
+        // non-video kind (a folder, an album, a Live TV channel or programme)
+        // omits the key entirely.
+        if options.contains_field(ItemFields::Chapters) && kinds::is_video(kind) {
             let mut chapters =
                 take_or_clone(&mut prefetched.chapters, &item_id, repeated).unwrap_or_default();
             // Each extracted chapter thumbnail needs its cache tag: clients gate
@@ -4974,6 +4977,8 @@ mod tests {
         // The all-fields channel detail carries a present-and-empty stream list
         // (C# assigns `GetMediaStreams()` = [] for every IHasMediaSources).
         assert_eq!(dto.media_streams, Some(Vec::new()));
+        // C# only assigns Chapters for a `Video`; a channel omits the key.
+        assert_eq!(dto.chapters, None);
 
         let sources = dto.media_sources.expect("placeholder media source");
         assert_eq!(sources.len(), 1);
@@ -5032,6 +5037,7 @@ mod tests {
         assert_eq!(dto.media_type, MediaType::Unknown);
         assert_eq!(dto.media_sources, None);
         assert_eq!(dto.media_streams, None);
+        assert_eq!(dto.chapters, None, "a programme is not a Video");
         assert_eq!(dto.channel_id, Some(channel));
         assert_eq!(dto.parent_id, Some(channel));
         assert_eq!(dto.run_time_ticks, Some(36_000_000_000));

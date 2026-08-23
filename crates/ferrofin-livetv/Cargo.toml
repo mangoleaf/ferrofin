@@ -10,6 +10,7 @@ description = "Live TV for Ferrofin — deferred; provides the DisabledLiveTvMan
 workspace = true
 
 [dependencies]
+ferrofin-util.workspace = true
 ferrofin-traits.workspace = true
 ferrofin-model.workspace = true
 ferrofin-common.workspace = true
