@@ -59,6 +59,10 @@ serde_json.workspace = true
 serde.workspace = true
 serde_urlencoded.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# The /socket tests drive a real WebSocket against a real listener — the
+# push path cannot be exercised through `tower::oneshot`.
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
 tower.workspace = true
 tempfile.workspace = true
 # Trace-correlation test: an in-memory span exporter + a scoped OTel subscriber.
