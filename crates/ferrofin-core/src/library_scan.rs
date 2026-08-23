@@ -56,6 +56,7 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::item_type_lookup;
+use crate::media_info_resolver::ExternalStreamResolvers;
 use crate::media_source_manager::stream_dto_to_entity;
 
 /// Per-scan artwork lookup state, so a series is matched against TMDB once and
@@ -497,24 +498,82 @@ fn probe_request(entity: &BaseItemEntity) -> Option<MediaInfoRequest> {
     })
 }
 
+/// The external-stream half of one video's probe: the sidecar resolvers plus
+/// the item's internal metadata folder (the second place upstream looks for
+/// sidecars — where an upload against a read-only library was written).
+struct ExternalProbe {
+    resolvers: Arc<ExternalStreamResolvers>,
+    internal_metadata_path: Option<String>,
+}
+
+/// The scan-wide external-stream seam handed to the probe pipeline: the
+/// resolver pair and the metadata root the per-item folder derives from.
+struct ExternalProbeSeam {
+    resolvers: Arc<ExternalStreamResolvers>,
+    metadata_dir: Option<PathBuf>,
+}
+
+impl ExternalProbeSeam {
+    /// The per-item half for `id`'s probe: the item's internal metadata
+    /// folder is `{metadata}/library/{id2}/{id}` (the same derivation the
+    /// subtitle manager writes its read-only-library fallback to).
+    fn for_item(&self, id: Uuid) -> ExternalProbe {
+        let dashless = id.simple().to_string();
+        ExternalProbe {
+            resolvers: Arc::clone(&self.resolvers),
+            internal_metadata_path: self
+                .metadata_dir
+                .as_ref()
+                .map(|root| root.join(&dashless[..2]).join(&dashless))
+                .map(|p| p.to_string_lossy().into_owned()),
+        }
+    }
+}
+
 /// Runs `request` on the encoder as a detached task, so the caller can keep
 /// several probes in flight while it works through the scan in order.
 ///
+/// For a video (`external` is `Some`) the task then resolves the sidecar
+/// subtitle/audio files next to it — each one its own ffprobe — and prepends
+/// them to the embedded streams in upstream's order (external subtitles,
+/// external audio, then the file's own streams, renumbered from 0). That
+/// keeps the sidecar probes off the scan loop like the main probe.
+///
 /// A probe failure is logged and reported as `None` — exactly what the
-/// inline probe did — so one unreadable file never aborts a scan.
+/// inline probe did — so one unreadable file never aborts a scan. The
+/// sidecars are then not looked for either: the item's stored streams are
+/// kept as they were, rather than replaced by externals alone.
 fn spawn_probe(
     encoder: Arc<dyn MediaEncoder>,
     request: MediaInfoRequest,
+    external: Option<ExternalProbe>,
 ) -> tokio::task::JoinHandle<Option<MediaInfo>> {
     tokio::task::spawn(async move {
-        match encoder.get_media_info_full(&request).await {
-            Ok(probed) => Some(probed),
+        let mut probed = match encoder.get_media_info_full(&request).await {
+            Ok(probed) => probed,
             Err(e) => {
                 let path = request.media_source.path.as_deref();
                 tracing::warn!(error = %e, ?path, "media probe failed; item left unprobed");
-                None
+                return None;
+            }
+        };
+        if let (Some(external), Some(path)) = (external, request.media_source.path.as_deref()) {
+            let target = external
+                .resolvers
+                .target_for(path, external.internal_metadata_path);
+            let externals = external.resolvers.external_streams(&target, 0).await;
+            if !externals.is_empty() {
+                tracing::debug!(
+                    path,
+                    count = externals.len(),
+                    "external media streams resolved"
+                );
+                let embedded = std::mem::take(&mut probed.media_source.media_streams);
+                probed.media_source.media_streams =
+                    ExternalStreamResolvers::merge_with_embedded(externals, embedded);
             }
         }
+        Some(probed)
     })
 }
 
@@ -529,6 +588,9 @@ struct ProbePipeline<'a> {
     /// The encoder seam, cloned into each spawned probe. `None` disables the
     /// pipeline entirely (no probe wired — the unit-test and no-ffmpeg case).
     encoder: Option<Arc<dyn MediaEncoder>>,
+    /// The sidecar subtitle/audio resolvers, run inside each **video**'s
+    /// probe task. `None` when no probe is wired.
+    externals: Option<ExternalProbeSeam>,
     /// The plan the scan is walking, borrowed so a request can be rebuilt at
     /// dispatch time from the row itself.
     planned: &'a [Planned],
@@ -549,7 +611,12 @@ struct ProbePipeline<'a> {
 
 impl<'a> ProbePipeline<'a> {
     /// Builds the pipeline over `planned` and primes `window` probes.
-    fn new(encoder: Option<Arc<dyn MediaEncoder>>, planned: &'a [Planned], window: usize) -> Self {
+    fn new(
+        encoder: Option<Arc<dyn MediaEncoder>>,
+        externals: Option<ExternalProbeSeam>,
+        planned: &'a [Planned],
+        window: usize,
+    ) -> Self {
         let eligible = if encoder.is_some() {
             planned
                 .iter()
@@ -560,6 +627,7 @@ impl<'a> ProbePipeline<'a> {
         };
         let mut this = Self {
             encoder,
+            externals,
             planned,
             eligible,
             next: 0,
@@ -582,8 +650,15 @@ impl<'a> ProbePipeline<'a> {
             if self.eligible[index].is_some()
                 && let Some(request) = probe_request(&self.planned[index].entity)
             {
+                // Sidecar streams are a video concern (`FFProbeVideoInfo`);
+                // an audio item's probe is the embedded-tag path only.
+                let external = self
+                    .externals
+                    .as_ref()
+                    .filter(|_| !request.media_is_audio)
+                    .map(|seam| seam.for_item(self.planned[index].id));
                 self.inflight
-                    .push_back((index, spawn_probe(Arc::clone(encoder), request)));
+                    .push_back((index, spawn_probe(Arc::clone(encoder), request, external)));
                 return;
             }
         }
@@ -2156,8 +2231,33 @@ impl LibraryScanner {
     }
 
     /// Opens the look-ahead ffprobe pipeline over an already-planned item set.
+    ///
+    /// When a probe is wired, every video's probe also resolves its sidecar
+    /// subtitle/audio files (`SubtitleResolver` + `AudioResolver`), which
+    /// need the naming options' extension/flag tables, the language lookup
+    /// (the configured localization, else the default culture set — the
+    /// lookup itself is culture-table-only), the encoder, and the filesystem.
     fn probe_pipeline<'a>(&self, planned: &'a [Planned]) -> ProbePipeline<'a> {
-        ProbePipeline::new(self.media_encoder.clone(), planned, self.probe_concurrency)
+        let externals = self.media_encoder.as_ref().map(|encoder| {
+            let localization = self.localization.clone().unwrap_or_else(|| {
+                Arc::new(crate::localization_manager::LocalizationManager::new(""))
+            });
+            ExternalProbeSeam {
+                resolvers: Arc::new(ExternalStreamResolvers::new(
+                    Arc::new(NamingOptions::new()),
+                    localization,
+                    Arc::clone(encoder),
+                    Arc::clone(&self.file_system),
+                )),
+                metadata_dir: self.metadata_dir.clone(),
+            }
+        });
+        ProbePipeline::new(
+            self.media_encoder.clone(),
+            externals,
+            planned,
+            self.probe_concurrency,
+        )
     }
 
     /// Folds a completed probe onto the item row — the probed

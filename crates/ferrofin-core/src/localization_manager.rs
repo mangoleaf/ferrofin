@@ -757,6 +757,15 @@ impl ferrofin_traits::localization::LocalizationManager for LocalizationManager 
     }
 }
 
+/// The language-token lookup the naming crate's `ExternalPathParser` needs
+/// to turn a sidecar's `.en`/`.English`/`.eng` token into a culture — the
+/// same `FindLanguageInfo` upstream injects as `ILocalizationManager`.
+impl ferrofin_naming::external_files::LocalizationManager for LocalizationManager {
+    fn find_language_info(&self, language: &str) -> Option<CultureDto> {
+        LocalizationManager::find_language_info(self, language).cloned()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
