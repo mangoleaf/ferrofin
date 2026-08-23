@@ -4,9 +4,9 @@
 
 use ferrofin_mediaencoding::subtitles::{SubtitleEditParser, SubtitleParser};
 
-/// The `Environment.NewLine` used by the reference platform (libse joins cue
-/// text with `\r\n`).
-const NL: &str = "\r\n";
+/// The `Environment.NewLine` libse joins cue text with — a bare LF on the Linux
+/// reference server (the C# oracle is written against `Environment.NewLine`).
+const NL: &str = "\n";
 
 fn load(name: &str) -> Vec<u8> {
     let path = format!("{}/tests/data/{name}", env!("CARGO_MANIFEST_DIR"));
@@ -16,6 +16,26 @@ fn load(name: &str) -> Vec<u8> {
 /// `TimeSpan.Parse("HH:MM:SS.fff").Ticks` — 100 ns ticks for a wall-clock time.
 fn ticks(h: i64, m: i64, s: i64, millis: i64) -> i64 {
     ((((h * 60) + m) * 60 + s) * 1000 + millis) * 10_000
+}
+
+#[test]
+fn srt_parse_treats_every_net_line_terminator_alike() {
+    // `StreamReader.ReadLine` ends a line at `\r\n`, `\n` or a bare `\r`; the
+    // joined cue text is the same whichever the file used.
+    let parser = SubtitleEditParser::new();
+    for data in [
+        "1\r\n00:00:01,000 --> 00:00:02,000\r\nfirst\r\nsecond\r\n",
+        "1\n00:00:01,000 --> 00:00:02,000\nfirst\nsecond\n",
+        "1\r00:00:01,000 --> 00:00:02,000\rfirst\rsecond\r",
+    ] {
+        let parsed = parser.parse(data.as_bytes(), "srt").unwrap();
+        assert_eq!(parsed.paragraphs.len(), 1, "{data:?}");
+        assert_eq!(
+            parsed.paragraphs[0].text,
+            format!("first{NL}second"),
+            "{data:?}"
+        );
+    }
 }
 
 // SrtParserTests.Parse_Valid_Success

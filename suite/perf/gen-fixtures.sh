@@ -29,7 +29,9 @@ TRACK=fixtures/.src/master.flac
 # stream/playlist endpoints and /Attachments need them on a real item (the mimetype tag
 # is what makes both servers list the attachment). No TTF on the host → no attachment.
 SRT=fixtures/.src/sub.srt
-printf '1\n00:00:00,000 --> 00:00:01,000\nParity subtitle\n' > "$SRT"
+# A two-line cue with CRLF terminators: the servers' parsers/writers must agree on
+# the joined cue text byte-for-byte (libse joins with the Linux Environment.NewLine).
+printf '1\r\n00:00:00,000 --> 00:00:01,000\r\nParity subtitle\r\nsecond line\r\n' > "$SRT"
 FONT="$(fc-match -f '%{file}' 'DejaVu Sans' 2>/dev/null || true)"
 case "$FONT" in *.ttf) ;; *) FONT="" ;; esac   # fc-match always answers; only a TrueType will do
 [ -f "${FONT:-}" ] || FONT="$(find /usr/share/fonts -name '*.ttf' 2>/dev/null | head -1 || true)"

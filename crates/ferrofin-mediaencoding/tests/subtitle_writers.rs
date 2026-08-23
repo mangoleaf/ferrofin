@@ -11,7 +11,8 @@ use ferrofin_mediaencoding::subtitles::model::{
 use ferrofin_mediaencoding::subtitles::{SubtitleEditParser, SubtitleParser};
 use ferrofin_mediaencoding::subtitles::{json_writer, srt, ssa, vtt};
 
-const NL: &str = "\r\n";
+/// `StreamWriter.WriteLine` on the Linux reference server.
+const NL: &str = "\n";
 
 fn subtitle_with(cues: &[(&str, i64, i64)]) -> Subtitle {
     let mut s = Subtitle::new();
@@ -53,7 +54,8 @@ fn renumber_is_one_based_and_sequential() {
 fn srt_to_text_formats_number_timing_and_text() {
     let s = subtitle_with(&[("Hello", 137_440, 140_375)]);
     let out = srt::to_text(&s);
-    let expected = format!("1{NL}00:02:17,440 --> 00:02:20,375{NL}Hello{NL}{NL}");
+    // `SrtWriter`: BOM first (StreamWriter with Encoding.UTF8), then the cue.
+    let expected = format!("\u{feff}1{NL}00:02:17,440 --> 00:02:20,375{NL}Hello{NL}{NL}");
     assert_eq!(out, expected);
 }
 
@@ -63,8 +65,18 @@ fn srt_to_text_multiple_cues_and_hours() {
     let out = srt::to_text(&s);
     assert!(out.contains("01:01:01,500 --> 01:01:02,000"));
     // Two cues -> two number lines.
-    assert!(out.starts_with(&format!("1{NL}")));
+    assert!(out.starts_with(&format!("\u{feff}1{NL}")));
     assert!(out.contains(&format!("{NL}2{NL}")));
+}
+
+#[test]
+fn srt_writer_wraps_the_hour_component_and_spaces_literal_newline_escapes() {
+    // `hh\:mm\:ss\,fff` is the 0–23 hour component; `NewLineEscapedRegex` (`\\n`,
+    // case-insensitive) turns a literal backslash-n into a space.
+    let s = subtitle_with(&[("one\\ntwo\\Nthree", 90_000_000, 90_001_000)]);
+    let out = srt::to_text(&s);
+    assert!(out.contains("01:00:00,000 --> 01:00:01,000"));
+    assert!(out.contains("one two three"));
 }
 
 #[test]
@@ -111,30 +123,33 @@ fn vtt_stretches_non_sequential_cues_and_unescapes_newlines() {
 // -- SSA / ASS writers -----------------------------------------------------
 
 #[test]
-fn ssa_to_text_has_v4_header_and_marked_dialogue() {
+fn ssa_to_text_is_jellyfins_ssa_writer() {
+    // Jellyfin's `SsaWriter`: its own header, `hh:mm:ss.ff` times, `Dialogue: 0,…,Default,text`,
+    // and every `\n` in the text replaced by the literal two characters `\n`.
     let s = subtitle_with(&[("line one\nline two", 1_180, 6_850)]);
     let out = ssa::to_text_ssa(&s);
-    assert!(out.contains("ScriptType: v4.00"));
-    // Centisecond precision, `Marked=0` prefix, `\N` line-break encoding.
-    assert!(out.contains(
-        "Dialogue: Marked=0,0:00:01.18,0:00:06.85,Default,,0000,0000,0000,,line one\\Nline two"
-    ));
+    let expected = "\u{feff}[Script Info]\nTitle: Jellyfin transcoded SSA subtitle\nScriptType: v4.00\n\n[V4 Styles]\n\
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, TertiaryColour, BackColour, Bold, Italic, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, AlphaLevel, Encoding\n\
+Style: Default,Arial,20,&H00FFFFFF,&H00FFFFFF,&H19333333,&H19333333,0,0,0,1,0,2,10,10,10,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Text\n\
+Dialogue: 0,00:00:01.18,00:00:06.85,Default,line one\\nline two\n";
+    assert_eq!(out, expected);
 }
 
 #[test]
-fn ass_to_text_has_v4plus_header_and_layer_dialogue() {
-    let s = subtitle_with(&[("hi", 1_180, 6_850)]);
+fn ass_to_text_is_jellyfins_ass_writer() {
+    let s = subtitle_with(&[("hi", 1_180, 6_850), ("two", 3_661_500, 3_662_000)]);
     let out = ssa::to_text_ass(&s);
-    assert!(out.contains("ScriptType: v4.00+"));
-    assert!(out.contains("Dialogue: 0,0:00:01.18,0:00:06.85,Default,,0000,0000,0000,,hi"));
+    assert!(out.starts_with("\u{feff}[Script Info]\nTitle: Jellyfin transcoded ASS subtitle\nScriptType: v4.00+\n\n[V4+ Styles]\n"));
+    assert!(out.contains("\nStyle: Default,Arial,20,&H00FFFFFF,&H00FFFFFF,&H19333333,&H910E0807,0,0,0,0,100,100,0,0,0,1,0,2,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Text\n"));
+    assert!(out.ends_with("Dialogue: 0,00:00:01.18,00:00:06.85,Default,hi\nDialogue: 0,01:01:01.50,01:01:02.00,Default,two\n"));
 }
 
 #[test]
-fn ssa_encode_text_strips_carriage_returns() {
-    let s = subtitle_with(&[("a\r\nb", 0, 100)]);
+fn ssa_writer_truncates_to_hundredths_and_wraps_the_hour_component() {
+    // `TimeSpan.ToString(@"hh\:mm\:ss\.ff")`: `ff` truncates, `hh` is the 0–23 hour component.
+    let s = subtitle_with(&[("x", 1_999, 90_000_000)]);
     let out = ssa::to_text_ssa(&s);
-    // \r removed, \n -> \N ; the "\r\n" collapses to a single "\N".
-    assert!(out.contains(",,a\\Nb\r\n"));
+    assert!(out.ends_with("Dialogue: 0,00:00:01.99,01:00:00.00,Default,x\n"));
 }
 
 // -- SSA parser edge cases -------------------------------------------------

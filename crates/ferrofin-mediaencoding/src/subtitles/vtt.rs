@@ -8,12 +8,7 @@
 //! literal `\n` escape in the text becomes a space.
 
 use super::model::Subtitle;
-
-/// The line terminator the C# writer emits on Linux (`Environment.NewLine`).
-const NEWLINE: &str = "\n";
-
-/// The byte-order mark `StreamWriter(stream, Encoding.UTF8)` writes first.
-const BOM: &str = "\u{feff}";
+use super::srt::{BOM, NEWLINE};
 
 /// The region every cue is placed in (verbatim from `VttWriter`).
 const REGION: &str =

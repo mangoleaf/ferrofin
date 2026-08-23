@@ -219,9 +219,10 @@ def text_sig(base, path, token):
     st, h, body = raw_headers("GET", base, path, token)
     if st != 200:
         return (st // 100, "")
+    # Exact text: a faithful writer is byte-identical (BOM, line terminators, blank
+    # lines included) — collapsing whitespace would hide a stray CR in a cue.
     text = body.decode("utf-8", "replace")
-    norm = " ".join(text.split())
-    return (2, (h.get("content-type") or "").lower().split(";")[0], norm)
+    return (2, (h.get("content-type") or "").lower().split(";")[0], text)
 
 
 def image_sig(base, path, token):

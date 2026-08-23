@@ -76,12 +76,13 @@ enum Format {
 
 /// Splits raw bytes into logical lines, matching .NET `Stream.ReadAllLines`.
 ///
-/// Both `\r\n` and `\n` terminate a line; a trailing empty line from a final
-/// terminator is dropped, mirroring the C# `ReadLine` loop.
+/// `\r\n`, `\n` and a bare `\r` each terminate a line (`StreamReader.ReadLine`);
+/// a trailing empty line from a final terminator is dropped, mirroring the C#
+/// `ReadLine` loop.
 fn read_all_lines(data: &[u8]) -> Vec<String> {
     let text = String::from_utf8_lossy(data);
     let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
-    let normalized = text.replace("\r\n", "\n");
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
     let mut lines: Vec<String> = normalized.split('\n').map(str::to_owned).collect();
     if lines.last().is_some_and(String::is_empty) {
         lines.pop();
