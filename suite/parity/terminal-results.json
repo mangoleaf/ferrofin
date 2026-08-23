@@ -1,0 +1,22 @@
+{
+  "errors": [],
+  "generated_by": "suite/parity/terminal.py",
+  "last_verified": "a518834 2026-08-23",
+  "rows": {
+    "POST /Backup/Restore": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True (post-restore LoginDisclaimer='parity-before') J=True (post-restore LoginDisclaimer='parity-before')"
+    },
+    "POST /System/Restart": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True (container running after restart: True) J=True (container running after restart: True)"
+    },
+    "POST /System/Shutdown": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True (container running after shutdown: False) J=True (container running after shutdown: False)"
+    }
+  }
+}
