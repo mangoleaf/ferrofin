@@ -231,7 +231,17 @@ pub trait ItemRepository: Send + Sync {
             .collect())
     }
 
-    /// Returns the latest item rows for the given collection type (Latest API).
+    /// The "latest media" rows of a **tvshows or music** library — port of C#
+    /// `BaseItemRepository.GetLatestItemList`.
+    ///
+    /// One grouped-threshold statement: the filter's predicates are grouped by
+    /// `SeriesName` (tvshows) or `Album` (music), the newest `filter.limit`
+    /// groups' `MAX(DateCreated)` are taken, and every row at or above the
+    /// *smallest* of those maxima is returned in the filter's `order_by`,
+    /// unpaged — so `limit` caps groups, not rows, and the caller buckets the
+    /// rows by container afterwards. Any other collection type returns an
+    /// empty list (the C# early exit); the caller uses
+    /// [`get_item_list`](Self::get_item_list) for those.
     async fn get_latest_item_list(
         &self,
         filter: &InternalItemsQuery,

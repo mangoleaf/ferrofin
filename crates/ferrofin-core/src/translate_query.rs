@@ -117,6 +117,53 @@ pub fn build_query<'a>(
     qb
 }
 
+/// Builds the "latest media" statement for a tvshows/music library — C#
+/// `BaseItemRepository.GetLatestItemList`.
+///
+/// Upstream composes two translations of the **same** filter: a grouped
+/// subquery that takes the newest `MAX(DateCreated)` per series (`SeriesName`)
+/// or album (`Album`), keeps the top `filter.limit` groups, and uses the
+/// *smallest* of those maxima as a threshold; the main query then returns
+/// every row at or above that threshold, ordered by the caller's `order_by`
+/// and **unpaged** (upstream nulls `Limit` before `ApplyQueryPaging`, so only a
+/// `StartIndex` survives). That is what makes one query return whole groups —
+/// the caller groups the rows by container afterwards.
+///
+/// `group_column` is the grouping expression (`bi."SeriesName"` /
+/// `bi."Album"`). Both translations share the predicate set, so the filter is
+/// appended twice; the inner `bi` alias shadows the outer inside the subquery,
+/// exactly as EF's nested query does.
+#[must_use]
+pub(crate) fn build_latest_item_list_query<'a>(
+    filter: &'a InternalItemsQuery,
+    group_column: &'static str,
+) -> QueryBuilder<'a, Sqlite> {
+    let mut qb: QueryBuilder<'a, Sqlite> =
+        QueryBuilder::new(r#"SELECT bi.* FROM "BaseItems" AS bi WHERE bi."Id" <> "#);
+    qb.push_bind(PLACEHOLDER_ID);
+    append_predicates(&mut qb, filter);
+
+    // `mainquery.Where(g => g.DateCreated >= subqueryGrouped.Min(s => s.MaxDateCreated))`
+    qb.push(r#" AND bi."DateCreated" >= (SELECT MIN(g."m") FROM ("#);
+    qb.push(r#"SELECT MAX(bi."DateCreated") AS "m" FROM "BaseItems" AS bi WHERE bi."Id" <> "#);
+    qb.push_bind(PLACEHOLDER_ID);
+    append_predicates(&mut qb, filter);
+    qb.push(" GROUP BY ");
+    qb.push(group_column);
+    qb.push(r#" ORDER BY "m" DESC"#);
+    if let Some(limit) = filter.limit {
+        qb.push(" LIMIT ").push_bind(i64::from(limit));
+    }
+    qb.push(") AS g)");
+
+    append_order_by(&mut qb, filter);
+    // `filter.Limit = null` upstream — only a start index can page this query.
+    if let Some(offset) = filter.start_index.filter(|o| *o > 0) {
+        qb.push(" LIMIT -1 OFFSET ").push_bind(i64::from(offset));
+    }
+    qb
+}
+
 /// Appends every `AND <predicate>` clause derived from the filter.
 ///
 /// Each block mirrors one C# `if (filter.X …) baseQuery = baseQuery.Where(…)`.
@@ -1261,4 +1308,70 @@ fn media_type_name(media: ferrofin_model::data::MediaType) -> String {
 /// [`None`] (mirrors the C# `!string.IsNullOrWhiteSpace` guards).
 fn non_blank(value: Option<&String>) -> Option<&str> {
     value.map(String::as_str).filter(|s| !s.trim().is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_latest_item_list_query;
+    use ferrofin_model::data::BaseItemKind;
+    use ferrofin_model::dto::SortOrder;
+    use ferrofin_model::live_tv::ItemSortBy;
+    use ferrofin_traits::options::InternalItemsQuery;
+
+    /// The statement `GetLatestItemList` sends: grouped-threshold subquery
+    /// capped at `limit`, the caller's triple ORDER BY verbatim, and no paging
+    /// on the outer query (upstream nulls `Limit` before `ApplyQueryPaging`).
+    #[test]
+    fn latest_item_list_query_groups_thresholds_and_does_not_page() {
+        let filter = InternalItemsQuery {
+            include_item_types: vec![BaseItemKind::Episode],
+            limit: Some(3),
+            order_by: vec![
+                (ItemSortBy::DateCreated, SortOrder::Descending),
+                (ItemSortBy::SortName, SortOrder::Descending),
+                (ItemSortBy::ProductionYear, SortOrder::Descending),
+            ],
+            ..InternalItemsQuery::default()
+        };
+        let qb = build_latest_item_list_query(&filter, r#"bi."SeriesName""#);
+        let sql = qb.sql();
+
+        assert!(
+            sql.contains(r#"GROUP BY bi."SeriesName" ORDER BY "m" DESC LIMIT "#),
+            "grouped subquery must order the per-group maxima newest-first and take `limit`: {sql}"
+        );
+        assert!(
+            sql.contains(r#"bi."DateCreated" >= (SELECT MIN(g."m") FROM ("#),
+            "the threshold is the smallest of the top-N group maxima: {sql}"
+        );
+        // The type predicate is applied to BOTH translations of the filter.
+        assert_eq!(
+            sql.matches(r#"bi."Type" IN"#).count(),
+            2,
+            "the subquery and the main query share the predicate set: {sql}"
+        );
+        let order = sql.rsplit(" ORDER BY ").next().expect("an outer ORDER BY");
+        assert_eq!(
+            order, r#"bi."DateCreated" DESC, bi."SortName" DESC, bi."ProductionYear" DESC"#,
+            "the caller's ordering rides through untouched, with no trailing LIMIT"
+        );
+    }
+
+    /// Without a `limit` the grouped subquery is uncapped (C# `Take` is only
+    /// applied when `filter.Limit.HasValue`); a start index still pages the
+    /// outer query as `LIMIT -1 OFFSET ?`.
+    #[test]
+    fn latest_item_list_query_without_limit_is_uncapped_and_offsets() {
+        let filter = InternalItemsQuery {
+            start_index: Some(5),
+            ..InternalItemsQuery::default()
+        };
+        let qb = build_latest_item_list_query(&filter, r#"bi."Album""#);
+        let sql = qb.sql();
+        assert!(
+            sql.contains(r#"GROUP BY bi."Album" ORDER BY "m" DESC) AS g)"#),
+            "{sql}"
+        );
+        assert!(sql.ends_with(" LIMIT -1 OFFSET ?"), "{sql}");
+    }
 }

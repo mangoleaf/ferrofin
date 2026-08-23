@@ -37,7 +37,8 @@ use ferrofin_traits::persistence::{
 use crate::db_error::{db_err, media_stream_type_disc};
 use crate::item_type_lookup::stored_type_name;
 use crate::translate_query::{
-    PLACEHOLDER_ID, QueryShape, append_predicates, build_query, push_in_list,
+    PLACEHOLDER_ID, QueryShape, append_predicates, build_latest_item_list_query, build_query,
+    push_in_list,
 };
 use sqlx::{FromRow, QueryBuilder, Row, Sqlite};
 
@@ -706,21 +707,23 @@ impl ItemRepository for FerrofinItemRepository {
         filter: &InternalItemsQuery,
         collection_type: CollectionType,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        // Only movies/tvshows/music support the Latest API (C# early exit).
-        if !matches!(
-            collection_type,
-            CollectionType::movies | CollectionType::tvshows | CollectionType::music
-        ) {
-            return Ok(Vec::new());
-        }
-        // The smart Season/Series container selection is deferred (library
-        // manager); the base behavior returns the filtered rows newest-first.
-        let mut latest = filter.clone();
-        latest.order_by = vec![(
-            ferrofin_model::live_tv::ItemSortBy::DateCreated,
-            ferrofin_model::dto::SortOrder::Descending,
-        )];
-        self.fetch_rows(&latest, QueryShape::FullRows).await
+        // C# `BaseItemRepository.GetLatestItemList`: only tvshows and music
+        // take the grouped path; every other collection type early-exits
+        // empty (the user-view manager sends those through `get_item_list`).
+        let group_column = match collection_type {
+            CollectionType::tvshows => r#"bi."SeriesName""#,
+            CollectionType::music => r#"bi."Album""#,
+            _ => return Ok(Vec::new()),
+        };
+        // One statement: the newest `limit` groups' maxima set a DateCreated
+        // threshold, and every row at or above it comes back in the caller's
+        // order (`filter.limit` caps GROUPS, not rows — the outer query is
+        // unpaged). The caller's `order_by` rides through untouched.
+        let mut qb = build_latest_item_list_query(filter, group_column);
+        qb.build_query_as::<BaseItemEntity>()
+            .fetch_all(self.db.pool())
+            .await
+            .map_err(db_err)
     }
 
     async fn item_exists(&self, id: Uuid) -> Result<bool, ServiceError> {
@@ -1214,6 +1217,7 @@ mod tests {
     use ferrofin_db::Database;
     use ferrofin_model::data::BaseItemKind;
     use ferrofin_model::entities::ExtraType;
+    use ferrofin_traits::persistence::ItemPersistenceService;
 
     fn repo(db: &Database) -> FerrofinItemRepository {
         FerrofinItemRepository::new(db.clone(), Arc::new(ItemTypeLookup::new()))
@@ -2223,25 +2227,220 @@ mod tests {
         );
     }
 
+    /// Seeds a full row through the persistence service so `DateCreated`,
+    /// `SeriesName`/`Album`, `SortName` and `Type` are all under test control
+    /// (the `test_support` inserts leave the dates `NULL`).
+    async fn seed_latest_row(
+        db: &Database,
+        id: Uuid,
+        kind: BaseItemKind,
+        name: &str,
+        group: &str,
+        created: chrono::DateTime<Utc>,
+    ) {
+        let persistence =
+            crate::item_persistence_service::FerrofinItemPersistenceService::new(db.clone());
+        let (series_name, album) = match kind {
+            BaseItemKind::Episode => (Some(group.to_owned()), None),
+            BaseItemKind::Audio => (None, Some(group.to_owned())),
+            _ => (None, None),
+        };
+        persistence
+            .save_items(&[BaseItemEntity {
+                id: guid_to_db(id),
+                type_: stored_type_name(kind).unwrap_or_default().to_owned(),
+                name: Some(name.to_owned()),
+                sort_name: Some(name.to_owned()),
+                series_name,
+                album,
+                date_created: Some(created),
+                ..BaseItemEntity::default()
+            }])
+            .await
+            .expect("seed latest row");
+    }
+
+    fn day(n: u32) -> chrono::DateTime<Utc> {
+        chrono::DateTime::parse_from_rfc3339(&format!("2024-01-{n:02}T00:00:00Z"))
+            .expect("date")
+            .with_timezone(&Utc)
+    }
+
+    /// The C# early exit: only `tvshows` and `music` take the grouped path —
+    /// `movies` (which the old port accepted) and `books` return nothing, the
+    /// user-view manager routes those through `get_item_list` instead.
     #[tokio::test]
-    async fn latest_item_list_gates_on_collection_type() {
+    async fn latest_item_list_is_empty_for_movies_and_books() {
         let db = test_db().await;
         let repository = repo(&db);
-        seed_named_item(&db, Uuid::from_u128(0xD001), BaseItemKind::Movie, "New").await;
+        seed_latest_row(
+            &db,
+            Uuid::from_u128(0xD001),
+            BaseItemKind::Movie,
+            "New",
+            "",
+            day(1),
+        )
+        .await;
 
-        // A supported collection type returns rows newest-first.
-        let movies = repository
-            .get_latest_item_list(&InternalItemsQuery::default(), CollectionType::movies)
-            .await
-            .expect("latest movies");
-        assert_eq!(movies.len(), 1);
+        for ct in [CollectionType::movies, CollectionType::books] {
+            let rows = repository
+                .get_latest_item_list(&InternalItemsQuery::default(), ct)
+                .await
+                .expect("latest");
+            assert!(rows.is_empty(), "{ct:?} must early-exit empty");
+        }
+    }
 
-        // An unsupported collection type early-returns empty.
-        let books = repository
-            .get_latest_item_list(&InternalItemsQuery::default(), CollectionType::books)
+    /// tvshows groups by `SeriesName`: with `limit` 2 and three series whose
+    /// newest episodes are day 9 / day 5 / day 3, the threshold is day 5 (the
+    /// smallest of the top-two maxima) — so series C is out entirely, and
+    /// series A's OLD episode (day 2, older than the threshold) is out too,
+    /// even though its series is in. That is upstream's exact semantics.
+    #[tokio::test]
+    async fn latest_item_list_groups_by_series_name_for_tvshows_with_min_of_top_n_threshold() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let (a_new, a_old, b_new, b_mid, c_new) = (
+            Uuid::from_u128(0xD101),
+            Uuid::from_u128(0xD102),
+            Uuid::from_u128(0xD103),
+            Uuid::from_u128(0xD104),
+            Uuid::from_u128(0xD105),
+        );
+        seed_latest_row(
+            &db,
+            a_new,
+            BaseItemKind::Episode,
+            "A e2",
+            "Series A",
+            day(9),
+        )
+        .await;
+        seed_latest_row(
+            &db,
+            a_old,
+            BaseItemKind::Episode,
+            "A e1",
+            "Series A",
+            day(2),
+        )
+        .await;
+        seed_latest_row(
+            &db,
+            b_new,
+            BaseItemKind::Episode,
+            "B e2",
+            "Series B",
+            day(5),
+        )
+        .await;
+        seed_latest_row(
+            &db,
+            b_mid,
+            BaseItemKind::Episode,
+            "B e1",
+            "Series B",
+            day(5),
+        )
+        .await;
+        seed_latest_row(
+            &db,
+            c_new,
+            BaseItemKind::Episode,
+            "C e1",
+            "Series C",
+            day(3),
+        )
+        .await;
+
+        let filter = InternalItemsQuery {
+            include_item_types: vec![BaseItemKind::Episode],
+            limit: Some(2),
+            order_by: vec![
+                (
+                    ferrofin_model::live_tv::ItemSortBy::DateCreated,
+                    ferrofin_model::dto::SortOrder::Descending,
+                ),
+                (
+                    ferrofin_model::live_tv::ItemSortBy::SortName,
+                    ferrofin_model::dto::SortOrder::Descending,
+                ),
+            ],
+            ..InternalItemsQuery::default()
+        };
+        let rows = repository
+            .get_latest_item_list(&filter, CollectionType::tvshows)
             .await
-            .expect("latest books");
-        assert!(books.is_empty());
+            .expect("latest tvshows");
+        let ids: Vec<Uuid> = rows
+            .iter()
+            .filter_map(|r| Uuid::parse_str(&r.id).ok())
+            .collect();
+        // DateCreated DESC, then SortName DESC on the day-5 tie ("B e2" > "B e1").
+        assert_eq!(ids, vec![a_new, b_new, b_mid]);
+    }
+
+    /// music groups by `Album`. The `limit` caps GROUPS: with `limit` 2 the
+    /// threshold is Album Y's maximum (day 6), so both of Album X's tracks (8,
+    /// 7) and Y's (6) come back while Album Z (day 4) is out. With `limit` 1
+    /// the threshold rises to X's own maximum and only the day-8 track
+    /// survives — the threshold is a row filter, not a group filter, exactly
+    /// as upstream's `DateCreated >= Min(MaxDateCreated)` behaves.
+    #[tokio::test]
+    async fn latest_item_list_groups_by_album_for_music() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let (x1, x2, y1, z1) = (
+            Uuid::from_u128(0xD201),
+            Uuid::from_u128(0xD202),
+            Uuid::from_u128(0xD203),
+            Uuid::from_u128(0xD204),
+        );
+        seed_latest_row(&db, x1, BaseItemKind::Audio, "X t1", "Album X", day(8)).await;
+        seed_latest_row(&db, x2, BaseItemKind::Audio, "X t2", "Album X", day(7)).await;
+        seed_latest_row(&db, y1, BaseItemKind::Audio, "Y t1", "Album Y", day(6)).await;
+        seed_latest_row(&db, z1, BaseItemKind::Audio, "Z t1", "Album Z", day(4)).await;
+
+        let filter = |limit: i32| InternalItemsQuery {
+            include_item_types: vec![BaseItemKind::Audio],
+            limit: Some(limit),
+            order_by: vec![(
+                ferrofin_model::live_tv::ItemSortBy::DateCreated,
+                ferrofin_model::dto::SortOrder::Descending,
+            )],
+            ..InternalItemsQuery::default()
+        };
+        let ids = |rows: Vec<BaseItemEntity>| -> Vec<Uuid> {
+            rows.iter()
+                .filter_map(|r| Uuid::parse_str(&r.id).ok())
+                .collect()
+        };
+
+        let two = repository
+            .get_latest_item_list(&filter(2), CollectionType::music)
+            .await
+            .expect("latest music, two groups");
+        assert_eq!(ids(two), vec![x1, x2, y1], "two newest albums, Z is out");
+
+        let one = repository
+            .get_latest_item_list(&filter(1), CollectionType::music)
+            .await
+            .expect("latest music, one group");
+        assert_eq!(
+            ids(one),
+            vec![x1],
+            "the threshold is X's own max, so X's older track is below it"
+        );
+
+        // No groups (`limit` 0) → `MIN` over nothing is NULL → `>= NULL` is
+        // never true → no rows. A "helpful" COALESCE here would turn "no
+        // groups" into "every row".
+        let none = repository
+            .get_latest_item_list(&filter(0), CollectionType::music)
+            .await
+            .expect("latest music, no groups");
+        assert!(none.is_empty());
     }
 
     #[tokio::test]
