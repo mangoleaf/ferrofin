@@ -118,6 +118,29 @@ impl FerrofinLyricManager {
         ServiceError::invalid_input("no remote lyric provider is configured")
     }
 
+    /// Routes a namespaced lyric id (`"{provider_id}_{provider_local_id}"`,
+    /// `GetProviderId` namespacing) back to its owning provider and fetches
+    /// the raw lyric — port of `LyricManager.InternalGetRemoteLyricsAsync`.
+    /// `None` when no registered provider owns the prefix (logged, as upstream
+    /// `GetProvider` does) or the provider has no such lyric.
+    async fn fetch_remote(
+        &self,
+        lyric_id: &str,
+    ) -> Result<Option<ferrofin_traits::stubs::LyricResponse>, ServiceError> {
+        // `id.Split('_', 2)`: the prefix before the first underscore is the
+        // provider id, the remainder is the provider-local id.
+        let (namespace, local_id) = lyric_id.split_once('_').unwrap_or((lyric_id, lyric_id));
+        let Some(provider) = self
+            .providers
+            .iter()
+            .find(|p| provider_id(p.name()) == namespace)
+        else {
+            tracing::warn!(lyric_id, "unknown lyric provider id");
+            return Ok(None);
+        };
+        provider.get_lyrics(local_id).await
+    }
+
     /// Runs one provider's search and maps its results into namespaced
     /// [`RemoteLyricInfoDto`]s. A provider that errors yields an empty list
     /// (logged) rather than failing the whole search — port of
@@ -258,19 +281,7 @@ impl LyricManager for FerrofinLyricManager {
             return Err(ServiceError::not_found("item has no media path for lyrics"));
         };
 
-        // The id is `"{provider_id}_{provider_local_id}"` (`GetProviderId`
-        // namespacing); route it back to the owning provider.
-        let (namespace, local_id) = lyric_id.split_once('_').unwrap_or((lyric_id, lyric_id));
-        let Some(provider) = self
-            .providers
-            .iter()
-            .find(|p| provider_id(p.name()) == namespace)
-        else {
-            tracing::warn!(lyric_id, "unknown lyric provider id");
-            return Ok(None);
-        };
-
-        let Some(response) = provider.get_lyrics(local_id).await? else {
+        let Some(response) = self.fetch_remote(lyric_id).await? else {
             tracing::debug!(lyric_id, "unable to download lyrics");
             return Ok(None);
         };
@@ -284,6 +295,15 @@ impl LyricManager for FerrofinLyricManager {
 
         // Return the saved lyric through the local parse path.
         Ok(Some(parse_by_format(&response.format, &response.text)))
+    }
+
+    async fn get_remote_lyrics(&self, lyric_id: &str) -> Result<Option<LyricDto>, ServiceError> {
+        // `LyricManager.GetRemoteLyricsAsync`: fetch + parse only — no item,
+        // no sidecar. An unknown provider id or a provider miss is `None`.
+        Ok(self
+            .fetch_remote(lyric_id)
+            .await?
+            .map(|response| parse_by_format(&response.format, &response.text)))
     }
 
     async fn save_lyric(
@@ -725,6 +745,53 @@ mod tests {
             .await
             .expect("download runs");
         assert!(dto.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_remote_lyrics_parses_without_item_or_sidecar() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut fake = FakeLyricProvider::new("Fake");
+        fake.fetch_response = Some(LyricResponse {
+            format: "lrc".to_owned(),
+            text: "[ar:Borislav Slavov]\n[00:17.12]I want to live".to_owned(),
+        });
+        let fake = Arc::new(fake);
+        // No item store at all: the route needs none.
+        let mgr = FerrofinLyricManager::new()
+            .with_providers(vec![Arc::clone(&fake) as Arc<dyn LyricProvider>]);
+
+        let lyric_id = format!("{}_42_synced", provider_id("Fake"));
+        let dto = mgr
+            .get_remote_lyrics(&lyric_id)
+            .await
+            .expect("fetch")
+            .expect("lyric found");
+        assert_eq!(
+            fake.last_fetch_id.lock().expect("lock").as_deref(),
+            Some("42_synced")
+        );
+        assert_eq!(dto.metadata.is_synced, Some(true));
+        assert_eq!(dto.metadata.artist.as_deref(), Some("Borislav Slavov"));
+        assert_eq!(dto.lyrics[0].text, "I want to live");
+        assert_eq!(dto.lyrics[0].start, Some(17_120 * 10_000));
+        // Nothing was written anywhere.
+        assert!(std::fs::read_dir(dir.path()).expect("dir").next().is_none());
+
+        // Unknown provider prefix → `None` (not an error).
+        assert!(
+            mgr.get_remote_lyrics("deadbeef_42_synced")
+                .await
+                .expect("runs")
+                .is_none()
+        );
+        // No providers at all → `None` as well (C# `GetProvider` miss).
+        assert!(
+            FerrofinLyricManager::new()
+                .get_remote_lyrics(&lyric_id)
+                .await
+                .expect("runs")
+                .is_none()
+        );
     }
 
     #[tokio::test]

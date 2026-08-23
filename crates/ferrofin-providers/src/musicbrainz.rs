@@ -71,14 +71,43 @@ struct Release {
     title: Option<String>,
     #[serde(default)]
     date: Option<String>,
+    #[serde(rename = "artist-credit", default)]
+    artist_credit: Vec<ArtistCreditWire>,
+}
+
+/// One `artist-credit` entry on a release: the credited name plus the artist
+/// it points at (`inc=artists` / the search's embedded credit).
+#[derive(Debug, Deserialize)]
+struct ArtistCreditWire {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    artist: Option<ArtistCreditArtist>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ArtistCreditArtist {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ArtistLookup {
     #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
     name: Option<String>,
     #[serde(rename = "life-span", default)]
     span: Option<LifeSpan>,
+}
+
+/// `/ws/2/artist?query=` with the full per-hit shape (id + name + life-span).
+#[derive(Debug, Deserialize)]
+struct ArtistSearchFull {
+    #[serde(default)]
+    artists: Vec<ArtistLookup>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -125,6 +154,69 @@ pub struct ReleaseDetails {
     pub premiere_date: Option<PartialDate>,
     /// The release year.
     pub production_year: Option<i32>,
+}
+
+/// One artist credit on a release — the "Identify" result's `Artists` entry.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReleaseArtistCredit {
+    /// The credited artist name.
+    pub name: Option<String>,
+    /// The `MusicBrainzArtist` id behind the credit, when MB supplied it.
+    pub artist_id: Option<String>,
+}
+
+/// One release as a search/lookup hit — the fields
+/// `MusicBrainzAlbumProvider.GetReleaseResult` reads off an `IRelease`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReleaseHit {
+    /// The `MusicBrainzAlbum` (release) id.
+    pub id: String,
+    /// The release title.
+    pub title: Option<String>,
+    /// The release date (`Date?.Year` / `NearestDate`).
+    pub date: Option<PartialDate>,
+    /// The `MusicBrainzReleaseGroup` id, when supplied.
+    pub release_group_id: Option<String>,
+    /// The artist credits in order; the first is the album artist.
+    pub artist_credits: Vec<ReleaseArtistCredit>,
+}
+
+/// One artist as a search/lookup hit — the fields
+/// `MusicBrainzArtistProvider.GetResultFromResponse` reads off an `IArtist`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ArtistHit {
+    /// The `MusicBrainzArtist` id.
+    pub id: String,
+    /// The artist name as MusicBrainz spells it.
+    pub name: Option<String>,
+    /// The life-span begin date (`LifeSpan?.Begin`).
+    pub begin: Option<PartialDate>,
+}
+
+impl From<Release> for ReleaseHit {
+    fn from(r: Release) -> Self {
+        Self {
+            id: r.id,
+            title: non_empty(r.title),
+            date: r.date.as_deref().and_then(parse_partial_date),
+            release_group_id: r.group.map(|g| g.id),
+            artist_credits: r
+                .artist_credit
+                .into_iter()
+                .map(|c| {
+                    let (artist_id, artist_name) = c
+                        .artist
+                        .map_or((None, None), |a| (non_empty(a.id), non_empty(a.name)));
+                    ReleaseArtistCredit {
+                        // The credited name (`ArtistCredit.Name`), falling back
+                        // to the artist's canonical name.
+                        name: non_empty(c.name).or(artist_name),
+                        artist_id,
+                    }
+                })
+                .collect(),
+        }
+    }
 }
 
 /// One artist's metadata beyond its id.
@@ -261,6 +353,98 @@ impl MusicBrainzClient {
                 release_id: Some(r.id),
                 release_group_id: r.group.map(|g| g.id),
             })
+    }
+
+    /// Runs a raw lucene release search (`/ws/2/release?query=`) and returns
+    /// every hit in MB's order — port of `Query.FindReleasesAsync` as the
+    /// "Identify" flow drives it (the caller composes the query exactly as the
+    /// C# provider does). Empty on any failure.
+    pub async fn find_releases(&self, query: &str) -> Vec<ReleaseHit> {
+        let Some(result): Option<ReleaseSearch> = self
+            .get("/ws/2/release", &[("query", query.to_owned())])
+            .await
+        else {
+            return Vec::new();
+        };
+        result.releases.into_iter().map(ReleaseHit::from).collect()
+    }
+
+    /// Looks up one release with its artists + release group
+    /// (`inc=artists+release-groups`) — port of `Query.LookupReleaseAsync(id,
+    /// Include.Artists | Include.ReleaseGroups)`. `None` on any failure.
+    pub async fn lookup_release(&self, release_id: &str) -> Option<ReleaseHit> {
+        let release: Release = self
+            .get(
+                &format!("/ws/2/release/{release_id}"),
+                &[("inc", "artists+release-groups".to_owned())],
+            )
+            .await?;
+        Some(ReleaseHit::from(release))
+    }
+
+    /// Looks up a release group's releases (`inc=releases`) and resolves each
+    /// through [`lookup_release`](Self::lookup_release) — port of the
+    /// `MusicBrainzAlbumProvider.GetReleaseGroupResultAsync` walk. Empty when
+    /// the group is unknown.
+    pub async fn release_group_releases(&self, release_group_id: &str) -> Vec<ReleaseHit> {
+        let Some(group): Option<ReleaseGroupLookup> = self
+            .get(
+                &format!("/ws/2/release-group/{release_group_id}"),
+                &[("inc", "releases".to_owned())],
+            )
+            .await
+        else {
+            return Vec::new();
+        };
+        let mut hits = Vec::with_capacity(group.releases.len());
+        for release in group.releases {
+            if let Some(hit) = self.lookup_release(&release.id).await {
+                hits.push(hit);
+            }
+        }
+        hits
+    }
+
+    /// Runs a raw lucene artist search (`/ws/2/artist?query=`) and returns
+    /// every hit — port of `Query.FindArtistsAsync` for the "Identify" flow.
+    /// Empty on any failure.
+    pub async fn find_artists(&self, query: &str) -> Vec<ArtistHit> {
+        let Some(result): Option<ArtistSearchFull> = self
+            .get("/ws/2/artist", &[("query", query.to_owned())])
+            .await
+        else {
+            return Vec::new();
+        };
+        result
+            .artists
+            .into_iter()
+            .filter_map(|a| {
+                Some(ArtistHit {
+                    id: non_empty(a.id)?,
+                    name: non_empty(a.name),
+                    begin: a
+                        .span
+                        .and_then(|s| s.begin)
+                        .as_deref()
+                        .and_then(parse_partial_date),
+                })
+            })
+            .collect()
+    }
+
+    /// Looks up one artist by id — port of `Query.LookupArtistAsync` as the
+    /// "Identify" flow uses it. `None` on any failure.
+    pub async fn lookup_artist(&self, artist_id: &str) -> Option<ArtistHit> {
+        let artist: ArtistLookup = self.get(&format!("/ws/2/artist/{artist_id}"), &[]).await?;
+        Some(ArtistHit {
+            id: non_empty(artist.id).unwrap_or_else(|| artist_id.to_owned()),
+            name: non_empty(artist.name),
+            begin: artist
+                .span
+                .and_then(|s| s.begin)
+                .as_deref()
+                .and_then(parse_partial_date),
+        })
     }
 
     /// Looks up a release to get its release-group id (`inc=release-groups`).
@@ -574,6 +758,56 @@ mod tests {
             )
             .await;
         assert_eq!(ids.release_group_id.as_deref(), Some("rg-looked-up"));
+    }
+
+    #[tokio::test]
+    async fn identify_hits_carry_title_date_group_and_artist_credits() {
+        use crate::mock_http::MockServer;
+        let server = MockServer::start(vec![
+            (
+                "/ws/2/artist?",
+                r#"{"artists":[{"id":"artist-mbid","name":"Miles Davis","life-span":{"begin":"1926-05-26"}},{"name":"no id"}]}"#.to_owned(),
+            ),
+            (
+                "/ws/2/artist/",
+                r#"{"id":"artist-mbid","name":"Miles Davis","life-span":{"begin":"1926"}}"#.to_owned(),
+            ),
+            (
+                "/ws/2/release?",
+                r#"{"releases":[{"id":"rel-1","title":"Kind of Blue","date":"1959-08-17","release-group":{"id":"rg-1"},"artist-credit":[{"name":"Miles Davis","artist":{"id":"artist-mbid","name":"Miles Davis"}},{"artist":{"id":"other","name":"Other"}}]}]}"#.to_owned(),
+            ),
+        ])
+        .await;
+        let c = MusicBrainzClient::new(&server.base_url, "test");
+
+        let hits = c.find_releases("\"Kind of Blue\"").await;
+        assert_eq!(hits.len(), 1);
+        let hit = &hits[0];
+        assert_eq!(hit.id, "rel-1");
+        assert_eq!(hit.title.as_deref(), Some("Kind of Blue"));
+        assert_eq!(hit.date.map(|d| d.year), Some(1959));
+        assert_eq!(hit.release_group_id.as_deref(), Some("rg-1"));
+        assert_eq!(hit.artist_credits.len(), 2);
+        assert_eq!(hit.artist_credits[0].name.as_deref(), Some("Miles Davis"));
+        assert_eq!(
+            hit.artist_credits[0].artist_id.as_deref(),
+            Some("artist-mbid")
+        );
+        // A credit without its own name falls back to the artist's name.
+        assert_eq!(hit.artist_credits[1].name.as_deref(), Some("Other"));
+
+        let artists = c.find_artists("\"Miles Davis\"").await;
+        // The id-less hit is dropped.
+        assert_eq!(artists.len(), 1);
+        assert_eq!(artists[0].id, "artist-mbid");
+        assert_eq!(
+            artists[0].begin.map(|d| (d.year, d.month, d.day)),
+            Some((1926, 5, 26))
+        );
+
+        let artist = c.lookup_artist("artist-mbid").await.expect("lookup");
+        assert_eq!(artist.name.as_deref(), Some("Miles Davis"));
+        assert_eq!(artist.begin.map(|d| d.year), Some(1926));
     }
 
     #[tokio::test]

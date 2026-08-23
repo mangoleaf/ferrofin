@@ -297,6 +297,64 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         Ok(())
     }
 
+    async fn replace_provider_ids(
+        &self,
+        item_id: Uuid,
+        ids: &[(String, String)],
+    ) -> Result<(), ServiceError> {
+        let id = guid_to_db(item_id);
+        // One transaction so the clear+rewrite is atomic on the single writer
+        // connection (same shape as `set_ancestors`).
+        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        sqlx::query(r#"DELETE FROM "BaseItemProviders" WHERE "ItemId" = ?1"#)
+            .bind(&id)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        for (provider, value) in ids {
+            // Blank keys/values are not ids (the C# `SetProviderId` drops them).
+            if provider.trim().is_empty() || value.trim().is_empty() {
+                continue;
+            }
+            sqlx::query(
+                r#"INSERT OR REPLACE INTO "BaseItemProviders"
+                   ("ItemId", "ProviderId", "ProviderValue") VALUES (?1, ?2, ?3)"#,
+            )
+            .bind(&id)
+            .bind(provider)
+            .bind(value)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        }
+        tx.commit().await.map_err(db_err)
+    }
+
+    async fn set_parent_id(&self, item_id: Uuid, parent_id: Uuid) -> Result<(), ServiceError> {
+        let id = guid_to_db(item_id);
+        let parent = guid_to_db(parent_id);
+        // Read first on the pool: the steady state (already parented) must not
+        // touch the single writer connection.
+        let current: Option<Option<String>> =
+            sqlx::query_scalar(r#"SELECT "ParentId" FROM "BaseItems" WHERE "Id" = ?1"#)
+                .bind(&id)
+                .fetch_optional(self.db.pool())
+                .await
+                .map_err(db_err)?;
+        match current {
+            None => return Ok(()),
+            Some(Some(existing)) if existing.eq_ignore_ascii_case(&parent) => return Ok(()),
+            Some(_) => {}
+        }
+        sqlx::query(r#"UPDATE "BaseItems" SET "ParentId" = ?2 WHERE "Id" = ?1"#)
+            .bind(&id)
+            .bind(&parent)
+            .execute(self.db.writer())
+            .await
+            .map_err(db_err)?;
+        Ok(())
+    }
+
     async fn save_item_values(
         &self,
         item_id: Uuid,
@@ -774,6 +832,45 @@ mod tests {
             .await
             .expect("lookup");
         assert_eq!(rows, vec![(movie, "604".to_owned())]);
+    }
+
+    // "Identify → Apply" assigns the chosen result's whole id set: stale keys
+    // go, the new ones land, blanks are dropped.
+    #[tokio::test]
+    async fn replace_provider_ids_swaps_the_whole_set() {
+        let db = test_db().await;
+        let movie = Uuid::new_v4();
+        seed_item(&db, movie, BaseItemKind::Movie).await;
+        let svc = FerrofinItemPersistenceService::new(db.clone());
+
+        svc.save_provider_id(movie, "Tvdb", "1")
+            .await
+            .expect("seed stale id");
+        svc.replace_provider_ids(
+            movie,
+            &[
+                ("Tmdb".to_owned(), "603".to_owned()),
+                ("Imdb".to_owned(), "tt0133093".to_owned()),
+                ("Blank".to_owned(), "  ".to_owned()),
+            ],
+        )
+        .await
+        .expect("replace");
+
+        let mut rows = svc
+            .provider_ids_for_items(&[movie])
+            .await
+            .expect("read back")
+            .remove(&movie)
+            .unwrap_or_default();
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![
+                ("Imdb".to_owned(), "tt0133093".to_owned()),
+                ("Tmdb".to_owned(), "603".to_owned()),
+            ]
+        );
     }
 
     // Saving an item must stamp the derived `CleanName` (C# `SaveItem` computes

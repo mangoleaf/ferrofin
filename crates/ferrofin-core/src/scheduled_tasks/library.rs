@@ -975,17 +975,11 @@ impl PeopleValidationTask {
                 {
                     Ok(_) => refreshed += 1,
                     Err(e) => {
-                        // One representative warning, then stop the pass: when
-                        // the provider manager defers single-item refresh (the
-                        // scan-time TMDB pipeline is what enriches people
-                        // today), every attempt fails identically. The next
+                        // One representative warning, then stop the pass: a
+                        // provider-manager failure (no network, no image store)
+                        // repeats identically for every person. The next
                         // scheduled run retries.
-                        tracing::warn!(
-                            person = id,
-                            error = %e,
-                            "person refresh unavailable; person images/bios are enriched \
-                             during library scans"
-                        );
+                        tracing::warn!(person = id, error = %e, "person refresh failed");
                         break;
                     }
                 }
@@ -1688,6 +1682,12 @@ mod tests {
                 .expect("lock")
                 .push((item_id, lyric_id.to_owned()));
             Ok(Some(LyricDto::default()))
+        }
+        async fn get_remote_lyrics(
+            &self,
+            _lyric_id: &str,
+        ) -> Result<Option<LyricDto>, ServiceError> {
+            unimplemented!("fake")
         }
         async fn save_lyric(
             &self,

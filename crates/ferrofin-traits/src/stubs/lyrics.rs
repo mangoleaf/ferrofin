@@ -19,9 +19,9 @@ use uuid::Uuid;
 
 use crate::error::ServiceError;
 
-/// The (deferred) lyrics manager.
+/// The lyrics manager.
 ///
-/// Port of `ILyricManager` (minimal slice). The overloaded `SearchLyricsAsync` /
+/// Port of `ILyricManager`. The overloaded `SearchLyricsAsync` /
 /// `DownloadLyricsAsync` / `SaveLyricAsync` methods each collapse to one form.
 #[async_trait]
 pub trait LyricManager: Send + Sync {
@@ -37,6 +37,12 @@ pub trait LyricManager: Send + Sync {
         item_id: Uuid,
         lyric_id: &str,
     ) -> Result<Option<LyricDto>, ServiceError>;
+
+    /// Fetches and parses a remote lyric by its namespaced id
+    /// (`"{provider_id}_{provider_local_id}"`) without an item and without
+    /// saving anything — `GET /Providers/Lyrics/{lyricId}`. `None` when the
+    /// provider id is unknown or the provider has no such lyric.
+    async fn get_remote_lyrics(&self, lyric_id: &str) -> Result<Option<LyricDto>, ServiceError>;
 
     /// Saves caller-supplied lyric text for an audio item.
     async fn save_lyric(

@@ -68,7 +68,7 @@ impl OmdbClient {
 
     /// Points the client at `base_url` (a mock server) for tests.
     #[cfg(test)]
-    fn with_base_url(mut self, base_url: &str) -> Self {
+    pub(crate) fn with_base_url(mut self, base_url: &str) -> Self {
         self.base_url = base_url.to_owned();
         self
     }

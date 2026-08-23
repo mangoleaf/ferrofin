@@ -112,7 +112,7 @@ impl AudioDbClient {
 
     /// Points the client at `base_url` (a mock server) for tests.
     #[cfg(test)]
-    fn with_base_url(base_url: &str) -> Self {
+    pub(crate) fn with_base_url(base_url: &str) -> Self {
         Self {
             http: reqwest::Client::new(),
             base_url: base_url.to_owned(),

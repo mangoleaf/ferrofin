@@ -1492,6 +1492,9 @@ impl LyricManager for FakeLyrics {
     ) -> Result<Option<LyricDto>, ServiceError> {
         unimplemented!("fake")
     }
+    async fn get_remote_lyrics(&self, _lyric_id: &str) -> Result<Option<LyricDto>, ServiceError> {
+        unimplemented!("fake")
+    }
     async fn save_lyric(
         &self,
         _item_id: Uuid,

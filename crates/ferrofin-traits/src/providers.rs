@@ -27,13 +27,15 @@
 //!
 //! The trait is object-safe and carries a `_assert_object_safe_*` assertion.
 
+use std::collections::HashMap;
+
 use async_trait::async_trait;
 use ferrofin_model::configuration::{MetadataOptions, MetadataPluginSummary};
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::entities::ImageType;
 use ferrofin_model::providers::{
     ExternalIdInfo, ImageProviderInfo, ItemLookupInfo, RemoteImageInfo, RemoteImageQuery,
-    RemoteSearchResult,
+    RemoteSearchResult, SongInfo,
 };
 use uuid::Uuid;
 
@@ -74,8 +76,10 @@ pub enum MetadataRefreshMode {
 /// The options driving a metadata/image refresh.
 ///
 /// Port of `MediaBrowser.Controller.Providers.MetadataRefreshOptions`, reduced
-/// to the fields the manager surface actually needs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// to the fields the manager surface actually needs. [`Default`] mirrors the
+/// C# constructor: both modes `Default` (fetch what is missing), nothing
+/// replaced.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MetadataRefreshOptions {
     /// How metadata should be (re)fetched.
     pub metadata_refresh_mode: MetadataRefreshMode,
@@ -85,6 +89,24 @@ pub struct MetadataRefreshOptions {
     pub replace_all_metadata: bool,
     /// Replace all existing images rather than filling gaps.
     pub replace_all_images: bool,
+    /// The "Identify" result the user chose (`POST /Items/RemoteSearch/Apply`):
+    /// its provider ids replace the item's and bind the fetch to that exact
+    /// record, its name/year drive any fallback search (the C#
+    /// `MetadataService.ApplySearchResult`).
+    pub search_result: Option<RemoteSearchResult>,
+}
+
+impl Default for MetadataRefreshOptions {
+    fn default() -> Self {
+        Self {
+            metadata_refresh_mode: MetadataRefreshMode::Default,
+            // `ImageRefreshOptions()` also defaults to `Default`.
+            image_refresh_mode: MetadataRefreshMode::Default,
+            replace_all_metadata: false,
+            replace_all_images: false,
+            search_result: None,
+        }
+    }
 }
 
 /// Which parts of an item a refresh changed.
@@ -116,10 +138,10 @@ pub enum ItemUpdateType {
 /// disabled-provider inclusion flag).
 ///
 /// The type-specific extension fields of the concrete `*Info` types (album
-/// artists, series name, contained song infos, …) are consumed by the
-/// per-provider fetchers; because those fetchers are deferred, only the shared
-/// base is carried across this seam. When the remote fetchers land, this request
-/// is the natural place to widen with the extra fields.
+/// artists, artist provider ids, contained song infos, music-video artists,
+/// book series name) ride alongside the base so the per-kind fetchers
+/// (MusicBrainz album/artist, …) see exactly what their C# `GetSearchResults`
+/// overloads read.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RemoteSearchRequest {
     /// The kind of item being searched for (selects the applicable providers).
@@ -132,6 +154,18 @@ pub struct RemoteSearchRequest {
     pub search_provider_name: Option<String>,
     /// Whether disabled providers should be included.
     pub include_disabled_providers: bool,
+    /// `AlbumInfo.AlbumArtists` — the album's artists by name.
+    pub album_artists: Vec<String>,
+    /// `AlbumInfo.ArtistProviderIds` — the album artist's provider ids
+    /// (`MusicBrainzArtist` drives the `arid:` release search).
+    pub artist_provider_ids: Option<HashMap<String, String>>,
+    /// `AlbumInfo.SongInfos` / `ArtistInfo.SongInfos` — the contained tracks,
+    /// whose album artists / provider ids are the C# fallbacks.
+    pub song_infos: Vec<SongInfo>,
+    /// `MusicVideoInfo.Artists` — the music video's artists by name.
+    pub artists: Vec<String>,
+    /// `BookInfo.SeriesName` — the book's series.
+    pub series_name: Option<String>,
 }
 
 /// Orchestrates metadata and image refreshing for library items.
@@ -184,14 +218,14 @@ pub trait ProviderManager: Send + Sync {
     ///
     /// Port of `BaseItem.DeleteImageAsync(imageType, index)` (the fan-in target of
     /// `ImageController.DeleteItemImage`/`DeleteItemImageByIndex`): removes the
-    /// on-disk file and the stored image row. The default implementation reports
-    /// the image pipeline as deferred, mirroring [`save_image`](Self::save_image)
-    /// in the shell manager; a host with the ported image store overrides it.
+    /// on-disk file and the stored image row. The default implementation (for
+    /// stub/test managers with no image store) reports the operation as unwired;
+    /// the concrete provider manager overrides it.
     ///
     /// # Errors
     ///
-    /// [`ServiceError::Backend`] while the image store is deferred, or whatever
-    /// error the concrete deletion surfaces.
+    /// [`ServiceError::Backend`] from a manager without an image store, or
+    /// whatever error the concrete deletion surfaces.
     async fn delete_image(
         &self,
         item_id: Uuid,
@@ -200,7 +234,7 @@ pub trait ProviderManager: Send + Sync {
     ) -> Result<(), ServiceError> {
         let _ = (item_id, image_type, image_index);
         Err(ServiceError::backend(
-            "delete_image is deferred until the image pipeline lands",
+            "delete_image needs an item-image store, which this provider manager has none of",
         ))
     }
 
@@ -239,11 +273,10 @@ pub trait ProviderManager: Send + Sync {
     /// merges duplicates by shared provider id (first hit wins; later hits only
     /// fill in missing provider ids / image url).
     ///
-    /// The remote provider fetchers (TMDb/TVDb/MusicBrainz/…) are **deferred** —
-    /// they need network I/O and API keys and are feature-gated off. With no
-    /// provider registered the applicable-provider set is empty, so the default
-    /// implementation returns an empty `Vec`, exactly as Jellyfin returns `[]`
-    /// when no provider matches. A host with real fetchers overrides this.
+    /// The default implementation (stub/test managers with no fetchers
+    /// registered) returns an empty `Vec`, exactly as Jellyfin returns `[]`
+    /// when no provider matches; the concrete provider manager fans out over
+    /// its registered TMDB/TVDB/OMDb/MusicBrainz/TheAudioDb fetchers.
     ///
     /// # Errors
     ///
@@ -391,10 +424,15 @@ mod tests {
     }
 
     #[test]
-    fn refresh_options_default_replaces_nothing() {
+    fn refresh_options_default_mirrors_the_c_sharp_constructor() {
         let o = MetadataRefreshOptions::default();
         assert!(!o.replace_all_metadata);
         assert!(!o.replace_all_images);
-        assert_eq!(o.metadata_refresh_mode, MetadataRefreshMode::None);
+        // `new MetadataRefreshOptions(directoryService)` sets the metadata
+        // mode to `Default`, and its base `ImageRefreshOptions()` constructor
+        // sets `ImageRefreshMode = Default` too (`ImageRefreshOptions.cs:14`).
+        assert_eq!(o.metadata_refresh_mode, MetadataRefreshMode::Default);
+        assert_eq!(o.image_refresh_mode, MetadataRefreshMode::Default);
+        assert!(o.search_result.is_none());
     }
 }

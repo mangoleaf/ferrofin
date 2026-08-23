@@ -473,6 +473,16 @@ pub trait ItemPersistenceService: Send + Sync {
         primary_version_id: Option<Uuid>,
     ) -> Result<(), ServiceError>;
 
+    /// Points an item's `ParentId` at `parent_id` without touching any other
+    /// column, and without a write at all when it already does.
+    ///
+    /// The library tree's self-healing reads use this to re-parent a
+    /// `CollectionFolder` row created before the `UserRootFolder` existed: a
+    /// full-row save would revert columns a scan or edit changed in between,
+    /// and an unconditional `UPDATE` would take the writer lock on every
+    /// `GET /Library/VirtualFolders`.
+    async fn set_parent_id(&self, item_id: Uuid, parent_id: Uuid) -> Result<(), ServiceError>;
+
     /// Replaces an item's `ItemValues` links (genres/studios/tags) with `values`,
     /// each a `(type discriminant, display value)` pair. Get-or-creates the shared
     /// `ItemValues` row per (type, value) and rewrites this item's `ItemValuesMap`
@@ -593,6 +603,25 @@ pub trait ItemPersistenceService: Send + Sync {
         value: &str,
     ) -> Result<(), ServiceError> {
         let _ = (item_id, provider, value);
+        Ok(())
+    }
+
+    /// Replaces an item's whole external-id set (`BaseItemProviders`) with
+    /// `ids` — the C# `item.ProviderIds = searchResult.ProviderIds` assignment
+    /// behind "Identify → Apply": rows the new set lacks are removed, the rest
+    /// upserted, atomically.
+    ///
+    /// The default is a no-op (for stub/fake services).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn replace_provider_ids(
+        &self,
+        item_id: Uuid,
+        ids: &[(String, String)],
+    ) -> Result<(), ServiceError> {
+        let _ = (item_id, ids);
         Ok(())
     }
 

@@ -320,6 +320,23 @@ pub async fn build_app_state(
     // critic score TMDB has no data for. Inert until FERROFIN_OMDB_KEY (config
     // `omdb_api_key`) is set: every call returns nothing without a key.
     let omdb_client = Arc::new(ferrofin_providers::OmdbClient::new(&config.omdb_api_key));
+    // MusicBrainz — the music authority (keyless; a mirror URL lifts the 1
+    // req/sec limit). Shared by the scan's enrichment pass and the
+    // MusicAlbum/MusicArtist "Identify" providers.
+    let musicbrainz_client = Arc::new(ferrofin_providers::MusicBrainzClient::new(
+        &config.musicbrainz_base_url,
+        env!("CARGO_PKG_VERSION"),
+    ));
+    // TheAudioDb — artist bio/genre + artist/album artwork by MusicBrainz id
+    // (built-in free key). Shared by the scan and the "Choose Image" methods.
+    let audiodb_client = Arc::new(ferrofin_providers::AudioDbClient::new());
+    // fanart.tv — logos/clear-art/disc/banners keyed off the Tmdb/Imdb/Tvdb/
+    // MusicBrainz ids. Built-in key works keyless; FERROFIN_FANART_KEY adds a
+    // personal client_key. Shared by the scan and the "Choose Image" methods.
+    let fanart_client = Arc::new(ferrofin_providers::FanartClient::new(
+        (!config.fanart_personal_api_key.is_empty())
+            .then(|| config.fanart_personal_api_key.clone()),
+    ));
     let search_providers: Vec<Arc<dyn ferrofin_providers::RemoteSearchProvider>> = vec![
         Arc::new(ferrofin_providers::TmdbSearchProvider::new(
             Arc::clone(&tmdb_client),
@@ -343,6 +360,28 @@ pub async fn build_app_state(
         // Box sets identify against TMDB's collections, a separate endpoint.
         Arc::new(ferrofin_providers::TmdbBoxSetSearchProvider::new(
             Arc::clone(&tmdb_client),
+        )),
+        // Trailers: OMDb's `IRemoteMetadataProvider<Trailer, TrailerInfo>`.
+        Arc::new(ferrofin_providers::OmdbSearchProvider::for_trailers(
+            Arc::clone(&omdb_client),
+        )),
+        // People identify against TMDB's person search.
+        Arc::new(ferrofin_providers::TmdbPersonSearchProvider::new(
+            Arc::clone(&tmdb_client),
+        )),
+        // Albums/artists identify against MusicBrainz; TheAudioDb is listed
+        // (selectable by name) but, as in Jellyfin, has no name search.
+        Arc::new(ferrofin_providers::MusicBrainzAlbumSearchProvider::new(
+            Arc::clone(&musicbrainz_client),
+        )),
+        Arc::new(ferrofin_providers::MusicBrainzArtistSearchProvider::new(
+            Arc::clone(&musicbrainz_client),
+        )),
+        Arc::new(ferrofin_providers::AudioDbSearchProvider::new(
+            ferrofin_model::data::BaseItemKind::MusicAlbum,
+        )),
+        Arc::new(ferrofin_providers::AudioDbSearchProvider::new(
+            ferrofin_model::data::BaseItemKind::MusicArtist,
         )),
     ];
     // Studio logos from the artwork repository (name-matched, keyless). The repo
@@ -395,6 +434,12 @@ pub async fn build_app_state(
             .with_remote_search_providers(search_providers)
             .with_dynamic_fetchers(wasm_host.provider_names())
             .with_studios(Arc::clone(&studios_client))
+            // The other "Choose Image" providers: fanart.tv (movies/series/
+            // artists/albums), TheAudioDb (artists/albums) and OMDb's poster
+            // (movies/trailers/episodes; inert without an API key).
+            .with_fanart(Arc::clone(&fanart_client))
+            .with_audiodb(Arc::clone(&audiodb_client))
+            .with_omdb(Arc::clone(&omdb_client))
             // Enables the kind-filtered built-in external-id descriptors the
             // Identify dialog renders as id input fields.
             .with_item_types(item_type_lookup.as_ref()),
@@ -572,10 +617,7 @@ pub async fn build_app_state(
     // fanart.tv artwork (logos/clear-art/disc/banners on top of TMDB's
     // poster/backdrop), keyed off the Tmdb/Imdb/Tvdb ids persisted during scan.
     // Built-in key works keyless; FERROFIN_FANART_KEY adds a personal client_key.
-    .with_fanart(Arc::new(ferrofin_providers::FanartClient::new(
-        (!config.fanart_personal_api_key.is_empty())
-            .then(|| config.fanart_personal_api_key.clone()),
-    )))
+    .with_fanart(Arc::clone(&fanart_client))
     // OMDb closes the metadata chain (plot/genres/cast/certificate/ratings and
     // a last-resort poster) and supplements TMDB with the Rotten Tomatoes score.
     // Enabled only when an OMDb API key is configured (FERROFIN_OMDB_KEY /
@@ -587,15 +629,12 @@ pub async fn build_app_state(
     // (the item repository lets it query the MusicAlbum/MusicArtist rows + tracks
     // it created). Keyless; a mirror URL lifts the 1 req/sec limit.
     .with_music(
-        Arc::new(ferrofin_providers::MusicBrainzClient::new(
-            &config.musicbrainz_base_url,
-            env!("CARGO_PKG_VERSION"),
-        )),
+        Arc::clone(&musicbrainz_client),
         Arc::clone(&item_repository),
     )
     // AudioDb artist bio/genre + artist/album artwork (by MusicBrainz id),
     // fetched in the post-scan music pass. Built-in free key.
-    .with_audiodb(Arc::new(ferrofin_providers::AudioDbClient::new()))
+    .with_audiodb(Arc::clone(&audiodb_client))
     // Studio thumbs from the artwork repository, downloaded post-scan for the
     // by-name Studio rows so the TV Networks / Studios tabs carry artwork.
     .with_studio_images(Arc::clone(&studios_client))

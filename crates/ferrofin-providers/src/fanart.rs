@@ -12,8 +12,8 @@
 //!
 //! Image ordering mirrors the plugin's `GetImages` sort exactly: widest first
 //! (HD variants win), then by language (preferred > `en` > none > other), then
-//! by community likes. The `music` (artist/album) leg is deferred until Ferrofin
-//! stamps MusicBrainz ids on music items.
+//! by community likes. The `music` leg (artist by MusicBrainz artist id, album
+//! by album-artist id + release-group id) is served the same way.
 
 use ferrofin_model::entities::ImageType;
 use serde::Deserialize;
@@ -151,7 +151,7 @@ impl FanartClient {
 
     /// Points the client at `base_url` (a mock server) for tests.
     #[cfg(test)]
-    fn with_base_url(mut self, base_url: &str) -> Self {
+    pub(crate) fn with_base_url(mut self, base_url: &str) -> Self {
         self.base_url = base_url.to_owned();
         self
     }
