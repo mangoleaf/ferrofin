@@ -22,6 +22,7 @@ Offline self-check:
 import json
 import os
 import sys
+import time
 import urllib.parse
 import urllib.request
 import urllib.error
@@ -705,16 +706,50 @@ def j_bulk_item_delete(base, token, user, mid, _m2):
     return r
 
 
+SUBTITLE_REFRESH_WAIT_S = 10   # Jellyfin lists an uploaded stream only once its refresh ran
+
+
+def external_subtitles(base, token, user, mid):
+    """(index, language) of the item's EXTERNAL subtitle streams (uploaded files)."""
+    item = q(base, f"/Items/{mid}?fields=MediaStreams", token, user) or {}
+    return [(s["Index"], s.get("Language")) for s in item.get("MediaStreams") or []
+            if s.get("Type") == "Subtitle" and s.get("IsExternal") and "Index" in s]
+
+
+def external_subtitle_indexes(base, token, user, mid):
+    return [i for i, _ in external_subtitles(base, token, user, mid)]
+
+
 def j_subtitles_upload(base, token, user, mid, _m2):
+    """Upload an external subtitle → it appears as an external subtitle stream → delete it by
+    index → it is gone. (Delete only ever targets external streams; the embedded eng track
+    the fixture carries stays.) The upload is "fra", and every external fra stream is reaped
+    at the end whatever happened, so a stale file from an aborted run cannot mask the next."""
     import base64
+    r = {}
+    before = set(external_subtitle_indexes(base, token, user, mid))
     srt = "1\n00:00:00,000 --> 00:00:01,000\nParity\n"
     body = json.dumps({
-        "Language": "eng", "Format": "srt", "IsForced": False,
+        "Language": "fra", "Format": "srt", "IsForced": False,
         "IsHearingImpaired": False,
         "Data": base64.b64encode(srt.encode()).decode(),
     })
     st, _ = http("POST", f"{base}/Videos/{mid}/Subtitles", token, body)
-    return {"POST /Videos/{itemId}/Subtitles": st < 300}
+    added = []
+    for _ in range(SUBTITLE_REFRESH_WAIT_S):
+        added = [i for i in external_subtitle_indexes(base, token, user, mid) if i not in before]
+        if added:
+            break
+        time.sleep(1)
+    r["POST /Videos/{itemId}/Subtitles"] = st < 300 and bool(added)
+    if added:
+        st, _ = http("DELETE", f"{base}/Videos/{mid}/Subtitles/{added[0]}", token)
+        gone = added[0] not in external_subtitle_indexes(base, token, user, mid)
+        r["DELETE /Videos/{itemId}/Subtitles/{index}"] = st < 300 and gone
+    for i, lang in external_subtitles(base, token, user, mid):   # reap, whichever path ran
+        if lang == "fra":
+            http("DELETE", f"{base}/Videos/{mid}/Subtitles/{i}", token)
+    return r
 
 
 def j_merge_versions_controller(base, token, user, mid, m2):
