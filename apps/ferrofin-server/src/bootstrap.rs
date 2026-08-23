@@ -388,6 +388,11 @@ fn spawn_pool_sampler(db: &Database) {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
         loop {
             tick.tick().await;
+            // The pool is closed when its server lifetime ends (in-process
+            // restart): stop sampling rather than keep it alive forever.
+            if pool.is_closed() {
+                break;
+            }
             let size = pool.size();
             let idle = pool.num_idle();
             tracing::debug!(

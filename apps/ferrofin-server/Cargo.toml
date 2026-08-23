@@ -66,6 +66,8 @@ tracing-opentelemetry.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# restart integration test: drives the real `run()` over loopback HTTP.
+reqwest.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 # First-Light integration test: drive the real router via tower oneshot and
 # assert JSON bodies.

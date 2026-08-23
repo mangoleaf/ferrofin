@@ -27,7 +27,7 @@ pub mod seed;
 pub mod state;
 
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Context as _;
@@ -45,7 +45,7 @@ use crate::bootstrap::{
 };
 use crate::config::Config;
 use crate::seed::{SeedOutcome, seed_default_admin};
-use crate::state::build_app_state;
+use crate::state::{WiredApp, build_app_state};
 
 /// The version Ferrofin reports for itself (startup log line and the session
 /// app-version fallback in the authorization context).
@@ -161,21 +161,30 @@ fn boot_stage(started: std::time::Instant, stage: &'static str) {
 /// then SIGKILLed (observed: the benchmark's cold-leg containers all exited
 /// `137`, and each restart cost the full 60 s grace). Every Kubernetes rolling
 /// update hit the same path. Handling it turns that into a real drain.
-async fn shutdown_signal(shutdown_rx: tokio::sync::oneshot::Receiver<()>) -> &'static str {
-    #[cfg(unix)]
-    let mut sigterm = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-    {
-        Ok(stream) => Some(stream),
-        Err(e) => {
-            tracing::warn!(error = %e, "SIGTERM listener could not be installed");
-            None
-        }
-    };
+async fn shutdown_signal(
+    shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+    signals: &Signals,
+) -> &'static str {
+    #[cfg_attr(not(unix), allow(unused_mut, unused_variables))]
+    let mut streams = signals.streams.lock().await;
     // `None` (install failed) must never resolve, or the select would treat it
     // as an immediate shutdown; a never-ready future is the neutral element.
     #[cfg(unix)]
+    let SignalStreams { sigterm, sigint } = &mut *streams;
+    #[cfg(unix)]
+    let (sigterm, sigint) = (sigterm.as_mut(), sigint.as_mut());
+    #[cfg(unix)]
     let terminate = async move {
-        match sigterm.as_mut() {
+        match sigterm {
+            Some(stream) => {
+                stream.recv().await;
+            }
+            None => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(unix)]
+    let interrupt = async move {
+        match sigint {
             Some(stream) => {
                 stream.recv().await;
             }
@@ -184,29 +193,40 @@ async fn shutdown_signal(shutdown_rx: tokio::sync::oneshot::Receiver<()>) -> &'s
     };
     #[cfg(not(unix))]
     let terminate = std::future::pending::<()>();
+    #[cfg(not(unix))]
+    let interrupt = async {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            tracing::warn!(error = %e, "ctrl-c listener failed");
+        }
+    };
 
-    tokio::select! {
+    let reason = tokio::select! {
         _ = shutdown_rx => "api",
         () = terminate => "sigterm",
-        result = tokio::signal::ctrl_c() => {
-            if let Err(e) = result {
-                tracing::warn!(error = %e, "ctrl-c listener failed");
-            }
-            "sigint"
-        }
+        () = interrupt => "sigint",
+    };
+    if reason != "api" {
+        signals
+            .fired
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
+    reason
 }
 
 /// The graceful-shutdown future handed to axum: waits for the first shutdown
 /// trigger, then tells connected clients before the socket drains, so they
 /// show "server unavailable" instead of silently hanging (C# sends
-/// `ServerShuttingDown`; a restart-vs-shutdown distinction would need a
-/// restart channel Ferrofin doesn't have — both drain the same way).
+/// `ServerShuttingDown` for restart and shutdown alike — 10.11.8 has no
+/// `ServerRestarting` push — so both drain the same way), and closes every
+/// WebSocket: an upgraded connection is outside axum's drain, and a socket
+/// that survived would stay bound to the OLD host's session manager after an
+/// in-process restart (Kestrel closes them on stop; clients reconnect).
 async fn announce_shutdown(
     shutdown_rx: tokio::sync::oneshot::Receiver<()>,
     sessions: Arc<dyn ferrofin_traits::session::SessionManager>,
+    signals: Signals,
 ) {
-    let reason = shutdown_signal(shutdown_rx).await;
+    let reason = shutdown_signal(shutdown_rx, &signals).await;
     tracing::info!(reason, "graceful shutdown requested");
     let _ = sessions
         .send_message_to_all_sessions(
@@ -214,6 +234,7 @@ async fn announce_shutdown(
             "",
         )
         .await;
+    ferrofin_api::handlers::websocket::close_all_sockets();
 }
 
 /// Boots the server from a resolved [`Config`] and serves until shutdown.
@@ -228,6 +249,13 @@ async fn announce_shutdown(
 /// The binary calls this after parsing CLI flags; it is the single entry point so
 /// the boot sequence has exactly one implementation.
 ///
+/// `POST /System/Restart` (and a scheduled backup restore) re-create the host
+/// IN-PROCESS: the server drains, the state is dropped, and [`serve_once`] runs
+/// again on the same configuration — Jellyfin's `Program.Main`
+/// `do { … } while (_restartOnShutdown)`. A container therefore survives a
+/// restart without a supervisor, exactly as a Jellyfin container does. Shutdown
+/// and signals return from here and the process exits.
+///
 /// # Errors
 ///
 /// Returns an error if the database cannot be opened/migrated, manager wiring
@@ -237,9 +265,50 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     // Hold the log-writer guard until after the server drains so the last
     // buffered file-log lines flush rather than being discarded on exit.
     let _log_guard = init_tracing(&config);
-    let started = std::time::Instant::now();
     log_startup_banner(&config);
+    // The Prometheus pipeline is process-global (OTel meter provider + the
+    // set-once HTTP instruments), so it lives across in-process restarts.
+    let mut metrics = None;
+    // The OS signal streams are created ONCE: a signal delivered while no
+    // stream exists is dropped, so per-lifetime streams would lose a
+    // `docker stop` that lands during the rebuild window of a restart.
+    let signals = Signals::install();
+    loop {
+        let started = std::time::Instant::now();
+        if !serve_once(&config, started, &mut metrics, &signals).await? {
+            break;
+        }
+        tracing::info!("restart requested — re-creating the host in-process");
+    }
+    // Flush the OTLP batch queue now that the server has drained; a restart that
+    // loses the last spans is a bug. No-op when trace export is disabled.
+    shutdown_tracing();
+    Ok(())
+}
 
+/// The process-lifetime half of the metrics wiring (see [`run`]).
+struct ProcessMetrics {
+    handle: ferrofin_metrics::MetricsHandle,
+    gauges: metrics_wiring::SamplerGauges,
+}
+
+/// One server lifetime: boot, serve until drained, tear the host down, and
+/// report whether an API restart was requested (`true` → the caller runs it
+/// again). A signal-initiated drain always reports `false`.
+async fn serve_once(
+    config: &Config,
+    started: std::time::Instant,
+    metrics: &mut Option<ProcessMetrics>,
+    signals: &Signals,
+) -> anyhow::Result<bool> {
+    // A restore scheduled by `POST /Backup/Restore` (then restart) is applied
+    // here, before the database file is opened — Jellyfin's `RestoreBackupPath`
+    // sequence. Synchronous on purpose: nothing may touch the tree meanwhile.
+    match ferrofin_api::handlers::backup::apply_pending_restore(&boot_tree_roots(config)) {
+        Ok(Some(archive)) => tracing::warn!(archive = %archive.display(), "restored backup"),
+        Ok(None) => {}
+        Err(e) => tracing::error!(error = %e, "scheduled backup restore failed"),
+    }
     // Opening/migrating the database, probing ffmpeg and probing `fpcalc` share
     // no state, and all three are dominated by waiting (SQLite I/O; five
     // `ffmpeg`/`ffprobe` spawns; one `fpcalc` spawn). Run them CONCURRENTLY —
@@ -252,8 +321,8 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     // missing is exactly the 15 ms serial spawn this removes; the answer is
     // simply discarded when the muxer is present.
     let (db, ffmpeg, fpcalc) = tokio::join!(
-        open_database(&config),
-        discover_ffmpeg(&config, None),
+        open_database(config),
+        discover_ffmpeg(config, None),
         ferrofin_extensions::fingerprint::discover_fpcalc_async(),
     );
     boot_stage(started, "db+encoder probe");
@@ -267,7 +336,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 
     // Wire every concrete manager into the shared AppState (the composition root).
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-    let wired = build_app_state(&db, &config, &ffmpeg, fpcalc, shutdown_tx)
+    let wired = build_app_state(&db, config, &ffmpeg, fpcalc, shutdown_tx)
         .await
         .context("failed to assemble application state")?;
     boot_stage(started, "app state wired");
@@ -275,7 +344,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     // Fresh-install seeding: on a database with no users, create the configured
     // default administrator (port of `UserManager.InitializeAsync` +
     // startup-wizard `UpdateStartupUser`). A no-op once any user exists.
-    match seed_default_admin(wired.state.users.as_ref(), &config)
+    match seed_default_admin(wired.state.users.as_ref(), config)
         .await
         .context("failed to seed the default administrator")?
     {
@@ -309,8 +378,9 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 
     // Optional Prometheus `/metrics` (gated on `EnableMetrics`, restart required —
     // Jellyfin semantics). Disabled ⇒ the route is never mounted (404), the global
-    // meter stays the built-in noop, and no sampler task runs. The handle must
-    // outlive the server (it owns the observable callbacks), so it is bound here.
+    // meter stays the built-in noop, and no sampler task runs. The handle owns the
+    // observable callbacks and is process-global, so it lives in `metrics` across
+    // restarts; only the sampler is per server lifetime.
     //
     // The bootstrap `FERROFIN_ENABLE_METRICS` env / `config.toml` override wins when
     // set (declarative/GitOps deploys); otherwise defer to the persisted
@@ -324,13 +394,13 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             .await
             .is_ok_and(|c| c.enable_metrics),
     };
-    let _metrics_handle = enable_metrics
+    let sampler = enable_metrics
         .then(|| {
             // Sampler cadence is a bootstrap knob (env / config.toml), kept out of
             // the API `ServerConfiguration` so `/System/Configuration` stays
             // byte-identical to Jellyfin. `None`/0 → the sampler's 15 s default.
             let interval = config.metrics_sample_interval.unwrap_or(0);
-            enable_metrics_endpoint(&mut router, &wired.state, &db, interval)
+            enable_metrics_endpoint(&mut router, &wired.state, &db, interval, metrics)
         })
         .flatten();
 
@@ -343,7 +413,6 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     // non-canonical case. Rewrite each request's path to its registered case
     // BEFORE routing. This must wrap the whole router as an outer layer (not
     // `Router::layer`, which runs per-matched-route, too late to re-route).
-    let app = axum::middleware::from_fn(canonicalize_path_case).layer(router);
 
     boot_stage(started, "router mounted");
     let addr = SocketAddr::new(config.bind_addr, config.port);
@@ -351,29 +420,166 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     boot_stage(started, "listener bound");
     tracing::info!(%addr, "ferrofin-server listening");
 
-    axum::serve(
+    serve_until_drained(
         listener,
-        // `with_connect_info` so handlers can read the client's socket address
-        // (e.g. `GET /System/Endpoint` reporting `IsLocal` for a loopback peer).
-        axum::ServiceExt::<axum::extract::Request>::into_make_service_with_connect_info::<SocketAddr>(
-            app,
+        router,
+        announce_shutdown(
+            shutdown_rx,
+            Arc::clone(&wired.state.sessions),
+            signals.clone(),
         ),
+        config.shutdown_timeout_secs,
     )
-    .with_graceful_shutdown(announce_shutdown(
-        shutdown_rx,
-        Arc::clone(&wired.state.sessions),
-    ))
-    .await
-    .context("server error")?;
+    .await?;
 
-    // Flush the OTLP batch queue now that the server has drained; a restart that
-    // loses the last spans is a bug. No-op when trace export is disabled.
-    shutdown_tracing();
+    // Tear the host down (Jellyfin: `using CoreAppHost` per iteration): stop
+    // every background task, then close the pools so nothing from this lifetime
+    // still holds the database file when the next one opens — or restores — it.
+    if let Some(sampler) = sampler {
+        sampler.abort();
+    }
+    let restart = wired.lifecycle.restart_requested() && !signals.fired();
+    // Running scheduled tasks (a library scan, trickplay generation) are their
+    // own spawned runs holding this host's manager graph: cancel them first, as
+    // Jellyfin's host dispose does, so nothing keeps working against a pool
+    // that is about to close.
+    cancel_running_tasks(wired.state.tasks.as_ref()).await;
+    let WiredApp { background, .. } = wired;
+    for task in background {
+        task.abort();
+    }
+    db.close().await;
     tracing::info!(
         uptime_s = started.elapsed().as_secs(),
         "ferrofin-server stopped"
     );
-    Ok(())
+    Ok(restart)
+}
+
+/// Serves until the shutdown trigger fires and the drain completes — or
+/// `timeout_secs` after the trigger, whichever comes first (Kestrel's
+/// `HostOptions.ShutdownTimeout`). Unbounded, a client mid-stream would keep
+/// the old host alive — listener already closed — for as long as it kept
+/// reading, so a restart during playback never came back. Dropping the serve
+/// future past the deadline aborts the remaining connections.
+async fn serve_until_drained(
+    listener: axum::serve::TapIo<tokio::net::TcpListener, fn(&mut tokio::net::TcpStream)>,
+    router: axum::Router,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+    timeout_secs: u32,
+) -> anyhow::Result<()> {
+    let app = axum::middleware::from_fn(canonicalize_path_case).layer(router);
+    let (drain_started_tx, drain_started_rx) = tokio::sync::oneshot::channel::<()>();
+    let serve =
+        axum::serve(
+            listener,
+            // `with_connect_info` so handlers can read the client's socket address
+            // (e.g. `GET /System/Endpoint` reporting `IsLocal` for a loopback peer).
+            axum::ServiceExt::<axum::extract::Request>::into_make_service_with_connect_info::<
+                SocketAddr,
+            >(app),
+        )
+        .with_graceful_shutdown(async move {
+            shutdown.await;
+            let _ = drain_started_tx.send(());
+        });
+    let deadline = async move {
+        let _ = drain_started_rx.await;
+        tokio::time::sleep(std::time::Duration::from_secs(u64::from(timeout_secs))).await;
+    };
+    tokio::select! {
+        result = serve => result.context("server error"),
+        () = deadline => {
+            tracing::warn!(
+                timeout_s = timeout_secs,
+                "shutdown timeout elapsed — aborting the remaining connections"
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Cancels every scheduled task currently running (best-effort: a task that
+/// finishes in between is simply no longer running).
+async fn cancel_running_tasks(tasks: &dyn ferrofin_traits::tasks::TaskManager) {
+    let Ok(list) = tasks.get_tasks().await else {
+        return;
+    };
+    for task in list {
+        if task.state == ferrofin_model::tasks::TaskState::Running
+            && let Some(id) = task.id.as_deref()
+            && let Err(e) = tasks.cancel_task(id).await
+        {
+            tracing::debug!(task = id, error = %e, "could not cancel a running task on shutdown");
+        }
+    }
+}
+
+/// The on-disk roots a scheduled backup restore writes to, resolved before the
+/// configuration manager exists: the configured data/config dirs and database
+/// file, plus `MetadataPath` read straight from `system.json` so a relocated
+/// metadata tree is restored where the server will look for it.
+fn boot_tree_roots(config: &Config) -> ferrofin_api::handlers::backup::TreeRoots {
+    let mut roots = ferrofin_api::handlers::backup::TreeRoots::defaults(
+        &config.data_dir,
+        &config.config_dir,
+        &config.database_path(),
+    );
+    if let Some(metadata) = std::fs::read_to_string(config.config_dir.join("system.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|cfg| cfg.get("MetadataPath")?.as_str().map(str::to_owned))
+        .filter(|p| !p.trim().is_empty())
+    {
+        roots.metadata = PathBuf::from(metadata);
+    }
+    roots
+}
+
+/// The process's OS signal streams (SIGTERM + SIGINT on unix), created once
+/// per process and shared by every server lifetime (the graceful-shutdown
+/// future must be `'static`, hence the shared handle).
+#[derive(Clone)]
+struct Signals {
+    streams: Arc<tokio::sync::Mutex<SignalStreams>>,
+    /// Set once any signal has been observed: the loop must exit even if an
+    /// API restart was requested in the same drain.
+    fired: Arc<std::sync::atomic::AtomicBool>,
+}
+
+struct SignalStreams {
+    #[cfg(unix)]
+    sigterm: Option<tokio::signal::unix::Signal>,
+    #[cfg(unix)]
+    sigint: Option<tokio::signal::unix::Signal>,
+}
+
+impl Signals {
+    fn install() -> Self {
+        #[cfg(unix)]
+        let stream = |kind: tokio::signal::unix::SignalKind, name: &str| {
+            match tokio::signal::unix::signal(kind) {
+                Ok(stream) => Some(stream),
+                Err(e) => {
+                    tracing::warn!(error = %e, signal = name, "signal listener could not be installed");
+                    None
+                }
+            }
+        };
+        Self {
+            streams: Arc::new(tokio::sync::Mutex::new(SignalStreams {
+                #[cfg(unix)]
+                sigterm: stream(tokio::signal::unix::SignalKind::terminate(), "SIGTERM"),
+                #[cfg(unix)]
+                sigint: stream(tokio::signal::unix::SignalKind::interrupt(), "SIGINT"),
+            })),
+            fired: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    fn fired(&self) -> bool {
+        self.fired.load(std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 /// Binds the HTTP listener, with Nagle's algorithm off on every connection it
@@ -420,36 +626,41 @@ const OPENAPI_SPEC: &str = include_str!("../../../contracts/jellyfin-openapi-10.
 
 /// Initialises the metrics pipeline, mounts `/metrics` + the HTTP tracking layer
 /// onto `router`, and spawns the background gauge sampler. Returns the
-/// [`MetricsHandle`](ferrofin_metrics::MetricsHandle) to keep alive, or `None` if
+/// sampler task to abort when the server drains, or `None` if
 /// init fails (logged; the server continues without metrics).
 fn enable_metrics_endpoint(
     router: &mut Router,
     state: &ferrofin_api::AppState,
     db: &ferrofin_db::Database,
     sample_interval_seconds: u32,
-) -> Option<ferrofin_metrics::MetricsHandle> {
-    // `endpoint` labels are the axum route templates (`MatchedPath`), so key the
-    // controller/action lookup by the same normalization the router applies.
-    let route_labels = ferrofin_metrics::RouteLabels::from_openapi_spec(OPENAPI_SPEC, |p| {
-        ferrofin_api::routes::normalize_contract_path(p)
-    });
-    match ferrofin_metrics::init(route_labels, tokio::runtime::Handle::current()) {
-        Ok(metrics) => {
-            *router = metrics_wiring::mount(std::mem::take(router), &metrics);
-            metrics_wiring::spawn_sampler(
-                &metrics,
-                Arc::clone(&state.sessions),
-                db.clone(),
-                sample_interval_seconds,
-            );
-            tracing::info!("prometheus metrics enabled at /metrics");
-            Some(metrics)
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "metrics init failed — continuing without");
-            None
+    process: &mut Option<ProcessMetrics>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if process.is_none() {
+        // `endpoint` labels are the axum route templates (`MatchedPath`), so key
+        // the controller/action lookup by the same normalization the router applies.
+        let route_labels = ferrofin_metrics::RouteLabels::from_openapi_spec(OPENAPI_SPEC, |p| {
+            ferrofin_api::routes::normalize_contract_path(p)
+        });
+        match ferrofin_metrics::init(route_labels, tokio::runtime::Handle::current()) {
+            Ok(handle) => {
+                let gauges = metrics_wiring::register_gauges(&handle);
+                *process = Some(ProcessMetrics { handle, gauges });
+                tracing::info!("prometheus metrics enabled at /metrics");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "metrics init failed — continuing without");
+                return None;
+            }
         }
     }
+    let process = process.as_ref()?;
+    *router = metrics_wiring::mount(std::mem::take(router), &process.handle);
+    Some(metrics_wiring::spawn_sampler(
+        process.gauges.clone(),
+        Arc::clone(&state.sessions),
+        db.clone(),
+        sample_interval_seconds,
+    ))
 }
 
 /// Rewrites a request's path to its canonical Jellyfin case before routing.

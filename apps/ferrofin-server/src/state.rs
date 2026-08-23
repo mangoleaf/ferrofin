@@ -84,6 +84,15 @@ pub struct WiredApp {
     /// The web-file transformation pipeline, shared with the static `/web`
     /// mount so registered transformations apply to the served files.
     pub file_transformations: Arc<dyn ferrofin_traits::plugins::FileTransformationService>,
+    /// The lifecycle controller — after the server drains, the composition root
+    /// asks it whether an API restart was requested and re-creates the host
+    /// in-process (Jellyfin's `Program.Main` `do … while (_restartOnShutdown)`).
+    pub lifecycle: Arc<FerrofinLifecycleController>,
+    /// The host's background tasks (trigger scheduler, filesystem-event pump):
+    /// aborted when the lifetime ends so they — and the manager graph they
+    /// hold — do not outlive it (Jellyfin disposes its `CoreAppHost` per
+    /// `StartServer` iteration).
+    pub background: Vec<tokio::task::JoinHandle<()>>,
 }
 
 /// The concrete [`LifecycleController`] for the running server.
@@ -100,6 +109,10 @@ pub struct FerrofinLifecycleController {
     shutting_down: std::sync::atomic::AtomicBool,
     /// Set when the requested stop should be followed by a restart.
     restart_pending: std::sync::atomic::AtomicBool,
+    /// Set only by `stop(true)`: the drain in progress is an API restart, as
+    /// opposed to a shutdown or a signal (which exit the process even when a
+    /// plugin had flagged restart-required).
+    restart_requested: std::sync::atomic::AtomicBool,
 }
 
 impl FerrofinLifecycleController {
@@ -110,7 +123,16 @@ impl FerrofinLifecycleController {
             shutdown: tokio::sync::Mutex::new(Some(shutdown)),
             shutting_down: std::sync::atomic::AtomicBool::new(false),
             restart_pending: std::sync::atomic::AtomicBool::new(false),
+            restart_requested: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Whether the stop that drained the server was `POST /System/Restart` (or a
+    /// scheduled backup restore) rather than a shutdown or a signal.
+    #[must_use]
+    pub fn restart_requested(&self) -> bool {
+        self.restart_requested
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -119,6 +141,7 @@ impl LifecycleController for FerrofinLifecycleController {
     async fn stop(&self, restart: bool) -> Result<(), ferrofin_traits::error::ServiceError> {
         use std::sync::atomic::Ordering;
         self.restart_pending.store(restart, Ordering::SeqCst);
+        self.restart_requested.store(restart, Ordering::SeqCst);
         self.shutting_down.store(true, Ordering::SeqCst);
         // Fire the graceful-shutdown trigger once; a second stop is a no-op.
         if let Some(tx) = self.shutdown.lock().await.take() {
@@ -214,6 +237,9 @@ pub async fn build_app_state(
         &config.cache_dir,
         &config.web_dir,
     ));
+    // The file actually opened (an adopted `jellyfin.db` may live elsewhere) —
+    // what a backup archives and a restore writes.
+    paths.set_database_path(config.database_path());
 
     // ---- configuration manager (loads persisted system.json) --------------
     let config_mgr = Arc::new(
@@ -662,15 +688,16 @@ pub async fn build_app_state(
             .with_refresh_target(library_impl.clone())
             .with_config(Arc::clone(&config_trait)),
     );
+    let mut background = Vec::new();
     if let Some(mut rx) = fs_events {
         let monitor = Arc::clone(&library_monitor);
-        tokio::spawn(async move {
+        background.push(tokio::spawn(async move {
             while let Some(path) = rx.recv().await {
                 if let Err(err) = monitor.report_file_system_changed(&path).await {
                     tracing::warn!(%err, path, "failed to report filesystem change");
                 }
             }
-        });
+        }));
     }
     // Establishing the watches is a FILESYSTEM WALK, not a registration: an
     // inotify recursive watch adds one kernel watch per directory under every
@@ -768,8 +795,9 @@ pub async fn build_app_state(
     // The lifecycle controller is built early so the plugin manager can flag
     // restart-required after a repository install/uninstall; the system
     // manager receives the same handle further down.
+    let lifecycle_concrete = Arc::new(FerrofinLifecycleController::new(shutdown));
     let lifecycle: Arc<dyn ferrofin_core::system_manager::LifecycleController> =
-        Arc::new(FerrofinLifecycleController::new(shutdown));
+        lifecycle_concrete.clone();
     // The install-time artifact validator (component + descriptor checks) —
     // built from the same settings as the host so limits match.
     let wasm_validator: Arc<dyn ferrofin_traits::plugins::PluginArtifactValidator> = Arc::new(
@@ -961,8 +989,8 @@ pub async fn build_app_state(
     }
     let tasks: Arc<dyn ferrofin_traits::tasks::TaskManager> = Arc::new(task_manager.clone());
     // The trigger scheduler: fires startup triggers now, then evaluates
-    // daily/weekly/interval triggers for the life of the process.
-    drop(task_manager.start_scheduler());
+    // daily/weekly/interval triggers for the life of this host.
+    background.push(task_manager.start_scheduler());
     let _external_data: Arc<dyn ferrofin_traits::system::ExternalDataManager> =
         Arc::new(FerrofinExternalDataManager::new(
             Arc::clone(&path_manager),
@@ -1258,7 +1286,8 @@ pub async fn build_app_state(
                 completed_installations: Vec::new(),
             },
         )
-        .with_library_storage(Arc::new(VirtualFolderStorage(Arc::clone(&virtual_folders)))),
+        .with_library_storage(Arc::new(VirtualFolderStorage(Arc::clone(&virtual_folders))))
+        .with_database(db.clone()),
     );
 
     // The auth service wraps an owned concrete authorization context, so build
@@ -1460,6 +1489,8 @@ pub async fn build_app_state(
         state,
         app_host,
         file_transformations,
+        lifecycle: lifecycle_concrete,
+        background,
     })
 }
 

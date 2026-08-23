@@ -41,6 +41,41 @@ PASS = os.environ.get("BENCH_ADMIN_PASSWORD", "benchpass123")
 # Modern MediaBrowser grammar only — 10.11 rejects X-Emby-* (see bench-lib.js).
 CLIENT = 'Client="parity", Device="parity", DeviceId="parity", Version="1.0"'
 
+# ---------------------------------------------------------------- docker (host-side effects)
+
+def compose_service(base):
+    """The docker-compose service behind a server URL: the parity leg runs both servers from
+    suite/perf/docker-compose.yml, so FERROFIN_URL ↔ `ferrofin`, JELLYFIN_URL ↔ `jellyfin`
+    (overridable via FERROFIN_SERVICE / JELLYFIN_SERVICE). None for an unknown URL."""
+    if base == os.environ.get("FERROFIN_URL", "http://localhost:18096"):
+        return os.environ.get("FERROFIN_SERVICE", "ferrofin")
+    if base == os.environ.get("JELLYFIN_URL", "http://localhost:18097"):
+        return os.environ.get("JELLYFIN_SERVICE", "jellyfin")
+    return None
+
+
+def compose(*args, timeout=60):
+    """Run `docker compose <args>` against the suite's compose project (cwd suite/perf, so the
+    project name / overrides come from the environment exactly as sweep.sh set them).
+    Returns (returncode, stdout); returncode -1 when docker is unavailable."""
+    import subprocess
+    try:
+        out = subprocess.run(["docker", "compose", *args], capture_output=True, text=True,
+                             timeout=timeout, cwd=os.path.join(ROOT, "suite", "perf"))
+        return out.returncode, out.stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return -1, ""
+
+
+def container_read(base, path):
+    """Read a file from inside the container serving `base` (a host-side effect the HTTP
+    surface only references, e.g. the password-reset PIN file). None when unreachable."""
+    svc = compose_service(base)
+    if not svc:
+        return None
+    rc, out = compose("exec", "-T", svc, "cat", path)
+    return out if rc == 0 else None
+
 # ---------------------------------------------------------------- HTTP
 
 def http(method, url, token=None, body=None):

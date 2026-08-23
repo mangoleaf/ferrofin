@@ -51,6 +51,17 @@ pub trait SystemManager: Send + Sync {
 
     /// Gets the server's storage resource usage.
     async fn get_system_storage_info(&self) -> Result<SystemStorageInfo, ServiceError>;
+
+    /// Writes a consistent snapshot of the database to `dest` for a backup (the
+    /// step Jellyfin's backup takes through its database provider). `dest` must
+    /// not exist beforehand.
+    ///
+    /// The default writes nothing — implementations without a database (test
+    /// fakes); the server's implementation snapshots the live SQLite file.
+    async fn snapshot_database(&self, dest: &std::path::Path) -> Result<(), ServiceError> {
+        let _ = dest;
+        Ok(())
+    }
 }
 
 fn _assert_object_safe_system_manager(_: &dyn SystemManager) {}
@@ -129,6 +140,26 @@ pub trait ServerApplicationPaths: Send + Sync {
 
     /// The user-configuration directory.
     fn user_configuration_directory_path(&self) -> String;
+
+    /// The application configuration root directory (`system.json` and the
+    /// per-area config files live here). Defaults to `{program-data}/config`,
+    /// the server layout; the real paths override it with the configured dir.
+    fn configuration_directory_path(&self) -> String {
+        std::path::Path::new(&self.program_data_path())
+            .join("config")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// The SQLite database file. Defaults to `{program-data}/ferrofin.db`; the
+    /// server overrides it with the file it actually opened (a drop-in-adopted
+    /// `jellyfin.db` lives elsewhere).
+    fn database_path(&self) -> String {
+        std::path::Path::new(&self.program_data_path())
+            .join("ferrofin.db")
+            .to_string_lossy()
+            .into_owned()
+    }
 
     /// The internal metadata directory (custom or default).
     fn internal_metadata_path(&self) -> String;

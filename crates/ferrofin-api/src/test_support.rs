@@ -924,8 +924,10 @@ impl SessionManager for FakeSessions {
 
 /// A fake [`SystemManager`]. The info getters return a default value so the
 /// now-real `/System/Info` and `/System/Info/Public` handlers resolve (the
-/// contract probe expects them to route, not `404`); the lifecycle/storage
-/// methods stay `unimplemented!` (never exercised by these tests).
+/// contract probe expects them to route, not `404`); `restart` accepts the
+/// request (the backup-restore handler schedules a restart, and its test
+/// asserts the on-disk marker instead); shutdown/storage stay `unimplemented!`.
+/// `snapshot_database` keeps the trait default (writes nothing — no database).
 pub struct FakeSystem;
 
 #[async_trait]
@@ -940,7 +942,7 @@ impl SystemManager for FakeSystem {
         Ok(PublicSystemInfo::default())
     }
     async fn restart(&self) -> Result<(), ServiceError> {
-        unimplemented!("fake")
+        Ok(())
     }
     async fn shutdown(&self) -> Result<(), ServiceError> {
         unimplemented!("fake")

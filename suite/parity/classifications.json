@@ -702,22 +702,6 @@
       "category": "accepted-divergence",
       "classification": "accepted-divergence: post-setup the first user already has a password and the contract is 403 (the Forbid guard upstream added in v12, ported by Ferrofin); Jellyfin 10.11.8 predates it and answers 204, silently re-setting the admin password. The journey asserts the correct contract (H=403 J=204)."
     },
-    "POST /Users/ForgotPassword": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: password-reset initiation returns a PIN challenge whose PinFile path is host-instance-specific and whose completion requires reading that file off the server host."
-    },
-    "POST /Users/ForgotPassword/Pin": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: completes the forgot-password flow using a PIN written to a host-instance file; no cross-server-stable body to diff."
-    },
-    "GET /Backup/Manifest": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: reads a backup archive's manifest from the host filesystem; no archive exists and the path is instance-specific (both servers 400)."
-    },
-    "POST /Backup/Create": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: writes a backup archive to the host filesystem; heavy and instance-specific, no cross-server-stable effect to diff."
-    },
     "POST /Backup/Restore": {
       "category": "not-testable-this-way",
       "classification": "not-testable-this-way: destructive host-filesystem restore from a backup archive; instance-specific and would replace live state mid-run."

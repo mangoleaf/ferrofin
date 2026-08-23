@@ -357,6 +357,38 @@ where
     true
 }
 
+/// The "close every socket" generation: bumped by [`close_all_sockets`], watched
+/// by every session loop. Process-wide on purpose — an upgraded connection is
+/// outside axum's graceful drain, and a socket that outlived its host would
+/// keep pushing through the previous lifetime's session manager after an
+/// in-process restart.
+static CLOSE_ALL: std::sync::LazyLock<tokio::sync::watch::Sender<u64>> =
+    std::sync::LazyLock::new(|| tokio::sync::watch::channel(0).0);
+
+/// Closes every open WebSocket: each session loop sends a Close frame and
+/// ends. Called by the composition root when the server drains (Kestrel
+/// closes its sockets on stop; clients reconnect to the new host).
+pub fn close_all_sockets() {
+    CLOSE_ALL.send_modify(|generation| *generation += 1);
+}
+
+/// Server drain: the ServerShuttingDown push was queued just before the
+/// close-all fired and `select!` is unordered, so flush whatever is queued
+/// first, then say goodbye properly so the client reconnects. Every send is
+/// bounded by `send_frame`, so a stalled peer cannot pin the old host.
+async fn say_goodbye(
+    socket: &mut WebSocket,
+    rx: &mut mpsc::Receiver<String>,
+    overflowed: &tokio::sync::Notify,
+) {
+    while let Ok(push) = rx.try_recv() {
+        if !send_frame(socket, Message::Text(push.into()), overflowed).await {
+            return;
+        }
+    }
+    let _ = send_frame(socket, Message::Close(None), overflowed).await;
+}
+
 /// Holds a WebSocket open: register the caller's push sink (if authenticated),
 /// answer pings, forward server→client pushes, send a periodic keep-alive, and
 /// close cleanly — unregistering the sink — when the peer goes away.
@@ -371,6 +403,7 @@ async fn handle_socket(
     caller: Result<SocketCaller, AnonymousReason>,
 ) {
     let started = std::time::Instant::now();
+    let mut close_all = CLOSE_ALL.subscribe();
     // `tx` feeds this socket; the bus holds a clone as the session's delivery
     // sink. Keeping `tx` alive here also keeps `rx` open for anonymous sockets
     // (no sink registered) so the forward branch stays pending rather than
@@ -432,6 +465,10 @@ async fn handle_socket(
             },
             () = overflowed.notified() => {
                 warn_overflow();
+                break;
+            },
+            Ok(()) = close_all.changed() => {
+                say_goodbye(&mut socket, &mut rx, &overflowed).await;
                 break;
             },
             _ = keepalive.tick() => {

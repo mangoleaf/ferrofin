@@ -27,7 +27,7 @@ import urllib.request
 import urllib.error
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from sweep import http, get_json, bring_up, ROOT, USER, PASS   # reuse HTTP + provisioning
+from sweep import http, get_json, bring_up, container_read, ROOT, USER, PASS   # reuse HTTP + provisioning
 
 
 def q(base, path, token, user):
@@ -792,6 +792,79 @@ def j_users_password(base, token, user, _m, _m2):
     return r
 
 
+def j_forgot_password(base, token, user, _m, _m2):
+    """The local password-reset flow on a throwaway user. ForgotPassword answers with a PIN
+    challenge whose PIN is written to a file on the server host; the harness reads that file
+    out of the container (docker compose exec) and redeems it. The effect (port of
+    DefaultPasswordResetProvider.RedeemPasswordResetPin) is that the PIN BECOMES the user's
+    password, so the read-back is a login with it. Requests come from the docker bridge (a
+    private range), which both servers treat as local — the gate for this flow."""
+    r = {}
+    # A stale fpprobe from an aborted run would make Users/New fail and leave both ops
+    # silently untested: remove it first.
+    for u in get_json(base, "/Users", token) or []:
+        if u.get("Name") == "fpprobe":
+            http("DELETE", f"{base}/Users/{u['Id']}", token)
+    _, uraw = http("POST", f"{base}/Users/New", token,
+                   json.dumps({"Name": "fpprobe", "Password": "Fp!123"}))
+    uid = json.loads(uraw).get("Id") if uraw else None
+    if not uid:
+        return r
+    st, raw = http("POST", f"{base}/Users/ForgotPassword", None,
+                   json.dumps({"EnteredUsername": "fpprobe"}))
+    try:
+        challenge = json.loads(raw)
+    except ValueError:
+        challenge = {}
+    pin_file = challenge.get("PinFile") or ""
+    r["POST /Users/ForgotPassword"] = (st == 200 and challenge.get("Action") == "PinCode"
+                                       and bool(pin_file) and bool(challenge.get("PinExpirationDate")))
+    pin = None
+    contents = container_read(base, pin_file) if pin_file else None
+    if contents:
+        try:
+            pin = json.loads(contents).get("Pin")
+        except ValueError:
+            pin = None
+    if pin:
+        st, raw = http("POST", f"{base}/Users/ForgotPassword/Pin", None, json.dumps({"Pin": pin}))
+        try:
+            result = json.loads(raw)
+        except ValueError:
+            result = {}
+        login = auth_device(base, "fpprobe", pin, "parity-fpprobe")
+        r["POST /Users/ForgotPassword/Pin"] = (st == 200 and result.get("Success") is True
+                                               and result.get("UsersReset") == ["fpprobe"]
+                                               and bool(login.get("AccessToken")))
+    else:
+        r["POST /Users/ForgotPassword/Pin"] = False   # PIN file unreadable (no docker access?)
+    http("DELETE", f"{base}/Users/{uid}", token)   # cleanup
+    return r
+
+
+def j_backup(base, token, user, _m, _m2):
+    """Backup create → manifest → list on the server's own data dir. The manifest must echo
+    the posted options, the Manifest route must read the same manifest back by the returned
+    path, and the listing must contain it. (Restore restarts the server: terminal.py.)"""
+    r = {}
+    opts = {"Metadata": False, "Trickplay": False, "Subtitles": False, "Database": True}
+    st, raw = http("POST", f"{base}/Backup/Create", token, json.dumps(opts))
+    try:
+        created = json.loads(raw)
+    except ValueError:
+        created = {}
+    path = created.get("Path") or ""
+    r["POST /Backup/Create"] = (st == 200 and bool(path) and created.get("Options") == opts
+                                and bool(created.get("BackupEngineVersion"))
+                                and bool(created.get("DateCreated")))
+    if path:
+        manifest = get_json(base, "/Backup/Manifest?path=" + urllib.parse.quote(path), token) or {}
+        r["GET /Backup/Manifest"] = manifest == created
+        listed = get_json(base, "/Backup", token) or []
+        r["GET /Backup"] = any(m.get("Path") == path for m in listed)
+    return r
+
+
 JOURNEYS = [j_startup,   # first: see its docstring
             j_favorites, j_played, j_rating, j_playlist, j_collection, j_users, j_item_edit,
             j_api_keys, j_user_item_data, j_display_prefs, j_scheduled_task_triggers,
@@ -802,6 +875,7 @@ JOURNEYS = [j_startup,   # first: see its docstring
             j_scheduled_run, j_playbackinfo_post, j_active_encodings, j_clientlog,
             j_authenticate, j_user_update, j_devices_delete, j_bulk_item_delete,
             j_subtitles_upload, j_quickconnect, j_system_and_refresh,
+            j_forgot_password, j_backup,
             # Destructive: merges/splits the shared movies, so it must run LAST so its
             # mutations can't corrupt the items other journeys read/refresh.
             j_merge_versions_controller]

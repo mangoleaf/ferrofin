@@ -281,8 +281,9 @@ fn fake_system_methods_run_and_panic() {
         .unwrap();
     assert!(rt.block_on(f.get_system_info(&ctx)).is_ok());
     assert!(rt.block_on(f.get_public_system_info(&ctx)).is_ok());
-    // The lifecycle/storage methods stay `unimplemented!`.
-    assert_panics(f.restart());
+    // `restart` accepts the request (the backup-restore handler schedules one);
+    // shutdown/storage stay `unimplemented!`.
+    assert!(rt.block_on(f.restart()).is_ok());
     assert_panics(f.shutdown());
     assert_panics(f.get_system_storage_info());
 }
