@@ -9,10 +9,12 @@
 //! trait exposes. Progress reporting and job teardown call out to the
 //! [`SessionReporter`] seam so unit tests inject a fake.
 
+pub mod fs_wait;
 pub mod manager;
 pub mod segment_transcoder;
 pub mod tokio_segment_transcoder;
 
+pub use fs_wait::FsWaiter;
 pub use manager::{
     FileCleaner, FsFileCleaner, HLS_PING_TIMEOUT_MS, NoopSessionReporter,
     PROGRESSIVE_PING_TIMEOUT_MS, SEGMENT_READY_POLL_INTERVAL_MS, SessionReporter,

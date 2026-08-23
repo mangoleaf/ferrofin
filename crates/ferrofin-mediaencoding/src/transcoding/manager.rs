@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use ferrofin_traits::error::ServiceError;
@@ -13,6 +13,7 @@ use ferrofin_traits::media_encoding::{
 
 use crate::encoding_helper::EncodingJobInfo;
 
+use super::fs_wait::FsWaiter;
 use super::segment_transcoder::{SegmentTranscoder, SpawnRequest, TranscodeChild};
 
 /// How long `start_ffmpeg` blocks for the first segment before erroring, in
@@ -29,9 +30,11 @@ use super::segment_transcoder::{SegmentTranscoder, SpawnRequest, TranscodeChild}
 /// began. Jellyfin waits as long as the request stays open.
 pub const WAIT_FOR_FILE_TIMEOUT_MS: u64 = 180_000;
 
-/// The poll cadence for the "wait until the segment file exists" loops, in
-/// milliseconds. Port of the hard-coded `Task.Delay(100)` in `StartFfMpeg` and
-/// `GetSegmentResult`.
+/// The **fallback** tick of the "wait until the segment file exists" loops, in
+/// milliseconds. The loops wake on inotify ([`FsWaiter`]) the instant ffmpeg
+/// writes the file; this tick only bounds how late a process exit that produced
+/// no filesystem event is noticed. Same value as upstream's `Task.Delay(100)`
+/// in `StartFfMpeg` / `GetSegmentResult`, which poll unconditionally.
 pub const SEGMENT_READY_POLL_INTERVAL_MS: u64 = 100;
 
 /// The inputs to [`TranscodeManagerImpl::start_ffmpeg`].
@@ -400,22 +403,21 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
             .wait_for_path
             .clone()
             .unwrap_or_else(|| output_path.to_path_buf());
-        let deadline_polls = WAIT_FOR_FILE_TIMEOUT_MS / SEGMENT_READY_POLL_INTERVAL_MS.max(1);
-        let mut polls = 0u64;
+        let waiter = FsWaiter::new(&target);
+        let deadline = Instant::now() + Duration::from_millis(WAIT_FOR_FILE_TIMEOUT_MS);
         loop {
             let exited = self.with_running(&handle, |r| r.child.has_exited());
             if target.exists() || exited == Some(true) {
                 break;
             }
-            polls += 1;
-            if polls > deadline_polls {
+            if Instant::now() >= deadline {
                 self.kill_and_remove(&handle, true).await;
                 return Err(format!(
                     "timed out waiting for {} after {WAIT_FOR_FILE_TIMEOUT_MS}ms",
                     target.display()
                 ));
             }
-            tokio::time::sleep(Duration::from_millis(SEGMENT_READY_POLL_INTERVAL_MS)).await;
+            waiter.wait().await;
         }
 
         // 8. A finished job that failed is an error (mirror the FfmpegException).
@@ -467,8 +469,9 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
     /// ready the moment its own file exists. Dropping the `+1` wait roughly halves
     /// time-to-first-segment (~4.3s → ~2.4s here) on start and on every seek.
     ///
-    /// Polls every [`SEGMENT_READY_POLL_INTERVAL_MS`] until the file exists or the
-    /// job exits; returns `true` if the segment ends up on disk.
+    /// Wakes on the directory's inotify events (fallback tick
+    /// [`SEGMENT_READY_POLL_INTERVAL_MS`]) until the file exists or the job
+    /// exits; returns `true` if the segment ends up on disk.
     ///
     /// # Panics
     ///
@@ -483,6 +486,7 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
             .with_running(handle, |r| r.segment_extension.clone())
             .unwrap_or_else(|| ".ts".to_owned());
         let seg = segment_path(playlist_path, index, &ext);
+        let waiter = FsWaiter::new(&seg);
 
         loop {
             if seg.exists() {
@@ -512,7 +516,7 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
                 );
                 return false;
             }
-            tokio::time::sleep(Duration::from_millis(SEGMENT_READY_POLL_INTERVAL_MS)).await;
+            waiter.wait().await;
         }
     }
 
@@ -555,41 +559,6 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
             }
         }
         self.reporter.on_job_killed(handle, delete_files).await;
-    }
-
-    /// Waits until an arbitrary `target` file of `handle`'s job exists, or the
-    /// job exits (whichever first); returns whether the file exists.
-    ///
-    /// The init-segment sibling of [`Self::wait_for_segment`] — same
-    /// job-alive-bounded poll, but on a caller-chosen path (the fMP4 init is
-    /// not a numbered segment).
-    pub async fn wait_for_file(
-        &self,
-        handle: &TranscodingJobHandle,
-        target: &Path,
-        playlist_path: &Path,
-    ) -> bool {
-        loop {
-            if target.exists() {
-                return true;
-            }
-            let exited = self
-                .with_running(handle, |r| r.child.has_exited())
-                .unwrap_or(true);
-            if exited {
-                if !target.exists() {
-                    let log = playlist_path.with_extension("log");
-                    tracing::warn!(
-                        target_file = %target.display(),
-                        log = %log.display(),
-                        "transcode exited before producing the requested file{}",
-                        stderr_log_tail(&log)
-                    );
-                }
-                return target.exists();
-            }
-            tokio::time::sleep(Duration::from_millis(SEGMENT_READY_POLL_INTERVAL_MS)).await;
-        }
     }
 
     /// One sweep of the idle reaper: kills every job that has **no active
@@ -847,7 +816,7 @@ fn read_tail(path: &Path, max_bytes: u64) -> String {
 ///
 /// Only the last [`STDERR_TAIL_BYTES`] are read. The log is small when a
 /// transcode fails to *start*, but this is also called when a long-running job
-/// dies mid-stream (`wait_for_segment` / `wait_for_file`), and ffmpeg's stderr
+/// dies mid-stream (`wait_for_segment`), and ffmpeg's stderr
 /// grows at roughly 0.4 kB per wall-clock second of encoding (measured): a
 /// two-hour job leaves a multi-megabyte log. Reading it whole would put that
 /// much blocking I/O — and, via the returned string, that much log line and

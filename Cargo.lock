@@ -1319,6 +1319,7 @@ dependencies = [
  "ferrofin-model",
  "ferrofin-traits",
  "ferrofin-util",
+ "notify",
  "quick-xml",
  "regex",
  "rstest",
