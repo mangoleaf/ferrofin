@@ -43,7 +43,7 @@ use ferrofin_db::store::{datetime_to_db, guid_to_db, opt_datetime_to_db};
 use ferrofin_model::configuration::{SubtitlePlaybackMode, UserConfiguration};
 use ferrofin_model::data::UnratedItem;
 use ferrofin_model::dto::{NameIdPair, UserDto};
-use ferrofin_model::users::{AccessSchedule, DynamicDayOfWeek, SyncPlayUserAccessType, UserPolicy};
+use ferrofin_model::users::{SyncPlayUserAccessType, UserPolicy};
 use sqlx::{Sqlite, SqliteExecutor};
 use uuid::Uuid;
 
@@ -58,7 +58,7 @@ use crate::auth_providers::{
 use crate::db_error::db_err;
 use crate::user_entity_ext::{
     has_permission, is_parental_schedule_allowed, seed_defaults, set_permission, set_permission_tx,
-    set_preference,
+    set_preference, set_preference_tx,
 };
 
 /// The C# type name of the default password-reset provider, stored on
@@ -1048,16 +1048,21 @@ impl UserManager for FerrofinUserManager {
     }
 
     async fn update_policy(&self, user_id: Uuid, policy: &UserPolicy) -> Result<(), ServiceError> {
-        // The full `UserPolicy` → `Users`/`Permissions`/`AccessSchedules` mapping
-        // is broad; the fields the `Users` table carries directly are persisted
-        // here, and the two most load-bearing permission flags are reflected into
-        // the `Permissions` table so authentication and access checks see them.
-        // Remaining policy fields (blocked media folders, access schedules, the
-        // many boolean permissions) are a deferred follow-up, flagged rather than
-        // silently dropped.
+        // Port of `UserManager.UpdatePolicyAsync`: the `Users` columns, every
+        // permission flag, the access schedules (replaced wholesale) and the
+        // list-valued preferences the policy carries.
         self.require_user(user_id).await?;
         let id = guid_to_db(user_id);
 
+        // "The default number of login attempts is 3, but for some god forsaken
+        // reason it's sent to the server as 0": -1 → unlimited (NULL), 0 → 3.
+        let max_login_attempts: Option<i64> = match policy.login_attempts_before_lockout {
+            -1 => None,
+            0 => Some(3),
+            n => Some(i64::from(n)),
+        };
+
+        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
         sqlx::query(
             r#"UPDATE "Users" SET
                 "MaxActiveSessions" = ?2, "MaxParentalRatingScore" = ?3,
@@ -1072,45 +1077,57 @@ impl UserManager for FerrofinUserManager {
         .bind(i64::from(policy.max_active_sessions))
         .bind(policy.max_parental_rating.map(i64::from))
         .bind(policy.max_parental_sub_rating.map(i64::from))
-        .bind(i64::from(policy.login_attempts_before_lockout))
+        .bind(max_login_attempts)
         .bind(policy.enable_user_preference_access)
         .bind(i64::from(policy.invalid_login_attempt_count))
         .bind(i64::from(policy.remote_client_bitrate_limit))
         .bind(&policy.authentication_provider_id)
         .bind(&policy.password_reset_provider_id)
         .bind(policy.sync_play_access as i32)
-        .execute(self.db.writer())
+        .execute(&mut *tx)
         .await
         .map_err(db_err)?;
 
-        set_permission(
-            self.db.pool(),
-            &id,
-            PermissionKind::IsAdministrator,
-            policy.is_administrator,
-        )
-        .await?;
-        set_permission(
-            self.db.pool(),
-            &id,
-            PermissionKind::IsDisabled,
-            policy.is_disabled,
-        )
-        .await?;
-        set_permission(
-            self.db.pool(),
-            &id,
-            PermissionKind::EnableContentDeletion,
-            policy.enable_content_deletion,
-        )
-        .await?;
-        set_permission(
-            self.db.pool(),
-            &id,
-            PermissionKind::EnableRemoteControlOfOtherUsers,
-            policy.enable_remote_control_of_other_users,
-        )
-        .await?;
+        for (kind, value) in policy_permissions(policy) {
+            set_permission_tx(&mut tx, &id, kind, value).await?;
+        }
+
+        crate::access_schedule_repository::replace_tx(&mut tx, &id, &policy.access_schedules)
+            .await?;
+
+        // `policy.BlockUnratedItems ?? Array.Empty<UnratedItem>()` and the six
+        // list preferences; each stored as the delimited value list C# writes.
+        let unrated: Vec<String> = policy
+            .block_unrated_items
+            .iter()
+            .map(|u| format!("{u:?}"))
+            .collect();
+        let guids = |ids: &[Uuid]| ids.iter().map(ToString::to_string).collect::<Vec<_>>();
+        for (kind, values) in [
+            (PreferenceKind::BlockUnratedItems, unrated),
+            (PreferenceKind::BlockedTags, policy.blocked_tags.clone()),
+            (PreferenceKind::AllowedTags, policy.allowed_tags.clone()),
+            (
+                PreferenceKind::EnabledChannels,
+                guids(&policy.enabled_channels),
+            ),
+            (
+                PreferenceKind::EnabledDevices,
+                policy.enabled_devices.clone(),
+            ),
+            (
+                PreferenceKind::EnabledFolders,
+                guids(&policy.enabled_folders),
+            ),
+            (
+                PreferenceKind::EnableContentDeletionFromFolders,
+                policy.enable_content_deletion_from_folders.clone(),
+            ),
+        ] {
+            set_preference_tx(&mut tx, &id, kind, &values).await?;
+        }
+        // One `SaveChangesAsync`: all or nothing.
+        tx.commit().await.map_err(db_err)?;
         self.auth_cache.clear();
         Ok(())
     }
@@ -1319,7 +1336,7 @@ async fn build_user_policy(
         enable_collection_management: perm(perms, PermissionKind::EnableCollectionManagement),
         enable_subtitle_management: perm(perms, PermissionKind::EnableSubtitleManagement),
         enable_lyric_management: perm(perms, PermissionKind::EnableLyricManagement),
-        access_schedules: access_schedules(pool, id, user_uuid).await?,
+        access_schedules: crate::access_schedule_repository::list(pool, id, user_uuid).await?,
         blocked_tags,
         allowed_tags,
         enabled_channels,
@@ -1346,36 +1363,6 @@ async fn set_uuid_preference(
     set_preference(pool, user_id, kind, &strings).await
 }
 
-/// Loads a user's access schedules as wire [`AccessSchedule`] rows.
-///
-/// `user_id` is the stored `Guid` text used for the lookup; `uid` is that same
-/// id already parsed by the caller, so the emitted `AccessSchedule.UserId`
-/// cannot silently become the nil GUID.
-async fn access_schedules(
-    pool: &sqlx::sqlite::SqlitePool,
-    user_id: &str,
-    uid: Uuid,
-) -> Result<Vec<AccessSchedule>, ServiceError> {
-    let rows: Vec<(i64, i32, f64, f64)> = sqlx::query_as(
-        r#"SELECT "Id", "DayOfWeek", "StartHour", "EndHour"
-           FROM "AccessSchedules" WHERE "UserId" = ?1"#,
-    )
-    .bind(user_id)
-    .fetch_all(pool)
-    .await
-    .map_err(db_err)?;
-    Ok(rows
-        .into_iter()
-        .map(|(id, day, start, end)| AccessSchedule {
-            id: cast_i32(id),
-            user_id: uid,
-            day_of_week: dynamic_day_from_i32(day),
-            start_hour: start,
-            end_hour: end,
-        })
-        .collect())
-}
-
 /// Narrows a stored `i64` column to the DTO's `i32`, clamping on overflow.
 fn cast_i32(value: i64) -> i32 {
     i32::try_from(value).unwrap_or(i32::MAX)
@@ -1393,20 +1380,92 @@ fn subtitle_mode_from_i32(value: i32) -> SubtitlePlaybackMode {
     }
 }
 
-/// Maps a stored `DayOfWeek` discriminant to its [`DynamicDayOfWeek`].
-fn dynamic_day_from_i32(value: i32) -> DynamicDayOfWeek {
-    match value {
-        1 => DynamicDayOfWeek::Monday,
-        2 => DynamicDayOfWeek::Tuesday,
-        3 => DynamicDayOfWeek::Wednesday,
-        4 => DynamicDayOfWeek::Thursday,
-        5 => DynamicDayOfWeek::Friday,
-        6 => DynamicDayOfWeek::Saturday,
-        7 => DynamicDayOfWeek::Everyday,
-        8 => DynamicDayOfWeek::Weekday,
-        9 => DynamicDayOfWeek::Weekend,
-        _ => DynamicDayOfWeek::Sunday,
-    }
+/// Every permission flag a [`UserPolicy`] carries, paired with its
+/// [`PermissionKind`] — the `SetPermission` list of `UpdatePolicyAsync`.
+fn policy_permissions(policy: &UserPolicy) -> [(PermissionKind, bool); 24] {
+    [
+        (PermissionKind::IsAdministrator, policy.is_administrator),
+        (PermissionKind::IsHidden, policy.is_hidden),
+        (PermissionKind::IsDisabled, policy.is_disabled),
+        (
+            PermissionKind::EnableSharedDeviceControl,
+            policy.enable_shared_device_control,
+        ),
+        (
+            PermissionKind::EnableRemoteAccess,
+            policy.enable_remote_access,
+        ),
+        (
+            PermissionKind::EnableLiveTvManagement,
+            policy.enable_live_tv_management,
+        ),
+        (
+            PermissionKind::EnableLiveTvAccess,
+            policy.enable_live_tv_access,
+        ),
+        (
+            PermissionKind::EnableMediaPlayback,
+            policy.enable_media_playback,
+        ),
+        (
+            PermissionKind::EnableAudioPlaybackTranscoding,
+            policy.enable_audio_playback_transcoding,
+        ),
+        (
+            PermissionKind::EnableVideoPlaybackTranscoding,
+            policy.enable_video_playback_transcoding,
+        ),
+        (
+            PermissionKind::EnableContentDeletion,
+            policy.enable_content_deletion,
+        ),
+        (
+            PermissionKind::EnableContentDownloading,
+            policy.enable_content_downloading,
+        ),
+        (
+            PermissionKind::EnableSyncTranscoding,
+            policy.enable_sync_transcoding,
+        ),
+        (
+            PermissionKind::EnableMediaConversion,
+            policy.enable_media_conversion,
+        ),
+        (
+            PermissionKind::EnableAllChannels,
+            policy.enable_all_channels,
+        ),
+        (PermissionKind::EnableAllDevices, policy.enable_all_devices),
+        (PermissionKind::EnableAllFolders, policy.enable_all_folders),
+        (
+            PermissionKind::EnableRemoteControlOfOtherUsers,
+            policy.enable_remote_control_of_other_users,
+        ),
+        (
+            PermissionKind::EnablePlaybackRemuxing,
+            policy.enable_playback_remuxing,
+        ),
+        (
+            PermissionKind::EnableCollectionManagement,
+            policy.enable_collection_management,
+        ),
+        (
+            PermissionKind::EnableSubtitleManagement,
+            policy.enable_subtitle_management,
+        ),
+        (
+            PermissionKind::EnableLyricManagement,
+            policy.enable_lyric_management,
+        ),
+        (
+            PermissionKind::ForceRemoteSourceTranscoding,
+            policy.force_remote_source_transcoding,
+        ),
+        (
+            PermissionKind::EnablePublicSharing,
+            policy.enable_public_sharing,
+        ),
+    ]
 }
 
 /// Parses a stored `BlockUnratedItems` entry into an [`UnratedItem`].
@@ -1509,6 +1568,140 @@ mod tests {
         // Idempotent: a second call is a no-op.
         mgr.initialize().await.expect("initialize again");
         assert_eq!(mgr.get_users().await.expect("users").len(), 1);
+    }
+
+    /// A policy with every flag flipped away from the seeded default and every
+    /// list populated — if `update_policy` dropped any field, the read-back
+    /// would show the default instead.
+    fn exhaustive_policy(user_id: Uuid) -> UserPolicy {
+        UserPolicy {
+            is_administrator: true,
+            is_hidden: false,
+            is_disabled: false,
+            max_parental_rating: Some(12),
+            max_parental_sub_rating: Some(3),
+            blocked_tags: vec!["gore".to_owned()],
+            allowed_tags: vec!["kids".to_owned()],
+            enable_user_preference_access: false,
+            access_schedules: vec![ferrofin_model::users::AccessSchedule {
+                id: 0,
+                user_id,
+                day_of_week: ferrofin_model::users::DynamicDayOfWeek::Weekend,
+                start_hour: 8.0,
+                end_hour: 20.5,
+            }],
+            block_unrated_items: vec![
+                ferrofin_model::data::UnratedItem::Movie,
+                ferrofin_model::data::UnratedItem::LiveTvChannel,
+            ],
+            enable_remote_control_of_other_users: true,
+            enable_shared_device_control: false,
+            enable_remote_access: false,
+            enable_live_tv_management: true,
+            enable_live_tv_access: false,
+            enable_media_playback: false,
+            enable_audio_playback_transcoding: false,
+            enable_video_playback_transcoding: false,
+            enable_playback_remuxing: false,
+            force_remote_source_transcoding: true,
+            enable_content_deletion: true,
+            enable_content_deletion_from_folders: vec!["/media/trash".to_owned()],
+            enable_content_downloading: false,
+            enable_sync_transcoding: false,
+            enable_media_conversion: false,
+            enabled_devices: vec!["device-1".to_owned()],
+            enable_all_devices: false,
+            enabled_channels: vec![Uuid::from_u128(0xC1)],
+            enable_all_channels: false,
+            enabled_folders: vec![Uuid::from_u128(0xF1), Uuid::from_u128(0xF2)],
+            enable_all_folders: false,
+            invalid_login_attempt_count: 2,
+            login_attempts_before_lockout: 5,
+            max_active_sessions: 4,
+            enable_public_sharing: false,
+            blocked_media_folders: Some(Vec::new()),
+            blocked_channels: Some(Vec::new()),
+            remote_client_bitrate_limit: 8_000_000,
+            authentication_provider_id:
+                "Jellyfin.Server.Implementations.Users.DefaultAuthenticationProvider".to_owned(),
+            password_reset_provider_id:
+                "Jellyfin.Server.Implementations.Users.DefaultPasswordResetProvider".to_owned(),
+            sync_play_access: SyncPlayUserAccessType::JoinGroups,
+            enable_collection_management: true,
+            enable_subtitle_management: true,
+            enable_lyric_management: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn update_policy_persists_every_field_upstream_does() {
+        // `UserManager.UpdatePolicyAsync`: every permission, the access schedules
+        // and the list preferences — the library restrictions
+        // (EnableAllFolders/EnabledFolders) and parental blocks among them.
+        let db = test_db().await;
+        let mgr = FerrofinUserManager::new(db.clone());
+        let user = mgr.create_user("erin").await.expect("create");
+        let id = Uuid::parse_str(&user.id).expect("uuid");
+        let policy = exhaustive_policy(id);
+        mgr.update_policy(id, &policy).await.expect("policy");
+
+        let reloaded = mgr.get_user_by_id(id).await.expect("reload").expect("some");
+        let mut read = mgr
+            .get_user_dto(&reloaded, None)
+            .await
+            .expect("dto")
+            .policy
+            .expect("policy");
+        // The schedule's row id is assigned by the database.
+        assert_eq!(read.access_schedules.len(), 1);
+        read.access_schedules[0].id = 0;
+        assert_eq!(read, policy);
+
+        // A second update REPLACES the schedules and lists (C# `Clear()` + re-add).
+        let mut fewer = policy.clone();
+        fewer.access_schedules.clear();
+        fewer.enabled_folders = vec![Uuid::from_u128(0xF3)];
+        fewer.enable_all_folders = true;
+        mgr.update_policy(id, &fewer).await.expect("policy 2");
+        let read = mgr
+            .get_user_dto(&reloaded, None)
+            .await
+            .expect("dto")
+            .policy
+            .expect("policy");
+        assert!(read.access_schedules.is_empty());
+        assert_eq!(read.enabled_folders, vec![Uuid::from_u128(0xF3)]);
+        assert!(read.enable_all_folders);
+    }
+
+    #[rstest::rstest]
+    #[case(-1, -1)]
+    #[case(0, 3)]
+    #[case(7, 7)]
+    #[tokio::test]
+    async fn update_policy_maps_login_attempts_like_upstream(
+        #[case] sent: i32,
+        #[case] stored: i32,
+    ) {
+        // "The default number of login attempts is 3, but ... it's sent as 0":
+        // -1 is unlimited (NULL, read back as -1), 0 becomes 3.
+        let db = test_db().await;
+        let mgr = FerrofinUserManager::new(db);
+        let user = mgr.create_user("finn").await.expect("create");
+        let id = Uuid::parse_str(&user.id).expect("uuid");
+        let policy = UserPolicy {
+            login_attempts_before_lockout: sent,
+            ..UserPolicy::default()
+        };
+        mgr.update_policy(id, &policy).await.expect("policy");
+        let reloaded = mgr.get_user_by_id(id).await.expect("reload").expect("some");
+        let read = mgr
+            .get_user_dto(&reloaded, None)
+            .await
+            .expect("dto")
+            .policy
+            .expect("policy");
+        assert_eq!(read.login_attempts_before_lockout, stored);
     }
 
     #[tokio::test]

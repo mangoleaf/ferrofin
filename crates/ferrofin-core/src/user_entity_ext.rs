@@ -178,30 +178,9 @@ pub async fn set_preference(
     kind: PreferenceKind,
     values: &[String],
 ) -> Result<(), ServiceError> {
-    let joined = values.join(&PREFERENCE_DELIMITER.to_string());
-
-    sqlx::query(r#"UPDATE "Preferences" SET "Value" = ?3 WHERE "UserId" = ?1 AND "Kind" = ?2"#)
-        .bind(user_id)
-        .bind(i32::from(kind))
-        .bind(&joined)
-        .execute(pool)
-        .await
-        .map_err(db_err)?;
-
-    sqlx::query(
-        r#"INSERT INTO "Preferences" ("Kind", "RowVersion", "UserId", "Value")
-           SELECT ?2, 1, ?1, ?3
-           WHERE NOT EXISTS (
-               SELECT 1 FROM "Preferences" WHERE "UserId" = ?1 AND "Kind" = ?2
-           )"#,
-    )
-    .bind(user_id)
-    .bind(i32::from(kind))
-    .bind(&joined)
-    .execute(pool)
-    .await
-    .map_err(db_err)?;
-    Ok(())
+    let mut tx = pool.begin().await.map_err(db_err)?;
+    set_preference_tx(&mut tx, user_id, kind, values).await?;
+    tx.commit().await.map_err(db_err)
 }
 
 /// Whether a list-valued preference contains `needle`, case-insensitively (the
@@ -328,6 +307,43 @@ pub async fn seed_defaults(
         .map_err(db_err)?;
     }
 
+    Ok(())
+}
+
+/// Writes a list-valued preference inside a caller-owned transaction: an
+/// `UPDATE`, then a conditional `INSERT` for a kind the user's row set lacks (a
+/// database adopted from Jellyfin may not carry every kind).
+///
+/// # Errors
+///
+/// Returns a backend error when either statement fails.
+pub async fn set_preference_tx(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    user_id: &str,
+    kind: PreferenceKind,
+    values: &[String],
+) -> Result<(), ServiceError> {
+    let joined = values.join(&PREFERENCE_DELIMITER.to_string());
+    sqlx::query(r#"UPDATE "Preferences" SET "Value" = ?3 WHERE "UserId" = ?1 AND "Kind" = ?2"#)
+        .bind(user_id)
+        .bind(i32::from(kind))
+        .bind(&joined)
+        .execute(&mut **tx)
+        .await
+        .map_err(db_err)?;
+    sqlx::query(
+        r#"INSERT INTO "Preferences" ("Kind", "RowVersion", "UserId", "Value")
+           SELECT ?2, 1, ?1, ?3
+           WHERE NOT EXISTS (
+               SELECT 1 FROM "Preferences" WHERE "UserId" = ?1 AND "Kind" = ?2
+           )"#,
+    )
+    .bind(user_id)
+    .bind(i32::from(kind))
+    .bind(&joined)
+    .execute(&mut **tx)
+    .await
+    .map_err(db_err)?;
     Ok(())
 }
 

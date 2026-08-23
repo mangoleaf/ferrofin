@@ -1264,6 +1264,7 @@ name = "ferrofin-hls"
 version = "0.4.1"
 dependencies = [
  "async-trait",
+ "ferrofin-db",
  "ferrofin-keyframes",
  "ferrofin-mediaencoding",
  "ferrofin-model",
@@ -1293,11 +1294,14 @@ version = "0.4.1"
 dependencies = [
  "async-trait",
  "chrono",
+ "ferrofin-common",
+ "ferrofin-core",
  "ferrofin-db",
  "ferrofin-model",
  "ferrofin-traits",
  "quick-xml",
  "reqwest",
+ "rstest",
  "serde",
  "serde_json",
  "sqlx",

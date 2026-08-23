@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 ferrofin-traits.workspace = true
 ferrofin-model.workspace = true
+ferrofin-common.workspace = true
 ferrofin-db.workspace = true
 async-trait.workspace = true
 quick-xml.workspace = true
@@ -26,3 +27,6 @@ tokio = { workspace = true }
 uuid = { workspace = true, features = ["v5"] }
 
 [dev-dependencies]
+rstest.workspace = true
+# The real user manager, for the EnabledUsers test (no cycle: core does not depend on livetv).
+ferrofin-core.workspace = true

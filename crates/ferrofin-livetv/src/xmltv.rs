@@ -52,8 +52,13 @@ pub struct XmltvProgramme {
     pub icon: Option<String>,
     /// Production year from `<date>` (first four digits), when present.
     pub year: Option<i32>,
-    /// `<episode-num>` in `xmltv_ns` form, when present (e.g. `0.5.` → S1E6).
+    /// The text of the last `<episode-num>` whose `system` the reader understands
+    /// (`xmltv_ns`, e.g. `0.5.` → S1E6, or `SxxExx`).
     pub episode_num: Option<String>,
+    /// `Episode.Series` — the 1-based season number from that `<episode-num>`.
+    pub season_number: Option<i32>,
+    /// `Episode.Episode` — the 1-based episode number from that `<episode-num>`.
+    pub episode_number: Option<i32>,
     /// `true` when a `<new/>` element is present.
     pub is_new: bool,
     /// `true` when a `<premiere>` element is present.
@@ -86,6 +91,8 @@ pub fn parse_xmltv(xml: &str) -> Xmltv {
     let mut out = Xmltv::default();
     // Scratch buffer for the text content of the element currently being read.
     let mut text = String::new();
+    // The `system` of the `<episode-num>` being read, if any.
+    let mut episode_system: Option<String> = None;
     let mut channel: Option<XmltvChannel> = None;
     let mut programme: Option<XmltvProgramme> = None;
 
@@ -102,6 +109,7 @@ pub fn parse_xmltv(xml: &str) -> Xmltv {
                     b"programme" => {
                         programme = Some(read_programme(&e));
                     }
+                    b"episode-num" => episode_system = attr(&e, b"system"),
                     _ => {}
                 }
                 text.clear();
@@ -121,7 +129,13 @@ pub fn parse_xmltv(xml: &str) -> Xmltv {
             Ok(Event::End(e)) => {
                 let name = e.local_name();
                 let name = name.as_ref();
-                apply_end(name, &text, channel.as_mut(), programme.as_mut());
+                apply_end(
+                    name,
+                    &text,
+                    episode_system.take().as_deref(),
+                    channel.as_mut(),
+                    programme.as_mut(),
+                );
                 match name {
                     b"channel" => {
                         if let Some(c) = channel.take() {
@@ -227,6 +241,7 @@ fn apply_empty(
 fn apply_end(
     name: &[u8],
     text: &str,
+    episode_system: Option<&str>,
     channel: Option<&mut XmltvChannel>,
     programme: Option<&mut XmltvProgramme>,
 ) {
@@ -244,8 +259,20 @@ fn apply_end(
         b"desc" if !text.is_empty() => p.desc = Some(text.to_owned()),
         b"category" if !text.is_empty() => p.categories.push(text.to_owned()),
         b"date" => p.year = text.get(0..4).and_then(|y| y.parse().ok()),
+        // `XmlTvReader.ProcessEpisodeNum` dispatches on `system`; a later
+        // element assigns only the parts it carries (a part that does not parse
+        // leaves the earlier value), and unknown systems (`onscreen`,
+        // `dd_progid`, …) are skipped.
         b"episode-num" if !text.is_empty() => {
-            p.episode_num.get_or_insert_with(|| text.to_owned());
+            if let Some((season, episode)) = parse_episode_num(episode_system, text) {
+                p.episode_num = Some(text.to_owned());
+                if season.is_some() {
+                    p.season_number = season;
+                }
+                if episode.is_some() {
+                    p.episode_number = episode;
+                }
+            }
         }
         // <rating><value>TV-PG</value></rating> — the value carries the text.
         b"value" if p.rating.is_none() && !text.is_empty() => p.rating = Some(text.to_owned()),
@@ -301,6 +328,60 @@ fn attr(e: &BytesStart<'_>, name: &[u8]) -> Option<String> {
             None
         }
     })
+}
+
+/// Season and episode numbers from an `<episode-num>` of the given `system`,
+/// as `XmlTvReader.ProcessEpisodeNum` reads them; `None` when the system is one
+/// the reader skips (`onscreen`, `dd_progid`, an unknown one).
+///
+/// `xmltv_ns` is `S.E.P`, each part 0-based and optionally `n/total`, any part
+/// empty → 1-based numbers. `SxxExx` is the `s(\d+)e(\d+)` pattern anywhere in
+/// the text, case-insensitive, taken as-is.
+#[must_use]
+pub fn parse_episode_num(system: Option<&str>, value: &str) -> Option<(Option<i32>, Option<i32>)> {
+    let value = value.trim();
+    // The upstream `switch` is an exact, case-sensitive match on the system name.
+    match system {
+        Some("xmltv_ns") => {
+            // Spaces are stripped from the whole value first (`Replace(" ", "")`).
+            let value: String = value.chars().filter(|c| *c != ' ').collect();
+            let part = |part: Option<&str>| -> Option<i32> {
+                let n = part?.split('/').next()?;
+                n.parse::<i32>().ok().map(|n| n + 1)
+            };
+            let mut parts = value.split('.');
+            Some((part(parts.next()), part(parts.next())))
+        }
+        Some("SxxExx") => {
+            let lower = value.to_ascii_lowercase();
+            let bytes = lower.as_bytes();
+            let digits = |from: usize| -> Option<(i32, usize)> {
+                let end = from
+                    + bytes
+                        .get(from..)?
+                        .iter()
+                        .take_while(|b| b.is_ascii_digit())
+                        .count();
+                if end == from {
+                    return None;
+                }
+                lower[from..end].parse().ok().map(|n| (n, end))
+            };
+            let mut at = 0;
+            while let Some(s_pos) = lower[at..].find('s') {
+                let s_pos = at + s_pos;
+                if let Some((season, e_pos)) = digits(s_pos + 1)
+                    && bytes.get(e_pos) == Some(&b'e')
+                    && let Some((episode, _)) = digits(e_pos + 1)
+                {
+                    return Some((Some(season), Some(episode)));
+                }
+                at = s_pos + 1;
+            }
+            None
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -439,5 +520,57 @@ mod tests {
         assert_eq!(g.programmes.len(), 1);
         assert_eq!(g.programmes[0].channel_id, "a&nope;b");
         assert_eq!(g.programmes[0].title, "T");
+    }
+}
+
+#[cfg(test)]
+mod episode_num_tests {
+    use super::{parse_episode_num, parse_xmltv};
+    use rstest::rstest;
+
+    #[rstest]
+    #[case(Some("xmltv_ns"), "0.5.", Some((Some(1), Some(6))))]
+    #[case(Some("xmltv_ns"), "0.41.", Some((Some(1), Some(42))))]
+    #[case(Some("xmltv_ns"), "1/3.0/10.", Some((Some(2), Some(1))))]
+    #[case(Some("xmltv_ns"), ".5.", Some((None, Some(6))))]
+    #[case(Some("xmltv_ns"), "2..", Some((Some(3), None)))]
+    #[case(Some("SxxExx"), "S01E06", Some((Some(1), Some(6))))]
+    #[case(Some("SxxExx"), "Episode s2e10 (repeat)", Some((Some(2), Some(10))))]
+    #[case(Some("sxxexx"), "S02E10", None)]
+    #[case(Some("xmltv_ns"), "1 0.5.", Some((Some(11), Some(6))))]
+    #[case(Some("onscreen"), "S01E06", None)]
+    #[case(Some("dd_progid"), "EP012345.0001", None)]
+    #[case(None, "0.5.", None)]
+    fn episode_numbers(
+        #[case] system: Option<&str>,
+        #[case] text: &str,
+        #[case] expected: Option<(Option<i32>, Option<i32>)>,
+    ) {
+        assert_eq!(parse_episode_num(system, text), expected);
+    }
+
+    #[test]
+    fn the_last_understood_episode_num_wins_and_skipped_systems_are_ignored() {
+        // Schedules Direct / zap2xml order: dd_progid, xmltv_ns, onscreen.
+        let guide = parse_xmltv(
+            "<tv><programme start=\"20260725060000 +0000\" channel=\"x\"><title>T</title>\
+             <episode-num system=\"dd_progid\">EP012345.0001</episode-num>\
+             <episode-num system=\"xmltv_ns\">0.5.</episode-num>\
+             <episode-num system=\"onscreen\">S09E09</episode-num></programme></tv>",
+        );
+        let p = &guide.programmes[0];
+        assert_eq!((p.season_number, p.episode_number), (Some(1), Some(6)));
+        assert_eq!(p.episode_num.as_deref(), Some("0.5."));
+
+        // Per-field assignment: a later element only overwrites the parts it
+        // carries, and an unparsable part leaves the earlier value alone.
+        let guide = parse_xmltv(
+            "<tv><programme start=\"20260725060000 +0000\" channel=\"x\"><title>T</title>\
+             <episode-num system=\"SxxExx\">S02E03</episode-num>\
+             <episode-num system=\"xmltv_ns\">.5.</episode-num>\
+             <episode-num system=\"xmltv_ns\">a.b.</episode-num></programme></tv>",
+        );
+        let p = &guide.programmes[0];
+        assert_eq!((p.season_number, p.episode_number), (Some(2), Some(6)));
     }
 }

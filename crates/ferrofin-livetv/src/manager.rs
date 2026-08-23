@@ -49,7 +49,9 @@ const PROGRAM_NS: Uuid = Uuid::from_u128(0x6c74_7670_726f_6772_616d_735f_6e73_30
 /// builders can be shared with the total-record count.
 const PROGRAM_SELECT: &str = r#"SELECT p."Id",p."ChannelId",p."StartDate",p."EndDate",p."Title",p."EpisodeTitle",
                       p."Overview",p."Genres",p."ProductionYear",p."OfficialRating",p."IsNew",
-                      p."IsRepeat",p."IsPremiere",c."Name" AS "ChannelName"
+                      p."IsRepeat",p."IsPremiere",p."IsMovie",p."IsSeries",p."IsNews",p."IsKids",
+                      p."IsSports",p."IsLive",p."ExternalId",p."ExternalSeriesId",
+                      p."SeasonNumber",p."EpisodeNumber",c."Name" AS "ChannelName"
                FROM "FerrofinLiveTvPrograms" p
                JOIN "FerrofinLiveTvChannels" c ON c."Id" = p."ChannelId""#;
 
@@ -65,6 +67,10 @@ pub struct FerrofinLiveTvManager {
     db: Database,
     fetcher: Arc<dyn SourceFetcher>,
     server_id: String,
+    /// The user manager, for `LiveTvInfo.EnabledUsers` (C# `IUserManager.Users`
+    /// filtered by the `EnableLiveTvAccess` permission). Absent in unit tests
+    /// that never ask for it.
+    users: Option<Arc<dyn ferrofin_traits::library::UserManager>>,
 }
 
 impl std::fmt::Debug for FerrofinLiveTvManager {
@@ -75,6 +81,123 @@ impl std::fmt::Debug for FerrofinLiveTvManager {
     }
 }
 
+/// One `(channel, programme)` binding ready to insert.
+struct ProgramRow<'a> {
+    id: String,
+    channel_id: &'a String,
+    start: String,
+    end: Option<String>,
+    genres: Option<String>,
+    class: ProgramClass,
+    prog: &'a crate::xmltv::XmltvProgramme,
+}
+
+/// What `XmlTvListingsProvider.GetProgramInfo` derives for one airing beyond
+/// the raw XMLTV fields.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // they are the upstream ProgramInfo flags
+struct ProgramClass {
+    is_movie: bool,
+    is_series: bool,
+    is_news: bool,
+    is_kids: bool,
+    is_sports: bool,
+    is_repeat: bool,
+    /// `ProgramInfo.EpisodeTitle` — cleared for movies.
+    episode_title: Option<String>,
+    season_number: Option<i32>,
+    /// Cleared for movies.
+    episode_number: Option<i32>,
+    /// `ProgramInfo.Id`: `{channelId}_{start:O}`.
+    external_id: Option<String>,
+    /// `ProgramInfo.SeriesId`: the title's MD5 (`N`) when the airing is an episode.
+    external_series_id: Option<String>,
+}
+
+/// The listings provider's category lists (`ListingsProviderInfo`), each
+/// falling back to Jellyfin's defaults when the provider carries none.
+struct CategoryClasses {
+    news: Vec<String>,
+    sports: Vec<String>,
+    kids: Vec<String>,
+    movie: Vec<String>,
+}
+
+impl CategoryClasses {
+    fn from_provider(provider: &ListingsProviderInfo) -> Self {
+        let defaults = ListingsProviderInfo::default();
+        let pick = |own: &Option<Vec<String>>, default: &Option<Vec<String>>| {
+            own.clone().or_else(|| default.clone()).unwrap_or_default()
+        };
+        Self {
+            news: pick(&provider.news_categories, &defaults.news_categories),
+            sports: pick(&provider.sports_categories, &defaults.sports_categories),
+            kids: pick(&provider.kids_categories, &defaults.kids_categories),
+            movie: pick(&provider.movie_categories, &defaults.movie_categories),
+        }
+    }
+
+    /// `programCategories.Any(c => list.Contains(c, OrdinalIgnoreCase))` —
+    /// per-character case folding, so non-ASCII names compare as .NET does.
+    fn any_in(list: &[String], categories: &[String]) -> bool {
+        let fold = |s: &str| s.chars().flat_map(char::to_uppercase).collect::<String>();
+        categories
+            .iter()
+            .any(|c| list.iter().any(|l| fold(l) == fold(c)))
+    }
+
+    /// Port of the derived part of `XmlTvListingsProvider.GetProgramInfo`.
+    fn classify(&self, prog: &crate::xmltv::XmltvProgramme) -> ProgramClass {
+        let categories: Vec<String> = prog
+            .categories
+            .iter()
+            .filter(|c| !c.trim().is_empty())
+            .cloned()
+            .collect();
+        let (season_number, episode_number) = (prog.season_number, prog.episode_number);
+        let is_movie = Self::any_in(&self.movie, &categories);
+        // The provider's `IsSeries = Episode is not null` is widened by
+        // `GuideManager.GetProgram` to `|| !IsNullOrEmpty(EpisodeTitle)`; a movie
+        // clears the episode number and title first, so it stays false.
+        let episode_title = if is_movie {
+            None
+        } else {
+            prog.sub_title.clone()
+        };
+        let is_series = !is_movie && (episode_number.is_some() || episode_title.is_some());
+        // `program.Title?.GetMD5()`: no title, no series id.
+        let external_series_id = episode_number.filter(|_| !prog.title.is_empty()).map(|_| {
+            ferrofin_common::extensions::get_md5(&prog.title)
+                .simple()
+                .to_string()
+        });
+        ProgramClass {
+            is_movie,
+            is_series,
+            is_news: Self::any_in(&self.news, &categories),
+            is_kids: Self::any_in(&self.kids, &categories),
+            is_sports: Self::any_in(&self.sports, &categories),
+            is_repeat: prog.is_previously_shown && !prog.is_new,
+            episode_title,
+            season_number,
+            episode_number: if is_movie { None } else { episode_number },
+            // `{channelId}_{start:O}`. Upstream formats the file's own
+            // DateTimeOffset (a `+0100` guide yields `…+01:00`); the parser here
+            // normalizes to UTC, so the offset is always +00:00 — an accepted
+            // divergence for an id no DTO field surfaces.
+            external_id: prog.start.map(|start| {
+                format!(
+                    "{}_{}.{:07}+00:00",
+                    prog.channel_id,
+                    start.format("%Y-%m-%dT%H:%M:%S"),
+                    start.timestamp_subsec_nanos() / 100
+                )
+            }),
+            external_series_id,
+        }
+    }
+}
+
 impl FerrofinLiveTvManager {
     /// Creates the manager over the given database and source fetcher.
     #[must_use]
@@ -82,8 +205,17 @@ impl FerrofinLiveTvManager {
         Self {
             db,
             fetcher,
+            users: None,
             server_id,
         }
+    }
+
+    /// Attaches the user manager so `GET /LiveTv/Info` can list the users who may
+    /// use Live TV (the composition root wires it; tests may leave it off).
+    #[must_use]
+    pub fn with_users(mut self, users: Arc<dyn ferrofin_traits::library::UserManager>) -> Self {
+        self.users = Some(users);
+        self
     }
 
     /// Rewrites the channel lineup for one tuner host from its M3U body, in a
@@ -127,9 +259,16 @@ impl FerrofinLiveTvManager {
     }
 
     /// Inserts programmes from an XMLTV body, binding each to every channel whose
-    /// `TvgId` matches the programme's `channel` attribute.
-    async fn insert_programs(&self, xmltv_body: &str) -> Result<(), ServiceError> {
+    /// `TvgId` matches the programme's `channel` attribute, classified against the
+    /// listings provider's category lists as `XmlTvListingsProvider.GetProgramInfo`
+    /// does.
+    async fn insert_programs(
+        &self,
+        xmltv_body: &str,
+        provider: &ListingsProviderInfo,
+    ) -> Result<(), ServiceError> {
         let guide = parse_xmltv(xmltv_body);
+        let classes = CategoryClasses::from_provider(provider);
 
         // Map each tvg-id to the channel UUIDs that carry it.
         let rows = sqlx::query(r#"SELECT "Id","TvgId" FROM "FerrofinLiveTvChannels""#)
@@ -144,7 +283,7 @@ impl FerrofinLiveTvManager {
         }
 
         // Flatten to one (channel, programme) row per binding, then insert in
-        // chunked multi-row statements (15 columns per row) instead of one
+        // chunked multi-row statements (25 columns per row) instead of one
         // round-trip per programme.
         let rows: Vec<_> = guide
             .programmes
@@ -158,48 +297,61 @@ impl FerrofinLiveTvManager {
                 } else {
                     serde_json::to_string(&prog.categories).ok()
                 };
+                let class = classes.classify(prog);
                 channel_ids.iter().map(move |channel_id| {
                     let id = Uuid::new_v5(&PROGRAM_NS, format!("{channel_id}|{start}").as_bytes());
-                    (
-                        guid_to_db(id),
+                    ProgramRow {
+                        id: guid_to_db(id),
                         channel_id,
-                        start.clone(),
-                        end.clone(),
-                        genres.clone(),
+                        start: start.clone(),
+                        end: end.clone(),
+                        genres: genres.clone(),
+                        class: class.clone(),
                         prog,
-                    )
+                    }
                 })
             })
             .collect();
 
         let mut tx = self.db.writer().begin().await.map_err(db_err)?;
-        for chunk in rows.chunks(SQLITE_BIND_LIMIT / 15) {
+        for chunk in rows.chunks(SQLITE_BIND_LIMIT / 25) {
             let mut qb: QueryBuilder<'_, Sqlite> = QueryBuilder::new(
                 r#"INSERT OR REPLACE INTO "FerrofinLiveTvPrograms"
                    ("Id","ChannelId","StartDate","EndDate","Title","EpisodeTitle","Overview",
                     "Genres","ImageUrl","ProductionYear","EpisodeNum","IsNew","IsPremiere",
-                    "IsRepeat","OfficialRating") "#,
+                    "IsRepeat","OfficialRating","IsMovie","IsSeries","IsNews","IsKids",
+                    "IsSports","IsLive","ExternalId","ExternalSeriesId","SeasonNumber",
+                    "EpisodeNumber") "#,
             );
-            qb.push_values(
-                chunk,
-                |mut b, (id, channel_id, start, end, genres, prog)| {
-                    b.push_bind(id)
-                        .push_bind(*channel_id)
-                        .push_bind(start)
-                        .push_bind(end)
-                        .push_bind(&prog.title)
-                        .push_bind(&prog.sub_title)
-                        .push_bind(&prog.desc)
-                        .push_bind(genres)
-                        .push_bind(&prog.icon)
-                        .push_bind(prog.year)
-                        .push_bind(&prog.episode_num)
-                        .push_bind(i32::from(prog.is_new))
-                        .push_bind(i32::from(prog.is_premiere))
-                        .push_bind(i32::from(prog.is_previously_shown))
-                        .push_bind(&prog.rating);
-                },
-            );
+            qb.push_values(chunk, |mut b, row| {
+                let prog = row.prog;
+                let class = &row.class;
+                b.push_bind(&row.id)
+                    .push_bind(row.channel_id)
+                    .push_bind(&row.start)
+                    .push_bind(&row.end)
+                    .push_bind(&prog.title)
+                    .push_bind(class.episode_title.as_deref())
+                    .push_bind(&prog.desc)
+                    .push_bind(&row.genres)
+                    .push_bind(&prog.icon)
+                    .push_bind(prog.year)
+                    .push_bind(&prog.episode_num)
+                    .push_bind(i32::from(prog.is_new))
+                    .push_bind(i32::from(prog.is_premiere))
+                    .push_bind(i32::from(class.is_repeat))
+                    .push_bind(&prog.rating)
+                    .push_bind(i32::from(class.is_movie))
+                    .push_bind(i32::from(class.is_series))
+                    .push_bind(i32::from(class.is_news))
+                    .push_bind(i32::from(class.is_kids))
+                    .push_bind(i32::from(class.is_sports))
+                    .push_bind(0_i32)
+                    .push_bind(&class.external_id)
+                    .push_bind(&class.external_series_id)
+                    .push_bind(class.season_number)
+                    .push_bind(class.episode_number);
+            });
             qb.build().execute(&mut *tx).await.map_err(db_err)?;
         }
         tx.commit().await.map_err(db_err)
@@ -209,29 +361,37 @@ impl FerrofinLiveTvManager {
 #[async_trait]
 impl LiveTvManager for FerrofinLiveTvManager {
     async fn get_live_tv_info(&self) -> Result<LiveTvInfo, ServiceError> {
-        // Always emit the built-in "Emby" service, mirroring Jellyfin's
-        // DefaultLiveTvService (which is always registered), then optionally
-        // append the M3U/XMLTV entry once a tuner host is configured.
-        // Jellyfin's DefaultLiveTvService reports IsVisible=false and an (empty) Tuners array.
-        let mut services = vec![LiveTvServiceInfo {
+        // Port of `LiveTvManager.GetLiveTvInfo`. `Services` is the list of
+        // `ILiveTvService`s, which on a stock server is exactly one —
+        // `DefaultLiveTvService`, named "Emby" — and `GetServiceInfo` sets only
+        // its name (so Status=Ok, IsVisible=false, Tuners=[] are the defaults).
+        // Tuner hosts are NOT services; they never add an entry.
+        let services = vec![LiveTvServiceInfo {
             name: Some("Emby".to_owned()),
             status: LiveTvServiceStatus::Ok,
             is_visible: false,
             tuners: Some(Vec::new()),
             ..LiveTvServiceInfo::default()
         }];
-        if !self.get_tuner_hosts().await?.is_empty() {
-            services.push(LiveTvServiceInfo {
-                name: Some("M3U/XMLTV".to_owned()),
-                status: LiveTvServiceStatus::Ok,
-                is_visible: true,
-                ..LiveTvServiceInfo::default()
-            });
+        // `IsLiveTvEnabled(user)`: the EnableLiveTvAccess permission AND
+        // (Services.Count > 1 || TunerHosts.Length > 0) — with one service, a
+        // tuner host must exist. Ids are `ToString("N")`.
+        let has_tuners = !self.get_tuner_hosts().await?.is_empty();
+        let mut enabled_users = Vec::new();
+        if has_tuners && let Some(users) = &self.users {
+            for user in users.get_users().await? {
+                let dto = users.get_user_dto(&user, None).await?;
+                if dto.policy.is_some_and(|p| p.enable_live_tv_access)
+                    && let Ok(id) = Uuid::parse_str(&user.id)
+                {
+                    enabled_users.push(id.simple().to_string());
+                }
+            }
         }
         Ok(LiveTvInfo {
             is_enabled: !services.is_empty(),
             services,
-            enabled_users: Vec::new(),
+            enabled_users,
         })
     }
 
@@ -423,7 +583,9 @@ impl LiveTvManager for FerrofinLiveTvManager {
         let row = sqlx::query(
             r#"SELECT p."Id",p."ChannelId",p."StartDate",p."EndDate",p."Title",p."EpisodeTitle",
                       p."Overview",p."Genres",p."ProductionYear",p."OfficialRating",p."IsNew",
-                      p."IsRepeat",p."IsPremiere",c."Name" AS "ChannelName"
+                      p."IsRepeat",p."IsPremiere",p."IsMovie",p."IsSeries",p."IsNews",p."IsKids",
+                      p."IsSports",p."IsLive",p."ExternalId",p."ExternalSeriesId",
+                      p."SeasonNumber",p."EpisodeNumber",c."Name" AS "ChannelName"
                FROM "FerrofinLiveTvPrograms" p
                JOIN "FerrofinLiveTvChannels" c ON c."Id" = p."ChannelId"
                WHERE p."Id" = ?1"#,
@@ -455,7 +617,7 @@ impl LiveTvManager for FerrofinLiveTvManager {
                 continue;
             };
             match self.fetcher.fetch(path).await {
-                Ok(body) => self.insert_programs(&body).await?,
+                Ok(body) => self.insert_programs(&body, &provider).await?,
                 Err(e) => tracing::warn!(%path, error = %e, "live tv: guide fetch failed"),
             }
         }
@@ -670,19 +832,36 @@ impl FerrofinLiveTvManager {
         }
     }
 
-    /// Maps a program row (joined to its channel) to a `BaseItemDto`
-    /// (`Type = "LiveTvProgram"`).
+    /// Maps a program row (joined to its channel) to a `BaseItemDto`.
+    ///
+    /// `Type` is `"Program"` (`LiveTvProgram.GetClientTypeName`), and the flags,
+    /// run time and episode numbers are what `GuideManager.GetProgram` +
+    /// `LiveTvManager.AddInfoToProgramDto` put on the item.
     fn program_dto(&self, r: &sqlx::sqlite::SqliteRow) -> BaseItemDto {
         let id = Uuid::parse_str(&r.get::<String, _>("Id")).unwrap_or_default();
         let channel_id = Uuid::parse_str(&r.get::<String, _>("ChannelId")).ok();
         let genres: Option<Vec<String>> = r
             .get::<Option<String>, _>("Genres")
             .and_then(|g| serde_json::from_str(&g).ok());
+        let start_date = parse_dt(r.get::<String, _>("StartDate").as_str());
+        let end_date = r
+            .get::<Option<String>, _>("EndDate")
+            .as_deref()
+            .and_then(parse_dt);
+        // `RunTimeTicks = (EndDate - StartDate).Ticks`.
+        let run_time_ticks = match (start_date, end_date) {
+            (Some(start), Some(end)) => Some((end - start).num_milliseconds() * 10_000),
+            _ => None,
+        };
+        // `dto.IsNews |= program.IsNews` on a `bool?` that starts null: a false
+        // flag stays null and is never written, so only true flags appear.
+        let flag =
+            |column: &str| -> Option<bool> { (r.get::<i32, _>(column) != 0).then_some(true) };
         BaseItemDto {
             id,
             server_id: Some(self.server_id.clone()),
             name: Some(r.get::<String, _>("Title")),
-            type_: BaseItemKind::LiveTvProgram,
+            type_: BaseItemKind::Program,
             channel_id,
             media_type: MediaType::Unknown,
             episode_title: r.get::<Option<String>, _>("EpisodeTitle"),
@@ -690,13 +869,20 @@ impl FerrofinLiveTvManager {
             genres,
             production_year: r.get::<Option<i32>, _>("ProductionYear"),
             official_rating: r.get::<Option<String>, _>("OfficialRating"),
-            start_date: parse_dt(r.get::<String, _>("StartDate").as_str()),
-            end_date: r
-                .get::<Option<String>, _>("EndDate")
-                .as_deref()
-                .and_then(parse_dt),
+            start_date,
+            end_date,
+            run_time_ticks,
+            is_repeat: flag("IsRepeat"),
+            is_premiere: flag("IsPremiere"),
+            is_movie: flag("IsMovie"),
+            is_series: flag("IsSeries"),
+            is_news: flag("IsNews"),
+            is_kids: flag("IsKids"),
+            is_sports: flag("IsSports"),
+            is_live: flag("IsLive"),
+            index_number: r.get::<Option<i32>, _>("EpisodeNumber"),
+            parent_index_number: r.get::<Option<i32>, _>("SeasonNumber"),
             channel_name: r.get::<Option<String>, _>("ChannelName"),
-            is_folder: Some(false),
             ..BaseItemDto::default()
         }
     }
@@ -775,12 +961,11 @@ fn push_separator(qb: &mut QueryBuilder<'_, Sqlite>, first: &mut bool) {
 /// does), the airing flag, the exact-name scope `librarySeriesId` sets, and the
 /// genre scope.
 ///
-/// Filters whose backing data the guide cache does not hold are deliberately
-/// not faked: `IsMovie`/`IsSeries`/`IsNews`/`IsKids`/`IsSports` need the
-/// per-listing-provider category classification Jellyfin stores as columns on
-/// the program item, `GenreIds` needs genre identity rows, and `SeriesTimerId`
-/// needs the timer↔program link. They stay unapplied until the schema carries
-/// them.
+/// The classification flags (`IsMovie`/`IsSeries`/`IsNews`/`IsKids`/`IsSports`)
+/// match the columns the guide refresh derives per listings provider. Filters
+/// whose backing data the guide cache does not hold are deliberately not faked:
+/// `GenreIds` needs genre identity rows and `SeriesTimerId` the timer↔program
+/// link.
 fn push_program_filters(
     qb: &mut QueryBuilder<'_, Sqlite>,
     query: &InternalItemsQuery,
@@ -850,6 +1035,19 @@ fn push_program_filters(
         push_separator(qb, &mut first);
         qb.push(r#"LOWER(p."Title") = "#)
             .push_bind(name.to_lowercase());
+    }
+
+    for (column, wanted) in [
+        (r#"p."IsMovie""#, query.is_movie),
+        (r#"p."IsSeries""#, query.is_series),
+        (r#"p."IsNews""#, query.is_news),
+        (r#"p."IsKids""#, query.is_kids),
+        (r#"p."IsSports""#, query.is_sports),
+    ] {
+        if let Some(wanted) = wanted {
+            push_separator(qb, &mut first);
+            qb.push(column).push(" = ").push_bind(i32::from(wanted));
+        }
     }
 
     if !query.genres.is_empty() {
@@ -969,6 +1167,9 @@ fn db_err(e: sqlx::Error) -> ServiceError {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use uuid::Uuid;
 
     use ferrofin_db::Database;
     use ferrofin_model::live_tv::{ListingsProviderInfo, TunerHostInfo};
@@ -1018,7 +1219,8 @@ mod tests {
         assert_eq!(info.services.len(), 1);
         assert_eq!(info.services[0].name.as_deref(), Some("Emby"));
 
-        // Once a tuner exists, the M3U/XMLTV service is appended alongside Emby.
+        // A tuner host is not a service: the list stays exactly [Emby] (Jellyfin
+        // lists ILiveTvServices, of which a stock server has one).
         mgr.save_tuner_host(TunerHostInfo {
             url: Some("http://tuner/playlist.m3u".to_owned()),
             ..TunerHostInfo::default()
@@ -1027,9 +1229,65 @@ mod tests {
         .expect("tuner");
         let info = mgr.get_live_tv_info().await.expect("info2");
         assert!(info.is_enabled);
-        assert_eq!(info.services.len(), 2);
+        assert_eq!(info.services.len(), 1);
         assert_eq!(info.services[0].name.as_deref(), Some("Emby"));
-        assert_eq!(info.services[1].name.as_deref(), Some("M3U/XMLTV"));
+    }
+
+    #[tokio::test]
+    async fn info_lists_the_users_allowed_live_tv_once_a_tuner_exists() {
+        let db = Database::connect_in_memory().await.expect("db");
+        db.run_migrations().await.expect("migrate");
+        let users: Arc<dyn ferrofin_traits::library::UserManager> = Arc::new(
+            ferrofin_core::user_manager::FerrofinUserManager::new(db.clone()),
+        );
+        let allowed = users.create_user("tv").await.expect("user");
+        let denied = users.create_user("radio").await.expect("user");
+        let allowed_id = Uuid::parse_str(&allowed.id).expect("guid");
+        let mut policy = users
+            .get_user_dto(&allowed, None)
+            .await
+            .expect("dto")
+            .policy
+            .expect("policy");
+        policy.enable_live_tv_access = true;
+        users
+            .update_policy(allowed_id, &policy)
+            .await
+            .expect("policy");
+        let mut policy = users
+            .get_user_dto(&denied, None)
+            .await
+            .expect("dto")
+            .policy
+            .expect("policy");
+        policy.enable_live_tv_access = false;
+        users
+            .update_policy(Uuid::parse_str(&denied.id).expect("guid"), &policy)
+            .await
+            .expect("policy");
+
+        let mgr =
+            FerrofinLiveTvManager::new(db, Arc::new(FakeFetcher(HashMap::new())), "srv".to_owned())
+                .with_users(users);
+        // `IsLiveTvEnabled`: the permission alone is not enough — a tuner host must exist.
+        assert!(
+            mgr.get_live_tv_info()
+                .await
+                .expect("info")
+                .enabled_users
+                .is_empty()
+        );
+        mgr.save_tuner_host(TunerHostInfo {
+            url: Some("http://tuner/playlist.m3u".to_owned()),
+            ..TunerHostInfo::default()
+        })
+        .await
+        .expect("tuner");
+        // Ids are `ToString("N")`.
+        assert_eq!(
+            mgr.get_live_tv_info().await.expect("info").enabled_users,
+            vec![allowed_id.simple().to_string()]
+        );
     }
 
     #[tokio::test]
@@ -1081,6 +1339,166 @@ mod tests {
         assert_eq!(mgr.get_listing_providers().await.expect("list").len(), 1);
         mgr.delete_listing_provider(&id).await.expect("delete");
         assert!(mgr.get_listing_providers().await.expect("list2").is_empty());
+    }
+
+    /// A guide with a news airing, a movie, and a series episode (xmltv_ns
+    /// `0.5.` → S1E6), so every classification branch of
+    /// `XmlTvListingsProvider.GetProgramInfo` is exercised.
+    const CLASSIFIED_XMLTV: &str = "<tv>\
+        <channel id=\"one.tv\"><display-name>Channel One</display-name></channel>\
+        <programme start=\"20260725060000 +0000\" stop=\"20260725070000 +0000\" channel=\"one.tv\">\
+        <title>Morning Show</title><category>News</category><previously-shown/></programme>\
+        <programme start=\"20260725070000 +0000\" stop=\"20260725090000 +0000\" channel=\"one.tv\">\
+        <title>Heat</title><sub-title>ignored for movies</sub-title><category>Movie</category>\
+        <episode-num system=\"xmltv_ns\">0.5.</episode-num></programme>\
+        <programme start=\"20260725090000 +0000\" stop=\"20260725093000 +0000\" channel=\"one.tv\">\
+        <title>Bluey</title><sub-title>Keepy Uppy</sub-title><category>Kids</category>\
+        <episode-num system=\"xmltv_ns\">0.5.</episode-num><new/><previously-shown/></programme>\
+        <programme start=\"20260725093000 +0000\" stop=\"20260725100000 +0000\" channel=\"one.tv\">\
+        <title>Late Talk</title><sub-title>With a guest</sub-title></programme>\
+        </tv>";
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one guide, every classification branch
+    async fn guide_refresh_classifies_programmes_like_the_xmltv_provider() {
+        let mut sources = HashMap::new();
+        sources.insert("http://tuner/playlist.m3u".to_owned(), M3U.to_owned());
+        sources.insert(
+            "http://guide/xmltv.xml".to_owned(),
+            CLASSIFIED_XMLTV.to_owned(),
+        );
+        let mgr = manager_with(FakeFetcher(sources)).await;
+        mgr.save_tuner_host(TunerHostInfo {
+            url: Some("http://tuner/playlist.m3u".to_owned()),
+            ..TunerHostInfo::default()
+        })
+        .await
+        .expect("tuner");
+        // A provider posted without category lists gets Jellyfin's defaults.
+        mgr.save_listing_provider(ListingsProviderInfo {
+            path: Some("http://guide/xmltv.xml".to_owned()),
+            news_categories: None,
+            movie_categories: None,
+            kids_categories: None,
+            sports_categories: None,
+            ..ListingsProviderInfo::default()
+        })
+        .await
+        .expect("provider");
+        mgr.refresh_guide().await.expect("refresh");
+
+        let all = mgr
+            .get_programs(&InternalItemsQuery::default(), &DtoOptions::default())
+            .await
+            .expect("progs");
+        assert_eq!(all.total_record_count, 4);
+        let by_name = |name: &str| {
+            all.items
+                .iter()
+                .find(|p| p.name.as_deref() == Some(name))
+                .cloned()
+                .expect(name)
+        };
+
+        let news = by_name("Morning Show");
+        assert_eq!(
+            news.type_,
+            ferrofin_model::data::BaseItemKind::Program,
+            "GetClientTypeName"
+        );
+        assert_eq!(news.is_news, Some(true));
+        assert_eq!(
+            // False flags are absent (`|=` on a null bool? stays null).
+            (news.is_movie, news.is_series, news.is_kids),
+            (None, None, None)
+        );
+        // `IsRepeat = IsPreviouslyShown && !IsNew`.
+        assert_eq!(news.is_repeat, Some(true));
+        // `RunTimeTicks = (EndDate - StartDate).Ticks`: one hour.
+        assert_eq!(news.run_time_ticks, Some(36_000_000_000));
+        assert_eq!(news.index_number, None);
+
+        // A movie: IsSeries cleared, and with it the episode number and title.
+        let movie = by_name("Heat");
+        assert_eq!(movie.is_movie, Some(true));
+        assert_eq!(movie.is_series, None);
+        assert_eq!(movie.index_number, None);
+        assert_eq!(movie.episode_title, None);
+
+        // An episode: IsSeries from the episode number, S1E6 from `0.5.`, and
+        // <new/> wins over <previously-shown/>.
+        let kids = by_name("Bluey");
+        assert_eq!((kids.is_kids, kids.is_series), (Some(true), Some(true)));
+        assert_eq!(
+            (kids.parent_index_number, kids.index_number),
+            (Some(1), Some(6))
+        );
+        assert_eq!(kids.episode_title.as_deref(), Some("Keepy Uppy"));
+        assert_eq!(kids.is_repeat, None);
+
+        // A sub-title alone makes a series (`GuideManager.GetProgram` widens
+        // IsSeries by the episode title).
+        let talk = by_name("Late Talk");
+        assert_eq!(talk.is_series, Some(true));
+        assert_eq!(talk.index_number, None);
+
+        // The guide filters read the same columns.
+        for (query, expected) in [
+            (
+                InternalItemsQuery {
+                    is_news: Some(true),
+                    ..Default::default()
+                },
+                "Morning Show",
+            ),
+            (
+                InternalItemsQuery {
+                    is_movie: Some(true),
+                    ..Default::default()
+                },
+                "Heat",
+            ),
+            (
+                InternalItemsQuery {
+                    is_kids: Some(true),
+                    ..Default::default()
+                },
+                "Bluey",
+            ),
+        ] {
+            let hits = mgr
+                .get_programs(&query, &DtoOptions::default())
+                .await
+                .expect("filtered");
+            assert_eq!(hits.total_record_count, 1, "{expected}");
+            assert_eq!(hits.items[0].name.as_deref(), Some(expected));
+        }
+        assert_eq!(
+            mgr.get_programs(
+                &InternalItemsQuery {
+                    is_sports: Some(true),
+                    ..Default::default()
+                },
+                &DtoOptions::default()
+            )
+            .await
+            .expect("sports")
+            .total_record_count,
+            0
+        );
+        assert_eq!(
+            mgr.get_programs(
+                &InternalItemsQuery {
+                    is_series: Some(true),
+                    ..Default::default()
+                },
+                &DtoOptions::default()
+            )
+            .await
+            .expect("series")
+            .total_record_count,
+            2
+        );
     }
 
     #[tokio::test]

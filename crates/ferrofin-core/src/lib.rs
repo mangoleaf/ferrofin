@@ -147,6 +147,7 @@
 //!   abortable queued runs, and on-disk trigger-override persistence.
 //!   `FullSystemBackup`/`BackupService` is deferred entirely.
 
+pub mod access_schedule_repository;
 pub mod activity_manager;
 pub mod api_key_manager;
 pub mod app_paths;
