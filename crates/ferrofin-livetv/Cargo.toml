@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "Live TV for Ferrofin — deferred; provides the DisabledLiveTvManager stub."
+description = "Live TV for Ferrofin — M3U tuners, XMLTV guide, DVR timers, Schedules Direct country list."
 
 [lints]
 workspace = true
@@ -26,3 +26,4 @@ tokio = { workspace = true }
 uuid = { workspace = true, features = ["v5"] }
 
 [dev-dependencies]
+tempfile.workspace = true

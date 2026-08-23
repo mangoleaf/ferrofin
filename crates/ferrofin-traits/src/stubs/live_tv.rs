@@ -145,6 +145,19 @@ pub trait LiveTvManager: Send + Sync {
 
     /// Deletes a recording (its DB row and, when present, its file).
     async fn delete_recording(&self, id: Uuid) -> Result<(), ServiceError>;
+
+    // ---- Schedules Direct ------------------------------------------------
+
+    /// The Schedules Direct "available countries" document, as the raw JSON
+    /// bytes SD served (the client parses them; the server never does).
+    ///
+    /// Port of `ISchedulesDirectService.GetAvailableCountries`
+    /// (`Jellyfin.LiveTv/Listings/SchedulesDirect.cs`): served from a
+    /// process-memory copy, else from the on-disk cache file while it is within
+    /// its TTL, else fetched from SD (no account needed) and cached both ways.
+    /// An upstream transport/status failure is a backend error (HTTP `500`),
+    /// as `EnsureSuccessStatusCode` throwing is upstream.
+    async fn get_schedules_direct_countries(&self) -> Result<Vec<u8>, ServiceError>;
 }
 
 fn _assert_object_safe_live_tv_manager(_: &dyn LiveTvManager) {}

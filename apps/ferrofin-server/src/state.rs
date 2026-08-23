@@ -466,6 +466,8 @@ pub async fn build_app_state(
             db.clone(),
             Arc::new(ferrofin_livetv::ReqwestFetcher::new()),
             server_id.clone(),
+            // `{cache}/sd-countries.json` — `IApplicationPaths.CachePath` upstream.
+            paths.cache_path(),
         ));
     let path_manager: Arc<dyn ferrofin_traits::system::PathManager> =
         Arc::new(FerrofinPathManager::new(Arc::clone(&paths)));

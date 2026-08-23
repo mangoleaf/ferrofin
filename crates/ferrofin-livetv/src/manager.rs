@@ -7,6 +7,7 @@
 //! Channels and programmes are surfaced to clients as `BaseItemDto`s.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -33,6 +34,7 @@ use serde::de::DeserializeOwned;
 use crate::error::LiveTvError;
 use crate::fetch::SourceFetcher;
 use crate::m3u::parse_m3u;
+use crate::schedules_direct::SchedulesDirect;
 use crate::xmltv::parse_xmltv;
 
 /// SQLite's conservative default bind-parameter limit (`SQLITE_MAX_VARIABLE_NUMBER`
@@ -65,6 +67,9 @@ pub struct FerrofinLiveTvManager {
     db: Database,
     fetcher: Arc<dyn SourceFetcher>,
     server_id: String,
+    /// The account-less Schedules Direct surface (country list), sharing the
+    /// fetcher and caching under the application cache directory.
+    schedules_direct: SchedulesDirect,
 }
 
 impl std::fmt::Debug for FerrofinLiveTvManager {
@@ -76,13 +81,22 @@ impl std::fmt::Debug for FerrofinLiveTvManager {
 }
 
 impl FerrofinLiveTvManager {
-    /// Creates the manager over the given database and source fetcher.
+    /// Creates the manager over the given database and source fetcher, caching
+    /// Schedules Direct documents under `cache_dir` (the application cache
+    /// path — `IApplicationPaths.CachePath` upstream).
     #[must_use]
-    pub fn new(db: Database, fetcher: Arc<dyn SourceFetcher>, server_id: String) -> Self {
+    pub fn new(
+        db: Database,
+        fetcher: Arc<dyn SourceFetcher>,
+        server_id: String,
+        cache_dir: impl Into<PathBuf>,
+    ) -> Self {
+        let schedules_direct = SchedulesDirect::new(Arc::clone(&fetcher), cache_dir);
         Self {
             db,
             fetcher,
             server_id,
+            schedules_direct,
         }
     }
 
@@ -641,6 +655,10 @@ impl LiveTvManager for FerrofinLiveTvManager {
         )
         .await
     }
+
+    async fn get_schedules_direct_countries(&self) -> Result<Vec<u8>, ServiceError> {
+        self.schedules_direct.get_available_countries().await
+    }
 }
 
 impl FerrofinLiveTvManager {
@@ -996,7 +1014,12 @@ mod tests {
     async fn manager_with(fetcher: FakeFetcher) -> FerrofinLiveTvManager {
         let db = Database::connect_in_memory().await.expect("db");
         db.run_migrations().await.expect("migrate");
-        FerrofinLiveTvManager::new(db, std::sync::Arc::new(fetcher), "srv".to_owned())
+        FerrofinLiveTvManager::new(
+            db,
+            std::sync::Arc::new(fetcher),
+            "srv".to_owned(),
+            std::env::temp_dir().join("ferrofin-livetv-manager-tests"),
+        )
     }
 
     const M3U: &str = "#EXTM3U\n\
@@ -1553,5 +1576,36 @@ mod tests {
             mgr.get_timers().await.expect("t2").is_empty(),
             "cancelling a series timer drops its timers"
         );
+    }
+
+    #[tokio::test]
+    async fn schedules_direct_countries_come_from_the_shared_fetcher_and_cache_dir() {
+        let cache_dir = tempfile::tempdir().expect("tempdir");
+        let mut map = HashMap::new();
+        map.insert(
+            format!("{}/available/countries", crate::schedules_direct::API_URL),
+            r#"{"Europe":[{"shortName":"GBR"}]}"#.to_owned(),
+        );
+        let db = Database::connect_in_memory().await.expect("db");
+        db.run_migrations().await.expect("migrate");
+        let mgr = FerrofinLiveTvManager::new(
+            db,
+            std::sync::Arc::new(FakeFetcher(map)),
+            "srv".to_owned(),
+            cache_dir.path(),
+        );
+
+        let bytes = mgr
+            .get_schedules_direct_countries()
+            .await
+            .expect("countries");
+        assert_eq!(bytes, br#"{"Europe":[{"shortName":"GBR"}]}"#);
+        // The disk cache lands in the manager's cache directory.
+        assert_eq!(
+            std::fs::read(cache_dir.path().join("sd-countries.json")).expect("cache file"),
+            bytes
+        );
+        // Debug stays free of the fetcher and cache internals.
+        assert!(format!("{mgr:?}").contains("srv"));
     }
 }

@@ -837,6 +837,9 @@ mod tests {
 
     #[async_trait]
     impl ferrofin_traits::stubs::LiveTvManager for FakeLiveTv {
+        async fn get_schedules_direct_countries(&self) -> Result<Vec<u8>, ServiceError> {
+            Ok(Vec::new())
+        }
         async fn get_live_tv_info(
             &self,
         ) -> Result<ferrofin_model::live_tv::LiveTvInfo, ServiceError> {

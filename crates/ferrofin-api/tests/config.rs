@@ -773,6 +773,9 @@ impl ferrofin_traits::stubs::LiveTvManager for FailingLiveTv {
     async fn delete_recording(&self, _id: Uuid) -> Result<(), ServiceError> {
         unreachable!()
     }
+    async fn get_schedules_direct_countries(&self) -> Result<Vec<u8>, ServiceError> {
+        unreachable!()
+    }
 }
 
 #[tokio::test]
