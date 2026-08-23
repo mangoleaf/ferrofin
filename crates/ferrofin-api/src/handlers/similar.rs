@@ -7,8 +7,9 @@
 //! [`SimilarItemsManager`](ferrofin_traits::library::SimilarItemsManager) seam.
 //!
 //! The C# body resolves the seed item (a nil id falls back to the root folder),
-//! short-circuits `Episode`/by-name-non-artist seeds to an empty result (the
-//! manager applies that internally), builds `DtoOptions` from `fields`, asks the
+//! short-circuits `Episode`/by-name-non-artist seeds to an empty result — the
+//! manager's `get_similar_items` applies that guard (`kinds::supports_similarity`)
+//! before any provider runs — builds `DtoOptions` from `fields`, asks the
 //! similar-items manager for the ranked rows, and returns a
 //! `QueryResult<BaseItemDto>` with `startIndex = 0` and `totalRecordCount` equal
 //! to the number of rows. The transform is identical for every alias — only the
@@ -54,11 +55,13 @@ struct SimilarParams {
 ///
 /// Port of `LibraryController.GetSimilarItems`. Resolves the (optional) user,
 /// parses `excludeArtistIds`/`fields`, and delegates to the
-/// [`SimilarItemsManager`](ferrofin_traits::library::SimilarItemsManager) — which
-/// applies the `Episode`/by-name empty-result short-circuit internally, matching
-/// the C# `if (item is Episode || (item is IItemByName && …)) return new
-/// QueryResult()` guard. Returns the ranked rows projected to
-/// [`BaseItemDto`] with `startIndex = 0`.
+/// [`SimilarItemsManager`](ferrofin_traits::library::SimilarItemsManager), whose
+/// `get_similar_items` answers empty for an `Episode` or a by-name seed other
+/// than a `MusicArtist` — the C# `if (item is Episode || (item is IItemByName
+/// && item is not MusicArtist)) return new QueryResult()` guard — and otherwise
+/// runs the providers with the user's access, the per-kind played filter and
+/// `excludeArtistIds` (honoured by the music providers only, as in C#).
+/// Returns the ranked rows projected to [`BaseItemDto`] with `startIndex = 0`.
 async fn similar_items(
     state: &AppState,
     auth: &ferrofin_traits::options::AuthorizationInfo,

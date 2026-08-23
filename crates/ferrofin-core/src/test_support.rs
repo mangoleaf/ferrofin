@@ -329,13 +329,24 @@ pub async fn fetch_item_opt(db: &Database, id: Uuid) -> Option<BaseItemEntity> {
 /// tables, so the `genres`/`genre_ids` query filters match it — and materializes
 /// the browsable by-name `Genre` row, exactly as the scanner does.
 ///
+/// See [`seed_item_value`] for the append semantics.
+pub async fn seed_item_genre(db: &Database, item_id: Uuid, genre: &str) {
+    seed_item_value(db, item_id, ferrofin_db::enums::ItemValueType::Genre, genre).await;
+}
+
+/// Attaches one `(type, value)` item value (genre / studio / tag / artist /
+/// album-artist) to an item, the way the scanner links it.
+///
 /// Goes through the production write path
 /// ([`ItemPersistenceService::save_item_values`]), which *replaces* an item's
 /// value links; the item's existing (type, value) pairs are therefore read back
-/// and re-sent alongside the new genre, so calling this repeatedly appends.
-pub async fn seed_item_genre(db: &Database, item_id: Uuid, genre: &str) {
-    let genre_type = i32::from(ferrofin_db::enums::ItemValueType::Genre);
-
+/// and re-sent alongside the new one, so calling this repeatedly appends.
+pub async fn seed_item_value(
+    db: &Database,
+    item_id: Uuid,
+    value_type: ferrofin_db::enums::ItemValueType,
+    value: &str,
+) {
     let mut values: Vec<(i32, String)> = sqlx::query_as(
         r#"SELECT iv."Type", iv."Value"
            FROM "ItemValuesMap" m
@@ -346,7 +357,7 @@ pub async fn seed_item_genre(db: &Database, item_id: Uuid, genre: &str) {
     .fetch_all(db.pool())
     .await
     .expect("read existing item values");
-    values.push((genre_type, genre.to_owned()));
+    values.push((i32::from(value_type), value.to_owned()));
 
     persistence_over(db)
         .save_item_values(item_id, &values)

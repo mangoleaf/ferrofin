@@ -588,7 +588,9 @@ pub async fn build_app_state(
             // The cache root itself: the manager appends Jellyfin's own
             // `{provider}-similar-{type}/{id}.json` layout under it, so a
             // cache directory shared with a Jellyfin install stays valid.
-            .with_cache_dir(std::path::PathBuf::from(paths.cache_path())),
+            .with_cache_dir(std::path::PathBuf::from(paths.cache_path()))
+            // `EnableExternalContentInSuggestions` (Trailer/LiveTvProgram fold-in).
+            .with_configuration(Arc::clone(&config_trait)),
     );
     let mut scanner = ferrofin_core::LibraryScanner::new(
         Arc::clone(&virtual_folders),

@@ -565,8 +565,10 @@ struct SimilarParams {
 ///
 /// Port of `LibraryController.GetSimilarItems` (the `GetSimilarShows` route).
 /// Delegates to the
-/// [`SimilarItemsManager`](ferrofin_traits::library::SimilarItemsManager), which
-/// applies the Episode / by-name empty-result short-circuits internally.
+/// [`SimilarItemsManager`](ferrofin_traits::library::SimilarItemsManager), whose
+/// `get_similar_items` answers empty for an `Episode` or a by-name seed other
+/// than a `MusicArtist` (the C# controller guard) and otherwise runs the
+/// providers with the user's access and the per-kind filter set.
 #[utoipa::path(
     get,
     path = "/Shows/{itemId}/Similar",
