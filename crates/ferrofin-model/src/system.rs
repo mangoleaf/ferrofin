@@ -28,10 +28,12 @@ pub struct CastReceiverApplication {
 pub struct LogFile {
     /// Gets or sets the date created.
     #[schema(value_type = String, format = "date-time")]
+    #[serde(with = "crate::json::datetime")]
     pub date_created: DateTime<Utc>,
 
     /// Gets or sets the date modified.
     #[schema(value_type = String, format = "date-time")]
+    #[serde(with = "crate::json::datetime")]
     pub date_modified: DateTime<Utc>,
 
     /// Gets or sets the size.
@@ -232,6 +234,7 @@ pub struct FolderStorageInfo {
 pub struct LibraryStorageInfo {
     /// Gets or sets the library id.
     #[schema(value_type = String, format = "uuid")]
+    #[serde(with = "crate::json::guid")]
     pub id: Uuid,
 
     /// Gets or sets the name of the library.

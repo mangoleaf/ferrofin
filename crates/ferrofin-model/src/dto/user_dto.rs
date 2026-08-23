@@ -31,6 +31,7 @@ pub struct UserDto {
 
     /// Gets or sets the id.
     #[schema(value_type = String, format = "uuid")]
+    #[serde(with = "crate::json::guid")]
     pub id: Uuid,
 
     /// Gets or sets the primary image tag.
@@ -58,11 +59,13 @@ pub struct UserDto {
     /// Gets or sets the last login date.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<String>, format = "date-time")]
+    #[serde(default, with = "crate::json::datetime::option")]
     pub last_login_date: Option<DateTime<Utc>>,
 
     /// Gets or sets the last activity date.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<String>, format = "date-time")]
+    #[serde(default, with = "crate::json::datetime::option")]
     pub last_activity_date: Option<DateTime<Utc>>,
 
     /// Gets or sets the configuration.
@@ -146,7 +149,11 @@ mod tests {
         let dto = UserDto {
             name: Some("Bob".to_owned()),
             id: Uuid::from_u128(42),
-            last_login_date: Some(Utc::now()),
+            // The wire form carries .NET ticks (100 ns), so a tick-aligned instant
+            // round-trips exactly.
+            last_login_date: Some(
+                chrono::DateTime::from_timestamp(1_700_000_000, 123_456_700).unwrap(),
+            ),
             ..UserDto::default()
         };
         let back: UserDto = serde_json::from_str(&serde_json::to_string(&dto).unwrap()).unwrap();

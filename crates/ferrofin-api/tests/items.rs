@@ -938,7 +938,7 @@ async fn items_returns_query_result_of_base_item_dto() {
     let json = json_body(response).await;
     assert_eq!(json["TotalRecordCount"], 1);
     assert_eq!(json["StartIndex"], 0);
-    assert_eq!(json["Items"][0]["Id"], item_id.to_string());
+    assert_eq!(json["Items"][0]["Id"], item_id.simple().to_string());
     assert_eq!(json["Items"][0]["Name"], "Test Item");
 }
 
@@ -958,7 +958,7 @@ async fn item_by_id_returns_base_item_dto() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let json = json_body(response).await;
-    assert_eq!(json["Id"], item_id.to_string());
+    assert_eq!(json["Id"], item_id.simple().to_string());
     assert_eq!(json["Name"], "Test Item");
 }
 
@@ -1002,7 +1002,7 @@ async fn get_items_with_filters_returns_query_result() {
     assert_eq!(response.status(), StatusCode::OK);
     let json = json_body(response).await;
     assert_eq!(json["TotalRecordCount"], 1);
-    assert_eq!(json["Items"][0]["Id"], item_id.to_string());
+    assert_eq!(json["Items"][0]["Id"], item_id.simple().to_string());
 }
 
 /// A `GET /Items` with an unknown enum token is a `400`.

@@ -36,5 +36,6 @@ pub struct QuickConnectResult {
 
     /// Gets or sets the `DateTime` that this request was created.
     #[schema(value_type = String, format = "date-time")]
+    #[serde(with = "crate::json::datetime")]
     pub date_added: DateTime<Utc>,
 }

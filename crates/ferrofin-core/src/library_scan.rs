@@ -1476,8 +1476,10 @@ impl LibraryScanner {
         let Some(events) = &self.events else {
             return;
         };
+        // `LibraryChangedNotifier`: the id in Jellyfin's guid spelling (N form) —
+        // jellyfin-web compares it with the card's `data-id` as a plain string.
         let payload = serde_json::json!({
-            "ItemId": library.to_string(),
+            "ItemId": library.simple().to_string(),
             "Progress": format!("{pct:.2}"),
         })
         .to_string();
@@ -1517,15 +1519,18 @@ impl LibraryScanner {
         collection_folders.sort_unstable();
         collection_folders.dedup();
 
+        // Every id as `ToString("N")` (`LibraryChangedNotifier`): jellyfin-web's
+        // itemsrefresher matches these strings against item ids.
+        let n = |id: &Uuid| id.simple().to_string();
         let mut update = ferrofin_model::entities_media::LibraryUpdateInfo {
-            folders_added_to: folders_added.iter().map(Uuid::to_string).collect(),
-            folders_removed_from: folders_removed.iter().map(Uuid::to_string).collect(),
-            items_added: added.iter().map(|p| p.id.to_string()).collect(),
+            folders_added_to: folders_added.iter().map(n).collect(),
+            folders_removed_from: folders_removed.iter().map(n).collect(),
+            items_added: added.iter().map(|p| n(&p.id)).collect(),
             items_removed: removed
                 .iter()
-                .flat_map(|(_, ids)| ids.iter().map(Uuid::to_string))
+                .flat_map(|(_, ids)| ids.iter().map(n))
                 .collect(),
-            collection_folders: collection_folders.iter().map(Uuid::to_string).collect(),
+            collection_folders: collection_folders.iter().map(n).collect(),
             ..ferrofin_model::entities_media::LibraryUpdateInfo::default()
         };
         update.is_empty = update.compute_is_empty();

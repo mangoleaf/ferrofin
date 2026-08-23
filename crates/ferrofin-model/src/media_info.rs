@@ -181,6 +181,7 @@ pub struct LiveStreamRequest {
     pub open_token: Option<String>,
     /// The user id.
     #[schema(value_type = String, format = "uuid")]
+    #[serde(with = "crate::json::guid")]
     pub user_id: Uuid,
     /// The play session id.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -202,6 +203,7 @@ pub struct LiveStreamRequest {
     pub max_audio_channels: Option<i32>,
     /// The item id.
     #[schema(value_type = String, format = "uuid")]
+    #[serde(with = "crate::json::guid")]
     pub item_id: Uuid,
     /// Whether direct play is enabled.
     pub enable_direct_play: bool,
@@ -317,6 +319,7 @@ pub struct MediaInfo {
     /// Gets or sets the premiere date.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<String>, format = "date-time")]
+    #[serde(default, with = "crate::json::datetime::option")]
     pub premiere_date: Option<DateTime<Utc>>,
 
     /// Gets or sets the people.

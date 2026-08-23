@@ -738,10 +738,10 @@ async fn playback_progress_pushes_user_data_changed_to_the_users_other_sessions(
     let frame: serde_json::Value =
         serde_json::from_slice(&web_conn.sent.lock().unwrap()[0]).unwrap();
     assert_eq!(frame["MessageType"], "UserDataChanged");
-    assert_eq!(frame["Data"]["UserId"], user_id.to_string());
+    assert_eq!(frame["Data"]["UserId"], user_id.simple().to_string());
     assert_eq!(
         frame["Data"]["UserDataList"][0]["ItemId"],
-        item_id.to_string()
+        item_id.simple().to_string()
     );
     // … and the unrelated user's session did not.
     assert_eq!(other_conn.sent_count(), 0);
@@ -1826,7 +1826,7 @@ async fn casting_stamps_the_controlling_user_on_play_and_playstate() {
     .unwrap();
     assert_eq!(
         only_pushed_data(&received)["ControllingUserId"],
-        serde_json::json!(controller_id.to_string()),
+        serde_json::json!(controller_id.simple().to_string()),
         "the target learns who cast to it"
     );
 

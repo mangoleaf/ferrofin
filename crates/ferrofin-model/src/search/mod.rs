@@ -13,10 +13,12 @@ use crate::data::{BaseItemKind, MediaType};
 pub struct SearchHint {
     /// Gets or sets the item id (deprecated; use [`Self::id`]).
     #[schema(value_type = String, format = "uuid")]
+    #[serde(with = "crate::json::guid")]
     pub item_id: Uuid,
 
     /// Gets or sets the item id.
     #[schema(value_type = String, format = "uuid")]
+    #[serde(with = "crate::json::guid")]
     pub id: Uuid,
 
     /// Gets or sets the name.
@@ -77,11 +79,13 @@ pub struct SearchHint {
     /// Gets or sets the start date.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<String>, format = "date-time")]
+    #[serde(default, with = "crate::json::datetime::option")]
     pub start_date: Option<DateTime<Utc>>,
 
     /// Gets or sets the end date.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<String>, format = "date-time")]
+    #[serde(default, with = "crate::json::datetime::option")]
     pub end_date: Option<DateTime<Utc>>,
 
     /// Gets or sets the series.
@@ -99,6 +103,7 @@ pub struct SearchHint {
     /// Gets or sets the album id.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<String>, format = "uuid")]
+    #[serde(default, with = "crate::json::guid::option")]
     pub album_id: Option<Uuid>,
 
     /// Gets or sets the album artist.
@@ -119,6 +124,7 @@ pub struct SearchHint {
     /// Gets or sets the channel identifier.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<String>, format = "uuid")]
+    #[serde(default, with = "crate::json::guid::option")]
     pub channel_id: Option<Uuid>,
 
     /// Gets or sets the name of the channel.
@@ -159,6 +165,7 @@ impl SearchHintResult {
 pub struct SearchQuery {
     /// Gets or sets the user to localize search results for.
     #[schema(value_type = String, format = "uuid")]
+    #[serde(with = "crate::json::guid")]
     pub user_id: Uuid,
 
     /// Gets or sets the search term.
@@ -199,6 +206,7 @@ pub struct SearchQuery {
     /// Gets or sets the parent id.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<String>, format = "uuid")]
+    #[serde(default, with = "crate::json::guid::option")]
     pub parent_id: Option<Uuid>,
 
     /// Gets or sets a value indicating whether the item is a movie.
@@ -296,8 +304,8 @@ mod tests {
     #[test]
     fn search_hint_uses_contract_field_names() {
         let json = serde_json::to_value(sample_hint()).unwrap();
-        assert_eq!(json["ItemId"], Uuid::from_u128(1).to_string());
-        assert_eq!(json["Id"], Uuid::from_u128(1).to_string());
+        assert_eq!(json["ItemId"], Uuid::from_u128(1).simple().to_string());
+        assert_eq!(json["Id"], Uuid::from_u128(1).simple().to_string());
         assert_eq!(json["Name"], "Result");
         assert_eq!(
             json["Type"],

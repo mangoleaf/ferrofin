@@ -43,6 +43,7 @@ pub struct BaseItemDto {
     pub server_id: Option<String>,
     /// Gets or sets the id.
     #[schema(value_type = String, format = "uuid")]
+    #[serde(with = "crate::json::guid")]
     pub id: Uuid,
     /// Gets or sets the etag.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -56,10 +57,12 @@ pub struct BaseItemDto {
     /// Gets or sets the date created.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<String>, format = "date-time")]
+    #[serde(default, with = "crate::json::datetime::option")]
     pub date_created: Option<DateTime<Utc>>,
     /// Gets or sets the date last media added.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<String>, format = "date-time")]
+    #[serde(default, with = "crate::json::datetime::option")]
     pub date_last_media_added: Option<DateTime<Utc>>,
     /// Gets or sets the extra type.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -106,6 +109,7 @@ pub struct BaseItemDto {
     /// Gets or sets the premiere date.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<String>, format = "date-time")]
+    #[serde(default, with = "crate::json::datetime::option")]
     pub premiere_date: Option<DateTime<Utc>>,
     /// Gets or sets the external urls.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -134,6 +138,7 @@ pub struct BaseItemDto {
     /// Gets or sets the channel identifier. Serialized even when null — Jellyfin always
     /// emits `ChannelId` (null for non-LiveTV items), so it is not skipped.
     #[schema(value_type = Option<String>, format = "uuid")]
+    #[serde(default, with = "crate::json::guid::option")]
     pub channel_id: Option<Uuid>,
     /// Gets or sets the channel name.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -198,6 +203,7 @@ pub struct BaseItemDto {
     /// Gets or sets the parent id.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<String>, format = "uuid")]
+    #[serde(default, with = "crate::json::guid::option")]
     pub parent_id: Option<Uuid>,
     /// Gets or sets the type.
     #[serde(rename = "Type")]
@@ -214,10 +220,12 @@ pub struct BaseItemDto {
     /// Gets or sets the parent logo item id.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<String>, format = "uuid")]
+    #[serde(default, with = "crate::json::guid::option")]
     pub parent_logo_item_id: Option<Uuid>,
     /// Gets or sets the parent backdrop item id.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<String>, format = "uuid")]
+    #[serde(default, with = "crate::json::guid::option")]
     pub parent_backdrop_item_id: Option<Uuid>,
     /// Gets or sets the parent backdrop image tags.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -240,10 +248,12 @@ pub struct BaseItemDto {
     /// Gets or sets the series id.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<String>, format = "uuid")]
+    #[serde(default, with = "crate::json::guid::option")]
     pub series_id: Option<Uuid>,
     /// Gets or sets the season id.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<String>, format = "uuid")]
+    #[serde(default, with = "crate::json::guid::option")]
     pub season_id: Option<Uuid>,
     /// Gets or sets the special feature count.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -284,6 +294,7 @@ pub struct BaseItemDto {
     /// Gets or sets the album id.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<String>, format = "uuid")]
+    #[serde(default, with = "crate::json::guid::option")]
     pub album_id: Option<Uuid>,
     /// Gets or sets the album primary image tag.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -327,6 +338,7 @@ pub struct BaseItemDto {
     /// Gets or sets the parent art item id.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<String>, format = "uuid")]
+    #[serde(default, with = "crate::json::guid::option")]
     pub parent_art_item_id: Option<Uuid>,
     /// Gets or sets the parent art image tag.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -343,6 +355,7 @@ pub struct BaseItemDto {
     /// Gets or sets the parent thumb item id.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<String>, format = "uuid")]
+    #[serde(default, with = "crate::json::guid::option")]
     pub parent_thumb_item_id: Option<Uuid>,
     /// Gets or sets the parent thumb image tag.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -370,6 +383,7 @@ pub struct BaseItemDto {
     /// Gets or sets the end date.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<String>, format = "date-time")]
+    #[serde(default, with = "crate::json::datetime::option")]
     pub end_date: Option<DateTime<Utc>>,
     /// Gets or sets the locked fields.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -458,6 +472,7 @@ pub struct BaseItemDto {
     /// Gets or sets the start date.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<String>, format = "date-time")]
+    #[serde(default, with = "crate::json::datetime::option")]
     pub start_date: Option<DateTime<Utc>>,
     /// Gets or sets the completion percentage.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -545,7 +560,7 @@ mod tests {
         };
         let json = serde_json::to_value(&value).unwrap();
         assert_eq!(json["Name"], "Inception");
-        assert_eq!(json["Id"], Uuid::from_u128(9).to_string());
+        assert_eq!(json["Id"], Uuid::from_u128(9).simple().to_string());
         assert_eq!(json["ProductionYear"], 2010);
         // None fields are omitted from the wire form.
         assert!(json.get("OriginalTitle").is_none());

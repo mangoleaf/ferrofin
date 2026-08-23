@@ -418,7 +418,11 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
                 locations: Self::resolve_locations(&path).await?,
                 collection_type: Self::read_collection_type(&path).await,
                 library_options: Some(Self::load_options(&path).await),
-                item_id: self.collection_folder_id(&path).map(|g| g.to_string()),
+                // `ToString("N")` as `LibraryManager.GetVirtualFolderInfo` does; the
+                // dashboard matches it against `RefreshProgress.ItemId` as a string.
+                item_id: self
+                    .collection_folder_id(&path)
+                    .map(|g| g.simple().to_string()),
                 // Jellyfin always reports a non-null refresh status; at rest it is
                 // "Idle" (it becomes "Queued"/"Active" only while a scan is running,
                 // which this manager does not track).

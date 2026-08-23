@@ -93,7 +93,7 @@ fn installation_info_id_is_named_guid() {
     };
     let v = serde_json::to_value(&info).expect("serialize");
     // The Id property is renamed to "Guid" on the wire; unset options omitted.
-    assert_eq!(v["Guid"], json!(id.to_string()));
+    assert_eq!(v["Guid"], json!(id.simple().to_string()));
     assert!(v.get("Id").is_none());
     assert!(v.get("Changelog").is_none());
 }
@@ -126,7 +126,7 @@ fn package_info_and_version_info_use_camel_case() {
     };
     let v = serde_json::to_value(&pkg).expect("serialize");
     assert_eq!(v["name"], json!("Sample"));
-    assert_eq!(v["guid"], json!(Uuid::nil().to_string()));
+    assert_eq!(v["guid"], json!(Uuid::nil().simple().to_string()));
     assert_eq!(v["versions"][0]["repositoryName"], json!("main"));
     assert_eq!(v["versions"][0]["targetAbi"], json!("10.9.0.0"));
 }
@@ -255,7 +255,7 @@ fn group_update_is_internally_tagged_on_type() {
         v,
         json!({
             "Type": "UserJoined",
-            "GroupId": gid.to_string(),
+            "GroupId": gid.simple().to_string(),
             "Data": "alice",
         }),
     );

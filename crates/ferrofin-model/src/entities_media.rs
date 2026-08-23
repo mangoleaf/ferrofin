@@ -144,6 +144,7 @@ pub struct ChapterInfo {
     pub image_path: Option<String>,
     /// The image date modified.
     #[schema(value_type = String, format = "date-time")]
+    #[serde(with = "crate::json::datetime")]
     pub image_date_modified: chrono::DateTime<chrono::Utc>,
     /// The image tag.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -266,6 +267,7 @@ impl ParentalRating {
 pub struct PlaylistUserPermissions {
     /// The user id.
     #[schema(value_type = String, format = "uuid")]
+    #[serde(with = "crate::json::guid")]
     pub user_id: Uuid,
     /// A value indicating whether the user has edit permissions.
     pub can_edit: bool,

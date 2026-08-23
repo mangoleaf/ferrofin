@@ -21,6 +21,7 @@ pub struct GeneralCommand {
     /// the caller's session — so it defaults to the nil GUID when absent.
     #[serde(default)]
     #[schema(value_type = String, format = "uuid")]
+    #[serde(with = "crate::json::guid")]
     pub controlling_user_id: Uuid,
 
     /// Gets the command arguments.

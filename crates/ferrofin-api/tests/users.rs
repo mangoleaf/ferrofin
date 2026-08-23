@@ -1609,7 +1609,7 @@ async fn authenticate_by_name_returns_authentication_result() {
     let json = json_body(response).await;
     // AuthenticationResult carries the session's user + session info.
     assert_eq!(json["SessionInfo"]["Id"], "session-1");
-    assert_eq!(json["User"]["Id"], USER_ID.to_string());
+    assert_eq!(json["User"]["Id"], USER_ID.simple().to_string());
     assert_eq!(json["User"]["Name"], "alice");
     assert_eq!(json["ServerId"], "server-1");
     // ...and the minted access token the client must present on later requests.
@@ -1631,7 +1631,7 @@ async fn current_user_returns_user_dto() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let json = json_body(response).await;
-    assert_eq!(json["Id"], USER_ID.to_string());
+    assert_eq!(json["Id"], USER_ID.simple().to_string());
     assert_eq!(json["Name"], "alice");
     assert_eq!(json["HasPassword"], true);
 }

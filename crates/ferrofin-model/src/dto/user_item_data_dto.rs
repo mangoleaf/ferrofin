@@ -38,6 +38,7 @@ pub struct UserItemDataDto {
     /// Gets or sets the last played date.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<String>, format = "date-time")]
+    #[serde(default, with = "crate::json::datetime::option")]
     pub last_played_date: Option<DateTime<Utc>>,
 
     /// Gets or sets a value indicating whether the item is played.
@@ -48,6 +49,7 @@ pub struct UserItemDataDto {
 
     /// Gets or sets the item identifier.
     #[schema(value_type = String, format = "uuid")]
+    #[serde(with = "crate::json::guid")]
     pub item_id: Uuid,
 }
 
@@ -86,6 +88,7 @@ pub struct UpdateUserItemDataDto {
     /// Gets or sets the last played date.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<String>, format = "date-time")]
+    #[serde(default, with = "crate::json::datetime::option")]
     pub last_played_date: Option<DateTime<Utc>>,
 
     /// Gets or sets a value indicating whether the item is played.

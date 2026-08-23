@@ -33,10 +33,12 @@ pub enum MediaSegmentType {
 pub struct MediaSegmentDto {
     /// Gets or sets the id of the media segment.
     #[schema(value_type = String, format = "uuid")]
+    #[serde(with = "crate::json::guid")]
     pub id: Uuid,
 
     /// Gets or sets the id of the associated item.
     #[schema(value_type = String, format = "uuid")]
+    #[serde(with = "crate::json::guid")]
     pub item_id: Uuid,
 
     /// Gets or sets the type of content this segment defines.
@@ -56,6 +58,7 @@ pub struct MediaSegmentDto {
 pub struct MediaSegmentGenerationRequest {
     /// Gets the id of the `BaseItem` the segments should be extracted from.
     #[schema(value_type = String, format = "uuid")]
+    #[serde(with = "crate::json::guid")]
     pub item_id: Uuid,
 
     /// Gets existing media segments generated on an earlier scan by this

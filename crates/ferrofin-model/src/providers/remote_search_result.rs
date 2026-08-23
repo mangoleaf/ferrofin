@@ -40,6 +40,7 @@ pub struct RemoteSearchResult {
     /// Gets or sets the premiere date.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<String>, format = "date-time")]
+    #[serde(default, with = "crate::json::datetime::option")]
     pub premiere_date: Option<DateTime<Utc>>,
 
     /// Gets or sets the image url.

@@ -219,14 +219,17 @@ pub struct GroupStateUpdate {
 pub struct SendCommand {
     /// Gets the group identifier.
     #[schema(value_type = String, format = "uuid")]
+    #[serde(with = "crate::json::guid")]
     pub group_id: Uuid,
 
     /// Gets the playlist identifier of the playing item.
     #[schema(value_type = String, format = "uuid")]
+    #[serde(with = "crate::json::guid")]
     pub playlist_item_id: Uuid,
 
     /// Gets or sets the UTC time when to execute the command.
     #[schema(value_type = String, format = "date-time")]
+    #[serde(with = "crate::json::datetime")]
     pub when: DateTime<Utc>,
 
     /// Gets the position ticks, for commands that require it.
@@ -238,6 +241,7 @@ pub struct SendCommand {
 
     /// Gets the UTC time when this command has been emitted.
     #[schema(value_type = String, format = "date-time")]
+    #[serde(with = "crate::json::datetime")]
     pub emitted_at: DateTime<Utc>,
 }
 
@@ -247,10 +251,12 @@ pub struct SendCommand {
 pub struct SyncPlayQueueItem {
     /// Gets the item identifier.
     #[schema(value_type = String, format = "uuid")]
+    #[serde(with = "crate::json::guid")]
     pub item_id: Uuid,
 
     /// Gets the playlist identifier of the item.
     #[schema(value_type = String, format = "uuid")]
+    #[serde(with = "crate::json::guid")]
     pub playlist_item_id: Uuid,
 }
 
@@ -263,6 +269,7 @@ pub struct PlayQueueUpdate {
 
     /// Gets the UTC time of the last change to the playing queue.
     #[schema(value_type = String, format = "date-time")]
+    #[serde(with = "crate::json::datetime")]
     pub last_update: DateTime<Utc>,
 
     /// Gets the playlist.
@@ -290,6 +297,7 @@ pub struct PlayQueueUpdate {
 pub struct GroupInfoDto {
     /// Gets the group identifier.
     #[schema(value_type = String, format = "uuid")]
+    #[serde(with = "crate::json::guid")]
     pub group_id: Uuid,
 
     /// Gets the group name.
@@ -303,6 +311,7 @@ pub struct GroupInfoDto {
 
     /// Gets the date when this DTO has been created.
     #[schema(value_type = String, format = "date-time")]
+    #[serde(with = "crate::json::datetime")]
     pub last_updated_at: DateTime<Utc>,
 }
 
@@ -312,10 +321,12 @@ pub struct GroupInfoDto {
 pub struct UtcTimeResponse {
     /// Gets the UTC time when the request has been received.
     #[schema(value_type = String, format = "date-time")]
+    #[serde(with = "crate::json::datetime")]
     pub request_reception_time: DateTime<Utc>,
 
     /// Gets the UTC time when the response has been sent.
     #[schema(value_type = String, format = "date-time")]
+    #[serde(with = "crate::json::datetime")]
     pub response_transmission_time: DateTime<Utc>,
 }
 
@@ -333,6 +344,7 @@ pub struct NewGroupRequestDto {
 pub struct JoinGroupRequestDto {
     /// The identifier of the group to join.
     #[schema(value_type = String, format = "uuid")]
+    #[serde(with = "crate::json::guid")]
     pub group_id: Uuid,
 }
 
@@ -342,6 +354,7 @@ pub struct JoinGroupRequestDto {
 pub struct PlayRequestDto {
     /// The ordered item ids that make up the queue.
     #[schema(value_type = Vec<String>, format = "uuid")]
+    #[serde(with = "crate::json::guid::vec")]
     pub playing_queue: Vec<Uuid>,
 
     /// The index (in `playing_queue`) of the item to play first.
@@ -357,6 +370,7 @@ pub struct PlayRequestDto {
 pub struct SetPlaylistItemRequestDto {
     /// The playlist identifier of the item to make current.
     #[schema(value_type = String, format = "uuid")]
+    #[serde(with = "crate::json::guid")]
     pub playlist_item_id: Uuid,
 }
 
@@ -366,6 +380,7 @@ pub struct SetPlaylistItemRequestDto {
 pub struct RemoveFromPlaylistRequestDto {
     /// The playlist identifiers to remove (ignored when clearing the playlist).
     #[schema(value_type = Vec<String>, format = "uuid")]
+    #[serde(with = "crate::json::guid::vec")]
     pub playlist_item_ids: Vec<Uuid>,
 
     /// Whether the entire playlist should be cleared.
@@ -381,6 +396,7 @@ pub struct RemoveFromPlaylistRequestDto {
 pub struct MovePlaylistItemRequestDto {
     /// The playlist identifier of the item to move.
     #[schema(value_type = String, format = "uuid")]
+    #[serde(with = "crate::json::guid")]
     pub playlist_item_id: Uuid,
 
     /// The new position for the item.
@@ -393,6 +409,7 @@ pub struct MovePlaylistItemRequestDto {
 pub struct QueueRequestDto {
     /// The items to enqueue.
     #[schema(value_type = Vec<String>, format = "uuid")]
+    #[serde(with = "crate::json::guid::vec")]
     pub item_ids: Vec<Uuid>,
 
     /// Where to insert the items.
@@ -413,6 +430,7 @@ pub struct SeekRequestDto {
 pub struct BufferRequestDto {
     /// When the client made the request (client UTC).
     #[schema(value_type = String, format = "date-time")]
+    #[serde(with = "crate::json::datetime")]
     pub when: DateTime<Utc>,
 
     /// The client's playback position, in ticks.
@@ -423,6 +441,7 @@ pub struct BufferRequestDto {
 
     /// The playlist item the client is playing.
     #[schema(value_type = String, format = "uuid")]
+    #[serde(with = "crate::json::guid")]
     pub playlist_item_id: Uuid,
 }
 
@@ -434,6 +453,7 @@ pub struct BufferRequestDto {
 pub struct ReadyRequestDto {
     /// When the client made the request (client UTC).
     #[schema(value_type = String, format = "date-time")]
+    #[serde(with = "crate::json::datetime")]
     pub when: DateTime<Utc>,
 
     /// The client's playback position, in ticks.
@@ -444,6 +464,7 @@ pub struct ReadyRequestDto {
 
     /// The playlist item the client is playing.
     #[schema(value_type = String, format = "uuid")]
+    #[serde(with = "crate::json::guid")]
     pub playlist_item_id: Uuid,
 }
 
@@ -461,6 +482,7 @@ pub struct IgnoreWaitRequestDto {
 pub struct NextItemRequestDto {
     /// The playlist item the client is currently playing.
     #[schema(value_type = String, format = "uuid")]
+    #[serde(with = "crate::json::guid")]
     pub playlist_item_id: Uuid,
 }
 
@@ -470,6 +492,7 @@ pub struct NextItemRequestDto {
 pub struct PreviousItemRequestDto {
     /// The playlist item the client is currently playing.
     #[schema(value_type = String, format = "uuid")]
+    #[serde(with = "crate::json::guid")]
     pub playlist_item_id: Uuid,
 }
 
@@ -530,6 +553,7 @@ pub enum GroupUpdate {
 pub struct UserJoinedUpdate {
     /// Gets the group identifier.
     #[schema(value_type = String, format = "uuid")]
+    #[serde(with = "crate::json::guid")]
     pub group_id: Uuid,
 
     /// Gets the update data (the joining user's name).
@@ -542,6 +566,7 @@ pub struct UserJoinedUpdate {
 pub struct UserLeftUpdate {
     /// Gets the group identifier.
     #[schema(value_type = String, format = "uuid")]
+    #[serde(with = "crate::json::guid")]
     pub group_id: Uuid,
 
     /// Gets the update data (the leaving user's name).
@@ -554,6 +579,7 @@ pub struct UserLeftUpdate {
 pub struct GroupJoinedUpdate {
     /// Gets the group identifier.
     #[schema(value_type = String, format = "uuid")]
+    #[serde(with = "crate::json::guid")]
     pub group_id: Uuid,
 
     /// Gets the update data (the joined group's info).
@@ -566,6 +592,7 @@ pub struct GroupJoinedUpdate {
 pub struct GroupLeftUpdate {
     /// Gets the group identifier.
     #[schema(value_type = String, format = "uuid")]
+    #[serde(with = "crate::json::guid")]
     pub group_id: Uuid,
 
     /// Gets the update data (the left group's id, stringified).
@@ -578,6 +605,7 @@ pub struct GroupLeftUpdate {
 pub struct StateUpdate {
     /// Gets the group identifier.
     #[schema(value_type = String, format = "uuid")]
+    #[serde(with = "crate::json::guid")]
     pub group_id: Uuid,
 
     /// Gets the update data (the new group state).
@@ -590,6 +618,7 @@ pub struct StateUpdate {
 pub struct PlayQueueGroupUpdate {
     /// Gets the group identifier.
     #[schema(value_type = String, format = "uuid")]
+    #[serde(with = "crate::json::guid")]
     pub group_id: Uuid,
 
     /// Gets the update data (the play queue update).
@@ -602,6 +631,7 @@ pub struct PlayQueueGroupUpdate {
 pub struct NotInGroupUpdate {
     /// Gets the group identifier.
     #[schema(value_type = String, format = "uuid")]
+    #[serde(with = "crate::json::guid")]
     pub group_id: Uuid,
 
     /// Gets the update data.
@@ -614,6 +644,7 @@ pub struct NotInGroupUpdate {
 pub struct GroupDoesNotExistUpdate {
     /// Gets the group identifier.
     #[schema(value_type = String, format = "uuid")]
+    #[serde(with = "crate::json::guid")]
     pub group_id: Uuid,
 
     /// Gets the update data.
@@ -627,6 +658,7 @@ pub struct GroupDoesNotExistUpdate {
 pub struct LibraryAccessDeniedUpdate {
     /// Gets the group identifier.
     #[schema(value_type = String, format = "uuid")]
+    #[serde(with = "crate::json::guid")]
     pub group_id: Uuid,
 
     /// Gets the update data.

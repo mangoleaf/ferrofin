@@ -70,6 +70,7 @@ pub struct ThemeMediaResult {
 
     /// Gets or sets the owner id.
     #[schema(value_type = String, format = "uuid")]
+    #[serde(with = "crate::json::guid")]
     pub owner_id: Uuid,
 }
 
@@ -142,7 +143,7 @@ mod tests {
         let json = serde_json::to_value(&value).unwrap();
         // Flattened base fields appear at the top level, not nested.
         assert_eq!(json["TotalRecordCount"], 0);
-        assert_eq!(json["OwnerId"], value.owner_id.to_string());
+        assert_eq!(json["OwnerId"], value.owner_id.simple().to_string());
         let back: ThemeMediaResult = serde_json::from_value(json).unwrap();
         assert_eq!(value, back);
     }

@@ -58,10 +58,12 @@ pub struct ActivityLogEntry {
 
     /// Gets or sets the date.
     #[schema(value_type = String, format = "date-time")]
+    #[serde(with = "crate::json::datetime")]
     pub date: DateTime<Utc>,
 
     /// Gets or sets the user identifier.
     #[schema(value_type = String, format = "uuid")]
+    #[serde(with = "crate::json::guid")]
     pub user_id: Uuid,
 
     /// Gets or sets the user primary image tag.

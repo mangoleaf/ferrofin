@@ -17,6 +17,7 @@ pub struct PlaylistCreationRequest {
 
     /// Gets or sets the list of items.
     #[schema(value_type = Vec<String>, format = "uuid")]
+    #[serde(with = "crate::json::guid::vec")]
     pub item_id_list: Vec<Uuid>,
 
     /// Gets or sets the media type.
@@ -25,6 +26,7 @@ pub struct PlaylistCreationRequest {
 
     /// Gets or sets the user id.
     #[schema(value_type = String, format = "uuid")]
+    #[serde(with = "crate::json::guid")]
     pub user_id: Uuid,
 
     /// Gets or sets the user permissions.
@@ -49,10 +51,12 @@ pub struct PlaylistCreationResult {
 pub struct PlaylistUpdateRequest {
     /// Gets or sets the id of the playlist.
     #[schema(value_type = String, format = "uuid")]
+    #[serde(with = "crate::json::guid")]
     pub id: Uuid,
 
     /// Gets or sets the id of the user updating the playlist.
     #[schema(value_type = String, format = "uuid")]
+    #[serde(with = "crate::json::guid")]
     pub user_id: Uuid,
 
     /// Gets or sets the name of the playlist.
@@ -62,6 +66,7 @@ pub struct PlaylistUpdateRequest {
     /// Gets or sets item ids to add to the playlist.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<Vec<String>>, format = "uuid")]
+    #[serde(default, with = "crate::json::guid::option_vec")]
     pub ids: Option<Vec<Uuid>>,
 
     /// Gets or sets the playlist users.
@@ -87,11 +92,13 @@ pub struct CreatePlaylistDto {
     /// Gets or sets item ids to add to the playlist.
     #[serde(default)]
     #[schema(value_type = Vec<String>, format = "uuid")]
+    #[serde(with = "crate::json::guid::vec")]
     pub ids: Vec<Uuid>,
 
     /// Gets or sets the user id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<String>, format = "uuid")]
+    #[serde(with = "crate::json::guid::option")]
     pub user_id: Option<Uuid>,
 
     /// Gets or sets the media type.
@@ -122,6 +129,7 @@ pub struct UpdatePlaylistDto {
     /// Gets or sets item ids of the playlist.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<Vec<String>>, format = "uuid")]
+    #[serde(with = "crate::json::guid::option_vec")]
     pub ids: Option<Vec<Uuid>>,
 
     /// Gets or sets the playlist users.
@@ -152,10 +160,12 @@ pub struct UpdatePlaylistUserDto {
 pub struct PlaylistUserUpdateRequest {
     /// Gets or sets the id of the playlist.
     #[schema(value_type = String, format = "uuid")]
+    #[serde(with = "crate::json::guid")]
     pub id: Uuid,
 
     /// Gets or sets the id of the updated user.
     #[schema(value_type = String, format = "uuid")]
+    #[serde(with = "crate::json::guid")]
     pub user_id: Uuid,
 
     /// Gets or sets a value indicating whether the user can edit the playlist.

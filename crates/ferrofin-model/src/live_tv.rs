@@ -159,10 +159,12 @@ pub enum ItemSortBy {
 pub struct GuideInfo {
     /// Gets or sets the start date.
     #[schema(value_type = String, format = "date-time")]
+    #[serde(with = "crate::json::datetime")]
     pub start_date: DateTime<Utc>,
 
     /// Gets or sets the end date.
     #[schema(value_type = String, format = "date-time")]
+    #[serde(with = "crate::json::datetime")]
     pub end_date: DateTime<Utc>,
 }
 
@@ -281,6 +283,7 @@ pub struct BaseTimerInfoDto {
 
     /// Gets or sets the channel id of the recording.
     #[schema(value_type = String, format = "uuid")]
+    #[serde(with = "crate::json::guid")]
     pub channel_id: Uuid,
 
     /// Gets or sets the external channel identifier.
@@ -313,10 +316,12 @@ pub struct BaseTimerInfoDto {
 
     /// Gets or sets the start date of the recording, in UTC.
     #[schema(value_type = String, format = "date-time")]
+    #[serde(with = "crate::json::datetime")]
     pub start_date: DateTime<Utc>,
 
     /// Gets or sets the end date of the recording, in UTC.
     #[schema(value_type = String, format = "date-time")]
+    #[serde(with = "crate::json::datetime")]
     pub end_date: DateTime<Utc>,
 
     /// Gets or sets the name of the service.
@@ -478,6 +483,7 @@ pub struct RecordingQuery {
 
     /// Gets or sets the user identifier.
     #[schema(value_type = String, format = "uuid")]
+    #[serde(with = "crate::json::guid")]
     pub user_id: Uuid,
 
     /// Gets or sets the identifier.
@@ -575,6 +581,7 @@ pub struct LiveTvChannelQuery {
 
     /// Gets or sets the user identifier.
     #[schema(value_type = String, format = "uuid")]
+    #[serde(with = "crate::json::guid")]
     pub user_id: Uuid,
 
     /// Gets or sets the start index. Used for paging.

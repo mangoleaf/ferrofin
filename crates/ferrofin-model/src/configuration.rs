@@ -359,6 +359,7 @@ pub struct UserConfiguration {
 
     /// Gets or sets the grouped folders.
     #[schema(value_type = Vec<String>, format = "uuid")]
+    #[serde(with = "crate::json::guid::vec")]
     pub grouped_folders: Vec<Uuid>,
 
     /// Gets or sets the subtitle mode.
@@ -372,14 +373,17 @@ pub struct UserConfiguration {
 
     /// Gets or sets the ordered views.
     #[schema(value_type = Vec<String>, format = "uuid")]
+    #[serde(with = "crate::json::guid::vec")]
     pub ordered_views: Vec<Uuid>,
 
     /// Gets or sets the latest items excludes.
     #[schema(value_type = Vec<String>, format = "uuid")]
+    #[serde(with = "crate::json::guid::vec")]
     pub latest_items_excludes: Vec<Uuid>,
 
     /// Gets or sets the my media excludes.
     #[schema(value_type = Vec<String>, format = "uuid")]
+    #[serde(with = "crate::json::guid::vec")]
     pub my_media_excludes: Vec<Uuid>,
 
     /// Gets or sets a value indicating whether to hide played items in latest.

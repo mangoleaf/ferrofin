@@ -56,6 +56,7 @@ impl FolderStorageDto {
 pub struct LibraryStorageDto {
     /// Gets or sets the library id.
     #[schema(value_type = String, format = "uuid")]
+    #[serde(with = "crate::json::guid")]
     pub id: Uuid,
 
     /// Gets or sets the name of the library.

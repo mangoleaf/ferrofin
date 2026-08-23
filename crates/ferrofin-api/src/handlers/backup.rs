@@ -135,6 +135,7 @@ struct BackupManifest {
     #[serde(default)]
     path: String,
     /// When the backup was created.
+    #[serde(with = "ferrofin_model::json::datetime")]
     date_created: DateTime<Utc>,
     /// The server version that wrote it.
     server_version: String,

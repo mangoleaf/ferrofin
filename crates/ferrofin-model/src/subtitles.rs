@@ -17,9 +17,11 @@ pub struct FontFile {
 
     /// Gets or sets the date created.
     #[schema(value_type = String, format = "date-time")]
+    #[serde(with = "crate::json::datetime")]
     pub date_created: DateTime<Utc>,
 
     /// Gets or sets the date modified.
     #[schema(value_type = String, format = "date-time")]
+    #[serde(with = "crate::json::datetime")]
     pub date_modified: DateTime<Utc>,
 }

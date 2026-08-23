@@ -33,6 +33,7 @@ pub struct DeviceProfile {
     /// The unique internal identifier.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<String>)]
+    #[serde(default, with = "crate::json::guid::option")]
     pub id: Option<Uuid>,
     /// The maximum allowed bitrate for all streamed content.
     #[serde(skip_serializing_if = "Option::is_none")]

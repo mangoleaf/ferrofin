@@ -125,7 +125,7 @@ impl FerrofinMediaSourceManager {
         };
         let probed = self.encoder.get_media_info(&request).await.ok();
         let mut source = probed.unwrap_or_default();
-        source.id = Some(item_id.to_string());
+        source.id = Some(item_id.simple().to_string());
         source.path = Some(url.clone());
         source.protocol = MediaProtocol::Http;
         source.container = Some(live_stream_container(&url));
