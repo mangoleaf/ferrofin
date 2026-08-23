@@ -177,7 +177,10 @@ impl FerrofinPeopleRepository {
     /// Returns a [`ServiceError`] when the rewrite transaction fails; the
     /// marker is only written after a successful pass.
     pub async fn unify_person_identities(&self) -> Result<u64, ServiceError> {
-        const META_KEY: &str = "person_identity_unified";
+        // `_v2`: the first pass hashed the case-sensitive path; Jellyfin's
+        // by-name ids are case-normalized, so the pass re-runs once to
+        // collapse onto the ids an adopted database already carries.
+        const META_KEY: &str = "person_identity_unified_v2";
         if self.identity.is_none() {
             return Ok(0);
         }

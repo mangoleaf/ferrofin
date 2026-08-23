@@ -277,10 +277,13 @@ pub fn person_path(people_path: &str, name: &str) -> String {
 }
 
 /// The deterministic by-name `Person` item id for `name` — Jellyfin's
-/// `GetItemByNameId<Person>(Person.GetPath(name))`, one id per name.
+/// `GetItemByNameId<Person>(Person.GetPath(name))`, one id per name. Like
+/// every by-name id the key is case-normalized (see [`by_name_item_id`];
+/// verified against a real 10.11.8 row: `Bob Parity` at
+/// `/config/metadata/People/B/Bob Parity` is `F6FE1D96-…`, the lowercased key).
 #[must_use]
 pub fn person_item_id(mode: &IdDerivation, people_path: &str, name: &str) -> Option<uuid::Uuid> {
-    derive_item_id_with(mode, BaseItemKind::Person, &person_path(people_path, name))
+    by_name_item_id(mode, BaseItemKind::Person, &person_path(people_path, name))
 }
 
 /// Derives a *by-name* item's id from its metadata path — the port of
@@ -539,6 +542,15 @@ mod tests {
         assert_eq!(
             year_item_id(&mode, "/config/metadata/Year", "2026"),
             Some(uuid::Uuid::parse_str("FEF3DB72-E066-FC0B-F454-F305935D09B6").expect("uuid")),
+        );
+        // Person rows from the same database (`%MetadataPath%/People/B/Bob Parity`).
+        assert_eq!(
+            super::person_item_id(&mode, "/config/metadata/People", "Bob Parity"),
+            Some(uuid::Uuid::parse_str("F6FE1D96-890D-8ADF-ADCE-23D3E1D98AF8").expect("uuid")),
+        );
+        assert_eq!(
+            super::person_item_id(&mode, "/config/metadata/People", "Alice Parity"),
+            Some(uuid::Uuid::parse_str("712EF9D6-0328-A6AA-F7E3-61C34BA4D087").expect("uuid")),
         );
         // The by-name key is case-normalized (EnableNormalizedItemByNameIds);
         // the case-sensitive scanned-item derivation gives a different id.
