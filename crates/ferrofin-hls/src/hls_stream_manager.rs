@@ -40,16 +40,19 @@ use ferrofin_mediaencoding::transcoding::manager::StartFfMpegRequest;
 use ferrofin_mediaencoding::transcoding::segment_transcoder::SegmentTranscoder;
 use ferrofin_mediaencoding::transcoding::{FsFileCleaner, SessionReporter};
 use ferrofin_mediaencoding::{EncodingJobInfo, TranscodeManagerImpl};
+use ferrofin_model::configuration::EncodingOptions;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::media_encoding::{
     HlsStreamManager, HlsStreamRequest, ServedFile, TranscodingJobType,
 };
 use ferrofin_traits::system::ServerApplicationPaths;
+use ferrofin_traits::trickplay::TrickplayManager;
 
 use crate::create_main_playlist_request::CreateMainPlaylistRequest;
 use crate::dynamic_hls_playlist_generator::{
     DynamicHlsPlaylistGenerator, EncodingOptionsProvider, TICKS_PER_MILLISECOND,
 };
+use crate::master_playlist::{MasterPlaylistContext, TrickplayResolution, build_master_playlist};
 
 /// A concrete transcode plan for one request: everything the runtime needs that
 /// [`HlsStreamRequest`] alone does not carry.
@@ -79,6 +82,16 @@ pub struct TranscodePlan {
     pub is_remuxing_video: bool,
     /// The resolved segment container (e.g. `"ts"`).
     pub segment_container: String,
+    /// A snapshot of the server's encoding options at plan time — the master
+    /// playlist reads `AllowHevcEncoding`/`AllowAv1Encoding` for its SDR
+    /// compatibility variants (`GetMasterPlaylistInternal`'s
+    /// `_serverConfigurationManager.GetEncodingOptions()`).
+    pub encoding_options: EncodingOptions,
+    /// The minimum segment count a live (`live.m3u8`) request waits for before
+    /// serving the playlist ffmpeg wrote. Port of `StreamState.MinSegments`:
+    /// the request's `MinSegments`, else 2 for segments of ten seconds or
+    /// longer, else 3.
+    pub min_segments: i32,
 }
 
 /// Resolves an [`HlsStreamRequest`] into a concrete [`TranscodePlan`].
@@ -185,6 +198,10 @@ where
     /// remembered for the life of the process.
     restart_failures:
         Arc<std::sync::Mutex<std::collections::HashMap<String, (u32, std::time::Instant)>>>,
+    /// The trickplay store the master playlist lists image playlists from
+    /// (`DynamicHlsHelper`'s `ITrickplayManager.GetTrickplayResolutions`).
+    /// `None` (the default, and every pre-seam test constructor) lists none.
+    trickplay: Option<Arc<dyn TrickplayManager>>,
 }
 
 impl<P, T, C, S> HlsStreamManagerImpl<P, T, C, S>
@@ -194,6 +211,45 @@ where
     C: EncodingOptionsProvider,
     S: SessionReporter,
 {
+    /// Wires the trickplay store so master playlists advertise the
+    /// `#EXT-X-IMAGE-STREAM-INF` tile playlists (the composition root calls
+    /// this; without it the master lists no trickplay entries).
+    #[must_use]
+    pub fn with_trickplay(mut self, trickplay: Arc<dyn TrickplayManager>) -> Self {
+        self.trickplay = Some(trickplay);
+        self
+    }
+
+    /// The trickplay resolutions for the request's media source, for the
+    /// master playlist. Port of the `Guid.Parse(state.Request.MediaSourceId)`
+    /// → `GetTrickplayResolutions` lookup; an absent/unparsable id or a store
+    /// error yields none (upstream would 500 on the former — not ported).
+    async fn trickplay_resolutions(&self, request: &HlsStreamRequest) -> Vec<TrickplayResolution> {
+        let Some(trickplay) = self.trickplay.as_ref() else {
+            return Vec::new();
+        };
+        let Some(source_id) = request
+            .media_source_id
+            .as_deref()
+            .and_then(|id| uuid::Uuid::parse_str(id).ok())
+        else {
+            return Vec::new();
+        };
+        match trickplay.get_trickplay_resolutions(source_id).await {
+            Ok(map) => map
+                .into_iter()
+                .map(|(width, info)| TrickplayResolution {
+                    width,
+                    height: info.height,
+                    bandwidth: info.bandwidth,
+                })
+                .collect(),
+            Err(error) => {
+                tracing::warn!(%error, %source_id, "failed to load trickplay resolutions for the master playlist");
+                Vec::new()
+            }
+        }
+    }
     /// Assembles the manager from its collaborators.
     ///
     /// * `planner` — resolves a request into a [`TranscodePlan`].
@@ -216,6 +272,7 @@ where
             paths,
             segment_locks: Arc::new(KeyedLocks::new()),
             restart_failures: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            trickplay: None,
         }
     }
 
@@ -660,34 +717,25 @@ where
         request: &HlsStreamRequest,
         is_audio: bool,
     ) -> Result<String, ServiceError> {
-        // The master playlist points at the single variant `main.m3u8`. Full
-        // adaptive-bitrate master generation (`DynamicHlsHelper` — CODECS,
-        // RESOLUTION, subtitle #EXT-X-MEDIA groups) is deferred; the
-        // single-stream master lists one variant carrying the request query.
-        //
-        // BANDWIDTH is real, though: RFC 8216 requires a positive value, and the
-        // old `BANDWIDTH=0` fed zero into client ABR bitrate math (NaN/Infinity
-        // in hls.js; the Cast receiver's player also keys segment budgeting off
-        // it). Negotiated output bitrate first, the source's probed bitrate as
-        // the copy-stream fallback (upstream sums the output streams the same
-        // way in DynamicHlsHelper.AppendPlaylist).
+        // `GetMasterPlaylistInternal`: resolve the state (the plan), then
+        // assemble the playlist from it. The trickplay lookup is the one async
+        // collaborator the pure builder cannot own; it is skipped exactly when
+        // upstream skips it (a live stream, or `enableTrickplay=false`).
         let plan = self.planner.plan(request, is_audio, None).await?;
-        let state = &plan.state;
-        let output =
-            state.output_video_bitrate.unwrap_or(0) + state.output_audio_bitrate.unwrap_or(0);
-        let bandwidth = if output > 0 {
-            output
+        // `state.VideoRequest?.EnableTrickplay ?? false`: only a video-route
+        // request lists trickplay — the audio master's DTO has no such flag.
+        let trickplay_resolutions = if !plan.state.is_segmented_live_stream()
+            && plan.state.is_input_video
+            && request.enable_trickplay
+        {
+            self.trickplay_resolutions(request).await
         } else {
-            state.media_source.bitrate.unwrap_or(0)
-        }
-        // A copy stream of an unprobed source still needs a positive value.
-        .max(128_000);
-        let variant_url = format!("main.m3u8{}", request.query_string);
-        Ok(format!(
-            "#EXTM3U\n#EXT-X-VERSION:7\n\
-             #EXT-X-STREAM-INF:BANDWIDTH={bandwidth},AVERAGE-BANDWIDTH={bandwidth}\n\
-             {variant_url}\n"
-        ))
+            Vec::new()
+        };
+        let ctx = MasterPlaylistContext {
+            trickplay_resolutions,
+        };
+        Ok(build_master_playlist(&plan, request, &ctx))
     }
 
     async fn variant_playlist(
@@ -926,7 +974,6 @@ mod tests {
         FakeScript, FakeSegmentTranscoder, NoopSessionReporter,
     };
     use ferrofin_mediaencoding::{BaseEncodingJobOptions, EncodingJobInfo};
-    use ferrofin_model::configuration::EncodingOptions;
     use ferrofin_model::dto::MediaSourceInfo;
     use std::sync::Mutex;
 
@@ -1046,6 +1093,8 @@ mod tests {
                 segment_length_ms: 6000,
                 is_remuxing_video: false,
                 segment_container: self.segment_container.clone(),
+                encoding_options: EncodingOptions::default(),
+                min_segments: 3,
             })
         }
     }
@@ -1106,14 +1155,135 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (mgr, _) = manager_with(tmp.path(), FakeScript::default(), "ts");
         let pl = mgr.master_playlist(&req(), false).await.unwrap();
-        assert!(pl.contains("#EXTM3U"));
-        assert!(pl.contains("main.m3u8?deviceId=dev"));
-        // The FakePlanner supplies neither output bitrates nor a probed source
-        // bitrate, so the 128 kbps floor applies — RFC 8216 requires a positive
-        // BANDWIDTH, and the old `BANDWIDTH=0` broke client ABR math.
-        assert!(!pl.contains("BANDWIDTH=0"), "got: {pl}");
-        assert!(pl.contains("BANDWIDTH=128000"), "got: {pl}");
-        assert!(pl.contains("AVERAGE-BANDWIDTH=128000"), "got: {pl}");
+        assert!(pl.starts_with("#EXTM3U\n#EXT-X-STREAM-INF:"), "got: {pl}");
+        // Upstream's master never carries a version tag.
+        assert!(!pl.contains("#EXT-X-VERSION"), "got: {pl}");
+        // The FakePlanner supplies no output bitrates, and the faithful
+        // `totalBitrate` is the plain sum — no floor, no source fallback.
+        assert!(pl.contains("BANDWIDTH=0,AVERAGE-BANDWIDTH=0"), "got: {pl}");
+        // `segment_container` is set on the request but absent from the query,
+        // so the universal-audio `&SegmentContainer=` append fires.
+        assert!(
+            pl.ends_with("\nmain.m3u8?deviceId=dev&SegmentContainer=ts\n"),
+            "got: {pl}"
+        );
+    }
+
+    /// Without a wired trickplay store the master lists no image playlists;
+    /// with one, the store's resolutions for the media source appear.
+    /// A trickplay store reporting one 320-wide resolution for every item.
+    struct FakeTrickplay;
+
+    #[async_trait]
+    impl TrickplayManager for FakeTrickplay {
+        async fn refresh_trickplay_data(
+            &self,
+            _item_id: uuid::Uuid,
+            _replace: bool,
+        ) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        async fn get_trickplay_resolutions(
+            &self,
+            item_id: uuid::Uuid,
+        ) -> Result<
+            std::collections::HashMap<i32, ferrofin_db::entities::playback::TrickplayInfoEntity>,
+            ServiceError,
+        > {
+            let info = ferrofin_db::entities::playback::TrickplayInfoEntity {
+                item_id: item_id.simple().to_string(),
+                width: 320,
+                height: 180,
+                bandwidth: 99_000,
+                interval: 10_000,
+                thumbnail_count: 1,
+                tile_height: 1,
+                tile_width: 1,
+            };
+            Ok(std::collections::HashMap::from([(320, info)]))
+        }
+        async fn get_trickplay_items(
+            &self,
+            _limit: i32,
+            _offset: i32,
+        ) -> Result<Vec<ferrofin_db::entities::playback::TrickplayInfoEntity>, ServiceError>
+        {
+            Ok(Vec::new())
+        }
+        async fn save_trickplay_info(
+            &self,
+            _info: &ferrofin_db::entities::playback::TrickplayInfoEntity,
+        ) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        async fn delete_trickplay_data(&self, _item_id: uuid::Uuid) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        async fn get_trickplay_manifest(
+            &self,
+            _item_id: uuid::Uuid,
+        ) -> Result<
+            std::collections::HashMap<
+                String,
+                std::collections::HashMap<
+                    i32,
+                    ferrofin_db::entities::playback::TrickplayInfoEntity,
+                >,
+            >,
+            ServiceError,
+        > {
+            Ok(std::collections::HashMap::new())
+        }
+        async fn get_hls_playlist(
+            &self,
+            _item_id: uuid::Uuid,
+            _width: i32,
+            _api_key: Option<&str>,
+        ) -> Result<Option<String>, ServiceError> {
+            Ok(None)
+        }
+        async fn get_trickplay_tile_path(
+            &self,
+            _item_id: uuid::Uuid,
+            _width: i32,
+            _index: i32,
+        ) -> Result<Option<String>, ServiceError> {
+            Ok(None)
+        }
+    }
+
+    #[tokio::test]
+    async fn master_playlist_lists_trickplay_when_wired() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mgr, _) = manager_with(tmp.path(), FakeScript::default(), "ts");
+        let request = HlsStreamRequest {
+            media_source_id: Some(uuid::Uuid::from_u128(9).simple().to_string()),
+            api_key: Some("tok".to_owned()),
+            ..req()
+        };
+        let pl = mgr.master_playlist(&request, false).await.unwrap();
+        assert!(!pl.contains("IMAGE-STREAM"), "unwired: {pl}");
+
+        let mgr = mgr.with_trickplay(Arc::new(FakeTrickplay));
+        let pl = mgr.master_playlist(&request, false).await.unwrap();
+        assert!(
+            pl.contains(
+                "#EXT-X-IMAGE-STREAM-INF:BANDWIDTH=99000,RESOLUTION=320x180,CODECS=\"jpeg\",URI=\"Trickplay/320/tiles.m3u8?MediaSourceId=00000000000000000000000000000009&ApiKey=tok\"\n"
+            ),
+            "wired: {pl}"
+        );
+        // `enableTrickplay=false` suppresses the lookup and the lines.
+        let pl = mgr
+            .master_playlist(
+                &HlsStreamRequest {
+                    enable_trickplay: false,
+                    ..request
+                },
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(!pl.contains("IMAGE-STREAM"), "disabled: {pl}");
     }
 
     #[tokio::test]

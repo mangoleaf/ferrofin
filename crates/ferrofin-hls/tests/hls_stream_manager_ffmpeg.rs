@@ -243,6 +243,8 @@ impl StreamStatePlanner for FfmpegPlanner {
             segment_length_ms: 2000,
             is_remuxing_video: false,
             segment_container: seg_ext.to_owned(),
+            encoding_options: EncodingOptions::default(),
+            min_segments: 3,
         })
     }
 }
@@ -304,8 +306,12 @@ async fn end_to_end_master_variant_and_real_segment() {
 
     // 1. Master playlist points at the single variant, carrying the query.
     let master = mgr.master_playlist(&req, false).await.expect("master");
-    assert!(master.contains("#EXTM3U"), "master: {master}");
-    assert!(master.contains("#EXT-X-VERSION:7"), "master: {master}");
+    assert!(
+        master.starts_with("#EXTM3U\n#EXT-X-STREAM-INF:"),
+        "master: {master}"
+    );
+    // Upstream's master never carries a version tag (only the variant does).
+    assert!(!master.contains("#EXT-X-VERSION"), "master: {master}");
     assert!(
         master.contains("main.m3u8?deviceId=dev"),
         "master: {master}"

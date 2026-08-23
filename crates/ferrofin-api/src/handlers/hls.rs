@@ -137,17 +137,103 @@ struct HlsQuery {
     /// Whether the client asked for a static (direct) stream.
     #[serde(default, rename = "static", alias = "Static")]
     is_static: Option<bool>,
+    /// The requested video profile (the `CODECS` profile byte of a re-encode).
+    #[serde(default, alias = "Profile")]
+    profile: Option<String>,
+    /// The requested video level (the `CODECS` level of a re-encode).
+    #[serde(default, alias = "Level")]
+    level: Option<String>,
+    /// The requested output framerate.
+    #[serde(default, alias = "Framerate")]
+    framerate: Option<f32>,
+    /// The requested fixed output width.
+    #[serde(default, alias = "Width")]
+    width: Option<i32>,
+    /// The requested fixed output height.
+    #[serde(default, alias = "Height")]
+    height: Option<i32>,
+    /// The minimum segment count a live playlist waits for before serving.
+    #[serde(default, alias = "MinSegments")]
+    min_segments: Option<i32>,
+    /// The subtitle stream to deliver or burn in.
+    #[serde(default, alias = "SubtitleStreamIndex")]
+    subtitle_stream_index: Option<i32>,
+    /// The negotiated subtitle delivery method name.
+    #[serde(default, alias = "SubtitleMethod")]
+    subtitle_method: Option<String>,
+    /// The client's transcode reasons (forwarded into the master's variant URL).
+    #[serde(default, alias = "TranscodeReasons")]
+    transcode_reasons: Option<String>,
+    /// Whether text subtitles are listed as a group in the master playlist
+    /// (route-specific default: `false` for `master.m3u8`, `true` for `live.m3u8`).
+    #[serde(default, alias = "EnableSubtitlesInManifest")]
+    enable_subtitles_in_manifest: Option<bool>,
+    /// Whether the master playlist adds two lower-bitrate variants (default `false`).
+    #[serde(default, alias = "EnableAdaptiveBitrateStreaming")]
+    enable_adaptive_bitrate_streaming: Option<bool>,
+    /// Whether the master playlist lists trickplay image playlists (default `true`).
+    #[serde(default, alias = "EnableTrickplay")]
+    enable_trickplay: Option<bool>,
 }
 
-/// Builds an [`HlsStreamRequest`] for `item_id` from the parsed query and the raw
-/// query string (forwarded verbatim into generated segment URLs).
-fn build_request(item_id: Uuid, query: HlsQuery, raw_query: Option<String>) -> HlsStreamRequest {
+/// The per-request context the HLS seam needs beyond the query: the session
+/// token (embedded as `ApiKey` in master-playlist subtitle/trickplay URIs) and
+/// whether the peer is on the local network (disables adaptive variants).
+///
+/// Port of what `DynamicHlsHelper` reads off `HttpContext` (`User.GetToken()`,
+/// `GetNormalizedRemoteIP()` → `INetworkManager.IsInLocalNetwork`).
+#[derive(Debug, Default)]
+struct HlsRequestContext {
+    /// The access token presented by the request, if any.
+    api_key: Option<String>,
+    /// The peer's IP from the connection; `None` when the server was not started
+    /// with connect-info (tests) — treated as not local, the conservative answer.
+    remote_ip: Option<std::net::IpAddr>,
+    /// The route's default for `enableSubtitlesInManifest` when the query omits
+    /// it: `false` on the master routes, `true` on `live.m3u8` (upstream's
+    /// per-DTO defaults).
+    subtitles_in_manifest_default: bool,
+}
+
+impl HlsRequestContext {
+    /// Reads the token and peer address off the request parts.
+    fn from_parts(
+        auth: &ferrofin_traits::options::AuthorizationInfo,
+        parts: &axum::http::request::Parts,
+        subtitles_in_manifest_default: bool,
+    ) -> Self {
+        Self {
+            api_key: auth.token.as_ref().map(|t| t.expose().to_owned()),
+            // Inserted by the server's `with_connect_info`; absent behind a
+            // body-consuming extractor or in tests.
+            remote_ip: parts
+                .extensions
+                .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+                .map(|ci| ci.0.ip()),
+            subtitles_in_manifest_default,
+        }
+    }
+}
+
+/// Builds an [`HlsStreamRequest`] for `item_id` from the parsed query, the raw
+/// query string (forwarded verbatim into generated segment URLs), and the
+/// request context (token + peer locality).
+fn build_request(
+    item_id: Uuid,
+    query: HlsQuery,
+    raw_query: Option<String>,
+    ctx: HlsRequestContext,
+) -> HlsStreamRequest {
     // Prefix the raw query with '?' so it slots straight into a playlist URL, as
     // the C# `Request.QueryString` does; an empty query stays empty.
     let query_string = match raw_query {
         Some(q) if !q.is_empty() => format!("?{q}"),
         _ => String::new(),
     };
+    // The struct update stays even while every field is named: the request
+    // DTO is still growing (Live TV's `liveStreamId` is next), and a missed
+    // field must take its DTO default rather than break the build.
+    #[allow(clippy::needless_update, reason = "room for the growing request DTO")]
     HlsStreamRequest {
         item_id,
         media_source_id: query.media_source_id,
@@ -167,7 +253,27 @@ fn build_request(item_id: Uuid, query: HlsQuery, raw_query: Option<String>) -> H
         allow_audio_stream_copy: query.allow_audio_stream_copy.unwrap_or(true),
         is_static: query.is_static.unwrap_or(false),
         start_time_ticks: query.start_time_ticks,
+        profile: query.profile,
+        level: query.level,
+        framerate: query.framerate,
+        width: query.width,
+        height: query.height,
+        min_segments: query.min_segments,
+        subtitle_stream_index: query.subtitle_stream_index,
+        subtitle_method: query.subtitle_method,
+        transcode_reasons: query.transcode_reasons,
+        enable_subtitles_in_manifest: query
+            .enable_subtitles_in_manifest
+            .unwrap_or(ctx.subtitles_in_manifest_default),
+        enable_adaptive_bitrate_streaming: query.enable_adaptive_bitrate_streaming.unwrap_or(false),
+        enable_trickplay: query.enable_trickplay.unwrap_or(true),
+        api_key: ctx.api_key,
+        is_in_local_network: ctx
+            .remote_ip
+            .is_some_and(crate::handlers::system::is_in_local_network),
         query_string,
+        // Fields this route does not read keep their DTO defaults.
+        ..HlsStreamRequest::default()
     }
 }
 
@@ -204,7 +310,9 @@ pub(crate) fn request_from_query(
     query: HlsQueryPub,
     raw_query: Option<String>,
 ) -> HlsStreamRequest {
-    build_request(item_id, query.0, raw_query)
+    // The progressive-transcode fallback builds no master playlist, so the
+    // token/peer context is irrelevant there.
+    build_request(item_id, query.0, raw_query, HlsRequestContext::default())
 }
 
 /// A public wrapper around the crate-private [`HlsQuery`] so `videos`/`audio` can
@@ -237,28 +345,49 @@ async fn served_file_response(file: ServedFile, request: Request) -> Result<Resp
 
 use axum::response::IntoResponse;
 
+/// Serves a master playlist the way `DynamicHlsHelper.GetMasterPlaylistInternal`
+/// does: `Expires: 0` on every response, and a `HEAD` answers with an empty
+/// body under the playlist MIME type (the state is still resolved, so a missing
+/// item is still a `404`).
+fn master_playlist_response(method: &axum::http::Method, playlist: String) -> Response {
+    let body = if method == axum::http::Method::HEAD {
+        String::new()
+    } else {
+        playlist
+    };
+    let mut response = playlist_response(body);
+    response
+        .headers_mut()
+        .insert(header::EXPIRES, header::HeaderValue::from_static("0"));
+    response
+}
+
 /// `GET|HEAD /Videos/{itemId}/master.m3u8` — the video master playlist.
 async fn get_video_master_playlist(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAuth(auth): RequireAuth,
     Path(item_id): Path<Uuid>,
     Query(query): Query<HlsQuery>,
     RawQuery(raw): RawQuery,
+    parts: axum::http::request::Parts,
 ) -> Result<Response, ApiError> {
-    let req = build_request(item_id, query, raw);
+    let ctx = HlsRequestContext::from_parts(&auth, &parts, false);
+    let req = build_request(item_id, query, raw, ctx);
     let playlist = state.hls.master_playlist(&req, false).await?;
-    Ok(playlist_response(playlist))
+    Ok(master_playlist_response(&parts.method, playlist))
 }
 
 /// `GET /Videos/{itemId}/main.m3u8` — the video variant playlist.
 async fn get_video_variant_playlist(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAuth(auth): RequireAuth,
     Path(item_id): Path<Uuid>,
     Query(query): Query<HlsQuery>,
     RawQuery(raw): RawQuery,
+    parts: axum::http::request::Parts,
 ) -> Result<Response, ApiError> {
-    let req = build_request(item_id, query, raw);
+    let ctx = HlsRequestContext::from_parts(&auth, &parts, false);
+    let req = build_request(item_id, query, raw, ctx);
     let playlist = state.hls.variant_playlist(&req, false).await?;
     Ok(playlist_response(playlist))
 }
@@ -266,12 +395,15 @@ async fn get_video_variant_playlist(
 /// `GET /Videos/{itemId}/live.m3u8` — the video live playlist.
 async fn get_video_live_playlist(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAuth(auth): RequireAuth,
     Path(item_id): Path<Uuid>,
     Query(query): Query<HlsQuery>,
     RawQuery(raw): RawQuery,
+    parts: axum::http::request::Parts,
 ) -> Result<Response, ApiError> {
-    let req = build_request(item_id, query, raw);
+    // `GetLiveHlsStream` defaults `EnableSubtitlesInManifest` to true.
+    let ctx = HlsRequestContext::from_parts(&auth, &parts, true);
+    let req = build_request(item_id, query, raw, ctx);
     let playlist = state.hls.live_playlist(&req).await?;
     Ok(playlist_response(playlist))
 }
@@ -279,25 +411,29 @@ async fn get_video_live_playlist(
 /// `GET|HEAD /Audio/{itemId}/master.m3u8` — the audio master playlist.
 async fn get_audio_master_playlist(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAuth(auth): RequireAuth,
     Path(item_id): Path<Uuid>,
     Query(query): Query<HlsQuery>,
     RawQuery(raw): RawQuery,
+    parts: axum::http::request::Parts,
 ) -> Result<Response, ApiError> {
-    let req = build_request(item_id, query, raw);
+    let ctx = HlsRequestContext::from_parts(&auth, &parts, false);
+    let req = build_request(item_id, query, raw, ctx);
     let playlist = state.hls.master_playlist(&req, true).await?;
-    Ok(playlist_response(playlist))
+    Ok(master_playlist_response(&parts.method, playlist))
 }
 
 /// `GET /Audio/{itemId}/main.m3u8` — the audio variant playlist.
 async fn get_audio_variant_playlist(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAuth(auth): RequireAuth,
     Path(item_id): Path<Uuid>,
     Query(query): Query<HlsQuery>,
     RawQuery(raw): RawQuery,
+    parts: axum::http::request::Parts,
 ) -> Result<Response, ApiError> {
-    let req = build_request(item_id, query, raw);
+    let ctx = HlsRequestContext::from_parts(&auth, &parts, false);
+    let req = build_request(item_id, query, raw, ctx);
     let playlist = state.hls.variant_playlist(&req, true).await?;
     Ok(playlist_response(playlist))
 }
@@ -330,7 +466,7 @@ async fn get_video_hls_segment(
     request: Request,
 ) -> Result<Response, ApiError> {
     let index = parse_segment_index(&segment_id)?;
-    let req = build_request(item_id, query, raw);
+    let req = build_request(item_id, query, raw, HlsRequestContext::default());
     let file = state.hls.dynamic_segment(&req, index, false).await?;
     served_file_response(file, request).await
 }
@@ -346,7 +482,7 @@ async fn get_audio_hls_segment(
     request: Request,
 ) -> Result<Response, ApiError> {
     let index = parse_segment_index(&segment_id)?;
-    let req = build_request(item_id, query, raw);
+    let req = build_request(item_id, query, raw, HlsRequestContext::default());
     let file = state.hls.dynamic_segment(&req, index, true).await?;
     served_file_response(file, request).await
 }
@@ -586,16 +722,78 @@ mod tests {
             uuid::Uuid::from_u128(7),
             query,
             Some("MaxWidth=1280".into()),
+            HlsRequestContext::default(),
         );
         assert_eq!(req.max_width, Some(1280));
         assert_eq!(req.video_bitrate, Some(4_000_000));
         assert!(req.allow_video_stream_copy, "copy allowed by default");
         assert!(req.allow_audio_stream_copy, "copy allowed by default");
         assert_eq!(req.query_string, "?MaxWidth=1280");
+        // The master-playlist DTO defaults.
+        assert!(!req.enable_subtitles_in_manifest);
+        assert!(!req.enable_adaptive_bitrate_streaming);
+        assert!(req.enable_trickplay);
+        assert_eq!(req.api_key, None);
+        assert!(!req.is_in_local_network, "unknown peer is not local");
 
         let query: HlsQuery =
             serde_urlencoded::from_str("AllowVideoStreamCopy=false").expect("parses");
-        let req = build_request(uuid::Uuid::from_u128(7), query, None);
+        let req = build_request(
+            uuid::Uuid::from_u128(7),
+            query,
+            None,
+            HlsRequestContext::default(),
+        );
         assert!(!req.allow_video_stream_copy, "explicit veto honored");
+    }
+
+    /// The master-playlist inputs `DynamicHlsHelper` reads off the query and
+    /// the HTTP context: profile/level/framerate/size, the subtitle selection,
+    /// the manifest flags, the session token and the peer's locality.
+    #[test]
+    fn build_request_carries_master_playlist_inputs() {
+        let query: HlsQuery = serde_urlencoded::from_str(
+            "Profile=high&Level=41&Framerate=30&Width=1280&Height=720&MinSegments=2&\
+             SubtitleStreamIndex=3&SubtitleMethod=Hls&TranscodeReasons=ContainerNotSupported&\
+             EnableSubtitlesInManifest=true&EnableAdaptiveBitrateStreaming=true&\
+             enableTrickplay=false",
+        )
+        .expect("parses");
+        let ctx = HlsRequestContext {
+            api_key: Some("tok".to_owned()),
+            remote_ip: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                192, 168, 1, 5,
+            ))),
+            subtitles_in_manifest_default: false,
+        };
+        let req = build_request(uuid::Uuid::from_u128(7), query, None, ctx);
+        assert_eq!(req.profile.as_deref(), Some("high"));
+        assert_eq!(req.level.as_deref(), Some("41"));
+        assert_eq!(req.framerate, Some(30.0));
+        assert_eq!((req.width, req.height), (Some(1280), Some(720)));
+        assert_eq!(req.min_segments, Some(2));
+        assert_eq!(req.subtitle_stream_index, Some(3));
+        assert_eq!(req.subtitle_method.as_deref(), Some("Hls"));
+        assert_eq!(
+            req.transcode_reasons.as_deref(),
+            Some("ContainerNotSupported")
+        );
+        assert!(req.enable_subtitles_in_manifest);
+        assert!(req.enable_adaptive_bitrate_streaming);
+        assert!(!req.enable_trickplay);
+        assert_eq!(req.api_key.as_deref(), Some("tok"));
+        assert!(req.is_in_local_network, "RFC1918 peer is local");
+
+        // The route default fills an omitted `EnableSubtitlesInManifest`
+        // (`live.m3u8` defaults it to true); a public peer is not local.
+        let query: HlsQuery = serde_urlencoded::from_str("").expect("parses");
+        let ctx = HlsRequestContext {
+            api_key: None,
+            remote_ip: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, 8))),
+            subtitles_in_manifest_default: true,
+        };
+        let req = build_request(uuid::Uuid::from_u128(7), query, None, ctx);
+        assert!(req.enable_subtitles_in_manifest);
+        assert!(!req.is_in_local_network);
     }
 }

@@ -16,6 +16,7 @@
 use std::path::PathBuf;
 
 use ferrofin_model::dlna::{EncodingContext, SubtitleDeliveryMethod};
+use ferrofin_model::drawing::ImageDimensions;
 use ferrofin_model::dto::MediaSourceInfo;
 use ferrofin_model::entities_media::MediaStream;
 use ferrofin_traits::media_encoding::TranscodingJobType;
@@ -346,6 +347,87 @@ impl EncodingJobInfo {
         }
     }
 
+    /// The effective output audio codec: the source codec when the output is a
+    /// stream copy, else the requested output codec; `None` without an audio
+    /// stream. Port of `ActualOutputAudioCodec`.
+    #[must_use]
+    pub fn actual_output_audio_codec(&self) -> Option<&str> {
+        let stream = self.audio_stream.as_ref()?;
+        if Self::is_copy_codec(self.output_audio_codec.as_deref()) {
+            stream.codec.as_deref()
+        } else {
+            self.output_audio_codec.as_deref()
+        }
+    }
+
+    /// Whether this job is an open-ended (segmented live) stream: a
+    /// non-progressive job whose source has no known runtime. Port of
+    /// `IsSegmentedLiveStream`.
+    #[must_use]
+    pub fn is_segmented_live_stream(&self) -> bool {
+        self.transcoding_type != TranscodingJobType::Progressive && self.run_time_ticks.is_none()
+    }
+
+    /// The output frame size after the request's `Width`/`Height` /
+    /// `MaxWidth`/`MaxHeight` are applied to the source dimensions
+    /// (`DrawingUtils.Resize`). Port of `OutputWidth`/`OutputHeight`: `None`
+    /// for an audio request without a sized video stream; a video request
+    /// without source dimensions falls back to the requested bound.
+    fn output_dimensions(&self) -> (Option<i32>, Option<i32>) {
+        let request = &self.base_request;
+        if let Some(stream) = self.video_stream.as_ref()
+            && let (Some(width), Some(height)) = (stream.width, stream.height)
+        {
+            let size = ferrofin_model::drawing::drawing_utils::resize(
+                ImageDimensions::new(width, height),
+                request.width.unwrap_or(0),
+                request.height.unwrap_or(0),
+                request.max_width.unwrap_or(0),
+                request.max_height.unwrap_or(0),
+            );
+            return (Some(size.width), Some(size.height));
+        }
+
+        if !self.is_input_video {
+            return (None, None);
+        }
+
+        (
+            request.max_width.or(request.width),
+            request.max_height.or(request.height),
+        )
+    }
+
+    /// The output width, in pixels (`OutputWidth`); see
+    /// [`Self::output_dimensions`].
+    #[must_use]
+    pub fn output_width(&self) -> Option<i32> {
+        self.output_dimensions().0
+    }
+
+    /// The output height, in pixels (`OutputHeight`); see
+    /// [`Self::output_dimensions`].
+    #[must_use]
+    pub fn output_height(&self) -> Option<i32> {
+        self.output_dimensions().1
+    }
+
+    /// The target output framerate. Port of `TargetFramerate`: a static or
+    /// stream-copied video keeps the source's reference framerate; a re-encode
+    /// targets `MaxFramerate`, else `Framerate`.
+    #[must_use]
+    pub fn target_framerate(&self) -> Option<f32> {
+        if self.base_request.is_static || Self::is_copy_codec(self.output_video_codec.as_deref()) {
+            return self
+                .video_stream
+                .as_ref()
+                .and_then(MediaStream::reference_frame_rate);
+        }
+        self.base_request
+            .max_framerate
+            .or(self.base_request.framerate)
+    }
+
     /// Whether the (interlaced) input should be deinterlaced for `video_codec`.
     ///
     /// Port of `DeInterlace(videoCodec, forceDeinterlaceIfSourceIsInterlaced)`.
@@ -527,6 +609,141 @@ fn split_options(value: Option<&str>) -> Vec<String> {
         .filter(|s| !s.is_empty())
         .map(str::to_owned)
         .collect()
+}
+
+#[cfg(test)]
+mod derived_state_tests {
+    use super::{BaseEncodingJobOptions, EncodingJobInfo, TranscodeDisplayNames};
+    use ferrofin_model::dlna::SubtitleDeliveryMethod;
+    use ferrofin_model::dto::MediaSourceInfo;
+    use ferrofin_model::entities::MediaStreamType;
+    use ferrofin_model::entities_media::MediaStream;
+    use ferrofin_traits::media_encoding::TranscodingJobType;
+
+    fn job() -> EncodingJobInfo {
+        EncodingJobInfo {
+            display: TranscodeDisplayNames::default(),
+            base_request: BaseEncodingJobOptions::default(),
+            video_stream: None,
+            audio_stream: None,
+            subtitle_stream: None,
+            media_source: MediaSourceInfo::default(),
+            output_video_codec: None,
+            output_audio_codec: None,
+            output_video_bitrate: None,
+            output_audio_bitrate: None,
+            output_audio_channels: None,
+            output_container: None,
+            output_video_sync: None,
+            output_file_path: String::new(),
+            input_container: None,
+            is_input_video: true,
+            subtitle_delivery_method: SubtitleDeliveryMethod::Encode,
+            run_time_ticks: Some(1),
+            transcoding_type: TranscodingJobType::Hls,
+            supported_video_codecs: Vec::new(),
+            supported_audio_codecs: Vec::new(),
+            segment_length_secs: 3,
+            wait_for_path: None,
+            segment_container: None,
+            play_session_id: None,
+            device_id: None,
+        }
+    }
+
+    fn video(width: i32, height: i32) -> MediaStream {
+        MediaStream {
+            codec: Some("h264".to_owned()),
+            stream_type: MediaStreamType::Video,
+            width: Some(width),
+            height: Some(height),
+            average_frame_rate: Some(23.976),
+            real_frame_rate: Some(24.0),
+            ..MediaStream::default()
+        }
+    }
+
+    #[test]
+    fn actual_output_audio_codec_follows_copy() {
+        let mut j = job();
+        assert_eq!(j.actual_output_audio_codec(), None);
+        j.audio_stream = Some(MediaStream {
+            codec: Some("flac".to_owned()),
+            stream_type: MediaStreamType::Audio,
+            ..MediaStream::default()
+        });
+        j.output_audio_codec = Some("aac".to_owned());
+        assert_eq!(j.actual_output_audio_codec(), Some("aac"));
+        j.output_audio_codec = Some("copy".to_owned());
+        assert_eq!(j.actual_output_audio_codec(), Some("flac"));
+    }
+
+    #[test]
+    fn segmented_live_stream_needs_unknown_runtime_and_non_progressive() {
+        let mut j = job();
+        assert!(!j.is_segmented_live_stream());
+        j.run_time_ticks = None;
+        assert!(j.is_segmented_live_stream());
+        j.transcoding_type = TranscodingJobType::Progressive;
+        assert!(!j.is_segmented_live_stream());
+    }
+
+    #[test]
+    fn output_dimensions_resize_by_request_bounds() {
+        let mut j = job();
+        j.video_stream = Some(video(1920, 1080));
+        // No bounds: the source size.
+        assert_eq!(
+            (j.output_width(), j.output_height()),
+            (Some(1920), Some(1080))
+        );
+        // MaxWidth bounds preserve the aspect ratio.
+        j.base_request.max_width = Some(1280);
+        assert_eq!(
+            (j.output_width(), j.output_height()),
+            (Some(1280), Some(720))
+        );
+        // The fixture: 320x240 under MaxWidth=320 is unchanged.
+        j.video_stream = Some(video(320, 240));
+        j.base_request.max_width = Some(320);
+        assert_eq!(
+            (j.output_width(), j.output_height()),
+            (Some(320), Some(240))
+        );
+        // No source dimensions on a video request: the requested bound.
+        j.video_stream = Some(MediaStream {
+            stream_type: MediaStreamType::Video,
+            ..MediaStream::default()
+        });
+        j.base_request.max_width = Some(640);
+        j.base_request.height = Some(360);
+        assert_eq!(
+            (j.output_width(), j.output_height()),
+            (Some(640), Some(360))
+        );
+        // An audio request has no output size.
+        j.is_input_video = false;
+        assert_eq!((j.output_width(), j.output_height()), (None, None));
+    }
+
+    #[test]
+    fn target_framerate_copies_source_else_request() {
+        let mut j = job();
+        j.video_stream = Some(video(320, 240));
+        j.output_video_codec = Some("h264".to_owned());
+        // Re-encode with no requested framerate: none.
+        assert_eq!(j.target_framerate(), None);
+        j.base_request.framerate = Some(30.0);
+        assert_eq!(j.target_framerate(), Some(30.0));
+        j.base_request.max_framerate = Some(25.0);
+        assert_eq!(j.target_framerate(), Some(25.0));
+        // Copy (or static): the source reference framerate (average first).
+        j.output_video_codec = Some("copy".to_owned());
+        assert_eq!(j.target_framerate(), Some(23.976));
+        j.output_video_codec = Some("h264".to_owned());
+        j.base_request.is_static = true;
+        assert_eq!(j.target_framerate(), Some(23.976));
+    }
 }
 
 #[cfg(test)]

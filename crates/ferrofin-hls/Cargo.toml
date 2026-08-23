@@ -21,5 +21,6 @@ tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+ferrofin-db.workspace = true
 rstest.workspace = true
 tempfile.workspace = true

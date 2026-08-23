@@ -425,6 +425,35 @@ fn query_param<'a>(query_string: &'a str, key: &str) -> Option<&'a str> {
         .map(|(_, v)| v)
 }
 
+/// Port of `StreamingHelpers.ParseStreamOptions`: every raw query pair whose
+/// key starts with a lower-case letter is a per-codec stream option (the
+/// generated transcode URL lower-cases e.g. `h264-profile`, `aac-profile`,
+/// `hevc-level`), keyed and valued as decoded. A repeated key keeps its last
+/// value (the dictionary indexer).
+fn parse_stream_options(query_string: &str) -> Vec<(String, String)> {
+    let mut options: Vec<(String, String)> = Vec::new();
+    for (key, value) in ferrofin_hls::query_pairs(query_string) {
+        if !key.chars().next().is_some_and(char::is_lowercase) {
+            continue;
+        }
+        if let Some((_, existing)) = options.iter_mut().find(|(k, _)| *k == key) {
+            *existing = value;
+        } else {
+            options.push((key, value));
+        }
+    }
+    options
+}
+
+/// Port of `EncodingHelper.LosslessAudioCodecs.Contains(codec)`: the output
+/// codecs whose HLS bitrate is the source's own (`alac`, `ape`, `flac`, `mlp`,
+/// `truehd`, `wavpack`).
+fn is_lossless_audio_codec(codec: &str) -> bool {
+    ["alac", "ape", "flac", "mlp", "truehd", "wavpack"]
+        .iter()
+        .any(|c| codec.eq_ignore_ascii_case(c))
+}
+
 /// Parses a `SubtitleMethod` query value (the names `StreamInfo::to_url` emits).
 fn parse_subtitle_method(value: &str) -> Option<SubtitleDeliveryMethod> {
     let method = if value.eq_ignore_ascii_case("Encode") {
@@ -508,14 +537,23 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
         // external/embedded track the PlaybackInfo DTO promised it, on top of
         // the burn-in. An absent method with an index means Encode (the C#
         // enum default).
-        let subtitle_index = query_param_i32(&request.query_string, "SubtitleStreamIndex");
+        let subtitle_index = request
+            .subtitle_stream_index
+            .or_else(|| query_param_i32(&request.query_string, "SubtitleStreamIndex"));
         let subtitle_stream = subtitle_stream(&media_source.media_streams, subtitle_index);
+        let requested_subtitle_method = request
+            .subtitle_method
+            .as_deref()
+            .or_else(|| query_param(&request.query_string, "SubtitleMethod"))
+            .and_then(parse_subtitle_method);
         let subtitle_delivery_method = if subtitle_stream.is_some() {
-            query_param(&request.query_string, "SubtitleMethod")
-                .and_then(parse_subtitle_method)
-                .unwrap_or(SubtitleDeliveryMethod::Encode)
+            requested_subtitle_method.unwrap_or(SubtitleDeliveryMethod::Encode)
         } else {
-            SubtitleDeliveryMethod::Hls
+            // No selected stream: the request DTO's `SubtitleMethod` default
+            // (`subtitleMethod ?? SubtitleDeliveryMethod.External` on every HLS
+            // route). The master playlist keys its subtitle group off this, so
+            // it must not read as `Hls` when nothing was selected.
+            requested_subtitle_method.unwrap_or(SubtitleDeliveryMethod::External)
         };
 
         let options = self.encoding_options().await;
@@ -581,6 +619,19 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
             max_framerate: request.max_framerate,
             allow_video_stream_copy: request.allow_video_stream_copy,
             allow_audio_stream_copy: request.allow_audio_stream_copy,
+            // The profile/level/framerate/size requests feed the master
+            // playlist's CODECS/RESOLUTION/FRAME-RATE fields (and the level
+            // clamp) exactly as `BaseEncodingJobOptions` does upstream.
+            profile: request.profile.clone(),
+            level: request.level.clone(),
+            framerate: request.framerate,
+            width: request.width,
+            height: request.height,
+            // `ParseStreamOptions`: every query key starting lower-case is a
+            // per-codec stream option (`h264-profile`, `aac-profile`, …) — the
+            // only way a real client's requested profile/level reaches
+            // `GetRequestedProfiles`/`GetRequestedLevel`.
+            stream_options: parse_stream_options(&request.query_string),
             ..BaseEncodingJobOptions::default()
         };
 
@@ -602,9 +653,9 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
             media_source: media_source.clone(),
             output_video_codec: Some(requested_video_codec.clone()),
             output_audio_codec: Some(requested_audio_codec.clone()),
-            output_video_bitrate: base_request.video_bit_rate,
-            output_audio_bitrate: base_request.audio_bit_rate,
-            output_audio_channels: base_request.audio_channels,
+            output_video_bitrate: None,
+            output_audio_bitrate: None,
+            output_audio_channels: None,
             output_container: Some(segment_container.clone()),
             output_video_sync: None,
             output_file_path: String::new(),
@@ -622,14 +673,64 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
             device_id: request.device_id.clone(),
         };
 
+        // `GetStreamingState` order: the output audio channels and bitrate are
+        // resolved against the REQUESTED audio codec before `TryStreamCopy`
+        // (a later copy does not recompute them — they still drive the master
+        // playlist's BANDWIDTH), and the video bitrate likewise before the
+        // copy decision, regardless of its outcome.
+        //
+        // Channels: a focused port of `GetNumAudioChannelsParam` — the
+        // requested channels (folding in `TranscodingMaxAudioChannels`),
+        // clamped to the source, the encoder ceiling, and the HLS layout fix.
+        let audio_encoder = self.encoding_helper.audio_encoder(&probe_state);
+        probe_state.output_audio_channels = resolve_output_audio_channels(
+            &probe_state,
+            Some(&requested_audio_codec),
+            &audio_encoder,
+        );
+        // `LosslessAudioCodecs.Contains(outputAudioCodec)` → the source's own
+        // bitrate (or 0); else `GetAudioBitrateParam(request.AudioBitRate,
+        // request.AudioCodec, AudioStream, OutputAudioChannels) ?? 0`.
+        probe_state.output_audio_bitrate =
+            Some(if is_lossless_audio_codec(&requested_audio_codec) {
+                audio_stream.as_ref().and_then(|a| a.bit_rate).unwrap_or(0)
+            } else {
+                self.encoding_helper
+                    .audio_bitrate_param(
+                        request.audio_bitrate,
+                        Some(&requested_audio_codec),
+                        audio_stream.as_ref(),
+                        probe_state.output_audio_channels,
+                    )
+                    .unwrap_or(0)
+            });
+        // `GetVideoBitrateParamValue(VideoRequest, VideoStream, OutputVideoCodec)`
+        // for every video request — a remux carries it too (it is the
+        // master playlist's BANDWIDTH); the arg builder only emits bitrate args
+        // on a re-encode.
+        probe_state.output_video_bitrate = if is_audio {
+            None
+        } else {
+            let value = self.encoding_helper.video_bitrate_param_value(
+                &probe_state.base_request,
+                probe_state.video_stream.as_ref(),
+                &requested_video_codec,
+            );
+            (value > 0).then_some(value)
+        };
+
         let copy_video = video_stream
             .as_ref()
             .is_some_and(|v| self.encoding_helper.can_stream_copy_video(&probe_state, v));
-        let copy_audio = audio_stream.as_ref().is_some_and(|a| {
-            self.encoding_helper
-                .can_stream_copy_audio(&probe_state, a, &supported_audio_codecs)
-                .0
-        });
+        // `TryStreamCopy` runs only under `if (state.VideoRequest is not null)`:
+        // an audio-only HLS request never stream-copies its audio (the variant
+        // URL keeps `audioCodec=aac`, and ffmpeg re-encodes).
+        let copy_audio = !is_audio
+            && audio_stream.as_ref().is_some_and(|a| {
+                self.encoding_helper
+                    .can_stream_copy_audio(&probe_state, a, &supported_audio_codecs)
+                    .0
+            });
 
         // Resolve the effective output codecs from the copy decision.
         let output_video_codec = video_stream.as_ref().map(|_| {
@@ -639,12 +740,14 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
                 requested_video_codec.clone()
             }
         });
-        let output_audio_codec = audio_stream.as_ref().map(|_| {
-            if copy_audio {
-                "copy".to_owned()
-            } else {
-                requested_audio_codec.clone()
-            }
+        // Upstream's `OutputAudioCodec` is never null (it is the requested
+        // codec, `"copy"` after `TryStreamCopy`), even for a source with no
+        // audio stream — the master playlist's `AudioCodec` rewrite compares
+        // against it. The arg builder only reads it under `audio_stream`.
+        let output_audio_codec = Some(if copy_audio {
+            "copy".to_owned()
+        } else {
+            requested_audio_codec.clone()
         });
         let is_remuxing_video = EncodingJobInfo::is_copy_codec(output_video_codec.as_deref());
 
@@ -666,26 +769,16 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
         probe_state
             .output_audio_codec
             .clone_from(&output_audio_codec);
-        // Resolve the target video bitrate for a re-encode: the requested cap
-        // bounded by the source bitrate and codec-efficiency scaled
-        // (`GetVideoBitrateParamValue`); a copy carries no bitrate args.
-        probe_state.output_video_bitrate =
-            if EncodingJobInfo::is_copy_codec(output_video_codec.as_deref()) {
-                None
-            } else {
-                let value = self.encoding_helper.video_bitrate_param_value(
-                    &probe_state.base_request,
-                    probe_state.video_stream.as_ref(),
-                    output_video_codec.as_deref().unwrap_or(DEFAULT_VIDEO_CODEC),
-                );
-                (value > 0).then_some(value)
-            };
         // Bitrate-driven resolution bound — port of the `ResolutionNormalizer`
         // application in `StreamingHelpers.GetStreamingState`: a bitrate-capped
         // re-encode also bounds the output resolution (an 8 Mbps ask on a 4K
         // source downscales to 1080p, like Jellyfin), unless the requested
-        // bitrate already exceeds the source's.
-        if let Some(output_bitrate) = probe_state.output_video_bitrate {
+        // bitrate already exceeds the source's. Upstream's guard is
+        // `!IsCopyCodec(OutputVideoCodec) && OutputVideoBitrate.HasValue`.
+        if let Some(output_bitrate) = probe_state
+            .output_video_bitrate
+            .filter(|_| !is_remuxing_video)
+        {
             let source_bitrate = probe_state.video_stream.as_ref().and_then(|v| v.bit_rate);
             let requested_not_reducing = probe_state
                 .base_request
@@ -727,18 +820,6 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
                 req.max_height = resolution.max_height;
             }
         }
-        // Resolve the output channel count now that the copy decision is known.
-        // A focused port of `EncodingHelper.GetAudioChannels`: the requested
-        // channels (which already fold in `TranscodingMaxAudioChannels`), clamped
-        // to the source's channel count and, when re-encoding, to the transcoding
-        // profile's hard cap. `None` → no `-ac`, so the source channels pass
-        // through (unchanged from before this resolution existed).
-        let audio_encoder = self.encoding_helper.audio_encoder(&probe_state);
-        probe_state.output_audio_channels = resolve_output_audio_channels(
-            &probe_state,
-            output_audio_codec.as_deref(),
-            &audio_encoder,
-        );
         probe_state.output_file_path = playlist_path.to_string_lossy().into_owned();
         probe_state.wait_for_path = Some(wait_for_path);
         let state = probe_state;
@@ -774,6 +855,11 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
         );
 
         // ---- (5) RETURN the TranscodePlan -----------------------------------
+        // `StreamState.MinSegments`: the request's value, else 2 for segments
+        // of ten seconds or longer, else 3.
+        let min_segments = request
+            .min_segments
+            .unwrap_or(if segment_length_secs >= 10 { 2 } else { 3 });
         Ok(TranscodePlan {
             state,
             playlist_path,
@@ -783,6 +869,8 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
             segment_length_ms: segment_length_secs.saturating_mul(MS_PER_SECOND),
             is_remuxing_video,
             segment_container,
+            encoding_options: options,
+            min_segments,
         })
     }
 }
@@ -2534,5 +2622,225 @@ mod tests {
         let args =
             nvenc_video_args("h264_nvenc", &options, true, Some((1920, 1080)), None).join(" ");
         assert!(!args.contains("-vf"), "{args}");
+    }
+
+    /// The parity fixture (320x240 h264 @ ~6 Mbps container bitrate, mono aac)
+    /// under the harness query. `GetStreamingState` yields
+    /// `OutputAudioBitrate = min(1 × 128000, 128000)` and `OutputVideoBitrate =
+    /// min(ScaleBitrate(GetMinBitrate(6M, 1M)), 1M) = 1_000_000` — the
+    /// 1_128_000 BANDWIDTH Jellyfin advertises. A remux carries the video
+    /// bitrate too (it only gates the bitrate *args*), and the audio bitrate is
+    /// computed against the requested codec even when the audio is copied.
+    #[tokio::test]
+    async fn plan_output_bitrates_follow_get_streaming_state() {
+        let mut video = video_stream("h264");
+        video.width = Some(320);
+        video.height = Some(240);
+        video.bit_rate = Some(6_000_000);
+        let mut audio = audio_stream("aac");
+        audio.channels = Some(1);
+        let src = source("abc", vec![video, audio]);
+
+        let mut req = request("abc");
+        req.video_codec = Some("h264".to_owned());
+        req.audio_codec = Some("aac".to_owned());
+        req.audio_bitrate = Some(128_000);
+        req.video_bitrate = Some(1_000_000);
+        req.max_width = Some(320);
+        req.transcoding_max_audio_channels = Some(2);
+        req.allow_video_stream_copy = false;
+        req.allow_audio_stream_copy = false;
+        let p = planner(vec![src.clone()]);
+        let plan = p.plan(&req, false, None).await.unwrap();
+        assert_eq!(plan.state.output_audio_channels, Some(1));
+        assert_eq!(plan.state.output_audio_bitrate, Some(128_000));
+        assert_eq!(plan.state.output_video_bitrate, Some(1_000_000));
+        assert_eq!(plan.state.output_video_codec.as_deref(), Some("h264"));
+        let args = plan.arguments.join(" ");
+        assert!(args.contains("-maxrate 1000000"), "re-encode caps: {args}");
+        assert!(args.contains("-b:a 128000"), "audio bitrate: {args}");
+
+        // A copy-eligible request (8 Mbps cap above the 6 Mbps source): both
+        // streams copy, the bitrates are still the GetStreamingState values
+        // (video: min(ScaleBitrate(GetMinBitrate(6M, 8M)), 8M) = 6M), and no
+        // bitrate args are emitted.
+        let mut req = request("abc");
+        req.video_codec = Some("h264".to_owned());
+        req.audio_codec = Some("aac".to_owned());
+        req.audio_bitrate = Some(128_000);
+        req.video_bitrate = Some(8_000_000);
+        req.max_width = Some(320);
+        let p = planner(vec![src]);
+        let plan = p.plan(&req, false, None).await.unwrap();
+        assert_eq!(plan.state.output_video_codec.as_deref(), Some("copy"));
+        assert_eq!(plan.state.output_audio_codec.as_deref(), Some("copy"));
+        assert_eq!(plan.state.output_video_bitrate, Some(6_000_000));
+        assert_eq!(plan.state.output_audio_bitrate, Some(128_000));
+        let args = plan.arguments.join(" ");
+        assert!(
+            !args.contains("-maxrate"),
+            "copy has no bitrate args: {args}"
+        );
+        assert!(!args.contains("-b:a"), "copy has no audio bitrate: {args}");
+        assert_eq!(
+            plan.min_segments, 3,
+            "3s segments → 3 (StreamState.MinSegments)"
+        );
+    }
+
+    /// A lossless target reports the source's own bitrate; an absent request
+    /// bitrate still yields the per-channel default (`GetAudioBitrateParam`
+    /// never returns null with an audio stream).
+    #[tokio::test]
+    async fn plan_audio_bitrate_defaults_and_lossless() {
+        let mut audio = audio_stream("dts");
+        audio.channels = Some(6);
+        audio.bit_rate = Some(1_536_000);
+        let src = source("abc", vec![video_stream("h264"), audio]);
+        let p = planner(vec![src.clone()]);
+        let mut req = request("abc");
+        req.audio_codec = Some("aac".to_owned());
+        let plan = p.plan(&req, false, None).await.unwrap();
+        // 6 in, 6 out → min(640000, MAX).
+        assert_eq!(plan.state.output_audio_bitrate, Some(640_000));
+
+        let p = planner(vec![src]);
+        let mut req = request("abc");
+        req.audio_codec = Some("flac".to_owned());
+        req.audio_bitrate = Some(128_000);
+        let plan = p.plan(&req, false, None).await.unwrap();
+        assert_eq!(plan.state.output_audio_bitrate, Some(1_536_000));
+        assert_eq!(plan.min_segments, 3);
+        // An explicit MinSegments wins; 10s+ segments default to 2.
+        let p = planner(vec![source("abc", vec![video_stream("h264")])]);
+        let mut req = request("abc");
+        req.segment_length = Some(10);
+        let plan = p.plan(&req, false, None).await.unwrap();
+        assert_eq!(plan.min_segments, 2);
+        req.min_segments = Some(1);
+        let plan = p.plan(&req, false, None).await.unwrap();
+        assert_eq!(plan.min_segments, 1);
+    }
+
+    /// `ParseStreamOptions`: lower-case-initial query keys reach the
+    /// per-codec option lookups (`h264-profile`/`h264-level`/`aac-profile`);
+    /// the typed `Profile`/`Level`/`Framerate`/`Width`/`Height` land on the
+    /// base request.
+    #[tokio::test]
+    async fn plan_parses_lowercase_stream_options_and_typed_fields() {
+        let src = source("abc", vec![video_stream("hevc"), audio_stream("aac")]);
+        let p = planner(vec![src]);
+        let mut req = request("abc");
+        req.query_string =
+            "?MediaSourceId=abc&h264-profile=high&h264-level=51&aac-profile=HE&VideoCodec=h264"
+                .to_owned();
+        req.video_codec = Some("h264".to_owned());
+        req.framerate = Some(24.0);
+        req.width = Some(640);
+        req.height = Some(360);
+        let plan = p.plan(&req, false, None).await.unwrap();
+        assert_eq!(
+            plan.state.requested_profiles("h264"),
+            vec!["high".to_owned()]
+        );
+        assert_eq!(plan.state.requested_level("h264").as_deref(), Some("51"));
+        assert_eq!(plan.state.requested_profiles("aac"), vec!["HE".to_owned()]);
+        // …and they reach the encoder args, as jellyfin-web's TranscodingUrl
+        // (`h264-profile=high&h264-level=51`) does on Jellyfin.
+        let args = plan.arguments.join(" ");
+        assert!(args.contains("-profile:v:0 high"), "{args}");
+        assert!(args.contains("-level 51"), "{args}");
+        // PascalCase keys are NOT stream options.
+        assert!(
+            !plan
+                .state
+                .base_request
+                .stream_options
+                .iter()
+                .any(|(k, _)| k == "MediaSourceId" || k == "VideoCodec"),
+            "{:?}",
+            plan.state.base_request.stream_options
+        );
+        assert_eq!(plan.state.base_request.framerate, Some(24.0));
+        assert_eq!(plan.state.base_request.width, Some(640));
+        assert_eq!(plan.state.base_request.height, Some(360));
+
+        // The typed `Profile`/`Level` take precedence over the per-codec option.
+        let src = source("abc", vec![video_stream("hevc"), audio_stream("aac")]);
+        let p = planner(vec![src]);
+        let mut req = request("abc");
+        req.query_string = "?h264-profile=high&h264-level=51".to_owned();
+        req.profile = Some("main".to_owned());
+        req.level = Some("40".to_owned());
+        let plan = p.plan(&req, false, None).await.unwrap();
+        assert_eq!(
+            plan.state.requested_profiles("h264"),
+            vec!["main".to_owned()]
+        );
+        assert_eq!(plan.state.requested_level("h264").as_deref(), Some("40"));
+    }
+
+    /// `TryStreamCopy` runs only for video requests: an audio-only HLS request
+    /// with a matching source codec still re-encodes (the variant URL keeps
+    /// `audioCodec=aac`, as Jellyfin's does).
+    #[tokio::test]
+    async fn plan_audio_request_never_stream_copies() {
+        let src = source("abc", vec![audio_stream("aac")]);
+        let p = planner(vec![src.clone()]);
+        let mut req = request("abc");
+        req.audio_codec = Some("aac".to_owned());
+        let plan = p.plan(&req, true, None).await.unwrap();
+        assert_eq!(plan.state.output_audio_codec.as_deref(), Some("aac"));
+        assert!(
+            !plan.arguments.join(" ").contains("-c:a copy"),
+            "{:?}",
+            plan.arguments
+        );
+
+        // The same source on the video route copies the matching audio.
+        let p = planner(vec![source(
+            "abc",
+            vec![video_stream("h264"), audio_stream("aac")],
+        )]);
+        let mut req = request("abc");
+        req.audio_codec = Some("aac".to_owned());
+        let plan = p.plan(&req, false, None).await.unwrap();
+        assert_eq!(plan.state.output_audio_codec.as_deref(), Some("copy"));
+    }
+
+    /// No selected subtitle: the delivery method is the DTO default
+    /// (`External`), never `Hls` — the master playlist keys its subtitle group
+    /// off it. The typed request fields select and deliver like the query.
+    #[tokio::test]
+    async fn plan_subtitle_method_defaults_to_external_without_a_selection() {
+        let src = source(
+            "abc",
+            vec![
+                video_stream("h264"),
+                audio_stream("aac"),
+                subtitle_stream("subrip", 2),
+            ],
+        );
+        let p = planner(vec![src.clone()]);
+        let plan = p.plan(&request("abc"), false, None).await.unwrap();
+        assert_eq!(
+            plan.state.subtitle_delivery_method,
+            SubtitleDeliveryMethod::External
+        );
+        assert!(plan.state.subtitle_stream.is_none());
+
+        let p = planner(vec![src]);
+        let mut req = request("abc");
+        req.subtitle_stream_index = Some(2);
+        req.subtitle_method = Some("Hls".to_owned());
+        let plan = p.plan(&req, false, None).await.unwrap();
+        assert_eq!(
+            plan.state.subtitle_delivery_method,
+            SubtitleDeliveryMethod::Hls
+        );
+        assert_eq!(
+            plan.state.subtitle_stream.as_ref().map(|s| s.index),
+            Some(2)
+        );
     }
 }

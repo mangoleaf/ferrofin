@@ -251,7 +251,11 @@ async fn get_endpoint_info(
 
 /// Whether `ip` is on the local network: loopback, link-local, or a private
 /// (RFC1918 IPv4 / `fc00::/7` unique-local IPv6) address.
-fn is_in_local_network(ip: std::net::IpAddr) -> bool {
+///
+/// Shared with the HLS master playlist, which (like upstream's
+/// `DynamicHlsHelper.EnableAdaptiveBitrateStreaming`) skips the adaptive
+/// variants for local peers.
+pub(crate) fn is_in_local_network(ip: std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
         // `is_unique_local`/`is_unicast_link_local` are unstable, so match the
