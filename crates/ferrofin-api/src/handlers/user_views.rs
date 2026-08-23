@@ -83,7 +83,11 @@ async fn get_user_views(
     let user = resolve_user(&state, &auth, query.user_id).await?;
     let user_id = user_uuid(&user)?;
     let folders = state.user_views.get_user_views(user_id).await?;
-    let options = DtoOptions::with_all_fields(false);
+    // C# `GetUserViews` builds `new DtoOptions()` — ALL item fields (minus the two
+    // default-excluded ones); its `AddClientFields` + explicit appends are subsumed.
+    // `with_all_fields(false)` served views with NO fields — strict-SDK clients
+    // (Android TV et al.) assume Jellyfin's always-present view fields exist.
+    let options = DtoOptions::with_all_fields(true);
     let mut dtos = state
         .dto
         .get_base_item_dtos(&folders, &options, Some(&user), None, true)

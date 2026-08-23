@@ -18,6 +18,9 @@ impl TryFrom<DeviceEntity> for DeviceInfo {
     /// `Capabilities` (session-scoped), and `IconUrl` are not carried by the
     /// `Devices` row, so they take their empty/default values. The stored
     /// `DeviceId` populates the DTO's `Id`, and `UserId` its `LastUserId`.
+    /// `AccessToken` is never copied from the row: C# `ToDeviceInfo` leaves it
+    /// null and Jellyfin omits it on the wire — carrying the live bearer token
+    /// here would leak a working credential to whoever lists devices.
     ///
     /// # Errors
     /// Returns [`DbError::InvalidGuid`] if the stored `UserId` is not a valid
@@ -26,7 +29,7 @@ impl TryFrom<DeviceEntity> for DeviceInfo {
         Ok(Self {
             name: Some(entity.device_name),
             custom_name: None,
-            access_token: Some(entity.access_token.into()),
+            access_token: None,
             id: Some(entity.device_id),
             last_user_name: None,
             app_name: Some(entity.app_name),

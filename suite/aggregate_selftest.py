@@ -40,8 +40,13 @@ def run(h50_fast, j50_fast, h50_tie, j50_tie):
         return {"op": f"GET /{variant}", "owner": "core",
                 "parity": {"deep_verified": True},
                 "perf": {"variant": variant, "comparable": comparable,
-                         "h_p50": h50, "h_p95": h50 * 2, "h_p99": h50 * 3,
-                         "j_p50": j50, "j_p95": j50 * 2, "j_p99": j50 * 3}}
+                         "f_p50": h50, "f_p95": h50 * 2, "f_p99": h50 * 3,
+                         "j_p50": j50, "j_p95": j50 * 2, "j_p99": j50 * 3,
+                         # A cold block on one op: cold aggregation (f/j keys) must
+                         # reduce AND render — a rename that misses a cold consumer
+                         # only crashes on cold-bearing data (round-2 regression).
+                         **({"cold": {"f_first": h50 * 5, "j_first": j50 * 5}}
+                            if variant == "fast" else {})}}
     return {"meta": {"ferrofin_sha": "abc", "ferrofin": "vX",
                      "load": {"model": "open-loop"}},
             "headline": {"parity_coverage": 1.0, "comparable_rows": 2,
@@ -53,7 +58,7 @@ def run(h50_fast, j50_fast, h50_tie, j50_tie):
 agg = aggregate.aggregate([run(100, 300, 0.1, 0.3), run(110, 310, 0.2, 0.4)])
 fast, tiny = agg["endpoints"]["fast"], agg["endpoints"]["tiny"]
 # fast: medians 105 vs 305 → paired ratio ~2.9×, IQR present.
-assert fast["h_p50"]["med"] == 105 and fast["j_p50"]["med"] == 305
+assert fast["f_p50"]["med"] == 105 and fast["j_p50"]["med"] == 305
 assert fast["paired_speedup"] == 2.9, fast["paired_speedup"]
 # tiny: sub-floor medians → NO ratio, counted as a paired tie.
 assert tiny["paired_speedup"] is None and tiny.get("paired_tie") is True
@@ -61,5 +66,8 @@ assert agg["headline"]["paired_excluded_ties"] == 1
 # The headline paired distribution covers only the ratio-carrying endpoint.
 assert agg["headline"]["paired_speedup"]["n"] == 1
 assert agg["headline"]["noise_floor_ms"] == 3.0
+# Cold firsts reduce under the f/j keys and the markdown renderer accepts them.
+assert fast["cold_first"]["f"]["med"] == 525 and fast["cold_first"]["j"]["med"] == 1525
+assert "525" in aggregate.render_md(agg, "abc")
 
 print("aggregate self-check: all assertions passed")

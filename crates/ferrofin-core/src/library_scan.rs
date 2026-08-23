@@ -3252,11 +3252,12 @@ impl LibraryScanner {
         // `ILocalImageProvider` ahead of the embedded-cover providers, so a
         // sidecar `folder.jpg` wins over the extracted cover.
         if !embedded_images.is_empty() {
-            let mut images = if policy.image_enabled(short, fetcher_names::LOCAL_IMAGES) {
-                discover_local_images(entity)
-            } else {
-                Vec::new()
-            };
+            // Local discovery is NEVER gated on the ImageFetchers list: upstream's
+            // `ProviderManager.CanRefreshImages` short-circuits `provider is
+            // ILocalImageProvider` to true before consulting `TypeOptions` — and the
+            // dashboard checkbox list only ever contains remote fetchers, so gating
+            // here silently killed all sidecar artwork once library options were saved.
+            let mut images = discover_local_images(entity);
             // Local discovery wins per type; the embedded cover fills what it
             // left empty (`dedup_images_by_type` is the `RemoteImage` twin of
             // this, which cannot be reused for `ItemImageInfo`).
@@ -3275,14 +3276,12 @@ impl LibraryScanner {
             }
             return;
         }
-        // "Local Images" is the media-adjacent discovery (poster.jpg next
-        // to the file); the metadata art dir below is Ferrofin-owned
-        // (uploads + earlier downloads) and is never gated.
-        let mut images = if policy.image_enabled(short, fetcher_names::LOCAL_IMAGES) {
-            discover_local_images(entity)
-        } else {
-            Vec::new()
-        };
+        // "Local Images" is the media-adjacent discovery (poster.jpg next to the
+        // file). Like the metadata art dir below, it is never gated: upstream's
+        // `CanRefreshImages` short-circuits `ILocalImageProvider` to enabled before
+        // the `TypeOptions.ImageFetchers` check, and that checkbox list only ever
+        // names remote fetchers — gating on it silently dropped all sidecar art.
+        let mut images = discover_local_images(entity);
         if images.is_empty() && policy.image_enabled(short, fetcher_names::EMBEDDED_IMAGES) {
             images = self.extract_embedded_cover(item_id, entity, streams).await;
         }
@@ -9625,6 +9624,86 @@ mod tests {
             path.as_deref().unwrap_or_default().ends_with("poster.jpg"),
             "primary image path points at the poster: {path:?}"
         );
+    }
+
+    /// Saved library options (any dashboard "Save", the bench harness, an adopted
+    /// Jellyfin DB) persist a `TypeOptions` whose `ImageFetchers` list can only ever
+    /// name REMOTE fetchers — "Local Images" is a `Cap::LocalImage` provider and never
+    /// appears in the checkbox list. Upstream short-circuits `ILocalImageProvider` to
+    /// enabled before that check; gating local discovery on the list silently dropped
+    /// every sidecar poster once options were saved.
+    #[tokio::test]
+    async fn saved_type_options_never_disable_local_artwork() {
+        use crate::item_repository::FerrofinItemRepository;
+        use crate::item_type_lookup::ItemTypeLookup;
+        use ferrofin_traits::options::InternalItemsQuery;
+        use ferrofin_traits::persistence::ItemRepository;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let media = tmp.path().join("movies");
+        std::fs::create_dir_all(&media).unwrap();
+        std::fs::write(media.join("The Matrix (1999).mkv"), b"").unwrap();
+        std::fs::write(media.join("The Matrix (1999)-poster.jpg"), b"jpg").unwrap();
+
+        let db = Database::connect_in_memory().await.unwrap();
+        db.run_migrations().await.unwrap();
+        let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+            FerrofinVirtualFolderManager::new(tmp.path().join("default"))
+                .with_item_store(persistence.clone()),
+        );
+        vf.add_virtual_folder(
+            "Movies",
+            Some(CollectionTypeOptions::movies),
+            &LibraryOptions {
+                path_infos: vec![MediaPathInfo {
+                    path: media.to_string_lossy().into_owned(),
+                }],
+                type_options: vec![ferrofin_model::configuration::TypeOptions {
+                    type_: Some("Movie".to_owned()),
+                    image_fetchers: Vec::new(),
+                    ..Default::default()
+                }],
+                ..LibraryOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let scanner = LibraryScanner::new(
+            vf.clone(),
+            Arc::new(FerrofinFileSystem::new()),
+            persistence.clone(),
+        );
+        scanner.scan_all().await.unwrap();
+
+        // Assert through the repository seam (the SQL-boundary ratchet forbids new raw
+        // queries in this file): the scanned movie carries the poster as its Primary.
+        let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
+            Arc::new(ItemTypeLookup::new());
+        let items: Arc<dyn ItemRepository> = Arc::new(FerrofinItemRepository::new(db, lookup));
+        let ids = items
+            .get_item_ids(&InternalItemsQuery {
+                include_item_types: vec![ferrofin_model::data::BaseItemKind::Movie],
+                recursive: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(ids.len(), 1, "the movie was scanned in");
+        let primaries: Vec<_> = items
+            .get_image_infos(ids[0])
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|i| i.image_type == ferrofin_model::entities::ImageType::Primary)
+            .collect();
+        assert_eq!(
+            primaries.len(),
+            1,
+            "the sidecar poster must survive an empty ImageFetchers list"
+        );
+        assert!(primaries[0].path.ends_with("poster.jpg"));
     }
 
     // With an image processor wired, the scan fills each artwork's pixel dimensions and

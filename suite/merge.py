@@ -8,12 +8,16 @@ Reads, all at a single Ferrofin SHA:
         suite/perf/results/raw/{ferrofin,jellyfin}-summary.json   (a fresh `suite/run.sh perf`)
         or the latest entry of suite/perf/bench-data.json       (fallback)
   - suite/results/raw/perf-fingerprints-{ferrofin,jellyfin}.json (optional, mid-run honesty check)
+  - suite/results/shape-baseline.json           the reviewed per-variant body-shape baseline
 
 Writes suite/results/run-<sha>.json and upserts it into suite/results/runs.json (the trend the
 viewer reads). Fairness rules baked in (not left to the reader):
   - a row is `comparable` only if the op is deep_verified, both servers answered 200 for it, and
-    Ferrofin's body SHAPE matched Jellyfin's when both were captured during the perf leg (same
-    library state — comparing across the parity/perf legs false-flags play-state fields);
+    Ferrofin's body SHAPE matches the reviewed shape baseline — an UNREVIEWED change in
+    Ferrofin's own body is exactly "fast because the body went hollow" and excludes the row
+    until acked (MERGE_ACK_SHAPES=1 advances the baseline). Ferrofin-vs-Jellyfin shape is
+    published on the row as information but NEVER excludes: the parity ledger owns that
+    verdict per-op, and gating on it silently exiled every documented divergence forever;
   - the headline median-speedup / win-rate are computed over comparable rows ONLY;
   - a Ferrofin "win" requires beating Jellyfin on p50 AND p95 AND p99 — a p50 win with a tail loss
     is surfaced as a tail loss, never folded into "faster".
@@ -42,15 +46,18 @@ from config import CONFIG  # noqa: E402
 def run_signature(record):
     """Fingerprint a run's *measured* numbers so an exact re-merge of the same raw
     artifacts collapses to one entry, while a genuine rerun (which differs in every
-    latency) stays distinct. Excludes meta.when, which changes on every merge."""
+    latency) stays distinct. Excludes meta.when (changes on every merge) and the
+    headline: exclusion OUTCOMES (comparable set, shape acks) differ between a
+    pre-ack merge and its MERGE_ACK_SHAPES re-merge of the same artifacts, and
+    hashing them turned that documented workflow into a double-counted trend point
+    (the re-merge must REPLACE the pre-ack record, not append beside it)."""
     perf = sorted(
         (o["perf"].get("variant"), o["perf"].get("f_p50"), o["perf"].get("j_p50"),
          o["perf"].get("f_p99"), o["perf"].get("j_p99"))
         for o in record.get("operations", [])
     )
     payload = json.dumps(
-        {"headline": record.get("headline"),
-         "footprint": record.get("meta", {}).get("footprint"),
+        {"footprint": record.get("meta", {}).get("footprint"),
          "perf": perf},
         sort_keys=True, default=str,
     )
@@ -252,6 +259,79 @@ def manifest_check(v2op, perf, foot, cold):
     return sorted(skip), sorted(missing)
 
 
+BASELINE_FILE = RESULTS / "shape-baseline.json"
+
+
+# Embedded diffs are capped per side so a whole-subtree divergence (hundreds of paths
+# × every /Items variant) can't balloon runs.json; the count of elided paths is kept.
+DIFF_PATH_CAP = 40
+
+
+def shape_diff(a_paths, b_paths):
+    """Key-paths present on only one side: 'missing' = in b but not a, 'extra' = in a but
+    not b (each capped at DIFF_PATH_CAP with an elided-count). None when either side has
+    no recorded paths (legacy hash-only captures)."""
+    if a_paths is None or b_paths is None:
+        return None
+    a, b = set(a_paths), set(b_paths)
+
+    def cap(paths):
+        return paths[:DIFF_PATH_CAP] + (
+            [f"… +{len(paths) - DIFF_PATH_CAP} more"] if len(paths) > DIFF_PATH_CAP else [])
+
+    return {"missing": cap(sorted(b - a)), "extra": cap(sorted(a - b))}
+
+
+def fp_entry(fp, variant, op):
+    """Normalize one capture entry. New files key {variant_id: {hash, paths}}; legacy raw
+    files keyed {op: "<hash>"} still merge (hash-only, no diffable paths)."""
+    e = fp.get(variant, fp.get(op))
+    if e is None:
+        return None
+    if isinstance(e, str):
+        return {"hash": e, "paths": None}
+    return e
+
+
+def shape_check(f, j, base, ack):
+    """The shape verdict for one GET row. Returns (reason, shape_block, baseline_entry):
+    reason         — exclusion reason string, or None (row stays comparable);
+    shape_block    — published on the row (cross-server match is informational);
+    baseline_entry — entry to write back to the shape baseline, or None to keep the old.
+    Ferrofin-vs-Jellyfin never excludes (the parity ledger owns that verdict per-op);
+    Ferrofin-vs-baseline excludes until a human acks the change. Pure so the selftest
+    pins it."""
+    if f is None or str(f["hash"]).startswith("error:"):
+        # A failed probe is NO capture, not a shape: seeding "error:HTTPError" into
+        # the baseline would flag every later healthy run (and an ack would enshrine
+        # the error as the reference). "non-json" stays — that IS a deterministic shape.
+        return None, None, None
+    if j is not None and str(j["hash"]).startswith("error:"):
+        j = None  # nobody captured a Jellyfin body — no cross-server verdict to publish
+    block = {"f": f["hash"]}
+    if j is not None:
+        block["j"] = j["hash"]
+        block["matches_jellyfin"] = f["hash"] == j["hash"]
+        if not block["matches_jellyfin"]:
+            d = shape_diff(f.get("paths"), j.get("paths"))
+            if d:
+                block["diff_vs_jellyfin"] = d
+    if base is None:
+        block["baseline"] = "new"
+        return None, block, f            # first sighting seeds the baseline
+    if f["hash"] == base["hash"]:
+        return None, block, None
+    block["changed_since_baseline"] = True
+    d = shape_diff(f.get("paths"), base.get("paths"))
+    if d:
+        block["diff_vs_baseline"] = d
+    if ack:
+        block["ack"] = True
+        return None, block, f
+    return ("body shape changed since baseline (review the diff, then re-merge with "
+            "MERGE_ACK_SHAPES=1 to accept)"), block, None
+
+
 def speedup_ratio(f_p50, j_p50):
     """The per-row speedup ratio: j/f. None when either side is missing or
     Ferrofin's median is zero (division undefined). Pure so merge_selftest.py
@@ -282,6 +362,21 @@ def main():
     perf, perf_src = perf_by_variant()
     fp_h = load_json(RAW / "perf-fingerprints-ferrofin.json", {})
     fp_j = load_json(RAW / "perf-fingerprints-jellyfin.json", {})
+    fixtures = fixture_hash()
+    # MERGE_ACK_SHAPES=1 acks every changed shape; a comma-separated variant list
+    # acks selectively (so an intended change can be accepted without also
+    # admitting an unexplained one that landed in the same run).
+    ack_env = os.environ.get("MERGE_ACK_SHAPES", "")
+    ack_all = ack_env.strip() == "1"
+    ack_set = set() if ack_all else {v.strip() for v in ack_env.split(",") if v.strip()}
+    baseline = load_json(BASELINE_FILE)
+    baseline_reset = None
+    if baseline and baseline.get("fixture_hash") != fixtures:
+        # Different fixtures shape different bodies — comparing to this baseline would flag
+        # every row for the wrong reason. Informational-only this run; reseed loudly.
+        baseline_reset = f"fixture changed {baseline.get('fixture_hash')} → {fixtures}"
+        baseline = None
+    baseline_updates, acked = {}, []
     foot = footprint()
     perf_meta = (load_json(SUITE / "perf/results/raw/ferrofin-summary.json") or {}).get("meta")
     cold = {tgt: load_json(SUITE / f"perf/results/raw/{tgt}-cold-requests.json", {})
@@ -316,7 +411,15 @@ def main():
         # them (a probe would mutate state), so their honesty gate is deep_verified —
         # the parity WRITE JOURNEY — plus the 100% expected-status check below.
         is_write = not op.startswith("GET ")
-        drift = (not is_write) and op in fp_h and op in fp_j and fp_h[op] != fp_j[op]
+        f_e = None if is_write else fp_entry(fp_h, variant, op)
+        j_e = None if is_write else fp_entry(fp_j, variant, op)
+        base_e = ((baseline or {}).get("variants") or {}).get(variant)
+        shape_reason, shape_block, base_update = shape_check(
+            f_e, j_e, base_e, ack_all or variant in ack_set)
+        if base_update is not None:
+            baseline_updates[variant] = base_update
+        if shape_block and shape_block.get("ack"):
+            acked.append(variant)
         both_ok = p.get("f_ok") == 100 and p.get("j_ok") == 100
         have_lat = p["f_p50"] is not None and p["j_p50"] is not None
         # G1: a latency comparison is only meaningful at the same arrival rate,
@@ -324,9 +427,9 @@ def main():
         # rate keys — None == None keeps them flowing through unchanged.
         same_rate = p.get("rate") == p.get("j_rate")
         rates_held = p.get("f_rate_held") is not False and p.get("j_rate_held") is not False
-        comparable = deep and both_ok and have_lat and not drift and same_rate and rates_held
+        comparable = deep and both_ok and have_lat and not shape_reason and same_rate and rates_held
         reason = (None if comparable else
-                  "body shape diverges from Jellyfin at bench time" if drift else
+                  shape_reason if shape_reason else
                   "not deep-verified" if not deep else
                   "200-rate < 100%" if not both_ok else
                   "measured at different arrival rates" if not same_rate else
@@ -351,6 +454,9 @@ def main():
             }
         operations.append({
             "op": op, "tag": tag,
+            # Body-shape record: Ferrofin's hash, Jellyfin's hash + match (informational),
+            # and — when changed vs the reviewed baseline — the field-level diff.
+            **({"shape": shape_block} if shape_block else {}),
             # E2: core vs compiled-in-extension ownership, from the parity
             # ledger (whose source is the EXTENSION_ROUTES const in
             # ferrofin-api — compile-time asserted against REAL_ROUTES).
@@ -405,6 +511,11 @@ def main():
         "comparable_rows": len(comp),
         "dropped_rows": sum(dropped.values()),
         "dropped_by_reason": dropped,
+        # Cross-server shape divergences are PUBLISHED, not hidden in exclusions: rows whose
+        # body shape differs from Jellyfin's at bench time (see each row's `shape` block —
+        # the parity ledger classifies whether each is a defect or a documented divergence).
+        "shape_divergences_vs_jellyfin": sum(
+            1 for o in operations if o.get("shape", {}).get("matches_jellyfin") is False),
         "median_speedup": round(median(speedups), 3) if speedups else None,
         "win_rate": round(sum(o["win_all_three"] for o in comp) / len(comp), 3) if comp else None,
         "tail_losses": [o["variant"] for o in comp if o["tail_loss"]],
@@ -418,7 +529,7 @@ def main():
             "ferrofin": sh("git", "describe", "--tags", "--always") or "dev",
             "ferrofin_sha": sha,
             "jellyfin_image": bench_env("JELLYFIN_IMAGE") or "jellyfin/jellyfin:10.11.8",
-            "fixture_hash": fixture_hash(),
+            "fixture_hash": fixtures,
             "cpus": int(bench_env("BENCH_CPUS")) if bench_env("BENCH_CPUS") else None,
             "mem": bench_env("BENCH_MEM"),
             # The load model + engine + resolved methodology knobs come from the
@@ -441,6 +552,8 @@ def main():
             "server_build": server_build(),
             "skipped_variants": skipped or None,
             "incomplete": missing or None,
+            **({"shape_baseline_reset": baseline_reset} if baseline_reset else {}),
+            **({"shape_acked": sorted(acked)} if acked else {}),
             "when": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%MZ"),
         },
         "headline": headline,
@@ -463,6 +576,20 @@ def main():
         out.write_text(json.dumps(record, indent=2) + "\n")
         print(f">> wrote {out.relative_to(ROOT)} — INCOMPLETE, excluded from the trend")
         return
+
+    # The shape baseline advances only on a COMPLETE record, and only when something
+    # actually moved (a seed, an ack, or a fixture reset): unchanged runs must leave
+    # the file byte-identical, so `git diff suite/results/shape-baseline.json` IS the
+    # body-shape change under review — a file that churned on every gate run would
+    # train people to blind-commit it. Variants dropped from the registry are pruned.
+    if fp_h and (baseline_updates or baseline_reset):
+        merged = dict(((baseline or {}).get("variants") or {}))
+        merged.update(baseline_updates)
+        known = {v for v, _ in v2op.items()}
+        merged = {v: e for v, e in merged.items() if v in known}
+        BASELINE_FILE.write_text(json.dumps(
+            {"fixture_hash": fixtures, "sha": sha, "variants": merged},
+            indent=2, sort_keys=True) + "\n")
 
     # Keep every distinct run of the same SHA (variance across reruns is the point) — but
     # collapse an exact re-merge of the same raw artifacts so a second `run.sh merge`
@@ -496,6 +623,20 @@ def main():
           f"parity coverage: {hl['parity_coverage']}")
     if hl["tail_losses"]:
         print(f"   tail losses (p50 win, p95/p99 loss): {', '.join(hl['tail_losses'])}")
+    if hl["shape_divergences_vs_jellyfin"]:
+        print(f"   shape ≠ jellyfin on {hl['shape_divergences_vs_jellyfin']} rows "
+              "(informational — each row's shape.diff_vs_jellyfin names the fields)")
+    changed = [o["perf"]["variant"] for o in operations
+               if (o.get("shape") or {}).get("changed_since_baseline")
+               and not (o.get("shape") or {}).get("ack")]
+    if changed:
+        print(f"   !! body shape CHANGED since baseline — rows excluded until reviewed "
+              f"(MERGE_ACK_SHAPES=1): {', '.join(changed)}")
+    unmatched = ack_set - set(acked)
+    if unmatched:
+        # A typo'd ack name would otherwise be silently ignored while its row stays excluded.
+        print(f"   !! MERGE_ACK_SHAPES named variants with no shape change to ack: "
+              f"{', '.join(sorted(unmatched))}")
 
 
 if __name__ == "__main__":

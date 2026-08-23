@@ -168,7 +168,11 @@ impl FerrofinDeviceManager {
         Ok(DeviceInfo {
             name: Some(device.device_name.clone()),
             custom_name: options.and_then(|o| o.custom_name.clone()),
-            access_token: Some(device.access_token.clone().into()),
+            // C# `ToDeviceInfo` never assigns AccessToken — the field exists in the
+            // schema but Jellyfin 10.11.8 always omits it on the wire. Copying the
+            // row's live bearer token here handed every device's working credential
+            // to whoever lists devices; port the omission, not the column.
+            access_token: None,
             id: Some(device.device_id.clone()),
             last_user_name: Some(last_user_name),
             app_name: Some(device.app_name.clone()),
@@ -937,6 +941,28 @@ mod tests {
         assert_eq!(by_id["dev-a"].last_user_name.as_deref(), Some("ay"));
         assert_eq!(by_id["dev-b"].last_user_name.as_deref(), Some("bee"));
         assert_eq!(by_id["dev-b"].custom_name.as_deref(), Some("Living Room"));
+    }
+
+    /// The wire paths must never carry a device's live bearer token: C# `ToDeviceInfo`
+    /// never assigns `AccessToken`, so Jellyfin 10.11.8 omits it — echoing the row's
+    /// token here handed every device's working credential to whoever lists devices.
+    #[tokio::test]
+    async fn device_listings_never_expose_the_access_token() {
+        let db = test_db().await;
+        let owner = Uuid::from_u128(23);
+        seed_named_user(&db, owner, "own").await;
+        let mgr = FerrofinDeviceManager::new(db.clone());
+        device_at(&mgr, owner, "dev-tok", Utc::now()).await;
+
+        let listed = mgr.get_devices_for_user(None).await.expect("list");
+        assert!(listed.items.iter().all(|d| d.access_token.is_none()));
+        let one = mgr.get_device("dev-tok").await.expect("get").expect("some");
+        assert!(one.access_token.is_none());
+        let infos = mgr
+            .get_device_infos(&DeviceQuery::default())
+            .await
+            .expect("infos");
+        assert!(infos.items.iter().all(|d| d.access_token.is_none()));
     }
 
     /// A device whose owning `Users` row is missing is a `404`, not a silently
