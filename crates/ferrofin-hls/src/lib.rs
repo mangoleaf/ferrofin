@@ -7,10 +7,13 @@
 //!   (+ `IDynamicHlsPlaylistGenerator`), including the parity-core timing
 //!   helpers ([`compute_segments`], [`compute_equal_length_segments`],
 //!   [`is_extraction_allowed_for_file`]).
+//! - [`hls_codec_strings`] — `Jellyfin.Api.Helpers.HlsCodecStringHelpers`, the
+//!   RFC 6381 `CODECS` strings the master playlist advertises.
 
 pub mod create_main_playlist_request;
 pub mod dynamic_hls_playlist_generator;
 pub mod error;
+pub mod hls_codec_strings;
 pub mod hls_stream_manager;
 
 pub use create_main_playlist_request::CreateMainPlaylistRequest;
