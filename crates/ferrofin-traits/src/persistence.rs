@@ -529,6 +529,31 @@ pub trait ItemPersistenceService: Send + Sync {
         Ok(())
     }
 
+    /// The stored dimensions/blurhash of every image row attached to
+    /// `item_ids`, read in one batch.
+    ///
+    /// This is the read half of C#'s `LibraryManager.ImageNeedsRefresh`: an
+    /// image whose stored `Width`/`Height`/`BlurHash` are already filled and
+    /// whose stored `DateModified` still matches the file's mtime is *not*
+    /// refreshed, so upstream never re-decodes an unchanged poster. Ferrofin
+    /// holds its image rows in the database rather than on an in-memory
+    /// `BaseItem`, so the scan reads them back — once for the whole run, in the
+    /// same shape as the other scan prereads, never once per item.
+    ///
+    /// The default returns nothing (stub/fake services), which is safe: a
+    /// caller that finds no stored metadata simply recomputes.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn image_metadata_for_items(
+        &self,
+        item_ids: &[Uuid],
+    ) -> Result<Vec<StoredImageMetadata>, ServiceError> {
+        let _ = item_ids;
+        Ok(Vec::new())
+    }
+
     /// Sets a single image (`image`) on an item, replacing any existing rows of
     /// the same [`ImageType`](ferrofin_model::entities::ImageType) — the write path
     /// for an uploaded poster/backdrop/logo (`ImageController.SetItemImage`).
@@ -882,6 +907,26 @@ pub trait MediaAttachmentRepository: Send + Sync {
 }
 
 fn _assert_object_safe_media_attachment_repository(_: &dyn MediaAttachmentRepository) {}
+
+/// What a previous scan already recorded about one image file: the probed
+/// dimensions, the blurhash, and the file mtime those were computed from.
+///
+/// Returned by
+/// [`ItemPersistenceService::image_metadata_for_items`] and consumed by the
+/// scan's port of C#'s `LibraryManager.ImageNeedsRefresh`.
+#[derive(Debug, Clone)]
+pub struct StoredImageMetadata {
+    /// The image file's path — the identity of the artwork on disk.
+    pub path: String,
+    /// The stored pixel width (`0` when never probed).
+    pub width: i32,
+    /// The stored pixel height (`0` when never probed).
+    pub height: i32,
+    /// The stored blurhash, absent when never computed.
+    pub blur_hash: Option<String>,
+    /// The file mtime the stored values were computed from.
+    pub date_modified: chrono::DateTime<chrono::Utc>,
+}
 
 /// The outcome of writing one credited person via
 /// [`PeopleRepository::update_people`] — enough for the caller to fetch that

@@ -49,7 +49,9 @@ use ferrofin_traits::filesystem::FileSystem;
 use ferrofin_traits::library::VirtualFolderManager;
 use ferrofin_traits::media_encoding::{MediaEncoder, MediaInfoRequest};
 use ferrofin_traits::options::{InternalItemsQuery, ItemImageInfo};
-use ferrofin_traits::persistence::{ItemPersistenceService, ItemRepository, MediaStreamRepository};
+use ferrofin_traits::persistence::{
+    ItemPersistenceService, ItemRepository, MediaStreamRepository, StoredImageMetadata,
+};
 use std::collections::HashMap;
 use uuid::Uuid;
 
@@ -83,6 +85,12 @@ struct ArtworkCache {
     /// Item id → OMDb's poster URL, captured during the metadata pass so the
     /// image pass can use it without a second OMDb request.
     omdb_poster: std::collections::HashMap<String, String>,
+    /// Image file path → what a previous scan already probed for that file
+    /// (dimensions, blurhash, and the mtime they were computed from), read
+    /// once for the whole scan. Keyed by PATH rather than by item because
+    /// dimensions and a blurhash are functions of the file alone, so two rows
+    /// sharing one `folder.jpg` share the answer.
+    stored_images: std::collections::HashMap<String, StoredImageMetadata>,
 }
 
 /// What a remote metadata fetch yields for one item: the cast/crew to persist
@@ -1379,15 +1387,19 @@ impl LibraryScanner {
         &self,
         planned: &[Planned],
     ) -> (
-        ArtworkCache,
+        Box<ArtworkCache>,
         std::collections::HashSet<Uuid>,
         std::collections::HashMap<Uuid, StoredText>,
     ) {
         // Carries matched series' TMDB ids + their episode-still URLs across
         // the scan so seasons/episodes resolve against the same series lookup,
         // pre-seeded with the external ids previous scans recorded.
-        let mut art_cache = ArtworkCache::default();
+        // Boxed: the scan loop holds this cache across every item's awaits, so
+        // keeping its six maps out of that future keeps the per-scan future
+        // small (clippy's `large_futures` ceiling is the tripwire).
+        let mut art_cache = Box::new(ArtworkCache::default());
         self.preload_provider_ids(planned, &mut art_cache).await;
+        self.preload_image_metadata(planned, &mut art_cache).await;
         // One read of the locked-item set for the whole scan, replacing the
         // per-item row hydration the loop used to pay (see `locked_items`).
         let locked_items = self.locked_items(planned).await;
@@ -1411,6 +1423,31 @@ impl LibraryScanner {
                 }
             }
             Err(err) => tracing::warn!(%err, "could not preload recorded provider ids"),
+        }
+    }
+
+    /// Seeds the scan's image cache with what previous scans already probed,
+    /// in ONE query for the whole run.
+    ///
+    /// This is what makes [`image_metadata_is_current`] answerable without a
+    /// read per item. C# gets the same information for free — its
+    /// `BaseItem.ImageInfos` are already in memory when
+    /// `LibraryManager.UpdateImagesAsync` runs `ImageNeedsRefresh` — whereas
+    /// Ferrofin's image rows live only in the database, so the scan reads them
+    /// back up front, in the same one-read-per-scan shape as the locked-item
+    /// and episode-text prereads.
+    async fn preload_image_metadata(&self, planned: &[Planned], art_cache: &mut ArtworkCache) {
+        if planned.is_empty() {
+            return;
+        }
+        let ids: Vec<Uuid> = planned.iter().map(|p| p.id).collect();
+        match self.persistence.image_metadata_for_items(&ids).await {
+            Ok(stored) => {
+                for image in stored {
+                    art_cache.stored_images.insert(image.path.clone(), image);
+                }
+            }
+            Err(err) => tracing::warn!(%err, "could not preload stored image metadata"),
         }
     }
 
@@ -1766,6 +1803,10 @@ impl LibraryScanner {
             dedup_images_by_type(remote),
         )
         .await;
+        // No adoption here: the post-scan music pass runs outside the item walk
+        // and so has no `ArtworkCache`. Re-probing a handful of album/artist
+        // covers is not the scan's cost centre; the adoption belongs here too
+        // once the passes share the walk's cache.
         self.fill_image_metadata(&mut infos).await;
         if !infos.is_empty()
             && let Err(err) = self.persistence.save_item_images(item_id, &infos).await
@@ -2097,6 +2138,12 @@ impl LibraryScanner {
             return;
         };
         for image in images.iter_mut() {
+            // Already answered — either by a caller that adopted a previous
+            // scan's values (`adopt_stored_image_metadata`) or by an earlier
+            // pass in this one. Re-probing would decode the same file twice.
+            if image_metadata_is_complete(image) {
+                continue;
+            }
             let Ok(dims) = processor.get_image_dimensions(&image.path).await else {
                 continue;
             };
@@ -3050,6 +3097,36 @@ impl LibraryScanner {
         }
     }
 
+    /// What previous scans already probed for the profile images of `written`,
+    /// keyed by image path — one query for the whole credit list.
+    ///
+    /// Built here rather than carried on the scan's `ArtworkCache`: person ids
+    /// are only known once `update_people` has written them, which is after the
+    /// per-scan prereads have run.
+    async fn stored_person_image_metadata(
+        &self,
+        written: &[ferrofin_traits::persistence::WrittenPerson],
+    ) -> std::collections::HashMap<String, StoredImageMetadata> {
+        let with_art: Vec<Uuid> = written
+            .iter()
+            .filter(|p| p.image_url.is_some())
+            .map(|p| p.id)
+            .collect();
+        if with_art.is_empty() {
+            return std::collections::HashMap::new();
+        }
+        match self.persistence.image_metadata_for_items(&with_art).await {
+            Ok(rows) => rows
+                .into_iter()
+                .map(|row| (row.path.clone(), row))
+                .collect(),
+            Err(err) => {
+                tracing::warn!(%err, "could not read stored person image metadata");
+                std::collections::HashMap::new()
+            }
+        }
+    }
+
     /// Enriches credited people: downloads each one's TMDB profile image as their
     /// `Primary` artwork, and fetches a biography (bio/birthday/deathday/birthplace)
     /// for each *newly-created* person. Best-effort and cached — images skip
@@ -3066,6 +3143,12 @@ impl LibraryScanner {
         let (Some(tmdb), Some(meta_root)) = (&self.tmdb, &self.metadata_dir) else {
             return;
         };
+        // The same `ImageNeedsRefresh` gate the item walk applies, batched over
+        // this item's whole credit list: without it every rescan re-decodes and
+        // re-BlurHash-encodes every cast member's profile photo, which on a
+        // library with thousands of credited people is more image work than the
+        // items themselves. One read per credited cast, not one per person.
+        let stored = self.stored_person_image_metadata(&written).await;
         for person in written {
             let id = person.id.to_string();
             if let Some(url) = person.image_url {
@@ -3089,6 +3172,7 @@ impl LibraryScanner {
                 // it writes the result back onto its in-memory BaseItem; Ferrofin
                 // reloads image rows from the DB each time, so the DB is where the
                 // answer has to live.)
+                adopt_stored_image_metadata(&mut infos, &stored);
                 self.fill_image_metadata(&mut infos).await;
                 if !infos.is_empty()
                     && let Err(err) = self.persistence.save_item_images(person.id, &infos).await
@@ -3332,6 +3416,7 @@ impl LibraryScanner {
             );
             self.append_art_dir_images(entity, &mut images);
             self.apply_dynamic_images(entity, &mut images, policy).await;
+            adopt_stored_image_metadata(&mut images, &art_cache.stored_images);
             self.fill_image_metadata(&mut images).await;
             if let Err(err) = self.persistence.save_item_images(item_id, &images).await {
                 tracing::warn!(%err, item = %item_id, "failed to persist embedded artwork");
@@ -3352,6 +3437,7 @@ impl LibraryScanner {
         }
         self.append_art_dir_images(entity, &mut images);
         self.apply_dynamic_images(entity, &mut images, policy).await;
+        adopt_stored_image_metadata(&mut images, &art_cache.stored_images);
         self.fill_image_metadata(&mut images).await;
         if !images.is_empty()
             && let Err(err) = self.persistence.save_item_images(item_id, &images).await
@@ -6186,12 +6272,70 @@ fn image_item_kind(type_: &str) -> ImageItemKind {
     }
 }
 
+/// Whether an image row already carries everything the DTO layer needs, so
+/// nothing has to decode the file.
+fn image_metadata_is_complete(image: &ItemImageInfo) -> bool {
+    image.width > 0 && image.height > 0 && image.blur_hash.as_ref().is_some_and(|b| !b.is_empty())
+}
+
+/// Copies a previous scan's dimensions and blurhash onto each discovered image
+/// whose file has not changed since, so the image pass has nothing left to
+/// decode.
+///
+/// This is the Ferrofin shape of C#'s `LibraryManager.UpdateImagesAsync`
+/// selecting only the `ImageNeedsRefresh` images: upstream's `BaseItem` already
+/// holds the previous values in memory, so it simply leaves the untouched ones
+/// alone. Here they come from the scan's one-query image preread.
+fn adopt_stored_image_metadata(
+    images: &mut [ItemImageInfo],
+    stored: &std::collections::HashMap<String, StoredImageMetadata>,
+) {
+    if stored.is_empty() {
+        return;
+    }
+    for image in images.iter_mut() {
+        if let Some(prev) = stored.get(&image.path)
+            && image_metadata_is_current(prev, image.date_modified)
+        {
+            image.width = prev.width;
+            image.height = prev.height;
+            image.blur_hash.clone_from(&prev.blur_hash);
+        }
+    }
+}
+
+/// Whether `stored` still describes the file, so its dimensions and blurhash
+/// can be reused instead of re-probing.
+///
+/// Verbatim port of the local-file half of C#
+/// `LibraryManager.ImageNeedsRefresh`: a refresh is needed when the stored
+/// width, height or blurhash is missing, or when the stored `DateModified`
+/// differs from the file's current mtime by **more than one second**. The
+/// one-second tolerance is upstream's, and it is load-bearing — a filesystem
+/// that stores mtimes at whole-second resolution would otherwise never agree
+/// with a sub-second timestamp Ferrofin wrote.
+fn image_metadata_is_current(
+    stored: &StoredImageMetadata,
+    file_modified: chrono::DateTime<Utc>,
+) -> bool {
+    stored.width > 0
+        && stored.height > 0
+        && stored.blur_hash.as_ref().is_some_and(|b| !b.is_empty())
+        && stored
+            .date_modified
+            .signed_duration_since(file_modified)
+            .num_milliseconds()
+            .abs()
+            <= 1000
+}
+
 /// Discovers an item's local artwork (poster/backdrop/logo/…) by scanning its
 /// folder with the local-image providers, returning rows ready to persist.
 ///
-/// Dimensions are left `0` (unknown) here — the image files are decoded lazily on
-/// serve, not during the scan. Episodes use the episode provider; everything the
-/// generic provider supports uses it; unsupported kinds yield nothing.
+/// Dimensions are left `0` (unknown) here; they are filled in afterwards, either
+/// by adopting a previous scan's probe or by decoding the file. Episodes use the
+/// episode provider; everything the generic provider supports uses it;
+/// unsupported kinds yield nothing.
 fn discover_local_images(entity: &BaseItemEntity) -> Vec<ItemImageInfo> {
     let Some(path) = entity.path.as_deref() else {
         return Vec::new();
@@ -6980,6 +7124,109 @@ mod tests {
                 .as_deref()
                 .is_some_and(|h| !h.is_empty()),
             "person art must carry the blurhash the same probe produces"
+        );
+    }
+
+    // Every scan re-runs the credits fetch, so before the `ImageNeedsRefresh`
+    // gate reached the cast, every scan also re-decoded and re-BlurHash-encoded
+    // every credited person's profile photo. A 2-movie live library already
+    // pulls 24 person images; a real one pulls thousands.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn enrich_people_reuses_stored_person_image_metadata_on_a_rescan() {
+        use crate::item_persistence_service::FerrofinItemPersistenceService;
+        use crate::item_repository::FerrofinItemRepository;
+        use crate::item_type_lookup::{ItemTypeLookup, stored_type_name};
+        use crate::people_repository::FerrofinPeopleRepository;
+        use crate::test_support::test_db;
+        use ferrofin_db::entities::base_items::BaseItemEntity;
+        use ferrofin_drawing::{ImageCrateEncoder, ImageProcessor};
+        use ferrofin_model::data::BaseItemKind;
+        use ferrofin_traits::persistence::{ItemPersistenceService, ItemRepository, WrittenPerson};
+        use std::sync::atomic::Ordering;
+
+        let db = test_db().await;
+        let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
+            Arc::new(ItemTypeLookup::new());
+        let items: Arc<dyn ItemRepository> =
+            Arc::new(FerrofinItemRepository::new(db.clone(), lookup));
+
+        let person_id = uuid::Uuid::new_v4();
+        persistence
+            .save_items(&[BaseItemEntity {
+                id: ferrofin_db::store::guid_to_db(person_id),
+                type_: stored_type_name(BaseItemKind::Person).unwrap().to_owned(),
+                name: Some("Ada Lovelace".into()),
+                ..Default::default()
+            }])
+            .await
+            .expect("seed person");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let meta_root = tmp.path().join("People");
+        // Pre-place the profile art where `download_images` looks, so the test
+        // never reaches the network.
+        let art_dir = meta_root.join(person_id.to_string());
+        std::fs::create_dir_all(&art_dir).unwrap();
+        write_poster(&art_dir.join("primary.jpg"), 48, 64);
+
+        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+            FerrofinVirtualFolderManager::new(tmp.path().join("default"))
+                .with_item_store(persistence.clone()),
+        );
+        let dimensions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let blur_hashes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let processor: Arc<dyn ferrofin_traits::drawing::ImageProcessor> =
+            Arc::new(CountingProcessor {
+                inner: Arc::new(ImageProcessor::new(
+                    Arc::new(ImageCrateEncoder::new()),
+                    tmp.path().join("cache"),
+                )),
+                dimensions: Arc::clone(&dimensions),
+                blur_hashes: Arc::clone(&blur_hashes),
+            });
+        let scanner =
+            LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence.clone())
+                .with_image_processor(processor)
+                .with_metadata(
+                    Arc::new(ferrofin_providers::TmdbClient::new()),
+                    meta_root.clone(),
+                );
+
+        let people = FerrofinPeopleRepository::new(db.clone());
+        let credit = || WrittenPerson {
+            id: person_id,
+            // No biography lookup: that branch is the only one that would
+            // reach the network.
+            needs_details: false,
+            image_url: Some("https://image.tmdb.invalid/ada.jpg".into()),
+            provider_id: None,
+        };
+
+        scanner.enrich_people(&people, vec![credit()]).await;
+        let first = items.get_image_infos(person_id).await.expect("images");
+        assert_eq!((first[0].width, first[0].height), (48, 64));
+        assert!(dimensions.swap(0, Ordering::Relaxed) >= 1);
+        assert!(blur_hashes.swap(0, Ordering::Relaxed) >= 1);
+
+        scanner.enrich_people(&people, vec![credit()]).await;
+        assert_eq!(
+            (
+                dimensions.load(Ordering::Relaxed),
+                blur_hashes.load(Ordering::Relaxed)
+            ),
+            (0, 0),
+            "an unchanged profile photo must not be decoded again"
+        );
+        let second = items.get_image_infos(person_id).await.expect("images");
+        assert_eq!(
+            (
+                second[0].width,
+                second[0].height,
+                second[0].blur_hash.clone()
+            ),
+            (first[0].width, first[0].height, first[0].blur_hash.clone()),
+            "the reused row is identical to the probed one"
         );
     }
 
@@ -11240,5 +11487,345 @@ mod tests {
         // rescans — favourites, play-state and client deep links all key on it,
         // and a Jellyfin-identical derivation is what makes the DB drop-in safe.
         assert_eq!(second[0].id, dune_id, "the survivor keeps its id");
+    }
+
+    // ---------------------------------------------------------------------
+    // Image metadata is probed ONCE per file, not once per scan.
+    // ---------------------------------------------------------------------
+
+    // Port oracle: `LibraryManager.ImageNeedsRefresh` (Emby.Server.Implementations/
+    // Library/LibraryManager.cs). A local image is refreshed only when its stored
+    // width/height/blurhash is missing, or when the stored DateModified differs
+    // from the file's mtime by MORE than one second.
+    #[test]
+    fn image_metadata_is_current_matches_jellyfins_image_needs_refresh() {
+        use ferrofin_traits::persistence::StoredImageMetadata;
+
+        let base = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
+        let complete = |dm: chrono::DateTime<chrono::Utc>| StoredImageMetadata {
+            path: "/m/poster.jpg".to_owned(),
+            width: 1000,
+            height: 1500,
+            blur_hash: Some("LEHV6nWB2yk8".to_owned()),
+            date_modified: dm,
+        };
+
+        assert!(
+            super::image_metadata_is_current(&complete(base), base),
+            "unchanged file with complete metadata is reused"
+        );
+        assert!(
+            super::image_metadata_is_current(&complete(base), base + chrono::Duration::seconds(1)),
+            "a one-second skew is inside upstream's tolerance"
+        );
+        assert!(
+            !super::image_metadata_is_current(&complete(base), base + chrono::Duration::seconds(2)),
+            "a file newer than the stored stamp forces a refresh"
+        );
+        assert!(
+            !super::image_metadata_is_current(&complete(base), base - chrono::Duration::seconds(2)),
+            "the comparison is absolute, as C#'s .Duration() is"
+        );
+
+        for (label, broken) in [
+            (
+                "no width",
+                StoredImageMetadata {
+                    width: 0,
+                    ..complete(base)
+                },
+            ),
+            (
+                "no height",
+                StoredImageMetadata {
+                    height: 0,
+                    ..complete(base)
+                },
+            ),
+            (
+                "no blurhash",
+                StoredImageMetadata {
+                    blur_hash: None,
+                    ..complete(base)
+                },
+            ),
+            (
+                "empty blurhash",
+                StoredImageMetadata {
+                    blur_hash: Some(String::new()),
+                    ..complete(base)
+                },
+            ),
+        ] {
+            assert!(
+                !super::image_metadata_is_current(&broken, base),
+                "{label}: incomplete stored metadata must be recomputed"
+            );
+        }
+    }
+
+    /// An [`ImageProcessor`](ferrofin_traits::drawing::ImageProcessor) that counts
+    /// the two calls the scan's image pass makes and delegates everything to a
+    /// real processor, so a test can prove a rescan did no pixel work.
+    struct CountingProcessor {
+        inner: Arc<dyn ferrofin_traits::drawing::ImageProcessor>,
+        dimensions: Arc<std::sync::atomic::AtomicUsize>,
+        blur_hashes: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl ferrofin_traits::drawing::ImageProcessor for CountingProcessor {
+        fn supported_input_formats(&self) -> Vec<String> {
+            self.inner.supported_input_formats()
+        }
+        fn supports_image_collage_creation(&self) -> bool {
+            self.inner.supports_image_collage_creation()
+        }
+        fn supported_image_output_formats(&self) -> Vec<ferrofin_model::drawing::ImageFormat> {
+            self.inner.supported_image_output_formats()
+        }
+        async fn get_image_dimensions(
+            &self,
+            path: &str,
+        ) -> Result<ferrofin_model::drawing::ImageDimensions, ServiceError> {
+            self.dimensions
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.get_image_dimensions(path).await
+        }
+        async fn get_item_image_dimensions(
+            &self,
+            item_id: uuid::Uuid,
+            info: &ferrofin_traits::options::ItemImageInfo,
+        ) -> Result<ferrofin_model::drawing::ImageDimensions, ServiceError> {
+            self.inner.get_item_image_dimensions(item_id, info).await
+        }
+        async fn get_image_blur_hash(&self, path: &str) -> Result<String, ServiceError> {
+            self.blur_hashes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.get_image_blur_hash(path).await
+        }
+        async fn get_image_blur_hash_sized(
+            &self,
+            path: &str,
+            image_dimensions: ferrofin_model::drawing::ImageDimensions,
+        ) -> Result<String, ServiceError> {
+            self.blur_hashes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner
+                .get_image_blur_hash_sized(path, image_dimensions)
+                .await
+        }
+        async fn get_image_cache_tag(
+            &self,
+            item_id: uuid::Uuid,
+            image: &ferrofin_traits::options::ItemImageInfo,
+        ) -> Result<Option<String>, ServiceError> {
+            self.inner.get_image_cache_tag(item_id, image).await
+        }
+        async fn get_image_cache_tag_for_path(
+            &self,
+            base_item_path: &str,
+            image_date_modified: chrono::DateTime<chrono::Utc>,
+        ) -> Result<Option<String>, ServiceError> {
+            self.inner
+                .get_image_cache_tag_for_path(base_item_path, image_date_modified)
+                .await
+        }
+        async fn process_image(
+            &self,
+            options: &ferrofin_traits::options::ImageProcessingOptions,
+        ) -> Result<ferrofin_traits::drawing::ProcessedImage, ServiceError> {
+            self.inner.process_image(options).await
+        }
+        async fn create_image_collage(
+            &self,
+            options: &ferrofin_traits::options::ImageCollageOptions,
+            library_name: Option<&str>,
+        ) -> Result<(), ServiceError> {
+            self.inner.create_image_collage(options, library_name).await
+        }
+    }
+
+    /// The scanner + repository + call counters a poster-refresh test drives,
+    /// built over a one-movie library with a `poster.jpg` beside the media file.
+    struct PosterFixture {
+        scanner: LibraryScanner,
+        repo: Arc<dyn ferrofin_traits::persistence::ItemRepository>,
+        poster: std::path::PathBuf,
+        dimensions: Arc<std::sync::atomic::AtomicUsize>,
+        blur_hashes: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl PosterFixture {
+        /// The stored Primary image row of the fixture's single movie.
+        async fn primary(&self) -> ferrofin_traits::options::ItemImageInfo {
+            use ferrofin_model::data::BaseItemKind;
+            use ferrofin_model::entities::ImageType;
+            use ferrofin_traits::options::InternalItemsQuery;
+
+            let movies = self
+                .repo
+                .get_item_list(&InternalItemsQuery {
+                    include_item_types: vec![BaseItemKind::Movie],
+                    recursive: true,
+                    ..Default::default()
+                })
+                .await
+                .expect("movie rows");
+            let id = uuid::Uuid::parse_str(&movies[0].id).expect("movie id");
+            self.repo
+                .get_image_infos(id)
+                .await
+                .expect("image rows")
+                .into_iter()
+                .find(|i| i.image_type == ImageType::Primary)
+                .expect("poster row")
+        }
+    }
+
+    /// Builds [`PosterFixture`] under `root`, with a `width`×`height` poster.
+    async fn poster_fixture(root: &std::path::Path, width: u32, height: u32) -> PosterFixture {
+        use ferrofin_drawing::{ImageCrateEncoder, ImageProcessor};
+        use ferrofin_traits::persistence::ItemRepository;
+
+        let movies = root.join("movies");
+        let media = movies.join("Heat (1995)");
+        std::fs::create_dir_all(&media).unwrap();
+        std::fs::write(media.join("Heat (1995).mkv"), b"").unwrap();
+        let poster_path = media.join("poster.jpg");
+        write_poster(&poster_path, width, height);
+
+        let db = Database::connect_in_memory().await.unwrap();
+        db.run_migrations().await.unwrap();
+        let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+            FerrofinVirtualFolderManager::new(root.join("default"))
+                .with_item_store(persistence.clone()),
+        );
+        vf.add_virtual_folder(
+            "Movies",
+            Some(CollectionTypeOptions::movies),
+            &LibraryOptions {
+                path_infos: vec![MediaPathInfo {
+                    path: movies.to_string_lossy().into_owned(),
+                }],
+                ..LibraryOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
+            Arc::new(crate::item_type_lookup::ItemTypeLookup::new());
+        let repo: Arc<dyn ItemRepository> =
+            Arc::new(crate::FerrofinItemRepository::new(db.clone(), lookup));
+        let dimensions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let blur_hashes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let processor: Arc<dyn ferrofin_traits::drawing::ImageProcessor> =
+            Arc::new(CountingProcessor {
+                inner: Arc::new(ImageProcessor::new(
+                    Arc::new(ImageCrateEncoder::new()),
+                    root.join("cache"),
+                )),
+                dimensions: Arc::clone(&dimensions),
+                blur_hashes: Arc::clone(&blur_hashes),
+            });
+        let scanner = LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence)
+            .with_image_processor(processor)
+            .with_items(Arc::clone(&repo))
+            .with_metadata_dir(root.join("meta"));
+
+        PosterFixture {
+            scanner,
+            repo,
+            poster: poster_path,
+            dimensions,
+            blur_hashes,
+        }
+    }
+
+    /// Writes a deterministic `width`×`height` JPEG to `path`.
+    fn write_poster(path: &std::path::Path, width: u32, height: u32) {
+        let mut poster = image::RgbImage::new(width, height);
+        for (x, y, px) in poster.enumerate_pixels_mut() {
+            *px = image::Rgb([
+                u8::try_from(x % 256).unwrap_or(0),
+                30,
+                u8::try_from(y % 256).unwrap_or(0),
+            ]);
+        }
+        poster.save(path).unwrap();
+    }
+
+    // Decoding a poster and BlurHash-encoding it is the largest non-ffprobe slice
+    // of a scan (measured: 2.79 s of a 5.76 s 1100-item loop), and it was paid
+    // again on EVERY rescan for files that had not changed. Upstream pays it once
+    // per file (`LibraryManager.ImageNeedsRefresh`), and so must we — while
+    // storing byte-identical rows.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rescan_reuses_stored_image_metadata_instead_of_re_probing() {
+        use std::sync::atomic::Ordering;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let fx = poster_fixture(tmp.path(), 40, 60).await;
+
+        fx.scanner.scan_all().await.unwrap();
+        let cold_dimensions = fx.dimensions.swap(0, Ordering::Relaxed);
+        let cold_hashes = fx.blur_hashes.swap(0, Ordering::Relaxed);
+        assert!(
+            cold_dimensions >= 1 && cold_hashes >= 1,
+            "the first scan must actually probe the poster (got {cold_dimensions} dimension \
+             probes / {cold_hashes} blurhashes)"
+        );
+        let cold = fx.primary().await;
+        assert!(cold.width > 0 && cold.blur_hash.is_some());
+
+        fx.scanner.scan_all().await.unwrap();
+        assert_eq!(
+            (
+                fx.dimensions.load(Ordering::Relaxed),
+                fx.blur_hashes.load(Ordering::Relaxed)
+            ),
+            (0, 0),
+            "an unchanged poster must not be decoded again on a rescan"
+        );
+
+        // …and the row the rescan wrote is identical to the one the cold scan did.
+        let rescanned = fx.primary().await;
+        assert_eq!(rescanned.width, cold.width);
+        assert_eq!(rescanned.height, cold.height);
+        assert_eq!(rescanned.blur_hash, cold.blur_hash);
+    }
+
+    // The other half of `ImageNeedsRefresh`: a poster the user replaced has an
+    // mtime past the stored stamp, so it IS re-probed and the row picks up the
+    // new dimensions. Without this the reuse above would pin stale artwork
+    // metadata forever.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_replaced_poster_is_re_probed() {
+        use std::sync::atomic::Ordering;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let fx = poster_fixture(tmp.path(), 40, 60).await;
+        fx.scanner.scan_all().await.unwrap();
+        fx.scanner.scan_all().await.unwrap();
+        fx.dimensions.store(0, Ordering::Relaxed);
+        fx.blur_hashes.store(0, Ordering::Relaxed);
+
+        write_poster(&fx.poster, 80, 20);
+        std::fs::File::options()
+            .write(true)
+            .open(&fx.poster)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_hours(1))
+            .unwrap();
+
+        fx.scanner.scan_all().await.unwrap();
+        assert!(
+            fx.blur_hashes.load(Ordering::Relaxed) >= 1,
+            "a changed poster must be re-probed"
+        );
+        let changed = fx.primary().await;
+        assert_eq!((changed.width, changed.height), (80, 20));
     }
 }

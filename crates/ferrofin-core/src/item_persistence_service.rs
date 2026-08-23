@@ -21,7 +21,7 @@ use uuid::Uuid;
 
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::options::ItemImageInfo;
-use ferrofin_traits::persistence::ItemPersistenceService;
+use ferrofin_traits::persistence::{ItemPersistenceService, StoredImageMetadata};
 
 use ferrofin_model::data::BaseItemKind;
 
@@ -516,6 +516,65 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         }
         tx.commit().await.map_err(db_err)?;
         Ok(())
+    }
+
+    async fn image_metadata_for_items(
+        &self,
+        item_ids: &[Uuid],
+    ) -> Result<Vec<StoredImageMetadata>, ServiceError> {
+        let mut out: Vec<StoredImageMetadata> = Vec::new();
+        if item_ids.is_empty() {
+            return Ok(out);
+        }
+        // Chunked to stay under SQLite's bound-parameter ceiling, the same
+        // 500-wide shape every other batched id lookup here uses.
+        for chunk in item_ids.chunks(500) {
+            let placeholders = (1..=chunk.len())
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                r#"SELECT "Path", "Width", "Height", "Blurhash", "DateModified"
+                   FROM "BaseItemImageInfos" WHERE "ItemId" IN ({placeholders})"#
+            );
+            let mut query = sqlx::query_as::<
+                _,
+                (
+                    String,
+                    i64,
+                    i64,
+                    Option<Vec<u8>>,
+                    Option<chrono::DateTime<chrono::Utc>>,
+                ),
+            >(&sql);
+            for id in chunk {
+                query = query.bind(guid_to_db(*id));
+            }
+            let rows = query.fetch_all(self.db.pool()).await.map_err(db_err)?;
+            out.extend(
+                rows.into_iter()
+                    .map(
+                        |(path, width, height, blurhash, date_modified)| StoredImageMetadata {
+                            path,
+                            width: i32::try_from(width).unwrap_or(0),
+                            height: i32::try_from(height).unwrap_or(0),
+                            // Stored as a UTF-8 byte blob; an empty or non-UTF-8 blob
+                            // reads back as "no blurhash", which forces a recompute.
+                            blur_hash: blurhash
+                                .filter(|b| !b.is_empty())
+                                .and_then(|b| String::from_utf8(b).ok()),
+                            // A row with no stored mtime can never match the file's,
+                            // so it falls through to a recompute — the same outcome
+                            // C# reaches for a `default(DateTime)` image.
+                            date_modified: date_modified.unwrap_or_else(|| {
+                                chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0)
+                                    .unwrap_or_else(chrono::Utc::now)
+                            }),
+                        },
+                    ),
+            );
+        }
+        Ok(out)
     }
 
     async fn set_item_image(
