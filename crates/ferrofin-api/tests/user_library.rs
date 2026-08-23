@@ -44,6 +44,9 @@ const TRAILER_ID: Uuid = Uuid::from_u128(0xA1);
 const SPECIAL_ID: Uuid = Uuid::from_u128(0xA2);
 const SHOWS_ID: Uuid = Uuid::from_u128(0x101);
 const MOVIES_ID: Uuid = Uuid::from_u128(0x102);
+const MUSIC_ID: Uuid = Uuid::from_u128(0x103);
+const MIXED_ID: Uuid = Uuid::from_u128(0x104);
+const PLAYLISTS_VIEW_ID: Uuid = Uuid::from_u128(0x105);
 
 /// Builds a minimal [`UserEntity`] with the given id/name; neutral zero fields.
 fn user_entity(id: Uuid, username: &str) -> UserEntity {
@@ -444,6 +447,10 @@ impl UserViewManager for StubUserViews {
         Ok(vec![
             item_entity(SHOWS_ID, "Shows", BaseItemKind::CollectionFolder),
             item_entity(MOVIES_ID, "Movies", BaseItemKind::CollectionFolder),
+            item_entity(MUSIC_ID, "Music", BaseItemKind::CollectionFolder),
+            item_entity(MIXED_ID, "Attic", BaseItemKind::CollectionFolder),
+            // A virtual view: no library behind it, so no virtual-folder entry.
+            item_entity(PLAYLISTS_VIEW_ID, "Playlists", BaseItemKind::UserView),
         ])
     }
     async fn get_media_folders(&self, user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError> {
@@ -607,6 +614,25 @@ impl DtoService for OkDto {
     }
 }
 
+/// The configured libraries behind the stub views: Shows is `tvshows`, Movies
+/// `movies`, Music `music` (grouping-ineligible), Attic `mixed` (untyped → eligible).
+fn virtual_folders() -> ferrofin_api::test_support::FakeVirtualFolders {
+    use ferrofin_model::entities::CollectionTypeOptions;
+    use ferrofin_model::entities_media::VirtualFolderInfo;
+    let folder = |id: Uuid, name: &str, ct: CollectionTypeOptions| VirtualFolderInfo {
+        name: Some(name.to_owned()),
+        item_id: Some(id.simple().to_string()),
+        collection_type: Some(ct),
+        ..VirtualFolderInfo::default()
+    };
+    ferrofin_api::test_support::FakeVirtualFolders::seeded(vec![
+        folder(SHOWS_ID, "Shows", CollectionTypeOptions::tvshows),
+        folder(MOVIES_ID, "Movies", CollectionTypeOptions::movies),
+        folder(MUSIC_ID, "Music", CollectionTypeOptions::music),
+        folder(MIXED_ID, "Attic", CollectionTypeOptions::mixed),
+    ])
+}
+
 /// Builds an [`AppState`] wired with the user-library stubs.
 fn state_as(elevated: bool) -> AppState {
     AppState::new(
@@ -643,6 +669,7 @@ fn state_as(elevated: bool) -> AppState {
         Arc::new(ferrofin_api::test_support::FakeFileSystem),
         Arc::new(ferrofin_api::test_support::FakeTasks),
     )
+    .with_virtual_folders(Arc::new(virtual_folders()))
 }
 
 /// Drives one request through the router and returns (status, body bytes).
@@ -833,21 +860,52 @@ async fn user_views_returns_query_result() {
     let (status, body) = send("GET", "/UserViews", Body::empty()).await;
     assert_eq!(status, StatusCode::OK);
     let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).expect("result");
-    assert_eq!(result.items.len(), 2);
+    assert_eq!(result.items.len(), 5);
     assert_eq!(result.items[0].id, SHOWS_ID);
 }
 
 #[tokio::test]
-async fn grouping_options_returns_name_sorted_views() {
+async fn grouping_options_returns_name_sorted_eligible_views() {
     let (status, body) = send("GET", "/UserViews/GroupingOptions", Body::empty()).await;
     assert_eq!(status, StatusCode::OK);
     let opts: Vec<SpecialViewOptionDto> = serde_json::from_slice(&body).expect("options");
-    assert_eq!(opts.len(), 2);
-    // Name-sorted: Movies before Shows.
-    assert_eq!(opts[0].name.as_deref(), Some("Movies"));
-    assert_eq!(opts[1].name.as_deref(), Some("Shows"));
+    // `UserView.IsEligibleForGrouping`: movies, tvshows and an UNTYPED (mixed) library;
+    // the music library and the view with no library behind it are out.
+    let names: Vec<&str> = opts.iter().filter_map(|o| o.name.as_deref()).collect();
+    assert_eq!(names, ["Attic", "Movies", "Shows"]);
     // Ids are dashless guids.
     assert!(opts[0].id.as_deref().is_some_and(|i| !i.contains('-')));
+}
+
+#[tokio::test]
+async fn grouping_options_fails_loudly_when_library_types_are_unreadable() {
+    // `/UserViews` only decorates with the type (swallowed); for GroupingOptions the
+    // type IS the answer, so an unreadable library configuration is an error, never
+    // a silently unfiltered or empty list.
+    let state = state_as(false).with_virtual_folders(Arc::new(
+        ferrofin_api::test_support::FakeVirtualFolders::failing(),
+    ));
+    let router = create_router(state);
+    let mut statuses = Vec::new();
+    for uri in ["/UserViews/GroupingOptions", "/UserViews"] {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(uri)
+                    .header("Authorization", "Token abc")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        statuses.push(response.status());
+    }
+    assert_eq!(
+        statuses,
+        [StatusCode::INTERNAL_SERVER_ERROR, StatusCode::OK]
+    );
 }
 
 #[tokio::test]
@@ -856,7 +914,7 @@ async fn media_folders_returns_collection_folders() {
     let (status, body) = send_elevated("GET", "/Library/MediaFolders", Body::empty()).await;
     assert_eq!(status, StatusCode::OK);
     let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).expect("folders");
-    assert_eq!(result.items.len(), 2);
+    assert_eq!(result.items.len(), 5);
 
     // No `UserData`, because upstream projects these WITHOUT a user:
     //   var dtoOptions = new DtoOptions().AddClientFields(User);
@@ -1025,7 +1083,7 @@ async fn user_scoped_views_and_grouping_options_forward() {
     let (status, body) = send("GET", &format!("/Users/{USER_ID}/Views"), Body::empty()).await;
     assert_eq!(status, StatusCode::OK);
     let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).expect("result");
-    assert_eq!(result.items.len(), 2);
+    assert_eq!(result.items.len(), 5);
     // The alias yields the exact body of the modern query-scoped route.
     let (modern_status, modern_body) = send(
         "GET",
@@ -1044,7 +1102,7 @@ async fn user_scoped_views_and_grouping_options_forward() {
     .await;
     assert_eq!(status, StatusCode::OK);
     let opts: Vec<SpecialViewOptionDto> = serde_json::from_slice(&body).expect("options");
-    assert_eq!(opts.len(), 2);
+    assert_eq!(opts.len(), 3);
     let (modern_status, modern_body) = send(
         "GET",
         &format!("/UserViews/GroupingOptions?userId={USER_ID}"),

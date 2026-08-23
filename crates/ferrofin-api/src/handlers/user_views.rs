@@ -11,12 +11,9 @@
 //!
 //! Port note — grouping eligibility: C#'s `UserView.IsEligibleForGrouping` keeps
 //! only collection folders whose `CollectionType` is `movies`/`tvshows`/unset.
-//! That per-folder collection-type metadata is not carried on the persisted
-//! [`BaseItemEntity`] rows at this seam (the same grouping metadata the
-//! `UserViewManager` port already documents as deferred), so the portable
-//! equivalent offers every top-level view folder the user sees — the superset the
-//! C# filter narrows. The projection, id format (`guid.simple`), name-ordering,
-//! and `404`-on-missing-user outcomes are already the final ones.
+//! The persisted `CollectionFolder` rows do not carry the type; the virtual-folder
+//! options do (what `/Library/VirtualFolders` returns), so both endpoints read the
+//! per-folder type from there, keyed by the folder's item id.
 
 use std::collections::HashMap;
 
@@ -49,6 +46,37 @@ fn map_collection_type(options: CollectionTypeOptions) -> Option<CollectionType>
         CollectionTypeOptions::books => CollectionType::books,
         CollectionTypeOptions::mixed => return None,
     })
+}
+
+/// The collection type of every configured library, keyed by its folder item id.
+///
+/// A `mixed` library has no single type and maps to `None` — which is still an
+/// entry, because C# treats an unset `CollectionType` as grouping-eligible.
+async fn collection_types_by_id(
+    state: &AppState,
+) -> Result<HashMap<Uuid, Option<CollectionType>>, ApiError> {
+    Ok(state
+        .virtual_folders
+        .get_virtual_folders()
+        .await?
+        .into_iter()
+        .filter_map(|vf| {
+            let id = vf
+                .item_id
+                .as_deref()
+                .and_then(|s| Uuid::parse_str(s).ok())?;
+            Some((id, vf.collection_type.and_then(map_collection_type)))
+        })
+        .collect())
+}
+
+/// C#'s `UserView.IsEligibleForGrouping`: only `movies`, `tvshows` and an unset
+/// collection type may be grouped into a home-screen view.
+fn is_eligible_for_grouping(collection_type: Option<CollectionType>) -> bool {
+    matches!(
+        collection_type,
+        None | Some(CollectionType::movies | CollectionType::tvshows)
+    )
 }
 
 /// Query parameters for `GET /UserViews`.
@@ -99,21 +127,10 @@ async fn get_user_views(
     // type renders as a plain folder and its series never surface as shows.
     // Backfill it from the virtual-folder options (matched by item id), which
     // already carry the collection type (as `/Library/VirtualFolders` returns).
-    if let Ok(folders_info) = state.virtual_folders.get_virtual_folders().await {
-        let by_id: HashMap<Uuid, CollectionType> = folders_info
-            .into_iter()
-            .filter_map(|vf| {
-                let id = vf
-                    .item_id
-                    .as_deref()
-                    .and_then(|s| Uuid::parse_str(s).ok())?;
-                let ct = vf.collection_type.and_then(map_collection_type)?;
-                Some((id, ct))
-            })
-            .collect();
+    if let Ok(by_id) = collection_types_by_id(&state).await {
         for dto in &mut dtos {
             if dto.collection_type.is_none()
-                && let Some(ct) = by_id.get(&dto.id)
+                && let Some(Some(ct)) = by_id.get(&dto.id)
             {
                 dto.collection_type = Some(*ct);
             }
@@ -126,9 +143,12 @@ async fn get_user_views(
 /// `GET /UserViews/GroupingOptions` — the user's grouping-eligible views.
 ///
 /// Port of `UserViewsController.GetGroupingOptions`: resolves the user (a missing
-/// user is `404`), takes their top-level view folders, and returns each as a
-/// [`SpecialViewOptionDto`] `{ Name, Id }`, id rendered as a dashless guid and
-/// the list ordered by name (see the module docs on the eligibility superset).
+/// user is `404`), takes their top-level view folders, keeps the ones
+/// `UserView.IsEligibleForGrouping` accepts (movies, tvshows, untyped), and
+/// returns each as a [`SpecialViewOptionDto`] `{ Name, Id }`, id rendered as a
+/// dashless guid and the list ordered by name. A folder that is not a configured
+/// library (no virtual-folder entry) is not a collection folder and is dropped,
+/// as C#'s `folder is ICollectionFolder` test does.
 #[utoipa::path(
     get,
     path = "/UserViews/GroupingOptions",
@@ -147,14 +167,17 @@ async fn get_grouping_options(
     let user = resolve_user(&state, &auth, query.user_id).await?;
     let user_id = user_uuid(&user)?;
     let folders = state.user_views.get_user_views(user_id).await?;
+    let by_id = collection_types_by_id(&state).await?;
     let mut options: Vec<SpecialViewOptionDto> = folders
         .into_iter()
-        .map(|folder| SpecialViewOptionDto {
-            // C#'s `Id.ToString("N")` — a dashless guid. Fall back to the raw id
-            // when it is not a parseable guid. Read the id first so the name can
-            // move out of the owned row instead of being copied.
-            id: Some(Uuid::parse_str(&folder.id).map_or(folder.id, |g| g.simple().to_string())),
-            name: folder.name,
+        .filter_map(|folder| {
+            let id = Uuid::parse_str(&folder.id).ok()?;
+            let collection_type = by_id.get(&id).copied()?;
+            is_eligible_for_grouping(collection_type).then(|| SpecialViewOptionDto {
+                // C#'s `Id.ToString("N")` — a dashless guid.
+                id: Some(id.simple().to_string()),
+                name: folder.name,
+            })
         })
         .collect();
     options.sort_by(|a, b| a.name.cmp(&b.name));

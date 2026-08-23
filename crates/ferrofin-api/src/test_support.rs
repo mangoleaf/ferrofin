@@ -1934,6 +1934,15 @@ impl FakeVirtualFolders {
         Self::default()
     }
 
+    /// A working fake pre-seeded with `folders` (e.g. to give views a collection type).
+    #[must_use]
+    pub fn seeded(folders: Vec<ferrofin_model::entities_media::VirtualFolderInfo>) -> Self {
+        Self {
+            fail: false,
+            folders: std::sync::Mutex::new(folders),
+        }
+    }
+
     /// A fake whose every method fails (to probe error mapping).
     #[must_use]
     pub fn failing() -> Self {
