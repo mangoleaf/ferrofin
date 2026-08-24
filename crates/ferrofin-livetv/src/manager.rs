@@ -7,6 +7,7 @@
 //! Channels and programmes are surfaced to clients as `BaseItemDto`s.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
@@ -97,6 +98,12 @@ pub struct FerrofinLiveTvManager {
     /// filtered by the `EnableLiveTvAccess` permission). Absent in unit tests
     /// that never ask for it.
     users: Option<Arc<dyn ferrofin_traits::library::UserManager>>,
+    /// Whether any tuner host is configured, kept current by
+    /// [`LiveTvManager::save_tuner_host`]/[`LiveTvManager::delete_tuner_host`]
+    /// and every [`LiveTvManager::get_tuner_hosts`] read. Backs the
+    /// synchronous [`LiveTvManager::has_tuner_hosts`] the "Refresh Guide"
+    /// task's hidden rule polls.
+    tuner_flag: Arc<AtomicBool>,
     /// The DTO service the channel/programme projections run through — the C#
     /// `LiveTvManager` holds `IDtoService` the same way. A `OnceLock` because
     /// the composition root has a cycle to break (`DtoService` needs the
@@ -240,6 +247,7 @@ impl FerrofinLiveTvManager {
             fetcher,
             users: None,
             server_id,
+            tuner_flag: Arc::new(AtomicBool::new(false)),
             dto: OnceLock::new(),
         }
     }
@@ -474,6 +482,11 @@ impl LiveTvManager for FerrofinLiveTvManager {
             .fetch_all(self.db.pool())
             .await
             .map_err(db_err)?;
+        // Every read refreshes the synchronous flag the "Refresh Guide" task's
+        // hidden rule polls (the composition root does one read at boot to seed
+        // it). It counts ROWS, not parsed DTOs: one undeserializable `Data`
+        // blob must not make a configured tuner vanish from the rule.
+        self.tuner_flag.store(!rows.is_empty(), Ordering::Relaxed);
         Ok(rows
             .iter()
             .filter_map(|r| serde_json::from_str(r.get::<String, _>("Data").as_str()).ok())
@@ -512,6 +525,7 @@ impl LiveTvManager for FerrofinLiveTvManager {
         .execute(self.db.writer())
         .await
         .map_err(db_err)?;
+        self.tuner_flag.store(true, Ordering::Relaxed);
         Ok(info)
     }
 
@@ -521,7 +535,18 @@ impl LiveTvManager for FerrofinLiveTvManager {
             .execute(self.db.writer())
             .await
             .map_err(db_err)?;
+        // Recount so deleting the last host hides the guide-refresh task. This
+        // is bookkeeping, not part of the delete's contract: a failed recount
+        // must not turn a committed delete into a client-visible error.
+        match crate::guide_repository::tuner_hosts_exist(&self.db).await {
+            Ok(any) => self.tuner_flag.store(any, Ordering::Relaxed),
+            Err(e) => tracing::warn!(error = %e, "live tv: tuner-host recount failed"),
+        }
         Ok(())
+    }
+
+    fn has_tuner_hosts(&self) -> bool {
+        self.tuner_flag.load(Ordering::Relaxed)
     }
 
     async fn get_listing_providers(&self) -> Result<Vec<ListingsProviderInfo>, ServiceError> {
@@ -1665,6 +1690,9 @@ mod tests {
     #[tokio::test]
     async fn tuner_host_crud_roundtrips() {
         let mgr = manager_with(FakeFetcher(HashMap::new())).await;
+        // The synchronous flag the "Refresh Guide" task's hidden rule polls
+        // tracks the store through every mutation.
+        assert!(!mgr.has_tuner_hosts(), "no host configured yet");
         let saved = mgr
             .save_tuner_host(TunerHostInfo {
                 url: Some("http://tuner/playlist.m3u".to_owned()),
@@ -1674,13 +1702,19 @@ mod tests {
             .expect("save");
         let id = saved.id.clone().expect("id assigned");
         assert_eq!(saved.type_.as_deref(), Some("m3u"));
+        assert!(mgr.has_tuner_hosts(), "saving a host reveals the task");
 
         let hosts = mgr.get_tuner_hosts().await.expect("list");
         assert_eq!(hosts.len(), 1);
         assert_eq!(hosts[0].url.as_deref(), Some("http://tuner/playlist.m3u"));
+        assert!(mgr.has_tuner_hosts());
 
         mgr.delete_tuner_host(&id).await.expect("delete");
         assert!(mgr.get_tuner_hosts().await.expect("list2").is_empty());
+        assert!(
+            !mgr.has_tuner_hosts(),
+            "deleting the last host hides the task again"
+        );
     }
 
     #[tokio::test]

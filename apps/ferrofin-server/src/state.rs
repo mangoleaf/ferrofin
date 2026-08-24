@@ -1001,6 +1001,16 @@ pub async fn build_app_state(
         task_manager.register(Arc::new(maint_tasks::MoveTrickplayImagesTask::new(
             Arc::clone(&trickplay_impl),
         )));
+        // "Refresh Guide" (Live TV category): the 24 h guide re-fetch, hidden
+        // while no tuner host exists. One tuner-host read seeds the flag its
+        // hidden rule polls, so the dashboard is right from the first paint.
+        if let Err(err) = live_tv.get_tuner_hosts().await {
+            // Only the task's hidden state depends on this; boot continues.
+            tracing::warn!(%err, "could not seed the Live TV tuner-host flag");
+        }
+        task_manager.register(Arc::new(
+            ferrofin_core::scheduled_tasks::live_tv::RefreshGuideTask::new(Arc::clone(&live_tv)),
+        ));
     }
     let tasks: Arc<dyn ferrofin_traits::tasks::TaskManager> = Arc::new(task_manager.clone());
     // The trigger scheduler: fires startup triggers now, then evaluates

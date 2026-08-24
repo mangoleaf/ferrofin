@@ -31,6 +31,7 @@ use ferrofin_traits::error::ServiceError;
 use tracing::Instrument as _;
 
 pub mod library;
+pub mod live_tv;
 pub mod maintenance;
 
 /// 100-nanosecond ticks per second (the `TaskTriggerInfo` time unit).

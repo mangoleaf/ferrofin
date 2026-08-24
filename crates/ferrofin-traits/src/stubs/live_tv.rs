@@ -146,6 +146,15 @@ pub trait LiveTvManager: Send + Sync {
     /// Resets the tuner backing the given channel/recording id.
     async fn reset_tuner(&self, id: &str) -> Result<(), ServiceError>;
 
+    /// Whether any tuner host is configured — the synchronous fact the
+    /// "Refresh Guide" task's hidden rule reads (C# `IsHidden =>
+    /// Services.Count == 1 && TunerHosts.Length == 0`, and a stock server has
+    /// exactly one service). Defaults to `false`; the real manager maintains
+    /// a flag on tuner-host save/delete and seeds it on the first read.
+    fn has_tuner_hosts(&self) -> bool {
+        false
+    }
+
     /// Refreshes the channel lineup and guide by fetching every configured
     /// tuner host (M3U) and listing provider (XMLTV) and rewriting the cache.
     async fn refresh_guide(&self) -> Result<(), ServiceError>;

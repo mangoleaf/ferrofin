@@ -114,6 +114,24 @@ pub async fn existing_channel_dates(
     .collect())
 }
 
+/// Whether any tuner host row exists.
+///
+/// Backs the synchronous `has_tuner_hosts` flag the "Refresh Guide" task's
+/// hidden rule polls: a row count rather than a DTO read, so a single
+/// undeserializable `Data` blob cannot make a configured tuner vanish.
+///
+/// # Errors
+///
+/// Fails when the database read fails.
+pub async fn tuner_hosts_exist(db: &Database) -> Result<bool, ServiceError> {
+    let exists: i64 =
+        sqlx::query_scalar(r#"SELECT EXISTS(SELECT 1 FROM "FerrofinLiveTvTunerHosts")"#)
+            .fetch_one(db.pool())
+            .await
+            .map_err(db_err)?;
+    Ok(exists != 0)
+}
+
 /// Maps a `sqlx` error into a [`ServiceError`] via `ferrofin-db`'s `DbError`.
 fn db_err(e: sqlx::Error) -> ServiceError {
     ServiceError::from(ferrofin_db::DbError::from(e))
