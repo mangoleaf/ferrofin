@@ -84,6 +84,11 @@ pub struct TranscodingJobHandle {
     pub job_type: TranscodingJobType,
     /// The id of the device the job is streaming to, if known.
     pub device_id: Option<String>,
+    /// The live stream the job reads, if any (C# `TranscodingJob.LiveStreamId`).
+    ///
+    /// Teardown closes it when no session still needs it, so a client that
+    /// vanishes without a `PlaybackStopped` does not hold a tuner open.
+    pub live_stream_id: Option<String>,
 }
 
 /// A snapshot of a transcode's progress, reported to the session layer.

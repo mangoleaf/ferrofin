@@ -57,8 +57,11 @@ pub struct FerrofinMediaSourceManager {
     /// Live TV manager, when configured — lets playback resolve a Live TV channel
     /// id (which is not a `BaseItems` row) to its tuner stream.
     live_tv: Option<Arc<dyn ferrofin_traits::stubs::LiveTvManager>>,
-    /// Open live streams keyed by their live-stream id. Guarded by a
-    /// `std::sync::Mutex` because the guard never spans an `.await`.
+    /// Open live streams keyed by [`stream_key`] of their live-stream id
+    /// (upstream's `_openStreams` is an `OrdinalIgnoreCase` dictionary, so a
+    /// client that echoes the id back in another case still finds its stream).
+    /// Guarded by a `std::sync::Mutex` because the guard never spans an
+    /// `.await`.
     open_streams: Arc<Mutex<HashMap<String, MediaSourceInfo>>>,
     /// What a live stream's probe found, keyed by the open token that names it.
     ///
@@ -360,6 +363,15 @@ fn parse_live_tv_open_token(token: &str) -> Option<(Uuid, Option<String>)> {
     }
     let channel_id = Uuid::parse_str(keys.next()?).ok()?;
     Some((channel_id, keys.next().map(ToOwned::to_owned)))
+}
+
+/// The `_openStreams` key for a live-stream id.
+///
+/// Upstream's dictionary is `StringComparer.OrdinalIgnoreCase`; the ids are
+/// generated hex, so lower-casing is the whole of that comparison and a client
+/// that echoes the id back in another case still resolves its stream.
+fn stream_key(id: &str) -> String {
+    id.to_ascii_lowercase()
 }
 
 /// Strips the Live TV provider prefix `SetKeyProperties` adds, leaving the key
@@ -877,7 +889,7 @@ impl MediaSourceManager for FerrofinMediaSourceManager {
             self.open_streams
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(live_id, source.clone());
+                .insert(stream_key(&live_id), source.clone());
             return Ok(source);
         }
 
@@ -897,7 +909,7 @@ impl MediaSourceManager for FerrofinMediaSourceManager {
         self.open_streams
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(live_id, source.clone());
+            .insert(stream_key(&live_id), source.clone());
         Ok(source)
     }
 
@@ -905,7 +917,7 @@ impl MediaSourceManager for FerrofinMediaSourceManager {
         self.open_streams
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(id)
+            .get(&stream_key(id))
             .cloned()
             .ok_or_else(|| ServiceError::not_found(format!("live stream {id}")))
     }
@@ -925,7 +937,7 @@ impl MediaSourceManager for FerrofinMediaSourceManager {
             self.open_streams
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(id);
+                .remove(&stream_key(id));
         }
         Ok(())
     }
@@ -1841,8 +1853,18 @@ mod tests {
 
         let fetched = mgr.get_live_stream(&id).await.expect("get");
         assert_eq!(fetched.live_stream_id, Some(id.clone()));
+        // `_openStreams` is an OrdinalIgnoreCase dictionary upstream: a client
+        // that echoes the id back upper-cased still finds its stream.
+        let shouted = id.to_ascii_uppercase();
+        assert_eq!(
+            mgr.get_live_stream(&shouted)
+                .await
+                .expect("get upper-cased")
+                .live_stream_id,
+            Some(id.clone())
+        );
 
-        mgr.close_live_stream(&id).await.expect("close");
+        mgr.close_live_stream(&shouted).await.expect("close");
         assert!(mgr.get_live_stream(&id).await.is_err());
     }
 }

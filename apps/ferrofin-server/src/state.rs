@@ -1393,6 +1393,8 @@ pub async fn build_app_state(
     let me_library = Arc::clone(&library);
     // The master playlist lists the item's trickplay tile streams.
     let me_trickplay = Arc::clone(&trickplay);
+    // A killed transcode releases the live stream it was reading.
+    let me_sessions = Arc::clone(&sessions);
     // SyncPlay resolves each member's library access; it is built after the
     // state below, which takes ownership of these.
     let sync_play_users = Arc::clone(&users);
@@ -1451,6 +1453,7 @@ pub async fn build_app_state(
             // Transcode logs resolve item/series/library names through the library.
             library: Some(me_library),
             trickplay: Some(me_trickplay),
+            sessions: Some(me_sessions),
         },
     );
     let state = state

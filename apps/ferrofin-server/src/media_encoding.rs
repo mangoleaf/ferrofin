@@ -56,6 +56,72 @@ pub struct MediaEncodingExtras {
     pub library: Option<Arc<dyn ferrofin_traits::library::LibraryManager>>,
     /// Supplies the item's trickplay tile resolutions for the master playlist.
     pub trickplay: Option<Arc<dyn ferrofin_traits::trickplay::TrickplayManager>>,
+    /// Releases the live stream a killed job was reading.
+    pub sessions: Option<Arc<dyn ferrofin_traits::session::SessionManager>>,
+}
+
+/// The one thing job teardown needs from the session layer: release a live
+/// stream no session still wants (`ISessionManager.CloseLiveStreamIfNeededAsync`).
+#[async_trait]
+trait LiveStreamReleaser: Send + Sync {
+    /// Closes `live_stream_id` unless another session is still using it.
+    async fn release(&self, live_stream_id: &str, session_id: &str) -> Result<(), ServiceError>;
+}
+
+#[async_trait]
+impl LiveStreamReleaser for Arc<dyn ferrofin_traits::session::SessionManager> {
+    async fn release(&self, live_stream_id: &str, session_id: &str) -> Result<(), ServiceError> {
+        self.close_live_stream_if_needed(live_stream_id, session_id)
+            .await
+    }
+}
+
+/// The [`SessionReporter`] the server runs with: on teardown it releases the
+/// live stream the job was reading.
+///
+/// Port of `TranscodeManager`'s
+/// `CloseLiveStreamIfNeededAsync(job.LiveStreamId, job.PlaySessionId)`. Without
+/// it a client that disappears without a `PlaybackStopped` — a killed browser
+/// tab, a cast receiver that drops off the network — leaves its tuner open
+/// until the process exits, and the next tune fails on a busy tuner.
+/// (Progress reporting stays a no-op; the session layer reports its own.)
+struct LiveStreamReleasingReporter<R: LiveStreamReleaser> {
+    releaser: R,
+}
+
+#[async_trait]
+impl<R: LiveStreamReleaser> ferrofin_mediaencoding::SessionReporter
+    for LiveStreamReleasingReporter<R>
+{
+    async fn report_progress(
+        &self,
+        _job: &ferrofin_traits::media_encoding::TranscodingJobHandle,
+        _progress: ferrofin_traits::media_encoding::TranscodingProgress,
+    ) {
+    }
+
+    async fn on_job_killed(
+        &self,
+        job: &ferrofin_traits::media_encoding::TranscodingJobHandle,
+        _delete_files: bool,
+    ) {
+        // `!string.IsNullOrWhiteSpace(job.LiveStreamId)`; the session id upstream
+        // passes is the play-session id the job was registered under.
+        let Some(live_stream_id) = job
+            .live_stream_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+        else {
+            return;
+        };
+        let session = job.play_session_id.as_deref().unwrap_or_default();
+        if let Err(error) = self.releaser.release(live_stream_id, session).await {
+            // Best effort, exactly as upstream's fire-and-forget teardown: a
+            // failure here must not stop the rest of the kill path.
+            tracing::warn!(%live_stream_id, %error, "releasing the job's live stream failed");
+        }
+    }
 }
 
 /// Builds the concrete media-encoding pair injected via
@@ -124,7 +190,12 @@ pub fn build_media_encoding(
         None => planner,
     };
     let transcoder = TokioSegmentTranscoder::new();
-    let manager = Arc::new(TranscodeManagerImpl::new(NoopSessionReporter));
+    // A live transcode holds a tuner: the reporter releases it when the job dies.
+    let reporter: Arc<dyn ferrofin_mediaencoding::SessionReporter> = match extras.sessions {
+        Some(sessions) => Arc::new(LiveStreamReleasingReporter { releaser: sessions }),
+        None => Arc::new(NoopSessionReporter),
+    };
+    let manager = Arc::new(TranscodeManagerImpl::new(reporter));
     // The idle reaper kills any transcode whose consumers vanished without a
     // stop report (a disconnected cast receiver, a killed browser tab): no
     // active segment request and no session ping within the job's ping timeout
@@ -718,8 +789,106 @@ mod tests {
             MediaEncodingExtras {
                 library: None,
                 trickplay: None,
+                sessions: None,
             },
         );
+    }
+
+    /// Records what job teardown asked the session layer to release.
+    #[derive(Default)]
+    struct RecordingReleaser {
+        released: std::sync::Mutex<Vec<(String, String)>>,
+        fail: bool,
+    }
+
+    #[async_trait]
+    impl LiveStreamReleaser for RecordingReleaser {
+        async fn release(
+            &self,
+            live_stream_id: &str,
+            session_id: &str,
+        ) -> Result<(), ServiceError> {
+            self.released
+                .lock()
+                .expect("lock")
+                .push((live_stream_id.to_owned(), session_id.to_owned()));
+            if self.fail {
+                return Err(ServiceError::backend("closing failed"));
+            }
+            Ok(())
+        }
+    }
+
+    fn killed_job(
+        live_stream_id: Option<&str>,
+        play_session_id: Option<&str>,
+    ) -> ferrofin_traits::media_encoding::TranscodingJobHandle {
+        ferrofin_traits::media_encoding::TranscodingJobHandle {
+            play_session_id: play_session_id.map(str::to_owned),
+            path: "/cache/out.m3u8".to_owned(),
+            job_type: ferrofin_traits::media_encoding::TranscodingJobType::Hls,
+            device_id: Some("dev".to_owned()),
+            live_stream_id: live_stream_id.map(str::to_owned),
+        }
+    }
+
+    #[tokio::test]
+    async fn killing_a_live_job_releases_its_stream() {
+        use ferrofin_mediaencoding::SessionReporter as _;
+        // The whole point: the idle reaper kills a job whose client vanished
+        // without a Stop report, and that must hand the tuner back.
+        let reporter = LiveStreamReleasingReporter {
+            releaser: RecordingReleaser::default(),
+        };
+        reporter
+            .on_job_killed(&killed_job(Some("live-1"), Some("sess-1")), true)
+            .await;
+        assert_eq!(
+            *reporter.releaser.released.lock().expect("lock"),
+            vec![("live-1".to_owned(), "sess-1".to_owned())]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_job_with_no_live_stream_releases_nothing() {
+        use ferrofin_mediaencoding::SessionReporter as _;
+        // `!string.IsNullOrWhiteSpace(job.LiveStreamId)` — an ordinary file
+        // transcode, and a blank id, both skip the call entirely.
+        let reporter = LiveStreamReleasingReporter {
+            releaser: RecordingReleaser::default(),
+        };
+        for job in [
+            killed_job(None, Some("sess-1")),
+            killed_job(Some("   "), Some("sess-1")),
+        ] {
+            reporter.on_job_killed(&job, true).await;
+        }
+        assert!(reporter.releaser.released.lock().expect("lock").is_empty());
+        // A job with no play session still releases: upstream passes the empty
+        // string through to `CloseLiveStreamIfNeededAsync`.
+        reporter
+            .on_job_killed(&killed_job(Some("live-2"), None), false)
+            .await;
+        assert_eq!(
+            reporter.releaser.released.lock().expect("lock")[0],
+            ("live-2".to_owned(), String::new())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_release_does_not_escape_teardown() {
+        use ferrofin_mediaencoding::SessionReporter as _;
+        let reporter = LiveStreamReleasingReporter {
+            releaser: RecordingReleaser {
+                fail: true,
+                ..RecordingReleaser::default()
+            },
+        };
+        // Returns normally (the kill path must finish); the attempt was made.
+        reporter
+            .on_job_killed(&killed_job(Some("live-3"), Some("sess")), true)
+            .await;
+        assert_eq!(reporter.releaser.released.lock().expect("lock").len(), 1);
     }
 
     #[test]

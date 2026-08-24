@@ -87,8 +87,25 @@ pub trait SessionReporter: Send + Sync {
     /// Tears a killed `job` down, deleting its partial output when
     /// `delete_files` is set.
     ///
-    /// Port of the `KillTranscodingJob` tail (`Stop` + `DeletePartialStreamFiles`).
+    /// Port of the `KillTranscodingJob` tail (`Stop` + `DeletePartialStreamFiles`
+    /// + `CloseLiveStreamIfNeededAsync(job.LiveStreamId, job.PlaySessionId)`):
+    /// releasing an open live stream here is what stops a client that vanishes
+    /// without a `PlaybackStopped` from holding a tuner until process exit.
     async fn on_job_killed(&self, job: &TranscodingJobHandle, delete_files: bool);
+}
+
+/// Forwards through a shared handle, so a composition root can pick its
+/// reporter at runtime (`Arc<dyn SessionReporter>`) and still satisfy the
+/// manager's `S: SessionReporter` bound.
+#[async_trait]
+impl<S: SessionReporter + ?Sized> SessionReporter for std::sync::Arc<S> {
+    async fn report_progress(&self, job: &TranscodingJobHandle, progress: TranscodingProgress) {
+        (**self).report_progress(job, progress).await;
+    }
+
+    async fn on_job_killed(&self, job: &TranscodingJobHandle, delete_files: bool) {
+        (**self).on_job_killed(job, delete_files).await;
+    }
 }
 
 /// A [`SessionReporter`] that does nothing (for tests / progressive-only hosts).
@@ -371,6 +388,7 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
             path: output_path.to_string_lossy().into_owned(),
             job_type: state.transcoding_type,
             device_id: state.device_id.clone(),
+            live_stream_id: state.base_request.live_stream_id.clone(),
         };
 
         // 4. Register the job FIRST (OnTranscodeBeginning), naming what it
@@ -1014,6 +1032,7 @@ mod tests {
             path: path.to_owned(),
             job_type,
             device_id: Some(device.to_owned()),
+            live_stream_id: None,
         }
     }
 
