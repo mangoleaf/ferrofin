@@ -120,7 +120,6 @@ impl RemoteMetadata {
 /// `large_futures` ceiling).
 struct StoredText {
     name: Option<String>,
-    sort_name: Option<String>,
     overview: Option<String>,
     /// Whether the stored `name` is a real title rather than the resolver's
     /// file-stem placeholder. Computed at read time, while the row's path is
@@ -136,7 +135,6 @@ impl StoredText {
         Self {
             titled: !name_is_placeholder(row.name.as_deref(), row.path.as_deref()),
             name: row.name,
-            sort_name: row.sort_name,
             overview: row.overview,
         }
     }
@@ -2813,7 +2811,13 @@ impl LibraryScanner {
         if let Some(stored) = stored.filter(|s| s.is_complete()) {
             if name_is_file_stem_placeholder(entity) {
                 entity.name.clone_from(&stored.name);
-                entity.sort_name.clone_from(&stored.sort_name);
+                // Recomputed, not copied: a stored key from an older algorithm
+                // would otherwise survive every rescan and sort next to freshly
+                // derived ones (the play queue reads this).
+                entity.sort_name = stored
+                    .name
+                    .as_deref()
+                    .map(|name| derived_sort_name(entity, name));
             }
             if entity.overview.is_none() {
                 entity.overview.clone_from(&stored.overview);

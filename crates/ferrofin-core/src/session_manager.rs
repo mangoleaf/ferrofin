@@ -199,16 +199,21 @@ pub struct FerrofinSessionManager {
     /// matching the C# `_activeConnections` keying.
     sessions: Arc<Mutex<HashMap<String, SessionInfo>>>,
     /// Which sessions are still holding each open live stream, keyed by
-    /// `LiveStreamId`.
+    /// `LiveStreamId`; the inner map pairs each session id with its play-session
+    /// id and back again.
     ///
     /// Port of `SessionManager._activeLiveStreamSessions`. It exists because a
     /// live stream's consumer count is real and shared: a Live TV channel two
     /// people are watching is ONE stream with two consumers, so a duplicate
     /// `PlaybackStopped` (or a client that both POSTs `/LiveStreams/Close` and
     /// reports stopped) must not decrement twice and tear the tuner down under
-    /// the other viewer. Only the first close reported by a given session
-    /// counts.
-    active_live_stream_sessions: Arc<Mutex<HashMap<String, std::collections::HashSet<String>>>>,
+    /// the other viewer.
+    ///
+    /// The pairing is what makes that work: one viewer is known by two ids (the
+    /// session and the play session), and a release under either drops BOTH, so
+    /// it counts once. A plain set of released ids would count that viewer
+    /// twice and close a stream another viewer is still watching.
+    active_live_stream_sessions: Arc<Mutex<HashMap<String, HashMap<String, String>>>>,
     /// Serializes the `MaxActiveSessions` admission decision with the session
     /// creation that satisfies it.
     ///
@@ -1059,6 +1064,18 @@ impl SessionManager for FerrofinSessionManager {
             .ok_or_else(|| ServiceError::invalid_input("sessionId is required"))?;
         let session = self.get_session_snapshot(session_id).await?;
 
+        // A live stream this playback holds is registered against both of the
+        // ids the client may later report a stop under (C#
+        // `UpdateLiveStreamActiveSessionMappings`).
+        if let Some(live_stream_id) = info.live_stream_id.as_deref() {
+            self.update_live_stream_session_mapping(
+                live_stream_id,
+                session_id,
+                info.play_session_id.as_deref(),
+            )
+            .await;
+        }
+
         // Record the now-playing item + mark automatic progress started.
         {
             let mut sessions = self.sessions.lock().await;
@@ -1113,6 +1130,17 @@ impl SessionManager for FerrofinSessionManager {
             .as_deref()
             .ok_or_else(|| ServiceError::invalid_input("sessionId is required"))?;
         let session = self.get_session_snapshot(session_id).await?;
+
+        // Progress re-registers the pairing: a client that starts reporting a
+        // play session only after the first progress tick still gets paired.
+        if let Some(live_stream_id) = info.live_stream_id.as_deref() {
+            self.update_live_stream_session_mapping(
+                live_stream_id,
+                session_id,
+                info.play_session_id.as_deref(),
+            )
+            .await;
+        }
 
         {
             let mut sessions = self.sessions.lock().await;
@@ -1702,19 +1730,33 @@ impl SessionManager for FerrofinSessionManager {
         if live_stream_id.is_empty() {
             return Ok(());
         }
-        // One close per session (C# `CloseLiveStreamIfNeededAsync`): the first
-        // report from this session releases its consumer, later ones are
-        // already released and must not touch the count again.
+        // One close per VIEWER (C# `CloseLiveStreamIfNeededAsync`): removing the
+        // id the caller used also removes its partner, so the same viewer
+        // reporting under both its session id and its play-session id — or
+        // reporting twice — releases the consumer once.
         {
             let mut holders = self.active_live_stream_sessions.lock().await;
-            let sessions = holders.entry(live_stream_id.to_owned()).or_default();
-            if !sessions.insert(session_or_play_session_id.to_owned()) {
+            let Some(mappings) = holders.get_mut(live_stream_id) else {
+                debug!(
+                    %live_stream_id,
+                    session = %session_or_play_session_id,
+                    "live stream has no registered holder"
+                );
+                return Ok(());
+            };
+            let Some(partner) = mappings.remove(session_or_play_session_id) else {
                 debug!(
                     %live_stream_id,
                     session = %session_or_play_session_id,
                     "live stream already released by this session"
                 );
                 return Ok(());
+            };
+            if !partner.is_empty() {
+                mappings.remove(&partner);
+            }
+            if mappings.is_empty() {
+                holders.remove(live_stream_id);
             }
         }
         let Some(media_sources) = self.media_sources.as_ref() else {
@@ -1735,6 +1777,44 @@ impl SessionManager for FerrofinSessionManager {
 }
 
 impl FerrofinSessionManager {
+    /// Pairs a session id with its play-session id for `live_stream_id`.
+    ///
+    /// Port of `SessionManager.UpdateLiveStreamActiveSessionMappings`, called
+    /// from playback start and progress: both directions are stored, so a later
+    /// close under either id releases the viewer exactly once. A re-report with a
+    /// new play-session id replaces the old pairing.
+    async fn update_live_stream_session_mapping(
+        &self,
+        live_stream_id: &str,
+        session_id: &str,
+        play_session_id: Option<&str>,
+    ) {
+        if live_stream_id.is_empty() || session_id.is_empty() {
+            return;
+        }
+        let mut holders = self.active_live_stream_sessions.lock().await;
+        let mappings = holders.entry(live_stream_id.to_owned()).or_default();
+        match play_session_id.filter(|id| !id.is_empty()) {
+            Some(play_session_id) => {
+                if mappings.get(session_id).map(String::as_str) != Some(play_session_id) {
+                    if let Some(stale) =
+                        mappings.insert(session_id.to_owned(), play_session_id.to_owned())
+                        && !stale.is_empty()
+                    {
+                        mappings.remove(&stale);
+                    }
+                    mappings.insert(play_session_id.to_owned(), session_id.to_owned());
+                }
+            }
+            // No play session yet: the session alone holds the stream.
+            None => {
+                mappings
+                    .entry(session_id.to_owned())
+                    .or_insert_with(String::new);
+            }
+        }
+    }
+
     /// Admits one more session for `user` under their `MaxActiveSessions`
     /// policy, returning the guard the caller must hold until that session
     /// actually exists.

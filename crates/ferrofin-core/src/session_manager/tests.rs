@@ -1064,6 +1064,32 @@ async fn stopping_playback_closes_the_reported_live_stream() {
         "a report without a live stream id closes nothing"
     );
 
+    // A stream this session never reported playing is not its to release
+    // (upstream's `_activeLiveStreamSessions` has no mapping, so
+    // `liveStreamNeedsToBeClosed` stays false).
+    mgr.on_playback_stopped(&PlaybackStopInfo {
+        session_id: session.id.clone(),
+        item_id: Uuid::nil(),
+        live_stream_id: Some("never-started".to_owned()),
+        ..PlaybackStopInfo::default()
+    })
+    .await
+    .unwrap();
+    assert!(
+        sources.closed.lock().expect("closed mutex").is_empty(),
+        "an unregistered live stream closes nothing"
+    );
+
+    // Playback start registers the holder; the stop then releases it.
+    mgr.on_playback_start(&ferrofin_model::session::PlaybackStartInfo {
+        session_id: session.id.clone(),
+        item_id: Uuid::nil(),
+        live_stream_id: Some("live-42".to_owned()),
+        play_session_id: Some("play-42".to_owned()),
+        ..ferrofin_model::session::PlaybackStartInfo::default()
+    })
+    .await
+    .unwrap();
     mgr.on_playback_stopped(&PlaybackStopInfo {
         session_id: session.id.clone(),
         item_id: Uuid::nil(),
@@ -1077,6 +1103,94 @@ async fn stopping_playback_closes_the_reported_live_stream() {
         vec!["live-42".to_owned()],
         "the reported live stream is closed exactly once"
     );
+
+    // The same viewer under its OTHER id (the play session) must not release a
+    // second consumer — that is what would tear the tuner out from under
+    // another viewer of the same channel.
+    mgr.close_live_stream_if_needed("live-42", "play-42")
+        .await
+        .unwrap();
+    assert_eq!(
+        sources.closed.lock().expect("closed mutex").len(),
+        1,
+        "one viewer releases once, however many of its ids report"
+    );
+}
+
+/// Two viewers of one channel: the first to stop must not close the stream the
+/// second is still watching. Each viewer is registered under its own session and
+/// play-session ids, and only its own release counts.
+#[tokio::test]
+async fn one_viewer_stopping_does_not_release_another_viewers_stream() {
+    use ferrofin_model::session::{PlaybackStartInfo, PlaybackStopInfo};
+
+    let db = test_db().await;
+    let sources = Arc::new(RecordingMediaSources {
+        closed: Mutex::new(Vec::new()),
+    });
+    let mgr = Arc::new(
+        Arc::try_unwrap(manager(&db))
+            .expect("sole owner")
+            .with_media_sources(
+                Arc::clone(&sources) as Arc<dyn ferrofin_traits::library::MediaSourceManager>
+            ),
+    );
+    let user = seed_named_user(&db, Uuid::new_v4(), "alice").await;
+    let alice = mgr
+        .log_session_activity("Web", "1.0", "dev-a", "TV A", "e", &user)
+        .await
+        .unwrap();
+    let bob = mgr
+        .log_session_activity("Web", "1.0", "dev-b", "TV B", "e", &user)
+        .await
+        .unwrap();
+
+    for (session, play) in [(&alice, "play-a"), (&bob, "play-b")] {
+        mgr.on_playback_start(&PlaybackStartInfo {
+            session_id: session.id.clone(),
+            item_id: Uuid::nil(),
+            live_stream_id: Some("shared".to_owned()),
+            play_session_id: Some(play.to_owned()),
+            ..PlaybackStartInfo::default()
+        })
+        .await
+        .unwrap();
+    }
+
+    mgr.on_playback_stopped(&PlaybackStopInfo {
+        session_id: alice.id.clone(),
+        item_id: Uuid::nil(),
+        live_stream_id: Some("shared".to_owned()),
+        ..PlaybackStopInfo::default()
+    })
+    .await
+    .unwrap();
+    // One release for Alice — the consumer count still covers Bob, and it is
+    // `MediaSourceManager::close_live_stream` that decides the tuner's fate.
+    assert_eq!(sources.closed.lock().expect("closed mutex").len(), 1);
+
+    // Alice reporting again (a duplicate stop, or an explicit /LiveStreams/Close)
+    // must not release a second time.
+    mgr.on_playback_stopped(&PlaybackStopInfo {
+        session_id: alice.id.clone(),
+        item_id: Uuid::nil(),
+        live_stream_id: Some("shared".to_owned()),
+        ..PlaybackStopInfo::default()
+    })
+    .await
+    .unwrap();
+    assert_eq!(sources.closed.lock().expect("closed mutex").len(), 1);
+
+    // Bob's own stop is his to make.
+    mgr.on_playback_stopped(&PlaybackStopInfo {
+        session_id: bob.id.clone(),
+        item_id: Uuid::nil(),
+        live_stream_id: Some("shared".to_owned()),
+        ..PlaybackStopInfo::default()
+    })
+    .await
+    .unwrap();
+    assert_eq!(sources.closed.lock().expect("closed mutex").len(), 2);
 }
 
 /// A session recreated after its previous one ended (the socket closed, or an

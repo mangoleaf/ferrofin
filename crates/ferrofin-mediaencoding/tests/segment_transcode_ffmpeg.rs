@@ -397,7 +397,7 @@ async fn manager_kill_stops_transcode_and_deletes_partial_files() {
     assert!(first_segment.exists(), "first segment written");
 
     // Kill via the manager with delete_files=true.
-    manager.kill_and_remove(&handle, true).await;
+    manager.kill_and_remove(&handle, true, false).await;
 
     assert_eq!(manager.active_job_count(), 0, "job removed after kill");
     // The partial files (sharing the playlist stem "out") were deleted.

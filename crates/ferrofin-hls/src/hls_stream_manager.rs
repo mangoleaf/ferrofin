@@ -529,7 +529,10 @@ where
             // restarting so the two don't write the same files. Keep its produced
             // segments (delete_files = false) — a later backward seek serves them
             // straight from disk via the fast path.
-            self.manager.kill_and_remove(&handle, false).await;
+            // `DynamicHlsController` kills the old job with `closeLiveStream:
+            // false` — the restart below re-opens ffmpeg on the SAME live stream,
+            // so releasing the tuner here would make it read a closed source.
+            self.manager.kill_and_remove(&handle, false, false).await;
         }
 
         // A source that keeps killing ffmpeg (flaky network storage, a file

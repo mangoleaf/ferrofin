@@ -84,7 +84,14 @@ impl LiveStreamReleaser for Arc<dyn ferrofin_traits::session::SessionManager> {
 /// it a client that disappears without a `PlaybackStopped` — a killed browser
 /// tab, a cast receiver that drops off the network — leaves its tuner open
 /// until the process exits, and the next tune fails on a busy tuner.
-/// (Progress reporting stays a no-op; the session layer reports its own.)
+///
+/// `report_progress` is a no-op, and deliberately says so: upstream's
+/// `TranscodeManager.ReportTranscodingProgress` builds a `TranscodingInfo` from
+/// the encoding state and pushes it into the session, but nothing in Ferrofin
+/// produces progress in the first place (no ffmpeg progress reader), so
+/// `SessionInfo.TranscodingInfo` stays null and the dashboard shows no transcode
+/// details. Building that reader is its own piece of work — see the ledger — and
+/// this is the seam it will report through.
 struct LiveStreamReleasingReporter<R: LiveStreamReleaser> {
     releaser: R,
 }
@@ -104,7 +111,11 @@ impl<R: LiveStreamReleaser> ferrofin_mediaencoding::SessionReporter
         &self,
         job: &ferrofin_traits::media_encoding::TranscodingJobHandle,
         _delete_files: bool,
+        close_live_stream: bool,
     ) {
+        if !close_live_stream {
+            return;
+        }
         // `!string.IsNullOrWhiteSpace(job.LiveStreamId)`; the session id upstream
         // passes is the play-session id the job was registered under.
         let Some(live_stream_id) = job
@@ -841,7 +852,7 @@ mod tests {
             releaser: RecordingReleaser::default(),
         };
         reporter
-            .on_job_killed(&killed_job(Some("live-1"), Some("sess-1")), true)
+            .on_job_killed(&killed_job(Some("live-1"), Some("sess-1")), true, true)
             .await;
         assert_eq!(
             *reporter.releaser.released.lock().expect("lock"),
@@ -861,18 +872,34 @@ mod tests {
             killed_job(None, Some("sess-1")),
             killed_job(Some("   "), Some("sess-1")),
         ] {
-            reporter.on_job_killed(&job, true).await;
+            reporter.on_job_killed(&job, true, true).await;
         }
         assert!(reporter.releaser.released.lock().expect("lock").is_empty());
         // A job with no play session still releases: upstream passes the empty
         // string through to `CloseLiveStreamIfNeededAsync`.
         reporter
-            .on_job_killed(&killed_job(Some("live-2"), None), false)
+            .on_job_killed(&killed_job(Some("live-2"), None), false, true)
             .await;
         assert_eq!(
             reporter.releaser.released.lock().expect("lock")[0],
             ("live-2".to_owned(), String::new())
         );
+    }
+
+    #[tokio::test]
+    async fn a_seek_restart_or_explicit_stop_keeps_the_live_stream() {
+        use ferrofin_mediaencoding::SessionReporter as _;
+        // Upstream's `closeLiveStream: false` callers: the seek restart is about
+        // to re-open ffmpeg on this very stream, and an explicit stop releases
+        // through the session layer instead. Releasing here would tear the tuner
+        // out from under the restart.
+        let reporter = LiveStreamReleasingReporter {
+            releaser: RecordingReleaser::default(),
+        };
+        reporter
+            .on_job_killed(&killed_job(Some("live-4"), Some("sess")), false, false)
+            .await;
+        assert!(reporter.releaser.released.lock().expect("lock").is_empty());
     }
 
     #[tokio::test]
@@ -886,9 +913,155 @@ mod tests {
         };
         // Returns normally (the kill path must finish); the attempt was made.
         reporter
-            .on_job_killed(&killed_job(Some("live-3"), Some("sess")), true)
+            .on_job_killed(&killed_job(Some("live-3"), Some("sess")), true, true)
             .await;
         assert_eq!(reporter.releaser.released.lock().expect("lock").len(), 1);
+    }
+
+    /// A [`TrickplayManager`](ferrofin_traits::trickplay::TrickplayManager) with
+    /// one canned resolution for every item, so a master playlist that reached
+    /// it says so. Every other method is unused by this test.
+    struct FakeTrickplay;
+
+    #[async_trait]
+    impl ferrofin_traits::trickplay::TrickplayManager for FakeTrickplay {
+        async fn get_trickplay_resolutions(
+            &self,
+            _item_id: uuid::Uuid,
+        ) -> Result<
+            std::collections::HashMap<i32, ferrofin_db::entities::playback::TrickplayInfoEntity>,
+            ServiceError,
+        > {
+            Ok(std::collections::HashMap::from([(
+                320,
+                ferrofin_db::entities::playback::TrickplayInfoEntity {
+                    item_id: String::new(),
+                    width: 320,
+                    height: 180,
+                    tile_width: 10,
+                    tile_height: 10,
+                    thumbnail_count: 100,
+                    interval: 10_000,
+                    bandwidth: 12_345,
+                },
+            )]))
+        }
+        async fn refresh_trickplay_data(
+            &self,
+            _item_id: uuid::Uuid,
+            _replace: bool,
+        ) -> Result<(), ServiceError> {
+            unimplemented!("fake")
+        }
+        async fn get_trickplay_items(
+            &self,
+            _limit: i32,
+            _offset: i32,
+        ) -> Result<Vec<ferrofin_db::entities::playback::TrickplayInfoEntity>, ServiceError>
+        {
+            unimplemented!("fake")
+        }
+        async fn save_trickplay_info(
+            &self,
+            _info: &ferrofin_db::entities::playback::TrickplayInfoEntity,
+        ) -> Result<(), ServiceError> {
+            unimplemented!("fake")
+        }
+        async fn delete_trickplay_data(&self, _item_id: uuid::Uuid) -> Result<(), ServiceError> {
+            unimplemented!("fake")
+        }
+        async fn get_trickplay_manifest(
+            &self,
+            _item_id: uuid::Uuid,
+        ) -> Result<
+            std::collections::HashMap<
+                String,
+                std::collections::HashMap<
+                    i32,
+                    ferrofin_db::entities::playback::TrickplayInfoEntity,
+                >,
+            >,
+            ServiceError,
+        > {
+            unimplemented!("fake")
+        }
+        async fn get_hls_playlist(
+            &self,
+            _item_id: uuid::Uuid,
+            _width: i32,
+            _api_key: Option<&str>,
+        ) -> Result<Option<String>, ServiceError> {
+            unimplemented!("fake")
+        }
+        async fn get_trickplay_tile_path(
+            &self,
+            _item_id: uuid::Uuid,
+            _width: i32,
+            _index: i32,
+        ) -> Result<Option<String>, ServiceError> {
+            unimplemented!("fake")
+        }
+    }
+
+    #[tokio::test]
+    async fn the_built_chain_carries_the_extras_it_was_given() {
+        // The trickplay bug this guards against was exactly "collaborator built,
+        // unit-tested, never attached": the master playlist listed no
+        // `#EXT-X-IMAGE-STREAM-INF` in production while every unit test passed.
+        // Assert through the BUILT chain, not the builder.
+        // A finite source with a guid id: a live stream lists no trickplay
+        // upstream either, and the tile lookup parses the media-source id.
+        let source_id = uuid::Uuid::from_u128(0xABC).simple().to_string();
+        let mut vod = source(&source_id);
+        vod.run_time_ticks = Some(90 * 60 * 10_000_000);
+        let media_sources: Arc<dyn MediaSourceManager> = Arc::new(FakeSources {
+            sources: vec![vod],
+            attachments: Vec::new(),
+        });
+        let encoder: Arc<dyn MediaEncoder> = Arc::new(RecordingEncoder);
+        let (config, paths) = config_and_paths();
+        let path_manager: Arc<dyn PathManager> = Arc::new(FakePathManager {
+            root: "/cache/att".to_owned(),
+        });
+        let ffmpeg = FfmpegPaths {
+            ffmpeg: "ffmpeg".into(),
+            ffprobe: "ffprobe".into(),
+            filters: Vec::new(),
+            encoders: Vec::new(),
+            chromaprint_muxer: false,
+        };
+        let (hls, _attachments, _subtitles) = build_media_encoding(
+            Arc::clone(&media_sources),
+            encoder,
+            config,
+            paths,
+            path_manager,
+            &ffmpeg,
+            MediaEncodingExtras {
+                library: None,
+                trickplay: Some(Arc::new(FakeTrickplay)),
+                sessions: None,
+            },
+        );
+
+        let request = ferrofin_traits::media_encoding::HlsStreamRequest {
+            item_id: uuid::Uuid::from_u128(1),
+            media_source_id: Some(source_id.clone()),
+            play_session_id: Some("sess".to_owned()),
+            device_id: Some("dev".to_owned()),
+            segment_container: Some("ts".to_owned()),
+            query_string: "?x=1".to_owned(),
+            enable_trickplay: true,
+            ..ferrofin_traits::media_encoding::HlsStreamRequest::default()
+        };
+        let playlist = hls
+            .master_playlist(&request, false)
+            .await
+            .expect("master playlist");
+        assert!(
+            playlist.contains("#EXT-X-IMAGE-STREAM-INF"),
+            "the trickplay manager the chain was given must reach the playlist: {playlist}"
+        );
     }
 
     #[test]

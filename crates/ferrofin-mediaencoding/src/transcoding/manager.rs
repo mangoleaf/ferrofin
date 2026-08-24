@@ -87,11 +87,21 @@ pub trait SessionReporter: Send + Sync {
     /// Tears a killed `job` down, deleting its partial output when
     /// `delete_files` is set.
     ///
-    /// Port of the `KillTranscodingJob` tail (`Stop` + `DeletePartialStreamFiles`
-    /// + `CloseLiveStreamIfNeededAsync(job.LiveStreamId, job.PlaySessionId)`):
-    /// releasing an open live stream here is what stops a client that vanishes
-    /// without a `PlaybackStopped` from holding a tuner until process exit.
-    async fn on_job_killed(&self, job: &TranscodingJobHandle, delete_files: bool);
+    /// Port of the `KillTranscodingJob` tail (`Stop` +
+    /// `DeletePartialStreamFiles` + a conditional
+    /// `CloseLiveStreamIfNeededAsync(job.LiveStreamId, job.PlaySessionId)`).
+    ///
+    /// `close_live_stream` is upstream's own parameter and is INDEPENDENT of
+    /// `delete_files`: only the idle reaper passes it (the abandoned client that
+    /// will never report a stop). A seek restart and an explicit stop both pass
+    /// `false` — the first is about to re-open ffmpeg on the same tuner, and the
+    /// second releases through the session layer instead.
+    async fn on_job_killed(
+        &self,
+        job: &TranscodingJobHandle,
+        delete_files: bool,
+        close_live_stream: bool,
+    );
 }
 
 /// Forwards through a shared handle, so a composition root can pick its
@@ -103,8 +113,15 @@ impl<S: SessionReporter + ?Sized> SessionReporter for std::sync::Arc<S> {
         (**self).report_progress(job, progress).await;
     }
 
-    async fn on_job_killed(&self, job: &TranscodingJobHandle, delete_files: bool) {
-        (**self).on_job_killed(job, delete_files).await;
+    async fn on_job_killed(
+        &self,
+        job: &TranscodingJobHandle,
+        delete_files: bool,
+        close_live_stream: bool,
+    ) {
+        (**self)
+            .on_job_killed(job, delete_files, close_live_stream)
+            .await;
     }
 }
 
@@ -115,7 +132,13 @@ pub struct NoopSessionReporter;
 #[async_trait]
 impl SessionReporter for NoopSessionReporter {
     async fn report_progress(&self, _job: &TranscodingJobHandle, _progress: TranscodingProgress) {}
-    async fn on_job_killed(&self, _job: &TranscodingJobHandle, _delete_files: bool) {}
+    async fn on_job_killed(
+        &self,
+        _job: &TranscodingJobHandle,
+        _delete_files: bool,
+        _close_live_stream: bool,
+    ) {
+    }
 }
 
 /// Deletes a killed HLS job's partial segment files from its cache directory.
@@ -429,7 +452,7 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
                 break;
             }
             if Instant::now() >= deadline {
-                self.kill_and_remove(&handle, true).await;
+                self.kill_and_remove(&handle, true, false).await;
                 return Err(format!(
                     "timed out waiting for {} after {WAIT_FOR_FILE_TIMEOUT_MS}ms",
                     target.display()
@@ -545,7 +568,12 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
     /// # Panics
     ///
     /// Panics if the internal job-registry mutex has been poisoned.
-    pub async fn kill_and_remove(&self, handle: &TranscodingJobHandle, delete_files: bool) {
+    pub async fn kill_and_remove(
+        &self,
+        handle: &TranscodingJobHandle,
+        delete_files: bool,
+        close_live_stream: bool,
+    ) {
         let (display, running) = {
             let mut jobs = self.jobs.lock().expect("jobs lock poisoned");
             let idx = jobs.iter().position(|j| {
@@ -576,7 +604,9 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
                     .delete_partial_stream_files(&running.output_dir, &stem);
             }
         }
-        self.reporter.on_job_killed(handle, delete_files).await;
+        self.reporter
+            .on_job_killed(handle, delete_files, close_live_stream)
+            .await;
     }
 
     /// One sweep of the idle reaper: kills every job that has **no active
@@ -613,7 +643,9 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
                 playing = %playing_label,
                 "killing idle transcode job (no consumer within the ping timeout)"
             );
-            self.kill_and_remove(handle, true).await;
+            // `OnTranscodeKillTimerStopped`: `KillTranscodingJob(job, true, _)` —
+            // the consumer is gone for good, so the tuner goes back.
+            self.kill_and_remove(handle, true, true).await;
         }
         idle.into_iter().map(|(handle, _)| handle).collect()
     }
@@ -957,7 +989,9 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManager for TranscodeManagerIm
         };
 
         for job in &killed {
-            self.kill_and_remove(job, delete_files).await;
+            // `KillTranscodingJobs` passes `closeLiveStream: false`; the session
+            // layer releases the stream on the stop report instead.
+            self.kill_and_remove(job, delete_files, false).await;
         }
         Ok(())
     }
@@ -1123,7 +1157,8 @@ mod tests {
 
     /// A reporter that records the kills it was asked to perform.
     struct RecordingReporter {
-        killed: Mutex<Vec<(String, bool)>>,
+        /// `(path, delete_files, close_live_stream)` per teardown.
+        killed: Mutex<Vec<(String, bool, bool)>>,
     }
 
     #[async_trait]
@@ -1134,11 +1169,16 @@ mod tests {
             _progress: TranscodingProgress,
         ) {
         }
-        async fn on_job_killed(&self, job: &TranscodingJobHandle, delete_files: bool) {
+        async fn on_job_killed(
+            &self,
+            job: &TranscodingJobHandle,
+            delete_files: bool,
+            close_live_stream: bool,
+        ) {
             self.killed
                 .lock()
                 .unwrap()
-                .push((job.path.clone(), delete_files));
+                .push((job.path.clone(), delete_files, close_live_stream));
         }
     }
 
@@ -1154,7 +1194,31 @@ mod tests {
             .unwrap();
         let killed = reporter.killed.lock().unwrap();
         assert_eq!(killed.len(), 1);
-        assert_eq!(killed[0], ("/t/a.m3u8".to_owned(), true));
+        // `KillTranscodingJobs` is `closeLiveStream: false`: the stop report
+        // releases the live stream, not the kill.
+        assert_eq!(killed[0], ("/t/a.m3u8".to_owned(), true, false));
+    }
+
+    #[tokio::test]
+    async fn only_the_idle_reaper_asks_teardown_to_release_the_live_stream() {
+        // Upstream's two callers differ exactly here: `OnTranscodeKillTimerStopped`
+        // passes `closeLiveStream: true` (the consumer is gone for good),
+        // `KillTranscodingJobs` passes `false`.
+        let reporter = Arc::new(RecordingReporter {
+            killed: Mutex::new(Vec::new()),
+        });
+        let m = TranscodeManagerImpl::new(ReporterHandle(Arc::clone(&reporter)));
+        let job = handle("s2", "/t/b.m3u8", TranscodingJobType::Hls, "dev2");
+        m.register_job(job);
+        // No consumer, and the ping timeout already elapsed → reaped.
+        {
+            let mut jobs = m.jobs.lock().unwrap();
+            jobs[0].ping_timeout_ms = -1;
+        }
+        let reaped = m.reap_idle_jobs().await;
+        assert_eq!(reaped.len(), 1);
+        let killed = reporter.killed.lock().unwrap();
+        assert_eq!(killed[0], ("/t/b.m3u8".to_owned(), true, true));
     }
 
     /// Adapter so an `Arc<RecordingReporter>` satisfies the `SessionReporter`
@@ -1166,8 +1230,15 @@ mod tests {
         async fn report_progress(&self, job: &TranscodingJobHandle, progress: TranscodingProgress) {
             self.0.report_progress(job, progress).await;
         }
-        async fn on_job_killed(&self, job: &TranscodingJobHandle, delete_files: bool) {
-            self.0.on_job_killed(job, delete_files).await;
+        async fn on_job_killed(
+            &self,
+            job: &TranscodingJobHandle,
+            delete_files: bool,
+            close_live_stream: bool,
+        ) {
+            self.0
+                .on_job_killed(job, delete_files, close_live_stream)
+                .await;
         }
     }
 
@@ -1486,7 +1557,7 @@ mod start_ffmpeg_tests {
             .start_ffmpeg(&fake, ffmpeg_req(&st, &playlist, vec![]))
             .await
             .unwrap();
-        m.kill_and_remove(&handle, false).await;
+        m.kill_and_remove(&handle, false, false).await;
         assert_eq!(m.active_job_count(), 0);
         assert!(playlist.exists(), "files kept when delete_files=false");
     }

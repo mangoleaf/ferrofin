@@ -927,17 +927,38 @@ impl MediaSourceManager for FerrofinMediaSourceManager {
         // lives with the tuner-side stream, so the Live TV manager decides
         // whether this was the last reader, and only then is the source
         // forgotten here — another viewer may still be watching it.
+        //
+        // Upstream holds the `ILiveStream` object itself and decrements on that;
+        // here the tuner-side map is keyed by string, so the id the CALLER used
+        // (which may differ in case) is first resolved back to the one the
+        // stream was opened under. Closing under the caller's spelling would
+        // miss the tuner entry and leak the handle while still forgetting the
+        // source.
+        let key = stream_key(id);
+        let canonical = {
+            let open = self
+                .open_streams
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            open.get(&key)
+                .and_then(|source| source.live_stream_id.clone())
+        };
+        let canonical = canonical.unwrap_or_else(|| id.to_owned());
         let gone = match self.live_tv.as_ref() {
             // The Live TV manager keys its streams by the id IT minted, before
             // `SetKeyProperties` prefixed it with the provider key.
-            Some(live_tv) => live_tv.close_channel_stream(strip_provider_key(id)).await?,
+            Some(live_tv) => {
+                live_tv
+                    .close_channel_stream(strip_provider_key(&canonical))
+                    .await?
+            }
             None => true,
         };
         if gone {
             self.open_streams
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(&stream_key(id));
+                .remove(&key);
         }
         Ok(())
     }
