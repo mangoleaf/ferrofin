@@ -205,9 +205,10 @@ pub struct FerrofinSessionManager {
     /// Port of `SessionManager._activeLiveStreamSessions`. It exists because a
     /// live stream's consumer count is real and shared: a Live TV channel two
     /// people are watching is ONE stream with two consumers, so a duplicate
-    /// `PlaybackStopped` (or a client that both POSTs `/LiveStreams/Close` and
-    /// reports stopped) must not decrement twice and tear the tuner down under
-    /// the other viewer.
+    /// `PlaybackStopped` must not decrement twice and tear the tuner down under
+    /// the other viewer. (An explicit `POST /LiveStreams/Close` bypasses this
+    /// map and decrements directly, exactly as upstream's
+    /// `MediaInfoController.CloseLiveStream` does.)
     ///
     /// The pairing is what makes that work: one viewer is known by two ids (the
     /// session and the play session), and a release under either drops BOTH, so
@@ -1719,14 +1720,15 @@ impl SessionManager for FerrofinSessionManager {
         live_stream_id: &str,
         session_or_play_session_id: &str,
     ) -> Result<(), ServiceError> {
-        // C# keeps a `_activeLiveStreamSessions` map so a live stream shared by
-        // several sessions is closed only by the last one. Ferrofin does not
-        // need that second layer: a Live TV stream IS shared between viewers
-        // (they all get the same `LiveStreamId`), but every `OpenLiveStream`
-        // raised its consumer count, so one close per session stop is exactly
-        // symmetric — `MediaSourceManager::close_live_stream` drops the tuner
-        // only when that count reaches zero. A non-Live-TV live stream still
-        // has a fresh id per open, where the count is trivially one.
+        // Port of `CloseLiveStreamIfNeededAsync`. A Live TV stream IS shared
+        // between viewers (they all get the same `LiveStreamId`) and every
+        // `OpenLiveStream` raised its consumer count, so a release must happen
+        // exactly once per viewer: `MediaSourceManager::close_live_stream` drops
+        // the tuner when that count reaches zero, and one release too many takes
+        // the channel away from someone still watching. The holder map is what
+        // makes "once per viewer" true — see its field docs. A report for a
+        // stream this server never registered releases nothing, as upstream's
+        // missing-mapping branch does.
         if live_stream_id.is_empty() {
             return Ok(());
         }

@@ -1628,6 +1628,43 @@ mod tests {
         assert!(mgr.get_live_stream(&live_id).await.is_err());
     }
 
+    #[tokio::test]
+    async fn a_close_under_another_casing_still_reaches_the_tuner() {
+        // A client echoes the id back however it likes. Upstream's `_openStreams`
+        // holds the stream OBJECT and decrements on it; here the tuner map is
+        // keyed by string, so the close has to resolve the caller's spelling
+        // back to the id the stream was opened under. Forgetting the source
+        // while leaving the tuner handle open is the leak this guards.
+        let db = test_db().await;
+        let live_tv = Arc::new(FakeLiveTv::default());
+        let mgr = manager(&db).with_live_tv(Arc::clone(&live_tv) as Arc<_>);
+        let channel = Uuid::from_u128(0x77A);
+        let opened = mgr
+            .open_live_stream(&LiveStreamRequest {
+                open_token: Some(format!(
+                    "{}_LiveTvChannel_{}_source-1",
+                    live_tv_provider_key(),
+                    channel.simple()
+                )),
+                item_id: channel,
+                ..Default::default()
+            })
+            .await
+            .expect("open");
+        let live_id = opened.live_stream_id.clone().expect("live stream id");
+
+        mgr.close_live_stream(&live_id.to_uppercase())
+            .await
+            .expect("close");
+        // The tuner side saw the id it minted, not the shouted one…
+        assert_eq!(
+            *live_tv.closed.lock().expect("closed"),
+            vec![strip_provider_key(&live_id).to_owned()]
+        );
+        // …and the source is forgotten either way.
+        assert!(mgr.get_live_stream(&live_id).await.is_err());
+    }
+
     #[test]
     fn the_provider_prefix_comes_back_off_a_live_stream_id() {
         let prefixed = format!("{}_servicekey_source-1", live_tv_provider_key());

@@ -2810,14 +2810,21 @@ impl LibraryScanner {
         // "checked" marker if it ever costs real time.
         if let Some(stored) = stored.filter(|s| s.is_complete()) {
             if name_is_file_stem_placeholder(entity) {
+                // Recomputed from the stored title, not copied from the stored
+                // key: a key derived by an older algorithm would otherwise
+                // survive every rescan and sort next to freshly derived ones
+                // (the play queue reads this). `BaseItem.SortName` prefers a
+                // `ForcedSortName` when the item has one, so this does too.
                 entity.name.clone_from(&stored.name);
-                // Recomputed, not copied: a stored key from an older algorithm
-                // would otherwise survive every rescan and sort next to freshly
-                // derived ones (the play queue reads this).
-                entity.sort_name = stored
-                    .name
-                    .as_deref()
-                    .map(|name| derived_sort_name(entity, name));
+                entity.sort_name = match entity.forced_sort_name.as_deref() {
+                    Some(forced) => {
+                        Some(ferrofin_util::sort_name::modify_sort_chunks(forced).to_lowercase())
+                    }
+                    None => stored
+                        .name
+                        .as_deref()
+                        .map(|name| derived_sort_name(entity, name)),
+                };
             }
             if entity.overview.is_none() {
                 entity.overview.clone_from(&stored.overview);
@@ -8241,6 +8248,66 @@ mod tests {
         assert_eq!(
             episode.sort_name.as_deref(),
             Some("001 - 0001 - Winter Is Coming")
+        );
+    }
+
+    // A key an older algorithm produced must not survive the rescan: the row
+    // carries the stored TITLE forward and derives the key from it again, so a
+    // library never ends up half-sorted by two different rules.
+    #[tokio::test]
+    async fn a_carried_forward_title_re_derives_its_sort_key() {
+        let (base, _hits, _all) = spawn_tmdb_server(Some(SEASON_JSON), Some(CREDITS_JSON));
+        let tmp = tempfile::tempdir().unwrap();
+        let (scanner, mut cache, mut episode) = tmdb_episode_fixture(&base, tmp.path()).await;
+
+        // A stale key: what the pre-convergence scanner wrote for this title.
+        let stored = super::StoredText::from_row(ferrofin_db::entities::base_items::ItemTextRow {
+            id: String::new(),
+            name: Some("Winter Is Coming".into()),
+            sort_name: Some("winter is coming".into()),
+            overview: Some("Ned is summoned south.".into()),
+            path: episode.path.clone(),
+        });
+
+        scanner
+            .fetch_tmdb_episode(&mut episode, &mut cache, Some(&stored))
+            .await
+            .expect("nothing to do");
+
+        assert_eq!(episode.name.as_deref(), Some("Winter Is Coming"));
+        assert_eq!(
+            episode.sort_name.as_deref(),
+            Some("001 - 0001 - Winter Is Coming"),
+            "the key is re-derived from the carried-forward title, not copied"
+        );
+    }
+
+    // `BaseItem.SortName` prefers a `ForcedSortName` (`<sorttitle>`); the
+    // re-derivation above must not overwrite one.
+    #[tokio::test]
+    async fn a_forced_sort_name_survives_the_re_derivation() {
+        let (base, _hits, _all) = spawn_tmdb_server(Some(SEASON_JSON), Some(CREDITS_JSON));
+        let tmp = tempfile::tempdir().unwrap();
+        let (scanner, mut cache, mut episode) = tmdb_episode_fixture(&base, tmp.path()).await;
+        episode.forced_sort_name = Some("Thrones 01".into());
+
+        let stored = super::StoredText::from_row(ferrofin_db::entities::base_items::ItemTextRow {
+            id: String::new(),
+            name: Some("Winter Is Coming".into()),
+            sort_name: Some("thrones 0000000001".into()),
+            overview: Some("Ned is summoned south.".into()),
+            path: episode.path.clone(),
+        });
+
+        scanner
+            .fetch_tmdb_episode(&mut episode, &mut cache, Some(&stored))
+            .await
+            .expect("nothing to do");
+
+        assert_eq!(
+            episode.sort_name.as_deref(),
+            Some("thrones 0000000001"),
+            "ModifySortChunks(ForcedSortName).ToLowerInvariant()"
         );
     }
 
