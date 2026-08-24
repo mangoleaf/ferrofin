@@ -33,7 +33,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use ferrofin_core::FerrofinServerApplicationPaths;
-use ferrofin_hls::{StreamStatePlanner, TranscodePlan};
+use ferrofin_hls::{PlaylistKind, StreamStatePlanner, TranscodePlan};
 use ferrofin_mediaencoding::{
     BaseEncodingJobOptions, EncodingHelper, EncodingJobInfo, ProbedEncoders,
 };
@@ -82,9 +82,14 @@ const DEFAULT_VIDEO_CODEC: &str = "h264";
 const DEFAULT_AUDIO_CODEC: &str = "aac";
 
 /// The default encoder preset handed to [`EncodingHelper::video_quality_param`]
-/// when the configured preset is `auto`. Port of the `veryfast` default the
-/// software path uses for on-the-fly encode.
+/// when the configured preset is `auto`, for a VOD job. Port of
+/// `DynamicHlsController.DefaultVodEncoderPreset = EncoderPreset.veryfast`.
 const DEFAULT_ENCODER_PRESET: EncoderPreset = EncoderPreset::veryfast;
+
+/// The default encoder preset for an EVENT (`live.m3u8`) job, which must keep
+/// up with real time. Port of
+/// `DynamicHlsController.DefaultEventEncoderPreset = EncoderPreset.superfast`.
+const DEFAULT_EVENT_ENCODER_PRESET: EncoderPreset = EncoderPreset::superfast;
 
 /// The number of ffmpeg ticks per second (100 ns units). Port of
 /// `TimeSpan.TicksPerSecond`.
@@ -515,6 +520,7 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
         request: &HlsStreamRequest,
         is_audio: bool,
         segment_id: Option<i32>,
+        kind: PlaylistKind,
     ) -> Result<TranscodePlan, ServiceError> {
         // ---- (1) RESOLVE MEDIA SOURCE (GetStreamingState) -------------------
         let media_source = self.resolve_media_source(request).await?;
@@ -852,6 +858,7 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
             &playlist_path,
             &options,
             burn_subtitle_path.as_deref(),
+            kind,
         );
 
         // ---- (5) RETURN the TranscodePlan -----------------------------------
@@ -913,8 +920,10 @@ impl FerrofinStreamStatePlanner {
         playlist_path: &std::path::Path,
         options: &EncodingOptions,
         burn_subtitle_path: Option<&str>,
+        kind: PlaylistKind,
     ) -> Vec<String> {
         let mut args: Vec<String> = Vec::new();
+        let is_event_playlist = kind == PlaylistKind::Event;
 
         // Resolve the video encoder up front (it decides input hwaccel too). NVENC
         // maps the target codec to its hardware encoder; otherwise the software
@@ -1083,7 +1092,11 @@ impl FerrofinStreamStatePlanner {
                         state,
                         &video_encoder,
                         options,
-                        DEFAULT_ENCODER_PRESET,
+                        if is_event_playlist {
+                            DEFAULT_EVENT_ENCODER_PRESET
+                        } else {
+                            DEFAULT_ENCODER_PRESET
+                        },
                     ),
                 );
             }
@@ -1136,6 +1149,14 @@ impl FerrofinStreamStatePlanner {
                 args.push("-vf".to_owned());
                 args.push(sw_filters.join(","));
             }
+        }
+        // `GetVideoArguments`' "TODO why was this not enabled for VOD?": an
+        // event playlist in mpegts segments drops the global header (copy and
+        // re-encode alike). Keyed on the NORMALISED container, as upstream's
+        // `outputExtension.TrimStart('.')` is — an unknown container falls back
+        // to mpegts there and must here too.
+        if is_event_playlist && segment_file_extension(segment_container) == "ts" {
+            push_split(&mut args, "-flags -global_header");
         }
 
         // ---- threads ---------------------------------------------------------
@@ -1273,7 +1294,7 @@ impl FerrofinStreamStatePlanner {
         push_split(&mut args, "-hls_time");
         args.push(state.segment_length_secs.to_string());
         push_split(&mut args, "-hls_playlist_type");
-        args.push("vod".to_owned());
+        args.push(if is_event_playlist { "event" } else { "vod" }.to_owned());
         // Write each segment to a `.tmp` and rename it into place only once fully
         // written, so a segment file appears **atomically complete**. This lets the
         // serve path wait for just segment N (not N+1) to prove completeness — it
@@ -1301,6 +1322,13 @@ impl FerrofinStreamStatePlanner {
         if let Some(id) = segment_id {
             push_split(&mut args, "-start_number");
             args.push(id.to_string());
+        }
+        // An event playlist is served as ffmpeg wrote it, so its segment URIs
+        // must already point at the `hls/{playlistId}/{segment}` route
+        // (`GetCommandLineArguments`' `-hls_base_url "hls/{0}/"`).
+        if is_event_playlist {
+            push_split(&mut args, "-hls_base_url");
+            args.push(format!("hls/{stem}/"));
         }
         // Align a seek-restarted transcode's timestamps to this segment's place
         // in the playlist. The `-ss` input seek makes ffmpeg reset output PTS to
@@ -1709,7 +1737,10 @@ mod tests {
     async fn plan_resolves_source_and_fills_runtime() {
         let src = source("abc", vec![video_stream("h264"), audio_stream("aac")]);
         let p = planner(vec![src]);
-        let plan = p.plan(&request("abc"), false, None).await.unwrap();
+        let plan = p
+            .plan(&request("abc"), false, None, PlaylistKind::Vod)
+            .await
+            .unwrap();
         assert_eq!(plan.media_path, "/media/movie.mkv");
         assert_eq!(plan.run_time_ticks, 90 * 60 * TICKS_PER_SECOND);
         assert_eq!(plan.segment_length_ms, 3000);
@@ -1727,7 +1758,10 @@ mod tests {
         let p = planner_full(vec![src], false, &["libfdk_aac"]);
         let mut req = request("abc");
         req.video_codec = Some("h264".to_owned()); // copy video, isolate the audio path
-        let plan = p.plan(&req, false, Some(0)).await.unwrap();
+        let plan = p
+            .plan(&req, false, Some(0), PlaylistKind::Vod)
+            .await
+            .unwrap();
 
         assert!(
             plan.arguments.windows(2).any(|w| w == ["-ac", "6"]),
@@ -1788,7 +1822,7 @@ mod tests {
         let p = planner(vec![src]);
         let mut req = request("abc");
         req.video_codec = Some("av1,h264,vp9".to_owned());
-        let plan = p.plan(&req, false, None).await.unwrap();
+        let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
         let args = plan.arguments.join(" ");
         assert!(
             args.contains("-c:v libx264"),
@@ -1809,7 +1843,7 @@ mod tests {
         let mut req = request("abc");
         req.audio_codec = Some("aac".to_owned());
         req.transcoding_max_audio_channels = Some(2);
-        let plan = p.plan(&req, false, None).await.unwrap();
+        let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
         let pos = plan.arguments.iter().position(|a| a == "-ac");
         assert_eq!(
             pos.map(|i| plan.arguments[i + 1].as_str()),
@@ -1831,7 +1865,7 @@ mod tests {
         let mut req = request("abc");
         req.audio_codec = Some("aac".to_owned());
         req.transcoding_max_audio_channels = Some(2);
-        let plan = p.plan(&req, false, None).await.unwrap();
+        let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
         let args = plan.arguments.join(" ");
         assert!(
             args.contains("-c:a libfdk_aac"),
@@ -1846,7 +1880,7 @@ mod tests {
         let p = planner(vec![src]);
         let mut req = request("abc");
         req.audio_codec = Some("aac".to_owned());
-        let plan = p.plan(&req, false, None).await.unwrap();
+        let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
         let args = plan.arguments.join(" ");
         assert!(
             !args.contains("-af volume"),
@@ -1866,7 +1900,7 @@ mod tests {
         let p = planner(vec![src]);
         let mut req = request("abc");
         req.audio_codec = Some("aac".to_owned());
-        let plan = p.plan(&req, false, None).await.unwrap();
+        let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
         let pos = plan.arguments.iter().position(|a| a == "-ac");
         assert_eq!(
             pos.map(|i| plan.arguments[i + 1].as_str()),
@@ -1885,7 +1919,10 @@ mod tests {
         let mut src = source("abc", vec![video_stream("h264"), audio_stream("ac3")]);
         src.path = Some("/media/My Movie (2010).mkv".to_owned());
         let p = planner(vec![src]);
-        let plan = p.plan(&request("abc"), false, None).await.unwrap();
+        let plan = p
+            .plan(&request("abc"), false, None, PlaylistKind::Vod)
+            .await
+            .unwrap();
 
         let i = plan
             .arguments
@@ -1910,7 +1947,9 @@ mod tests {
     async fn plan_missing_source_is_not_found() {
         let src = source("abc", vec![video_stream("h264")]);
         let p = planner(vec![src]);
-        let result = p.plan(&request("nope"), false, None).await;
+        let result = p
+            .plan(&request("nope"), false, None, PlaylistKind::Vod)
+            .await;
         assert!(matches!(result, Err(ServiceError::NotFound(_))));
     }
 
@@ -1928,7 +1967,10 @@ mod tests {
             "D37ECB9D-75B0-C0A8-E9EC-B0A864EC670E",
             "d37ecb9d-75b0-c0a8-e9ec-b0a864ec670e",
         ] {
-            let plan = p.plan(&request(id), false, None).await.unwrap();
+            let plan = p
+                .plan(&request(id), false, None, PlaylistKind::Vod)
+                .await
+                .unwrap();
             assert_eq!(plan.media_path, "/media/movie.mkv", "{id}");
         }
     }
@@ -1943,6 +1985,7 @@ mod tests {
                 &request(&Uuid::from_u128(1).simple().to_string()),
                 false,
                 None,
+                PlaylistKind::Vod,
             )
             .await
             .unwrap();
@@ -1967,7 +2010,10 @@ mod tests {
         let mut req = request("abc");
         req.video_codec = Some("h264".to_owned());
         req.query_string = "?SubtitleStreamIndex=2".to_owned();
-        let plan = p.plan(&req, false, Some(0)).await.unwrap();
+        let plan = p
+            .plan(&req, false, Some(0), PlaylistKind::Vod)
+            .await
+            .unwrap();
         let args = plan.arguments.join(" ");
         assert!(
             args.contains("-vf subtitles=f='/media/movie.mkv':si=0"),
@@ -1992,7 +2038,10 @@ mod tests {
         let p = planner(vec![src]);
         let mut req = request("abc");
         req.query_string = "?SubtitleStreamIndex=2".to_owned();
-        let plan = p.plan(&req, false, Some(3)).await.unwrap();
+        let plan = p
+            .plan(&req, false, Some(3), PlaylistKind::Vod)
+            .await
+            .unwrap();
         let vf = plan
             .arguments
             .iter()
@@ -2017,7 +2066,10 @@ mod tests {
             ],
         );
         let p = planner(vec![src]);
-        let plan = p.plan(&request("abc"), false, Some(0)).await.unwrap();
+        let plan = p
+            .plan(&request("abc"), false, Some(0), PlaylistKind::Vod)
+            .await
+            .unwrap();
         assert!(
             !plan.arguments.iter().any(|a| a.contains("subtitles=")),
             "no subtitle selected → no burn filter: {:?}",
@@ -2042,7 +2094,10 @@ mod tests {
             let p = planner(vec![src]);
             let mut req = request("abc");
             req.query_string = format!("?SubtitleStreamIndex=2&SubtitleMethod={method}");
-            let plan = p.plan(&req, false, Some(0)).await.unwrap();
+            let plan = p
+                .plan(&req, false, Some(0), PlaylistKind::Vod)
+                .await
+                .unwrap();
             assert!(
                 !plan.arguments.iter().any(|a| a.contains("subtitles=")),
                 "SubtitleMethod={method} must not burn: {:?}",
@@ -2064,7 +2119,10 @@ mod tests {
         let p = planner(vec![src]);
         let mut req = request("abc");
         req.query_string = "?SubtitleStreamIndex=2&SubtitleMethod=Encode".to_owned();
-        let plan = p.plan(&req, false, Some(0)).await.unwrap();
+        let plan = p
+            .plan(&req, false, Some(0), PlaylistKind::Vod)
+            .await
+            .unwrap();
         let args = plan.arguments.join(" ");
         assert!(
             args.contains("subtitles=f='/media/movie.mkv':si=0"),
@@ -2101,7 +2159,10 @@ mod tests {
         let mut req = request("abc");
         req.segment_container = Some("mp4".to_owned());
         req.video_codec = Some("hevc".to_owned()); // client supports hevc → copy
-        let plan = p.plan(&req, false, Some(0)).await.unwrap();
+        let plan = p
+            .plan(&req, false, Some(0), PlaylistKind::Vod)
+            .await
+            .unwrap();
 
         assert!(
             plan.arguments.windows(2).any(|w| w == ["-c:v", "copy"]),
@@ -2142,7 +2203,10 @@ mod tests {
         let p = planner(vec![src]);
         let mut req = request("abc"); // segment_container defaults to "ts"
         req.video_codec = Some("hevc".to_owned());
-        let plan = p.plan(&req, false, Some(0)).await.unwrap();
+        let plan = p
+            .plan(&req, false, Some(0), PlaylistKind::Vod)
+            .await
+            .unwrap();
         assert!(
             !plan.arguments.iter().any(|a| a == "-tag:v:0"),
             "TS must not carry the hvc1 tag: {:?}",
@@ -2163,7 +2227,10 @@ mod tests {
         // transcode by requesting a codec the source doesn't have.
         let src = source("abc", vec![video_stream("mpeg4"), audio_stream("mp3")]);
         let p = planner(vec![src]);
-        let plan = p.plan(&request("abc"), false, Some(0)).await.unwrap();
+        let plan = p
+            .plan(&request("abc"), false, Some(0), PlaylistKind::Vod)
+            .await
+            .unwrap();
         // Source is mpeg4, target defaults to h264 → not copyable → libx264.
         assert!(
             plan.arguments.windows(2).any(|w| w == ["-c:v", "libx264"]),
@@ -2186,7 +2253,10 @@ mod tests {
         let mut req = request("abc");
         req.video_codec = Some("h264,hevc,vp9,av1".to_owned());
         req.audio_codec = Some("aac,mp3,mp2,opus,flac,vorbis".to_owned());
-        let plan = p.plan(&req, false, Some(0)).await.unwrap();
+        let plan = p
+            .plan(&req, false, Some(0), PlaylistKind::Vod)
+            .await
+            .unwrap();
 
         // hevc is supported → copy video; eac3 unsupported → transcode to aac.
         assert!(
@@ -2215,7 +2285,7 @@ mod tests {
         let mut req = request("abc");
         req.video_codec = Some("copy".to_owned());
         req.audio_codec = Some("copy".to_owned());
-        let plan = p.plan(&req, false, None).await.unwrap();
+        let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
         assert!(plan.is_remuxing_video);
         assert!(plan.arguments.windows(2).any(|w| w == ["-c:v", "copy"]));
         assert!(plan.arguments.windows(2).any(|w| w == ["-c:a", "copy"]));
@@ -2232,7 +2302,10 @@ mod tests {
         let p = planner(vec![src]);
         let mut req = request("abc");
         req.segment_length = Some(6);
-        let plan = p.plan(&req, false, Some(0)).await.unwrap();
+        let plan = p
+            .plan(&req, false, Some(0), PlaylistKind::Vod)
+            .await
+            .unwrap();
         assert_eq!(plan.segment_length_ms, 6000);
         assert!(
             plan.arguments.windows(2).any(|w| w == ["-hls_time", "6"]),
@@ -2241,7 +2314,10 @@ mod tests {
         );
 
         // Absent → the 3s default.
-        let plan = p.plan(&request("abc"), false, Some(0)).await.unwrap();
+        let plan = p
+            .plan(&request("abc"), false, Some(0), PlaylistKind::Vod)
+            .await
+            .unwrap();
         assert_eq!(plan.segment_length_ms, 3000);
 
         // A degenerate 0 would make the playlist generator divide by zero
@@ -2249,7 +2325,10 @@ mod tests {
         // instead. Deliberate divergence: upstream takes the 0 verbatim.
         let mut req = request("abc");
         req.segment_length = Some(0);
-        let plan = p.plan(&req, false, Some(0)).await.unwrap();
+        let plan = p
+            .plan(&req, false, Some(0), PlaylistKind::Vod)
+            .await
+            .unwrap();
         assert_eq!(plan.segment_length_ms, 3000);
     }
 
@@ -2257,7 +2336,10 @@ mod tests {
     async fn plan_builds_hls_muxer_args() {
         let src = source("abc", vec![video_stream("h264"), audio_stream("aac")]);
         let p = planner(vec![src]);
-        let plan = p.plan(&request("abc"), false, Some(0)).await.unwrap();
+        let plan = p
+            .plan(&request("abc"), false, Some(0), PlaylistKind::Vod)
+            .await
+            .unwrap();
         assert!(plan.arguments.windows(2).any(|w| w == ["-f", "hls"]));
         assert!(plan.arguments.windows(2).any(|w| w == ["-hls_time", "3"]));
         assert!(
@@ -2287,7 +2369,10 @@ mod tests {
     async fn plan_seeks_for_nonzero_segment() {
         let src = source("abc", vec![video_stream("mpeg4"), audio_stream("aac")]);
         let p = planner(vec![src]);
-        let plan = p.plan(&request("abc"), true, Some(2)).await.unwrap();
+        let plan = p
+            .plan(&request("abc"), true, Some(2), PlaylistKind::Vod)
+            .await
+            .unwrap();
         // Audio-only plan: segment 2 seeks to 2 * 3s = 6s worth of ticks.
         assert!(
             plan.arguments.iter().any(|a| a == "-ss"),
@@ -2328,7 +2413,10 @@ mod tests {
         let mut req = request("abc");
         req.segment_container = Some("mp4".to_owned());
         req.video_codec = Some("hevc".to_owned()); // client supports hevc → copy
-        let plan = p.plan(&req, false, Some(2)).await.unwrap();
+        let plan = p
+            .plan(&req, false, Some(2), PlaylistKind::Vod)
+            .await
+            .unwrap();
         assert!(
             plan.arguments.windows(2).any(|w| w == ["-c:v", "copy"]),
             "{:?}",
@@ -2344,7 +2432,10 @@ mod tests {
         // seek is correct there, and the flag must not appear.
         let src = source("abc", vec![video_stream("hevc"), audio_stream("eac3")]);
         let p = planner(vec![src]);
-        let plan = p.plan(&request("abc"), false, Some(2)).await.unwrap();
+        let plan = p
+            .plan(&request("abc"), false, Some(2), PlaylistKind::Vod)
+            .await
+            .unwrap();
         assert!(
             !plan.arguments.iter().any(|a| a == "-noaccurate_seek"),
             "re-encode seek keeps accurate seek: {:?}",
@@ -2357,7 +2448,10 @@ mod tests {
         let mut req = request("abc");
         req.segment_container = Some("mp4".to_owned());
         req.video_codec = Some("hevc".to_owned());
-        let plan = p.plan(&req, false, Some(0)).await.unwrap();
+        let plan = p
+            .plan(&req, false, Some(0), PlaylistKind::Vod)
+            .await
+            .unwrap();
         assert!(
             !plan.arguments.iter().any(|a| a == "-noaccurate_seek"),
             "no seek, no flag: {:?}",
@@ -2371,7 +2465,10 @@ mod tests {
         // no -start_number (segments number from 0 as usual).
         let src = source("abc", vec![video_stream("h264"), audio_stream("aac")]);
         let p = planner(vec![src]);
-        let plan = p.plan(&request("abc"), false, None).await.unwrap();
+        let plan = p
+            .plan(&request("abc"), false, None, PlaylistKind::Vod)
+            .await
+            .unwrap();
         assert!(
             !plan.arguments.iter().any(|a| a == "-start_number"),
             "{:?}",
@@ -2431,7 +2528,7 @@ mod tests {
         req.video_bitrate = Some(8_000_000);
         req.max_width = Some(1920);
         req.max_height = Some(1080);
-        let plan = p.plan(&req, false, None).await.unwrap();
+        let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
         let args = plan.arguments.join(" ");
         assert!(args.contains("-c:v libx264"), "re-encode expected: {args}");
         // Force a keyframe on every 3 s segment boundary so the HLS muxer cuts on
@@ -2476,7 +2573,7 @@ mod tests {
         req.video_bitrate = Some(8_000_000);
         req.max_width = Some(1920);
         req.max_height = Some(1080);
-        let plan = p.plan(&req, false, None).await.unwrap();
+        let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
         let args = plan.arguments.join(" ");
         let vf = plan
             .arguments
@@ -2504,7 +2601,7 @@ mod tests {
         let p = planner(vec![src]);
         let mut req = request("abc");
         req.video_codec = Some("h264".to_owned());
-        let plan = p.plan(&req, false, None).await.unwrap();
+        let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
         let args = plan.arguments.join(" ");
         // (`zscale=` from the tonemap chain is expected; a downscale would
         // prefix the chain as `-vf scale=…`.)
@@ -2531,7 +2628,7 @@ mod tests {
         let p = planner(vec![src]);
         let mut req = request("abc");
         req.video_codec = Some("h264".to_owned());
-        let plan = p.plan(&req, false, None).await.unwrap();
+        let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
         let args = plan.arguments.join(" ");
         assert!(
             args.contains("-vf format=yuv420p"),
@@ -2549,7 +2646,7 @@ mod tests {
         let p = planner(vec![src.clone()]);
         let mut req = request("abc");
         req.video_codec = Some("hevc,h264".to_owned());
-        let plan = p.plan(&req, false, None).await.unwrap();
+        let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
         assert!(
             plan.arguments.join(" ").contains("-c:v copy"),
             "control: copy expected when allowed"
@@ -2559,7 +2656,7 @@ mod tests {
         let mut req = request("abc");
         req.video_codec = Some("hevc,h264".to_owned());
         req.allow_video_stream_copy = false;
-        let plan = p.plan(&req, false, None).await.unwrap();
+        let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
         let args = plan.arguments.join(" ");
         assert!(
             !args.contains("-c:v copy"),
@@ -2580,7 +2677,7 @@ mod tests {
         let mut req = request("abc");
         req.video_codec = Some("h264".to_owned());
         req.video_bitrate = Some(8_000_000);
-        let plan = p.plan(&req, false, None).await.unwrap();
+        let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
         let args = plan.arguments.join(" ");
         assert!(
             args.contains("scale=1920:1080"),
@@ -2651,7 +2748,7 @@ mod tests {
         req.allow_video_stream_copy = false;
         req.allow_audio_stream_copy = false;
         let p = planner(vec![src.clone()]);
-        let plan = p.plan(&req, false, None).await.unwrap();
+        let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
         assert_eq!(plan.state.output_audio_channels, Some(1));
         assert_eq!(plan.state.output_audio_bitrate, Some(128_000));
         assert_eq!(plan.state.output_video_bitrate, Some(1_000_000));
@@ -2671,7 +2768,7 @@ mod tests {
         req.video_bitrate = Some(8_000_000);
         req.max_width = Some(320);
         let p = planner(vec![src]);
-        let plan = p.plan(&req, false, None).await.unwrap();
+        let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
         assert_eq!(plan.state.output_video_codec.as_deref(), Some("copy"));
         assert_eq!(plan.state.output_audio_codec.as_deref(), Some("copy"));
         assert_eq!(plan.state.output_video_bitrate, Some(6_000_000));
@@ -2700,7 +2797,7 @@ mod tests {
         let p = planner(vec![src.clone()]);
         let mut req = request("abc");
         req.audio_codec = Some("aac".to_owned());
-        let plan = p.plan(&req, false, None).await.unwrap();
+        let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
         // 6 in, 6 out → min(640000, MAX).
         assert_eq!(plan.state.output_audio_bitrate, Some(640_000));
 
@@ -2708,17 +2805,17 @@ mod tests {
         let mut req = request("abc");
         req.audio_codec = Some("flac".to_owned());
         req.audio_bitrate = Some(128_000);
-        let plan = p.plan(&req, false, None).await.unwrap();
+        let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
         assert_eq!(plan.state.output_audio_bitrate, Some(1_536_000));
         assert_eq!(plan.min_segments, 3);
         // An explicit MinSegments wins; 10s+ segments default to 2.
         let p = planner(vec![source("abc", vec![video_stream("h264")])]);
         let mut req = request("abc");
         req.segment_length = Some(10);
-        let plan = p.plan(&req, false, None).await.unwrap();
+        let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
         assert_eq!(plan.min_segments, 2);
         req.min_segments = Some(1);
-        let plan = p.plan(&req, false, None).await.unwrap();
+        let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
         assert_eq!(plan.min_segments, 1);
     }
 
@@ -2738,7 +2835,7 @@ mod tests {
         req.framerate = Some(24.0);
         req.width = Some(640);
         req.height = Some(360);
-        let plan = p.plan(&req, false, None).await.unwrap();
+        let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
         assert_eq!(
             plan.state.requested_profiles("h264"),
             vec!["high".to_owned()]
@@ -2772,7 +2869,7 @@ mod tests {
         req.query_string = "?h264-profile=high&h264-level=51".to_owned();
         req.profile = Some("main".to_owned());
         req.level = Some("40".to_owned());
-        let plan = p.plan(&req, false, None).await.unwrap();
+        let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
         assert_eq!(
             plan.state.requested_profiles("h264"),
             vec!["main".to_owned()]
@@ -2789,7 +2886,7 @@ mod tests {
         let p = planner(vec![src.clone()]);
         let mut req = request("abc");
         req.audio_codec = Some("aac".to_owned());
-        let plan = p.plan(&req, true, None).await.unwrap();
+        let plan = p.plan(&req, true, None, PlaylistKind::Vod).await.unwrap();
         assert_eq!(plan.state.output_audio_codec.as_deref(), Some("aac"));
         assert!(
             !plan.arguments.join(" ").contains("-c:a copy"),
@@ -2804,8 +2901,55 @@ mod tests {
         )]);
         let mut req = request("abc");
         req.audio_codec = Some("aac".to_owned());
-        let plan = p.plan(&req, false, None).await.unwrap();
+        let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
         assert_eq!(plan.state.output_audio_codec.as_deref(), Some("copy"));
+    }
+
+    /// An EVENT plan (`live.m3u8`) writes an event playlist with routed
+    /// segment URIs, the `superfast` preset and, for mpegts, no global header;
+    /// a VOD plan keeps `vod`/`veryfast` and neither flag.
+    #[tokio::test]
+    async fn plan_event_playlist_args_follow_get_live_hls_stream() {
+        let src = source("abc", vec![video_stream("hevc"), audio_stream("aac")]);
+        let p = planner(vec![src.clone()]);
+        let mut req = request("abc");
+        req.video_codec = Some("h264".to_owned());
+        let plan = p
+            .plan(&req, false, Some(0), PlaylistKind::Event)
+            .await
+            .unwrap();
+        let args = plan.arguments.join(" ");
+        assert!(args.contains("-hls_playlist_type event"), "{args}");
+        let stem = plan.playlist_path.file_stem().unwrap().to_string_lossy();
+        assert!(
+            args.contains(&format!("-hls_base_url hls/{stem}/")),
+            "{args}"
+        );
+        assert!(args.contains("-flags -global_header"), "{args}");
+        assert!(args.contains("-preset superfast"), "{args}");
+        assert!(!args.contains("-preset veryfast"), "{args}");
+
+        let p = planner(vec![src.clone()]);
+        let plan = p
+            .plan(&req, false, Some(0), PlaylistKind::Vod)
+            .await
+            .unwrap();
+        let args = plan.arguments.join(" ");
+        assert!(args.contains("-hls_playlist_type vod"), "{args}");
+        assert!(!args.contains("-hls_base_url"), "{args}");
+        assert!(!args.contains("-global_header"), "{args}");
+        assert!(args.contains("-preset veryfast"), "{args}");
+
+        // fMP4 event segments keep the global header (the flag is mpegts-only).
+        let p = planner(vec![src]);
+        req.segment_container = Some("mp4".to_owned());
+        let plan = p
+            .plan(&req, false, Some(0), PlaylistKind::Event)
+            .await
+            .unwrap();
+        let args = plan.arguments.join(" ");
+        assert!(args.contains("-hls_playlist_type event"), "{args}");
+        assert!(!args.contains("-global_header"), "{args}");
     }
 
     /// No selected subtitle: the delivery method is the DTO default
@@ -2822,7 +2966,10 @@ mod tests {
             ],
         );
         let p = planner(vec![src.clone()]);
-        let plan = p.plan(&request("abc"), false, None).await.unwrap();
+        let plan = p
+            .plan(&request("abc"), false, None, PlaylistKind::Vod)
+            .await
+            .unwrap();
         assert_eq!(
             plan.state.subtitle_delivery_method,
             SubtitleDeliveryMethod::External
@@ -2833,7 +2980,7 @@ mod tests {
         let mut req = request("abc");
         req.subtitle_stream_index = Some(2);
         req.subtitle_method = Some("Hls".to_owned());
-        let plan = p.plan(&req, false, None).await.unwrap();
+        let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
         assert_eq!(
             plan.state.subtitle_delivery_method,
             SubtitleDeliveryMethod::Hls

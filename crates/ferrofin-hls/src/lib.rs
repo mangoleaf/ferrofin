@@ -26,7 +26,9 @@ pub use dynamic_hls_playlist_generator::{
     is_extraction_allowed_for_file,
 };
 pub use error::HlsError;
-pub use hls_stream_manager::{HlsStreamManagerImpl, StreamStatePlanner, TranscodePlan};
+pub use hls_stream_manager::{
+    HlsStreamManagerImpl, PlaylistKind, StreamStatePlanner, TranscodePlan,
+};
 pub use master_playlist::{
     MasterPlaylistContext, TrickplayResolution, build_master_playlist, query_pairs,
 };
