@@ -2134,7 +2134,10 @@ mod tests {
         // bitrate, so without the field every channel a client could have
         // direct-played gets a full software transcode instead.
         let p = planner_with_live_stream(
-            vec![source("abc", vec![video_stream("h264"), audio_stream("aac")])],
+            vec![source(
+                "abc",
+                vec![video_stream("h264"), audio_stream("aac")],
+            )],
             "prov_service_source",
             live_source("prov_service_source"),
         );
