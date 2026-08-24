@@ -1487,8 +1487,6 @@ mod tests {
         );
     }
 
-    /// Without a wired trickplay store the master lists no image playlists;
-    /// with one, the store's resolutions for the media source appear.
     /// A trickplay store reporting one 320-wide resolution for every item.
     struct FakeTrickplay;
 
@@ -1498,6 +1496,7 @@ mod tests {
             &self,
             _item_id: uuid::Uuid,
             _replace: bool,
+            _library_options: &ferrofin_model::configuration::LibraryOptions,
         ) -> Result<(), ServiceError> {
             Ok(())
         }
@@ -1570,6 +1569,8 @@ mod tests {
         }
     }
 
+    /// Without a wired trickplay store the master lists no image playlists;
+    /// with one, the store's resolutions for the media source appear.
     #[tokio::test]
     async fn master_playlist_lists_trickplay_when_wired() {
         let tmp = tempfile::tempdir().unwrap();

@@ -39,7 +39,7 @@ use ferrofin_traits::persistence::{ItemPersistenceService, ItemRepository};
 
 use crate::item_type_lookup;
 use crate::kinds;
-use crate::resolvers::sort_name as create_sort_name;
+use ferrofin_util::sort_name::create_sort_name;
 
 /// The display name of the auto-provisioned playlists media folder
 /// (C# `ManualPlaylistsFolder.Name`).

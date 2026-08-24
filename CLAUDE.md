@@ -81,6 +81,26 @@ chromaprint      health       │          ├─ drawing
 
 ## Architecture rules (do not violate)
 
+### Nothing is deferred — ever
+**"Deferred" is not a state Ferrofin has.** Every Jellyfin behaviour reachable through the
+contract is either ported faithfully or is an open work item to port now — never a stub, a
+no-op, a "faithful-empty" shrug, or an "out-of-scope"/"subsystem decision" label. This is
+a standing directive from the project owner (2026-08-22), and it is retroactive: any
+`deferred`/`deferred-hollow`/`deferred-remote-or-feature-gated`/"documented out-of-scope"
+wording you find in `suite/parity/classifications.json`, `brain/DEFERRED.md`, code comments,
+or trait-default `Err("… is deferred")` bodies is **legacy debt to remove by porting the
+thing**, not a precedent to lean on.
+
+- When a parity note says *deferred*, first verify the real code state (the notes go stale —
+  several were already ported when re-checked), then port whatever is actually missing from
+  the C# at `~/dev/3rdparty/jellyfin`, test it, and run it live.
+- The only accepted divergences are the ones listed under **Current scope** below (native .NET
+  plugin loading, SSDP discovery, OMDb without a key). Adding to that list is the owner's call,
+  never an agent's.
+- Never write the word "deferred" into a classification, a doc, or a comment as a reason to
+  skip work. If something cannot be finished in the current task, say so in the summary and
+  leave it as an explicit TODO work item with the un-defer path — not as an accepted state.
+
 ### `ferrofin-traits` is the dependency-injection seam
 The manager interfaces (`LibraryManager`, `UserManager`, `DtoService`, `ItemRepository`,
 `TranscodeManager`, …) are `#[async_trait]` **traits** in `ferrofin-traits`. This is load-bearing:
@@ -243,9 +263,11 @@ the substance of what a handler actually does — don't rely on a green checkmar
 ## Current scope
 
 **All 412 operations in the vendored contract are wired to real handlers — 0 stubs, 0 `501`s.**
-The parity ledger (`suite/parity/LEDGER.md`) classifies every op `REAL`, with 201 of them
-deep-verified (response + read-back diffed clean against Jellyfin 10.11.8) and the remainder
-classified as accepted divergences. Working end-to-end: authentication/users/QuickConnect,
+The parity ledger (`suite/parity/LEDGER.md`) classifies every op `REAL`, with 241 of them
+deep-verified (response + read-back diffed clean against Jellyfin 10.11.8), 146 classified as
+divergences (accepted, or named open work), and 25 awaiting a parity leg on the current tree.
+Those counts come from the ledger — re-read it rather than quoting this paragraph, and
+regenerate it (`python3 suite/parity/gen-ledger.py`) after any parity run. Working end-to-end: authentication/users/QuickConnect,
 library scan + live filesystem watch, browse/query/DTO, images, sessions/playstate/remote
 control, WebSocket push, playlists/collections, direct play + live HLS transcode (subtitle
 burn-in, fMP4 HEVC/AV1), Live TV (M3U/XMLTV + DVR timers), SyncPlay, all 20 scheduled tasks,

@@ -700,6 +700,24 @@ fn append_media_attribute_predicates(
         );
     }
 
+    // Image presence: an `EXISTS` over the item's image rows whose `ImageType`
+    // discriminant is in the requested set (C# `BaseItemRepository.TranslateQuery`:
+    // `e.Images!.Any(w => imgTypes.Contains(w.ImageType))`). The dynamic image
+    // providers sample their collage sources with `ImageTypes = [Primary]`.
+    if !filter.image_types.is_empty() {
+        let discs: Vec<i64> = filter
+            .image_types
+            .iter()
+            .map(|t| i64::from(crate::item_repository::image_type_to_disc(*t)))
+            .collect();
+        qb.push(
+            r#" AND EXISTS (SELECT 1 FROM "BaseItemImageInfos" ii
+                WHERE ii."ItemId" = bi."Id" AND "#,
+        );
+        push_in_list(qb, r#"ii."ImageType""#, &discs);
+        qb.push(")");
+    }
+
     // Owned extras: `ExtraType` discriminants match `extra_type_from_disc`
     // (2 = Trailer, 8 = ThemeSong, 9 = ThemeVideo).
     let mut extra_exists = |want: bool, cond: &str| {
@@ -1085,6 +1103,66 @@ fn push_search_relevance(qb: &mut QueryBuilder<'_, Sqlite>, term: &str) {
         .push(" THEN 2 ELSE 3 END ASC");
 }
 
+/// SQLite's unary `+`, prefixed to an `ORDER BY` term to stop an index from
+/// satisfying that ordering. The term stops being a bare column reference, so
+/// the planner must sort — `WHERE`-clause index seeks are unaffected.
+///
+/// This exists because of `FerrofinIX_BaseItems_SortName_Name` (migration
+/// `0018`). That index makes `ORDER BY SortName ASC, Name ASC` an ordered index
+/// walk instead of "read every row, sort, take the page" — measured 8.4× on the
+/// 100-item mixed browse. But an index walk also *fixes* the order of rows that
+/// TIE on the sort key, and Jellyfin (which has no such index) leaves those in
+/// whatever order its sort produced. Two orderings therefore have to keep the
+/// sort:
+///
+/// - **descending** `SortName`: the index is walked backwards, so ties come out
+///   reversed (126 of 9,679 positions on the bench library);
+/// - **`ORDER BY SortName` with no `Name` tiebreaker** — the no-`sortBy`
+///   default, and every key that falls back to the `SortName` column: `SortName`
+///   alone is not a total order here (7,093 of 9,862 rows are people/studios/
+///   genres with a NULL `SortName`), and the index reorders 7,189 positions.
+///
+/// The ascending `(SortName, Name)` ordering is the one case proven identical:
+/// all 9,679 rows come back in the same order with and without the index,
+/// because SQLite's sorter and the index agree on rowid order within a tie.
+const SORT_PLAN_PIN: &str = "+";
+
+/// Whether the leading `ORDER BY` term must carry [`SORT_PLAN_PIN`].
+///
+/// True when the term is the bare `BaseItems."SortName"` column *and* the
+/// ordering is not the proven-identical ascending `(SortName, Name)` shape.
+/// A key that renders as anything else (`DateCreated`, a correlated user-data
+/// sub-select, `ferrofin_random()`, …) can never be served by
+/// `FerrofinIX_BaseItems_SortName_Name`, so it is left alone.
+fn pins_sort_plan(by: ItemSortBy, order: SortOrder, filter: &InternalItemsQuery) -> bool {
+    if by == ItemSortBy::SortName && order == SortOrder::Ascending {
+        return false;
+    }
+    orders_by_sort_name_column(by, filter)
+}
+
+/// Whether [`push_order_expression`] renders `by` as the bare
+/// `bi."SortName"` column (rather than a correlated sub-select or another
+/// column).
+fn orders_by_sort_name_column(by: ItemSortBy, filter: &InternalItemsQuery) -> bool {
+    // The user-data keys become correlated sub-selects when a user is present;
+    // without one they fall through to the column like everything else.
+    if filter.user_id().is_some()
+        && matches!(
+            by,
+            ItemSortBy::DatePlayed
+                | ItemSortBy::SeriesDatePlayed
+                | ItemSortBy::PlayCount
+                | ItemSortBy::IsPlayed
+                | ItemSortBy::IsUnplayed
+                | ItemSortBy::IsFavoriteOrLiked
+        )
+    {
+        return false;
+    }
+    order_column(by, filter.user_id().is_some()) == r#"bi."SortName""#
+}
+
 /// Appends the `ORDER BY` clause from `filter.order_by`, mapping each
 /// [`ItemSortBy`] to its column (subset of C# `OrderMapper.MapOrderByField`),
 /// with `SortName` as the default / tiebreaker.
@@ -1125,17 +1203,28 @@ fn append_order_by(qb: &mut QueryBuilder<'_, Sqlite>, filter: &InternalItemsQuer
     }
 
     if ordered.is_empty() {
+        // C# `ApplyOrder` returns `query.OrderBy(e => e.SortName)` here and adds
+        // no tiebreaker, so rows that tie on `SortName` come back in whatever
+        // order the engine's sort produced. `+` keeps that sort — see
+        // [`SORT_PLAN_PIN`].
+        qb.push(SORT_PLAN_PIN);
         qb.push(r#"bi."SortName""#);
         return;
     }
 
-    let mut first = true;
     let mut has_name_sort = false;
-    for (by, order) in &ordered {
-        if !first {
+    // C# `ApplyOrder` appends `ThenBy(e => e.Name)` when the FIRST ordering key
+    // is `SortName` — see below.
+    let leads_with_sort_name = matches!(ordered.first(), Some((ItemSortBy::SortName, _)));
+    // Only the leading term can be satisfied by an index, so it is the only one
+    // that ever carries the plan pin.
+    let pin_leading_term = pins_sort_plan(ordered[0].0, ordered[0].1, filter);
+    for (index, (by, order)) in ordered.iter().enumerate() {
+        if index > 0 {
             qb.push(", ");
+        } else if pin_leading_term {
+            qb.push(SORT_PLAN_PIN);
         }
-        first = false;
         push_order_expression(qb, *by, filter);
         qb.push(match order {
             SortOrder::Ascending => " ASC",
@@ -1144,9 +1233,31 @@ fn append_order_by(qb: &mut QueryBuilder<'_, Sqlite>, filter: &InternalItemsQuer
         if matches!(by, ItemSortBy::SortName | ItemSortBy::Name) {
             has_name_sort = true;
         }
+        // C# `ApplyOrder`:
+        //     if (firstOrdering.OrderBy is ItemSortBy.Default or ItemSortBy.SortName)
+        //         orderedQuery = ascending ? ThenBy(e => e.Name)
+        //                                  : ThenByDescending(e => e.Name);
+        //     foreach (var item in orderBy.Skip(1)) { … }
+        //
+        // The tiebreaker sits INSIDE the first-ordering block, BEFORE the loop
+        // over the remaining keys — so it is the SECOND term, not the last.
+        // Appending it after every key silently reorders any multi-key sort:
+        // `SortBy=SortName,ProductionYear` (jellyfin-web's default Movies view)
+        // becomes `SortName, ProductionYear, Name` where upstream is
+        // `SortName, Name, ProductionYear`. Because `Name` is near-unique,
+        // upstream's third term is effectively inert and ours is not.
+        //
+        // It fires only for a leading `SortName` (`Default` is filtered out
+        // above), never for a leading `Name` — which upstream maps to
+        // `CleanName`, not `SortName`.
+        if index == 0 && leads_with_sort_name {
+            qb.push(match order {
+                SortOrder::Ascending => r#", bi."Name" ASC"#,
+                SortOrder::Descending => r#", bi."Name" DESC"#,
+            });
+        }
     }
-    // SortName tiebreaker, matching C# ApplyOrder.
-    if !has_name_sort {
+    if !leads_with_sort_name && !has_name_sort {
         qb.push(r#", bi."SortName" ASC"#);
     }
 }
@@ -1313,7 +1424,7 @@ fn non_blank(value: Option<&String>) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use super::build_latest_item_list_query;
+    use super::{QueryShape, build_latest_item_list_query, build_query};
     use ferrofin_model::data::BaseItemKind;
     use ferrofin_model::dto::SortOrder;
     use ferrofin_model::live_tv::ItemSortBy;
@@ -1374,5 +1485,172 @@ mod tests {
             "{sql}"
         );
         assert!(sql.ends_with(" LIMIT -1 OFFSET ?"), "{sql}");
+    }
+    /// The `ORDER BY …` tail of the statement `filter` translates to.
+    fn order_by(filter: &InternalItemsQuery) -> String {
+        let sql = build_query(filter, QueryShape::FullRows).into_sql();
+        let at = sql.find(" ORDER BY ").expect("statement has an ORDER BY");
+        sql[at + 1..].to_owned()
+    }
+
+    fn sorted_by(keys: &[(ItemSortBy, SortOrder)]) -> InternalItemsQuery {
+        InternalItemsQuery {
+            order_by: keys.to_vec(),
+            ..InternalItemsQuery::default()
+        }
+    }
+
+    /// The `Name` tiebreaker is the SECOND term of a multi-key sort, not the
+    /// last.
+    ///
+    /// C# `ApplyOrder` puts it inside the first-ordering block, before the
+    /// loop over the remaining keys:
+    ///
+    /// ```csharp
+    /// if (firstOrdering.OrderBy is ItemSortBy.Default or ItemSortBy.SortName)
+    ///     orderedQuery = ascending ? ThenBy(e => e.Name) : ThenByDescending(e => e.Name);
+    /// foreach (var item in orderBy.Skip(1)) { … }
+    /// ```
+    ///
+    /// Appending it after every key instead silently reorders any multi-key
+    /// sort. `SortBy=SortName,ProductionYear` is jellyfin-web's DEFAULT Movies
+    /// view: upstream emits `SortName, Name, ProductionYear`, where `Name` is
+    /// near-unique so the year term is effectively inert; appending gives
+    /// `SortName, ProductionYear, Name`, where the year term actually reorders
+    /// the page.
+    #[test]
+    fn the_name_tiebreaker_follows_the_first_key_not_the_last() {
+        let asc = order_by(&sorted_by(&[
+            (ItemSortBy::SortName, SortOrder::Ascending),
+            (ItemSortBy::ProductionYear, SortOrder::Descending),
+        ]));
+        let name_at = asc.find(r#"bi."Name""#).expect("tiebreaker present");
+        let year_at = asc
+            .find(r#"bi."ProductionYear""#)
+            .expect("second key present");
+        assert!(
+            name_at < year_at,
+            "Name must precede the second key, got: {asc}"
+        );
+
+        // Direction follows the FIRST key, as `ThenByDescending` does.
+        let desc = order_by(&sorted_by(&[
+            (ItemSortBy::SortName, SortOrder::Descending),
+            (ItemSortBy::DateCreated, SortOrder::Ascending),
+        ]));
+        assert!(
+            desc.contains(r#"bi."Name" DESC"#),
+            "a descending leading SortName takes a descending tiebreaker: {desc}"
+        );
+
+        // It fires only for a LEADING SortName — never for a leading Name,
+        // which upstream maps to CleanName rather than SortName.
+        let leading_name = order_by(&sorted_by(&[
+            (ItemSortBy::Name, SortOrder::Ascending),
+            (ItemSortBy::ProductionYear, SortOrder::Ascending),
+        ]));
+        assert_eq!(
+            leading_name.matches(r#"bi."Name""#).count(),
+            leading_name.matches(r#"bi."Name" ASC"#).count(),
+            "no extra Name tiebreaker for a leading Name key: {leading_name}"
+        );
+    }
+
+    /// `ImageTypes` is an `EXISTS` over the item's image rows (C#
+    /// `e.Images!.Any(w => imgTypes.Contains(w.ImageType))`), and costs nothing
+    /// when unset — every other query must stay textually untouched.
+    #[test]
+    fn image_types_filter_is_an_exists_over_image_rows() {
+        use ferrofin_model::entities::ImageType;
+        let filtered = build_query(
+            &InternalItemsQuery {
+                image_types: vec![ImageType::Primary, ImageType::Thumb],
+                ..InternalItemsQuery::default()
+            },
+            QueryShape::FullRows,
+        )
+        .into_sql();
+        assert!(
+            filtered.contains(r#"EXISTS (SELECT 1 FROM "BaseItemImageInfos" ii"#),
+            "{filtered}"
+        );
+        assert!(
+            filtered.contains(r#"ii."ImageType" IN (?, ?)"#),
+            "{filtered}"
+        );
+        let plain = build_query(&InternalItemsQuery::default(), QueryShape::FullRows).into_sql();
+        assert!(!plain.contains("BaseItemImageInfos"), "{plain}");
+    }
+
+    /// The exact `ORDER BY` text for each shape, because the *text* is what
+    /// decides whether `FerrofinIX_BaseItems_SortName_Name` may serve the
+    /// ordering — and a lost `+` is a silent parity change (tie order), not a
+    /// failing query. Row-level tests cannot see it: both plans return the same
+    /// rows on any fixture without ties.
+    #[test]
+    fn sort_name_orderings_carry_the_upstream_tiebreaker_and_the_plan_pin() {
+        // Explicit ascending SortName — upstream's ThenBy(Name), no pin: this
+        // is the one ordering the index is proven to reproduce exactly.
+        assert_eq!(
+            order_by(&sorted_by(&[(ItemSortBy::SortName, SortOrder::Ascending)])),
+            r#"ORDER BY bi."SortName" ASC, bi."Name" ASC"#
+        );
+        // Explicit descending — ThenByDescending(Name), and pinned: walking the
+        // index backwards would reverse the order of tied rows.
+        assert_eq!(
+            order_by(&sorted_by(&[(ItemSortBy::SortName, SortOrder::Descending)])),
+            r#"ORDER BY +bi."SortName" DESC, bi."Name" DESC"#
+        );
+        // No sortBy at all — upstream returns a bare OrderBy(SortName) with no
+        // tiebreaker, so this one is pinned too.
+        assert_eq!(
+            order_by(&InternalItemsQuery::default()),
+            r#"ORDER BY +bi."SortName""#
+        );
+        // A key that falls back to the SortName column without being SortName
+        // (upstream maps `Name` to `CleanName`, so it gets no Name tiebreaker)
+        // is pinned for the same reason as the bare default.
+        assert_eq!(
+            order_by(&sorted_by(&[(ItemSortBy::Name, SortOrder::Ascending)])),
+            r#"ORDER BY +bi."SortName" ASC"#
+        );
+        // A leading key on another column can never be served by the index, so
+        // it is left unpinned — and takes no Name tiebreaker.
+        assert_eq!(
+            order_by(&sorted_by(&[(
+                ItemSortBy::DateCreated,
+                SortOrder::Descending
+            )])),
+            r#"ORDER BY bi."DateCreated" DESC, bi."SortName" ASC"#
+        );
+        // SortName as a *secondary* key: the leading key decides both the
+        // tiebreaker and the pin.
+        assert_eq!(
+            order_by(&sorted_by(&[
+                (ItemSortBy::ProductionYear, SortOrder::Ascending),
+                (ItemSortBy::SortName, SortOrder::Ascending),
+            ])),
+            r#"ORDER BY bi."ProductionYear" ASC, bi."SortName" ASC"#
+        );
+    }
+
+    /// The search branch already carried upstream's `(SortName, Name)` pair;
+    /// its relevance rank leads, so no index can serve the ordering and the
+    /// leading term must stay unpinned.
+    #[test]
+    fn search_ordering_is_unchanged() {
+        let filter = InternalItemsQuery {
+            search_term: Some("blade".to_owned()),
+            ..InternalItemsQuery::default()
+        };
+        let sql = order_by(&filter);
+        assert!(
+            sql.contains(r#", bi."SortName" ASC, bi."Name" ASC"#),
+            "search keeps the SortName/Name pair: {sql}"
+        );
+        assert!(
+            !sql.contains('+'),
+            "the relevance rank leads, so nothing is pinned: {sql}"
+        );
     }
 }

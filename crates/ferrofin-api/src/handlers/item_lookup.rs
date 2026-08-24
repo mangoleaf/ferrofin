@@ -12,24 +12,12 @@
 //! - `POST /Items/RemoteSearch/Apply/{itemId}` — apply a chosen search result to
 //!   an item and trigger a full metadata refresh.
 //!
-//! ## Honest deferral
-//!
-//! The remote metadata *fetchers* (TMDb/TVDb/MusicBrainz/…) are deferred:
-//! feature-gated off, they need API keys and network I/O. The endpoints are wired
-//! against the provider manager's real remote-search surface, but with no fetcher
-//! registered the applicable-provider set is empty and the search faithfully
-//! returns `[]` — exactly as Jellyfin returns an empty list when no provider
-//! matches. The dedup/merge algorithm is nonetheless ported for real (see
-//! `ferrofin-providers`), so registering a fetcher yields correct results with no
-//! further change here.
-//!
-//! `Apply` resolves the item (`404` when absent) and drives the provider
-//! manager's `refresh_full_item`, which re-fetches the item's metadata + artwork
-//! from TMDB and persists them. It re-searches by the item's title rather than
-//! binding the exact provider id on the chosen result (that needs a
-//! `BaseItemProviders` write path not yet present), so a title with multiple
-//! matches may not honor the precise pick; the metadata applied is real either
-//! way and the common case matches the user's selection.
+//! The searches fan out over the registered fetchers (TMDB for movies/series/
+//! box sets/people, TVDB for series, OMDb for movies/series/trailers,
+//! MusicBrainz + TheAudioDb for albums/artists); the type-specific lookup
+//! fields (album artists, song infos, …) ride along on the request. `Apply`
+//! resolves the item (`404` when absent), replaces its provider ids with the
+//! chosen result's and refreshes against that exact record.
 
 use axum::extract::{Path, Query, State};
 use axum::routing::{get, post};
@@ -37,7 +25,7 @@ use axum::{Json, Router};
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::providers::{
     AlbumInfo, ArtistInfo, BookInfo, BoxSetInfo, ExternalIdInfo, ItemLookupInfo, MovieInfo,
-    MusicVideoInfo, PersonLookupInfo, RemoteSearchQuery, RemoteSearchResult, SeriesInfo,
+    MusicVideoInfo, PersonLookupInfo, RemoteSearchQuery, RemoteSearchResult, SeriesInfo, SongInfo,
     TrailerInfo,
 };
 use ferrofin_traits::providers::{
@@ -77,23 +65,115 @@ async fn get_external_id_infos(
     Ok(Json(infos))
 }
 
+/// The type-specific lookup fields a concrete `*Info` carries beyond the
+/// shared [`ItemLookupInfo`] base — what each C# `GetSearchResults(XInfo)`
+/// overload reads past the base class.
+#[derive(Default)]
+struct LookupExtras {
+    album_artists: Vec<String>,
+    artist_provider_ids: Option<std::collections::HashMap<String, String>>,
+    song_infos: Vec<SongInfo>,
+    artists: Vec<String>,
+    series_name: Option<String>,
+}
+
+/// Splits a concrete lookup type into its shared base + its extension fields.
+trait IntoLookup {
+    fn into_lookup(self) -> (ItemLookupInfo, LookupExtras);
+}
+
+/// `IntoLookup` for the lookup types that add nothing beyond the base.
+macro_rules! base_only_lookup {
+    ($($ty:ty),* $(,)?) => {$(
+        impl IntoLookup for $ty {
+            fn into_lookup(self) -> (ItemLookupInfo, LookupExtras) {
+                (self.base, LookupExtras::default())
+            }
+        }
+    )*};
+}
+base_only_lookup!(
+    MovieInfo,
+    TrailerInfo,
+    SeriesInfo,
+    BoxSetInfo,
+    PersonLookupInfo
+);
+
+impl IntoLookup for MusicVideoInfo {
+    fn into_lookup(self) -> (ItemLookupInfo, LookupExtras) {
+        (
+            self.base,
+            LookupExtras {
+                artists: self.artists,
+                ..LookupExtras::default()
+            },
+        )
+    }
+}
+
+impl IntoLookup for BookInfo {
+    fn into_lookup(self) -> (ItemLookupInfo, LookupExtras) {
+        (
+            self.base,
+            LookupExtras {
+                series_name: self.series_name,
+                ..LookupExtras::default()
+            },
+        )
+    }
+}
+
+impl IntoLookup for AlbumInfo {
+    fn into_lookup(self) -> (ItemLookupInfo, LookupExtras) {
+        (
+            self.base,
+            LookupExtras {
+                album_artists: self.album_artists,
+                artist_provider_ids: self.artist_provider_ids,
+                song_infos: self.song_infos,
+                ..LookupExtras::default()
+            },
+        )
+    }
+}
+
+impl IntoLookup for ArtistInfo {
+    fn into_lookup(self) -> (ItemLookupInfo, LookupExtras) {
+        (
+            self.base,
+            LookupExtras {
+                song_infos: self.song_infos,
+                ..LookupExtras::default()
+            },
+        )
+    }
+}
+
 /// Collapses a typed `RemoteSearchQuery<T>` into the object-safe
-/// [`RemoteSearchRequest`] for the given item kind.
-///
-/// `extract_base` pulls the shared [`ItemLookupInfo`] out of the concrete lookup
-/// type; the type-specific extension fields are consumed by the (deferred)
-/// per-provider fetchers and are not carried across the object-safe seam.
-fn to_request<T>(
+/// [`RemoteSearchRequest`] for the given item kind: the shared
+/// [`ItemLookupInfo`] plus the type-specific extension fields the per-kind
+/// fetchers read (album artists / artist provider ids / song infos for
+/// MusicBrainz, music-video artists, a book's series name).
+fn to_request<T: IntoLookup>(
     query: RemoteSearchQuery<T>,
     item_kind: BaseItemKind,
-    extract_base: impl FnOnce(T) -> ItemLookupInfo,
 ) -> RemoteSearchRequest {
+    let (search_info, extras) = query
+        .search_info
+        .map(IntoLookup::into_lookup)
+        .unwrap_or_default();
     RemoteSearchRequest {
         item_kind,
-        search_info: query.search_info.map(extract_base).unwrap_or_default(),
+        search_info,
         item_id: query.item_id,
         search_provider_name: query.search_provider_name,
         include_disabled_providers: query.include_disabled_providers,
+        album_artists: extras.album_artists,
+        artist_provider_ids: extras.artist_provider_ids,
+        song_infos: extras.song_infos,
+        artists: extras.artists,
+        series_name: extras.series_name,
     }
 }
 
@@ -131,7 +211,7 @@ macro_rules! remote_search_handler {
             _auth: $auth,
             Json(query): Json<RemoteSearchQuery<$info>>,
         ) -> Result<Json<Vec<RemoteSearchResult>>, ApiError> {
-            let request = to_request(query, $kind, |info| info.base);
+            let request = to_request(query, $kind);
             run_remote_search(&state, request).await
         }
     };
@@ -190,9 +270,11 @@ fn default_true() -> bool {
 /// `POST /Items/RemoteSearch/Apply/{itemId}` — apply a chosen result + refresh.
 ///
 /// Port of `ItemLookupController.ApplySearchCriteria`: resolves the item (`404`
-/// when absent), then drives a full metadata + image refresh through the provider
-/// manager's `refresh_full_item`, which re-fetches and persists the item's TMDB
-/// metadata and downloads its primary/backdrop artwork.
+/// when absent), then drives a `FullRefresh` (`ReplaceAllMetadata = true`,
+/// `ReplaceAllImages = <query>`) carrying the chosen result — the provider
+/// manager replaces the item's provider ids with the result's
+/// (`item.ProviderIds = searchResult.ProviderIds`) and fetches against that
+/// exact record rather than re-searching by title.
 #[utoipa::path(
     post,
     path = "/Items/RemoteSearch/Apply/{itemId}",
@@ -212,20 +294,27 @@ async fn apply_search_criteria(
     RequireAdmin(_auth): RequireAdmin,
     Path(item_id): Path<Uuid>,
     Query(query): Query<ApplyQuery>,
-    Json(_search_result): Json<RemoteSearchResult>,
+    Json(search_result): Json<RemoteSearchResult>,
 ) -> Result<axum::http::StatusCode, ApiError> {
-    if state.library.get_item_by_id(item_id).await?.is_none() {
+    let Some(item) = state.library.get_item_by_id(item_id).await? else {
         return Err(ApiError::NotFound(format!("item {item_id}")));
-    }
+    };
+    tracing::info!(
+        %item_id,
+        item_name = item.name.as_deref().unwrap_or_default(),
+        provider_ids = ?search_result.provider_ids,
+        "setting provider ids from the chosen search result"
+    );
 
     // Full metadata + image refresh, replacing everything (the C# builds
-    // `FullRefresh` for both modes with `ReplaceAllMetadata = true`). The chosen
-    // result's provider ids are consumed by the refresh pipeline.
+    // `FullRefresh` for both modes with `ReplaceAllMetadata = true`), bound to
+    // the chosen result (`SearchResult = searchResult`).
     let options = MetadataRefreshOptions {
         metadata_refresh_mode: MetadataRefreshMode::FullRefresh,
         image_refresh_mode: MetadataRefreshMode::FullRefresh,
         replace_all_metadata: true,
         replace_all_images: query.replace_all_images,
+        search_result: Some(search_result),
     };
     state.providers.refresh_full_item(item_id, &options).await?;
 

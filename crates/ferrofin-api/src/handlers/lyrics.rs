@@ -8,12 +8,10 @@
 //! - `POST /Audio/{itemId}/RemoteSearch/Lyrics/{lyricId}` — download a remote lyric.
 //! - `GET /Providers/Lyrics/{lyricId}` — fetch a remote lyric by id.
 //!
-//! Lyrics are a **deferred subsystem** (`ferrofin-core`'s [`LyricManager`] is a
-//! stub): reads return empty (`404` for a missing lyric), and the mutating /
-//! provider routes surface the manager's "not enabled" rejection. The routes are
-//! nonetheless real (not `501`) so a client sees the correct not-found / empty
-//! semantics rather than a blanket unimplemented. On a successful item resolve,
-//! upload / download also queue a metadata refresh, matching the C# flow.
+//! Every route is backed by the [`LyricManager`] (sidecar `.lrc`/`.txt` files
+//! plus the registered remote providers such as LrcLib). On a successful item
+//! resolve, upload / download also queue a metadata refresh, matching the C#
+//! flow.
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -221,13 +219,11 @@ async fn get_remote_lyrics(
     RequireAuth(_auth): RequireAuth,
     Path(lyric_id): Path<String>,
 ) -> Result<Json<LyricDto>, ApiError> {
-    // No provider host is wired, so nothing resolves; C# returns `404` on a
-    // `null` provider result, which is the same shape a missing lyric yields.
-    // A provider rejection (the stub's "not enabled") also maps to not-found so
-    // the route reports a stable not-found rather than a `500`.
-    match state.lyrics.download_lyrics(Uuid::nil(), &lyric_id).await {
-        Ok(Some(dto)) => Ok(Json(dto)),
-        Ok(None) | Err(_) => Err(ApiError::NotFound(format!("remote lyric {lyric_id}"))),
+    // `LyricManager.GetRemoteLyricsAsync`: route the namespaced id to its
+    // provider, fetch + parse, no item and no sidecar write. `null` → 404.
+    match state.lyrics.get_remote_lyrics(&lyric_id).await? {
+        Some(dto) => Ok(Json(dto)),
+        None => Err(ApiError::NotFound(format!("remote lyric {lyric_id}"))),
     }
 }
 

@@ -1,100 +1,105 @@
-//! The alphanumeric sort key Jellyfin derives from an item's name.
-//!
-//! Port of `BaseItem.CreateSortName` + `BaseItem.ModifySortChunks`
-//! (`MediaBrowser.Controller/Entities/BaseItem.cs`) under the default server
-//! configuration. It lives here rather than in the scanner because the guide
-//! (Live TV channels and programmes, which never pass through a scan) needs the
-//! same key: one definition, one behaviour.
-//!
-//! The key is load-bearing beyond display order — clients build their play queue
-//! from `SortName`, so an episode ordering that differs from Jellyfin's makes
-//! "next episode"/autoplay pick the wrong item.
+//! Sort-name derivation — port of C# `BaseItem.CreateSortName` / `ModifySortChunks`
+//! (`MediaBrowser.Controller/Entities/BaseItem.cs`), with Jellyfin's default
+//! `SortRemoveWords` / `SortRemoveCharacters` / `SortReplaceCharacters`.
 
 use crate::string_extensions::remove_diacritics;
 
-/// The words `ServerConfiguration.SortRemoveWords` carries by default.
+/// `ServerConfiguration.SortRemoveWords` — leading/interior/trailing articles.
 const SORT_REMOVE_WORDS: [&str; 3] = ["the", "a", "an"];
 
-/// The characters `ServerConfiguration.SortRemoveCharacters` drops by default.
+/// `ServerConfiguration.SortRemoveCharacters` — deleted outright.
 const SORT_REMOVE_CHARACTERS: [char; 6] = [',', '&', '-', '{', '}', '\''];
 
-/// The characters `ServerConfiguration.SortReplaceCharacters` turns into a space.
+/// `ServerConfiguration.SortReplaceCharacters` — each becomes a space.
 const SORT_REPLACE_CHARACTERS: [char; 3] = ['.', '+', '%'];
 
-/// How wide `ModifySortChunks` left-pads a run of digits, so "2" sorts before
-/// "10" as text.
-const SORT_CHUNK_WIDTH: usize = 10;
-
-/// The sort key for `name`.
+/// Port of C# `BaseItem.CreateSortName` + `ModifySortChunks`.
 ///
-/// Port of `CreateSortName` with `EnableAlphaNumericSorting` on (the default):
-/// lower-cased and trimmed, each configured word removed at the start, in the
-/// middle and at the end, then the remove/replace character passes, then
-/// [`modify_sort_chunks`]. The word pass runs FIRST — doing it after the
-/// character passes would keep an interior article ("take a bow"), which sorts
-/// differently from Jellyfin.
+/// Lower-cases the trimmed name, removes each article where it stands as a
+/// whole word (at the start, surrounded by spaces, or at the end), then applies
+/// the remove/replace character sets, then left-pads every run of digits to 10
+/// so numbers sort naturally (`Movie 0001 (2020)` → `movie 0000000001
+/// (0000002020)`).
+///
+/// **The stage order is load-bearing and matches C#: words, then removes, then
+/// replaces.** Doing characters first changes the answer for real titles —
+/// `A.I. Artificial Intelligence` replaces `.`→space into `a i  artificial …`,
+/// which then *starts* with the article `a` and gets it stripped. C# strips
+/// articles while the `.` is still attached, so nothing matches.
 #[must_use]
 pub fn create_sort_name(name: &str) -> String {
     let mut sortable = name.trim().to_lowercase();
-    for word in SORT_REMOVE_WORDS {
-        // Remove from beginning if a space follows…
-        let prefix = format!("{word} ");
-        if let Some(rest) = sortable.strip_prefix(&prefix) {
+    for search in SORT_REMOVE_WORDS {
+        if let Some(rest) = sortable.strip_prefix(&format!("{search} ")) {
             sortable = rest.to_owned();
         }
-        // …from the middle if surrounded by spaces…
-        sortable = sortable.replace(&format!(" {word} "), " ");
-        // …and from the end if preceded by a space.
-        let suffix = format!(" {word}");
-        if let Some(rest) = sortable.strip_suffix(&suffix) {
+        sortable = sortable.replace(&format!(" {search} "), " ");
+        if let Some(rest) = sortable.strip_suffix(&format!(" {search}")) {
             sortable = rest.to_owned();
         }
     }
-    for ch in SORT_REMOVE_CHARACTERS {
-        sortable = sortable.replace(ch, "");
+    for c in SORT_REMOVE_CHARACTERS {
+        sortable = sortable.replace(c, "");
     }
-    for ch in SORT_REPLACE_CHARACTERS {
-        sortable = sortable.replace(ch, " ");
+    for c in SORT_REPLACE_CHARACTERS {
+        sortable = sortable.replace(c, " ");
     }
     modify_sort_chunks(&sortable)
 }
 
-/// Left-pads every run of digits to [`SORT_CHUNK_WIDTH`] and strips diacritics.
+/// The sort key C# derives from a non-empty `ForcedSortName`.
 ///
-/// Port of `BaseItem.ModifySortChunks`. (C# `char.IsDigit` covers the Unicode
-/// `Nd` category; ASCII digits cover every value a media name or guide feed
-/// carries. The final ICU `Transliterated()` step — which romanizes a title
-/// still non-ASCII after the strip, e.g. Cyrillic — is not ported: it would pull
-/// an ICU dependency in for a sort key no Latin-script library needs.)
+/// `BaseItem.SortName` short-circuits to `ModifySortChunks(ForcedSortName)
+/// .ToLowerInvariant()` — the digit padding and the lower-casing, but
+/// deliberately **not** the article/character stripping: a forced sort name is
+/// the user's explicit answer and only gets the numeric normalization that
+/// makes it comparable with derived keys.
 #[must_use]
-pub fn modify_sort_chunks(name: &str) -> String {
-    fn flush(chunk: &mut String, digit_chunk: bool, out: &mut String) {
-        if digit_chunk && chunk.len() < SORT_CHUNK_WIDTH {
-            for _ in 0..(SORT_CHUNK_WIDTH - chunk.len()) {
+pub fn forced_sort_key(forced: &str) -> String {
+    modify_sort_chunks(forced).to_lowercase()
+}
+
+/// Left-pads each maximal run of ASCII digits in `name` to width 10 with `0`,
+/// then strips diacritics.
+///
+/// Port of `BaseItem.ModifySortChunks`.
+///
+/// TODO(open work, not an accepted divergence): two steps of the C# are still
+/// missing, and both change the sort key a client sees.
+///
+/// 1. Upstream closes with `if (!result.All(char.IsAscii)) result.Transliterated()`
+///    — an ICU romanization of whatever is still non-ASCII after the strip. A
+///    Cyrillic, Greek or CJK title therefore sorts differently here than on
+///    Jellyfin, and `SortName` drives the client play queue. Porting it means
+///    taking an ICU transliteration dependency, which is the owner's call to
+///    make; raise it rather than leaving this note to rot.
+/// 2. C# `char.IsDigit` matches the whole Unicode `Nd` category, not just
+///    ASCII — so an Arabic-Indic or fullwidth digit run goes unpadded here.
+///    That one is a local fix (`char::is_numeric` plus a width decision).
+fn modify_sort_chunks(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut chars = name.chars().peekable();
+    while let Some(&c) = chars.peek() {
+        if c.is_ascii_digit() {
+            let mut digits = String::new();
+            while chars.peek().is_some_and(char::is_ascii_digit) {
+                digits.push(chars.next().unwrap_or_default());
+            }
+            for _ in digits.len()..10 {
                 out.push('0');
             }
+            out.push_str(&digits);
+        } else {
+            out.push(c);
+            chars.next();
         }
-        out.push_str(chunk);
-        chunk.clear();
     }
-    let mut out = String::with_capacity(name.len() + SORT_CHUNK_WIDTH - 1);
-    let mut chunk = String::new();
-    let mut digit_chunk = false;
-    for ch in name.chars() {
-        let is_digit = ch.is_ascii_digit();
-        if !chunk.is_empty() && is_digit != digit_chunk {
-            flush(&mut chunk, digit_chunk, &mut out);
-        }
-        digit_chunk = is_digit;
-        chunk.push(ch);
-    }
-    flush(&mut chunk, digit_chunk, &mut out);
     remove_diacritics(&out)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{create_sort_name, modify_sort_chunks};
+    use super::{create_sort_name, forced_sort_key, modify_sort_chunks};
 
     // The upstream xUnit oracle, transliterated verbatim
     // (`Jellyfin.Controller.Tests/Entities/BaseItemTests.cs`
@@ -111,34 +116,80 @@ mod tests {
     }
 
     #[test]
-    fn digit_runs_pad_and_diacritics_are_stripped() {
+    fn create_sort_name_matches_jellyfin() {
         assert_eq!(
             create_sort_name("Movie 0001 (2020)"),
             "movie 0000000001 (0000002020)"
         );
-        assert_eq!(create_sort_name("Se7en"), "se0000000007en");
-        assert_eq!(create_sort_name("Café Größe"), "cafe grosse");
-    }
-
-    #[test]
-    fn configured_words_go_from_the_start_middle_and_end() {
         assert_eq!(create_sort_name("The Matrix"), "matrix");
+        assert_eq!(create_sort_name("A Beautiful Mind"), "beautiful mind");
         assert_eq!(create_sort_name("An Education"), "education");
-        // Interior and trailing articles too — the pass upstream runs before the
-        // character passes, which an article-prefix-only version would miss.
-        assert_eq!(create_sort_name("Take a Bow"), "take bow");
-        assert_eq!(create_sort_name("Best of the Best"), "best of best");
-        assert_eq!(create_sort_name("Kill the"), "kill");
-        // Not a whole word, so it stays.
-        assert_eq!(create_sort_name("Theodore"), "theodore");
+        assert_eq!(create_sort_name("Theatre of Blood"), "theatre of blood");
+        assert_eq!(create_sort_name("Se7en"), "se0000000007en");
     }
 
+    /// C# removes an article anywhere it stands as a whole word, not just at
+    /// the front — `sortable.Replace(" the ", " ")` and the `EndsWith` arm.
     #[test]
-    fn characters_are_removed_or_replaced_per_the_default_configuration() {
+    fn articles_are_removed_in_the_middle_and_at_the_end() {
+        assert_eq!(
+            create_sort_name("Attack of the Killer Tomatoes"),
+            "attack of killer tomatoes"
+        );
+        assert_eq!(create_sort_name("All About the"), "all about");
+        assert_eq!(create_sort_name("Withnail and I"), "withnail and i");
+    }
+
+    /// Words run BEFORE the character sets. With the order reversed the `.`
+    /// becomes a space first and `a` then looks like a leading article.
+    #[test]
+    fn words_are_stripped_before_characters_are_replaced() {
+        assert_eq!(
+            create_sort_name("A.I. Artificial Intelligence"),
+            "a i  artificial intelligence"
+        );
+        // Removal characters likewise: the leading `-` means C# sees no
+        // leading article at all, and only deletes the dash afterwards.
+        assert_eq!(create_sort_name("-The Matrix"), "the matrix");
+    }
+
+    /// A name that is *only* an article keeps it — C# matches on `"the "`,
+    /// `" the "` and `" the"`, none of which occur in a bare `"The"`.
+    #[test]
+    fn a_bare_article_survives() {
+        assert_eq!(create_sort_name("The"), "the");
+        assert_eq!(create_sort_name("Theatre"), "theatre");
+    }
+
+    /// `ForcedSortName` skips article and character handling.
+    #[test]
+    fn a_forced_sort_name_is_only_padded_and_lowercased() {
+        assert_eq!(forced_sort_key("The Matrix 2"), "the matrix 0000000002");
+        assert_eq!(forced_sort_key("A.I."), "a.i.");
+    }
+
+    /// `ModifySortChunks` closes with `RemoveDiacritics()`, so an accented title
+    /// sorts as ASCII and interleaves with the rest of the library instead of
+    /// landing after it under SQLite's BINARY collation. Both paths fold: the
+    /// derived key and the forced one.
+    #[test]
+    fn diacritics_are_folded_on_both_paths() {
+        assert_eq!(create_sort_name("Café Größe"), "cafe grosse");
+        assert_eq!(create_sort_name("Amélie"), "amelie");
+        assert_eq!(forced_sort_key("Æon Flux 2"), "aeon flux 0000000002");
+    }
+
+    /// The remove set (`, & - { } '`) is deleted outright and each of the
+    /// replace set (`. + %`) becomes its own space — C# does not collapse runs.
+    #[test]
+    fn the_default_character_sets_are_applied_verbatim() {
         assert_eq!(create_sort_name("Mr. & Mrs-Smith"), "mr   mrssmith");
         assert_eq!(create_sort_name("{Braces} 'quoted'"), "braces quoted");
-        // A replaced character becomes its own space; C# does not collapse runs.
         assert_eq!(create_sort_name("100% Wolf"), "0000000100  wolf");
+        assert_eq!(
+            create_sort_name("Crosby, Stills + Nash"),
+            "crosby stills   nash"
+        );
     }
 
     #[test]

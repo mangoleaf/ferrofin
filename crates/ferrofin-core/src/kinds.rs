@@ -96,6 +96,22 @@ pub fn is_item_by_name(kind: BaseItemKind) -> bool {
     )
 }
 
+/// Whether items of this kind can own media sources — the rows in
+/// `MediaStreamInfos`, `Chapters` and `TrickplayInfos`, and the alternate
+/// versions that point at them through `PrimaryVersionId`.
+///
+/// Stated as an exclusion (`not a folder, not an item-by-name`) rather than a
+/// list of media kinds, so a leaf kind can never lose its relations by being
+/// forgotten here: only the kinds that provably own none — every `Folder`
+/// subclass and every `IItemByName` — are excluded. Upstream never asks the
+/// question because a C# `Folder`/`Person` simply has no streams in memory;
+/// here the answer decides whether a page pays four DB round trips to learn
+/// the same thing.
+#[must_use]
+pub fn has_media_sources(kind: BaseItemKind) -> bool {
+    !is_folder(kind) && !is_item_by_name(kind)
+}
+
 /// Whether items of this kind carry cast/crew people
 /// (C# `BaseItem.SupportsPeople`, `false` by default, `true` for `Video`).
 #[must_use]
@@ -124,6 +140,39 @@ pub fn supports_inherited_parent_images(kind: BaseItemKind) -> bool {
 #[must_use]
 pub fn supports_ancestors(kind: BaseItemKind) -> bool {
     !is_item_by_name(kind)
+}
+
+/// Whether an item of this kind may be deleted at all — the kind half of
+/// C# `BaseItem.CanDelete()` (the per-user content-deletion permission is the
+/// caller's concern).
+///
+/// Structural and by-name rows return `false` and the overrides say why:
+/// `Folder.CanDelete` refuses the root (`UserRootFolder.IsRoot`),
+/// `AggregateFolder`/`CollectionFolder`/`UserView`/`BasePluginFolder`
+/// (`ManualPlaylistsFolder`) are hard `false`, and so are `Genre`/
+/// `MusicGenre`/`Studio`/`Year` (the `Person` row is metadata-only as well).
+/// `MusicArtist.CanDelete` is `!IsAccessedByName`, i.e. only a physically
+/// parented artist folder is deletable — hence `has_parent`.
+///
+/// Deleting one of these rows is never harmless: `BaseItems.ParentId` is a
+/// cascading foreign key, so deleting the `UserRootFolder` would take every
+/// library and all of its items with it.
+#[must_use]
+pub fn can_delete(kind: BaseItemKind, has_parent: bool) -> bool {
+    match kind {
+        BaseItemKind::UserRootFolder
+        | BaseItemKind::AggregateFolder
+        | BaseItemKind::CollectionFolder
+        | BaseItemKind::UserView
+        | BaseItemKind::ManualPlaylistsFolder
+        | BaseItemKind::Genre
+        | BaseItemKind::MusicGenre
+        | BaseItemKind::Studio
+        | BaseItemKind::Year
+        | BaseItemKind::Person => false,
+        BaseItemKind::MusicArtist => has_parent,
+        _ => true,
+    }
 }
 
 /// Whether items of this kind track played/unplayed status
@@ -191,24 +240,17 @@ pub fn is_music(kind: BaseItemKind) -> bool {
     )
 }
 
-/// Whether items of this kind participate in "similar items" / recommendation
-/// queries (C# similarity providers register for `Movie`/`Series`/`Album`/
-/// `Artist`/`Playlist`/`Audio`).
+/// Whether a "similar items" request about an item of this kind runs at all —
+/// the C# `LibraryController.GetSimilarItems` guard, which answers an empty
+/// result for an `Episode` or for any `IItemByName` other than a
+/// `MusicArtist` (genres, studios, years, people, music genres) before a
+/// provider is consulted.
 ///
-/// The by-name grouping kinds and pure containers are excluded — similarity is
-/// only meaningful for real, comparable media (and the music album/artist
-/// aggregates the instant-mix path treats as seeds).
+/// Every other kind passes; whether a local provider then serves it is the
+/// similar-items manager's per-kind decision.
 #[must_use]
 pub fn supports_similarity(kind: BaseItemKind) -> bool {
-    matches!(
-        kind,
-        BaseItemKind::Movie
-            | BaseItemKind::Series
-            | BaseItemKind::MusicAlbum
-            | BaseItemKind::MusicArtist
-            | BaseItemKind::Playlist
-            | BaseItemKind::Audio
-    )
+    kind != BaseItemKind::Episode && !(is_item_by_name(kind) && kind != BaseItemKind::MusicArtist)
 }
 
 /// The container a "latest media" row groups under — C#
@@ -260,7 +302,7 @@ mod tests {
     use super::{
         collection_type_of, is_displayed_as_folder, is_folder, is_item_by_name, is_video,
         latest_items_index_container_kind, supports_ancestors, supports_inherited_parent_images,
-        supports_people, supports_played_status, supports_theme_media,
+        supports_people, supports_played_status, supports_similarity, supports_theme_media,
     };
     use ferrofin_model::data::{BaseItemKind, CollectionType};
     use ferrofin_model::entities::CollectionTypeOptions;
@@ -300,6 +342,33 @@ mod tests {
         #[case] expected: Option<CollectionType>,
     ) {
         assert_eq!(collection_type_of(options), expected);
+    }
+
+    // The controller guard: `item is Episode || (item is IItemByName &&
+    // item is not MusicArtist)` short-circuits; everything else proceeds.
+    #[test]
+    fn similarity_guard_matches_the_controller_rule() {
+        for kind in [
+            BaseItemKind::Episode,
+            BaseItemKind::Genre,
+            BaseItemKind::MusicGenre,
+            BaseItemKind::Studio,
+            BaseItemKind::Year,
+            BaseItemKind::Person,
+        ] {
+            assert!(!supports_similarity(kind), "{kind:?} must short-circuit");
+        }
+        for kind in [
+            BaseItemKind::MusicArtist,
+            BaseItemKind::Movie,
+            BaseItemKind::Series,
+            BaseItemKind::MusicAlbum,
+            BaseItemKind::Audio,
+            BaseItemKind::Trailer,
+            BaseItemKind::BoxSet,
+        ] {
+            assert!(supports_similarity(kind), "{kind:?} must proceed");
+        }
     }
 
     #[test]
@@ -363,7 +432,39 @@ mod tests {
         assert!(supports_similarity(BaseItemKind::Movie));
         assert!(supports_similarity(BaseItemKind::MusicAlbum));
         assert!(!supports_similarity(BaseItemKind::Genre));
-        assert!(!supports_similarity(BaseItemKind::Folder));
+        // The controller guard stops only episodes and by-name kinds; a plain
+        // folder proceeds (and then finds no local provider).
+        assert!(supports_similarity(BaseItemKind::Folder));
+    }
+
+    #[test]
+    fn structural_and_by_name_kinds_cannot_be_deleted() {
+        use super::can_delete;
+        for kind in [
+            BaseItemKind::UserRootFolder,
+            BaseItemKind::AggregateFolder,
+            BaseItemKind::CollectionFolder,
+            BaseItemKind::UserView,
+            BaseItemKind::ManualPlaylistsFolder,
+            BaseItemKind::Genre,
+            BaseItemKind::Year,
+            BaseItemKind::Person,
+        ] {
+            assert!(!can_delete(kind, true), "{kind:?}");
+        }
+        // `MusicArtist.CanDelete => !IsAccessedByName`.
+        assert!(!can_delete(BaseItemKind::MusicArtist, false));
+        assert!(can_delete(BaseItemKind::MusicArtist, true));
+        for kind in [
+            BaseItemKind::Movie,
+            BaseItemKind::Episode,
+            BaseItemKind::Series,
+            BaseItemKind::BoxSet,
+            BaseItemKind::Playlist,
+            BaseItemKind::Folder,
+        ] {
+            assert!(can_delete(kind, false), "{kind:?}");
+        }
     }
 
     #[test]

@@ -21,7 +21,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
-use crate::handlers::by_name::project_item_rows;
+use crate::handlers::by_name::{additional_dto_options, project_item_rows};
 use crate::handlers::items::resolve_user;
 use crate::state::AppState;
 
@@ -44,6 +44,23 @@ struct YearsQuery {
     /// Whether to search descendants recursively (Jellyfin defaults to `true`).
     #[serde(default)]
     recursive: Option<bool>,
+    /// Comma-delimited [`ItemFields`](ferrofin_model::querying::ItemFields) to
+    /// populate on each DTO. Absent/empty ⇒ the base DTO.
+    #[serde(default)]
+    fields: Option<String>,
+    /// Whether image information is populated (C# default `true`).
+    #[serde(default)]
+    enable_images: Option<bool>,
+    /// The maximum number of images to return, per image type.
+    #[serde(default)]
+    image_type_limit: Option<i32>,
+    /// Comma-delimited [`ImageType`](ferrofin_model::entities::ImageType) set to
+    /// populate. Empty ⇒ every type, as upstream.
+    #[serde(default)]
+    enable_image_types: Option<String>,
+    /// Whether user data is populated.
+    #[serde(default)]
+    enable_user_data: Option<bool>,
 }
 
 /// `GET /Years` — the library's production years.
@@ -78,7 +95,13 @@ async fn get_years(
         ..ferrofin_traits::options::InternalItemsQuery::default()
     };
     let result = state.library.get_years(&internal).await?;
-    let options = DtoOptions::with_all_fields(false);
+    let options = additional_dto_options(
+        query.fields.as_deref(),
+        query.enable_images,
+        query.enable_user_data,
+        query.image_type_limit,
+        query.enable_image_types.as_deref(),
+    );
     let projected = project_item_rows(&state, result, &options, internal.user.as_ref()).await?;
     Ok(Json(projected))
 }

@@ -17,6 +17,7 @@
 //!   `max_list_order`, and the name range/substring predicates are applied as in
 //!   C#. The `is_favorite` user-data path is honored via a `UserData` join.
 
+use ferrofin_util::sort_name::create_sort_name;
 use std::collections::HashMap;
 
 use async_trait::async_trait;
@@ -111,15 +112,23 @@ impl FerrofinPeopleRepository {
         if create_target {
             let clean = crate::text_util::get_clean_value(name);
             sqlx::query(
+                // `SortName` is written here, not derived on read. C#
+                // `BaseItem.SortName` lazily computes `CreateSortName()` and is
+                // never null for a named item, and `BaseItemRepository` persists
+                // it on every save. Leaving it NULL makes `ORDER BY SortName` a
+                // no-op for these rows AND makes `nameStartsWith` — which
+                // filters `lower(SortName)`, faithfully to C# `ApplyNameFilters`
+                // — match nothing at all.
                 r#"INSERT OR IGNORE INTO "BaseItems"
-                   ("Id","Type","Name","CleanName","IsFolder","IsInMixedFolder",
+                   ("Id","Type","Name","CleanName","SortName","IsFolder","IsInMixedFolder",
                     "IsLocked","IsMovie","IsRepeat","IsSeries","IsVirtualItem")
-                   VALUES (?1,?2,?3,?4,0,0,0,0,0,0,0)"#,
+                   VALUES (?1,?2,?3,?4,?5,0,0,0,0,0,0,0)"#,
             )
             .bind(target)
             .bind(person_type)
             .bind(name)
             .bind(&clean)
+            .bind(create_sort_name(name))
             .execute(&mut **tx)
             .await
             .map_err(db_err)?;
@@ -177,7 +186,10 @@ impl FerrofinPeopleRepository {
     /// Returns a [`ServiceError`] when the rewrite transaction fails; the
     /// marker is only written after a successful pass.
     pub async fn unify_person_identities(&self) -> Result<u64, ServiceError> {
-        const META_KEY: &str = "person_identity_unified";
+        // `_v2`: the first pass hashed the case-sensitive path; Jellyfin's
+        // by-name ids are case-normalized, so the pass re-runs once to
+        // collapse onto the ids an adopted database already carries.
+        const META_KEY: &str = "person_identity_unified_v2";
         if self.identity.is_none() {
             return Ok(0);
         }
@@ -382,15 +394,21 @@ fn base_query<'a>(cols: &str, filter: &InternalPeopleQuery) -> QueryBuilder<'a, 
     base_query_from(cols, r#""Peoples""#, filter)
 }
 
-/// The deduped-people derived table: one representative row per lower-cased
-/// name. SQLite's documented single-`MIN` bare-column semantics make the
-/// non-aggregated columns come from the `MIN("Id")` row — the same
-/// representative the previous `p."Id" IN (SELECT MIN(...) GROUP BY ...)`
-/// shape selected (verified row-identical on the bench library), but in ONE
-/// aggregation pass that the `FerrofinIX_Peoples_LowerName_Cover` index serves
-/// as an index-only scan: 28 ms → 0.85 ms per query on 7.5k people.
-const DEDUP_PEOPLE_FROM: &str = r#"(SELECT MIN(p2."Id") AS "Id", p2."Name", p2."PersonType"
-     FROM "Peoples" p2 GROUP BY LOWER(p2."Name"))"#;
+/// Restricts a plain `"Peoples"` scan to one representative row per lower-cased
+/// name: the `MIN("Id")` row, exactly the representative the earlier
+/// `GROUP BY LOWER("Name")` derived table selected (verified row-identical,
+/// ids included, on the bench library).
+///
+/// As a *predicate* rather than a derived table, the page can be driven from
+/// `IX_Peoples_Name` — which already supplies the `ORDER BY p."Name"` — so the
+/// `LIMIT` stops the scan after a page's worth of representatives. The derived
+/// table had to aggregate every person and then sort all of them through a temp
+/// B-tree before the `LIMIT` could discard 98% of the result: 1.26 ms → 0.31 ms
+/// per query on the bench library (7.5k people, `limit=100`). The dedup test
+/// per candidate row is a covering-index seek on
+/// `FerrofinIX_Peoples_LowerName_Cover`.
+const DEDUP_PEOPLE_PREDICATE: &str = r#" AND p."Id" = (SELECT MIN(d."Id") FROM "Peoples" d
+     WHERE LOWER(d."Name") = LOWER(p."Name"))"#;
 
 /// The total column for an **unnarrowed** by-name listing: the deduped set is
 /// then exactly the distinct lower-cased names, so the total comes off
@@ -453,9 +471,10 @@ fn by_name_page_query<'a>(filter: &InternalPeopleQuery) -> QueryBuilder<'a, Sqli
     };
     let mut qb = base_query_from(
         &format!(r#"p."Id", p."Name", p."PersonType", {total}"#),
-        DEDUP_PEOPLE_FROM,
+        r#""Peoples""#,
         filter,
     );
+    qb.push(DEDUP_PEOPLE_PREDICATE);
     push_predicates(&mut qb, filter);
     qb.push(r#" ORDER BY p."Name""#);
     let start = filter.start_index.unwrap_or(0);
@@ -487,7 +506,8 @@ impl FerrofinPeopleRepository {
                 .await
                 .map_err(db_err);
         }
-        let mut qb = base_query_from("COUNT(*)", DEDUP_PEOPLE_FROM, filter);
+        let mut qb = base_query_from("COUNT(*)", r#""Peoples""#, filter);
+        qb.push(DEDUP_PEOPLE_PREDICATE);
         push_predicates(&mut qb, filter);
         let count: i64 = qb
             .build_query_scalar()
@@ -523,6 +543,13 @@ impl FerrofinPeopleRepository {
     /// 11.2 ms → 6.6 ms. A narrowed query keeps the window function, which
     /// measures fastest there (e.g. a name substring: 3.2 ms window vs 5.9 ms
     /// for any second-pass shape, since the window only spans the matches).
+    ///
+    /// The third cost was the dedup itself: as a derived table it had to
+    /// aggregate all 7.5k people and sort them through a temp B-tree before the
+    /// `LIMIT` could drop 98% of the result. [`DEDUP_PEOPLE_PREDICATE`] moves it
+    /// onto a plain `"Peoples"` scan driven by `IX_Peoples_Name`, which already
+    /// supplies the ordering — 1.26 ms → 0.31 ms per query, and `/Persons`
+    /// 2.8 ms → 1.4 ms p50 at its calibrated rate.
     async fn get_people_by_name(
         &self,
         filter: &InternalPeopleQuery,
@@ -726,15 +753,18 @@ impl PeopleRepository for FerrofinPeopleRepository {
             if let Some(type_name) = person_type_name {
                 let clean = crate::text_util::get_clean_value(name);
                 sqlx::query(
+                    // `SortName` persisted here for the same reason as above:
+                    // it is what `ORDER BY SortName` and `nameStartsWith` read.
                     r#"INSERT OR IGNORE INTO "BaseItems"
-                       ("Id","Type","Name","CleanName","IsFolder","IsInMixedFolder",
+                       ("Id","Type","Name","CleanName","SortName","IsFolder","IsInMixedFolder",
                         "IsLocked","IsMovie","IsRepeat","IsSeries","IsVirtualItem")
-                       VALUES (?1,?2,?3,?4,0,0,0,0,0,0,0)"#,
+                       VALUES (?1,?2,?3,?4,?5,0,0,0,0,0,0,0)"#,
                 )
                 .bind(&item_id)
                 .bind(type_name)
                 .bind(name)
                 .bind(&clean)
+                .bind(create_sort_name(name))
                 .execute(&mut *tx)
                 .await
                 .map_err(db_err)?;
@@ -1284,8 +1314,10 @@ mod tests {
 
         // …and SQLite agrees: planning the unpaged form (identical plan to the
         // paged one, which only adds a bound LIMIT) shows a single aggregate
-        // pass. `EXPLAIN QUERY PLAN` names each extra materialization pass
-        // `(subquery-N)`.
+        // pass, and — the whole point of the dedup *predicate* — no temp B-tree
+        // sort, so the paged form's `LIMIT` can stop the scan early instead of
+        // ordering every person in the library first. `EXPLAIN QUERY PLAN` names
+        // each extra materialization pass `(subquery-N)`.
         let sql = super::by_name_page_query(&InternalPeopleQuery::default()).into_sql();
         let plan: Vec<(i64, i64, i64, String)> =
             sqlx::query_as(&format!("EXPLAIN QUERY PLAN {sql}"))
@@ -1302,6 +1334,11 @@ mod tests {
                 .iter()
                 .any(|d| d.contains("FerrofinIX_Peoples_LowerName_Cover")),
             "the dedup pass must stay index-only, got {details:?}"
+        );
+        assert!(
+            !details.iter().any(|d| d.contains("TEMP B-TREE")),
+            "the page must come off the name index in order, not a sort of \
+             every person, got {details:?}"
         );
 
         // A narrowed query deliberately keeps the window function: it spans

@@ -42,7 +42,11 @@ async fn get_music_genres(
     let user = resolve_user(&state, &auth, query.user_id).await?;
     let internal = query.base_query(Some(user.clone()));
     let result = state.library.get_music_genres(&internal).await?;
-    let options = DtoOptions::with_all_fields(false);
+    // C# `MusicGenresController` builds its options as
+    // `new DtoOptions { Fields = fields }.AddAdditionalDtoOptions(enableImages,
+    // false, imageTypeLimit, enableImageTypes)` — note the literal `false` for
+    // `enableUserData`, so upstream never emits a `UserData` block on these rows.
+    let options = query.dto_options(Some(false));
     let projected = project_query_result(
         &state,
         result,

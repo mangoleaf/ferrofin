@@ -1,19 +1,19 @@
 //! Port of `Emby.Naming.Common.EpisodeExpression`.
 
-use std::cell::OnceCell;
+use std::sync::OnceLock;
 
 use crate::common::GuardedRegex;
 
 /// Regular expression for parsing TV episodes.
 ///
 /// The C# type lazily compiles the [`GuardedRegex`] on first access and resets it when
-/// [`Self::set_expression`] is called; we mirror that with a [`OnceCell`].
+/// [`Self::set_expression`] is called; we mirror that with a [`OnceLock`] (so a shared `NamingOptions` stays `Sync`).
 // Four independent flags, one-for-one with the C# `EpisodeExpression` class.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone)]
 pub struct EpisodeExpression {
     expression: String,
-    regex: OnceCell<GuardedRegex>,
+    regex: OnceLock<GuardedRegex>,
     /// Indicates whether a date is expected in the expression.
     pub is_by_date: bool,
     /// Indicates whether the expression is optimistic.
@@ -32,7 +32,7 @@ impl EpisodeExpression {
     pub fn new(expression: impl Into<String>, by_date: bool) -> Self {
         Self {
             expression: expression.into(),
-            regex: OnceCell::new(),
+            regex: OnceLock::new(),
             is_by_date: by_date,
             is_optimistic: false,
             is_named: false,
@@ -50,7 +50,7 @@ impl EpisodeExpression {
     /// Sets the raw expression string, invalidating the compiled regex.
     pub fn set_expression(&mut self, value: impl Into<String>) {
         self.expression = value.into();
-        self.regex = OnceCell::new();
+        self.regex = OnceLock::new();
     }
 
     /// Returns the compiled [`GuardedRegex`], compiling it (case-insensitively)

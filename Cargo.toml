@@ -89,6 +89,10 @@ tokio = { version = "1", features = ["full"] }
 # The `Stream` trait `axum::body::Body::from_stream` takes — the progressive
 # (tail-following) response bodies the Live TV live-stream/recording routes serve.
 futures-core = "0.3"
+# WebSocket client for the /socket integration tests only. Same version axum
+# 0.8 already links for its `ws` feature, so it adds no new compilation.
+tokio-tungstenite = "0.29"
+futures-util = "0.3"
 notify = "8.2"
 
 # ── persistence: sqlx + SQLite (speed-first; see plan) ─────────────

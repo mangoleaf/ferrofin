@@ -950,6 +950,7 @@ mod tests {
             &self,
             _item_id: uuid::Uuid,
             _replace: bool,
+            _library_options: &ferrofin_model::configuration::LibraryOptions,
         ) -> Result<(), ServiceError> {
             unimplemented!("fake")
         }

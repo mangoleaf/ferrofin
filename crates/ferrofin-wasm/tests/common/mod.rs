@@ -761,6 +761,9 @@ impl ferrofin_traits::stubs::LyricManager for StubLyrics {
     ) -> Result<Option<LyricDto>, ServiceError> {
         unimplemented!("stub")
     }
+    async fn get_remote_lyrics(&self, _lyric_id: &str) -> Result<Option<LyricDto>, ServiceError> {
+        unimplemented!("stub")
+    }
     async fn save_lyric(
         &self,
         item_id: Uuid,

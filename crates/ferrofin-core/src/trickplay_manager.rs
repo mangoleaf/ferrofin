@@ -11,9 +11,10 @@
 //! into the [`PathManager`] trickplay layout, and persist the info row.
 //!
 //! Departures from the C# (documented per the port rules):
-//! - There is no per-library `LibraryOptions` in Ferrofin (no
-//!   `EnableTrickplayImageExtraction` / `SaveTrickplayWithMedia`), so extraction
-//!   is always enabled and tiles are always generated into the **internal**
+//! - The per-library `EnableTrickplayImageExtraction` gate is honoured (an
+//!   item in a library with it off has its tiles and rows pruned, as in C#),
+//!   but `SaveTrickplayWithMedia` only feeds the "user-managed, leave alone"
+//!   guard: tiles are always generated into the **internal**
 //!   (non-save-with-media) layout, matching [`Self::get_trickplay_tile_path`].
 //! - The eligibility gate (`CanGenerateTrickplay`) checks the persisted row:
 //!   not a virtual item, an existing on-disk media path, and a runtime of at
@@ -29,9 +30,9 @@
 //!   software ffmpeg path (see [`TrickplayFrameExtractor`]).
 //!
 //! The manifest key mirrors C#: trickplay is keyed by *media-source id*, and the
-//! primary media source of an item is the item's own id, so
-//! [`Self::get_trickplay_manifest`] nests the resolutions under the item-id
-//! string.
+//! primary media source of an item is the item's own id in the dashless
+//! `ToString("N")` form, so [`Self::get_trickplay_manifest`] nests the
+//! resolutions under that string (the same one `MediaSources[].Id` carries).
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -43,7 +44,7 @@ use ferrofin_db::Database;
 use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_db::entities::playback::TrickplayInfoEntity;
 use ferrofin_db::store::guid_to_db;
-use ferrofin_model::configuration::TrickplayOptions;
+use ferrofin_model::configuration::{LibraryOptions, TrickplayOptions};
 use uuid::Uuid;
 
 use ferrofin_traits::configuration::ServerConfigurationManager;
@@ -548,6 +549,7 @@ impl TrickplayManager for FerrofinTrickplayManager {
         &self,
         item_id: Uuid,
         replace: bool,
+        library_options: &LibraryOptions,
     ) -> Result<(), ServiceError> {
         let Some(entity) = self.items.retrieve_item(item_id).await? else {
             return Ok(());
@@ -575,7 +577,14 @@ impl TrickplayManager for FerrofinTrickplayManager {
             .path_manager
             .trickplay_directory(item_id, &media_path, false);
 
-        if replace {
+        let enabled = library_options.enable_trickplay_image_extraction;
+        // When extraction is disabled and files live next to media, treat them
+        // as user-managed: discovery above already catalogued what is on disk.
+        if !enabled && !replace && library_options.save_trickplay_with_media {
+            return Ok(());
+        }
+
+        if !enabled || replace {
             // Prune existing data.
             if Path::new(&trickplay_dir).exists()
                 && let Err(e) = std::fs::remove_dir_all(&trickplay_dir)
@@ -586,6 +595,9 @@ impl TrickplayManager for FerrofinTrickplayManager {
                 );
             }
             self.delete_trickplay_data(item_id).await?;
+            if !replace {
+                return Ok(());
+            }
         }
 
         tracing::debug!(item = %item_id, replace, "trickplay refresh");
@@ -678,8 +690,9 @@ impl TrickplayManager for FerrofinTrickplayManager {
         let resolutions = self.resolutions_for(item_id).await?;
         let mut manifest = HashMap::new();
         if !resolutions.is_empty() {
-            // The primary media source of an item is the item itself (its id).
-            manifest.insert(item_id.to_string(), resolutions);
+            // The primary media source of an item is the item itself, reported
+            // by the media-source manager as the dashless id (C# `ToString("N")`).
+            manifest.insert(item_id.simple().to_string(), resolutions);
         }
         Ok(manifest)
     }
@@ -711,12 +724,12 @@ impl TrickplayManager for FerrofinTrickplayManager {
             }
             for row in query.fetch_all(self.db.pool()).await.map_err(db_err)? {
                 if let Ok(id) = Uuid::parse_str(&row.item_id) {
-                    // Key the inner manifest with the same lowercase-hyphenated
-                    // media-source id the single-item form emits, independent of
-                    // the stored (uppercase) column format.
+                    // Key the inner manifest with the same dashless media-source
+                    // id the single-item form emits, independent of the stored
+                    // (uppercase-hyphenated) column format.
                     out.entry(id)
                         .or_default()
-                        .entry(id.to_string())
+                        .entry(id.simple().to_string())
                         .or_default()
                         .insert(row.width, row);
                 }
@@ -938,9 +951,10 @@ fn move_content(src: &Path, dst: &Path) -> Result<(), ServiceError> {
 
 #[cfg(test)]
 mod tests {
+
     use ferrofin_db::entities::playback::TrickplayInfoEntity;
     use ferrofin_db::store::guid_to_db;
-    use ferrofin_model::configuration::{ServerConfiguration, TrickplayOptions};
+    use ferrofin_model::configuration::{LibraryOptions, ServerConfiguration, TrickplayOptions};
     use ferrofin_model::data::BaseItemKind;
     use uuid::Uuid;
 
@@ -1105,6 +1119,15 @@ mod tests {
         }
     }
 
+    /// Library options with trickplay extraction enabled (the C# task only
+    /// generates for libraries that opt in).
+    fn extraction_on() -> LibraryOptions {
+        LibraryOptions {
+            enable_trickplay_image_extraction: true,
+            ..LibraryOptions::default()
+        }
+    }
+
     /// A 2×2-tile options fixture at the given widths.
     fn options_2x2(widths: &[i32]) -> TrickplayOptions {
         TrickplayOptions {
@@ -1187,7 +1210,7 @@ mod tests {
         // Manifest nests resolutions under the media-source (item) id.
         let manifest = r.mgr.get_trickplay_manifest(item).await.expect("manifest");
         assert_eq!(manifest.len(), 1);
-        assert_eq!(manifest[&item.to_string()].len(), 2);
+        assert_eq!(manifest[&item.simple().to_string()].len(), 2);
 
         let page = r.mgr.get_trickplay_items(10, 0).await.expect("items");
         assert_eq!(page.len(), 2);
@@ -1211,7 +1234,7 @@ mod tests {
         let media = seed_video(&db, &r, item, Some(HOUR_TICKS), None).await;
 
         r.mgr
-            .refresh_trickplay_data(item, false)
+            .refresh_trickplay_data(item, false, &extraction_on())
             .await
             .expect("refresh");
 
@@ -1251,14 +1274,14 @@ mod tests {
         let media = seed_video(&db, &r, item, Some(HOUR_TICKS), None).await;
 
         r.mgr
-            .refresh_trickplay_data(item, false)
+            .refresh_trickplay_data(item, false, &extraction_on())
             .await
             .expect("first");
         assert_eq!(r.extractor.calls(), 1);
 
         // Tiles + row exist → a non-replace refresh does nothing.
         r.mgr
-            .refresh_trickplay_data(item, false)
+            .refresh_trickplay_data(item, false, &extraction_on())
             .await
             .expect("second");
         assert_eq!(r.extractor.calls(), 1, "existing data is skipped");
@@ -1267,7 +1290,7 @@ mod tests {
         let root = PathBuf::from(r.pm.trickplay_directory(item, &media, false));
         std::fs::write(root.join("stale.txt"), b"x").expect("marker");
         r.mgr
-            .refresh_trickplay_data(item, true)
+            .refresh_trickplay_data(item, true, &extraction_on())
             .await
             .expect("replace");
         assert_eq!(r.extractor.calls(), 2, "replace regenerates");
@@ -1294,7 +1317,7 @@ mod tests {
             .expect("tile jpg");
 
         r.mgr
-            .refresh_trickplay_data(item, false)
+            .refresh_trickplay_data(item, false, &extraction_on())
             .await
             .expect("refresh");
 
@@ -1307,6 +1330,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn refresh_prunes_when_library_extraction_is_disabled() {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        let r = rig(&db, options_2x2(&[320]), FakeExtractor::new(6, 180));
+        let media = seed_video(&db, &r, item, Some(HOUR_TICKS), None).await;
+        r.mgr
+            .refresh_trickplay_data(item, false, &extraction_on())
+            .await
+            .expect("generate");
+        let tile_dir = Path::new(&r.pm.trickplay_directory(item, &media, false)).join("320 - 2x2");
+        assert!(tile_dir.join("0.jpg").is_file());
+
+        // The library turns extraction off: tiles and rows go (C# prune branch).
+        r.mgr
+            .refresh_trickplay_data(item, false, &LibraryOptions::default())
+            .await
+            .expect("prune");
+        assert_eq!(r.extractor.calls(), 1, "no regeneration while disabled");
+        assert!(!tile_dir.exists(), "tile directory pruned");
+        assert!(
+            r.mgr
+                .get_trickplay_resolutions(item)
+                .await
+                .expect("res")
+                .is_empty()
+        );
+
+        // Save-with-media + disabled: user-managed, left alone.
+        std::fs::create_dir_all(&tile_dir).expect("tile dir");
+        std::fs::write(tile_dir.join("0.jpg"), b"x").expect("tile");
+        r.mgr
+            .refresh_trickplay_data(
+                item,
+                false,
+                &LibraryOptions {
+                    save_trickplay_with_media: true,
+                    ..LibraryOptions::default()
+                },
+            )
+            .await
+            .expect("leave alone");
+        assert!(tile_dir.join("0.jpg").is_file(), "user-managed tiles kept");
+    }
+
+    #[tokio::test]
     async fn refresh_is_a_noop_for_ineligible_items() {
         let db = test_db().await;
         let r = rig(&db, options_2x2(&[320]), FakeExtractor::new(4, 180));
@@ -1314,7 +1382,7 @@ mod tests {
         // Unknown item.
         let missing = Uuid::new_v4();
         r.mgr
-            .refresh_trickplay_data(missing, true)
+            .refresh_trickplay_data(missing, true, &extraction_on())
             .await
             .expect("missing ok");
 
@@ -1322,7 +1390,7 @@ mod tests {
         let no_path = Uuid::new_v4();
         seed_item(&db, no_path, BaseItemKind::Movie).await;
         r.mgr
-            .refresh_trickplay_data(no_path, true)
+            .refresh_trickplay_data(no_path, true, &extraction_on())
             .await
             .expect("no path ok");
 
@@ -1330,7 +1398,7 @@ mod tests {
         let short = Uuid::new_v4();
         seed_video(&db, &r, short, Some(5_000 * 10_000), None).await;
         r.mgr
-            .refresh_trickplay_data(short, true)
+            .refresh_trickplay_data(short, true, &extraction_on())
             .await
             .expect("short ok");
 
@@ -1338,7 +1406,7 @@ mod tests {
         let no_runtime = Uuid::new_v4();
         seed_video(&db, &r, no_runtime, None, None).await;
         r.mgr
-            .refresh_trickplay_data(no_runtime, true)
+            .refresh_trickplay_data(no_runtime, true, &extraction_on())
             .await
             .expect("no runtime ok");
 
@@ -1363,7 +1431,7 @@ mod tests {
         seed_video(&db, &r, item, Some(HOUR_TICKS), Some(201)).await;
 
         r.mgr
-            .refresh_trickplay_data(item, false)
+            .refresh_trickplay_data(item, false, &extraction_on())
             .await
             .expect("refresh");
 
@@ -1395,7 +1463,7 @@ mod tests {
         std::fs::write(stray.join("0.jpg"), b"x").expect("stray tile");
 
         r.mgr
-            .refresh_trickplay_data(item, false)
+            .refresh_trickplay_data(item, false, &extraction_on())
             .await
             .expect("refresh");
 

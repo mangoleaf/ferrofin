@@ -25,7 +25,7 @@
 
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
@@ -1019,15 +1019,22 @@ async fn get_recording_group(
 /// `GET /LiveTv/ListingProviders/SchedulesDirect/Countries` — Schedules Direct
 /// country list.
 ///
-/// Port of `LiveTvController.GetSchedulesDirectCountries`: Ferrofin's Live TV is
-/// M3U + XMLTV, with no Schedules Direct provider, so the available-country set
-/// is empty (faithful — Jellyfin streams SD's country JSON only when SD is
-/// configured). Returned as a JSON array so the dashboard's SD setup page parses
-/// it instead of erroring.
+/// Port of `LiveTvController.GetSchedulesDirectCountries`: the raw JSON document
+/// Schedules Direct serves at `available/countries` (no SD account involved),
+/// passed through as `application/json` exactly as upstream's `File(stream, …)`
+/// does. The manager serves it from Jellyfin's memory + on-disk
+/// (`{cache}/sd-countries.json`, 7-day TTL) cache and fetches on a miss; an
+/// upstream failure is a `500` (upstream `EnsureSuccessStatusCode` throws).
 async fn get_schedules_direct_countries(
+    State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
-) -> Json<serde_json::Value> {
-    Json(serde_json::json!([]))
+) -> Result<Response, ApiError> {
+    let bytes = live_tv(&state)?.get_schedules_direct_countries().await?;
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        bytes,
+    )
+        .into_response())
 }
 
 /// `GET /LiveTv/LiveRecordings/{recordingId}/stream` — a recording in flight.
@@ -1823,11 +1830,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn schedules_direct_countries_is_empty() {
+    async fn schedules_direct_countries_passes_the_manager_bytes_through_as_json() {
+        let doc = br#"{"North America":[{"fullName":"United States","shortName":"USA"}]}"#;
+        let state = fake_state().with_live_tv(std::sync::Arc::new(FakeLiveTv {
+            countries: Some(doc.to_vec()),
+            ..FakeLiveTv::default()
+        }));
+        let resp = get_schedules_direct_countries(State(state), admin_auth())
+            .await
+            .expect("countries");
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
         assert_eq!(
-            get_schedules_direct_countries(admin_auth()).await.0,
-            serde_json::json!([])
+            resp.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json")
         );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(
+            &body[..],
+            doc,
+            "the SD document is passed through untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn schedules_direct_countries_maps_an_upstream_failure_to_500() {
+        let state = fake_state().with_live_tv(std::sync::Arc::new(FakeLiveTv::default()));
+        let err = get_schedules_direct_countries(State(state), admin_auth())
+            .await
+            .expect_err("upstream failure");
+        assert_eq!(err.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn schedules_direct_countries_501_without_manager() {
+        let err = get_schedules_direct_countries(State(fake_state()), admin_auth())
+            .await
+            .expect_err("no manager wired");
+        assert_eq!(err.status(), axum::http::StatusCode::NOT_IMPLEMENTED);
     }
 
     #[tokio::test]
@@ -1996,6 +2039,9 @@ mod tests {
         programs_options: std::sync::Mutex<Option<DtoOptions>>,
         channels_query: std::sync::Mutex<Option<LiveTvChannelQuery>>,
         channels_options: std::sync::Mutex<Option<DtoOptions>>,
+        /// The Schedules Direct country document; `None` models an upstream
+        /// fetch failure.
+        countries: Option<Vec<u8>>,
     }
 
     #[async_trait::async_trait]
@@ -2031,6 +2077,13 @@ mod tests {
                 .as_ref()
                 .filter(|(id, _)| id == unique_id)
                 .map(|(_, file)| file.clone()))
+        }
+        async fn get_schedules_direct_countries(
+            &self,
+        ) -> Result<Vec<u8>, ferrofin_traits::error::ServiceError> {
+            self.countries.clone().ok_or_else(|| {
+                ferrofin_traits::error::ServiceError::backend("schedulesdirect.org: 503")
+            })
         }
         async fn get_live_tv_info(
             &self,

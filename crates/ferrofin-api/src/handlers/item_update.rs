@@ -504,6 +504,7 @@ async fn refresh_item(
         image_refresh_mode,
         replace_all_metadata: query.replace_all_metadata.unwrap_or(false),
         replace_all_images: query.replace_all_images.unwrap_or(false),
+        search_result: None,
     };
     state
         .providers

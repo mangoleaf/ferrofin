@@ -234,11 +234,12 @@ pub trait LibraryManager: Send + Sync {
     /// materialized.
     ///
     /// Port of `ILibraryManager.GetUserRootFolder`. Jellyfin lazily creates the
-    /// [`BaseItemKind::UserRootFolder`] on disk; that filesystem side effect is
-    /// out of scope for this portable seam, so the default resolves the single
+    /// [`BaseItemKind::UserRootFolder`] (directory + row at
+    /// `DefaultUserViewsPath`) on first use; the concrete manager does the
+    /// same through its root provisioner. This default resolves the single
     /// persisted `UserRootFolder` row (the first one, mirroring C#
     /// `FirstOrDefault`) via [`Self::get_item_list`] and reports `None` when
-    /// absent.
+    /// absent — the behaviour of an implementation without a provisioner.
     async fn get_user_root_folder(&self) -> Result<Option<BaseItemEntity>, ServiceError> {
         let query = InternalItemsQuery {
             include_item_types: vec![BaseItemKind::UserRootFolder],
@@ -507,23 +508,25 @@ pub trait LibraryManager: Send + Sync {
     ///
     /// Port of `YearsController.GetYears`: Jellyfin walks the (localized) item
     /// tree, collects each item's distinct `ProductionYear`, and resolves each
-    /// to a `Year` item. Here the distinct years come from
-    /// [`Self::get_query_filters_legacy`] over the same `query`, and each is
-    /// resolved via [`Self::get_named_item`]; years without a materialized row
-    /// are skipped (Jellyfin's `.Where(i => i is not null)`), since on-disk
-    /// creation is out of scope for this portable seam.
+    /// through `GetYear`, which creates the `Year` item when it does not exist
+    /// yet. Here the distinct years come from [`Self::get_distinct_years`]
+    /// over the same `query` and are resolved via [`Self::get_named_items`];
+    /// the concrete manager materializes a missing `Year` on that lookup, and
+    /// the library scan creates every scanned year up front, so each year
+    /// resolves. The default still drops a slot no implementation resolved
+    /// (a fake without the provisioner), mirroring `.Where(i => i is not null)`.
     async fn get_years(
         &self,
         query: &InternalItemsQuery,
     ) -> Result<QueryResult<BaseItemEntity>, ServiceError> {
-        let mut years = self.get_query_filters_legacy(query).await?.years;
+        let mut years = self.get_distinct_years(query).await?;
         years.retain(|y| *y > 0);
         years.sort_unstable();
         years.dedup();
         let start = usize::try_from(query.start_index.unwrap_or(0).max(0)).unwrap_or(0);
-        // Page the year list first, then resolve the slice in one query. Years are
-        // materialized during the scan, so every one resolves — matching the old
-        // per-year loop that stopped once it had `limit` resolved items.
+        // Page the year list first, then resolve the slice in one query. Every
+        // year resolves (the scan materializes them and the lookup creates any
+        // straggler), so paging the names is paging the rows.
         let paged: Vec<String> = match query.limit.filter(|l| *l >= 0) {
             Some(limit) => years
                 .into_iter()
@@ -555,6 +558,26 @@ pub trait LibraryManager: Send + Sync {
         &self,
         query: &InternalItemsQuery,
     ) -> Result<QueryFiltersLegacy, ServiceError>;
+
+    /// Gets just the distinct production years of the matching items — the one
+    /// facet [`Self::get_years`] uses.
+    ///
+    /// `/Years` used to read the whole legacy filter aggregate and keep only
+    /// `.years`. That aggregate is four independent statements — distinct
+    /// years, distinct official ratings, and a `MIN` over `ItemValues` for
+    /// genres and for tags — so three of them were issued, run to completion,
+    /// and dropped. Measured on the bench library that was 16.8 ms of the
+    /// endpoint's 31.4 ms of SQL, and 3 of its 5 round trips.
+    ///
+    /// The default keeps the old behaviour for implementations that only have
+    /// the aggregate (test fakes); the repository-backed one overrides it with
+    /// the single `SELECT DISTINCT "ProductionYear"` statement.
+    async fn get_distinct_years(
+        &self,
+        query: &InternalItemsQuery,
+    ) -> Result<Vec<i32>, ServiceError> {
+        Ok(self.get_query_filters_legacy(query).await?.years)
+    }
 
     /// Gets the distinct language codes of the matching items' media streams of
     /// a given [`MediaStreamType`].
@@ -727,7 +750,7 @@ pub trait UserManager: Send + Sync {
     ) -> Result<(), ServiceError> {
         let _ = (user, content, mime_type, extension);
         Err(ServiceError::backend(
-            "save_profile_image is deferred until the image pipeline lands",
+            "save_profile_image is not wired on this UserManager",
         ))
     }
 

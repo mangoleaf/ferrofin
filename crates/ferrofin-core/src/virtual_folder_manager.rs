@@ -52,6 +52,7 @@ use ferrofin_traits::library::VirtualFolderManager;
 use ferrofin_traits::persistence::ItemPersistenceService;
 
 use crate::item_type_lookup;
+use crate::user_root_folder::UserRootFolderStore;
 
 /// The shortcut-file extension Jellyfin uses (`MbLinkShortcutHandler.Extension`).
 const SHORTCUT_EXTENSION: &str = "mblink";
@@ -80,6 +81,11 @@ pub struct FerrofinVirtualFolderManager {
     /// The per-database item-id derivation mode (see
     /// [`item_type_lookup::IdDerivation`]).
     id_derivation: item_type_lookup::IdDerivation,
+    /// `CollectionFolder` ids whose parent link to the `UserRootFolder` has
+    /// been verified (or written) in this process. The self-heal runs on
+    /// every listing, which is a hot read path; once a row is known to be
+    /// parented the two extra probes (root exists, parent set) are skipped.
+    parented: Arc<std::sync::Mutex<std::collections::HashSet<uuid::Uuid>>>,
 }
 
 impl std::fmt::Debug for FerrofinVirtualFolderManager {
@@ -88,7 +94,7 @@ impl std::fmt::Debug for FerrofinVirtualFolderManager {
             .field("root", &self.root)
             .field("has_item_store", &self.persistence.is_some())
             .field("id_derivation", &self.id_derivation)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -103,6 +109,7 @@ impl FerrofinVirtualFolderManager {
             root: default_user_views_path.into(),
             persistence: None,
             id_derivation: item_type_lookup::IdDerivation::LegacyLowercase,
+            parented: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         }
     }
 
@@ -135,32 +142,63 @@ impl FerrofinVirtualFolderManager {
         )
     }
 
+    /// The `UserRootFolder` provisioner over this manager's root, item store
+    /// and derivation mode — the parent every `CollectionFolder` row hangs off
+    /// (its directory is a child of `root/default/`, and so is its row). `None`
+    /// without an item store wired.
+    fn user_root(&self) -> Option<UserRootFolderStore> {
+        let persistence = self.persistence.as_ref()?;
+        Some(UserRootFolderStore::new(
+            Arc::clone(persistence),
+            self.id_derivation.clone(),
+            self.root.clone(),
+        ))
+    }
+
     /// Upserts the library's `CollectionFolder` row for `folder_path` when it is
     /// missing (idempotent). No-op without an item store wired. This is the single
     /// place the row is created — on add and, self-healingly, on every
     /// [`get_virtual_folders`](VirtualFolderManager::get_virtual_folders) read — so
     /// the projected `ItemId` always backs a real row and children can parent to it
     /// without a foreign-key failure.
+    ///
+    /// The row's parent is the `UserRootFolder` (ensured first, as Jellyfin's
+    /// `GetUserRootFolder()` does before resolving its children); a row that
+    /// predates the root is re-parented in place, so the ancestor chain of
+    /// every library climbs to `Items/Root` on old and adopted databases alike.
     async fn ensure_collection_folder(
         &self,
         folder_path: &Path,
         name: &str,
     ) -> Result<(), ServiceError> {
-        let (Some(persistence), Some(id)) =
-            (&self.persistence, self.collection_folder_id(folder_path))
-        else {
+        let (Some(persistence), Some(id), Some(root)) = (
+            &self.persistence,
+            self.collection_folder_id(folder_path),
+            self.user_root(),
+        ) else {
             return Ok(());
         };
         if persistence.item_exists(id).await? {
+            if self.parented.lock().is_ok_and(|set| set.contains(&id)) {
+                return Ok(());
+            }
+            let root_id = root.ensure().await?;
+            persistence.set_parent_id(id, root_id).await?;
+            if let Ok(mut set) = self.parented.lock() {
+                set.insert(id);
+            }
             return Ok(());
         }
+        let root_id = root.ensure().await?;
         let entity = BaseItemEntity {
             id: guid_to_db(id),
             type_: item_type_lookup::stored_type_name(BaseItemKind::CollectionFolder)
                 .unwrap_or_default()
                 .to_owned(),
             name: Some(name.to_owned()),
+            sort_name: Some(ferrofin_util::sort_name::create_sort_name(name)),
             path: Some(folder_path.to_string_lossy().into_owned()),
+            parent_id: Some(guid_to_db(root_id)),
             is_folder: true,
             date_created: Some(Utc::now()),
             ..BaseItemEntity::default()
@@ -168,6 +206,9 @@ impl FerrofinVirtualFolderManager {
         persistence
             .save_items(std::slice::from_ref(&entity))
             .await?;
+        if let Ok(mut set) = self.parented.lock() {
+            set.insert(id);
+        }
         Ok(())
     }
 
@@ -750,6 +791,65 @@ mod tests {
             .await
             .expect("count");
         assert_eq!(exists, 1, "the CollectionFolder row was re-created");
+    }
+
+    #[tokio::test]
+    async fn collection_folder_rows_are_children_of_the_user_root_folder() {
+        use crate::test_support::fetch_item;
+        let (tmp, db, mgr) = manager_with_store().await;
+        let media = media_dir(&tmp, "movies");
+        mgr.add_virtual_folder(
+            "Movies",
+            Some(CollectionTypeOptions::movies),
+            &opts_with_paths(&[media]),
+        )
+        .await
+        .expect("add");
+        let item_id = mgr.get_virtual_folders().await.expect("get")[0]
+            .item_id
+            .clone()
+            .expect("ItemId");
+        let library = uuid::Uuid::parse_str(&item_id).expect("uuid");
+        let root_id = mgr.user_root().expect("store").id();
+
+        // The UserRootFolder row exists (directory + row) with the derived id,
+        // and the new library's row is its child.
+        let root = fetch_item(&db, root_id).await;
+        assert_eq!(
+            root.type_,
+            "MediaBrowser.Controller.Entities.UserRootFolder"
+        );
+        assert_eq!(root.name.as_deref(), Some("Media Folders"));
+        assert_eq!(root.parent_id, None);
+        let row = fetch_item(&db, library).await;
+        assert_eq!(
+            row.parent_id.as_deref(),
+            Some(super::guid_to_db(root_id).as_str())
+        );
+
+        // A row created before the root existed (ParentId NULL) is re-parented
+        // on the next listing by a fresh manager (a restarted server: the
+        // parent memo is per process, so the orphan is re-checked).
+        let persistence = FerrofinItemPersistenceService::new(db.clone());
+        let orphaned = ferrofin_db::entities::base_items::BaseItemEntity {
+            parent_id: None,
+            ..row
+        };
+        ferrofin_traits::persistence::ItemPersistenceService::save_items(
+            &persistence,
+            std::slice::from_ref(&orphaned),
+        )
+        .await
+        .expect("orphan");
+        assert_eq!(fetch_item(&db, library).await.parent_id, None);
+        let restarted = FerrofinVirtualFolderManager::new(tmp.path().join("default"))
+            .with_item_store(Arc::new(persistence));
+        restarted.get_virtual_folders().await.expect("get");
+        assert_eq!(
+            fetch_item(&db, library).await.parent_id.as_deref(),
+            Some(super::guid_to_db(root_id).as_str()),
+            "re-parented in place"
+        );
     }
 
     /// Creates a real on-disk media directory under `tmp` and returns its path.

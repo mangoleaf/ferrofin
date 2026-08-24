@@ -1385,7 +1385,11 @@ impl FerrofinDtoService {
                 .sort_name
                 .clone()
                 .filter(|s| !s.is_empty())
-                .or_else(|| item.name.as_deref().map(crate::resolvers::sort_name));
+                .or_else(|| {
+                    item.name
+                        .as_deref()
+                        .map(ferrofin_util::sort_name::create_sort_name)
+                });
         }
         if options.contains_field(ItemFields::CustomRating) {
             dto.custom_rating = item.custom_rating.clone();
@@ -2040,28 +2044,44 @@ impl FerrofinDtoService {
             }
         };
         let (user_data, people) = tokio::try_join!(user_data_fut, people_fut)?;
+        // The page ids that can actually own media sources. A folder or a
+        // by-name item (person, genre, studio, …) owns no stream, chapter,
+        // trickplay or alternate-version row, so asking for them is four
+        // guaranteed-empty round trips — the whole cost of an all-fields
+        // `/Library/MediaFolders`, `/Items/{id}/Ancestors` or `/Persons` page,
+        // where upstream pays nothing because a C# `Folder` has no streams to
+        // begin with. A mixed page still asks, just with the folders left out.
+        let media_ids: Vec<Uuid> = items
+            .iter()
+            .filter(|i| kinds::has_media_sources(row_kind(i)))
+            .map(row_id)
+            .collect();
         // Merged alternate versions (rows pointing at a page item via
         // `PrimaryVersionId`), so each item's extra selectable sources build
         // without a per-item query; their streams join the stream batch below.
-        let alternates = if options.contains_field(ItemFields::MediaSources) {
-            self.media_sources
-                .get_alternate_versions_batch(&ids)
-                .await?
-        } else {
-            HashMap::new()
-        };
+        let alternates =
+            if options.contains_field(ItemFields::MediaSources) && !media_ids.is_empty() {
+                self.media_sources
+                    .get_alternate_versions_batch(&media_ids)
+                    .await?
+            } else {
+                HashMap::new()
+            };
         // The heavy per-item relations, bulk-loaded once for the page when their
         // field is requested (an all-fields list DTO otherwise fans out a query
         // per item for each — costly on the 2-connection pool).
         let want_streams = options.contains_field(ItemFields::MediaStreams)
             || options.contains_field(ItemFields::MediaSources);
-        let stream_ids: Vec<Uuid> = if want_streams {
-            ids.iter()
+        // Only the items that can HAVE a media source are asked for one, and an
+        // alternate version is read alongside the primary it belongs to.
+        let stream_ids: Vec<Uuid> = if media_ids.is_empty() {
+            Vec::new()
+        } else {
+            media_ids
+                .iter()
                 .copied()
                 .chain(alternates.values().flatten().map(row_id))
                 .collect()
-        } else {
-            Vec::new()
         };
         // A source lists its attachments too (C# `MediaAttachments =
         // MediaSourceManager.GetMediaAttachments(item.Id)` on every static source);
@@ -2069,7 +2089,7 @@ impl FerrofinDtoService {
         let want_attachments = options.contains_field(ItemFields::MediaSources);
         let (media_streams, media_attachments) = tokio::try_join!(
             async {
-                if want_streams {
+                if want_streams && !stream_ids.is_empty() {
                     self.media_sources
                         .get_media_streams_batch(&stream_ids)
                         .await
@@ -2078,7 +2098,7 @@ impl FerrofinDtoService {
                 }
             },
             async {
-                if want_attachments {
+                if want_attachments && !stream_ids.is_empty() {
                     self.media_sources
                         .get_media_attachments_batch(&stream_ids)
                         .await
@@ -2252,13 +2272,15 @@ impl FerrofinDtoService {
             }
             (self.resolve_value_ids(&pairs).await?, clean_values)
         };
-        let chapters = if options.contains_field(ItemFields::Chapters) {
-            self.chapters.get_chapters_batch(&ids).await?
+        let chapters = if options.contains_field(ItemFields::Chapters) && !media_ids.is_empty() {
+            self.chapters.get_chapters_batch(&media_ids).await?
         } else {
             HashMap::new()
         };
-        let trickplay = if options.contains_field(ItemFields::Trickplay) {
-            self.trickplay.get_trickplay_manifest_batch(&ids).await?
+        let trickplay = if options.contains_field(ItemFields::Trickplay) && !media_ids.is_empty() {
+            self.trickplay
+                .get_trickplay_manifest_batch(&media_ids)
+                .await?
         } else {
             HashMap::new()
         };
@@ -3213,6 +3235,51 @@ mod tests {
         }
     }
 
+    /// A [`ChapterManager`] fake that records the id sets it is asked for, so a
+    /// test can assert which of a page's items the prefetch decided could own
+    /// chapters at all. A fake that only returned rows could not see the
+    /// difference between "asked and got nothing" and "never asked".
+    #[derive(Default)]
+    struct RecordingChapters {
+        batches: std::sync::Mutex<Vec<Vec<Uuid>>>,
+    }
+
+    #[async_trait]
+    impl ChapterManager for RecordingChapters {
+        async fn supports(&self, _item_id: Uuid) -> Result<bool, ServiceError> {
+            Ok(true)
+        }
+        async fn save_chapters(
+            &self,
+            _item_id: Uuid,
+            _chapters: &[ChapterInfo],
+        ) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        async fn get_chapter(
+            &self,
+            _item_id: Uuid,
+            _index: i32,
+        ) -> Result<Option<ChapterInfo>, ServiceError> {
+            Ok(None)
+        }
+        async fn get_chapters(&self, _item_id: Uuid) -> Result<Vec<ChapterInfo>, ServiceError> {
+            Ok(vec![])
+        }
+        async fn get_chapters_batch(
+            &self,
+            item_ids: &[Uuid],
+        ) -> Result<HashMap<Uuid, Vec<ChapterInfo>>, ServiceError> {
+            if let Ok(mut batches) = self.batches.lock() {
+                batches.push(item_ids.to_vec());
+            }
+            Ok(HashMap::new())
+        }
+        async fn delete_chapter_data(&self, _item_id: Uuid) -> Result<(), ServiceError> {
+            Ok(())
+        }
+    }
+
     /// A [`ChapterManager`] fake with one thumbnailed and one bare chapter.
     struct ChaptersWithImages;
 
@@ -3265,6 +3332,7 @@ mod tests {
             &self,
             _item_id: Uuid,
             _replace: bool,
+            _library_options: &ferrofin_model::configuration::LibraryOptions,
         ) -> Result<(), ServiceError> {
             Ok(())
         }
@@ -3381,6 +3449,69 @@ mod tests {
             Arc::new(FakeChapters),
             Arc::new(FakeTrickplay),
         )
+    }
+
+    // A folder or a by-name item owns no chapter, stream, trickplay or
+    // alternate-version row, so an all-fields page of them must not spend four
+    // round trips proving it. Upstream never asks — a C# `Folder` has no
+    // streams in memory — and `/Library/MediaFolders`, `/Persons` and
+    // `/Items/{id}/Ancestors` are exactly such pages.
+    #[tokio::test]
+    async fn a_page_that_cannot_own_media_sources_is_never_asked_for_them() {
+        let db = test_db().await;
+        let folder = Uuid::new_v4();
+        let person = Uuid::new_v4();
+        let movie = Uuid::new_v4();
+        seed_named_item(&db, folder, BaseItemKind::CollectionFolder, "Movies").await;
+        seed_named_item(&db, person, BaseItemKind::Person, "Ada").await;
+        seed_named_item(&db, movie, BaseItemKind::Movie, "Solaris").await;
+        let folder_row = fetch_item(&db, folder).await;
+        let person_row = fetch_item(&db, person).await;
+        let movie_row = fetch_item(&db, movie).await;
+
+        let chapters = Arc::new(RecordingChapters::default());
+        let svc = FerrofinDtoService::new(
+            db,
+            "server-1".into(),
+            Arc::new(FakeLibrary::default()),
+            Arc::new(FakeUserData),
+            Arc::new(FakeCounts),
+            Arc::new(FakeImages),
+            Arc::new(FakeSources::default()),
+            Arc::clone(&chapters) as Arc<dyn ChapterManager>,
+            Arc::new(FakeTrickplay),
+        );
+
+        svc.get_base_item_dtos(
+            &[folder_row.clone(), person_row.clone()],
+            &DtoOptions::default(),
+            None,
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(
+            chapters.batches.lock().unwrap().is_empty(),
+            "a page of only folders/people must not query chapters at all"
+        );
+
+        // A mixed page still asks — but only for the rows that can answer.
+        svc.get_base_item_dtos(
+            &[folder_row, movie_row, person_row],
+            &DtoOptions::default(),
+            None,
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+        let batches = chapters.batches.lock().unwrap().clone();
+        assert_eq!(
+            batches,
+            vec![vec![movie]],
+            "only the movie can own chapters"
+        );
     }
 
     // Clients gate the chapter-thumbnail request on `ImageTag`; without it the

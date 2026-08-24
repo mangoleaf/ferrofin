@@ -357,6 +357,23 @@ pub async fn build_app_state(
     // critic score TMDB has no data for. Inert until FERROFIN_OMDB_KEY (config
     // `omdb_api_key`) is set: every call returns nothing without a key.
     let omdb_client = Arc::new(ferrofin_providers::OmdbClient::new(&config.omdb_api_key));
+    // MusicBrainz — the music authority (keyless; a mirror URL lifts the 1
+    // req/sec limit). Shared by the scan's enrichment pass and the
+    // MusicAlbum/MusicArtist "Identify" providers.
+    let musicbrainz_client = Arc::new(ferrofin_providers::MusicBrainzClient::new(
+        &config.musicbrainz_base_url,
+        env!("CARGO_PKG_VERSION"),
+    ));
+    // TheAudioDb — artist bio/genre + artist/album artwork by MusicBrainz id
+    // (built-in free key). Shared by the scan and the "Choose Image" methods.
+    let audiodb_client = Arc::new(ferrofin_providers::AudioDbClient::new());
+    // fanart.tv — logos/clear-art/disc/banners keyed off the Tmdb/Imdb/Tvdb/
+    // MusicBrainz ids. Built-in key works keyless; FERROFIN_FANART_KEY adds a
+    // personal client_key. Shared by the scan and the "Choose Image" methods.
+    let fanart_client = Arc::new(ferrofin_providers::FanartClient::new(
+        (!config.fanart_personal_api_key.is_empty())
+            .then(|| config.fanart_personal_api_key.clone()),
+    ));
     let search_providers: Vec<Arc<dyn ferrofin_providers::RemoteSearchProvider>> = vec![
         Arc::new(ferrofin_providers::TmdbSearchProvider::new(
             Arc::clone(&tmdb_client),
@@ -380,6 +397,28 @@ pub async fn build_app_state(
         // Box sets identify against TMDB's collections, a separate endpoint.
         Arc::new(ferrofin_providers::TmdbBoxSetSearchProvider::new(
             Arc::clone(&tmdb_client),
+        )),
+        // Trailers: OMDb's `IRemoteMetadataProvider<Trailer, TrailerInfo>`.
+        Arc::new(ferrofin_providers::OmdbSearchProvider::for_trailers(
+            Arc::clone(&omdb_client),
+        )),
+        // People identify against TMDB's person search.
+        Arc::new(ferrofin_providers::TmdbPersonSearchProvider::new(
+            Arc::clone(&tmdb_client),
+        )),
+        // Albums/artists identify against MusicBrainz; TheAudioDb is listed
+        // (selectable by name) but, as in Jellyfin, has no name search.
+        Arc::new(ferrofin_providers::MusicBrainzAlbumSearchProvider::new(
+            Arc::clone(&musicbrainz_client),
+        )),
+        Arc::new(ferrofin_providers::MusicBrainzArtistSearchProvider::new(
+            Arc::clone(&musicbrainz_client),
+        )),
+        Arc::new(ferrofin_providers::AudioDbSearchProvider::new(
+            ferrofin_model::data::BaseItemKind::MusicAlbum,
+        )),
+        Arc::new(ferrofin_providers::AudioDbSearchProvider::new(
+            ferrofin_model::data::BaseItemKind::MusicArtist,
         )),
     ];
     // Studio logos from the artwork repository (name-matched, keyless). The repo
@@ -432,6 +471,12 @@ pub async fn build_app_state(
             .with_remote_search_providers(search_providers)
             .with_dynamic_fetchers(wasm_host.provider_names())
             .with_studios(Arc::clone(&studios_client))
+            // The other "Choose Image" providers: fanart.tv (movies/series/
+            // artists/albums), TheAudioDb (artists/albums) and OMDb's poster
+            // (movies/trailers/episodes; inert without an API key).
+            .with_fanart(Arc::clone(&fanart_client))
+            .with_audiodb(Arc::clone(&audiodb_client))
+            .with_omdb(Arc::clone(&omdb_client))
             // Enables the kind-filtered built-in external-id descriptors the
             // Identify dialog renders as id input fields.
             .with_item_types(item_type_lookup.as_ref()),
@@ -444,7 +489,10 @@ pub async fn build_app_state(
     let event_bus = FerrofinEventManager::new();
     let event_manager: Arc<dyn ferrofin_traits::events::EventManager> = Arc::new(event_bus.clone());
     let localization: Arc<dyn ferrofin_traits::localization::LocalizationManager> = Arc::new(
-        LocalizationManager::new(&server_config.metadata_country_code),
+        LocalizationManager::new(&server_config.metadata_country_code).with_ui_culture_source({
+            let config_mgr = Arc::clone(&config_mgr);
+            move || config_mgr.snapshot_shared().ui_culture.clone()
+        }),
     );
     let lyric_providers: Vec<Arc<dyn ferrofin_traits::stubs::LyricProvider>> =
         vec![Arc::new(ferrofin_providers::LrcLibProvider::new())];
@@ -515,6 +563,8 @@ pub async fn build_app_state(
             db.clone(),
             Arc::new(ferrofin_livetv::ReqwestFetcher::new()),
             server_id.clone(),
+            // `{cache}/sd-countries.json` — `IApplicationPaths.CachePath` upstream.
+            paths.cache_path(),
         )
         .with_users(Arc::clone(&users))
         // ffmpeg, for the DVR's encoded recorder (the remux upstream falls
@@ -607,7 +657,27 @@ pub async fn build_app_state(
             // The cache root itself: the manager appends Jellyfin's own
             // `{provider}-similar-{type}/{id}.json` layout under it, so a
             // cache directory shared with a Jellyfin install stays valid.
-            .with_cache_dir(std::path::PathBuf::from(paths.cache_path())),
+            .with_cache_dir(std::path::PathBuf::from(paths.cache_path()))
+            // `EnableExternalContentInSuggestions` (Trailer/LiveTvProgram fold-in).
+            .with_configuration(Arc::clone(&config_trait)),
+    );
+    // The by-name `Year` provisioner (`GetYear`): one row per production year
+    // at `{metadata}/Year/{year}` with Jellyfin's normalized by-name id. Shared
+    // by the scan's post-pass (every scanned year) and the library manager's
+    // on-demand `/Years/{year}` resolution.
+    let year_store = ferrofin_core::YearStore::new(
+        Arc::clone(&item_persistence_service),
+        id_derivation.clone(),
+        paths.year_path(),
+    );
+    // The `UserRootFolder` provisioner (`GetUserRootFolder()`): the row
+    // `Items/Root` resolves to and the parent of every library's
+    // `CollectionFolder` (the virtual-folder manager builds its own over the
+    // same root + store, so both land on the one derived id).
+    let user_root_store = ferrofin_core::UserRootFolderStore::new(
+        Arc::clone(&item_persistence_service),
+        id_derivation.clone(),
+        paths.default_user_views_path(),
     );
     let mut scanner = ferrofin_core::LibraryScanner::new(
         Arc::clone(&virtual_folders),
@@ -615,6 +685,9 @@ pub async fn build_app_state(
         Arc::clone(&item_persistence_service),
     )
     .with_id_derivation(id_derivation)
+    // Materialize a `Year` item per distinct ProductionYear at the end of
+    // every scan (needs the item repository wired via `with_music` below).
+    .with_years(year_store.clone())
     // OfficialRating → numeric parental score on each scanned row (the
     // Parental Rating sort and max-rating filters read the numeric column).
     .with_localization(Arc::new(LocalizationManager::new(
@@ -639,10 +712,7 @@ pub async fn build_app_state(
     // fanart.tv artwork (logos/clear-art/disc/banners on top of TMDB's
     // poster/backdrop), keyed off the Tmdb/Imdb/Tvdb ids persisted during scan.
     // Built-in key works keyless; FERROFIN_FANART_KEY adds a personal client_key.
-    .with_fanart(Arc::new(ferrofin_providers::FanartClient::new(
-        (!config.fanart_personal_api_key.is_empty())
-            .then(|| config.fanart_personal_api_key.clone()),
-    )))
+    .with_fanart(Arc::clone(&fanart_client))
     // OMDb closes the metadata chain (plot/genres/cast/certificate/ratings and
     // a last-resort poster) and supplements TMDB with the Rotten Tomatoes score.
     // Enabled only when an OMDb API key is configured (FERROFIN_OMDB_KEY /
@@ -654,15 +724,12 @@ pub async fn build_app_state(
     // (the item repository lets it query the MusicAlbum/MusicArtist rows + tracks
     // it created). Keyless; a mirror URL lifts the 1 req/sec limit.
     .with_music(
-        Arc::new(ferrofin_providers::MusicBrainzClient::new(
-            &config.musicbrainz_base_url,
-            env!("CARGO_PKG_VERSION"),
-        )),
+        Arc::clone(&musicbrainz_client),
         Arc::clone(&item_repository),
     )
     // AudioDb artist bio/genre + artist/album artwork (by MusicBrainz id),
     // fetched in the post-scan music pass. Built-in free key.
-    .with_audiodb(Arc::new(ferrofin_providers::AudioDbClient::new()))
+    .with_audiodb(Arc::clone(&audiodb_client))
     // Studio thumbs from the artwork repository, downloaded post-scan for the
     // by-name Studio rows so the TV Networks / Studios tabs carry artwork.
     .with_studio_images(Arc::clone(&studios_client))
@@ -700,7 +767,11 @@ pub async fn build_app_state(
         .with_scanner(Arc::clone(&library_scanner))
         // Chapter thumbnails are served from the chapter rows, not the item's
         // image rows.
-        .with_chapters(Arc::clone(&chapter_repository)),
+        .with_chapters(Arc::clone(&chapter_repository))
+        // `Items/Root` creates the root on first use; `/Years/{year}` creates
+        // the year on first use — both as Jellyfin does.
+        .with_user_root(user_root_store)
+        .with_years(year_store),
     );
     let library: Arc<dyn ferrofin_traits::library::LibraryManager> = library_impl.clone();
     // The library monitor drives refreshes from two change sources: the
@@ -800,7 +871,8 @@ pub async fn build_app_state(
             Arc::clone(&media_encoder),
             Arc::clone(&providers),
         )
-        .with_live_tv(Arc::clone(&live_tv)),
+        .with_live_tv(Arc::clone(&live_tv))
+        .with_localization(Arc::clone(&localization)),
     );
 
     // ---- managers over library -------------------------------------------
@@ -1020,6 +1092,7 @@ pub async fn build_app_state(
         )));
         task_manager.register(Arc::new(lib_tasks::TrickplayImagesTask::new(
             Arc::clone(&library),
+            Arc::clone(&virtual_folders),
             Arc::clone(&trickplay),
         )));
         task_manager.register(Arc::new(maint_tasks::CleanActivityLogTask::new(
@@ -1586,7 +1659,10 @@ pub async fn build_app_state(
 
     // ---- playback-decision metrics (feeds the benchmark suite) -------------
     let playback_metrics: Arc<dyn ferrofin_traits::metrics::PlaybackMetrics> =
-        Arc::new(ferrofin_core::FerrofinPlaybackMetrics::new(db.clone()));
+        Arc::new(ferrofin_core::FerrofinPlaybackMetrics::with_queue_depth(
+            db.clone(),
+            config.playback_metrics_queue.unwrap_or(0) as usize,
+        ));
 
     // The runtime plugins' URL space (`/Plugins/{id}/web/…`).
     let plugin_routes: Arc<dyn ferrofin_traits::plugins::PluginRequestHandler> = Arc::new(

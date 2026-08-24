@@ -44,6 +44,7 @@ use crate::m3u::parse_m3u;
 use crate::projection::{
     ChannelRow, ProgramRow as GuideProgramRow, channel_entity, program_entity, remove_fields,
 };
+use crate::schedules_direct::SchedulesDirect;
 use crate::stream::{LiveStreamHandle, LiveStreamKind, TunerStreamSource};
 use crate::xmltv::parse_xmltv;
 
@@ -199,6 +200,9 @@ pub struct FerrofinLiveTvManager {
     /// `AsyncNonKeyedLocker(1)` around the whole of `OpenLiveStreamInternal`);
     /// a `tokio::sync::Mutex` because this one *is* held across awaits.
     open_lock: Arc<tokio::sync::Mutex<()>>,
+    /// The account-less Schedules Direct surface (country list), sharing the
+    /// fetcher and caching under the application cache directory.
+    schedules_direct: SchedulesDirect,
 }
 
 impl std::fmt::Debug for FerrofinLiveTvManager {
@@ -327,9 +331,17 @@ impl CategoryClasses {
 }
 
 impl FerrofinLiveTvManager {
-    /// Creates the manager over the given database and source fetcher.
+    /// Creates the manager over the given database and source fetcher, caching
+    /// Schedules Direct documents under `cache_dir` (the application cache
+    /// path — `IApplicationPaths.CachePath` upstream).
     #[must_use]
-    pub fn new(db: Database, fetcher: Arc<dyn SourceFetcher>, server_id: String) -> Self {
+    pub fn new(
+        db: Database,
+        fetcher: Arc<dyn SourceFetcher>,
+        server_id: String,
+        cache_dir: impl Into<PathBuf>,
+    ) -> Self {
+        let schedules_direct = SchedulesDirect::new(Arc::clone(&fetcher), cache_dir);
         Self {
             db,
             fetcher,
@@ -346,6 +358,7 @@ impl FerrofinLiveTvManager {
             retry_counts: Arc::new(Mutex::new(HashMap::new())),
             encoder: None,
             open_lock: Arc::new(tokio::sync::Mutex::new(())),
+            schedules_direct,
         }
     }
 
@@ -1492,6 +1505,10 @@ impl LiveTvManager for FerrofinLiveTvManager {
             self.arm_timer(&timer);
         }
         Ok(())
+    }
+
+    async fn get_schedules_direct_countries(&self) -> Result<Vec<u8>, ServiceError> {
+        self.schedules_direct.get_available_countries().await
     }
 }
 
@@ -2891,8 +2908,13 @@ mod tests {
     async fn manager_with(fetcher: FakeFetcher) -> FerrofinLiveTvManager {
         let db = Database::connect_in_memory().await.expect("db");
         db.run_migrations().await.expect("migrate");
-        FerrofinLiveTvManager::new(db, std::sync::Arc::new(fetcher), "srv".to_owned())
-            .with_dto(Arc::new(FakeDto))
+        FerrofinLiveTvManager::new(
+            db,
+            std::sync::Arc::new(fetcher),
+            "srv".to_owned(),
+            std::env::temp_dir().join("ferrofin-livetv-manager-tests"),
+        )
+        .with_dto(Arc::new(FakeDto))
     }
 
     const M3U: &str = "#EXTM3U\n\
@@ -2961,9 +2983,13 @@ mod tests {
             .await
             .expect("policy");
 
-        let mgr =
-            FerrofinLiveTvManager::new(db, Arc::new(FakeFetcher(HashMap::new())), "srv".to_owned())
-                .with_users(users);
+        let mgr = FerrofinLiveTvManager::new(
+            db,
+            Arc::new(FakeFetcher(HashMap::new())),
+            "srv".to_owned(),
+            std::env::temp_dir().join("ferrofin-livetv-manager-tests"),
+        )
+        .with_users(users);
         // `IsLiveTvEnabled`: the permission alone is not enough — a tuner host must exist.
         assert!(
             mgr.get_live_tv_info()
@@ -4485,6 +4511,7 @@ mod tests {
             db.clone(),
             Arc::new(FakeFetcher(sources)),
             "srv".to_owned(),
+            std::env::temp_dir().join("ferrofin-livetv-manager-tests"),
         )
         .with_dto(Arc::new(FakeDto));
         mgr.save_tuner_host(TunerHostInfo {
@@ -4919,5 +4946,38 @@ mod tests {
             .expect("after");
         assert_eq!(after.timer_id, None);
         assert_eq!(after.status, None);
+    }
+
+    /// Countries come off the shared fetcher and cache under the manager's own
+    /// cache directory (`{cache}/sd-countries.json`, as upstream).
+    #[tokio::test]
+    async fn schedules_direct_countries_come_from_the_shared_fetcher_and_cache_dir() {
+        let cache_dir = tempfile::tempdir().expect("tempdir");
+        let mut map = HashMap::new();
+        map.insert(
+            format!("{}/available/countries", crate::schedules_direct::API_URL),
+            r#"{"Europe":[{"shortName":"GBR"}]}"#.to_owned(),
+        );
+        let db = Database::connect_in_memory().await.expect("db");
+        db.run_migrations().await.expect("migrate");
+        let mgr = FerrofinLiveTvManager::new(
+            db,
+            std::sync::Arc::new(FakeFetcher(map)),
+            "srv".to_owned(),
+            cache_dir.path(),
+        );
+
+        let bytes = mgr
+            .get_schedules_direct_countries()
+            .await
+            .expect("countries");
+        assert_eq!(bytes, br#"{"Europe":[{"shortName":"GBR"}]}"#);
+        // The disk cache lands in the manager's cache directory.
+        assert_eq!(
+            std::fs::read(cache_dir.path().join("sd-countries.json")).expect("cache file"),
+            bytes
+        );
+        // Debug stays free of the fetcher and cache internals.
+        assert!(format!("{mgr:?}").contains("srv"));
     }
 }

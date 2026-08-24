@@ -236,6 +236,15 @@ impl LocalizationManager for StubLocalization {
             value: "en-US".to_owned(),
         }]
     }
+    fn get_localized_string(&self, phrase: &str) -> String {
+        phrase.to_owned()
+    }
+    fn get_localized_string_for(&self, phrase: &str, _culture: &str) -> String {
+        phrase.to_owned()
+    }
+    fn get_language_display_name(&self, _language: &str) -> Option<String> {
+        None
+    }
     fn get_rating_score(
         &self,
         _rating: &str,
@@ -774,6 +783,9 @@ impl ferrofin_traits::stubs::LiveTvManager for FailingLiveTv {
         unreachable!()
     }
     async fn delete_recording(&self, _id: Uuid) -> Result<(), ServiceError> {
+        unreachable!()
+    }
+    async fn get_schedules_direct_countries(&self) -> Result<Vec<u8>, ServiceError> {
         unreachable!()
     }
 }

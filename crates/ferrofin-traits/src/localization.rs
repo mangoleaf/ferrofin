@@ -29,6 +29,18 @@ pub trait LocalizationManager: Send + Sync {
     /// The list of localization (UI-language) options (C# `GetLocalizationOptions`).
     fn get_localization_options(&self) -> Vec<LocalizationOption>;
 
+    /// A phrase localized in the server UI culture, falling back to `en-US`
+    /// and then to the phrase itself (C# `GetLocalizedString(phrase)`).
+    fn get_localized_string(&self, phrase: &str) -> String;
+
+    /// A phrase localized in `culture` (empty ⇒ the server UI culture), with
+    /// the same fallbacks (C# `GetLocalizedString(phrase, culture)`).
+    fn get_localized_string_for(&self, phrase: &str, culture: &str) -> String;
+
+    /// The display name of a language code (`"eng"` → `"English"`), `None`
+    /// when unknown (C# `GetLanguageDisplayName`).
+    fn get_language_display_name(&self, language: &str) -> Option<String>;
+
     /// Resolves a rating string to a score, honouring the given country code
     /// (C# `GetRatingScore`).
     fn get_rating_score(

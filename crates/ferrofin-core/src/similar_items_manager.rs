@@ -14,13 +14,23 @@
 //! orders by recommendation type. With no user or empty history it returns nothing,
 //! matching C# (every category query is user-scoped).
 //!
-//! Accepted divergences from C#: the provider registry (local + remote providers,
-//! caching) is dropped — this is the local scorer only; similar candidates are
-//! restricted to the seed's own kind (C# also folds in `Trailer`/`LiveTvProgram`
-//! when `EnableExternalContentInSuggestions`); `IsFavoriteOrLiked` is approximated
-//! as favorite-only (as elsewhere in the query layer); the person-recommendation
-//! IMDb de-dup is dropped; and ties are broken **deterministically** (`SortName`,
-//! then `Id`) rather than by C#'s `Random`, so results are stable.
+//! The local provider runs in two phases, as C# `MovieSimilarItemsProvider`
+//! does: the score pass above, then **one** `InternalItemsQuery` over the scored
+//! ids carrying the per-kind filter set of the C# provider that serves the seed
+//! (`Movie`/`Trailer`: movie kinds — plus `Trailer`/`LiveTvProgram` when
+//! `EnableExternalContentInSuggestions` — `IsMovie`, unplayed only; `Series`;
+//! `MusicAlbum`/`MusicArtist`/`Audio` honouring `ExcludeArtistIds`;
+//! `LiveTvProgram` by its movie/series flag) and the user's library access, so
+//! the watch-state and access rules are the query layer's, not a second copy.
+//! A kind C# has no local provider for scores nothing, and the controller's
+//! `Episode` / by-name short-circuit lives in [`SimilarItemsManager::get_similar_items`].
+//!
+//! Accepted divergences from C#: one weighted scorer serves every kind (C#'s
+//! `Series`/music/Live TV providers run a plain genre-or-tag match in random
+//! order); `IsFavoriteOrLiked` is approximated as favorite-only (as elsewhere in
+//! the query layer); the person-recommendation IMDb de-dup is dropped; and ties
+//! are broken **deterministically** (`SortName`, then `Id`) rather than by C#'s
+//! `Random`, so results are stable.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -36,6 +46,7 @@ use ferrofin_model::dto::{RecommendationType, SortOrder};
 use ferrofin_model::live_tv::ItemSortBy;
 use uuid::Uuid;
 
+use ferrofin_traits::configuration::ServerConfigurationManager;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::{
     RemoteSimilarItemsProvider, SimilarItemReference, SimilarItemsManager, SimilarItemsQuery,
@@ -44,6 +55,8 @@ use ferrofin_traits::library::{
 use ferrofin_traits::options::{DtoOptions, InternalItemsQuery};
 use ferrofin_traits::persistence::ItemRepository;
 
+use crate::item_type_lookup::stored_type_name;
+use crate::kinds::supports_similarity;
 use crate::similar_items_repository::SimilarItemsRepository;
 
 /// Reads an unexpired reference cache, or `None` when it is missing, stale or
@@ -243,6 +256,65 @@ const LOCAL_SIMILARITY_PROVIDER: &str = "Local Genre/Tag";
 /// The default number of similar items returned when the caller gives no limit.
 const DEFAULT_SIMILAR_LIMIT: i32 = 10;
 
+/// How many scored candidates the score pass keeps per result wanted, so the
+/// access/played filter that follows can drop rows without under-filling the
+/// page (C# `MovieSimilarItemsProvider`: `.Take(limit * 3)`).
+const CANDIDATE_OVERSAMPLE: i32 = 3;
+
+/// The filter a C# local similarity provider applies to its candidates — phase
+/// 2 of `MovieSimilarItemsProvider.GetBatchSimilarItemsAsync`, or the
+/// `InternalItemsQuery` the `Series`/`MusicAlbum`/`MusicArtist`/`Audio`/
+/// `LiveTvProgram` providers build. The user's library access is added on top
+/// by [`FerrofinSimilarItemsManager::configure_user_access`].
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct LocalFilter {
+    /// The kinds a result may be (C# `IncludeItemTypes`); empty when no C#
+    /// provider serves the seed's kind, in which case nothing is scored.
+    include_item_types: Vec<BaseItemKind>,
+    /// C# `IsMovie` (the movie provider sets it; the others leave it null).
+    is_movie: Option<bool>,
+    /// Whether only unplayed rows qualify (the movie provider's
+    /// `IsPlayed = false`). Only meaningful with a user.
+    unplayed_only: bool,
+    /// Whether the request's `ExcludeArtistIds` apply (the music providers).
+    honours_exclude_artist_ids: bool,
+}
+
+/// One similar-items request as the local provider sees it.
+struct LocalRequest<'a> {
+    /// The seed row.
+    seed: &'a BaseItemEntity,
+    /// The seed's id, parsed.
+    seed_id: Uuid,
+    /// The seed's kind.
+    kind: BaseItemKind,
+    /// The request's `ExcludeArtistIds`.
+    exclude_artist_ids: &'a [Uuid],
+    /// The requesting user, when the request is user-scoped.
+    user_id: Option<Uuid>,
+    /// How many results the request wants in all.
+    wanted: i32,
+}
+
+impl LocalFilter {
+    /// A provider that only restricts the result kinds (`Series`, Live TV).
+    fn of_kinds(include_item_types: Vec<BaseItemKind>) -> Self {
+        Self {
+            include_item_types,
+            ..Self::default()
+        }
+    }
+
+    /// A music provider: one result kind, and the caller's artist exclusions.
+    fn music(kind: BaseItemKind) -> Self {
+        Self {
+            include_item_types: vec![kind],
+            honours_exclude_artist_ids: true,
+            ..Self::default()
+        }
+    }
+}
+
 /// Recently-played movies sampled to seed the "similar to recently played"
 /// categories (C# `GetMovieRecommendationsAsync`: `Limit = 7`).
 const RECENTLY_PLAYED_LIMIT: i32 = 7;
@@ -267,6 +339,10 @@ pub struct FerrofinSimilarItemsManager {
     /// Where a remote provider's references are cached between requests.
     /// Absent → no caching, exactly as a `None` cache duration does.
     cache_dir: Option<PathBuf>,
+    /// Reads `EnableExternalContentInSuggestions`, which widens movie
+    /// suggestions to trailers and Live TV programs. Absent → Jellyfin's
+    /// default for that setting (`true`).
+    configuration: Option<Arc<dyn ServerConfigurationManager>>,
 }
 
 impl std::fmt::Debug for FerrofinSimilarItemsManager {
@@ -286,7 +362,20 @@ impl FerrofinSimilarItemsManager {
             remote: Vec::new(),
             library: None,
             cache_dir: None,
+            configuration: None,
         }
+    }
+
+    /// Reads the server configuration through `configuration` — the
+    /// `EnableExternalContentInSuggestions` switch that lets trailers and Live
+    /// TV programs stand in as "similar movies" (composition root only).
+    #[must_use]
+    pub fn with_configuration(
+        mut self,
+        configuration: Arc<dyn ServerConfigurationManager>,
+    ) -> Self {
+        self.configuration = Some(configuration);
+        self
     }
 
     /// Registers the remote similarity providers and the library manager whose
@@ -391,33 +480,184 @@ impl FerrofinSimilarItemsManager {
         }
     }
 
-    /// Runs the local weighted-overlap scorer and appends its results at
-    /// `provider_order`, skipping anything already taken.
-    #[allow(clippy::too_many_arguments)]
+    /// The kinds a "similar movie" may be: `Movie`, plus `Trailer` and
+    /// `LiveTvProgram` when `EnableExternalContentInSuggestions` is on (the
+    /// list C# `MovieSimilarItemsProvider` and `GetMovieRecommendationsAsync`
+    /// both build). Unconfigured, the setting takes Jellyfin's default, `true`.
+    async fn movie_candidate_kinds(&self) -> Vec<BaseItemKind> {
+        let mut kinds = vec![BaseItemKind::Movie];
+        let external = match self.configuration.as_ref() {
+            None => true,
+            Some(configuration) => match configuration.configuration().await {
+                Ok(config) => config.enable_external_content_in_suggestions,
+                Err(err) => {
+                    tracing::warn!(%err, "reading the server configuration failed; assuming its default");
+                    true
+                }
+            },
+        };
+        if external {
+            kinds.push(BaseItemKind::Trailer);
+            kinds.push(BaseItemKind::LiveTvProgram);
+        }
+        kinds
+    }
+
+    /// The filter set of the C# local provider that serves `seed` —
+    /// `ILocalSimilarItemsProvider.Supports(type)` resolved per kind, with each
+    /// provider's own `InternalItemsQuery` shape. A kind none of them serves
+    /// gets an empty filter, i.e. no local results.
+    async fn local_filter(&self, seed: &BaseItemEntity, kind: BaseItemKind) -> LocalFilter {
+        match kind {
+            // `MovieSimilarItemsProvider` (Movie + Trailer seeds): movie kinds,
+            // `IsMovie = true`, `IsPlayed = false`.
+            BaseItemKind::Movie | BaseItemKind::Trailer => LocalFilter {
+                include_item_types: self.movie_candidate_kinds().await,
+                is_movie: Some(true),
+                unplayed_only: true,
+                honours_exclude_artist_ids: false,
+            },
+            BaseItemKind::Series => LocalFilter::of_kinds(vec![BaseItemKind::Series]),
+            BaseItemKind::MusicAlbum => LocalFilter::music(BaseItemKind::MusicAlbum),
+            BaseItemKind::MusicArtist => LocalFilter::music(BaseItemKind::MusicArtist),
+            // `AudioBook : Audio`, so the audio provider's `Supports` admits it.
+            BaseItemKind::Audio | BaseItemKind::AudioBook => {
+                LocalFilter::music(BaseItemKind::Audio)
+            }
+            // `LiveTvProgramSimilarItemsProvider` picks the list by the
+            // program's own flags; it sets neither `IsMovie` nor `IsPlayed`.
+            BaseItemKind::LiveTvProgram if seed.is_movie => {
+                LocalFilter::of_kinds(self.movie_candidate_kinds().await)
+            }
+            BaseItemKind::LiveTvProgram if seed.is_series => {
+                LocalFilter::of_kinds(vec![BaseItemKind::Series])
+            }
+            BaseItemKind::LiveTvProgram => LocalFilter::of_kinds(vec![BaseItemKind::LiveTvProgram]),
+            _ => LocalFilter::default(),
+        }
+    }
+
+    /// Scopes `query` to `user_id` the way C# `ConfigureUserAccess`
+    /// (`AddUserToQuery`) does: the user goes on the query, which is what the
+    /// watch-state predicates key on, and a user who may not see every library
+    /// is confined to the `TopParentId`s they may. Returns `false` when the
+    /// user can see no library at all — C# reaches for a `Guid.NewGuid()`
+    /// scope there so the query matches nothing; the caller skips it instead.
+    ///
+    /// An id that resolves to no user leaves the query unscoped, as the C#
+    /// controller hands a null user through.
+    async fn configure_user_access(
+        &self,
+        query: &mut InternalItemsQuery,
+        user_id: Uuid,
+    ) -> Result<bool, ServiceError> {
+        let Some(user) = self.repo.fetch_user(user_id).await? else {
+            return Ok(true);
+        };
+        if let Some(scope) = self.repo.accessible_top_parents(&user).await? {
+            if scope.is_empty() {
+                return Ok(false);
+            }
+            query.top_parent_ids = scope;
+        }
+        query.set_user(user);
+        Ok(true)
+    }
+
+    /// The local provider's results for `seed`, in score order, over-sampled
+    /// for `wanted`: the score pass, then ONE access/played query over the
+    /// scored ids (C# phases 1–2 of `GetBatchSimilarItemsAsync`). The caller
+    /// takes its fill after the presentation-key de-dup, as C# `DistinctBy`
+    /// runs before `Take(limit)`.
+    ///
+    /// `exclude_ids` is handed to the score pass, so its limit yields that
+    /// many *new* rows; the filter pass carries `ExcludeArtistIds` (for the
+    /// kinds whose provider honours it), the kind set, `IsMovie`/`IsPlayed`
+    /// and the user's access, all through the shared query translator.
+    async fn local_similar(
+        &self,
+        request: &LocalRequest<'_>,
+        exclude_ids: &[Uuid],
+        wanted: i32,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        if wanted <= 0 {
+            return Ok(Vec::new());
+        }
+        let filter = self.local_filter(request.seed, request.kind).await;
+        let candidate_types: Vec<&str> = filter
+            .include_item_types
+            .iter()
+            .copied()
+            .filter_map(stored_type_name)
+            .collect();
+        let mut candidates = self
+            .repo
+            .weighted_similar_items(
+                request.seed_id,
+                &candidate_types,
+                exclude_ids,
+                wanted.saturating_mul(CANDIDATE_OVERSAMPLE),
+            )
+            .await?;
+        if candidates.is_empty() {
+            return Ok(candidates);
+        }
+
+        let mut access = InternalItemsQuery {
+            item_ids: candidates
+                .iter()
+                .filter_map(|c| Uuid::parse_str(&c.id).ok())
+                .collect(),
+            include_item_types: filter.include_item_types.clone(),
+            is_movie: filter.is_movie,
+            is_played: filter.unplayed_only.then_some(false),
+            exclude_artist_ids: if filter.honours_exclude_artist_ids {
+                request.exclude_artist_ids.to_vec()
+            } else {
+                Vec::new()
+            },
+            ..InternalItemsQuery::default()
+        };
+        if let Some(user_id) = request.user_id
+            && !self.configure_user_access(&mut access, user_id).await?
+        {
+            return Ok(Vec::new());
+        }
+        let accessible: std::collections::HashSet<Uuid> = self
+            .items
+            .get_item_ids(&access)
+            .await?
+            .into_iter()
+            .collect();
+        // Phase 3: the filter says which survive; the score pass says in
+        // what order.
+        candidates.retain(|c| Uuid::parse_str(&c.id).is_ok_and(|id| accessible.contains(&id)));
+        Ok(candidates)
+    }
+
+    /// Runs the local provider and appends its results at `provider_order`,
+    /// skipping anything already taken.
     async fn push_local_results(
         &self,
-        item_id: Uuid,
-        seed: &BaseItemEntity,
-        exclude_artist_ids: &[Uuid],
-        wanted: i32,
+        request: &LocalRequest<'_>,
         provider_order: usize,
         claimed: &mut Seen,
         scored: &mut Vec<(BaseItemEntity, f32)>,
     ) -> Result<(), ServiceError> {
-        let remaining = wanted - i32::try_from(scored.len()).unwrap_or(0);
+        let remaining = request.wanted - i32::try_from(scored.len()).unwrap_or(0);
         if remaining <= 0 {
             return Ok(());
         }
         // C# hands the local provider `ExcludeItemIds`, so its `Limit` yields
         // that many *new* rows. Filtering in Rust instead would let each
         // duplicate burn a slot and under-fill the requested limit.
-        let mut exclude: Vec<Uuid> = claimed.ids();
-        exclude.extend_from_slice(exclude_artist_ids);
-        let by_overlap = self
-            .repo
-            .weighted_similar_items(item_id, &seed.type_, &exclude, remaining)
-            .await?;
+        let exclude: Vec<Uuid> = claimed.ids();
+        let by_overlap = self.local_similar(request, &exclude, remaining).await?;
+        let wanted_len = usize::try_from(request.wanted).unwrap_or(0);
         for (position, entity) in by_overlap.into_iter().enumerate() {
+            if scored.len() >= wanted_len {
+                break;
+            }
             if let Ok(id) = Uuid::parse_str(&entity.id)
                 && claimed.claim(id, &entity)
             {
@@ -598,6 +838,7 @@ impl FerrofinSimilarItemsManager {
     async fn similar_category(
         &self,
         seed: &BaseItemEntity,
+        user_id: Uuid,
         recommendation_type: RecommendationType,
         item_limit: i32,
         dto_options: &DtoOptions,
@@ -605,16 +846,35 @@ impl FerrofinSimilarItemsManager {
         let Ok(seed_id) = Uuid::parse_str(&seed.id) else {
             return Ok(None);
         };
-        // Recommendations use the LOCAL scorer only. C#
+        // Recommendations use the LOCAL provider only. C#
         // `GetSimilarItemsRecommendationsAsync` resolves an
         // `IBatchLocalSimilarItemsProvider` and calls that alone — remote
         // providers never take part, so a category never fans out to TMDB
-        // once per baseline.
+        // once per baseline — and hands it the user, so the movie provider's
+        // unplayed/access filter applies here too.
         let _ = dto_options;
-        let items = self
-            .repo
-            .weighted_similar_items(seed_id, &seed.type_, &[], item_limit)
-            .await?;
+        let request = LocalRequest {
+            seed,
+            seed_id,
+            kind: kind_of(seed),
+            exclude_artist_ids: &[],
+            user_id: Some(user_id),
+            wanted: item_limit,
+        };
+        let mut claimed = Seen::new(seed_id, seed.presentation_unique_key.as_deref());
+        let mut items = Vec::new();
+        let item_limit_len = usize::try_from(item_limit).unwrap_or(0);
+        for entity in self.local_similar(&request, &[seed_id], item_limit).await? {
+            if items.len() >= item_limit_len {
+                break;
+            }
+            // C# `DistinctBy(PresentationUniqueKey)`: one row per film.
+            if let Ok(id) = Uuid::parse_str(&entity.id)
+                && claimed.claim(id, &entity)
+            {
+                items.push(entity);
+            }
+        }
         if items.is_empty() {
             return Ok(None);
         }
@@ -624,6 +884,28 @@ impl FerrofinSimilarItemsManager {
             recommendation_type,
             items,
         }))
+    }
+
+    /// One "similar to" category per baseline `seed`, skipping the seeds with
+    /// no similar items (C# `GetSimilarItemsRecommendationsAsync`).
+    async fn similar_categories(
+        &self,
+        seeds: impl Iterator<Item = BaseItemEntity> + Send,
+        user_id: Uuid,
+        recommendation_type: RecommendationType,
+        item_limit: i32,
+        dto_options: &DtoOptions,
+    ) -> Result<Vec<SimilarItemsRecommendation>, ServiceError> {
+        let mut out = Vec::new();
+        for seed in seeds {
+            if let Some(rec) = self
+                .similar_category(&seed, user_id, recommendation_type, item_limit, dto_options)
+                .await?
+            {
+                out.push(rec);
+            }
+        }
+        Ok(out)
     }
 
     /// Builds one category per person `name`: their unplayed movies (C#
@@ -644,10 +926,12 @@ impl FerrofinSimilarItemsManager {
             } else {
                 Vec::new()
             };
+        let movie_kinds = self.movie_candidate_kinds().await;
         let mut out = Vec::with_capacity(names.len());
         for name in names {
             let mut query = InternalItemsQuery {
-                include_item_types: vec![BaseItemKind::Movie],
+                include_item_types: movie_kinds.clone(),
+                is_movie: Some(true),
                 recursive: true,
                 person: Some(name.clone()),
                 person_types: person_types.clone(),
@@ -685,8 +969,14 @@ impl SimilarItemsManager for FerrofinSimilarItemsManager {
         let Some(seed) = self.items.retrieve_item(item_id).await? else {
             return Ok(Vec::new());
         };
-        let wanted = limit.unwrap_or(DEFAULT_SIMILAR_LIMIT);
         let kind = kind_of(&seed);
+        // C# `LibraryController.GetSimilarItems`: an `Episode`, or an
+        // `IItemByName` other than a `MusicArtist`, answers with an empty
+        // result before any provider runs.
+        if !supports_similarity(kind) {
+            return Ok(Vec::new());
+        }
+        let wanted = limit.unwrap_or(DEFAULT_SIMILAR_LIMIT);
         // The local scorer is always enabled, but it takes its place in the
         // SAME order list as the remote providers (C# puts local and remote
         // into one `matchingProviders` list and sorts the lot by
@@ -703,6 +993,14 @@ impl SimilarItemsManager for FerrofinSimilarItemsManager {
             self.repo.provider_ids(item_id).await.unwrap_or_default()
         };
 
+        let local = LocalRequest {
+            seed: &seed,
+            seed_id: item_id,
+            kind,
+            exclude_artist_ids,
+            user_id,
+            wanted,
+        };
         let mut claimed = Seen::new(item_id, seed.presentation_unique_key.as_deref());
         let mut scored: Vec<(BaseItemEntity, f32)> = Vec::new();
         let mut ran_local = false;
@@ -712,16 +1010,8 @@ impl SimilarItemsManager for FerrofinSimilarItemsManager {
             // Run the local scorer once, at its configured position.
             if !ran_local && local_order <= index {
                 ran_local = true;
-                self.push_local_results(
-                    item_id,
-                    &seed,
-                    exclude_artist_ids,
-                    wanted,
-                    index,
-                    &mut claimed,
-                    &mut scored,
-                )
-                .await?;
+                self.push_local_results(&local, index, &mut claimed, &mut scored)
+                    .await?;
             }
             if scored.len() >= wanted_len {
                 break;
@@ -750,16 +1040,8 @@ impl SimilarItemsManager for FerrofinSimilarItemsManager {
             // Local ranked last: its position in the combined list is the
             // number of remote providers ahead of it, which still earns the
             // rank boost C# gives it — `usize::MAX` would zero it out.
-            self.push_local_results(
-                item_id,
-                &seed,
-                exclude_artist_ids,
-                wanted,
-                remote_count,
-                &mut claimed,
-                &mut scored,
-            )
-            .await?;
+            self.push_local_results(&local, remote_count, &mut claimed, &mut scored)
+                .await?;
         }
 
         // Highest score first. The sort is deliberately left STABLE with no
@@ -816,7 +1098,8 @@ impl SimilarItemsManager for FerrofinSimilarItemsManager {
             .collect();
         let mut liked_q = InternalItemsQuery {
             parent_id,
-            include_item_types: vec![BaseItemKind::Movie],
+            include_item_types: self.movie_candidate_kinds().await,
+            is_movie: Some(true),
             recursive: true,
             is_favorite_or_liked: Some(true),
             limit: Some(LIKED_LIMIT),
@@ -843,34 +1126,24 @@ impl SimilarItemsManager for FerrofinSimilarItemsManager {
 
         // One category per baseline (empties skipped). Baselines are capped to
         // category_limit — the round-robin can't use more categories than that.
-        let mut similar_to_played = Vec::new();
-        for seed in recently_played.into_iter().take(cat_limit) {
-            if let Some(rec) = self
-                .similar_category(
-                    &seed,
-                    RecommendationType::SimilarToRecentlyPlayed,
-                    item_limit,
-                    dto_options,
-                )
-                .await?
-            {
-                similar_to_played.push(rec);
-            }
-        }
-        let mut similar_to_liked = Vec::new();
-        for seed in liked.into_iter().take(cat_limit) {
-            if let Some(rec) = self
-                .similar_category(
-                    &seed,
-                    RecommendationType::SimilarToLikedItem,
-                    item_limit,
-                    dto_options,
-                )
-                .await?
-            {
-                similar_to_liked.push(rec);
-            }
-        }
+        let similar_to_played = self
+            .similar_categories(
+                recently_played.into_iter().take(cat_limit),
+                uid,
+                RecommendationType::SimilarToRecentlyPlayed,
+                item_limit,
+                dto_options,
+            )
+            .await?;
+        let similar_to_liked = self
+            .similar_categories(
+                liked.into_iter().take(cat_limit),
+                uid,
+                RecommendationType::SimilarToLikedItem,
+                item_limit,
+                dto_options,
+            )
+            .await?;
         let has_director = self
             .person_categories(
                 &directors,
@@ -934,7 +1207,9 @@ mod tests {
     use crate::item_repository::FerrofinItemRepository;
     use crate::item_type_lookup::{ItemTypeLookup, stored_type_name};
     use crate::people_repository::FerrofinPeopleRepository;
-    use crate::test_support::{seed_item_genre, seed_user, seed_user_data, test_db};
+    use crate::test_support::{
+        seed_item_genre, seed_item_value, seed_named_user, seed_user, seed_user_data, test_db,
+    };
     use ferrofin_db::Database;
     use ferrofin_db::entities::base_items::PeopleEntity;
     use ferrofin_traits::persistence::{ItemPersistenceService, PeopleRepository};
@@ -1019,6 +1294,114 @@ mod tests {
             .expect("seed movie");
         for genre in genres.split('|').filter(|g| !g.is_empty()) {
             seed_item_genre(db, id, genre).await;
+        }
+    }
+
+    /// Gives `user` the `EnableAllFolders` permission every Jellyfin-created
+    /// user holds by default (`seed_user` writes the bare row only).
+    async fn grant_all_folders(db: &Database, user: &UserEntity) {
+        crate::user_entity_ext::set_permission(
+            db.writer(),
+            &user.id,
+            ferrofin_db::enums::PermissionKind::EnableAllFolders,
+            true,
+        )
+        .await
+        .expect("grant EnableAllFolders");
+    }
+
+    /// Confines `user` to `folders` (`EnableAllFolders = false`, `EnabledFolders
+    /// = folders`) — the dashboard's "Library access" checkboxes.
+    async fn restrict_to_folders(db: &Database, user: &UserEntity, folders: &[Uuid]) {
+        crate::user_entity_ext::set_permission(
+            db.writer(),
+            &user.id,
+            ferrofin_db::enums::PermissionKind::EnableAllFolders,
+            false,
+        )
+        .await
+        .expect("revoke EnableAllFolders");
+        let ids: Vec<String> = folders.iter().map(ToString::to_string).collect();
+        crate::user_entity_ext::set_preference(
+            db.writer(),
+            &user.id,
+            ferrofin_db::enums::PreferenceKind::EnabledFolders,
+            &ids,
+        )
+        .await
+        .expect("set EnabledFolders");
+    }
+
+    /// Seeds a `kind` row named `name` with `genres` attached through
+    /// `ItemValues`, for the non-movie providers.
+    async fn seed_kind(db: &Database, id: Uuid, kind: BaseItemKind, name: &str, genres: &str) {
+        let row = ferrofin_db::entities::base_items::BaseItemEntity {
+            id: ferrofin_db::store::guid_to_db(id),
+            type_: stored_type_name(kind).expect("type name").to_owned(),
+            name: Some(name.to_owned()),
+            clean_name: Some(crate::text_util::get_clean_value(name)),
+            genres: Some(genres.to_owned()),
+            ..Default::default()
+        };
+        FerrofinItemPersistenceService::new(db.clone())
+            .save_items(&[row])
+            .await
+            .expect("seed item");
+        for genre in genres.split('|').filter(|g| !g.is_empty()) {
+            seed_item_genre(db, id, genre).await;
+        }
+    }
+
+    /// Attaches an `AlbumArtist` item value to `item` (what the scanner writes
+    /// for an album's artist), appending to its existing values.
+    async fn seed_album_artist(db: &Database, item: Uuid, artist: &str) {
+        seed_item_value(
+            db,
+            item,
+            ferrofin_db::enums::ItemValueType::AlbumArtist,
+            artist,
+        )
+        .await;
+    }
+
+    /// The names of `rows`, in order.
+    fn names(rows: &[BaseItemEntity]) -> Vec<String> {
+        rows.iter().filter_map(|r| r.name.clone()).collect()
+    }
+
+    /// A configuration manager with one knob: `EnableExternalContentInSuggestions`.
+    struct FakeConfig {
+        external: bool,
+    }
+
+    #[async_trait]
+    impl ServerConfigurationManager for FakeConfig {
+        fn application_paths(&self) -> Arc<dyn ferrofin_traits::system::ServerApplicationPaths> {
+            unreachable!("application paths are not read by similar items")
+        }
+        async fn configuration(
+            &self,
+        ) -> Result<Arc<ferrofin_model::configuration::ServerConfiguration>, ServiceError> {
+            let mut config = crate::configuration_manager::default_server_configuration();
+            config.enable_external_content_in_suggestions = self.external;
+            Ok(Arc::new(config))
+        }
+        async fn update_configuration(
+            &self,
+            _config: &ferrofin_model::configuration::ServerConfiguration,
+        ) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        async fn get_branding(
+            &self,
+        ) -> Result<ferrofin_model::branding::BrandingOptions, ServiceError> {
+            Ok(ferrofin_model::branding::BrandingOptions::default())
+        }
+        async fn update_branding(
+            &self,
+            _branding: &ferrofin_model::branding::BrandingOptions,
+        ) -> Result<(), ServiceError> {
+            Ok(())
         }
     }
 
@@ -1676,6 +2059,7 @@ mod tests {
         let db = test_db().await;
         let user = seed_user(&db, Uuid::from_u128(0x311)).await;
         let user_id = Uuid::parse_str(&user.id).expect("user id");
+        grant_all_folders(&db, &user).await;
         let played = Uuid::from_u128(0x312);
         let similar = Uuid::from_u128(0x313);
         seed_movie(&db, played, "Played", "SciFi|Horror").await;
@@ -1701,5 +2085,379 @@ mod tests {
             item_names.contains(&"Similar".to_owned()),
             "the genre-sharing movie is recommended; got {item_names:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_played_movie_is_not_suggested_to_the_user_who_played_it() {
+        // C# `MovieSimilarItemsProvider` phase 2: `IsPlayed = false`.
+        let db = test_db().await;
+        let user = seed_user(&db, Uuid::from_u128(0x401)).await;
+        grant_all_folders(&db, &user).await;
+        let user_id = Uuid::parse_str(&user.id).expect("user id");
+        let seed = Uuid::from_u128(0x402);
+        let unplayed = Uuid::from_u128(0x403);
+        let played = Uuid::from_u128(0x404);
+        seed_movie(&db, seed, "Seed", "SciFi").await;
+        seed_movie(&db, unplayed, "Unplayed", "SciFi").await;
+        seed_movie(&db, played, "Played", "SciFi").await;
+        seed_user_data(&db, user_id, played, true, None).await;
+        let mgr = manager(&db);
+
+        let for_user = mgr
+            .get_similar_items(seed, &[], Some(user_id), &DtoOptions::default(), None)
+            .await
+            .expect("similar");
+        assert_eq!(names(&for_user), vec!["Unplayed".to_owned()]);
+
+        // Without a user there is no watch state to filter on (C# skips the
+        // predicate when `User` is null). Both share the seed's one genre, so
+        // the similarity scores tie and the sort name breaks it — alphabetical,
+        // as upstream, where `BaseItem.SortName` is never null. This assertion
+        // read `["Unplayed", "Played"]` while the column was NULL for both and
+        // the tie fell through to insertion order.
+        let anonymous = mgr
+            .get_similar_items(seed, &[], None, &DtoOptions::default(), None)
+            .await
+            .expect("similar");
+        assert_eq!(
+            names(&anonymous),
+            vec!["Played".to_owned(), "Unplayed".to_owned()]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_library_the_user_cannot_access_contributes_nothing() {
+        // C# `ConfigureUserAccess`: the query is scoped to the user's
+        // `TopParentIds`. The inaccessible row is the best match (shared
+        // director, +50) and must vanish; the accessible rows keep their
+        // score order (director before genre).
+        let db = test_db().await;
+        let user = seed_user(&db, Uuid::from_u128(0x411)).await;
+        let user_id = Uuid::parse_str(&user.id).expect("user id");
+        let mine = Uuid::from_u128(0x4A1);
+        let theirs = Uuid::from_u128(0x4A2);
+        restrict_to_folders(&db, &user, &[mine]).await;
+        let seed = Uuid::from_u128(0x412);
+        let by_director = Uuid::from_u128(0x413);
+        let by_genre = Uuid::from_u128(0x414);
+        let hidden = Uuid::from_u128(0x415);
+        seed_movie_in(&db, seed, "Seed", "SciFi", Some(mine)).await;
+        seed_movie_in(&db, by_director, "SharesDirector", "Drama", Some(mine)).await;
+        seed_movie_in(&db, by_genre, "SharesGenre", "SciFi", Some(mine)).await;
+        seed_movie_in(&db, hidden, "HiddenLibrary", "SciFi", Some(theirs)).await;
+        credit_person(&db, seed, "Chris Director", "Director").await;
+        credit_person(&db, by_director, "Chris Director", "Director").await;
+        credit_person(&db, hidden, "Chris Director", "Director").await;
+        let mgr = manager(&db);
+
+        let for_user = mgr
+            .get_similar_items(seed, &[], Some(user_id), &DtoOptions::default(), None)
+            .await
+            .expect("similar");
+        assert_eq!(
+            names(&for_user),
+            vec!["SharesDirector".to_owned(), "SharesGenre".to_owned()]
+        );
+
+        // An admin (every folder enabled) sees the hidden library's row too,
+        // still in score order.
+        let admin = seed_named_user(&db, Uuid::from_u128(0x416), "admin").await;
+        grant_all_folders(&db, &admin).await;
+        let for_admin = mgr
+            .get_similar_items(
+                seed,
+                &[],
+                Uuid::parse_str(&admin.id).ok(),
+                &DtoOptions::default(),
+                None,
+            )
+            .await
+            .expect("similar");
+        assert_eq!(
+            names(&for_admin),
+            vec![
+                "HiddenLibrary".to_owned(),
+                "SharesDirector".to_owned(),
+                "SharesGenre".to_owned()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_blocked_media_folder_hides_its_rows() {
+        // `Folder.IsVisible`: a non-empty `BlockedMediaFolders` blocks exactly
+        // those folders, whatever `EnableAllFolders` says.
+        let db = test_db().await;
+        let user = seed_user(&db, Uuid::from_u128(0x421)).await;
+        grant_all_folders(&db, &user).await;
+        let open = Uuid::from_u128(0x4B1);
+        let blocked = Uuid::from_u128(0x4B2);
+        for folder in [open, blocked] {
+            crate::test_support::seed_item(&db, folder, BaseItemKind::CollectionFolder).await;
+        }
+        crate::user_entity_ext::set_preference(
+            db.writer(),
+            &user.id,
+            ferrofin_db::enums::PreferenceKind::BlockedMediaFolders,
+            &[blocked.to_string()],
+        )
+        .await
+        .expect("block folder");
+        let seed = Uuid::from_u128(0x422);
+        seed_movie_in(&db, seed, "Seed", "SciFi", Some(open)).await;
+        seed_movie_in(&db, Uuid::from_u128(0x423), "Visible", "SciFi", Some(open)).await;
+        seed_movie_in(
+            &db,
+            Uuid::from_u128(0x424),
+            "Blocked",
+            "SciFi",
+            Some(blocked),
+        )
+        .await;
+
+        let rows = manager(&db)
+            .get_similar_items(
+                seed,
+                &[],
+                Uuid::parse_str(&user.id).ok(),
+                &DtoOptions::default(),
+                None,
+            )
+            .await
+            .expect("similar");
+        assert_eq!(names(&rows), vec!["Visible".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn the_access_filter_does_not_starve_the_page() {
+        // The score pass over-samples (C# `limit * 3`) so rows the filter
+        // drops do not leave the page short.
+        let db = test_db().await;
+        let user = seed_user(&db, Uuid::from_u128(0x431)).await;
+        grant_all_folders(&db, &user).await;
+        let user_id = Uuid::parse_str(&user.id).expect("user id");
+        let seed = Uuid::from_u128(0x432);
+        seed_movie(&db, seed, "Seed", "SciFi").await;
+        // Four played rows outrank (by sort name) the two unplayed ones.
+        for (id, name) in [(0x440, "A"), (0x441, "B"), (0x442, "C"), (0x443, "D")] {
+            let id = Uuid::from_u128(id);
+            seed_movie(&db, id, name, "SciFi").await;
+            seed_user_data(&db, user_id, id, true, None).await;
+        }
+        seed_movie(&db, Uuid::from_u128(0x450), "Y", "SciFi").await;
+        seed_movie(&db, Uuid::from_u128(0x451), "Z", "SciFi").await;
+
+        let rows = manager(&db)
+            .get_similar_items(seed, &[], Some(user_id), &DtoOptions::default(), Some(2))
+            .await
+            .expect("similar");
+        assert_eq!(names(&rows), vec!["Y".to_owned(), "Z".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn an_episode_or_by_name_seed_short_circuits_but_an_artist_does_not() {
+        // C# `LibraryController.GetSimilarItems`: `item is Episode ||
+        // (item is IItemByName && item is not MusicArtist)` ⇒ empty.
+        let db = test_db().await;
+        let episode = Uuid::from_u128(0x501);
+        let genre = Uuid::from_u128(0x502);
+        seed_kind(&db, episode, BaseItemKind::Episode, "Pilot", "Drama").await;
+        seed_kind(
+            &db,
+            Uuid::from_u128(0x503),
+            BaseItemKind::Episode,
+            "Ep 2",
+            "Drama",
+        )
+        .await;
+        seed_kind(&db, genre, BaseItemKind::Genre, "Drama", "Drama").await;
+        seed_kind(
+            &db,
+            Uuid::from_u128(0x504),
+            BaseItemKind::Genre,
+            "Dramedy",
+            "Drama",
+        )
+        .await;
+        let artist = Uuid::from_u128(0x505);
+        seed_kind(&db, artist, BaseItemKind::MusicArtist, "The Band", "Rock").await;
+        seed_kind(
+            &db,
+            Uuid::from_u128(0x506),
+            BaseItemKind::MusicArtist,
+            "The Other Band",
+            "Rock",
+        )
+        .await;
+        let mgr = manager(&db);
+
+        for seed in [episode, genre] {
+            let rows = mgr
+                .get_similar_items(seed, &[], None, &DtoOptions::default(), None)
+                .await
+                .expect("similar");
+            assert!(
+                rows.is_empty(),
+                "{seed} must short-circuit; got {:?}",
+                names(&rows)
+            );
+        }
+        let rows = mgr
+            .get_similar_items(artist, &[], None, &DtoOptions::default(), None)
+            .await
+            .expect("similar");
+        assert_eq!(names(&rows), vec!["The Other Band".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn a_kind_without_a_local_provider_scores_nothing() {
+        // C# registers no `ILocalSimilarItemsProvider` for a box set, so the
+        // request proceeds past the controller guard and finds no provider.
+        let db = test_db().await;
+        let seed = Uuid::from_u128(0x511);
+        seed_kind(&db, seed, BaseItemKind::BoxSet, "Alien Collection", "SciFi").await;
+        seed_kind(
+            &db,
+            Uuid::from_u128(0x512),
+            BaseItemKind::BoxSet,
+            "Predator Collection",
+            "SciFi",
+        )
+        .await;
+        let rows = manager(&db)
+            .get_similar_items(seed, &[], None, &DtoOptions::default(), None)
+            .await
+            .expect("similar");
+        assert!(rows.is_empty(), "got {:?}", names(&rows));
+    }
+
+    #[tokio::test]
+    async fn exclude_artist_ids_drops_that_artists_albums_not_the_artist_row() {
+        // `ExcludeArtistIds` (C# `WhereReferencedItemMultipleTypes(Artist |
+        // AlbumArtist, ids, invert: true)`) removes candidates credited to the
+        // artist; it is not an item-id exclusion.
+        let db = test_db().await;
+        let seed = Uuid::from_u128(0x601);
+        let by_band = Uuid::from_u128(0x602);
+        let by_other = Uuid::from_u128(0x603);
+        let band = Uuid::from_u128(0x604);
+        seed_kind(&db, seed, BaseItemKind::MusicAlbum, "Seed Album", "Rock").await;
+        seed_kind(&db, by_band, BaseItemKind::MusicAlbum, "Band Album", "Rock").await;
+        seed_kind(
+            &db,
+            by_other,
+            BaseItemKind::MusicAlbum,
+            "Other Album",
+            "Rock",
+        )
+        .await;
+        seed_kind(&db, band, BaseItemKind::MusicArtist, "The Band", "Rock").await;
+        seed_album_artist(&db, by_band, "The Band").await;
+        seed_album_artist(&db, by_other, "Someone Else").await;
+        let mgr = manager(&db);
+
+        let all = mgr
+            .get_similar_items(seed, &[], None, &DtoOptions::default(), None)
+            .await
+            .expect("similar");
+        assert_eq!(
+            names(&all),
+            vec!["Band Album".to_owned(), "Other Album".to_owned()]
+        );
+        let without_band = mgr
+            .get_similar_items(seed, &[band], None, &DtoOptions::default(), None)
+            .await
+            .expect("similar");
+        assert_eq!(names(&without_band), vec!["Other Album".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn exclude_artist_ids_is_ignored_for_movies() {
+        // Only the music providers honour `ExcludeArtistIds`; a movie request
+        // carrying one (clients send it on every alias) is unaffected.
+        let db = test_db().await;
+        let seed = Uuid::from_u128(0x611);
+        let other = Uuid::from_u128(0x612);
+        seed_movie(&db, seed, "Seed", "SciFi").await;
+        seed_movie(&db, other, "Other", "SciFi").await;
+        let rows = manager(&db)
+            .get_similar_items(seed, &[other], None, &DtoOptions::default(), None)
+            .await
+            .expect("similar");
+        assert_eq!(names(&rows), vec!["Other".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn external_content_widens_movie_suggestions_when_enabled() {
+        // `EnableExternalContentInSuggestions` folds trailers and Live TV
+        // programs into the movie provider's kinds (and nothing else — a
+        // series sharing the genre never qualifies).
+        let db = test_db().await;
+        let seed = Uuid::from_u128(0x621);
+        seed_movie(&db, seed, "Seed", "SciFi").await;
+        seed_kind(
+            &db,
+            Uuid::from_u128(0x622),
+            BaseItemKind::Trailer,
+            "Trailer",
+            "SciFi",
+        )
+        .await;
+        seed_kind(
+            &db,
+            Uuid::from_u128(0x623),
+            BaseItemKind::Series,
+            "Series",
+            "SciFi",
+        )
+        .await;
+
+        let on = manager(&db).with_configuration(Arc::new(FakeConfig { external: true }));
+        let rows = on
+            .get_similar_items(seed, &[], None, &DtoOptions::default(), None)
+            .await
+            .expect("similar");
+        assert_eq!(names(&rows), vec!["Trailer".to_owned()]);
+
+        let off = manager(&db).with_configuration(Arc::new(FakeConfig { external: false }));
+        let rows = off
+            .get_similar_items(seed, &[], None, &DtoOptions::default(), None)
+            .await
+            .expect("similar");
+        assert!(rows.is_empty(), "got {:?}", names(&rows));
+    }
+
+    #[tokio::test]
+    async fn recommendations_skip_the_users_played_movies() {
+        // The batch provider is handed the user, so a category never
+        // recommends a film the user already watched.
+        let db = test_db().await;
+        let user = seed_user(&db, Uuid::from_u128(0x631)).await;
+        grant_all_folders(&db, &user).await;
+        let user_id = Uuid::parse_str(&user.id).expect("user id");
+        let played = Uuid::from_u128(0x632);
+        let also_played = Uuid::from_u128(0x633);
+        let fresh = Uuid::from_u128(0x634);
+        seed_movie(&db, played, "Played", "SciFi").await;
+        seed_movie(&db, also_played, "AlsoPlayed", "SciFi").await;
+        seed_movie(&db, fresh, "Fresh", "SciFi").await;
+        seed_user_data(&db, user_id, played, true, None).await;
+        seed_user_data(&db, user_id, also_played, true, None).await;
+
+        let recs = manager(&db)
+            .get_movie_recommendations(Some(user_id), Uuid::nil(), 6, 5, &DtoOptions::default())
+            .await
+            .expect("recommendations");
+        for category in recs
+            .iter()
+            .filter(|r| r.recommendation_type == RecommendationType::SimilarToRecentlyPlayed)
+        {
+            assert_eq!(
+                names(&category.items),
+                vec!["Fresh".to_owned()],
+                "category {:?}",
+                category.baseline_item_name
+            );
+        }
     }
 }

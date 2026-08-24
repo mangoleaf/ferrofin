@@ -107,6 +107,8 @@ struct ImagesResponse {
     posters: Vec<ImageEntry>,
     #[serde(default)]
     backdrops: Vec<ImageEntry>,
+    #[serde(default)]
+    logos: Vec<ImageEntry>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -171,6 +173,11 @@ pub struct EpisodeDetails {
 /// Full title metadata from `/movie|tv/{id}` (the detail-page fields).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TmdbDetails {
+    /// The localized title (`title` for movies, `name` for series) — the C#
+    /// provider's `Name = movieResult.Title ?? movieResult.OriginalTitle`.
+    pub name: Option<String>,
+    /// The original-language title (`original_title` / `original_name`).
+    pub original_title: Option<String>,
     /// Plot synopsis.
     pub overview: Option<String>,
     /// Marketing tagline.
@@ -229,6 +236,23 @@ pub struct TmdbPersonDetails {
     pub place_of_birth: Option<String>,
 }
 
+/// One `/search/person` hit — the fields `TmdbPersonProvider.GetSearchResults`
+/// maps into a `RemoteSearchResult`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TmdbPersonHit {
+    /// The TMDB person id.
+    pub tmdb_id: i64,
+    /// The person's name.
+    pub name: Option<String>,
+    /// The profile image URL (`GetProfileUrl(profile_path)`), when present.
+    pub profile_url: Option<String>,
+    /// The biography (only populated by a by-id lookup, like the C#
+    /// `GetPersonAsync` branch).
+    pub biography: Option<String>,
+    /// The IMDb id from `external_ids` (by-id lookup only).
+    pub imdb_id: Option<String>,
+}
+
 /// A trailer/video link for a title (name + URL).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TmdbTrailer {
@@ -238,8 +262,42 @@ pub struct TmdbTrailer {
     pub url: String,
 }
 
+/// YouTube "Trailer"/"Teaser" videos from a details `videos` append become
+/// `RemoteTrailers` (the C# `TmdbMovieProvider` / `TmdbSeriesProvider` rule).
+fn youtube_trailers(videos: Option<VideosResults>) -> Vec<TmdbTrailer> {
+    videos
+        .map(|v| v.results)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|v| {
+            v.site.as_deref() == Some("YouTube")
+                && matches!(v.type_.as_deref(), Some("Trailer" | "Teaser"))
+        })
+        .filter_map(|v| {
+            let key = v.key.filter(|k| !k.is_empty())?;
+            Some(TmdbTrailer {
+                name: v
+                    .name
+                    .filter(|n| !n.is_empty())
+                    .unwrap_or_else(|| "Trailer".to_owned()),
+                url: format!("https://www.youtube.com/watch?v={key}"),
+            })
+        })
+        .collect()
+}
+
 #[derive(Debug, Deserialize)]
 struct DetailsResponse {
+    /// Movie title.
+    #[serde(default)]
+    title: Option<String>,
+    /// Series name.
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    original_title: Option<String>,
+    #[serde(default)]
+    original_name: Option<String>,
     #[serde(default)]
     overview: Option<String>,
     #[serde(default)]
@@ -905,8 +963,10 @@ impl TmdbClient {
         )
     }
 
-    /// Lists **all** poster (Primary) + backdrop images TMDB has for a title (the
-    /// "Choose Image" flow), via `/movie|tv/{id}/images`. Empty on any error.
+    /// Lists **all** poster (Primary), backdrop (Backdrop; languaged → Thumb)
+    /// and logo (Logo) images TMDB has for a title (the "Choose Image" flow),
+    /// via `/movie|tv/{id}/images` — the set `TmdbMovieImageProvider` /
+    /// `TmdbSeriesImageProvider.GetImages` return. Empty on any error.
     pub async fn all_images(&self, kind: TmdbKind, tmdb_id: i64) -> Vec<TmdbImage> {
         let path = match kind {
             TmdbKind::Movie => "movie",
@@ -930,6 +990,14 @@ impl TmdbClient {
         let map = |entries: Vec<ImageEntry>, image_type: ImageType| {
             entries.into_iter().filter_map(move |e| {
                 let path = e.file_path.filter(|p| !p.is_empty())?;
+                let language = e.iso_639_1.filter(|l| !l.is_empty());
+                // A backdrop with a language carries text — C#
+                // `ConvertToRemoteImageInfo` returns those as `Thumb`.
+                let image_type = if image_type == ImageType::Backdrop && language.is_some() {
+                    ImageType::Thumb
+                } else {
+                    image_type
+                };
                 Some(TmdbImage {
                     image_type,
                     url: format!("{IMAGE_BASE}{path}"),
@@ -937,12 +1005,13 @@ impl TmdbClient {
                     height: e.height,
                     community_rating: e.vote_average,
                     vote_count: e.vote_count,
-                    language: e.iso_639_1.filter(|l| !l.is_empty()),
+                    language,
                 })
             })
         };
         map(parsed.posters, ImageType::Primary)
             .chain(map(parsed.backdrops, ImageType::Backdrop))
+            .chain(map(parsed.logos, ImageType::Logo))
             .collect()
     }
 
@@ -1022,6 +1091,42 @@ impl TmdbClient {
         Some(people)
     }
 
+    /// Resolves a TMDB id from an external id (`/find/{id}?external_source=`)
+    /// — port of `TmdbClientManager.FindByExternalIdAsync`, which the movie/
+    /// series providers use to honour an IMDb/TVDB id already on the item.
+    /// `source` is TMDB's source name (`imdb_id` / `tvdb_id`). `None` on no
+    /// match or any error.
+    pub async fn find_by_external_id(
+        &self,
+        kind: TmdbKind,
+        source: &str,
+        external_id: &str,
+    ) -> Option<i64> {
+        let external_id = external_id.trim();
+        if external_id.is_empty() {
+            return None;
+        }
+        let resp = self
+            .http
+            .get(format!("{}/find/{external_id}", self.base_url))
+            .query(&[
+                ("api_key", self.api_key.expose_secret()),
+                ("external_source", source),
+            ])
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let found = resp.json::<FindResponse>().await.ok()?;
+        let hits = match kind {
+            TmdbKind::Movie => found.movie_results,
+            TmdbKind::Series => found.tv_results,
+        };
+        hits.into_iter().next().map(|hit| hit.id)
+    }
+
     /// Fetches full metadata for a title (overview, tagline, genres, studios,
     /// rating, certification, premiere date, runtime, and cast + key crew) via
     /// `/movie|tv/{id}?append_to_response=credits,release_dates|content_ratings`.
@@ -1091,29 +1196,19 @@ impl TmdbClient {
             }
         }
 
-        // Trailers: YouTube "Trailer"/"Teaser" videos become RemoteTrailers.
-        let trailers = d
-            .videos
-            .map(|v| v.results)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|v| {
-                v.site.as_deref() == Some("YouTube")
-                    && matches!(v.type_.as_deref(), Some("Trailer" | "Teaser"))
-            })
-            .filter_map(|v| {
-                let key = v.key.filter(|k| !k.is_empty())?;
-                Some(TmdbTrailer {
-                    name: v
-                        .name
-                        .filter(|n| !n.is_empty())
-                        .unwrap_or_else(|| "Trailer".to_owned()),
-                    url: format!("https://www.youtube.com/watch?v={key}"),
-                })
-            })
-            .collect();
+        let trailers = youtube_trailers(d.videos);
 
+        let original_title = d
+            .original_title
+            .or(d.original_name)
+            .filter(|s| !s.is_empty());
         Some(TmdbDetails {
+            name: d
+                .title
+                .or(d.name)
+                .filter(|s| !s.is_empty())
+                .or_else(|| original_title.clone()),
+            original_title,
             overview: d.overview.filter(|s| !s.is_empty()),
             tagline: d.tagline.filter(|s| !s.is_empty()),
             genres: d.genres.into_iter().filter_map(|g| g.name).collect(),
@@ -1129,6 +1224,75 @@ impl TmdbClient {
                 .imdb_id
                 .or_else(|| d.external_ids.and_then(|e| e.imdb_id))
                 .filter(|s| !s.is_empty()),
+        })
+    }
+
+    /// Searches TMDB's people by name (`/search/person`) — port of
+    /// `TmdbClientManager.SearchPersonAsync`, the "Identify" flow for a
+    /// `Person`. Empty on no match or any error.
+    pub async fn search_person(&self, name: &str) -> Vec<TmdbPersonHit> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Vec::new();
+        }
+        let Ok(resp) = self
+            .http
+            .get(format!("{}/search/person", self.base_url))
+            .query(&[("api_key", self.api_key.expose_secret()), ("query", name)])
+            .send()
+            .await
+        else {
+            return Vec::new();
+        };
+        if !resp.status().is_success() {
+            return Vec::new();
+        }
+        let Ok(parsed) = resp.json::<PersonSearchResponse>().await else {
+            return Vec::new();
+        };
+        parsed
+            .results
+            .into_iter()
+            .map(|hit| TmdbPersonHit {
+                tmdb_id: hit.id,
+                name: non_empty(hit.name),
+                profile_url: non_empty(hit.profile_path).map(|p| format!("{IMAGE_BASE}{p}")),
+                biography: None,
+                imdb_id: None,
+            })
+            .collect()
+    }
+
+    /// Looks a person up by TMDB id with their images + external ids
+    /// (`/person/{id}?append_to_response=images,external_ids`) — port of
+    /// `TmdbClientManager.GetPersonAsync` as the "Identify" flow's
+    /// already-identified branch uses it. `None` on any error.
+    pub async fn person_lookup(&self, tmdb_id: i64) -> Option<TmdbPersonHit> {
+        let resp = self
+            .http
+            .get(format!("{}/person/{tmdb_id}", self.base_url))
+            .query(&[
+                ("api_key", self.api_key.expose_secret()),
+                ("append_to_response", "images,external_ids"),
+            ])
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let p = resp.json::<PersonLookupResponse>().await.ok()?;
+        Some(TmdbPersonHit {
+            tmdb_id: p.id.unwrap_or(tmdb_id),
+            name: non_empty(p.name),
+            // `Images.Profiles[0]` — the first profile image.
+            profile_url: p
+                .images
+                .and_then(|i| i.profiles.into_iter().next())
+                .and_then(|i| non_empty(i.file_path))
+                .map(|path| format!("{IMAGE_BASE}{path}")),
+            biography: non_empty(p.biography),
+            imdb_id: p.external_ids.and_then(|e| non_empty(e.imdb_id)),
         })
     }
 
@@ -1170,6 +1334,71 @@ impl TmdbClient {
         }
         resp.bytes().await.ok().map(|b| b.to_vec())
     }
+}
+
+/// `/find/{external_id}`: the matching movies and TV series.
+#[derive(Debug, Default, Deserialize)]
+struct FindResponse {
+    #[serde(default)]
+    movie_results: Vec<IdOnly>,
+    #[serde(default)]
+    tv_results: Vec<IdOnly>,
+}
+
+#[derive(Debug, Deserialize)]
+struct IdOnly {
+    #[serde(default)]
+    id: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct PersonSearchResponse {
+    #[serde(default)]
+    results: Vec<PersonSearchHit>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PersonSearchHit {
+    #[serde(default)]
+    id: i64,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    profile_path: Option<String>,
+}
+
+/// `/person/{id}` with `images` + `external_ids` appended — the Identify
+/// by-id branch.
+#[derive(Debug, Deserialize)]
+struct PersonLookupResponse {
+    #[serde(default)]
+    id: Option<i64>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    biography: Option<String>,
+    #[serde(default)]
+    images: Option<PersonImages>,
+    #[serde(default)]
+    external_ids: Option<PersonExternalIds>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PersonImages {
+    #[serde(default)]
+    profiles: Vec<PersonProfileImage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PersonProfileImage {
+    #[serde(default)]
+    file_path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PersonExternalIds {
+    #[serde(default)]
+    imdb_id: Option<String>,
 }
 
 /// The subset of TMDB `/person/{id}` Ferrofin surfaces on the person page.
@@ -1258,6 +1487,77 @@ mod tests {
                 "https://image.tmdb.org/t/p/original/alt.jpg",
                 "https://image.tmdb.org/t/p/original/alt-back.jpg",
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn person_search_and_lookup_map_the_identify_shape() {
+        let server = crate::mock_http::MockServer::start(vec![
+            (
+                "/search/person",
+                r#"{"results":[{"id":287,"name":"Brad Pitt","profile_path":"/bp.jpg"},{"id":1,"name":"No Photo","profile_path":null}]}"#.to_owned(),
+            ),
+            (
+                "/person/287",
+                r#"{"id":287,"name":"Brad Pitt","biography":"An actor.","images":{"profiles":[{"file_path":"/first.jpg"},{"file_path":"/second.jpg"}]},"external_ids":{"imdb_id":"nm0000093"}}"#.to_owned(),
+            ),
+        ])
+        .await;
+        let client = TmdbClient::new().with_base_url(&server.base_url);
+
+        let hits = client.search_person("Brad Pitt").await;
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].tmdb_id, 287);
+        assert_eq!(hits[0].name.as_deref(), Some("Brad Pitt"));
+        assert_eq!(
+            hits[0].profile_url.as_deref(),
+            Some("https://image.tmdb.org/t/p/original/bp.jpg")
+        );
+        assert!(hits[1].profile_url.is_none());
+        assert!(client.search_person("  ").await.is_empty());
+
+        let person = client.person_lookup(287).await.expect("lookup");
+        assert_eq!(person.name.as_deref(), Some("Brad Pitt"));
+        assert_eq!(person.biography.as_deref(), Some("An actor."));
+        assert_eq!(person.imdb_id.as_deref(), Some("nm0000093"));
+        assert_eq!(
+            person.profile_url.as_deref(),
+            Some("https://image.tmdb.org/t/p/original/first.jpg")
+        );
+    }
+
+    #[tokio::test]
+    async fn find_by_external_id_picks_the_kinds_result_list() {
+        let server = crate::mock_http::MockServer::start(vec![(
+            "/find/tt0133093",
+            r#"{"movie_results":[{"id":603}],"tv_results":[{"id":1}]}"#.to_owned(),
+        )])
+        .await;
+        let client = TmdbClient::new().with_base_url(&server.base_url);
+        assert_eq!(
+            client
+                .find_by_external_id(TmdbKind::Movie, "imdb_id", "tt0133093")
+                .await,
+            Some(603)
+        );
+        assert_eq!(
+            client
+                .find_by_external_id(TmdbKind::Series, "imdb_id", "tt0133093")
+                .await,
+            Some(1)
+        );
+        // Unknown id → the mock's `{}` → no match; blank → no request.
+        assert!(
+            client
+                .find_by_external_id(TmdbKind::Movie, "imdb_id", "tt0")
+                .await
+                .is_none()
+        );
+        assert!(
+            client
+                .find_by_external_id(TmdbKind::Movie, "imdb_id", " ")
+                .await
+                .is_none()
         );
     }
 

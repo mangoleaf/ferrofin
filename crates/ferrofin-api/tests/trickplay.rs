@@ -255,6 +255,7 @@ impl TrickplayManager for CannedTrickplay {
         &self,
         _item_id: Uuid,
         _replace: bool,
+        _library_options: &ferrofin_model::configuration::LibraryOptions,
     ) -> Result<(), ServiceError> {
         Ok(())
     }
@@ -432,7 +433,8 @@ async fn trickplay_tile_serves_file_then_404() {
         Arc::new(FakeLyrics),
         Arc::new(FakeSubtitles),
     );
-    // The playlist names tiles `0.jpg`: the `.jpg` suffix rides along in the capture.
+    // jellyfin-web requests `{index}.jpg` — the vendored route shape, whose
+    // `.jpg` suffix rides along in the capture.
     let (ok, body) = call(
         app.clone(),
         "GET",
@@ -448,6 +450,7 @@ async fn trickplay_tile_serves_file_then_404() {
     )
     .await;
     assert_eq!(ok, StatusCode::OK);
+    // A non-numeric index is a client error, not a crash or a 404.
     let (bad, _) = call(
         app,
         "GET",
@@ -464,6 +467,11 @@ async fn trickplay_tile_serves_file_then_404() {
         Arc::new(FakeLyrics),
         Arc::new(FakeSubtitles),
     );
-    let (missing, _) = call(app, "GET", &format!("/Videos/{ITEM_ID}/Trickplay/320/0")).await;
+    let (missing, _) = call(
+        app,
+        "GET",
+        &format!("/Videos/{ITEM_ID}/Trickplay/320/0.jpg"),
+    )
+    .await;
     assert_eq!(missing, StatusCode::NOT_FOUND);
 }

@@ -162,6 +162,81 @@ impl FromRequestParts<AppState> for RequireAdmin {
     }
 }
 
+/// Extractor for handlers behind Jellyfin's `LocalAccessOrRequiresElevation`
+/// policy — in the vendored contract, `POST /System/Restart` alone.
+///
+/// Port of `LocalAccessOrRequiresElevationHandler`: a caller whose peer address
+/// is on the local network is allowed regardless of role; anyone else must be an
+/// administrator. Restarting the server is the kind of thing someone standing at
+/// the machine should be able to do, and the kind of thing a stranger on the
+/// internet should not.
+///
+/// Two deliberate divergences, both in the safe direction:
+///
+/// 1. **Authentication is still required.** Upstream registers this policy as
+///    `AddPolicy(name, new LocalAccessOrRequiresElevationRequirement())` — the
+///    requirement list replaces the default policy wholesale and nothing in it
+///    demands an authenticated user, so a LAN caller with no token at all
+///    satisfies it. Ferrofin keeps [`RequireAuth`] in front, so an anonymous
+///    request is `401` whatever its source address. No authenticated client can
+///    tell the difference.
+/// 2. **An unknown peer address is treated as remote.** C# accepts a null IP
+///    ("Loopback will be on LAN, so we can accept null"), but in Ferrofin the
+///    peer address is missing only when there is no connection to ask —
+///    synthetic routing in tests, never a served request, since the composition
+///    root installs `with_connect_info`. Failing closed there costs a real
+///    caller nothing and keeps the unknown case from being the permissive one.
+///
+/// The local-network test is [`crate::handlers::system::is_in_local_network`],
+/// shared with `GET /System/Endpoint` so the endpoint that *reports* whether a
+/// client is in-network and the policy that *acts* on it can never disagree.
+///
+/// Two limits of that test, both of which make this arm **wider** than
+/// upstream's. Neither is a regression — before this gate the route took plain
+/// [`RequireAuth`], so any account could restart from anywhere, and both cases
+/// below still land on "authenticated caller only". But do not read the gate as
+/// stronger than it is:
+///
+/// - **Reverse proxies.** The peer address is the transport peer, and nothing
+///   here consumes `X-Forwarded-For`. Behind a proxy or ingress — including
+///   this repo's own `charts/ferrofin/templates/ingress.yaml` — every request
+///   presents the proxy's address, which is private, so the local arm is
+///   satisfied for all callers and the gate degrades to "any authenticated
+///   account". Upstream needs `KnownProxies` configured to do better;
+///   `NetworkConfiguration::known_proxies` exists here but nothing reads it
+///   yet.
+/// - **Configured subnets.** `NetworkManager.IsInLocalNetwork` intersects
+///   `LocalNetworkSubnets` and subtracts `!`-prefixed exclusions; this uses only
+///   the private-range fallback. An operator who has *narrowed*
+///   `LocalNetworkSubnets`, or excluded a range, gets "remote" from Jellyfin and
+///   "local" from here — so the hosts they deliberately excluded are still
+///   allowed. [`ferrofin_networking::NetworkManager`] implements the faithful
+///   test, but it is not constructible into [`AppState`] today: its
+///   `Rc<dyn Logger>` is not `Send`.
+#[derive(Debug, Clone)]
+pub struct RequireLocalAccessOrAdmin(pub AuthorizationInfo);
+
+impl FromRequestParts<AppState> for RequireLocalAccessOrAdmin {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        // Read the peer before `RequireAuth` borrows `parts` mutably.
+        let local = parts
+            .extensions
+            .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+            .is_some_and(|ci| crate::handlers::system::is_in_local_network(ci.0.ip()));
+        if local {
+            let RequireAuth(info) = RequireAuth::from_request_parts(parts, state).await?;
+            return Ok(Self(info));
+        }
+        let RequireAdmin(info) = RequireAdmin::from_request_parts(parts, state).await?;
+        Ok(Self(info))
+    }
+}
+
 /// Extractor for handlers behind Jellyfin's `FirstTimeSetupOrDefault` policy.
 ///
 /// Port of `FirstTimeSetupHandler`: while the startup wizard is **not** complete

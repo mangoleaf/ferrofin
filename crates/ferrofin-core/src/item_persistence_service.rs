@@ -21,7 +21,7 @@ use uuid::Uuid;
 
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::options::ItemImageInfo;
-use ferrofin_traits::persistence::ItemPersistenceService;
+use ferrofin_traits::persistence::{ItemPersistenceService, StoredImageMetadata};
 
 use ferrofin_model::data::BaseItemKind;
 
@@ -84,6 +84,31 @@ impl FerrofinItemPersistenceService {
             .as_deref()
             .filter(|n| !n.is_empty())
             .map(crate::text_util::get_clean_value);
+        // Same reasoning for `SortName`, and it is why this belongs here rather
+        // than at each call site. In C# `SortName` is not a field a caller can
+        // forget: `BaseItem.SortName` is a lazy property that resolves to
+        // `ModifySortChunks(ForcedSortName).ToLowerInvariant()` or
+        // `CreateSortName()` on first read, so `SaveItems` can never persist a
+        // null. Modelled as a plain `Option` on the entity, every construction
+        // site *could* forget — and several did, leaving 7,191 of 9,865 rows
+        // with `SortName IS NULL`. That is not merely an unsorted list:
+        // `nameStartsWith` filters `lower(SortName)` (faithfully to C#
+        // `ApplyNameFilters`), so a NULL row matches nothing and the A-Z picker
+        // returned `TotalRecordCount: 0` for types that had hundreds of rows.
+        //
+        // A caller-supplied value always wins — that is what carries the
+        // per-kind `CreateSortName` overrides (episode/season) the scanner
+        // computes, which drive the client's play queue.
+        let sort_name = item.sort_name.clone().or_else(|| {
+            let forced = item.forced_sort_name.as_deref().filter(|f| !f.is_empty());
+            match forced {
+                Some(f) => Some(ferrofin_util::sort_name::forced_sort_key(f)),
+                None => item
+                    .name
+                    .as_deref()
+                    .map(ferrofin_util::sort_name::create_sort_name),
+            }
+        });
         sqlx::query(sql)
             .bind(&item.id)
             .bind(&item.album)
@@ -147,7 +172,7 @@ impl FerrofinItemPersistenceService {
             .bind(&item.series_presentation_unique_key)
             .bind(&item.show_id)
             .bind(item.size)
-            .bind(&item.sort_name)
+            .bind(&sort_name)
             .bind(opt_datetime_to_db(item.start_date))
             .bind(&item.studios)
             .bind(&item.tagline)
@@ -297,6 +322,64 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         Ok(())
     }
 
+    async fn replace_provider_ids(
+        &self,
+        item_id: Uuid,
+        ids: &[(String, String)],
+    ) -> Result<(), ServiceError> {
+        let id = guid_to_db(item_id);
+        // One transaction so the clear+rewrite is atomic on the single writer
+        // connection (same shape as `set_ancestors`).
+        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        sqlx::query(r#"DELETE FROM "BaseItemProviders" WHERE "ItemId" = ?1"#)
+            .bind(&id)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        for (provider, value) in ids {
+            // Blank keys/values are not ids (the C# `SetProviderId` drops them).
+            if provider.trim().is_empty() || value.trim().is_empty() {
+                continue;
+            }
+            sqlx::query(
+                r#"INSERT OR REPLACE INTO "BaseItemProviders"
+                   ("ItemId", "ProviderId", "ProviderValue") VALUES (?1, ?2, ?3)"#,
+            )
+            .bind(&id)
+            .bind(provider)
+            .bind(value)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        }
+        tx.commit().await.map_err(db_err)
+    }
+
+    async fn set_parent_id(&self, item_id: Uuid, parent_id: Uuid) -> Result<(), ServiceError> {
+        let id = guid_to_db(item_id);
+        let parent = guid_to_db(parent_id);
+        // Read first on the pool: the steady state (already parented) must not
+        // touch the single writer connection.
+        let current: Option<Option<String>> =
+            sqlx::query_scalar(r#"SELECT "ParentId" FROM "BaseItems" WHERE "Id" = ?1"#)
+                .bind(&id)
+                .fetch_optional(self.db.pool())
+                .await
+                .map_err(db_err)?;
+        match current {
+            None => return Ok(()),
+            Some(Some(existing)) if existing.eq_ignore_ascii_case(&parent) => return Ok(()),
+            Some(_) => {}
+        }
+        sqlx::query(r#"UPDATE "BaseItems" SET "ParentId" = ?2 WHERE "Id" = ?1"#)
+            .bind(&id)
+            .bind(&parent)
+            .execute(self.db.writer())
+            .await
+            .map_err(db_err)?;
+        Ok(())
+    }
+
     async fn save_item_values(
         &self,
         item_id: Uuid,
@@ -352,15 +435,20 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
             // shared value id the DTO layer already emits for genre_items.
             if let Some(type_name) = by_name_type_name(*type_) {
                 sqlx::query(
+                    // `SortName` persisted, not derived on read — see
+                    // `people_repository`. Without it the Genres/Studios tabs
+                    // (which sort on it) come back unsorted and
+                    // `nameStartsWith` matches nothing.
                     r#"INSERT OR IGNORE INTO "BaseItems"
-                       ("Id","Type","Name","CleanName","IsFolder","IsInMixedFolder",
+                       ("Id","Type","Name","CleanName","SortName","IsFolder","IsInMixedFolder",
                         "IsLocked","IsMovie","IsRepeat","IsSeries","IsVirtualItem")
-                       VALUES (?1,?2,?3,?4,1,0,0,0,0,0,0)"#,
+                       VALUES (?1,?2,?3,?4,?5,1,0,0,0,0,0,0)"#,
                 )
                 .bind(&value_id)
                 .bind(type_name)
                 .bind(value)
                 .bind(&clean)
+                .bind(ferrofin_util::sort_name::create_sort_name(value))
                 .execute(&mut *tx)
                 .await
                 .map_err(db_err)?;
@@ -458,6 +546,65 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         }
         tx.commit().await.map_err(db_err)?;
         Ok(())
+    }
+
+    async fn image_metadata_for_items(
+        &self,
+        item_ids: &[Uuid],
+    ) -> Result<Vec<StoredImageMetadata>, ServiceError> {
+        let mut out: Vec<StoredImageMetadata> = Vec::new();
+        if item_ids.is_empty() {
+            return Ok(out);
+        }
+        // Chunked to stay under SQLite's bound-parameter ceiling, the same
+        // 500-wide shape every other batched id lookup here uses.
+        for chunk in item_ids.chunks(500) {
+            let placeholders = (1..=chunk.len())
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                r#"SELECT "Path", "Width", "Height", "Blurhash", "DateModified"
+                   FROM "BaseItemImageInfos" WHERE "ItemId" IN ({placeholders})"#
+            );
+            let mut query = sqlx::query_as::<
+                _,
+                (
+                    String,
+                    i64,
+                    i64,
+                    Option<Vec<u8>>,
+                    Option<chrono::DateTime<chrono::Utc>>,
+                ),
+            >(&sql);
+            for id in chunk {
+                query = query.bind(guid_to_db(*id));
+            }
+            let rows = query.fetch_all(self.db.pool()).await.map_err(db_err)?;
+            out.extend(
+                rows.into_iter()
+                    .map(
+                        |(path, width, height, blurhash, date_modified)| StoredImageMetadata {
+                            path,
+                            width: i32::try_from(width).unwrap_or(0),
+                            height: i32::try_from(height).unwrap_or(0),
+                            // Stored as a UTF-8 byte blob; an empty or non-UTF-8 blob
+                            // reads back as "no blurhash", which forces a recompute.
+                            blur_hash: blurhash
+                                .filter(|b| !b.is_empty())
+                                .and_then(|b| String::from_utf8(b).ok()),
+                            // A row with no stored mtime can never match the file's,
+                            // so it falls through to a recompute — the same outcome
+                            // C# reaches for a `default(DateTime)` image.
+                            date_modified: date_modified.unwrap_or_else(|| {
+                                chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0)
+                                    .unwrap_or_else(chrono::Utc::now)
+                            }),
+                        },
+                    ),
+            );
+        }
+        Ok(out)
     }
 
     async fn set_item_image(
@@ -688,6 +835,58 @@ fn scan_upsert_sql() -> &'static str {
     &SQL
 }
 
+/// Fills in `BaseItems."SortName"` for rows written before the write path
+/// derived it — run once at startup, and cheap thereafter.
+///
+/// `upsert_item` now guarantees a non-null `SortName` on every save, but that
+/// only covers rows written from here on. Rows already in the database keep
+/// whatever they were created with, and a `Person`/`Genre`/`Studio` row is
+/// inserted with `INSERT OR IGNORE` — a rescan will not rewrite it. Without a
+/// repair pass those rows stay invisible to `nameStartsWith` forever.
+///
+/// The derivation cannot be expressed in SQLite: it strips articles as whole
+/// words and left-pads every run of digits to width 10. So the rows are read,
+/// computed in Rust, and written back in one transaction on the single writer.
+///
+/// Only NULL `SortName`s are touched — an adopted Jellyfin database, where the
+/// column is already populated, is left byte-identical. The one exception is
+/// the `PLACEHOLDER` row migration `0001` seeds (UserData detached from its
+/// item): Jellyfin inserts it with a NULL `SortName` and never lists it, so
+/// writing one would be a gratuitous divergence from an adopted database.
+/// Returns the number of rows repaired.
+///
+/// # Errors
+/// Returns [`ServiceError`] if the read or the write fails.
+pub async fn backfill_missing_sort_names(db: &Database) -> Result<usize, ServiceError> {
+    let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
+        r#"SELECT "Id", "Name", "ForcedSortName" FROM "BaseItems"
+           WHERE "SortName" IS NULL AND "Name" IS NOT NULL AND "Name" <> ''
+             AND "Type" <> 'PLACEHOLDER'"#,
+    )
+    .fetch_all(db.pool())
+    .await
+    .map_err(db_err)?;
+    if rows.is_empty() {
+        return Ok(0);
+    }
+
+    let mut tx = db.writer().begin().await.map_err(db_err)?;
+    for (id, name, forced) in &rows {
+        let sort_name = match forced.as_deref().filter(|f| !f.is_empty()) {
+            Some(f) => ferrofin_util::sort_name::forced_sort_key(f),
+            None => ferrofin_util::sort_name::create_sort_name(name),
+        };
+        sqlx::query(r#"UPDATE "BaseItems" SET "SortName" = ?1 WHERE "Id" = ?2"#)
+            .bind(sort_name)
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+    }
+    tx.commit().await.map_err(db_err)?;
+    Ok(rows.len())
+}
+
 #[cfg(test)]
 mod tests {
     use ferrofin_model::data::BaseItemKind;
@@ -776,6 +975,45 @@ mod tests {
         assert_eq!(rows, vec![(movie, "604".to_owned())]);
     }
 
+    // "Identify → Apply" assigns the chosen result's whole id set: stale keys
+    // go, the new ones land, blanks are dropped.
+    #[tokio::test]
+    async fn replace_provider_ids_swaps_the_whole_set() {
+        let db = test_db().await;
+        let movie = Uuid::new_v4();
+        seed_item(&db, movie, BaseItemKind::Movie).await;
+        let svc = FerrofinItemPersistenceService::new(db.clone());
+
+        svc.save_provider_id(movie, "Tvdb", "1")
+            .await
+            .expect("seed stale id");
+        svc.replace_provider_ids(
+            movie,
+            &[
+                ("Tmdb".to_owned(), "603".to_owned()),
+                ("Imdb".to_owned(), "tt0133093".to_owned()),
+                ("Blank".to_owned(), "  ".to_owned()),
+            ],
+        )
+        .await
+        .expect("replace");
+
+        let mut rows = svc
+            .provider_ids_for_items(&[movie])
+            .await
+            .expect("read back")
+            .remove(&movie)
+            .unwrap_or_default();
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![
+                ("Imdb".to_owned(), "tt0133093".to_owned()),
+                ("Tmdb".to_owned(), "603".to_owned()),
+            ]
+        );
+    }
+
     // Saving an item must stamp the derived `CleanName` (C# `SaveItem` computes
     // `GetCleanValue(item.Name)` at write time). No scan path pre-computes it,
     // and the `searchTerm` filter queries `CleanName` — a NULL there makes the
@@ -803,6 +1041,149 @@ mod tests {
                 .await
                 .expect("query");
         assert_eq!(clean.as_deref(), Some("amelie"));
+    }
+
+    /// Saves `entity` and returns the `SortName` the write path persisted.
+    async fn persisted_sort_name(
+        db: &ferrofin_db::Database,
+        entity: ferrofin_db::entities::base_items::BaseItemEntity,
+    ) -> Option<String> {
+        let svc = FerrofinItemPersistenceService::new(db.clone());
+        svc.save_items(std::slice::from_ref(&entity))
+            .await
+            .expect("save");
+        sqlx::query_scalar(r#"SELECT "SortName" FROM "BaseItems" WHERE "Id" = ?1"#)
+            .bind(&entity.id)
+            .fetch_one(db.pool())
+            .await
+            .expect("query")
+    }
+
+    fn named(name: &str) -> ferrofin_db::entities::base_items::BaseItemEntity {
+        ferrofin_db::entities::base_items::BaseItemEntity {
+            id: ferrofin_db::store::guid_to_db(Uuid::new_v4()),
+            type_: "MediaBrowser.Controller.Entities.Movies.Movie".to_owned(),
+            name: Some(name.to_owned()),
+            ..ferrofin_db::entities::base_items::BaseItemEntity::default()
+        }
+    }
+
+    // C# `BaseItem.SortName` is a lazy property, so `SaveItems` can never write
+    // a null. Deriving it here is what makes that true for every construction
+    // site — including the ones (virtual folders, by-name items) that never set
+    // the field and left the column NULL, which made `nameStartsWith` — it
+    // filters `lower(SortName)` — match nothing.
+    #[tokio::test]
+    async fn save_items_derives_a_sort_name_when_the_caller_leaves_it_unset() {
+        let db = test_db().await;
+        assert_eq!(
+            persisted_sort_name(&db, named("The Matrix"))
+                .await
+                .as_deref(),
+            Some("matrix")
+        );
+    }
+
+    // The repair pass for rows written before the derivation existed. Those
+    // rows are unreachable by `nameStartsWith` (it filters `lower(SortName)`),
+    // and an `INSERT OR IGNORE` by-name row is never rewritten by a rescan, so
+    // without this they stay broken forever.
+    #[tokio::test]
+    async fn backfill_fills_null_sort_names_and_leaves_populated_ones_alone() {
+        let db = test_db().await;
+        let svc = FerrofinItemPersistenceService::new(db.clone());
+
+        // Two rows the write path would now derive for, forced to NULL to stand
+        // in for what a pre-fix insert left behind, plus one already populated.
+        let (null_plain, null_forced, populated) =
+            (named("The Matrix"), named("Alien"), named("Up"));
+        for e in [&null_plain, &null_forced, &populated] {
+            svc.save_items(std::slice::from_ref(e)).await.expect("save");
+        }
+        sqlx::query(r#"UPDATE "BaseItems" SET "SortName" = NULL WHERE "Id" IN (?1, ?2)"#)
+            .bind(&null_plain.id)
+            .bind(&null_forced.id)
+            .execute(db.writer())
+            .await
+            .expect("null them out");
+        sqlx::query(r#"UPDATE "BaseItems" SET "ForcedSortName" = 'Zzz 9' WHERE "Id" = ?1"#)
+            .bind(&null_forced.id)
+            .execute(db.writer())
+            .await
+            .expect("force");
+        sqlx::query(r#"UPDATE "BaseItems" SET "SortName" = 'hand-written' WHERE "Id" = ?1"#)
+            .bind(&populated.id)
+            .execute(db.writer())
+            .await
+            .expect("populate");
+
+        assert_eq!(
+            super::backfill_missing_sort_names(&db)
+                .await
+                .expect("backfill"),
+            2,
+            "only the NULL rows are repaired"
+        );
+
+        let read = |id: String| async {
+            let v: Option<String> =
+                sqlx::query_scalar(r#"SELECT "SortName" FROM "BaseItems" WHERE "Id" = ?1"#)
+                    .bind(id)
+                    .fetch_one(db.pool())
+                    .await
+                    .expect("query");
+            v
+        };
+        assert_eq!(read(null_plain.id.clone()).await.as_deref(), Some("matrix"));
+        assert_eq!(
+            read(null_forced.id.clone()).await.as_deref(),
+            Some("zzz 0000000009"),
+            "a forced sort name is padded and lower-cased, not article-stripped"
+        );
+        assert_eq!(
+            read(populated.id.clone()).await.as_deref(),
+            Some("hand-written"),
+            "an adopted Jellyfin database must come through byte-identical"
+        );
+
+        assert_eq!(
+            super::backfill_missing_sort_names(&db)
+                .await
+                .expect("second run"),
+            0,
+            "the pass is a no-op once repaired"
+        );
+    }
+
+    // A caller-supplied sort name wins: that is what carries the per-kind
+    // `CreateSortName` overrides (episode/season) the scanner computes, and
+    // those drive the client's play queue.
+    #[tokio::test]
+    async fn save_items_keeps_a_caller_supplied_sort_name() {
+        let db = test_db().await;
+        let entity = ferrofin_db::entities::base_items::BaseItemEntity {
+            sort_name: Some("0003".to_owned()),
+            ..named("The Matrix")
+        };
+        assert_eq!(
+            persisted_sort_name(&db, entity).await.as_deref(),
+            Some("0003")
+        );
+    }
+
+    // `ForcedSortName` short-circuits `CreateSortName` in C#: it is padded and
+    // lower-cased, but its articles and punctuation are left alone.
+    #[tokio::test]
+    async fn save_items_derives_from_a_forced_sort_name_when_present() {
+        let db = test_db().await;
+        let entity = ferrofin_db::entities::base_items::BaseItemEntity {
+            forced_sort_name: Some("The Matrix 2".to_owned()),
+            ..named("The Matrix")
+        };
+        assert_eq!(
+            persisted_sort_name(&db, entity).await.as_deref(),
+            Some("the matrix 0000000002")
+        );
     }
 
     // Saving a movie's genre/studio values must also materialize the browsable

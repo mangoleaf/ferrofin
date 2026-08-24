@@ -17,6 +17,6 @@ pub mod book;
 pub mod common;
 pub mod external_files;
 pub mod io;
-mod path;
+pub mod path;
 pub mod tv;
 pub mod video;

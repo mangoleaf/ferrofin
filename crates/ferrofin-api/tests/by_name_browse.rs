@@ -485,6 +485,12 @@ impl AuthorizationContext for OkAuth {
 }
 
 fn by_name_state() -> AppState {
+    by_name_state_with_dto(Arc::new(OkDto))
+}
+
+/// The by-name test state, with the DTO service injected so a test can observe
+/// the [`DtoOptions`] the handlers build.
+fn by_name_state_with_dto(dto: Arc<dyn DtoService>) -> AppState {
     AppState::new(
         Arc::new(ByNameLibrary),
         Arc::new(OkUsers),
@@ -499,7 +505,7 @@ fn by_name_state() -> AppState {
         Arc::new(FakeMusic),
         Arc::new(FakeSimilarItems),
         Arc::new(FakeSearch),
-        Arc::new(OkDto),
+        dto,
         Arc::new(OkAuth),
         Arc::new(OkAuth),
         Arc::new(ferrofin_api::test_support::FakeQuickConnect),
@@ -657,4 +663,207 @@ async fn by_name_routes_require_auth() {
             "{uri} should require auth"
         );
     }
+}
+
+/// A [`DtoService`] that records the [`DtoOptions`] each projection was handed.
+///
+/// The plain `OkDto` above ignores its `DtoOptions`, so it cannot observe the
+/// thing these tests are about — which options the by-name handlers build from
+/// the request. This one captures them.
+#[derive(Default)]
+struct RecordingDto {
+    seen: std::sync::Mutex<Vec<DtoOptions>>,
+}
+
+impl RecordingDto {
+    /// The options handed to the most recent projection call.
+    fn last(&self) -> DtoOptions {
+        self.seen
+            .lock()
+            .expect("recorder lock")
+            .last()
+            .cloned()
+            .expect("a projection call was made")
+    }
+}
+
+#[async_trait]
+impl DtoService for RecordingDto {
+    async fn get_primary_image_aspect_ratio(
+        &self,
+        _item_id: Uuid,
+    ) -> Result<Option<f64>, ServiceError> {
+        unimplemented!()
+    }
+    async fn get_base_item_dto(
+        &self,
+        item: &BaseItemEntity,
+        o: &DtoOptions,
+        _u: Option<&UserEntity>,
+        _owner: Option<Uuid>,
+    ) -> Result<BaseItemDto, ServiceError> {
+        self.seen.lock().expect("recorder lock").push(o.clone());
+        Ok(entity_to_dto(item))
+    }
+    async fn get_base_item_dtos(
+        &self,
+        items: &[BaseItemEntity],
+        o: &DtoOptions,
+        _u: Option<&UserEntity>,
+        _owner: Option<Uuid>,
+        _skip: bool,
+    ) -> Result<Vec<BaseItemDto>, ServiceError> {
+        self.seen.lock().expect("recorder lock").push(o.clone());
+        Ok(items.iter().map(entity_to_dto).collect())
+    }
+    async fn get_item_by_name_dto(
+        &self,
+        item: &BaseItemEntity,
+        o: &DtoOptions,
+        _tagged: Option<&[Uuid]>,
+        _u: Option<&UserEntity>,
+    ) -> Result<BaseItemDto, ServiceError> {
+        self.seen.lock().expect("recorder lock").push(o.clone());
+        Ok(entity_to_dto(item))
+    }
+}
+
+/// Drives `uri` through the by-name router with a recording DTO service and
+/// returns the options that projection was given.
+async fn options_for(uri: &str) -> DtoOptions {
+    let recorder = Arc::new(RecordingDto::default());
+    let state = by_name_state_with_dto(recorder.clone());
+    let response = create_router(state)
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK, "{uri}");
+    recorder.last()
+}
+
+/// A by-name LIST must never project `ItemCounts`, even when the client asks
+/// for it.
+///
+/// C# `DtoService.GetItemByNameDto` stamps the ten count fields only when
+/// `ItemFields.ItemCounts` is requested AND `taggedItems` is non-empty:
+///
+/// ```csharp
+/// if (options.ContainsField(ItemFields.ItemCounts)
+///     && taggedItems is not null && taggedItems.Count != 0)
+/// ```
+///
+/// Every by-name list passes `null` (Genres/MusicGenres/Studios/Artists via
+/// `RequestHelpers.CreateQueryResult`, and Persons) or an empty list (Years),
+/// so the guard never fires upstream — counts on a list come only from the
+/// separate `includeItemTypes` block.
+///
+/// Ferrofin's `get_base_item_dtos` runs `name_counts_batch` on sight of
+/// `ItemCounts` and stamps all ten (AlbumCount, ArtistCount, EpisodeCount,
+/// MovieCount, MusicVideoCount, ProgramCount, SeriesCount, SongCount,
+/// TrailerCount, ChildCount). That was unreachable while these routes
+/// hardcoded "no fields"; honouring the caller's `fields` makes it reachable,
+/// so the precondition is enforced in the projector instead.
+#[tokio::test]
+async fn a_by_name_list_never_projects_item_counts() {
+    for uri in [
+        "/Genres?fields=ItemCounts",
+        "/MusicGenres?fields=ItemCounts",
+        "/Studios?fields=ItemCounts",
+        "/Artists?fields=ItemCounts",
+        "/Persons?fields=ItemCounts",
+        "/Years?fields=ItemCounts",
+    ] {
+        let opts = options_for(uri).await;
+        assert!(
+            !opts
+                .fields
+                .contains(&ferrofin_model::querying::ItemFields::ItemCounts),
+            "{uri}: ItemCounts must not reach the by-name list projection — \
+             Jellyfin's taggedItems guard is never satisfied for a list"
+        );
+    }
+
+    // The client's OTHER fields must still get through — this strips one field,
+    // it does not go back to ignoring the parameter.
+    let opts = options_for("/Genres?fields=ItemCounts,Path").await;
+    assert!(
+        opts.fields
+            .contains(&ferrofin_model::querying::ItemFields::Path),
+        "stripping ItemCounts must not discard the rest of `fields`"
+    );
+}
+
+#[tokio::test]
+async fn genres_browse_never_enables_user_data() {
+    // `GenresController.GetGenres` passes a literal `false` for `enableUserData`
+    // to `AddAdditionalDtoOptions`, so Jellyfin never emits a `UserData` block on
+    // a genre row. Ferrofin used to send one on every genre and music genre.
+    assert!(!options_for("/Genres").await.enable_user_data);
+    assert!(!options_for("/MusicGenres").await.enable_user_data);
+    // Even an explicit request cannot turn it on — upstream has no such param.
+    assert!(
+        !options_for("/Genres?enableUserData=true")
+            .await
+            .enable_user_data
+    );
+}
+
+#[tokio::test]
+async fn by_name_browses_honour_requested_fields() {
+    use ferrofin_model::querying::ItemFields;
+    for uri in [
+        "/Genres?fields=Overview,Path",
+        "/MusicGenres?fields=Overview,Path",
+        "/Studios?fields=Overview,Path",
+        "/Artists?fields=Overview,Path",
+        "/Artists/AlbumArtists?fields=Overview,Path",
+        "/Persons?fields=Overview,Path",
+        "/Years?fields=Overview,Path",
+    ] {
+        let o = options_for(uri).await;
+        assert!(o.contains_field(ItemFields::Overview), "{uri}");
+        assert!(o.contains_field(ItemFields::Path), "{uri}");
+        assert!(
+            !o.contains_field(ItemFields::People),
+            "{uri} over-populates"
+        );
+    }
+    // Absent `fields` ⇒ the base DTO, as `new DtoOptions { Fields = [] }`.
+    assert!(options_for("/Genres").await.fields.is_empty());
+}
+
+#[tokio::test]
+async fn by_name_browses_honour_image_and_user_data_toggles() {
+    use ferrofin_model::entities::ImageType;
+    let o =
+        options_for("/Studios?imageTypeLimit=1&enableImageTypes=Primary&enableImages=false").await;
+    assert_eq!(o.image_type_limit, 1);
+    assert_eq!(o.image_types, vec![ImageType::Primary]);
+    assert!(!o.enable_images);
+    // `enableUserData` is forwarded on the controllers that expose it.
+    assert!(
+        !options_for("/Studios?enableUserData=false")
+            .await
+            .enable_user_data
+    );
+    assert!(options_for("/Studios").await.enable_user_data);
+    assert!(
+        !options_for("/Persons?enableUserData=false")
+            .await
+            .enable_user_data
+    );
+    assert!(
+        !options_for("/Years?enableUserData=false")
+            .await
+            .enable_user_data
+    );
+    assert!(
+        !options_for("/Artists?enableUserData=false")
+            .await
+            .enable_user_data
+    );
+    // Defaults with no toggles sent: images on, no per-type limit.
+    let base = options_for("/Studios").await;
+    assert!(base.enable_images);
+    assert_eq!(base.image_type_limit, i32::MAX);
 }

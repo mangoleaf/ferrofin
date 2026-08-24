@@ -52,6 +52,36 @@ const KEEPALIVE_SECS: u64 = 60;
 /// on overflow so the client reconnects and refetches state.
 const PUSH_QUEUE_DEPTH: usize = 256;
 
+/// Capacity of each socket's inbound frame buffer.
+///
+/// This is not a protocol knob — it is the per-socket scratch buffer tungstenite
+/// reads into, and it is charged on the **push** path, not the receive path:
+/// `read_in` does `in_buffer.resize(capacity, 0)` — a memset of the whole
+/// buffer — before *every* read attempt, then truncates back. The socket task's
+/// `select!` re-polls `socket.recv()` on every loop iteration, and every
+/// server→client push wakes that loop, so one push costs one full-buffer memset
+/// even though the client sent nothing.
+///
+/// tungstenite's default (which axum inherits) is 128 KiB, so 500 idle-reading
+/// sockets memset 64 MiB per broadcast round and hold 64 MiB resident for it.
+/// Measured at 500 sockets receiving a `UserDataChanged` fan-out (interleaved
+/// A/B, 3 cycles, ~30 s each, noise floor +/-5%):
+///
+/// | read buffer | CPU per pushed message | RSS at 500 sockets |
+/// |-------------|------------------------|--------------------|
+/// | 256 KiB     | 105 us                 | 235 MB             |
+/// | 128 KiB     | 36 us                  | 197 MB             |
+/// | 16 KiB      |  9.5 us                | 121 MB             |
+/// | 4 KiB       |  8.3 us                | 130 MB             |
+///
+/// 4 KiB is chosen because nothing a Jellyfin client sends over this socket is
+/// large: the inbound vocabulary is `KeepAlive` and the `*Start`/`*Stop`
+/// subscription messages, all well under 100 bytes. A larger inbound frame is
+/// still handled correctly — tungstenite reserves the frame's full length once
+/// the header is parsed and reads it across several passes — it just costs more
+/// than one read.
+const READ_BUFFER_BYTES: usize = 4 * 1024;
+
 /// Registers the WebSocket routes (`/socket` + the legacy `/embywebsocket`).
 pub fn register(router: Router<AppState>) -> Router<AppState> {
     router
@@ -71,7 +101,8 @@ async fn websocket_upgrade(
     RawQuery(query): RawQuery,
 ) -> Response {
     let caller = resolve_caller(&state, &headers, query.as_deref()).await;
-    ws.on_upgrade(move |socket| handle_socket(socket, state, caller))
+    ws.read_buffer_size(READ_BUFFER_BYTES)
+        .on_upgrade(move |socket| handle_socket(socket, state, caller))
 }
 
 /// The resolved identity of an authenticated socket: its session id (the bus

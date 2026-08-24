@@ -53,7 +53,10 @@ pub use opensubtitles::{OpenSubtitlesConfig, OpenSubtitlesProvider};
 pub use audiodb::{AudioDbAlbum, AudioDbArtist, AudioDbClient};
 pub use fanart::FanartClient;
 pub use listenbrainz::{ListenBrainzClient, ListenBrainzConfig, SimilarityAlgorithm};
-pub use musicbrainz::{AlbumIds, ArtistDetails, MusicBrainzClient, PartialDate, ReleaseDetails};
+pub use musicbrainz::{
+    AlbumIds, ArtistDetails, ArtistHit, MusicBrainzClient, PartialDate, ReleaseArtistCredit,
+    ReleaseDetails, ReleaseHit,
+};
 pub use omdb::{OmdbClient, OmdbItem, OmdbKind, OmdbPersonKind, OmdbSearchHit, OmdbSearchKey};
 pub use similarity::{
     ListenBrainzSimilarArtistProvider, TMDB_SIMILAR_CACHE_DAYS, TmdbSimilarProvider,
@@ -61,7 +64,8 @@ pub use similarity::{
 pub use studios::StudiosClient;
 pub use tmdb::{
     EpisodeDetails, RemoteImage, SeasonDetails, SeriesMatch, TmdbClient, TmdbCollection,
-    TmdbCollectionHit, TmdbDetails, TmdbImage, TmdbKind, TmdbPerson, TmdbSearchHit, TmdbTrailer,
+    TmdbCollectionHit, TmdbDetails, TmdbImage, TmdbKind, TmdbPerson, TmdbPersonHit, TmdbSearchHit,
+    TmdbTrailer,
 };
 pub use tvdb::{
     TvdbClient, TvdbEpisodeDetails, TvdbPerson, TvdbPersonDetails, TvdbSearchHit,
@@ -79,8 +83,9 @@ pub use local_images::{
 };
 pub use mediainfo::{FFProbeVideoInfo, VideoProbeInput};
 pub use provider_manager::{
-    LocalProviderManager, OmdbSearchProvider, RemoteSearchProvider, TmdbBoxSetSearchProvider,
-    TmdbSearchProvider, TvdbSearchProvider,
+    AudioDbSearchProvider, LocalProviderManager, MusicBrainzAlbumSearchProvider,
+    MusicBrainzArtistSearchProvider, OmdbSearchProvider, RemoteSearchProvider,
+    TmdbBoxSetSearchProvider, TmdbPersonSearchProvider, TmdbSearchProvider, TvdbSearchProvider,
 };
 pub use xbmc::saver::{
     NfoAlbum, NfoTrack, save_album, save_artist, save_episode, save_movie, save_season, save_series,

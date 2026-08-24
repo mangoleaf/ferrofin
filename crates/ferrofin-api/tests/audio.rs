@@ -384,6 +384,8 @@ impl LibraryManager for StreamLibrary {
 /// A [`LyricManager`] whose stored lyrics / mutation results are configurable.
 struct CannedLyrics {
     stored: Option<LyricDto>,
+    /// The remote lyric served for the namespaced id `remote.0`.
+    remote: Option<(String, LyricDto)>,
     deleted: Arc<Mutex<bool>>,
 }
 
@@ -401,6 +403,13 @@ impl LyricManager for CannedLyrics {
         _lyric_id: &str,
     ) -> Result<Option<LyricDto>, ServiceError> {
         Ok(None)
+    }
+    async fn get_remote_lyrics(&self, lyric_id: &str) -> Result<Option<LyricDto>, ServiceError> {
+        Ok(self
+            .remote
+            .as_ref()
+            .filter(|(id, _)| id == lyric_id)
+            .map(|(_, dto)| dto.clone()))
     }
     async fn save_lyric(
         &self,
@@ -561,6 +570,7 @@ async fn lyrics_get_returns_stored_or_404() {
         &path,
         Arc::new(CannedLyrics {
             stored: Some(dto),
+            remote: None,
             deleted: Arc::new(Mutex::new(false)),
         }),
     );
@@ -575,6 +585,7 @@ async fn lyrics_get_returns_stored_or_404() {
         &path,
         Arc::new(CannedLyrics {
             stored: None,
+            remote: None,
             deleted: Arc::new(Mutex::new(false)),
         }),
     );
@@ -590,6 +601,7 @@ async fn lyrics_delete_is_204_and_calls_manager() {
         &path,
         Arc::new(CannedLyrics {
             stored: None,
+            remote: None,
             deleted: deleted.clone(),
         }),
     );
@@ -605,6 +617,7 @@ async fn lyrics_remote_search_is_empty_list() {
         &path,
         Arc::new(CannedLyrics {
             stored: None,
+            remote: None,
             deleted: Arc::new(Mutex::new(false)),
         }),
     );
@@ -612,4 +625,47 @@ async fn lyrics_remote_search_is_empty_list() {
     assert_eq!(status, StatusCode::OK);
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert!(v.as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn providers_lyrics_by_id_returns_remote_lyric_without_item() {
+    // `GET /Providers/Lyrics/{lyricId}` resolves the namespaced id straight
+    // through the manager (`LyricManager.GetRemoteLyricsAsync`): no item is
+    // involved, and the parsed lyric is returned as-is.
+    let (_dir, path) = temp_media();
+    let mut dto = LyricDto::default();
+    dto.metadata.is_synced = Some(true);
+    dto.lyrics.push(ferrofin_model::lyrics::LyricLine {
+        text: "I want to live".to_owned(),
+        start: Some(171_200_000),
+        cues: None,
+    });
+    let lyric_id = "0d3b1a5a9f1c4e8e8b1f2c3d4e5f6a7b_42_synced";
+    let app = state(
+        &path,
+        Arc::new(CannedLyrics {
+            stored: None,
+            remote: Some((lyric_id.to_owned(), dto)),
+            deleted: Arc::new(Mutex::new(false)),
+        }),
+    );
+    let (status, body) = call(app, "GET", &format!("/Providers/Lyrics/{lyric_id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["Metadata"]["IsSynced"], true);
+    assert_eq!(v["Lyrics"][0]["Text"], "I want to live");
+    assert_eq!(v["Lyrics"][0]["Start"], 171_200_000);
+
+    // An id the providers don't know → 404 (the C# `NotFound` on null).
+    let (_dir, path) = temp_media();
+    let app = state(
+        &path,
+        Arc::new(CannedLyrics {
+            stored: None,
+            remote: None,
+            deleted: Arc::new(Mutex::new(false)),
+        }),
+    );
+    let (missing, _) = call(app, "GET", "/Providers/Lyrics/deadbeef_1").await;
+    assert_eq!(missing, StatusCode::NOT_FOUND);
 }

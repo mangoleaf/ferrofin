@@ -653,25 +653,10 @@ mod tests {
         // SortRemoveCharacters and SortReplaceCharacters.
         assert_eq!(item_sort_name("Mr. & Mrs-Smith"), "mr   mrssmith");
         assert_eq!(item_sort_name("A Team"), "team");
-        // RemoveDiacritics runs last, so an accented title sorts as ASCII.
+        // `ModifySortChunks` ends with `RemoveDiacritics()`, so an accented
+        // title sorts as ASCII and interleaves with the rest of the library
+        // instead of landing after it under SQLite's BINARY collation.
         assert_eq!(item_sort_name("Café Größe"), "cafe grosse");
-    }
-
-    // The upstream xUnit oracle, transliterated verbatim
-    // (`Jellyfin.Controller.Tests/Entities/BaseItemTests.cs`
-    // `BaseItem_ModifySortChunks_Valid`).
-    #[rstest::rstest]
-    #[case("", "")]
-    #[case("1", "0000000001")]
-    #[case("t", "t")]
-    #[case("test", "test")]
-    #[case("test1", "test0000000001")]
-    #[case("1test 2", "0000000001test 0000000002")]
-    fn modify_sort_chunks_matches_the_upstream_oracle(#[case] input: &str, #[case] expected: &str) {
-        assert_eq!(
-            ferrofin_util::sort_name::modify_sort_chunks(input),
-            expected
-        );
     }
 
     #[test]

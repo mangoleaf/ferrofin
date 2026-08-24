@@ -237,6 +237,8 @@ impl FfmpegRunner for TokioFfmpegRunner {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
+            // Task cancel = future drop; the child must not outlive it.
+            .kill_on_drop(true)
             .output()
             .await
             .map_err(|e| ServiceError::backend(format!("failed to start {program}: {e}")))?;
@@ -980,17 +982,11 @@ impl PeopleValidationTask {
                 {
                     Ok(_) => refreshed += 1,
                     Err(e) => {
-                        // One representative warning, then stop the pass: when
-                        // the provider manager defers single-item refresh (the
-                        // scan-time TMDB pipeline is what enriches people
-                        // today), every attempt fails identically. The next
+                        // One representative warning, then stop the pass: a
+                        // provider-manager failure (no network, no image store)
+                        // repeats identically for every person. The next
                         // scheduled run retries.
-                        tracing::warn!(
-                            person = id,
-                            error = %e,
-                            "person refresh unavailable; person images/bios are enriched \
-                             during library scans"
-                        );
+                        tracing::warn!(person = id, error = %e, "person refresh failed");
                         break;
                     }
                 }
@@ -1322,14 +1318,24 @@ impl ScheduledTask for LyricDownloadTask {
 /// generation and the already-generated skip).
 pub struct TrickplayImagesTask {
     library: Arc<dyn LibraryManager>,
+    folders: Arc<dyn VirtualFolderManager>,
     trickplay: Arc<dyn TrickplayManager>,
 }
 
 impl TrickplayImagesTask {
-    /// Builds the task over the library and trickplay-manager seams.
+    /// Builds the task over the library, virtual-folder (per-library options)
+    /// and trickplay-manager seams.
     #[must_use]
-    pub fn new(library: Arc<dyn LibraryManager>, trickplay: Arc<dyn TrickplayManager>) -> Self {
-        Self { library, trickplay }
+    pub fn new(
+        library: Arc<dyn LibraryManager>,
+        folders: Arc<dyn VirtualFolderManager>,
+        trickplay: Arc<dyn TrickplayManager>,
+    ) -> Self {
+        Self {
+            library,
+            folders,
+            trickplay,
+        }
     }
 }
 
@@ -1364,6 +1370,7 @@ impl ScheduledTask for TrickplayImagesTask {
             ..InternalItemsQuery::default()
         };
         let total = self.library.get_count(&query).await?.max(0);
+        let folders = self.folders.get_virtual_folders().await?;
         let mut done = 0i32;
         let mut start_index = 0i32;
         while start_index < total {
@@ -1373,8 +1380,19 @@ impl ScheduledTask for TrickplayImagesTask {
             }
             for item in &items {
                 done += 1;
+                // C# `GetLibraryOptions(video)`: the containing library's
+                // options, or a default (extraction off) when none contains it.
+                let options = item
+                    .path
+                    .as_deref()
+                    .and_then(|path| options_for_path(&folders, path))
+                    .cloned()
+                    .unwrap_or_default();
                 if let Ok(item_id) = Uuid::parse_str(&item.id)
-                    && let Err(e) = self.trickplay.refresh_trickplay_data(item_id, false).await
+                    && let Err(e) = self
+                        .trickplay
+                        .refresh_trickplay_data(item_id, false, &options)
+                        .await
                 {
                     tracing::warn!(item = %item.id, error = %e, "trickplay generation failed");
                 }
@@ -1831,6 +1849,12 @@ mod tests {
                 .push((item_id, lyric_id.to_owned()));
             Ok(Some(LyricDto::default()))
         }
+        async fn get_remote_lyrics(
+            &self,
+            _lyric_id: &str,
+        ) -> Result<Option<LyricDto>, ServiceError> {
+            unimplemented!("fake")
+        }
         async fn save_lyric(
             &self,
             _item_id: Uuid,
@@ -1853,7 +1877,8 @@ mod tests {
     /// A [`TrickplayManager`] fake recording refreshes.
     #[derive(Default)]
     struct FakeTrickplay {
-        refreshed: Mutex<Vec<Uuid>>,
+        /// `(item, library option "extraction enabled")` per refresh call.
+        refreshed: Mutex<Vec<(Uuid, bool)>>,
     }
 
     #[async_trait]
@@ -1862,8 +1887,12 @@ mod tests {
             &self,
             item_id: Uuid,
             _replace: bool,
+            library_options: &LibraryOptions,
         ) -> Result<(), ServiceError> {
-            self.refreshed.lock().expect("lock").push(item_id);
+            self.refreshed
+                .lock()
+                .expect("lock")
+                .push((item_id, library_options.enable_trickplay_image_extraction));
             Ok(())
         }
         async fn get_trickplay_resolutions(
@@ -2191,8 +2220,24 @@ mod tests {
             set_media_type(&db, v, "Video").await;
         }
 
+        // v1 lives in a library with extraction on; v2 outside any library
+        // (C# `GetLibraryOptions` → default options, extraction off).
+        set_path(&db, v1, "/media/movies/a.mkv").await;
+        set_path(&db, v2, "/elsewhere/b.mkv").await;
+
         let trickplay = Arc::new(FakeTrickplay::default());
-        let task = TrickplayImagesTask::new(library, trickplay.clone());
+        let task = TrickplayImagesTask::new(
+            library,
+            Arc::new(folder_with(
+                LibraryOptions {
+                    enable_trickplay_image_extraction: true,
+                    ..LibraryOptions::default()
+                },
+                None,
+                "/media/movies",
+            )),
+            trickplay.clone(),
+        );
         assert_eq!(task.key(), "RefreshTrickplayImages");
         assert_eq!(
             task.default_triggers()[0].type_,
@@ -2202,7 +2247,7 @@ mod tests {
 
         let mut refreshed = trickplay.refreshed.lock().expect("lock").clone();
         refreshed.sort();
-        assert_eq!(refreshed, vec![v1, v2]);
+        assert_eq!(refreshed, vec![(v1, true), (v2, false)]);
     }
 
     // -- Media Segment Scan --------------------------------------------------

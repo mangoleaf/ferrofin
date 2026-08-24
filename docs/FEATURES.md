@@ -12,16 +12,21 @@ comparison harness. Headline as of the current release:
 |---|---:|---|
 | Wired to a real handler (`REAL`) | **412 / 412** | 100% |
 | `501` / hollow stubs | **0** | none |
-| Deep-verified vs Jellyfin 10.11.8 | **201** | response + read-back diffed clean |
-| Classified accepted-divergence | **211** | intentional or Jellyfin-bug-avoiding differences |
-| Untested | **0** | — |
+| Deep-verified vs Jellyfin 10.11.8 | **241** | response + read-back diffed clean |
+| Classified divergence | **146** | intentional, Jellyfin-bug-avoiding, or open work |
+| Untested | **25** | awaiting a parity leg on the current tree |
 
 Deep-verified means the response body **and** the persisted read-back were diffed against a
 real `jellyfin/jellyfin:10.11.8` server on identical inputs and matched (for binary/asset
-routes, the bytes were compared). The rest are classified: a difference exists and has been
-reviewed and accepted — usually because Ferrofin is correct where Jellyfin has a known bug
-(see the "don't port Jellyfin bugs" policy), or because the difference is a documented,
-bounded simplification.
+routes, the bytes were compared). Most of the rest are classified: a difference exists and
+has been reviewed — usually because Ferrofin is correct where Jellyfin has a known bug
+(see the "don't port Jellyfin bugs" policy), because the difference is a documented,
+bounded simplification, or because it is named open work still to be ported.
+
+The untested count is ops the harness has no current measurement for. It is not a claim that
+they are broken, and not a claim that they are fine — it is the ledger refusing to carry a
+result forward from a tree that is no longer this one. Re-running the parity leg is what
+moves them; `suite/parity/LEDGER.md` names each one.
 
 ## Implemented & verified
 

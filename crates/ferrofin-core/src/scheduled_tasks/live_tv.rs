@@ -112,6 +112,9 @@ mod tests {
             self.refreshes.fetch_add(1, Ordering::Relaxed);
             Ok(())
         }
+        async fn get_schedules_direct_countries(&self) -> Result<Vec<u8>, ServiceError> {
+            unreachable!("the guide-refresh task never asks for listings countries")
+        }
         async fn get_live_tv_info(
             &self,
         ) -> Result<ferrofin_model::live_tv::LiveTvInfo, ServiceError> {

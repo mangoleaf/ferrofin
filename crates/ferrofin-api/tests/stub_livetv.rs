@@ -7,7 +7,8 @@
 //! ops (channel mappings, the SchedulesDirect country list, the two live-stream /
 //! recording file endpoints, and the deprecated recording-group-by-id lookup) are
 //! now real too — faithful for Ferrofin's M3U+XMLTV backend (empty/`404` where no
-//! DVR capture / live-stream buffering exists).
+//! DVR capture / live-stream buffering exists; the SchedulesDirect country list
+//! is the cached SD document itself, pinned in `live_tv_schedules_direct.rs`).
 //!
 //! Most real handlers sit behind the `RequireAuth` extractor, so a **tokenless**
 //! probe is rejected with `401 Unauthorized` — never `501` (which only the shared

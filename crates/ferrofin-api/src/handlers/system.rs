@@ -17,7 +17,7 @@ use ferrofin_model::system::{LogFile, PublicSystemInfo, SystemInfo};
 use ferrofin_model::system_info_dtos::SystemStorageDto;
 use ferrofin_traits::net::RequestContext;
 
-use crate::auth::{RequireAdmin, RequireAuth};
+use crate::auth::{RequireAdmin, RequireAuth, RequireLocalAccessOrAdmin};
 use crate::error::ApiError;
 use crate::state::AppState;
 
@@ -101,16 +101,23 @@ async fn ping_system(State(state): State<AppState>) -> Json<String> {
 
 /// `POST /System/Restart` — begins the application restart process.
 ///
-/// Port of `SystemController.RestartApplication` (local-access-or-elevation).
+/// Port of `SystemController.RestartApplication`
+/// (`Policies.LocalAccessOrRequiresElevation`): a caller on the local network
+/// may restart, anyone else must be an administrator. See
+/// [`RequireLocalAccessOrAdmin`] for the two deliberate divergences.
 #[utoipa::path(
     post,
     path = "/System/Restart",
-    responses((status = 204, description = "Server restarted")),
+    responses(
+        (status = 204, description = "Server restarted"),
+        (status = 401, description = "Unauthenticated"),
+        (status = 403, description = "Remote caller is not an administrator"),
+    ),
     tag = "ferrofin"
 )]
 async fn restart_application(
     State(state): State<AppState>,
-    _auth: RequireAuth,
+    _auth: RequireLocalAccessOrAdmin,
 ) -> Result<StatusCode, ApiError> {
     state.system.restart().await?;
     Ok(StatusCode::NO_CONTENT)
@@ -250,20 +257,37 @@ async fn get_endpoint_info(
 }
 
 /// Whether `ip` is on the local network: loopback, link-local, or a private
-/// (RFC1918 IPv4 / `fc00::/7` unique-local IPv6) address.
+/// (RFC1918 IPv4 / `fc00::/7` unique-local / `fec0::/10` site-local IPv6)
+/// address.
+///
+/// An IPv4-mapped IPv6 address is unmapped first. With a dual-stack bind
+/// (`--bind ::`) every IPv4 client arrives as `::ffff:192.168.1.5`, which
+/// matches none of the IPv6 prefixes — so without this the same-machine web
+/// client reads as off-network. C# unmaps in both `GetNormalizedRemoteIP` and
+/// `IsInLocalNetwork`, as does Ferrofin's own
+/// [`ferrofin_networking::NetworkManager::is_in_local_network`].
+///
+/// This is `NetworkManager`'s *fallback* subnet set, without the configured
+/// `LocalNetworkSubnets` / excluded-subnet list. See
+/// [`crate::auth::RequireLocalAccessOrAdmin`] for what that costs.
 ///
 /// Shared with the HLS master playlist, which (like upstream's
 /// `DynamicHlsHelper.EnableAdaptiveBitrateStreaming`) skips the adaptive
 /// variants for local peers.
 pub(crate) fn is_in_local_network(ip: std::net::IpAddr) -> bool {
+    let ip = match ip {
+        std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, std::net::IpAddr::V4),
+        std::net::IpAddr::V4(_) => ip,
+    };
     match ip {
         std::net::IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
         // `is_unique_local`/`is_unicast_link_local` are unstable, so match the
-        // fc00::/7 and fe80::/10 prefixes directly.
+        // fc00::/7, fe80::/10 and fec0::/10 prefixes directly.
         std::net::IpAddr::V6(v6) => {
             v6.is_loopback()
                 || (v6.segments()[0] & 0xfe00) == 0xfc00
                 || (v6.segments()[0] & 0xffc0) == 0xfe80
+                || (v6.segments()[0] & 0xffc0) == 0xfec0
         }
     }
 }

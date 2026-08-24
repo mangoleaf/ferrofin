@@ -1,0 +1,18 @@
+{
+    "HeaderContinueWatching": "Simudzira kuona",
+    "AppDeviceValues": "Apu: {0}, Dhivhaisi: {1}",
+    "Artists": "Vaimbi",
+    "AuthenticationSucceededWithUserName": "apinda",
+    "Books": "Mabhuku",
+    "ChapterNameValue": "Chikamu {0}",
+    "Collections": "Akafanana",
+    "Default": "Zvakasarudzwa Kare",
+    "External": "Zvekunze",
+    "FailedLoginAttemptWithUserName": "Vatadza kuloga chimboedza kushandisa {0}",
+    "Favorites": "Zvaunofarira",
+    "Folders": "Mafoodha",
+    "Forced": "Zvekumanikidzira",
+    "Genres": "Mhando",
+    "HeaderFavoriteEpisodes": "Maepisodhi aunofarira",
+    "HeaderFavoriteShows": "Masirisi aunofarira"
+}

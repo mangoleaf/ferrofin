@@ -23,11 +23,6 @@ use async_trait::async_trait;
 
 use ferrofin_traits::error::ServiceError;
 
-/// Leading articles stripped when computing a [`sort_name`] (C#
-/// `BaseItem.SortName` uses the configurable `SortRemoveWords`; these are the
-/// English defaults shipped in `ServerConfiguration.SortRemoveWords`).
-const SORT_REMOVE_WORDS: &[&str] = &["the", "a", "an"];
-
 /// File-name globs whose match means "ignore this path" (C#
 /// `IgnorePatterns._patterns`). Each entry is a `(needle, kind)` rule evaluated
 /// against the lower-cased path; see [`IgnoreRule`].
@@ -151,30 +146,6 @@ pub fn should_ignore_path(path: &str) -> bool {
         .any(|rule| rule.matches(&lower, &segments, file_name))
 }
 
-/// Computes the sort key for a display `name` (C# `BaseItem.SortName`): strip a
-/// single leading article (`the`/`a`/`an`) and lower-case the remainder.
-///
-/// A name that is *only* an article is returned lower-cased unchanged (dropping
-/// it would yield an empty, unsortable key).
-#[must_use]
-pub fn sort_name(name: &str) -> String {
-    let trimmed = name.trim();
-    let lower = trimmed.to_lowercase();
-    for word in SORT_REMOVE_WORDS {
-        if let Some(rest) = lower.strip_prefix(word) {
-            // Only strip when the article is a whole leading word (followed by
-            // whitespace), so "theatre" is not mangled into "atre".
-            if let Some(remainder) = rest.strip_prefix(' ') {
-                let remainder = remainder.trim_start();
-                if !remainder.is_empty() {
-                    return remainder.to_owned();
-                }
-            }
-        }
-    }
-    lower
-}
-
 /// A minimal filesystem-watch seam so the [`crate::library_monitor`] can be
 /// tested against a fake.
 ///
@@ -198,7 +169,7 @@ fn _assert_object_safe_file_system_watcher(_: &dyn FileSystemWatcher) {}
 
 #[cfg(test)]
 mod tests {
-    use super::{should_ignore_path, sort_name};
+    use super::should_ignore_path;
 
     #[test]
     fn ignores_artwork_and_sample_files() {
@@ -225,16 +196,5 @@ mod tests {
         assert!(should_ignore_path("/media/Movie/.DS_Store"));
         assert!(should_ignore_path("/media/Movie/movie.trickplay"));
         assert!(!should_ignore_path("/media/Movie/movie.mkv"));
-    }
-
-    #[test]
-    fn sort_name_strips_leading_articles() {
-        assert_eq!(sort_name("The Matrix"), "matrix");
-        assert_eq!(sort_name("A Beautiful Mind"), "beautiful mind");
-        assert_eq!(sort_name("An Education"), "education");
-        // Not a leading article word — left intact (lower-cased).
-        assert_eq!(sort_name("Theatre of Blood"), "theatre of blood");
-        // Article-only name is kept.
-        assert_eq!(sort_name("The"), "the");
     }
 }

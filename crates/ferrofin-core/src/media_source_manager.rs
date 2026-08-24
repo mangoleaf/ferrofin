@@ -57,6 +57,10 @@ pub struct FerrofinMediaSourceManager {
     /// Live TV manager, when configured — lets playback resolve a Live TV channel
     /// id (which is not a `BaseItems` row) to its tuner stream.
     live_tv: Option<Arc<dyn ferrofin_traits::stubs::LiveTvManager>>,
+    /// Localization for the `MediaStream.Localized*` labels re-stamped on
+    /// every read (the C# `MediaStreamRepository.Map` does the same — they are
+    /// not persisted). `None` (unit tests) leaves them unset.
+    localization: Option<Arc<dyn ferrofin_traits::localization::LocalizationManager>>,
     /// Open live streams keyed by [`stream_key`] of their live-stream id
     /// (upstream's `_openStreams` is an `OrdinalIgnoreCase` dictionary, so a
     /// client that echoes the id back in another case still finds its stream).
@@ -97,6 +101,7 @@ impl FerrofinMediaSourceManager {
             encoder,
             provider,
             live_tv: None,
+            localization: None,
             open_streams: Arc::new(Mutex::new(HashMap::new())),
             probe_cache: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -108,6 +113,25 @@ impl FerrofinMediaSourceManager {
     pub fn with_live_tv(mut self, live_tv: Arc<dyn ferrofin_traits::stubs::LiveTvManager>) -> Self {
         self.live_tv = Some(live_tv);
         self
+    }
+
+    /// Sets the localization the read-back `Localized*` stream labels come from.
+    #[must_use]
+    pub fn with_localization(
+        mut self,
+        localization: Arc<dyn ferrofin_traits::localization::LocalizationManager>,
+    ) -> Self {
+        self.localization = Some(localization);
+        self
+    }
+
+    /// Maps a persisted stream row to its DTO and stamps the localized labels.
+    fn row_to_dto(&self, row: MediaStreamInfoEntity) -> MediaStream {
+        let mut stream = stream_to_dto(row);
+        if let Some(localization) = &self.localization {
+            localize_stream(&mut stream, localization.as_ref());
+        }
+        stream
     }
 
     /// The media sources for a Live TV channel id, or empty when Live TV is
@@ -229,7 +253,7 @@ impl FerrofinMediaSourceManager {
                 ..Default::default()
             })
             .await?;
-        Ok(rows.into_iter().map(stream_to_dto).collect())
+        Ok(rows.into_iter().map(|row| self.row_to_dto(row)).collect())
     }
 
     /// Builds the static [`MediaSourceInfo`] for a resolved item row and its
@@ -262,13 +286,14 @@ impl FerrofinMediaSourceManager {
             })
             .map(|s| s.index);
 
+        // C# `BaseItem.GetVersionInfo` (behind `Video.GetMediaSources`) reports
+        // the source id as `item.Id.ToString("N")` — the dashless form; clients
+        // key the trickplay manifest (and echo `MediaSourceId`) with exactly
+        // this string.
+        let id =
+            Uuid::parse_str(&item.id).map_or_else(|_| item.id.clone(), |u| u.simple().to_string());
         let mut source = MediaSourceInfo {
-            // C# `item.Id.ToString("N")`: the 32-hex spelling, not the DB's
-            // upper-case hyphenated text (which a client would echo back verbatim).
-            id: Some(
-                Uuid::parse_str(&item.id)
-                    .map_or_else(|_| item.id.clone(), |g| g.simple().to_string()),
-            ),
+            id: Some(id),
             path: item.path.clone(),
             name: item.name.clone(),
             container: container_of(item),
@@ -628,6 +653,37 @@ fn stream_to_dto(row: MediaStreamInfoEntity) -> MediaStream {
     stream
 }
 
+/// Port of the tail of `MediaStreamRepository.Map(MediaStreamInfo)`: the
+/// `Localized*` labels are derived on every read, never persisted. Audio and
+/// subtitle streams get `Default`/`External` (+ the language display name);
+/// subtitles add `Undefined`/`Forced`/`HearingImpaired`.
+/// Runs after `display_title` so the title is recomputed with the labels, as
+/// the C# getter evaluates them lazily.
+fn localize_stream(
+    stream: &mut MediaStream,
+    localization: &dyn ferrofin_traits::localization::LocalizationManager,
+) {
+    if !matches!(
+        stream.stream_type,
+        MediaStreamType::Audio | MediaStreamType::Subtitle
+    ) {
+        return;
+    }
+    stream.localized_default = Some(localization.get_localized_string("Default"));
+    stream.localized_external = Some(localization.get_localized_string("External"));
+    if let Some(language) = stream.language.as_deref().filter(|l| !l.is_empty()) {
+        stream.localized_language = localization.get_language_display_name(language);
+    }
+    // (`LocalizedOriginal` is post-10.11.8 and absent from the contract.)
+    if stream.stream_type == MediaStreamType::Subtitle {
+        stream.localized_undefined = Some(localization.get_localized_string("Undefined"));
+        stream.localized_forced = Some(localization.get_localized_string("Forced"));
+        stream.localized_hearing_impaired =
+            Some(localization.get_localized_string("HearingImpaired"));
+    }
+    stream.display_title = stream.display_title();
+}
+
 /// Maps a probed wire [`MediaStream`] back to a persistable
 /// [`MediaStreamInfoEntity`] — the inverse of [`stream_to_dto`], used to store the
 /// streams a scan probe returned. Codec/geometry plus the HDR/Dolby-Vision
@@ -734,7 +790,15 @@ impl MediaSourceManager for FerrofinMediaSourceManager {
         let rows = self.streams.get_media_streams_batch(item_ids).await?;
         Ok(rows
             .into_iter()
-            .map(|(id, streams)| (id, streams.into_iter().map(stream_to_dto).collect()))
+            .map(|(id, streams)| {
+                (
+                    id,
+                    streams
+                        .into_iter()
+                        .map(|row| self.row_to_dto(row))
+                        .collect(),
+                )
+            })
             .collect())
     }
 
@@ -1108,6 +1172,55 @@ mod tests {
         assert_eq!(back.video_range_type(), VideoRangeType::DoviWithHdr10);
     }
 
+    /// `MediaStreamRepository.Map` re-stamps the `Localized*` labels on every
+    /// read (they are not persisted) for audio/subtitle streams only, and the
+    /// display title picks them up.
+    #[test]
+    fn read_back_stamps_localized_labels_for_audio_and_subtitles() {
+        let de = crate::localization_manager::LocalizationManager::default().with_ui_culture("de");
+        let mut subtitle = MediaStream {
+            stream_type: MediaStreamType::Subtitle,
+            codec: Some("subrip".to_owned()),
+            language: Some("eng".to_owned()),
+            is_forced: true,
+            is_default: true,
+            ..Default::default()
+        };
+        localize_stream(&mut subtitle, &de);
+        assert_eq!(subtitle.localized_default.as_deref(), Some("Standard"));
+        assert_eq!(subtitle.localized_forced.as_deref(), Some("Erzwungen"));
+        assert_eq!(subtitle.localized_undefined.as_deref(), Some("Undefiniert"));
+        assert_eq!(
+            subtitle.localized_hearing_impaired.as_deref(),
+            Some("Hörgeschädigt")
+        );
+        assert_eq!(subtitle.localized_external.as_deref(), Some("Extern"));
+        assert_eq!(subtitle.localized_language.as_deref(), Some("English"));
+        let title = subtitle.display_title.clone().unwrap_or_default();
+        assert!(
+            title.contains("Standard") && title.contains("Erzwungen"),
+            "{title}"
+        );
+
+        let mut audio = MediaStream {
+            stream_type: MediaStreamType::Audio,
+            language: Some("fra".to_owned()),
+            ..Default::default()
+        };
+        localize_stream(&mut audio, &de);
+        assert_eq!(audio.localized_default.as_deref(), Some("Standard"));
+        assert_eq!(audio.localized_external.as_deref(), Some("Extern"));
+        assert!(audio.localized_forced.is_none() && audio.localized_undefined.is_none());
+        assert_eq!(audio.localized_language.as_deref(), Some("French"));
+
+        let mut video = MediaStream {
+            stream_type: MediaStreamType::Video,
+            ..Default::default()
+        };
+        localize_stream(&mut video, &de);
+        assert!(video.localized_default.is_none());
+    }
+
     /// A stub encoder whose probe returns a fixed source (no ffmpeg needed).
     struct StubEncoder;
 
@@ -1282,6 +1395,9 @@ mod tests {
 
     #[async_trait]
     impl ferrofin_traits::stubs::LiveTvManager for FakeLiveTv {
+        async fn get_schedules_direct_countries(&self) -> Result<Vec<u8>, ServiceError> {
+            Ok(Vec::new())
+        }
         async fn get_live_tv_info(
             &self,
         ) -> Result<ferrofin_model::live_tv::LiveTvInfo, ServiceError> {
@@ -1739,7 +1855,8 @@ mod tests {
             .await
             .expect("sources");
         assert_eq!(sources.len(), 1);
-        // C# `item.Id.ToString("N")`, never the DB's upper-case hyphenated text.
+        // The wire id is the dashless `ToString("N")` form (the row stores it
+        // uppercase-hyphenated) — the key clients use for `Trickplay`.
         assert_eq!(
             sources[0].id.as_deref(),
             Some(id.simple().to_string().as_str())

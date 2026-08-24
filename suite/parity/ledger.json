@@ -23,8 +23,8 @@
       "schema_valid": true,
       "note": "H=200 J=200",
       "deep_verified": false,
-      "classification": "deferred: weighted similarity scorer not ported (same as Items/{id}/Similar).",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "classification": "instance/methodology: Jellyfin 10.11.8 serves /Similar from a flat Genres/Tags query ordered Random (non-deterministic, not diffable); Ferrofin implements upstream master's weighted SimilarItemsManager (genre 10/tag 5/studio 5/director 50/actor 15 + IsPlayed/user-access phase-2 filter, Episode/by-name short-circuit). Verified by unit tests against the C# weights.",
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "GET /Artists",
@@ -88,8 +88,8 @@
       "schema_valid": true,
       "note": "H=200 J=200",
       "deep_verified": false,
-      "classification": "deferred: weighted similarity scorer not ported.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "classification": "instance/methodology: Jellyfin 10.11.8 serves /Similar from a flat Genres/Tags query ordered Random (non-deterministic, not diffable); Ferrofin implements upstream master's weighted SimilarItemsManager (genre 10/tag 5/studio 5/director 50/actor 15 + IsPlayed/user-access phase-2 filter, Episode/by-name short-circuit). Verified by unit tests against the C# weights.",
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "GET /Artists/{name}",
@@ -140,8 +140,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness).",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "classification": "",
+      "last_verified": null
     },
     {
       "operation": "GET /Audio/{itemId}/Lyrics",
@@ -153,8 +153,8 @@
       "schema_valid": null,
       "note": "H=404 J=404",
       "deep_verified": null,
-      "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness).",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "classification": "",
+      "last_verified": null
     },
     {
       "operation": "POST /Audio/{itemId}/Lyrics",
@@ -166,8 +166,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness).",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "classification": "",
+      "last_verified": null
     },
     {
       "operation": "GET /Audio/{itemId}/RemoteSearch/Lyrics",
@@ -179,8 +179,8 @@
       "schema_valid": true,
       "note": "H=200 J=200",
       "deep_verified": true,
-      "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness).",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "classification": "",
+      "last_verified": "a518834 2026-08-23"
     },
     {
       "operation": "POST /Audio/{itemId}/RemoteSearch/Lyrics/{lyricId}",
@@ -192,8 +192,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness).",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "classification": "",
+      "last_verified": null
     },
     {
       "operation": "GET /Audio/{itemId}/hls/{segmentId}/stream.aac",
@@ -596,7 +596,7 @@
       "note": "unresolved path param: channelId",
       "deep_verified": null,
       "classification": "requires-channel-plugin: the ChannelsController serves IChannel plugin channels, not Live TV \u2014 no tuner journey can reach these; they need a channel plugin on both servers.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "GET /Channels/{channelId}/Items",
@@ -609,7 +609,7 @@
       "note": "unresolved path param: channelId",
       "deep_verified": null,
       "classification": "requires-channel-plugin: the ChannelsController serves IChannel plugin channels, not Live TV \u2014 no tuner journey can reach these; they need a channel plugin on both servers.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "POST /ClientLog/Document",
@@ -739,7 +739,7 @@
       "note": "unresolved path param: displayPreferencesId",
       "deep_verified": false,
       "classification": "verified 2026-08-11: the auto-flag was a harness artifact (literal unresolved {displayPreferencesId}); with a real client key (e.g. usersettings?client=emby) Ferrofin returns 200 DisplayPreferencesDto (Id/Client/SortBy/CustomPrefs) \u2014 the by-client resolution Jellyfin uses.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "POST /DisplayPreferences/{displayPreferencesId}",
@@ -791,7 +791,7 @@
       "note": "H=200 J=200",
       "deep_verified": false,
       "classification": "instance: per-host filesystem drives.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "GET /Environment/NetworkShares",
@@ -843,7 +843,7 @@
       "note": "H=200 J=404",
       "deep_verified": null,
       "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "POST /Episode/{Id}/Timestamps",
@@ -856,7 +856,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "GET /Episode/{id}/IntroSkipperSegments",
@@ -869,7 +869,7 @@
       "note": "H=200 J=404",
       "deep_verified": null,
       "classification": "expected-extension: IntroSkipper is a compiled-in Ferrofin plugin; stock Jellyfin 10.11.8 lacks it (J=404 without the plugin installed). JSON API, not streaming.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "GET /FallbackFont/Fonts",
@@ -908,7 +908,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "GET /Genres",
@@ -921,7 +921,7 @@
       "note": "H=200 J=200",
       "deep_verified": false,
       "classification": "verified 2026-08-11: QueryResult<BaseItemDto> (Items array + TotalRecordCount + StartIndex), status+schema conformant; empty-library returns the well-formed empty result.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "GET /Genres/{genreName}",
@@ -934,7 +934,7 @@
       "note": "H=200 J=200",
       "deep_verified": false,
       "classification": "accepted-divergence: same no-lazy-create-on-GET family as /Studios/{name}. Existing genre\u2192200 BaseItemDto (both servers), absent\u2192Ferrofin 404 vs Jellyfin auto-created 200. Shape verified.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "GET /Genres/{name}/Images/{imageType}",
@@ -946,8 +946,8 @@
       "schema_valid": null,
       "note": "H=404 J=200",
       "deep_verified": false,
-      "classification": "deferred: Jellyfin dynamically generates a genre image by compositing the genre's child-item posters into a collage (DynamicImageProvider); Ferrofin has no dynamic image-collage generator, so it returns 404 (H=404 vs J=200 600x600). Not ported.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "classification": "flagged: asset property diff vs Jellyfin (verify)",
+      "last_verified": "a518834 2026-08-23"
     },
     {
       "operation": "HEAD /Genres/{name}/Images/{imageType}",
@@ -959,8 +959,8 @@
       "schema_valid": null,
       "note": "H=404 J=200",
       "deep_verified": false,
-      "classification": "deferred: Jellyfin dynamically generates a genre image by compositing the genre's child-item posters into a collage (DynamicImageProvider); Ferrofin has no dynamic image-collage generator, so it returns 404 (H=404 vs J=200 600x600). Not ported.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "classification": "flagged: asset property diff vs Jellyfin (verify)",
+      "last_verified": "a518834 2026-08-23"
     },
     {
       "operation": "GET /Genres/{name}/Images/{imageType}/{imageIndex}",
@@ -972,8 +972,8 @@
       "schema_valid": null,
       "note": "H=404 J=200",
       "deep_verified": false,
-      "classification": "deferred: Jellyfin dynamically generates a genre image by compositing the genre's child-item posters into a collage (DynamicImageProvider); Ferrofin has no dynamic image-collage generator, so it returns 404 (H=404 vs J=200 600x600). Not ported.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "classification": "flagged: asset property diff vs Jellyfin (verify)",
+      "last_verified": "a518834 2026-08-23"
     },
     {
       "operation": "HEAD /Genres/{name}/Images/{imageType}/{imageIndex}",
@@ -985,8 +985,8 @@
       "schema_valid": null,
       "note": "H=404 J=200",
       "deep_verified": false,
-      "classification": "deferred: Jellyfin dynamically generates a genre image by compositing the genre's child-item posters into a collage (DynamicImageProvider); Ferrofin has no dynamic image-collage generator, so it returns 404 (H=404 vs J=200 600x600). Not ported.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "classification": "flagged: asset property diff vs Jellyfin (verify)",
+      "last_verified": "a518834 2026-08-23"
     },
     {
       "operation": "GET /GetUtcTime",
@@ -1012,7 +1012,7 @@
       "note": "H=200 J=404",
       "deep_verified": null,
       "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "GET /IntroSkipper/SupportBundle",
@@ -1025,7 +1025,7 @@
       "note": "H=200 J=404",
       "deep_verified": null,
       "classification": "expected-extension: IntroSkipper is a compiled-in Ferrofin plugin; stock Jellyfin 10.11.8 lacks it (H=200 vs J=404). By design.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "POST /Intros/AnalyzerActions/UpdateSeason",
@@ -1038,7 +1038,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "GET /Intros/AnalyzerActions/{SeasonId}",
@@ -1051,7 +1051,7 @@
       "note": "H=200 J=404",
       "deep_verified": null,
       "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "POST /Intros/EraseTimestamps",
@@ -1064,7 +1064,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "POST /Intros/RebuildDatabase",
@@ -1077,7 +1077,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "POST /Intros/ScanSeason/{SeriesId}/{SeasonId}",
@@ -1090,7 +1090,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "GET /Intros/ScanStatus",
@@ -1103,7 +1103,7 @@
       "note": "H=200 J=404",
       "deep_verified": null,
       "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "DELETE /Intros/Show/{SeriesId}/{SeasonId}",
@@ -1116,7 +1116,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "GET /Intros/Show/{SeriesId}/{SeasonId}",
@@ -1129,7 +1129,7 @@
       "note": "H=200 J=404",
       "deep_verified": null,
       "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "DELETE /Items",
@@ -1219,8 +1219,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness).",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "classification": "",
+      "last_verified": null
     },
     {
       "operation": "POST /Items/RemoteSearch/Book",
@@ -1232,8 +1232,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness).",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "classification": "",
+      "last_verified": null
     },
     {
       "operation": "POST /Items/RemoteSearch/BoxSet",
@@ -1245,8 +1245,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness).",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "classification": "",
+      "last_verified": null
     },
     {
       "operation": "POST /Items/RemoteSearch/Movie",
@@ -1258,8 +1258,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness).",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "classification": "",
+      "last_verified": null
     },
     {
       "operation": "POST /Items/RemoteSearch/MusicAlbum",
@@ -1271,8 +1271,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness).",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "classification": "",
+      "last_verified": null
     },
     {
       "operation": "POST /Items/RemoteSearch/MusicArtist",
@@ -1284,8 +1284,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness).",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "classification": "",
+      "last_verified": null
     },
     {
       "operation": "POST /Items/RemoteSearch/MusicVideo",
@@ -1297,8 +1297,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness).",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "classification": "",
+      "last_verified": null
     },
     {
       "operation": "POST /Items/RemoteSearch/Person",
@@ -1310,8 +1310,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness).",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "classification": "",
+      "last_verified": null
     },
     {
       "operation": "POST /Items/RemoteSearch/Series",
@@ -1323,8 +1323,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness).",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "classification": "",
+      "last_verified": null
     },
     {
       "operation": "POST /Items/RemoteSearch/Trailer",
@@ -1336,8 +1336,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness).",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "classification": "",
+      "last_verified": null
     },
     {
       "operation": "GET /Items/Root",
@@ -1349,8 +1349,8 @@
       "schema_valid": null,
       "note": "H=404 J=200",
       "deep_verified": null,
-      "classification": "deferred: Ferrofin deliberately omits the synthetic root/aggregate folder tree (documented out-of-scope \u2014 see the Items/{id}/Ancestors classification), so there is no user root folder item to return (H=404 vs J=200).",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "classification": "",
+      "last_verified": null
     },
     {
       "operation": "GET /Items/Suggestions",
@@ -1363,7 +1363,7 @@
       "note": "H=200 J=200",
       "deep_verified": false,
       "classification": "instance/methodology: Jellyfin orders suggestions by Random, so the set is non-deterministic across independent scans (matches Jellyfin's behavior).",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "DELETE /Items/{itemId}",
@@ -1388,8 +1388,8 @@
       "schema_valid": true,
       "note": "H=200 J=200",
       "deep_verified": false,
-      "classification": "instance/probe-noise: residual diffs are MediaStream probe values (BitRate/IsAVC/Level/RealFrameRate) that vary per independent probe, plus Localized* (needs localization on read-back, deferred).",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "classification": "instance/probe-noise: residual diffs are MediaStream probe values (BitRate/IsAVC/Level/RealFrameRate) that vary per independent probe. The Localized* labels that used to diff are now served on read-back (MediaSourceManager::with_localization).",
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "POST /Items/{itemId}",
@@ -1402,7 +1402,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "instance/methodology: the metadata edit persists correctly on Ferrofin (read-back reflects it); Jellyfin's read-back didn't reflect the synthetic tag-edit body (oracle/body difference), so this is not a Ferrofin defect.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "GET /Items/{itemId}/Ancestors",
@@ -1414,8 +1414,8 @@
       "schema_valid": true,
       "note": "H=200 J=200",
       "deep_verified": false,
-      "classification": "instance: ancestor set differs only by /config-vs-/data path-derived ids + the deliberately-omitted synthetic root/aggregate folder tree (documented out-of-scope).",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "classification": "instance: ancestor chain now includes the UserRootFolder hop as Jellyfin's does; residual diff is /config-vs-/data path-derived ids only.",
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "POST /Items/{itemId}/ContentType",
@@ -1466,8 +1466,8 @@
       "schema_valid": true,
       "note": "H=200 J=200",
       "deep_verified": false,
-      "classification": "deferred: external-id provider metadata (TMDB/etc.) is feature-gated off.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "classification": "flagged: read diff vs Jellyfin (sweep single-item align)",
+      "last_verified": "a518834 2026-08-23"
     },
     {
       "operation": "GET /Items/{itemId}/File",
@@ -1687,8 +1687,8 @@
       "schema_valid": true,
       "note": "H=200 J=200",
       "deep_verified": false,
-      "classification": "deferred: Countries/ParentalRatings/ContentTypeOptions now match; the only residual is ExternalIdInfos, which is empty because remote-id providers (TMDB/etc.) are feature-gated off.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "classification": "flagged: read diff vs Jellyfin (sweep single-item align)",
+      "last_verified": "a518834 2026-08-23"
     },
     {
       "operation": "GET /Items/{itemId}/PlaybackInfo",
@@ -1701,7 +1701,7 @@
       "note": "H=200 J=200",
       "deep_verified": false,
       "classification": "instance/probe-noise: same MediaStream probe-value residual as Items/{itemId}.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "POST /Items/{itemId}/PlaybackInfo",
@@ -1739,8 +1739,8 @@
       "schema_valid": true,
       "note": "H=200 J=200",
       "deep_verified": false,
-      "classification": "deferred: remote image providers feature-gated off.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "classification": "flagged: read diff vs Jellyfin (sweep single-item align)",
+      "last_verified": "a518834 2026-08-23"
     },
     {
       "operation": "POST /Items/{itemId}/RemoteImages/Download",
@@ -1752,8 +1752,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness).",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "classification": "",
+      "last_verified": null
     },
     {
       "operation": "GET /Items/{itemId}/RemoteImages/Providers",
@@ -1765,8 +1765,8 @@
       "schema_valid": true,
       "note": "H=200 J=200",
       "deep_verified": false,
-      "classification": "deferred: remote image providers feature-gated off.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "classification": "flagged: read diff vs Jellyfin (sweep single-item align)",
+      "last_verified": "a518834 2026-08-23"
     },
     {
       "operation": "GET /Items/{itemId}/RemoteSearch/Subtitles/{language}",
@@ -1792,7 +1792,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "remote-opt-in: needs an opensubtitles.com account and the public internet. With OPENSUBTITLES_USERNAME/PASSWORD/API_KEY set, the parity leg installs the plugin on the oracle, configures both, and the remote-subtitle journey (search -> download -> stream read-back -> provider file) runs live.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "GET /Items/{itemId}/Similar",
@@ -1804,8 +1804,8 @@
       "schema_valid": true,
       "note": "H=200 J=200",
       "deep_verified": false,
-      "classification": "deferred: weighted GetSimilarityScore scorer not ported; the single-year metadata-poor fixture also has no stable target (every candidate ties under Jellyfin's Random tiebreak).",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "classification": "instance/methodology: Jellyfin 10.11.8 serves /Similar from a flat Genres/Tags query ordered Random (non-deterministic, not diffable); Ferrofin implements upstream master's weighted SimilarItemsManager (genre 10/tag 5/studio 5/director 50/actor 15 + IsPlayed/user-access phase-2 filter, Episode/by-name short-circuit). Verified by unit tests against the C# weights.",
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "GET /Items/{itemId}/SpecialFeatures",
@@ -1870,7 +1870,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "GET /Libraries/AvailableOptions",
@@ -1883,7 +1883,7 @@
       "note": "H=200 J=200",
       "deep_verified": false,
       "classification": "verified 2026-08-11: LibraryOptionsResultDto (MetadataReaders/MetadataSavers/SubtitleFetchers/LyricFetchers/MediaSegmentProviders/TypeOptions), status+schema conformant.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "POST /Library/Media/Updated",
@@ -1895,8 +1895,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "deferred-hollow: filesystem-change webhook handed to NoopLibraryMonitor (not wired); documented deferral.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "classification": "",
+      "last_verified": null
     },
     {
       "operation": "GET /Library/MediaFolders",
@@ -1909,7 +1909,7 @@
       "note": "H=200 J=200",
       "deep_verified": false,
       "classification": "instance: after WI-7 the folder COUNT matches; residual is /config-vs-/data path-alignment noise on the folder rows.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "POST /Library/Movies/Added",
@@ -1921,8 +1921,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "deferred-hollow: filesystem-change webhook handed to NoopLibraryMonitor (not wired); documented deferral.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "classification": "",
+      "last_verified": null
     },
     {
       "operation": "POST /Library/Movies/Updated",
@@ -1934,8 +1934,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "deferred-hollow: filesystem-change webhook handed to NoopLibraryMonitor (not wired); documented deferral.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "classification": "",
+      "last_verified": null
     },
     {
       "operation": "GET /Library/PhysicalPaths",
@@ -1948,7 +1948,7 @@
       "note": "H=200 J=200",
       "deep_verified": false,
       "classification": "instance: data-dir-relative physical paths differ by container (/config vs /data).",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "POST /Library/Refresh",
@@ -1973,8 +1973,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "deferred-hollow: filesystem-change webhook handed to NoopLibraryMonitor (not wired); documented deferral.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "classification": "",
+      "last_verified": null
     },
     {
       "operation": "POST /Library/Series/Updated",
@@ -1986,8 +1986,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "deferred-hollow: filesystem-change webhook handed to NoopLibraryMonitor (not wired); documented deferral.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "classification": "",
+      "last_verified": null
     },
     {
       "operation": "DELETE /Library/VirtualFolders",
@@ -2130,7 +2130,7 @@
       "note": "H=200 J=500",
       "deep_verified": null,
       "classification": "requires-livetv-tuner: the fixture tuner (M3U + XMLTV, two channels) exists, but no probe exercises this op yet \u2014 needs a channel-mapping probe against the fixture's listings provider.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "POST /LiveTv/ChannelMappings",
@@ -2143,7 +2143,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "requires-livetv-tuner: the fixture tuner (M3U + XMLTV, two channels) exists, but no probe exercises this op yet \u2014 needs a channel-mapping probe against the fixture's listings provider.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "GET /LiveTv/Channels",
@@ -2182,7 +2182,7 @@
       "note": "H=200 J=200",
       "deep_verified": false,
       "classification": "instance: now-relative guide window (now .. now+7d) matches Jellyfin's behavior, but the exact StartDate/EndDate timestamps can't match across two independently-clocked servers.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "GET /LiveTv/Info",
@@ -2208,7 +2208,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "requires-livetv-tuner: the fixture tuner (M3U + XMLTV, two channels) exists, but no probe exercises this op yet \u2014 needs a journey that removes the fixture's listings provider and observes the guide emptying.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "POST /LiveTv/ListingProviders",
@@ -2247,7 +2247,7 @@
       "note": "H=200 J=404",
       "deep_verified": null,
       "classification": "requires-livetv-tuner: the fixture tuner (M3U + XMLTV, two channels) exists, but no probe exercises this op yet \u2014 needs a lineup probe (needs a Schedules Direct-style provider; xmltv has none).",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "GET /LiveTv/ListingProviders/SchedulesDirect/Countries",
@@ -2259,8 +2259,8 @@
       "schema_valid": false,
       "note": "H=200 J=200",
       "deep_verified": false,
-      "classification": "deferred: Jellyfin proxies json.schedulesdirect.org; Ferrofin has no Schedules Direct DVR provider (returns empty). Subsystem decision.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "classification": "flagged: read diff vs Jellyfin (sweep single-item align)",
+      "last_verified": "a518834 2026-08-23"
     },
     {
       "operation": "GET /LiveTv/LiveRecordings/{recordingId}/stream",
@@ -2312,7 +2312,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "requires-livetv-tuner: the fixture tuner (M3U + XMLTV, two channels) exists, but no probe exercises this op yet \u2014 needs a programmes-by-body probe (the POST form of /LiveTv/Programs).",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "GET /LiveTv/Programs/Recommended",
@@ -2390,7 +2390,7 @@
       "note": "unresolved path param: groupId",
       "deep_verified": null,
       "classification": "requires-livetv-tuner: the fixture tuner (M3U + XMLTV, two channels) exists, but no probe exercises this op yet \u2014 needs a recordings-group probe once a recording exists.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "GET /LiveTv/Recordings/Series",
@@ -2455,7 +2455,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "requires-livetv-tuner: the fixture tuner (M3U + XMLTV, two channels) exists, but no probe exercises this op yet \u2014 needs a series-timer journey (create from a programme \u2192 list \u2192 delete).",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "DELETE /LiveTv/SeriesTimers/{timerId}",
@@ -2468,7 +2468,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "requires-livetv-tuner: the fixture tuner (M3U + XMLTV, two channels) exists, but no probe exercises this op yet \u2014 needs a series-timer journey (create from a programme \u2192 list \u2192 delete).",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "GET /LiveTv/SeriesTimers/{timerId}",
@@ -2481,7 +2481,7 @@
       "note": "unresolved path param: timerId",
       "deep_verified": null,
       "classification": "requires-livetv-tuner: the fixture tuner (M3U + XMLTV, two channels) exists, but no probe exercises this op yet \u2014 needs a series-timer journey (create from a programme \u2192 list \u2192 delete).",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "POST /LiveTv/SeriesTimers/{timerId}",
@@ -2494,7 +2494,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "requires-livetv-tuner: the fixture tuner (M3U + XMLTV, two channels) exists, but no probe exercises this op yet \u2014 needs a series-timer journey (create from a programme \u2192 list \u2192 delete).",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "GET /LiveTv/Timers",
@@ -2533,7 +2533,7 @@
       "note": "H=200 J=200",
       "deep_verified": false,
       "classification": "verified 2026-08-11: SeriesTimerInfoDto defaults (ChannelId/Days/padding flags/\u2026), 200 + schema conformant.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "DELETE /LiveTv/Timers/{timerId}",
@@ -2572,7 +2572,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "requires-livetv-tuner: the fixture tuner (M3U + XMLTV, two channels) exists, but no probe exercises this op yet \u2014 needs an update step in the timer journey (change pre-padding, read back).",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "DELETE /LiveTv/TunerHosts",
@@ -2585,7 +2585,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "requires-livetv-tuner: the fixture tuner (M3U + XMLTV, two channels) exists, but no probe exercises this op yet \u2014 needs a journey that removes the fixture tuner and observes its channels going.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "POST /LiveTv/TunerHosts",
@@ -2610,8 +2610,8 @@
       "schema_valid": true,
       "note": "H=200 J=200",
       "deep_verified": false,
-      "classification": "deferred: Ferrofin implements only the M3U tuner-host type and correctly advertises only that; HDHomeRun/etc. tuner hosts are unported.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "classification": "open-work (NOT accepted): Ferrofin advertises only the M3U tuner host; Jellyfin also lists HDHomeRun. Port of HdHomerunHost (~1.2K C# LOC: UDP discovery, lineup, legacy control protocol, HTTP/UDP streams) is an open work item \u2014 see brain/DEFERRED.md 2026-08-22 sweep.",
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "GET /LiveTv/Tuners/Discover",
@@ -2650,7 +2650,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "requires-livetv-tuner: the fixture tuner (M3U + XMLTV, two channels) exists, but no probe exercises this op yet \u2014 needs a tuner-reset probe with the fixture tuner's id.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "GET /Localization/Countries",
@@ -2728,7 +2728,7 @@
       "note": "H=200 J=404",
       "deep_verified": null,
       "classification": "expected-extension: MediaSegmentsApi is a compiled-in Ferrofin plugin; stock Jellyfin 10.11.8 lacks it (J=404 without the plugin installed). JSON API, not streaming.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "POST /MediaSegmentsApi/{itemId}",
@@ -2741,7 +2741,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "expected-extension: MediaSegmentsApi is a compiled-in Ferrofin plugin; stock Jellyfin 10.11.8 lacks it (J=404 without the plugin installed). JSON API, not streaming.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "DELETE /MediaSegmentsApi/{segmentId}",
@@ -2754,7 +2754,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "expected-extension: MediaSegmentsApi is a compiled-in Ferrofin plugin; stock Jellyfin 10.11.8 lacks it (J=404 without the plugin installed). JSON API, not streaming.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "POST /MergeVersions/MergeEpisodes",
@@ -2767,7 +2767,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": false,
       "classification": "expected-extension: Ferrofin ships the MergeVersions controller compiled-in; stock Jellyfin 10.11.8 lacks it (H=2xx vs J=404). By design.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "POST /MergeVersions/MergeMovies",
@@ -2780,7 +2780,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": false,
       "classification": "expected-extension: Ferrofin ships the MergeVersions controller (danieladov 'Merge Versions' plugin surface) compiled-in; stock Jellyfin 10.11.8 lacks it (H=2xx vs J=404). By design.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "POST /MergeVersions/SplitEpisodes",
@@ -2793,7 +2793,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": false,
       "classification": "expected-extension: Ferrofin ships the MergeVersions controller compiled-in; stock Jellyfin 10.11.8 lacks it (H=2xx vs J=404). By design.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "POST /MergeVersions/SplitMovies",
@@ -2806,7 +2806,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": false,
       "classification": "expected-extension: Ferrofin ships the MergeVersions controller compiled-in; stock Jellyfin 10.11.8 lacks it (H=2xx vs J=404). By design.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "GET /Movies/Recommendations",
@@ -2818,8 +2818,8 @@
       "schema_valid": true,
       "note": "H=200 J=200",
       "deep_verified": true,
-      "classification": "deferred: Ferrofin seeds recommendations off DateCreated recency, not user behavior (played/favorites/people). Real gap but L-effort and only observable on a fixture with user data.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "classification": "ok",
+      "last_verified": "a518834 2026-08-23"
     },
     {
       "operation": "GET /Movies/{itemId}/Similar",
@@ -2831,8 +2831,8 @@
       "schema_valid": true,
       "note": "H=200 J=200",
       "deep_verified": false,
-      "classification": "deferred: same weighted similarity scorer as Items/{id}/Similar.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "classification": "instance/methodology: Jellyfin 10.11.8 serves /Similar from a flat Genres/Tags query ordered Random (non-deterministic, not diffable); Ferrofin implements upstream master's weighted SimilarItemsManager (genre 10/tag 5/studio 5/director 50/actor 15 + IsPlayed/user-access phase-2 filter, Episode/by-name short-circuit). Verified by unit tests against the C# weights.",
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "GET /MusicGenres",
@@ -2845,7 +2845,7 @@
       "note": "H=200 J=200",
       "deep_verified": false,
       "classification": "verified 2026-08-11: QueryResult<BaseItemDto>, status+schema conformant (same by-name list shape as /Genres).",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "GET /MusicGenres/InstantMix",
@@ -2949,7 +2949,7 @@
       "note": "H=200 J=200",
       "deep_verified": false,
       "classification": "instance: aggregates the enabled repositories' manifests (PackageInfo[]) plus synthesized compiled-in entries; repositoryName/Url stamped from the repository actually fetched (manifest claims are untrusted); manifest fetch is size-capped + timed out. Catalog content is repository-config-specific \u2014 harness instances configure none \u2014 so nothing to diff. Verified 2026-08-14 by unit + server HTTP tests.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "POST /Packages/Installed/{name}",
@@ -2962,7 +2962,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "accepted-divergence: repository install of WASM plugins is real (2026-08-14: ABI gate \u2192 HTTPS-per-hop download \u2192 streamed size cap \u2192 sha256/md5 verify \u2192 component+identity validation \u2192 guid-squat refusal \u2192 atomic stage \u2192 restart-required; admin-only; end-to-end server test). Divergence vs Jellyfin: the install is SYNCHRONOUS \u2014 none of the PackageInstalling/Completed/Failed/Cancelled WebSocket messages are emitted (no dashboard progress; a slow repo holds the POST open), and the plugin appears in /Plugins only after the activating restart. Async install + Package* push is the recorded follow-up (WebSocket-push backlog).",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "DELETE /Packages/Installing/{packageId}",
@@ -2975,7 +2975,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "accepted-divergence: always 404 \u2014 installs are synchronous, so no tracked installation exists to cancel (Jellyfin tracks async installs). Admin-only.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "GET /Packages/{name}",
@@ -2988,7 +2988,7 @@
       "note": "H=404 J=404",
       "deep_verified": null,
       "classification": "instance: resolves a package by name/assemblyGuid from the aggregated repository catalog \u2014 catalog content is repository-config-specific, and the harness instances configure none, so there is no package to diff. Route verified 2026-08-14 by unit + server HTTP tests.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "GET /Persons",
@@ -3014,7 +3014,7 @@
       "note": "H=404 J=404",
       "deep_verified": false,
       "classification": "accepted-divergence: same no-lazy-create-on-GET family as /Studios/{name}. Existing person\u2192200 BaseItemDto, absent\u2192404 (both servers 404 in the harness run). Shape verified.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "GET /Persons/{name}/Images/{imageType}",
@@ -3144,7 +3144,7 @@
       "note": "H=200 J=404",
       "deep_verified": null,
       "classification": "expected-extension: Ferrofin generates an instant mix for a playlist (H=200); stock Jellyfin returns 404 (playlists are not an instant-mix source). A harmless superset.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "GET /Playlists/{playlistId}",
@@ -3248,7 +3248,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": false,
       "classification": "instance/methodology: Ferrofin correctly removes the playlist share (H read-back shows it gone); Jellyfin returns 204 but still lists the user (Jellyfin quirk), so Ferrofin is the more-correct side \u2014 not a defect.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "GET /Playlists/{playlistId}/Users/{userId}",
@@ -3287,7 +3287,7 @@
       "note": "H=200 J=200",
       "deep_verified": false,
       "classification": "expected-extension: lists Ferrofin's installed plugins (compiled-in extensions + staged WASM plugins) \u2014 the set necessarily differs from any stock Jellyfin instance. Route is real and schema-conformant (server HTTP tests).",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "DELETE /Plugins/{pluginId}",
@@ -3300,7 +3300,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "accepted-divergence: real uninstall for a staged WASM plugin (file + config + enabled override removed, restart-required); a compiled-in extension honestly rejects with 400 where Jellyfin can uninstall any plugin. Admin-only.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "GET /Plugins/{pluginId}/Configuration",
@@ -3313,7 +3313,7 @@
       "note": "unresolved path param: pluginId",
       "deep_verified": null,
       "classification": "instance: the two servers share no plugin id (Ferrofin ships compiled-in extensions + WASM plugins; stock Jellyfin ships neither), so there is no config to fetch on both sides. Real read (stored values overlaid on defaults, C# partial-deserialize semantics); verified 2026-08-14 by unit + handler tests.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "POST /Plugins/{pluginId}/Configuration",
@@ -3326,7 +3326,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "instance: no shared plugin id across the two servers, so no config write to diff. Real write (JSON-validated, persisted; admin-only \u2014 a WASM plugin's config is guest input); verified 2026-08-14 by unit + handler tests incl. 403.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "POST /Plugins/{pluginId}/Manifest",
@@ -3339,7 +3339,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "instance: no shared plugin id across the two servers, so no manifest to fetch on both sides. Real read (GetPluginManifest port); verified 2026-08-14 by handler tests.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "DELETE /Plugins/{pluginId}/{version}",
@@ -3352,7 +3352,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "accepted-divergence: real uninstall for a staged WASM plugin (restart-required); a compiled-in extension honestly rejects with 400 where Jellyfin can uninstall any plugin. Admin-only.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "POST /Plugins/{pluginId}/{version}/Disable",
@@ -3365,7 +3365,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "accepted-divergence: real enabled-flag toggle (admin-only), but a freshly repository-installed WASM plugin 404s until its activating restart (not in the registry until the boot that loads it) while Jellyfin already lists it restart-pending. Cosmetic pre-restart window.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "POST /Plugins/{pluginId}/{version}/Enable",
@@ -3378,7 +3378,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "accepted-divergence: real enabled-flag toggle (admin-only), but a freshly repository-installed WASM plugin 404s until its activating restart (not in the registry until the boot that loads it) while Jellyfin already lists it restart-pending. Cosmetic pre-restart window.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "GET /Plugins/{pluginId}/{version}/Image",
@@ -3391,7 +3391,7 @@
       "note": "unresolved path param: pluginId,version",
       "deep_verified": null,
       "classification": "instance: no shared plugin id across the two servers, so no image to fetch on both sides. Real read (bundled image bytes + content type); verified 2026-08-14 by handler tests.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "GET /Providers/Lyrics/{lyricId}",
@@ -3403,8 +3403,8 @@
       "schema_valid": null,
       "note": "unresolved path param: lyricId",
       "deep_verified": null,
-      "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness).",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "classification": "",
+      "last_verified": null
     },
     {
       "operation": "GET /Providers/Subtitles/Subtitles/{subtitleId}",
@@ -3417,7 +3417,7 @@
       "note": "unresolved path param: subtitleId",
       "deep_verified": null,
       "classification": "remote-opt-in: needs an opensubtitles.com account and the public internet. With OPENSUBTITLES_USERNAME/PASSWORD/API_KEY set, the parity leg installs the plugin on the oracle, configures both, and the remote-subtitle journey (search -> download -> stream read-back -> provider file) runs live.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "POST /QuickConnect/Authorize",
@@ -3482,7 +3482,7 @@
       "note": "H=200 J=200",
       "deep_verified": false,
       "classification": "instance: returns the admin-configured package repositories \u2014 instance-local state (harness instances configure none), nothing to diff. Verified 2026-08-14 by unit + handler tests.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "POST /Repositories",
@@ -3495,7 +3495,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "instance: replaces the configured package repositories (admin-only, RequiresElevation port) \u2014 instance-local state, nothing to diff. Verified 2026-08-14 by unit + handler tests incl. 403 for non-admin.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "GET /ScheduledTasks",
@@ -3508,7 +3508,7 @@
       "note": "H=200 J=200",
       "deep_verified": false,
       "classification": "instance: LastExecutionResult depends on whether/when a task last ran.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "DELETE /ScheduledTasks/Running/{taskId}",
@@ -3572,8 +3572,8 @@
       "schema_valid": null,
       "note": "H=400 J=400",
       "deep_verified": false,
-      "classification": "deferred: search path is correct; the missing Genre hint is because remote metadata (TMDB) is feature-gated off and the synthetic fixture carries no NFO <genre>.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "classification": "flagged: read diff vs Jellyfin (verify)",
+      "last_verified": "a518834 2026-08-23"
     },
     {
       "operation": "GET /Sessions",
@@ -3845,8 +3845,8 @@
       "schema_valid": true,
       "note": "H=200 J=200",
       "deep_verified": false,
-      "classification": "deferred: weighted similarity scorer not ported.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "classification": "instance/methodology: Jellyfin 10.11.8 serves /Similar from a flat Genres/Tags query ordered Random (non-deterministic, not diffable); Ferrofin implements upstream master's weighted SimilarItemsManager (genre 10/tag 5/studio 5/director 50/actor 15 + IsPlayed/user-access phase-2 filter, Episode/by-name short-circuit). Verified by unit tests against the C# weights.",
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "GET /Shows/{seriesId}/Episodes",
@@ -3885,7 +3885,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "POST /SkipButtonCss/UpdateSkipDuration",
@@ -3898,7 +3898,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "GET /Songs/{itemId}/InstantMix",
@@ -4002,7 +4002,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": false,
       "classification": "accepted-divergence: post-setup the first user already has a password and the contract is 403 (the Forbid guard upstream added in v12, ported by Ferrofin); Jellyfin 10.11.8 predates it and answers 204, silently re-setting the admin password. The journey asserts the correct contract (H=403 J=204).",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "GET /Studios",
@@ -4028,7 +4028,7 @@
       "note": "H=404 J=200",
       "deep_verified": false,
       "classification": "accepted-divergence: Ferrofin does not lazily CREATE a by-name item on a GET (Jellyfin's GetItemByName writes a row as a read side-effect \u2192 J=200 for an absent studio). Ferrofin returns the item if it exists (200, BaseItemDto) else 404 \u2014 a GET with no filesystem write. Verified live 2026-08-11: existing\u2192200, absent\u2192404.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "GET /Studios/{name}/Images/{imageType}",
@@ -4093,7 +4093,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "verified-by-push-probe: the response body carries no signal here \u2014 the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py).",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "POST /SyncPlay/Join",
@@ -4106,7 +4106,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "verified-by-push-probe: the response body carries no signal here \u2014 the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py).",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "POST /SyncPlay/Leave",
@@ -4119,7 +4119,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "verified-by-push-probe: the response body carries no signal here \u2014 the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py).",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "GET /SyncPlay/List",
@@ -4145,7 +4145,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "verified-by-push-probe: the response body carries no signal here \u2014 the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py).",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "POST /SyncPlay/New",
@@ -4158,7 +4158,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "verified-by-push-probe: the response body carries no signal here \u2014 the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py).",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "POST /SyncPlay/NextItem",
@@ -4171,7 +4171,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "verified-by-push-probe: the response body carries no signal here \u2014 the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py).",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "POST /SyncPlay/Pause",
@@ -4184,7 +4184,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "verified-by-push-probe: the response body carries no signal here \u2014 the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py).",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "POST /SyncPlay/Ping",
@@ -4197,7 +4197,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "verified-by-push-probe: the response body carries no signal here \u2014 the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py).",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "POST /SyncPlay/PreviousItem",
@@ -4210,7 +4210,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "verified-by-push-probe: the response body carries no signal here \u2014 the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py).",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "POST /SyncPlay/Queue",
@@ -4223,7 +4223,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "verified-by-push-probe: the response body carries no signal here \u2014 the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py).",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "POST /SyncPlay/Ready",
@@ -4236,7 +4236,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "verified-by-push-probe: the response body carries no signal here \u2014 the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py).",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "POST /SyncPlay/RemoveFromPlaylist",
@@ -4249,7 +4249,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "verified-by-push-probe: the response body carries no signal here \u2014 the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py).",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "POST /SyncPlay/Seek",
@@ -4262,7 +4262,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "verified-by-push-probe: the response body carries no signal here \u2014 the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py).",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "POST /SyncPlay/SetIgnoreWait",
@@ -4275,7 +4275,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "verified-by-push-probe: the response body carries no signal here \u2014 the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py).",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "POST /SyncPlay/SetNewQueue",
@@ -4288,7 +4288,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "verified-by-push-probe: the response body carries no signal here \u2014 the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py).",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "POST /SyncPlay/SetPlaylistItem",
@@ -4301,7 +4301,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "verified-by-push-probe: the response body carries no signal here \u2014 the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py).",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "POST /SyncPlay/SetRepeatMode",
@@ -4314,7 +4314,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "verified-by-push-probe: the response body carries no signal here \u2014 the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py).",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "POST /SyncPlay/SetShuffleMode",
@@ -4327,7 +4327,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "verified-by-push-probe: the response body carries no signal here \u2014 the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py).",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "POST /SyncPlay/Stop",
@@ -4340,7 +4340,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "verified-by-push-probe: the response body carries no signal here \u2014 the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py).",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "POST /SyncPlay/Unpause",
@@ -4353,7 +4353,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "verified-by-push-probe: the response body carries no signal here \u2014 the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py).",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "GET /SyncPlay/{id}",
@@ -4366,7 +4366,7 @@
       "note": "H=404 J=404",
       "deep_verified": null,
       "classification": "verified-by-push-probe: the response body carries no signal here \u2014 the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py).",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "GET /System/ActivityLog/Entries",
@@ -4379,7 +4379,7 @@
       "note": "H=200 J=200",
       "deep_verified": false,
       "classification": "instance: activity-log entries differ per instance/run.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "GET /System/Configuration",
@@ -4392,7 +4392,7 @@
       "note": "H=200 J=200",
       "deep_verified": false,
       "classification": "instance/methodology: real default fields (PluginRepositories/EnableLegacyAuthorization/CacheSize) now match; residual IsStartupWizardCompleted/IsPortAuthorized reflect the harness completing Jellyfin's wizard during setup while Ferrofin auto-seeds \u2014 setup state, not a bug.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "POST /System/Configuration",
@@ -4509,7 +4509,7 @@
       "note": "H=200 J=200",
       "deep_verified": false,
       "classification": "instance: per-host disk paths and free/used space.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "GET /System/Logs",
@@ -4522,7 +4522,7 @@
       "note": "H=200 J=200",
       "deep_verified": false,
       "classification": "instance: log-file set differs per instance/run.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "GET /System/Logs/Log",
@@ -4548,7 +4548,7 @@
       "note": "H=200 J=200",
       "deep_verified": false,
       "classification": "instance: returns the server name string (ferrofin vs the Jellyfin instance name).",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "POST /System/Ping",
@@ -4613,7 +4613,7 @@
       "note": "H=200 J=500",
       "deep_verified": null,
       "classification": "instance: Jellyfin 10.11.8 returns 500 here (its own error with no Trailers provider), while Ferrofin correctly returns 200 with an empty result. Kept correct per policy (do not port Jellyfin bugs); not a Ferrofin gap.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "GET /Trailers/{itemId}/Similar",
@@ -4625,8 +4625,8 @@
       "schema_valid": true,
       "note": "H=200 J=200",
       "deep_verified": false,
-      "classification": "deferred: weighted similarity scorer not ported.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "classification": "instance/methodology: Jellyfin 10.11.8 serves /Similar from a flat Genres/Tags query ordered Random (non-deterministic, not diffable); Ferrofin implements upstream master's weighted SimilarItemsManager (genre 10/tag 5/studio 5/director 50/actor 15 + IsPlayed/user-access phase-2 filter, Episode/by-name short-circuit). Verified by unit tests against the C# weights.",
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "DELETE /UserFavoriteItems/{itemId}",
@@ -4808,7 +4808,7 @@
       "note": "H=200 J=200",
       "deep_verified": false,
       "classification": "instance: view Path (and path-derived id) differ only by /config vs /data data-dir; identical under a shared data-dir. (Historic note: until the with_all_fields(false) fix the views also lacked ~25 default fields Jellyfin emits \u2014 that was a real defect, not instance noise; re-verify on the next sweep.)",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "GET /UserViews/GroupingOptions",
@@ -5315,7 +5315,7 @@
       "note": "H=200 J=200",
       "deep_verified": false,
       "classification": "expected-extension: Ferrofin does not materialize Year items (documented out-of-scope).",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "GET /Years/{year}",
@@ -5328,7 +5328,7 @@
       "note": "H=404 J=200",
       "deep_verified": null,
       "classification": "expected-extension: Ferrofin does not materialize Year items (documented out-of-scope; matches the GET /Years classification), so a single year has no item to return (H=404 vs J=200).",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "GET /web/ConfigurationPage",
@@ -5341,7 +5341,7 @@
       "note": "H=404 J=404",
       "deep_verified": null,
       "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     },
     {
       "operation": "GET /web/ConfigurationPages",
@@ -5354,7 +5354,7 @@
       "note": "H=200 J=200",
       "deep_verified": false,
       "classification": "expected-extension: plugin configuration pages come from external plugins Ferrofin doesn't host.",
-      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
+      "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)"
     }
   ]
 }

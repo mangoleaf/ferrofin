@@ -4,11 +4,12 @@
 //! `POST /Items/RemoteSearch/{kind}` searches and
 //! `POST /Items/RemoteSearch/Apply/{itemId}`.
 //!
-//! The remote fetchers are deferred, so a search with no provider registered
-//! returns `[]`. Here a provider-backed manager proves the typed query is
-//! deserialized, collapsed to the object-safe request, and its results are
-//! returned with the provider name stamped on. `Apply` resolves the item (`404`
-//! when absent) and drives the real `refresh_full_item` seam.
+//! A provider-backed manager proves the typed query is deserialized,
+//! collapsed to the object-safe request (base fields plus the type-specific
+//! album-artist / song-info / artist / series-name extras), and its results
+//! are returned with the provider name stamped on. `Apply` resolves the item
+//! (`404` when absent) and drives the `refresh_full_item` seam with the chosen
+//! result bound into the refresh options.
 
 use std::sync::Arc;
 
@@ -152,9 +153,16 @@ impl LibraryManager for OneItemLibrary {
     }
 }
 
+/// The last `(item, options)` the Apply route handed to `refresh_full_item`.
+type RefreshRecorder = Arc<std::sync::Mutex<Option<(Uuid, MetadataRefreshOptions)>>>;
+
 /// A provider manager returning a fixed remote-search hit and a refresh that
-/// succeeds (proving the Apply route reaches the real seam).
-struct SearchProviders;
+/// succeeds (proving the Apply route reaches the real seam), recording the
+/// refresh it was handed.
+#[derive(Default)]
+struct SearchProviders {
+    last_refresh: RefreshRecorder,
+}
 
 #[async_trait]
 impl ProviderManager for SearchProviders {
@@ -162,9 +170,19 @@ impl ProviderManager for SearchProviders {
         &self,
         request: &RemoteSearchRequest,
     ) -> Result<Vec<RemoteSearchResult>, ServiceError> {
-        // Echo the searched name so the test can assert the query was decoded.
+        // Echo the searched name so the test can assert the query was decoded,
+        // and the type-specific extras (`album artists | song count | artists |
+        // series name`) so the seam is proven to carry them.
         Ok(vec![RemoteSearchResult {
             name: request.search_info.name.clone(),
+            overview: Some(format!(
+                "{}|{}|{}|{}",
+                request.album_artists.join(","),
+                request.song_infos.len(),
+                request.artists.join(","),
+                request.series_name.clone().unwrap_or_default()
+            )),
+            provider_ids: request.artist_provider_ids.clone(),
             search_provider_name: Some("TheMovieDb".to_owned()),
             ..RemoteSearchResult::default()
         }])
@@ -172,9 +190,10 @@ impl ProviderManager for SearchProviders {
 
     async fn refresh_full_item(
         &self,
-        _item_id: Uuid,
-        _options: &MetadataRefreshOptions,
+        item_id: Uuid,
+        options: &MetadataRefreshOptions,
     ) -> Result<(), ServiceError> {
+        *self.last_refresh.lock().unwrap() = Some((item_id, options.clone()));
         Ok(())
     }
 
@@ -261,18 +280,37 @@ impl ProviderManager for SearchProviders {
 /// nine typed searches on plain `[Authorize]` — is pinned by
 /// [`only_person_and_apply_require_elevation`].
 fn state() -> AppState {
-    elevated_state_with_library_and_providers(Arc::new(OneItemLibrary), Arc::new(SearchProviders))
+    state_recording(RefreshRecorder::default())
+}
+
+/// The elevated [`AppState`] whose provider manager records refreshes into
+/// `recorder`.
+fn state_recording(recorder: RefreshRecorder) -> AppState {
+    elevated_state_with_library_and_providers(
+        Arc::new(OneItemLibrary),
+        Arc::new(SearchProviders {
+            last_refresh: recorder,
+        }),
+    )
 }
 
 /// The plain-user [`AppState`], for proving which routes an ordinary account
 /// may still reach.
 fn user_state() -> AppState {
-    authed_state_with_library_and_providers(Arc::new(OneItemLibrary), Arc::new(SearchProviders))
+    authed_state_with_library_and_providers(
+        Arc::new(OneItemLibrary),
+        Arc::new(SearchProviders::default()),
+    )
 }
 
 /// Sends one request through the real router, returning `(status, body bytes)`.
 async fn send(method: &str, uri: &str, body: Body) -> (StatusCode, Vec<u8>) {
-    let router = create_router(state());
+    send_to(state(), method, uri, body).await
+}
+
+/// Sends one request through the real router over `state`.
+async fn send_to(state: AppState, method: &str, uri: &str, body: Body) -> (StatusCode, Vec<u8>) {
+    let router = create_router(state);
     let response = router
         .oneshot(
             Request::builder()
@@ -335,14 +373,77 @@ async fn remote_search_accepts_empty_body() {
     assert!(results[0].name.is_none());
 }
 
-/// Apply on an existing item drives the refresh seam and returns `204`.
+/// The type-specific lookup fields cross the object-safe seam: an album's
+/// artists / artist provider ids / song infos, a music video's artists, a
+/// book's series name.
+#[tokio::test]
+async fn typed_lookup_extras_cross_the_seam() {
+    let album = r#"{"SearchInfo":{"Name":"Kind of Blue","AlbumArtists":["Miles Davis"],
+        "ArtistProviderIds":{"MusicBrainzArtist":"mb-artist"},
+        "SongInfos":[{"Name":"So What"},{"Name":"Blue in Green"}]}}"#;
+    let (status, bytes) = send("POST", "/Items/RemoteSearch/MusicAlbum", Body::from(album)).await;
+    assert_eq!(status, StatusCode::OK);
+    let results: Vec<RemoteSearchResult> = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(results[0].overview.as_deref(), Some("Miles Davis|2||"));
+    assert_eq!(
+        results[0].provider_ids.as_ref().unwrap()["MusicBrainzArtist"],
+        "mb-artist"
+    );
+
+    let artist = r#"{"SearchInfo":{"Name":"Miles Davis","SongInfos":[{"Name":"So What"}]}}"#;
+    let (_, bytes) = send(
+        "POST",
+        "/Items/RemoteSearch/MusicArtist",
+        Body::from(artist),
+    )
+    .await;
+    let results: Vec<RemoteSearchResult> = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(results[0].overview.as_deref(), Some("|1||"));
+
+    let video = r#"{"SearchInfo":{"Name":"Thriller","Artists":["Michael Jackson"]}}"#;
+    let (_, bytes) = send("POST", "/Items/RemoteSearch/MusicVideo", Body::from(video)).await;
+    let results: Vec<RemoteSearchResult> = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(results[0].overview.as_deref(), Some("|0|Michael Jackson|"));
+
+    let book = r#"{"SearchInfo":{"Name":"Mort","SeriesName":"Discworld"}}"#;
+    let (_, bytes) = send("POST", "/Items/RemoteSearch/Book", Body::from(book)).await;
+    let results: Vec<RemoteSearchResult> = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(results[0].overview.as_deref(), Some("|0||Discworld"));
+}
+
+/// Apply on an existing item drives the refresh seam with the chosen result
+/// bound into a full, replace-all refresh, and returns `204`.
 #[tokio::test]
 async fn apply_refreshes_existing_item() {
     let uri = format!("/Items/RemoteSearch/Apply/{ITEM_ID}");
-    let body = Body::from(r#"{"ProviderIds":{"Tmdb":"603"}}"#);
-    let (status, bytes) = send("POST", &uri, body).await;
+    let body =
+        Body::from(r#"{"Name":"The Matrix","ProductionYear":1999,"ProviderIds":{"Tmdb":"603"}}"#);
+    let recorder = RefreshRecorder::default();
+    let (status, bytes) = send_to(state_recording(recorder.clone()), "POST", &uri, body).await;
     assert_eq!(status, StatusCode::NO_CONTENT);
     assert!(bytes.is_empty());
+
+    let (item_id, options) = recorder.lock().unwrap().clone().expect("refresh ran");
+    assert_eq!(item_id, ITEM_ID);
+    assert_eq!(
+        options.metadata_refresh_mode,
+        ferrofin_traits::providers::MetadataRefreshMode::FullRefresh
+    );
+    assert_eq!(
+        options.image_refresh_mode,
+        ferrofin_traits::providers::MetadataRefreshMode::FullRefresh
+    );
+    assert!(options.replace_all_metadata);
+    assert!(
+        options.replace_all_images,
+        "replaceAllImages defaults to true"
+    );
+    let chosen = options
+        .search_result
+        .expect("the chosen result rides along");
+    assert_eq!(chosen.name.as_deref(), Some("The Matrix"));
+    assert_eq!(chosen.production_year, Some(1999));
+    assert_eq!(chosen.provider_ids.unwrap()["Tmdb"], "603");
 }
 
 /// Apply respects the `replaceAllImages` query flag (still `204`).

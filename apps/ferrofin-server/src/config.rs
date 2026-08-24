@@ -139,6 +139,7 @@ struct FileConfig {
     wasm_image_timeout_secs: Option<u32>,
     wasm_write_content_mb: Option<u32>,
     wasm_subtitle_extract_mb: Option<u32>,
+    playback_metrics_queue: Option<u32>,
 }
 
 /// The `db_pool` value in `config.toml`: an explicit SQLite connection count,
@@ -377,6 +378,16 @@ pub struct Config {
     /// `wasm_subtitle_extract_mb` in `config.toml` > default.
     pub wasm_subtitle_extract_mb: Option<u32>,
 
+    /// Depth of the playback-metrics write queue, in events. `None`/zero =
+    /// `ferrofin_core::playback_metrics::DEFAULT_QUEUE_DEPTH`. The recorder
+    /// hands each PlaybackInfo decision and playstate update to this queue and
+    /// returns, so a WAL checkpoint never stalls a playback request; a full
+    /// queue drops the event with a warning rather than blocking. Raise it if
+    /// `playback-metrics queue full` shows up in the log under a load spike.
+    /// Resolved `FERROFIN_PLAYBACK_METRICS_QUEUE` env >
+    /// `playback_metrics_queue` in `config.toml` > default.
+    pub playback_metrics_queue: Option<u32>,
+
     /// Concurrent media-decode budget for WASM plugin analysis
     /// (`extract-audio`/`extract-frames`). `None`/zero = a quarter of the
     /// visible cores, at least one — plugin analysis must never starve
@@ -600,6 +611,8 @@ impl Config {
                 .or(file.wasm_write_content_mb),
             wasm_subtitle_extract_mb: parse_var(env, "FERROFIN_WASM_SUBTITLE_EXTRACT_MB")
                 .or(file.wasm_subtitle_extract_mb),
+            playback_metrics_queue: parse_var(env, "FERROFIN_PLAYBACK_METRICS_QUEUE")
+                .or(file.playback_metrics_queue),
         })
     }
 
@@ -687,6 +700,7 @@ impl Config {
             wasm_image_timeout_secs: None,
             wasm_write_content_mb: None,
             wasm_subtitle_extract_mb: None,
+            playback_metrics_queue: None,
         }
     }
 }

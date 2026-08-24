@@ -81,9 +81,9 @@ fn user() -> UserEntity {
 /// `Info/Storage`, `Logs`, `Logs/Log` and `Shutdown`. Off by default so
 /// `Info/Public`, `Ping` and `Endpoint` keep proving they work unelevated.
 ///
-/// `Restart` is deliberately NOT gated: upstream guards it with
-/// `LocalAccessOrRequiresElevation`, a different policy Ferrofin does not
-/// implement yet.
+/// `Restart` is gated too, but by `LocalAccessOrRequiresElevation` — the
+/// caller's peer address decides, and `elevated` only matters off-network. Its
+/// tests inject `ConnectInfo` rather than relying on this flag.
 struct OkAuth {
     elevated: bool,
 }
@@ -552,6 +552,118 @@ async fn system_restart_and_shutdown_no_content() {
     )
     .await;
     assert_eq!(s, StatusCode::NO_CONTENT);
+}
+
+/// `POST /System/Restart` from `peer`, as the state's user.
+///
+/// `peer` is injected the way the composition root's `with_connect_info` does
+/// it — as a `ConnectInfo` request extension — so the policy sees a real peer
+/// address. `None` stands for a request with no connection to ask.
+async fn restart_from(app: AppState, peer: Option<&str>) -> StatusCode {
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/System/Restart")
+        .header("X-Emby-Token", "tok")
+        .body(Body::empty())
+        .unwrap();
+    if let Some(peer) = peer {
+        request.extensions_mut().insert(axum::extract::ConnectInfo(
+            peer.parse::<std::net::SocketAddr>().unwrap(),
+        ));
+    }
+    create_router(app).oneshot(request).await.unwrap().status()
+}
+
+// `LocalAccessOrRequiresElevation`: someone at the machine (or on the LAN) may
+// restart it, a stranger may not. Before this gate the route took plain
+// `RequireAuth`, so any account with a token could bounce the server from
+// anywhere.
+#[tokio::test]
+async fn restart_is_allowed_from_the_local_network_whoever_asks() {
+    for peer in [
+        "127.0.0.1:5000",
+        "[::1]:5000",
+        "192.168.1.5:5000",
+        "10.0.0.7:5000",
+    ] {
+        assert_eq!(
+            restart_from(full_state(), Some(peer)).await,
+            StatusCode::NO_CONTENT,
+            "{peer} is on the local network — a non-admin may restart from there"
+        );
+    }
+}
+
+// A dual-stack bind (`--bind ::`) delivers every IPv4 client as an
+// IPv4-mapped IPv6 address. Left unmapped, `::ffff:127.0.0.1` matches no IPv6
+// local prefix, so the same-machine web client reads as off-network.
+#[tokio::test]
+async fn restart_treats_ipv4_mapped_ipv6_peers_as_the_ipv4_address() {
+    for peer in ["[::ffff:127.0.0.1]:5000", "[::ffff:192.168.1.5]:5000"] {
+        assert_eq!(
+            restart_from(full_state(), Some(peer)).await,
+            StatusCode::NO_CONTENT,
+            "{peer} is a mapped local IPv4 address"
+        );
+    }
+    assert_eq!(
+        restart_from(full_state(), Some("[::ffff:203.0.113.9]:5000")).await,
+        StatusCode::FORBIDDEN,
+        "a mapped PUBLIC IPv4 address must stay remote — unmapping must not \
+         make everything local"
+    );
+}
+
+#[tokio::test]
+async fn restart_from_off_network_requires_an_administrator() {
+    for peer in ["203.0.113.9:5000", "[2001:db8::1]:5000"] {
+        assert_eq!(
+            restart_from(full_state(), Some(peer)).await,
+            StatusCode::FORBIDDEN,
+            "{peer} is off-network — an ordinary account must not restart the server"
+        );
+        assert_eq!(
+            restart_from(elevated_full_state(), Some(peer)).await,
+            StatusCode::NO_CONTENT,
+            "{peer} is off-network, but an administrator may still restart"
+        );
+    }
+}
+
+// Deliberate divergence: C# accepts a null peer address as local. Here the
+// address is missing only when there is no connection to ask, so the unknown
+// case is the guarded one rather than the permissive one.
+#[tokio::test]
+async fn restart_treats_an_unknown_peer_as_remote() {
+    assert_eq!(
+        restart_from(full_state(), None).await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        restart_from(elevated_full_state(), None).await,
+        StatusCode::NO_CONTENT
+    );
+}
+
+// `POST /System/Shutdown` is `RequiresElevation` in C# with no local-access
+// arm, so being on the LAN must not buy a non-admin a shutdown.
+#[tokio::test]
+async fn shutdown_stays_admin_only_even_from_the_local_network() {
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/System/Shutdown")
+        .header("X-Emby-Token", "tok")
+        .body(Body::empty())
+        .unwrap();
+    request.extensions_mut().insert(axum::extract::ConnectInfo(
+        "127.0.0.1:5000".parse::<std::net::SocketAddr>().unwrap(),
+    ));
+    let status = create_router(full_state())
+        .oneshot(request)
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]
