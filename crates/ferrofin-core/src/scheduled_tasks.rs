@@ -16,7 +16,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -39,6 +39,11 @@ const TICKS_PER_SECOND: i64 = 10_000_000;
 
 /// How often the scheduler evaluates triggers.
 const SCHEDULER_PERIOD: Duration = Duration::from_secs(30);
+
+/// How long a `StartupTrigger` waits before firing — upstream's
+/// `StartupTrigger.DelayMs` (3000), ported verbatim: the grace period keeps a
+/// task's first run off the boot critical path.
+const STARTUP_TRIGGER_DELAY: Duration = Duration::from_secs(3);
 
 /// A live handle a running task uses to report its completion percentage.
 ///
@@ -140,9 +145,23 @@ struct Registration {
     /// using the scheduler start (upstream's `IntervalTrigger.Start` does
     /// re-arm a due interval shortly after a reload).
     triggers_since: Option<DateTime<Utc>>,
+    /// Whether this key's `StartupTrigger` has already fired in this process —
+    /// set under the `tasks` lock by whichever path fires it (the scheduler's
+    /// startup sweep or a late [`register`](FerrofinTaskManager::register)),
+    /// and carried across a re-registration of the same key so a task cannot
+    /// be started twice at boot.
+    startup_fired: bool,
 }
 
 impl Registration {
+    /// Whether this registration's effective triggers include a
+    /// `StartupTrigger`.
+    fn has_startup_trigger(&self) -> bool {
+        self.effective_triggers()
+            .iter()
+            .any(|t| t.type_ == TaskTriggerInfoType::StartupTrigger)
+    }
+
     /// The triggers the scheduler acts on: the configured override, else the
     /// task's defaults.
     fn effective_triggers(&self) -> Vec<TaskTriggerInfo> {
@@ -186,6 +205,21 @@ pub struct FerrofinTaskManager {
     stored_overrides: Arc<Mutex<HashMap<String, Vec<TaskTriggerInfo>>>>,
     /// Where trigger overrides persist (`None` = in-memory only).
     store_path: Arc<Mutex<Option<PathBuf>>>,
+    /// Last run outcomes loaded from / persisted to `result_store_path`,
+    /// applied to a task when it registers so the dashboard's "Last ran"
+    /// column survives a restart (upstream keeps one history file per task).
+    stored_results: Arc<Mutex<HashMap<String, TaskResult>>>,
+    /// Where run outcomes persist (`None` = in-memory only).
+    result_store_path: Arc<Mutex<Option<PathBuf>>>,
+    /// Whether [`start_scheduler`](Self::start_scheduler) has run. A task
+    /// registered *after* that moment fires its own `StartupTrigger` on
+    /// registration (upstream arms each task's triggers when its worker is
+    /// constructed, so registration order cannot cost a task its startup run).
+    ///
+    /// Written and read **while holding the `tasks` lock**, so a task either
+    /// lands in the scheduler's startup snapshot or fires its own trigger —
+    /// never both, never neither.
+    scheduler_started: Arc<AtomicBool>,
     /// Optional domain-event seam: every recorded run outcome is published as
     /// a `TaskCompleted` event (the composition root forwards it to admin
     /// sessions as the `ScheduledTaskEnded` WebSocket push the dashboard
@@ -214,6 +248,79 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// Serializes `value` to `path` **atomically** (temp file + rename), creating
+/// the parent directory, and logs a warning on failure.
+///
+/// Persisting registry state is best-effort: a read-only config or data
+/// directory must never fail a task run. The rename matters because one file
+/// holds every task's state (upstream keeps one small file per task, so a torn
+/// write there costs one task) — a half-written file would take the whole map
+/// down with it.
+///
+/// Callers must hold the lock guarding `value` across this call, so concurrent
+/// writers cannot lose each other's updates.
+fn write_store<T: serde::Serialize>(path: &std::path::Path, value: &T, store: &str) {
+    let bytes = match serde_json::to_vec_pretty(value) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            tracing::warn!(store, error = %e, "failed to serialize task store");
+            return;
+        }
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    // One fixed temp name per store: writers are serialized by the caller's
+    // lock, and the two stores live in different directories. A crash between
+    // the write and the rename leaves a stale `.tmp` behind, overwritten by the
+    // next save.
+    let tmp = path.with_extension("json.tmp");
+    if let Err(e) = write_synced(&tmp, &bytes) {
+        tracing::warn!(store, path = %tmp.display(), error = %e, "failed to persist task store");
+        return;
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        tracing::warn!(store, path = %path.display(), error = %e, "failed to persist task store");
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+/// Writes `bytes` to `path` and flushes them to the device, so the rename that
+/// follows publishes a complete file rather than a possibly empty one.
+fn write_synced(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut file = std::fs::File::create(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
+}
+
+/// Reads a JSON store written by [`write_store`], returning an empty map when
+/// the file does not exist (a first boot) and warning — loudly, as upstream's
+/// `Error deserializing {File}` does — when it exists but cannot be parsed, so
+/// a corrupt store is never mistaken for "nothing has run yet".
+fn read_store<T: serde::de::DeserializeOwned + Default>(path: &std::path::Path, store: &str) -> T {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return T::default(),
+        Err(e) => {
+            tracing::warn!(store, path = %path.display(), error = %e, "failed to read task store");
+            return T::default();
+        }
+    };
+    if bytes.is_empty() {
+        return T::default();
+    }
+    serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+        tracing::warn!(
+            store,
+            path = %path.display(),
+            error = %e,
+            "failed to parse task store; starting empty"
+        );
+        T::default()
+    })
+}
+
 impl FerrofinTaskManager {
     /// Creates an empty task registry.
     #[must_use]
@@ -224,56 +331,130 @@ impl FerrofinTaskManager {
     /// Points the registry at its trigger-override store, loading any
     /// previously persisted overrides (applied as tasks register).
     ///
-    /// Call before [`register`](Self::register). A missing or unreadable file
-    /// is treated as empty (first boot).
+    /// Call before [`register`](Self::register). A missing file is treated as
+    /// empty (first boot); an unparseable one is warned about and treated as
+    /// empty, rather than silently resetting every configured schedule.
     pub fn set_trigger_store(&self, path: PathBuf) {
-        let loaded: HashMap<String, Vec<TaskTriggerInfo>> = std::fs::read(&path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_default();
-        *lock(&self.stored_overrides) = loaded;
+        *lock(&self.stored_overrides) = read_store(&path, "task triggers");
         *lock(&self.store_path) = Some(path);
     }
 
     /// Persists the current trigger overrides to the store, if one is set.
+    ///
+    /// The map's lock is held across the write so two concurrent savers cannot
+    /// lose each other's update (or interleave two truncating writes into
+    /// invalid JSON).
     fn persist_overrides(&self) {
         let Some(path) = lock(&self.store_path).clone() else {
             return;
         };
-        let overrides = lock(&self.stored_overrides).clone();
-        match serde_json::to_vec_pretty(&overrides) {
-            Ok(bytes) => {
-                if let Some(parent) = path.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                if let Err(e) = std::fs::write(&path, bytes) {
-                    tracing::warn!(path = %path.display(), error = %e, "failed to persist task triggers");
-                }
-            }
-            Err(e) => tracing::warn!(error = %e, "failed to serialize task triggers"),
-        }
+        let overrides = lock(&self.stored_overrides);
+        write_store(&path, &*overrides, "task triggers");
+    }
+
+    /// Points the registry at its run-history store, loading any previously
+    /// persisted last results (applied as tasks register).
+    ///
+    /// Call before [`register`](Self::register). A missing file is treated as
+    /// empty (first boot); an unparseable one is warned about and treated as
+    /// empty. Port of upstream's per-task history file
+    /// (`{DataPath}/ScheduledTasks/{id}.js`, read back into
+    /// `ScheduledTaskWorker.LastExecutionResult`); one file for the whole map
+    /// is equivalent and simpler, matching the trigger store next to it.
+    ///
+    /// Accepted divergence for drop-in adoption: upstream names those files by
+    /// the MD5 of the task *type*, so a data directory adopted from a real
+    /// Jellyfin install starts with an empty "Last ran" column here — each
+    /// task fills it in on its first Ferrofin run. Nothing is lost: Jellyfin's
+    /// own files stay untouched for a swap back.
+    pub fn set_result_store(&self, path: PathBuf) {
+        *lock(&self.stored_results) = read_store(&path, "task history");
+        *lock(&self.result_store_path) = Some(path);
+    }
+
+    /// Records a task's last run outcome in the history store and persists it,
+    /// if one is set.
+    ///
+    /// Blocking serialize + write of a few KB, called once per finished run
+    /// (upstream's write is synchronous too). The map's lock is held across
+    /// the write — see [`persist_overrides`](Self::persist_overrides).
+    fn persist_result(&self, key: &str, result: &TaskResult) {
+        let Some(path) = lock(&self.result_store_path).clone() else {
+            return;
+        };
+        let mut results = lock(&self.stored_results);
+        results.insert(key.to_owned(), result.clone());
+        write_store(&path, &*results, "task history");
     }
 
     /// Registers a task, replacing any existing task with the same key.
     ///
-    /// Mirrors the C# `AddTasks`; the new registration starts
-    /// [`Idle`](TaskState::Idle) with no last result, picking up any persisted
-    /// trigger override for its key.
+    /// Mirrors the C# `AddTasks`: the new registration starts
+    /// [`Idle`](TaskState::Idle), picking up any persisted trigger override
+    /// **and** last run result for its key. If the scheduler is already
+    /// running and the task has a `StartupTrigger`, that trigger fires here —
+    /// upstream arms a task's triggers when its worker is constructed, so a
+    /// task registered late (after
+    /// [`start_scheduler`](Self::start_scheduler)) must not silently lose its
+    /// startup run.
     pub fn register(&self, task: Arc<dyn ScheduledTask>) {
         let key = task.key().to_string();
         let triggers_override = lock(&self.stored_overrides).get(&key).cloned();
-        let registration = Registration {
+        let last_result = lock(&self.stored_results).get(&key).cloned();
+        let mut registration = Registration {
             task,
             state: TaskState::Idle,
-            last_result: None,
+            last_result,
             triggers_override,
             progress: TaskProgress::default(),
             abort: None,
             started_at: None,
             trigger_fires: HashMap::new(),
             triggers_since: None,
+            startup_fired: false,
         };
-        lock(&self.tasks).insert(key, registration);
+        // Insert, and decide whether to fire, under the *same* `tasks` guard
+        // `start_scheduler`'s startup snapshot takes — and record the decision
+        // on the registration itself, so each key's startup trigger fires
+        // exactly once per process even if the key is re-registered.
+        let fire_startup = {
+            let mut guard = lock(&self.tasks);
+            registration.startup_fired = guard.get(&key).is_some_and(|r| r.startup_fired);
+            let fire = self.scheduler_started.load(Ordering::Acquire)
+                && registration.has_startup_trigger()
+                && !registration.startup_fired;
+            registration.startup_fired |= fire;
+            guard.insert(key.clone(), registration);
+            fire
+        };
+        if !fire_startup {
+            return;
+        }
+        // Late registration: the scheduler's one startup sweep has already run,
+        // so fire this task's startup trigger now — after upstream's grace
+        // period (`StartupTrigger.Start` awaits `DelayMs` first).
+        if tokio::runtime::Handle::try_current().is_err() {
+            // No runtime to spawn the delayed run on (`register` is also called
+            // from sync code, e.g. tests): nothing fires, and saying so keeps
+            // "why didn't my task run at startup?" answerable.
+            tracing::debug!(task = key, "no tokio runtime; startup trigger not fired");
+            return;
+        }
+        let this = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(STARTUP_TRIGGER_DELAY).await;
+            match this.queue_with_trigger(&key, "startup") {
+                Ok(()) => {}
+                // Benign: something (an admin pressing Run) started the task
+                // inside the grace window, so the startup run is redundant.
+                Err(ServiceError::InvalidInput(e)) => {
+                    tracing::debug!(task = key, reason = %e, "startup trigger skipped");
+                }
+                Err(e) => {
+                    tracing::warn!(task = key, error = %e, "startup trigger failed to queue");
+                }
+            }
+        });
     }
 
     /// Lists every registered task as a wire [`TaskInfo`] (hidden tasks included),
@@ -352,6 +533,7 @@ impl FerrofinTaskManager {
     fn record_result(&self, key: &str, result: TaskResult) {
         self.publish_task_completed(&result);
         self.log_failed_task(&result);
+        self.persist_result(key, &result);
         let mut guard = lock(&self.tasks);
         if let Some(reg) = guard.get_mut(key) {
             reg.state = TaskState::Idle;
@@ -537,6 +719,7 @@ impl FerrofinTaskManager {
         reg.last_result = Some(result.clone());
         drop(guard);
         self.publish_task_completed(&result);
+        self.persist_result(key, &result);
         Ok(())
     }
 
@@ -571,17 +754,38 @@ impl FerrofinTaskManager {
 
     /// Starts the background trigger scheduler, returning its join handle.
     ///
-    /// Fires each registered task's `StartupTrigger`s immediately, then
-    /// evaluates daily/weekly/interval triggers every [`SCHEDULER_PERIOD`] and
-    /// aborts runs that exceed their trigger's `max_runtime_ticks`. Call once
-    /// from the composition root after registering all tasks.
+    /// Fires each registered task's `StartupTrigger`s after
+    /// [`STARTUP_TRIGGER_DELAY`], then evaluates daily/weekly/interval triggers
+    /// every [`SCHEDULER_PERIOD`] and aborts runs that exceed their trigger's
+    /// `max_runtime_ticks`. Call once from the composition root; a task
+    /// registered afterwards fires its own startup trigger from
+    /// [`register`](Self::register).
     #[must_use = "dropping the handle is fine; aborting it stops the scheduler"]
     pub fn start_scheduler(&self) -> tokio::task::JoinHandle<()> {
         let this = self.clone();
+        // The snapshot and the flag are taken under one `tasks` guard, and
+        // `register` inserts + reads the flag under the same one: every task
+        // fires its startup trigger from exactly one of the two paths.
+        let startup_keys = {
+            let mut guard = lock(&self.tasks);
+            let keys: Vec<String> = guard
+                .iter()
+                .filter(|(_, reg)| reg.has_startup_trigger() && !reg.startup_fired)
+                .map(|(k, _)| k.clone())
+                .collect();
+            for key in &keys {
+                if let Some(reg) = guard.get_mut(key) {
+                    reg.startup_fired = true;
+                }
+            }
+            self.scheduler_started.store(true, Ordering::Release);
+            keys
+        };
         tokio::spawn(async move {
             let scheduler_start = Utc::now();
-            // Startup triggers fire once, now.
-            for key in this.keys_with_startup_trigger() {
+            // Startup triggers fire once, after upstream's grace period.
+            tokio::time::sleep(STARTUP_TRIGGER_DELAY).await;
+            for key in startup_keys {
                 if let Err(e) = this.queue_with_trigger(&key, "startup") {
                     tracing::warn!(task = key, error = %e, "startup trigger failed to queue");
                 }
@@ -593,19 +797,6 @@ impl FerrofinTaskManager {
                 this.scheduler_sweep(scheduler_start, Utc::now());
             }
         })
-    }
-
-    /// Keys of tasks whose effective triggers include a `StartupTrigger`.
-    fn keys_with_startup_trigger(&self) -> Vec<String> {
-        lock(&self.tasks)
-            .iter()
-            .filter(|(_, reg)| {
-                reg.effective_triggers()
-                    .iter()
-                    .any(|t| t.type_ == TaskTriggerInfoType::StartupTrigger)
-            })
-            .map(|(k, _)| k.clone())
-            .collect()
     }
 
     /// One scheduler pass: queue tasks whose triggers are due and abort runs
@@ -1264,6 +1455,214 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn last_execution_result_survives_a_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = dir.path().join("task_results.json");
+
+        let mgr = FerrofinTaskManager::new();
+        mgr.set_result_store(store.clone());
+        mgr.register(Arc::new(CountingTask {
+            runs: Arc::new(AtomicU32::new(0)),
+            fail: false,
+            hidden: false,
+        }));
+        mgr.run_now("counting").await.expect("run");
+        let first = mgr
+            .get("counting")
+            .expect("info")
+            .last_execution_result
+            .expect("result");
+
+        // A fresh registry over the same store reports the previous run — the
+        // dashboard's "Last ran" column is not wiped by a restart.
+        let mgr2 = FerrofinTaskManager::new();
+        mgr2.set_result_store(store);
+        mgr2.register(Arc::new(CountingTask {
+            runs: Arc::new(AtomicU32::new(0)),
+            fail: false,
+            hidden: false,
+        }));
+        let restored = mgr2
+            .get("counting")
+            .expect("info")
+            .last_execution_result
+            .expect("restored result");
+        assert_eq!(restored.status, TaskCompletionStatus::Completed);
+        assert_eq!(restored.key.as_deref(), Some("counting"));
+        assert_eq!(restored.name.as_deref(), Some("Counting Task"));
+        // Times round-trip through the wire format, whose precision is coarser
+        // than chrono's nanoseconds.
+        assert_eq!(
+            (restored.start_time_utc - first.start_time_utc).num_milliseconds(),
+            0
+        );
+        assert_eq!(
+            (restored.end_time_utc - first.end_time_utc).num_milliseconds(),
+            0
+        );
+        // …and the restored task is idle, not stuck mid-run.
+        assert_eq!(mgr2.get("counting").expect("info").state, TaskState::Idle);
+    }
+
+    #[tokio::test]
+    async fn a_task_registered_after_the_scheduler_still_runs_at_startup() {
+        // Regression: the composition root registers a few tasks *after*
+        // `start_scheduler` (they need managers built later). Their
+        // `StartupTrigger` used to be dropped on the floor, so those tasks
+        // never ran and reported no `LastExecutionResult` at all.
+        let mgr = FerrofinTaskManager::new();
+        let handle = mgr.start_scheduler();
+
+        let runs = Arc::new(AtomicU32::new(0));
+        mgr.register(Arc::new(StartupTask { runs: runs.clone() }));
+        // Re-registering the same key must not queue a second startup run: the
+        // fire is recorded on the registration and carried across the replace.
+        mgr.register(Arc::new(StartupTask { runs: runs.clone() }));
+
+        wait_for_run(&runs, "late registration never fired its startup trigger").await;
+        // Exactly once — the scheduler's own startup sweep must not queue it a
+        // second time.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        handle.abort();
+    }
+
+    /// A task with a `StartupTrigger` that counts its runs — the fixture both
+    /// startup-path tests share.
+    struct StartupTask {
+        runs: Arc<AtomicU32>,
+    }
+
+    #[allow(clippy::unnecessary_literal_bound)]
+    #[async_trait]
+    impl ScheduledTask for StartupTask {
+        fn key(&self) -> &str {
+            "startup"
+        }
+        fn name(&self) -> &str {
+            "Startup Task"
+        }
+        fn description(&self) -> &str {
+            "runs at startup"
+        }
+        fn category(&self) -> &str {
+            "Test"
+        }
+        fn default_triggers(&self) -> Vec<TaskTriggerInfo> {
+            vec![TaskTriggerInfo {
+                type_: TaskTriggerInfoType::StartupTrigger,
+                ..TaskTriggerInfo::default()
+            }]
+        }
+        async fn execute(&self, _progress: &TaskProgress) -> Result<(), ServiceError> {
+            self.runs.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// Waits for a counter to reach one run, allowing for the startup grace
+    /// period (`STARTUP_TRIGGER_DELAY`) plus generous slack.
+    async fn wait_for_run(runs: &Arc<AtomicU32>, message: &str) {
+        let deadline = std::time::Instant::now()
+            + super::STARTUP_TRIGGER_DELAY
+            + std::time::Duration::from_secs(10);
+        while runs.load(Ordering::SeqCst) == 0 {
+            assert!(std::time::Instant::now() < deadline, "{message}");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_result_store_starts_empty_and_still_registers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = dir.path().join("task_results.json");
+        std::fs::write(&store, b"{not json").expect("write");
+
+        let mgr = FerrofinTaskManager::new();
+        mgr.set_result_store(store.clone());
+        mgr.register(Arc::new(CountingTask {
+            runs: Arc::new(AtomicU32::new(0)),
+            fail: false,
+            hidden: false,
+        }));
+        let info = mgr.get("counting").expect("info");
+        assert!(info.last_execution_result.is_none());
+
+        // …and the next run overwrites the corrupt file with a good one.
+        mgr.run_now("counting").await.expect("run");
+        let reloaded = FerrofinTaskManager::new();
+        reloaded.set_result_store(store);
+        reloaded.register(Arc::new(CountingTask {
+            runs: Arc::new(AtomicU32::new(0)),
+            fail: false,
+            hidden: false,
+        }));
+        assert!(
+            reloaded
+                .get("counting")
+                .expect("info")
+                .last_execution_result
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_run_is_persisted_with_its_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = dir.path().join("task_results.json");
+
+        let mgr = FerrofinTaskManager::new();
+        mgr.set_result_store(store.clone());
+        mgr.register(Arc::new(CountingTask {
+            runs: Arc::new(AtomicU32::new(0)),
+            fail: true,
+            hidden: false,
+        }));
+        mgr.run_now("counting").await.expect_err("task fails");
+
+        let mgr2 = FerrofinTaskManager::new();
+        mgr2.set_result_store(store);
+        mgr2.register(Arc::new(CountingTask {
+            runs: Arc::new(AtomicU32::new(0)),
+            fail: true,
+            hidden: false,
+        }));
+        let restored = mgr2
+            .get("counting")
+            .expect("info")
+            .last_execution_result
+            .expect("restored result");
+        assert_eq!(restored.status, TaskCompletionStatus::Failed);
+        assert!(restored.error_message.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_run_is_persisted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = dir.path().join("task_results.json");
+
+        let mgr = FerrofinTaskManager::new();
+        mgr.set_result_store(store.clone());
+        let gate = Arc::new(tokio::sync::Notify::new());
+        mgr.register(Arc::new(GatedTask { gate }));
+        mgr.queue("gated").expect("queued");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        mgr.cancel("gated").expect("cancel");
+
+        let mgr2 = FerrofinTaskManager::new();
+        mgr2.set_result_store(store);
+        mgr2.register(Arc::new(GatedTask {
+            gate: Arc::new(tokio::sync::Notify::new()),
+        }));
+        let restored = mgr2
+            .get("gated")
+            .expect("info")
+            .last_execution_result
+            .expect("restored result");
+        assert_eq!(restored.status, TaskCompletionStatus::Cancelled);
+    }
+
     #[test]
     fn interval_trigger_due_after_interval_from_latest_reference() {
         let start = Utc
@@ -1463,46 +1862,16 @@ mod tests {
 
     #[tokio::test]
     async fn scheduler_fires_startup_triggers_and_aborts_overruns() {
-        struct StartupTask {
-            runs: Arc<AtomicU32>,
-        }
-        #[allow(clippy::unnecessary_literal_bound)]
-        #[async_trait]
-        impl ScheduledTask for StartupTask {
-            fn key(&self) -> &str {
-                "startup"
-            }
-            fn name(&self) -> &str {
-                "Startup Task"
-            }
-            fn description(&self) -> &str {
-                "runs at startup"
-            }
-            fn category(&self) -> &str {
-                "Test"
-            }
-            fn default_triggers(&self) -> Vec<TaskTriggerInfo> {
-                vec![TaskTriggerInfo {
-                    type_: TaskTriggerInfoType::StartupTrigger,
-                    ..TaskTriggerInfo::default()
-                }]
-            }
-            async fn execute(&self, _progress: &TaskProgress) -> Result<(), ServiceError> {
-                self.runs.fetch_add(1, Ordering::SeqCst);
-                Ok(())
-            }
-        }
-
         let mgr = FerrofinTaskManager::new();
         let runs = Arc::new(AtomicU32::new(0));
         mgr.register(Arc::new(StartupTask { runs: runs.clone() }));
 
         let handle = mgr.start_scheduler();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while runs.load(Ordering::SeqCst) == 0 {
-            assert!(std::time::Instant::now() < deadline, "startup never fired");
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
+        wait_for_run(&runs, "startup never fired").await;
+        // Exactly once: registering before the scheduler must fire from the
+        // startup snapshot only, never also from `register`.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
         handle.abort();
 
         // Overrun abort: a hung run whose trigger caps runtime is aborted by a
