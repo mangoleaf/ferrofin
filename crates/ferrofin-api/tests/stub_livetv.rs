@@ -9,11 +9,14 @@
 //! now real too — faithful for Ferrofin's M3U+XMLTV backend (empty/`404` where no
 //! DVR capture / live-stream buffering exists).
 //!
-//! Each real handler sits behind the `RequireAuth` extractor, so a **tokenless**
+//! Most real handlers sit behind the `RequireAuth` extractor, so a **tokenless**
 //! probe is rejected with `401 Unauthorized` — never `501` (which only the shared
-//! `not_implemented` stub returns) and never `404`. This test pins that the five
-//! formerly-stubbed ops have graduated off the stub; the full superset gate lives
-//! in `contract_superset.rs`.
+//! `not_implemented` stub returns). The live-stream file route is the deliberate
+//! exception: upstream's `GetLiveStreamFile` action carries no `[Authorize]`
+//! (the server's own ffmpeg reads it), so a tokenless probe of an unopened
+//! stream gets `404`, never `401`. Either way it is a real handler, never the
+//! `501` stub. This test pins that the five formerly-stubbed ops have graduated
+//! off the stub; the full superset gate lives in `contract_superset.rs`.
 
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
@@ -21,24 +24,43 @@ use ferrofin_api::create_router;
 use ferrofin_api::test_support::fake_state;
 use tower::ServiceExt;
 
-/// The five `LiveTvController` ops promoted off the `501` stub, with concrete
-/// segment values where the vendored route has a `{param}`.
-const LIVETV_PROMOTED: &[(Method, &str)] = &[
-    (Method::POST, "/LiveTv/ChannelMappings"),
+/// The `LiveTvController` ops promoted off the `501` stub, with concrete
+/// segment values where the vendored route has a `{param}`, and the status a
+/// tokenless probe must get.
+const LIVETV_PROMOTED: &[(Method, &str, StatusCode)] = &[
+    (
+        Method::POST,
+        "/LiveTv/ChannelMappings",
+        StatusCode::UNAUTHORIZED,
+    ),
     (
         Method::GET,
         "/LiveTv/ListingProviders/SchedulesDirect/Countries",
+        StatusCode::UNAUTHORIZED,
     ),
-    (Method::GET, "/LiveTv/LiveRecordings/recording-1/stream"),
-    (Method::GET, "/LiveTv/LiveStreamFiles/stream-1/stream.mp4"),
-    (Method::GET, "/LiveTv/Recordings/Groups/group-1"),
+    (
+        Method::GET,
+        "/LiveTv/LiveRecordings/recording-1/stream",
+        StatusCode::UNAUTHORIZED,
+    ),
+    // Anonymous upstream: no such stream is open, so 404 — not 401.
+    (
+        Method::GET,
+        "/LiveTv/LiveStreamFiles/stream-1/stream.mp4",
+        StatusCode::NOT_FOUND,
+    ),
+    (
+        Method::GET,
+        "/LiveTv/Recordings/Groups/group-1",
+        StatusCode::UNAUTHORIZED,
+    ),
 ];
 
 #[tokio::test]
 async fn promoted_livetv_routes_are_real_not_501() {
     let router = create_router(fake_state());
 
-    for (method, uri) in LIVETV_PROMOTED {
+    for (method, uri, expected) in LIVETV_PROMOTED {
         let response = router
             .clone()
             .oneshot(
@@ -50,12 +72,12 @@ async fn promoted_livetv_routes_are_real_not_501() {
             )
             .await
             .unwrap();
-        // A real handler behind `RequireAuth` rejects a tokenless probe with 401;
-        // it must never be the `501` stub (nor a `404`).
+        // A real handler answers on its own terms; it must never be the `501`
+        // stub, which is the only thing that returns NOT_IMPLEMENTED here.
         assert_eq!(
             response.status(),
-            StatusCode::UNAUTHORIZED,
-            "LiveTv route {method} {uri} should be a real handler behind auth (401), got {}",
+            *expected,
+            "LiveTv route {method} {uri} should be a real handler, got {}",
             response.status()
         );
     }

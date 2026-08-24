@@ -29,5 +29,6 @@ uuid = { workspace = true, features = ["v5"] }
 
 [dev-dependencies]
 rstest.workspace = true
+tempfile.workspace = true
 # The real user manager, for the EnabledUsers test (no cycle: core does not depend on livetv).
 ferrofin-core.workspace = true

@@ -23,6 +23,7 @@
 //! recommendation *score* re-ordering (it needs channel user-data the seam does
 //! not expose).
 
+use axum::body::Body;
 use axum::extract::{Path, Query, Request, State};
 use axum::response::Response;
 use axum::routing::{get, post};
@@ -967,19 +968,174 @@ async fn get_live_recording_stream(
     }
 }
 
-/// `GET /LiveTv/LiveStreamFiles/{streamId}/stream.{container}` — serve a buffered
+/// How much of a still-growing file one progressive read pulls, in bytes.
+///
+/// Port of `IODefaults.CopyToBufferSize`.
+const PROGRESSIVE_BUFFER_BYTES: usize = 81_920;
+
+/// How long a progressive read waits before looking for more bytes, in
+/// milliseconds (C# `ProgressiveFileStream`'s `Task.Delay(50)`).
+const PROGRESSIVE_POLL_MS: u64 = 50;
+
+/// How long a progressive read tolerates a file that stops growing before it
+/// reports end-of-stream, in milliseconds (C# `ProgressiveFileStream`'s
+/// `timeoutMs = 30000`). A live stream ends when the viewer stops watching, but
+/// a stalled tuner must not hold the connection open for ever.
+const PROGRESSIVE_TIMEOUT_MS: u64 = 30_000;
+
+/// How many buffers the progressive reader may run ahead of the client.
+///
+/// Backpressure, not a tuning knob: the reader blocks once the client is this
+/// far behind, and the tuner's own buffer keeps filling meanwhile.
+const PROGRESSIVE_QUEUE_DEPTH: usize = 4;
+
+/// A response body fed by a background reader over a channel.
+///
+/// The `Stream` impl `axum::body::Body::from_stream` needs; the work happens in
+/// the spawned task, and dropping the body (the client hung up) makes its next
+/// send fail, which ends that task.
+struct ProgressiveBody(tokio::sync::mpsc::Receiver<Result<Vec<u8>, std::io::Error>>);
+
+impl futures_core::Stream for ProgressiveBody {
+    type Item = Result<Vec<u8>, std::io::Error>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.0.poll_recv(cx)
+    }
+}
+
+/// Serves a file that is still being written, from `start_at`, as an endless
+/// response.
+///
+/// Port of `MediaBrowser.Controller.Streaming.ProgressiveFileStream`: a read
+/// returns as soon as anything is there; when nothing is, it waits
+/// [`PROGRESSIVE_POLL_MS`] and tries again, and only after
+/// [`PROGRESSIVE_TIMEOUT_MS`] of no growth does it report end-of-stream.
+fn progressive_file_body(path: std::path::PathBuf, start_at: u64) -> Body {
+    let (tx, rx) = tokio::sync::mpsc::channel(PROGRESSIVE_QUEUE_DEPTH);
+    tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
+        let mut file = match tokio::fs::File::open(&path).await {
+            Ok(file) => file,
+            Err(error) => {
+                let _ = tx.send(Err(error)).await;
+                return;
+            }
+        };
+        if start_at > 0
+            && let Err(error) = file.seek(std::io::SeekFrom::Start(start_at)).await
+        {
+            let _ = tx.send(Err(error)).await;
+            return;
+        }
+        let mut buffer = vec![0_u8; PROGRESSIVE_BUFFER_BYTES];
+        let mut idle_ms = 0_u64;
+        loop {
+            match file.read(&mut buffer).await {
+                Ok(0) => {
+                    if idle_ms >= PROGRESSIVE_TIMEOUT_MS {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(PROGRESSIVE_POLL_MS)).await;
+                    idle_ms += PROGRESSIVE_POLL_MS;
+                }
+                Ok(read) => {
+                    idle_ms = 0;
+                    if tx.send(Ok(buffer[..read].to_vec())).await.is_err() {
+                        // The client hung up.
+                        break;
+                    }
+                }
+                Err(error) => {
+                    let _ = tx.send(Err(error)).await;
+                    break;
+                }
+            }
+        }
+    });
+    Body::from_stream(ProgressiveBody(rx))
+}
+
+/// Where a reader of an open live stream starts in its buffer.
+///
+/// Port of `LiveStream.GetStream()`: a reader that arrives more than
+/// [`TAIL_SEEK_AFTER_SECONDS`](ferrofin_traits::stubs::TAIL_SEEK_AFTER_SECONDS)
+/// after the stream opened joins near the live edge instead of replaying
+/// everything buffered so far.
+async fn live_stream_start_offset(file: &ferrofin_traits::stubs::LiveStreamFile) -> u64 {
+    let age = Utc::now()
+        .signed_duration_since(file.opened_at)
+        .num_seconds();
+    if age <= ferrofin_traits::stubs::TAIL_SEEK_AFTER_SECONDS {
+        return 0;
+    }
+    let length = tokio::fs::metadata(&file.path).await.map_or(0, |m| m.len());
+    let tail = u64::try_from(ferrofin_traits::stubs::TAIL_SEEK_BYTES).unwrap_or(0);
+    length.saturating_sub(tail)
+}
+
+/// Builds the `200` progressive response for `path`, typed by its container.
+fn progressive_response(path: std::path::PathBuf, start_at: u64, file_name: &str) -> Response {
+    let content_type = ferrofin_model::net::mime_types::get_mime_type(file_name);
+    Response::builder()
+        .header(axum::http::header::CONTENT_TYPE, content_type)
+        // The body is generated as the file grows: nothing here is cacheable
+        // and no range of it is addressable.
+        .header(axum::http::header::CACHE_CONTROL, "no-cache")
+        .header(axum::http::header::ACCEPT_RANGES, "none")
+        .body(progressive_file_body(path, start_at))
+        // The builder only fails on a malformed header, and all three are
+        // literals — but never panic on a playback path.
+        .unwrap_or_else(|_| Response::new(Body::empty()))
+}
+
+/// The container extension of a `stream.{container}` route segment, validated
+/// the way upstream's `[RegularExpression(ContainerValidationRegexStr)]` does.
+fn route_container(segment: &str) -> Option<&str> {
+    let container = segment.rsplit_once('.').map_or(segment, |(_, ext)| ext);
+    // `^[a-zA-Z0-9\-\._,|]{0,40}$` — empty is allowed, as it is upstream.
+    let valid = container.len() <= 40
+        && container
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b',' | b'|'));
+    valid.then_some(container)
+}
+
+/// `GET /LiveTv/LiveStreamFiles/{streamId}/stream.{container}` — the buffered
 /// live-stream file.
 ///
-/// Port of `LiveTvController.GetLiveStreamFile`. Jellyfin serves the on-disk file
-/// a tuner buffers a live stream into; Ferrofin direct-plays each M3U channel from
-/// its source URL (see `LiveTvManager::get_channel_stream_url`) and buffers
-/// nothing to disk, so there is no such file to serve and this reports `404` —
-/// the faithful result for a stream id that has no buffered file.
+/// Port of `LiveTvController.GetLiveStreamFile`: resolves the open live stream
+/// by its unique id and serves the temp file the tuner is being copied into as
+/// a progressive (tail-following) stream, so a client — or ffmpeg, transcoding
+/// the same channel — reads it while it grows. `404` when no such stream is
+/// open, which is also what a closed stream reports.
+///
+/// **Anonymous, like upstream**: the action carries no `[Authorize]`, because
+/// the server's own ffmpeg reads this URL without a token. It exposes only a
+/// live stream a caller already opened, and the unique id is an unguessable
+/// per-open GUID.
 async fn get_live_stream_file(
-    RequireAuth(_auth): RequireAuth,
-    Path((_stream_id, _container)): Path<(String, String)>,
+    State(state): State<AppState>,
+    Path((stream_id, container)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
-    Err(ApiError::NotFound("live stream file".into()))
+    let Some(container) = route_container(&container) else {
+        return Err(ApiError::NotFound("live stream file".into()));
+    };
+    let Some(live_tv) = state.live_tv.as_ref() else {
+        return Err(ApiError::NotFound("live stream file".into()));
+    };
+    let Some(file) = live_tv.get_live_stream_file(&stream_id).await? else {
+        return Err(ApiError::NotFound("live stream file".into()));
+    };
+    let start_at = live_stream_start_offset(&file).await;
+    Ok(progressive_response(
+        file.path.clone(),
+        start_at,
+        &format!("file.{container}"),
+    ))
 }
 
 /// The `POST /LiveTv/ChannelMappings` request body.
@@ -1280,6 +1436,7 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
             "/LiveTv/LiveRecordings/{recordingId}/stream",
             get(get_live_recording_stream),
         )
+        // Anonymous, as upstream: the server's own ffmpeg reads this URL.
         .route(
             "/LiveTv/LiveStreamFiles/{streamId}/{container}",
             get(get_live_stream_file),
@@ -1506,15 +1663,129 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recording_group_and_live_stream_file_are_404() {
+    async fn recording_group_and_an_unopened_live_stream_file_are_404() {
         let group = get_recording_group(auth(), Path(Uuid::nil()))
             .await
             .unwrap_err();
         assert_eq!(group.status(), axum::http::StatusCode::NOT_FOUND);
-        let file = get_live_stream_file(auth(), Path(("s1".into(), "mp4".into())))
+        // No Live TV manager at all — still 404, never 501: upstream's route is
+        // anonymous and reports only "no such stream".
+        let file = get_live_stream_file(
+            State(fake_state()),
+            Path(("s1".into(), "stream.mp4".into())),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(file.status(), axum::http::StatusCode::NOT_FOUND);
+        // A manager with nothing open says the same.
+        let state = fake_state().with_live_tv(std::sync::Arc::new(FakeLiveTv::default()));
+        let file = get_live_stream_file(State(state), Path(("s1".into(), "stream.ts".into())))
             .await
             .unwrap_err();
         assert_eq!(file.status(), axum::http::StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn the_route_container_is_the_validated_extension() {
+        assert_eq!(route_container("stream.ts"), Some("ts"));
+        assert_eq!(route_container("stream.mp4"), Some("mp4"));
+        // No dot: the whole segment is the container, as upstream's route would
+        // have bound it.
+        assert_eq!(route_container("ts"), Some("ts"));
+        // Upstream's regex is `{0,40}`, so an empty container is legal (and
+        // simply has no known MIME type).
+        assert_eq!(route_container("stream."), Some(""));
+        assert_eq!(route_container("stream.a/b"), None);
+        assert_eq!(route_container(&format!("stream.{}", "x".repeat(41))), None);
+    }
+
+    /// The first chunk a progressive body yields. Only the first: the body is
+    /// a live tail and draining it would block for the no-growth timeout.
+    async fn first_chunk(response: Response) -> Vec<u8> {
+        use futures_core::Stream as _;
+        let mut stream = response.into_body().into_data_stream();
+        std::future::poll_fn(|cx| std::pin::Pin::new(&mut stream).poll_next(cx))
+            .await
+            .expect("a chunk")
+            .expect("no error")
+            .to_vec()
+    }
+
+    #[tokio::test]
+    async fn an_open_live_stream_is_served_progressively_as_mpeg_ts() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("buffer.ts");
+        tokio::fs::write(&path, vec![0x47_u8; 512])
+            .await
+            .expect("write buffer");
+        let state = fake_state().with_live_tv(std::sync::Arc::new(FakeLiveTv {
+            live_stream: Some((
+                "uid-1".to_owned(),
+                ferrofin_traits::stubs::LiveStreamFile {
+                    path: path.clone(),
+                    opened_at: Utc::now(),
+                },
+            )),
+            ..FakeLiveTv::default()
+        }));
+
+        let response = get_live_stream_file(
+            State(state),
+            Path(("uid-1".to_owned(), "stream.ts".to_owned())),
+        )
+        .await
+        .expect("stream");
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("video/mp2t")
+        );
+        let data = first_chunk(response).await;
+        assert_eq!(data.len(), 512);
+        assert!(data.iter().all(|b| *b == 0x47));
+    }
+
+    #[tokio::test]
+    async fn a_late_reader_joins_an_old_live_stream_near_its_tail() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("buffer.ts");
+        // Bigger than the tail window, so the seek is observable.
+        let size = usize::try_from(ferrofin_traits::stubs::TAIL_SEEK_BYTES).expect("tail") * 2;
+        let mut buffer = vec![0x00_u8; size];
+        buffer[size - 1] = 0xff;
+        tokio::fs::write(&path, &buffer)
+            .await
+            .expect("write buffer");
+        let state = fake_state().with_live_tv(std::sync::Arc::new(FakeLiveTv {
+            live_stream: Some((
+                "uid-1".to_owned(),
+                ferrofin_traits::stubs::LiveStreamFile {
+                    path: path.clone(),
+                    // Opened long enough ago that a new reader must not replay
+                    // the whole buffer (C# `LiveStream.GetStream`'s tail seek).
+                    opened_at: Utc::now()
+                        - chrono::Duration::seconds(
+                            ferrofin_traits::stubs::TAIL_SEEK_AFTER_SECONDS + 5,
+                        ),
+                },
+            )),
+            ..FakeLiveTv::default()
+        }));
+
+        let response = get_live_stream_file(
+            State(state),
+            Path(("uid-1".to_owned(), "stream.ts".to_owned())),
+        )
+        .await
+        .expect("stream");
+        let data = first_chunk(response).await;
+        assert_eq!(
+            u64::try_from(data.len()).expect("len"),
+            u64::try_from(ferrofin_traits::stubs::TAIL_SEEK_BYTES).expect("tail"),
+            "a late reader starts one tail window from the end, not at byte 0"
+        );
     }
 
     #[tokio::test]
@@ -1557,6 +1828,8 @@ mod tests {
     struct FakeLiveTv {
         providers: std::sync::Mutex<Vec<ListingsProviderInfo>>,
         recording_path: Option<String>,
+        /// The one open live stream, keyed by its unique id.
+        live_stream: Option<(String, ferrofin_traits::stubs::LiveStreamFile)>,
         programs_query: std::sync::Mutex<Option<InternalItemsQuery>>,
         programs_options: std::sync::Mutex<Option<DtoOptions>>,
         channels_query: std::sync::Mutex<Option<LiveTvChannelQuery>>,
@@ -1583,6 +1856,19 @@ mod tests {
             _id: Uuid,
         ) -> Result<Option<String>, ferrofin_traits::error::ServiceError> {
             Ok(self.recording_path.clone())
+        }
+        async fn get_live_stream_file(
+            &self,
+            unique_id: &str,
+        ) -> Result<
+            Option<ferrofin_traits::stubs::LiveStreamFile>,
+            ferrofin_traits::error::ServiceError,
+        > {
+            Ok(self
+                .live_stream
+                .as_ref()
+                .filter(|(id, _)| id == unique_id)
+                .map(|(_, file)| file.clone()))
         }
         async fn get_live_tv_info(
             &self,

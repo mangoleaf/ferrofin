@@ -60,6 +60,14 @@ pub struct FerrofinMediaSourceManager {
     /// Open live streams keyed by their live-stream id. Guarded by a
     /// `std::sync::Mutex` because the guard never spans an `.await`.
     open_streams: Arc<Mutex<HashMap<String, MediaSourceInfo>>>,
+    /// What a live stream's probe found, keyed by the open token that names it.
+    ///
+    /// Port of `LiveStreamHelper`'s `{cache}/mediainfo/{md5(cacheKey)}.json`
+    /// cache: probing costs a 3 s wait plus an ffprobe against a live stream,
+    /// and without the cache every channel change and every extra viewer pays
+    /// it again. Ferrofin keeps it in memory rather than on disk — a restart
+    /// re-probes once per channel, which is the only difference.
+    probe_cache: Arc<Mutex<HashMap<String, MediaSourceInfo>>>,
 }
 
 impl std::fmt::Debug for FerrofinMediaSourceManager {
@@ -87,6 +95,7 @@ impl FerrofinMediaSourceManager {
             provider,
             live_tv: None,
             open_streams: Arc::new(Mutex::new(HashMap::new())),
+            probe_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -98,11 +107,14 @@ impl FerrofinMediaSourceManager {
         self
     }
 
-    /// Builds the media source for a Live TV channel id: probe its tuner stream so
-    /// transcode negotiation knows the codecs, then mark it as an infinite stream
-    /// that must be transcoded (the raw tuner container/codec is rarely
-    /// browser-playable). Returns empty when Live TV is unconfigured or the id is
-    /// not a known channel.
+    /// The media sources for a Live TV channel id, or empty when Live TV is
+    /// unconfigured or the id is not a known channel.
+    ///
+    /// Port of `MediaSourceManager.GetDynamicMediaSources` over the Live TV
+    /// provider: the tuner source is handed back **unopened** (the tuner is not
+    /// touched, and nothing is probed) carrying `RequiresOpening` and the
+    /// provider-prefixed `OpenToken` a client redeems at
+    /// `POST /LiveStreams/Open`.
     async fn channel_media_source(
         &self,
         item_id: Uuid,
@@ -110,31 +122,76 @@ impl FerrofinMediaSourceManager {
         let Some(live_tv) = &self.live_tv else {
             return Ok(Vec::new());
         };
-        let Some(url) = live_tv.get_channel_stream_url(item_id).await? else {
-            return Ok(Vec::new());
-        };
-        // Probe the tuner stream for its real streams; if the probe fails (tuner
-        // unreachable), fall back to a bare source so the id still resolves.
+        let mut sources = live_tv.get_channel_media_sources(item_id).await?;
+        for source in &mut sources {
+            source.infer_total_bitrate(false);
+            // Every dynamic source is checked before it reaches PlaybackInfo
+            // (C# `GetDynamicMediaSources` → the `SupportsDirectStream` gate),
+            // so an `.m3u8` channel is never advertised as direct-streamable.
+            if source.supports_direct_stream {
+                source.supports_direct_stream =
+                    supports_direct_stream(source.path.as_deref(), source.protocol);
+            }
+            set_live_tv_key_properties(source);
+        }
+        Ok(sources)
+    }
+
+    /// Probes an opened live stream for its real container/streams, reporting
+    /// whether the probe produced anything.
+    ///
+    /// Port of `LiveStreamHelper.AddMediaInfoWithProbe`: a cached result for
+    /// this `cache_key` short-circuits everything; otherwise wait for the tuner
+    /// to produce something worth probing (`add_probe_delay`), probe with a
+    /// bounded analyze duration, and — when the call has a cache key, which the
+    /// Live TV open always does — keep only the first video + audio stream with
+    /// unknown indexes. The tail (`IsAVC = null`, the width-derived bitrate,
+    /// the forced total-bitrate estimate) is upstream's, verbatim.
+    async fn add_media_info_with_probe(
+        &self,
+        source: &mut MediaSourceInfo,
+        cache_key: Option<&str>,
+        add_probe_delay: bool,
+    ) -> bool {
+        if let Some(cached) = cache_key.and_then(|key| {
+            self.probe_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(key)
+                .cloned()
+        }) {
+            apply_probed_media_info(source, &cached, cache_key.is_some());
+            return true;
+        }
+
+        if add_probe_delay {
+            // ffprobe on a stream with nothing in it yet reports nothing.
+            let delay = u64::from(LIVE_STREAM_PROBE_DELAY_MS).max(
+                source
+                    .analyze_duration_ms
+                    .and_then(|ms| u64::try_from(ms).ok())
+                    .unwrap_or(0),
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+        }
+        source.analyze_duration_ms = Some(LIVE_STREAM_ANALYZE_DURATION_MS);
         let request = ferrofin_traits::media_encoding::MediaInfoRequest {
-            media_source: MediaSourceInfo {
-                path: Some(url.clone()),
-                ..Default::default()
-            },
+            media_source: source.clone(),
             extract_chapters: false,
             media_is_audio: false,
         };
-        let probed = self.encoder.get_media_info(&request).await.ok();
-        let mut source = probed.unwrap_or_default();
-        source.id = Some(item_id.simple().to_string());
-        source.path = Some(url.clone());
-        source.protocol = MediaProtocol::Http;
-        source.container = Some(live_stream_container(&url));
-        source.is_infinite_stream = true;
-        source.run_time_ticks = None;
-        source.supports_direct_play = false;
-        source.supports_direct_stream = false;
-        source.supports_transcoding = true;
-        Ok(vec![source])
+        let Ok(probed) = self.encoder.get_media_info(&request).await else {
+            tracing::warn!("live tv: probing the live stream failed; using the tuner's own info");
+            return false;
+        };
+        if let Some(key) = cache_key {
+            self.probe_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(key.to_owned(), probed.clone());
+        }
+        apply_probed_media_info(source, &probed, cache_key.is_some());
+        true
     }
 
     /// Reads an item's media streams as DTOs.
@@ -210,16 +267,223 @@ impl FerrofinMediaSourceManager {
     }
 }
 
-/// The container reported for a Live TV tuner stream, from its URL extension: an
-/// HLS playlist (`.m3u8`) or MPEG-TS (`.ts`); otherwise `ts` (the common IPTV
-/// default). Used only for negotiation labelling — the transcode reads the URL
-/// directly regardless.
-fn live_stream_container(url: &str) -> String {
-    let path = url.split(['?', '#']).next().unwrap_or(url);
-    if path.to_ascii_lowercase().ends_with(".m3u8") {
-        "hls".to_owned()
-    } else {
-        "ts".to_owned()
+/// The C# type name whose MD5 prefixes every Live TV `OpenToken` and
+/// `LiveStreamId`.
+///
+/// Port of `MediaSourceManager.SetKeyProperties`'
+/// `provider.GetType().FullName.GetMD5()`.
+const LIVE_TV_MEDIA_SOURCE_PROVIDER_TYPE: &str = "Jellyfin.LiveTv.LiveTvMediaSourceProvider";
+
+/// The separator between the keys of an open token / live-stream id (C#
+/// `MediaSourceManager.LiveStreamIdDelimiter`).
+const LIVE_STREAM_ID_DELIMITER: char = '_';
+
+/// How long to let a freshly-opened live stream fill before probing it, in
+/// milliseconds (C# `LiveStreamHelper.AddMediaInfoWithProbe`'s `addProbeDelay`
+/// floor of 3000 ms). ffprobe on a stream with nothing in it yet reports
+/// nothing.
+const LIVE_STREAM_PROBE_DELAY_MS: u32 = 3000;
+
+/// The `-analyzeduration` a live-stream probe is given, in milliseconds (C#
+/// `mediaSource.AnalyzeDurationMs = 3000`) — a live stream never ends, so the
+/// probe must be bounded.
+const LIVE_STREAM_ANALYZE_DURATION_MS: i32 = 3000;
+
+/// A cached probe result never expires, the way upstream's on-disk
+/// `{cache}/mediainfo/{md5(cacheKey)}.json` never does either: one entry per
+/// distinct channel source, bounded by the tuner's own lineup.
+///
+/// The MD5 of the Live TV media-source provider's C# type name, in `"N"` form.
+fn live_tv_provider_key() -> &'static str {
+    static KEY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    KEY.get_or_init(|| {
+        ferrofin_common::extensions::get_md5(LIVE_TV_MEDIA_SOURCE_PROVIDER_TYPE)
+            .simple()
+            .to_string()
+    })
+}
+
+/// Prefixes a Live TV source's `OpenToken`/`LiveStreamId` with the provider key
+/// that routes them back to the Live TV provider.
+///
+/// Port of `MediaSourceManager.SetKeyProperties`; already-prefixed values are
+/// left alone, so it is idempotent.
+fn set_live_tv_key_properties(source: &mut MediaSourceInfo) {
+    let prefix = format!("{}{LIVE_STREAM_ID_DELIMITER}", live_tv_provider_key());
+    for value in [&mut source.open_token, &mut source.live_stream_id] {
+        if let Some(current) = value.as_deref()
+            && !current.is_empty()
+            && !current.starts_with(prefix.as_str())
+        {
+            *value = Some(format!("{prefix}{current}"));
+        }
+    }
+}
+
+/// Parses a Live TV `OpenToken` into the channel id and media-source id it
+/// names, or `None` when it is not one.
+///
+/// Port of `MediaSourceManager.GetProvider` (`Split('_', 2)` — the provider key
+/// and its own key) followed by `LiveTvMediaSourceProvider.OpenMediaSource`
+/// (`Split('_', 3)` — item type, item id, media-source id).
+fn parse_live_tv_open_token(token: &str) -> Option<(Uuid, Option<String>)> {
+    let (prefix, key) = token.split_once(LIVE_STREAM_ID_DELIMITER)?;
+    if !prefix.eq_ignore_ascii_case(live_tv_provider_key()) {
+        return None;
+    }
+    let mut keys = key.splitn(3, LIVE_STREAM_ID_DELIMITER);
+    if !keys.next()?.eq_ignore_ascii_case("LiveTvChannel") {
+        return None;
+    }
+    let channel_id = Uuid::parse_str(keys.next()?).ok()?;
+    Some((channel_id, keys.next().map(ToOwned::to_owned)))
+}
+
+/// Strips the Live TV provider prefix `SetKeyProperties` adds, leaving the key
+/// the Live TV manager itself minted. An id without the prefix is its own key.
+fn strip_provider_key(id: &str) -> &str {
+    id.strip_prefix(live_tv_provider_key())
+        .and_then(|rest| rest.strip_prefix(LIVE_STREAM_ID_DELIMITER))
+        .unwrap_or(id)
+}
+
+/// Folds a probe result into the live source it was taken for.
+///
+/// Port of the second half of `LiveStreamHelper.AddMediaInfoWithProbe`: the
+/// probed container/streams replace the tuner's placeholders, a cache key means
+/// only one video and one audio stream survive (with unknown indexes, because
+/// the next open of the same channel may lay them out differently), an infinite
+/// stream keeps no runtime, and the video bitrate is estimated from the width
+/// when the probe reported none.
+fn apply_probed_media_info(
+    source: &mut MediaSourceInfo,
+    probed: &MediaSourceInfo,
+    reduce_streams: bool,
+) {
+    let original_runtime = source.run_time_ticks;
+    let mut streams = probed.media_streams.clone();
+    if reduce_streams {
+        let mut reduced: Vec<ferrofin_model::entities_media::MediaStream> = Vec::new();
+        reduced.extend(
+            streams
+                .iter()
+                .find(|s| s.stream_type == MediaStreamType::Video)
+                .cloned(),
+        );
+        reduced.extend(
+            streams
+                .iter()
+                .find(|s| s.stream_type == MediaStreamType::Audio)
+                .cloned(),
+        );
+        for stream in &mut reduced {
+            stream.index = -1;
+            stream.language = None;
+        }
+        streams = reduced;
+    }
+
+    source.bitrate = probed.bitrate;
+    source.container.clone_from(&probed.container);
+    source.formats.clone_from(&probed.formats);
+    source.media_streams = streams;
+    source.run_time_ticks = probed.run_time_ticks;
+    source.size = probed.size;
+    source.timestamp = probed.timestamp;
+    source.video3d_format = probed.video3d_format;
+    source.video_type = probed.video_type;
+
+    source.default_subtitle_stream_index = None;
+    // A source that had no runtime is a live stream, and stays one.
+    if original_runtime.is_none() {
+        source.run_time_ticks = None;
+    }
+    source.default_audio_stream_index = source
+        .media_streams
+        .iter()
+        .find(|s| s.stream_type == MediaStreamType::Audio)
+        .map(|s| s.index)
+        .filter(|index| *index != -1);
+
+    if let Some(video) = source
+        .media_streams
+        .iter_mut()
+        .find(|s| s.stream_type == MediaStreamType::Video)
+    {
+        if video.bit_rate.is_none() {
+            video.bit_rate = estimated_video_bitrate(video.width.unwrap_or(DEFAULT_PROBE_WIDTH));
+        }
+        // "This is coming up false and preventing stream copy" — upstream's own
+        // comment. Leaving it set costs live TV its video stream copy.
+        video.is_avc = None;
+    }
+
+    source.analyze_duration_ms = Some(LIVE_STREAM_ANALYZE_DURATION_MS);
+    // Forced: the probe's own total is for a fragment of an endless stream.
+    source.infer_total_bitrate(true);
+}
+
+/// Whether a source can be direct-streamed from its path.
+///
+/// Port of `MediaSourceManager.SupportsDirectStream`: a file always can, an
+/// HTTP source can unless it is an `.m3u`/`.m3u8` playlist, anything else
+/// cannot.
+fn supports_direct_stream(path: Option<&str>, protocol: MediaProtocol) -> bool {
+    match protocol {
+        MediaProtocol::File => true,
+        MediaProtocol::Http => path.is_some_and(|p| !p.to_ascii_lowercase().contains(".m3u")),
+        _ => false,
+    }
+}
+
+/// Fills in the stream defaults a live stream needs once it is open.
+///
+/// Port of `MediaSourceManager.AddMediaInfo`: no default subtitle, no runtime
+/// for an infinite stream, a default audio index only when the index is known,
+/// and a video bitrate estimated from the width when the probe reported none.
+fn add_media_info(source: &mut MediaSourceInfo) {
+    source.default_subtitle_stream_index = None;
+
+    // Null this out so that it will be treated like a live stream.
+    if source.is_infinite_stream {
+        source.run_time_ticks = None;
+    }
+
+    source.default_audio_stream_index = source
+        .media_streams
+        .iter()
+        .find(|s| s.stream_type == MediaStreamType::Audio)
+        .map(|s| s.index)
+        .filter(|index| *index != -1);
+
+    if let Some(video) = source
+        .media_streams
+        .iter_mut()
+        .find(|s| s.stream_type == MediaStreamType::Video)
+        && video.bit_rate.is_none()
+    {
+        video.bit_rate = estimated_video_bitrate(video.width.unwrap_or(DEFAULT_PROBE_WIDTH));
+    }
+
+    // Try to estimate this.
+    source.infer_total_bitrate(false);
+}
+
+/// The width assumed for a live video stream whose probe reported none (C#
+/// `videoStream.Width ?? 1920`).
+const DEFAULT_PROBE_WIDTH: i32 = 1920;
+
+/// The bitrate `AddMediaInfo` assumes for a live video stream of a given width,
+/// or `None` below the smallest band (C# leaves the bitrate unset there).
+///
+/// The bands are `MediaSourceManager.AddMediaInfo`'s verbatim.
+fn estimated_video_bitrate(width: i32) -> Option<i32> {
+    match width {
+        w if w >= 3000 => Some(30_000_000),
+        w if w >= 1900 => Some(20_000_000),
+        w if w >= 1200 => Some(8_000_000),
+        w if w >= 700 => Some(2_000_000),
+        _ => None,
     }
 }
 
@@ -542,9 +806,53 @@ impl MediaSourceManager for FerrofinMediaSourceManager {
         &self,
         request: &LiveStreamRequest,
     ) -> Result<MediaSourceInfo, ServiceError> {
-        // Probe the item to obtain a source, register it under a fresh id, and hand
-        // it back. The C# open-token/tuner negotiation is out of scope; the probe
-        // via the injected encoder is the real work.
+        // Port of `MediaSourceManager.OpenLiveStreamInternal`: the open token
+        // names the provider and the key it opens, the provider opens (or
+        // joins) the stream, and the result is probed and registered.
+        let token = request
+            .open_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty());
+        if let (Some(live_tv), Some(token)) = (self.live_tv.as_ref(), token)
+            && let Some((channel_id, media_source_id)) = parse_live_tv_open_token(token)
+        {
+            let mut source = live_tv
+                .open_channel_stream(channel_id, media_source_id.as_deref())
+                .await?;
+            // Validate that this is actually possible.
+            if source.supports_direct_stream {
+                source.supports_direct_stream =
+                    supports_direct_stream(source.path.as_deref(), source.protocol);
+            }
+            set_live_tv_key_properties(&mut source);
+            let live_id = source.live_stream_id.clone().unwrap_or_default();
+            // Either the tuner already knows its streams (or forbids probing),
+            // or the probe fills them in — never both, and a failed probe falls
+            // back to the tuner's own info (C# `OpenLiveStreamInternal`).
+            // C# `OpenLiveStreamInternal`: `string cacheKey = request.OpenToken`
+            // — the token the caller redeemed, not the `OpenToken` on the
+            // opened source, which no longer carries one.
+            let probe_worth_trying =
+                source.supports_probing && source.media_streams.iter().all(|s| s.index == -1);
+            let probed = probe_worth_trying
+                && self
+                    .add_media_info_with_probe(&mut source, Some(token), true)
+                    .await;
+            if !probed {
+                // The tuner already knew its streams, forbade probing, or the
+                // probe failed — all three land on the tuner's own info (C#
+                // `OpenLiveStreamInternal`, whose catch does the same).
+                add_media_info(&mut source);
+            }
+            self.open_streams
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(live_id, source.clone());
+            return Ok(source);
+        }
+
+        // Not a Live TV token: probe the item and register it under a fresh id.
         let request_info = ferrofin_traits::media_encoding::MediaInfoRequest {
             media_source: MediaSourceInfo {
                 id: Some(request.item_id.to_string()),
@@ -559,7 +867,7 @@ impl MediaSourceManager for FerrofinMediaSourceManager {
         source.requires_closing = true;
         self.open_streams
             .lock()
-            .expect("open streams not poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(live_id, source.clone());
         Ok(source)
     }
@@ -567,17 +875,29 @@ impl MediaSourceManager for FerrofinMediaSourceManager {
     async fn get_live_stream(&self, id: &str) -> Result<MediaSourceInfo, ServiceError> {
         self.open_streams
             .lock()
-            .expect("open streams not poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(id)
             .cloned()
             .ok_or_else(|| ServiceError::not_found(format!("live stream {id}")))
     }
 
     async fn close_live_stream(&self, id: &str) -> Result<(), ServiceError> {
-        self.open_streams
-            .lock()
-            .expect("open streams not poisoned")
-            .remove(id);
+        // Port of `MediaSourceManager.CloseLiveStream`: the consumer count
+        // lives with the tuner-side stream, so the Live TV manager decides
+        // whether this was the last reader, and only then is the source
+        // forgotten here — another viewer may still be watching it.
+        let gone = match self.live_tv.as_ref() {
+            // The Live TV manager keys its streams by the id IT minted, before
+            // `SetKeyProperties` prefixed it with the provider key.
+            Some(live_tv) => live_tv.close_channel_stream(strip_provider_key(id)).await?,
+            None => true,
+        };
+        if gone {
+            self.open_streams
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(id);
+        }
         Ok(())
     }
 
@@ -884,8 +1204,19 @@ mod tests {
         )
     }
 
-    /// A Live TV manager that resolves any channel id to a fixed tuner URL.
-    struct FakeLiveTv;
+    /// The tuner URL every fake channel plays.
+    const FAKE_TUNER_URL: &str = "http://tuner/live.ts";
+
+    /// A Live TV manager that resolves any channel id to a fixed tuner URL, and
+    /// records the live-stream ids it was asked to close — as the *tuner side*
+    /// sees them, which is the seam the prefix bug hid in.
+    #[derive(Default)]
+    struct FakeLiveTv {
+        closed: std::sync::Mutex<Vec<String>>,
+        /// How many consumers to report still watching after each close, in
+        /// order (a `false` means "not the last one").
+        remaining_consumers: std::sync::Mutex<Vec<bool>>,
+    }
 
     #[async_trait]
     impl ferrofin_traits::stubs::LiveTvManager for FakeLiveTv {
@@ -965,7 +1296,69 @@ mod tests {
             Ok(())
         }
         async fn get_channel_stream_url(&self, _id: Uuid) -> Result<Option<String>, ServiceError> {
-            Ok(Some("http://tuner/live.ts".to_owned()))
+            Ok(Some(FAKE_TUNER_URL.to_owned()))
+        }
+        async fn get_channel_media_sources(
+            &self,
+            id: Uuid,
+        ) -> Result<Vec<MediaSourceInfo>, ServiceError> {
+            Ok(vec![MediaSourceInfo {
+                id: Some("source-1".to_owned()),
+                path: Some(FAKE_TUNER_URL.to_owned()),
+                protocol: MediaProtocol::Http,
+                requires_opening: true,
+                requires_closing: true,
+                is_infinite_stream: true,
+                open_token: Some(format!("LiveTvChannel_{}_source-1", id.simple())),
+                buffer_ms: Some(1500),
+                media_streams: vec![
+                    ferrofin_model::entities_media::MediaStream {
+                        stream_type: MediaStreamType::Video,
+                        index: -1,
+                        width: Some(1920),
+                        ..Default::default()
+                    },
+                    ferrofin_model::entities_media::MediaStream {
+                        stream_type: MediaStreamType::Audio,
+                        index: -1,
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }])
+        }
+        async fn open_channel_stream(
+            &self,
+            channel_id: Uuid,
+            media_source_id: Option<&str>,
+        ) -> Result<MediaSourceInfo, ServiceError> {
+            let mut source = self.get_channel_media_sources(channel_id).await?.remove(0);
+            source.open_token = None;
+            source.path =
+                Some("http://server:8096/LiveTv/LiveStreamFiles/uid-1/stream.ts".to_owned());
+            source.container = Some("ts".to_owned());
+            source.live_stream_id = Some(format!(
+                "servicekey_{}",
+                media_source_id.unwrap_or("source-1")
+            ));
+            // The fake has no tuner to probe, so skip the probe branch.
+            source.supports_probing = false;
+            Ok(source)
+        }
+        async fn close_channel_stream(&self, live_stream_id: &str) -> Result<bool, ServiceError> {
+            self.closed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(live_stream_id.to_owned());
+            let mut remaining = self
+                .remaining_consumers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if remaining.is_empty() {
+                Ok(true)
+            } else {
+                Ok(remaining.remove(0))
+            }
         }
         async fn get_timers(
             &self,
@@ -1044,21 +1437,186 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn channel_id_resolves_to_infinite_transcodable_stream() {
+    async fn channel_id_resolves_to_an_unopened_tuner_source_with_a_prefixed_open_token() {
         let db = test_db().await;
-        let mgr = manager(&db).with_live_tv(Arc::new(FakeLiveTv));
+        let mgr = manager(&db).with_live_tv(Arc::new(FakeLiveTv::default()));
+        let channel = Uuid::from_u128(0x777);
         // An id absent from BaseItems falls through to the Live TV channel path.
         let sources = mgr
-            .get_static_media_sources(Uuid::from_u128(0x777), false, None)
+            .get_static_media_sources(channel, false, None)
             .await
             .expect("sources");
         assert_eq!(sources.len(), 1);
         let s = &sources[0];
-        assert_eq!(s.path.as_deref(), Some("http://tuner/live.ts"));
+        assert_eq!(s.path.as_deref(), Some(FAKE_TUNER_URL));
         assert!(s.is_infinite_stream);
-        assert!(s.supports_transcoding);
-        assert!(!s.supports_direct_play);
-        assert_eq!(s.container.as_deref(), Some("ts"));
+        assert!(s.requires_opening, "a tuner source must be opened first");
+        // `SetKeyProperties` routes the token back to the Live TV provider.
+        let token = s.open_token.as_deref().expect("open token");
+        assert_eq!(
+            token,
+            format!(
+                "{}_LiveTvChannel_{}_source-1",
+                live_tv_provider_key(),
+                channel.simple()
+            )
+        );
+        assert_eq!(
+            parse_live_tv_open_token(token),
+            Some((channel, Some("source-1".to_owned())))
+        );
+    }
+
+    #[tokio::test]
+    async fn opening_a_live_tv_token_registers_the_stream_and_closing_releases_the_tuner() {
+        let db = test_db().await;
+        let live_tv = Arc::new(FakeLiveTv::default());
+        let mgr = manager(&db).with_live_tv(Arc::clone(&live_tv) as Arc<_>);
+        let channel = Uuid::from_u128(0x778);
+        let token = format!(
+            "{}_LiveTvChannel_{}_source-1",
+            live_tv_provider_key(),
+            channel.simple()
+        );
+
+        let opened = mgr
+            .open_live_stream(&LiveStreamRequest {
+                open_token: Some(token),
+                item_id: channel,
+                ..Default::default()
+            })
+            .await
+            .expect("open");
+
+        // The live-stream id is prefixed with the provider key, so `Close` and
+        // the HLS planner can route it back here.
+        let live_id = opened.live_stream_id.clone().expect("live stream id");
+        assert_eq!(
+            live_id,
+            format!("{}_servicekey_source-1", live_tv_provider_key())
+        );
+        assert!(
+            opened
+                .path
+                .as_deref()
+                .expect("path")
+                .contains("/LiveTv/LiveStreamFiles/"),
+            "the opened source must play from the buffered copy, not the tuner"
+        );
+        // `AddMediaInfo`: infinite ⇒ no runtime, unknown index ⇒ no default
+        // audio stream, and the 1920-wide video gets the 20 Mbit estimate.
+        assert_eq!(opened.run_time_ticks, None);
+        assert_eq!(opened.default_audio_stream_index, None);
+        assert_eq!(opened.default_subtitle_stream_index, None);
+        assert_eq!(
+            opened.video_stream().and_then(|v| v.bit_rate),
+            Some(20_000_000)
+        );
+
+        // It is retrievable by its live-stream id until it is closed.
+        let fetched = mgr.get_live_stream(&live_id).await.expect("get");
+        assert_eq!(fetched.path, opened.path);
+
+        mgr.close_live_stream(&live_id).await.expect("close");
+        assert!(mgr.get_live_stream(&live_id).await.is_err());
+        // The tuner side keys its streams by the id IT minted — the provider
+        // prefix `SetKeyProperties` added here must come back off, or the
+        // consumer count never drops and the tuner leaks.
+        assert_eq!(
+            live_tv
+                .closed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_slice(),
+            ["servicekey_source-1"],
+            "closing must release the tuner-side stream under ITS key"
+        );
+    }
+
+    #[tokio::test]
+    async fn closing_one_of_two_viewers_leaves_the_stream_open() {
+        let db = test_db().await;
+        let live_tv = Arc::new(FakeLiveTv {
+            // The first close is not the last consumer; the second is.
+            remaining_consumers: std::sync::Mutex::new(vec![false, true]),
+            ..FakeLiveTv::default()
+        });
+        let mgr = manager(&db).with_live_tv(Arc::clone(&live_tv) as Arc<_>);
+        let channel = Uuid::from_u128(0x779);
+        let opened = mgr
+            .open_live_stream(&LiveStreamRequest {
+                open_token: Some(format!(
+                    "{}_LiveTvChannel_{}_source-1",
+                    live_tv_provider_key(),
+                    channel.simple()
+                )),
+                item_id: channel,
+                ..Default::default()
+            })
+            .await
+            .expect("open");
+        let live_id = opened.live_stream_id.clone().expect("live stream id");
+
+        mgr.close_live_stream(&live_id).await.expect("close");
+        assert!(
+            mgr.get_live_stream(&live_id).await.is_ok(),
+            "the source must survive while another viewer still holds it"
+        );
+        mgr.close_live_stream(&live_id).await.expect("close");
+        assert!(mgr.get_live_stream(&live_id).await.is_err());
+    }
+
+    #[test]
+    fn the_provider_prefix_comes_back_off_a_live_stream_id() {
+        let prefixed = format!("{}_servicekey_source-1", live_tv_provider_key());
+        assert_eq!(strip_provider_key(&prefixed), "servicekey_source-1");
+        // Not ours: left exactly as it came.
+        assert_eq!(strip_provider_key("other_thing"), "other_thing");
+        assert_eq!(strip_provider_key("plain"), "plain");
+    }
+
+    #[test]
+    fn a_foreign_open_token_is_not_a_live_tv_one() {
+        assert_eq!(parse_live_tv_open_token("nonsense"), None);
+        assert_eq!(
+            parse_live_tv_open_token(&format!("{}_Movie_abc_def", live_tv_provider_key())),
+            None
+        );
+        assert_eq!(
+            parse_live_tv_open_token("deadbeef_LiveTvChannel_abc_def"),
+            None
+        );
+    }
+
+    #[test]
+    fn direct_stream_support_follows_the_protocol_and_path() {
+        assert!(supports_direct_stream(
+            Some("/media/x.mkv"),
+            MediaProtocol::File
+        ));
+        assert!(supports_direct_stream(
+            Some("http://tuner/live.ts"),
+            MediaProtocol::Http
+        ));
+        // A playlist is an indirection, not a stream.
+        assert!(!supports_direct_stream(
+            Some("http://tuner/list.m3u8"),
+            MediaProtocol::Http
+        ));
+        assert!(!supports_direct_stream(None, MediaProtocol::Http));
+        assert!(!supports_direct_stream(
+            Some("rtsp://tuner/live"),
+            MediaProtocol::Rtsp
+        ));
+    }
+
+    #[test]
+    fn the_live_video_bitrate_bands_are_upstreams() {
+        assert_eq!(estimated_video_bitrate(3840), Some(30_000_000));
+        assert_eq!(estimated_video_bitrate(1920), Some(20_000_000));
+        assert_eq!(estimated_video_bitrate(1280), Some(8_000_000));
+        assert_eq!(estimated_video_bitrate(720), Some(2_000_000));
+        assert_eq!(estimated_video_bitrate(320), None);
     }
 
     #[tokio::test]

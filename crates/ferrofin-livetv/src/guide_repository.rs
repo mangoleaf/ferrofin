@@ -132,6 +132,31 @@ pub async fn tuner_hosts_exist(db: &Database) -> Result<bool, ServiceError> {
     Ok(exists != 0)
 }
 
+/// The tuner stream URL and owning tuner-host id of one channel, or `None`
+/// when the id is not a known channel — what opening a live stream starts from.
+///
+/// # Errors
+///
+/// Fails when the database read fails.
+pub async fn channel_stream_source(
+    db: &Database,
+    id: Uuid,
+) -> Result<Option<(String, String)>, ServiceError> {
+    let row = sqlx::query(
+        r#"SELECT "StreamUrl","TunerHostId" FROM "FerrofinLiveTvChannels" WHERE "Id" = ?1"#,
+    )
+    .bind(guid_to_db(id))
+    .fetch_optional(db.pool())
+    .await
+    .map_err(db_err)?;
+    Ok(row.map(|r| {
+        (
+            r.get::<String, _>("StreamUrl"),
+            r.get::<String, _>("TunerHostId"),
+        )
+    }))
+}
+
 /// Maps a `sqlx` error into a [`ServiceError`] via `ferrofin-db`'s `DbError`.
 fn db_err(e: sqlx::Error) -> ServiceError {
     ServiceError::from(ferrofin_db::DbError::from(e))
@@ -193,6 +218,14 @@ pub mod test_support {
     /// Every channel's stored `DateCreated`.
     pub async fn channel_dates(db: &Database) -> Result<Vec<String>, ServiceError> {
         sqlx::query_scalar(r#"SELECT "DateCreated" FROM "FerrofinLiveTvChannels""#)
+            .fetch_all(db.pool())
+            .await
+            .map_err(db_err)
+    }
+
+    /// Every channel's stored id, in lineup order.
+    pub async fn channel_ids(db: &Database) -> Result<Vec<String>, ServiceError> {
+        sqlx::query_scalar(r#"SELECT "Id" FROM "FerrofinLiveTvChannels" ORDER BY "SortIndex""#)
             .fetch_all(db.pool())
             .await
             .map_err(db_err)

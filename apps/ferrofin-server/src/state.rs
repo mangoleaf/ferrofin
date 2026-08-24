@@ -71,6 +71,17 @@ const PACKAGE_NAME: &str = "ferrofin-server";
 /// Keep this in sync with `contracts/jellyfin-openapi-*.json`.
 const JELLYFIN_API_VERSION: &str = "10.11.8";
 
+/// The host a Live TV live stream's buffered file is served from.
+///
+/// Jellyfin's `GetApiUrlForLocalAccess()` is the server's own bind address and
+/// deliberately never consults `PublishedServerUrl` (only `GetSmartApiUrl`
+/// does). Loopback is the strictly-local form of that, and it is right for the
+/// readers that matter: this process's own ffmpeg — which probes and transcodes
+/// the channel — and the DVR recorder. Routing them out through a public
+/// hostname would add TLS, a reverse proxy and a dependency on external DNS
+/// resolving from inside the container, any of which breaks Live TV outright.
+const LIVE_STREAM_LOCAL_HOST: &str = "127.0.0.1";
+
 /// The assembled application state plus the handles the composition root still
 /// needs after wiring (the concrete host, to flip its startup flag and drive
 /// name refresh, and the lifecycle controller's restart flag).
@@ -505,7 +516,19 @@ pub async fn build_app_state(
             Arc::new(ferrofin_livetv::ReqwestFetcher::new()),
             server_id.clone(),
         )
-        .with_users(Arc::clone(&users)),
+        .with_users(Arc::clone(&users))
+        // Where a shared tuner stream buffers, where the DVR records, and where
+        // the dashboard's Live TV options live (C# `GetTranscodePath()`,
+        // `CommonApplicationPaths.DataPath`, the `livetv` named config).
+        .with_paths(ferrofin_livetv::LiveTvPaths {
+            transcode_dir: std::path::PathBuf::from(
+                ferrofin_traits::system::ServerApplicationPaths::transcode_path(paths.as_ref()),
+            ),
+            data_dir: std::path::PathBuf::from(paths.data_path()),
+            options_file: std::path::PathBuf::from(paths.user_configuration_directory_path())
+                .join("named")
+                .join("livetv.json"),
+        }),
     );
     let live_tv: Arc<dyn ferrofin_traits::stubs::LiveTvManager> = live_tv_impl.clone();
     let devices: Arc<dyn ferrofin_traits::devices::DeviceManager> =
@@ -1294,6 +1317,18 @@ pub async fn build_app_state(
         .refresh_server_name()
         .await
         .context("failed to refresh advertised server name")?;
+    // The URL a live stream's buffered file is served from (C#
+    // `GetApiUrlForLocalAccess()`).
+    live_tv_impl.set_local_api_url(
+        ferrofin_traits::system::ServerApplicationHost::get_local_api_url(
+            app_host.as_ref(),
+            LIVE_STREAM_LOCAL_HOST,
+            None,
+            None,
+        )
+        .await
+        .context("failed to build the Live TV local api url")?,
+    );
     let app_host_trait: Arc<dyn ferrofin_traits::system::ServerApplicationHost> =
         Arc::clone(&app_host) as Arc<_>;
 
@@ -1347,6 +1382,8 @@ pub async fn build_app_state(
     let me_path_manager = Arc::clone(&path_manager);
     // The transcode planner resolves item/library display names for its logs.
     let me_library = Arc::clone(&library);
+    // The master playlist lists the item's trickplay tile streams.
+    let me_trickplay = Arc::clone(&trickplay);
     // SyncPlay resolves each member's library access; it is built after the
     // state below, which takes ownership of these.
     let sync_play_users = Arc::clone(&users);
@@ -1403,6 +1440,7 @@ pub async fn build_app_state(
         ffmpeg,
         // Transcode logs resolve item/series/library names through the library.
         Some(me_library),
+        Some(me_trickplay),
     );
     let state = state
         .with_media_encoding(hls, attachments)

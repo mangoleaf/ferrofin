@@ -11,10 +11,11 @@
 //! `async fn -> Result<T, ServiceError>`.
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use ferrofin_db::entities::users::UserEntity;
-use ferrofin_model::dto::{BaseItemDto, SortOrder};
+use ferrofin_model::dto::{BaseItemDto, MediaSourceInfo, SortOrder};
 use ferrofin_model::live_tv::{
     ChannelType, ItemSortBy, ListingsProviderInfo, LiveTvInfo, SeriesTimerInfoDto, TimerInfoDto,
     TunerHostInfo,
@@ -68,6 +69,30 @@ pub struct LiveTvChannelQuery {
     /// Whether each channel DTO carries its currently-airing programme.
     pub add_current_program: bool,
 }
+
+/// The buffered file behind an open tuner live stream.
+///
+/// Port of what `LiveStream.GetStream()` opens: the `{transcode}/{uniqueId}.ts`
+/// file the tuner copy task writes, plus the instant the stream was opened.
+/// Upstream seeks a reader that arrives more than [`TAIL_SEEK_AFTER_SECONDS`]
+/// late to [`TAIL_SEEK_BYTES`] from the end, so it joins the broadcast live
+/// instead of replaying the buffer from the start.
+#[derive(Debug, Clone)]
+pub struct LiveStreamFile {
+    /// The temp file the copy task appends tuner bytes to.
+    pub path: std::path::PathBuf,
+    /// When the stream was opened (C# `ILiveStream.DateOpened`).
+    pub opened_at: DateTime<Utc>,
+}
+
+/// How stale an open live stream must be before a new reader starts at the tail
+/// rather than the head of the buffer (C# `LiveStream.GetStream`'s
+/// `(DateTime.UtcNow - DateOpened).TotalSeconds > 10`).
+pub const TAIL_SEEK_AFTER_SECONDS: i64 = 10;
+
+/// How far from the end of the buffer such a late reader starts, in bytes (C#
+/// `LiveStream.GetStream`'s `TrySeek(stream, -20000)`).
+pub const TAIL_SEEK_BYTES: i64 = 20_000;
 
 /// The Live TV manager.
 ///
@@ -162,6 +187,76 @@ pub trait LiveTvManager: Send + Sync {
     /// Resolves a channel id to the tuner stream URL that plays it, or `None`
     /// when the channel is unknown.
     async fn get_channel_stream_url(&self, id: Uuid) -> Result<Option<String>, ServiceError>;
+
+    // ---- live streams ----------------------------------------------------
+
+    /// The playable media sources for a Live TV channel, or empty when the id
+    /// is not a known channel.
+    ///
+    /// Port of `LiveTvMediaSourceProvider.GetChannelMediaSources` →
+    /// `M3UTunerHost.CreateMediaSourceInfo` + `Normalize`: an unopened tuner
+    /// source (`RequiresOpening`/`RequiresClosing`, placeholder `Index = -1`
+    /// streams, the tuner's `RequiredHttpHeaders`), which the media-source
+    /// manager then stamps with the provider-prefixed `OpenToken`.
+    ///
+    /// The default reports no sources — the "no tuner configured" state.
+    async fn get_channel_media_sources(
+        &self,
+        id: Uuid,
+    ) -> Result<Vec<MediaSourceInfo>, ServiceError> {
+        let _ = id;
+        Ok(Vec::new())
+    }
+
+    /// Opens (or joins) the tuner stream for a channel, returning the opened
+    /// media source: its `Path` is the
+    /// `/LiveTv/LiveStreamFiles/{uniqueId}/stream.ts` URL the buffered copy is
+    /// served from, and its `LiveStreamId` is the handle
+    /// [`close_channel_stream`](Self::close_channel_stream) takes.
+    ///
+    /// Port of `DefaultLiveTvService.GetChannelStreamWithDirectStreamProvider`
+    /// (join an open stream with the same `OriginalStreamId`, else open a new
+    /// one) + `M3UTunerHost.GetChannelStream` + `SharedHttpStream.Open`.
+    ///
+    /// The default reports the channel as unknown.
+    async fn open_channel_stream(
+        &self,
+        channel_id: Uuid,
+        media_source_id: Option<&str>,
+    ) -> Result<MediaSourceInfo, ServiceError> {
+        let _ = (channel_id, media_source_id);
+        Err(ServiceError::not_found("live tv channel stream"))
+    }
+
+    /// The buffered file behind the open live stream with this unique id, or
+    /// `None` when no such stream is open.
+    ///
+    /// Port of `MediaSourceManager.GetLiveStreamInfoByUniqueId(...)` +
+    /// `ILiveStream.GetStream()` — what
+    /// `GET /LiveTv/LiveStreamFiles/{streamId}/stream.{container}` serves.
+    ///
+    /// The default reports nothing open.
+    async fn get_live_stream_file(
+        &self,
+        unique_id: &str,
+    ) -> Result<Option<LiveStreamFile>, ServiceError> {
+        let _ = unique_id;
+        Ok(None)
+    }
+
+    /// Releases one consumer of an open live stream, closing the tuner
+    /// connection and deleting its buffer once the last one goes. Reports
+    /// whether that was the last consumer — i.e. whether the stream is now
+    /// really gone, or still serving somebody else.
+    ///
+    /// Port of the tuner half of `MediaSourceManager.CloseLiveStream`
+    /// (`ConsumerCount--`, then `liveStream.Close()` at zero).
+    ///
+    /// The default reports "gone" — there was nothing open to close.
+    async fn close_channel_stream(&self, live_stream_id: &str) -> Result<bool, ServiceError> {
+        let _ = live_stream_id;
+        Ok(true)
+    }
 
     // ---- DVR: recording timers -------------------------------------------
 

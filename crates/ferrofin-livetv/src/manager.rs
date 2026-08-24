@@ -7,8 +7,9 @@
 //! Channels and programmes are surfaced to clients as `BaseItemDto`s.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -19,17 +20,18 @@ use uuid::Uuid;
 
 use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::data::{BaseItemKind, MediaType};
-use ferrofin_model::dto::BaseItemDto;
 use ferrofin_model::dto::SortOrder;
+use ferrofin_model::dto::{BaseItemDto, MediaSourceInfo, MediaSourceType};
 use ferrofin_model::live_tv::{
     ChannelType, ItemSortBy, ListingsProviderInfo, LiveTvInfo, LiveTvServiceInfo,
     LiveTvServiceStatus, RecordingStatus, SeriesTimerInfoDto, TimerInfoDto, TunerHostInfo,
 };
+use ferrofin_model::media_info::MediaProtocol;
 use ferrofin_model::querying::{ItemFields, QueryResult};
 use ferrofin_traits::dto::DtoService;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::options::{DtoOptions, InternalItemsQuery};
-use ferrofin_traits::stubs::{LiveTvChannelQuery, LiveTvManager};
+use ferrofin_traits::stubs::{LiveStreamFile, LiveTvChannelQuery, LiveTvManager};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -39,11 +41,40 @@ use crate::m3u::parse_m3u;
 use crate::projection::{
     ChannelRow, ProgramRow as GuideProgramRow, channel_entity, program_entity, remove_fields,
 };
+use crate::stream::{LiveStreamHandle, LiveStreamKind, TunerStreamSource};
 use crate::xmltv::parse_xmltv;
 
 /// SQLite's conservative default bind-parameter limit (`SQLITE_MAX_VARIABLE_NUMBER`
 /// is 999 before 3.32, 32766 after); multi-row inserts chunk to stay under it.
 const SQLITE_BIND_LIMIT: usize = 999;
+
+/// The C# type name whose MD5 prefixes every Live TV `LiveStreamId`.
+///
+/// Port of `LiveTvMediaSourceProvider.GetChannelStream`'s
+/// `service.GetType().FullName.GetMD5().ToString("N") + "_"` — the built-in
+/// service is `DefaultLiveTvService` (the one named "Emby").
+const LIVE_TV_SERVICE_TYPE_NAME: &str = "Jellyfin.LiveTv.DefaultLiveTvService";
+
+/// The first key of a channel's `OpenToken`: C# `item.GetType().Name`.
+const OPEN_TOKEN_ITEM_TYPE: &str = "LiveTvChannel";
+
+/// The separator between an open token's / live-stream id's keys.
+///
+/// Port of `LiveTvMediaSourceProvider.StreamIdDelimiter` — deliberately not a
+/// pipe, because Roku clients fail on one without an error message.
+const STREAM_ID_DELIMITER: char = '_';
+
+/// The buffer a Live TV media source declares when the tuner set none.
+///
+/// Port of `LiveTvMediaSourceProvider.GetMediaSourcesInternal`'s
+/// `source.BufferMs ??= 1500`.
+const DEFAULT_LIVE_STREAM_BUFFER_MS: i32 = 1500;
+
+/// The container a shared live stream's buffer is written in — it is literally
+/// the `{uniqueId}.ts` MPEG-TS file the copy task appends to. A probe of the
+/// opened source refines the rest of the media info; this is what the recorder's
+/// direct-vs-encoded choice reads when no probe is possible.
+const LIVE_STREAM_BUFFER_CONTAINER: &str = "ts";
 
 /// Namespace for deriving stable channel UUIDs (v5) from `tuner-host|tvg-id`.
 const CHANNEL_NS: Uuid = Uuid::from_u128(0x6c74_7663_6861_6e6e_656c_735f_6e73_3031);
@@ -88,6 +119,24 @@ const PROGRAM_UPSERT_CONFLICT: &str = r#" ON CONFLICT("Id") DO UPDATE SET
                     "IsLive"=excluded."IsLive","ExternalSeriesId"=excluded."ExternalSeriesId",
                     "SeasonNumber"=excluded."SeasonNumber","EpisodeNumber"=excluded."EpisodeNumber""#;
 
+/// The on-disk locations the Live TV engine reads and writes.
+///
+/// Ports the three application paths the C# Live TV code reaches for:
+/// `IConfigurationManager.GetTranscodePath()` (the live-stream buffer),
+/// `CommonApplicationPaths.DataPath` (`livetv/recordings`), and the
+/// `livetv` named-configuration file that holds `LiveTvOptions`.
+#[derive(Debug, Clone, Default)]
+pub struct LiveTvPaths {
+    /// Where a shared live stream's `{uniqueId}.ts` buffer is written
+    /// (C# `GetTranscodePath()`).
+    pub transcode_dir: PathBuf,
+    /// The server data directory, under which `livetv/recordings` is the
+    /// default DVR target (C# `CommonApplicationPaths.DataPath`).
+    pub data_dir: PathBuf,
+    /// The `named/livetv.json` file holding the dashboard's `LiveTvOptions`.
+    pub options_file: PathBuf,
+}
+
 /// Concrete Live TV manager backed by [`Database`] and a [`SourceFetcher`].
 #[derive(Clone)]
 pub struct FerrofinLiveTvManager {
@@ -111,6 +160,27 @@ pub struct FerrofinLiveTvManager {
     /// [`FerrofinLiveTvManager::set_dto`] once the DTO service exists, the way
     /// C# breaks the same cycle with `Lazy<ILiveTvManager>`.
     dto: OnceLock<Arc<dyn DtoService>>,
+    /// Where the live-stream buffer and DVR recordings live.
+    paths: LiveTvPaths,
+    /// The tuner HTTP seam the live-stream engine opens channels through.
+    tuner_source: Arc<dyn TunerStreamSource>,
+    /// The API base URL a live stream's buffered file is served from — C#
+    /// `IServerApplicationHost.GetApiUrlForLocalAccess()`. An `Arc<OnceLock<_>>`
+    /// because the composition root builds the application host *after* this
+    /// manager, and every clone must see the value once it lands.
+    local_api_url: Arc<OnceLock<String>>,
+    /// The open live streams, keyed by `LiveStreamId` (C#
+    /// `MediaSourceManager._openStreams`, whose values are the tuner-side
+    /// `ILiveStream`s). Guarded by a `std::sync::Mutex`: the guard is always
+    /// dropped before an `.await`.
+    live_streams: Arc<Mutex<HashMap<String, LiveStreamHandle>>>,
+    /// Serializes "join or open", so two clients tuning the same channel at
+    /// once cannot both miss the join and both dial the tuner.
+    ///
+    /// Port of `MediaSourceManager._liveStreamLocker` (an
+    /// `AsyncNonKeyedLocker(1)` around the whole of `OpenLiveStreamInternal`);
+    /// a `tokio::sync::Mutex` because this one *is* held across awaits.
+    open_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl std::fmt::Debug for FerrofinLiveTvManager {
@@ -249,7 +319,35 @@ impl FerrofinLiveTvManager {
             server_id,
             tuner_flag: Arc::new(AtomicBool::new(false)),
             dto: OnceLock::new(),
+            paths: LiveTvPaths::default(),
+            tuner_source: Arc::new(crate::stream::ReqwestTunerSource::new()),
+            local_api_url: Arc::new(OnceLock::new()),
+            live_streams: Arc::new(Mutex::new(HashMap::new())),
+            open_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
+    }
+
+    /// Sets the on-disk locations the live-stream buffer and DVR recordings use.
+    #[must_use]
+    pub fn with_paths(mut self, paths: LiveTvPaths) -> Self {
+        self.paths = paths;
+        self
+    }
+
+    /// Replaces the tuner HTTP seam (tests serve an in-memory broadcast).
+    #[must_use]
+    pub fn with_tuner_source(mut self, source: Arc<dyn TunerStreamSource>) -> Self {
+        self.tuner_source = source;
+        self
+    }
+
+    /// Publishes the API base URL a live stream's buffered file is served from
+    /// (C# `GetApiUrlForLocalAccess()`), e.g. `http://127.0.0.1:8096`.
+    ///
+    /// The composition root calls this once the application host exists; a
+    /// second call is ignored.
+    pub fn set_local_api_url(&self, url: impl Into<String>) {
+        let _ = self.local_api_url.set(url.into());
     }
 
     /// Attaches the user manager so `GET /LiveTv/Info` can list the users who may
@@ -792,6 +890,208 @@ impl LiveTvManager for FerrofinLiveTvManager {
         Ok(url)
     }
 
+    async fn get_channel_media_sources(
+        &self,
+        id: Uuid,
+    ) -> Result<Vec<MediaSourceInfo>, ServiceError> {
+        let Some((path, tuner_host_id)) =
+            crate::guide_repository::channel_stream_source(&self.db, id).await?
+        else {
+            return Ok(Vec::new());
+        };
+        let tuner = self.tuner_host(&tuner_host_id).await?;
+        let mut source = crate::stream::create_media_source_info(&path, &tuner);
+        crate::stream::normalize(&mut source);
+        Self::stamp_source(&mut source);
+        // `LiveTvMediaSourceProvider.GetMediaSourcesInternal`: the open token is
+        // `{item type}_{item id "N"}_{source id}`. The media-source manager
+        // prefixes the provider key before it reaches a client.
+        source.open_token = Some(format!(
+            "{OPEN_TOKEN_ITEM_TYPE}{STREAM_ID_DELIMITER}{}{STREAM_ID_DELIMITER}{}",
+            id.simple(),
+            source.id.clone().unwrap_or_default()
+        ));
+        Ok(vec![source])
+    }
+
+    async fn open_channel_stream(
+        &self,
+        channel_id: Uuid,
+        media_source_id: Option<&str>,
+    ) -> Result<MediaSourceInfo, ServiceError> {
+        // C# `GetChannelStream`: a media-source id equal to the channel id is
+        // no id at all.
+        let channel_key = channel_id.simple().to_string();
+        let stream_id: Option<String> = media_source_id
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case(&channel_key))
+            .map(ToOwned::to_owned);
+
+        // The whole join-or-open runs under one lock: two viewers tuning the
+        // same channel at once must share one tuner connection, not race past
+        // the join and open two. The lock is held across the DB reads, the
+        // share probe and the tuner open — upstream serializes the identical
+        // span (`MediaSourceManager._liveStreamLocker` wraps all of
+        // `OpenLiveStreamInternal`), so a slow tuner delays other opens.
+        let _open_guard = self.open_lock.lock().await;
+
+        // Forget streams whose tuner hung up: their buffer is gone and nobody
+        // can join them, so keeping them only grows the map.
+        self.live_streams_lock()
+            .retain(|_, entry| entry.is_sharing());
+
+        // Upstream resolves the channel item before anything else
+        // (`LiveTvMediaSourceProvider.GetChannelStream`), so an unknown id is a
+        // 404 whether or not some other stream happens to be open.
+        let Some((path, tuner_host_id)) =
+            crate::guide_repository::channel_stream_source(&self.db, channel_id).await?
+        else {
+            return Err(ServiceError::not_found(format!(
+                "live tv channel {channel_id}"
+            )));
+        };
+
+        // Join a stream already open on the same source (C#
+        // `GetChannelStreamWithDirectStreamProvider`'s `ConsumerCount++`).
+        if let Some(stream_id) = stream_id.as_deref()
+            && let Some(shared) = self.join_open_stream(stream_id)
+        {
+            return Ok(shared);
+        }
+
+        let tuner = self.tuner_host(&tuner_host_id).await?;
+        self.enforce_tuner_count(&tuner_host_id, tuner.tuner_count)?;
+
+        let mut source = crate::stream::create_media_source_info(&path, &tuner);
+        crate::stream::normalize(&mut source);
+        Self::stamp_source(&mut source);
+
+        let share = tuner.allow_stream_sharing
+            && source.protocol == MediaProtocol::Http
+            && !source.requires_looping
+            && self.can_share_stream(&path, &source).await;
+
+        let (unique_id, opened_at, alive, kind) = if share {
+            let transcode_dir = self.transcode_dir()?;
+            let base_url = self.local_api_url()?;
+            let opened = crate::stream::open_shared_http_stream(
+                self.tuner_source.as_ref(),
+                &path,
+                &source.required_http_headers,
+                &transcode_dir,
+            )
+            .await?;
+            // Every consumer now reads the one buffered copy, not the tuner
+            // (C# `SharedHttpStream.Open`).
+            source.path = Some(format!(
+                "{base_url}/LiveTv/LiveStreamFiles/{}/stream.{LIVE_STREAM_BUFFER_CONTAINER}",
+                opened.unique_id
+            ));
+            source.protocol = MediaProtocol::Http;
+            source.container = Some(LIVE_STREAM_BUFFER_CONTAINER.to_owned());
+            (
+                opened.unique_id,
+                opened.opened_at,
+                opened.alive,
+                LiveStreamKind::Shared {
+                    temp_path: opened.temp_path,
+                    task: opened.task,
+                },
+            )
+        } else {
+            // The pass-through stream: nothing is buffered and the media source
+            // keeps the tuner URL (C# bare `LiveStream`).
+            (
+                Uuid::new_v4().simple().to_string(),
+                Utc::now(),
+                Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                LiveStreamKind::Direct,
+            )
+        };
+
+        source.requires_closing = true;
+        let live_stream_id = format!(
+            "{}{STREAM_ID_DELIMITER}{}",
+            live_tv_service_key(),
+            source.id.clone().unwrap_or_default()
+        );
+        source.live_stream_id = Some(live_stream_id.clone());
+
+        let handle = LiveStreamHandle {
+            unique_id,
+            original_stream_id: stream_id,
+            tuner_host_id: Some(tuner_host_id),
+            opened_at,
+            consumer_count: 1,
+            enable_stream_sharing: alive,
+            media_source: source.clone(),
+            kind,
+        };
+        // Two channels can share a stream URL, and a token without a
+        // media-source id cannot join — either way the key may already be
+        // taken. Dropping the old handle would DETACH its copy task (a
+        // dropped `JoinHandle` does not abort), leaving a tuner connection
+        // and a growing buffer that nothing can ever stop.
+        let displaced = self.live_streams_lock().insert(live_stream_id, handle);
+        if let Some(old) = displaced {
+            tracing::warn!(
+                unique_id = old.unique_id,
+                "live tv: a new open displaced an existing live stream; closing the old one"
+            );
+            old.close().await;
+        }
+        Ok(source)
+    }
+
+    async fn get_live_stream_file(
+        &self,
+        unique_id: &str,
+    ) -> Result<Option<LiveStreamFile>, ServiceError> {
+        let open = self.live_streams_lock();
+        Ok(open
+            .values()
+            .find(|entry| entry.unique_id.eq_ignore_ascii_case(unique_id) && entry.is_sharing())
+            .and_then(|entry| {
+                entry.temp_path().map(|path| LiveStreamFile {
+                    path: path.to_path_buf(),
+                    opened_at: entry.opened_at,
+                })
+            }))
+    }
+
+    async fn close_channel_stream(&self, live_stream_id: &str) -> Result<bool, ServiceError> {
+        // C# `MediaSourceManager.CloseLiveStream`: one consumer leaves, and the
+        // tuner connection only drops when the last one has.
+        let closing = {
+            let mut open = self.live_streams_lock();
+            match open.get_mut(live_stream_id) {
+                Some(entry) => {
+                    entry.consumer_count -= 1;
+                    tracing::info!(
+                        live_stream_id,
+                        consumers = entry.consumer_count,
+                        "live tv: released a live stream consumer"
+                    );
+                    if entry.consumer_count <= 0 {
+                        open.remove(live_stream_id)
+                    } else {
+                        None
+                    }
+                }
+                // Nothing open under that id: as far as the caller is
+                // concerned it is closed.
+                None => return Ok(true),
+            }
+        };
+        match closing {
+            Some(handle) => {
+                handle.close().await;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
     async fn get_timers(&self) -> Result<Vec<TimerInfoDto>, ServiceError> {
         self.json_list(r#"SELECT "Data" FROM "FerrofinLiveTvTimers" ORDER BY "StartDate""#)
             .await
@@ -1188,6 +1488,118 @@ impl FerrofinLiveTvManager {
         }
     }
 
+    /// The open-live-stream map, locked. The guard never spans an `.await`.
+    fn live_streams_lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, LiveStreamHandle>> {
+        self.live_streams
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The tuner host with this id, or its defaults when the row has gone (the
+    /// channel outlives a deleted host only in a torn state, and upstream's
+    /// `TunerHostInfo` defaults are the same "nothing configured" answer).
+    async fn tuner_host(&self, id: &str) -> Result<TunerHostInfo, ServiceError> {
+        Ok(self
+            .get_tuner_hosts()
+            .await?
+            .into_iter()
+            .find(|t| t.id.as_deref() == Some(id))
+            .unwrap_or_default())
+    }
+
+    /// The per-source stamp `LiveTvMediaSourceProvider.GetMediaSourcesInternal`
+    /// applies to every Live TV source.
+    fn stamp_source(source: &mut MediaSourceInfo) {
+        source.type_ = MediaSourceType::Default;
+        if source.buffer_ms.is_none() {
+            source.buffer_ms = Some(DEFAULT_LIVE_STREAM_BUFFER_MS);
+        }
+    }
+
+    /// Joins an open, shareable stream on `stream_id`, returning its media
+    /// source once the consumer count has been raised.
+    fn join_open_stream(&self, stream_id: &str) -> Option<MediaSourceInfo> {
+        let mut open = self.live_streams_lock();
+        let entry = open.values_mut().find(|entry| {
+            entry.is_sharing()
+                && entry
+                    .original_stream_id
+                    .as_deref()
+                    .is_some_and(|original| original.eq_ignore_ascii_case(stream_id))
+        })?;
+        entry.consumer_count += 1;
+        // The stored source is the one handed out at open time, i.e. before the
+        // media-source manager probed it (C# hands back the same object the
+        // probe mutated). The joiner's probe is a cache hit, so the two end up
+        // reporting the same streams.
+        tracing::info!(
+            stream_id,
+            consumers = entry.consumer_count,
+            "live tv: joined an open live stream"
+        );
+        Some(entry.media_source.clone())
+    }
+
+    /// Rejects an open that would exceed the tuner host's simultaneous-stream
+    /// limit (C# `M3UTunerHost.GetChannelStream`'s `LiveTvConflictException`).
+    fn enforce_tuner_count(
+        &self,
+        tuner_host_id: &str,
+        tuner_count: i32,
+    ) -> Result<(), ServiceError> {
+        if tuner_count <= 0 {
+            return Ok(());
+        }
+        let open = self.live_streams_lock();
+        // A stream whose tuner has already hung up occupies nothing: its
+        // buffer is gone and no consumer can join it. Upstream counts those
+        // too, and so runs out of tuners it is not using.
+        let in_use = open
+            .values()
+            .filter(|entry| {
+                entry.is_sharing() && entry.tuner_host_id.as_deref() == Some(tuner_host_id)
+            })
+            .count();
+        if i64::try_from(in_use).unwrap_or(i64::MAX) >= i64::from(tuner_count) {
+            return Err(ServiceError::Conflict(
+                "M3U simultaneous stream limit has been reached.".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Whether the tuner's HTTP stream may be shared between consumers: the
+    /// URL's extension decides, and a URL without one is settled by a `HEAD`
+    /// probe of the `Content-Type` (C# `M3UTunerHost.GetChannelStream`).
+    async fn can_share_stream(&self, path: &str, source: &MediaSourceInfo) -> bool {
+        match crate::stream::extension_can_share(path) {
+            Some(can_share) => can_share,
+            None => self
+                .tuner_source
+                .content_type(path, &source.required_http_headers)
+                .await
+                .is_some_and(|content_type| crate::stream::mime_type_can_share(&content_type)),
+        }
+    }
+
+    /// The directory a shared live stream's buffer is written to.
+    fn transcode_dir(&self) -> Result<PathBuf, ServiceError> {
+        if self.paths.transcode_dir.as_os_str().is_empty() {
+            return Err(ServiceError::Backend(
+                "live tv transcode path not wired".to_owned(),
+            ));
+        }
+        Ok(self.paths.transcode_dir.clone())
+    }
+
+    /// The API base URL a live stream's buffered file is served from.
+    fn local_api_url(&self) -> Result<&str, ServiceError> {
+        self.local_api_url
+            .get()
+            .map(String::as_str)
+            .ok_or_else(|| ServiceError::Backend("live tv local api url not wired".to_owned()))
+    }
+
     /// Reads a JSON `Data` column across all rows of `sql`, deserializing each.
     async fn json_list<T: DeserializeOwned>(&self, sql: &str) -> Result<Vec<T>, ServiceError> {
         let rows = sqlx::query(sql)
@@ -1450,6 +1862,20 @@ fn parse_dt(s: &str) -> Option<DateTime<Utc>> {
 
 /// Maps a `sqlx` error into a [`ServiceError`] via `ferrofin-db`'s `DbError`, for
 /// consistency with the repository layer's error text.
+/// The MD5 of the built-in Live TV service's C# type name, in `"N"` form —
+/// the first half of every Live TV `LiveStreamId`.
+///
+/// Port of `LiveTvMediaSourceProvider.GetChannelStream`'s `idPrefix`. Computed
+/// once: it is a constant of the port, not of the configuration.
+fn live_tv_service_key() -> &'static str {
+    static KEY: OnceLock<String> = OnceLock::new();
+    KEY.get_or_init(|| {
+        ferrofin_common::extensions::get_md5(LIVE_TV_SERVICE_TYPE_NAME)
+            .simple()
+            .to_string()
+    })
+}
+
 fn db_err(e: sqlx::Error) -> ServiceError {
     ServiceError::from(ferrofin_db::DbError::from(e))
 }
@@ -1460,6 +1886,8 @@ mod tests {
     use std::sync::Arc;
 
     use uuid::Uuid;
+
+    use super::{DEFAULT_LIVE_STREAM_BUFFER_MS, LiveTvPaths, live_tv_service_key};
 
     use ferrofin_db::Database;
     use ferrofin_model::live_tv::{ListingsProviderInfo, TunerHostInfo};
@@ -2158,6 +2586,279 @@ mod tests {
         .expect("provider");
         mgr.refresh_guide().await.expect("refresh");
         mgr
+    }
+
+    /// The ids of the channels in the lineup, in order.
+    async fn channel_ids(mgr: &FerrofinLiveTvManager) -> Vec<Uuid> {
+        crate::guide_repository::test_support::channel_ids(&mgr.db)
+            .await
+            .expect("channels")
+            .iter()
+            .map(|id| Uuid::parse_str(id).expect("guid"))
+            .collect()
+    }
+
+    /// The id of the first channel in the lineup, by `SortIndex`.
+    async fn first_channel_id(mgr: &FerrofinLiveTvManager) -> Uuid {
+        channel_ids(mgr).await.remove(0)
+    }
+
+    /// The `{uniqueId}` segment of a `LiveStreamFiles` path.
+    fn unique_id_of(path: &str) -> String {
+        path.split("/LiveTv/LiveStreamFiles/")
+            .nth(1)
+            .expect("live stream path")
+            .split('/')
+            .next()
+            .expect("unique id")
+            .to_owned()
+    }
+
+    /// A manager over the relative guide whose tuner is an in-memory endless
+    /// MPEG-TS broadcast, buffering into `transcode_dir`.
+    async fn manager_with_tuner(
+        transcode_dir: &std::path::Path,
+        opens: &Arc<std::sync::atomic::AtomicUsize>,
+    ) -> FerrofinLiveTvManager {
+        let tuner = crate::stream::tests::LoopingTuner {
+            chunk: vec![0x47; 188],
+            opens: Arc::clone(opens),
+            // The fixture M3U's URLs carry no extension, so the share decision
+            // falls through to the HEAD probe — as it does for a real IPTV
+            // tuner that serves `/live` rather than `/live.ts`.
+            content_type: Some("video/MP2T".to_owned()),
+        };
+        let mgr = manager_with_relative_guide()
+            .await
+            .with_tuner_source(Arc::new(tuner))
+            .with_paths(LiveTvPaths {
+                transcode_dir: transcode_dir.to_path_buf(),
+                ..LiveTvPaths::default()
+            });
+        mgr.set_local_api_url("http://127.0.0.1:8096");
+        mgr
+    }
+
+    #[tokio::test]
+    async fn a_channel_media_source_is_unopened_and_carries_its_open_token() {
+        let mgr = manager_with_relative_guide().await;
+        let channel = first_channel_id(&mgr).await;
+        let sources = mgr
+            .get_channel_media_sources(channel)
+            .await
+            .expect("sources");
+        assert_eq!(sources.len(), 1);
+        let source = &sources[0];
+        // `CreateMediaSourceInfo`: the raw tuner URL, opened on demand.
+        assert_eq!(source.path.as_deref(), Some("http://tuner/one"));
+        assert!(source.requires_opening && source.requires_closing);
+        assert!(source.is_infinite_stream);
+        assert_eq!(source.buffer_ms, Some(DEFAULT_LIVE_STREAM_BUFFER_MS));
+        assert_eq!(
+            source.id.as_deref(),
+            Some(
+                ferrofin_common::extensions::get_md5("http://tuner/one")
+                    .simple()
+                    .to_string()
+                    .as_str()
+            ),
+            "the source id is the MD5 of the tuner path, as upstream derives it"
+        );
+        // Two placeholder streams whose real indexes nothing knows yet.
+        assert_eq!(source.media_streams.len(), 2);
+        assert!(source.media_streams.iter().all(|s| s.index == -1));
+        assert_eq!(
+            source
+                .required_http_headers
+                .get("User-Agent")
+                .map(String::as_str),
+            Some(crate::stream::DEFAULT_TUNER_USER_AGENT)
+        );
+        assert_eq!(
+            source.open_token.as_deref(),
+            Some(
+                format!(
+                    "LiveTvChannel_{}_{}",
+                    channel.simple(),
+                    source.id.clone().unwrap_or_default()
+                )
+                .as_str()
+            )
+        );
+        // An unknown id is not a channel.
+        assert!(
+            mgr.get_channel_media_sources(Uuid::from_u128(0xdead))
+                .await
+                .expect("sources")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn opening_a_channel_shares_one_tuner_connection_until_the_last_consumer_closes() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let opens = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mgr = manager_with_tuner(dir.path(), &opens).await;
+        let channel = first_channel_id(&mgr).await;
+        let source_id = mgr
+            .get_channel_media_sources(channel)
+            .await
+            .expect("sources")[0]
+            .id
+            .clone();
+
+        let opened = mgr
+            .open_channel_stream(channel, source_id.as_deref())
+            .await
+            .expect("open");
+        let path = opened.path.clone().expect("path");
+        assert!(
+            path.starts_with("http://127.0.0.1:8096/LiveTv/LiveStreamFiles/")
+                && path.ends_with("/stream.ts"),
+            "the opened source must play the buffered copy: {path}"
+        );
+        assert_eq!(opened.container.as_deref(), Some("ts"));
+        assert!(opened.requires_closing);
+        let live_id = opened.live_stream_id.clone().expect("live stream id");
+        assert_eq!(
+            live_id,
+            format!(
+                "{}_{}",
+                live_tv_service_key(),
+                source_id.clone().unwrap_or_default()
+            )
+        );
+
+        // The buffer exists and is being written.
+        let unique_id = unique_id_of(&path);
+        let file = mgr
+            .get_live_stream_file(&unique_id)
+            .await
+            .expect("lookup")
+            .expect("open stream");
+        assert!(file.path.exists());
+
+        // A second open of the same source JOINS the stream: one tuner, two
+        // consumers (C# `ConsumerCount++`).
+        let joined = mgr
+            .open_channel_stream(channel, source_id.as_deref())
+            .await
+            .expect("join");
+        assert_eq!(joined.live_stream_id.as_deref(), Some(live_id.as_str()));
+        assert_eq!(joined.path.as_deref(), Some(path.as_str()));
+        assert_eq!(opens.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // The first close only decrements; the stream stays up for the other.
+        mgr.close_channel_stream(&live_id).await.expect("close");
+        assert!(
+            mgr.get_live_stream_file(&unique_id)
+                .await
+                .expect("lookup")
+                .is_some()
+        );
+
+        // The last close drops the tuner and deletes the buffer.
+        mgr.close_channel_stream(&live_id).await.expect("close");
+        assert!(
+            mgr.get_live_stream_file(&unique_id)
+                .await
+                .expect("lookup")
+                .is_none()
+        );
+        assert!(!file.path.exists(), "the buffer must be deleted");
+        // Closing an unknown id is a no-op, never an error.
+        mgr.close_channel_stream("nope").await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn a_tuner_at_its_stream_limit_rejects_a_second_channel() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let opens = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mgr = manager_with_tuner(dir.path(), &opens).await;
+        // One tuner: a second, DIFFERENT source on the same host must be
+        // refused (C# `LiveTvConflictException`).
+        let mut tuner = mgr.get_tuner_hosts().await.expect("tuners").remove(0);
+        tuner.tuner_count = 1;
+        mgr.save_tuner_host(tuner).await.expect("save");
+
+        let channels = channel_ids(&mgr).await;
+        let (first, second) = (channels[0], channels[1]);
+        let first_source = mgr.get_channel_media_sources(first).await.expect("sources")[0]
+            .id
+            .clone();
+        let second_source = mgr
+            .get_channel_media_sources(second)
+            .await
+            .expect("sources")[0]
+            .id
+            .clone();
+
+        let opened = mgr
+            .open_channel_stream(first, first_source.as_deref())
+            .await
+            .expect("open");
+        let error = mgr
+            .open_channel_stream(second, second_source.as_deref())
+            .await
+            .expect_err("the tuner is busy");
+        assert!(
+            matches!(error, ServiceError::Conflict(ref m) if m.contains("simultaneous stream limit")),
+            "{error}"
+        );
+        mgr.close_channel_stream(&opened.live_stream_id.unwrap_or_default())
+            .await
+            .expect("close");
+    }
+
+    #[tokio::test]
+    async fn a_stream_the_tuner_forbids_sharing_stays_a_pass_through() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let opens = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mgr = manager_with_tuner(dir.path(), &opens).await;
+        let mut tuner = mgr.get_tuner_hosts().await.expect("tuners").remove(0);
+        tuner.allow_stream_sharing = false;
+        mgr.save_tuner_host(tuner).await.expect("save");
+
+        let channel = first_channel_id(&mgr).await;
+        let source_id = mgr
+            .get_channel_media_sources(channel)
+            .await
+            .expect("sources")[0]
+            .id
+            .clone();
+        let opened = mgr
+            .open_channel_stream(channel, source_id.as_deref())
+            .await
+            .expect("open");
+        // Nothing is buffered: the media source keeps the tuner URL and the
+        // `LiveStreamFiles` route has no file to serve.
+        assert_eq!(opened.path.as_deref(), Some("http://tuner/one"));
+        assert_eq!(opens.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(
+            mgr.get_live_stream_file("anything")
+                .await
+                .expect("lookup")
+                .is_none()
+        );
+        mgr.close_channel_stream(&opened.live_stream_id.unwrap_or_default())
+            .await
+            .expect("close");
+    }
+
+    #[tokio::test]
+    async fn opening_a_shared_stream_without_the_wiring_fails_loudly() {
+        // A shareable tuner, but no transcode directory: there is nowhere to
+        // buffer to, and that must be said out loud rather than silently
+        // handing back a source that plays nothing.
+        let opens = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mgr = manager_with_tuner(std::path::Path::new(""), &opens).await;
+        let channel = first_channel_id(&mgr).await;
+        let error = mgr
+            .open_channel_stream(channel, Some("some-source"))
+            .await
+            .expect_err("no transcode path");
+        assert!(error.to_string().contains("transcode path"), "{error}");
+        assert_eq!(opens.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     /// The programme titles a query returns, in the order it returned them.

@@ -51,7 +51,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use tokio::sync::Mutex;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 use uuid::Uuid;
 
 use ferrofin_db::Database;
@@ -198,6 +198,17 @@ pub struct FerrofinSessionManager {
     /// The pool of active sessions keyed by session key (`app + deviceId`),
     /// matching the C# `_activeConnections` keying.
     sessions: Arc<Mutex<HashMap<String, SessionInfo>>>,
+    /// Which sessions are still holding each open live stream, keyed by
+    /// `LiveStreamId`.
+    ///
+    /// Port of `SessionManager._activeLiveStreamSessions`. It exists because a
+    /// live stream's consumer count is real and shared: a Live TV channel two
+    /// people are watching is ONE stream with two consumers, so a duplicate
+    /// `PlaybackStopped` (or a client that both POSTs `/LiveStreams/Close` and
+    /// reports stopped) must not decrement twice and tear the tuner down under
+    /// the other viewer. Only the first close reported by a given session
+    /// counts.
+    active_live_stream_sessions: Arc<Mutex<HashMap<String, std::collections::HashSet<String>>>>,
     /// Serializes the `MaxActiveSessions` admission decision with the session
     /// creation that satisfies it.
     ///
@@ -262,6 +273,7 @@ impl FerrofinSessionManager {
             db,
             server_id: server_id.into(),
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            active_live_stream_sessions: Arc::new(Mutex::new(HashMap::new())),
             session_limit_gate: Arc::new(Mutex::new(())),
             media_sources: None,
             music_manager: None,
@@ -1677,16 +1689,33 @@ impl SessionManager for FerrofinSessionManager {
     async fn close_live_stream_if_needed(
         &self,
         live_stream_id: &str,
-        _session_or_play_session_id: &str,
+        session_or_play_session_id: &str,
     ) -> Result<(), ServiceError> {
         // C# keeps a `_activeLiveStreamSessions` map so a live stream shared by
-        // several sessions is closed only by the last one; when a live stream has
-        // no mapping it closes outright. Ferrofin mints a fresh live-stream id per
-        // `OpenLiveStream`, so no two sessions ever name the same id and the
-        // no-mapping branch is the only reachable one — the refcount map (itself
-        // unbounded) buys nothing here.
+        // several sessions is closed only by the last one. Ferrofin does not
+        // need that second layer: a Live TV stream IS shared between viewers
+        // (they all get the same `LiveStreamId`), but every `OpenLiveStream`
+        // raised its consumer count, so one close per session stop is exactly
+        // symmetric — `MediaSourceManager::close_live_stream` drops the tuner
+        // only when that count reaches zero. A non-Live-TV live stream still
+        // has a fresh id per open, where the count is trivially one.
         if live_stream_id.is_empty() {
             return Ok(());
+        }
+        // One close per session (C# `CloseLiveStreamIfNeededAsync`): the first
+        // report from this session releases its consumer, later ones are
+        // already released and must not touch the count again.
+        {
+            let mut holders = self.active_live_stream_sessions.lock().await;
+            let sessions = holders.entry(live_stream_id.to_owned()).or_default();
+            if !sessions.insert(session_or_play_session_id.to_owned()) {
+                debug!(
+                    %live_stream_id,
+                    session = %session_or_play_session_id,
+                    "live stream already released by this session"
+                );
+                return Ok(());
+            }
         }
         let Some(media_sources) = self.media_sources.as_ref() else {
             return Ok(());
