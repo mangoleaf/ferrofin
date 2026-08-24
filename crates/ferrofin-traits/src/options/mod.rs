@@ -37,4 +37,4 @@ pub use image_processing_options::{ImageCollageOptions, ImageProcessingOptions};
 pub use internal_items_query::{InternalItemsQuery, SourceType};
 pub use internal_people_query::InternalPeopleQuery;
 pub use item_image_info::ItemImageInfo;
-pub use latest_items_query::LatestItemsQuery;
+pub use latest_items_query::{LATEST_ITEMS_FALLBACK_LIMIT, LatestItemsQuery};

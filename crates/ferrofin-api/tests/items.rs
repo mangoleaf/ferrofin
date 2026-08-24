@@ -515,7 +515,7 @@ impl UserViewManager for OkUserViews {
         &self,
         _query: &ferrofin_traits::options::LatestItemsQuery,
         _options: &DtoOptions,
-    ) -> Result<Vec<(BaseItemEntity, Vec<BaseItemEntity>)>, ServiceError> {
+    ) -> Result<Vec<(Option<BaseItemEntity>, Vec<BaseItemEntity>)>, ServiceError> {
         unimplemented!()
     }
 }
@@ -955,9 +955,9 @@ impl UserViewManager for StubUserViews {
         &self,
         _query: &ferrofin_traits::options::LatestItemsQuery,
         _options: &DtoOptions,
-    ) -> Result<Vec<(BaseItemEntity, Vec<BaseItemEntity>)>, ServiceError> {
+    ) -> Result<Vec<(Option<BaseItemEntity>, Vec<BaseItemEntity>)>, ServiceError> {
         Ok(vec![(
-            item_entity(ROOT_ID, "Movies", BaseItemKind::CollectionFolder),
+            None,
             vec![item_entity(ITEM_ID, "Movie", BaseItemKind::Movie)],
         )])
     }
@@ -1044,7 +1044,7 @@ async fn items_returns_query_result_of_base_item_dto() {
     let json = json_body(response).await;
     assert_eq!(json["TotalRecordCount"], 1);
     assert_eq!(json["StartIndex"], 0);
-    assert_eq!(json["Items"][0]["Id"], item_id.to_string());
+    assert_eq!(json["Items"][0]["Id"], item_id.simple().to_string());
     assert_eq!(json["Items"][0]["Name"], "Test Item");
 }
 
@@ -1064,7 +1064,7 @@ async fn item_by_id_returns_base_item_dto() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let json = json_body(response).await;
-    assert_eq!(json["Id"], item_id.to_string());
+    assert_eq!(json["Id"], item_id.simple().to_string());
     assert_eq!(json["Name"], "Test Item");
 }
 
@@ -1108,7 +1108,7 @@ async fn get_items_with_filters_returns_query_result() {
     assert_eq!(response.status(), StatusCode::OK);
     let json = json_body(response).await;
     assert_eq!(json["TotalRecordCount"], 1);
-    assert_eq!(json["Items"][0]["Id"], item_id.to_string());
+    assert_eq!(json["Items"][0]["Id"], item_id.simple().to_string());
 }
 
 /// A `GET /Items` with an unknown enum token is a `400`.
@@ -1210,11 +1210,16 @@ async fn ancestors_translate_physical_root_to_the_users_view() {
             .iter()
             .map(|a| a["Id"].as_str().unwrap().to_ascii_uppercase())
             .collect();
+        // `.simple()`: ids go out in Jellyfin's dashless "N" form
+        // (`JsonGuidConverter`); this test is about the chain, not the format.
         assert_eq!(
             ids,
             vec![
-                COLLECTION_FOLDER_ID.to_string().to_ascii_uppercase(),
-                USER_ROOT_ID.to_string().to_ascii_uppercase(),
+                COLLECTION_FOLDER_ID
+                    .simple()
+                    .to_string()
+                    .to_ascii_uppercase(),
+                USER_ROOT_ID.simple().to_string().to_ascii_uppercase(),
             ],
             "{uri}: the view, then the user root: {translated}"
         );

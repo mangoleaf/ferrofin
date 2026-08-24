@@ -3,8 +3,9 @@
 //! Hand-port of `Nikse.SubtitleEdit.Core.SubtitleFormats.SubRip` (`libse` has no
 //! Rust equivalent), reduced to the load/save behaviour the Jellyfin
 //! `SubtitleEditParser` and `SubtitleEncoder` drive. Cue text lines are joined
-//! with `\r\n` to match libse's `Environment.NewLine` on the reference platform,
-//! so the ported oracle values are reproduced byte-for-byte.
+//! with `\n`: libse joins with `Environment.NewLine`, and the reference server
+//! runs on Linux, where that is a bare LF (the upstream `SrtParserTests`
+//! oracle is written against `Environment.NewLine` for exactly that reason).
 
 use std::sync::LazyLock;
 
@@ -12,8 +13,13 @@ use regex::Regex;
 
 use super::model::{Paragraph, Subtitle, TimeCode};
 
-/// The line separator libse uses when joining/emitting multi-line cue text.
-pub(crate) const NEWLINE: &str = "\r\n";
+/// The line separator libse uses when joining/emitting multi-line cue text —
+/// `Environment.NewLine` on the Linux reference server.
+pub(crate) const NEWLINE: &str = "\n";
+
+/// The byte-order mark `StreamWriter(stream, Encoding.UTF8)` writes first — every
+/// text writer in `SubtitleEncoder` (srt, ssa, ass, vtt) starts its output with it.
+pub(crate) const BOM: &str = "\u{feff}";
 
 /// Matches a SubRip timing line: `HH:MM:SS,mmm --> HH:MM:SS,mmm`.
 ///
@@ -134,11 +140,14 @@ fn parse_timecode(part: &str) -> Option<TimeCode> {
 
 /// Serializes `subtitle` to SubRip text.
 ///
-/// Port of `SubRip.ToText`: each cue is `number`, the `start --> end` timing,
-/// the text, and a trailing blank line, joined with `\r\n`.
+/// Port of Jellyfin's `SrtWriter.Write` (the `SubtitleEncoder` never uses libse's
+/// `SubRip.ToText`): a UTF-8 BOM, then per cue `number`, the
+/// `hh:mm:ss,fff --> hh:mm:ss,fff` timing, the text with any literal `\n`/`\N`
+/// escape turned into a space (`NewLineEscapedRegex`), and a blank line — each
+/// terminated by `StreamWriter.WriteLine`'s `\n`.
 #[must_use]
 pub fn to_text(subtitle: &Subtitle) -> String {
-    let mut out = String::new();
+    let mut out = String::from(BOM);
     for (i, p) in subtitle.paragraphs.iter().enumerate() {
         out.push_str(&(i + 1).to_string());
         out.push_str(NEWLINE);
@@ -146,19 +155,20 @@ pub fn to_text(subtitle: &Subtitle) -> String {
         out.push_str(" --> ");
         out.push_str(&format_timecode(p.end_time));
         out.push_str(NEWLINE);
-        out.push_str(&p.text);
+        out.push_str(&p.text.replace("\\n", " ").replace("\\N", " "));
         out.push_str(NEWLINE);
         out.push_str(NEWLINE);
     }
     out
 }
 
-/// Formats a timecode as `HH:MM:SS,mmm`.
+/// `TimeSpan.ToString(@"hh\:mm\:ss\,fff")`: the 0–23 hour component, minutes,
+/// seconds and milliseconds.
 pub(crate) fn format_timecode(tc: TimeCode) -> String {
     let total = tc.total_milliseconds().max(0);
     let millis = total % 1000;
     let seconds = (total / 1000) % 60;
     let minutes = (total / 60_000) % 60;
-    let hours = total / 3_600_000;
+    let hours = (total / 3_600_000) % 24;
     format!("{hours:02}:{minutes:02}:{seconds:02},{millis:03}")
 }

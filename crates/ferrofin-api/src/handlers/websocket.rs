@@ -388,6 +388,38 @@ where
     true
 }
 
+/// The "close every socket" generation: bumped by [`close_all_sockets`], watched
+/// by every session loop. Process-wide on purpose — an upgraded connection is
+/// outside axum's graceful drain, and a socket that outlived its host would
+/// keep pushing through the previous lifetime's session manager after an
+/// in-process restart.
+static CLOSE_ALL: std::sync::LazyLock<tokio::sync::watch::Sender<u64>> =
+    std::sync::LazyLock::new(|| tokio::sync::watch::channel(0).0);
+
+/// Closes every open WebSocket: each session loop sends a Close frame and
+/// ends. Called by the composition root when the server drains (Kestrel
+/// closes its sockets on stop; clients reconnect to the new host).
+pub fn close_all_sockets() {
+    CLOSE_ALL.send_modify(|generation| *generation += 1);
+}
+
+/// Server drain: the ServerShuttingDown push was queued just before the
+/// close-all fired and `select!` is unordered, so flush whatever is queued
+/// first, then say goodbye properly so the client reconnects. Every send is
+/// bounded by `send_frame`, so a stalled peer cannot pin the old host.
+async fn say_goodbye(
+    socket: &mut WebSocket,
+    rx: &mut mpsc::Receiver<String>,
+    overflowed: &tokio::sync::Notify,
+) {
+    while let Ok(push) = rx.try_recv() {
+        if !send_frame(socket, Message::Text(push.into()), overflowed).await {
+            return;
+        }
+    }
+    let _ = send_frame(socket, Message::Close(None), overflowed).await;
+}
+
 /// Holds a WebSocket open: register the caller's push sink (if authenticated),
 /// answer pings, forward server→client pushes, send a periodic keep-alive, and
 /// close cleanly — unregistering the sink — when the peer goes away.
@@ -402,6 +434,7 @@ async fn handle_socket(
     caller: Result<SocketCaller, AnonymousReason>,
 ) {
     let started = std::time::Instant::now();
+    let mut close_all = CLOSE_ALL.subscribe();
     // `tx` feeds this socket; the bus holds a clone as the session's delivery
     // sink. Keeping `tx` alive here also keeps `rx` open for anonymous sockets
     // (no sink registered) so the forward branch stays pending rather than
@@ -463,6 +496,10 @@ async fn handle_socket(
             },
             () = overflowed.notified() => {
                 warn_overflow();
+                break;
+            },
+            Ok(()) = close_all.changed() => {
+                say_goodbye(&mut socket, &mut rx, &overflowed).await;
                 break;
             },
             _ = keepalive.tick() => {
@@ -568,11 +605,12 @@ async fn tick(stream: &mut Option<tokio::time::Interval>) {
 }
 
 /// One outbound envelope: `{MessageType, MessageId, Data}` with the required
-/// hyphenated `MessageId` (strict Kotlin-SDK clients crash without it).
+/// `MessageId` (strict Kotlin-SDK clients crash without it), spelled as every
+/// Jellyfin guid is (`JsonGuidConverter`: 32 hex digits).
 fn envelope(message_type: &str, data: &serde_json::Value) -> String {
     serde_json::json!({
         "MessageType": message_type,
-        "MessageId": uuid::Uuid::new_v4().hyphenated().to_string(),
+        "MessageId": uuid::Uuid::new_v4().simple().to_string(),
         "Data": data,
     })
     .to_string()
@@ -625,7 +663,7 @@ async fn activity_message(
 
 /// The `KeepAlive` ack sent in reply to a client keep-alive ping.
 fn keep_alive_ack() -> String {
-    let message_id = uuid::Uuid::new_v4().hyphenated();
+    let message_id = uuid::Uuid::new_v4().simple();
     format!("{{\"MessageType\":\"KeepAlive\",\"MessageId\":\"{message_id}\"}}")
 }
 
@@ -634,11 +672,11 @@ fn keep_alive_ack() -> String {
 /// Every outbound message carries a `MessageId` (C# `OutboundWebSocketMessage`
 /// sets `Guid.NewGuid()`). It is `format: uuid` and *required* by strict
 /// clients: without it the Jellyfin Kotlin SDK throws `MissingFieldException`
-/// and the Android TV app crashes mid-playback. Emit a fresh, canonically
-/// hyphenated UUID (the SDK parses it via `UUID.fromString`, which rejects the
-/// dash-less form).
+/// and the Android TV app crashes mid-playback. It is written the way Jellyfin
+/// writes every guid — 32 hex digits, no dashes (`JsonGuidConverter`); the
+/// SDK's `UUIDSerializer` exists precisely to read that form.
 fn force_keep_alive_message() -> String {
-    let message_id = uuid::Uuid::new_v4().hyphenated();
+    let message_id = uuid::Uuid::new_v4().simple();
     format!(
         "{{\"MessageType\":\"ForceKeepAlive\",\"MessageId\":\"{message_id}\",\"Data\":{KEEPALIVE_SECS}}}"
     )
@@ -815,7 +853,10 @@ mod tests {
     fn keep_alive_ack_is_valid_json_with_a_message_id() {
         let v: serde_json::Value = serde_json::from_str(&keep_alive_ack()).unwrap();
         assert_eq!(v["MessageType"], "KeepAlive");
-        assert!(v["MessageId"].as_str().unwrap().contains('-'));
+        // Jellyfin's guid spelling: 32 hex digits, no dashes.
+        let id = v["MessageId"].as_str().unwrap();
+        assert_eq!(id.len(), 32);
+        assert!(uuid::Uuid::try_parse(id).is_ok());
     }
 
     #[test]
@@ -825,14 +866,14 @@ mod tests {
         assert_eq!(v["MessageType"], "ForceKeepAlive");
         assert_eq!(v["Data"], KEEPALIVE_SECS);
         // The SDK requires `MessageId` (`format: uuid`) or the Android client
-        // crashes with MissingFieldException. Must be a canonical, hyphenated
-        // UUID — the dash-less form fails the SDK's `UUID.fromString`.
+        // crashes with MissingFieldException. Spelled as Jellyfin spells every
+        // guid (32 hex digits) — the SDK's `UUIDSerializer` reads that form.
         let id = v["MessageId"].as_str().expect("MessageId present");
         assert!(
             uuid::Uuid::try_parse(id).is_ok(),
             "MessageId is a UUID: {id}"
         );
-        assert_eq!(id.len(), 36, "hyphenated form (8-4-4-4-12)");
+        assert_eq!(id.len(), 32, "Jellyfin's dash-less form");
     }
 
     /// A bus whose `unregister` answers a canned "a sink still remains", and

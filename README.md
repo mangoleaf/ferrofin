@@ -55,7 +55,7 @@ tiered matrix (verified · known-partial · not-implemented-by-design) is in
 **[`docs/FEATURES.md`](docs/FEATURES.md)**. In short, working end-to-end: auth/users/QuickConnect,
 library scan + live filesystem watch, browse/query, images, sessions/playstate/remote control,
 WebSocket push, playlists/collections, direct play + live HLS transcode, Live TV (M3U/XMLTV +
-DVR), SyncPlay, all 17 scheduled tasks, metrics/tracing, and backup/restore. Runtime plugin
+DVR), SyncPlay, all 18 scheduled tasks, metrics/tracing, and backup/restore. Runtime plugin
 installation is arriving as sandboxed WASM components (see
 [Plugins](#plugins-compiled-in-extensions--sandboxed-wasm)); the deliberate gaps: .NET-style
 native plugin loading (never — see below) and DLNA SSDP discovery. Remote metadata providers

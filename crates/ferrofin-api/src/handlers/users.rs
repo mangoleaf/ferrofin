@@ -595,7 +595,7 @@ async fn delete_user(
     .await;
     // Tell the deleted user's still-open clients (their sessions outlive the
     // token revocation until they disconnect) — port of `UserDeleted`.
-    if let Ok(data) = serde_json::to_string(&user_id.to_string()) {
+    if let Ok(data) = serde_json::to_string(&user_id.simple().to_string()) {
         let _ = state
             .sessions
             .send_message_to_user_sessions(

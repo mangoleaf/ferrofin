@@ -44,11 +44,13 @@ pub struct DeviceInfoDto {
     /// Gets or sets the last user identifier.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<String>, format = "uuid")]
+    #[serde(default, with = "crate::json::guid::option")]
     pub last_user_id: Option<Uuid>,
 
     /// Gets or sets the date of last activity.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<String>, format = "date-time")]
+    #[serde(default, with = "crate::json::datetime::option")]
     pub date_last_activity: Option<DateTime<Utc>>,
 
     /// Gets or sets the capabilities.

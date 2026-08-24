@@ -56,6 +56,7 @@ pub struct PluginInfo {
 
     /// Gets or sets the unique id.
     #[schema(value_type = String, format = "uuid")]
+    #[serde(with = "crate::json::guid")]
     pub id: Uuid,
 
     /// Gets or sets a value indicating whether the plugin can be uninstalled.
@@ -126,5 +127,6 @@ pub struct ConfigurationPageInfo {
     /// Gets or sets the plugin id.
     #[schema(value_type = Option<String>, format = "uuid")]
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, with = "crate::json::guid::option")]
     pub plugin_id: Option<Uuid>,
 }

@@ -30,6 +30,7 @@ pub struct BrowseRequest {
 pub struct PlayRequest {
     /// Gets or sets the item ids.
     #[schema(value_type = Vec<String>, format = "uuid")]
+    #[serde(with = "crate::json::guid::vec")]
     pub item_ids: Vec<Uuid>,
 
     /// Gets or sets the start position ticks the first item should play at.
@@ -41,6 +42,7 @@ pub struct PlayRequest {
 
     /// Gets or sets the controlling user identifier.
     #[schema(value_type = String, format = "uuid")]
+    #[serde(with = "crate::json::guid")]
     pub controlling_user_id: Uuid,
 
     /// Gets or sets the subtitle stream index.

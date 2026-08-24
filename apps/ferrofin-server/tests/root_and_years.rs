@@ -195,8 +195,10 @@ async fn items_root_ancestors_and_years_over_real_http() {
         "/config/root/default",
     )
     .expect("derived");
+    // `.simple()`: ids go out in Jellyfin's dashless "N" spelling
+    // (`JsonGuidConverter`), so compare in that spelling.
     assert!(
-        root_id.eq_ignore_ascii_case(&expected_root.to_string()),
+        root_id.eq_ignore_ascii_case(&expected_root.simple().to_string()),
         "root id {root_id} is the Jellyfin-derived {expected_root}"
     );
 
@@ -299,10 +301,13 @@ async fn items_root_ancestors_and_years_over_real_http() {
     assert_eq!(status, StatusCode::OK, "{year}");
     assert_eq!(year["Name"].as_str(), Some("1999"));
     assert_eq!(year["Type"].as_str(), Some("Year"));
+    // The row id is stored hyphenated; the wire spelling is Jellyfin's dashless
+    // "N" form, so compare the hex digits.
+    let scanned = year_rows[0].id.replace('-', "");
     assert!(
         year["Id"]
             .as_str()
-            .is_some_and(|id| id.eq_ignore_ascii_case(&year_rows[0].id)),
+            .is_some_and(|id| id.eq_ignore_ascii_case(&scanned)),
         "/Years/1999 is the scanned row: {year}"
     );
     // A year no item carries is created on demand (`GetYear` always creates).

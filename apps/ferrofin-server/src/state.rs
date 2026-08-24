@@ -71,6 +71,17 @@ const PACKAGE_NAME: &str = "ferrofin-server";
 /// Keep this in sync with `contracts/jellyfin-openapi-*.json`.
 const JELLYFIN_API_VERSION: &str = "10.11.8";
 
+/// The host a Live TV live stream's buffered file is served from.
+///
+/// Jellyfin's `GetApiUrlForLocalAccess()` is the server's own bind address and
+/// deliberately never consults `PublishedServerUrl` (only `GetSmartApiUrl`
+/// does). Loopback is the strictly-local form of that, and it is right for the
+/// readers that matter: this process's own ffmpeg — which probes and transcodes
+/// the channel — and the DVR recorder. Routing them out through a public
+/// hostname would add TLS, a reverse proxy and a dependency on external DNS
+/// resolving from inside the container, any of which breaks Live TV outright.
+const LIVE_STREAM_LOCAL_HOST: &str = "127.0.0.1";
+
 /// The assembled application state plus the handles the composition root still
 /// needs after wiring (the concrete host, to flip its startup flag and drive
 /// name refresh, and the lifecycle controller's restart flag).
@@ -84,6 +95,15 @@ pub struct WiredApp {
     /// The web-file transformation pipeline, shared with the static `/web`
     /// mount so registered transformations apply to the served files.
     pub file_transformations: Arc<dyn ferrofin_traits::plugins::FileTransformationService>,
+    /// The lifecycle controller — after the server drains, the composition root
+    /// asks it whether an API restart was requested and re-creates the host
+    /// in-process (Jellyfin's `Program.Main` `do … while (_restartOnShutdown)`).
+    pub lifecycle: Arc<FerrofinLifecycleController>,
+    /// The host's background tasks (trigger scheduler, filesystem-event pump):
+    /// aborted when the lifetime ends so they — and the manager graph they
+    /// hold — do not outlive it (Jellyfin disposes its `CoreAppHost` per
+    /// `StartServer` iteration).
+    pub background: Vec<tokio::task::JoinHandle<()>>,
 }
 
 /// The concrete [`LifecycleController`] for the running server.
@@ -100,6 +120,10 @@ pub struct FerrofinLifecycleController {
     shutting_down: std::sync::atomic::AtomicBool,
     /// Set when the requested stop should be followed by a restart.
     restart_pending: std::sync::atomic::AtomicBool,
+    /// Set only by `stop(true)`: the drain in progress is an API restart, as
+    /// opposed to a shutdown or a signal (which exit the process even when a
+    /// plugin had flagged restart-required).
+    restart_requested: std::sync::atomic::AtomicBool,
 }
 
 impl FerrofinLifecycleController {
@@ -110,7 +134,16 @@ impl FerrofinLifecycleController {
             shutdown: tokio::sync::Mutex::new(Some(shutdown)),
             shutting_down: std::sync::atomic::AtomicBool::new(false),
             restart_pending: std::sync::atomic::AtomicBool::new(false),
+            restart_requested: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Whether the stop that drained the server was `POST /System/Restart` (or a
+    /// scheduled backup restore) rather than a shutdown or a signal.
+    #[must_use]
+    pub fn restart_requested(&self) -> bool {
+        self.restart_requested
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -119,6 +152,7 @@ impl LifecycleController for FerrofinLifecycleController {
     async fn stop(&self, restart: bool) -> Result<(), ferrofin_traits::error::ServiceError> {
         use std::sync::atomic::Ordering;
         self.restart_pending.store(restart, Ordering::SeqCst);
+        self.restart_requested.store(restart, Ordering::SeqCst);
         self.shutting_down.store(true, Ordering::SeqCst);
         // Fire the graceful-shutdown trigger once; a second stop is a no-op.
         if let Some(tx) = self.shutdown.lock().await.take() {
@@ -214,6 +248,9 @@ pub async fn build_app_state(
         &config.cache_dir,
         &config.web_dir,
     ));
+    // The file actually opened (an adopted `jellyfin.db` may live elsewhere) —
+    // what a backup archives and a restore writes.
+    paths.set_database_path(config.database_path());
 
     // ---- configuration manager (loads persisted system.json) --------------
     let config_mgr = Arc::new(
@@ -464,14 +501,6 @@ pub async fn build_app_state(
             .with_items(Arc::clone(&item_repository))
             .with_providers(lyric_providers),
     );
-    let live_tv: Arc<dyn ferrofin_traits::stubs::LiveTvManager> =
-        Arc::new(FerrofinLiveTvManager::new(
-            db.clone(),
-            Arc::new(ferrofin_livetv::ReqwestFetcher::new()),
-            server_id.clone(),
-            // `{cache}/sd-countries.json` — `IApplicationPaths.CachePath` upstream.
-            paths.cache_path(),
-        ));
     let path_manager: Arc<dyn ferrofin_traits::system::PathManager> =
         Arc::new(FerrofinPathManager::new(Arc::clone(&paths)));
     let client_event_logger: Arc<dyn ferrofin_traits::events::ClientEventLogger> =
@@ -524,20 +553,43 @@ pub async fn build_app_state(
     let user_data: Arc<dyn ferrofin_traits::library::UserDataManager> = Arc::new(
         FerrofinUserDataManager::new(db.clone(), Arc::clone(&config_trait)),
     );
+    // Live TV. Built after `users` (EnabledUsers needs the user manager) and
+    // kept concrete: the DTO service the channel/programme projections need is
+    // built later — it consumes the media-source manager, which consumes this
+    // manager — so `set_dto` closes that cycle below once the DTO service
+    // exists (the C# equivalent is its `Lazy<ILiveTvManager>`).
+    let live_tv_impl = Arc::new(
+        FerrofinLiveTvManager::new(
+            db.clone(),
+            Arc::new(ferrofin_livetv::ReqwestFetcher::new()),
+            server_id.clone(),
+            // `{cache}/sd-countries.json` — `IApplicationPaths.CachePath` upstream.
+            paths.cache_path(),
+        )
+        .with_users(Arc::clone(&users))
+        // ffmpeg, for the DVR's encoded recorder (the remux upstream falls
+        // back to when a tuner is not a transport stream).
+        .with_encoder(Arc::clone(&media_encoder))
+        // Where a shared tuner stream buffers, where the DVR records, and where
+        // the dashboard's Live TV options live (C# `GetTranscodePath()`,
+        // `CommonApplicationPaths.DataPath`, the `livetv` named config).
+        .with_paths(ferrofin_livetv::LiveTvPaths {
+            transcode_dir: std::path::PathBuf::from(
+                ferrofin_traits::system::ServerApplicationPaths::transcode_path(paths.as_ref()),
+            ),
+            data_dir: std::path::PathBuf::from(paths.data_path()),
+            options_file: std::path::PathBuf::from(paths.user_configuration_directory_path())
+                .join("named")
+                .join("livetv.json"),
+        }),
+    );
+    let live_tv: Arc<dyn ferrofin_traits::stubs::LiveTvManager> = live_tv_impl.clone();
     let devices: Arc<dyn ferrofin_traits::devices::DeviceManager> =
         Arc::new(FerrofinDeviceManager::new(db.clone()).with_auth_cache(Arc::clone(&auth_cache)));
     let api_keys: Arc<dyn ferrofin_traits::security::ApiKeyManager> =
         Arc::new(FerrofinApiKeyManager::new(db.clone()));
     let display_preferences: Arc<dyn ferrofin_traits::configuration::DisplayPreferencesManager> =
         Arc::new(FerrofinDisplayPreferencesManager::new(db.clone()));
-    // The playlists media folder lives at `{data}/playlists` (C#
-    // `ManualPlaylistsFolder`); the user-view seam provisions it lazily.
-    let playlists_path = std::path::PathBuf::from(paths.data_path()).join("playlists");
-    let user_views: Arc<dyn ferrofin_traits::library::UserViewManager> = Arc::new(
-        FerrofinUserViewManager::new(Arc::clone(&item_repository))
-            .with_playlists_store(Arc::clone(&item_persistence_service), playlists_path)
-            .with_id_derivation(id_derivation.clone()),
-    );
     let music: Arc<dyn ferrofin_traits::library::MusicManager> =
         Arc::new(FerrofinMusicManager::new(Arc::clone(&item_repository)));
     let search: Arc<dyn ferrofin_traits::library::SearchManager> =
@@ -569,6 +621,18 @@ pub async fn build_app_state(
     );
     let virtual_folders: Arc<dyn ferrofin_traits::library::VirtualFolderManager> =
         virtual_folders_impl.clone();
+    // The playlists media folder lives at `{data}/playlists` (C#
+    // `ManualPlaylistsFolder`); the user-view seam provisions it lazily. The
+    // virtual-folder manager gives `/Items/Latest` each library's collection
+    // type (C# `CollectionFolder.CollectionType`), which is why this is built
+    // after it.
+    let playlists_path = std::path::PathBuf::from(paths.data_path()).join("playlists");
+    let user_views: Arc<dyn ferrofin_traits::library::UserViewManager> = Arc::new(
+        FerrofinUserViewManager::new(Arc::clone(&item_repository))
+            .with_playlists_store(Arc::clone(&item_persistence_service), playlists_path)
+            .with_id_derivation(id_derivation.clone())
+            .with_virtual_folders(Arc::clone(&virtual_folders)),
+    );
     // Similar items: the local weighted-overlap scorer always runs; the remote
     // providers below run only for a library that ticked them in its
     // "Similarity providers" list, in the admin's configured order.
@@ -636,6 +700,9 @@ pub async fn build_app_state(
         Arc::clone(&media_stream_repository),
         Arc::clone(&chapter_repository),
     )
+    // Embedded attachments (fonts, attached pictures) ride along with the probe,
+    // as `FFProbeVideoInfo.SaveMediaAttachments` does.
+    .with_attachments(Arc::clone(&media_attachment_repository))
     // Fetch remote artwork (TMDB) for movies/series with no local images,
     // using Jellyfin's built-in key so posters/backdrops appear with no setup.
     .with_metadata(Arc::clone(&tmdb_client), metadata_library)
@@ -733,15 +800,16 @@ pub async fn build_app_state(
             .with_refresh_target(library_impl.clone())
             .with_config(Arc::clone(&config_trait)),
     );
+    let mut background = Vec::new();
     if let Some(mut rx) = fs_events {
         let monitor = Arc::clone(&library_monitor);
-        tokio::spawn(async move {
+        background.push(tokio::spawn(async move {
             while let Some(path) = rx.recv().await {
                 if let Err(err) = monitor.report_file_system_changed(&path).await {
                     tracing::warn!(%err, path, "failed to report filesystem change");
                 }
             }
-        });
+        }));
     }
     // Establishing the watches is a FILESYSTEM WALK, not a registration: an
     // inotify recursive watch adds one kernel watch per directory under every
@@ -769,6 +837,10 @@ pub async fn build_app_state(
     // managers exist, and the scheduler starts after registration.
     let task_manager = FerrofinTaskManager::new();
     task_manager.set_trigger_store(config.config_dir.join("task_triggers.json"));
+    // Last run outcomes persist too (upstream keeps a per-task history file
+    // under the data directory), so the dashboard's "Last ran" column and the
+    // `LastExecutionResult` field survive a restart.
+    task_manager.set_result_store(config.data_dir.join("task_results.json"));
     // Run outcomes publish `TaskCompleted` → forwarded to admin sessions as
     // the `ScheduledTaskEnded` push the dashboard's task page listens for.
     task_manager.set_event_manager(Arc::clone(&event_manager));
@@ -840,8 +912,9 @@ pub async fn build_app_state(
     // The lifecycle controller is built early so the plugin manager can flag
     // restart-required after a repository install/uninstall; the system
     // manager receives the same handle further down.
+    let lifecycle_concrete = Arc::new(FerrofinLifecycleController::new(shutdown));
     let lifecycle: Arc<dyn ferrofin_core::system_manager::LifecycleController> =
-        Arc::new(FerrofinLifecycleController::new(shutdown));
+        lifecycle_concrete.clone();
     // The install-time artifact validator (component + descriptor checks) —
     // built from the same settings as the host so limits match.
     let wasm_validator: Arc<dyn ferrofin_traits::plugins::PluginArtifactValidator> = Arc::new(
@@ -936,6 +1009,20 @@ pub async fn build_app_state(
         cache_dir: config.cache_dir.join("extensions"),
         merge_versions: Arc::clone(&merge_versions),
     };
+    // "Media Segment Scan" (Library category): upstream registers this one in
+    // the core task set, independent of any plugin, so the dashboard lists it
+    // even with every extension disabled. It goes in FIRST on purpose: the
+    // Intro Skipper extension registers a richer pass under the same upstream
+    // key (its season-level fingerprinting is what actually produces
+    // segments), and registration replaces by key — so whenever that extension
+    // is loaded it wins, and this core registration is what remains when it is
+    // not.
+    task_manager.register(Arc::new(
+        ferrofin_core::scheduled_tasks::library::MediaSegmentExtractionTask::new(
+            Arc::clone(&library),
+            Arc::clone(&media_segments),
+        ),
+    ));
     ferrofin_extensions::register_tasks(&extensions, &extension_cx, &task_manager);
     // Tier-1b WASM plugin tasks and event delivery. Tasks self-gate on the
     // plugin's enabled flag (the Tier-1a pattern); event delivery is
@@ -1031,11 +1118,39 @@ pub async fn build_app_state(
         task_manager.register(Arc::new(maint_tasks::MoveTrickplayImagesTask::new(
             Arc::clone(&trickplay_impl),
         )));
+        // "Refresh Guide" (Live TV category): the 24 h guide re-fetch, hidden
+        // while no tuner host exists. One tuner-host read seeds the flag its
+        // hidden rule polls, so the dashboard is right from the first paint.
+        if let Err(err) = live_tv.get_tuner_hosts().await {
+            // Only the task's hidden state depends on this; boot continues.
+            tracing::warn!(%err, "could not seed the Live TV tuner-host flag");
+        }
+        task_manager.register(Arc::new(
+            ferrofin_core::scheduled_tasks::live_tv::RefreshGuideTask::new(Arc::clone(&live_tv)),
+        ));
+        // "Update Plugins" (Application category): installs available updates
+        // for the runtime-installed (Tier-1b WASM) plugins through the same
+        // path as `POST /Packages/Installed/{name}`.
+        task_manager.register(Arc::new(
+            ferrofin_core::scheduled_tasks::application::PluginUpdateTask::new(Arc::clone(
+                &plugins,
+            )),
+        ));
+        // "Refresh Channels" (Internet Channels category): registered exactly
+        // as upstream does, over Ferrofin's own channel set — which is empty
+        // (no channel-plugin mechanism, see `docs/EXTENSIONS.md`), so the task
+        // reports itself hidden just like a Jellyfin with no channel plugin.
+        task_manager.register(Arc::new(
+            ferrofin_core::scheduled_tasks::channels::RefreshChannelsTask::new(Arc::new(
+                ferrofin_core::FerrofinChannelManager::new(),
+            ))
+            .await,
+        ));
     }
     let tasks: Arc<dyn ferrofin_traits::tasks::TaskManager> = Arc::new(task_manager.clone());
     // The trigger scheduler: fires startup triggers now, then evaluates
-    // daily/weekly/interval triggers for the life of the process.
-    drop(task_manager.start_scheduler());
+    // daily/weekly/interval triggers for the life of this host.
+    background.push(task_manager.start_scheduler());
     let _external_data: Arc<dyn ferrofin_traits::system::ExternalDataManager> =
         Arc::new(FerrofinExternalDataManager::new(
             Arc::clone(&path_manager),
@@ -1062,6 +1177,15 @@ pub async fn build_app_state(
         // Jellyfin's link providers use the plugin's configured server.
         .with_musicbrainz_server(&config.musicbrainz_base_url),
     );
+    // Close the Live TV ↔ media-sources ↔ DTO cycle: the channel/programme
+    // projections run through the same DTO service as every other item.
+    live_tv_impl.set_dto(Arc::clone(&dto));
+    // Re-arm every persisted recording timer (C# `TimerManager.RestartTimers`),
+    // so a restart mid-schedule still records. Failing here must not stop the
+    // server: everything else about Live TV still works.
+    if let Err(err) = live_tv.start_dvr().await {
+        tracing::warn!(%err, "could not restart the Live TV recording timers");
+    }
 
     // ---- sessions + tv_series (consume dto) -------------------------------
     // The session message bus is created here (not with SyncPlay below) because
@@ -1311,6 +1435,18 @@ pub async fn build_app_state(
         .refresh_server_name()
         .await
         .context("failed to refresh advertised server name")?;
+    // The URL a live stream's buffered file is served from (C#
+    // `GetApiUrlForLocalAccess()`).
+    live_tv_impl.set_local_api_url(
+        ferrofin_traits::system::ServerApplicationHost::get_local_api_url(
+            app_host.as_ref(),
+            LIVE_STREAM_LOCAL_HOST,
+            None,
+            None,
+        )
+        .await
+        .context("failed to build the Live TV local api url")?,
+    );
     let app_host_trait: Arc<dyn ferrofin_traits::system::ServerApplicationHost> =
         Arc::clone(&app_host) as Arc<_>;
 
@@ -1331,7 +1467,8 @@ pub async fn build_app_state(
                 completed_installations: Vec::new(),
             },
         )
-        .with_library_storage(Arc::new(VirtualFolderStorage(Arc::clone(&virtual_folders)))),
+        .with_library_storage(Arc::new(VirtualFolderStorage(Arc::clone(&virtual_folders))))
+        .with_database(db.clone()),
     );
 
     // The auth service wraps an owned concrete authorization context, so build
@@ -1363,6 +1500,10 @@ pub async fn build_app_state(
     let me_path_manager = Arc::clone(&path_manager);
     // The transcode planner resolves item/library display names for its logs.
     let me_library = Arc::clone(&library);
+    // The master playlist lists the item's trickplay tile streams.
+    let me_trickplay = Arc::clone(&trickplay);
+    // A killed transcode releases the live stream it was reading.
+    let me_sessions = Arc::clone(&sessions);
     // SyncPlay resolves each member's library access; it is built after the
     // state below, which takes ownership of these.
     let sync_play_users = Arc::clone(&users);
@@ -1417,8 +1558,12 @@ pub async fn build_app_state(
         Arc::clone(&paths),
         me_path_manager,
         ffmpeg,
-        // Transcode logs resolve item/series/library names through the library.
-        Some(me_library),
+        crate::media_encoding::MediaEncodingExtras {
+            // Transcode logs resolve item/series/library names through the library.
+            library: Some(me_library),
+            trickplay: Some(me_trickplay),
+            sessions: Some(me_sessions),
+        },
     );
     let state = state
         .with_media_encoding(hls, attachments)
@@ -1536,6 +1681,8 @@ pub async fn build_app_state(
         state,
         app_host,
         file_transformations,
+        lifecycle: lifecycle_concrete,
+        background,
     })
 }
 

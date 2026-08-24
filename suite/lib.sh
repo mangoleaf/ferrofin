@@ -50,8 +50,16 @@ suite_build_libraries() {
   [ -n "${REAL_TV_DIR:-}" ]    && { libs="$libs${sep}{\"name\":\"Shows\",\"type\":\"tvshows\",\"path\":\"/media/tv-real\"}"; sep=","; }
   [ "${FIXTURE_MOVIES:-0}" -gt 0 ] && { libs="$libs${sep}{\"name\":\"Movies (synth)\",\"type\":\"movies\",\"path\":\"/media/synth/movies\"}"; sep=","; }
   [ "${FIXTURE_SERIES:-0}" -gt 0 ] && { libs="$libs${sep}{\"name\":\"Shows (synth)\",\"type\":\"tvshows\",\"path\":\"/media/synth/tv\"}"; sep=","; }
+  [ "${FIXTURE_ARTISTS:-0}" -gt 0 ] && { libs="$libs${sep}{\"name\":\"Music (synth)\",\"type\":\"music\",\"path\":\"/media/synth/music\"}"; sep=","; }
   libs="$libs]"
   [ "$libs" = "[]" ] && { echo "No media: set REAL_MEDIA_DIR or FIXTURE_MOVIES>0 in the env file" >&2; exit 1; }
+  # Live TV fixture: the M3U tuner + XMLTV guide both servers are provisioned with (paths on
+  # the shared mount; the channel streams themselves come from the livetv-source sidecar).
+  if [ "${FIXTURE_LIVETV:-0}" -gt 0 ]; then
+    export LIVETV_M3U=/media/synth/livetv/channels.m3u LIVETV_XMLTV=/media/synth/livetv/guide.xml
+  else
+    export LIVETV_M3U="" LIVETV_XMLTV=""
+  fi
 
   # Real counts are unknown up front (naming resolvers diverge on real files); the scan waiter
   # settles on a stable total instead. Synthetic count is exact and known.
@@ -62,11 +70,16 @@ suite_build_libraries() {
          BENCH_ADMIN_USER BENCH_ADMIN_PASSWORD JELLYFIN_IMAGE
 }
 
-# Generate synthetic fixtures once, only when padding is requested and none exist yet.
+# Generate synthetic fixtures once, only when padding is requested and none exist yet — or
+# when a requested library (music) is missing from an older fixture tree.
 suite_gen_fixtures() {
   if { [ "${FIXTURE_MOVIES:-0}" -gt 0 ] || [ "${FIXTURE_SERIES:-0}" -gt 0 ]; } && \
      [ -z "$(find fixtures/media -type f 2>/dev/null | head -1)" ]; then
     echo ">> generating synthetic fixtures"; ./gen-fixtures.sh
+  elif [ "${FIXTURE_ARTISTS:-0}" -gt 0 ] && [ ! -d fixtures/media/music ]; then
+    echo ">> regenerating synthetic fixtures (music library requested, absent)"; ./gen-fixtures.sh
+  elif [ "${FIXTURE_LIVETV:-0}" -gt 0 ] && [ ! -d fixtures/media/livetv ]; then
+    echo ">> regenerating synthetic fixtures (live tv fixture requested, absent)"; ./gen-fixtures.sh
   fi
 }
 

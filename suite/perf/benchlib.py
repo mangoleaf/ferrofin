@@ -229,7 +229,8 @@ def provision(base, target, ctx):
             "TypeOptions": [
                 {"Type": t, "MetadataFetchers": [], "MetadataFetcherOrder": [],
                  "ImageFetchers": [], "ImageFetcherOrder": []}
-                for t in ("Movie", "Series", "Season", "Episode")
+                for t in ("Movie", "Series", "Season", "Episode",
+                          "MusicArtist", "MusicAlbum", "Audio")
             ],
         },
     }

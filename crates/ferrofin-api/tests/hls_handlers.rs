@@ -122,7 +122,7 @@ impl HlsStreamManager for FakeHls {
             .unwrap()
             .push((file_name.to_owned(), require_m3u8));
         self.served(if require_m3u8 {
-            "application/x-mpegURL"
+            "application/vnd.apple.mpegurl"
         } else {
             "video/mp2t"
         })
@@ -210,7 +210,17 @@ impl AuthorizationContext for OkAuth {
         &self,
         _request: &RequestContext,
     ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(AuthorizationInfo::default())
+        Ok(ok_auth_info())
+    }
+}
+
+/// The authorization every request resolves to: authenticated, carrying the
+/// presented token (the master playlist embeds it as `ApiKey`).
+fn ok_auth_info() -> AuthorizationInfo {
+    AuthorizationInfo {
+        token: Some(ferrofin_model::secret::Secret::new("token")),
+        is_authenticated: true,
+        ..AuthorizationInfo::default()
     }
 }
 
@@ -220,7 +230,7 @@ impl AuthService for OkAuth {
         &self,
         _request: &RequestContext,
     ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(AuthorizationInfo::default())
+        Ok(ok_auth_info())
     }
 }
 
@@ -645,7 +655,7 @@ async fn video_master_playlist_returns_m3u8() {
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(
         resp.headers().get("content-type").unwrap(),
-        "application/x-mpegURL"
+        "application/vnd.apple.mpegurl"
     );
     let last = rec.last.lock().unwrap().clone().unwrap();
     assert_eq!(last.item_id, ITEM_ID);
@@ -653,8 +663,64 @@ async fn video_master_playlist_returns_m3u8() {
     assert_eq!(last.play_session_id.as_deref(), Some("s1"));
     assert_eq!(last.media_source_id.as_deref(), Some("src9"));
     assert!(last.query_string.starts_with('?'));
+    // The HTTP-context inputs `DynamicHlsHelper` reads: the session token (for
+    // the subtitle/trickplay `ApiKey`), the peer locality (none in a oneshot
+    // → not local), and the master route's DTO defaults.
+    assert_eq!(last.api_key.as_deref(), Some("token"));
+    assert!(!last.is_in_local_network);
+    assert!(!last.enable_subtitles_in_manifest);
+    assert!(!last.enable_adaptive_bitrate_streaming);
+    assert!(last.enable_trickplay);
+    // `GetMasterPlaylistInternal` stamps `Expires: 0` on every master response.
+    assert_eq!(resp.headers().get("expires").unwrap(), "0");
     let body = body_string(resp).await;
     assert!(body.contains("#MASTER"));
+}
+
+/// The contract spells the caps `videoBitRate`/`audioBitRate` and the manifest
+/// flags `enableAdaptiveBitrateStreaming`/`enableTrickplay`; all reach the seam.
+#[tokio::test]
+async fn video_master_playlist_parses_contract_spellings() {
+    let rec = Arc::new(Recorded::default());
+    let router = router_with(
+        ok_hls("/nonexistent", rec.clone()),
+        Arc::new(FakeAttachments {
+            mime: None,
+            data: vec![],
+        }),
+        Arc::new(ItemLibrary { present: true }),
+    );
+    let resp = router
+        .oneshot(authed(
+            "GET",
+            &format!(
+                "/Videos/{ITEM_ID}/master.m3u8?videoBitRate=1000000&audioBitRate=128000&\
+                 enableAdaptiveBitrateStreaming=true&enableTrickplay=false&\
+                 enableSubtitlesInManifest=true&subtitleStreamIndex=3&subtitleMethod=Hls&\
+                 profile=high&level=41&framerate=30&width=640&height=360&minSegments=2&\
+                 transcodeReasons=ContainerNotSupported"
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let last = rec.last.lock().unwrap().clone().unwrap();
+    assert_eq!(last.video_bitrate, Some(1_000_000));
+    assert_eq!(last.audio_bitrate, Some(128_000));
+    assert!(last.enable_adaptive_bitrate_streaming);
+    assert!(!last.enable_trickplay);
+    assert!(last.enable_subtitles_in_manifest);
+    assert_eq!(last.subtitle_stream_index, Some(3));
+    assert_eq!(last.subtitle_method.as_deref(), Some("Hls"));
+    assert_eq!(last.profile.as_deref(), Some("high"));
+    assert_eq!(last.level.as_deref(), Some("41"));
+    assert_eq!(last.framerate, Some(30.0));
+    assert_eq!((last.width, last.height), (Some(640), Some(360)));
+    assert_eq!(last.min_segments, Some(2));
+    assert_eq!(
+        last.transcode_reasons.as_deref(),
+        Some("ContainerNotSupported")
+    );
 }
 
 #[tokio::test]
@@ -673,6 +739,14 @@ async fn video_master_head_is_ok() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+    // A HEAD answers with the playlist MIME, `Expires: 0`, and no body
+    // (`new FileContentResult(Array.Empty<byte>(), playlist mime)`).
+    assert_eq!(
+        resp.headers().get("content-type").unwrap(),
+        "application/vnd.apple.mpegurl"
+    );
+    assert_eq!(resp.headers().get("expires").unwrap(), "0");
+    assert_eq!(body_string(resp).await, "");
 }
 
 #[tokio::test]
@@ -697,9 +771,17 @@ async fn video_main_and_live_and_audio_playlists() {
         assert_eq!(resp.status(), StatusCode::OK, "uri {uri}");
         assert_eq!(
             resp.headers().get("content-type").unwrap(),
-            "application/x-mpegURL"
+            "application/vnd.apple.mpegurl"
         );
         assert!(body_string(resp).await.contains(marker), "uri {uri}");
+        // `GetLiveHlsStream` defaults `EnableSubtitlesInManifest` to true;
+        // every other route's DTO defaults it to false.
+        let last = rec.last.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            last.enable_subtitles_in_manifest,
+            uri.ends_with("live.m3u8"),
+            "uri {uri}"
+        );
     }
 }
 

@@ -25,8 +25,9 @@
 //! the `UserData` reads/writes needs the un-ported per-user administration
 //! policy; the portable seam authenticates the caller (`RequireAuth`) and scopes
 //! to the resolved user. The person on-demand metadata refresh
-//! (`RefreshItemOnDemandIfNeeded`) and the latest-media parent grouping are the
-//! filesystem/OOP-tree slices deferred elsewhere.
+//! (`RefreshItemOnDemandIfNeeded`) is the filesystem/OOP-tree slice deferred
+//! elsewhere; `GET /Items/Latest` is the full `GetLatestMedia` port (the
+//! grouping lives in the [`UserViewManager`](ferrofin_traits::library::UserViewManager)).
 
 use axum::extract::{Path, Query, State};
 use axum::routing::{get, post};
@@ -525,32 +526,46 @@ struct LatestQuery {
     /// Localizes the search to a specific parent item/folder.
     #[serde(default)]
     parent_id: Option<Uuid>,
+    /// Comma-delimited [`ItemFields`](ferrofin_model::querying::ItemFields) to populate on
+    /// each DTO. Absent/empty ⇒ the base DTO (matches Jellyfin's GetLatestMedia).
+    #[serde(default)]
+    fields: Option<String>,
     /// Comma-delimited [`BaseItemKind`](ferrofin_model::data::BaseItemKind) set to include.
     #[serde(default)]
     include_item_types: Option<String>,
     /// Filter by items that are played, or not.
     #[serde(default)]
     is_played: Option<bool>,
+    /// Include image information in the output (default `true`).
+    #[serde(default)]
+    enable_images: Option<bool>,
+    /// The max number of images to return, per image type.
+    #[serde(default)]
+    image_type_limit: Option<i32>,
+    /// Comma-delimited [`ImageType`](ferrofin_model::entities::ImageType)s to include.
+    #[serde(default)]
+    enable_image_types: Option<String>,
+    /// Include user data (default `true`).
+    #[serde(default)]
+    enable_user_data: Option<bool>,
     /// Return item limit (default 20).
     #[serde(default)]
     limit: Option<i32>,
     /// Whether to group items into a parent container (default `true`).
     #[serde(default)]
     group_items: Option<bool>,
-    /// Comma-delimited [`ItemFields`](ferrofin_model::querying::ItemFields) to populate on
-    /// each DTO. Absent/empty ⇒ the base DTO (matches Jellyfin's GetLatestMedia).
-    #[serde(default)]
-    fields: Option<String>,
 }
 
 /// `GET /Items/Latest` — the user's newest media.
 ///
-/// Port of `UserLibraryController.GetLatestMedia`. The per-view grouping comes
-/// from the [`UserViewManager`](ferrofin_traits::library::UserViewManager); when
-/// `groupItems` is true each grouped run collapses to its parent with a
-/// `ChildCount`, otherwise the individual items are returned. The
-/// filesystem-localized parent walk is deferred, so `parentId`/`includeItemTypes`
-/// scope the flat result set.
+/// Port of `UserLibraryController.GetLatestMedia`. The
+/// [`UserViewManager`](ferrofin_traits::library::UserViewManager) returns the
+/// C# `(container, items)` tuples — one query across the user's views (or the
+/// `parentId` folder), grouped by index container up to `limit` groups — and
+/// this handler applies the controller's projection: a container with more
+/// than one new item, or a `MusicAlbum` with any, is emitted in place of its
+/// items with `ChildCount` = the number of new items; everything else is the
+/// first item with `ChildCount` 0.
 #[utoipa::path(
     get,
     path = "/Items/Latest",
@@ -565,174 +580,81 @@ async fn get_latest_media(
     use crate::handlers::query_parse::parse_csv_enums_lenient;
 
     let user = resolve_user(&state, &auth, query.user_id).await?;
-    let user_uuid = user_uuid(&user)?;
 
     // C#: an unset `isPlayed` defaults to `false` when the user hides played
     // items from the "latest" rows.
     let is_played = query
         .is_played
         .or_else(|| user.hide_played_in_latest.then_some(false));
-    let include_item_types: Vec<ferrofin_model::data::BaseItemKind> =
-        parse_csv_enums_lenient(query.include_item_types.as_deref());
-    let group_items = query.group_items.unwrap_or(true);
     let limit = query.limit.unwrap_or(DEFAULT_LATEST_LIMIT).max(0);
 
-    // Honour the requested `fields` (Jellyfin's GetLatestMedia builds DtoOptions from them);
-    // was hardcoded to all fields, which over-populated the response vs Jellyfin's fields=Path.
-    let options = DtoOptions {
-        fields: parse_csv_enums_lenient(query.fields.as_deref()),
-        ..DtoOptions::default()
-    };
-    // Parent/type scoping and the virtual-item exclusion are pushed into the
-    // manager's SQL (C# GetLatestItemsInternal); played state is post-filtered
-    // below over the flat rows.
+    // `new DtoOptions { Fields = fields }.AddAdditionalDtoOptions(enableImages,
+    // enableUserData, imageTypeLimit, enableImageTypes)`.
+    let options = crate::handlers::tv_shows::build_dto_options(
+        query.fields.as_deref(),
+        query.enable_images,
+        query.image_type_limit,
+        query.enable_image_types.as_deref(),
+        query.enable_user_data,
+    );
+    // The views the user excluded from "latest"
+    // (`user.GetPreferenceValues<Guid>(PreferenceKind.LatestItemExcludes)`).
+    let latest_item_excludes = state
+        .users
+        .get_user_dto(&user, None)
+        .await?
+        .configuration
+        .map(|c| c.latest_items_excludes)
+        .unwrap_or_default();
     let latest_query = ferrofin_traits::options::LatestItemsQuery {
-        user_id: user_uuid,
+        user: Some(user.clone()),
         parent_id: query.parent_id,
-        include_item_types: include_item_types.clone(),
-        limit,
+        include_item_types: parse_csv_enums_lenient(query.include_item_types.as_deref()),
+        is_played,
+        limit: Some(limit),
+        group_items: query.group_items.unwrap_or(true),
+        latest_item_excludes,
     };
     let groups = state
         .user_views
         .get_latest_items(&latest_query, &options)
         .await?;
 
-    // Flatten the per-view groups. The type filter re-runs here defensively —
-    // the fake managers in tests don't all push it into SQL.
-    let mut resolved: Vec<ferrofin_db::entities::base_items::BaseItemEntity> = Vec::new();
-    for (_view, items) in groups {
-        for item in items {
-            if !include_item_types.is_empty()
-                && !include_item_types
-                    .iter()
-                    .any(|k| type_name_matches(&item.type_, *k))
-            {
-                continue;
+    // The controller's tuple projection.
+    let mut entities = Vec::with_capacity(groups.len());
+    let mut child_counts = Vec::with_capacity(groups.len());
+    for (container, mut items) in groups {
+        let collapses = container.as_ref().is_some_and(|c| {
+            items.len() > 1
+                || type_name_matches(&c.type_, ferrofin_model::data::BaseItemKind::MusicAlbum)
+        });
+        match container {
+            Some(container) if collapses => {
+                child_counts.push(i32::try_from(items.len()).unwrap_or(i32::MAX));
+                entities.push(container);
             }
-            resolved.push(item);
+            _ => {
+                if items.is_empty() {
+                    // A manager never yields an empty group (C# builds each
+                    // tuple with its first item); skip rather than index.
+                    continue;
+                }
+                child_counts.push(0);
+                entities.push(items.swap_remove(0));
+            }
         }
     }
-
-    // isPlayed filter: keep only items whose played state matches the request.
-    // C# applies this inside the latest-items query; here it is a post-filter
-    // over the flat rows using each item's user data.
-    if let Some(want_played) = is_played {
-        let ids: Vec<Uuid> = resolved
-            .iter()
-            .filter_map(|i| Uuid::parse_str(&i.id).ok())
-            .collect();
-        let data = state.user_data.get_user_data_batch(&ids, user_uuid).await?;
-        resolved.retain(|i| {
-            let played = Uuid::parse_str(&i.id)
-                .ok()
-                .and_then(|id| data.get(&id))
-                .is_some_and(|d| d.played);
-            played == want_played
-        });
-    }
-
-    // C# caps the flat item list at `limit` (default 20) before grouping.
-    resolved.truncate(usize::try_from(limit).unwrap_or(0));
-
-    // groupItems (default true): collapse each grouping parent's run of ≥2 items
-    // (episodes → their series, audio → its album) into the parent with a
-    // `ChildCount`; single items and ungrouped kinds stand alone. Port of
-    // `UserLibraryController.GetLatestMedia`'s tuple projection.
-    let (entities, child_counts) = if group_items {
-        group_latest(&state, resolved).await?
-    } else {
-        let counts = vec![0i32; resolved.len()];
-        (resolved, counts)
-    };
 
     let mut dtos = state
         .dto
         .get_base_item_dtos(&entities, &options, Some(&user), None, true)
         .await?;
     for (dto, count) in dtos.iter_mut().zip(child_counts) {
-        // Jellyfin's GetLatestMedia sets ChildCount on every latest item (0 for ungrouped movies).
+        // `dto.ChildCount = childCount` on every row — 0 (serialized) for an
+        // ungrouped item, the fetched-children count for a collapsed container.
         dto.child_count = Some(count);
     }
     Ok(Json(dtos))
-}
-
-/// The parent an item groups under in the "Latest" row: an episode's series or
-/// an audio/music-video's album (its parent). Other kinds do not group. Returns
-/// `None` for a nil/absent/unparseable id.
-fn grouping_parent(item: &ferrofin_db::entities::base_items::BaseItemEntity) -> Option<Uuid> {
-    let short = item.type_.rsplit('.').next().unwrap_or(&item.type_);
-    let id_str = match short {
-        "Episode" => item.series_id.as_deref(),
-        "Audio" | "MusicVideo" => item.parent_id.as_deref(),
-        _ => None,
-    }?;
-    Uuid::parse_str(id_str).ok().filter(|u| !u.is_nil())
-}
-
-/// Buckets the latest rows by [`grouping_parent`], preserving first-seen order.
-///
-/// Ungroupable rows (movies, and episodes/audio with no parent) each get their
-/// own single-item bucket keyed by their own id, so they can never merge with
-/// one another.
-///
-/// The key map points at a **slot** in the result rather than owning a second
-/// copy of the key: the key string moves into the map once and is never cloned,
-/// and the result vector is itself the first-seen ordering. Both are per-row on
-/// the `/Items/Latest` home row.
-fn group_by_parent(
-    items: Vec<ferrofin_db::entities::base_items::BaseItemEntity>,
-) -> Vec<(
-    Option<Uuid>,
-    Vec<ferrofin_db::entities::base_items::BaseItemEntity>,
-)> {
-    use std::collections::HashMap;
-    let mut slot_of: HashMap<String, usize> = HashMap::new();
-    let mut groups: Vec<(
-        Option<Uuid>,
-        Vec<ferrofin_db::entities::base_items::BaseItemEntity>,
-    )> = Vec::new();
-    for item in items {
-        let (key, parent) = match grouping_parent(&item) {
-            Some(pid) => (pid.to_string(), Some(pid)),
-            None => (item.id.clone(), None),
-        };
-        let slot = *slot_of.entry(key).or_insert_with(|| {
-            groups.push((parent, Vec::new()));
-            groups.len() - 1
-        });
-        groups[slot].1.push(item);
-    }
-    groups
-}
-
-/// Groups the latest items by their grouping parent, preserving first-seen order.
-/// A group of ≥2 items collapses to its (resolved) parent with a child count;
-/// everything else is emitted as-is with a zero count.
-async fn group_latest(
-    state: &AppState,
-    items: Vec<ferrofin_db::entities::base_items::BaseItemEntity>,
-) -> Result<
-    (
-        Vec<ferrofin_db::entities::base_items::BaseItemEntity>,
-        Vec<i32>,
-    ),
-    ApiError,
-> {
-    let mut entities = Vec::new();
-    let mut counts = Vec::new();
-    for (parent, mut group) in group_by_parent(items) {
-        if group.len() > 1
-            && let Some(pid) = parent
-            && let Some(parent_item) = state.library.get_item_by_id(pid).await?
-        {
-            entities.push(parent_item);
-            counts.push(i32::try_from(group.len()).unwrap_or(i32::MAX));
-        } else {
-            entities.push(group.remove(0));
-            counts.push(0);
-        }
-    }
-    Ok((entities, counts))
 }
 
 /// Whether a stored type name matches a [`BaseItemKind`](ferrofin_model::data::BaseItemKind).
@@ -742,9 +664,8 @@ async fn group_latest(
 /// segment against the serde name of the kind (Jellyfin's `BaseItemKind` names).
 fn type_name_matches(stored: &str, kind: ferrofin_model::data::BaseItemKind) -> bool {
     let short = stored.rsplit('.').next().unwrap_or(stored);
-    // Compare against the serialized name in place. This runs once per (row ×
-    // requested kind) on `/Items/Latest`, so the old `to_value(…) → to_string()`
-    // pair bought two heap allocations per comparison for a borrowed `&str`.
+    // Compare against the serialized name in place: a borrowed `&str` against
+    // the kind's name, no allocation of the stored name.
     matches!(serde_json::to_value(kind), Ok(serde_json::Value::String(name)) if name == short)
 }
 
@@ -917,86 +838,15 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
 
 #[cfg(test)]
 mod tests {
-    use super::{group_by_parent, grouping_parent, type_name_matches};
-    use ferrofin_db::entities::base_items::BaseItemEntity;
+    use super::type_name_matches;
     use ferrofin_model::data::BaseItemKind;
-    use uuid::Uuid;
-
-    fn item(type_: &str, series_id: Option<&str>, parent_id: Option<&str>) -> BaseItemEntity {
-        BaseItemEntity {
-            type_: type_.to_owned(),
-            series_id: series_id.map(str::to_owned),
-            parent_id: parent_id.map(str::to_owned),
-            ..BaseItemEntity::default()
-        }
-    }
-
-    /// An item with an id, so grouping can key ungroupable rows by their own id.
-    fn identified(id: Uuid, type_: &str, series_id: Option<&str>) -> BaseItemEntity {
-        BaseItemEntity {
-            id: id.to_string(),
-            type_: type_.to_owned(),
-            series_id: series_id.map(str::to_owned),
-            ..BaseItemEntity::default()
-        }
-    }
-
-    const EPISODE: &str = "MediaBrowser.Controller.Entities.TV.Episode";
-    const MOVIE: &str = "MediaBrowser.Controller.Entities.Movies.Movie";
-
-    #[test]
-    fn group_by_parent_buckets_by_series_in_first_seen_order() {
-        let series_a = Uuid::from_u128(0xA);
-        let series_b = Uuid::from_u128(0xB);
-        let (e1, e2, e3) = (Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3));
-        let movie = Uuid::from_u128(9);
-        // Interleaved so a "collapse only adjacent runs" implementation fails.
-        let groups = group_by_parent(vec![
-            identified(e1, EPISODE, Some(&series_a.to_string())),
-            identified(movie, MOVIE, None),
-            identified(e2, EPISODE, Some(&series_b.to_string())),
-            identified(e3, EPISODE, Some(&series_a.to_string())),
-        ]);
-        // Order is first-seen: series A, the movie, then series B.
-        let shape: Vec<(Option<Uuid>, Vec<String>)> = groups
-            .into_iter()
-            .map(|(parent, items)| (parent, items.into_iter().map(|i| i.id).collect()))
-            .collect();
-        assert_eq!(
-            shape,
-            vec![
-                (Some(series_a), vec![e1.to_string(), e3.to_string()]),
-                (None, vec![movie.to_string()]),
-                (Some(series_b), vec![e2.to_string()]),
-            ]
-        );
-    }
-
-    #[test]
-    fn group_by_parent_keeps_ungroupable_rows_apart() {
-        // Two parentless movies must never share a bucket (they are keyed by
-        // their own ids), or the handler would collapse them into one row.
-        let (a, b) = (Uuid::from_u128(4), Uuid::from_u128(5));
-        let groups = group_by_parent(vec![identified(a, MOVIE, None), identified(b, MOVIE, None)]);
-        assert_eq!(groups.len(), 2);
-        assert!(
-            groups
-                .iter()
-                .all(|(parent, items)| parent.is_none() && items.len() == 1)
-        );
-    }
-
-    #[test]
-    fn group_by_parent_of_nothing_is_nothing() {
-        assert!(group_by_parent(Vec::new()).is_empty());
-    }
 
     #[test]
     fn type_filter_matches_full_clr_name() {
         // Stored `Type` is the full CLR name; the short kind name must still match.
         assert!(type_name_matches(
-            "MediaBrowser.Controller.Entities.TV.Episode",
-            BaseItemKind::Episode
+            "MediaBrowser.Controller.Entities.Audio.MusicAlbum",
+            BaseItemKind::MusicAlbum
         ));
         assert!(type_name_matches(
             "MediaBrowser.Controller.Entities.Movies.Movie",
@@ -1006,45 +856,5 @@ mod tests {
             "MediaBrowser.Controller.Entities.TV.Episode",
             BaseItemKind::Movie
         ));
-    }
-
-    #[test]
-    fn grouping_parent_is_series_for_episodes_and_album_for_audio() {
-        let series = Uuid::from_u128(0xAB);
-        let album = Uuid::from_u128(0xCD);
-        assert_eq!(
-            grouping_parent(&item(
-                "MediaBrowser.Controller.Entities.TV.Episode",
-                Some(&series.to_string()),
-                None
-            )),
-            Some(series)
-        );
-        assert_eq!(
-            grouping_parent(&item(
-                "MediaBrowser.Controller.Entities.Audio.Audio",
-                None,
-                Some(&album.to_string())
-            )),
-            Some(album)
-        );
-        // Movies never group.
-        assert_eq!(
-            grouping_parent(&item(
-                "MediaBrowser.Controller.Entities.Movies.Movie",
-                None,
-                None
-            )),
-            None
-        );
-        // A nil / unparseable parent id groups to nothing.
-        assert_eq!(
-            grouping_parent(&item(
-                "MediaBrowser.Controller.Entities.TV.Episode",
-                Some(&Uuid::nil().to_string()),
-                None
-            )),
-            None
-        );
     }
 }

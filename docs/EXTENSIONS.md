@@ -330,9 +330,10 @@ source on every run so the WIT contract cannot drift silently.
 
 **Contract stability:** the world is `0.x` and explicitly unstable until a few real
 third-party plugins exist; after that it freezes like the OpenAPI contract (additive
-evolution only). Planned capability growth (host-mediated HTTP, read-only item queries,
-media-segment writes, then a metadata-provider export) is tracked in
-`brain/plans/PLAN_PLUGIN_TIERS.md` phases E2–E3.
+evolution only). Planned capability growth (host-mediated HTTP, then a
+metadata-provider export) is tracked in `brain/plans/PLAN_PLUGIN_TIERS.md`
+phases E2–E3; read-only item queries and media-segment writes have since
+shipped.
 
 ## Non-goals for the WASM tier
 
@@ -341,6 +342,41 @@ media-segment writes, then a metadata-provider export) is tracked in
 - **DLNA** — needs SSDP/UDP sockets; the sandbox has no sockets by design.
 - **Item mutation/linking** (Merge-Versions-shaped) — item identity stays host-owned;
   plugins supplement, they never restructure the library.
+- **Internet channels** (Jellyfin's `IChannel`) — upstream's channel backends are .NET
+  plugins; neither tier supplies one, so Ferrofin registers no channels. The
+  `RefreshInternetChannels` scheduled task exists for API parity and, like a Jellyfin with
+  no channel plugin, hides itself while the channel set is empty.
+
+## Updating installed plugins
+
+The **Update Plugins** scheduled task (`PluginUpdates`, Application category — startup
+plus every 24 h, as upstream) keeps runtime-installed WASM plugins current: for each
+installed, **enabled** plugin it asks the configured repositories for a newer version
+targeting this server's plugin ABI and installs it through the same path as
+`POST /Packages/Installed/{name}` (HTTPS-only, size-capped download → checksum → component
+validation → identity check → staged, restart-required). Compiled-in extensions are never
+touched — they ship with the server, and the installer refuses their ids.
+
+Two things to know:
+
+- **This stages new code unattended.** Once a plugin is installed, a *release* the
+  repository publishes later is downloaded and staged by the task, without an admin action;
+  it activates on the next restart. (Prereleases are never installed this way — the
+  unattended path takes releases only. Nor is a version that is already staged and waiting
+  for its restart.) Every install gate still applies — HTTPS, size cap, checksum, component
+  validation, id match — and a published version is immutable: re-publishing different
+  bytes under a version already installed is refused. But the trust decision is "I trust
+  this repository", not "I approve this build".
+- **An update can widen what a plugin may reach.** A new version declares its own
+  public-egress allowlist, and a growth is *logged loudly* (`WARN`), not refused — so an
+  unattended update can extend a plugin's network reach with only a log line to show for
+  it. If that matters for your deployment, remove the repository and install by hand.
+- **The opt-out is per plugin, by disabling it** (or removing the repository). Upstream
+  honours an `AutoUpdate` flag in each installed plugin's manifest; Ferrofin's WASM
+  artifacts carry no such manifest, so a disabled plugin is what the task skips. Disabling
+  takes effect live for tasks, providers and analysis, and keeps the plugin installed and
+  inert; a plugin's **web transforms** are wired at boot, so disarming those needs a
+  restart.
 
 ## Roadmap
 

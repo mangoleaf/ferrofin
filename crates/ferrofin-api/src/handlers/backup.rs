@@ -1,18 +1,19 @@
 //! `BackupController` — create, list, inspect, and restore server backups.
 //!
 //! Ports Jellyfin's `BackupController`. A backup is a single `.zip` under
-//! `{data}/backups/` bundling the SQLite database file and the whole
-//! configuration directory, plus a `manifest.json` describing it:
+//! `{data}/backups/` bundling the configuration directory, the SQLite database
+//! file (`Options.Database`) and, per the posted `BackupOptionsDto`, the
+//! internal metadata, trickplay and subtitle-cache trees, plus a
+//! `manifest.json` describing it:
 //!
 //! - `GET  /Backup` — list the available backups' manifests.
 //! - `GET  /Backup/Manifest?path=` — read one backup's manifest.
 //! - `POST /Backup/Create` — write a new backup and return its manifest.
-//! - `POST /Backup/Restore?archiveFileName=` — extract a backup back over the
-//!   data + config directories (takes effect on the next restart).
-//!
-//! The DB + config are what Jellyfin's default `BackupOptions` cover; the
-//! per-section toggles in the posted options are accepted but the DB/config are
-//! always included (they are the restorable state Ferrofin has).
+//! - `POST /Backup/Restore` (`BackupRestoreRequestDto` body) — schedule the
+//!   archive for restore and restart; the next boot extracts it over the live
+//!   tree before the database is opened ([`apply_pending_restore`]), exactly as
+//!   Jellyfin's `ScheduleRestoreAndRestartServer` does. Restoring in-process
+//!   would overwrite an open SQLite file.
 
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -29,6 +30,80 @@ use crate::state::AppState;
 
 /// The SQLite database file name inside the data directory.
 const DB_FILE_NAME: &str = "ferrofin.db";
+
+/// The version of Ferrofin's archive layout, reported as `BackupEngineVersion`.
+/// Deliberately not Jellyfin's `0.2.0`: that engine serialises each database
+/// table to JSON, while Ferrofin archives the SQLite file itself, so the two
+/// archive formats are not interchangeable and must not claim to be.
+const BACKUP_ENGINE_VERSION: &str = "1.0.0";
+
+/// The marker Restore leaves next to the archives naming the one to apply on
+/// the next boot (Jellyfin keeps the same intent in `RestoreBackupPath`).
+const RESTORE_PENDING_FILE: &str = "restore-pending";
+
+/// The on-disk roots of everything an archive holds: the directory of the
+/// database file (archived under `data/`) and the four trees, each archived
+/// under its own prefix. `config` is always included; the others follow
+/// `BackupOptions`. Built from the live application paths (so a configured
+/// `FERROFIN_CONFIG_DIR` / `MetadataPath` is honoured, as Jellyfin archives
+/// `ConfigurationDirectoryPath` / `InternalMetadataPath`), or from the default
+/// layout at boot, before any configuration is loaded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeRoots {
+    /// The program-data root (the backups directory hangs off its `data/`).
+    pub program_data: PathBuf,
+    /// The database file the server opened (archived as `data/ferrofin.db`
+    /// whatever its on-disk name — an adopted `jellyfin.db` included).
+    pub database: PathBuf,
+    /// The configuration directory (`config/` in the archive).
+    pub config: PathBuf,
+    /// The internal metadata directory (`metadata/`).
+    pub metadata: PathBuf,
+    /// The trickplay directory (`trickplay/`).
+    pub trickplay: PathBuf,
+    /// The subtitle cache directory (`subtitles/`).
+    pub subtitles: PathBuf,
+}
+
+impl TreeRoots {
+    /// The roots the running server actually uses.
+    fn from_paths(paths: &dyn ferrofin_traits::system::ServerApplicationPaths) -> Self {
+        let data = PathBuf::from(paths.data_path());
+        Self {
+            program_data: PathBuf::from(paths.program_data_path()),
+            database: PathBuf::from(paths.database_path()),
+            config: PathBuf::from(paths.configuration_directory_path()),
+            metadata: PathBuf::from(paths.internal_metadata_path()),
+            trickplay: data.join("trickplay"),
+            subtitles: data.join("subtitles"),
+        }
+    }
+
+    /// The default layout under `program_data` with the given configuration
+    /// directory and database file — what the composition root knows before
+    /// configuration loads.
+    #[must_use]
+    pub fn defaults(program_data: &Path, config_dir: &Path, database: &Path) -> Self {
+        Self {
+            program_data: program_data.to_path_buf(),
+            database: database.to_path_buf(),
+            config: config_dir.to_path_buf(),
+            metadata: program_data.join("metadata"),
+            trickplay: program_data.join("data").join("trickplay"),
+            subtitles: program_data.join("data").join("subtitles"),
+        }
+    }
+
+    /// (archive prefix, on-disk root) for each tree.
+    fn trees(&self) -> [(&'static str, &Path); 4] {
+        [
+            ("config", &self.config),
+            ("metadata", &self.metadata),
+            ("trickplay", &self.trickplay),
+            ("subtitles", &self.subtitles),
+        ]
+    }
+}
 
 /// Serializes `POST /Backup/Create`.
 ///
@@ -52,34 +127,69 @@ const BACKUPS_DIR: &str = "backups";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct BackupManifest {
-    /// The archive's file name (its handle for restore).
+    /// The archive's absolute path (Jellyfin reports the full path; its file
+    /// name is the handle Restore / Manifest accept). Always re-derived from the
+    /// on-disk location on read — and defaulted, because a Jellyfin manifest
+    /// carries no `Path` at all and must still parse so `restorable` can refuse
+    /// it (and the listing can show it, as Jellyfin lists foreign archives).
+    #[serde(default)]
     path: String,
     /// When the backup was created.
+    #[serde(with = "ferrofin_model::json::datetime")]
     date_created: DateTime<Utc>,
     /// The server version that wrote it.
     server_version: String,
+    /// The archive-layout version ([`BACKUP_ENGINE_VERSION`]). Defaulted on read
+    /// so archives written before the field existed (same layout) still list.
+    #[serde(default)]
+    backup_engine_version: String,
     /// The options the backup was created with (echoed back).
     options: BackupOptions,
 }
 
 /// The `POST /Backup/Create` body — which sections to include. Port of
-/// `BackupOptionsDto`; the DB + config are always backed up, so these are recorded
-/// on the manifest but do not change what is written.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "PascalCase")]
+/// `BackupOptionsDto` with its defaults: only the database is on unless asked.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "PascalCase", default)]
+#[allow(clippy::struct_excessive_bools)] // the contract's DTO is four flags
 struct BackupOptions {
-    #[serde(default = "default_true")]
     metadata: bool,
-    #[serde(default = "default_true")]
-    subtitles: bool,
-    #[serde(default = "default_true")]
     trickplay: bool,
-    #[serde(default)]
-    manual_list_ids: Vec<String>,
+    subtitles: bool,
+    database: bool,
 }
 
-const fn default_true() -> bool {
-    true
+impl Default for BackupOptions {
+    fn default() -> Self {
+        Self {
+            metadata: false,
+            trickplay: false,
+            subtitles: false,
+            database: true,
+        }
+    }
+}
+
+impl BackupOptions {
+    /// Whether the tree stored under `prefix` is selected by these options.
+    fn includes(&self, prefix: &str) -> bool {
+        match prefix {
+            "config" => true,
+            "metadata" => self.metadata,
+            "trickplay" => self.trickplay,
+            "subtitles" => self.subtitles,
+            _ => false,
+        }
+    }
+}
+
+/// The `POST /Backup/Restore` body. Port of `BackupRestoreRequestDto`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct BackupRestoreRequest {
+    /// The archive file name (must be present in the backups directory).
+    #[serde(default)]
+    archive_file_name: Option<String>,
 }
 
 /// The directory holding the archives (`{data}/backups`).
@@ -94,6 +204,15 @@ fn io_err(context: &str, e: &impl std::fmt::Display) -> ApiError {
     )))
 }
 
+/// Whether a manifest names an archive THIS engine can restore: its own layout
+/// version, or a legacy manifest from before the field existed (same layout).
+/// A Jellyfin `0.2.0` archive — which shares the backups directory after a
+/// drop-in adoption — is refused, as Jellyfin refuses foreign versions.
+fn restorable(manifest: &BackupManifest) -> bool {
+    manifest.backup_engine_version.is_empty()
+        || manifest.backup_engine_version == BACKUP_ENGINE_VERSION
+}
+
 /// Reads the `manifest.json` embedded in one archive, if it parses.
 fn read_manifest(archive_path: &Path) -> Option<BackupManifest> {
     let file = std::fs::File::open(archive_path).ok()?;
@@ -102,10 +221,8 @@ fn read_manifest(archive_path: &Path) -> Option<BackupManifest> {
     let mut buf = String::new();
     entry.read_to_string(&mut buf).ok()?;
     let mut manifest: BackupManifest = serde_json::from_str(&buf).ok()?;
-    // Trust the on-disk name over whatever the manifest recorded.
-    if let Some(name) = archive_path.file_name().and_then(|n| n.to_str()) {
-        name.clone_into(&mut manifest.path);
-    }
+    // Trust the on-disk location over whatever the manifest recorded.
+    manifest.path = archive_path.to_string_lossy().into_owned();
     Some(manifest)
 }
 
@@ -239,17 +356,25 @@ async fn create_backup(
         ));
     };
     let options = body.map(|Json(b)| b).unwrap_or_default();
-    // The restorable state lives at the program-data root: the SQLite DB file and
-    // the whole `config/` tree.
-    let program_data = PathBuf::from(state.config.application_paths().program_data_path());
+    let roots = TreeRoots::from_paths(state.config.application_paths().as_ref());
     let dir = backups_dir(&state);
     let now = Utc::now();
-    // Deflating the SQLite file (tens to hundreds of MB) plus the whole config
-    // tree is seconds of CPU + disk: it must not run on a runtime worker.
-    blocking(move || write_backup(&dir, &program_data, options, now))
-        .await
-        .map(Json)
-        .map_err(|e| io_err("create backup", &e))
+    // The database goes into the archive from a consistent `VACUUM INTO`
+    // snapshot, never from the live WAL-mode file (a checkpoint can tear a
+    // file copy mid-read). The snapshot lives beside the archive until zipped.
+    let snapshot = options
+        .database
+        .then(|| dir.join(format!(".snapshot-{}.db", now.timestamp())));
+    if let Some(snapshot) = &snapshot {
+        std::fs::create_dir_all(&dir).map_err(|e| io_err("create backup", &e))?;
+        let _ = std::fs::remove_file(snapshot);
+        state.system.snapshot_database(snapshot).await?;
+    }
+    // Deflating the SQLite snapshot (tens to hundreds of MB) plus the whole
+    // config tree is seconds of CPU + disk: it must not run on a runtime worker.
+    let result =
+        blocking(move || write_backup(&dir, &roots, options, now, snapshot.as_deref())).await;
+    result.map(Json).map_err(|e| io_err("create backup", &e))
 }
 
 /// Runs a blocking filesystem job on tokio's blocking pool, mapping a lost pool
@@ -264,25 +389,31 @@ where
         .unwrap_or_else(|e| Err(std::io::Error::other(e)))
 }
 
-/// Writes a backup archive (DB file + `config/` tree + `manifest.json`) under
-/// `backups_dir`, returning the manifest. Pure over paths — no `AppState` — so it
-/// is unit-testable and shared by the handler.
+/// Writes a backup archive (database + `config/` tree + the selected trees +
+/// `manifest.json`) under `backups_dir`, returning the manifest. The database
+/// comes from `snapshot` when given (a consistent copy the caller produced,
+/// consumed — deleted — here), else from the live file (tests with no server).
+/// Pure over paths — no `AppState` — so it is unit-testable and shared by the
+/// handler.
 fn write_backup(
     backups_dir: &Path,
-    program_data: &Path,
+    roots: &TreeRoots,
     options: BackupOptions,
     now: DateTime<Utc>,
+    snapshot: Option<&Path>,
 ) -> std::io::Result<BackupManifest> {
     std::fs::create_dir_all(backups_dir)?;
     let file_name = format!("ferrofin-backup-{}.zip", now.format("%Y%m%d-%H%M%S"));
+    let archive_path = backups_dir.join(&file_name);
     let manifest = BackupManifest {
-        path: file_name.clone(),
+        path: archive_path.to_string_lossy().into_owned(),
         date_created: now,
         server_version: env!("CARGO_PKG_VERSION").to_owned(),
+        backup_engine_version: BACKUP_ENGINE_VERSION.to_owned(),
         options,
     };
 
-    let file = std::fs::File::create(backups_dir.join(&file_name))?;
+    let file = std::fs::File::create(&archive_path)?;
     let mut zip = zip::ZipWriter::new(file);
     let opts = zip::write::SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated);
@@ -291,43 +422,41 @@ fn write_backup(
     let manifest_json = serde_json::to_vec_pretty(&manifest).unwrap_or_default();
     zip.write_all(&manifest_json)?;
 
-    // The database file (skipped if absent — e.g. an in-memory test DB).
-    if let Ok(bytes) = std::fs::read(program_data.join(DB_FILE_NAME)) {
-        zip.start_file(format!("data/{DB_FILE_NAME}"), opts)?;
-        zip.write_all(&bytes)?;
+    // The database (skipped if absent — e.g. an in-memory test DB).
+    if manifest.options.database {
+        let source = snapshot.filter(|p| p.is_file()).unwrap_or(&roots.database);
+        if let Ok(mut file) = std::fs::File::open(source) {
+            zip.start_file(format!("data/{DB_FILE_NAME}"), opts)?;
+            std::io::copy(&mut file, &mut zip)?;
+        }
+    }
+    if let Some(snapshot) = snapshot {
+        let _ = std::fs::remove_file(snapshot);
     }
 
-    // The configuration tree.
-    let config_dir = program_data.join("config");
-    if config_dir.is_dir() {
-        add_dir_to_zip(&mut zip, &config_dir, "config", opts)?;
+    // The configuration tree, plus every optional tree the options select.
+    for (prefix, dir) in roots.trees() {
+        if manifest.options.includes(prefix) && dir.is_dir() {
+            add_dir_to_zip(&mut zip, dir, prefix, opts)?;
+        }
     }
 
     zip.finish()?;
     Ok(manifest)
 }
 
-/// Query for `POST /Backup/Restore`.
-#[derive(Debug, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RestoreQuery {
-    /// The archive file name to restore.
-    #[serde(default)]
-    archive_file_name: Option<String>,
-}
-
-/// `POST /Backup/Restore?archiveFileName=` — restores a backup.
+/// `POST /Backup/Restore` — schedules a backup restore and restarts.
 ///
-/// Port of `BackupController.StartRestoreBackup`: extracts the archive's `data/`
-/// and `config/` entries back over the data + configuration directories. As with
-/// Jellyfin, the running process keeps its open handles, so the restore fully
-/// takes effect on the next restart. `404` when the archive is missing.
+/// Port of `BackupController.StartRestoreBackup` +
+/// `BackupService.ScheduleRestoreAndRestartServer`: the body's `ArchiveFileName`
+/// is reduced to a file name inside the backups directory (`404` when absent),
+/// recorded in the restore-pending marker, and the server restarts; the next
+/// boot applies it ([`apply_pending_restore`]) before the database is opened.
 #[utoipa::path(
     post,
     path = "/Backup/Restore",
-    params(("archiveFileName" = String, Query, description = "The archive to restore")),
     responses(
-        (status = 204, description = "Restore applied (restart to complete)"),
+        (status = 204, description = "Restore scheduled; the server restarts to apply it"),
         (status = 404, description = "Backup not found")
     ),
     tag = "ferrofin"
@@ -335,44 +464,113 @@ struct RestoreQuery {
 async fn restore_backup(
     State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
-    Query(query): Query<RestoreQuery>,
+    body: Option<Json<BackupRestoreRequest>>,
 ) -> Result<axum::http::StatusCode, ApiError> {
-    let name = query
-        .archive_file_name
+    let name = body
+        .and_then(|Json(b)| b.archive_file_name)
         .as_deref()
         .and_then(|p| Path::new(p).file_name().and_then(|n| n.to_str()))
         .filter(|n| !n.is_empty())
-        .ok_or_else(|| ApiError::BadRequest("missing 'archiveFileName'".to_owned()))?;
-    let archive_path = backups_dir(&state).join(name);
-    if !archive_path.is_file() {
+        .map(str::to_owned)
+        .ok_or_else(|| ApiError::BadRequest("missing 'ArchiveFileName'".to_owned()))?;
+    let dir = backups_dir(&state);
+    let archive = dir.join(&name);
+    if !archive.is_file() {
         return Err(ApiError::NotFound(format!("backup {name}")));
     }
-
-    let program_data = PathBuf::from(state.config.application_paths().program_data_path());
-    // Inflating the archive back over the data + config tree is the same
-    // seconds-long blocking job as creating it.
-    blocking(move || restore_archive(&archive_path, &program_data))
-        .await
-        .map_err(|e| io_err("restore backup", &e))?;
+    // Refuse an archive this engine cannot restore BEFORE scheduling a restart
+    // for nothing (a Jellyfin archive in a shared backups dir, a stray zip).
+    if !read_manifest(&archive).is_some_and(|m| restorable(&m)) {
+        return Err(ApiError::BadRequest(format!(
+            "backup {name} is not a Ferrofin {BACKUP_ENGINE_VERSION} archive"
+        )));
+    }
+    std::fs::write(dir.join(RESTORE_PENDING_FILE), &name)
+        .map_err(|e| io_err("schedule restore", &e))?;
+    state.system.restart().await?;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
-/// Extracts a backup archive's `data/` + `config/` entries back under
-/// `program_data` (`data/ferrofin.db` → `{root}/ferrofin.db`, `config/…` →
-/// `{root}/config/…`), skipping the manifest and anything else. Pure over paths so
-/// it is unit-testable and shared by the handler.
-fn restore_archive(archive_path: &Path, program_data: &Path) -> std::io::Result<()> {
+/// Applies a restore scheduled by `POST /Backup/Restore`, if one is pending.
+///
+/// The composition root calls this at boot BEFORE the database is opened: it
+/// reads the marker under `{program_data}/data/backups/`, extracts the named
+/// archive over the tree described by `roots`, removes the marker, and returns the archive path
+/// it applied (`None` when nothing was pending). A marker naming a missing or
+/// foreign archive is dropped with an error so a stale marker cannot block
+/// every boot. One deliberate difference from Jellyfin, whose pending path is
+/// in-memory and dies with the process: the marker is durable, so a restore
+/// scheduled right before a crash still applies on the next boot (logged).
+///
+/// # Errors
+///
+/// The extraction's I/O error; the marker is removed either way.
+pub fn apply_pending_restore(roots: &TreeRoots) -> std::io::Result<Option<PathBuf>> {
+    let dir = roots.program_data.join("data").join(BACKUPS_DIR);
+    let marker = dir.join(RESTORE_PENDING_FILE);
+    let Ok(name) = std::fs::read_to_string(&marker) else {
+        return Ok(None);
+    };
+    let _ = std::fs::remove_file(&marker);
+    let name = Path::new(name.trim())
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| std::io::Error::other("restore-pending marker names no archive"))?;
+    let archive = dir.join(name);
+    if !read_manifest(&archive).is_some_and(|m| restorable(&m)) {
+        return Err(std::io::Error::other(format!(
+            "{} is not a Ferrofin {BACKUP_ENGINE_VERSION} archive",
+            archive.display()
+        )));
+    }
+    restore_archive(&archive, roots)?;
+    Ok(Some(archive))
+}
+
+/// Extracts a backup archive's entries back over `roots`: `data/ferrofin.db` →
+/// the database file, and each tree prefix to its on-disk root. Skips the
+/// manifest and anything else. Pure over paths so it is unit-testable and
+/// shared by the boot hook.
+///
+/// The database is written to a temporary file beside the target and renamed
+/// into place only once fully extracted, so a failure mid-way (disk full, a
+/// corrupt archive) cannot leave a truncated database behind. It runs in WAL
+/// mode, so its `-wal`/`-shm` sidecars are removed at the same moment: a stale
+/// WAL left beside a restored database would be replayed over it on open.
+fn restore_archive(archive_path: &Path, roots: &TreeRoots) -> std::io::Result<()> {
     let file = std::fs::File::open(archive_path)?;
     let mut zip = zip::ZipArchive::new(file).map_err(std::io::Error::other)?;
+    let db_entry = format!("data/{DB_FILE_NAME}");
     for i in 0..zip.len() {
         let mut entry = zip.by_index(i).map_err(std::io::Error::other)?;
         let Some(enclosed) = entry.enclosed_name() else {
             continue; // path-traversal guard (zip-slip)
         };
-        let dest = if let Ok(rest) = enclosed.strip_prefix("data") {
-            program_data.join(rest)
-        } else if enclosed.starts_with("config") {
-            program_data.join(&enclosed)
+        if enclosed == Path::new(&db_entry) {
+            let tmp = roots.database.with_extension("restore-tmp");
+            {
+                let mut out = std::fs::File::create(&tmp)?;
+                std::io::copy(&mut entry, &mut out)?;
+                out.sync_all()?;
+            }
+            for sidecar in ["-wal", "-shm"] {
+                let mut name = roots.database.as_os_str().to_owned();
+                name.push(sidecar);
+                match std::fs::remove_file(&name) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            std::fs::rename(&tmp, &roots.database)?;
+            continue;
+        }
+        let dest = if let Some((root, rest)) = roots
+            .trees()
+            .into_iter()
+            .find_map(|(prefix, root)| enclosed.strip_prefix(prefix).ok().map(|r| (root, r)))
+        {
+            root.join(rest)
         } else {
             continue;
         };
@@ -408,7 +606,7 @@ mod tests {
     /// them as threads in one process, where they fail.
     static TEST_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-    use super::{BackupManifest, BackupOptions, add_dir_to_zip, read_manifest};
+    use super::{BackupManifest, BackupOptions, TreeRoots, add_dir_to_zip, read_manifest};
     use std::io::Write as _;
 
     #[test]
@@ -425,6 +623,7 @@ mod tests {
             path: "backup.zip".to_owned(),
             date_created: "2024-01-02T03:04:05Z".parse().unwrap(),
             server_version: "9.9.9".to_owned(),
+            backup_engine_version: super::BACKUP_ENGINE_VERSION.to_owned(),
             options: BackupOptions::default(),
         };
         {
@@ -437,10 +636,9 @@ mod tests {
             add_dir_to_zip(&mut zip, &src, "config", opts).unwrap();
             zip.finish().unwrap();
         }
-
-        // The manifest round-trips (path re-derived from the file name).
+        // The manifest round-trips (path re-derived from the on-disk location).
         let read = read_manifest(&archive).expect("manifest");
-        assert_eq!(read.path, "backup.zip");
+        assert_eq!(read.path, archive.to_string_lossy());
         assert_eq!(read.server_version, "9.9.9");
 
         // The directory tree was archived under `config/…`.
@@ -465,6 +663,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // one end-to-end story: write → restore → boot-apply → list
     fn backup_then_restore_round_trips_db_and_config() {
         use super::{list_backups_in, restore_archive, write_backup};
 
@@ -478,15 +677,35 @@ mod tests {
 
         let backups = tmp.path().join("backups");
         let now = "2024-05-06T07:08:09Z".parse().unwrap();
-        let manifest =
-            write_backup(&backups, &program_data, BackupOptions::default(), now).unwrap();
-        assert!(manifest.path.starts_with("ferrofin-backup-"));
-        let archive = backups.join(&manifest.path);
+        let roots = TreeRoots::defaults(
+            &program_data,
+            &program_data.join("config"),
+            &program_data.join("ferrofin.db"),
+        );
+        let manifest = write_backup(&backups, &roots, BackupOptions::default(), now, None).unwrap();
+        let archive = std::path::PathBuf::from(&manifest.path);
+        assert!(
+            archive.starts_with(&backups),
+            "absolute path: {}",
+            manifest.path
+        );
         assert!(archive.is_file());
+        assert_eq!(manifest.backup_engine_version, super::BACKUP_ENGINE_VERSION);
 
-        // Corrupt the live files, then restore over a fresh root.
+        // Restore over a fresh root (a stale WAL sidecar beside the DB is dropped).
         let restore_root = tmp.path().join("restored");
-        restore_archive(&archive, &restore_root).unwrap();
+        std::fs::create_dir_all(&restore_root).unwrap();
+        std::fs::write(restore_root.join("ferrofin.db-wal"), b"stale").unwrap();
+        let restore_roots = TreeRoots::defaults(
+            &restore_root,
+            &restore_root.join("config"),
+            &restore_root.join("ferrofin.db"),
+        );
+        restore_archive(&archive, &restore_roots).unwrap();
+        assert!(
+            !restore_root.join("ferrofin.db-wal").exists(),
+            "stale WAL removed"
+        );
         assert_eq!(
             std::fs::read(restore_root.join("ferrofin.db")).unwrap(),
             b"DBv1"
@@ -500,10 +719,62 @@ mod tests {
             b"user"
         );
 
+        // A scheduled restore is applied once at boot: the marker names the archive
+        // (by file name), the tree is extracted, the marker is consumed.
+        let boot_root = tmp.path().join("boot");
+        let boot_backups = boot_root.join("data").join(super::BACKUPS_DIR);
+        std::fs::create_dir_all(&boot_backups).unwrap();
+        std::fs::copy(&archive, boot_backups.join(archive.file_name().unwrap())).unwrap();
+        std::fs::write(
+            boot_backups.join(super::RESTORE_PENDING_FILE),
+            archive.file_name().unwrap().to_str().unwrap(),
+        )
+        .unwrap();
+        let boot_roots = TreeRoots::defaults(
+            &boot_root,
+            &boot_root.join("config"),
+            &boot_root.join("ferrofin.db"),
+        );
+        let applied = super::apply_pending_restore(&boot_roots).unwrap();
+        assert_eq!(
+            applied.as_deref(),
+            Some(boot_backups.join(archive.file_name().unwrap()).as_path())
+        );
+        assert_eq!(
+            std::fs::read(boot_root.join("ferrofin.db")).unwrap(),
+            b"DBv1"
+        );
+        assert!(
+            !boot_backups.join(super::RESTORE_PENDING_FILE).exists(),
+            "marker consumed"
+        );
+        assert_eq!(super::apply_pending_restore(&boot_roots).unwrap(), None);
+        // A marker naming a missing archive errors once and is dropped.
+        std::fs::write(boot_backups.join(super::RESTORE_PENDING_FILE), "gone.zip").unwrap();
+        assert!(super::apply_pending_restore(&boot_roots).is_err());
+        assert_eq!(super::apply_pending_restore(&boot_roots).unwrap(), None);
+        // A foreign archive (Jellyfin's engine) is refused, marker dropped.
+        let foreign = boot_backups.join("jellyfin-backup.zip");
+        {
+            let file = std::fs::File::create(&foreign).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            zip.start_file("manifest.json", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(br#"{"Path":"x","DateCreated":"2024-01-01T00:00:00Z","ServerVersion":"10.11.8","BackupEngineVersion":"0.2.0","Options":{}}"#).unwrap();
+            zip.finish().unwrap();
+        }
+        std::fs::write(
+            boot_backups.join(super::RESTORE_PENDING_FILE),
+            "jellyfin-backup.zip",
+        )
+        .unwrap();
+        assert!(super::apply_pending_restore(&boot_roots).is_err());
+        assert_eq!(super::apply_pending_restore(&boot_roots).unwrap(), None);
+
         // Listing the backups directory finds the archive, newest first.
         // A second, newer backup + a non-zip file that is ignored.
         let newer = "2024-05-06T09:00:00Z".parse().unwrap();
-        let m2 = write_backup(&backups, &program_data, BackupOptions::default(), newer).unwrap();
+        let m2 = write_backup(&backups, &roots, BackupOptions::default(), newer, None).unwrap();
         std::fs::write(backups.join("notes.txt"), b"ignored").unwrap();
         let listed = list_backups_in(&backups);
         assert_eq!(listed.len(), 2, "two archives, txt ignored");
@@ -628,7 +899,22 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let created: BackupManifest = serde_json::from_slice(&body).unwrap();
-        assert!(created.path.starts_with("ferrofin-backup-"));
+        let created_name = std::path::Path::new(&created.path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap()
+            .to_owned();
+        assert!(
+            created_name.starts_with("ferrofin-backup-"),
+            "{}",
+            created.path
+        );
+        // The manifest carries the contract's fields with the 10.11.8 defaults.
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["BackupEngineVersion"], super::BACKUP_ENGINE_VERSION);
+        assert_eq!(json["Options"]["Database"], true);
+        assert_eq!(json["Options"]["Metadata"], false);
+        assert!(json["Options"].get("ManualListIds").is_none());
 
         // List shows it.
         let resp = send("GET", "/Backup".to_owned(), "").await;
@@ -638,19 +924,50 @@ mod tests {
         assert!(listed.iter().any(|m| m.path == created.path));
 
         // Its manifest reads back; an unknown one is 404.
-        let resp = send("GET", format!("/Backup/Manifest?path={}", created.path), "").await;
+        let resp = send("GET", format!("/Backup/Manifest?path={created_name}"), "").await;
         assert_eq!(resp.status(), StatusCode::OK);
         let resp = send("GET", "/Backup/Manifest?path=nope.zip".to_owned(), "").await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
-        // Restore the just-created archive.
+        // Restore takes the `BackupRestoreRequestDto` body, schedules the archive
+        // (the marker names it) and asks for a restart; an unknown archive is 404
+        // and a missing name is 400.
         let resp = send(
             "POST",
-            format!("/Backup/Restore?archiveFileName={}", created.path),
-            "",
+            "/Backup/Restore".to_owned(),
+            &format!("{{\"ArchiveFileName\":\"{created_name}\"}}"),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            std::fs::read_to_string(backups.join(super::RESTORE_PENDING_FILE)).unwrap(),
+            created_name
+        );
+        let resp = send(
+            "POST",
+            "/Backup/Restore".to_owned(),
+            "{\"ArchiveFileName\":\"nope.zip\"}",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        // A foreign (Jellyfin-engine) archive in the same directory is refused up front.
+        {
+            let file = std::fs::File::create(backups.join("jellyfin-backup.zip")).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            zip.start_file("manifest.json", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(br#"{"Path":"x","DateCreated":"2024-01-01T00:00:00Z","ServerVersion":"10.11.8","BackupEngineVersion":"0.2.0","Options":{}}"#).unwrap();
+            zip.finish().unwrap();
+        }
+        let resp = send(
+            "POST",
+            "/Backup/Restore".to_owned(),
+            "{\"ArchiveFileName\":\"jellyfin-backup.zip\"}",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let resp = send("POST", "/Backup/Restore".to_owned(), "{}").await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
         let _ = std::fs::remove_dir_all(&backups);
     }

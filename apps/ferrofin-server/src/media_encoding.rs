@@ -49,6 +49,91 @@ use crate::planner::FerrofinStreamStatePlanner;
 /// A job dies within (its ping timeout + one sweep); 10s adds at most a sixth
 /// of the 60s HLS timeout as latency while keeping the scan negligible.
 const IDLE_REAPER_SWEEP_SECS: u64 = 10;
+/// The managers the media-encoding chain only decorates itself with: absent in
+/// the unit tests that build the chain without a database behind it.
+pub struct MediaEncodingExtras {
+    /// Resolves item/series/library display names for the transcode logs.
+    pub library: Option<Arc<dyn ferrofin_traits::library::LibraryManager>>,
+    /// Supplies the item's trickplay tile resolutions for the master playlist.
+    pub trickplay: Option<Arc<dyn ferrofin_traits::trickplay::TrickplayManager>>,
+    /// Releases the live stream a killed job was reading.
+    pub sessions: Option<Arc<dyn ferrofin_traits::session::SessionManager>>,
+}
+
+/// The one thing job teardown needs from the session layer: release a live
+/// stream no session still wants (`ISessionManager.CloseLiveStreamIfNeededAsync`).
+#[async_trait]
+trait LiveStreamReleaser: Send + Sync {
+    /// Closes `live_stream_id` unless another session is still using it.
+    async fn release(&self, live_stream_id: &str, session_id: &str) -> Result<(), ServiceError>;
+}
+
+#[async_trait]
+impl LiveStreamReleaser for Arc<dyn ferrofin_traits::session::SessionManager> {
+    async fn release(&self, live_stream_id: &str, session_id: &str) -> Result<(), ServiceError> {
+        self.close_live_stream_if_needed(live_stream_id, session_id)
+            .await
+    }
+}
+
+/// The [`SessionReporter`] the server runs with: on teardown it releases the
+/// live stream the job was reading.
+///
+/// Port of `TranscodeManager`'s
+/// `CloseLiveStreamIfNeededAsync(job.LiveStreamId, job.PlaySessionId)`. Without
+/// it a client that disappears without a `PlaybackStopped` — a killed browser
+/// tab, a cast receiver that drops off the network — leaves its tuner open
+/// until the process exits, and the next tune fails on a busy tuner.
+///
+/// `report_progress` is a no-op, and deliberately says so: upstream's
+/// `TranscodeManager.ReportTranscodingProgress` builds a `TranscodingInfo` from
+/// the encoding state and pushes it into the session, but nothing in Ferrofin
+/// produces progress in the first place (no ffmpeg progress reader), so
+/// `SessionInfo.TranscodingInfo` stays null and the dashboard shows no transcode
+/// details. Building that reader is its own piece of work — see the ledger — and
+/// this is the seam it will report through.
+struct LiveStreamReleasingReporter<R: LiveStreamReleaser> {
+    releaser: R,
+}
+
+#[async_trait]
+impl<R: LiveStreamReleaser> ferrofin_mediaencoding::SessionReporter
+    for LiveStreamReleasingReporter<R>
+{
+    async fn report_progress(
+        &self,
+        _job: &ferrofin_traits::media_encoding::TranscodingJobHandle,
+        _progress: ferrofin_traits::media_encoding::TranscodingProgress,
+    ) {
+    }
+
+    async fn on_job_killed(
+        &self,
+        job: &ferrofin_traits::media_encoding::TranscodingJobHandle,
+        _delete_files: bool,
+        close_live_stream: bool,
+    ) {
+        if !close_live_stream {
+            return;
+        }
+        // `!string.IsNullOrWhiteSpace(job.LiveStreamId)`; the session id upstream
+        // passes is the play-session id the job was registered under.
+        let Some(live_stream_id) = job
+            .live_stream_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+        else {
+            return;
+        };
+        let session = job.play_session_id.as_deref().unwrap_or_default();
+        if let Err(error) = self.releaser.release(live_stream_id, session).await {
+            // Best effort, exactly as upstream's fire-and-forget teardown: a
+            // failure here must not stop the rest of the kill path.
+            tracing::warn!(%live_stream_id, %error, "releasing the job's live stream failed");
+        }
+    }
+}
 
 /// Builds the concrete media-encoding pair injected via
 /// [`AppState::with_media_encoding`](ferrofin_api::AppState::with_media_encoding).
@@ -79,12 +164,13 @@ pub fn build_media_encoding(
     paths: Arc<FerrofinServerApplicationPaths>,
     path_manager: Arc<dyn PathManager>,
     ffmpeg: &FfmpegPaths,
-    library: Option<Arc<dyn ferrofin_traits::library::LibraryManager>>,
+    extras: MediaEncodingExtras,
 ) -> (
     Arc<dyn HlsStreamManager>,
     Arc<dyn AttachmentExtractor>,
     Arc<dyn SubtitleEncoder>,
 ) {
+    let library = extras.library;
     // ---- subtitle encoder (real ffmpeg extraction + charset/format conv) ---
     // Built first: the planner also consumes it, resolving a burned text
     // subtitle to its cached extracted file so the `subtitles` filter doesn't
@@ -115,7 +201,12 @@ pub fn build_media_encoding(
         None => planner,
     };
     let transcoder = TokioSegmentTranscoder::new();
-    let manager = Arc::new(TranscodeManagerImpl::new(NoopSessionReporter));
+    // A live transcode holds a tuner: the reporter releases it when the job dies.
+    let reporter: Arc<dyn ferrofin_mediaencoding::SessionReporter> = match extras.sessions {
+        Some(sessions) => Arc::new(LiveStreamReleasingReporter { releaser: sessions }),
+        None => Arc::new(NoopSessionReporter),
+    };
+    let manager = Arc::new(TranscodeManagerImpl::new(reporter));
     // The idle reaper kills any transcode whose consumers vanished without a
     // stop report (a disconnected cast receiver, a killed browser tab): no
     // active segment request and no session ping within the job's ping timeout
@@ -136,13 +227,19 @@ pub fn build_media_encoding(
         generator_config,
         Vec::new(),
     ));
-    let hls: Arc<dyn HlsStreamManager> = Arc::new(HlsStreamManagerImpl::new(
+    let mut hls_impl = HlsStreamManagerImpl::new(
         planner,
         transcoder,
         manager,
         generator,
         paths as Arc<dyn ferrofin_traits::system::ServerApplicationPaths>,
-    ));
+    );
+    // Without this the master playlist lists no `#EXT-X-IMAGE-STREAM-INF`, so a
+    // client sees no trickplay tiles however many the library holds.
+    if let Some(trickplay) = extras.trickplay {
+        hls_impl = hls_impl.with_trickplay(trickplay);
+    }
+    let hls: Arc<dyn HlsStreamManager> = Arc::new(hls_impl);
 
     // ---- attachment extractor (real ffmpeg + filesystem) ------------------
     let resolver = Arc::new(MediaSourceManagerResolver { media_sources });
@@ -313,9 +410,8 @@ impl MediaEncoder for DynMediaEncoder {
 ///
 /// Port of the `IMediaSourceManager.GetPlaybackMediaSources` call inside
 /// `GetAttachment`: resolves `(item_id, media_source_id)` to a
-/// [`MediaSourceInfo`] with its attachments populated (the static source list
-/// carries streams but not attachments, so the attachment rows are fetched and
-/// merged here).
+/// [`MediaSourceInfo`]; each static source already carries its own attachment
+/// rows (so a merged alternate version resolves to ITS attachments).
 struct MediaSourceManagerResolver {
     media_sources: Arc<dyn MediaSourceManager>,
 }
@@ -331,16 +427,7 @@ impl MediaSourceResolver for MediaSourceManagerResolver {
             .media_sources
             .get_static_media_sources(item_id, false, None)
             .await?;
-        let Some(mut source) = sources
-            .into_iter()
-            .find(|s| s.id.as_deref() == Some(media_source_id))
-        else {
-            return Ok(None);
-        };
-        // The static source carries streams but not attachments; fill them from
-        // the attachment repository so `get_attachment` can locate the row.
-        source.media_attachments = self.media_sources.get_media_attachments(item_id).await?;
-        Ok(Some(source))
+        Ok(sources.into_iter().find(|s| s.id_matches(media_source_id)))
     }
 }
 
@@ -361,13 +448,37 @@ impl AttachmentIo for FfmpegAttachmentIo {
     }
 
     fn attachment_path(&self, media_source_id: &str, file_name: &str) -> String {
+        // The path manager refuses a file name that is not a plain leaf
+        // (`..`, separators). Such a name came from the file's own `filename`
+        // tag, so it must never reach the command line as-is: fall back to a
+        // sanitized leaf inside the cache folder rather than the raw name.
         self.path_manager
             .attachment_path(media_source_id, file_name)
+            .or_else(|| {
+                let leaf: String = file_name
+                    .chars()
+                    .map(|c| {
+                        if c.is_alphanumeric() || c == '.' || c == '-' || c == '_' {
+                            c
+                        } else {
+                            '_'
+                        }
+                    })
+                    .collect();
+                self.path_manager
+                    .attachment_path(media_source_id, leaf.trim_matches('.'))
+            })
             .unwrap_or_else(|| file_name.to_owned())
     }
 
     fn file_exists(&self, path: &str) -> bool {
         std::path::Path::new(path).is_file()
+    }
+
+    async fn create_directory(&self, path: &str) -> Result<(), String> {
+        tokio::fs::create_dir_all(path)
+            .await
+            .map_err(|e| format!("create {path}: {e}"))
     }
 
     async fn read_file(&self, path: &str) -> Result<Vec<u8>, String> {
@@ -376,12 +487,21 @@ impl AttachmentIo for FfmpegAttachmentIo {
             .map_err(|e| format!("read {path}: {e}"))
     }
 
-    async fn run_ffmpeg(&self, ffmpeg_path: &str, args: &str) -> Result<i32, String> {
+    async fn run_ffmpeg(
+        &self,
+        ffmpeg_path: &str,
+        args: &str,
+        working_dir: Option<&str>,
+    ) -> Result<i32, String> {
         // `args` is a pre-built ffmpeg command line (a single space-joined
         // string, matching the C# `arguments` string); split it into parts while
         // honouring the double-quoted attachment-output path.
         let parts = split_ffmpeg_args(args);
-        let status = tokio::process::Command::new(ffmpeg_path)
+        let mut command = tokio::process::Command::new(ffmpeg_path);
+        if let Some(dir) = working_dir {
+            command.current_dir(dir);
+        }
+        let status = command
             .args(&parts)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
@@ -677,21 +797,314 @@ mod tests {
             paths,
             path_manager,
             &ffmpeg,
-            None,
+            MediaEncodingExtras {
+                library: None,
+                trickplay: None,
+                sessions: None,
+            },
+        );
+    }
+
+    /// Records what job teardown asked the session layer to release.
+    #[derive(Default)]
+    struct RecordingReleaser {
+        released: std::sync::Mutex<Vec<(String, String)>>,
+        fail: bool,
+    }
+
+    #[async_trait]
+    impl LiveStreamReleaser for RecordingReleaser {
+        async fn release(
+            &self,
+            live_stream_id: &str,
+            session_id: &str,
+        ) -> Result<(), ServiceError> {
+            self.released
+                .lock()
+                .expect("lock")
+                .push((live_stream_id.to_owned(), session_id.to_owned()));
+            if self.fail {
+                return Err(ServiceError::backend("closing failed"));
+            }
+            Ok(())
+        }
+    }
+
+    fn killed_job(
+        live_stream_id: Option<&str>,
+        play_session_id: Option<&str>,
+    ) -> ferrofin_traits::media_encoding::TranscodingJobHandle {
+        ferrofin_traits::media_encoding::TranscodingJobHandle {
+            play_session_id: play_session_id.map(str::to_owned),
+            path: "/cache/out.m3u8".to_owned(),
+            job_type: ferrofin_traits::media_encoding::TranscodingJobType::Hls,
+            device_id: Some("dev".to_owned()),
+            live_stream_id: live_stream_id.map(str::to_owned),
+        }
+    }
+
+    #[tokio::test]
+    async fn killing_a_live_job_releases_its_stream() {
+        use ferrofin_mediaencoding::SessionReporter as _;
+        // The whole point: the idle reaper kills a job whose client vanished
+        // without a Stop report, and that must hand the tuner back.
+        let reporter = LiveStreamReleasingReporter {
+            releaser: RecordingReleaser::default(),
+        };
+        reporter
+            .on_job_killed(&killed_job(Some("live-1"), Some("sess-1")), true, true)
+            .await;
+        assert_eq!(
+            *reporter.releaser.released.lock().expect("lock"),
+            vec![("live-1".to_owned(), "sess-1".to_owned())]
         );
     }
 
     #[tokio::test]
-    async fn resolver_finds_source_and_merges_attachments() {
+    async fn a_job_with_no_live_stream_releases_nothing() {
+        use ferrofin_mediaencoding::SessionReporter as _;
+        // `!string.IsNullOrWhiteSpace(job.LiveStreamId)` — an ordinary file
+        // transcode, and a blank id, both skip the call entirely.
+        let reporter = LiveStreamReleasingReporter {
+            releaser: RecordingReleaser::default(),
+        };
+        for job in [
+            killed_job(None, Some("sess-1")),
+            killed_job(Some("   "), Some("sess-1")),
+        ] {
+            reporter.on_job_killed(&job, true, true).await;
+        }
+        assert!(reporter.releaser.released.lock().expect("lock").is_empty());
+        // A job with no play session still releases: upstream passes the empty
+        // string through to `CloseLiveStreamIfNeededAsync`.
+        reporter
+            .on_job_killed(&killed_job(Some("live-2"), None), false, true)
+            .await;
+        assert_eq!(
+            reporter.releaser.released.lock().expect("lock")[0],
+            ("live-2".to_owned(), String::new())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_seek_restart_or_explicit_stop_keeps_the_live_stream() {
+        use ferrofin_mediaencoding::SessionReporter as _;
+        // Upstream's `closeLiveStream: false` callers: the seek restart is about
+        // to re-open ffmpeg on this very stream, and an explicit stop releases
+        // through the session layer instead. Releasing here would tear the tuner
+        // out from under the restart.
+        let reporter = LiveStreamReleasingReporter {
+            releaser: RecordingReleaser::default(),
+        };
+        reporter
+            .on_job_killed(&killed_job(Some("live-4"), Some("sess")), false, false)
+            .await;
+        assert!(reporter.releaser.released.lock().expect("lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failed_release_does_not_escape_teardown() {
+        use ferrofin_mediaencoding::SessionReporter as _;
+        let reporter = LiveStreamReleasingReporter {
+            releaser: RecordingReleaser {
+                fail: true,
+                ..RecordingReleaser::default()
+            },
+        };
+        // Returns normally (the kill path must finish); the attempt was made.
+        reporter
+            .on_job_killed(&killed_job(Some("live-3"), Some("sess")), true, true)
+            .await;
+        assert_eq!(reporter.releaser.released.lock().expect("lock").len(), 1);
+    }
+
+    /// A [`TrickplayManager`](ferrofin_traits::trickplay::TrickplayManager) with
+    /// one canned resolution for every item, so a master playlist that reached
+    /// it says so. Every other method is unused by this test.
+    struct FakeTrickplay;
+
+    #[async_trait]
+    impl ferrofin_traits::trickplay::TrickplayManager for FakeTrickplay {
+        async fn get_trickplay_resolutions(
+            &self,
+            _item_id: uuid::Uuid,
+        ) -> Result<
+            std::collections::HashMap<i32, ferrofin_db::entities::playback::TrickplayInfoEntity>,
+            ServiceError,
+        > {
+            Ok(std::collections::HashMap::from([(
+                320,
+                ferrofin_db::entities::playback::TrickplayInfoEntity {
+                    item_id: String::new(),
+                    width: 320,
+                    height: 180,
+                    tile_width: 10,
+                    tile_height: 10,
+                    thumbnail_count: 100,
+                    interval: 10_000,
+                    bandwidth: 12_345,
+                },
+            )]))
+        }
+        async fn refresh_trickplay_data(
+            &self,
+            _item_id: uuid::Uuid,
+            _replace: bool,
+            _library_options: &ferrofin_model::configuration::LibraryOptions,
+        ) -> Result<(), ServiceError> {
+            unimplemented!("fake")
+        }
+        async fn get_trickplay_items(
+            &self,
+            _limit: i32,
+            _offset: i32,
+        ) -> Result<Vec<ferrofin_db::entities::playback::TrickplayInfoEntity>, ServiceError>
+        {
+            unimplemented!("fake")
+        }
+        async fn save_trickplay_info(
+            &self,
+            _info: &ferrofin_db::entities::playback::TrickplayInfoEntity,
+        ) -> Result<(), ServiceError> {
+            unimplemented!("fake")
+        }
+        async fn delete_trickplay_data(&self, _item_id: uuid::Uuid) -> Result<(), ServiceError> {
+            unimplemented!("fake")
+        }
+        async fn get_trickplay_manifest(
+            &self,
+            _item_id: uuid::Uuid,
+        ) -> Result<
+            std::collections::HashMap<
+                String,
+                std::collections::HashMap<
+                    i32,
+                    ferrofin_db::entities::playback::TrickplayInfoEntity,
+                >,
+            >,
+            ServiceError,
+        > {
+            unimplemented!("fake")
+        }
+        async fn get_hls_playlist(
+            &self,
+            _item_id: uuid::Uuid,
+            _width: i32,
+            _api_key: Option<&str>,
+        ) -> Result<Option<String>, ServiceError> {
+            unimplemented!("fake")
+        }
+        async fn get_trickplay_tile_path(
+            &self,
+            _item_id: uuid::Uuid,
+            _width: i32,
+            _index: i32,
+        ) -> Result<Option<String>, ServiceError> {
+            unimplemented!("fake")
+        }
+    }
+
+    #[tokio::test]
+    async fn the_built_chain_carries_the_extras_it_was_given() {
+        // The trickplay bug this guards against was exactly "collaborator built,
+        // unit-tested, never attached": the master playlist listed no
+        // `#EXT-X-IMAGE-STREAM-INF` in production while every unit test passed.
+        // Assert through the BUILT chain, not the builder.
+        // A finite source with a guid id: a live stream lists no trickplay
+        // upstream either, and the tile lookup parses the media-source id.
+        let source_id = uuid::Uuid::from_u128(0xABC).simple().to_string();
+        let mut vod = source(&source_id);
+        vod.run_time_ticks = Some(90 * 60 * 10_000_000);
+        let media_sources: Arc<dyn MediaSourceManager> = Arc::new(FakeSources {
+            sources: vec![vod],
+            attachments: Vec::new(),
+        });
+        let encoder: Arc<dyn MediaEncoder> = Arc::new(RecordingEncoder);
+        let (config, paths) = config_and_paths();
+        let path_manager: Arc<dyn PathManager> = Arc::new(FakePathManager {
+            root: "/cache/att".to_owned(),
+        });
+        let ffmpeg = FfmpegPaths {
+            ffmpeg: "ffmpeg".into(),
+            ffprobe: "ffprobe".into(),
+            filters: Vec::new(),
+            encoders: Vec::new(),
+            chromaprint_muxer: false,
+        };
+        let (hls, _attachments, _subtitles) = build_media_encoding(
+            Arc::clone(&media_sources),
+            encoder,
+            config,
+            paths,
+            path_manager,
+            &ffmpeg,
+            MediaEncodingExtras {
+                library: None,
+                trickplay: Some(Arc::new(FakeTrickplay)),
+                sessions: None,
+            },
+        );
+
+        let request = ferrofin_traits::media_encoding::HlsStreamRequest {
+            item_id: uuid::Uuid::from_u128(1),
+            media_source_id: Some(source_id.clone()),
+            play_session_id: Some("sess".to_owned()),
+            device_id: Some("dev".to_owned()),
+            segment_container: Some("ts".to_owned()),
+            query_string: "?x=1".to_owned(),
+            enable_trickplay: true,
+            ..ferrofin_traits::media_encoding::HlsStreamRequest::default()
+        };
+        let playlist = hls
+            .master_playlist(&request, false)
+            .await
+            .expect("master playlist");
+        assert!(
+            playlist.contains("#EXT-X-IMAGE-STREAM-INF"),
+            "the trickplay manager the chain was given must reach the playlist: {playlist}"
+        );
+    }
+
+    #[test]
+    fn attachment_path_never_lets_a_traversal_file_name_leave_the_cache_folder() {
+        // The name comes from the file's own `filename` tag; the path manager
+        // refuses anything but a plain leaf, and the fallback must stay inside
+        // the cache folder rather than hand the raw name to ffmpeg.
+        let (_, paths) = config_and_paths();
+        let io = FfmpegAttachmentIo {
+            path_manager: Arc::new(ferrofin_core::path_manager::FerrofinPathManager::new(paths)),
+        };
+        let id = "d37ecb9d75b0c0a8e9ecb0a864ec670e";
+        let folder = io.attachment_folder_path(id).expect("guid folder");
+        for evil in ["../../etc/passwd", "a/b.ttf", "..\\x.ttf"] {
+            let path = io.attachment_path(id, evil);
+            assert!(path.starts_with(&folder), "{evil} -> {path}");
+            // A plain leaf: no separator after the folder, so `..` is inert.
+            assert!(
+                !path[folder.len() + 1..].contains(['/', '\\']),
+                "{evil} -> {path}"
+            );
+        }
+        assert_eq!(
+            io.attachment_path(id, "font.ttf"),
+            format!("{folder}/font.ttf")
+        );
+    }
+
+    #[tokio::test]
+    async fn resolver_finds_the_source_with_its_own_attachments() {
         let attachment = MediaAttachment {
             index: 1,
             file_name: Some("font.ttf".to_owned()),
             ..MediaAttachment::default()
         };
+        let mut primary = source("abc");
+        primary.media_attachments = vec![attachment];
+        let alternate = source("alt");
         let resolver = MediaSourceManagerResolver {
             media_sources: Arc::new(FakeSources {
-                sources: vec![source("abc")],
-                attachments: vec![attachment],
+                sources: vec![primary, alternate],
+                attachments: Vec::new(),
             }),
         };
         let outcome = resolver
@@ -700,8 +1113,15 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(outcome.id.as_deref(), Some("abc"));
-        // The attachment rows are merged in from get_media_attachments.
         assert_eq!(outcome.media_attachments.len(), 1);
+        // A merged alternate version resolves to ITS (empty) attachment list, never
+        // the primary's.
+        let alt = resolver
+            .resolve(Uuid::from_u128(1), "ALT")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(alt.media_attachments.is_empty());
     }
 
     #[tokio::test]

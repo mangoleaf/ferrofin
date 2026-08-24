@@ -66,6 +66,7 @@ pub struct ItemLookupInfo {
     /// Gets or sets the premiere date.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<String>, format = "date-time")]
+    #[serde(default, with = "crate::json::datetime::option")]
     pub premiere_date: Option<DateTime<Utc>>,
 
     /// Gets or sets a value indicating whether this lookup was automated.
@@ -228,7 +229,11 @@ pub struct RemoteSearchQuery<T> {
     pub search_info: Option<T>,
 
     /// The id of an existing item to use as the reference for the search.
-    #[serde(default, skip_serializing_if = "uuid::Uuid::is_nil")]
+    #[serde(
+        default,
+        skip_serializing_if = "uuid::Uuid::is_nil",
+        with = "crate::json::guid"
+    )]
     #[schema(value_type = String, format = "uuid")]
     pub item_id: uuid::Uuid,
 

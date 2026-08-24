@@ -187,6 +187,9 @@ pub struct FerrofinSystemManager {
     storage_probe: Arc<dyn StorageProbe>,
     library_storage: Arc<dyn LibraryStorageProvider>,
     facts: SystemHostFacts,
+    /// The live database, for `snapshot_database` (`None` until the
+    /// composition root injects it; tests run without one).
+    db: Option<ferrofin_db::Database>,
 }
 
 impl std::fmt::Debug for FerrofinSystemManager {
@@ -216,7 +219,15 @@ impl FerrofinSystemManager {
             storage_probe: Arc::new(FsStorageProbe),
             library_storage: Arc::new(NoLibraries),
             facts,
+            db: None,
         }
+    }
+
+    /// Injects the live database so `snapshot_database` can copy it.
+    #[must_use]
+    pub fn with_database(mut self, db: ferrofin_db::Database) -> Self {
+        self.db = Some(db);
+        self
     }
 
     /// Overrides the storage probe (tests inject a fake).
@@ -329,6 +340,15 @@ impl ferrofin_traits::system::SystemManager for FerrofinSystemManager {
 
     async fn shutdown(&self) -> Result<(), ServiceError> {
         self.lifecycle.stop(false).await
+    }
+
+    async fn snapshot_database(&self, dest: &std::path::Path) -> Result<(), ServiceError> {
+        let Some(db) = &self.db else {
+            return Ok(());
+        };
+        db.snapshot_to(dest)
+            .await
+            .map_err(|e| ServiceError::backend(format!("database snapshot: {e}")))
     }
 
     async fn get_system_storage_info(&self) -> Result<SystemStorageInfo, ServiceError> {

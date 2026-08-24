@@ -405,15 +405,19 @@ async fn step_items(router: &axum::Router, auth_header: &str, harness: &Harness)
     assert_eq!(items.status(), StatusCode::OK, "Items list is 200");
     let items = body_json(items).await;
     let returned = items["Items"].as_array().expect("Items array");
-    let ids: Vec<&str> = returned.iter().filter_map(|i| i["Id"].as_str()).collect();
-    let movie = harness.movie_id.to_string();
-    let second = harness.second_id.to_string();
+    // Ids are written in Jellyfin's "N" form; compare as guids.
+    let ids: Vec<Uuid> = returned
+        .iter()
+        .filter_map(|i| i["Id"].as_str().and_then(|s| Uuid::parse_str(s).ok()))
+        .collect();
+    let movie = harness.movie_id;
+    let second = harness.second_id;
     assert!(
-        ids.iter().any(|id| id.eq_ignore_ascii_case(&movie)),
+        ids.contains(&movie),
         "the playable movie is listed: {ids:?}"
     );
     assert!(
-        ids.iter().any(|id| id.eq_ignore_ascii_case(&second)),
+        ids.contains(&second),
         "the second seeded item is listed: {ids:?}"
     );
 }

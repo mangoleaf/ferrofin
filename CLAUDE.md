@@ -101,7 +101,6 @@ thing**, not a precedent to lean on.
   skip work. If something cannot be finished in the current task, say so in the summary and
   leave it as an explicit TODO work item with the un-defer path — not as an accepted state.
 
-
 ### `ferrofin-traits` is the dependency-injection seam
 The manager interfaces (`LibraryManager`, `UserManager`, `DtoService`, `ItemRepository`,
 `TranscodeManager`, …) are `#[async_trait]` **traits** in `ferrofin-traits`. This is load-bearing:
@@ -264,12 +263,14 @@ the substance of what a handler actually does — don't rely on a green checkmar
 ## Current scope
 
 **All 412 operations in the vendored contract are wired to real handlers — 0 stubs, 0 `501`s.**
-The parity ledger (`suite/parity/LEDGER.md`) classifies every op `REAL`, with 201 of them
-deep-verified (response + read-back diffed clean against Jellyfin 10.11.8) and the remainder
-classified as accepted divergences. Working end-to-end: authentication/users/QuickConnect,
+The parity ledger (`suite/parity/LEDGER.md`) classifies every op `REAL`, with 241 of them
+deep-verified (response + read-back diffed clean against Jellyfin 10.11.8), 146 classified as
+divergences (accepted, or named open work), and 25 awaiting a parity leg on the current tree.
+Those counts come from the ledger — re-read it rather than quoting this paragraph, and
+regenerate it (`python3 suite/parity/gen-ledger.py`) after any parity run. Working end-to-end: authentication/users/QuickConnect,
 library scan + live filesystem watch, browse/query/DTO, images, sessions/playstate/remote
 control, WebSocket push, playlists/collections, direct play + live HLS transcode (subtitle
-burn-in, fMP4 HEVC/AV1), Live TV (M3U/XMLTV + DVR timers), SyncPlay, all 17 scheduled tasks,
+burn-in, fMP4 HEVC/AV1), Live TV (M3U/XMLTV + DVR timers), SyncPlay, all 20 scheduled tasks,
 metrics/tracing, trickplay/chapters/lyrics/media segments, photo and book libraries
 (EXIF / `ComicInfo` / OPF), and backup/restore. See `docs/FEATURES.md` for the tiered
 status matrix.

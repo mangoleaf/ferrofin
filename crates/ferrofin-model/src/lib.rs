@@ -24,6 +24,7 @@ pub mod environment_dtos;
 pub mod extensions;
 pub mod globalization;
 pub mod io;
+pub mod json;
 pub mod library;
 pub mod live_tv;
 pub mod lyrics;

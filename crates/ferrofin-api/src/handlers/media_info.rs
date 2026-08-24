@@ -654,6 +654,15 @@ struct OpenLiveStreamQuery {
     /// The open token identifying the source to open.
     #[serde(default)]
     open_token: Option<String>,
+    /// Whether direct play is enabled. Default `true`.
+    #[serde(default)]
+    enable_direct_play: Option<bool>,
+    /// Whether direct stream is enabled. Default `true`.
+    #[serde(default)]
+    enable_direct_stream: Option<bool>,
+    /// Whether subtitles are always burned in when transcoding. Default `false`.
+    #[serde(default)]
+    always_burn_in_subtitle_when_transcoding: Option<bool>,
     /// The target user; defaults to the authenticated caller when absent.
     #[serde(default)]
     user_id: Option<Uuid>,
@@ -680,13 +689,86 @@ struct OpenLiveStreamQuery {
     item_id: Option<Uuid>,
 }
 
+/// Reads an optional `i64` that a client may have posted as a JSON string.
+///
+/// The `i64` twin of [`opt_i32`]: the C# binder runs with
+/// `JsonNumberHandling.AllowReadingFromString`, and a client that quotes
+/// `StartTimeTicks` must not turn the whole request into a `422`.
+///
+/// # Errors
+///
+/// Fails when the value is neither a number, a numeric string, nor `null`.
+fn opt_i64<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<i64>, D::Error> {
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum Lenient {
+        Number(i64),
+        Text(String),
+        Null,
+    }
+    match <Lenient as serde::Deserialize>::deserialize(d)? {
+        Lenient::Number(n) => Ok(Some(n)),
+        Lenient::Text(s) if s.trim().is_empty() => Ok(None),
+        Lenient::Text(s) => s
+            .trim()
+            .parse()
+            .map(Some)
+            .map_err(|_| serde::de::Error::custom(format!("expected an integer, got {s:?}"))),
+        Lenient::Null => Ok(None),
+    }
+}
+
+/// The posted `OpenLiveStreamDto` body.
+///
+/// Every scalar the query carries may instead arrive here — jellyfin-web and the
+/// Android clients POST the whole request as a body — and the query wins where
+/// both are present (C# `openToken ?? openLiveStreamDto?.OpenToken`). The device
+/// profile it may also carry is not yet honoured.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+struct OpenLiveStreamDto {
+    /// The open token identifying the source to open.
+    open_token: Option<String>,
+    /// The target user.
+    user_id: Option<Uuid>,
+    /// The play session id.
+    play_session_id: Option<String>,
+    /// The maximum streaming bitrate.
+    #[serde(deserialize_with = "opt_i32")]
+    max_streaming_bitrate: Option<i32>,
+    /// The start time in ticks.
+    #[serde(deserialize_with = "opt_i64")]
+    start_time_ticks: Option<i64>,
+    /// The audio stream index.
+    #[serde(deserialize_with = "opt_i32")]
+    audio_stream_index: Option<i32>,
+    /// The subtitle stream index.
+    #[serde(deserialize_with = "opt_i32")]
+    subtitle_stream_index: Option<i32>,
+    /// The maximum number of audio channels.
+    #[serde(deserialize_with = "opt_i32")]
+    max_audio_channels: Option<i32>,
+    /// The item id whose source is opened.
+    item_id: Option<Uuid>,
+    /// Whether direct play is enabled.
+    enable_direct_play: Option<bool>,
+    /// Whether direct stream is enabled.
+    enable_direct_stream: Option<bool>,
+    /// Whether subtitles are always burned in when transcoding.
+    always_burn_in_subtitle_when_transcoding: Option<bool>,
+    /// The protocols the client will direct-play.
+    direct_play_protocols: Option<Vec<ferrofin_model::media_info::MediaProtocol>>,
+}
+
 /// `POST /LiveStreams/Open` — open a media source and return its live stream.
 ///
-/// Port of `MediaInfoController.OpenLiveStream`. The device-profile negotiation
-/// carried by the posted body is deferred; the query/body scalar parameters are
-/// assembled into a [`LiveStreamRequest`] and handed to
+/// Port of `MediaInfoController.OpenLiveStream`: the query and the posted
+/// [`OpenLiveStreamDto`] are folded together (query wins) into a
+/// [`LiveStreamRequest`] and handed to
 /// [`MediaSourceManager::open_live_stream`](ferrofin_traits::library::MediaSourceManager::open_live_stream),
-/// which probes the source and registers it in the open-stream table.
+/// which redeems the open token — for a Live TV channel that opens the tuner —
+/// probes the result and registers it in the open-stream table. The posted
+/// device profile is not yet honoured.
 #[utoipa::path(
     post,
     path = "/LiveStreams/Open",
@@ -697,25 +779,54 @@ async fn open_live_stream(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
     Query(query): Query<OpenLiveStreamQuery>,
-    body: Option<Json<serde_json::Value>>,
+    body: Option<Json<OpenLiveStreamDto>>,
 ) -> Result<Json<LiveStreamResponse>, ApiError> {
-    // The posted `OpenLiveStreamDto` device profile is not yet honoured.
-    let _ = body;
-    let user_id = query.user_id.unwrap_or_else(|| auth.user_id());
-    let request = LiveStreamRequest {
-        open_token: query.open_token,
-        user_id,
-        play_session_id: query.play_session_id,
-        max_streaming_bitrate: query.max_streaming_bitrate,
-        start_time_ticks: query.start_time_ticks,
-        audio_stream_index: query.audio_stream_index,
-        subtitle_stream_index: query.subtitle_stream_index,
-        max_audio_channels: query.max_audio_channels,
-        item_id: query.item_id.unwrap_or_else(Uuid::nil),
-        ..Default::default()
-    };
+    let request = live_stream_request(
+        query,
+        body.map(|Json(dto)| dto).unwrap_or_default(),
+        auth.user_id(),
+    );
     let media_source = state.media_sources.open_live_stream(&request).await?;
     Ok(Json(LiveStreamResponse::new(media_source)))
+}
+
+/// Folds the query and the posted body into one [`LiveStreamRequest`].
+///
+/// Port of the `?? openLiveStreamDto?.Field` chain in
+/// `MediaInfoController.OpenLiveStream`: the query wins, the body fills the
+/// gaps, and the documented defaults (direct play and direct stream on,
+/// burn-in off, HTTP the only direct-play protocol) apply last.
+fn live_stream_request(
+    query: OpenLiveStreamQuery,
+    dto: OpenLiveStreamDto,
+    authenticated_user: Uuid,
+) -> LiveStreamRequest {
+    LiveStreamRequest {
+        open_token: query.open_token.or(dto.open_token),
+        user_id: query.user_id.or(dto.user_id).unwrap_or(authenticated_user),
+        play_session_id: query.play_session_id.or(dto.play_session_id),
+        max_streaming_bitrate: query.max_streaming_bitrate.or(dto.max_streaming_bitrate),
+        start_time_ticks: query.start_time_ticks.or(dto.start_time_ticks),
+        audio_stream_index: query.audio_stream_index.or(dto.audio_stream_index),
+        subtitle_stream_index: query.subtitle_stream_index.or(dto.subtitle_stream_index),
+        max_audio_channels: query.max_audio_channels.or(dto.max_audio_channels),
+        item_id: query.item_id.or(dto.item_id).unwrap_or_else(Uuid::nil),
+        enable_direct_play: query
+            .enable_direct_play
+            .or(dto.enable_direct_play)
+            .unwrap_or(true),
+        enable_direct_stream: query
+            .enable_direct_stream
+            .or(dto.enable_direct_stream)
+            .unwrap_or(true),
+        always_burn_in_subtitle_when_transcoding: query
+            .always_burn_in_subtitle_when_transcoding
+            .or(dto.always_burn_in_subtitle_when_transcoding)
+            .unwrap_or(false),
+        direct_play_protocols: dto
+            .direct_play_protocols
+            .unwrap_or_else(|| vec![ferrofin_model::media_info::MediaProtocol::Http]),
+    }
 }
 
 /// Query parameters for `POST /LiveStreams/Close`.
@@ -817,6 +928,63 @@ mod tests {
     use ferrofin_model::dto::MediaSourceInfo;
     use ferrofin_model::entities::MediaStreamType;
     use ferrofin_model::entities_media::MediaStream;
+
+    #[test]
+    fn open_live_stream_reads_the_posted_body_and_lets_the_query_win() {
+        // The shape jellyfin-web (and the parity harness) POSTs: everything in
+        // the body, nothing in the query. Before this was bound, the open token
+        // never reached the manager and a Live TV channel could not be opened.
+        let dto: super::OpenLiveStreamDto = serde_json::from_str(
+            r#"{"OpenToken":"prov_LiveTvChannel_abc_src","UserId":"85c9c1a0f0b74a1b8c4d9e2f3a4b5c6d",
+                "ItemId":"11111111222233334444555566667777","PlaySessionId":"parity-livetv",
+                "EnableDirectPlay":true,"EnableDirectStream":false,
+                "DeviceProfile":{"Name":"ignored"}}"#,
+        )
+        .expect("body parses");
+        let request = super::live_stream_request(
+            super::OpenLiveStreamQuery::default(),
+            dto,
+            uuid::Uuid::nil(),
+        );
+        assert_eq!(
+            request.open_token.as_deref(),
+            Some("prov_LiveTvChannel_abc_src")
+        );
+        assert_eq!(request.play_session_id.as_deref(), Some("parity-livetv"));
+        assert_eq!(
+            request.user_id,
+            uuid::Uuid::parse_str("85c9c1a0f0b74a1b8c4d9e2f3a4b5c6d").expect("guid")
+        );
+        assert_eq!(
+            request.item_id,
+            uuid::Uuid::parse_str("11111111222233334444555566667777").expect("guid")
+        );
+        assert!(request.enable_direct_play);
+        assert!(!request.enable_direct_stream);
+        assert!(!request.always_burn_in_subtitle_when_transcoding);
+        assert_eq!(
+            request.direct_play_protocols,
+            vec![ferrofin_model::media_info::MediaProtocol::Http]
+        );
+
+        // The query wins over the body wherever both speak.
+        let query = super::OpenLiveStreamQuery {
+            open_token: Some("from-query".to_owned()),
+            enable_direct_stream: Some(true),
+            ..super::OpenLiveStreamQuery::default()
+        };
+        let dto = super::OpenLiveStreamDto {
+            open_token: Some("from-body".to_owned()),
+            enable_direct_stream: Some(false),
+            ..super::OpenLiveStreamDto::default()
+        };
+        let user = uuid::Uuid::from_u128(9);
+        let request = super::live_stream_request(query, dto, user);
+        assert_eq!(request.open_token.as_deref(), Some("from-query"));
+        assert!(request.enable_direct_stream);
+        // Neither side named a user: the authenticated caller is it.
+        assert_eq!(request.user_id, user);
+    }
 
     #[test]
     fn playback_info_body_accepts_stringly_numbers() {

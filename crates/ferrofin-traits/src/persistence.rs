@@ -231,7 +231,17 @@ pub trait ItemRepository: Send + Sync {
             .collect())
     }
 
-    /// Returns the latest item rows for the given collection type (Latest API).
+    /// The "latest media" rows of a **tvshows or music** library — port of C#
+    /// `BaseItemRepository.GetLatestItemList`.
+    ///
+    /// One grouped-threshold statement: the filter's predicates are grouped by
+    /// `SeriesName` (tvshows) or `Album` (music), the newest `filter.limit`
+    /// groups' `MAX(DateCreated)` are taken, and every row at or above the
+    /// *smallest* of those maxima is returned in the filter's `order_by`,
+    /// unpaged — so `limit` caps groups, not rows, and the caller buckets the
+    /// rows by container afterwards. Any other collection type returns an
+    /// empty list (the C# early exit); the caller uses
+    /// [`get_item_list`](Self::get_item_list) for those.
     async fn get_latest_item_list(
         &self,
         filter: &InternalItemsQuery,
@@ -897,6 +907,29 @@ pub trait MediaAttachmentRepository: Send + Sync {
         &self,
         filter: &MediaAttachmentQuery,
     ) -> Result<Vec<AttachmentStreamInfoEntity>, ServiceError>;
+
+    /// Batch form of [`Self::get_media_attachments`] for a page of items, keyed
+    /// by item; items with no attachments are absent. The default loops the
+    /// single-item form; the concrete repository runs one `IN (…)` query.
+    async fn get_media_attachments_batch(
+        &self,
+        item_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, Vec<AttachmentStreamInfoEntity>>, ServiceError>
+    {
+        let mut map = std::collections::HashMap::new();
+        for &item_id in item_ids {
+            let rows = self
+                .get_media_attachments(&MediaAttachmentQuery {
+                    item_id,
+                    index: None,
+                })
+                .await?;
+            if !rows.is_empty() {
+                map.insert(item_id, rows);
+            }
+        }
+        Ok(map)
+    }
 
     /// Replaces an item's media attachments with the given set.
     async fn save_media_attachments(

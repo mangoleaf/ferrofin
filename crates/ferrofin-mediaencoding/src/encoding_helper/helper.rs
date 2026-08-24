@@ -877,7 +877,11 @@ fn preset_name(preset: EncoderPreset) -> &'static str {
 
 /// Clamps a requested level to a codec-safe maximum. Port of
 /// `NormalizeTranscodingLevel`. Returns `None` for a non-numeric level.
-fn normalize_transcoding_level(state: &EncodingJobInfo, level: Option<&str>) -> Option<String> {
+///
+/// Public because the HLS master playlist's `GetOutputVideoCodecLevel` runs the
+/// requested level through the same clamp before formatting the `CODECS` entry.
+#[must_use]
+pub fn normalize_transcoding_level(state: &EncodingJobInfo, level: Option<&str>) -> Option<String> {
     let request_level = level?.parse::<f64>().ok()?;
     let codec = state.actual_output_video_codec().unwrap_or_default();
 

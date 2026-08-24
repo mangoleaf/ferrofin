@@ -211,6 +211,7 @@ mod tests {
             "image/svg+xml",
             "application/octet-stream",
             "application/x-mpegURL",
+            "application/vnd.apple.mpegurl",
             "text/vtt",
             "text/event-stream",
             "font/woff2",

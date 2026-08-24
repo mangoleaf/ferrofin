@@ -182,15 +182,11 @@ fn opt_f32<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<f32>, D::Err
         .map(|n| n as f32))
 }
 
-/// Deserializes an optional timestamp, treating a cleared field (`null` or `""`)
-/// as `None` rather than a parse error.
+/// Deserializes an optional timestamp the way Jellyfin reads one: a cleared
+/// field (`null` or `""`) is `None`, and a bare date — what jellyfin-web's
+/// metadata editor sends for a date the user changed — is midnight UTC.
 fn opt_date<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<DateTime<Utc>>, D::Error> {
-    match Option::<String>::deserialize(d)? {
-        Some(s) if !s.trim().is_empty() => DateTime::parse_from_rfc3339(s.trim())
-            .map(|dt| Some(dt.with_timezone(&Utc)))
-            .map_err(serde::de::Error::custom),
-        _ => Ok(None),
-    }
+    ferrofin_model::json::datetime::option::deserialize(d)
 }
 
 /// Whether any editor-owned field differs between the stored row and the

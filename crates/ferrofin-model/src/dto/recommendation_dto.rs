@@ -23,5 +23,6 @@ pub struct RecommendationDto {
 
     /// Gets or sets the category identifier.
     #[schema(value_type = String, format = "uuid")]
+    #[serde(with = "crate::json::guid")]
     pub category_id: Uuid,
 }

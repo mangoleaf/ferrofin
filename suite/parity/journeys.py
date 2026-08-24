@@ -22,12 +22,13 @@ Offline self-check:
 import json
 import os
 import sys
+import time
 import urllib.parse
 import urllib.request
 import urllib.error
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from sweep import http, get_json, bring_up, ROOT   # reuse HTTP + provisioning
+from sweep import http, get_json, bring_up, container_read, ROOT, USER, PASS, CLIENT, opensubtitles_credentials   # reuse HTTP + provisioning
 
 
 def q(base, path, token, user):
@@ -44,6 +45,40 @@ def user_data(base, token, user, mid):
     return (q(base, f"/Items/{mid}", token, user) or {}).get("UserData", {}) or {}
 
 # ---------------------------------------------------------------- journeys (per server → {op: effect_ok})
+
+def j_startup(base, token, user, _m, _m2):
+    """The first-run wizard endpoints. Setup is complete on both servers by the time journeys
+    run, but the controller's policy is FirstTimeSetupOrElevated — an admin can drive it after
+    setup — so each POST is replayed with exactly the values the harness provisioned and its
+    effect confirmed on the read-back (nothing actually changes). Must run FIRST: Startup/User
+    rewrites "the first user", which is only the admin while no throwaway users exist."""
+    r = {}
+    cfg = {"UICulture": "en-US", "MetadataCountryCode": "US", "PreferredMetadataLanguage": "en"}
+    st, _ = http("POST", f"{base}/Startup/Configuration", token, json.dumps(cfg))
+    back = get_json(base, "/Startup/Configuration", token) or {}
+    r["POST /Startup/Configuration"] = st < 300 and all(back.get(k) == v for k, v in cfg.items())
+    # Post-setup the first user already has a password, and the contract is 403 (the Forbid
+    # guard upstream added in v12, which Ferrofin ports). Jellyfin 10.11.8 predates it and
+    # silently re-sets the admin password instead — sending the provisioned credentials keeps
+    # that a no-op. Classified in classifications.json; this asserts the correct contract.
+    # Jellyfin picks `Users.First()` from an unordered dictionary, so the call is only safe
+    # while the admin is the ONLY user — a stray user from a failed cleanup would be the one
+    # renamed/re-passworded instead. Guarded rather than assumed.
+    if len(get_json(base, "/Users", token) or []) == 1:
+        st, _ = http("POST", f"{base}/Startup/User", token, json.dumps({"Name": USER, "Password": PASS}))
+        back = get_json(base, "/Startup/User", token) or {}
+        r["POST /Startup/User"] = st == 403 and back.get("Name") == USER
+    else:
+        r["POST /Startup/User"] = False   # not attempted: more than one user on the instance
+    st, _ = http("POST", f"{base}/Startup/RemoteAccess", token,
+                 json.dumps({"EnableRemoteAccess": True, "EnableAutomaticPortMapping": False}))
+    net = get_json(base, "/System/Configuration/network", token) or {}
+    r["POST /Startup/RemoteAccess"] = st < 300 and net.get("EnableRemoteAccess") is True
+    st, _ = http("POST", f"{base}/Startup/Complete", token, "")
+    pub = get_json(base, "/System/Info/Public", None) or {}
+    r["POST /Startup/Complete"] = st < 300 and pub.get("StartupWizardCompleted") is True
+    return r
+
 
 def j_favorites(base, token, user, mid, _m2):
     r = {}
@@ -671,16 +706,50 @@ def j_bulk_item_delete(base, token, user, mid, _m2):
     return r
 
 
+SUBTITLE_REFRESH_WAIT_S = 10   # Jellyfin lists an uploaded stream only once its refresh ran
+
+
+def external_subtitles(base, token, user, mid):
+    """(index, language) of the item's EXTERNAL subtitle streams (uploaded files)."""
+    item = q(base, f"/Items/{mid}?fields=MediaStreams", token, user) or {}
+    return [(s["Index"], s.get("Language")) for s in item.get("MediaStreams") or []
+            if s.get("Type") == "Subtitle" and s.get("IsExternal") and "Index" in s]
+
+
+def external_subtitle_indexes(base, token, user, mid):
+    return [i for i, _ in external_subtitles(base, token, user, mid)]
+
+
 def j_subtitles_upload(base, token, user, mid, _m2):
+    """Upload an external subtitle → it appears as an external subtitle stream → delete it by
+    index → it is gone. (Delete only ever targets external streams; the embedded eng track
+    the fixture carries stays.) The upload is "fra", and every external fra stream is reaped
+    at the end whatever happened, so a stale file from an aborted run cannot mask the next."""
     import base64
+    r = {}
+    before = set(external_subtitle_indexes(base, token, user, mid))
     srt = "1\n00:00:00,000 --> 00:00:01,000\nParity\n"
     body = json.dumps({
-        "Language": "eng", "Format": "srt", "IsForced": False,
+        "Language": "fra", "Format": "srt", "IsForced": False,
         "IsHearingImpaired": False,
         "Data": base64.b64encode(srt.encode()).decode(),
     })
     st, _ = http("POST", f"{base}/Videos/{mid}/Subtitles", token, body)
-    return {"POST /Videos/{itemId}/Subtitles": st < 300}
+    added = []
+    for _ in range(SUBTITLE_REFRESH_WAIT_S):
+        added = [i for i in external_subtitle_indexes(base, token, user, mid) if i not in before]
+        if added:
+            break
+        time.sleep(1)
+    r["POST /Videos/{itemId}/Subtitles"] = st < 300 and bool(added)
+    if added:
+        st, _ = http("DELETE", f"{base}/Videos/{mid}/Subtitles/{added[0]}", token)
+        gone = added[0] not in external_subtitle_indexes(base, token, user, mid)
+        r["DELETE /Videos/{itemId}/Subtitles/{index}"] = st < 300 and gone
+    for i, lang in external_subtitles(base, token, user, mid):   # reap, whichever path ran
+        if lang == "fra":
+            http("DELETE", f"{base}/Videos/{mid}/Subtitles/{i}", token)
+    return r
 
 
 def j_merge_versions_controller(base, token, user, mid, m2):
@@ -758,7 +827,261 @@ def j_users_password(base, token, user, _m, _m2):
     return r
 
 
-JOURNEYS = [j_favorites, j_played, j_rating, j_playlist, j_collection, j_users, j_item_edit,
+def j_forgot_password(base, token, user, _m, _m2):
+    """The local password-reset flow on a throwaway user. ForgotPassword answers with a PIN
+    challenge whose PIN is written to a file on the server host; the harness reads that file
+    out of the container (docker compose exec) and redeems it. The effect (port of
+    DefaultPasswordResetProvider.RedeemPasswordResetPin) is that the PIN BECOMES the user's
+    password, so the read-back is a login with it. Requests come from the docker bridge (a
+    private range), which both servers treat as local — the gate for this flow."""
+    r = {}
+    # A stale fpprobe from an aborted run would make Users/New fail and leave both ops
+    # silently untested: remove it first.
+    for u in get_json(base, "/Users", token) or []:
+        if u.get("Name") == "fpprobe":
+            http("DELETE", f"{base}/Users/{u['Id']}", token)
+    _, uraw = http("POST", f"{base}/Users/New", token,
+                   json.dumps({"Name": "fpprobe", "Password": "Fp!123"}))
+    uid = json.loads(uraw).get("Id") if uraw else None
+    if not uid:
+        return r
+    st, raw = http("POST", f"{base}/Users/ForgotPassword", None,
+                   json.dumps({"EnteredUsername": "fpprobe"}))
+    try:
+        challenge = json.loads(raw)
+    except ValueError:
+        challenge = {}
+    pin_file = challenge.get("PinFile") or ""
+    r["POST /Users/ForgotPassword"] = (st == 200 and challenge.get("Action") == "PinCode"
+                                       and bool(pin_file) and bool(challenge.get("PinExpirationDate")))
+    pin = None
+    contents = container_read(base, pin_file) if pin_file else None
+    if contents:
+        try:
+            pin = json.loads(contents).get("Pin")
+        except ValueError:
+            pin = None
+    if pin:
+        st, raw = http("POST", f"{base}/Users/ForgotPassword/Pin", None, json.dumps({"Pin": pin}))
+        try:
+            result = json.loads(raw)
+        except ValueError:
+            result = {}
+        login = auth_device(base, "fpprobe", pin, "parity-fpprobe")
+        r["POST /Users/ForgotPassword/Pin"] = (st == 200 and result.get("Success") is True
+                                               and result.get("UsersReset") == ["fpprobe"]
+                                               and bool(login.get("AccessToken")))
+    else:
+        r["POST /Users/ForgotPassword/Pin"] = False   # PIN file unreadable (no docker access?)
+    http("DELETE", f"{base}/Users/{uid}", token)   # cleanup
+    return r
+
+
+LIVETV_OPS = [
+    "POST /LiveTv/TunerHosts", "POST /LiveTv/ListingProviders",
+    "POST /LiveStreams/Open", "GET /LiveTv/LiveStreamFiles/{streamId}/stream.{container}",
+    "POST /LiveStreams/Close", "GET /LiveTv/Programs/{programId}", "POST /LiveTv/Timers",
+    "GET /LiveTv/Timers/{timerId}", "GET /LiveTv/LiveRecordings/{recordingId}/stream",
+    "GET /LiveTv/Recordings/{recordingId}", "DELETE /LiveTv/Timers/{timerId}",
+    "DELETE /LiveTv/Recordings/{recordingId}",
+]
+RECORDING_START_WAIT_S = 60   # the recorder opens the tuner stream + the Recordings folder refreshes
+RECORDING_POLL_S = 5
+STREAM_PREFIX_BYTES = 16384   # ~87 TS packets: enough for is_mpegts, cheap to pull
+STREAM_READ_TIMEOUT_S = 30
+
+
+def read_prefix(base, path, token, n=STREAM_PREFIX_BYTES, timeout=STREAM_READ_TIMEOUT_S):
+    """(status, content-type, first n bytes) of a progressive/endless response — a live tuner
+    stream or an in-progress recording never ends, so only a prefix is read."""
+    hdr = {"Authorization": f'MediaBrowser Token="{token}", {CLIENT}'}
+    req = urllib.request.Request(base + path, headers=hdr)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, r.headers.get("Content-Type", ""), r.read(n)
+    except urllib.error.HTTPError as e:
+        return e.code, "", b""
+    except (urllib.error.URLError, TimeoutError, ConnectionError, OSError):
+        return 0, "", b""
+
+
+def is_mpegts(body):
+    return body[:1] == b"\x47" and len(body) > 188 and body[188:189] == b"\x47"
+
+
+def mpegts_response(st, ct, body):
+    return st == 200 and ct.split(";")[0].strip().lower() == "video/mp2t" and is_mpegts(body)
+
+
+def j_livetv(base, token, user, _m, _m2):
+    """The Live TV flow on the M3U fixture tuner: PlaybackInfo on a channel hands out an
+    OpenToken → LiveStreams/Open returns a live media source → its LiveStreamFiles stream
+    is a real MPEG-TS → Close revokes it. Then a timer on the programme airing now starts
+    a recording → the in-progress recording streams → timer and recording are deleted.
+    Every op starts False so an early exit (no channels, no programme, no timer) leaves a
+    flagged row, never a missing one."""
+    r = dict.fromkeys(LIVETV_OPS, False)
+    channels = (get_json(base, f"/LiveTv/Channels?userId={user}", token) or {}).get("Items") or []
+    # Provisioning (sweep.provision_livetv) added the tuner host and the listings provider;
+    # their effect is what this journey runs on: channels from the tuner, programmes from
+    # the guide.
+    r["POST /LiveTv/TunerHosts"] = bool(channels)
+    if not channels:
+        return r
+    ch = channels[0]["Id"]
+    programs = (get_json(base, f"/LiveTv/Programs?channelIds={ch}&isAiring=true&userId={user}", token)
+                or {}).get("Items") or []
+    r["POST /LiveTv/ListingProviders"] = bool(programs)
+    # --- live stream -------------------------------------------------------------------
+    _, raw = http("POST", f"{base}/Items/{ch}/PlaybackInfo?userId={user}", token, json.dumps({}))
+    try:
+        sources = json.loads(raw).get("MediaSources") or []
+    except ValueError:
+        sources = []
+    token_src = next((s for s in sources if s.get("OpenToken")), None)
+    live = {}
+    if token_src:
+        st, raw = http("POST", f"{base}/LiveStreams/Open", token, json.dumps({
+            "OpenToken": token_src["OpenToken"], "UserId": user, "ItemId": ch,
+            "PlaySessionId": "parity-livetv", "EnableDirectPlay": True, "EnableDirectStream": True}))
+        try:
+            live = json.loads(raw).get("MediaSource") or {}
+        except ValueError:
+            live = {}
+        r["POST /LiveStreams/Open"] = st == 200 and bool(live.get("LiveStreamId"))
+    stream_id = live.get("LiveStreamId") or ""
+    path = live.get("Path") or ""
+    if "/LiveTv/LiveStreamFiles/" in path:
+        stream_id = path.split("/LiveTv/LiveStreamFiles/", 1)[1].split("/", 1)[0]
+    if stream_id:
+        r["GET /LiveTv/LiveStreamFiles/{streamId}/stream.{container}"] = mpegts_response(
+            *read_prefix(base, f"/LiveTv/LiveStreamFiles/{stream_id}/stream.ts", token))
+    if live.get("LiveStreamId"):
+        st, _ = http("POST", f"{base}/LiveStreams/Close?liveStreamId={urllib.parse.quote(live['LiveStreamId'])}",
+                     token, "")
+        gone = read_prefix(base, f"/LiveTv/LiveStreamFiles/{stream_id}/stream.ts", token, timeout=10)[0]
+        r["POST /LiveStreams/Close"] = st < 300 and gone != 200
+    # --- timer → in-progress recording -------------------------------------------------
+    if not programs:
+        return r
+    prog = programs[0]["Id"]
+    got = get_json(base, f"/LiveTv/Programs/{prog}?userId={user}", token) or {}
+    r["GET /LiveTv/Programs/{programId}"] = got.get("Id") == prog
+    defaults = get_json(base, f"/LiveTv/Timers/Defaults?programId={prog}", token) or {}
+    st, _ = http("POST", f"{base}/LiveTv/Timers", token, json.dumps(defaults))
+    timers = (get_json(base, f"/LiveTv/Timers?channelId={ch}", token) or {}).get("Items") or []
+    timer = next((t for t in timers if t.get("ProgramId") == prog), None) or (timers[0] if timers else None)
+    r["POST /LiveTv/Timers"] = st < 300 and timer is not None
+    if not timer:
+        return r
+    tid = timer.get("Id")
+    rec = None
+    try:
+        r["GET /LiveTv/Timers/{timerId}"] = (get_json(base, f"/LiveTv/Timers/{tid}", token) or {}).get("Id") == tid
+        for _ in range(RECORDING_START_WAIT_S // RECORDING_POLL_S):
+            recs = (get_json(base, f"/LiveTv/Recordings?isInProgress=true&userId={user}", token)
+                    or {}).get("Items") or []
+            if recs:
+                rec = recs[0]
+                break
+            time.sleep(RECORDING_POLL_S)
+        if rec:
+            rid = rec["Id"]
+            # An in-progress recording is served through /LiveTv/LiveRecordings/{id}/stream,
+            # keyed by Jellyfin's INTERNAL timer id (not the timer DTO's hashed id): the only
+            # way a client learns it is PlaybackInfo on the recording item, whose media
+            # source carries that URL as EncoderPath (the direct Path is the growing file).
+            _, raw = http("POST", f"{base}/Items/{rid}/PlaybackInfo?userId={user}", token, json.dumps({}))
+            try:
+                paths = [(m.get("EncoderPath") or "") + " " + (m.get("Path") or "")
+                         for m in json.loads(raw).get("MediaSources") or []]
+            except ValueError:
+                paths = []
+            live_path = next((p for p in paths if "/LiveTv/LiveRecordings/" in p), "")
+            if live_path:
+                key = live_path.split("/LiveTv/LiveRecordings/", 1)[1].split("/", 1)[0]
+                r["GET /LiveTv/LiveRecordings/{recordingId}/stream"] = mpegts_response(
+                    *read_prefix(base, f"/LiveTv/LiveRecordings/{key}/stream", token))
+            r["GET /LiveTv/Recordings/{recordingId}"] = (
+                (get_json(base, f"/LiveTv/Recordings/{rid}?userId={user}", token) or {}).get("Id") == rid)
+    finally:
+        # Whatever happened above, the timer (and with it the recording in progress) goes.
+        st, _ = http("DELETE", f"{base}/LiveTv/Timers/{tid}", token)
+        left = (get_json(base, f"/LiveTv/Timers?channelId={ch}", token) or {}).get("Items") or []
+        r["DELETE /LiveTv/Timers/{timerId}"] = st < 300 and all(t.get("Id") != tid for t in left)
+        if rec:
+            st, _ = http("DELETE", f"{base}/LiveTv/Recordings/{rec['Id']}", token)
+            still = get_json(base, f"/LiveTv/Recordings/{rec['Id']}?userId={user}", token)
+            r["DELETE /LiveTv/Recordings/{recordingId}"] = st < 300 and not still
+    return r
+
+
+def j_remote_subtitles(base, token, user, mid, _m2):
+    """Remote subtitles through OpenSubtitles — only when credentials are configured (see
+    sweep.opensubtitles_credentials). The fixture's first movie carries a real IMDb id in
+    its NFO, so both servers search the same title: search → download the first hit → the
+    item gains an external subtitle stream → the provider's own subtitle file is fetched.
+    Cost: two provider downloads per server (the POST and the Providers GET both download),
+    so four quota units per two-leg run. Jellyfin's plugin uses its own bundled API key,
+    Ferrofin uses OPENSUBTITLES_API_KEY — an exhausted quota can therefore flag one side only."""
+    if not opensubtitles_credentials():
+        return {}
+    r = {}
+    hits = get_json(base, f"/Items/{mid}/RemoteSearch/Subtitles/eng", token) or []
+    r["GET /Items/{itemId}/RemoteSearch/Subtitles/{language}"] = bool(hits)
+    sub_id = hits[0].get("Id") if hits else None
+    if not sub_id:
+        return r
+    before = set(external_subtitle_indexes(base, token, user, mid))
+    st, _ = http("POST", f"{base}/Items/{mid}/RemoteSearch/Subtitles/{urllib.parse.quote(sub_id, safe='')}",
+                 token, "")
+    # Jellyfin answers 204 even when the download failed (it logs and swallows), and only
+    # QUEUES the refresh that creates the stream row — the read-back below is the verdict.
+    # The verdict wants the stream the search asked for: a new EXTERNAL stream tagged eng
+    # (the provider id carries the language; a server that drops it lands an "und" stream).
+    added = []
+    for _ in range(SUBTITLE_REFRESH_WAIT_S):
+        added = [i for i, lang in external_subtitles(base, token, user, mid)
+                 if i not in before and lang == "eng"]
+        if added:
+            break
+        time.sleep(1)
+    r["POST /Items/{itemId}/RemoteSearch/Subtitles/{subtitleId}"] = st < 300 and bool(added)
+    st, raw = http("GET", f"{base}/Providers/Subtitles/Subtitles/{urllib.parse.quote(sub_id, safe='')}", token)
+    r["GET /Providers/Subtitles/Subtitles/{subtitleId}"] = st == 200 and bool(raw)
+    for i, lang in external_subtitles(base, token, user, mid):   # reap, whichever path ran
+        # Our own debris whatever language the server gave it, plus any external eng stream
+        # (the fixture's own eng track is embedded, never external).
+        if i not in before or lang == "eng":
+            http("DELETE", f"{base}/Videos/{mid}/Subtitles/{i}", token)
+    return r
+
+
+def j_backup(base, token, user, _m, _m2):
+    """Backup create → manifest → list on the server's own data dir. The manifest must echo
+    the posted options, the Manifest route must read the same manifest back by the returned
+    path, and the listing must contain it. (Restore restarts the server: terminal.py.)"""
+    r = {}
+    opts = {"Metadata": False, "Trickplay": False, "Subtitles": False, "Database": True}
+    st, raw = http("POST", f"{base}/Backup/Create", token, json.dumps(opts))
+    try:
+        created = json.loads(raw)
+    except ValueError:
+        created = {}
+    path = created.get("Path") or ""
+    r["POST /Backup/Create"] = (st == 200 and bool(path) and created.get("Options") == opts
+                                and bool(created.get("BackupEngineVersion"))
+                                and bool(created.get("DateCreated")))
+    if path:
+        manifest = get_json(base, "/Backup/Manifest?path=" + urllib.parse.quote(path), token) or {}
+        r["GET /Backup/Manifest"] = manifest == created
+        listed = get_json(base, "/Backup", token) or []
+        r["GET /Backup"] = any(m.get("Path") == path for m in listed)
+    return r
+
+
+JOURNEYS = [j_startup,   # first: see its docstring
+            j_favorites, j_played, j_rating, j_playlist, j_collection, j_users, j_item_edit,
             j_api_keys, j_user_item_data, j_display_prefs, j_scheduled_task_triggers,
             j_device_options, j_playstate, j_capabilities, j_user_config, j_system_config,
             j_playlist_share, j_item_delete, j_capabilities_query, j_environment_validate,
@@ -767,6 +1090,7 @@ JOURNEYS = [j_favorites, j_played, j_rating, j_playlist, j_collection, j_users, 
             j_scheduled_run, j_playbackinfo_post, j_active_encodings, j_clientlog,
             j_authenticate, j_user_update, j_devices_delete, j_bulk_item_delete,
             j_subtitles_upload, j_quickconnect, j_system_and_refresh,
+            j_forgot_password, j_backup, j_livetv, j_remote_subtitles,
             # Destructive: merges/splits the shared movies, so it must run LAST so its
             # mutations can't corrupt the items other journeys read/refresh.
             j_merge_versions_controller]

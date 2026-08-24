@@ -91,7 +91,9 @@ struct SearchItem {
 #[derive(Deserialize, Default)]
 struct SearchAttributes {
     #[serde(default)]
-    language: Option<String>,
+    hearing_impaired: Option<bool>,
+    #[serde(default)]
+    foreign_parts_only: Option<bool>,
     #[serde(default)]
     release: Option<String>,
     #[serde(default)]
@@ -118,41 +120,89 @@ struct SubFile {
 #[derive(Serialize)]
 struct DownloadRequest {
     file_id: i64,
+    sub_format: String,
 }
 
 #[derive(Deserialize)]
 struct DownloadResponse {
     link: String,
-    #[serde(default)]
-    file_name: Option<String>,
+}
+
+/// The provider-local id of one downloadable file, in the exact shape of the
+/// Jellyfin plugin's `BuildSubtitleId`: `srt-{language}-{file_id}[-sdh][-forced]`.
+///
+/// The language and the flags ride along in the id because the download call
+/// only receives the id back — that is how the downloaded stream knows its
+/// language (and so its sidecar name) without a second search.
+fn build_subtitle_id(language: &str, attrs: &SearchAttributes, file_id: i64) -> String {
+    let mut id = format!("srt-{language}-{file_id}");
+    if attrs.hearing_impaired.unwrap_or(false) {
+        id.push_str("-sdh");
+    }
+    if attrs.foreign_parts_only.unwrap_or(false) {
+        id.push_str("-forced");
+    }
+    id
+}
+
+/// A parsed provider-local id (the inverse of [`build_subtitle_id`]).
+struct ParsedId {
+    format: String,
+    language: String,
+    file_id: i64,
+    is_hearing_impaired: bool,
+    is_forced: bool,
+}
+
+/// Parses `srt-{language}-{file_id}[-sdh][-forced]` like the plugin's
+/// `GetSubtitlesInternal`: fewer than three `-` parts or a non-numeric file id
+/// is an invalid id.
+fn parse_subtitle_id(id: &str) -> Option<ParsedId> {
+    let parts: Vec<&str> = id.split('-').collect();
+    if parts.len() < 3 {
+        return None;
+    }
+    let lower = id.to_ascii_lowercase();
+    Some(ParsedId {
+        format: parts[0].to_owned(),
+        language: parts[1].to_owned(),
+        file_id: parts[2].parse().ok()?,
+        is_hearing_impaired: lower.contains("-sdh"),
+        is_forced: lower.contains("-forced"),
+    })
 }
 
 /// Maps a search response into namespaced [`RemoteSubtitleInfo`] candidates.
 ///
-/// Each candidate's `id` is `"{PLUGIN_NAME}_{file_id}"` so the manager can route
+/// Each candidate's `id` is `"{PLUGIN_NAME}_{local}"` so the manager can route
 /// a later download back to this provider (it strips the `"{name}_"` prefix and
-/// hands us the `file_id`). Pulled out as a pure function so it is unit-testable
-/// without a live API.
-fn map_search(response: &SearchResponse) -> Vec<RemoteSubtitleInfo> {
+/// hands us the local id, see [`build_subtitle_id`]). As in the plugin, the
+/// language stamped on the candidate and into its id is the CALLER's 3-letter
+/// code (`request.Language`), never the API's own tag: the search was already
+/// filtered by it, and the API's tags (`pt-BR`, `zh-CN`) carry a `-` that would
+/// break the id. Pulled out as a pure function so it is unit-testable without a
+/// live API.
+fn map_search(response: &SearchResponse, language: &str) -> Vec<RemoteSubtitleInfo> {
     let mut out = Vec::new();
     for item in &response.data {
         let attrs = &item.attributes;
         // A result can carry several files; each downloadable file is a candidate.
         for file in &attrs.files {
             out.push(RemoteSubtitleInfo {
-                id: Some(format!("{PLUGIN_NAME}_{}", file.file_id)),
+                id: Some(format!(
+                    "{PLUGIN_NAME}_{}",
+                    build_subtitle_id(language, attrs, file.file_id)
+                )),
                 provider_name: Some(PLUGIN_NAME.to_owned()),
-                three_letter_iso_language_name: attrs
-                    .language
-                    .as_deref()
-                    .map(two_to_three_letter)
-                    .map(str::to_owned),
+                three_letter_iso_language_name: Some(language.to_owned()),
                 name: file.file_name.clone().or_else(|| attrs.release.clone()),
                 format: Some("srt".to_owned()),
                 author: attrs.uploader.as_ref().and_then(|u| u.name.clone()),
                 comment: attrs.release.clone(),
                 download_count: attrs.download_count.and_then(|c| i32::try_from(c).ok()),
                 is_hash_match: None,
+                hearing_impaired: attrs.hearing_impaired,
+                forced: attrs.foreign_parts_only,
                 ..Default::default()
             });
         }
@@ -160,39 +210,8 @@ fn map_search(response: &SearchResponse) -> Vec<RemoteSubtitleInfo> {
     out
 }
 
-/// The subtitle format implied by a downloaded file name (defaulting to `srt`).
-fn format_from_name(name: Option<&str>) -> String {
-    name.and_then(|n| n.rsplit_once('.'))
-        .map(|(_, ext)| ext.to_ascii_lowercase())
-        .filter(|ext| !ext.is_empty())
-        .unwrap_or_else(|| "srt".to_owned())
-}
-
-/// Converts a 2-letter ISO-639-1 code to a 3-letter ISO-639-2/T code for the
-/// common subtitle languages; unknown codes pass through unchanged (best effort).
-fn two_to_three_letter(code: &str) -> &str {
-    match code.to_ascii_lowercase().as_str() {
-        "en" => "eng",
-        "es" => "spa",
-        "fr" => "fra",
-        "de" => "deu",
-        "it" => "ita",
-        "pt" => "por",
-        "ru" => "rus",
-        "ja" => "jpn",
-        "zh" => "zho",
-        "ko" => "kor",
-        "nl" => "nld",
-        "pl" => "pol",
-        "ar" => "ara",
-        "sv" => "swe",
-        "tr" => "tur",
-        _ => code,
-    }
-}
-
-/// The reverse of [`two_to_three_letter`] for the search `languages` parameter
-/// (OpenSubtitles expects 2-letter codes); unknown codes pass through.
+/// A 3-letter ISO-639-2/T code to the 2-letter ISO-639-1 code the search `languages`
+/// parameter expects; unknown codes pass through.
 fn three_to_two_letter(code: &str) -> &str {
     match code.to_ascii_lowercase().as_str() {
         "eng" => "en",
@@ -200,10 +219,11 @@ fn three_to_two_letter(code: &str) -> &str {
         "fra" | "fre" => "fr",
         "deu" | "ger" => "de",
         "ita" => "it",
-        "por" => "pt",
+        // The API lists no bare pt/zh; the plugin's GetLanguage rewrites them.
+        "por" => "pt-PT",
         "rus" => "ru",
         "jpn" => "ja",
-        "zho" | "chi" => "zh",
+        "zho" | "chi" => "zh-CN",
         "kor" => "ko",
         "nld" | "dut" => "nl",
         "pol" => "pl",
@@ -362,7 +382,7 @@ impl SubtitleProvider for OpenSubtitlesProvider {
             )));
         }
         let body: SearchResponse = resp.json().await.map_err(net_err)?;
-        Ok(map_search(&body))
+        Ok(map_search(&body, &request.language))
     }
 
     async fn validate_login(&self, config_json: &[u8]) -> Result<(), ServiceError> {
@@ -381,9 +401,9 @@ impl SubtitleProvider for OpenSubtitlesProvider {
                 "OpenSubtitles API key is not configured",
             ));
         }
-        let file_id: i64 = provider_local_id
-            .parse()
-            .map_err(|_| ServiceError::invalid_input("invalid OpenSubtitles file id"))?;
+        let parsed = parse_subtitle_id(provider_local_id)
+            .ok_or_else(|| ServiceError::invalid_input("invalid OpenSubtitles subtitle id"))?;
+        let file_id = parsed.file_id;
 
         let token = self.login(&cfg).await?;
 
@@ -395,7 +415,10 @@ impl SubtitleProvider for OpenSubtitlesProvider {
             .header(reqwest::header::USER_AGENT, USER_AGENT)
             .header(reqwest::header::ACCEPT, "application/json")
             .bearer_auth(&token)
-            .json(&DownloadRequest { file_id })
+            .json(&DownloadRequest {
+                file_id,
+                sub_format: parsed.format.clone(),
+            })
             .send()
             .await
             .map_err(net_err)?
@@ -421,10 +444,10 @@ impl SubtitleProvider for OpenSubtitlesProvider {
             .to_vec();
 
         Ok(SubtitleResponse {
-            language: String::new(),
-            format: format_from_name(dl.file_name.as_deref()),
-            is_forced: false,
-            is_hearing_impaired: false,
+            language: parsed.language,
+            format: parsed.format,
+            is_forced: parsed.is_forced,
+            is_hearing_impaired: parsed.is_hearing_impaired,
             content,
         })
     }
@@ -458,10 +481,12 @@ mod tests {
             ]
         }"#;
         let parsed: SearchResponse = serde_json::from_str(json).unwrap();
-        let mapped = map_search(&parsed);
+        let mapped = map_search(&parsed, "eng");
         assert_eq!(mapped.len(), 1);
         let c = &mapped[0];
-        assert_eq!(c.id.as_deref(), Some("opensubtitles_998877"));
+        assert_eq!(c.id.as_deref(), Some("opensubtitles_srt-eng-998877"));
+        assert_eq!(c.hearing_impaired, Some(false));
+        assert_eq!(c.forced, None);
         assert_eq!(c.provider_name.as_deref(), Some("opensubtitles"));
         assert_eq!(c.three_letter_iso_language_name.as_deref(), Some("eng"));
         assert_eq!(c.author.as_deref(), Some("alice"));
@@ -469,21 +494,50 @@ mod tests {
     }
 
     #[test]
-    fn language_code_round_trip_common_cases() {
-        for (three, two) in [("eng", "en"), ("spa", "es"), ("fra", "fr"), ("jpn", "ja")] {
-            assert_eq!(three_to_two_letter(three), two);
-            assert_eq!(two_to_three_letter(two), three);
-        }
-        // French alternate 3-letter code also maps.
-        assert_eq!(three_to_two_letter("fre"), "fr");
-        // Unknown passes through (truncated to 2 for the search param).
-        assert_eq!(three_to_two_letter("xyz"), "xy");
+    fn candidate_language_is_the_requested_code_not_the_api_tag() {
+        // The API tags pt-BR/zh-CN carry a '-'; the plugin stamps request.Language instead.
+        let json = r#"{"data": [{"attributes": {"language": "pt-BR",
+            "files": [{"file_id": 5}]}}]}"#;
+        let parsed: SearchResponse = serde_json::from_str(json).unwrap();
+        let c = &map_search(&parsed, "por")[0];
+        assert_eq!(c.id.as_deref(), Some("opensubtitles_srt-por-5"));
+        assert_eq!(c.three_letter_iso_language_name.as_deref(), Some("por"));
+        let p = parse_subtitle_id("srt-por-5").unwrap();
+        assert_eq!((p.language.as_str(), p.file_id), ("por", 5));
     }
 
     #[test]
-    fn format_inferred_from_file_name() {
-        assert_eq!(format_from_name(Some("movie.en.ASS")), "ass");
-        assert_eq!(format_from_name(Some("noext")), "srt");
-        assert_eq!(format_from_name(None), "srt");
+    fn subtitle_id_round_trips_like_the_plugin() {
+        let attrs = SearchAttributes {
+            hearing_impaired: Some(true),
+            foreign_parts_only: Some(true),
+            ..Default::default()
+        };
+        let id = build_subtitle_id("eng", &attrs, 42);
+        assert_eq!(id, "srt-eng-42-sdh-forced");
+        let p = parse_subtitle_id(&id).unwrap();
+        assert_eq!(
+            (p.format.as_str(), p.language.as_str(), p.file_id),
+            ("srt", "eng", 42)
+        );
+        assert!(p.is_hearing_impaired && p.is_forced);
+        let plain = parse_subtitle_id("srt-fre-7").unwrap();
+        assert!(!plain.is_hearing_impaired && !plain.is_forced);
+        assert!(parse_subtitle_id("998877").is_none());
+        assert!(parse_subtitle_id("srt-eng-x").is_none());
+    }
+
+    #[test]
+    fn language_code_three_to_two_common_cases() {
+        for (three, two) in [("eng", "en"), ("spa", "es"), ("fra", "fr"), ("jpn", "ja")] {
+            assert_eq!(three_to_two_letter(three), two);
+        }
+        // French alternate 3-letter code also maps.
+        assert_eq!(three_to_two_letter("fre"), "fr");
+        // Portuguese and Chinese use the regioned tags the API actually lists.
+        assert_eq!(three_to_two_letter("por"), "pt-PT");
+        assert_eq!(three_to_two_letter("chi"), "zh-CN");
+        // Unknown passes through (truncated to 2 for the search param).
+        assert_eq!(three_to_two_letter("xyz"), "xy");
     }
 }

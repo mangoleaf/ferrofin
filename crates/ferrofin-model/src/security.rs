@@ -41,6 +41,7 @@ pub struct AuthenticationInfo {
 
     /// Gets or sets the user identifier.
     #[schema(value_type = String, format = "uuid")]
+    #[serde(with = "crate::json::guid")]
     pub user_id: Uuid,
 
     /// Gets or sets a value indicating whether this instance is active.
@@ -48,15 +49,18 @@ pub struct AuthenticationInfo {
 
     /// Gets or sets the date created.
     #[schema(value_type = String, format = "date-time")]
+    #[serde(with = "crate::json::datetime")]
     pub date_created: DateTime<Utc>,
 
     /// Gets or sets the date revoked.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<String>, format = "date-time")]
+    #[serde(default, with = "crate::json::datetime::option")]
     pub date_revoked: Option<DateTime<Utc>>,
 
     /// Gets or sets the date of last activity.
     #[schema(value_type = String, format = "date-time")]
+    #[serde(with = "crate::json::datetime")]
     pub date_last_activity: DateTime<Utc>,
 
     /// Gets or sets the user name.

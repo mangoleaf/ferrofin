@@ -68,9 +68,11 @@ async fn get_trickplay_hls_playlist(
         .get_hls_playlist(source_id, width, auth.token.as_ref().map(Secret::expose))
         .await?;
     match playlist {
-        Some(text) if !text.is_empty() => {
-            Ok(([(header::CONTENT_TYPE, "application/x-mpegURL")], text).into_response())
-        }
+        Some(text) if !text.is_empty() => Ok((
+            [(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")],
+            text,
+        )
+            .into_response()),
         _ => Err(ApiError::NotFound(format!(
             "no trickplay playlist for item {item_id} at width {width}"
         ))),
@@ -94,7 +96,7 @@ async fn get_trickplay_hls_playlist(
     params(
         ("itemId" = String, Path, description = "The item id"),
         ("width" = i32, Path, description = "The width of a single tile"),
-        ("index" = i32, Path, description = "The index of the desired tile"),
+        ("index" = String, Path, description = "The index of the desired tile (`{index}.jpg`)"),
         ("mediaSourceId" = Option<String>, Query, description = "The media version id, if using an alternate version")
     ),
     responses(

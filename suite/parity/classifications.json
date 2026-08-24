@@ -1,6 +1,6 @@
 {
   "_comment": "Curated ACCEPTED divergences (not bugs). Highest-precedence classification in gen-ledger: overrides the auto 'flagged: verify' from the Layer-2 read diff. deep_verified stays as the live layers report it (these do not diff clean vs Jellyfin by design). Sourced from the parity-triage workflow verdicts (parity/triage-findings.json) + the roadmap synthesis, minus the ops since fixed (Filters2 WI-2, Collections add/remove WI-6, Images Size WI-1).",
-  "last_verified": "2026-08-22 no-deferral sweep: every deferred* row verified in code and either ported or reclassified; 'deferred' is no longer a category",
+  "last_verified": "2026-08-24 merge of two retirement sweeps: main's no-deferral sweep (every deferred* row verified in code, then ported or reclassified) and this branch's not-testable-this-way retirement (streaming/binary/terminal ops now diffed by the stream, asset and terminal layers)",
   "rows": {
     "GET /IntroSkipper/SupportBundle": {
       "category": "expected-extension",
@@ -14,6 +14,14 @@
       "category": "instance",
       "classification": "instance: ancestor chain now includes the UserRootFolder hop as Jellyfin's does; residual diff is /config-vs-/data path-derived ids only."
     },
+    "GET /Items/{itemId}/Similar": {
+      "category": "instance",
+      "classification": "instance/methodology: Jellyfin 10.11.8 serves /Similar from a flat Genres/Tags query ordered Random (non-deterministic, not diffable); Ferrofin implements upstream master's weighted SimilarItemsManager (genre 10/tag 5/studio 5/director 50/actor 15 + IsPlayed/user-access phase-2 filter, Episode/by-name short-circuit). Verified by unit tests against the C# weights."
+    },
+    "GET /Movies/{itemId}/Similar": {
+      "category": "instance",
+      "classification": "instance/methodology: Jellyfin 10.11.8 serves /Similar from a flat Genres/Tags query ordered Random (non-deterministic, not diffable); Ferrofin implements upstream master's weighted SimilarItemsManager (genre 10/tag 5/studio 5/director 50/actor 15 + IsPlayed/user-access phase-2 filter, Episode/by-name short-circuit). Verified by unit tests against the C# weights."
+    },
     "GET /UserViews": {
       "category": "instance",
       "classification": "instance: view Path (and path-derived id) differ only by /config vs /data data-dir; identical under a shared data-dir. (Historic note: until the with_all_fields(false) fix the views also lacked ~25 default fields Jellyfin emits — that was a real defect, not instance noise; re-verify on the next sweep.)"
@@ -21,6 +29,22 @@
     "GET /Library/MediaFolders": {
       "category": "instance",
       "classification": "instance: after WI-7 the folder COUNT matches; residual is /config-vs-/data path-alignment noise on the folder rows."
+    },
+    "GET /Albums/{itemId}/Similar": {
+      "category": "instance",
+      "classification": "instance/methodology: Jellyfin 10.11.8 serves /Similar from a flat Genres/Tags query ordered Random (non-deterministic, not diffable); Ferrofin implements upstream master's weighted SimilarItemsManager (genre 10/tag 5/studio 5/director 50/actor 15 + IsPlayed/user-access phase-2 filter, Episode/by-name short-circuit). Verified by unit tests against the C# weights."
+    },
+    "GET /Artists/{itemId}/Similar": {
+      "category": "instance",
+      "classification": "instance/methodology: Jellyfin 10.11.8 serves /Similar from a flat Genres/Tags query ordered Random (non-deterministic, not diffable); Ferrofin implements upstream master's weighted SimilarItemsManager (genre 10/tag 5/studio 5/director 50/actor 15 + IsPlayed/user-access phase-2 filter, Episode/by-name short-circuit). Verified by unit tests against the C# weights."
+    },
+    "GET /Shows/{itemId}/Similar": {
+      "category": "instance",
+      "classification": "instance/methodology: Jellyfin 10.11.8 serves /Similar from a flat Genres/Tags query ordered Random (non-deterministic, not diffable); Ferrofin implements upstream master's weighted SimilarItemsManager (genre 10/tag 5/studio 5/director 50/actor 15 + IsPlayed/user-access phase-2 filter, Episode/by-name short-circuit). Verified by unit tests against the C# weights."
+    },
+    "GET /Trailers/{itemId}/Similar": {
+      "category": "instance",
+      "classification": "instance/methodology: Jellyfin 10.11.8 serves /Similar from a flat Genres/Tags query ordered Random (non-deterministic, not diffable); Ferrofin implements upstream master's weighted SimilarItemsManager (genre 10/tag 5/studio 5/director 50/actor 15 + IsPlayed/user-access phase-2 filter, Episode/by-name short-circuit). Verified by unit tests against the C# weights."
     },
     "GET /Plugins": {
       "category": "expected-extension",
@@ -40,7 +64,7 @@
     },
     "GET /Items/{itemId}": {
       "category": "instance",
-      "classification": "instance/probe-noise: residual diffs are MediaStream probe values (BitRate/IsAVC/Level/RealFrameRate) that vary per independent probe, plus Localized* (needs localization on read-back, deferred)."
+      "classification": "instance/probe-noise: residual diffs are MediaStream probe values (BitRate/IsAVC/Level/RealFrameRate) that vary per independent probe. The Localized* labels that used to diff are now served on read-back (MediaSourceManager::with_localization)."
     },
     "GET /Items/{itemId}/PlaybackInfo": {
       "category": "instance",
@@ -86,6 +110,10 @@
       "category": "instance",
       "classification": "instance/methodology: real default fields (PluginRepositories/EnableLegacyAuthorization/CacheSize) now match; residual IsStartupWizardCompleted/IsPortAuthorized reflect the harness completing Jellyfin's wizard during setup while Ferrofin auto-seeds — setup state, not a bug."
     },
+    "GET /LiveTv/TunerHosts/Types": {
+      "category": "open-work",
+      "classification": "open-work (NOT accepted): Ferrofin advertises only the M3U tuner host; Jellyfin also lists HDHomeRun. Port of HdHomerunHost (~1.2K C# LOC: UDP discovery, lineup, legacy control protocol, HTTP/UDP streams) is an open work item — see brain/DEFERRED.md 2026-08-22 sweep."
+    },
     "POST /Items/{itemId}": {
       "category": "instance",
       "classification": "instance/methodology: the metadata edit persists correctly on Ferrofin (read-back reflects it); Jellyfin's read-back didn't reflect the synthetic tag-edit body (oracle/body difference), so this is not a Ferrofin defect."
@@ -94,61 +122,13 @@
       "category": "instance",
       "classification": "instance/methodology: Ferrofin correctly removes the playlist share (H read-back shows it gone); Jellyfin returns 204 but still lists the user (Jellyfin quirk), so Ferrofin is the more-correct side — not a defect."
     },
-    "GET /Audio/{itemId}/hls/{segmentId}/stream.aac": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
-    },
-    "GET /Audio/{itemId}/hls/{segmentId}/stream.mp3": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
-    },
-    "GET /Audio/{itemId}/hls1/{playlistId}/{segmentId}.{container}": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
-    },
-    "GET /Audio/{itemId}/main.m3u8": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
-    },
-    "GET /Audio/{itemId}/master.m3u8": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
-    },
-    "HEAD /Audio/{itemId}/master.m3u8": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
-    },
-    "GET /Audio/{itemId}/stream": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
-    },
-    "HEAD /Audio/{itemId}/stream": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
-    },
-    "GET /Audio/{itemId}/stream.{container}": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
-    },
-    "HEAD /Audio/{itemId}/stream.{container}": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
-    },
-    "GET /Audio/{itemId}/universal": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
-    },
-    "HEAD /Audio/{itemId}/universal": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
-    },
     "GET /Channels/{channelId}/Features": {
-      "category": "requires-livetv-tuner",
-      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
+      "category": "requires-channel-plugin",
+      "classification": "requires-channel-plugin: the ChannelsController serves IChannel plugin channels, not Live TV — no tuner journey can reach these; they need a channel plugin on both servers."
     },
     "GET /Channels/{channelId}/Items": {
-      "category": "requires-livetv-tuner",
-      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
+      "category": "requires-channel-plugin",
+      "classification": "requires-channel-plugin: the ChannelsController serves IChannel plugin channels, not Live TV — no tuner journey can reach these; they need a channel plugin on both servers."
     },
     "GET /Episode/{Id}/Timestamps": {
       "category": "expected-extension",
@@ -159,8 +139,8 @@
       "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises."
     },
     "GET /Episode/{id}/IntroSkipperSegments": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
+      "category": "expected-extension",
+      "classification": "expected-extension: IntroSkipper is a compiled-in Ferrofin plugin; stock Jellyfin 10.11.8 lacks it (J=404 without the plugin installed). JSON API, not streaming."
     },
     "POST /FileTransformation/RegisterTransformation": {
       "category": "expected-extension",
@@ -202,17 +182,9 @@
       "category": "expected-extension",
       "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises."
     },
-    "GET /Items/{itemId}/Download": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: binary/subtitle file output — not a JSON body to diff."
-    },
-    "GET /Items/{itemId}/File": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: binary/subtitle file output — not a JSON body to diff."
-    },
     "POST /Items/{itemId}/RemoteSearch/Subtitles/{subtitleId}": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: binary/subtitle file output — not a JSON body to diff."
+      "category": "remote-opt-in",
+      "classification": "remote-opt-in: needs an opensubtitles.com account and the public internet. With OPENSUBTITLES_USERNAME/PASSWORD/API_KEY set, the parity leg installs the plugin on the oracle, configures both, and the remote-subtitle journey (search -> download -> stream read-back -> provider file) runs live."
     },
     "POST /Jellyfin.Plugin.OpenSubtitles/ValidateLoginInfo": {
       "category": "expected-extension",
@@ -220,111 +192,67 @@
     },
     "GET /LiveTv/ChannelMappingOptions": {
       "category": "requires-livetv-tuner",
-      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
+      "classification": "requires-livetv-tuner: the fixture tuner (M3U + XMLTV, two channels) exists, but no probe exercises this op yet — needs a channel-mapping probe against the fixture's listings provider."
     },
     "POST /LiveTv/ChannelMappings": {
       "category": "requires-livetv-tuner",
-      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
-    },
-    "GET /LiveTv/Channels/{channelId}": {
-      "category": "requires-livetv-tuner",
-      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
+      "classification": "requires-livetv-tuner: the fixture tuner (M3U + XMLTV, two channels) exists, but no probe exercises this op yet — needs a channel-mapping probe against the fixture's listings provider."
     },
     "DELETE /LiveTv/ListingProviders": {
       "category": "requires-livetv-tuner",
-      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
-    },
-    "POST /LiveTv/ListingProviders": {
-      "category": "requires-livetv-tuner",
-      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
+      "classification": "requires-livetv-tuner: the fixture tuner (M3U + XMLTV, two channels) exists, but no probe exercises this op yet — needs a journey that removes the fixture's listings provider and observes the guide emptying."
     },
     "GET /LiveTv/ListingProviders/Lineups": {
       "category": "requires-livetv-tuner",
-      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
-    },
-    "GET /LiveTv/LiveRecordings/{recordingId}/stream": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
-    },
-    "GET /LiveTv/LiveStreamFiles/{streamId}/stream.{container}": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
+      "classification": "requires-livetv-tuner: the fixture tuner (M3U + XMLTV, two channels) exists, but no probe exercises this op yet — needs a lineup probe (needs a Schedules Direct-style provider; xmltv has none)."
     },
     "POST /LiveTv/Programs": {
       "category": "requires-livetv-tuner",
-      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
-    },
-    "GET /LiveTv/Programs/{programId}": {
-      "category": "requires-livetv-tuner",
-      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
+      "classification": "requires-livetv-tuner: the fixture tuner (M3U + XMLTV, two channels) exists, but no probe exercises this op yet — needs a programmes-by-body probe (the POST form of /LiveTv/Programs)."
     },
     "GET /LiveTv/Recordings/Groups/{groupId}": {
       "category": "requires-livetv-tuner",
-      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
-    },
-    "DELETE /LiveTv/Recordings/{recordingId}": {
-      "category": "requires-livetv-tuner",
-      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
-    },
-    "GET /LiveTv/Recordings/{recordingId}": {
-      "category": "requires-livetv-tuner",
-      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
+      "classification": "requires-livetv-tuner: the fixture tuner (M3U + XMLTV, two channels) exists, but no probe exercises this op yet — needs a recordings-group probe once a recording exists."
     },
     "POST /LiveTv/SeriesTimers": {
       "category": "requires-livetv-tuner",
-      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
+      "classification": "requires-livetv-tuner: the fixture tuner (M3U + XMLTV, two channels) exists, but no probe exercises this op yet — needs a series-timer journey (create from a programme → list → delete)."
     },
     "DELETE /LiveTv/SeriesTimers/{timerId}": {
       "category": "requires-livetv-tuner",
-      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
+      "classification": "requires-livetv-tuner: the fixture tuner (M3U + XMLTV, two channels) exists, but no probe exercises this op yet — needs a series-timer journey (create from a programme → list → delete)."
     },
     "GET /LiveTv/SeriesTimers/{timerId}": {
       "category": "requires-livetv-tuner",
-      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
+      "classification": "requires-livetv-tuner: the fixture tuner (M3U + XMLTV, two channels) exists, but no probe exercises this op yet — needs a series-timer journey (create from a programme → list → delete)."
     },
     "POST /LiveTv/SeriesTimers/{timerId}": {
       "category": "requires-livetv-tuner",
-      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
-    },
-    "POST /LiveTv/Timers": {
-      "category": "requires-livetv-tuner",
-      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
-    },
-    "DELETE /LiveTv/Timers/{timerId}": {
-      "category": "requires-livetv-tuner",
-      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
-    },
-    "GET /LiveTv/Timers/{timerId}": {
-      "category": "requires-livetv-tuner",
-      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
+      "classification": "requires-livetv-tuner: the fixture tuner (M3U + XMLTV, two channels) exists, but no probe exercises this op yet — needs a series-timer journey (create from a programme → list → delete)."
     },
     "POST /LiveTv/Timers/{timerId}": {
       "category": "requires-livetv-tuner",
-      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
+      "classification": "requires-livetv-tuner: the fixture tuner (M3U + XMLTV, two channels) exists, but no probe exercises this op yet — needs an update step in the timer journey (change pre-padding, read back)."
     },
     "DELETE /LiveTv/TunerHosts": {
       "category": "requires-livetv-tuner",
-      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
-    },
-    "POST /LiveTv/TunerHosts": {
-      "category": "requires-livetv-tuner",
-      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
+      "classification": "requires-livetv-tuner: the fixture tuner (M3U + XMLTV, two channels) exists, but no probe exercises this op yet — needs a journey that removes the fixture tuner and observes its channels going."
     },
     "POST /LiveTv/Tuners/{tunerId}/Reset": {
       "category": "requires-livetv-tuner",
-      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
+      "classification": "requires-livetv-tuner: the fixture tuner (M3U + XMLTV, two channels) exists, but no probe exercises this op yet — needs a tuner-reset probe with the fixture tuner's id."
     },
     "GET /MediaSegmentsApi": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
+      "category": "expected-extension",
+      "classification": "expected-extension: MediaSegmentsApi is a compiled-in Ferrofin plugin; stock Jellyfin 10.11.8 lacks it (J=404 without the plugin installed). JSON API, not streaming."
     },
     "POST /MediaSegmentsApi/{itemId}": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
+      "category": "expected-extension",
+      "classification": "expected-extension: MediaSegmentsApi is a compiled-in Ferrofin plugin; stock Jellyfin 10.11.8 lacks it (J=404 without the plugin installed). JSON API, not streaming."
     },
     "DELETE /MediaSegmentsApi/{segmentId}": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
+      "category": "expected-extension",
+      "classification": "expected-extension: MediaSegmentsApi is a compiled-in Ferrofin plugin; stock Jellyfin 10.11.8 lacks it (J=404 without the plugin installed). JSON API, not streaming."
     },
     "POST /Packages/Installed/{name}": {
       "category": "accepted-divergence",
@@ -337,10 +265,6 @@
     "GET /Packages/{name}": {
       "category": "instance",
       "classification": "instance: resolves a package by name/assemblyGuid from the aggregated repository catalog — catalog content is repository-config-specific, and the harness instances configure none, so there is no package to diff. Route verified 2026-08-14 by unit + server HTTP tests."
-    },
-    "GET /Playback/BitrateTest": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: binary/subtitle file output — not a JSON body to diff."
     },
     "DELETE /Plugins/{pluginId}": {
       "category": "accepted-divergence",
@@ -375,8 +299,8 @@
       "classification": "instance: no shared plugin id across the two servers, so no image to fetch on both sides. Real read (bundled image bytes + content type); verified 2026-08-14 by handler tests."
     },
     "GET /Providers/Subtitles/Subtitles/{subtitleId}": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: binary/subtitle file output — not a JSON body to diff."
+      "category": "remote-opt-in",
+      "classification": "remote-opt-in: needs an opensubtitles.com account and the public internet. With OPENSUBTITLES_USERNAME/PASSWORD/API_KEY set, the parity leg installs the plugin on the oracle, configures both, and the remote-subtitle journey (search -> download -> stream read-back -> provider file) runs live."
     },
     "POST /Repositories": {
       "category": "instance",
@@ -474,145 +398,13 @@
       "category": "verified-by-push-probe",
       "classification": "verified-by-push-probe: the response body carries no signal here — the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py)."
     },
-    "GET /System/Logs/Log": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: binary/subtitle file output — not a JSON body to diff."
-    },
-    "DELETE /Videos/{itemId}/Subtitles/{index}": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: binary/subtitle file output — not a JSON body to diff."
-    },
-    "GET /Videos/{itemId}/Trickplay/{width}/tiles.m3u8": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
-    },
-    "GET /Videos/{itemId}/Trickplay/{width}/{index}.jpg": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
-    },
-    "GET /Videos/{itemId}/hls/{playlistId}/stream.m3u8": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
-    },
-    "GET /Videos/{itemId}/hls/{playlistId}/{segmentId}.{segmentContainer}": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
-    },
-    "GET /Videos/{itemId}/hls1/{playlistId}/{segmentId}.{container}": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
-    },
-    "GET /Videos/{itemId}/live.m3u8": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
-    },
-    "GET /Videos/{itemId}/main.m3u8": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
-    },
-    "GET /Videos/{itemId}/master.m3u8": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
-    },
-    "HEAD /Videos/{itemId}/master.m3u8": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
-    },
-    "GET /Videos/{itemId}/stream": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
-    },
-    "HEAD /Videos/{itemId}/stream": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
-    },
-    "GET /Videos/{itemId}/stream.{container}": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
-    },
-    "HEAD /Videos/{itemId}/stream.{container}": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
-    },
-    "GET /Videos/{itemId}/{mediaSourceId}/Subtitles/{index}/subtitles.m3u8": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
-    },
-    "GET /Videos/{routeItemId}/{routeMediaSourceId}/Subtitles/{routeIndex}/Stream.{routeFormat}": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
-    },
-    "GET /Videos/{routeItemId}/{routeMediaSourceId}/Subtitles/{routeIndex}/{routeStartPositionTicks}/Stream.{routeFormat}": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
-    },
-    "GET /Videos/{videoId}/{mediaSourceId}/Attachments/{index}": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: binary/subtitle file output — not a JSON body to diff."
-    },
     "GET /web/ConfigurationPage": {
       "category": "expected-extension",
       "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises."
     },
-    "POST /LiveStreams/Open": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: opening a live stream is only meaningful for a tuner/transcode context; on a static direct-play fixture item neither server returns a LiveStreamId to diff."
-    },
-    "POST /LiveStreams/Close": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: pairs with LiveStreams/Open (no live-stream context on a static fixture item)."
-    },
-    "POST /System/Restart": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: restarts the server process, which would tear down the running differential; destructive and unobservable via body-diff."
-    },
-    "POST /System/Shutdown": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: shuts the server down, ending the differential run; destructive and unobservable via body-diff."
-    },
-    "POST /Startup/Complete": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: first-run setup-wizard endpoint; the provisioned server has already completed setup, so there is no wizard state to advance or diff."
-    },
-    "POST /Startup/Configuration": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: first-run setup-wizard endpoint (initial server config); only meaningful before setup completes, which the provisioned server has already done."
-    },
-    "POST /Startup/RemoteAccess": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: first-run setup-wizard endpoint; only meaningful during initial setup, already completed on the provisioned server."
-    },
     "POST /Startup/User": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: first-run setup-wizard endpoint (seed admin user); only meaningful before setup completes, already done on the provisioned server."
-    },
-    "POST /Users/ForgotPassword": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: password-reset initiation returns a PIN challenge whose PinFile path is host-instance-specific and whose completion requires reading that file off the server host."
-    },
-    "POST /Users/ForgotPassword/Pin": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: completes the forgot-password flow using a PIN written to a host-instance file; no cross-server-stable body to diff."
-    },
-    "GET /Environment/DirectoryContents": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: lists the server host's filesystem, which differs per container instance."
-    },
-    "GET /Environment/ParentPath": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: resolves a parent path on the server host filesystem; instance-specific."
-    },
-    "GET /Backup/Manifest": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: reads a backup archive's manifest from the host filesystem; no archive exists and the path is instance-specific (both servers 400)."
-    },
-    "POST /Backup/Create": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: writes a backup archive to the host filesystem; heavy and instance-specific, no cross-server-stable effect to diff."
-    },
-    "POST /Backup/Restore": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: destructive host-filesystem restore from a backup archive; instance-specific and would replace live state mid-run."
+      "category": "accepted-divergence",
+      "classification": "accepted-divergence: post-setup the first user already has a password and the contract is 403 (the Forbid guard upstream added in v12, ported by Ferrofin); Jellyfin 10.11.8 predates it and answers 204, silently re-setting the admin password. The journey asserts the correct contract (H=403 J=204)."
     },
     "GET /Trailers": {
       "category": "instance",
@@ -637,22 +429,6 @@
     "GET /Years/{year}": {
       "category": "expected-extension",
       "classification": "expected-extension: Ferrofin does not materialize Year items (documented out-of-scope; matches the GET /Years classification), so a single year has no item to return (H=404 vs J=200)."
-    },
-    "GET /Artists/{name}": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: by-name artist lookup needs a music library; the parity fixture is movies+TV only, so there is no artist corpus to diff (H=404 vs J=200)."
-    },
-    "GET /MusicGenres/{genreName}": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: by-name music-genre lookup needs a music library, absent from the movies+TV parity fixture (H=404 vs J=200)."
-    },
-    "GET /Artists/InstantMix": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: an artist instant mix needs a music library, absent from the movies+TV parity fixture (both servers 400 without a valid artist)."
-    },
-    "GET /MusicGenres/InstantMix": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: a music-genre instant mix needs a music library, absent from the movies+TV parity fixture (both servers 400 without a valid genre)."
     },
     "GET /Playlists/{itemId}/InstantMix": {
       "category": "expected-extension",
@@ -689,34 +465,6 @@
     "GET /DisplayPreferences/{displayPreferencesId}": {
       "category": "verified",
       "classification": "verified 2026-08-11: the auto-flag was a harness artifact (literal unresolved {displayPreferencesId}); with a real client key (e.g. usersettings?client=emby) Ferrofin returns 200 DisplayPreferencesDto (Id/Client/SortBy/CustomPrefs) — the by-client resolution Jellyfin uses."
-    },
-    "GET /Items/{itemId}/Similar": {
-      "category": "instance",
-      "classification": "instance/methodology: Jellyfin 10.11.8 serves /Similar from a flat Genres/Tags query ordered Random (non-deterministic, not diffable); Ferrofin implements upstream master's weighted SimilarItemsManager (genre 10/tag 5/studio 5/director 50/actor 15 + IsPlayed/user-access phase-2 filter, Episode/by-name short-circuit). Verified by unit tests against the C# weights."
-    },
-    "GET /Movies/{itemId}/Similar": {
-      "category": "instance",
-      "classification": "instance/methodology: Jellyfin 10.11.8 serves /Similar from a flat Genres/Tags query ordered Random (non-deterministic, not diffable); Ferrofin implements upstream master's weighted SimilarItemsManager (genre 10/tag 5/studio 5/director 50/actor 15 + IsPlayed/user-access phase-2 filter, Episode/by-name short-circuit). Verified by unit tests against the C# weights."
-    },
-    "GET /Albums/{itemId}/Similar": {
-      "category": "instance",
-      "classification": "instance/methodology: Jellyfin 10.11.8 serves /Similar from a flat Genres/Tags query ordered Random (non-deterministic, not diffable); Ferrofin implements upstream master's weighted SimilarItemsManager (genre 10/tag 5/studio 5/director 50/actor 15 + IsPlayed/user-access phase-2 filter, Episode/by-name short-circuit). Verified by unit tests against the C# weights."
-    },
-    "GET /Artists/{itemId}/Similar": {
-      "category": "instance",
-      "classification": "instance/methodology: Jellyfin 10.11.8 serves /Similar from a flat Genres/Tags query ordered Random (non-deterministic, not diffable); Ferrofin implements upstream master's weighted SimilarItemsManager (genre 10/tag 5/studio 5/director 50/actor 15 + IsPlayed/user-access phase-2 filter, Episode/by-name short-circuit). Verified by unit tests against the C# weights."
-    },
-    "GET /Shows/{itemId}/Similar": {
-      "category": "instance",
-      "classification": "instance/methodology: Jellyfin 10.11.8 serves /Similar from a flat Genres/Tags query ordered Random (non-deterministic, not diffable); Ferrofin implements upstream master's weighted SimilarItemsManager (genre 10/tag 5/studio 5/director 50/actor 15 + IsPlayed/user-access phase-2 filter, Episode/by-name short-circuit). Verified by unit tests against the C# weights."
-    },
-    "GET /Trailers/{itemId}/Similar": {
-      "category": "instance",
-      "classification": "instance/methodology: Jellyfin 10.11.8 serves /Similar from a flat Genres/Tags query ordered Random (non-deterministic, not diffable); Ferrofin implements upstream master's weighted SimilarItemsManager (genre 10/tag 5/studio 5/director 50/actor 15 + IsPlayed/user-access phase-2 filter, Episode/by-name short-circuit). Verified by unit tests against the C# weights."
-    },
-    "GET /LiveTv/TunerHosts/Types": {
-      "category": "open-work",
-      "classification": "open-work (NOT accepted): Ferrofin advertises only the M3U tuner host; Jellyfin also lists HDHomeRun. Port of HdHomerunHost (~1.2K C# LOC: UDP discovery, lineup, legacy control protocol, HTTP/UDP streams) is an open work item — see brain/DEFERRED.md 2026-08-22 sweep."
     }
   }
 }

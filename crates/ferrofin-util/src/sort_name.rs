@@ -2,6 +2,8 @@
 //! (`MediaBrowser.Controller/Entities/BaseItem.cs`), with Jellyfin's default
 //! `SortRemoveWords` / `SortRemoveCharacters` / `SortReplaceCharacters`.
 
+use crate::string_extensions::remove_diacritics;
+
 /// `ServerConfiguration.SortRemoveWords` — leading/interior/trailing articles.
 const SORT_REMOVE_WORDS: [&str; 3] = ["the", "a", "an"];
 
@@ -57,7 +59,23 @@ pub fn forced_sort_key(forced: &str) -> String {
     modify_sort_chunks(forced).to_lowercase()
 }
 
-/// Left-pads each maximal run of ASCII digits in `name` to width 10 with `0`.
+/// Left-pads each maximal run of ASCII digits in `name` to width 10 with `0`,
+/// then strips diacritics.
+///
+/// Port of `BaseItem.ModifySortChunks`.
+///
+/// TODO(open work, not an accepted divergence): two steps of the C# are still
+/// missing, and both change the sort key a client sees.
+///
+/// 1. Upstream closes with `if (!result.All(char.IsAscii)) result.Transliterated()`
+///    — an ICU romanization of whatever is still non-ASCII after the strip. A
+///    Cyrillic, Greek or CJK title therefore sorts differently here than on
+///    Jellyfin, and `SortName` drives the client play queue. Porting it means
+///    taking an ICU transliteration dependency, which is the owner's call to
+///    make; raise it rather than leaving this note to rot.
+/// 2. C# `char.IsDigit` matches the whole Unicode `Nd` category, not just
+///    ASCII — so an Arabic-Indic or fullwidth digit run goes unpadded here.
+///    That one is a local fix (`char::is_numeric` plus a width decision).
 fn modify_sort_chunks(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     let mut chars = name.chars().peekable();
@@ -76,12 +94,26 @@ fn modify_sort_chunks(name: &str) -> String {
             chars.next();
         }
     }
-    out
+    remove_diacritics(&out)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{create_sort_name, forced_sort_key};
+    use super::{create_sort_name, forced_sort_key, modify_sort_chunks};
+
+    // The upstream xUnit oracle, transliterated verbatim
+    // (`Jellyfin.Controller.Tests/Entities/BaseItemTests.cs`
+    // `BaseItem_ModifySortChunks_Valid`).
+    #[rstest::rstest]
+    #[case("", "")]
+    #[case("1", "0000000001")]
+    #[case("t", "t")]
+    #[case("test", "test")]
+    #[case("test1", "test0000000001")]
+    #[case("1test 2", "0000000001test 0000000002")]
+    fn modify_sort_chunks_matches_the_upstream_oracle(#[case] input: &str, #[case] expected: &str) {
+        assert_eq!(modify_sort_chunks(input), expected);
+    }
 
     #[test]
     fn create_sort_name_matches_jellyfin() {
@@ -134,5 +166,34 @@ mod tests {
     fn a_forced_sort_name_is_only_padded_and_lowercased() {
         assert_eq!(forced_sort_key("The Matrix 2"), "the matrix 0000000002");
         assert_eq!(forced_sort_key("A.I."), "a.i.");
+    }
+
+    /// `ModifySortChunks` closes with `RemoveDiacritics()`, so an accented title
+    /// sorts as ASCII and interleaves with the rest of the library instead of
+    /// landing after it under SQLite's BINARY collation. Both paths fold: the
+    /// derived key and the forced one.
+    #[test]
+    fn diacritics_are_folded_on_both_paths() {
+        assert_eq!(create_sort_name("Café Größe"), "cafe grosse");
+        assert_eq!(create_sort_name("Amélie"), "amelie");
+        assert_eq!(forced_sort_key("Æon Flux 2"), "aeon flux 0000000002");
+    }
+
+    /// The remove set (`, & - { } '`) is deleted outright and each of the
+    /// replace set (`. + %`) becomes its own space — C# does not collapse runs.
+    #[test]
+    fn the_default_character_sets_are_applied_verbatim() {
+        assert_eq!(create_sort_name("Mr. & Mrs-Smith"), "mr   mrssmith");
+        assert_eq!(create_sort_name("{Braces} 'quoted'"), "braces quoted");
+        assert_eq!(create_sort_name("100% Wolf"), "0000000100  wolf");
+        assert_eq!(
+            create_sort_name("Crosby, Stills + Nash"),
+            "crosby stills   nash"
+        );
+    }
+
+    #[test]
+    fn a_blank_name_yields_a_blank_key() {
+        assert_eq!(create_sort_name("   "), "");
     }
 }

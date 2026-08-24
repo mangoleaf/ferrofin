@@ -91,6 +91,8 @@ struct Prefetched {
     /// the `MediaSources` field is requested), so a page builds them in one
     /// query instead of N. Read three times — see [`take_or_clone`].
     media_streams: HashMap<Uuid, Vec<ferrofin_model::entities_media::MediaStream>>,
+    /// Media attachments per item id (when `MediaSources` is requested).
+    media_attachments: HashMap<Uuid, Vec<ferrofin_model::entities_media::MediaAttachment>>,
     /// Provider-id maps per item id (populated when EITHER the `ProviderIds`
     /// or the `ExternalUrls` field is requested — the "Links" row is built from
     /// the same ids, so one batch read serves both).
@@ -408,6 +410,32 @@ fn row_kind(item: &BaseItemEntity) -> BaseItemKind {
     kind_from_type_name(&item.type_).unwrap_or(BaseItemKind::Folder)
 }
 
+/// Whether this kind is a Live TV channel (C# `item is LiveTvChannel`). Both
+/// spellings appear because `kind_from_type_name` maps the stored type name to
+/// `LiveTvChannel` while callers may hand a `TvChannel` row directly.
+fn is_live_tv_channel(kind: BaseItemKind) -> bool {
+    matches!(kind, BaseItemKind::LiveTvChannel | BaseItemKind::TvChannel)
+}
+
+/// Whether this kind is a Live TV programme (C# `item is LiveTvProgram`).
+fn is_live_tv_program(kind: BaseItemKind) -> bool {
+    matches!(
+        kind,
+        BaseItemKind::LiveTvProgram | BaseItemKind::TvProgram | BaseItemKind::Program
+    )
+}
+
+/// The kind a client sees as the DTO's `Type` — C# `GetClientTypeName`, which
+/// `LiveTvChannel`/`LiveTvProgram` override to `"TvChannel"`/`"Program"`. Every
+/// other kind passes through.
+fn client_kind(kind: BaseItemKind) -> BaseItemKind {
+    match kind {
+        BaseItemKind::LiveTvChannel => BaseItemKind::TvChannel,
+        BaseItemKind::LiveTvProgram => BaseItemKind::Program,
+        other => other,
+    }
+}
+
 /// Whether this row enters the C# `AttachUserSpecificInfo` folder branch — the
 /// *runtime* `BaseItem.IsFolder`, not just the stored column. Pure by-name kinds
 /// (`Genre`/`MusicGenre`/`Studio`/`Person`/`Year`) are `BaseItem` subclasses in
@@ -625,8 +653,7 @@ impl FerrofinDtoService {
         item_ids: &[Uuid],
     ) -> Result<HashMap<Uuid, Vec<ItemImageInfo>>, ServiceError> {
         let mut map: HashMap<Uuid, Vec<ItemImageInfo>> = HashMap::with_capacity(item_ids.len());
-        // 500 stays far below SQLite's conservative 999-host-variable floor.
-        for chunk in item_ids.chunks(500) {
+        for chunk in item_ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
             let placeholders = (1..=chunk.len())
                 .map(|i| format!("?{i}"))
                 .collect::<Vec<_>>()
@@ -677,7 +704,8 @@ impl FerrofinDtoService {
             return Ok(map);
         }
         let keys: Vec<(i32, String)> = want.into_iter().collect();
-        for chunk in keys.chunks(500) {
+        // Two host variables per key.
+        for chunk in keys.chunks(ferrofin_db::BATCH_BIND_CHUNK / 2) {
             let ph = (0..chunk.len())
                 .map(|_| "(?, ?)")
                 .collect::<Vec<_>>()
@@ -985,7 +1013,10 @@ impl FerrofinDtoService {
         let mut dto = BaseItemDto {
             id: item_id,
             server_id: Some(self.server_id.clone()),
-            type_: kind,
+            // Clients see `GetClientTypeName` (`LiveTvChannel` → "TvChannel",
+            // `LiveTvProgram` → "Program"); the internal `kind` keeps driving
+            // the per-kind gates below.
+            type_: client_kind(kind),
             media_type: parse_media_type(item.media_type.as_deref()),
             ..BaseItemDto::default()
         };
@@ -1047,7 +1078,19 @@ impl FerrofinDtoService {
         // Media sources. Jellyfin only attaches these for `IHasMediaSources`
         // (video/audio) — a Genre/Studio/Person/folder has no playable source, so
         // it must not carry a spurious one (C# `DtoService` gates on the interface).
-        if options.contains_field(ItemFields::MediaSources)
+        // A Live TV channel IS `IHasMediaSources`, but its `GetMediaSources`
+        // override returns the one Placeholder source, not a probed file.
+        if options.contains_field(ItemFields::MediaSources) && is_live_tv_channel(kind) {
+            dto.media_sources = Some(vec![ferrofin_model::dto::MediaSourceInfo {
+                id: Some(item_id.simple().to_string()),
+                name: item.name.clone(),
+                path: item.path.clone(),
+                run_time_ticks: item.run_time_ticks,
+                type_: ferrofin_model::dto::MediaSourceType::Placeholder,
+                is_infinite_stream: item.run_time_ticks.is_none(),
+                ..ferrofin_model::dto::MediaSourceInfo::default()
+            }]);
+        } else if options.contains_field(ItemFields::MediaSources)
             && (kinds::is_video(kind) || kinds::is_audio(kind))
         {
             // The row and its streams are already prefetched, so assemble the
@@ -1057,9 +1100,16 @@ impl FerrofinDtoService {
                 .get(&item_id)
                 .cloned()
                 .unwrap_or_default();
+            let attachments = prefetched
+                .media_attachments
+                .get(&item_id)
+                .cloned()
+                .unwrap_or_default();
             let mut sources = vec![
                 crate::media_source_manager::FerrofinMediaSourceManager::static_source(
-                    item, streams,
+                    item,
+                    streams,
+                    attachments,
                 ),
             ];
             // Merged alternate versions report as additional selectable sources
@@ -1070,10 +1120,16 @@ impl FerrofinDtoService {
                     .get(&row_id(alt))
                     .cloned()
                     .unwrap_or_default();
+                let alt_attachments = prefetched
+                    .media_attachments
+                    .get(&row_id(alt))
+                    .cloned()
+                    .unwrap_or_default();
                 sources.push(
                     crate::media_source_manager::FerrofinMediaSourceManager::static_source(
                         alt,
                         alt_streams,
+                        alt_attachments,
                     ),
                 );
             }
@@ -1096,16 +1152,20 @@ impl FerrofinDtoService {
         // per-library `EnableContentDeletionFromFolders` refinement needs the
         // un-ported collection-folder walk and is deferred; admin or the global
         // permission covers the real cases.
+        // Live TV channels/programmes hard-override both to false upstream
+        // (`LiveTvChannel.CanDelete() => false`, and `LiveTvProgram` keeps the
+        // `BaseItem` defaults — no file to delete or download).
+        let live_tv = is_live_tv_channel(kind) || is_live_tv_program(kind);
         if options.contains_field(ItemFields::CanDelete) {
             // By-name items (Genre/Studio/Person/…) have no file — C# `CanDelete()`
             // returns false (default `IsFileProtocol`, plus explicit overrides).
-            let file_deletable = !item.is_virtual_item && !kinds::is_item_by_name(kind);
+            let file_deletable = !item.is_virtual_item && !kinds::is_item_by_name(kind) && !live_tv;
             dto.can_delete = Some(file_deletable && perms.is_none_or(|p| p.can_delete));
         }
         if options.contains_field(ItemFields::CanDownload) {
             // C# `CanDownload()` is false by default and only true for playable media;
             // a by-name item is not a folder but still isn't downloadable.
-            let file_downloadable = !item.is_folder && !kinds::is_item_by_name(kind);
+            let file_downloadable = !item.is_folder && !kinds::is_item_by_name(kind) && !live_tv;
             dto.can_download = Some(file_downloadable && perms.is_none_or(|p| p.can_download));
         }
 
@@ -1246,15 +1306,25 @@ impl FerrofinDtoService {
         };
         if item_is_folder {
             dto.is_folder = Some(true);
-        } else if kinds::is_video(kind) || kinds::is_audio(kind) {
+        } else if kinds::is_video(kind) || kinds::is_audio(kind) || is_live_tv_channel(kind) {
+            // A Live TV channel is `IHasMediaSources`, so C# sets IsFolder=false;
+            // a programme is neither a folder nor a source, so its stays unset.
             dto.is_folder = Some(false);
         }
 
-        dto.location_type = Some(if item.is_virtual_item {
-            LocationType::Virtual
+        // C# skips LocationType for `LiveTvProgram`, and `LiveTvChannel`
+        // overrides it to `Remote`; everything else derives from the row.
+        if is_live_tv_program(kind) {
+            // absent on programme DTOs
+        } else if is_live_tv_channel(kind) {
+            dto.location_type = Some(LocationType::Remote);
         } else {
-            LocationType::FileSystem
-        });
+            dto.location_type = Some(if item.is_virtual_item {
+                LocationType::Virtual
+            } else {
+                LocationType::FileSystem
+            });
+        }
 
         dto.audio = item.audio.and_then(program_audio_from_disc);
         dto.critic_rating = item.critic_rating.map(f64_to_f32);
@@ -1386,7 +1456,10 @@ impl FerrofinDtoService {
         }
 
         // Chapters — [] when requested but there are none (matches Jellyfin).
-        if options.contains_field(ItemFields::Chapters) {
+        // C# assigns them only inside its `item is Video` branch, so every
+        // non-video kind (a folder, an album, a Live TV channel or programme)
+        // omits the key entirely.
+        if options.contains_field(ItemFields::Chapters) && kinds::is_video(kind) {
             let mut chapters =
                 take_or_clone(&mut prefetched.chapters, &item_id, repeated).unwrap_or_default();
             // Each extracted chapter thumbnail needs its cache tag: clients gate
@@ -1422,11 +1495,20 @@ impl FerrofinDtoService {
         // when its field is requested and the kind is video/audio, already took
         // its own copy; when it is not, there was no earlier read at all.)
         if options.contains_field(ItemFields::MediaStreams) {
-            let pinned = repeated || prefetched.alt_referenced.contains(&item_id);
-            let streams =
-                take_or_clone(&mut prefetched.media_streams, &item_id, pinned).unwrap_or_default();
-            if !streams.is_empty() {
-                dto.media_streams = Some(streams);
+            if is_live_tv_channel(kind) {
+                // C# assigns for every `IHasMediaSources`, and a channel's
+                // `GetMediaStreams()` override is always `[]` — the field is
+                // present-and-empty on the channel detail, never probed rows.
+                dto.media_streams = Some(Vec::new());
+            } else if is_live_tv_program(kind) {
+                // A programme is not `IHasMediaSources`; C# never assigns.
+            } else {
+                let pinned = repeated || prefetched.alt_referenced.contains(&item_id);
+                let streams = take_or_clone(&mut prefetched.media_streams, &item_id, pinned)
+                    .unwrap_or_default();
+                if !streams.is_empty() {
+                    dto.media_streams = Some(streams);
+                }
             }
         }
 
@@ -1514,7 +1596,7 @@ impl FerrofinDtoService {
         if item_ids.is_empty() {
             return Ok(map);
         }
-        for chunk in item_ids.chunks(500) {
+        for chunk in item_ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
             let ph = (1..=chunk.len())
                 .map(|i| format!("?{i}"))
                 .collect::<Vec<_>>()
@@ -1990,18 +2072,41 @@ impl FerrofinDtoService {
         // per item for each — costly on the 2-connection pool).
         let want_streams = options.contains_field(ItemFields::MediaStreams)
             || options.contains_field(ItemFields::MediaSources);
-        let media_streams = if want_streams && !media_ids.is_empty() {
-            let stream_ids: Vec<Uuid> = media_ids
+        // Only the items that can HAVE a media source are asked for one, and an
+        // alternate version is read alongside the primary it belongs to.
+        let stream_ids: Vec<Uuid> = if media_ids.is_empty() {
+            Vec::new()
+        } else {
+            media_ids
                 .iter()
                 .copied()
                 .chain(alternates.values().flatten().map(row_id))
-                .collect();
-            self.media_sources
-                .get_media_streams_batch(&stream_ids)
-                .await?
-        } else {
-            HashMap::new()
+                .collect()
         };
+        // A source lists its attachments too (C# `MediaAttachments =
+        // MediaSourceManager.GetMediaAttachments(item.Id)` on every static source);
+        // both relations load concurrently so `MediaSources` costs one round-trip.
+        let want_attachments = options.contains_field(ItemFields::MediaSources);
+        let (media_streams, media_attachments) = tokio::try_join!(
+            async {
+                if want_streams && !stream_ids.is_empty() {
+                    self.media_sources
+                        .get_media_streams_batch(&stream_ids)
+                        .await
+                } else {
+                    Ok(HashMap::new())
+                }
+            },
+            async {
+                if want_attachments && !stream_ids.is_empty() {
+                    self.media_sources
+                        .get_media_attachments_batch(&stream_ids)
+                        .await
+                } else {
+                    Ok(HashMap::new())
+                }
+            }
+        )?;
         // An id listed here is another page item's alternate, so its streams are
         // read while projecting that item — it cannot be drained by its own.
         let alt_referenced: std::collections::HashSet<Uuid> =
@@ -2285,6 +2390,7 @@ impl FerrofinDtoService {
             images,
             user_data,
             media_streams,
+            media_attachments,
             provider_ids,
             series_display_order,
             photo_album_names,
@@ -3030,9 +3136,17 @@ mod tests {
         }
         async fn get_media_attachments(
             &self,
-            _item_id: Uuid,
+            item_id: Uuid,
         ) -> Result<Vec<MediaAttachment>, ServiceError> {
-            Ok(vec![])
+            // One canned font per item, tagged with the item it belongs to, so a
+            // projection that handed a primary's attachments to its alternate (or
+            // vice versa) would be caught.
+            Ok(vec![MediaAttachment {
+                index: 3,
+                codec: Some("ttf".to_owned()),
+                file_name: Some(format!("{}.ttf", item_id.simple())),
+                ..MediaAttachment::default()
+            }])
         }
         async fn get_playback_media_sources(
             &self,
@@ -4880,6 +4994,20 @@ mod tests {
         let batch_sources = batch[0].media_sources.as_ref().expect("batch sources");
         assert_eq!(batch_sources.len(), 2);
         assert_eq!(batch_sources[1].path.as_deref(), Some("/media/alt.mkv"));
+
+        // Every source carries ITS OWN attachments (C# `MediaAttachments =
+        // MediaSourceManager.GetMediaAttachments(item.Id)`), on both paths.
+        let own = |s: &MediaSourceInfo| {
+            s.media_attachments
+                .iter()
+                .map(|a| a.file_name.clone().unwrap_or_default())
+                .collect::<Vec<_>>()
+        };
+        let alt_id = Uuid::parse_str(sources[1].id.as_deref().unwrap()).unwrap();
+        assert_eq!(own(&sources[0]), [format!("{}.ttf", id.simple())]);
+        assert_eq!(own(&sources[1]), [format!("{}.ttf", alt_id.simple())]);
+        assert_eq!(own(&batch_sources[0]), [format!("{}.ttf", id.simple())]);
+        assert_eq!(own(&batch_sources[1]), [format!("{}.ttf", alt_id.simple())]);
     }
 
     // The two book kinds project the fields Jellyfin's DtoService gives them —
@@ -4932,5 +5060,119 @@ mod tests {
 
         // A real track still links back to its album row.
         assert_eq!(dto(&track).await.album_id, Some(album));
+    }
+
+    /// A synthetic Live TV channel entity, as `ferrofin-livetv` builds them
+    /// (`type_` is the stored `LiveTvChannel` name; no path — the tuner URL is
+    /// resolved at stream time, exactly like upstream's channel items).
+    fn live_tv_channel_entity(id: Uuid) -> BaseItemEntity {
+        BaseItemEntity {
+            id: ferrofin_db::store::guid_to_db(id),
+            type_: "MediaBrowser.Controller.LiveTv.LiveTvChannel".to_owned(),
+            name: Some("Parity One".to_owned()),
+            media_type: Some("Video".to_owned()),
+            sort_name: Some("00001.0-Parity One".to_owned()),
+            date_created: Some(Utc.with_ymd_and_hms(2026, 8, 23, 18, 0, 0).unwrap()),
+            is_folder: false,
+            ..BaseItemEntity::default()
+        }
+    }
+
+    // The Live TV channel kind hooks: C# `LiveTvChannel` overrides LocationType
+    // to Remote, IsFolder to false (IHasMediaSources), CanDelete to false, the
+    // client type name to "TvChannel", and its media sources to the one
+    // Placeholder source with empty MediaStreams.
+    #[tokio::test]
+    async fn live_tv_channel_dto_carries_the_upstream_overrides() {
+        let db = test_db().await;
+        let id = Uuid::new_v4();
+        let entity = live_tv_channel_entity(id);
+        let svc = service(db);
+
+        let dto = svc
+            .get_base_item_dto(&entity, &DtoOptions::default(), None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(dto.type_, BaseItemKind::TvChannel);
+        assert_eq!(
+            dto.location_type,
+            Some(ferrofin_model::entities::LocationType::Remote)
+        );
+        assert_eq!(dto.is_folder, Some(false));
+        assert_eq!(dto.can_delete, Some(false));
+        assert_eq!(dto.can_download, Some(false));
+        assert_eq!(dto.media_type, MediaType::Video);
+        assert_eq!(dto.sort_name.as_deref(), Some("00001.0-Parity One"));
+        assert!(dto.date_created.is_some());
+        // The all-fields channel detail carries a present-and-empty stream list
+        // (C# assigns `GetMediaStreams()` = [] for every IHasMediaSources).
+        assert_eq!(dto.media_streams, Some(Vec::new()));
+        // C# only assigns Chapters for a `Video`; a channel omits the key.
+        assert_eq!(dto.chapters, None);
+
+        let sources = dto.media_sources.expect("placeholder media source");
+        assert_eq!(sources.len(), 1);
+        let source = &sources[0];
+        assert_eq!(source.id.as_deref(), Some(id.simple().to_string().as_str()));
+        assert_eq!(
+            source.type_,
+            ferrofin_model::dto::MediaSourceType::Placeholder
+        );
+        assert_eq!(
+            source.protocol,
+            ferrofin_model::media_info::MediaProtocol::File
+        );
+        assert!(source.is_infinite_stream, "no runtime → infinite");
+        assert!(source.media_streams.is_empty());
+        assert_eq!(source.path, None);
+    }
+
+    // The Live TV programme kind hooks: "Program" client type name, no
+    // LocationType, no IsFolder, CanDelete/CanDownload false, MediaType
+    // passes through as Unknown, and no media sources (a programme is not
+    // IHasMediaSources).
+    #[tokio::test]
+    async fn live_tv_program_dto_omits_location_and_folder_and_sources() {
+        let db = test_db().await;
+        let channel = Uuid::new_v4();
+        let entity = BaseItemEntity {
+            id: ferrofin_db::store::guid_to_db(Uuid::new_v4()),
+            type_: "MediaBrowser.Controller.LiveTv.LiveTvProgram".to_owned(),
+            name: Some("Parity Show".to_owned()),
+            media_type: Some("Unknown".to_owned()),
+            channel_id: Some(ferrofin_db::store::guid_to_db(channel)),
+            parent_id: Some(ferrofin_db::store::guid_to_db(channel)),
+            end_date: Some(Utc.with_ymd_and_hms(2026, 8, 23, 19, 0, 0).unwrap()),
+            run_time_ticks: Some(36_000_000_000),
+            genres: Some("News".to_owned()),
+            tags: Some("News".to_owned()),
+            is_folder: false,
+            ..BaseItemEntity::default()
+        };
+        let svc = service(db);
+
+        let dto = svc
+            .get_base_item_dto(&entity, &DtoOptions::default(), None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(dto.type_, BaseItemKind::Program);
+        assert_eq!(
+            dto.location_type, None,
+            "C# skips LocationType for programmes"
+        );
+        assert_eq!(dto.is_folder, None, "not a folder, not IHasMediaSources");
+        assert_eq!(dto.can_delete, Some(false));
+        assert_eq!(dto.can_download, Some(false));
+        assert_eq!(dto.media_type, MediaType::Unknown);
+        assert_eq!(dto.media_sources, None);
+        assert_eq!(dto.media_streams, None);
+        assert_eq!(dto.chapters, None, "a programme is not a Video");
+        assert_eq!(dto.channel_id, Some(channel));
+        assert_eq!(dto.parent_id, Some(channel));
+        assert_eq!(dto.run_time_ticks, Some(36_000_000_000));
+        assert_eq!(dto.genres, Some(vec!["News".to_owned()]));
+        assert_eq!(dto.tags, Some(vec!["News".to_owned()]));
     }
 }

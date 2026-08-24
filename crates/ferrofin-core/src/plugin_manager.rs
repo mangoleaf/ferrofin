@@ -24,7 +24,7 @@ use uuid::Uuid;
 
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::plugins::{
-    PluginArtifactValidator, PluginDescriptor, PluginImage, PluginManager,
+    PluginArtifactValidator, PluginDescriptor, PluginImage, PluginManager, PluginUpdateInfo,
 };
 
 use crate::system_manager::LifecycleController;
@@ -654,6 +654,86 @@ impl PluginManager for FerrofinPluginManager {
         ))
     }
 
+    async fn available_plugin_updates(&self) -> Result<Vec<PluginUpdateInfo>, ServiceError> {
+        // Port of `InstallationManager.GetAvailablePluginUpdates`: for every
+        // installed plugin, the newest catalog version that is *compatible*,
+        // strictly newer than the installed one, and not already staged.
+        let (Some(wasm_dir), Some(validator)) = (&self.wasm_plugins_dir, &self.validator) else {
+            // No installer armed: nothing here could be installed even if the
+            // catalog offered it.
+            return Ok(Vec::new());
+        };
+        // Narrow to the updatable plugins BEFORE touching the network: the
+        // common deployment has only compiled-in extensions, and fetching every
+        // repository at boot and every 24 h to produce an empty list is pure
+        // cost.
+        let updatable: Vec<PluginDescriptor> = self
+            .list_plugins()
+            .await?
+            .into_iter()
+            // Upstream skips a plugin whose manifest disables auto-update or
+            // that is disabled. Ferrofin has no per-plugin auto-update flag —
+            // its manifests belong to the repository, not the artifact — so
+            // only the disabled gate applies; disabling the plugin (or the
+            // repository) is the opt-out. See `docs/EXTENSIONS.md`.
+            .filter(|plugin| plugin.enabled)
+            // Only a runtime-installed (staged) WASM plugin can be replaced —
+            // `install_package` refuses a compiled-in extension's id, so
+            // offering it an "update" would only produce a failed install.
+            .filter(|plugin| wasm_dir.join(format!("{}.wasm", plugin.id)).exists())
+            .collect();
+        if updatable.is_empty() {
+            return Ok(Vec::new());
+        }
+        let catalog = self.list_packages().await?;
+        let abi = validator.supported_abi();
+        let installed_versions = {
+            let state = self.state.lock().expect("plugin state lock poisoned");
+            state.installed_digests.clone()
+        };
+        let mut updates = Vec::new();
+        for plugin in updatable {
+            let installed_key = version_sort_key(&plugin.version);
+            // A version already staged in this data directory is not offered
+            // again — it is waiting for the activating restart, and re-staging
+            // it every run would re-download the same bytes forever (upstream's
+            // `CompletedInstallations` guard, made durable).
+            let staged = installed_versions.get(&plugin.id.to_string());
+            // Every catalog entry for this id, not just the first: a package
+            // listed by two repositories keeps both repositories' versions in
+            // play, and the winner carries its own repository's URL so the
+            // install resolves the same entry this decision was made on.
+            let chosen = catalog
+                .iter()
+                .filter(|package| package.id == plugin.id)
+                .flat_map(|package| {
+                    package
+                        .versions
+                        .iter()
+                        .map(move |version| (package.name.as_str(), version))
+                })
+                .filter(|(_, v)| v.target_abi.as_deref() == Some(abi))
+                // Releases only: a prerelease sorts above the release it
+                // precedes, and staging `1.1.0-rc1` over `1.0.0` with nobody
+                // watching is not what "keep my plugins current" means. The
+                // admin can still install one by hand.
+                .filter(|(_, v)| version_sort_key(&v.version).1)
+                .filter(|(_, v)| version_sort_key(&v.version) > installed_key)
+                .filter(|(_, v)| !staged.is_some_and(|versions| versions.contains_key(&v.version)))
+                .max_by_key(|(_, v)| version_sort_key(&v.version));
+            if let Some((name, version)) = chosen {
+                updates.push(PluginUpdateInfo {
+                    id: plugin.id,
+                    name: name.to_owned(),
+                    installed_version: plugin.version.clone(),
+                    version: version.version.clone(),
+                    repository_url: Some(version.repository_url.clone()),
+                });
+            }
+        }
+        Ok(updates)
+    }
+
     async fn install_package(
         &self,
         name: &str,
@@ -670,12 +750,20 @@ impl PluginManager for FerrofinPluginManager {
         // 1. Resolve the package (guid beats name — names collide across
         //    repositories) and the version (pinned, else newest).
         let catalog = self.list_packages().await?;
-        let package = catalog
+        // EVERY catalog entry for this identity, not just the first: two
+        // repositories may list the same plugin, and `list_packages` keeps
+        // their entries separate. Picking only the first would make a version
+        // published by the second repository unreachable — including the one a
+        // caller pinned by `version`/`repository_url`.
+        let matching: Vec<&PackageInfo> = catalog
             .iter()
-            .find(|p| match assembly_guid {
+            .filter(|p| match assembly_guid {
                 Some(guid) => p.id == guid,
                 None => p.name.eq_ignore_ascii_case(name),
             })
+            .collect();
+        let package = *matching
+            .first()
             .ok_or_else(|| ServiceError::not_found(format!("package {name}")))?;
 
         // A repository must not squat a compiled-in plugin's identity: the
@@ -692,18 +780,17 @@ impl PluginManager for FerrofinPluginManager {
             )));
         }
 
-        let mut candidates: Vec<&ferrofin_model::updates::VersionInfo> = package
-            .versions
+        let chosen = matching
             .iter()
+            .flat_map(|p| p.versions.iter())
             .filter(|v| repository_url.is_none_or(|r| v.repository_url == r))
             .filter(|v| version.is_none_or(|want| v.version == want))
-            .collect();
-        candidates.sort_by_cached_key(|v| version_sort_key(&v.version));
-        let chosen = candidates.last().ok_or_else(|| {
-            ServiceError::not_found(format!(
-                "package {name} has no matching version (version={version:?}, repository={repository_url:?})"
-            ))
-        })?;
+            .max_by_key(|v| version_sort_key(&v.version))
+            .ok_or_else(|| {
+                ServiceError::not_found(format!(
+                    "package {name} has no matching version (version={version:?}, repository={repository_url:?})"
+                ))
+            })?;
         let source_url = chosen
             .source_url
             .as_deref()
@@ -1403,6 +1490,286 @@ mod tests {
         );
         // Unknown id after removal → NotFound (not in registry either).
         assert!(rig.mgr.remove_plugin(PKG_ID).await.is_err());
+    }
+
+    /// Builds an install rig whose registry already knows `PKG_ID` at
+    /// `installed_version`, optionally with its artifact staged on disk (a
+    /// runtime-installed WASM plugin) and optionally disabled.
+    async fn update_rig(installed_version: &str, staged: bool, enabled: bool) -> InstallRig {
+        let artifact = b"bytes".to_vec();
+        let md5 = ferrofin_common::extensions::md5_hex(&artifact);
+        let mut rig = install_rig(&artifact, None, &md5, TEST_ABI, Ok(PKG_ID)).await;
+        let mut d = descriptor(PKG_ID, "HelloPkg", enabled);
+        d.version = installed_version.to_owned();
+        rig.mgr = FerrofinPluginManager::new(
+            vec![RegisteredPlugin::new(d, None)],
+            rig.mgr.plugins_dir_for_test().to_path_buf(),
+        )
+        .with_installer(
+            rig.wasm_dir.clone(),
+            Arc::new(StubValidator {
+                id: Ok(PKG_ID),
+                abi: TEST_ABI,
+            }),
+            rig.lifecycle.clone(),
+        );
+        if staged {
+            std::fs::create_dir_all(&rig.wasm_dir).unwrap();
+            std::fs::write(rig.wasm_dir.join(format!("{PKG_ID}.wasm")), b"staged").unwrap();
+        }
+        rig
+    }
+
+    #[tokio::test]
+    async fn available_updates_offer_the_newest_compatible_version_for_staged_plugins() {
+        // Installed 0.9.0, catalog has 0.9.0 + 0.10.0 → the newer one is offered.
+        let rig = update_rig("0.9.0", true, true).await;
+        let updates = rig.mgr.available_plugin_updates().await.expect("updates");
+        assert_eq!(updates.len(), 1, "{updates:?}");
+        assert_eq!(updates[0].id, PKG_ID);
+        assert_eq!(updates[0].name, "HelloPkg");
+        assert_eq!(updates[0].installed_version, "0.9.0");
+        assert_eq!(updates[0].version, "0.10.0");
+
+        // Already on the newest catalog version → nothing to do.
+        let rig = update_rig("0.10.0", true, true).await;
+        assert!(
+            rig.mgr
+                .available_plugin_updates()
+                .await
+                .expect("updates")
+                .is_empty()
+        );
+
+        // A compiled-in extension (no staged artifact) is never offered an
+        // update — `install_package` refuses its id outright.
+        let rig = update_rig("0.9.0", false, true).await;
+        assert!(
+            rig.mgr
+                .available_plugin_updates()
+                .await
+                .expect("updates")
+                .is_empty()
+        );
+
+        // A disabled plugin is skipped, matching upstream's gate.
+        let rig = update_rig("0.9.0", true, false).await;
+        assert!(
+            rig.mgr
+                .available_plugin_updates()
+                .await
+                .expect("updates")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn available_updates_refuse_wrong_abi_stale_repeats_and_a_disarmed_installer() {
+        // A catalog that only offers versions built against another server's
+        // plugin ABI is no update at all.
+        let artifact = b"bytes".to_vec();
+        let md5 = ferrofin_common::extensions::md5_hex(&artifact);
+        let mut rig = install_rig(&artifact, None, &md5, "ferrofin:plugin@9.9.9", Ok(PKG_ID)).await;
+        let mut d = descriptor(PKG_ID, "HelloPkg", true);
+        d.version = "0.9.0".to_owned();
+        rig.mgr = FerrofinPluginManager::new(
+            vec![RegisteredPlugin::new(d.clone(), None)],
+            rig.mgr.plugins_dir_for_test().to_path_buf(),
+        )
+        .with_installer(
+            rig.wasm_dir.clone(),
+            Arc::new(StubValidator {
+                id: Ok(PKG_ID),
+                abi: TEST_ABI,
+            }),
+            rig.lifecycle.clone(),
+        );
+        std::fs::create_dir_all(&rig.wasm_dir).unwrap();
+        std::fs::write(rig.wasm_dir.join(format!("{PKG_ID}.wasm")), b"staged").unwrap();
+        assert!(
+            rig.mgr
+                .available_plugin_updates()
+                .await
+                .expect("updates")
+                .is_empty(),
+            "a version targeting another ABI is never offered"
+        );
+
+        // A version already staged in this data directory is waiting for the
+        // activating restart, so it must not be downloaded and staged again on
+        // every run.
+        let rig = update_rig("0.9.0", true, true).await;
+        rig.mgr
+            .install_package("HelloPkg", None, None, None)
+            .await
+            .expect("install the update");
+        assert!(
+            rig.mgr
+                .available_plugin_updates()
+                .await
+                .expect("updates")
+                .is_empty(),
+            "an already-staged version is not offered again"
+        );
+
+        // Without an installer armed nothing here is installable, so the task
+        // must not even reach the network.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bare = FerrofinPluginManager::new(
+            vec![RegisteredPlugin::new(d, None)],
+            dir.path().to_path_buf(),
+        );
+        assert!(
+            bare.available_plugin_updates()
+                .await
+                .expect("updates")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_repository_can_publish_the_update_and_the_install_follows_it() {
+        // Two repositories list the same plugin; only the second has the newer
+        // release. The offered version must come from that repository AND the
+        // install must resolve the same entry — resolving "the first catalog
+        // entry with this id" would look for the version in the wrong
+        // repository and fail forever.
+        let artifact = b"newer-bytes".to_vec();
+        let md5 = ferrofin_common::extensions::md5_hex(&artifact);
+        let (old_base, _stop_old) = repo_server(
+            |base| {
+                format!(
+                    r#"[{{"name":"HelloPkg","description":"d","overview":"o","owner":"me","category":"General",
+                    "guid":"{PKG_ID}",
+                    "versions":[
+                      {{"version":"0.9.0","targetAbi":"{TEST_ABI}","sourceUrl":"{base}/plugin.wasm","checksum":"deadbeef","repositoryName":"old","repositoryUrl":"{base}/manifest.json"}}
+                    ]}}]"#
+                )
+            },
+            b"old-bytes".to_vec(),
+        );
+        let (new_base, _stop_new) = repo_server(
+            move |base| {
+                format!(
+                    r#"[{{"name":"HelloPkg","description":"d","overview":"o","owner":"me","category":"General",
+                    "guid":"{PKG_ID}",
+                    "versions":[
+                      {{"version":"1.2.0","targetAbi":"{TEST_ABI}","sourceUrl":"{base}/plugin.wasm","checksum":"{md5}","repositoryName":"new","repositoryUrl":"{base}/manifest.json"}}
+                    ]}}]"#
+                )
+            },
+            artifact.clone(),
+        );
+
+        let state_dir = tempfile::tempdir().unwrap();
+        let wasm_root = tempfile::tempdir().unwrap();
+        let wasm_dir = wasm_root.path().join("plugins");
+        std::fs::create_dir_all(&wasm_dir).unwrap();
+        std::fs::write(wasm_dir.join(format!("{PKG_ID}.wasm")), b"staged").unwrap();
+        let mut installed = descriptor(PKG_ID, "HelloPkg", true);
+        installed.version = "0.9.0".to_owned();
+        let mgr = FerrofinPluginManager::new(
+            vec![RegisteredPlugin::new(installed, None)],
+            state_dir.path().to_path_buf(),
+        )
+        .with_installer(
+            wasm_dir.clone(),
+            Arc::new(StubValidator {
+                id: Ok(PKG_ID),
+                abi: TEST_ABI,
+            }),
+            Arc::new(FlagLifecycle(AtomicBool::new(false))),
+        );
+        mgr.set_repositories(vec![
+            RepositoryInfo {
+                name: Some("old".to_owned()),
+                url: Some(format!("{old_base}/manifest.json")),
+                enabled: true,
+            },
+            RepositoryInfo {
+                name: Some("new".to_owned()),
+                url: Some(format!("{new_base}/manifest.json")),
+                enabled: true,
+            },
+        ])
+        .await
+        .unwrap();
+
+        let updates = mgr.available_plugin_updates().await.expect("updates");
+        assert_eq!(updates.len(), 1, "{updates:?}");
+        assert_eq!(updates[0].version, "1.2.0");
+        assert_eq!(
+            updates[0].repository_url.as_deref(),
+            Some(format!("{new_base}/manifest.json").as_str()),
+            "the offer carries the repository that published it"
+        );
+
+        mgr.install_package(
+            &updates[0].name,
+            Some(updates[0].id),
+            Some(&updates[0].version),
+            updates[0].repository_url.as_deref(),
+        )
+        .await
+        .expect("the pinned repository resolves");
+        assert_eq!(
+            std::fs::read(wasm_dir.join(format!("{PKG_ID}.wasm"))).unwrap(),
+            artifact,
+            "the second repository's artifact was staged"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_updatable_plugin_means_no_repository_traffic() {
+        // The common deployment has only compiled-in extensions. Fetching every
+        // repository at boot and every 24 h to produce an empty list is pure
+        // cost, so the eligible set is computed before any request goes out.
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&hits);
+        let (base, _stop) = raw_server(move |_| {
+            Box::new(move |_request| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                http_ok("application/json", b"[]")
+            })
+        });
+
+        let state_dir = tempfile::tempdir().unwrap();
+        let wasm_root = tempfile::tempdir().unwrap();
+        // A registered plugin with NO staged artifact — i.e. a compiled-in one.
+        let mgr = FerrofinPluginManager::new(
+            vec![RegisteredPlugin::new(
+                descriptor(PKG_ID, "Compiled In", true),
+                None,
+            )],
+            state_dir.path().to_path_buf(),
+        )
+        .with_installer(
+            wasm_root.path().join("plugins"),
+            Arc::new(StubValidator {
+                id: Ok(PKG_ID),
+                abi: TEST_ABI,
+            }),
+            Arc::new(FlagLifecycle(AtomicBool::new(false))),
+        );
+        mgr.set_repositories(vec![RepositoryInfo {
+            name: Some("test".to_owned()),
+            url: Some(format!("{base}/manifest.json")),
+            enabled: true,
+        }])
+        .await
+        .unwrap();
+
+        assert!(
+            mgr.available_plugin_updates()
+                .await
+                .expect("updates")
+                .is_empty()
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "no repository was contacted"
+        );
     }
 
     #[tokio::test]

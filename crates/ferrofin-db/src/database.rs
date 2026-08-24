@@ -253,7 +253,7 @@ impl Database {
         ids: &[String],
     ) -> Result<Vec<(String, String, String)>> {
         let mut out = Vec::new();
-        for chunk in ids.chunks(500) {
+        for chunk in ids.chunks(crate::BATCH_BIND_CHUNK) {
             let placeholders = (1..=chunk.len())
                 .map(|i| format!("?{i}"))
                 .collect::<Vec<_>>()
@@ -283,7 +283,7 @@ impl Database {
     /// Returns an error if the query fails.
     pub async fn item_data_blobs(&self, ids: &[String]) -> Result<Vec<(String, String)>> {
         let mut out = Vec::with_capacity(ids.len());
-        for chunk in ids.chunks(500) {
+        for chunk in ids.chunks(crate::BATCH_BIND_CHUNK) {
             let placeholders = (1..=chunk.len())
                 .map(|i| format!("?{i}"))
                 .collect::<Vec<_>>()
@@ -314,7 +314,7 @@ impl Database {
     /// Returns an error if the query fails.
     pub async fn photo_album_names(&self, ids: &[String]) -> Result<Vec<(String, String)>> {
         let mut out = Vec::with_capacity(ids.len());
-        for chunk in ids.chunks(500) {
+        for chunk in ids.chunks(crate::BATCH_BIND_CHUNK) {
             let placeholders = (1..=chunk.len())
                 .map(|i| format!("?{i}"))
                 .collect::<Vec<_>>()
@@ -357,6 +357,40 @@ impl Database {
     #[must_use]
     pub fn writer(&self) -> &SqlitePool {
         &self.writer
+    }
+
+    /// Closes both pools, waiting for checked-out connections to be returned.
+    ///
+    /// The composition root calls this when a server lifetime ends so that an
+    /// in-process restart reopens the file with NO connection from the previous
+    /// host still holding it (a lingering connection closing later would
+    /// checkpoint its stale WAL over a freshly restored database). Idempotent.
+    pub async fn close(&self) {
+        self.pool.close().await;
+        self.writer.close().await;
+    }
+
+    /// Whether [`Database::close`] has run.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.pool.is_closed()
+    }
+
+    /// Writes a consistent snapshot of the database to `dest` (`VACUUM INTO`):
+    /// one transaction's view, complete with everything in the WAL, unaffected
+    /// by writers that keep going meanwhile — unlike a file copy of a live
+    /// WAL-mode database, which a checkpoint can tear mid-read. `dest` must not
+    /// exist.
+    ///
+    /// # Errors
+    /// Returns [`DbError::Sqlx`](crate::DbError::Sqlx) if the statement fails
+    /// (including when `dest` already exists).
+    pub async fn snapshot_to(&self, dest: &std::path::Path) -> Result<()> {
+        let dest = dest.to_string_lossy().replace('\'', "''");
+        sqlx::query(&format!("VACUUM INTO '{dest}'"))
+            .execute(&self.writer)
+            .await?;
+        Ok(())
     }
 }
 

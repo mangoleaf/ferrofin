@@ -57,7 +57,7 @@ use uuid::Uuid;
 
 use crate::item_type_lookup;
 use crate::media_info_resolver::ExternalStreamResolvers;
-use crate::media_source_manager::stream_dto_to_entity;
+use crate::media_source_manager::{attachment_dto_to_entity, stream_dto_to_entity};
 
 /// Per-scan artwork lookup state, so a series is matched against TMDB once and
 /// its seasons/episodes reuse that match (and its per-season episode stills).
@@ -129,7 +129,6 @@ impl RemoteMetadata {
 /// `large_futures` ceiling).
 struct StoredText {
     name: Option<String>,
-    sort_name: Option<String>,
     overview: Option<String>,
     /// Whether the stored `name` is a real title rather than the resolver's
     /// file-stem placeholder. Computed at read time, while the row's path is
@@ -145,7 +144,6 @@ impl StoredText {
         Self {
             titled: !name_is_placeholder(row.name.as_deref(), row.path.as_deref()),
             name: row.name,
-            sort_name: row.sort_name,
             overview: row.overview,
         }
     }
@@ -847,6 +845,9 @@ pub struct LibraryScanner {
     people: Option<Arc<dyn ferrofin_traits::persistence::PeopleRepository>>,
     /// Where probed chapter markers are persisted (paired with the probe seam).
     chapters: Option<Arc<dyn ferrofin_traits::persistence::ChapterRepository>>,
+    /// Where probed attachments (embedded fonts, cover art streams) are persisted —
+    /// C# `FFProbeVideoInfo` saves them right after the streams.
+    media_attachments: Option<Arc<dyn ferrofin_traits::persistence::MediaAttachmentRepository>>,
     /// Optional image processor. When present, each discovered/downloaded artwork file
     /// gets its pixel dimensions and blurhash filled in during the scan (so the DTO layer
     /// can surface Width/Height and ImageBlurHashes). Absent in unit tests.
@@ -904,6 +905,7 @@ impl LibraryScanner {
             metadata_dir: None,
             people: None,
             chapters: None,
+            media_attachments: None,
             image_processor: None,
             localization: None,
             progress_every: DEFAULT_SCAN_PROGRESS_EVERY,
@@ -1125,6 +1127,18 @@ impl LibraryScanner {
         self
     }
 
+    /// Attaches the attachment repository so each probe's embedded attachments
+    /// (fonts, attached pictures) are persisted with the item, as
+    /// `FFProbeVideoInfo.SaveMediaAttachments` does after the streams.
+    #[must_use]
+    pub fn with_attachments(
+        mut self,
+        media_attachments: Arc<dyn ferrofin_traits::persistence::MediaAttachmentRepository>,
+    ) -> Self {
+        self.media_attachments = Some(media_attachments);
+        self
+    }
+
     /// Scans every configured library; returns the number of items created.
     ///
     /// # Errors
@@ -1259,8 +1273,8 @@ impl LibraryScanner {
             // size (the streams themselves are saved after, since they FK the row).
             let mut entity = item.entity.clone();
             let (media_info, is_audio) = probes.take(scanned).await;
-            let (streams, chapters, tag_provider_ids) =
-                Self::apply_probe(&mut entity, media_info.as_ref(), is_audio);
+            let rows = Self::apply_probe(&mut entity, media_info.as_ref(), is_audio);
+            let tag_provider_ids = rows.provider_ids.clone();
             // Local Kodi/XBMC NFO sidecar first — this is Jellyfin's default local
             // metadata reader, which runs before any remote fetch. It fills
             // genres/studios/tags/overview/ratings/year from `movie.nfo` /
@@ -1343,8 +1357,7 @@ impl LibraryScanner {
                 item.id,
                 &entity,
                 ItemMedia {
-                    streams: &streams,
-                    chapters: &chapters,
+                    probe: &rows,
                     embedded_images,
                     policy,
                     locked,
@@ -1454,16 +1467,23 @@ impl LibraryScanner {
         media: ItemMedia<'_>,
         art_cache: &mut ArtworkCache,
     ) -> Result<(), ServiceError> {
-        if let (false, Some(repo)) = (media.streams.is_empty(), &self.media_streams) {
-            repo.save_media_streams(item_id, media.streams).await?;
+        let probe = media.probe;
+        if let (false, Some(repo)) = (probe.streams.is_empty(), &self.media_streams) {
+            repo.save_media_streams(item_id, &probe.streams).await?;
         }
-        self.save_chapters(item_id, media.chapters).await?;
+        // Attachments are replaced whenever a video probe ran (an empty set clears
+        // the rows of a re-muxed file); without a probe the stored rows stay.
+        if let (true, Some(repo)) = (probe.save_attachments, &self.media_attachments) {
+            repo.save_media_attachments(item_id, &probe.attachments)
+                .await?;
+        }
+        self.save_chapters(item_id, &probe.chapters).await?;
         // Artwork — locked items skip the rewrite entirely: their image rows
         // are user-owned.
         if !media.locked {
             let art = ArtworkPass {
                 entity,
-                streams: media.streams,
+                streams: &probe.streams,
                 policy: media.policy,
                 embedded_images: media.embedded_images,
             };
@@ -1648,8 +1668,10 @@ impl LibraryScanner {
         let Some(events) = &self.events else {
             return;
         };
+        // `LibraryChangedNotifier`: the id in Jellyfin's guid spelling (N form) —
+        // jellyfin-web compares it with the card's `data-id` as a plain string.
         let payload = serde_json::json!({
-            "ItemId": library.to_string(),
+            "ItemId": library.simple().to_string(),
             "Progress": format!("{pct:.2}"),
         })
         .to_string();
@@ -1689,15 +1711,18 @@ impl LibraryScanner {
         collection_folders.sort_unstable();
         collection_folders.dedup();
 
+        // Every id as `ToString("N")` (`LibraryChangedNotifier`): jellyfin-web's
+        // itemsrefresher matches these strings against item ids.
+        let n = |id: &Uuid| id.simple().to_string();
         let mut update = ferrofin_model::entities_media::LibraryUpdateInfo {
-            folders_added_to: folders_added.iter().map(Uuid::to_string).collect(),
-            folders_removed_from: folders_removed.iter().map(Uuid::to_string).collect(),
-            items_added: added.iter().map(|p| p.id.to_string()).collect(),
+            folders_added_to: folders_added.iter().map(n).collect(),
+            folders_removed_from: folders_removed.iter().map(n).collect(),
+            items_added: added.iter().map(|p| n(&p.id)).collect(),
             items_removed: removed
                 .iter()
-                .flat_map(|(_, ids)| ids.iter().map(Uuid::to_string))
+                .flat_map(|(_, ids)| ids.iter().map(n))
                 .collect(),
-            collection_folders: collection_folders.iter().map(Uuid::to_string).collect(),
+            collection_folders: collection_folders.iter().map(n).collect(),
             ..ferrofin_model::entities_media::LibraryUpdateInfo::default()
         };
         update.is_empty = update.compute_is_empty();
@@ -2295,14 +2320,9 @@ impl LibraryScanner {
         entity: &mut BaseItemEntity,
         probed: Option<&MediaInfo>,
         media_is_audio: bool,
-    ) -> (
-        Vec<MediaStreamInfoEntity>,
-        Vec<ChapterEntity>,
-        Vec<(String, String)>,
-    ) {
-        let empty = (Vec::new(), Vec::new(), Vec::new());
+    ) -> ProbeRows {
         let Some(probed) = probed else {
-            return empty;
+            return ProbeRows::default();
         };
         let source = &probed.media_source;
         entity.run_time_ticks = source.run_time_ticks.or(entity.run_time_ticks);
@@ -2326,7 +2346,25 @@ impl LibraryScanner {
             .enumerate()
             .map(|(index, c)| chapter_to_entity(&entity.id, index, c))
             .collect();
-        (streams, chapters, provider_ids)
+        // Only the video prober saves attachments (`FFProbeVideoInfo`); the audio
+        // prober (`AudioFileProber`) never touches the attachment table, so an
+        // embedded cover art "attached_pic" stream stays out of it.
+        let attachments = if media_is_audio {
+            Vec::new()
+        } else {
+            source
+                .media_attachments
+                .iter()
+                .map(|a| attachment_dto_to_entity(&entity.id, a))
+                .collect()
+        };
+        ProbeRows {
+            streams,
+            chapters,
+            attachments,
+            provider_ids,
+            save_attachments: !media_is_audio,
+        }
     }
 
     /// Fetches remote artwork (TMDB) for an item that has no local images,
@@ -3001,8 +3039,19 @@ impl LibraryScanner {
         // "checked" marker if it ever costs real time.
         if let Some(stored) = stored.filter(|s| s.is_complete()) {
             if name_is_file_stem_placeholder(entity) {
+                // Recomputed from the stored title, not copied from the stored
+                // key: a key derived by an older algorithm would otherwise
+                // survive every rescan and sort next to freshly derived ones
+                // (the play queue reads this). `BaseItem.SortName` prefers a
+                // `ForcedSortName` when the item has one, so this does too.
                 entity.name.clone_from(&stored.name);
-                entity.sort_name.clone_from(&stored.sort_name);
+                entity.sort_name = match entity.forced_sort_name.as_deref() {
+                    Some(forced) => Some(ferrofin_util::sort_name::forced_sort_key(forced)),
+                    None => stored
+                        .name
+                        .as_deref()
+                        .map(|name| derived_sort_name(entity, name)),
+                };
             }
             if entity.overview.is_none() {
                 entity.overview.clone_from(&stored.overview);
@@ -4214,6 +4263,17 @@ impl LibraryScanner {
     ) -> Option<(Uuid, BaseItemEntity)> {
         let id = item_type_lookup::derive_item_id_with(&self.id_derivation, kind, path)?;
         let sort_name = create_sort_name(&name);
+        // One stat per file feeds both dates (a second `getattr` round-trip
+        // per item adds up on an NFS-backed library); `std::fs::metadata`
+        // follows symlinks, matching upstream's `LinkTarget` resolution. A
+        // path that cannot be stat'ed at all is stamped with the scan time
+        // (upstream's `dateCreated == MinValue` guard). A folder is never
+        // stat'ed for its dates at all (see below).
+        let times = if is_folder {
+            None
+        } else {
+            std::fs::metadata(path).ok().map(|m| FileTimes::of(&m))
+        };
         let entity = BaseItemEntity {
             id: guid_to_db(id),
             type_: item_type_lookup::stored_type_name(kind)
@@ -4225,10 +4285,23 @@ impl LibraryScanner {
             parent_id: Some(guid_to_db(parent)),
             top_parent_id: Some(guid_to_db(cf)),
             is_folder,
-            // "Date Added" is the FILE's creation time (upstream sets
-            // `DateCreated = info.CreationTimeUtc` at resolve): scan wall-clock
-            // made a first scan order the whole library by directory traversal.
-            date_created: Some(file_date_created(path)),
+            // Port of `ResolverHelper.SetDateCreated` (+ `EnsureDates`): with
+            // `UseFileCreationTimeForDateAdded` (the default) a FILE's "Date
+            // Added" is its creation time and `DateModified` its mtime — scan
+            // wall-clock would order a first scan by directory traversal. A
+            // DIRECTORY is different: `ManagedFileSystem.GetFileSystemMetadata`
+            // only fills `CreationTimeUtc`/`LastWriteTimeUtc` for a `FileInfo`,
+            // so every folder item (Series, Season, MusicAlbum, PhotoAlbum, a
+            // disc-rip Movie whose path is the directory) resolves with
+            // `MinValue` dates → `DateCreated = DateTime.UtcNow` at FIRST
+            // resolve and `DateModified` unset (stored NULL). The scan upsert's
+            // `coalesce("DateCreated", excluded."DateCreated")` is what keeps
+            // that first-resolve stamp stable across rescans.
+            date_created: Some(match &times {
+                Some(times) => creation_time_from(times).into(),
+                None => Utc::now(),
+            }),
+            date_modified: times.map(|t| t.mtime.into()),
             ..BaseItemEntity::default()
         };
         Some((id, entity))
@@ -5586,13 +5659,56 @@ fn owner_for_extra(
     }
 }
 
-/// The file's creation time (falling back to modification time, then to now)
-/// — what "Date Added" sorts by, as upstream's resolvers stamp it.
-fn file_date_created(path: &str) -> chrono::DateTime<Utc> {
-    std::fs::metadata(path)
-        .ok()
-        .and_then(|m| m.created().or_else(|_| m.modified()).ok())
-        .map_or_else(Utc::now, chrono::DateTime::<Utc>::from)
+/// The three stat timestamps the creation-time rule reads.
+#[derive(Debug, Clone, Copy)]
+struct FileTimes {
+    /// The statx birth time, when the filesystem reports one.
+    birth: Option<std::time::SystemTime>,
+    /// The inode change time (`st_ctime`).
+    ctime: std::time::SystemTime,
+    /// The content modification time (`st_mtime`).
+    mtime: std::time::SystemTime,
+}
+
+impl FileTimes {
+    /// Reads the timestamps off a stat result. `Metadata::created()` is
+    /// `ErrorKind::Unsupported` exactly when statx reports no `STATX_BTIME` —
+    /// the same condition as .NET's `HasBirthTime`.
+    fn of(meta: &std::fs::Metadata) -> Self {
+        let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+        Self {
+            birth: meta.created().ok(),
+            ctime: ctime_of(meta).unwrap_or(mtime),
+            mtime,
+        }
+    }
+}
+
+/// `st_ctime` as a [`SystemTime`](std::time::SystemTime) (Unix only; other
+/// targets have no change time and fall back to the mtime).
+#[cfg(unix)]
+fn ctime_of(meta: &std::fs::Metadata) -> Option<std::time::SystemTime> {
+    use std::os::unix::fs::MetadataExt as _;
+    let secs = u64::try_from(meta.ctime()).ok()?;
+    let nanos = u32::try_from(meta.ctime_nsec()).ok()?;
+    std::time::UNIX_EPOCH.checked_add(std::time::Duration::new(secs, nanos))
+}
+
+#[cfg(not(unix))]
+fn ctime_of(_meta: &std::fs::Metadata) -> Option<std::time::SystemTime> {
+    None
+}
+
+/// .NET's `FileSystemInfo.CreationTimeUtc` on Unix (`FileStatus.Unix.cs`
+/// `GetCreationTime`): the statx birth time when the filesystem has one,
+/// otherwise "the oldest time we have in between change and modify time" —
+/// the older of `ctime` and `mtime`. Ported for fidelity rather than effect:
+/// `min(ctime, mtime)` only differs from the mtime alone when the mtime lies
+/// in the future of the inode change (clock skew, a future-dated copy) — a
+/// `cp -p`/rsync-preserved file still dates by its preserved mtime, exactly
+/// as it does on Jellyfin.
+fn creation_time_from(times: &FileTimes) -> std::time::SystemTime {
+    times.birth.unwrap_or_else(|| times.ctime.min(times.mtime))
 }
 
 /// The file name without its extension — a lightweight display name until real
@@ -5702,6 +5818,18 @@ fn apply_nfo(entity: &mut BaseItemEntity, n: &ferrofin_providers::xbmc::item::Nf
     }
     if entity.end_date.is_none() {
         entity.end_date = n.end_date;
+    }
+    // `<dateadded>` overrides the resolver's stamp (`BaseNfoParser`:
+    // `item.DateCreated = dateCreated`, and `MetadataService.MergeData` copies
+    // a non-MinValue `DateCreated` from the provider result onto the item).
+    // Accepted divergence: this lands on FIRST import only — the scan upsert
+    // (`item_persistence_service::scan_upsert_sql`) coalesces `DateCreated`,
+    // so a `<dateadded>` added or edited later is not re-applied on rescan or
+    // refresh, where upstream's `MergeData` re-stamps it on every refresh.
+    // Letting an NFO-sourced `DateCreated` win that coalesce is the
+    // persistence-side follow-up.
+    if n.date_created.is_some() {
+        entity.date_created = n.date_created;
     }
     merge_multi_value(&mut entity.genres, &n.genres);
     merge_multi_value(&mut entity.studios, &n.studios);
@@ -5828,13 +5956,27 @@ fn known_provider_ids(
     )
 }
 
+/// Everything one ffprobe result contributes beyond the item row itself.
+#[derive(Default)]
+struct ProbeRows {
+    /// The stream rows (`MediaStreamInfos`).
+    streams: Vec<MediaStreamInfoEntity>,
+    /// The chapter rows.
+    chapters: Vec<ChapterEntity>,
+    /// The attachment rows (`AttachmentStreamInfos`).
+    attachments: Vec<ferrofin_db::entities::base_items::AttachmentStreamInfoEntity>,
+    /// Provider ids read from embedded audio tags.
+    provider_ids: Vec<(String, String)>,
+    /// Whether the attachment rows are authoritative: a probe ran and the item
+    /// is a video (`false` — no probe, or an audio file — leaves stored rows alone).
+    save_attachments: bool,
+}
+
 /// What one scanned item contributes beyond its own row — the arguments
 /// [`LibraryScanner::persist_item_media`] would otherwise take positionally.
 struct ItemMedia<'a> {
-    /// The probed media streams.
-    streams: &'a [ferrofin_db::entities::base_items::MediaStreamInfoEntity],
-    /// The probed chapters.
-    chapters: &'a [ferrofin_db::entities::base_items::ChapterEntity],
+    /// What the probe yielded (streams, chapters, attachments).
+    probe: &'a ProbeRows,
     /// Images the file itself yielded (a photo, or a book's cover).
     embedded_images: Vec<ItemImageInfo>,
     /// The library's fetcher policy for this item.
@@ -6348,7 +6490,7 @@ fn derived_sort_name(entity: &BaseItemEntity, title: &str) -> String {
 
 /// Port of C# `BaseItem.CreateSortName` + `ModifySortChunks`; the shared
 /// implementation lives in `ferrofin-util` so the metadata providers (Identify
-/// renames) compute the same sort key as the scanner.
+/// renames) and the Live TV guide compute the same sort key as the scanner.
 pub(crate) use ferrofin_util::sort_name::create_sort_name;
 
 /// The final path segment (folder name) of a directory path, if any. Mirrors C#
@@ -6504,6 +6646,9 @@ mod tests {
     use super::LibraryScanner;
     use crate::file_system::FerrofinFileSystem;
     use crate::item_persistence_service::FerrofinItemPersistenceService;
+    use ferrofin_db::entities::base_items::BaseItemEntity;
+    use ferrofin_model::data::BaseItemKind;
+    use ferrofin_traits::persistence::ItemPersistenceService as _;
 
     // date_modified must be the file's mtime (stable across rescans), never the
     // scan time: it feeds ImageTags and the resize-cache key, so a churning value
@@ -6527,6 +6672,210 @@ mod tests {
         let missing = super::file_date_modified(&dir.join("nope.jpg"));
         assert!((chrono::Utc::now() - missing).num_seconds().abs() < 60);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// .NET `GetCreationTime` on Unix: the birth time wins; without one the
+    /// OLDER of ctime and mtime (not the mtime alone).
+    #[rstest::rstest]
+    #[case(Some(10), 20, 30, 10)]
+    #[case(Some(40), 20, 30, 40)]
+    #[case(None, 20, 30, 20)]
+    #[case(None, 30, 20, 20)]
+    #[case(None, 25, 25, 25)]
+    fn creation_time_is_birth_time_or_oldest_of_ctime_mtime(
+        #[case] birth: Option<u64>,
+        #[case] ctime: u64,
+        #[case] mtime: u64,
+        #[case] expected: u64,
+    ) {
+        let at = |secs: u64| std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+        let times = super::FileTimes {
+            birth: birth.map(at),
+            ctime: at(ctime),
+            mtime: at(mtime),
+        };
+        assert_eq!(super::creation_time_from(&times), at(expected));
+    }
+
+    /// On a real file the stat rule agrees with the filesystem: the statx
+    /// birth time when there is one, else the older of ctime/mtime.
+    #[test]
+    fn file_times_read_the_birth_time_when_the_filesystem_has_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("movie.mkv");
+        std::fs::write(&file, b"x").expect("write");
+        let meta = std::fs::metadata(&file).expect("stat");
+        let times = super::FileTimes::of(&meta);
+        let expected = meta
+            .created()
+            .ok()
+            .unwrap_or_else(|| times.ctime.min(times.mtime));
+        assert_eq!(super::creation_time_from(&times), expected);
+    }
+
+    /// `ResolverHelper.SetDateCreated` + the `ManagedFileSystem` directory
+    /// quirk: a FILE row carries its creation time and mtime; a FOLDER row is
+    /// stamped with the resolve time and no `DateModified` (upstream only
+    /// fills the dates for a `FileInfo`, so directories resolve with
+    /// `MinValue` → `UtcNow`).
+    #[tokio::test]
+    async fn base_item_stamps_folders_with_now_and_files_with_file_times() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let series_dir = dir.path().join("Series 01");
+        std::fs::create_dir(&series_dir).expect("mkdir");
+        let file = series_dir.join("S01E01.mkv");
+        std::fs::write(&file, b"x").expect("write");
+        // Push the directory's own mtime into the past so "now" is
+        // distinguishable from the directory's timestamps. On a filesystem
+        // with birth times the just-created directory's btime is also "now",
+        // so the `created > past` check only bites the old behaviour on
+        // btime-less filesystems; the `date_modified == None` assertion is
+        // the discriminating one everywhere.
+        let past = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+        std::fs::File::open(&series_dir)
+            .expect("open dir")
+            .set_modified(past)
+            .expect("set dir mtime");
+
+        let db = Database::connect_in_memory().await.unwrap();
+        db.run_migrations().await.unwrap();
+        let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+            FerrofinVirtualFolderManager::new(dir.path().join("default"))
+                .with_item_store(persistence.clone()),
+        );
+        let scanner = LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence);
+        let cf = uuid::Uuid::from_u128(0x7100);
+
+        let before = chrono::Utc::now() - chrono::Duration::seconds(5);
+        let (_, folder) = scanner
+            .base_item(
+                BaseItemKind::Series,
+                cf,
+                cf,
+                "Series 01".into(),
+                &series_dir.to_string_lossy(),
+                true,
+            )
+            .expect("series row");
+        let created = folder.date_created.expect("folders are stamped");
+        assert!(
+            created >= before,
+            "a folder is stamped with the resolve time"
+        );
+        assert!(
+            created > chrono::DateTime::<chrono::Utc>::from(past),
+            "not the directory's own timestamp"
+        );
+        assert_eq!(folder.date_modified, None, "a folder has no DateModified");
+
+        let (_, episode) = scanner
+            .base_item(
+                BaseItemKind::Episode,
+                cf,
+                cf,
+                "S01E01".into(),
+                &file.to_string_lossy(),
+                false,
+            )
+            .expect("episode row");
+        let meta = std::fs::metadata(&file).expect("stat");
+        assert_eq!(
+            episode.date_created,
+            Some(chrono::DateTime::<chrono::Utc>::from(
+                super::creation_time_from(&super::FileTimes::of(&meta))
+            )),
+            "a file's DateCreated is its creation time"
+        );
+        assert_eq!(
+            episode.date_modified,
+            Some(chrono::DateTime::<chrono::Utc>::from(
+                meta.modified().expect("mtime")
+            )),
+            "a file's DateModified is its mtime"
+        );
+
+        // A path that cannot be stat'ed is stamped with the scan time —
+        // upstream's `MinValue → UtcNow` guard.
+        let (_, ghost) = scanner
+            .base_item(
+                BaseItemKind::Movie,
+                cf,
+                cf,
+                "Ghost".into(),
+                &dir.path().join("nope.mkv").to_string_lossy(),
+                false,
+            )
+            .expect("ghost row");
+        let created = ghost.date_created.expect("stamped");
+        assert!((chrono::Utc::now() - created).num_seconds().abs() < 60);
+        assert_eq!(ghost.date_modified, None);
+    }
+
+    /// A folder's first-resolve stamp survives a rescan: the scan upsert
+    /// coalesces `DateCreated`, so the `now` of a later scan never replaces
+    /// the `now` of the first (what makes the folder's "Date Added" stable).
+    #[tokio::test]
+    async fn rescan_preserves_folder_date_created() {
+        let db = Database::connect_in_memory().await.unwrap();
+        db.run_migrations().await.unwrap();
+        let persistence = FerrofinItemPersistenceService::new(db.clone());
+        let id = uuid::Uuid::from_u128(0x7200);
+        let first = chrono::DateTime::parse_from_rfc3339("2026-01-02T03:04:05Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let mut series = BaseItemEntity {
+            id: ferrofin_db::store::guid_to_db(id),
+            type_: crate::item_type_lookup::stored_type_name(BaseItemKind::Series)
+                .unwrap()
+                .to_owned(),
+            name: Some("Series 01".into()),
+            is_folder: true,
+            date_created: Some(first),
+            ..Default::default()
+        };
+        persistence
+            .save_scanned_items(std::slice::from_ref(&series))
+            .await
+            .expect("first scan");
+        series.date_created = Some(chrono::Utc::now());
+        persistence
+            .save_scanned_items(std::slice::from_ref(&series))
+            .await
+            .expect("rescan");
+        let stored = crate::test_support::fetch_item(&db, id).await;
+        assert_eq!(stored.date_created, Some(first));
+    }
+
+    /// An NFO `<dateadded>` overrides the resolver's stamp (`BaseNfoParser`
+    /// sets `item.DateCreated`; `MergeData` copies a non-MinValue value).
+    #[test]
+    fn apply_nfo_applies_dateadded_as_date_created() {
+        let resolver_stamp = chrono::Utc::now();
+        let added = chrono::DateTime::parse_from_rfc3339("2020-05-06T07:08:09Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let mut entity = BaseItemEntity {
+            date_created: Some(resolver_stamp),
+            ..Default::default()
+        };
+        let nfo = ferrofin_providers::xbmc::item::NfoBaseItem {
+            date_created: Some(added),
+            ..Default::default()
+        };
+        super::apply_nfo(&mut entity, &nfo);
+        assert_eq!(entity.date_created, Some(added));
+
+        // No `<dateadded>` leaves the resolver's stamp alone.
+        let mut entity = BaseItemEntity {
+            date_created: Some(resolver_stamp),
+            ..Default::default()
+        };
+        super::apply_nfo(
+            &mut entity,
+            &ferrofin_providers::xbmc::item::NfoBaseItem::default(),
+        );
+        assert_eq!(entity.date_created, Some(resolver_stamp));
     }
 
     // Port of C# CreateSortName: lowercase, strip a leading article, zero-pad digit runs to 10.
@@ -8328,6 +8677,66 @@ mod tests {
         );
     }
 
+    // A key an older algorithm produced must not survive the rescan: the row
+    // carries the stored TITLE forward and derives the key from it again, so a
+    // library never ends up half-sorted by two different rules.
+    #[tokio::test]
+    async fn a_carried_forward_title_re_derives_its_sort_key() {
+        let (base, _hits, _all) = spawn_tmdb_server(Some(SEASON_JSON), Some(CREDITS_JSON));
+        let tmp = tempfile::tempdir().unwrap();
+        let (scanner, mut cache, mut episode) = tmdb_episode_fixture(&base, tmp.path()).await;
+
+        // A stale key: what the pre-convergence scanner wrote for this title.
+        let stored = super::StoredText::from_row(ferrofin_db::entities::base_items::ItemTextRow {
+            id: String::new(),
+            name: Some("Winter Is Coming".into()),
+            sort_name: Some("winter is coming".into()),
+            overview: Some("Ned is summoned south.".into()),
+            path: episode.path.clone(),
+        });
+
+        scanner
+            .fetch_tmdb_episode(&mut episode, &mut cache, Some(&stored))
+            .await
+            .expect("nothing to do");
+
+        assert_eq!(episode.name.as_deref(), Some("Winter Is Coming"));
+        assert_eq!(
+            episode.sort_name.as_deref(),
+            Some("001 - 0001 - Winter Is Coming"),
+            "the key is re-derived from the carried-forward title, not copied"
+        );
+    }
+
+    // `BaseItem.SortName` prefers a `ForcedSortName` (`<sorttitle>`); the
+    // re-derivation above must not overwrite one.
+    #[tokio::test]
+    async fn a_forced_sort_name_survives_the_re_derivation() {
+        let (base, _hits, _all) = spawn_tmdb_server(Some(SEASON_JSON), Some(CREDITS_JSON));
+        let tmp = tempfile::tempdir().unwrap();
+        let (scanner, mut cache, mut episode) = tmdb_episode_fixture(&base, tmp.path()).await;
+        episode.forced_sort_name = Some("Thrones 01".into());
+
+        let stored = super::StoredText::from_row(ferrofin_db::entities::base_items::ItemTextRow {
+            id: String::new(),
+            name: Some("Winter Is Coming".into()),
+            sort_name: Some("thrones 0000000001".into()),
+            overview: Some("Ned is summoned south.".into()),
+            path: episode.path.clone(),
+        });
+
+        scanner
+            .fetch_tmdb_episode(&mut episode, &mut cache, Some(&stored))
+            .await
+            .expect("nothing to do");
+
+        assert_eq!(
+            episode.sort_name.as_deref(),
+            Some("thrones 0000000001"),
+            "ModifySortChunks(ForcedSortName).ToLowerInvariant()"
+        );
+    }
+
     // A season TMDB has nothing for is recorded as a miss, so a 24-episode
     // season costs ONE failed request rather than 24. Without the negative
     // caching every episode under an unmatched season re-asks.
@@ -8998,6 +9407,14 @@ mod tests {
                         ..Default::default()
                     },
                 ],
+                media_attachments: vec![ferrofin_model::entities_media::MediaAttachment {
+                    index: 2,
+                    codec: Some("ttf".to_owned()),
+                    codec_tag: Some("[0][0][0][0]".to_owned()),
+                    file_name: Some("font.ttf".to_owned()),
+                    mime_type: Some("application/x-truetype-font".to_owned()),
+                    ..Default::default()
+                }],
                 ..Default::default()
             })
         }
@@ -9036,6 +9453,7 @@ mod tests {
 
     #[tokio::test]
     async fn scan_probes_media_and_persists_streams_and_duration() {
+        use ferrofin_traits::persistence::MediaAttachmentRepository as _;
         let tmp = tempfile::tempdir().unwrap();
         let media = tmp.path().join("movies");
         std::fs::create_dir_all(&media).unwrap();
@@ -9061,6 +9479,9 @@ mod tests {
         .await
         .unwrap();
 
+        let attachments = Arc::new(
+            crate::media_attachment_repository::FerrofinMediaAttachmentRepository::new(db.clone()),
+        );
         let scanner =
             LibraryScanner::new(vf.clone(), Arc::new(FerrofinFileSystem::new()), persistence)
                 .with_probe(
@@ -9069,12 +9490,13 @@ mod tests {
                     Arc::new(crate::chapter_repository::FerrofinChapterRepository::new(
                         db.clone(),
                     )),
-                );
+                )
+                .with_attachments(attachments.clone());
         scanner.scan_all().await.unwrap();
 
         // The probed duration + size land on the item row.
-        let (ticks, size): (Option<i64>, Option<i64>) = sqlx::query_as(
-            r#"SELECT "RunTimeTicks","Size" FROM "BaseItems" WHERE "Type" LIKE '%Movies.Movie'"#,
+        let (ticks, size, movie_id): (Option<i64>, Option<i64>, String) = sqlx::query_as(
+            r#"SELECT "RunTimeTicks","Size","Id" FROM "BaseItems" WHERE "Type" LIKE '%Movies.Movie'"#,
         )
         .fetch_one(db.pool())
         .await
@@ -9094,6 +9516,23 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(video_codec.as_deref(), Some("h264"));
+
+        // The probed attachment is persisted with the item (`SaveMediaAttachments`),
+        // under the ffprobe stream index a client later asks /Attachments/{index} for.
+        let rows = attachments
+            .get_media_attachments(&ferrofin_traits::persistence::MediaAttachmentQuery {
+                item_id: uuid::Uuid::parse_str(&movie_id).unwrap(),
+                index: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].index, 2);
+        assert_eq!(rows[0].filename.as_deref(), Some("font.ttf"));
+        assert_eq!(
+            rows[0].mime_type.as_deref(),
+            Some("application/x-truetype-font")
+        );
     }
 
     /// A probe that answers with a duration derived from the file it was given
@@ -9286,7 +9725,8 @@ mod tests {
                 db.clone(),
             )),
         );
-        scanner.scan_all().await.unwrap();
+        // Boxed: the scan future is over clippy's `large_futures` ceiling.
+        Box::pin(scanner.scan_all()).await.unwrap();
         let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
             Arc::new(crate::item_type_lookup::ItemTypeLookup::new());
         let items: Arc<dyn ferrofin_traits::persistence::ItemRepository> = Arc::new(

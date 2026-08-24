@@ -19,6 +19,7 @@ pub struct BaseItemPerson {
 
     /// Gets or sets the identifier.
     #[schema(value_type = String, format = "uuid")]
+    #[serde(with = "crate::json::guid")]
     pub id: Uuid,
 
     /// Gets or sets the role.
@@ -73,7 +74,7 @@ mod tests {
     fn uses_contract_field_names() {
         let json = serde_json::to_value(sample()).unwrap();
         assert_eq!(json["Name"], "Morgan Freeman");
-        assert_eq!(json["Id"], Uuid::from_u128(7).to_string());
+        assert_eq!(json["Id"], Uuid::from_u128(7).simple().to_string());
         assert_eq!(json["Role"], "Red");
         assert_eq!(json["Type"], "Actor");
         assert_eq!(json["PrimaryImageTag"], "abc123");

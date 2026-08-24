@@ -15,6 +15,7 @@ use crate::dto::{BaseItemDto, UserItemDataDto};
 pub struct QueueItem {
     /// Gets or sets the item id.
     #[schema(value_type = String, format = "uuid")]
+    #[serde(with = "crate::json::guid")]
     pub id: Uuid,
 
     /// Gets or sets the playlist item id.
@@ -40,6 +41,7 @@ pub struct PlaybackProgressInfo {
 
     /// Gets or sets the item identifier.
     #[schema(value_type = String, format = "uuid")]
+    #[serde(with = "crate::json::guid")]
     pub item_id: Uuid,
 
     /// Gets or sets the session id.
@@ -129,6 +131,7 @@ pub struct PlaybackStopInfo {
 
     /// Gets or sets the item identifier.
     #[schema(value_type = String, format = "uuid")]
+    #[serde(with = "crate::json::guid")]
     pub item_id: Uuid,
 
     /// Gets or sets the session id.
@@ -173,6 +176,7 @@ pub struct PlaybackStopInfo {
 pub struct SessionUserInfo {
     /// Gets or sets the user identifier.
     #[schema(value_type = String, format = "uuid")]
+    #[serde(with = "crate::json::guid")]
     pub user_id: Uuid,
 
     /// Gets or sets the name of the user.
@@ -186,6 +190,7 @@ pub struct SessionUserInfo {
 pub struct UserDataChangeInfo {
     /// Gets or sets the user id.
     #[schema(value_type = String, format = "uuid")]
+    #[serde(with = "crate::json::guid")]
     pub user_id: Uuid,
 
     /// Gets or sets the user data list.

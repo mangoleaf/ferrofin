@@ -433,7 +433,8 @@ async fn trickplay_tile_serves_file_then_404() {
         Arc::new(FakeLyrics),
         Arc::new(FakeSubtitles),
     );
-    // jellyfin-web requests `{index}.jpg` — the vendored route shape.
+    // jellyfin-web requests `{index}.jpg` — the vendored route shape, whose
+    // `.jpg` suffix rides along in the capture.
     let (ok, body) = call(
         app.clone(),
         "GET",
@@ -442,16 +443,22 @@ async fn trickplay_tile_serves_file_then_404() {
     .await;
     assert_eq!(ok, StatusCode::OK);
     assert!(body.starts_with(&[0xff, 0xd8]));
-    std::fs::remove_file(&path).ok();
-
+    let (ok, _) = call(
+        app.clone(),
+        "GET",
+        &format!("/Videos/{ITEM_ID}/Trickplay/320/0"),
+    )
+    .await;
+    assert_eq!(ok, StatusCode::OK);
     // A non-numeric index is a client error, not a crash or a 404.
     let (bad, _) = call(
         app,
         "GET",
-        &format!("/Videos/{ITEM_ID}/Trickplay/320/x.jpg"),
+        &format!("/Videos/{ITEM_ID}/Trickplay/320/zero.jpg"),
     )
     .await;
     assert_eq!(bad, StatusCode::BAD_REQUEST);
+    std::fs::remove_file(&path).ok();
 
     // No tile path resolved → 404.
     let app = state(

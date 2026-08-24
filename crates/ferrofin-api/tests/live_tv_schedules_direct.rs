@@ -19,6 +19,7 @@ use axum::http::{Request, StatusCode, header};
 use ferrofin_api::create_router;
 use ferrofin_api::state::AppState;
 use ferrofin_api::test_support::{authed_fake_state, elevated_fake_state, fake_state};
+use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::dto::BaseItemDto;
 use ferrofin_model::live_tv::{
     ListingsProviderInfo, LiveTvInfo, SeriesTimerInfoDto, TimerInfoDto, TunerHostInfo,
@@ -26,7 +27,7 @@ use ferrofin_model::live_tv::{
 use ferrofin_model::querying::QueryResult;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::options::{DtoOptions, InternalItemsQuery};
-use ferrofin_traits::stubs::LiveTvManager;
+use ferrofin_traits::stubs::{LiveTvChannelQuery, LiveTvManager};
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -95,6 +96,7 @@ impl LiveTvManager for CountriesLiveTv {
     }
     async fn get_channels(
         &self,
+        _query: &LiveTvChannelQuery,
         _options: &DtoOptions,
     ) -> Result<QueryResult<BaseItemDto>, ServiceError> {
         unreachable!()
@@ -102,6 +104,7 @@ impl LiveTvManager for CountriesLiveTv {
     async fn get_channel(
         &self,
         _id: Uuid,
+        _user: Option<&UserEntity>,
         _options: &DtoOptions,
     ) -> Result<Option<BaseItemDto>, ServiceError> {
         unreachable!()
@@ -116,6 +119,7 @@ impl LiveTvManager for CountriesLiveTv {
     async fn get_program(
         &self,
         _id: Uuid,
+        _user: Option<&UserEntity>,
         _options: &DtoOptions,
     ) -> Result<Option<BaseItemDto>, ServiceError> {
         unreachable!()

@@ -270,6 +270,10 @@ async fn get_endpoint_info(
 /// This is `NetworkManager`'s *fallback* subnet set, without the configured
 /// `LocalNetworkSubnets` / excluded-subnet list. See
 /// [`crate::auth::RequireLocalAccessOrAdmin`] for what that costs.
+///
+/// Shared with the HLS master playlist, which (like upstream's
+/// `DynamicHlsHelper.EnableAdaptiveBitrateStreaming`) skips the adaptive
+/// variants for local peers.
 pub(crate) fn is_in_local_network(ip: std::net::IpAddr) -> bool {
     let ip = match ip {
         std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, std::net::IpAddr::V4),

@@ -597,7 +597,7 @@ fn envelope(message_type: &str, data: serde_json::Value) -> String {
     );
     map.insert(
         "MessageId".to_owned(),
-        serde_json::Value::String(Uuid::new_v4().hyphenated().to_string()),
+        serde_json::Value::String(Uuid::new_v4().simple().to_string()),
     );
     map.insert("Data".to_owned(), data);
     serde_json::Value::Object(map).to_string()

@@ -75,10 +75,13 @@ async fn a_frame_many_times_the_read_buffer_is_still_answered() {
         large["MessageType"], "KeepAlive",
         "a frame far larger than the read buffer must be reassembled and answered"
     );
+    // The SDK's `MessageId` is a required `format: uuid` field, so it has to be
+    // present on every outbound message — in Jellyfin's dashless "N" spelling,
+    // which every `Guid` takes through `JsonGuidConverter`.
     assert!(
         large["MessageId"]
             .as_str()
-            .is_some_and(|id| id.contains('-')),
-        "every outbound message carries a hyphenated MessageId"
+            .is_some_and(|id| id.len() == 32 && id.chars().all(|c| c.is_ascii_hexdigit())),
+        "every outbound message carries a dashless MessageId: {large}"
     );
 }

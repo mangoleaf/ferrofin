@@ -655,7 +655,7 @@ impl PeopleRepository for FerrofinPeopleRepository {
         if item_ids.is_empty() {
             return Ok(out);
         }
-        for chunk in item_ids.chunks(500) {
+        for chunk in item_ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
             let mut qb = QueryBuilder::<Sqlite>::new(
                 r#"SELECT m."ItemId", p."Id", p."Name", p."PersonType",
                           NULLIF(m."Role", '') AS "Role"

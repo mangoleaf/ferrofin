@@ -370,8 +370,8 @@ pub const REAL_ROUTES: &[(&str, &str)] = &[
     ("get", "/Channels/{channelId}/Items"),
     ("get", "/Channels/Items/Latest"),
     // Batch 11 — Subtitles + Lyrics + MediaSegments + Trickplay.
-    // Media segments (read); the plugin `SegmentEditor` `/MediaSegmentsApi/*`
-    // routes stay on the 501 stub (dynamic plugin host is deferred).
+    // Media segments (read). The `SegmentEditor` plugin's `/MediaSegmentsApi/*`
+    // write routes are served by the intro-skipper extension (listed below).
     ("get", "/MediaSegments/{itemId}"),
     // Trickplay playlist + tile. The `{index}.jpg` segment normalizes to a bare
     // `{index}` capture (the `.jpg` literal is dropped).
@@ -410,7 +410,6 @@ pub const REAL_ROUTES: &[(&str, &str)] = &[
     ),
     ("get", "/FallbackFont/Fonts"),
     ("get", "/FallbackFont/Fonts/{name}"),
-    // Deferred (stay on the 501 stub): `/MediaSegmentsApi/*` (plugin host).
     // Batch 12 — Devices + ApiKeys + ClientLog.
     ("get", "/Devices"),
     ("delete", "/Devices"),
@@ -549,11 +548,9 @@ pub const REAL_ROUTES: &[(&str, &str)] = &[
     ("post", "/MergeVersions/SplitMovies"),
     ("post", "/MergeVersions/MergeEpisodes"),
     ("post", "/MergeVersions/SplitEpisodes"),
-    // Deferred — third-party PLUGIN routes with no core-Jellyfin controller to
-    // port from (they need the un-ported dynamic plugin host); they stay on the
-    // `501` stub: `GET|POST /Episode/{Id}/Timestamps` (the
-    // `IntroSkipper`/`SkipIntro` plugin) and `/MediaSegmentsApi/*` (the
-    // `SegmentEditor` plugin).
+    // The third-party PLUGIN routes with no core-Jellyfin controller
+    // (`/Episode/{Id}/Timestamps`, `/MediaSegmentsApi/*`) are served by the
+    // compiled-in intro-skipper extension — see `EXTENSION_ROUTES` below.
     // Library structure — the media-folder listing (`LibraryController`).
     ("get", "/Library/MediaFolders"),
     // Batch 1 (this unit) — Library admin / virtual folders. The

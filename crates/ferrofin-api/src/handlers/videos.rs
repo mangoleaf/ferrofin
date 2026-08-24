@@ -210,16 +210,61 @@ async fn get_download(
     let filename = std::path::Path::new(&path)
         .file_name()
         .and_then(|n| n.to_str())
-        .map_or_else(|| "download".to_owned(), |n| n.replace('"', ""));
+        .unwrap_or("download");
     let mut response = serve_static_file(&path, request).await?;
-    if let Ok(value) =
-        header::HeaderValue::from_str(&format!("attachment; filename=\"{filename}\""))
-    {
+    if let Ok(value) = header::HeaderValue::from_str(&attachment_disposition(filename)) {
         response
             .headers_mut()
             .insert(header::CONTENT_DISPOSITION, value);
     }
     Ok(response)
+}
+
+/// The `Content-Disposition` value Jellyfin's `GetDownload` produces:
+/// `attachment; filename=<name>; filename*=UTF-8''<rfc5987>`.
+///
+/// `LibraryController.GetDownload` first strips every `"` from the file name,
+/// then ASP.NET's `ContentDispositionHeaderValue.SetHttpFileName` builds both
+/// forms: `filename=` carries the name with every control / non-ASCII character
+/// replaced by `_`, quoted (with `\` escaped) only when the result is not a
+/// plain HTTP token; `filename*` carries the exact UTF-8 name percent-encoded
+/// per RFC 5987 (only `attr-char` survives unencoded). Both are sent on every
+/// download, so a client with a non-ASCII title still gets the real file name.
+///
+/// One deliberate non-port: ASP.NET sanitizes UTF-16 code units, so an
+/// astral-plane character (an emoji) becomes `__` there and `_` here; the
+/// `filename*` form — the one clients prefer — is byte-identical either way.
+fn attachment_disposition(filename: &str) -> String {
+    let filename = filename.replace('"', "");
+    // ASP.NET `HttpRuleParser` token characters.
+    let is_token = |c: char| c.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~".contains(c);
+    let sanitized: String = filename
+        .chars()
+        .map(|c| {
+            if c.is_ascii() && !c.is_ascii_control() {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let plain = if sanitized.chars().all(is_token) {
+        sanitized
+    } else {
+        format!("\"{}\"", sanitized.replace('\\', "\\\\"))
+    };
+    let mut star = String::with_capacity(filename.len() * 3);
+    for b in filename.bytes() {
+        // RFC 5987 attr-char: ALPHA / DIGIT / "!" / "#" / "$" / "&" / "+" / "-" / "." /
+        // "^" / "_" / "`" / "|" / "~".
+        if b.is_ascii_alphanumeric() || b"!#$&+-.^_`|~".contains(&b) {
+            star.push(char::from(b));
+        } else {
+            use std::fmt::Write as _;
+            let _ = write!(star, "%{b:02X}");
+        }
+    }
+    format!("attachment; filename={plain}; filename*=UTF-8''{star}")
 }
 
 /// Registers this controller's real routes onto `router`.
@@ -243,4 +288,34 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
             delete(delete_alternate_sources),
         )
         .route("/Items/{itemId}/Download", get(get_download))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::attachment_disposition;
+
+    #[test]
+    fn disposition_matches_aspnet_set_http_file_name() {
+        // Spaces and parens: quoted verbatim, percent-encoded in the RFC 5987 form.
+        assert_eq!(
+            attachment_disposition("Movie 0001 (2020).mkv"),
+            "attachment; filename=\"Movie 0001 (2020).mkv\"; \
+             filename*=UTF-8''Movie%200001%20%282020%29.mkv"
+        );
+        // A plain HTTP token (the dot-separated release shape) is NOT quoted.
+        assert_eq!(
+            attachment_disposition("Movie.2020.1080p.mkv"),
+            "attachment; filename=Movie.2020.1080p.mkv; filename*=UTF-8''Movie.2020.1080p.mkv"
+        );
+        // Non-ASCII: `_` in the sanitized form (still a token), exact UTF-8 in the star form.
+        assert_eq!(
+            attachment_disposition("Amélie.mkv"),
+            "attachment; filename=Am_lie.mkv; filename*=UTF-8''Am%C3%A9lie.mkv"
+        );
+        // Quotes are stripped up front (GetDownload); a backslash forces quoting and is escaped.
+        assert_eq!(
+            attachment_disposition("a\"b\\c.mkv"),
+            "attachment; filename=\"ab\\\\c.mkv\"; filename*=UTF-8''ab%5Cc.mkv"
+        );
+    }
 }

@@ -23,7 +23,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use ferrofin_hls::{
-    DynamicHlsPlaylistGenerator, HlsStreamManagerImpl, StreamStatePlanner, TranscodePlan,
+    DynamicHlsPlaylistGenerator, HlsStreamManagerImpl, PlaylistKind, StreamStatePlanner,
+    TranscodePlan,
 };
 use ferrofin_mediaencoding::transcoding::{NoopSessionReporter, TokioSegmentTranscoder};
 use ferrofin_mediaencoding::{
@@ -155,7 +156,13 @@ struct FfmpegPlanner {
 
 impl FfmpegPlanner {
     /// The real HLS args writing `out%d.{ts,mp4}` + `out.m3u8` under `dir`.
-    fn hls_args(&self, playlist: &Path) -> Vec<String> {
+    ///
+    /// `kind` selects the same VOD/EVENT muxer options the production planner
+    /// emits (`-hls_playlist_type`, `-hls_base_url`, and the mpegts-only
+    /// `-flags -global_header`), so the event assertions below are about what a
+    /// real ffmpeg actually writes.
+    fn hls_args(&self, playlist: &Path, kind: PlaylistKind) -> Vec<String> {
+        let event = kind == PlaylistKind::Event;
         let seg_ext = if self.fmp4 { "mp4" } else { "ts" };
         let seg_pattern = self.dir.join(format!("out%d.{seg_ext}"));
         let mut args = vec![
@@ -176,10 +183,16 @@ impl FfmpegPlanner {
             "-hls_list_size".into(),
             "0".into(),
             "-hls_playlist_type".into(),
-            "vod".into(),
+            if event { "event".into() } else { "vod".into() },
             "-hls_segment_filename".into(),
             seg_pattern.to_string_lossy().into_owned(),
         ];
+        if event {
+            args.extend(["-hls_base_url".into(), "hls/out/".into()]);
+            if !self.fmp4 {
+                args.extend(["-flags".into(), "-global_header".into()]);
+            }
+        }
         if self.fmp4 {
             args.extend([
                 "-hls_segment_type".into(),
@@ -200,6 +213,7 @@ impl StreamStatePlanner for FfmpegPlanner {
         _request: &HlsStreamRequest,
         _is_audio: bool,
         segment_id: Option<i32>,
+        kind: PlaylistKind,
     ) -> Result<TranscodePlan, ServiceError> {
         let playlist = self.dir.join("out.m3u8");
         // The wait target for a segment request is that segment's file; a plain
@@ -235,7 +249,7 @@ impl StreamStatePlanner for FfmpegPlanner {
             device_id: Some("dev".to_owned()),
         };
         Ok(TranscodePlan {
-            arguments: self.hls_args(&playlist),
+            arguments: self.hls_args(&playlist, kind),
             state,
             playlist_path: playlist,
             media_path: self.clip.to_string_lossy().into_owned(),
@@ -243,6 +257,8 @@ impl StreamStatePlanner for FfmpegPlanner {
             segment_length_ms: 2000,
             is_remuxing_video: false,
             segment_container: seg_ext.to_owned(),
+            encoding_options: EncodingOptions::default(),
+            min_segments: 3,
         })
     }
 }
@@ -304,8 +320,12 @@ async fn end_to_end_master_variant_and_real_segment() {
 
     // 1. Master playlist points at the single variant, carrying the query.
     let master = mgr.master_playlist(&req, false).await.expect("master");
-    assert!(master.contains("#EXTM3U"), "master: {master}");
-    assert!(master.contains("#EXT-X-VERSION:7"), "master: {master}");
+    assert!(
+        master.starts_with("#EXTM3U\n#EXT-X-STREAM-INF:"),
+        "master: {master}"
+    );
+    // Upstream's master never carries a version tag (only the variant does).
+    assert!(!master.contains("#EXT-X-VERSION"), "master: {master}");
     assert!(
         master.contains("main.m3u8?deviceId=dev"),
         "master: {master}"
@@ -396,4 +416,88 @@ async fn concurrent_init_and_segment_requests_share_one_job() {
         s.matches("ffmpeg version").count().max(1)
     });
     assert_eq!(spawns, 1, "one ffmpeg owns the segment files");
+}
+
+/// `live.m3u8` against a real ffmpeg: the served text is the EVENT playlist
+/// ffmpeg wrote — its own `#EXT-X-TARGETDURATION`, its `hls/out/` segment URIs
+/// (from `-hls_base_url`) — not something Ferrofin generated, and the segment
+/// files those URIs name are on disk. A second request serves the same file
+/// without starting a second transcode.
+#[tokio::test]
+async fn live_playlist_serves_the_event_playlist_ffmpeg_wrote() {
+    if !ffmpeg_gate() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tmp.path().join("transcodes");
+    std::fs::create_dir_all(&cache).unwrap();
+    let clip = tmp.path().join("clip.mp4");
+    make_clip(&clip);
+
+    let mgr = build_manager(&cache, &clip);
+    let text = mgr.live_playlist(&request()).await.expect("live playlist");
+
+    assert!(text.starts_with("#EXTM3U"), "live: {text}");
+    assert!(
+        text.contains("#EXT-X-PLAYLIST-TYPE:EVENT"),
+        "ffmpeg's event playlist: {text}"
+    );
+    // ffmpeg's own target duration for the 2s cuts — never a value Ferrofin
+    // computed (the old implementation regenerated the variant playlist).
+    assert!(
+        text.contains("#EXT-X-TARGETDURATION:2"),
+        "ffmpeg's TARGETDURATION: {text}"
+    );
+    // `-hls_base_url` routed the segment URIs through the `hls/{playlistId}/`
+    // route, and the file each one names exists.
+    assert!(text.contains("hls/out/out0.ts"), "routed URIs: {text}");
+    assert!(cache.join("out0.ts").exists(), "segment 0 on disk");
+    // The playlist is served verbatim: every non-tag line is a routed segment.
+    for line in text
+        .lines()
+        .filter(|l| !l.starts_with('#') && !l.is_empty())
+    {
+        assert!(line.starts_with("hls/out/out"), "unexpected URI {line}");
+    }
+
+    // A second request finds the playlist on disk and serves the same bytes —
+    // no regeneration. (That it also starts no second transcode is asserted by
+    // the unit test `live_playlist_starts_event_job_and_serves_ffmpeg_written_file`,
+    // which counts the fake transcoder's spawns; the log here is truncated by
+    // each spawn, so it cannot carry that evidence.)
+    let again = mgr.live_playlist(&request()).await.expect("live playlist");
+    assert_eq!(again, text, "served verbatim on the second request");
+}
+
+/// The fMP4 event playlist: ffmpeg writes a bare `#EXT-X-MAP:URI="out-1.mp4"`
+/// (it does not apply `-hls_base_url` to the init), and `GetLivePlaylistText`
+/// rewrites exactly that one URI to the `hls/{playlistId}/` route while the
+/// segment URIs (already routed by ffmpeg) are untouched.
+#[tokio::test]
+async fn live_playlist_routes_the_real_fmp4_init_uri() {
+    if !ffmpeg_gate() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tmp.path().join("transcodes");
+    std::fs::create_dir_all(&cache).unwrap();
+    let clip = tmp.path().join("clip.mp4");
+    make_clip(&clip);
+
+    let mgr = build_manager_fmp4(&cache, &clip);
+    let mut req = request();
+    req.segment_container = Some("mp4".to_owned());
+    let text = mgr.live_playlist(&req).await.expect("live playlist");
+
+    assert!(
+        text.contains("#EXT-X-MAP:URI=\"hls/out/out-1.mp4\""),
+        "init URI routed: {text}"
+    );
+    assert!(
+        !text.contains("URI=\"out-1.mp4\""),
+        "the bare init URI must not survive: {text}"
+    );
+    assert!(text.contains("hls/out/out0.mp4"), "routed segments: {text}");
+    assert!(cache.join("out-1.mp4").exists(), "init written");
+    assert!(cache.join("out0.mp4").exists(), "segment 0 written");
 }

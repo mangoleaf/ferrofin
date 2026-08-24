@@ -84,6 +84,11 @@ pub struct TranscodingJobHandle {
     pub job_type: TranscodingJobType,
     /// The id of the device the job is streaming to, if known.
     pub device_id: Option<String>,
+    /// The live stream the job reads, if any (C# `TranscodingJob.LiveStreamId`).
+    ///
+    /// Teardown closes it when no session still needs it, so a client that
+    /// vanishes without a `PlaybackStopped` does not hold a tuner open.
+    pub live_stream_id: Option<String>,
 }
 
 /// A snapshot of a transcode's progress, reported to the session layer.
@@ -402,11 +407,23 @@ fn _assert_object_safe_attachment_extractor(_: &dyn AttachmentExtractor) {}
 /// raw `query_string` is preserved verbatim so the generated playlist's segment
 /// URLs carry the client's parameters forward (the C# `Request.QueryString`).
 #[derive(Debug, Clone, PartialEq)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "faithful field-for-field port of the C# StreamingRequestDto flags"
+)]
 pub struct HlsStreamRequest {
     /// The item being streamed (`itemId`).
     pub item_id: Uuid,
     /// The chosen media source id (`mediaSourceId`), if the client pinned one.
     pub media_source_id: Option<String>,
+    /// The open live stream this transcode reads (`liveStreamId`).
+    ///
+    /// Port of the `LiveStreamId` branch of
+    /// `StreamingHelpers.GetStreamingState`: a Live TV client opens the channel
+    /// first and then asks for a transcode of THAT stream, so the source is the
+    /// buffered copy the tuner is filling — not the tuner URL, which would open
+    /// a second connection to it.
+    pub live_stream_id: Option<String>,
     /// The playback-session id this stream belongs to (`playSessionId`).
     pub play_session_id: Option<String>,
     /// The requesting device id (`deviceId`) — the kill/keep-alive scope.
@@ -455,6 +472,51 @@ pub struct HlsStreamRequest {
     /// it then plays. Without this, a from-segment-0 init pairs with seek-offset
     /// segments and the player maps the media back to t≈0 and stalls on a resume.
     pub start_time_ticks: Option<i64>,
+    /// The requested video profile (`profile`), e.g. `high` — the
+    /// `CODECS` profile byte of a re-encode.
+    pub profile: Option<String>,
+    /// The requested video level (`level`), e.g. `41` — the `CODECS` level of
+    /// a re-encode (clamped by `NormalizeTranscodingLevel`).
+    pub level: Option<String>,
+    /// The requested output framerate (`framerate`); `maxFramerate` wins when
+    /// both are set (`TargetFramerate`).
+    pub framerate: Option<f32>,
+    /// The requested fixed output width (`width`).
+    pub width: Option<i32>,
+    /// The requested fixed output height (`height`).
+    pub height: Option<i32>,
+    /// The minimum segment count a live (`live.m3u8`) playlist waits for before
+    /// it is served (`minSegments`); `None` derives it from the segment length
+    /// (`StreamState.MinSegments`).
+    pub min_segments: Option<i32>,
+    /// The subtitle stream to deliver or burn in (`subtitleStreamIndex`).
+    pub subtitle_stream_index: Option<i32>,
+    /// The negotiated subtitle delivery method name (`subtitleMethod`:
+    /// `Encode`/`Embed`/`External`/`Hls`/`Drop`).
+    pub subtitle_method: Option<String>,
+    /// The client's transcode reasons (`transcodeReasons`), forwarded into the
+    /// master playlist's variant URL when the query lacks it.
+    pub transcode_reasons: Option<String>,
+    /// Whether text subtitle tracks are listed as a `#EXT-X-MEDIA` subtitle group
+    /// in the master playlist (`enableSubtitlesInManifest`). The master route's
+    /// DTO defaults this to `false` (`VideoRequestDto`); the live route defaults
+    /// it to `true`.
+    pub enable_subtitles_in_manifest: bool,
+    /// Whether the master playlist adds two lower-bitrate variants
+    /// (`enableAdaptiveBitrateStreaming`, default `false`). Ignored for
+    /// requests from the local network.
+    pub enable_adaptive_bitrate_streaming: bool,
+    /// Whether the master playlist lists trickplay image playlists
+    /// (`enableTrickplay`, default `true`).
+    pub enable_trickplay: bool,
+    /// The access token of the requesting session, embedded as `ApiKey` in the
+    /// master playlist's subtitle/trickplay URIs (`ClaimsPrincipal.GetToken()`).
+    pub api_key: Option<String>,
+    /// Whether the request came from the local network
+    /// (`INetworkManager.IsInLocalNetwork(remoteIp)`): disables the adaptive
+    /// bitrate variants, which "within the local network will likely do more
+    /// harm than good".
+    pub is_in_local_network: bool,
     /// The raw request query string (including the leading `?`), forwarded into
     /// the generated playlist's segment URLs (`Request.QueryString`).
     pub query_string: String,
@@ -465,6 +527,7 @@ impl Default for HlsStreamRequest {
         Self {
             item_id: Uuid::nil(),
             media_source_id: None,
+            live_stream_id: None,
             play_session_id: None,
             device_id: None,
             segment_container: None,
@@ -483,6 +546,22 @@ impl Default for HlsStreamRequest {
             allow_audio_stream_copy: true,
             is_static: false,
             start_time_ticks: None,
+            profile: None,
+            level: None,
+            framerate: None,
+            width: None,
+            height: None,
+            min_segments: None,
+            subtitle_stream_index: None,
+            subtitle_method: None,
+            transcode_reasons: None,
+            // The master-playlist DTO defaults (`GetMasterHlsVideoPlaylist`):
+            // no subtitle group, no adaptive variants, trickplay listed.
+            enable_subtitles_in_manifest: false,
+            enable_adaptive_bitrate_streaming: false,
+            enable_trickplay: true,
+            api_key: None,
+            is_in_local_network: false,
             query_string: String::new(),
         }
     }

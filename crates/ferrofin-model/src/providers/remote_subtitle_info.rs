@@ -43,6 +43,7 @@ pub struct RemoteSubtitleInfo {
     /// Gets or sets the date created.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<String>, format = "date-time")]
+    #[serde(default, with = "crate::json::datetime::option")]
     pub date_created: Option<DateTime<Utc>>,
 
     /// Gets or sets the community rating.

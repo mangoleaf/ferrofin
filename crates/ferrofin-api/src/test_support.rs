@@ -629,7 +629,7 @@ impl UserViewManager for FakeUserViews {
         &self,
         _query: &ferrofin_traits::options::LatestItemsQuery,
         _options: &DtoOptions,
-    ) -> Result<Vec<(BaseItemEntity, Vec<BaseItemEntity>)>, ServiceError> {
+    ) -> Result<Vec<(Option<BaseItemEntity>, Vec<BaseItemEntity>)>, ServiceError> {
         unimplemented!("fake")
     }
 }
@@ -942,8 +942,10 @@ impl SessionManager for FakeSessions {
 
 /// A fake [`SystemManager`]. The info getters return a default value so the
 /// now-real `/System/Info` and `/System/Info/Public` handlers resolve (the
-/// contract probe expects them to route, not `404`); the lifecycle/storage
-/// methods stay `unimplemented!` (never exercised by these tests).
+/// contract probe expects them to route, not `404`); `restart` accepts the
+/// request (the backup-restore handler schedules a restart, and its test
+/// asserts the on-disk marker instead); shutdown/storage stay `unimplemented!`.
+/// `snapshot_database` keeps the trait default (writes nothing — no database).
 pub struct FakeSystem;
 
 #[async_trait]
@@ -958,7 +960,7 @@ impl SystemManager for FakeSystem {
         Ok(PublicSystemInfo::default())
     }
     async fn restart(&self) -> Result<(), ServiceError> {
-        unimplemented!("fake")
+        Ok(())
     }
     async fn shutdown(&self) -> Result<(), ServiceError> {
         unimplemented!("fake")
@@ -1961,6 +1963,15 @@ impl FakeVirtualFolders {
     #[must_use]
     pub fn working() -> Self {
         Self::default()
+    }
+
+    /// A working fake pre-seeded with `folders` (e.g. to give views a collection type).
+    #[must_use]
+    pub fn seeded(folders: Vec<ferrofin_model::entities_media::VirtualFolderInfo>) -> Self {
+        Self {
+            fail: false,
+            folders: std::sync::Mutex::new(folders),
+        }
     }
 
     /// A fake whose every method fails (to probe error mapping).

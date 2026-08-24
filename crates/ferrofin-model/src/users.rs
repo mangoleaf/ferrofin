@@ -110,6 +110,7 @@ pub struct AccessSchedule {
 
     /// Gets the id of the associated user.
     #[schema(value_type = String, format = "uuid")]
+    #[serde(with = "crate::json::guid")]
     pub user_id: Uuid,
 
     /// Gets or sets the day of week.
@@ -136,6 +137,7 @@ pub struct ForgotPasswordResult {
     /// Gets or sets the pin expiration date.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<String>, format = "date-time")]
+    #[serde(default, with = "crate::json::datetime::option")]
     pub pin_expiration_date: Option<chrono::DateTime<chrono::Utc>>,
 }
 
@@ -257,6 +259,7 @@ pub struct UserPolicy {
 
     /// Gets or sets the enabled channels.
     #[schema(value_type = Vec<String>, format = "uuid")]
+    #[serde(with = "crate::json::guid::vec")]
     pub enabled_channels: Vec<Uuid>,
 
     /// Gets or sets a value indicating whether all channels are enabled.
@@ -264,6 +267,7 @@ pub struct UserPolicy {
 
     /// Gets or sets the enabled folders.
     #[schema(value_type = Vec<String>, format = "uuid")]
+    #[serde(with = "crate::json::guid::vec")]
     pub enabled_folders: Vec<Uuid>,
 
     /// Gets or sets a value indicating whether all folders are enabled.
@@ -284,11 +288,13 @@ pub struct UserPolicy {
     /// Gets or sets the blocked media folders.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<Vec<String>>, format = "uuid")]
+    #[serde(default, with = "crate::json::guid::option_vec")]
     pub blocked_media_folders: Option<Vec<Uuid>>,
 
     /// Gets or sets the blocked channels.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<Vec<String>>, format = "uuid")]
+    #[serde(default, with = "crate::json::guid::option_vec")]
     pub blocked_channels: Option<Vec<Uuid>>,
 
     /// Gets or sets the remote client bitrate limit.

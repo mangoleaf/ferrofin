@@ -17,6 +17,7 @@ pub struct InstallationInfo {
     /// Gets or sets the id.
     #[serde(rename = "Guid")]
     #[schema(value_type = String, format = "uuid")]
+    #[serde(with = "crate::json::guid")]
     pub id: Uuid,
 
     /// Gets or sets the name.
@@ -118,6 +119,7 @@ pub struct PackageInfo {
     /// Gets or sets the guid of the assembly associated with this plugin.
     #[serde(rename = "guid")]
     #[schema(value_type = String, format = "uuid")]
+    #[serde(with = "crate::json::guid")]
     pub id: Uuid,
 
     /// Gets or sets the versions.
@@ -169,7 +171,7 @@ mod tests {
         };
         let json = serde_json::to_value(&value).unwrap();
         // The id field serializes under the "Guid" key upstream.
-        assert_eq!(json["Guid"], Uuid::from_u128(1).to_string());
+        assert_eq!(json["Guid"], Uuid::from_u128(1).simple().to_string());
         assert_eq!(json["Name"], "MyPlugin");
         assert_eq!(json["Version"], "1.2.3");
         let back: InstallationInfo = serde_json::from_value(json).unwrap();
@@ -220,7 +222,7 @@ mod tests {
         };
         let json = serde_json::to_value(&value).unwrap();
         assert_eq!(json["name"], "Plugin");
-        assert_eq!(json["guid"], Uuid::from_u128(42).to_string());
+        assert_eq!(json["guid"], Uuid::from_u128(42).simple().to_string());
         assert_eq!(json["imageUrl"], "https://img");
         let back: PackageInfo = serde_json::from_value(json).unwrap();
         assert_eq!(value, back);

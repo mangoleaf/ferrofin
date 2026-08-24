@@ -21,7 +21,8 @@
 //! richer per-instance behavior (which depends on runtime fields, not just the
 //! kind) is not part of this seam.
 
-use ferrofin_model::data::BaseItemKind;
+use ferrofin_model::data::{BaseItemKind, CollectionType};
+use ferrofin_model::entities::CollectionTypeOptions;
 
 /// Whether items of this kind are folders (C# `BaseItem.IsFolder`, overridden to
 /// `true` by every `Folder` subclass).
@@ -252,14 +253,96 @@ pub fn supports_similarity(kind: BaseItemKind) -> bool {
     kind != BaseItemKind::Episode && !(is_item_by_name(kind) && kind != BaseItemKind::MusicArtist)
 }
 
+/// The container a "latest media" row groups under — C#
+/// `BaseItem.LatestItemsIndexContainer`, which only three subclasses override:
+/// `Episode.LatestItemsIndexContainer => Series`,
+/// `Audio.LatestItemsIndexContainer => AlbumEntity` (the nearest `MusicAlbum`
+/// ancestor) and `Photo.LatestItemsIndexContainer => AlbumEntity` (the nearest
+/// `PhotoAlbum` ancestor). Every other kind — including `MusicVideo`, `Movie`
+/// and `Book` — inherits the `null` default and is listed on its own.
+///
+/// This names the *kind* of the container; resolving the actual row is the
+/// caller's job (an episode's `SeriesId`, a track's/photo's parent chain).
+#[must_use]
+pub fn latest_items_index_container_kind(kind: BaseItemKind) -> Option<BaseItemKind> {
+    match kind {
+        BaseItemKind::Episode => Some(BaseItemKind::Series),
+        BaseItemKind::Audio => Some(BaseItemKind::MusicAlbum),
+        BaseItemKind::Photo => Some(BaseItemKind::PhotoAlbum),
+        _ => None,
+    }
+}
+
+/// Maps a library's configured [`CollectionTypeOptions`] to the
+/// [`CollectionType`] its `CollectionFolder` reports (C#
+/// `CollectionFolder.CollectionType`, parsed from the `<type>.collection`
+/// marker). `mixed` has no single type and maps to `None` — exactly what
+/// Jellyfin does for a mixed-content library.
+///
+/// The API crate carries the same table (`handlers::user_views::
+/// map_collection_type`) because handlers may not import `ferrofin-core`; the
+/// one home that would serve both is `ferrofin-model`, which this crate does
+/// not own. Keep the two in step (both are pinned by an exhaustive test).
+#[must_use]
+pub fn collection_type_of(options: CollectionTypeOptions) -> Option<CollectionType> {
+    Some(match options {
+        CollectionTypeOptions::movies => CollectionType::movies,
+        CollectionTypeOptions::tvshows => CollectionType::tvshows,
+        CollectionTypeOptions::music => CollectionType::music,
+        CollectionTypeOptions::musicvideos => CollectionType::musicvideos,
+        CollectionTypeOptions::homevideos => CollectionType::homevideos,
+        CollectionTypeOptions::boxsets => CollectionType::boxsets,
+        CollectionTypeOptions::books => CollectionType::books,
+        CollectionTypeOptions::mixed => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        is_displayed_as_folder, is_folder, is_item_by_name, is_video, supports_ancestors,
-        supports_inherited_parent_images, supports_people, supports_played_status,
-        supports_similarity, supports_theme_media,
+        collection_type_of, is_displayed_as_folder, is_folder, is_item_by_name, is_video,
+        latest_items_index_container_kind, supports_ancestors, supports_inherited_parent_images,
+        supports_people, supports_played_status, supports_similarity, supports_theme_media,
     };
-    use ferrofin_model::data::BaseItemKind;
+    use ferrofin_model::data::{BaseItemKind, CollectionType};
+    use ferrofin_model::entities::CollectionTypeOptions;
+    use rstest::rstest;
+
+    /// The `LatestItemsIndexContainer` override table: only `Episode`, `Audio`
+    /// and `Photo` group; `MusicVideo` in particular does NOT (it inherits the
+    /// `Video` default) — the old handler grouped it under its parent.
+    #[rstest]
+    #[case(BaseItemKind::Episode, Some(BaseItemKind::Series))]
+    #[case(BaseItemKind::Audio, Some(BaseItemKind::MusicAlbum))]
+    #[case(BaseItemKind::Photo, Some(BaseItemKind::PhotoAlbum))]
+    #[case(BaseItemKind::MusicVideo, None)]
+    #[case(BaseItemKind::Movie, None)]
+    #[case(BaseItemKind::Book, None)]
+    #[case(BaseItemKind::Video, None)]
+    #[case(BaseItemKind::Series, None)]
+    #[case(BaseItemKind::MusicAlbum, None)]
+    fn latest_index_container_follows_the_csharp_overrides(
+        #[case] kind: BaseItemKind,
+        #[case] expected: Option<BaseItemKind>,
+    ) {
+        assert_eq!(latest_items_index_container_kind(kind), expected);
+    }
+
+    #[rstest]
+    #[case(CollectionTypeOptions::movies, Some(CollectionType::movies))]
+    #[case(CollectionTypeOptions::tvshows, Some(CollectionType::tvshows))]
+    #[case(CollectionTypeOptions::music, Some(CollectionType::music))]
+    #[case(CollectionTypeOptions::musicvideos, Some(CollectionType::musicvideos))]
+    #[case(CollectionTypeOptions::homevideos, Some(CollectionType::homevideos))]
+    #[case(CollectionTypeOptions::boxsets, Some(CollectionType::boxsets))]
+    #[case(CollectionTypeOptions::books, Some(CollectionType::books))]
+    #[case(CollectionTypeOptions::mixed, None)]
+    fn collection_type_maps_library_options_to_the_folder_type(
+        #[case] options: CollectionTypeOptions,
+        #[case] expected: Option<CollectionType>,
+    ) {
+        assert_eq!(collection_type_of(options), expected);
+    }
 
     // The controller guard: `item is Episode || (item is IItemByName &&
     // item is not MusicArtist)` short-circuits; everything else proceeds.

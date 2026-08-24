@@ -52,6 +52,9 @@ const SYSTEM_DATA_DIR: &str = "/var/lib/ferrofin";
 /// The file stem of the SQLite database inside the data directory.
 const DATABASE_FILE_NAME: &str = "ferrofin.db";
 
+/// ASP.NET's `HostOptions.ShutdownTimeout` default, which Jellyfin runs with.
+const DEFAULT_SHUTDOWN_TIMEOUT_SECS: u32 = 30;
+
 /// Command-line arguments — the highest-precedence configuration layer.
 ///
 /// Only the knobs a operator commonly overrides on the command line are
@@ -122,6 +125,7 @@ struct FileConfig {
     enable_metrics: Option<bool>,
     disable_extensions: Option<bool>,
     metrics_sample_interval: Option<u32>,
+    shutdown_timeout_secs: Option<u32>,
     scan_progress_every: Option<u32>,
     scan_probe_concurrency: Option<u32>,
     wasm_call_timeout_secs: Option<u32>,
@@ -288,6 +292,15 @@ pub struct Config {
     /// out of the API `ServerConfiguration` so `/System/Configuration` stays
     /// byte-identical to Jellyfin.
     pub metrics_sample_interval: Option<u32>,
+
+    /// How long a graceful shutdown/restart waits for in-flight requests before
+    /// the remaining connections are aborted, in seconds. Default 30 — ASP.NET's
+    /// `HostOptions.ShutdownTimeout`, which Jellyfin runs with. Without a bound a
+    /// client mid-stream would keep a draining host alive indefinitely, so an
+    /// in-process restart during playback would never come back. Resolved
+    /// `FERROFIN_SHUTDOWN_TIMEOUT_SECS` env > `shutdown_timeout_secs` in
+    /// `config.toml` > 30.
+    pub shutdown_timeout_secs: u32,
 
     /// Library-scan progress cadence: emit a progress `info!` every N items.
     /// `None` = the 100-item default; `0` disables progress logs. Resolved in
@@ -567,6 +580,9 @@ impl Config {
                 .or(file.disable_extensions)
                 .unwrap_or(false),
             metrics_sample_interval: resolve_metrics_interval(env, file.metrics_sample_interval),
+            shutdown_timeout_secs: parse_var(env, "FERROFIN_SHUTDOWN_TIMEOUT_SECS")
+                .or(file.shutdown_timeout_secs)
+                .unwrap_or(DEFAULT_SHUTDOWN_TIMEOUT_SECS),
             scan_progress_every: parse_var(env, "FERROFIN_SCAN_PROGRESS_EVERY")
                 .or(file.scan_progress_every),
             scan_probe_concurrency: parse_var(env, "FERROFIN_SCAN_PROBE_CONCURRENCY")
@@ -670,6 +686,7 @@ impl Config {
             enable_metrics: None,
             disable_extensions: false,
             metrics_sample_interval: None,
+            shutdown_timeout_secs: DEFAULT_SHUTDOWN_TIMEOUT_SECS,
             scan_progress_every: None,
             scan_probe_concurrency: None,
             wasm_call_timeout_secs: None,

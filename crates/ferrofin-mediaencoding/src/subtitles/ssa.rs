@@ -4,10 +4,11 @@
 //! Hand-port of `Nikse.SubtitleEdit.Core.SubtitleFormats.SubStationAlpha` and
 //! `AdvancedSubStationAlpha` (`libse` has no Rust equivalent), reduced to the
 //! `[Events]`/`Dialogue:` load path the Jellyfin `SubtitleEditParser` drives and
-//! the minimal writers the `SubtitleEncoder` needs.
+//! the writers, which are ports of Jellyfin's own `SsaWriter`/`AssWriter` (the
+//! `SubtitleEncoder` never uses libse's `ToText`).
 
 use super::model::{Paragraph, Subtitle, TimeCode};
-use super::srt::NEWLINE;
+use super::srt::{BOM, NEWLINE};
 
 /// Parses SSA/ASS `lines` into `subtitle`, returning the number of errors.
 ///
@@ -131,61 +132,58 @@ pub fn is_ssa_like(lines: &[String]) -> bool {
         .any(|l| l.trim().to_ascii_lowercase().starts_with("dialogue:"))
 }
 
-/// Formats an SSA/ASS `H:MM:SS.cc` timecode (centisecond precision).
+/// Encodes cue text for a `Dialogue:` line: the writers replace every `\n` with
+/// the literal two characters `\n` (`NewLineRegex().Replace(text, "\\n")`).
+fn encode_text(text: &str) -> String {
+    text.replace('\n', "\\n")
+}
+
+/// The header `SsaWriter.Write` emits before the events.
+const SSA_HEADER: &str = "[Script Info]\nTitle: Jellyfin transcoded SSA subtitle\nScriptType: v4.00\n\n[V4 Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, TertiaryColour, BackColour, Bold, Italic, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, AlphaLevel, Encoding\nStyle: Default,Arial,20,&H00FFFFFF,&H00FFFFFF,&H19333333,&H19333333,0,0,0,1,0,2,10,10,10,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Text\n";
+
+/// The header `AssWriter.Write` emits before the events.
+const ASS_HEADER: &str = "[Script Info]\nTitle: Jellyfin transcoded ASS subtitle\nScriptType: v4.00+\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Arial,20,&H00FFFFFF,&H00FFFFFF,&H19333333,&H910E0807,0,0,0,0,100,100,0,0,0,1,0,2,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Text\n";
+
+/// `TimeSpan.ToString(@"hh\:mm\:ss\.ff")`: two-digit hours (the 0–23 hour
+/// component), minutes, seconds and truncated hundredths.
 fn format_timecode(tc: TimeCode) -> String {
     let total = tc.total_milliseconds().max(0);
     let centis = (total % 1000) / 10;
     let seconds = (total / 1000) % 60;
     let minutes = (total / 60_000) % 60;
-    let hours = total / 3_600_000;
-    format!("{hours}:{minutes:02}:{seconds:02}.{centis:02}")
+    let hours = (total / 3_600_000) % 24;
+    format!("{hours:02}:{minutes:02}:{seconds:02}.{centis:02}")
 }
 
-/// Encodes cue text for an SSA/ASS `Dialogue:` line (line breaks → `\N`).
-fn encode_text(text: &str) -> String {
-    text.replace('\n', "\\N").replace('\r', "")
+/// Writes the BOM, the header and the events the way both upstream writers do:
+/// `Dialogue: 0,{start},{end},Default,{text}` per line, each terminated by
+/// `StreamWriter.WriteLine`'s `\n`.
+fn write_events(header: &str, subtitle: &Subtitle) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::from(BOM);
+    out.push_str(header);
+    for p in &subtitle.paragraphs {
+        // Writing into a String cannot fail.
+        let _ = writeln!(
+            out,
+            "Dialogue: 0,{},{},Default,{}",
+            format_timecode(p.start_time),
+            format_timecode(p.end_time),
+            encode_text(&p.text)
+        );
+    }
+    out
 }
 
-/// The SSA (v4) file header written before the `[Events]` section.
-const SSA_HEADER: &str = "[Script Info]\r\nScriptType: v4.00\r\nCollisions: Normal\r\n\r\n[V4 Styles]\r\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, TertiaryColour, BackColour, Bold, Italic, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, AlphaLevel, Encoding\r\nStyle: Default,Arial,20,65535,65535,65535,-2147483640,-1,0,1,3,0,2,10,10,10,0,0\r\n\r\n[Events]\r\nFormat: Marked, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\r\n";
-
-/// The ASS (v4+) file header written before the `[Events]` section.
-const ASS_HEADER: &str = "[Script Info]\r\nScriptType: v4.00+\r\nCollisions: Normal\r\n\r\n[V4+ Styles]\r\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\r\nStyle: Default,Arial,20,&H00FFFFFF,&H0300FFFF,&H00000000,&H02000000,-1,0,0,0,100,100,0,0,1,2,2,2,10,10,10,1\r\n\r\n[Events]\r\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\r\n";
-
-/// Serializes `subtitle` to SSA (v4) text.
-///
-/// Port of `SubStationAlpha.ToText`, using the `Marked=0` dialogue prefix.
+/// Serializes `subtitle` to SSA (v4) text. Port of Jellyfin's `SsaWriter`.
 #[must_use]
 pub fn to_text_ssa(subtitle: &Subtitle) -> String {
-    let mut out = String::from(SSA_HEADER);
-    for p in &subtitle.paragraphs {
-        let line = format!(
-            "Dialogue: Marked=0,{},{},Default,,0000,0000,0000,,{}",
-            format_timecode(p.start_time),
-            format_timecode(p.end_time),
-            encode_text(&p.text)
-        );
-        out.push_str(&line);
-        out.push_str("\r\n");
-    }
-    out
+    write_events(SSA_HEADER, subtitle)
 }
 
-/// Serializes `subtitle` to Advanced SubStation Alpha (v4+) text.
-///
-/// Port of `AdvancedSubStationAlpha.ToText`, using the `Layer` dialogue prefix.
+/// Serializes `subtitle` to Advanced SubStation Alpha (v4+) text. Port of
+/// Jellyfin's `AssWriter`.
 #[must_use]
 pub fn to_text_ass(subtitle: &Subtitle) -> String {
-    let mut out = String::from(ASS_HEADER);
-    for p in &subtitle.paragraphs {
-        let line = format!(
-            "Dialogue: 0,{},{},Default,,0000,0000,0000,,{}",
-            format_timecode(p.start_time),
-            format_timecode(p.end_time),
-            encode_text(&p.text)
-        );
-        out.push_str(&line);
-        out.push_str("\r\n");
-    }
-    out
+    write_events(ASS_HEADER, subtitle)
 }

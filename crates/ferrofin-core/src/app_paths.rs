@@ -52,6 +52,9 @@ pub struct FerrofinServerApplicationPaths {
     default_internal_metadata_path: PathBuf,
     /// Mutable: rewritten when `Configuration.MetadataPath` changes.
     internal_metadata_path: RwLock<PathBuf>,
+    /// The database file the server opened (`{program-data}/ferrofin.db`
+    /// unless the composition root adopted a Jellyfin database elsewhere).
+    database_path: RwLock<PathBuf>,
 }
 
 impl std::fmt::Debug for FerrofinServerApplicationPaths {
@@ -91,6 +94,7 @@ impl FerrofinServerApplicationPaths {
         let default_internal_metadata_path = program_data_path.join("metadata");
         Self {
             internal_metadata_path: RwLock::new(default_internal_metadata_path.clone()),
+            database_path: RwLock::new(program_data_path.join("ferrofin.db")),
             default_internal_metadata_path,
             default_user_views_path,
             root_folder_path,
@@ -122,6 +126,13 @@ impl FerrofinServerApplicationPaths {
         };
         if let Ok(mut guard) = self.internal_metadata_path.write() {
             *guard = resolved;
+        }
+    }
+
+    /// Records the database file the server actually opened.
+    pub fn set_database_path(&self, path: impl Into<PathBuf>) {
+        if let Ok(mut guard) = self.database_path.write() {
+            *guard = path.into();
         }
     }
 
@@ -218,6 +229,17 @@ impl ServerApplicationPaths for FerrofinServerApplicationPaths {
 
     fn user_configuration_directory_path(&self) -> String {
         path_string(&self.configuration_directory_path.join("users"))
+    }
+
+    fn configuration_directory_path(&self) -> String {
+        path_string(&self.configuration_directory_path)
+    }
+
+    fn database_path(&self) -> String {
+        self.database_path.read().map_or_else(
+            |_| path_string(&self.program_data_path.join("ferrofin.db")),
+            |g| path_string(&g),
+        )
     }
 
     fn internal_metadata_path(&self) -> String {

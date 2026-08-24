@@ -20,6 +20,7 @@ pub struct NameGuidPair {
     /// nil so those bodies deserialize (serialization still always emits it).
     #[serde(default)]
     #[schema(value_type = String, format = "uuid")]
+    #[serde(with = "crate::json::guid")]
     pub id: Uuid,
 }
 
@@ -72,7 +73,7 @@ mod tests {
         };
         let json = serde_json::to_value(&value).unwrap();
         assert_eq!(json["Name"], "Genre");
-        assert_eq!(json["Id"], value.id.to_string());
+        assert_eq!(json["Id"], value.id.simple().to_string());
         let back: NameGuidPair = serde_json::from_value(json).unwrap();
         assert_eq!(value, back);
     }

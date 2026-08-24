@@ -62,6 +62,35 @@ impl MediaAttachmentRepository for FerrofinMediaAttachmentRepository {
         query.fetch_all(self.db.pool()).await.map_err(db_err)
     }
 
+    async fn get_media_attachments_batch(
+        &self,
+        item_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, Vec<AttachmentStreamInfoEntity>>, ServiceError>
+    {
+        let mut map: std::collections::HashMap<Uuid, Vec<AttachmentStreamInfoEntity>> =
+            std::collections::HashMap::new();
+        for chunk in item_ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+            let ph = (1..=chunk.len())
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                r#"SELECT * FROM "AttachmentStreamInfos" WHERE "ItemId" IN ({ph})
+                   ORDER BY "ItemId", "Index""#,
+            );
+            let mut query = sqlx::query_as::<_, AttachmentStreamInfoEntity>(&sql);
+            for id in chunk {
+                query = query.bind(guid_to_db(*id));
+            }
+            for row in query.fetch_all(self.db.pool()).await.map_err(db_err)? {
+                if let Ok(id) = Uuid::parse_str(&row.item_id) {
+                    map.entry(id).or_default().push(row);
+                }
+            }
+        }
+        Ok(map)
+    }
+
     async fn save_media_attachments(
         &self,
         item_id: Uuid,
@@ -156,5 +185,39 @@ mod tests {
             .await
             .expect("all");
         assert!(all.is_empty());
+    }
+
+    #[tokio::test]
+    async fn batch_read_groups_rows_per_item_in_index_order_and_omits_bare_items() {
+        let db = test_db().await;
+        let (a, b, bare) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        for id in [a, b, bare] {
+            seed_item(&db, id, BaseItemKind::Movie).await;
+        }
+        let repo = FerrofinMediaAttachmentRepository::new(db);
+        repo.save_media_attachments(a, &[attachment(5, "ttf"), attachment(2, "otf")])
+            .await
+            .expect("save a");
+        repo.save_media_attachments(b, &[attachment(0, "png")])
+            .await
+            .expect("save b");
+
+        let map = repo
+            .get_media_attachments_batch(&[a, b, bare])
+            .await
+            .expect("batch");
+        assert_eq!(map.len(), 2, "an item with no rows is absent");
+        assert_eq!(
+            map[&a].iter().map(|r| r.index).collect::<Vec<_>>(),
+            [2, 5],
+            "per-item Index order"
+        );
+        assert_eq!(map[&b][0].codec.as_deref(), Some("png"));
+        assert!(
+            repo.get_media_attachments_batch(&[])
+                .await
+                .expect("empty")
+                .is_empty()
+        );
     }
 }

@@ -18,5 +18,6 @@ pub struct PlaylistDto {
 
     /// Gets or sets the item ids.
     #[schema(value_type = Vec<String>, format = "uuid")]
+    #[serde(with = "crate::json::guid::vec")]
     pub item_ids: Vec<Uuid>,
 }

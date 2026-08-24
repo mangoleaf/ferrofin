@@ -2,9 +2,11 @@
 //!
 //! This module is the ONLY place that knows about `ferrofin-metrics`: nothing in
 //! `ferrofin-api`/`ferrofin-core` changes. [`mount`] adds the `/metrics` route + the
-//! HTTP tracking layer; [`spawn_sampler`] registers the async-sourced gauges and
-//! drives their background mirror updates. Both run only when
-//! `EnableMetrics` is set (the endpoint is 404 and no sampler exists otherwise).
+//! HTTP tracking layer; [`register_gauges`] registers the async-sourced gauges
+//! (once per process — OTel instruments are process-global) and
+//! [`spawn_sampler`] drives their background mirror updates for one server
+//! lifetime. All run only when `EnableMetrics` is set (the endpoint is 404 and
+//! no sampler exists otherwise).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -38,61 +40,95 @@ pub fn mount(router: Router, metrics: &MetricsHandle) -> Router {
         .layer(axum::middleware::from_fn(ferrofin_metrics::track_http))
 }
 
-/// Registers the async-/DB-sourced gauges and spawns the background sampler that
-/// writes their mirror cells/maps every `interval_seconds` (≤0 → the 15 s
-/// default). The sampler swallows and logs its own errors — a metrics failure
-/// never disrupts the server.
+/// The sampler-fed gauges' mirror cells/maps. Registered ONCE per process by
+/// [`register_gauges`]: an OTel observable instrument is process-global, so an
+/// in-process restart re-spawns the sampler over the same cells rather than
+/// registering duplicates.
+#[derive(Clone)]
+pub struct SamplerGauges {
+    sessions_active: ferrofin_metrics::GaugeCell,
+    streams_active: ferrofin_metrics::GaugeCell,
+    streams_by_method: ferrofin_metrics::GaugeMap,
+    transcode_active: ferrofin_metrics::GaugeCell,
+    pool_connections: ferrofin_metrics::GaugeMap,
+    pool_idle: ferrofin_metrics::GaugeMap,
+    library_items: ferrofin_metrics::GaugeMap,
+    uptime: ferrofin_metrics::GaugeCell,
+}
+
+/// Registers the async-/DB-sourced gauges on `metrics` and returns their mirrors.
+#[must_use]
+pub fn register_gauges(metrics: &MetricsHandle) -> SamplerGauges {
+    SamplerGauges {
+        sessions_active: metrics.gauge_cell(
+            "ferrofin_sessions_active",
+            "Number of active client sessions.",
+            vec![],
+        ),
+        streams_active: metrics.gauge_cell(
+            "ferrofin_playback_streams_active",
+            "Number of sessions currently playing an item.",
+            vec![],
+        ),
+        streams_by_method: metrics.gauge_map(
+            "ferrofin_playback_streams",
+            "Active playback streams by play method.",
+            "method",
+        ),
+        transcode_active: metrics.gauge_cell(
+            "ferrofin_transcode_jobs_active",
+            "Number of sessions with an active transcode.",
+            vec![],
+        ),
+        pool_connections: metrics.gauge_map(
+            "ferrofin_db_pool_connections",
+            "Total connections in each database pool.",
+            "pool",
+        ),
+        pool_idle: metrics.gauge_map(
+            "ferrofin_db_pool_idle_connections",
+            "Idle connections in each database pool.",
+            "pool",
+        ),
+        library_items: metrics.gauge_map(
+            "ferrofin_library_items",
+            "Library item count by item type.",
+            "type",
+        ),
+        uptime: metrics.gauge_cell(
+            "ferrofin_uptime_seconds",
+            "Seconds since the metrics sampler started.",
+            vec![],
+        ),
+    }
+}
+
+/// Spawns the background sampler that writes the gauges' mirror cells/maps every
+/// `interval_seconds` (≤0 → the 15 s default) from THIS server lifetime's session
+/// manager and database. The sampler swallows and logs its own errors — a metrics
+/// failure never disrupts the server. The returned handle lets the composition
+/// root abort it when the server drains (an in-process restart spawns a fresh one).
 pub fn spawn_sampler(
-    metrics: &MetricsHandle,
+    gauges: SamplerGauges,
     sessions: Arc<dyn SessionManager>,
     db: Database,
     interval_seconds: u32,
-) {
+) -> tokio::task::JoinHandle<()> {
     let sample_interval = if interval_seconds > 0 {
         std::time::Duration::from_secs(u64::from(interval_seconds))
     } else {
         DEFAULT_SAMPLE_INTERVAL
     };
-    let sessions_active = metrics.gauge_cell(
-        "ferrofin_sessions_active",
-        "Number of active client sessions.",
-        vec![],
-    );
-    let streams_active = metrics.gauge_cell(
-        "ferrofin_playback_streams_active",
-        "Number of sessions currently playing an item.",
-        vec![],
-    );
-    let streams_by_method = metrics.gauge_map(
-        "ferrofin_playback_streams",
-        "Active playback streams by play method.",
-        "method",
-    );
-    let transcode_active = metrics.gauge_cell(
-        "ferrofin_transcode_jobs_active",
-        "Number of sessions with an active transcode.",
-        vec![],
-    );
-    let pool_connections = metrics.gauge_map(
-        "ferrofin_db_pool_connections",
-        "Total connections in each database pool.",
-        "pool",
-    );
-    let pool_idle = metrics.gauge_map(
-        "ferrofin_db_pool_idle_connections",
-        "Idle connections in each database pool.",
-        "pool",
-    );
-    let library_items = metrics.gauge_map(
-        "ferrofin_library_items",
-        "Library item count by item type.",
-        "type",
-    );
-    let uptime = metrics.gauge_cell(
-        "ferrofin_uptime_seconds",
-        "Seconds since the metrics sampler started.",
-        vec![],
-    );
+    let SamplerGauges {
+        sessions_active,
+        streams_active,
+        streams_by_method,
+        transcode_active,
+        pool_connections,
+        pool_idle,
+        library_items,
+        uptime,
+    } = gauges;
 
     let started = Instant::now();
     tokio::spawn(async move {
@@ -145,7 +181,7 @@ pub fn spawn_sampler(
                 }
             }
         }
-    });
+    })
 }
 
 /// Idle-connection count for one pool as an `i64` (sqlx reports `usize`).

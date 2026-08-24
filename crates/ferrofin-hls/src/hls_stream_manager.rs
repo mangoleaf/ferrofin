@@ -38,18 +38,23 @@ use async_trait::async_trait;
 use ferrofin_mediaencoding::keyed_locks::KeyedLocks;
 use ferrofin_mediaencoding::transcoding::manager::StartFfMpegRequest;
 use ferrofin_mediaencoding::transcoding::segment_transcoder::SegmentTranscoder;
-use ferrofin_mediaencoding::transcoding::{FsFileCleaner, SessionReporter};
+use ferrofin_mediaencoding::transcoding::{
+    FsFileCleaner, SessionReporter, WAIT_FOR_FILE_TIMEOUT_MS,
+};
 use ferrofin_mediaencoding::{EncodingJobInfo, TranscodeManagerImpl};
+use ferrofin_model::configuration::EncodingOptions;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::media_encoding::{
     HlsStreamManager, HlsStreamRequest, ServedFile, TranscodingJobType,
 };
 use ferrofin_traits::system::ServerApplicationPaths;
+use ferrofin_traits::trickplay::TrickplayManager;
 
 use crate::create_main_playlist_request::CreateMainPlaylistRequest;
 use crate::dynamic_hls_playlist_generator::{
     DynamicHlsPlaylistGenerator, EncodingOptionsProvider, TICKS_PER_MILLISECOND,
 };
+use crate::master_playlist::{MasterPlaylistContext, TrickplayResolution, build_master_playlist};
 
 /// A concrete transcode plan for one request: everything the runtime needs that
 /// [`HlsStreamRequest`] alone does not carry.
@@ -79,6 +84,30 @@ pub struct TranscodePlan {
     pub is_remuxing_video: bool,
     /// The resolved segment container (e.g. `"ts"`).
     pub segment_container: String,
+    /// A snapshot of the server's encoding options at plan time — the master
+    /// playlist reads `AllowHevcEncoding`/`AllowAv1Encoding` for its SDR
+    /// compatibility variants (`GetMasterPlaylistInternal`'s
+    /// `_serverConfigurationManager.GetEncodingOptions()`).
+    pub encoding_options: EncodingOptions,
+    /// The minimum segment count a live (`live.m3u8`) request waits for before
+    /// serving the playlist ffmpeg wrote. Port of `StreamState.MinSegments`:
+    /// the request's `MinSegments`, else 2 for segments of ten seconds or
+    /// longer, else 3.
+    pub min_segments: i32,
+}
+
+/// Which playlist shape the transcode's HLS muxer writes — the
+/// `isEventPlaylist` flag of `DynamicHlsController.GetCommandLineArguments`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaylistKind {
+    /// `-hls_playlist_type vod`: the segment routes' on-demand job
+    /// (`GetDynamicSegment`), whose playlist Ferrofin generates itself.
+    Vod,
+    /// `-hls_playlist_type event` + `-hls_base_url "hls/{stem}/"` (+ the
+    /// `superfast` preset and `-flags -global_header` for mpegts): the
+    /// `live.m3u8` job (`GetLiveHlsStream`), whose playlist ffmpeg writes and
+    /// the server serves verbatim.
+    Event,
 }
 
 /// Resolves an [`HlsStreamRequest`] into a concrete [`TranscodePlan`].
@@ -93,18 +122,38 @@ pub trait StreamStatePlanner: Send + Sync {
     /// Builds the transcode plan for `request`. `is_audio` selects the audio
     /// stream shape; `segment_id` is the first segment ffmpeg should emit (the
     /// `StartTimeTicks` seek target for a mid-stream segment request), or `None`
-    /// for a playlist request that only needs the media path + runtime.
+    /// for a playlist request that only needs the media path + runtime;
+    /// `kind` selects the VOD or event muxer arguments.
     async fn plan(
         &self,
         request: &HlsStreamRequest,
         is_audio: bool,
         segment_id: Option<i32>,
+        kind: PlaylistKind,
     ) -> Result<TranscodePlan, ServiceError>;
 }
 
+/// How long [`HlsStreamManagerImpl::wait_for_minimum_segment_count`] pauses
+/// between re-reads of the playlist once the next segment file has landed —
+/// ffmpeg rewrites the `.m3u8` just after the segment, so the first re-read
+/// can still miss it. Port of `HlsHelpers.WaitForMinimumSegmentCount`'s
+/// `Task.Delay(100)`.
+const MIN_SEGMENT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// How long [`HlsStreamManagerImpl::wait_for_minimum_segment_count`] waits in
+/// total before serving whatever the playlist holds.
+///
+/// Upstream's loop has no wall clock — it ends only when the job's
+/// `CancellationToken` fires. A live ffmpeg that stalls without exiting (a hung
+/// network read) would otherwise hold the request open forever, so the wait is
+/// bounded by the same budget `TranscodeManagerImpl::start_ffmpeg` gives the
+/// first output file ([`WAIT_FOR_FILE_TIMEOUT_MS`]).
+const MIN_SEGMENT_WAIT_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_millis(WAIT_FOR_FILE_TIMEOUT_MS);
+
 /// The MIME type for an HLS playlist, matching Jellyfin's
 /// `MimeTypes.GetMimeType("playlist.m3u8")`.
-const HLS_PLAYLIST_MIME: &str = "application/x-mpegURL";
+const HLS_PLAYLIST_MIME: &str = "application/vnd.apple.mpegurl";
 
 /// The ffmpeg program handed to the transcoder seam.
 ///
@@ -185,6 +234,10 @@ where
     /// remembered for the life of the process.
     restart_failures:
         Arc<std::sync::Mutex<std::collections::HashMap<String, (u32, std::time::Instant)>>>,
+    /// The trickplay store the master playlist lists image playlists from
+    /// (`DynamicHlsHelper`'s `ITrickplayManager.GetTrickplayResolutions`).
+    /// `None` (the default, and every pre-seam test constructor) lists none.
+    trickplay: Option<Arc<dyn TrickplayManager>>,
 }
 
 impl<P, T, C, S> HlsStreamManagerImpl<P, T, C, S>
@@ -194,6 +247,45 @@ where
     C: EncodingOptionsProvider,
     S: SessionReporter,
 {
+    /// Wires the trickplay store so master playlists advertise the
+    /// `#EXT-X-IMAGE-STREAM-INF` tile playlists (the composition root calls
+    /// this; without it the master lists no trickplay entries).
+    #[must_use]
+    pub fn with_trickplay(mut self, trickplay: Arc<dyn TrickplayManager>) -> Self {
+        self.trickplay = Some(trickplay);
+        self
+    }
+
+    /// The trickplay resolutions for the request's media source, for the
+    /// master playlist. Port of the `Guid.Parse(state.Request.MediaSourceId)`
+    /// → `GetTrickplayResolutions` lookup; an absent/unparsable id or a store
+    /// error yields none (upstream would 500 on the former — not ported).
+    async fn trickplay_resolutions(&self, request: &HlsStreamRequest) -> Vec<TrickplayResolution> {
+        let Some(trickplay) = self.trickplay.as_ref() else {
+            return Vec::new();
+        };
+        let Some(source_id) = request
+            .media_source_id
+            .as_deref()
+            .and_then(|id| uuid::Uuid::parse_str(id).ok())
+        else {
+            return Vec::new();
+        };
+        match trickplay.get_trickplay_resolutions(source_id).await {
+            Ok(map) => map
+                .into_iter()
+                .map(|(width, info)| TrickplayResolution {
+                    width,
+                    height: info.height,
+                    bandwidth: info.bandwidth,
+                })
+                .collect(),
+            Err(error) => {
+                tracing::warn!(%error, %source_id, "failed to load trickplay resolutions for the master playlist");
+                Vec::new()
+            }
+        }
+    }
     /// Assembles the manager from its collaborators.
     ///
     /// * `planner` — resolves a request into a [`TranscodePlan`].
@@ -216,6 +308,7 @@ where
             paths,
             segment_locks: Arc::new(KeyedLocks::new()),
             restart_failures: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            trickplay: None,
         }
     }
 
@@ -302,7 +395,10 @@ where
         request: &HlsStreamRequest,
         is_audio: bool,
     ) -> Result<String, ServiceError> {
-        let plan = self.planner.plan(request, is_audio, None).await?;
+        let plan = self
+            .planner
+            .plan(request, is_audio, None, PlaylistKind::Vod)
+            .await?;
         let media_source_id = request
             .media_source_id
             .as_deref()
@@ -367,17 +463,17 @@ where
 
         let plan = self
             .planner
-            .plan(request, is_audio, Some(segment_id))
+            .plan(request, is_audio, Some(segment_id), PlaylistKind::Vod)
             .await?;
         let playlist_path = plan.playlist_path.clone();
         let playlist_key = playlist_path.to_string_lossy().into_owned();
         let ext = segment_extension(&plan.segment_container);
-        let segment_path = segment_file(&playlist_path, segment_id, &ext);
+        let segment_path = segment_file(&playlist_path, segment_id, ext);
 
         // Fast path: the segment already exists (a live job produced it) → mark
         // the consumer active (keep-alive) and serve it. Port of the
         // `File.Exists` try-1; the guard drop restarts the idle countdown.
-        if let Some(file) = self.serve_if_present(&playlist_key, &segment_path, &ext) {
+        if let Some(file) = self.serve_if_present(&playlist_key, &segment_path, ext) {
             return Ok(file);
         }
 
@@ -392,7 +488,7 @@ where
         // it open-coded the check without the keep-alive it left
         // `last_activity` stale and the idle reaper free to kill a job that was
         // actively being consumed.
-        if let Some(file) = self.serve_if_present(&playlist_key, &segment_path, &ext) {
+        if let Some(file) = self.serve_if_present(&playlist_key, &segment_path, ext) {
             return Ok(file);
         }
 
@@ -412,7 +508,7 @@ where
         {
             // `current` sees in-progress `.tmp` segments too, so a live job that
             // is still encoding its first segment reads as progress, not absence.
-            let current = current_transcoding_index(&playlist_path, &ext);
+            let current = current_transcoding_index(&playlist_path, ext);
             if should_wait_for_running_job(current, segment_id) {
                 // The wait is an active consumer: the guard keeps the idle
                 // reaper away and self-releases if the client disconnects.
@@ -426,14 +522,17 @@ where
                     && segment_path.exists()
                 {
                     self.clear_restart_failures(&playlist_key);
-                    return Ok(served(&segment_path, &ext));
+                    return Ok(served(&segment_path, ext));
                 }
             }
             // A seek (or the running job died mid-wait): drop the stale job before
             // restarting so the two don't write the same files. Keep its produced
             // segments (delete_files = false) — a later backward seek serves them
             // straight from disk via the fast path.
-            self.manager.kill_and_remove(&handle, false).await;
+            // `DynamicHlsController` kills the old job with `closeLiveStream:
+            // false` — the restart below re-opens ffmpeg on the SAME live stream,
+            // so releasing the tuner here would make it read a closed source.
+            self.manager.kill_and_remove(&handle, false, false).await;
         }
 
         // A source that keeps killing ffmpeg (flaky network storage, a file
@@ -479,7 +578,7 @@ where
             && segment_path.exists()
         {
             self.clear_restart_failures(&playlist_key);
-            Ok(served(&segment_path, &ext))
+            Ok(served(&segment_path, ext))
         } else {
             // A 5xx, not a 404: HLS clients skip past a 404'd segment and walk
             // the whole playlist (each request spawning another doomed ffmpeg);
@@ -510,9 +609,12 @@ where
     ) -> Result<ServedFile, ServiceError> {
         use ferrofin_traits::media_encoding::TranscodeManager as _;
 
-        let plan = self.planner.plan(request, is_audio, Some(0)).await?;
+        let plan = self
+            .planner
+            .plan(request, is_audio, Some(0), PlaylistKind::Vod)
+            .await?;
         let ext = segment_extension(&plan.segment_container);
-        let init_path = init_segment_file(&plan.playlist_path, &ext);
+        let init_path = init_segment_file(&plan.playlist_path, ext);
 
         // Start the transcode at the RESUME segment, not segment 0. The fMP4
         // init header (its moov edit list) encodes the job's start offset, so
@@ -530,13 +632,15 @@ where
         let plan = if start == 0 {
             plan
         } else {
-            self.planner.plan(request, is_audio, Some(start)).await?
+            self.planner
+                .plan(request, is_audio, Some(start), PlaylistKind::Vod)
+                .await?
         };
-        let start_segment = segment_file(&plan.playlist_path, start, &ext);
+        let start_segment = segment_file(&plan.playlist_path, start, ext);
 
         if init_is_complete(&init_path, &start_segment) {
             // A completed/earlier job left both — complete by construction.
-            return Ok(served(&init_path, &ext));
+            return Ok(served(&init_path, ext));
         }
 
         let playlist_key = plan.playlist_path.to_string_lossy().into_owned();
@@ -601,7 +705,7 @@ where
         }
 
         if init_is_complete(&init_path, &start_segment) {
-            Ok(served(&init_path, &ext))
+            Ok(served(&init_path, ext))
         } else {
             Err(ServiceError::NotFound(
                 "fmp4 init segment did not materialise".to_owned(),
@@ -660,34 +764,28 @@ where
         request: &HlsStreamRequest,
         is_audio: bool,
     ) -> Result<String, ServiceError> {
-        // The master playlist points at the single variant `main.m3u8`. Full
-        // adaptive-bitrate master generation (`DynamicHlsHelper` — CODECS,
-        // RESOLUTION, subtitle #EXT-X-MEDIA groups) is deferred; the
-        // single-stream master lists one variant carrying the request query.
-        //
-        // BANDWIDTH is real, though: RFC 8216 requires a positive value, and the
-        // old `BANDWIDTH=0` fed zero into client ABR bitrate math (NaN/Infinity
-        // in hls.js; the Cast receiver's player also keys segment budgeting off
-        // it). Negotiated output bitrate first, the source's probed bitrate as
-        // the copy-stream fallback (upstream sums the output streams the same
-        // way in DynamicHlsHelper.AppendPlaylist).
-        let plan = self.planner.plan(request, is_audio, None).await?;
-        let state = &plan.state;
-        let output =
-            state.output_video_bitrate.unwrap_or(0) + state.output_audio_bitrate.unwrap_or(0);
-        let bandwidth = if output > 0 {
-            output
+        // `GetMasterPlaylistInternal`: resolve the state (the plan), then
+        // assemble the playlist from it. The trickplay lookup is the one async
+        // collaborator the pure builder cannot own; it is skipped exactly when
+        // upstream skips it (a live stream, or `enableTrickplay=false`).
+        let plan = self
+            .planner
+            .plan(request, is_audio, None, PlaylistKind::Vod)
+            .await?;
+        // `state.VideoRequest?.EnableTrickplay ?? false`: only a video-route
+        // request lists trickplay — the audio master's DTO has no such flag.
+        let trickplay_resolutions = if !plan.state.is_segmented_live_stream()
+            && plan.state.is_input_video
+            && request.enable_trickplay
+        {
+            self.trickplay_resolutions(request).await
         } else {
-            state.media_source.bitrate.unwrap_or(0)
-        }
-        // A copy stream of an unprobed source still needs a positive value.
-        .max(128_000);
-        let variant_url = format!("main.m3u8{}", request.query_string);
-        Ok(format!(
-            "#EXTM3U\n#EXT-X-VERSION:7\n\
-             #EXT-X-STREAM-INF:BANDWIDTH={bandwidth},AVERAGE-BANDWIDTH={bandwidth}\n\
-             {variant_url}\n"
-        ))
+            Vec::new()
+        };
+        let ctx = MasterPlaylistContext {
+            trickplay_resolutions,
+        };
+        Ok(build_master_playlist(&plan, request, &ctx))
     }
 
     async fn variant_playlist(
@@ -699,8 +797,113 @@ where
     }
 
     async fn live_playlist(&self, request: &HlsStreamRequest) -> Result<String, ServiceError> {
-        // A live (open-ended) stream reuses the variant playlist shape.
-        self.build_variant_playlist(request, false).await
+        // Port of `DynamicHlsController.GetLiveHlsStream`: the server never
+        // generates this playlist. It resolves the state, starts an EVENT
+        // transcode if `{OutputFilePath}.m3u8` does not exist yet (waiting for
+        // `MinSegments` to land), and then serves the file ffmpeg wrote — only
+        // rewriting the fMP4 init URI. A playlist left by an earlier VOD job
+        // for the same session/output is served as-is (same upstream
+        // behaviour: the file exists, so nothing starts).
+        let plan = self
+            .planner
+            .plan(request, false, Some(0), PlaylistKind::Event)
+            .await?;
+        let playlist_path = plan.playlist_path.clone();
+        let playlist_key = playlist_path.to_string_lossy().into_owned();
+        let log_path = playlist_path.with_extension("log");
+
+        // `OnTranscodeBeginRequest` … `OnTranscodeEndRequest` (the guard's
+        // drop): marks this request an active consumer of an ALREADY-RUNNING
+        // job, so the idle reaper leaves it alone while we read its playlist.
+        // A job this request starts itself is not registered yet, so this
+        // guard resolves to nothing for it — the start branch takes its own
+        // guard below, once `start_ffmpeg` has registered the job.
+        // Ferrofin's guards are symmetric — upstream calls End without a
+        // matching Begin when this request started the job, driving its
+        // ActiveRequestCount to -1; that bug is deliberately not ported.
+        let _request_guard = self
+            .manager
+            .begin_request_guard(&playlist_key, TranscodingJobType::Hls);
+
+        if !playlist_path.exists() {
+            // `_transcodeManager.LockAsync(playlistPath)`: one starter per
+            // playlist; a concurrent request re-checks under the lock.
+            let lock = self.playlist_lock(&playlist_key);
+            let _guard = lock.lock().await;
+            if !playlist_path.exists() {
+                // An event playlist is reloaded by the client on a timer, so a
+                // source that keeps killing ffmpeg would otherwise turn every
+                // reload into a fresh spawn — the same storm the segment path
+                // guards against (ffmpeg writes the `.m3u8` only at the first
+                // segment boundary, so a job that dies early leaves nothing to
+                // find on the next request).
+                if self.restart_breaker_open(&playlist_key) {
+                    return Err(ServiceError::backend(format!(
+                        "transcode for this stream died {RESTART_FAILURE_LIMIT}+ times in a row \
+                         (source unreadable?); retrying after cooldown — see {}",
+                        log_path.display()
+                    )));
+                }
+                let start = StartFfMpegRequest {
+                    program: FFMPEG_PROGRAM,
+                    state: &plan.state,
+                    output_path: &playlist_path,
+                    arguments: plan.arguments.clone(),
+                    log_path: log_path.clone(),
+                    working_dir: None,
+                };
+                let handle = match self.manager.start_ffmpeg(&self.transcoder, start).await {
+                    Ok(handle) => handle,
+                    Err(e) => {
+                        self.record_restart_failure(&playlist_key);
+                        return Err(ServiceError::backend(format!(
+                            "failed to start transcode: {e}"
+                        )));
+                    }
+                };
+                // The wait IS an active consumer: without this mark the idle
+                // reaper kills the job we just started (its ping timeout is
+                // 60s, and a slow software transcode can need longer than that
+                // to produce `MinSegments` segments). The registry only knows
+                // the job now, after `start_ffmpeg` registered it — which is
+                // why the guard above could not cover this.
+                let _start_guard = self
+                    .manager
+                    .begin_request_guard(&playlist_key, TranscodingJobType::Hls);
+                if plan.min_segments > 0 {
+                    self.wait_for_minimum_segment_count(&handle, &playlist_path, plan.min_segments)
+                        .await;
+                }
+                if playlist_path.exists() {
+                    self.clear_restart_failures(&playlist_key);
+                } else {
+                    // ffmpeg died before its first segment boundary, so it never
+                    // wrote the playlist: count it, and fail with the log path
+                    // rather than a bare ENOENT.
+                    let failures = self.record_restart_failure(&playlist_key);
+                    return Err(ServiceError::backend(format!(
+                        "transcode exited before writing the live playlist \
+                         (consecutive failures: {failures}); see {}",
+                        log_path.display()
+                    )));
+                }
+            }
+        }
+
+        let text = tokio::fs::read_to_string(&playlist_path)
+            .await
+            .map_err(|e| {
+                ServiceError::backend(format!(
+                    "failed to read live playlist {} (see {}): {e}",
+                    playlist_path.display(),
+                    log_path.display()
+                ))
+            })?;
+        Ok(live_playlist_text(
+            &text,
+            &playlist_path,
+            &plan.segment_container,
+        ))
     }
 
     async fn dynamic_segment(
@@ -751,7 +954,10 @@ where
         // The progressive-transcode branch produces a single output file; reuse
         // the plan's output path and run the transcode to completion via the
         // segment-0 wait (a progressive job writes one growing file).
-        let plan = self.planner.plan(request, is_audio, Some(0)).await?;
+        let plan = self
+            .planner
+            .plan(request, is_audio, Some(0), PlaylistKind::Vod)
+            .await?;
         let output = plan.state.output_file_path.clone();
         let log_path = Path::new(&output).with_extension("log");
         let start = StartFfMpegRequest {
@@ -793,15 +999,165 @@ where
     }
 }
 
+impl<P, T, C, S> HlsStreamManagerImpl<P, T, C, S>
+where
+    P: StreamStatePlanner,
+    T: SegmentTranscoder,
+    C: EncodingOptionsProvider,
+    S: SessionReporter,
+{
+    /// Waits until the playlist ffmpeg is writing lists at least
+    /// `min_segments` `#EXTINF:` entries, or the job exits.
+    ///
+    /// Port of `HlsHelpers.WaitForMinimumSegmentCount`, whose loop is cancelled
+    /// by the job's own token: upstream re-reads the playlist every 100 ms;
+    /// here the re-read is event-driven — wait for the next segment *file*
+    /// (index = the count listed so far) through the manager's inotify-backed
+    /// [`TranscodeManagerImpl::wait_for_segment`], which also returns the
+    /// moment the job is gone (a short clip never reaches three segments).
+    async fn wait_for_minimum_segment_count(
+        &self,
+        handle: &ferrofin_traits::media_encoding::TranscodingJobHandle,
+        playlist_path: &Path,
+        min_segments: i32,
+    ) {
+        tracing::debug!(
+            playlist = %playlist_path.display(),
+            min_segments,
+            "waiting for segments in live playlist"
+        );
+        // The segment index each wait targets. It only ever moves forward, so a
+        // segment already on disk cannot satisfy the wait twice: without that,
+        // a job that wrote segment 0 and then died (or one whose playlist
+        // ffmpeg never rewrote) would spin here forever.
+        let mut next_index = 0;
+        let deadline = tokio::time::Instant::now() + MIN_SEGMENT_WAIT_TIMEOUT;
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                tracing::warn!(
+                    playlist = %playlist_path.display(),
+                    min_segments,
+                    timeout_secs = MIN_SEGMENT_WAIT_TIMEOUT.as_secs(),
+                    "live playlist did not reach its minimum segment count in time; \
+                     serving what the transcode has written so far"
+                );
+                return;
+            }
+            let count = count_playlist_segments(playlist_path).await;
+            if count >= min_segments {
+                tracing::debug!(
+                    playlist = %playlist_path.display(),
+                    min_segments,
+                    "finished waiting for segments in live playlist"
+                );
+                return;
+            }
+            let target = count.max(next_index);
+            // Waiting for a segment the playlist has not caught up with yet
+            // (`next_index > count`) could over-wait a whole further segment if
+            // ffmpeg rewrites the `.m3u8` a moment after the rename, so that
+            // one is bounded by the playlist re-read cadence — upstream polls
+            // the playlist on exactly this interval. Waiting for a segment the
+            // playlist is genuinely behind is unbounded, keeping the
+            // event-driven path free of the per-poll watcher churn (a fresh
+            // inotify watch per call).
+            let wait = self.manager.wait_for_segment(handle, playlist_path, target);
+            // Both branches are bounded by the overall deadline — an
+            // alive-but-hung ffmpeg (a stalled network read never exits, so
+            // `wait_for_segment` would never return) must not hold the request
+            // open, and the un-timed branch is exactly the one it takes.
+            let over_wait_risk = next_index > count;
+            let until = if over_wait_risk {
+                deadline.min(tokio::time::Instant::now() + MIN_SEGMENT_POLL_INTERVAL)
+            } else {
+                deadline
+            };
+            let produced = match tokio::time::timeout_at(until, wait).await {
+                Ok(produced) => produced,
+                // The short re-read tick elapsed: re-read the playlist and wait
+                // again. The overall deadline is re-checked at the top of the
+                // loop, which logs and serves what exists.
+                Err(_elapsed) => continue,
+            };
+            if !produced {
+                // The job exited without producing it — upstream's loop is
+                // cancelled by the job's token at the same point. Whatever it
+                // wrote is the whole playlist.
+                return;
+            }
+            next_index = target.saturating_add(1);
+            // The segment landed; ffmpeg rewrites the playlist right after.
+            tokio::time::sleep(MIN_SEGMENT_POLL_INTERVAL).await;
+        }
+    }
+}
+
+/// The playlist tag introducing a segment, as
+/// `HlsHelpers.WaitForMinimumSegmentCount` matches it (case-insensitively).
+const EXTINF_TAG: &[u8] = b"#EXTINF:";
+
+/// Whether `line` contains [`EXTINF_TAG`], ASCII-case-insensitively, without
+/// allocating (the playlist is re-read on every poll).
+fn contains_extinf(line: &str) -> bool {
+    line.as_bytes()
+        .windows(EXTINF_TAG.len())
+        .any(|window| window.eq_ignore_ascii_case(EXTINF_TAG))
+}
+
+/// The number of `#EXTINF:` entries in the playlist at `path` (0 when it
+/// cannot be read yet — ffmpeg may still be creating it). Port of the counting
+/// half of `HlsHelpers.WaitForMinimumSegmentCount`, whose read likewise
+/// tolerates a file being written concurrently.
+async fn count_playlist_segments(path: &Path) -> i32 {
+    let Ok(text) = tokio::fs::read_to_string(path).await else {
+        return 0;
+    };
+    let count = text
+        .lines()
+        .filter(|line| line.len() >= EXTINF_TAG.len() && contains_extinf(line))
+        .count();
+    i32::try_from(count).unwrap_or(i32::MAX)
+}
+
+/// The live playlist text to serve. Port of `HlsHelpers.GetLivePlaylistText`:
+/// the file ffmpeg wrote, with — for fMP4 — the bare init-segment URI
+/// (`{stem}-1.mp4`, ffmpeg's `-hls_fmp4_init_filename`) rewritten to the
+/// `hls/{stem}/{stem}-1.mp4` route the segments already use via
+/// `-hls_base_url`.
+fn live_playlist_text(text: &str, playlist_path: &Path, segment_container: &str) -> String {
+    if !segment_container.trim().eq_ignore_ascii_case("mp4") {
+        return text.to_owned();
+    }
+    let stem = playlist_path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let init_file_name = format!("{stem}-1.mp4");
+    let routed_init = format!("hls/{stem}/{init_file_name}");
+    text.replace(&init_file_name, &routed_init)
+}
+
 /// The segment file extension for `segment_container` (`.ts` default).
 ///
 /// Mirrors `EncodingHelper.GetSegmentFileExtension` and the transcode manager's
 /// own helper so the served path agrees with what ffmpeg wrote.
-fn segment_extension(segment_container: &str) -> String {
-    match segment_container.trim() {
-        "mp4" => ".mp4".to_owned(),
-        "" => ".ts".to_owned(),
-        other => format!(".{other}"),
+fn segment_extension(segment_container: &str) -> &'static str {
+    // ACCEPTED DIVERGENCE, deliberately: upstream's `GetSegmentFileExtension`
+    // is literally `"." + segmentContainer`, so it echoes the client's raw
+    // string. Ferrofin normalises instead, exactly as the planner's
+    // `segment_file_extension`/`hls_segment_type` do when they tell ffmpeg what
+    // to write — otherwise `segmentContainer=TS` (or any unknown container)
+    // makes the serve path look for `out0.TS` while ffmpeg wrote `out0.ts`, a
+    // permanent miss on a case-sensitive filesystem that reads to the client as
+    // a dead transcode.
+    //
+    // The transcode manager's own `segment_file_extension`
+    // (`ferrofin-mediaencoding`, `transcoding/manager.rs`) normalises the same
+    // way; change both together.
+    if segment_container.trim().eq_ignore_ascii_case("mp4") {
+        ".mp4"
+    } else {
+        ".ts"
     }
 }
 
@@ -926,7 +1282,6 @@ mod tests {
         FakeScript, FakeSegmentTranscoder, NoopSessionReporter,
     };
     use ferrofin_mediaencoding::{BaseEncodingJobOptions, EncodingJobInfo};
-    use ferrofin_model::configuration::EncodingOptions;
     use ferrofin_model::dto::MediaSourceInfo;
     use std::sync::Mutex;
 
@@ -989,8 +1344,8 @@ mod tests {
         }
     }
 
-    /// Records each `(is_audio, segment_id)` the fake planner was asked to plan.
-    type PlanCalls = Arc<Mutex<Vec<(bool, Option<i32>)>>>;
+    /// Records each `(is_audio, segment_id, kind)` the fake planner was asked to plan.
+    type PlanCalls = Arc<Mutex<Vec<(bool, Option<i32>, PlaylistKind)>>>;
 
     /// A fake planner writing its playlist under `dir`, with the recorded request.
     struct FakePlanner {
@@ -1006,8 +1361,12 @@ mod tests {
             _request: &HlsStreamRequest,
             is_audio: bool,
             segment_id: Option<i32>,
+            kind: PlaylistKind,
         ) -> Result<TranscodePlan, ServiceError> {
-            self.requests.lock().unwrap().push((is_audio, segment_id));
+            self.requests
+                .lock()
+                .unwrap()
+                .push((is_audio, segment_id, kind));
             let playlist = self.dir.join("out.m3u8");
             let state = EncodingJobInfo {
                 display: TranscodeDisplayNames::default(),
@@ -1037,15 +1396,23 @@ mod tests {
                 play_session_id: Some("sess".to_owned()),
                 device_id: Some("dev".to_owned()),
             };
+            // The real planner's event args differ; the fake tags them so the
+            // live path's choice of plan is observable.
+            let mut arguments = vec!["-i".to_owned(), "in.mkv".to_owned()];
+            if kind == PlaylistKind::Event {
+                arguments.extend(["-hls_playlist_type".to_owned(), "event".to_owned()]);
+            }
             Ok(TranscodePlan {
                 state,
                 playlist_path: playlist,
-                arguments: vec!["-i".to_owned(), "in.mkv".to_owned()],
+                arguments,
                 media_path: "/media/in.mkv".to_owned(),
                 run_time_ticks: 60 * 10_000_000,
                 segment_length_ms: 6000,
                 is_remuxing_video: false,
                 segment_container: self.segment_container.clone(),
+                encoding_options: EncodingOptions::default(),
+                min_segments: 3,
             })
         }
     }
@@ -1106,14 +1473,136 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (mgr, _) = manager_with(tmp.path(), FakeScript::default(), "ts");
         let pl = mgr.master_playlist(&req(), false).await.unwrap();
-        assert!(pl.contains("#EXTM3U"));
-        assert!(pl.contains("main.m3u8?deviceId=dev"));
-        // The FakePlanner supplies neither output bitrates nor a probed source
-        // bitrate, so the 128 kbps floor applies — RFC 8216 requires a positive
-        // BANDWIDTH, and the old `BANDWIDTH=0` broke client ABR math.
-        assert!(!pl.contains("BANDWIDTH=0"), "got: {pl}");
-        assert!(pl.contains("BANDWIDTH=128000"), "got: {pl}");
-        assert!(pl.contains("AVERAGE-BANDWIDTH=128000"), "got: {pl}");
+        assert!(pl.starts_with("#EXTM3U\n#EXT-X-STREAM-INF:"), "got: {pl}");
+        // Upstream's master never carries a version tag.
+        assert!(!pl.contains("#EXT-X-VERSION"), "got: {pl}");
+        // The FakePlanner supplies no output bitrates, and the faithful
+        // `totalBitrate` is the plain sum — no floor, no source fallback.
+        assert!(pl.contains("BANDWIDTH=0,AVERAGE-BANDWIDTH=0"), "got: {pl}");
+        // `segment_container` is set on the request but absent from the query,
+        // so the universal-audio `&SegmentContainer=` append fires.
+        assert!(
+            pl.ends_with("\nmain.m3u8?deviceId=dev&SegmentContainer=ts\n"),
+            "got: {pl}"
+        );
+    }
+
+    /// A trickplay store reporting one 320-wide resolution for every item.
+    struct FakeTrickplay;
+
+    #[async_trait]
+    impl TrickplayManager for FakeTrickplay {
+        async fn refresh_trickplay_data(
+            &self,
+            _item_id: uuid::Uuid,
+            _replace: bool,
+            _library_options: &ferrofin_model::configuration::LibraryOptions,
+        ) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        async fn get_trickplay_resolutions(
+            &self,
+            item_id: uuid::Uuid,
+        ) -> Result<
+            std::collections::HashMap<i32, ferrofin_db::entities::playback::TrickplayInfoEntity>,
+            ServiceError,
+        > {
+            let info = ferrofin_db::entities::playback::TrickplayInfoEntity {
+                item_id: item_id.simple().to_string(),
+                width: 320,
+                height: 180,
+                bandwidth: 99_000,
+                interval: 10_000,
+                thumbnail_count: 1,
+                tile_height: 1,
+                tile_width: 1,
+            };
+            Ok(std::collections::HashMap::from([(320, info)]))
+        }
+        async fn get_trickplay_items(
+            &self,
+            _limit: i32,
+            _offset: i32,
+        ) -> Result<Vec<ferrofin_db::entities::playback::TrickplayInfoEntity>, ServiceError>
+        {
+            Ok(Vec::new())
+        }
+        async fn save_trickplay_info(
+            &self,
+            _info: &ferrofin_db::entities::playback::TrickplayInfoEntity,
+        ) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        async fn delete_trickplay_data(&self, _item_id: uuid::Uuid) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        async fn get_trickplay_manifest(
+            &self,
+            _item_id: uuid::Uuid,
+        ) -> Result<
+            std::collections::HashMap<
+                String,
+                std::collections::HashMap<
+                    i32,
+                    ferrofin_db::entities::playback::TrickplayInfoEntity,
+                >,
+            >,
+            ServiceError,
+        > {
+            Ok(std::collections::HashMap::new())
+        }
+        async fn get_hls_playlist(
+            &self,
+            _item_id: uuid::Uuid,
+            _width: i32,
+            _api_key: Option<&str>,
+        ) -> Result<Option<String>, ServiceError> {
+            Ok(None)
+        }
+        async fn get_trickplay_tile_path(
+            &self,
+            _item_id: uuid::Uuid,
+            _width: i32,
+            _index: i32,
+        ) -> Result<Option<String>, ServiceError> {
+            Ok(None)
+        }
+    }
+
+    /// Without a wired trickplay store the master lists no image playlists;
+    /// with one, the store's resolutions for the media source appear.
+    #[tokio::test]
+    async fn master_playlist_lists_trickplay_when_wired() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mgr, _) = manager_with(tmp.path(), FakeScript::default(), "ts");
+        let request = HlsStreamRequest {
+            media_source_id: Some(uuid::Uuid::from_u128(9).simple().to_string()),
+            api_key: Some("tok".to_owned()),
+            ..req()
+        };
+        let pl = mgr.master_playlist(&request, false).await.unwrap();
+        assert!(!pl.contains("IMAGE-STREAM"), "unwired: {pl}");
+
+        let mgr = mgr.with_trickplay(Arc::new(FakeTrickplay));
+        let pl = mgr.master_playlist(&request, false).await.unwrap();
+        assert!(
+            pl.contains(
+                "#EXT-X-IMAGE-STREAM-INF:BANDWIDTH=99000,RESOLUTION=320x180,CODECS=\"jpeg\",URI=\"Trickplay/320/tiles.m3u8?MediaSourceId=00000000000000000000000000000009&ApiKey=tok\"\n"
+            ),
+            "wired: {pl}"
+        );
+        // `enableTrickplay=false` suppresses the lookup and the lines.
+        let pl = mgr
+            .master_playlist(
+                &HlsStreamRequest {
+                    enable_trickplay: false,
+                    ..request
+                },
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(!pl.contains("IMAGE-STREAM"), "disabled: {pl}");
     }
 
     #[tokio::test]
@@ -1122,16 +1611,121 @@ mod tests {
         let (mgr, recorded) = manager_with(tmp.path(), FakeScript::default(), "ts");
         let pl = mgr.variant_playlist(&req(), false).await.unwrap();
         assert!(pl.starts_with("#EXTM3U"));
-        // The planner was asked for a playlist (segment_id None), video.
-        assert_eq!(recorded.lock().unwrap()[0], (false, None));
+        // The planner was asked for a playlist (segment_id None), video, VOD.
+        assert_eq!(
+            recorded.lock().unwrap()[0],
+            (false, None, PlaylistKind::Vod)
+        );
+    }
+
+    /// `GetLiveHlsStream` serves the playlist ffmpeg wrote — here the fake
+    /// transcoder writes `out.m3u8` with a 1 s target duration on spawn — and
+    /// never regenerates it. Starting it plans an EVENT job at segment 0.
+    #[tokio::test]
+    async fn live_playlist_starts_event_job_and_serves_ffmpeg_written_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let playlist = "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n\
+                        #EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:VOD\n\
+                        #EXTINF:1.020000,\nhls/out/out0.ts\n#EXT-X-ENDLIST\n";
+        let script = FakeScript {
+            segment_files: vec!["out0.ts".to_owned()],
+            extra_files: vec!["out.m3u8".to_owned()],
+            exits_immediately: true,
+            ..FakeScript::default()
+        };
+        let (mgr, recorded, spawns) = manager_full(tmp.path(), script, "ts");
+        // The fake "ffmpeg" spawns synchronously inside `start_ffmpeg`, writes
+        // its placeholder playlist, and has already exited, so the
+        // minimum-segment wait returns at once (a 1 s clip never reaches 3).
+        let pl = mgr.live_playlist(&req()).await.unwrap();
+        assert_eq!(
+            pl,
+            "fake
+",
+            "whatever ffmpeg wrote is served"
+        );
+        // Now the file holds what a real ffmpeg writes for the 1 s clip; the
+        // next request finds it and serves it verbatim — no regeneration, no
+        // second transcode.
+        std::fs::write(tmp.path().join("out.m3u8"), playlist).unwrap();
+        let served = mgr.live_playlist(&req()).await.unwrap();
+        assert_eq!(served, playlist, "served verbatim, TARGETDURATION 1 intact");
+        // Exactly one transcode was started (the second call found the file),
+        // planned as an EVENT job from segment 0.
+        assert_eq!(spawns.requests.lock().unwrap().len(), 1);
+        let calls = recorded.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .all(|c| *c == (false, Some(0), PlaylistKind::Event)),
+            "got {calls:?}"
+        );
+        let args = spawns.requests.lock().unwrap()[0].arguments.join(" ");
+        assert!(args.contains("-hls_playlist_type event"), "got: {args}");
+    }
+
+    /// An existing playlist (left by the VOD job of the same session) is
+    /// served without starting anything — the harness case where `main.m3u8`
+    /// segment fetches already ran.
+    ///
+    /// ACCEPTED DIVERGENCE (ported deliberately): that playlist is a VOD one,
+    /// so it carries `#EXT-X-PLAYLIST-TYPE:VOD` and BARE segment URIs (the VOD
+    /// plan has no `-hls_base_url`), which resolve against `/Videos/{id}/`
+    /// rather than the `hls/{playlistId}/` route. Upstream `GetLiveHlsStream`
+    /// serves the very same file the very same way — a client that asks for
+    /// `live.m3u8` after driving `main.m3u8` gets Jellyfin's behaviour, warts
+    /// and all, and the parity harness diffs clean.
+    #[tokio::test]
+    async fn live_playlist_serves_an_existing_file_without_spawning() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("out.m3u8"),
+            "#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXTINF:1.020000,\nout0.ts\n#EXT-X-ENDLIST\n",
+        )
+        .unwrap();
+        let (mgr, _, spawns) = manager_full(tmp.path(), FakeScript::default(), "ts");
+        let pl = mgr.live_playlist(&req()).await.unwrap();
+        assert!(pl.contains("#EXT-X-TARGETDURATION:1\n"), "got: {pl}");
+        assert!(spawns.requests.lock().unwrap().is_empty());
+    }
+
+    /// fMP4: the bare init URI ffmpeg writes is routed under `hls/{stem}/`,
+    /// matching the `-hls_base_url` the segments carry.
+    #[test]
+    fn live_playlist_text_routes_the_fmp4_init() {
+        let text = "#EXTM3U\n#EXT-X-MAP:URI=\"out-1.mp4\"\n#EXTINF:3.0,\nhls/out/out0.mp4\n";
+        let routed = live_playlist_text(text, Path::new("/c/out.m3u8"), "mp4");
+        assert_eq!(
+            routed,
+            "#EXTM3U\n#EXT-X-MAP:URI=\"hls/out/out-1.mp4\"\n#EXTINF:3.0,\nhls/out/out0.mp4\n"
+        );
+        // mpegts playlists pass through untouched.
+        assert_eq!(
+            live_playlist_text(text, Path::new("/c/out.m3u8"), "ts"),
+            text
+        );
     }
 
     #[tokio::test]
-    async fn live_playlist_uses_the_variant_shape() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (mgr, _) = manager_with(tmp.path(), FakeScript::default(), "ts");
-        let pl = mgr.live_playlist(&req()).await.unwrap();
-        assert!(pl.starts_with("#EXTM3U"));
+    async fn count_playlist_segments_counts_extinf_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let pl = dir.path().join("x.m3u8");
+        assert_eq!(count_playlist_segments(&pl).await, 0, "missing file");
+        std::fs::write(&pl, "#EXTM3U\n#EXTINF:3.0,\na0.ts\n#extinf:3.0,\na1.ts\n").unwrap();
+        assert_eq!(count_playlist_segments(&pl).await, 2);
+        // A line shorter than the tag can never match (the window guard).
+        std::fs::write(&pl, "#EXTM3U\n#EXT\n").unwrap();
+        assert_eq!(count_playlist_segments(&pl).await, 0);
+    }
+
+    #[test]
+    fn segment_extension_normalises_the_container() {
+        assert_eq!(segment_extension("MP4"), ".mp4");
+        assert_eq!(segment_extension(" mp4 "), ".mp4");
+        // Everything else is mpegts — the planner tells ffmpeg exactly that,
+        // so the serve path must look for the same file.
+        assert_eq!(segment_extension("TS"), ".ts");
+        assert_eq!(segment_extension("webm"), ".ts");
     }
 
     #[tokio::test]
@@ -1341,7 +1935,7 @@ mod tests {
         // The init serve started the transcode at the resume segment (10), not 0.
         let calls = recorded.lock().unwrap();
         assert!(
-            calls.contains(&(false, Some(10))),
+            calls.contains(&(false, Some(10), PlaylistKind::Vod)),
             "expected a plan at resume segment 10, got {calls:?}"
         );
     }
@@ -1369,7 +1963,7 @@ mod tests {
         let calls = recorded.lock().unwrap();
         assert_eq!(
             calls.as_slice(),
-            &[(false, Some(0))],
+            &[(false, Some(0), PlaylistKind::Vod)],
             "one plan for a non-resuming init serve"
         );
     }
@@ -1455,7 +2049,7 @@ mod tests {
         std::fs::write(tmp.path().join("pl.m3u8"), b"#EXTM3U").unwrap();
         let (mgr, _) = manager_with(tmp.path(), FakeScript::default(), "ts");
         let served = mgr.resolve_transcode_file("pl.m3u8", true).await.unwrap();
-        assert_eq!(served.content_type, "application/x-mpegURL");
+        assert_eq!(served.content_type, "application/vnd.apple.mpegurl");
     }
 
     #[tokio::test]
@@ -1494,7 +2088,8 @@ mod tests {
         assert_eq!(segment_extension("ts"), ".ts");
         assert_eq!(segment_extension("mp4"), ".mp4");
         assert_eq!(segment_extension(""), ".ts");
-        assert_eq!(mime_for_extension(".m3u8"), "application/x-mpegURL");
+        assert_eq!(segment_extension("MP4"), ".mp4");
+        assert_eq!(mime_for_extension(".m3u8"), "application/vnd.apple.mpegurl");
         assert_eq!(mime_for_extension("ts"), "video/mp2t");
         assert_eq!(mime_for_extension(".aac"), "audio/aac");
         assert_eq!(mime_for_extension(".mp3"), "audio/mpeg");

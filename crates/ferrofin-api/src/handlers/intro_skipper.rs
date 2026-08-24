@@ -124,7 +124,7 @@ fn secs_to_ticks(secs: f64) -> i64 {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct Segment {
-    #[serde(default)]
+    #[serde(default, with = "ferrofin_model::json::guid")]
     episode_id: Uuid,
     start: f64,
     end: f64,
@@ -172,6 +172,7 @@ struct ScanStatusResponse {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "PascalCase")]
 struct EpisodeVisualization {
+    #[serde(with = "ferrofin_model::json::guid")]
     id: Uuid,
     name: String,
 }

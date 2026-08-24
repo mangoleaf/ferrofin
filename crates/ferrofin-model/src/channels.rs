@@ -89,6 +89,7 @@ pub struct ChannelFeatures {
 
     /// Gets or sets the identifier.
     #[schema(value_type = String, format = "uuid")]
+    #[serde(with = "crate::json::guid")]
     pub id: Uuid,
 
     /// Gets or sets a value indicating whether this instance can search.
@@ -150,6 +151,7 @@ pub struct ChannelQuery {
 
     /// Gets or sets the user identifier.
     #[schema(value_type = String, format = "uuid")]
+    #[serde(with = "crate::json::guid")]
     pub user_id: Uuid,
 
     /// Gets or sets the start index. Use for paging.

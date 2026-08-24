@@ -84,7 +84,12 @@ async fn metrics_enabled_serves_exposition() {
     let handle =
         ferrofin_metrics::init(RouteLabels::default(), tokio::runtime::Handle::current()).unwrap();
     let router = metrics_wiring::mount(ferrofin_api::create_router(wired.state.clone()), &handle);
-    metrics_wiring::spawn_sampler(&handle, Arc::clone(&wired.state.sessions), db.clone(), 0);
+    let _sampler = metrics_wiring::spawn_sampler(
+        metrics_wiring::register_gauges(&handle),
+        Arc::clone(&wired.state.sessions),
+        db.clone(),
+        0,
+    );
 
     // Let the sampler's immediate first tick populate the mirror gauges.
     tokio::time::sleep(std::time::Duration::from_millis(250)).await;

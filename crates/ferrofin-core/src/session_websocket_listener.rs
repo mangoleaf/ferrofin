@@ -85,8 +85,8 @@ fn force_keep_alive_bytes() -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({
         "MessageType": SessionMessageType::ForceKeepAlive,
         // Required `format: uuid` field on every outbound message; strict clients
-        // (the Jellyfin Kotlin SDK) crash without it.
-        "MessageId": Uuid::new_v4().hyphenated().to_string(),
+        // (the Jellyfin Kotlin SDK) crash without it. Jellyfin's guid spelling.
+        "MessageId": Uuid::new_v4().simple().to_string(),
         "Data": WEB_SOCKET_LOST_TIMEOUT_SECS,
     }))
     .unwrap_or_default()

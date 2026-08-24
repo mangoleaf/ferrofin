@@ -284,7 +284,10 @@ mod tests {
             .await
             .expect("convert");
         let text = String::from_utf8(out).expect("utf8");
-        assert!(text.starts_with("WEBVTT"), "expected WEBVTT header: {text}");
+        assert!(
+            text.starts_with("\u{feff}WEBVTT"),
+            "expected WEBVTT header: {text}"
+        );
         assert!(text.contains("Hello"));
     }
 

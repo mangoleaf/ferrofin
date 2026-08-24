@@ -45,6 +45,28 @@ pub struct PluginDescriptor {
     pub can_uninstall: bool,
 }
 
+/// An installed plugin with a newer, installable version in the catalog.
+///
+/// Port of the `InstallationInfo` slice upstream's
+/// `IInstallationManager.GetAvailablePluginUpdates` yields to
+/// `PluginUpdateTask` — enough to name the package and the version to install.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginUpdateInfo {
+    /// The plugin's stable id (the catalog package's guid).
+    pub id: Uuid,
+    /// The package name, as the repository advertises it.
+    pub name: String,
+    /// The version currently installed.
+    pub installed_version: String,
+    /// The newer compatible version available for install.
+    pub version: String,
+    /// The repository that offers [`version`](Self::version), so the install
+    /// resolves the same catalog entry this update was chosen from (upstream's
+    /// `InstallationInfo` pins the `SourceUrl` for the same reason). `None`
+    /// leaves the repository unconstrained.
+    pub repository_url: Option<String>,
+}
+
 /// A plugin's bundled image, served by `GET /Plugins/{id}/{version}/Image`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginImage {
@@ -105,6 +127,21 @@ pub trait PluginManager: Send + Sync {
     /// Lists the packages available from the enabled repositories, merged
     /// with catalog entries for the compiled-in plugins.
     async fn list_packages(&self) -> Result<Vec<PackageInfo>, ServiceError>;
+
+    /// The installed plugins for which a newer, installable version exists in
+    /// the configured repositories.
+    ///
+    /// Port of `IInstallationManager.GetAvailablePluginUpdates`, which backs
+    /// upstream's `PluginUpdateTask`: every enabled installed plugin is looked
+    /// up in the catalog and offered its newest compatible version above the
+    /// one installed. The default implementation reports none (a manager
+    /// without an installer has nothing to update).
+    ///
+    /// # Errors
+    /// Backend errors from reading the configured repositories.
+    async fn available_plugin_updates(&self) -> Result<Vec<PluginUpdateInfo>, ServiceError> {
+        Ok(Vec::new())
+    }
 
     /// Installs a package from the configured repositories: resolve →
     /// download → verify checksum → validate the artifact → stage into the

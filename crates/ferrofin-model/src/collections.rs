@@ -10,5 +10,6 @@ use uuid::Uuid;
 pub struct CollectionCreationResult {
     /// Gets or sets the collection id.
     #[schema(value_type = String, format = "uuid")]
+    #[serde(with = "crate::json::guid")]
     pub id: Uuid,
 }

@@ -95,10 +95,12 @@ pub struct TaskTriggerInfo {
 pub struct TaskResult {
     /// Gets or sets the start time UTC.
     #[schema(value_type = String, format = "date-time")]
+    #[serde(with = "crate::json::datetime")]
     pub start_time_utc: DateTime<Utc>,
 
     /// Gets or sets the end time UTC.
     #[schema(value_type = String, format = "date-time")]
+    #[serde(with = "crate::json::datetime")]
     pub end_time_utc: DateTime<Utc>,
 
     /// Gets or sets the status.
