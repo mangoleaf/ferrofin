@@ -1041,6 +1041,14 @@ pub async fn build_app_state(
         task_manager.register(Arc::new(
             ferrofin_core::scheduled_tasks::live_tv::RefreshGuideTask::new(Arc::clone(&live_tv)),
         ));
+        // "Update Plugins" (Application category): installs available updates
+        // for the runtime-installed (Tier-1b WASM) plugins through the same
+        // path as `POST /Packages/Installed/{name}`.
+        task_manager.register(Arc::new(
+            ferrofin_core::scheduled_tasks::application::PluginUpdateTask::new(Arc::clone(
+                &plugins,
+            )),
+        ));
     }
     let tasks: Arc<dyn ferrofin_traits::tasks::TaskManager> = Arc::new(task_manager.clone());
     // The trigger scheduler: fires startup triggers now, then evaluates

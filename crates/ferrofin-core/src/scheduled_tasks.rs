@@ -30,6 +30,7 @@ use ferrofin_model::tasks::{
 use ferrofin_traits::error::ServiceError;
 use tracing::Instrument as _;
 
+pub mod application;
 pub mod library;
 pub mod live_tv;
 pub mod maintenance;
@@ -39,6 +40,16 @@ const TICKS_PER_SECOND: i64 = 10_000_000;
 
 /// How often the scheduler evaluates triggers.
 const SCHEDULER_PERIOD: Duration = Duration::from_secs(30);
+
+/// An interval trigger firing every `hours` hours (the shape most upstream
+/// tasks declare).
+pub(crate) fn interval_hours(hours: i64) -> TaskTriggerInfo {
+    TaskTriggerInfo {
+        type_: TaskTriggerInfoType::IntervalTrigger,
+        interval_ticks: Some(hours * 3600 * TICKS_PER_SECOND),
+        ..TaskTriggerInfo::default()
+    }
+}
 
 /// How long a `StartupTrigger` waits before firing — upstream's
 /// `StartupTrigger.DelayMs` (3000), ported verbatim: the grace period keeps a
