@@ -937,6 +937,20 @@ pub async fn build_app_state(
         cache_dir: config.cache_dir.join("extensions"),
         merge_versions: Arc::clone(&merge_versions),
     };
+    // "Media Segment Scan" (Library category): upstream registers this one in
+    // the core task set, independent of any plugin, so the dashboard lists it
+    // even with every extension disabled. It goes in FIRST on purpose: the
+    // Intro Skipper extension registers a richer pass under the same upstream
+    // key (its season-level fingerprinting is what actually produces
+    // segments), and registration replaces by key — so whenever that extension
+    // is loaded it wins, and this core registration is what remains when it is
+    // not.
+    task_manager.register(Arc::new(
+        ferrofin_core::scheduled_tasks::library::MediaSegmentExtractionTask::new(
+            Arc::clone(&library),
+            Arc::clone(&media_segments),
+        ),
+    ));
     ferrofin_extensions::register_tasks(&extensions, &extension_cx, &task_manager);
     // Tier-1b WASM plugin tasks and event delivery. Tasks self-gate on the
     // plugin's enabled flag (the Tier-1a pattern); event delivery is

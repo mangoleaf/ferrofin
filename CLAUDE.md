@@ -248,7 +248,7 @@ deep-verified (response + read-back diffed clean against Jellyfin 10.11.8) and t
 classified as accepted divergences. Working end-to-end: authentication/users/QuickConnect,
 library scan + live filesystem watch, browse/query/DTO, images, sessions/playstate/remote
 control, WebSocket push, playlists/collections, direct play + live HLS transcode (subtitle
-burn-in, fMP4 HEVC/AV1), Live TV (M3U/XMLTV + DVR timers), SyncPlay, all 18 scheduled tasks,
+burn-in, fMP4 HEVC/AV1), Live TV (M3U/XMLTV + DVR timers), SyncPlay, all 20 scheduled tasks,
 metrics/tracing, trickplay/chapters/lyrics/media segments, photo and book libraries
 (EXIF / `ComicInfo` / OPF), and backup/restore. See `docs/FEATURES.md` for the tiered
 status matrix.

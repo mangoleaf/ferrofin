@@ -12,11 +12,13 @@
 //! DTO conversion.
 //!
 //! Deferred (documented): the plugin **provider** fan-out — `GetSegments` with
-//! `filter_by_provider`, `GetSupportedProviders`, and per-library provider
-//! enablement — needs the un-ported `IMediaSegmentProvider` plugin registry and
-//! `LibraryOptions`. Here `filter_by_provider` is accepted but not narrowed
-//! (all stored segments are returned) and [`Self::get_supported_providers`]
-//! returns an empty list. Segment *generation* is out of scope for this seam.
+//! `filter_by_provider`, `GetSupportedProviders`, `RunSegmentPluginProviders`,
+//! and per-library provider enablement — needs the un-ported
+//! `IMediaSegmentProvider` plugin registry and `LibraryOptions`. Here
+//! `filter_by_provider` is accepted but not narrowed (all stored segments are
+//! returned), [`Self::get_supported_providers`] returns an empty list, and
+//! [`Self::run_segment_providers`] runs none. Segment *generation* happens
+//! outside this seam (see `run_segment_providers` for who does it instead).
 
 use std::sync::Arc;
 
@@ -226,6 +228,23 @@ impl MediaSegmentManager for FerrofinMediaSegmentManager {
         // deferral); no providers are advertised.
         Ok(Vec::new())
     }
+
+    async fn run_segment_providers(
+        &self,
+        _item_id: Uuid,
+        _overwrite: bool,
+    ) -> Result<usize, ServiceError> {
+        // No providers are registered here, so nothing runs — and nothing
+        // pretends to. Ferrofin's segment *producers* do not plug in per item:
+        // the Intro Skipper extension fingerprints a whole season at a time to
+        // find a shared intro (its own `IntroSkipper.Detect` pass, which also
+        // claims the upstream `TaskExtractMediaSegments` key while it is
+        // loaded), and WASM analyzer plugins write segments from their own
+        // analysis pass. What is missing versus upstream is the per-item
+        // `IMediaSegmentProvider` registry those would register into; when one
+        // exists, it fans out from exactly here.
+        Ok(0)
+    }
 }
 
 #[cfg(test)]
@@ -313,6 +332,13 @@ mod tests {
                 .await
                 .expect("providers")
                 .is_empty()
+        );
+        // …and running "the providers" honestly reports that none did.
+        assert_eq!(
+            mgr.run_segment_providers(episode, false)
+                .await
+                .expect("run providers"),
+            0
         );
     }
 }

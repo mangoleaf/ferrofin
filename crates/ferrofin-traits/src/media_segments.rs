@@ -97,6 +97,38 @@ pub trait MediaSegmentManager: Send + Sync {
         &self,
         item_id: Uuid,
     ) -> Result<Vec<MediaSegmentProviderInfo>, ServiceError>;
+
+    /// Runs every segment provider enabled for the item's library over it,
+    /// returning how many providers ran.
+    ///
+    /// Port of `IMediaSegmentManager.RunSegmentPluginProviders(item,
+    /// libraryOptions, forceOverwrite, ct)`, which backs upstream's
+    /// `MediaSegmentExtractionTask`. Every provider enabled for the item's
+    /// library runs either way; `overwrite` deletes the item's existing
+    /// segments first, so a provider that would have returned exactly what is
+    /// already stored writes them again instead of being skipped. The
+    /// `LibraryOptions` argument is resolved by the implementation from the
+    /// item itself. The provider count is a Ferrofin addition (upstream
+    /// returns nothing) so a caller can log what actually ran.
+    ///
+    /// Defaults to "no provider ran" so stub/test managers need not implement
+    /// it.
+    ///
+    /// # Errors
+    /// Backend errors from resolving the item, clearing its segments, or
+    /// deciding which providers support it. Divergence worth knowing: upstream
+    /// catches a *provider's* own failure inside this call and only logs it, so
+    /// it never reaches the caller; an implementation here may surface one, and
+    /// a caller should read it as "this item got no segments", not as a reason
+    /// to abandon a whole pass.
+    async fn run_segment_providers(
+        &self,
+        item_id: Uuid,
+        overwrite: bool,
+    ) -> Result<usize, ServiceError> {
+        let _ = (item_id, overwrite);
+        Ok(0)
+    }
 }
 
 fn _assert_object_safe_media_segment_manager(_: &dyn MediaSegmentManager) {}

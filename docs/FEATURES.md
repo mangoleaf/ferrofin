@@ -49,8 +49,8 @@ Deep-verified against a real Jellyfin server:
   recordings. Deep-verified at the API level only — **not yet exercised end-to-end with a
   real tuner/guide by a human**; treat as less battle-tested than the rest of this list.
 - **SyncPlay** — groups, playback-command relay, time sync.
-- **Scheduled tasks** — all 18 dashboard tasks (including the Live TV guide
-  refresh) plus the trigger scheduler.
+- **Scheduled tasks** — all 20 of Jellyfin's scheduled tasks (including the Live TV
+  guide refresh and the hidden channel refresh) plus the trigger scheduler.
 - **Observability** — Prometheus `/metrics` (Jellyfin-parity names), OTLP traces (opt-in).
 - **Media detail** — trickplay, chapters, lyrics, media segments.
 - **Photos & books** — a home-videos library resolves its images into `Photo` items with

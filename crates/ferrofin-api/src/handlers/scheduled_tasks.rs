@@ -8,12 +8,11 @@
 //! - `POST /ScheduledTasks/Running/{taskId}` — run a task now (`204`; `404` when
 //!   missing).
 //! - `DELETE /ScheduledTasks/Running/{taskId}` — cancel a task (`204`; `404` when
-//!   missing). This registry runs nothing in the background, so cancelling is a
-//!   state reset — the observable `404`/`204` outcome matches the C# `StopTask`.
+//!   missing). A running task's spawned run is aborted and recorded as
+//!   `Cancelled`, matching the C# `StopTask`.
 //! - `POST /ScheduledTasks/{taskId}/Triggers` — replace a task's configured
-//!   triggers (`204`; `404` when missing). The triggers are persisted on the task
-//!   and surfaced on its next read; with no scheduler they never fire, exactly as
-//!   the C# `task.Triggers = triggerInfos` assignment is advisory here.
+//!   triggers (`204`; `404` when missing). The triggers are persisted, surfaced
+//!   on the task's next read, and acted on by the registry's scheduler.
 //!
 //! Elevation-policy enforcement (`Policies.RequiresElevation`) is deferred to the
 //! composition root, matching the other admin controllers; every handler here
@@ -105,11 +104,12 @@ async fn get_task(
 
 /// `POST /ScheduledTasks/Running/{taskId}` — run a task now.
 ///
-/// Port of `ScheduledTasksController.StartTask` → `ITaskManager.Execute`,
-/// reduced to the synchronous manual-run path: the task runs to completion and
-/// the handler returns `204 No Content`. A missing task is `404`; the underlying
-/// registry maps an already-running task to `400` (the C# guard that only queues
-/// an idle task).
+/// Port of `ScheduledTasksController.StartTask` → `ITaskManager.Execute`: the
+/// run is queued (it starts immediately on a background task) and the handler
+/// returns `204 No Content` as soon as the task is `Running`, so the dashboard
+/// can track its progress. A missing task is `404`; the underlying registry
+/// maps an already-running task to `400` (the C# guard that only queues an idle
+/// task).
 #[utoipa::path(
     post,
     path = "/ScheduledTasks/Running/{taskId}",
@@ -138,8 +138,8 @@ async fn start_task(
 /// `DELETE /ScheduledTasks/Running/{taskId}` — cancel a task.
 ///
 /// Port of `ScheduledTasksController.StopTask` → `ITaskManager.Cancel`. Returns
-/// `204 No Content`; a missing task is `404`. This registry runs nothing in the
-/// background, so cancellation is a state reset (see the module docs).
+/// `204 No Content`; a missing task is `404`. A running task's spawned run is
+/// aborted and recorded as `Cancelled`; an idle task is left idle.
 #[utoipa::path(
     delete,
     path = "/ScheduledTasks/Running/{taskId}",

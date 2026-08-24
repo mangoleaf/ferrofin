@@ -12,9 +12,13 @@
 //! - [`SubtitleDownloadTask`] — `SubtitleScheduledTask` (`DownloadSubtitles`)
 //! - [`LyricDownloadTask`] — `LyricScheduledTask` (`DownloadLyrics`)
 //! - [`TrickplayImagesTask`] — `TrickplayImagesTask` (`RefreshTrickplayImages`)
+//! - [`MediaSegmentExtractionTask`] — `MediaSegmentExtractionTask`
+//!   (`TaskExtractMediaSegments`)
 //!
-//! The "Media Segment Scan" task (`TaskExtractMediaSegments`) lives in
-//! `ferrofin-extensions`, next to the segment providers it runs.
+//! The Intro Skipper extension registers its own richer task under that last
+//! key when it is loaded (its season-level fingerprint pass produces the
+//! segments); this one is the always-present core registration upstream has,
+//! so the dashboard shows the task even with every extension disabled.
 //!
 //! The C# `IProgress<double>` maps to [`TaskProgress`]; `CancellationToken`s
 //! are dropped (a queued run is cancelled by aborting its tokio task).
@@ -37,7 +41,8 @@ use ferrofin_traits::chapters::ChapterManager;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::{LibraryManager, VirtualFolderManager};
 use ferrofin_traits::media_encoding::MediaEncoder;
-use ferrofin_traits::options::InternalItemsQuery;
+use ferrofin_traits::media_segments::MediaSegmentManager;
+use ferrofin_traits::options::{InternalItemsQuery, SourceType};
 use ferrofin_traits::persistence::{KeyframeRepository, MediaStreamQuery, MediaStreamRepository};
 use ferrofin_traits::providers::{MetadataRefreshOptions, ProviderManager};
 use ferrofin_traits::stubs::LyricManager;
@@ -1382,6 +1387,143 @@ impl ScheduledTask for TrickplayImagesTask {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Media Segment Scan
+// ---------------------------------------------------------------------------
+
+/// "Media Segment Scan" — runs the media-segment providers over every eligible
+/// library item. Port of `MediaSegmentExtractionTask`.
+///
+/// The item gating is upstream's, verbatim: video/audio media types, the
+/// `Episode`/`Movie`/`Audio`/`AudioBook` kinds, non-virtual, library-sourced,
+/// recursive, walked a page at a time, and only items whose file actually
+/// exists on disk ("only local files supported"). Each such item is handed to
+/// [`MediaSegmentManager::run_segment_providers`] — the port of upstream's
+/// `RunSegmentPluginProviders`. (`source_types` is set for parity and is inert
+/// on both sides: upstream's repository never filters on it either.)
+///
+/// Accepted divergence: upstream catches a *provider's* failure inside
+/// `RunSegmentPluginProviders`, but lets the surrounding failures (clearing an
+/// item's segments, deciding which providers support it) abort the whole task.
+/// Here any error from that call is logged against the item and the scan moves
+/// on, matching the sibling library tasks — one bad item cannot cost the pass.
+///
+/// When this body runs at all: the Intro Skipper extension registers its own
+/// task under this key and replaces this registration whenever the extension is
+/// **loaded** — which is not the same as enabled, since a plugin disabled in the
+/// dashboard still owns the key and its task self-gates. So this is what a
+/// server started with `disable_extensions` runs, and there it walks the library
+/// and runs zero providers: exactly what upstream does on an install with no
+/// media-segment plugin.
+///
+/// **What runs there in Ferrofin.** Ferrofin has no per-item segment-provider
+/// registry: its producers are the Intro Skipper extension (a season-level
+/// fingerprint pass, which claims this same upstream task key while it is
+/// loaded and does the real detection) and WASM analyzer plugins (their own
+/// analysis pass). So on a server with those disabled this task walks the
+/// library and runs zero providers — exactly what upstream does on an install
+/// with no media-segment plugin, and it stops `GET /ScheduledTasks` from
+/// hiding a task every Jellyfin advertises. Nothing here fabricates segments.
+pub struct MediaSegmentExtractionTask {
+    library: Arc<dyn LibraryManager>,
+    media_segments: Arc<dyn MediaSegmentManager>,
+}
+
+impl MediaSegmentExtractionTask {
+    /// Builds the task over the library and media-segment seams.
+    #[must_use]
+    pub fn new(
+        library: Arc<dyn LibraryManager>,
+        media_segments: Arc<dyn MediaSegmentManager>,
+    ) -> Self {
+        Self {
+            library,
+            media_segments,
+        }
+    }
+}
+
+#[allow(clippy::unnecessary_literal_bound)]
+#[async_trait]
+impl ScheduledTask for MediaSegmentExtractionTask {
+    fn key(&self) -> &str {
+        "TaskExtractMediaSegments"
+    }
+    fn name(&self) -> &str {
+        "Media Segment Scan"
+    }
+    fn description(&self) -> &str {
+        "Extracts or obtains media segments from MediaSegment enabled plugins."
+    }
+    fn category(&self) -> &str {
+        LIBRARY
+    }
+    fn default_triggers(&self) -> Vec<TaskTriggerInfo> {
+        vec![interval_hours(12)]
+    }
+    async fn execute(&self, progress: &TaskProgress) -> Result<(), ServiceError> {
+        progress.report(0.0);
+        let query = InternalItemsQuery {
+            media_types: vec![MediaType::Video, MediaType::Audio],
+            include_item_types: vec![
+                BaseItemKind::Episode,
+                BaseItemKind::Movie,
+                BaseItemKind::Audio,
+                BaseItemKind::AudioBook,
+            ],
+            is_virtual_item: Some(false),
+            source_types: vec![SourceType::Library],
+            recursive: true,
+            ..InternalItemsQuery::default()
+        };
+        let total = self.library.get_count(&query).await?.max(0);
+        let mut done = 0i32;
+        let mut start_index = 0i32;
+        let mut providers_run = 0usize;
+        while start_index < total {
+            let items = page(&self.library, &query, start_index).await?;
+            if items.is_empty() {
+                break;
+            }
+            for item in &items {
+                done += 1;
+                // Only local files are supported (upstream's `IsFileProtocol
+                // && File.Exists`); a missing file is skipped, not an error.
+                // `tokio::fs` because this stats every movie/episode/track in
+                // the library — on a network mount a blocking stat per item
+                // would stall a runtime worker for the whole pass.
+                if let Some(path) = item.path.as_deref()
+                    && tokio::fs::try_exists(path).await.unwrap_or(false)
+                {
+                    match Uuid::parse_str(&item.id) {
+                        Ok(item_id) => match self
+                            .media_segments
+                            .run_segment_providers(item_id, false)
+                            .await
+                        {
+                            Ok(ran) => providers_run += ran,
+                            Err(e) => {
+                                tracing::warn!(item = %item.id, path, error = %e, "media segment providers failed");
+                            }
+                        },
+                        // A row whose id is not a GUID cannot be addressed by
+                        // any provider; saying so keeps "4000 items, 0
+                        // providers ran" answerable.
+                        Err(e) => {
+                            tracing::debug!(item = %item.id, error = %e, "skipping item with an unparseable id");
+                        }
+                    }
+                }
+                progress.report(100.0 * f64::from(done) / f64::from(total.max(1)));
+            }
+            start_index += PAGE_SIZE;
+        }
+        tracing::info!(items = done, providers_run, "media segment scan finished");
+        progress.report(100.0);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
@@ -2061,6 +2203,159 @@ mod tests {
         let mut refreshed = trickplay.refreshed.lock().expect("lock").clone();
         refreshed.sort();
         assert_eq!(refreshed, vec![v1, v2]);
+    }
+
+    // -- Media Segment Scan --------------------------------------------------
+
+    /// A media-segment manager recording which items the providers were run
+    /// over. Everything else is unreachable from this task.
+    #[derive(Default)]
+    struct FakeSegments {
+        ran: Mutex<Vec<Uuid>>,
+    }
+
+    #[async_trait]
+    impl MediaSegmentManager for FakeSegments {
+        async fn is_type_supported(&self, _item_id: Uuid) -> Result<bool, ServiceError> {
+            Ok(true)
+        }
+        async fn create_segment(
+            &self,
+            _segment: &ferrofin_model::media_segments::MediaSegmentDto,
+            _segment_provider_id: &str,
+        ) -> Result<ferrofin_model::media_segments::MediaSegmentDto, ServiceError> {
+            unimplemented!("fake")
+        }
+        async fn delete_segment(&self, _segment_id: Uuid) -> Result<(), ServiceError> {
+            unimplemented!("fake")
+        }
+        async fn delete_segments(&self, _item_id: Uuid) -> Result<(), ServiceError> {
+            unimplemented!("fake")
+        }
+        async fn delete_provider_segments(
+            &self,
+            _item_id: Uuid,
+            _provider_id: &str,
+            _type_filter: Option<ferrofin_model::media_segments::MediaSegmentType>,
+        ) -> Result<(), ServiceError> {
+            unimplemented!("fake")
+        }
+        async fn get_segments(
+            &self,
+            _item_id: Uuid,
+            _type_filter: Option<&[ferrofin_model::media_segments::MediaSegmentType]>,
+            _filter_by_provider: bool,
+        ) -> Result<Vec<ferrofin_model::media_segments::MediaSegmentDto>, ServiceError> {
+            unimplemented!("fake")
+        }
+        async fn has_segments(&self, _item_id: Uuid) -> Result<bool, ServiceError> {
+            unimplemented!("fake")
+        }
+        async fn get_supported_providers(
+            &self,
+            _item_id: Uuid,
+        ) -> Result<Vec<ferrofin_traits::media_segments::MediaSegmentProviderInfo>, ServiceError>
+        {
+            Ok(Vec::new())
+        }
+        async fn run_segment_providers(
+            &self,
+            item_id: Uuid,
+            overwrite: bool,
+        ) -> Result<usize, ServiceError> {
+            assert!(!overwrite, "upstream passes overwrite: false");
+            self.ran.lock().expect("lock").push(item_id);
+            Ok(1)
+        }
+    }
+
+    #[tokio::test]
+    async fn media_segment_scan_runs_providers_over_local_files_only() {
+        let db = test_db().await;
+        let library = library_manager_over(db.clone());
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // Two eligible items with a real file, one whose file is missing, and
+        // one of an ineligible kind.
+        let (present_a, present_b) = (Uuid::from_u128(0xA1), Uuid::from_u128(0xA2));
+        for (id, kind, name) in [
+            (present_a, BaseItemKind::Movie, "a.mkv"),
+            (present_b, BaseItemKind::Episode, "b.mkv"),
+        ] {
+            seed_item(&db, id, kind).await;
+            set_media_type(&db, id, "Video").await;
+            let path = dir.path().join(name);
+            std::fs::write(&path, b"x").expect("write");
+            set_path(&db, id, &path.to_string_lossy()).await;
+        }
+        let missing = Uuid::from_u128(0xA3);
+        seed_item(&db, missing, BaseItemKind::Movie).await;
+        set_media_type(&db, missing, "Video").await;
+        set_path(&db, missing, &dir.path().join("gone.mkv").to_string_lossy()).await;
+        let series = Uuid::from_u128(0xA4);
+        seed_item(&db, series, BaseItemKind::Series).await;
+
+        let segments = Arc::new(FakeSegments::default());
+        let task = MediaSegmentExtractionTask::new(library, segments.clone());
+
+        assert_eq!(task.key(), "TaskExtractMediaSegments");
+        assert_eq!(task.name(), "Media Segment Scan");
+        assert_eq!(task.category(), "Library");
+        assert_eq!(
+            task.description(),
+            "Extracts or obtains media segments from MediaSegment enabled plugins."
+        );
+        let triggers = task.default_triggers();
+        assert_eq!(triggers.len(), 1);
+        assert_eq!(triggers[0].type_, TaskTriggerInfoType::IntervalTrigger);
+        // 12 hours, matching the oracle's `IntervalTicks`.
+        assert_eq!(triggers[0].interval_ticks, Some(432_000_000_000));
+
+        let progress = TaskProgress::default();
+        task.execute(&progress).await.expect("run");
+
+        let mut ran = segments.ran.lock().expect("lock").clone();
+        ran.sort();
+        let mut expected = vec![present_a, present_b];
+        expected.sort();
+        assert_eq!(
+            ran, expected,
+            "only items with a local file are handed over"
+        );
+        assert!((progress.current() - 100.0).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn media_segment_scan_pages_past_the_first_page() {
+        // The page size is 100; a fixture smaller than that never exercises the
+        // `start_index` walk, which is exactly where an off-by-one hides.
+        let db = test_db().await;
+        let library = library_manager_over(db.clone());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("shared.mkv");
+        std::fs::write(&path, b"x").expect("write");
+
+        let count = usize::try_from(PAGE_SIZE).expect("page size") + 37;
+        for n in 0..count {
+            let id = Uuid::from_u128(0x1000 + n as u128);
+            seed_item(&db, id, BaseItemKind::Movie).await;
+            set_media_type(&db, id, "Video").await;
+            set_path(&db, id, &path.to_string_lossy()).await;
+        }
+        // A virtual item (an episode the series has but the disk does not) must
+        // not be handed over even though it matches on kind and media type.
+        let virtual_id = Uuid::from_u128(0x2000);
+        crate::test_support::seed_episode(&db, virtual_id, "series-key", 1, 1, true, None).await;
+        set_media_type(&db, virtual_id, "Video").await;
+        set_path(&db, virtual_id, &path.to_string_lossy()).await;
+
+        let segments = Arc::new(FakeSegments::default());
+        let task = MediaSegmentExtractionTask::new(library, segments.clone());
+        task.execute(&TaskProgress::default()).await.expect("run");
+
+        let ran = segments.ran.lock().expect("lock").clone();
+        assert_eq!(ran.len(), count, "every page was walked");
+        assert!(!ran.contains(&virtual_id), "virtual items are skipped");
     }
 
     // -- Refresh People ------------------------------------------------------
