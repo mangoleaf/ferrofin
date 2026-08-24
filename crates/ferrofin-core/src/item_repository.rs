@@ -1370,10 +1370,6 @@ mod tests {
 
         let query = InternalItemsQuery {
             include_item_types: vec![BaseItemKind::Movie],
-            order_by: vec![(
-                ferrofin_model::live_tv::ItemSortBy::SortName,
-                ferrofin_model::dto::SortOrder::Ascending,
-            )],
             ..InternalItemsQuery::default()
         };
         let rows = repository.get_item_list(&query).await.expect("rows");
@@ -1969,6 +1965,59 @@ mod tests {
         let w = repository.get_genres(&wild).await.expect("wild");
         assert_eq!(w.items.len(), 1);
         assert_eq!(w.items[0].item.name.as_deref(), Some("Drama"));
+    }
+
+    #[tokio::test]
+    async fn is_liked_uses_upstreams_min_like_value_of_six_point_five() {
+        // `UserItemData.MinLikeValue` is 6.5, so a 6.5 rating is liked and a 6 is
+        // not; a whole-number threshold of 7 would drop 6.5 and 6.9.
+        let db = test_db().await;
+        let repository = repo(&db);
+        let user_id = Uuid::from_u128(0x11B0);
+        let user = seed_user(&db, user_id).await;
+
+        let rated = |rating: f64, id: u128, name: &'static str| {
+            let db = db.clone();
+            async move {
+                let item = Uuid::from_u128(id);
+                seed_named_item(&db, item, BaseItemKind::Movie, name).await;
+                sqlx::query(
+                    r#"INSERT INTO "UserData"
+                       ("ItemId", "UserId", "CustomDataKey", "IsFavorite", "PlayCount",
+                        "PlaybackPositionTicks", "Played", "Rating")
+                       VALUES (?1, ?2, ?1, 0, 0, 0, 0, ?3)"#,
+                )
+                .bind(guid_to_db(item))
+                .bind(guid_to_db(user_id))
+                .bind(rating)
+                .execute(db.writer())
+                .await
+                .expect("rate");
+            }
+        };
+        rated(6.0, 0x11B1, "Six").await;
+        rated(6.5, 0x11B2, "Six And A Half").await;
+        rated(9.0, 0x11B3, "Nine").await;
+
+        let liked = InternalItemsQuery {
+            user: Some(user),
+            is_liked: Some(true),
+            include_item_types: vec![BaseItemKind::Movie],
+            order_by: vec![(
+                ferrofin_model::live_tv::ItemSortBy::SortName,
+                ferrofin_model::dto::SortOrder::Ascending,
+            )],
+            ..Default::default()
+        };
+        let mut names: Vec<_> = repository
+            .get_item_list(&liked)
+            .await
+            .expect("liked")
+            .into_iter()
+            .filter_map(|i| i.name)
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["Nine", "Six And A Half"]);
     }
 
     #[tokio::test]

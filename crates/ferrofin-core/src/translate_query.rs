@@ -780,8 +780,9 @@ fn append_user_data_predicates(qb: &mut QueryBuilder<'_, Sqlite>, filter: &Inter
         push_user_data_exists(qb, &uid, r#"ud."IsFavorite" = 1"#, want);
     }
     if let Some(want) = filter.is_liked {
-        // MinLikeValue upstream is 7 on a 0-10 rating scale.
-        push_user_data_exists(qb, &uid, r#"ud."Rating" >= 7"#, want);
+        // `UserItemData.MinLikeValue` is 6.5 on the 0-10 rating scale, not 7 — a
+        // 6.5 rating is "liked" upstream.
+        push_user_data_exists(qb, &uid, r#"ud."Rating" >= 6.5"#, want);
     }
     if let Some(want) = filter.is_played {
         push_user_data_exists(qb, &uid, r#"ud."Played" = 1"#, want);
