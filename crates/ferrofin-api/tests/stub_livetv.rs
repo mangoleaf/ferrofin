@@ -38,10 +38,12 @@ const LIVETV_PROMOTED: &[(Method, &str, StatusCode)] = &[
         "/LiveTv/ListingProviders/SchedulesDirect/Countries",
         StatusCode::UNAUTHORIZED,
     ),
+    // Anonymous upstream (the server's own ffmpeg reads it): no such
+    // recording is in progress, so 404 — not 401.
     (
         Method::GET,
         "/LiveTv/LiveRecordings/recording-1/stream",
-        StatusCode::UNAUTHORIZED,
+        StatusCode::NOT_FOUND,
     ),
     // Anonymous upstream: no such stream is open, so 404 — not 401.
     (

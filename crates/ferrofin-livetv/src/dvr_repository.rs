@@ -1,0 +1,302 @@
+//! Row reads and writes for the DVR — timers and recordings.
+//!
+//! The SQL boundary keeps raw queries in repository modules; the scheduler and
+//! the recorder in [`crate::dvr`] and [`crate::manager`] compose these with the
+//! capture logic and the DTO-service projection.
+
+use chrono::{DateTime, Utc};
+use ferrofin_db::Database;
+use ferrofin_db::store::{datetime_to_db, guid_to_db};
+use ferrofin_model::live_tv::{RecordingQuery, RecordingStatus, TimerInfoDto};
+use sqlx::{QueryBuilder, Sqlite};
+use uuid::Uuid;
+
+use ferrofin_traits::error::ServiceError;
+
+use crate::projection::RecordingRow;
+
+/// The columns a recording read returns, joined to its channel for the
+/// `ChannelName` `AddInfoToRecordingDto` sets from the channel item.
+const RECORDING_SELECT: &str = r#"SELECT r."Id",r."ChannelId",r."TimerId",r."SeriesTimerId",
+              r."Name",r."Overview",r."StartDate",r."EndDate",r."Status",r."Path",
+              r."DateCreated",r."EpisodeTitle",r."ProductionYear",r."SeasonNumber",
+              r."EpisodeNumber",r."ProgramId",r."ExternalProgramId",
+              r."PrePaddingSeconds",r."PostPaddingSeconds",
+              r."IsMovie",r."IsSeries",r."IsNews",r."IsKids",r."IsSports",
+              r."IsLive",r."IsRepeat",r."IsPremiere",
+              c."Name" AS "ChannelName"
+       FROM "FerrofinLiveTvRecordings" r
+       LEFT JOIN "FerrofinLiveTvChannels" c ON c."Id" = r."ChannelId""#;
+
+/// Inserts or replaces one timer, storing the whole DTO as JSON so a `GET`
+/// round-trips exactly what was posted.
+///
+/// # Errors
+///
+/// Fails when the write fails, or when the DTO cannot be serialized.
+pub async fn upsert_timer(db: &Database, timer: &TimerInfoDto) -> Result<String, ServiceError> {
+    let id = timer.base.id.clone().unwrap_or_default();
+    let data = serde_json::to_string(timer).map_err(|e| {
+        ServiceError::from(crate::error::LiveTvError::serialize("serialize timer", e))
+    })?;
+    sqlx::query(
+        r#"INSERT INTO "FerrofinLiveTvTimers"
+           ("Id","ChannelId","ProgramId","SeriesTimerId","Name","StartDate","EndDate","Status",
+            "PrePaddingSeconds","PostPaddingSeconds","Data")
+           VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
+           ON CONFLICT("Id") DO UPDATE SET
+             "ChannelId"=excluded."ChannelId","ProgramId"=excluded."ProgramId",
+             "SeriesTimerId"=excluded."SeriesTimerId","Name"=excluded."Name",
+             "StartDate"=excluded."StartDate","EndDate"=excluded."EndDate",
+             "Status"=excluded."Status","Data"=excluded."Data""#,
+    )
+    .bind(&id)
+    .bind(guid_to_db(timer.base.channel_id))
+    .bind(&timer.base.program_id)
+    .bind(&timer.series_timer_id)
+    .bind(timer.base.name.clone().unwrap_or_default())
+    .bind(datetime_to_db(timer.base.start_date))
+    .bind(datetime_to_db(timer.base.end_date))
+    .bind(status_name(timer.status))
+    .bind(timer.base.pre_padding_seconds)
+    .bind(timer.base.post_padding_seconds)
+    .bind(&data)
+    .execute(db.writer())
+    .await
+    .map_err(db_err)?;
+    Ok(id)
+}
+
+/// The stored timer whose `ProgramId` or `ExternalProgramId` names this
+/// programme, or `None` when nothing is scheduled for it.
+///
+/// Port of `TimerManager.GetTimerByProgramId`, widened to accept either
+/// spelling of the programme id, because the two travel together on the DTO.
+///
+/// # Errors
+///
+/// Fails when the read fails.
+pub async fn timer_for_program(
+    db: &Database,
+    program_id: &str,
+    external_program_id: Option<&str>,
+) -> Result<Option<TimerInfoDto>, ServiceError> {
+    let data: Option<String> = sqlx::query_scalar(
+        r#"SELECT "Data" FROM "FerrofinLiveTvTimers"
+           WHERE "ProgramId" IS NOT NULL
+             AND ("ProgramId" = ?1 COLLATE NOCASE OR "ProgramId" = ?2 COLLATE NOCASE)
+           LIMIT 1"#,
+    )
+    .bind(program_id)
+    .bind(external_program_id.unwrap_or(program_id))
+    .fetch_optional(db.pool())
+    .await
+    .map_err(db_err)?;
+    Ok(data.and_then(|d| serde_json::from_str(&d).ok()))
+}
+
+/// Inserts the row a capture is about to fill.
+///
+/// # Errors
+///
+/// Fails when the write fails.
+#[allow(clippy::too_many_arguments)] // one argument per stored recording column
+pub async fn insert_recording(
+    db: &Database,
+    recording_id: Uuid,
+    timer: &crate::dvr::TimerRecordingInfo,
+    path: &std::path::Path,
+    created: DateTime<Utc>,
+) -> Result<(), ServiceError> {
+    sqlx::query(
+        r#"INSERT INTO "FerrofinLiveTvRecordings"
+           ("Id","ChannelId","TimerId","SeriesTimerId","Name","Overview","StartDate","EndDate",
+            "Status","Path","DateCreated","EpisodeTitle","ProductionYear","SeasonNumber",
+            "EpisodeNumber","ProgramId","ExternalProgramId","PrePaddingSeconds",
+            "PostPaddingSeconds","IsMovie","IsSeries","IsNews","IsKids","IsSports","IsLive",
+            "IsRepeat","IsPremiere")
+           VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,
+                   ?22,?23,?24,?25,?26,?27)"#,
+    )
+    .bind(guid_to_db(recording_id))
+    .bind(guid_to_db(timer.channel_id))
+    .bind(&timer.id)
+    .bind(&timer.series_timer_id)
+    .bind(&timer.name)
+    .bind(&timer.overview)
+    .bind(datetime_to_db(timer.start_date))
+    .bind(datetime_to_db(timer.end_date))
+    .bind(status_name(RecordingStatus::InProgress))
+    .bind(path.display().to_string())
+    .bind(datetime_to_db(created))
+    .bind(&timer.episode_title)
+    .bind(timer.production_year)
+    .bind(timer.season_number)
+    .bind(timer.episode_number)
+    .bind(&timer.program_id)
+    .bind(&timer.external_program_id)
+    .bind(timer.pre_padding_seconds)
+    .bind(timer.post_padding_seconds)
+    .bind(timer.is_movie)
+    .bind(timer.is_program_series)
+    .bind(timer.is_news)
+    .bind(timer.is_kids)
+    .bind(timer.is_sports)
+    .bind(timer.is_live)
+    .bind(timer.is_repeat)
+    .bind(timer.is_premiere)
+    .execute(db.writer())
+    .await
+    .map_err(db_err)?;
+    Ok(())
+}
+
+/// Moves a recording to its final status, recording where the file ended up.
+///
+/// # Errors
+///
+/// Fails when the write fails.
+pub async fn finish_recording(
+    db: &Database,
+    recording_id: Uuid,
+    status: RecordingStatus,
+    path: Option<&str>,
+) -> Result<(), ServiceError> {
+    sqlx::query(
+        r#"UPDATE "FerrofinLiveTvRecordings" SET "Status" = ?2, "Path" = ?3 WHERE "Id" = ?1"#,
+    )
+    .bind(guid_to_db(recording_id))
+    .bind(status_name(status))
+    .bind(path)
+    .execute(db.writer())
+    .await
+    .map_err(db_err)?;
+    Ok(())
+}
+
+/// Deletes one recording row.
+///
+/// # Errors
+///
+/// Fails when the write fails.
+pub async fn delete_recording(db: &Database, recording_id: Uuid) -> Result<(), ServiceError> {
+    sqlx::query(r#"DELETE FROM "FerrofinLiveTvRecordings" WHERE "Id" = ?1"#)
+        .bind(guid_to_db(recording_id))
+        .execute(db.writer())
+        .await
+        .map_err(db_err)?;
+    Ok(())
+}
+
+/// One recording by id, or `None` when unknown.
+///
+/// # Errors
+///
+/// Fails when the read fails.
+pub async fn recording_row(
+    db: &Database,
+    recording_id: Uuid,
+) -> Result<Option<RecordingRow>, ServiceError> {
+    let mut qb: QueryBuilder<'_, Sqlite> = QueryBuilder::new(RECORDING_SELECT);
+    qb.push(r#" WHERE r."Id" = "#)
+        .push_bind(guid_to_db(recording_id));
+    qb.build_query_as()
+        .fetch_optional(db.pool())
+        .await
+        .map_err(db_err)
+}
+
+/// The recordings a query selects, newest capture first.
+///
+/// Port of the filters `LiveTvManager.GetRecordingsAsync` applies:
+/// in-progress/status, channel, series timer and the programme kind flags.
+///
+/// # Errors
+///
+/// Fails when the read fails.
+pub async fn recording_rows(
+    db: &Database,
+    query: &RecordingQuery,
+) -> Result<Vec<RecordingRow>, ServiceError> {
+    let mut qb: QueryBuilder<'_, Sqlite> = QueryBuilder::new(RECORDING_SELECT);
+    let mut first = true;
+    let mut separator = |qb: &mut QueryBuilder<'_, Sqlite>| {
+        qb.push(if first { " WHERE " } else { " AND " });
+        first = false;
+    };
+
+    if let Some(in_progress) = query.is_in_progress {
+        separator(&mut qb);
+        qb.push(if in_progress {
+            r#"r."Status" = 'InProgress'"#
+        } else {
+            r#"r."Status" <> 'InProgress'"#
+        });
+    }
+    if let Some(status) = query.status {
+        separator(&mut qb);
+        qb.push(r#"r."Status" = "#).push_bind(status_name(status));
+    }
+    if let Some(channel_id) = query
+        .channel_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .and_then(|c| Uuid::parse_str(c).ok())
+    {
+        separator(&mut qb);
+        qb.push(r#"r."ChannelId" = "#)
+            .push_bind(guid_to_db(channel_id));
+    }
+    if let Some(series_timer_id) = query
+        .series_timer_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        separator(&mut qb);
+        qb.push(r#"r."SeriesTimerId" = "#)
+            .push_bind(series_timer_id.to_owned());
+    }
+    for (wanted, column) in [
+        (query.is_movie, r#"r."IsMovie""#),
+        (query.is_series, r#"r."IsSeries""#),
+        (query.is_news, r#"r."IsNews""#),
+        (query.is_kids, r#"r."IsKids""#),
+        (query.is_sports, r#"r."IsSports""#),
+    ] {
+        if let Some(wanted) = wanted {
+            separator(&mut qb);
+            qb.push(column).push(" = ").push_bind(i32::from(wanted));
+        }
+    }
+
+    // Newest first: a client polling a running capture wants it at the top.
+    qb.push(r#" ORDER BY COALESCE(r."DateCreated", r."StartDate") DESC, r."Name""#);
+    qb.build_query_as()
+        .fetch_all(db.pool())
+        .await
+        .map_err(db_err)
+}
+
+/// The `RecordingStatus` name a row stores.
+///
+/// Port of `RecordingStatus.ToString()`, which is what the wire and the column
+/// both carry.
+#[must_use]
+pub fn status_name(status: RecordingStatus) -> &'static str {
+    match status {
+        RecordingStatus::New => "New",
+        RecordingStatus::InProgress => "InProgress",
+        RecordingStatus::Completed => "Completed",
+        RecordingStatus::Cancelled => "Cancelled",
+        RecordingStatus::ConflictedOk => "ConflictedOk",
+        RecordingStatus::ConflictedNotOk => "ConflictedNotOk",
+        RecordingStatus::Error => "Error",
+    }
+}
+
+/// Maps a `sqlx` error into a [`ServiceError`] via `ferrofin-db`'s `DbError`.
+fn db_err(e: sqlx::Error) -> ServiceError {
+    ServiceError::from(ferrofin_db::DbError::from(e))
+}

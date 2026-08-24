@@ -24,7 +24,7 @@
 //! not expose).
 
 use axum::body::Body;
-use axum::extract::{Path, Query, Request, State};
+use axum::extract::{Path, Query, State};
 use axum::response::Response;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -47,7 +47,6 @@ use crate::auth::{RequireAdmin, RequireAuth};
 use crate::error::ApiError;
 use crate::handlers::items::resolve_user_opt;
 use crate::handlers::query_parse::{parse_csv_enums_lenient, parse_csv_uuids, parse_pipe_strings};
-use crate::handlers::streaming::serve_static_file;
 use crate::state::AppState;
 
 /// `GET /LiveTv/Info` — top-level Live TV status.
@@ -877,15 +876,99 @@ struct IdQuery {
     id: String,
 }
 
+/// The query `GET /LiveTv/Recordings` binds.
+///
+/// Port of `LiveTvController.GetRecordings`' parameter list.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+#[allow(clippy::struct_excessive_bools)] // one field per contract parameter
+struct RecordingsQuery {
+    /// Restrict to one channel.
+    channel_id: Option<String>,
+    /// The user whose data the recordings are projected for.
+    user_id: Option<Uuid>,
+    /// The index of the first record to return.
+    start_index: Option<i32>,
+    /// The maximum number of records to return.
+    limit: Option<i32>,
+    /// Restrict to one recording status.
+    status: Option<ferrofin_model::live_tv::RecordingStatus>,
+    /// Restrict to recordings that are (not) being captured right now.
+    is_in_progress: Option<bool>,
+    /// Restrict to the recordings a series timer made.
+    series_timer_id: Option<String>,
+    /// Restrict to movies.
+    is_movie: Option<bool>,
+    /// Restrict to series episodes.
+    is_series: Option<bool>,
+    /// Restrict to kids' programmes.
+    is_kids: Option<bool>,
+    /// Restrict to sport.
+    is_sports: Option<bool>,
+    /// Restrict to news.
+    is_news: Option<bool>,
+    /// Restrict to recordings that are library items.
+    is_library_item: Option<bool>,
+    /// The extra fields to populate.
+    fields: Option<String>,
+    /// Whether image information is included.
+    enable_images: Option<bool>,
+    /// The maximum number of images per type.
+    image_type_limit: Option<i32>,
+    /// The image types to include.
+    enable_image_types: Option<String>,
+    /// Whether user data is included.
+    enable_user_data: Option<bool>,
+    /// Whether the total record count is computed.
+    enable_total_record_count: Option<bool>,
+}
+
 /// `GET /LiveTv/Recordings` — DVR recordings.
+///
+/// Port of `LiveTvController.GetRecordings`: the query selects, the DTO
+/// projection runs through the same service every other item uses, and each
+/// recording carries its timer link, status and (while it is being captured)
+/// how far through it is.
 async fn get_recordings(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAuth(auth): RequireAuth,
+    Query(query): Query<RecordingsQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
-    match state.live_tv.as_ref() {
-        Some(m) => Ok(Json(m.get_recordings().await?)),
-        None => Ok(Json(QueryResult::default())),
-    }
+    let Some(manager) = state.live_tv.as_ref() else {
+        return Ok(Json(QueryResult::default()));
+    };
+    let user = resolve_user_opt(&state, &auth, query.user_id).await?;
+    let options = program_dto_options(
+        parse_csv_enums_lenient(query.fields.as_deref()),
+        query.enable_images,
+        query.image_type_limit,
+        parse_csv_enums_lenient(query.enable_image_types.as_deref()),
+        query.enable_user_data,
+    );
+    let recording_query = ferrofin_model::live_tv::RecordingQuery {
+        channel_id: query.channel_id,
+        user_id: user
+            .as_ref()
+            .and_then(|u| Uuid::parse_str(&u.id).ok())
+            .unwrap_or_else(Uuid::nil),
+        start_index: query.start_index,
+        limit: query.limit,
+        status: query.status,
+        is_in_progress: query.is_in_progress,
+        series_timer_id: query.series_timer_id,
+        is_movie: query.is_movie,
+        is_series: query.is_series,
+        is_kids: query.is_kids,
+        is_sports: query.is_sports,
+        is_news: query.is_news,
+        is_library_item: query.is_library_item,
+        ..ferrofin_model::live_tv::RecordingQuery::default()
+    };
+    Ok(Json(
+        manager
+            .get_recordings_matching(&recording_query, user.as_ref(), &options)
+            .await?,
+    ))
 }
 
 /// `GET /LiveTv/Recordings/{recordingId}` — a single recording (`404` if absent).
@@ -947,23 +1030,33 @@ async fn get_schedules_direct_countries(
     Json(serde_json::json!([]))
 }
 
-/// `GET /LiveTv/LiveRecordings/{recordingId}/stream` — stream a recording file.
+/// `GET /LiveTv/LiveRecordings/{recordingId}/stream` — a recording in flight.
 ///
-/// Port of `LiveTvController.GetLiveRecordingFile`: resolves the recording's
-/// captured file path and serves it (HTTP Range supported). `404` when the
-/// recording is unknown or has no file on disk yet — the faithful result until
-/// the capture engine (a later Live TV increment) writes recordings.
+/// Port of `LiveTvController.GetLiveRecordingFile`: the id is the FIRING
+/// TIMER's, not the recording row's (upstream's `ActiveRecordingInfo.Id` is
+/// `timer.Id`), and the growing file is served progressively so a client — or
+/// the server's own ffmpeg, transcoding it — can watch a programme while it is
+/// still being captured.
+///
+/// **Anonymous, like upstream**: the action carries no `[Authorize]`, because
+/// ffmpeg reads this URL without a token. It is also, like upstream, *only*
+/// this: a capture in progress, named by a timer id that exists for the length
+/// of one programme. A finished recording is a library item and is fetched
+/// through the authenticated item routes — serving it here would make every
+/// recording readable without a token.
 async fn get_live_recording_stream(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
     Path(recording_id): Path<String>,
-    request: Request,
 ) -> Result<Response, ApiError> {
-    let Ok(id) = Uuid::parse_str(&recording_id) else {
+    let Some(live_tv) = state.live_tv.as_ref() else {
         return Err(ApiError::NotFound("recording".into()));
     };
-    match live_tv(&state)?.get_recording_path(id).await? {
-        Some(path) => serve_static_file(&path, request).await,
+    match live_tv.get_active_recording_path(&recording_id).await? {
+        Some(path) => Ok(progressive_response(
+            std::path::PathBuf::from(&path),
+            0,
+            &path,
+        )),
         None => Err(ApiError::NotFound("recording".into())),
     }
 }
@@ -1205,15 +1298,44 @@ async fn get_recordings_series(RequireAuth(_auth): RequireAuth) -> Json<QueryRes
     Json(QueryResult::default())
 }
 
-/// `GET /LiveTv/Timers` — pending recording timers.
+/// The query `GET /LiveTv/Timers` binds.
+///
+/// Port of `LiveTvController.GetTimers`' parameter list.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct TimersQuery {
+    /// Restrict to the timers on one channel.
+    channel_id: Option<String>,
+    /// Restrict to the timers one series timer scheduled.
+    series_timer_id: Option<String>,
+    /// Restrict to timers that are (not) recording right now.
+    is_active: Option<bool>,
+    /// Restrict to timers that are (not) still waiting to fire.
+    is_scheduled: Option<bool>,
+}
+
+/// `GET /LiveTv/Timers` — recording timers.
+///
+/// Port of `LiveTvController.GetTimers`: the channel/series-timer/active/
+/// scheduled filters, ordered by start date.
 async fn get_timers(
     State(state): State<AppState>,
     RequireAuth(_auth): RequireAuth,
+    Query(query): Query<TimersQuery>,
 ) -> Result<Json<QueryResult<TimerInfoDto>>, ApiError> {
-    match state.live_tv.as_ref() {
-        Some(m) => Ok(Json(QueryResult::from_items(m.get_timers().await?))),
-        None => Ok(Json(QueryResult::default())),
-    }
+    let Some(manager) = state.live_tv.as_ref() else {
+        return Ok(Json(QueryResult::default()));
+    };
+    let timer_query = ferrofin_model::live_tv::TimerQuery {
+        channel_id: query.channel_id,
+        series_timer_id: query.series_timer_id,
+        is_active: query.is_active,
+        is_scheduled: query.is_scheduled,
+        ..ferrofin_model::live_tv::TimerQuery::default()
+    };
+    Ok(Json(QueryResult::from_items(
+        manager.get_timers_matching(&timer_query).await?,
+    )))
 }
 
 /// `GET /LiveTv/Timers/{timerId}` — a single timer (`404` if absent).
@@ -1296,9 +1418,45 @@ async fn cancel_timer(
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
-/// `GET /LiveTv/Timers/Defaults` — default values for a new timer.
-async fn get_default_timer(RequireAuth(_auth): RequireAuth) -> Json<SeriesTimerInfoDto> {
-    Json(SeriesTimerInfoDto::default())
+/// The query `GET /LiveTv/Timers/Defaults` binds.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct TimerDefaultsQuery {
+    /// The programme the new timer would record.
+    ///
+    /// The contract declares this a plain string, and clients really do send
+    /// `?programId=` empty — binding it as a `Uuid` would turn that into a
+    /// `400` instead of the standing defaults.
+    program_id: Option<String>,
+}
+
+/// `GET /LiveTv/Timers/Defaults` — the values a new timer starts from.
+///
+/// Port of `LiveTvController.GetDefaultTimer`: the standing defaults (padding
+/// from the Live TV configuration, every day, keep until deleted), plus the
+/// named programme's own name, channel, window and ids — which is what the
+/// client posts straight back to create the timer.
+async fn get_default_timer(
+    State(state): State<AppState>,
+    RequireAuth(_auth): RequireAuth,
+    Query(query): Query<TimerDefaultsQuery>,
+) -> Result<Json<SeriesTimerInfoDto>, ApiError> {
+    match state.live_tv.as_ref() {
+        Some(manager) => Ok(Json(
+            manager
+                .get_new_timer_defaults(
+                    query
+                        .program_id
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|id| !id.is_empty())
+                        .and_then(|id| Uuid::parse_str(id).ok()),
+                )
+                .await?,
+        )),
+        // No Live TV configured: the padding-free standing defaults.
+        None => Ok(Json(ferrofin_traits::stubs::new_timer_defaults(0, 0))),
+    }
 }
 
 /// `GET /LiveTv/SeriesTimers` — recurring (series) timers.
@@ -1432,6 +1590,7 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
             get(get_recording_group),
         )
         .route("/LiveTv/Recordings/Series", get(get_recordings_series))
+        // Anonymous, as upstream: the server's own ffmpeg reads this URL.
         .route(
             "/LiveTv/LiveRecordings/{recordingId}/stream",
             get(get_live_recording_stream),
@@ -1594,7 +1753,12 @@ mod tests {
     #[tokio::test]
     async fn defaults_and_lists() {
         let _ = get_guide_info(auth()).await;
-        let _ = get_default_timer(auth()).await;
+        let _ = get_default_timer(
+            State(fake_state()),
+            auth(),
+            Query(TimerDefaultsQuery::default()),
+        )
+        .await;
         let _ = get_channel_mapping_options(admin_auth()).await;
         let _ = get_default_listing_provider(auth()).await;
         assert!(get_lineups(auth()).await.0.is_empty());
@@ -1602,18 +1766,22 @@ mod tests {
         assert!(discover_tuners(admin_auth()).await.0.is_empty());
         let state = fake_state();
         assert!(
-            get_recordings(State(state.clone()), auth())
-                .await
-                .unwrap()
-                .0
-                .items
-                .is_empty()
+            get_recordings(
+                State(state.clone()),
+                auth(),
+                Query(RecordingsQuery::default())
+            )
+            .await
+            .unwrap()
+            .0
+            .items
+            .is_empty()
         );
         assert!(get_recording_folders(auth()).await.0.items.is_empty());
         assert!(get_recording_groups(auth()).await.0.items.is_empty());
         assert!(get_recordings_series(auth()).await.0.items.is_empty());
         assert_eq!(
-            get_timers(State(state.clone()), auth())
+            get_timers(State(state.clone()), auth(), Query(TimersQuery::default()))
                 .await
                 .unwrap()
                 .0
@@ -1791,18 +1959,12 @@ mod tests {
     #[tokio::test]
     async fn manager_backed_ops_501_without_manager() {
         let state = fake_state();
-        let req = axum::http::Request::builder()
-            .body(axum::body::Body::empty())
-            .unwrap();
-        let rec = get_live_recording_stream(
-            State(state.clone()),
-            auth(),
-            Path(Uuid::nil().to_string()),
-            req,
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(rec.status(), axum::http::StatusCode::NOT_IMPLEMENTED);
+        // The recording stream is anonymous upstream, so it reports only
+        // "no such recording" — never 501, whatever is wired.
+        let rec = get_live_recording_stream(State(state.clone()), Path(Uuid::nil().to_string()))
+            .await
+            .unwrap_err();
+        assert_eq!(rec.status(), axum::http::StatusCode::NOT_FOUND);
         let map = set_channel_mapping(
             State(state),
             admin_auth(),
@@ -2379,13 +2541,13 @@ mod tests {
     async fn live_recording_stream_404_when_no_file() {
         let fake = std::sync::Arc::new(FakeLiveTv::default());
         let state = fake_state().with_live_tv(fake);
-        let req = axum::http::Request::builder()
-            .body(axum::body::Body::empty())
-            .unwrap();
-        let err =
-            get_live_recording_stream(State(state), auth(), Path(Uuid::new_v4().to_string()), req)
-                .await
-                .unwrap_err();
+        // Upstream's route serves ONLY a capture in progress: a finished
+        // recording is a library item behind the authenticated item routes, and
+        // serving it from this anonymous route would make every recording
+        // readable without a token.
+        let err = get_live_recording_stream(State(state), Path(Uuid::new_v4().to_string()))
+            .await
+            .unwrap_err();
         assert_eq!(err.status(), axum::http::StatusCode::NOT_FOUND);
     }
 }

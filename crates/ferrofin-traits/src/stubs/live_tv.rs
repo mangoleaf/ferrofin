@@ -15,10 +15,11 @@ use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use ferrofin_db::entities::users::UserEntity;
+use ferrofin_model::dto::DayOfWeek;
 use ferrofin_model::dto::{BaseItemDto, MediaSourceInfo, SortOrder};
 use ferrofin_model::live_tv::{
-    ChannelType, ItemSortBy, ListingsProviderInfo, LiveTvInfo, SeriesTimerInfoDto, TimerInfoDto,
-    TunerHostInfo,
+    ChannelType, DayPattern, ItemSortBy, KeepUntil, ListingsProviderInfo, LiveTvInfo,
+    RecordingQuery, RecordingStatus, SeriesTimerInfoDto, TimerInfoDto, TimerQuery, TunerHostInfo,
 };
 use ferrofin_model::querying::QueryResult;
 
@@ -93,6 +94,101 @@ pub const TAIL_SEEK_AFTER_SECONDS: i64 = 10;
 /// How far from the end of the buffer such a late reader starts, in bytes (C#
 /// `LiveStream.GetStream`'s `TrySeek(stream, -20000)`).
 pub const TAIL_SEEK_BYTES: i64 = 20_000;
+
+/// The service name Jellyfin's built-in Live TV service reports.
+///
+/// Port of `DefaultLiveTvService.ServiceName`; it is what every timer, series
+/// timer and channel carries as `ServiceName`.
+pub const LIVE_TV_SERVICE_NAME: &str = "Emby";
+
+/// The defaults a new timer starts from, before any programme is applied.
+///
+/// Port of `DefaultLiveTvService.GetNewTimerDefaultsAsync` +
+/// `LiveTvManager.GetNewTimerDefaultsInternal`: record at any time on this
+/// channel only, new episodes only, every day of the week, keep until deleted,
+/// and the configured padding (which the caller supplies, since only the real
+/// manager can read it).
+#[must_use]
+pub fn new_timer_defaults(
+    pre_padding_seconds: i32,
+    post_padding_seconds: i32,
+) -> SeriesTimerInfoDto {
+    let record_new_only = true;
+    SeriesTimerInfoDto {
+        base: ferrofin_model::live_tv::BaseTimerInfoDto {
+            // `LiveTvManager.GetNewTimerDefaultsInternal` nulls the id: these
+            // are defaults for a timer that does not exist yet.
+            id: None,
+            type_: Some("SeriesTimer".to_owned()),
+            service_name: Some(LIVE_TV_SERVICE_NAME.to_owned()),
+            pre_padding_seconds: pre_padding_seconds.max(0),
+            post_padding_seconds: post_padding_seconds.max(0),
+            keep_until: KeepUntil::UntilDeleted,
+            ..ferrofin_model::live_tv::BaseTimerInfoDto::default()
+        },
+        record_any_channel: false,
+        record_any_time: true,
+        record_new_only,
+        skip_episodes_in_library: record_new_only,
+        days: vec![
+            DayOfWeek::Sunday,
+            DayOfWeek::Monday,
+            DayOfWeek::Tuesday,
+            DayOfWeek::Wednesday,
+            DayOfWeek::Thursday,
+            DayOfWeek::Friday,
+            DayOfWeek::Saturday,
+        ],
+        day_pattern: Some(DayPattern::Daily),
+        ..SeriesTimerInfoDto::default()
+    }
+}
+
+/// Selects the timers a [`TimerQuery`] asks for, in start-date order.
+///
+/// Port of `LiveTvManager.GetTimersInternal`: the service hands back every
+/// timer and the manager filters and orders them in memory, so this is the
+/// whole implementation rather than a fallback.
+#[must_use]
+pub fn filter_timers(timers: Vec<TimerInfoDto>, query: &TimerQuery) -> Vec<TimerInfoDto> {
+    let matches_opt = |wanted: Option<&str>, actual: Option<&str>| match wanted
+        .map(str::trim)
+        .filter(|w| !w.is_empty())
+    {
+        Some(wanted) => actual.is_some_and(|a| a.eq_ignore_ascii_case(wanted)),
+        None => true,
+    };
+    let mut selected: Vec<TimerInfoDto> = timers
+        .into_iter()
+        .filter(|timer| {
+            // `IsActive` is "recording right now"; `IsScheduled` is "not yet
+            // started" — upstream compares the status, not the clock.
+            query
+                .is_active
+                .is_none_or(|active| (timer.status == RecordingStatus::InProgress) == active)
+                && query
+                    .is_scheduled
+                    .is_none_or(|scheduled| (timer.status == RecordingStatus::New) == scheduled)
+                // Clients echo back whatever spelling they were given, so the
+                // comparison is on the parsed guid, not its text.
+                && query
+                    .channel_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|c| !c.is_empty())
+                    .is_none_or(|wanted| {
+                        Uuid::parse_str(wanted).is_ok_and(|wanted| wanted == timer.base.channel_id)
+                    })
+                && matches_opt(
+                    query.series_timer_id.as_deref(),
+                    timer.series_timer_id.as_deref(),
+                )
+                && matches_opt(query.id.as_deref(), timer.base.id.as_deref())
+        })
+        .collect();
+    selected.sort_by_key(|timer| timer.base.start_date);
+    selected
+}
 
 /// The Live TV manager.
 ///
@@ -296,10 +392,93 @@ pub trait LiveTvManager: Send + Sync {
     /// Cancels (deletes) the series timer and its pending timers.
     async fn cancel_series_timer(&self, id: &str) -> Result<(), ServiceError>;
 
+    /// The defaults a client seeds a new timer form with, for a programme or in
+    /// general.
+    ///
+    /// Port of `LiveTvManager.GetNewTimerDefaults(programId)`: the standing
+    /// defaults, then the programme's own name/overview/channel/dates when one
+    /// is named.
+    ///
+    /// The default reports the standing defaults with no padding — the right
+    /// answer when nothing is configured.
+    async fn get_new_timer_defaults(
+        &self,
+        program_id: Option<Uuid>,
+    ) -> Result<SeriesTimerInfoDto, ServiceError> {
+        let _ = program_id;
+        Ok(new_timer_defaults(0, 0))
+    }
+
+    /// Lists the timers a query selects.
+    ///
+    /// Port of `LiveTvManager.GetTimers`. The default filters the full list in
+    /// memory, which is what upstream does — see [`filter_timers`].
+    async fn get_timers_matching(
+        &self,
+        query: &TimerQuery,
+    ) -> Result<Vec<TimerInfoDto>, ServiceError> {
+        Ok(filter_timers(self.get_timers().await?, query))
+    }
+
     // ---- DVR: recordings -------------------------------------------------
 
     /// Lists recordings as `BaseItemDto`s (`Type = "Recording"`).
     async fn get_recordings(&self) -> Result<QueryResult<BaseItemDto>, ServiceError>;
+
+    /// Lists the recordings a query selects, projected for `user`.
+    ///
+    /// Port of `LiveTvManager.GetRecordingsAsync`: the in-progress/status/
+    /// channel/series-timer filters and paging, then the DTO projection with
+    /// the list-path `RemoveFields` strip and the recording post-pass.
+    ///
+    /// The default ignores the query — the "nothing recorded" state.
+    async fn get_recordings_matching(
+        &self,
+        query: &RecordingQuery,
+        user: Option<&UserEntity>,
+        options: &DtoOptions,
+    ) -> Result<QueryResult<BaseItemDto>, ServiceError> {
+        let _ = (query, user, options);
+        self.get_recordings().await
+    }
+
+    /// The file a capture is writing right now, keyed by the FIRING TIMER's id
+    /// — which is what `GET /LiveTv/LiveRecordings/{recordingId}/stream` takes
+    /// (upstream's `ActiveRecordingInfo.Id` is `timer.Id`, not the recording's).
+    ///
+    /// Port of `RecordingsManager.GetActiveRecordingPath`. The default reports
+    /// nothing recording.
+    async fn get_active_recording_path(
+        &self,
+        timer_id: &str,
+    ) -> Result<Option<String>, ServiceError> {
+        let _ = timer_id;
+        Ok(None)
+    }
+
+    /// The media sources for a recording: while it is being captured, the
+    /// growing file plus the `EncoderPath` a transcode reads it through;
+    /// afterwards, the finished file.
+    ///
+    /// Port of `MediaSourceManager.GetRecordingStreamMediaSources` (reached
+    /// from `LiveTvMediaSourceProvider.GetMediaSources` when the item has an
+    /// active recording). The default reports none.
+    async fn get_recording_media_sources(
+        &self,
+        recording_id: Uuid,
+    ) -> Result<Vec<MediaSourceInfo>, ServiceError> {
+        let _ = recording_id;
+        Ok(Vec::new())
+    }
+
+    /// Arms every persisted timer, so a server restart does not lose the
+    /// recordings it had scheduled.
+    ///
+    /// Port of `TimerManager.RestartTimers`, which upstream runs when the Live
+    /// TV service starts. The default has no timers to arm.
+    async fn start_dvr(&self) -> Result<(), ServiceError> {
+        Ok(())
+    }
 
     /// Gets a single recording by id, or `None` when unknown.
     async fn get_recording(&self, id: Uuid) -> Result<Option<BaseItemDto>, ServiceError>;

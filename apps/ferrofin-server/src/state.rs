@@ -517,6 +517,9 @@ pub async fn build_app_state(
             server_id.clone(),
         )
         .with_users(Arc::clone(&users))
+        // ffmpeg, for the DVR's encoded recorder (the remux upstream falls
+        // back to when a tuner is not a transport stream).
+        .with_encoder(Arc::clone(&media_encoder))
         // Where a shared tuner stream buffers, where the DVR records, and where
         // the dashboard's Live TV options live (C# `GetTranscodePath()`,
         // `CommonApplicationPaths.DataPath`, the `livetv` named config).
@@ -1068,6 +1071,12 @@ pub async fn build_app_state(
     // Close the Live TV ↔ media-sources ↔ DTO cycle: the channel/programme
     // projections run through the same DTO service as every other item.
     live_tv_impl.set_dto(Arc::clone(&dto));
+    // Re-arm every persisted recording timer (C# `TimerManager.RestartTimers`),
+    // so a restart mid-schedule still records. Failing here must not stop the
+    // server: everything else about Live TV still works.
+    if let Err(err) = live_tv.start_dvr().await {
+        tracing::warn!(%err, "could not restart the Live TV recording timers");
+    }
 
     // ---- sessions + tv_series (consume dto) -------------------------------
     // The session message bus is created here (not with SyncPlay below) because

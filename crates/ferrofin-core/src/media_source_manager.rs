@@ -137,6 +137,29 @@ impl FerrofinMediaSourceManager {
         Ok(sources)
     }
 
+    /// The media sources for a DVR recording, or empty when the id is not one.
+    ///
+    /// Port of `LiveTvMediaSourceProvider.GetMediaSources`' active-recording
+    /// branch → `MediaSourceManager.GetRecordingStreamMediaSources`: the Live
+    /// TV manager knows whether the capture is still running (and so whether
+    /// there is an `EncoderPath` to hand out), and the probe happens here,
+    /// where the encoder is.
+    async fn recording_media_source(
+        &self,
+        item_id: Uuid,
+    ) -> Result<Vec<MediaSourceInfo>, ServiceError> {
+        let Some(live_tv) = &self.live_tv else {
+            return Ok(Vec::new());
+        };
+        let mut sources = live_tv.get_recording_media_sources(item_id).await?;
+        for source in &mut sources {
+            // `AddMediaInfoWithProbe(stream, false, false, ct)`: no cache key
+            // and no probe delay — the file already has bytes in it.
+            self.add_media_info_with_probe(source, None, false).await;
+        }
+        Ok(sources)
+    }
+
     /// Probes an opened live stream for its real container/streams, reporting
     /// whether the probe produced anything.
     ///
@@ -770,8 +793,14 @@ impl MediaSourceManager for FerrofinMediaSourceManager {
         _user_id: Option<Uuid>,
     ) -> Result<Vec<MediaSourceInfo>, ServiceError> {
         let Some(mut item) = self.items.retrieve_item(item_id).await? else {
-            // Not a library item — it may be a Live TV channel.
-            return self.channel_media_source(item_id).await;
+            // Not a library item — it may be a Live TV channel, or a DVR
+            // recording (which upstream resolves through the same Live TV
+            // media-source provider).
+            let channel = self.channel_media_source(item_id).await?;
+            if !channel.is_empty() {
+                return Ok(channel);
+            }
+            return self.recording_media_source(item_id).await;
         };
         // An ALTERNATE version (PrimaryVersionId set) resolves through its
         // primary, so playing any version yields the full merged source list

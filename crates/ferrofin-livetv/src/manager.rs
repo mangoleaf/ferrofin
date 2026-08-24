@@ -22,6 +22,7 @@ use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::data::{BaseItemKind, MediaType};
 use ferrofin_model::dto::SortOrder;
 use ferrofin_model::dto::{BaseItemDto, MediaSourceInfo, MediaSourceType};
+use ferrofin_model::live_tv::LiveTvOptions;
 use ferrofin_model::live_tv::{
     ChannelType, ItemSortBy, ListingsProviderInfo, LiveTvInfo, LiveTvServiceInfo,
     LiveTvServiceStatus, RecordingStatus, SeriesTimerInfoDto, TimerInfoDto, TunerHostInfo,
@@ -30,11 +31,13 @@ use ferrofin_model::media_info::MediaProtocol;
 use ferrofin_model::querying::{ItemFields, QueryResult};
 use ferrofin_traits::dto::DtoService;
 use ferrofin_traits::error::ServiceError;
+use ferrofin_traits::media_encoding::MediaEncoder;
 use ferrofin_traits::options::{DtoOptions, InternalItemsQuery};
 use ferrofin_traits::stubs::{LiveStreamFile, LiveTvChannelQuery, LiveTvManager};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
+use crate::dvr::{ActiveRecording, RecorderKind, RecordingInput, TimerRecordingInfo};
 use crate::error::LiveTvError;
 use crate::fetch::SourceFetcher;
 use crate::m3u::parse_m3u;
@@ -174,6 +177,21 @@ pub struct FerrofinLiveTvManager {
     /// `ILiveStream`s). Guarded by a `std::sync::Mutex`: the guard is always
     /// dropped before an `.await`.
     live_streams: Arc<Mutex<HashMap<String, LiveStreamHandle>>>,
+    /// The recordings being captured right now, keyed by the FIRING TIMER's id
+    /// (C# `RecordingsManager._activeRecordings`, whose key is `timer.Id`).
+    active_recordings: Arc<Mutex<HashMap<String, ActiveRecording>>>,
+    /// The timers armed to fire, keyed by timer id (C# `TimerManager._timers`,
+    /// a `System.Threading.Timer` each). The value is the flag that cancels a
+    /// *pending* fire — see [`FerrofinLiveTvManager::arm_timer`] for why the
+    /// task is never aborted.
+    armed_timers: Arc<Mutex<HashMap<String, Arc<std::sync::atomic::AtomicBool>>>>,
+    /// How many times each timer has been retried after a failed capture (C#
+    /// `TimerInfo.RetryCount`, which upstream persists; a restart re-arms the
+    /// timer anyway, so in memory is enough).
+    retry_counts: Arc<Mutex<HashMap<String, u32>>>,
+    /// The media encoder, for the encoded recorder's ffmpeg. Absent in tests
+    /// and on a server with no ffmpeg, where only the direct recorder runs.
+    encoder: Option<Arc<dyn MediaEncoder>>,
     /// Serializes "join or open", so two clients tuning the same channel at
     /// once cannot both miss the join and both dial the tuner.
     ///
@@ -323,8 +341,22 @@ impl FerrofinLiveTvManager {
             tuner_source: Arc::new(crate::stream::ReqwestTunerSource::new()),
             local_api_url: Arc::new(OnceLock::new()),
             live_streams: Arc::new(Mutex::new(HashMap::new())),
+            active_recordings: Arc::new(Mutex::new(HashMap::new())),
+            armed_timers: Arc::new(Mutex::new(HashMap::new())),
+            retry_counts: Arc::new(Mutex::new(HashMap::new())),
+            encoder: None,
             open_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
+    }
+
+    /// Attaches the media encoder the encoded recorder runs ffmpeg through.
+    ///
+    /// Without one, a source that needs remuxing cannot be recorded at all —
+    /// which is also true of upstream on a server with no ffmpeg.
+    #[must_use]
+    pub fn with_encoder(mut self, encoder: Arc<dyn MediaEncoder>) -> Self {
+        self.encoder = Some(encoder);
+        self
     }
 
     /// Sets the on-disk locations the live-stream buffer and DVR recordings use.
@@ -1106,44 +1138,112 @@ impl LiveTvManager for FerrofinLiveTvManager {
     }
 
     async fn create_timer(&self, mut timer: TimerInfoDto) -> Result<String, ServiceError> {
-        let id = ensure_id(&mut timer.base.id);
-        let data = to_json(&timer)?;
-        sqlx::query(
-            r#"INSERT INTO "FerrofinLiveTvTimers"
-               ("Id","ChannelId","ProgramId","SeriesTimerId","Name","StartDate","EndDate","Status",
-                "PrePaddingSeconds","PostPaddingSeconds","Data")
-               VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
-               ON CONFLICT("Id") DO UPDATE SET
-                 "ChannelId"=excluded."ChannelId","ProgramId"=excluded."ProgramId",
-                 "SeriesTimerId"=excluded."SeriesTimerId","Name"=excluded."Name",
-                 "StartDate"=excluded."StartDate","EndDate"=excluded."EndDate",
-                 "Status"=excluded."Status","Data"=excluded."Data""#,
-        )
-        .bind(&id)
-        .bind(guid_to_db(timer.base.channel_id))
-        .bind(&timer.base.program_id)
-        .bind(&timer.series_timer_id)
-        .bind(timer.base.name.clone().unwrap_or_default())
-        .bind(datetime_to_db(timer.base.start_date))
-        .bind(datetime_to_db(timer.base.end_date))
-        .bind(recording_status_name(timer.status))
-        .bind(timer.base.pre_padding_seconds)
-        .bind(timer.base.post_padding_seconds)
-        .bind(&data)
-        .execute(self.db.writer())
-        .await
-        .map_err(db_err)?;
+        // Port of `DefaultLiveTvService.CreateTimer`: one timer per programme —
+        // a cancelled or completed one is revived, a live one is a conflict.
+        if let Some(existing) = self.timer_for_program(&timer).await? {
+            let existing_id = existing.base.id.clone().unwrap_or_default();
+            if matches!(
+                existing.status,
+                RecordingStatus::Cancelled | RecordingStatus::Completed
+            ) {
+                let mut revived = existing;
+                revived.status = RecordingStatus::New;
+                self.persist_timer(&revived).await?;
+                self.arm_timer(&revived);
+                return Ok(existing_id);
+            }
+            return Err(ServiceError::InvalidInput(
+                "A scheduled recording already exists for this program.".to_owned(),
+            ));
+        }
+
+        // The id is always the server's to mint: C# overwrites whatever the
+        // client posted with a fresh GUID.
+        timer.base.id = Some(Uuid::new_v4().simple().to_string());
+        timer.base.type_ = Some("Timer".to_owned());
+        timer.base.service_name = Some(ferrofin_traits::stubs::LIVE_TV_SERVICE_NAME.to_owned());
+        // `CopyProgramInfoToTimerInfo`: the guide is the authority on what this
+        // timer is actually recording.
+        if let Some(program) = self.timer_program_row(&timer).await? {
+            copy_program_into_timer(&program, &mut timer);
+        }
+        let id = self.persist_timer(&timer).await?;
+        self.arm_timer(&timer);
         Ok(id)
     }
 
     async fn update_timer(&self, id: &str, mut timer: TimerInfoDto) -> Result<(), ServiceError> {
         timer.base.id = Some(id.to_owned());
-        self.create_timer(timer).await.map(|_| ())
+        self.persist_timer(&timer).await?;
+        // C# `TimerManager.Update` re-arms the system timer behind it.
+        self.arm_timer(&timer);
+        Ok(())
     }
 
     async fn cancel_timer(&self, id: &str) -> Result<(), ServiceError> {
-        self.delete_by_id(r#"DELETE FROM "FerrofinLiveTvTimers" WHERE "Id" = ?1"#, id)
-            .await
+        // Port of `DefaultLiveTvService.CancelTimerInternal`: the timer goes to
+        // `Cancelled`; a manual one (nothing scheduled it) is deleted outright,
+        // and any capture it started stops.
+        match self.get_timer(id).await? {
+            Some(mut timer) => {
+                timer.status = RecordingStatus::Cancelled;
+                if timer
+                    .series_timer_id
+                    .as_deref()
+                    .map(str::trim)
+                    .is_none_or(str::is_empty)
+                {
+                    self.delete_by_id(DELETE_TIMER_SQL, id).await?;
+                } else {
+                    self.persist_timer(&timer).await?;
+                }
+            }
+            None => self.delete_by_id(DELETE_TIMER_SQL, id).await?,
+        }
+        self.disarm_timer(id);
+        self.cancel_recording(id);
+        Ok(())
+    }
+
+    async fn get_new_timer_defaults(
+        &self,
+        program_id: Option<Uuid>,
+    ) -> Result<SeriesTimerInfoDto, ServiceError> {
+        let options = self.live_tv_options().await;
+        let mut defaults = ferrofin_traits::stubs::new_timer_defaults(
+            options.pre_padding_seconds,
+            options.post_padding_seconds,
+        );
+        let Some(program_id) = program_id else {
+            return Ok(defaults);
+        };
+        let Some(program) = self.program_row(program_id).await? else {
+            return Ok(defaults);
+        };
+
+        // `LiveTvManager.GetNewTimerDefaults(programId)`: the programme's own
+        // identity replaces the standing defaults.
+        defaults.record_new_only = !program.is_repeat;
+        defaults.skip_episodes_in_library = defaults.record_new_only;
+        defaults.base.name = Some(program.title.clone());
+        defaults.base.overview.clone_from(&program.overview);
+        defaults.base.channel_id = Uuid::parse_str(&program.channel_id).unwrap_or_default();
+        defaults.base.channel_name = Some(program.channel_name.clone());
+        if let Some(start) = parse_dt(&program.start_date) {
+            defaults.base.start_date = start;
+        }
+        if let Some(end) = program.end_date.as_deref().and_then(parse_dt) {
+            defaults.base.end_date = end;
+        }
+        // The client posts these straight back as the new timer, so the
+        // programme is named the way a DTO names it (`programDto.Id`), with the
+        // listing provider's own id alongside.
+        defaults.base.program_id = Some(program_id.simple().to_string());
+        defaults
+            .base
+            .external_program_id
+            .clone_from(&program.external_id);
+        Ok(defaults)
     }
 
     async fn get_series_timers(&self) -> Result<Vec<SeriesTimerInfoDto>, ServiceError> {
@@ -1207,58 +1307,191 @@ impl LiveTvManager for FerrofinLiveTvManager {
     }
 
     async fn get_recordings(&self) -> Result<QueryResult<BaseItemDto>, ServiceError> {
-        let rows = sqlx::query(
-            r#"SELECT "Id","Name","Overview","StartDate","EndDate","Status","ChannelId"
-               FROM "FerrofinLiveTvRecordings" ORDER BY "StartDate" DESC"#,
+        self.get_recordings_matching(
+            &ferrofin_model::live_tv::RecordingQuery::default(),
+            None,
+            &DtoOptions::default(),
         )
-        .fetch_all(self.db.pool())
         .await
-        .map_err(db_err)?;
-        let items: Vec<BaseItemDto> = rows.iter().map(|r| self.recording_dto(r)).collect();
-        Ok(QueryResult::from_items(items))
+    }
+
+    async fn get_recordings_matching(
+        &self,
+        query: &ferrofin_model::live_tv::RecordingQuery,
+        user: Option<&UserEntity>,
+        options: &DtoOptions,
+    ) -> Result<QueryResult<BaseItemDto>, ServiceError> {
+        let rows = crate::dvr_repository::recording_rows(&self.db, query).await?;
+        let start_index = query.start_index.unwrap_or(0);
+        let total = i32::try_from(rows.len()).unwrap_or(i32::MAX);
+        let page: Vec<crate::projection::RecordingRow> = rows
+            .into_iter()
+            .skip(usize::try_from(start_index).unwrap_or(0))
+            .take(
+                query
+                    .limit
+                    .and_then(|l| usize::try_from(l).ok())
+                    .unwrap_or(usize::MAX),
+            )
+            .collect();
+
+        // `RemoveFields(options)` on the list path, as the channel and
+        // programme lists do.
+        let mut list_options = options.clone();
+        remove_fields(&mut list_options);
+        let dtos = self.recording_dtos(&page, &list_options, user).await?;
+        Ok(QueryResult::new(Some(start_index), Some(total), dtos))
     }
 
     async fn get_recording(&self, id: Uuid) -> Result<Option<BaseItemDto>, ServiceError> {
-        let row = sqlx::query(
-            r#"SELECT "Id","Name","Overview","StartDate","EndDate","Status","ChannelId"
-               FROM "FerrofinLiveTvRecordings" WHERE "Id" = ?1"#,
-        )
-        .bind(guid_to_db(id))
-        .fetch_optional(self.db.pool())
-        .await
-        .map_err(db_err)?;
-        Ok(row.map(|r| self.recording_dto(&r)))
+        let Some(row) = crate::dvr_repository::recording_row(&self.db, id).await? else {
+            return Ok(None);
+        };
+        // The single-recording path keeps every requested field (upstream's
+        // `GetRecording` uses `new DtoOptions()` and never strips).
+        Ok(self
+            .recording_dtos(
+                std::slice::from_ref(&row),
+                &DtoOptions::with_all_fields(true),
+                None,
+            )
+            .await?
+            .pop())
     }
 
     async fn get_recording_path(&self, id: Uuid) -> Result<Option<String>, ServiceError> {
-        let path: Option<String> =
-            sqlx::query_scalar(r#"SELECT "Path" FROM "FerrofinLiveTvRecordings" WHERE "Id" = ?1"#)
-                .bind(guid_to_db(id))
-                .fetch_optional(self.db.pool())
-                .await
-                .map_err(db_err)?
-                .flatten();
+        let Some(row) = crate::dvr_repository::recording_row(&self.db, id).await? else {
+            return Ok(None);
+        };
         // Only report a path that actually points at a captured file.
-        Ok(path.filter(|p| !p.is_empty()))
+        Ok(row.path.filter(|p| !p.is_empty()))
+    }
+
+    async fn get_active_recording_path(
+        &self,
+        timer_id: &str,
+    ) -> Result<Option<String>, ServiceError> {
+        Ok(self
+            .active_recordings_lock()
+            .get(timer_id)
+            .map(|recording| recording.path.display().to_string()))
+    }
+
+    async fn get_recording_media_sources(
+        &self,
+        recording_id: Uuid,
+    ) -> Result<Vec<MediaSourceInfo>, ServiceError> {
+        let Some(row) = crate::dvr_repository::recording_row(&self.db, recording_id).await? else {
+            return Ok(Vec::new());
+        };
+        let active = row
+            .timer_id
+            .as_deref()
+            .and_then(|id| self.active_recordings_lock().get(id).cloned());
+
+        if let Some(active) = active {
+            // Port of `MediaSourceManager.GetRecordingStreamMediaSources`: the
+            // growing file is the path, and `EncoderPath` is how a transcode
+            // reads it — progressively, back through this server.
+            let base_url = self.local_api_url()?;
+            return Ok(vec![MediaSourceInfo {
+                id: Some(active.timer_id.clone()),
+                encoder_path: Some(format!(
+                    "{base_url}/LiveTv/LiveRecordings/{}/stream",
+                    active.timer_id
+                )),
+                encoder_protocol: Some(MediaProtocol::Http),
+                path: Some(active.path.display().to_string()),
+                protocol: MediaProtocol::File,
+                supports_direct_play: false,
+                supports_direct_stream: true,
+                supports_transcoding: true,
+                is_infinite_stream: true,
+                requires_opening: false,
+                requires_closing: false,
+                buffer_ms: Some(0),
+                ignore_dts: true,
+                ignore_index: true,
+                ..MediaSourceInfo::default()
+            }]);
+        }
+
+        // A finished recording is an ordinary file.
+        let Some(path) = row.path.as_deref().filter(|p| !p.is_empty()) else {
+            return Ok(Vec::new());
+        };
+        Ok(vec![MediaSourceInfo {
+            id: Some(recording_id.simple().to_string()),
+            path: Some(path.to_owned()),
+            protocol: MediaProtocol::File,
+            container: Some(LIVE_STREAM_BUFFER_CONTAINER.to_owned()),
+            name: Some(row.name.clone()),
+            ..MediaSourceInfo::default()
+        }])
     }
 
     async fn delete_recording(&self, id: Uuid) -> Result<(), ServiceError> {
-        // Remove the file first (best-effort), then the row.
-        let path: Option<String> =
-            sqlx::query_scalar(r#"SELECT "Path" FROM "FerrofinLiveTvRecordings" WHERE "Id" = ?1"#)
-                .bind(guid_to_db(id))
-                .fetch_optional(self.db.pool())
-                .await
-                .map_err(db_err)?
-                .flatten();
-        if let Some(path) = path {
+        // A capture still running has to stop before its file can go.
+        let row = crate::dvr_repository::recording_row(&self.db, id).await?;
+        if let Some(timer_id) = row.as_ref().and_then(|row| row.timer_id.as_deref()) {
+            self.cancel_recording(timer_id);
+        }
+        if let Some(path) = row.and_then(|row| row.path) {
+            // Best-effort: a row whose file has already gone still deletes.
             let _ = tokio::fs::remove_file(&path).await;
         }
-        self.delete_by_id(
-            r#"DELETE FROM "FerrofinLiveTvRecordings" WHERE "Id" = ?1"#,
-            &guid_to_db(id),
+        crate::dvr_repository::delete_recording(&self.db, id).await
+    }
+
+    async fn start_dvr(&self) -> Result<(), ServiceError> {
+        // Nothing is capturing yet, so a row still marked `InProgress` is one a
+        // crash or restart abandoned. Left alone it would answer
+        // `isInProgress=true` for ever and report a percentage that keeps
+        // climbing; settle it by whether its file survived.
+        for row in crate::dvr_repository::recording_rows(
+            &self.db,
+            &ferrofin_model::live_tv::RecordingQuery {
+                is_in_progress: Some(true),
+                ..ferrofin_model::live_tv::RecordingQuery::default()
+            },
         )
-        .await
+        .await?
+        {
+            let Ok(id) = Uuid::parse_str(&row.id) else {
+                continue;
+            };
+            let path = row.path.as_deref().filter(|p| !p.is_empty());
+            let kept = match path {
+                Some(path) => {
+                    tokio::fs::try_exists(path).await.unwrap_or(false)
+                        && !crate::dvr::is_empty_file(std::path::Path::new(path)).await
+                }
+                None => false,
+            };
+            if kept {
+                crate::dvr_repository::finish_recording(
+                    &self.db,
+                    id,
+                    RecordingStatus::Completed,
+                    path,
+                )
+                .await?;
+            } else {
+                crate::dvr_repository::delete_recording(&self.db, id).await?;
+            }
+            tracing::warn!(
+                recording_id = row.id,
+                kept,
+                "live tv: settled a recording the last run left in progress"
+            );
+        }
+
+        // C# `TimerManager.RestartTimers`: every persisted timer is re-armed,
+        // so a restart mid-schedule still records.
+        for timer in self.get_timers().await? {
+            self.arm_timer(&timer);
+        }
+        Ok(())
     }
 }
 
@@ -1466,25 +1699,578 @@ impl FerrofinLiveTvManager {
         Ok(())
     }
 
-    /// Maps a recording row to a `BaseItemDto` (`Type = "Recording"`).
-    fn recording_dto(&self, r: &sqlx::sqlite::SqliteRow) -> BaseItemDto {
-        let id = Uuid::parse_str(&r.get::<String, _>("Id")).unwrap_or_default();
-        BaseItemDto {
-            id,
-            server_id: Some(self.server_id.clone()),
-            name: Some(r.get::<String, _>("Name")),
-            type_: BaseItemKind::Recording,
-            channel_id: Uuid::parse_str(&r.get::<String, _>("ChannelId")).ok(),
-            media_type: MediaType::Video,
-            overview: r.get::<Option<String>, _>("Overview"),
-            start_date: parse_dt(r.get::<String, _>("StartDate").as_str()),
-            end_date: r
-                .get::<Option<String>, _>("EndDate")
-                .as_deref()
-                .and_then(parse_dt),
-            status: r.get::<Option<String>, _>("Status"),
-            is_folder: Some(false),
-            ..BaseItemDto::default()
+    // ---- DVR ------------------------------------------------------------
+
+    /// The active-recording registry, locked. The guard never spans an
+    /// `.await`.
+    fn active_recordings_lock(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<String, ActiveRecording>> {
+        self.active_recordings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The armed-timer registry, locked. The guard never spans an `.await`.
+    fn armed_timers_lock(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<String, Arc<std::sync::atomic::AtomicBool>>> {
+        self.armed_timers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The dashboard's Live TV options, or the defaults when nothing has been
+    /// saved (which is also what upstream falls back to on a corrupt store).
+    async fn live_tv_options(&self) -> LiveTvOptions {
+        if self.paths.options_file.as_os_str().is_empty() {
+            return LiveTvOptions::default();
+        }
+        let Ok(body) = tokio::fs::read_to_string(&self.paths.options_file).await else {
+            return LiveTvOptions::default();
+        };
+        serde_json::from_str(&body).unwrap_or_default()
+    }
+
+    /// Writes a timer through, DTO and promoted columns together.
+    async fn persist_timer(&self, timer: &TimerInfoDto) -> Result<String, ServiceError> {
+        crate::dvr_repository::upsert_timer(&self.db, timer).await
+    }
+
+    /// The timer already scheduled for this timer's programme, if any.
+    async fn timer_for_program(
+        &self,
+        timer: &TimerInfoDto,
+    ) -> Result<Option<TimerInfoDto>, ServiceError> {
+        let Some(program_id) = timer
+            .base
+            .program_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+        else {
+            return Ok(None);
+        };
+        crate::dvr_repository::timer_for_program(
+            &self.db,
+            program_id,
+            timer.base.external_program_id.as_deref(),
+        )
+        .await
+    }
+
+    /// One guide programme by id, or `None` when it is not in the guide.
+    async fn program_row(&self, id: Uuid) -> Result<Option<GuideProgramRow>, ServiceError> {
+        Ok(self
+            .query_program_rows(
+                &InternalItemsQuery {
+                    item_ids: vec![id],
+                    ..InternalItemsQuery::default()
+                },
+                Utc::now(),
+            )
+            .await?
+            .pop())
+    }
+
+    /// The guide programme a timer names, by its internal id or the listing
+    /// provider's own — a timer created from `Timers/Defaults` carries both.
+    async fn timer_program_row(
+        &self,
+        timer: &TimerInfoDto,
+    ) -> Result<Option<GuideProgramRow>, ServiceError> {
+        if let Some(id) = timer
+            .base
+            .program_id
+            .as_deref()
+            .and_then(|p| Uuid::parse_str(p).ok())
+            && let Some(row) = self.program_row(id).await?
+        {
+            return Ok(Some(row));
+        }
+        let Some(external) = timer
+            .base
+            .external_program_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|e| !e.is_empty())
+        else {
+            return Ok(None);
+        };
+        // The listing provider's id is not the row's key, so fall back to the
+        // channel's guide and match on it (upstream's cache lookup does the
+        // same by external id).
+        Ok(self
+            .query_program_rows(
+                &InternalItemsQuery {
+                    channel_ids: vec![timer.base.channel_id],
+                    ..InternalItemsQuery::default()
+                },
+                Utc::now(),
+            )
+            .await?
+            .into_iter()
+            .find(|row| {
+                row.external_id
+                    .as_deref()
+                    .is_some_and(|id| id.eq_ignore_ascii_case(external))
+            }))
+    }
+
+    /// Arms (or re-arms) the system timer behind one recording timer.
+    ///
+    /// Port of `TimerManager.AddOrUpdateSystemTimer`: a finished or cancelled
+    /// timer arms nothing, one whose start has already passed fires now, and
+    /// anything else sleeps until `StartDate - PrePaddingSeconds`.
+    fn arm_timer(&self, timer: &TimerInfoDto) {
+        let Some(id) = timer.base.id.clone().filter(|id| !id.is_empty()) else {
+            return;
+        };
+        self.disarm_timer(&id);
+        if matches!(
+            timer.status,
+            RecordingStatus::Completed | RecordingStatus::Cancelled
+        ) {
+            return;
+        }
+
+        let start = timer.base.start_date
+            - chrono::Duration::seconds(i64::from(timer.base.pre_padding_seconds));
+        let delay = (start - Utc::now())
+            .to_std()
+            .unwrap_or(std::time::Duration::ZERO);
+        let manager = self.clone();
+        let fire_id = id.clone();
+        tracing::info!(
+            timer_id = id,
+            name = timer.base.name.as_deref().unwrap_or_default(),
+            in_seconds = delay.as_secs(),
+            "live tv: recording timer armed"
+        );
+
+        // Disarming sets a flag the waiting task reads; it never aborts the
+        // task. A `JoinHandle::abort` would be a live hazard: by the time
+        // `cancel_timer` runs, the task may already BE the capture, and killing
+        // it there would strand the active recording, leave the tuner open and
+        // freeze the row at `InProgress`. Cancelling a capture is
+        // `cancel_recording`'s job (C# `RecordingsManager.CancelRecording`);
+        // this only stops one that has not started.
+        //
+        // The flag is registered BEFORE the task exists, so a zero-delay timer
+        // cannot fire before it is observable.
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.armed_timers_lock().insert(id, Arc::clone(&cancelled));
+        tokio::spawn(async move {
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+            if cancelled.load(Ordering::SeqCst) {
+                return;
+            }
+            manager.on_timer_fired(fire_id).await;
+        });
+    }
+
+    /// Cancels the pending fire of one timer (C# `TimerManager.StopTimer`).
+    ///
+    /// A timer that has already fired is no longer armed, so this cannot touch
+    /// the capture it started.
+    fn disarm_timer(&self, id: &str) {
+        if let Some(cancelled) = self.armed_timers_lock().remove(id) {
+            cancelled.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Stops a capture in flight (C# `RecordingsManager.CancelRecording`).
+    fn cancel_recording(&self, timer_id: &str) {
+        if let Some(recording) = self.active_recordings_lock().get(timer_id) {
+            tracing::info!(timer_id, "live tv: cancelling the recording in progress");
+            recording.cancel();
+        }
+    }
+
+    /// Runs one fired timer.
+    ///
+    /// Port of `DefaultLiveTvService.OnTimerManagerTimerFired`: a programme
+    /// that has already ended is dropped, one already recording is left alone,
+    /// and otherwise the guide is re-read and the capture starts.
+    async fn on_timer_fired(&self, timer_id: String) {
+        // The system timer is one-shot: once it has fired it is no longer
+        // armed, and — crucially — cancelling the recording timer from here on
+        // must stop the CAPTURE (`RecordingsManager.CancelRecording`) rather
+        // than abort the task that is running it. Dropping the handle detaches
+        // this task instead of aborting it.
+        self.armed_timers_lock().remove(&timer_id);
+
+        let Ok(Some(timer)) = self.get_timer(&timer_id).await else {
+            return;
+        };
+        let mut info = TimerRecordingInfo::from_timer(&timer);
+        if let Ok(Some(program)) = self.timer_program_row(&timer).await {
+            apply_program_to_recording_info(&program, &mut info);
+        }
+
+        if info.recording_end_date() <= Utc::now() {
+            tracing::warn!(
+                timer_id,
+                "live tv: the recording timer fired but the programme has already ended"
+            );
+            let _ = self.delete_by_id(DELETE_TIMER_SQL, &timer_id).await;
+            return;
+        }
+        if self.active_recordings_lock().contains_key(&timer_id) {
+            tracing::info!(timer_id, "live tv: that recording is already in progress");
+            return;
+        }
+        // `record_stream` settles the timer itself; an error here is the
+        // settle failing, which is the only thing left to report.
+        if let Err(error) = self.record_stream(timer, info).await {
+            tracing::error!(timer_id, %error, "live tv: settling the recording timer failed");
+        }
+    }
+
+    /// Captures one programme.
+    ///
+    /// Port of `RecordingsManager.RecordStream`: open the channel, choose the
+    /// recorder, register the capture and write the row, copy until the
+    /// programme ends or the timer is cancelled, then close the live stream and
+    /// settle the timer (retry, complete, or drop).
+    /// Captures one programme, and settles the timer however it ends.
+    ///
+    /// Port of `RecordingsManager.RecordStream`, whose whole body is inside one
+    /// try/catch: every failure — the channel gone, the tuner busy, ffmpeg
+    /// missing, a database hiccup — becomes a *failed recording* that retries,
+    /// never an error that silently leaves a timer armed at nothing.
+    async fn record_stream(
+        &self,
+        mut timer: TimerInfoDto,
+        info: TimerRecordingInfo,
+    ) -> Result<(), ServiceError> {
+        let options = self.live_tv_options().await;
+        let (target, _series_path) =
+            crate::dvr::recording_path(&info, &options, &self.paths.data_dir);
+        let target = {
+            let active: Vec<ActiveRecording> =
+                self.active_recordings_lock().values().cloned().collect();
+            crate::dvr::ensure_file_unique(&target, &info.id, &active)
+        };
+
+        let capture = self.capture(&mut timer, &info, &target).await;
+        let (recording_id, outcome) = match capture {
+            Ok(captured) => captured,
+            // Nothing was ever opened or registered, so there is nothing to
+            // unwind — but the timer still has to settle, or it stays armed at
+            // a recording that never happens.
+            Err(error) => (None, Err(error)),
+        };
+
+        // A zero-byte file is a failed capture, not a recording.
+        if crate::dvr::is_empty_file(&target).await {
+            let _ = tokio::fs::remove_file(&target).await;
+        }
+        let recorded = tokio::fs::try_exists(&target).await.unwrap_or(false);
+        self.settle_timer(timer, &info, recording_id, &target, recorded, outcome)
+            .await
+    }
+
+    /// Opens the channel, registers the capture and runs the recorder,
+    /// unwinding both the live stream and the registry whatever happens.
+    ///
+    /// Reports the recording row it created (when it got that far) and how the
+    /// capture itself ended.
+    async fn capture(
+        &self,
+        timer: &mut TimerInfoDto,
+        info: &TimerRecordingInfo,
+        target: &std::path::Path,
+    ) -> Result<(Option<Uuid>, Result<(), ServiceError>), ServiceError> {
+        // The tuner source, opened if it needs opening.
+        let sources = self.get_channel_media_sources(info.channel_id).await?;
+        let Some(source) = sources.into_iter().next() else {
+            return Err(ServiceError::not_found(format!(
+                "live tv channel {}",
+                info.channel_id
+            )));
+        };
+        let mut live_stream_id = None;
+        let opened = if source.requires_opening {
+            let opened = self
+                .open_channel_stream(info.channel_id, source.id.as_deref())
+                .await?;
+            live_stream_id.clone_from(&opened.live_stream_id);
+            opened
+        } else {
+            source
+        };
+
+        // From here on the tuner is open: every exit goes through
+        // `finish_capture`, which closes it and de-registers.
+        let started = self.start_capture(timer, info, target, &opened).await;
+        let (recording_id, outcome) = match started {
+            Ok((recording_id, cancel)) => {
+                let outcome = self
+                    .run_recorder(info, target, &opened, &cancel, live_stream_id.as_deref())
+                    .await;
+                (Some(recording_id), outcome)
+            }
+            Err(error) => (None, Err(error)),
+        };
+        self.finish_capture(&info.id, live_stream_id.as_deref())
+            .await;
+        Ok((recording_id, outcome))
+    }
+
+    /// C# `OnStarted`: the recording row, the active-recording registry and the
+    /// timer's status all move together, before the first byte is written.
+    async fn start_capture(
+        &self,
+        timer: &mut TimerInfoDto,
+        info: &TimerRecordingInfo,
+        target: &std::path::Path,
+        opened: &MediaSourceInfo,
+    ) -> Result<(Uuid, Arc<std::sync::atomic::AtomicBool>), ServiceError> {
+        let _ = opened;
+        let recording_id = Uuid::new_v4();
+        let recording = ActiveRecording::new(info.id.clone(), recording_id, target.to_path_buf());
+        let cancel = recording.cancellation();
+        crate::dvr_repository::insert_recording(
+            &self.db,
+            recording_id,
+            info,
+            target,
+            recording.started_at,
+        )
+        .await?;
+        self.active_recordings_lock()
+            .insert(info.id.clone(), recording);
+        timer.status = RecordingStatus::InProgress;
+        self.persist_timer(timer).await?;
+        Ok((recording_id, cancel))
+    }
+
+    /// Runs the recorder upstream's `GetRecorder` would have chosen.
+    async fn run_recorder(
+        &self,
+        info: &TimerRecordingInfo,
+        target: &std::path::Path,
+        opened: &MediaSourceInfo,
+        cancel: &std::sync::atomic::AtomicBool,
+        live_stream_id: Option<&str>,
+    ) -> Result<(), ServiceError> {
+        let _ = live_stream_id;
+        // C# reads the buffered copy through the direct-stream provider rather
+        // than back out over HTTP; the buffer file IS that provider here, and
+        // a reader that joins a stream someone is already watching starts near
+        // the live edge rather than replaying the backlog into the recording
+        // (`LiveStream.GetStream`'s tail seek).
+        let unique_id = opened
+            .path
+            .as_deref()
+            .and_then(|p| p.split("/LiveTv/LiveStreamFiles/").nth(1))
+            .and_then(|rest| rest.split('/').next())
+            .map(ToOwned::to_owned);
+        let buffer = match unique_id {
+            Some(unique_id) => self.get_live_stream_file(&unique_id).await?,
+            None => None,
+        };
+        let input = match buffer {
+            Some(file) => RecordingInput::Buffer {
+                path: file.path,
+                opened_at: file.opened_at,
+            },
+            None => RecordingInput::Url {
+                url: opened.path.clone().unwrap_or_default(),
+                headers: opened.required_http_headers.clone(),
+            },
+        };
+
+        let duration = (info.recording_end_date() - Utc::now())
+            .to_std()
+            .unwrap_or(std::time::Duration::ZERO);
+        tracing::info!(
+            timer_id = info.id,
+            path = %target.display(),
+            minutes = duration.as_secs() / 60,
+            "live tv: recording started"
+        );
+
+        match RecorderKind::choose(opened) {
+            RecorderKind::Direct => {
+                crate::dvr::record_direct(
+                    self.tuner_source.as_ref(),
+                    &input,
+                    target,
+                    duration,
+                    cancel,
+                )
+                .await
+            }
+            RecorderKind::Encoded => match self.encoder.as_ref() {
+                Some(encoder) => {
+                    crate::dvr::record_encoded(
+                        &encoder.encoder_path(),
+                        opened,
+                        &input,
+                        target,
+                        duration,
+                        cancel,
+                    )
+                    .await
+                }
+                None => Err(ServiceError::backend(
+                    "this source needs remuxing to record, and no media encoder is configured"
+                        .to_owned(),
+                )),
+            },
+        }
+    }
+
+    /// Releases everything a capture held, however it ended.
+    async fn finish_capture(&self, timer_id: &str, live_stream_id: Option<&str>) {
+        if let Some(live_stream_id) = live_stream_id {
+            // Logged and swallowed: the recording is what matters, and the
+            // stream is torn down either way.
+            if let Err(error) = self.close_channel_stream(live_stream_id).await {
+                tracing::error!(%error, "live tv: closing the recording's live stream failed");
+            }
+        }
+        self.active_recordings_lock().remove(timer_id);
+    }
+
+    /// Decides what a finished capture leaves behind: a retry, a completed
+    /// recording, or nothing.
+    ///
+    /// Port of the tail of `RecordingsManager.RecordStream`.
+    async fn settle_timer(
+        &self,
+        mut timer: TimerInfoDto,
+        info: &TimerRecordingInfo,
+        recording_id: Option<Uuid>,
+        target: &std::path::Path,
+        recorded: bool,
+        outcome: Result<(), ServiceError>,
+    ) -> Result<(), ServiceError> {
+        let failed = outcome.is_err();
+        if let Err(error) = outcome {
+            tracing::error!(timer_id = info.id, %error, "live tv: the capture ended in error");
+        }
+
+        let retries = {
+            let mut counts = self
+                .retry_counts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *counts.entry(info.id.clone()).or_insert(0)
+        };
+        if failed && Utc::now() < info.end_date && retries < crate::dvr::MAX_RETRY_COUNT {
+            // Try again shortly, without the pre-padding that has already
+            // elapsed (C# `RetryIntervalSeconds`). The failed attempt's row
+            // goes with it: upstream has no row at all until the recording is
+            // in the library, and a fileless "recording" per retry would fill
+            // the client's list with ten ghosts.
+            if let Some(recording_id) = recording_id {
+                crate::dvr_repository::delete_recording(&self.db, recording_id).await?;
+            }
+            self.retry_counts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(info.id.clone(), retries + 1);
+            timer.status = RecordingStatus::New;
+            timer.base.pre_padding_seconds = 0;
+            timer.base.start_date =
+                Utc::now() + chrono::Duration::seconds(crate::dvr::RETRY_INTERVAL_SECONDS);
+            self.persist_timer(&timer).await?;
+            self.arm_timer(&timer);
+            return Ok(());
+        }
+
+        self.retry_counts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&info.id);
+        match (recorded, recording_id) {
+            (true, Some(recording_id)) => {
+                crate::dvr_repository::finish_recording(
+                    &self.db,
+                    recording_id,
+                    RecordingStatus::Completed,
+                    Some(target.display().to_string().as_str()),
+                )
+                .await?;
+                timer.status = RecordingStatus::Completed;
+                self.persist_timer(&timer).await?;
+                tracing::info!(timer_id = info.id, path = %target.display(), "live tv: recording completed");
+            }
+            // Nothing was captured: the row and the timer both go, as upstream
+            // deletes a timer whose file never appeared.
+            (_, recording_id) => {
+                if let Some(recording_id) = recording_id {
+                    crate::dvr_repository::delete_recording(&self.db, recording_id).await?;
+                }
+                self.delete_by_id(DELETE_TIMER_SQL, &info.id).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Projects recording rows through the DTO service and applies the
+    /// recording post-pass.
+    async fn recording_dtos(
+        &self,
+        rows: &[crate::projection::RecordingRow],
+        options: &DtoOptions,
+        user: Option<&UserEntity>,
+    ) -> Result<Vec<BaseItemDto>, ServiceError> {
+        let entities: Vec<_> = rows
+            .iter()
+            .map(|row| crate::projection::recording_entity(row, parse_dt))
+            .collect();
+        let mut dtos = self
+            .dto_service()?
+            .get_base_item_dtos(&entities, options, user, None, true)
+            .await?;
+        Self::add_info_to_recording_dtos(&mut dtos, rows);
+        Ok(dtos)
+    }
+
+    /// Port of `LiveTvManager.AddInfoToRecordingDto`: the timer link, the
+    /// status, the programme flags, the channel name and how far through the
+    /// capture is.
+    ///
+    /// Upstream reaches this only for an item with an ACTIVE recording
+    /// (`DtoService` gates it on `GetActiveRecordingInfo(item.Path)`), and that
+    /// same branch re-types the item as a `Recording` with no runtime and no
+    /// download. A finished recording is an ordinary library `Video` and gets
+    /// none of it — so neither does one here.
+    fn add_info_to_recording_dtos(
+        dtos: &mut [BaseItemDto],
+        rows: &[crate::projection::RecordingRow],
+    ) {
+        for (dto, row) in dtos.iter_mut().zip(rows) {
+            if row.status != "InProgress" {
+                continue;
+            }
+            // The in-progress shape: jellyfin-web keys its recording card and
+            // its progress bar off `Type === "Recording"`.
+            dto.type_ = BaseItemKind::Recording;
+            dto.can_download = Some(false);
+            dto.run_time_ticks = None;
+            dto.series_timer_id = row.series_timer_id.clone().filter(|id| !id.is_empty());
+            dto.timer_id = row.timer_id.clone().filter(|id| !id.is_empty());
+            dto.start_date = parse_dt(&row.start_date);
+            dto.end_date = row.end_date.as_deref().and_then(parse_dt);
+            dto.status = Some(row.status.clone());
+            dto.is_repeat = Some(row.is_repeat);
+            dto.episode_title.clone_from(&row.episode_title);
+            dto.is_movie = Some(row.is_movie);
+            dto.is_series = Some(row.is_series);
+            dto.is_sports = Some(row.is_sports);
+            dto.is_live = Some(row.is_live);
+            dto.is_news = Some(row.is_news);
+            dto.is_kids = Some(row.is_kids);
+            dto.is_premiere = Some(row.is_premiere);
+            dto.channel_name.clone_from(&row.channel_name);
+            dto.completion_percentage = completion_percentage(row, parse_dt);
         }
     }
 
@@ -1862,6 +2648,87 @@ fn parse_dt(s: &str) -> Option<DateTime<Utc>> {
 
 /// Maps a `sqlx` error into a [`ServiceError`] via `ferrofin-db`'s `DbError`, for
 /// consistency with the repository layer's error text.
+/// The `DELETE` that removes one timer row.
+const DELETE_TIMER_SQL: &str = r#"DELETE FROM "FerrofinLiveTvTimers" WHERE "Id" = ?1"#;
+
+/// Copies what the guide knows about a programme onto the timer that records it.
+///
+/// Port of `DefaultLiveTvService.CopyProgramInfoToTimerInfo`, restricted to the
+/// fields the wire `TimerInfoDto` carries; the richer programme facts the
+/// recorder needs travel on [`TimerRecordingInfo`] instead.
+fn copy_program_into_timer(program: &GuideProgramRow, timer: &mut TimerInfoDto) {
+    timer.base.name = Some(program.title.clone());
+    timer.base.overview.clone_from(&program.overview);
+    if let Some(start) = parse_dt(&program.start_date) {
+        timer.base.start_date = start;
+    }
+    if let Some(end) = program.end_date.as_deref().and_then(parse_dt) {
+        timer.base.end_date = end;
+    }
+    if let Ok(channel_id) = Uuid::parse_str(&program.channel_id) {
+        timer.base.channel_id = channel_id;
+    }
+    timer.base.channel_name = Some(program.channel_name.clone());
+    timer
+        .base
+        .external_program_id
+        .clone_from(&program.external_id);
+    timer.run_time_ticks =
+        Some((timer.base.end_date - timer.base.start_date).num_milliseconds() * 10_000);
+}
+
+/// Fills in the programme facts the recorder and the recording row need.
+///
+/// The other half of `CopyProgramInfoToTimerInfo` — the fields that have no
+/// place on the wire DTO but decide the recording's name and folder.
+fn apply_program_to_recording_info(program: &GuideProgramRow, info: &mut TimerRecordingInfo) {
+    info.name.clone_from(&program.title);
+    info.overview.clone_from(&program.overview);
+    if let Some(start) = parse_dt(&program.start_date) {
+        info.start_date = start;
+    }
+    if let Some(end) = program.end_date.as_deref().and_then(parse_dt) {
+        info.end_date = end;
+    }
+    if let Ok(channel_id) = Uuid::parse_str(&program.channel_id) {
+        info.channel_id = channel_id;
+    }
+    info.episode_title.clone_from(&program.episode_title);
+    info.season_number = program.season_number;
+    info.episode_number = program.episode_number;
+    info.production_year = program.production_year;
+    info.is_program_series = program.is_series;
+    info.is_movie = program.is_movie;
+    info.is_kids = program.is_kids;
+    info.is_sports = program.is_sports;
+    info.is_news = program.is_news;
+    info.is_live = program.is_live;
+    info.is_repeat = program.is_repeat;
+    info.is_premiere = program.is_premiere;
+    info.external_program_id.clone_from(&program.external_id);
+}
+
+/// How far through a running capture is, as a percentage.
+///
+/// Port of `AddInfoToRecordingDto`'s `InProgress` branch: the padded window is
+/// what is being recorded, so it is the window the percentage is of.
+fn completion_percentage(
+    row: &crate::projection::RecordingRow,
+    parse: fn(&str) -> Option<DateTime<Utc>>,
+) -> Option<f64> {
+    let start =
+        parse(&row.start_date)? - chrono::Duration::seconds(i64::from(row.pre_padding_seconds));
+    let end = row.end_date.as_deref().and_then(parse)?
+        + chrono::Duration::seconds(i64::from(row.post_padding_seconds));
+    let total = (end - start).num_milliseconds();
+    if total <= 0 {
+        return None;
+    }
+    let elapsed = (Utc::now() - start).num_milliseconds();
+    #[allow(clippy::cast_precision_loss)] // a percentage; millisecond precision is ample
+    Some((elapsed as f64 / total as f64 * 100.0).clamp(0.0, 100.0))
+}
+
 /// The MD5 of the built-in Live TV service's C# type name, in `"N"` form —
 /// the first half of every Live TV `LiveStreamId`.
 ///
@@ -1887,7 +2754,10 @@ mod tests {
 
     use uuid::Uuid;
 
-    use super::{DEFAULT_LIVE_STREAM_BUFFER_MS, LiveTvPaths, live_tv_service_key};
+    use super::{DEFAULT_LIVE_STREAM_BUFFER_MS, GuideProgramRow, LiveTvPaths, live_tv_service_key};
+    use ferrofin_model::live_tv::{
+        BaseTimerInfoDto, RecordingStatus, SeriesTimerInfoDto, TimerInfoDto,
+    };
 
     use ferrofin_db::Database;
     use ferrofin_model::live_tv::{ListingsProviderInfo, TunerHostInfo};
@@ -2861,6 +3731,418 @@ mod tests {
         assert_eq!(opens.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
+    /// A manager over the relative guide whose tuner is an in-memory endless
+    /// broadcast and whose DVR writes under `root`.
+    async fn manager_with_dvr(root: &std::path::Path) -> FerrofinLiveTvManager {
+        let opens = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tuner = crate::stream::tests::LoopingTuner {
+            chunk: vec![0x47; 188],
+            opens,
+            content_type: Some("video/MP2T".to_owned()),
+        };
+        let mgr = manager_with_relative_guide()
+            .await
+            .with_tuner_source(Arc::new(tuner))
+            .with_paths(LiveTvPaths {
+                transcode_dir: root.join("transcodes"),
+                data_dir: root.join("data"),
+                options_file: root.join("named").join("livetv.json"),
+            });
+        mgr.set_local_api_url("http://127.0.0.1:8096");
+        mgr
+    }
+
+    /// The guide programme airing right now on the first channel.
+    async fn now_playing(mgr: &FerrofinLiveTvManager) -> GuideProgramRow {
+        mgr.query_program_rows(&InternalItemsQuery::default(), chrono::Utc::now())
+            .await
+            .expect("rows")
+            .into_iter()
+            .find(|r| r.title == "Now Playing")
+            .expect("now playing")
+    }
+
+    #[tokio::test]
+    async fn timer_defaults_describe_the_programme_they_would_record() {
+        let mgr = manager_with_relative_guide().await;
+        let program = now_playing(&mgr).await;
+        let program_id = Uuid::parse_str(&program.id).expect("guid");
+
+        let defaults = mgr
+            .get_new_timer_defaults(Some(program_id))
+            .await
+            .expect("defaults");
+        // The standing defaults (C# `GetNewTimerDefaultsAsync`).
+        assert!(defaults.record_any_time);
+        assert!(!defaults.record_any_channel);
+        assert_eq!(defaults.days.len(), 7);
+        assert_eq!(
+            defaults.day_pattern,
+            Some(ferrofin_model::live_tv::DayPattern::Daily)
+        );
+        assert_eq!(
+            defaults.base.keep_until,
+            ferrofin_model::live_tv::KeepUntil::UntilDeleted
+        );
+        assert_eq!(defaults.base.service_name.as_deref(), Some("Emby"));
+        // …and the programme's own identity on top.
+        assert_eq!(defaults.base.name.as_deref(), Some("Now Playing"));
+        assert_eq!(
+            defaults.base.channel_id,
+            Uuid::parse_str(&program.channel_id).expect("guid")
+        );
+        assert_eq!(
+            defaults.base.program_id.as_deref(),
+            Some(program_id.simple().to_string().as_str()),
+            "the client posts this back, so it must name the programme the way a DTO does"
+        );
+        assert_eq!(defaults.base.external_program_id, program.external_id);
+        assert_eq!(
+            defaults.base.start_date,
+            parse_dt(&program.start_date).unwrap()
+        );
+        // No id: these are defaults for a timer that does not exist yet.
+        assert_eq!(defaults.base.id, None);
+
+        // Without a programme, just the standing defaults.
+        let bare = mgr.get_new_timer_defaults(None).await.expect("defaults");
+        assert_eq!(bare.base.name, None);
+        assert_eq!(bare.base.program_id, None);
+    }
+
+    #[tokio::test]
+    async fn a_second_timer_for_the_same_programme_is_a_conflict_until_the_first_is_cancelled() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mgr = manager_with_dvr(dir.path()).await;
+        let program = now_playing(&mgr).await;
+        let program_id = Uuid::parse_str(&program.id).expect("guid");
+        // A timer far enough out that it never fires during the test.
+        let mut defaults = mgr
+            .get_new_timer_defaults(Some(program_id))
+            .await
+            .expect("defaults");
+        defaults.base.start_date = chrono::Utc::now() + chrono::Duration::hours(6);
+        defaults.base.end_date = chrono::Utc::now() + chrono::Duration::hours(7);
+        let timer = timer_from_defaults(&defaults);
+
+        let id = mgr.create_timer(timer.clone()).await.expect("create");
+        assert!(!id.is_empty());
+        let error = mgr
+            .create_timer(timer.clone())
+            .await
+            .expect_err("the programme is already scheduled");
+        assert!(
+            matches!(error, ServiceError::InvalidInput(ref m) if m.contains("already exists")),
+            "{error}"
+        );
+
+        // Cancelling a manual timer removes it, so the programme is free again.
+        mgr.cancel_timer(&id).await.expect("cancel");
+        assert!(mgr.get_timer(&id).await.expect("get").is_none());
+        let again = mgr.create_timer(timer).await.expect("re-create");
+        assert!(!again.is_empty());
+        mgr.cancel_timer(&again).await.expect("cancel");
+    }
+
+    #[tokio::test]
+    async fn the_timer_query_selects_by_channel_and_state() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mgr = manager_with_dvr(dir.path()).await;
+        let channels = channel_ids(&mgr).await;
+        for (index, channel) in channels.iter().enumerate() {
+            let hours = i64::try_from(index).expect("a handful of channels");
+            let timer = TimerInfoDto {
+                status: RecordingStatus::New,
+                base: BaseTimerInfoDto {
+                    channel_id: *channel,
+                    name: Some(format!("Timer {index}")),
+                    start_date: chrono::Utc::now() + chrono::Duration::hours(6 + hours),
+                    end_date: chrono::Utc::now() + chrono::Duration::hours(7 + hours),
+                    ..BaseTimerInfoDto::default()
+                },
+                ..TimerInfoDto::default()
+            };
+            mgr.create_timer(timer).await.expect("create");
+        }
+
+        let all = mgr
+            .get_timers_matching(&ferrofin_model::live_tv::TimerQuery::default())
+            .await
+            .expect("timers");
+        assert_eq!(all.len(), 2);
+        // Ordered by start date, as `GetTimersInternal` orders them.
+        assert!(all[0].base.start_date <= all[1].base.start_date);
+
+        let on_first = mgr
+            .get_timers_matching(&ferrofin_model::live_tv::TimerQuery {
+                channel_id: Some(channels[0].simple().to_string()),
+                ..ferrofin_model::live_tv::TimerQuery::default()
+            })
+            .await
+            .expect("timers");
+        assert_eq!(on_first.len(), 1);
+        assert_eq!(on_first[0].base.channel_id, channels[0]);
+
+        // Nothing is recording yet, so `isActive=true` is empty and
+        // `isScheduled=true` is everything.
+        assert!(
+            mgr.get_timers_matching(&ferrofin_model::live_tv::TimerQuery {
+                is_active: Some(true),
+                ..ferrofin_model::live_tv::TimerQuery::default()
+            })
+            .await
+            .expect("timers")
+            .is_empty()
+        );
+        assert_eq!(
+            mgr.get_timers_matching(&ferrofin_model::live_tv::TimerQuery {
+                is_scheduled: Some(true),
+                ..ferrofin_model::live_tv::TimerQuery::default()
+            })
+            .await
+            .expect("timers")
+            .len(),
+            2
+        );
+        for timer in all {
+            mgr.cancel_timer(&timer.base.id.unwrap_or_default())
+                .await
+                .expect("cancel");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cancelling_a_timer_mid_capture_releases_it_on_a_real_runtime() {
+        // On a multi-thread runtime the firing task and the cancel really do
+        // run at once. Disarming must stop only a PENDING fire — an abort here
+        // would strand the active recording, leave the tuner open and freeze
+        // the row at `InProgress` for ever.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mgr = manager_with_dvr(dir.path()).await;
+        let program = now_playing(&mgr).await;
+        let defaults = mgr
+            .get_new_timer_defaults(Some(Uuid::parse_str(&program.id).expect("guid")))
+            .await
+            .expect("defaults");
+        let timer_id = mgr
+            .create_timer(timer_from_defaults(&defaults))
+            .await
+            .expect("create");
+
+        let path = wait_for(|| async {
+            mgr.get_active_recording_path(&timer_id)
+                .await
+                .ok()
+                .flatten()
+        })
+        .await
+        .expect("the capture must start");
+        mgr.cancel_timer(&timer_id).await.expect("cancel");
+
+        let released = wait_for(|| async {
+            mgr.get_active_recording_path(&timer_id)
+                .await
+                .expect("path")
+                .is_none()
+                .then_some(())
+        })
+        .await;
+        assert!(
+            released.is_some(),
+            "the capture must be released, not orphaned"
+        );
+        // The recording settled rather than being stuck mid-flight.
+        let in_progress = mgr
+            .get_recordings_matching(
+                &ferrofin_model::live_tv::RecordingQuery {
+                    is_in_progress: Some(true),
+                    ..ferrofin_model::live_tv::RecordingQuery::default()
+                },
+                None,
+                &DtoOptions::default(),
+            )
+            .await
+            .expect("recordings");
+        assert!(
+            in_progress.items.is_empty(),
+            "nothing may still report itself as recording"
+        );
+        let _ = tokio::fs::remove_file(path).await;
+    }
+
+    #[tokio::test]
+    async fn a_timer_whose_channel_has_gone_retries_instead_of_dying_quietly() {
+        // A capture can fail before it ever starts — the channel deleted, every
+        // tuner busy, no transcode directory. Upstream turns that into a failed
+        // recording that retries; a timer that just vanished from the schedule
+        // would be a silent data loss.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mgr = manager_with_dvr(dir.path()).await;
+        let program = now_playing(&mgr).await;
+        let mut defaults = mgr
+            .get_new_timer_defaults(Some(Uuid::parse_str(&program.id).expect("guid")))
+            .await
+            .expect("defaults");
+        // A channel that is not in the lineup: the open cannot succeed. The
+        // programme ids go too, or `CopyProgramInfoToTimerInfo` would put the
+        // real channel back.
+        defaults.base.channel_id = Uuid::from_u128(0xdead_beef);
+        defaults.base.program_id = None;
+        defaults.base.external_program_id = None;
+        let timer_id = mgr
+            .create_timer(timer_from_defaults(&defaults))
+            .await
+            .expect("create");
+
+        let retried = wait_for(|| async {
+            let timer = mgr.get_timer(&timer_id).await.expect("get")?;
+            // The retry re-arms it for a minute out, with the elapsed
+            // pre-padding dropped.
+            (timer.status == RecordingStatus::New
+                && timer.base.start_date > chrono::Utc::now()
+                && timer.base.pre_padding_seconds == 0)
+                .then_some(())
+        })
+        .await;
+        assert!(
+            retried.is_some(),
+            "a failed capture must reschedule the timer"
+        );
+        // …and no ghost recording is left behind for it.
+        assert!(
+            mgr.get_recordings()
+                .await
+                .expect("recordings")
+                .items
+                .is_empty(),
+            "a failed attempt leaves no fileless recording"
+        );
+        mgr.cancel_timer(&timer_id).await.expect("cancel");
+    }
+
+    #[tokio::test]
+    async fn a_timer_on_a_programme_airing_now_records_it_and_the_recording_is_playable() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mgr = manager_with_dvr(dir.path()).await;
+        let program = now_playing(&mgr).await;
+        let program_id = Uuid::parse_str(&program.id).expect("guid");
+        let defaults = mgr
+            .get_new_timer_defaults(Some(program_id))
+            .await
+            .expect("defaults");
+        // The programme started in the past, so the timer fires immediately —
+        // which is the whole point: `arm_timer` must not wait for a start that
+        // has already gone by.
+        let timer_id = mgr
+            .create_timer(timer_from_defaults(&defaults))
+            .await
+            .expect("create");
+
+        // The capture registers itself before the first byte is written.
+        let recording = wait_for(|| async {
+            let recordings = mgr
+                .get_recordings_matching(
+                    &ferrofin_model::live_tv::RecordingQuery {
+                        is_in_progress: Some(true),
+                        ..ferrofin_model::live_tv::RecordingQuery::default()
+                    },
+                    None,
+                    &DtoOptions::default(),
+                )
+                .await
+                .expect("recordings");
+            recordings.items.into_iter().next()
+        })
+        .await
+        .expect("the timer must have started a recording");
+
+        assert_eq!(recording.name.as_deref(), Some("Now Playing"));
+        assert_eq!(recording.status.as_deref(), Some("InProgress"));
+        assert_eq!(recording.timer_id.as_deref(), Some(timer_id.as_str()));
+        assert!(
+            recording.completion_percentage.is_some_and(|p| p >= 0.0),
+            "an in-progress recording reports how far through it is"
+        );
+        // The capture is keyed by the TIMER's id, which is what
+        // `/LiveTv/LiveRecordings/{id}/stream` takes.
+        let active_path = mgr
+            .get_active_recording_path(&timer_id)
+            .await
+            .expect("path")
+            .expect("a capture is in progress");
+        assert!(
+            std::path::Path::new(&active_path)
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("ts")),
+            "{active_path}"
+        );
+        assert!(
+            std::path::Path::new(&active_path).starts_with(dir.path().join("data")),
+            "the recording must land under the data directory: {active_path}"
+        );
+
+        // PlaybackInfo on the recording reaches it through the EncoderPath.
+        let sources = mgr
+            .get_recording_media_sources(recording.id)
+            .await
+            .expect("sources");
+        assert_eq!(sources.len(), 1);
+        assert_eq!(
+            sources[0].encoder_path.as_deref(),
+            Some(format!("http://127.0.0.1:8096/LiveTv/LiveRecordings/{timer_id}/stream").as_str())
+        );
+        assert_eq!(sources[0].path.as_deref(), Some(active_path.as_str()));
+        assert!(sources[0].is_infinite_stream);
+        assert!(!sources[0].supports_direct_play);
+
+        // Deleting the timer stops the capture and, with it, the tuner.
+        mgr.cancel_timer(&timer_id).await.expect("cancel");
+        let stopped = wait_for(|| async {
+            mgr.get_active_recording_path(&timer_id)
+                .await
+                .expect("path")
+                .is_none()
+                .then_some(())
+        })
+        .await;
+        assert!(
+            stopped.is_some(),
+            "cancelling the timer must stop the capture"
+        );
+
+        // …and deleting the recording removes both the row and the file.
+        mgr.delete_recording(recording.id).await.expect("delete");
+        assert!(
+            mgr.get_recording(recording.id)
+                .await
+                .expect("get")
+                .is_none(),
+            "the deleted recording must be gone"
+        );
+    }
+
+    /// The timer a client creates from `Timers/Defaults` — the same JSON the
+    /// parity harness POSTs straight back.
+    fn timer_from_defaults(defaults: &SeriesTimerInfoDto) -> TimerInfoDto {
+        let json = serde_json::to_string(defaults).expect("serialize");
+        serde_json::from_str(&json).expect("a SeriesTimerInfoDto body binds as a TimerInfoDto")
+    }
+
+    /// Polls `f` until it yields a value, up to a few seconds.
+    async fn wait_for<T, F, Fut>(mut f: F) -> Option<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Option<T>>,
+    {
+        for _ in 0..200 {
+            if let Some(value) = f().await {
+                return Some(value);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        None
+    }
+
     /// The programme titles a query returns, in the order it returned them.
     async fn titles(mgr: &FerrofinLiveTvManager, query: &InternalItemsQuery) -> Vec<String> {
         mgr.get_programs(query, &DtoOptions::default())
@@ -3584,8 +4866,10 @@ mod tests {
                 base: BaseTimerInfoDto {
                     channel_id: Uuid::parse_str(&target.channel_id).expect("guid"),
                     program_id: Some(external_id.clone()),
-                    start_date: parse_dt("2026-07-25T06:00:00Z").unwrap(),
-                    end_date: parse_dt("2026-07-25T07:00:00Z").unwrap(),
+                    // Far enough out that the scheduler leaves it alone: this
+                    // test is about the programme→timer link, not the capture.
+                    start_date: chrono::Utc::now() + chrono::Duration::hours(6),
+                    end_date: chrono::Utc::now() + chrono::Duration::hours(7),
                     ..BaseTimerInfoDto::default()
                 },
                 ..TimerInfoDto::default()

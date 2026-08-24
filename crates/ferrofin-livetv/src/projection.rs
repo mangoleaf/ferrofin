@@ -668,7 +668,59 @@ mod tests {
     #[case("test1", "test0000000001")]
     #[case("1test 2", "0000000001test 0000000002")]
     fn modify_sort_chunks_matches_the_upstream_oracle(#[case] input: &str, #[case] expected: &str) {
-        assert_eq!(modify_sort_chunks(input), expected);
+        assert_eq!(
+            ferrofin_util::sort_name::modify_sort_chunks(input),
+            expected
+        );
+    }
+
+    #[test]
+    fn a_recording_projects_as_a_video_item() {
+        let row = RecordingRow {
+            id: "11111111-2222-3333-4444-555555555555".to_owned(),
+            channel_id: "66666666-7777-8888-9999-000000000000".to_owned(),
+            timer_id: Some("t1".to_owned()),
+            series_timer_id: None,
+            name: "The Late Show".to_owned(),
+            overview: Some("Tonight".to_owned()),
+            start_date: "2026-08-23T17:00:00Z".to_owned(),
+            end_date: Some("2026-08-23T18:00:00Z".to_owned()),
+            status: "Completed".to_owned(),
+            path: Some("/data/livetv/recordings/Other/The Late Show/x.ts".to_owned()),
+            date_created: Some("2026-08-23T17:00:00Z".to_owned()),
+            episode_title: Some("Pilot".to_owned()),
+            production_year: Some(2026),
+            season_number: Some(1),
+            episode_number: Some(2),
+            program_id: None,
+            external_program_id: None,
+            pre_padding_seconds: 0,
+            post_padding_seconds: 0,
+            is_movie: false,
+            is_series: true,
+            is_news: false,
+            is_kids: false,
+            is_sports: false,
+            is_live: false,
+            is_repeat: false,
+            is_premiere: false,
+            channel_name: Some("Parity One".to_owned()),
+        };
+        let entity = recording_entity(&row, parse);
+
+        // Jellyfin's recordings are library `Video` items scanned out of the
+        // recordings folder — not a `Recording` type of their own.
+        assert_eq!(entity.type_, RECORDING_TYPE_NAME);
+        assert_eq!(entity.media_type.as_deref(), Some("Video"));
+        assert_eq!(entity.name.as_deref(), Some("The Late Show"));
+        assert_eq!(entity.path, row.path);
+        assert!(!entity.is_folder);
+        assert_eq!(entity.index_number, Some(2));
+        assert_eq!(entity.parent_index_number, Some(1));
+        assert_eq!(entity.production_year, Some(2026));
+        // One hour, in ticks.
+        assert_eq!(entity.run_time_ticks, Some(36_000_000_000));
+        assert_eq!(entity.sort_name.as_deref(), Some("late show"));
     }
 
     #[test]

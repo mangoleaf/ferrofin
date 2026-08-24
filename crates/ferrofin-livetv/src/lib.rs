@@ -10,6 +10,8 @@
 //! from `/LiveTv/LiveStreamFiles/{uniqueId}/stream.ts` — so one tuner connection
 //! feeds several viewers plus the transcoder.
 
+pub mod dvr;
+pub mod dvr_repository;
 pub mod error;
 pub mod fetch;
 pub mod guide_repository;
@@ -19,6 +21,7 @@ pub mod projection;
 pub mod stream;
 pub mod xmltv;
 
+pub use dvr::{ActiveRecording, RecorderKind, RecordingInput, TimerRecordingInfo};
 pub use error::LiveTvError;
 pub use fetch::{ReqwestFetcher, SourceFetcher};
 pub use manager::{FerrofinLiveTvManager, LiveTvPaths};
