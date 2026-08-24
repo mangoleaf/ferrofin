@@ -12,7 +12,28 @@ const ADMIN_PASSWORD: &str = "restart-pw";
 const CLIENT: &str =
     r#"MediaBrowser Client="restart-test", Device="test", DeviceId="restart-test", Version="1""#;
 
+/// Ceiling for a single request, here only to turn a genuine hang into a
+/// failure rather than a stalled job — it is not a latency assertion.
+///
+/// It has to be generous: `/Users/AuthenticateByName` runs Jellyfin's
+/// 210 000-iteration PBKDF2-HMAC-SHA512 (`ferrofin_common::cryptography`), and
+/// an unoptimized test build pays that in seconds. Seeding the same password at
+/// startup was measured at ~13s on CI with the suite running in parallel, and a
+/// verify costs the same, so a low ceiling here fails the run on a busy machine
+/// instead of catching a bug. Do not tighten this to "something reasonable".
+const REQUEST_TIMEOUT: Duration = Duration::from_mins(1);
+
+/// How long a server gets to bind and finish booting, for the same reason: the
+/// admin seed hashes a password before the listener opens, so "booting" is
+/// seconds of CPU, and a poll budget sized for a quiet laptop is exactly what
+/// fails on a loaded runner.
+const STARTUP_DEADLINE: Duration = Duration::from_mins(2);
+
 /// A port nobody is listening on right now (bind 0, read, release).
+///
+/// A probe, not a reservation: the listener closes before the server binds, so
+/// a test starting at the same moment can be handed the same port.
+/// [`spawn_server`] is what makes that survivable.
 fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
         .expect("bind ephemeral")
@@ -21,17 +42,33 @@ fn free_port() -> u16 {
         .port()
 }
 
-async fn is_up(client: &reqwest::Client, base: &str) -> bool {
-    client
+/// The `ServerName` whoever is listening on `base` reports, if anyone is.
+async fn server_name_at(client: &reqwest::Client, base: &str) -> Option<String> {
+    let body: serde_json::Value = client
         .get(format!("{base}/System/Info/Public"))
         .send()
         .await
-        .is_ok_and(|r| r.status().is_success())
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+    body["ServerName"].as_str().map(str::to_owned)
 }
 
-async fn wait_until(client: &reqwest::Client, base: &str, up: bool) {
-    for _ in 0..600 {
-        if is_up(client, base).await == up {
+/// Whether *this* test's server — not merely *a* server — answers on `base`.
+///
+/// The identity check carries real weight: the tests in this file share an
+/// admin user, password and client id, so a sibling that won the race for the
+/// port would answer every request happily and the run would only fall over
+/// later, somewhere unrelated.
+async fn is_up(client: &reqwest::Client, base: &str, name: &str) -> bool {
+    server_name_at(client, base).await.as_deref() == Some(name)
+}
+
+async fn wait_until(client: &reqwest::Client, base: &str, name: &str, up: bool) {
+    let deadline = std::time::Instant::now() + STARTUP_DEADLINE;
+    while std::time::Instant::now() < deadline {
+        if is_up(client, base, name).await == up {
             return;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -40,6 +77,45 @@ async fn wait_until(client: &reqwest::Client, base: &str, up: bool) {
         "server never became {}",
         if up { "reachable" } else { "unreachable" }
     );
+}
+
+/// Start `run` on a free port and wait until this server answers there.
+///
+/// If the port went to somebody else between the probe and the bind, `run`
+/// returns an address-in-use error straight away; take another port rather than
+/// poll one that now belongs to another test.
+async fn spawn_server(
+    client: &reqwest::Client,
+    make_config: impl Fn(u16) -> Config,
+) -> (std::thread::JoinHandle<anyhow::Result<()>>, String, String) {
+    for _ in 0..5 {
+        let port = free_port();
+        let config = make_config(port);
+        let name = config.server_name.clone();
+        // `run`'s future trips rustc's higher-ranked `Send` inference under
+        // `tokio::spawn`; the binary drives it from `main`, so give it its own
+        // thread and runtime here too.
+        let server = std::thread::spawn(move || {
+            tokio::runtime::Runtime::new()
+                .expect("server runtime")
+                .block_on(ferrofin_server::run(config))
+        });
+        let base = format!("http://127.0.0.1:{port}");
+        let deadline = std::time::Instant::now() + STARTUP_DEADLINE;
+        let mut lost_the_port = false;
+        while std::time::Instant::now() < deadline {
+            if is_up(client, &base, &name).await {
+                return (server, base, name);
+            }
+            if server.is_finished() {
+                lost_the_port = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(lost_the_port, "server never became reachable on {base}");
+    }
+    panic!("no free port survived long enough to bind");
 }
 
 async fn token(client: &reqwest::Client, base: &str) -> String {
@@ -73,8 +149,11 @@ async fn post(client: &reqwest::Client, base: &str, path: &str, token: &str) -> 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn restart_recreates_the_host_in_process_and_shutdown_exits() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let port = free_port();
-    let config = Config {
+    let client = reqwest::Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .build()
+        .expect("client");
+    let (server, base, name) = spawn_server(&client, |port| Config {
         server_name: "ferrofin-restart".to_owned(),
         admin_user: ADMIN_USER.to_owned(),
         admin_password: ADMIN_PASSWORD.to_owned(),
@@ -82,21 +161,8 @@ async fn restart_recreates_the_host_in_process_and_shutdown_exits() {
         // The Prometheus pipeline is process-global: it must survive the restart.
         enable_metrics: Some(true),
         ..Config::test_stub(tmp.path())
-    };
-    // `run`'s future trips rustc's higher-ranked `Send` inference under
-    // `tokio::spawn`; the binary drives it from `main`, so give it its own thread
-    // and runtime here too.
-    let server = std::thread::spawn(move || {
-        tokio::runtime::Runtime::new()
-            .expect("server runtime")
-            .block_on(ferrofin_server::run(config))
-    });
-    let base = format!("http://127.0.0.1:{port}");
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .expect("client");
-    wait_until(&client, &base, true).await;
+    })
+    .await;
     let metrics = |client: &reqwest::Client| {
         let url = format!("{base}/metrics");
         let client = client.clone();
@@ -115,8 +181,8 @@ async fn restart_recreates_the_host_in_process_and_shutdown_exits() {
     // Restart: the listener goes away and comes back while `run` keeps running.
     let tok = token(&client, &base).await;
     assert_eq!(post(&client, &base, "/System/Restart", &tok).await, 204);
-    wait_until(&client, &base, false).await;
-    wait_until(&client, &base, true).await;
+    wait_until(&client, &base, &name, false).await;
+    wait_until(&client, &base, &name, true).await;
     assert!(!server.is_finished(), "a restart must not exit the process");
     assert_eq!(metrics(&client).await, 200, "/metrics survives the restart");
 
@@ -133,7 +199,7 @@ async fn restart_recreates_the_host_in_process_and_shutdown_exits() {
     .expect("server thread did not panic");
     outcome.expect("run exits cleanly");
     assert!(
-        !is_up(&client, &base).await,
+        !is_up(&client, &base, &name).await,
         "shutdown leaves nothing listening"
     );
 }
@@ -180,25 +246,18 @@ async fn post_json(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn backup_restore_applies_on_the_in_process_restart() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let port = free_port();
-    let config = Config {
+    let client = reqwest::Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .build()
+        .expect("client");
+    let (server, base, name) = spawn_server(&client, |port| Config {
         server_name: "ferrofin-restore".to_owned(),
         admin_user: ADMIN_USER.to_owned(),
         admin_password: ADMIN_PASSWORD.to_owned(),
         port,
         ..Config::test_stub(tmp.path())
-    };
-    let server = std::thread::spawn(move || {
-        tokio::runtime::Runtime::new()
-            .expect("server runtime")
-            .block_on(ferrofin_server::run(config))
-    });
-    let base = format!("http://127.0.0.1:{port}");
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .expect("client");
-    wait_until(&client, &base, true).await;
+    })
+    .await;
     let tok = token(&client, &base).await;
 
     // A distinctive config value, backed up, then overwritten.
@@ -257,8 +316,8 @@ async fn backup_restore_applies_on_the_in_process_restart() {
     )
     .await;
     assert_eq!(st, 204);
-    wait_until(&client, &base, false).await;
-    wait_until(&client, &base, true).await;
+    wait_until(&client, &base, &name, false).await;
+    wait_until(&client, &base, &name, true).await;
     assert!(!server.is_finished(), "restore restarts in-process");
     let tok = token(&client, &base).await;
     assert_eq!(
