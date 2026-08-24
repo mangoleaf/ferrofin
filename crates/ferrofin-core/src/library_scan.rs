@@ -6211,47 +6211,10 @@ fn derived_sort_name(entity: &BaseItemEntity, title: &str) -> String {
     }
 }
 
-/// Port of C# `BaseItem.CreateSortName` + `ModifySortChunks`: lowercase the name, apply the
-/// default `SortReplace`/`SortRemove` characters and strip a leading article, then left-pad each
-/// run of digits to 10 so numbers sort naturally (e.g. `Movie 0001 (2020)` →
-/// `movie 0000000001 (0000002020)`).
+/// The alphanumeric sort key for `name` — `BaseItem.CreateSortName`, shared with
+/// the Live TV guide (see [`ferrofin_util::sort_name`]).
 fn create_sort_name(name: &str) -> String {
-    let mut s = name.trim().to_lowercase();
-    for c in [',', '&', '-', '{', '}', '\''] {
-        s = s.replace(c, ""); // default SortRemoveCharacters
-    }
-    for c in ['.', '+', '%'] {
-        s = s.replace(c, " "); // default SortReplaceCharacters → space
-    }
-    for article in ["the ", "a ", "an "] {
-        if let Some(rest) = s.strip_prefix(article) {
-            s = rest.to_owned();
-            break;
-        }
-    }
-    modify_sort_chunks(&s)
-}
-
-/// Left-pads each maximal run of ASCII digits in `name` to width 10 with `0`.
-fn modify_sort_chunks(name: &str) -> String {
-    let mut out = String::with_capacity(name.len());
-    let mut chars = name.chars().peekable();
-    while let Some(&c) = chars.peek() {
-        if c.is_ascii_digit() {
-            let mut digits = String::new();
-            while chars.peek().is_some_and(char::is_ascii_digit) {
-                digits.push(chars.next().unwrap());
-            }
-            for _ in digits.len()..10 {
-                out.push('0');
-            }
-            out.push_str(&digits);
-        } else {
-            out.push(c);
-            chars.next();
-        }
-    }
-    out
+    ferrofin_util::sort_name::create_sort_name(name)
 }
 
 /// The final path segment (folder name) of a directory path, if any. Mirrors C#

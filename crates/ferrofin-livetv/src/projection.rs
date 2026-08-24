@@ -22,6 +22,14 @@ pub const CHANNEL_TYPE_NAME: &str = "MediaBrowser.Controller.LiveTv.LiveTvChanne
 /// The stored `BaseItems.Type` name of a Live TV programme.
 pub const PROGRAM_TYPE_NAME: &str = "MediaBrowser.Controller.LiveTv.LiveTvProgram";
 
+/// The stored `BaseItems.Type` name of a DVR recording.
+///
+/// Jellyfin's recordings are ordinary library `Video` items scanned out of the
+/// recordings folder (`LiveTvManager.GetEmbyRecordingsAsync` queries
+/// `BaseItemKind.Video`), so a recording DTO's `Type` is `"Video"` — not
+/// `"Recording"`, which is a timer-side concept.
+pub const RECORDING_TYPE_NAME: &str = "MediaBrowser.Controller.Entities.Video";
+
 /// The synthetic "Live TV" folder every channel parents to.
 ///
 /// Upstream parents channels under `GetInternalLiveTvFolder()` — a real
@@ -280,6 +288,114 @@ pub fn channel_entity(
     }
 }
 
+/// One `FerrofinLiveTvRecordings` row, as the recording query paths read it.
+#[derive(Debug, Clone, sqlx::FromRow)]
+#[sqlx(rename_all = "PascalCase")]
+#[allow(clippy::struct_excessive_bools)] // the upstream TimerInfo flags
+pub struct RecordingRow {
+    /// The recording's `Guid`, hyphenated.
+    pub id: String,
+    /// The recorded channel's `Guid`, hyphenated.
+    pub channel_id: String,
+    /// The firing timer's id — the key `/LiveTv/LiveRecordings/{id}/stream`
+    /// takes while the capture is in progress.
+    pub timer_id: Option<String>,
+    /// The series timer that scheduled it, if any.
+    pub series_timer_id: Option<String>,
+    /// The programme's name.
+    pub name: String,
+    /// The programme description.
+    pub overview: Option<String>,
+    /// The airing start (DB text form).
+    pub start_date: String,
+    /// The airing end (DB text form), if known.
+    pub end_date: Option<String>,
+    /// The `RecordingStatus` name.
+    pub status: String,
+    /// The captured file, once there is one.
+    pub path: Option<String>,
+    /// When the capture started (DB text form).
+    pub date_created: Option<String>,
+    /// The episode's own title, when the programme is an episode.
+    pub episode_title: Option<String>,
+    /// The production year, when known.
+    pub production_year: Option<i32>,
+    /// The season number, when known.
+    pub season_number: Option<i32>,
+    /// The episode number, when known.
+    pub episode_number: Option<i32>,
+    /// The guide programme the timer was created for.
+    pub program_id: Option<String>,
+    /// The listing provider's own programme id.
+    pub external_program_id: Option<String>,
+    /// Seconds of recording before the programme's start.
+    pub pre_padding_seconds: i32,
+    /// Seconds of recording after the programme's end.
+    pub post_padding_seconds: i32,
+    /// Whether the programme is a movie.
+    pub is_movie: bool,
+    /// Whether the programme is a series episode.
+    pub is_series: bool,
+    /// Whether the programme is news.
+    pub is_news: bool,
+    /// Whether the programme is for kids.
+    pub is_kids: bool,
+    /// Whether the programme is sport.
+    pub is_sports: bool,
+    /// Whether the programme is live.
+    pub is_live: bool,
+    /// Whether the airing is a repeat.
+    pub is_repeat: bool,
+    /// Whether the airing is a premiere.
+    pub is_premiere: bool,
+    /// The owning channel's display name (joined).
+    pub channel_name: Option<String>,
+}
+
+/// Builds the synthetic `BaseItems` row a recording projects from.
+///
+/// Jellyfin scans its recordings folder and projects the resulting `Video`
+/// items; Ferrofin keeps the recordings in its own table (the library-folder
+/// end state is a follow-up — see the module docs on
+/// [`crate::dvr`]) and builds the equivalent row here, so a recording DTO
+/// carries the same `UserData`, image maps, `SortName` and `MediaSources` as
+/// any other video.
+#[must_use]
+pub fn recording_entity(
+    row: &RecordingRow,
+    parse_dt: fn(&str) -> Option<DateTime<Utc>>,
+) -> BaseItemEntity {
+    let start_date = parse_dt(&row.start_date);
+    let end_date = row.end_date.as_deref().and_then(parse_dt);
+    let run_time_ticks = match (start_date, end_date) {
+        (Some(start), Some(end)) => Some((end - start).num_milliseconds() * 10_000),
+        _ => None,
+    };
+    BaseItemEntity {
+        id: row.id.clone(),
+        type_: RECORDING_TYPE_NAME.to_owned(),
+        name: Some(row.name.clone()),
+        overview: row.overview.clone(),
+        episode_title: row.episode_title.clone(),
+        channel_id: Some(row.channel_id.clone()),
+        path: row.path.clone(),
+        start_date,
+        end_date,
+        run_time_ticks,
+        production_year: row.production_year.map(i64::from),
+        index_number: row.episode_number.map(i64::from),
+        parent_index_number: row.season_number.map(i64::from),
+        sort_name: Some(item_sort_name(&row.name)),
+        media_type: Some("Video".to_owned()),
+        date_created: row.date_created.as_deref().and_then(parse_dt),
+        is_movie: row.is_movie,
+        is_series: row.is_series,
+        is_repeat: row.is_repeat,
+        is_folder: false,
+        ..BaseItemEntity::default()
+    }
+}
+
 /// Builds the synthetic `BaseItems` row a programme projects from.
 ///
 /// Port of `GuideManager.GetProgram`'s item shape: the flag-derived `Tags`
@@ -390,75 +506,15 @@ pub fn db_guid(id: Uuid) -> String {
     ferrofin_db::store::guid_to_db(id)
 }
 
-/// Port of `BaseItem.CreateSortName` with the default server configuration
-/// (`SortRemoveWords` the/a/an, `SortRemoveCharacters`, `SortReplaceCharacters`)
-/// plus `ModifySortChunks`: digit runs pad to 10 with leading zeros, so
-/// "Parity Show 02" sorts as "parity show 0000000002". Guide rows never pass
-/// through the scanner, so the key is derived here.
+/// The alphanumeric sort key for a guide item's name.
 ///
-/// (`ferrofin-core`'s scan carries an older `create_sort_name` that diverges
-/// from C#: it runs the character passes before the word pass, strips only a
-/// leading article, and has no diacritic tail. The two should converge on
-/// this port — the scan's is the side that is wrong.)
+/// `BaseItem.CreateSortName` + `ModifySortChunks`, shared with the scanner in
+/// [`ferrofin_util::sort_name`]: digit runs pad to ten, so "Parity Show 02"
+/// sorts as "parity show 0000000002". Guide rows never pass through the scanner,
+/// so the key is derived here instead of read from a stored column.
 #[must_use]
 pub fn item_sort_name(name: &str) -> String {
-    let mut sortable = name.trim().to_lowercase();
-    for word in ["the", "a", "an"] {
-        // Remove from beginning if a space follows…
-        let prefix = format!("{word} ");
-        if let Some(rest) = sortable.strip_prefix(&prefix) {
-            sortable = rest.to_owned();
-        }
-        // …from the middle if surrounded by spaces…
-        sortable = sortable.replace(&format!(" {word} "), " ");
-        // …and from the end if preceded by a space.
-        let suffix = format!(" {word}");
-        if let Some(rest) = sortable.strip_suffix(&suffix) {
-            sortable = rest.to_owned();
-        }
-    }
-    for ch in [",", "&", "-", "{", "}", "'"] {
-        sortable = sortable.replace(ch, "");
-    }
-    for ch in [".", "+", "%"] {
-        sortable = sortable.replace(ch, " ");
-    }
-    modify_sort_chunks(&sortable)
-}
-
-/// Port of `BaseItem.ModifySortChunks`: each digit run shorter than ten
-/// characters is left-padded with zeros to ten, then the result is stripped of
-/// diacritics. (C# `char.IsDigit` covers the Unicode Nd category; ASCII digits
-/// cover every value a guide feed carries. Its final ICU `Transliterated()`
-/// step — which romanizes a title still non-ASCII after the strip, e.g.
-/// Cyrillic — is not ported: it would pull an ICU dependency in for a sort key
-/// no Latin-script guide needs.)
-fn modify_sort_chunks(name: &str) -> String {
-    fn flush(chunk: &mut String, digit_chunk: bool, out: &mut String) {
-        if digit_chunk && chunk.len() < 10 {
-            for _ in 0..(10 - chunk.len()) {
-                out.push('0');
-            }
-        }
-        out.push_str(chunk);
-        chunk.clear();
-    }
-    let mut out = String::with_capacity(name.len() + 9);
-    let mut chunk = String::new();
-    let mut digit_chunk = false;
-    for ch in name.chars() {
-        let is_digit = ch.is_ascii_digit();
-        if !chunk.is_empty() && is_digit != digit_chunk {
-            flush(&mut chunk, digit_chunk, &mut out);
-        }
-        digit_chunk = is_digit;
-        chunk.push(ch);
-    }
-    flush(&mut chunk, digit_chunk, &mut out);
-    // C# ends `ModifySortChunks` with `RemoveDiacritics()`; the shared port
-    // in `ferrofin-util` is the one carrying upstream's transliterated test
-    // oracle, so the guide uses it rather than a second fold table.
-    ferrofin_util::string_extensions::remove_diacritics(&out)
+    ferrofin_util::sort_name::create_sort_name(name)
 }
 
 #[cfg(test)]

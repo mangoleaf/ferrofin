@@ -14,6 +14,7 @@ pub mod guid_extensions;
 pub mod path_helper;
 pub mod read_only_list_extension;
 pub mod shuffle_extensions;
+pub mod sort_name;
 pub mod split_string_extensions;
 pub mod stream_extensions;
 pub mod string_builder_extensions;
