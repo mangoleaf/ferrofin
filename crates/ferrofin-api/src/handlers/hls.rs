@@ -69,6 +69,9 @@ struct HlsQuery {
     /// The pinned media source id, if any.
     #[serde(default, alias = "MediaSourceId")]
     media_source_id: Option<String>,
+    /// The open live stream to transcode, when the client opened one.
+    #[serde(default, alias = "LiveStreamId")]
+    live_stream_id: Option<String>,
     /// The playback-session id this stream belongs to.
     #[serde(default, alias = "PlaySessionId")]
     play_session_id: Option<String>,
@@ -231,12 +234,13 @@ fn build_request(
         _ => String::new(),
     };
     // The struct update stays even while every field is named: the request
-    // DTO is still growing (Live TV's `liveStreamId` is next), and a missed
-    // field must take its DTO default rather than break the build.
+    // DTO is still growing, and a missed field must take its DTO default
+    // rather than break the build.
     #[allow(clippy::needless_update, reason = "room for the growing request DTO")]
     HlsStreamRequest {
         item_id,
         media_source_id: query.media_source_id,
+        live_stream_id: query.live_stream_id,
         play_session_id: query.play_session_id,
         device_id: query.device_id,
         segment_container: query.segment_container,
@@ -712,6 +716,47 @@ mod tests {
         assert_eq!(contract_pascal.audio_bitrate, Some(128_000));
         let lower: HlsQuery = serde_urlencoded::from_str("audioBitrate=96000").expect("parses");
         assert_eq!(lower.audio_bitrate, Some(96_000));
+    }
+
+    #[test]
+    fn build_request_carries_the_open_live_stream() {
+        // A Live TV client opens the channel, then asks for a transcode of the
+        // stream it opened. Without this the planner would resolve the channel's
+        // static source and dial the tuner a second time.
+        let query: HlsQuery =
+            serde_urlencoded::from_str("LiveStreamId=prov_service_source&MediaSourceId=source")
+                .expect("parses");
+        let req = build_request(
+            uuid::Uuid::from_u128(7),
+            query,
+            None,
+            HlsRequestContext::default(),
+        );
+        assert_eq!(req.live_stream_id.as_deref(), Some("prov_service_source"));
+        assert_eq!(req.media_source_id.as_deref(), Some("source"));
+
+        // The camelCase spelling parses too. It also looks like a
+        // `ParseStreamOptions` key (lower-case initial), so assert it still
+        // reaches the field rather than being swallowed as a stream option.
+        let query: HlsQuery =
+            serde_urlencoded::from_str("liveStreamId=prov_service_source").expect("parses");
+        let req = build_request(
+            uuid::Uuid::from_u128(7),
+            query,
+            None,
+            HlsRequestContext::default(),
+        );
+        assert_eq!(req.live_stream_id.as_deref(), Some("prov_service_source"));
+
+        // An ordinary transcode names no live stream.
+        let query: HlsQuery = serde_urlencoded::from_str("MediaSourceId=source").expect("parses");
+        let req = build_request(
+            uuid::Uuid::from_u128(7),
+            query,
+            None,
+            HlsRequestContext::default(),
+        );
+        assert_eq!(req.live_stream_id, None);
     }
 
     #[test]

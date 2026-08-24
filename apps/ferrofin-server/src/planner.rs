@@ -213,19 +213,33 @@ impl FerrofinStreamStatePlanner {
     /// Resolves the [`MediaSourceInfo`] for `request`.
     ///
     /// Port of the media-source resolution in `StreamingHelpers.GetStreamingState`:
-    /// fetch the item's static media sources and select the one matching the
-    /// request's `media_source_id` (defaulting to the first when unspecified).
+    /// an open live stream (`live_stream_id`) wins outright and is returned as
+    /// its own source; otherwise fetch the item's static media sources and
+    /// select the one matching the request's `media_source_id` (defaulting to
+    /// the first when unspecified).
     async fn resolve_media_source(
         &self,
         request: &HlsStreamRequest,
     ) -> Result<MediaSourceInfo, ServiceError> {
+        // `StreamingHelpers.GetStreamingState`: an open live stream wins over
+        // everything — its source is the buffered copy of the tuner, and going
+        // back to the static sources here would dial the tuner a second time.
+        if let Some(live_stream_id) = request
+            .live_stream_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+        {
+            return self.media_sources.get_live_stream(live_stream_id).await;
+        }
+
         let sources = self
             .media_sources
             .get_static_media_sources(request.item_id, false, None)
             .await?;
 
-        // `StreamingHelpers.GetStreamingState`: match the requested id, else when the
-        // "media source id" is really the item id, the first source.
+        // Match the requested id, else when the "media source id" is really the
+        // item id, the first source.
         let chosen = match request.media_source_id.as_deref() {
             Some(id) => match sources.iter().position(|s| s.id_matches(id)) {
                 Some(i) => sources.into_iter().nth(i),
@@ -524,6 +538,19 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
     ) -> Result<TranscodePlan, ServiceError> {
         // ---- (1) RESOLVE MEDIA SOURCE (GetStreamingState) -------------------
         let media_source = self.resolve_media_source(request).await?;
+        // `StreamingHelpers.GetStreamingState`, live branch: "cap the max
+        // bitrate when it is too high. This is usually due to ffmpeg is unable
+        // to probe the source liveTV streams' bitrate." A client asking for its
+        // "auto" ceiling (100-140 Mbps) would otherwise put that straight into
+        // `-maxrate` and suppress the downscale filter for a channel the tuner
+        // itself caps far lower.
+        let requested_video_bitrate = match (
+            request.video_bitrate,
+            media_source.fallback_max_streaming_bitrate,
+        ) {
+            (Some(requested), Some(fallback)) => Some(requested.min(fallback)),
+            (requested, _) => requested,
+        };
         let media_path = media_source
             .path
             .clone()
@@ -618,7 +645,7 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
             // The PlaybackInfo-negotiated caps: they drive the bitrate params
             // (`-maxrate`/`-b:a`), the downscale filter, the framerate cap, and
             // the copy veto.
-            video_bit_rate: request.video_bitrate,
+            video_bit_rate: requested_video_bitrate,
             audio_bit_rate: request.audio_bitrate,
             max_width: request.max_width,
             max_height: request.max_height,
@@ -638,6 +665,11 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
             // only way a real client's requested profile/level reaches
             // `GetRequestedProfiles`/`GetRequestedLevel`.
             stream_options: parse_stream_options(&request.query_string),
+            // `EncodingHelper.CanStreamCopyVideo` reads this for its "for LiveTV
+            // with no bitrate, try copy if other conditions are met" branch — a
+            // live MPEG-TS usually probes with no bitrate, so leaving it unset
+            // software-transcodes every channel that could have been copied.
+            live_stream_id: request.live_stream_id.clone(),
             ..BaseEncodingJobOptions::default()
         };
 
@@ -1466,6 +1498,11 @@ fn output_id(request: &HlsStreamRequest, segment_container: &str, is_audio: bool
     request.media_source_id.hash(&mut hasher);
     request.play_session_id.hash(&mut hasher);
     request.device_id.hash(&mut hasher);
+    // Upstream keys the output path on `state.MediaPath`, which for a live
+    // stream is the per-open buffer file and so differs on every tune. Without
+    // this, re-tuning a channel on the same play-session/device tuple collides
+    // with the previous tune and replays its segments.
+    request.live_stream_id.hash(&mut hasher);
     request.audio_codec.hash(&mut hasher);
     request.video_codec.hash(&mut hasher);
     // A burned-in subtitle changes the video, so it must key the cache — else a
@@ -1493,11 +1530,15 @@ mod tests {
     use super::*;
     use ferrofin_model::entities_media::MediaAttachment;
     use ferrofin_model::media_info::LiveStreamRequest;
+    use std::collections::HashMap;
     use uuid::Uuid;
 
-    /// A fake [`MediaSourceManager`] returning a fixed source list.
+    /// A fake [`MediaSourceManager`] returning a fixed source list, plus the
+    /// open live streams `get_live_stream` can hand back.
+    #[derive(Default)]
     struct FakeMediaSources {
         sources: Vec<MediaSourceInfo>,
+        live_streams: HashMap<String, MediaSourceInfo>,
     }
 
     #[async_trait]
@@ -1537,8 +1578,13 @@ mod tests {
         ) -> Result<MediaSourceInfo, ServiceError> {
             Err(ServiceError::backend("no live streams in test"))
         }
-        async fn get_live_stream(&self, _id: &str) -> Result<MediaSourceInfo, ServiceError> {
-            Err(ServiceError::backend("no live streams in test"))
+        async fn get_live_stream(&self, id: &str) -> Result<MediaSourceInfo, ServiceError> {
+            // The real manager 404s a closed/unknown id rather than falling
+            // back to the item's static sources.
+            self.live_streams
+                .get(id)
+                .cloned()
+                .ok_or_else(|| ServiceError::not_found("live stream is not open"))
         }
         async fn refresh_media_streams(&self, _item_id: uuid::Uuid) -> Result<(), ServiceError> {
             Ok(())
@@ -1646,6 +1692,25 @@ mod tests {
         planner_full(sources, false, &[])
     }
 
+    /// A planner whose fake media-source manager also has `id` open as a live
+    /// stream, alongside the static `sources`.
+    fn planner_with_live_stream(
+        sources: Vec<MediaSourceInfo>,
+        id: &str,
+        live: MediaSourceInfo,
+    ) -> FerrofinStreamStatePlanner {
+        let mut live_streams = HashMap::new();
+        live_streams.insert(id.to_owned(), live);
+        planner_over(
+            Arc::new(FakeMediaSources {
+                sources,
+                live_streams,
+            }),
+            false,
+            &[],
+        )
+    }
+
     fn planner_with_tonemapx(
         sources: Vec<MediaSourceInfo>,
         supports_tonemapx: bool,
@@ -1658,7 +1723,23 @@ mod tests {
         supports_tonemapx: bool,
         encoders: &[&str],
     ) -> FerrofinStreamStatePlanner {
-        let media_sources: Arc<dyn MediaSourceManager> = Arc::new(FakeMediaSources { sources });
+        planner_over(
+            Arc::new(FakeMediaSources {
+                sources,
+                live_streams: HashMap::new(),
+            }),
+            supports_tonemapx,
+            encoders,
+        )
+    }
+
+    /// [`planner_full`] over a caller-supplied fake, for the tests that need
+    /// open live streams as well as static sources.
+    fn planner_over(
+        media_sources: Arc<dyn MediaSourceManager>,
+        supports_tonemapx: bool,
+        encoders: &[&str],
+    ) -> FerrofinStreamStatePlanner {
         let encoder: Arc<dyn MediaEncoder> = Arc::new(FakeEncoder);
         let helper = EncodingHelper::with_processor_count(
             ProbedEncoders::new(encoders.iter().map(|e| (*e).to_owned()).collect()),
@@ -1940,6 +2021,163 @@ mod tests {
             !plan.arguments.iter().any(|a| a.contains('"')),
             "no argv token should contain a literal quote: {:?}",
             plan.arguments
+        );
+    }
+
+    /// The buffered tuner copy a live stream resolves to: an infinite MPEG-TS
+    /// whose bitrate ffmpeg could not probe, carrying the tuner's fallback cap.
+    fn live_source(id: &str) -> MediaSourceInfo {
+        MediaSourceInfo {
+            id: Some(id.to_owned()),
+            path: Some("/transcodes/tuner-buffer.ts".to_owned()),
+            container: Some("ts".to_owned()),
+            is_infinite_stream: true,
+            run_time_ticks: None,
+            fallback_max_streaming_bitrate: Some(30_000_000),
+            media_streams: vec![video_stream("h264"), audio_stream("aac")],
+            ..MediaSourceInfo::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn plan_prefers_the_open_live_stream_over_the_static_source() {
+        // `StreamingHelpers.GetStreamingState` puts the whole media-source-id
+        // resolution inside `if (string.IsNullOrWhiteSpace(LiveStreamId))`.
+        // Re-resolving the channel's static source here would dial the tuner a
+        // second time while one is already open.
+        let stale = source("abc", vec![video_stream("h264"), audio_stream("aac")]);
+        let p = planner_with_live_stream(
+            vec![stale],
+            "prov_service_source",
+            live_source("prov_service_source"),
+        );
+
+        let mut req = request("abc");
+        req.live_stream_id = Some("prov_service_source".to_owned());
+        let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
+        assert_eq!(plan.media_path, "/transcodes/tuner-buffer.ts");
+
+        // Without the id the static source still wins — the very same fake, so
+        // this is the branch and not a different planner.
+        let plan = p
+            .plan(&request("abc"), false, None, PlaylistKind::Vod)
+            .await
+            .unwrap();
+        assert_eq!(plan.media_path, "/media/movie.mkv");
+    }
+
+    #[tokio::test]
+    async fn plan_reports_a_closed_live_stream_rather_than_falling_back() {
+        // A tuner that has been closed (or an id a client invented) must not
+        // quietly become "transcode the item's file instead" — that would dial
+        // the tuner again behind the client's back.
+        let p = planner_with_live_stream(
+            vec![source(
+                "abc",
+                vec![video_stream("h264"), audio_stream("aac")],
+            )],
+            "open",
+            live_source("open"),
+        );
+        let mut req = request("abc");
+        req.live_stream_id = Some("closed".to_owned());
+        let result = p.plan(&req, false, None, PlaylistKind::Vod).await;
+        assert!(matches!(result, Err(ServiceError::NotFound(_))));
+
+        // Whitespace is `IsNullOrWhiteSpace` upstream: it means "no live
+        // stream", not "a live stream named a space".
+        let mut req = request("abc");
+        req.live_stream_id = Some("   ".to_owned());
+        let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
+        assert_eq!(plan.media_path, "/media/movie.mkv");
+    }
+
+    #[tokio::test]
+    async fn plan_caps_the_requested_bitrate_at_the_live_source_fallback() {
+        // A client's "auto" ceiling is far above what the tuner delivers.
+        // Upstream caps the ask against `FallbackMaxStreamingBitrate`;
+        // uncapped it flows into `-maxrate` and suppresses the downscale.
+        // Give the source a probed bitrate so the copy path is out of the way
+        // and the number really does reach the encoder args.
+        let mut live = live_source("prov_service_source");
+        live.media_streams[0].bit_rate = Some(40_000_000);
+        let p = planner_with_live_stream(Vec::new(), "prov_service_source", live);
+
+        let mut req = request("abc");
+        req.live_stream_id = Some("prov_service_source".to_owned());
+        req.video_bitrate = Some(140_000_000);
+        let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
+        let args = plan.arguments.join(" ");
+        assert!(
+            !args.contains("140000000"),
+            "the uncapped ask must not reach ffmpeg: {args}"
+        );
+        assert!(args.contains("30000000"), "capped at the fallback: {args}");
+
+        // An ask below the fallback is left alone.
+        let mut req = request("abc");
+        req.live_stream_id = Some("prov_service_source".to_owned());
+        req.video_bitrate = Some(3_000_000);
+        let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
+        assert!(
+            plan.arguments.join(" ").contains("3000000"),
+            "{:?}",
+            plan.arguments
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_lets_an_unprobed_live_stream_stream_copy() {
+        // `EncodingHelper.CanStreamCopyVideo`: "for LiveTV with no bitrate, try
+        // copy if other conditions are met" — gated on `live_stream_id` being
+        // set on the job options. A live MPEG-TS usually probes with no
+        // bitrate, so without the field every channel a client could have
+        // direct-played gets a full software transcode instead.
+        let p = planner_with_live_stream(
+            vec![source("abc", vec![video_stream("h264"), audio_stream("aac")])],
+            "prov_service_source",
+            live_source("prov_service_source"),
+        );
+        let mut req = request("abc");
+        req.live_stream_id = Some("prov_service_source".to_owned());
+        req.video_bitrate = Some(3_000_000);
+        req.video_codec = Some("h264".to_owned());
+        let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
+        assert!(
+            plan.arguments.join(" ").contains("-c:v copy"),
+            "{:?}",
+            plan.arguments
+        );
+
+        // The same unprobed source WITHOUT an open live stream is an ordinary
+        // file: the ask below the (unknown) source bitrate vetoes the copy.
+        let mut unprobed = source("abc", vec![video_stream("h264"), audio_stream("aac")]);
+        unprobed.container = Some("ts".to_owned());
+        let p = planner(vec![unprobed]);
+        let mut req = request("abc");
+        req.video_bitrate = Some(3_000_000);
+        req.video_codec = Some("h264".to_owned());
+        let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
+        assert!(
+            !plan.arguments.join(" ").contains("-c:v copy"),
+            "{:?}",
+            plan.arguments
+        );
+    }
+
+    #[test]
+    fn output_id_separates_two_tunes_of_the_same_channel() {
+        // Upstream keys the output path on the media path, which for a live
+        // stream is the per-open buffer file. Two tunes on one
+        // play-session/device tuple must not share a transcode directory, or
+        // the second replays the first tune's segments.
+        let mut first = request("abc");
+        first.live_stream_id = Some("prov_service_a".to_owned());
+        let mut second = request("abc");
+        second.live_stream_id = Some("prov_service_b".to_owned());
+        assert_ne!(
+            output_id(&first, "ts", false),
+            output_id(&second, "ts", false)
         );
     }
 

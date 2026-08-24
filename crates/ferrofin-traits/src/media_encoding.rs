@@ -411,6 +411,14 @@ pub struct HlsStreamRequest {
     pub item_id: Uuid,
     /// The chosen media source id (`mediaSourceId`), if the client pinned one.
     pub media_source_id: Option<String>,
+    /// The open live stream this transcode reads (`liveStreamId`).
+    ///
+    /// Port of the `LiveStreamId` branch of
+    /// `StreamingHelpers.GetStreamingState`: a Live TV client opens the channel
+    /// first and then asks for a transcode of THAT stream, so the source is the
+    /// buffered copy the tuner is filling — not the tuner URL, which would open
+    /// a second connection to it.
+    pub live_stream_id: Option<String>,
     /// The playback-session id this stream belongs to (`playSessionId`).
     pub play_session_id: Option<String>,
     /// The requesting device id (`deviceId`) — the kill/keep-alive scope.
@@ -514,6 +522,7 @@ impl Default for HlsStreamRequest {
         Self {
             item_id: Uuid::nil(),
             media_source_id: None,
+            live_stream_id: None,
             play_session_id: None,
             device_id: None,
             segment_container: None,
