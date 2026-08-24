@@ -1148,13 +1148,9 @@ fn segment_extension(segment_container: &str) -> &'static str {
     // permanent miss on a case-sensitive filesystem that reads to the client as
     // a dead transcode.
     //
-    // One helper still disagrees on casing: the transcode manager's own
-    // `segment_file_extension` (`ferrofin-mediaencoding`,
-    // `transcoding/manager.rs`) matches `Some("mp4")` case-sensitively, so a
-    // `segmentContainer=MP4` request has its `wait_for_segment` poll `.ts`
-    // while everything else uses `.mp4`. Harmless today (the wait then just
-    // falls back to its timeout) and out of this crate's reach; noted so the
-    // next person changing either helper changes both.
+    // The transcode manager's own `segment_file_extension`
+    // (`ferrofin-mediaencoding`, `transcoding/manager.rs`) normalises the same
+    // way; change both together.
     if segment_container.trim().eq_ignore_ascii_case("mp4") {
         ".mp4"
     } else {

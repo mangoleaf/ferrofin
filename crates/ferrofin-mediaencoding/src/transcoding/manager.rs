@@ -764,8 +764,11 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
 /// Port of `EncodingHelper.GetSegmentFileExtension` (mirrors the `ferrofin-hls`
 /// helper) so the cache-dir naming here agrees with the playlist generator.
 fn segment_file_extension(segment_container: Option<&str>) -> String {
+    // Case-insensitive, like the `ferrofin-hls` helper: a `segmentContainer=MP4`
+    // request must not have this poll `.ts` while the playlist and ffmpeg use
+    // `.mp4` (the wait would then only ever time out).
     match segment_container.map(str::trim).filter(|s| !s.is_empty()) {
-        Some("mp4") => ".mp4".to_owned(),
+        Some(container) if container.eq_ignore_ascii_case("mp4") => ".mp4".to_owned(),
         _ => ".ts".to_owned(),
     }
 }
@@ -1563,6 +1566,8 @@ mod start_ffmpeg_tests {
         let p = segment_path(Path::new("/cache/abcd.m3u8"), 3, &ext);
         assert_eq!(p, Path::new("/cache/abcd3.ts"));
         assert_eq!(segment_file_extension(Some("mp4")), ".mp4");
+        // Case-insensitive, as the playlist side is.
+        assert_eq!(segment_file_extension(Some("MP4")), ".mp4");
         assert_eq!(segment_file_extension(Some("  ")), ".ts");
         assert_eq!(segment_file_extension(None), ".ts");
     }
