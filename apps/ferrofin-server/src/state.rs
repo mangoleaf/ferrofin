@@ -1049,6 +1049,16 @@ pub async fn build_app_state(
                 &plugins,
             )),
         ));
+        // "Refresh Channels" (Internet Channels category): registered exactly
+        // as upstream does, over Ferrofin's own channel set — which is empty
+        // (no channel-plugin mechanism, see `docs/EXTENSIONS.md`), so the task
+        // reports itself hidden just like a Jellyfin with no channel plugin.
+        task_manager.register(Arc::new(
+            ferrofin_core::scheduled_tasks::channels::RefreshChannelsTask::new(Arc::new(
+                ferrofin_core::FerrofinChannelManager::new(),
+            ))
+            .await,
+        ));
     }
     let tasks: Arc<dyn ferrofin_traits::tasks::TaskManager> = Arc::new(task_manager.clone());
     // The trigger scheduler: fires startup triggers now, then evaluates

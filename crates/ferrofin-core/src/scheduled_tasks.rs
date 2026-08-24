@@ -31,6 +31,7 @@ use ferrofin_traits::error::ServiceError;
 use tracing::Instrument as _;
 
 pub mod application;
+pub mod channels;
 pub mod library;
 pub mod live_tv;
 pub mod maintenance;

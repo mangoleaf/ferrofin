@@ -342,6 +342,10 @@ shipped.
 - **DLNA** — needs SSDP/UDP sockets; the sandbox has no sockets by design.
 - **Item mutation/linking** (Merge-Versions-shaped) — item identity stays host-owned;
   plugins supplement, they never restructure the library.
+- **Internet channels** (Jellyfin's `IChannel`) — upstream's channel backends are .NET
+  plugins; neither tier supplies one, so Ferrofin registers no channels. The
+  `RefreshInternetChannels` scheduled task exists for API parity and, like a Jellyfin with
+  no channel plugin, hides itself while the channel set is empty.
 
 ## Updating installed plugins
 
