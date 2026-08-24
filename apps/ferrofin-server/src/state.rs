@@ -1438,9 +1438,11 @@ pub async fn build_app_state(
         Arc::clone(&paths),
         me_path_manager,
         ffmpeg,
-        // Transcode logs resolve item/series/library names through the library.
-        Some(me_library),
-        Some(me_trickplay),
+        crate::media_encoding::MediaEncodingExtras {
+            // Transcode logs resolve item/series/library names through the library.
+            library: Some(me_library),
+            trickplay: Some(me_trickplay),
+        },
     );
     let state = state
         .with_media_encoding(hls, attachments)

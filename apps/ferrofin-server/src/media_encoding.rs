@@ -49,6 +49,14 @@ use crate::planner::FerrofinStreamStatePlanner;
 /// A job dies within (its ping timeout + one sweep); 10s adds at most a sixth
 /// of the 60s HLS timeout as latency while keeping the scan negligible.
 const IDLE_REAPER_SWEEP_SECS: u64 = 10;
+/// The managers the media-encoding chain only decorates itself with: absent in
+/// the unit tests that build the chain without a database behind it.
+pub struct MediaEncodingExtras {
+    /// Resolves item/series/library display names for the transcode logs.
+    pub library: Option<Arc<dyn ferrofin_traits::library::LibraryManager>>,
+    /// Supplies the item's trickplay tile resolutions for the master playlist.
+    pub trickplay: Option<Arc<dyn ferrofin_traits::trickplay::TrickplayManager>>,
+}
 
 /// Builds the concrete media-encoding pair injected via
 /// [`AppState::with_media_encoding`](ferrofin_api::AppState::with_media_encoding).
@@ -79,12 +87,13 @@ pub fn build_media_encoding(
     paths: Arc<FerrofinServerApplicationPaths>,
     path_manager: Arc<dyn PathManager>,
     ffmpeg: &FfmpegPaths,
-    library: Option<Arc<dyn ferrofin_traits::library::LibraryManager>>,
+    extras: MediaEncodingExtras,
 ) -> (
     Arc<dyn HlsStreamManager>,
     Arc<dyn AttachmentExtractor>,
     Arc<dyn SubtitleEncoder>,
 ) {
+    let library = extras.library;
     // ---- subtitle encoder (real ffmpeg extraction + charset/format conv) ---
     // Built first: the planner also consumes it, resolving a burned text
     // subtitle to its cached extracted file so the `subtitles` filter doesn't
@@ -136,13 +145,19 @@ pub fn build_media_encoding(
         generator_config,
         Vec::new(),
     ));
-    let hls: Arc<dyn HlsStreamManager> = Arc::new(HlsStreamManagerImpl::new(
+    let mut hls_impl = HlsStreamManagerImpl::new(
         planner,
         transcoder,
         manager,
         generator,
         paths as Arc<dyn ferrofin_traits::system::ServerApplicationPaths>,
-    ));
+    );
+    // Without this the master playlist lists no `#EXT-X-IMAGE-STREAM-INF`, so a
+    // client sees no trickplay tiles however many the library holds.
+    if let Some(trickplay) = extras.trickplay {
+        hls_impl = hls_impl.with_trickplay(trickplay);
+    }
+    let hls: Arc<dyn HlsStreamManager> = Arc::new(hls_impl);
 
     // ---- attachment extractor (real ffmpeg + filesystem) ------------------
     let resolver = Arc::new(MediaSourceManagerResolver { media_sources });
@@ -700,7 +715,10 @@ mod tests {
             paths,
             path_manager,
             &ffmpeg,
-            None,
+            MediaEncodingExtras {
+                library: None,
+                trickplay: None,
+            },
         );
     }
 
