@@ -202,6 +202,7 @@ pub struct FfmpegCapabilities {
     ffmpeg_version: Option<FfmpegVersion>,
     os_version: Option<FfmpegVersion>,
     platform: Platform,
+    is_arm64: bool,
     is_vaapi_device_amd: bool,
     is_vaapi_device_intel_ihd: bool,
     is_vaapi_device_intel_i965: bool,
@@ -309,6 +310,18 @@ impl FfmpegCapabilities {
     #[must_use]
     pub fn platform(&self) -> Platform {
         self.platform
+    }
+
+    /// Whether the CPU is 64-bit ARM. Port of
+    /// `RuntimeInformation.OSArchitecture.Equals(Architecture.Arm64)`.
+    ///
+    /// Only Apple Silicon consults this: VideoToolbox gained H.264 Hi10P
+    /// decoding there in macOS 14.6, and has Hi444PP (and in theory Hi422P)
+    /// that no other platform offers. Carried as data for the same reason the
+    /// platform is — so those branches are testable off an Apple machine.
+    #[must_use]
+    pub fn is_arm64(&self) -> bool {
+        self.is_arm64
     }
 
     /// Whether the configured VAAPI render node is an AMD (Mesa Gallium)
@@ -486,6 +499,13 @@ impl FfmpegCapabilitiesBuilder {
         self
     }
 
+    /// Sets whether the CPU is 64-bit ARM.
+    #[must_use]
+    pub fn arm64(mut self, is_arm64: bool) -> Self {
+        self.caps.is_arm64 = is_arm64;
+        self
+    }
+
     /// Sets the three VAAPI driver-detection flags at once.
     #[must_use]
     pub fn vaapi_driver(mut self, amd: bool, intel_ihd: bool, intel_i965: bool) -> Self {
@@ -639,6 +659,7 @@ mod tests {
         assert_eq!(caps.ffmpeg_version(), None);
         assert_eq!(caps.os_version(), None);
         assert_eq!(caps.platform(), Platform::Other);
+        assert!(!caps.is_arm64());
         assert!(!caps.is_vaapi_device_amd());
         assert!(!caps.is_vaapi_device_intel_ihd());
         assert!(!caps.is_vaapi_device_intel_i965());
@@ -717,6 +738,7 @@ mod tests {
             .ffmpeg_version(FfmpegVersion::with_build(7, 0, 1))
             .os_version(FfmpegVersion::with_build(6, 1, 3))
             .platform(Platform::Windows)
+            .arm64(true)
             .build();
         assert_eq!(
             caps.ffmpeg_version(),
@@ -724,6 +746,7 @@ mod tests {
         );
         assert_eq!(caps.os_version(), Some(FfmpegVersion::with_build(6, 1, 3)));
         assert_eq!(caps.platform(), Platform::Windows);
+        assert!(caps.is_arm64());
         assert!(caps.ffmpeg_at_least(FfmpegVersion::new(6, 0)));
         assert!(caps.ffmpeg_at_least(FfmpegVersion::with_build(7, 0, 1)));
         assert!(!caps.ffmpeg_at_least(FfmpegVersion::with_build(7, 1, 1)));

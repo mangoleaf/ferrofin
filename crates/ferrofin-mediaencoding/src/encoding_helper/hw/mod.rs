@@ -16,12 +16,16 @@
 //!   before emitting an argument.
 //! - [`device_init`] — the `-init_hw_device` graphs.
 //! - [`encoder`] — hardware encoder selection.
+//! - [`decoder`] — hardware decoder selection: `-hwaccel` and `-c:v`.
+//! - [`input_args`] — the dispatcher that assembles everything before `-i`.
 //!
-//! Still to come, as named work items in `brain/plans/PLAN_HWACCEL.md`:
-//! hardware decoder selection and the input-argument dispatcher (rest of phase
-//! 1), the shared filter helpers and tonemapping (phase 2), and the per-vendor
-//! filter chains (phases 3–7). Until each lands, the software path in
-//! [`super::helper`] is what runs.
+//! Everything before ffmpeg's `-i` is therefore ported. Still to come, as named
+//! work items in `brain/plans/PLAN_HWACCEL.md`: the shared filter helpers and
+//! tonemapping (phase 2), the per-vendor filter chains (phases 3–7), the
+//! Dolby Vision / HDR10+ bitstream handling (phase 8), and the accelerated
+//! trickplay path (phase 9). Nothing here is wired into the planner yet —
+//! phase 3 does that, and until then the software path in [`super::helper`] is
+//! what runs.
 //!
 //! Two rules shape everything in this module:
 //!
@@ -36,8 +40,10 @@
 //!   upstream case.
 
 pub mod capabilities;
+pub mod decoder;
 pub mod device_init;
 pub mod encoder;
+pub mod input_args;
 pub mod support;
 pub mod versions;
 

@@ -518,6 +518,9 @@ pub async fn discover_ffmpeg(
         .decoders(decoders)
         .hwaccels(hwaccels)
         .platform(Platform::current())
+        // `RuntimeInformation.OSArchitecture == Arm64`; only the Apple Silicon
+        // VideoToolbox decode branches read it.
+        .arm64(std::env::consts::ARCH == "aarch64")
         .low_priority_hwaccel_flag(low_priority_hwaccel_flag);
     if let Some(version) = ffmpeg_version {
         builder = builder.ffmpeg_version(version);
