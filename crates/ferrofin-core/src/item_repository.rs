@@ -305,7 +305,7 @@ impl FerrofinItemRepository {
 }
 
 /// A by-name row plus its in-scope item count, read from the joined by-name
-/// aggregate query (the `cnt` column is the aggregate's `COUNT(DISTINCT ItemId)`).
+/// aggregate query (the `cnt` column is the aggregate's per-value `COUNT(*)`).
 /// `total_count` carries the `COUNT(*) OVER()` window-function total when the
 /// caller needs pagination metadata, avoiding a separate COUNT round-trip.
 #[derive(sqlx::FromRow)]
@@ -329,8 +329,17 @@ fn push_value_aggregate<'a>(
     exclude_content_types: &'a [String],
     ancestors: &'a [String],
 ) {
+    // `COUNT(*)`, not `COUNT(DISTINCT ivm."ItemId")`: `ItemValuesMap`'s primary
+    // key IS `("ItemValueId", "ItemId")`, so within one `GROUP BY
+    // iv."ItemValueId"` every `ItemId` is already distinct, and the `ci` join is
+    // 1:1 on `BaseItems`'s primary key so it cannot duplicate a map row either.
+    // The `DISTINCT` was therefore never able to remove a row — it only bought
+    // SQLite a `USE TEMP B-TREE FOR count(DISTINCT)` per group, whose cost grows
+    // with the number of items sharing a genre/studio. Row-identical on the
+    // bench library; the statement behind `/Studios` measures 0.407 ms → 0.366,
+    // `/Items/Filters2` 0.566 → 0.490.
     qb.push(
-        r#"(SELECT iv."ItemValueId" AS vid, COUNT(DISTINCT ivm."ItemId") AS cnt
+        r#"(SELECT iv."ItemValueId" AS vid, COUNT(*) AS cnt
            FROM "ItemValues" iv
            JOIN "ItemValuesMap" ivm ON ivm."ItemValueId" = iv."ItemValueId"
            JOIN "BaseItems" ci ON ci."Id" = ivm."ItemId"
