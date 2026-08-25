@@ -26,7 +26,9 @@
 //! persisted encoding options select it, else software `libx264`. What it does
 //! *not* do is the full device-profile negotiation, the rest of the
 //! hardware-acceleration matrix (QSV/VAAPI/AMF), or subtitle provider fan-out
-//! (only stored/embedded burn-in). Those are deferred.
+//! (only stored/embedded burn-in). The hardware matrix is the work of
+//! `brain/plans/PLAN_HWACCEL.md`; the subtitle-provider fan-out is work item 5
+//! in that plan's list.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -623,7 +625,7 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
         // h264/aac). A `copy` request is honoured verbatim. The video target is
         // NOT simply the client's first preference: browsers list av1/vp9 ahead
         // of h264 for efficiency, but Ferrofin's hardware-encoder matrix is
-        // deferred, so encoding to av1/vp9 in software (libaom-av1 etc.) runs far
+        // not yet wired, so encoding to av1/vp9 in software (libaom-av1 etc.) runs far
         // slower than realtime and stalls HLS (fragLoadTimeOut). Pick the first
         // preference Ferrofin can actually encode in realtime instead.
         let requested_video_codec = preferred_transcode_video_codec(&video_codecs, &options);
@@ -978,7 +980,7 @@ impl FerrofinStreamStatePlanner {
         // HDR→SDR tonemap chain — or a bare 8-bit down-convert for 10-bit SDR
         // sources (libx264 would otherwise emit High10, undecodable in browser
         // MSE). NVENC keeps its existing GPU-side handling (the hw filter
-        // matrix is deferred).
+        // matrix lands with `PLAN_HWACCEL.md` phases 2-7).
         let sw_filters: Vec<String> = if !copying_video && !nvenc_video {
             let mut filters = Vec::new();
             let tonemap =

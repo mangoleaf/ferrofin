@@ -12,12 +12,16 @@
 //! - [`capabilities`] — the resolved environment: what the running ffmpeg can
 //!   do, which OS it is on, and which kernel is underneath.
 //! - [`versions`] — the ffmpeg and kernel version gates the builders consult.
+//! - [`support`] — "is this backend usable?", the predicates every branch asks
+//!   before emitting an argument.
+//! - [`device_init`] — the `-init_hw_device` graphs.
+//! - [`encoder`] — hardware encoder selection.
 //!
-//! The argument builders themselves are the named next work items in
-//! `brain/plans/PLAN_HWACCEL.md`: the device-init graphs and hardware decoder
-//! selection (phase 1), the shared filter helpers and tonemapping (phase 2),
-//! and the per-vendor filter chains (phases 3–7). Until each lands, the
-//! software path in [`super::helper`] is what runs.
+//! Still to come, as named work items in `brain/plans/PLAN_HWACCEL.md`:
+//! hardware decoder selection and the input-argument dispatcher (rest of phase
+//! 1), the shared filter helpers and tonemapping (phase 2), and the per-vendor
+//! filter chains (phases 3–7). Until each lands, the software path in
+//! [`super::helper`] is what runs.
 //!
 //! Two rules shape everything in this module:
 //!
@@ -32,6 +36,9 @@
 //!   upstream case.
 
 pub mod capabilities;
+pub mod device_init;
+pub mod encoder;
+pub mod support;
 pub mod versions;
 
 pub use capabilities::{

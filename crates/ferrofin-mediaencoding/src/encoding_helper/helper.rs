@@ -37,7 +37,10 @@ use super::transcode_state::{BaseEncodingJobOptions, EncoderCapabilities, Encodi
 /// Port of `EncodingHelper.ContainerValidationRegexStr` (`^[a-zA-Z0-9\-\._,|]
 /// {0,40}$`), transliterated as a byte-for-byte character check to avoid a
 /// runtime regex dependency for such a simple predicate.
-fn is_valid_container(value: &str) -> bool {
+///
+/// Shared with [`super::hw::encoder`], which validates a passthrough codec name
+/// against the same pattern before it reaches an ffmpeg command line.
+pub(crate) fn is_valid_container(value: &str) -> bool {
     value.len() <= 40
         && value
             .bytes()
@@ -116,10 +119,25 @@ impl<C: EncoderCapabilities> EncodingHelper<C> {
 
     /// Selects the ffmpeg video encoder for `state`.
     ///
-    /// Port of the **software path** of `GetVideoEncoder`: `h264` maps to
-    /// `libx264` and any pass-through/unknown-but-valid codec is returned as-is;
-    /// hardware encoders (av1/h265/mjpeg hw variants) are deferred. Returns
-    /// `"copy"` when no output codec is set.
+    /// Port of the **software path** of `GetVideoEncoder`: each codec C#
+    /// dispatches on maps to its software encoder, any other valid codec name
+    /// passes through, and `"copy"` is returned when no output codec is set.
+    ///
+    /// The four mappings are not cosmetic. `h265` has **no ffmpeg encoder of
+    /// that name**, so passing it through would emit `-c:v h265` and fail with
+    /// `Unknown encoder 'h265'` before a frame is written. That is latent
+    /// today — the planner only ever asks this method for `copy` or `h264`,
+    /// having intercepted the hardware-mapped codecs earlier — and becomes
+    /// reachable the moment the dispatcher routes real codecs here. And while
+    /// ffmpeg does resolve `hevc`/`av1`/`mjpeg` to whatever it considers that
+    /// codec's default encoder, upstream names the encoder explicitly so the
+    /// choice does not vary with how ffmpeg was built.
+    ///
+    /// The hardware variants live in
+    /// [`hw::encoder::video_encoder`](super::hw::encoder::video_encoder), which
+    /// supersedes this method once the input-argument dispatcher wires it in
+    /// (`brain/plans/PLAN_HWACCEL.md` phase 1b); it makes the same four
+    /// mappings its software fallbacks.
     #[must_use]
     pub fn video_encoder(&self, state: &EncodingJobInfo) -> String {
         let Some(codec) = state
@@ -130,16 +148,16 @@ impl<C: EncoderCapabilities> EncodingHelper<C> {
             return "copy".to_owned();
         };
 
-        if codec.eq_ignore_ascii_case("h264") {
-            // Software H.264 encoder. The hardware h264_* variants are deferred.
-            return "libx264".to_owned();
+        // The software half of C#'s dispatch; `hw::encoder` picks the
+        // `_nvenc`/`_qsv`/`_vaapi`/… variants when a hardware type is set.
+        match codec.to_ascii_lowercase().as_str() {
+            "h264" => "libx264".to_owned(),
+            "h265" | "hevc" => "libx265".to_owned(),
+            "av1" => "libsvtav1".to_owned(),
+            "mjpeg" => "mjpeg".to_owned(),
+            lower if is_valid_container(lower) => lower.to_owned(),
+            _ => "copy".to_owned(),
         }
-
-        if is_valid_container(codec) {
-            return codec.to_ascii_lowercase();
-        }
-
-        "copy".to_owned()
     }
 
     /// Selects the ffmpeg audio encoder for `state`.
@@ -244,7 +262,14 @@ impl<C: EncoderCapabilities> EncodingHelper<C> {
     ///
     /// Port of the **software encoders' branches** of `GetVideoBitrateParam`
     /// (`libx264`/`libx265` → `-maxrate/-bufsize`, `libsvtav1` → `-b:v/-bufsize`).
-    /// Hardware-encoder branches are deferred. Returns empty when no output
+    /// Two things are missing here. The per-vendor hardware arms (the
+    /// `h264_qsv` minimum-bitrate clamp and `-mbbrc`, and the vaapi/amf/
+    /// videotoolbox rate-control shapes; nvenc has no arm of its own) are the
+    /// work items of `PLAN_HWACCEL.md` phases 4-7. Separately, C#'s **generic
+    /// fallback** — ` -b:v {b} -maxrate {b} -bufsize {bufsize}` for any encoder
+    /// matching no arm — is not ported, so an mjpeg or passthrough encoder gets
+    /// no bitrate cap where upstream caps it; that is software work, recorded
+    /// as work item 8 in that plan. Returns empty when no output
     /// bitrate is set.
     #[must_use]
     pub fn video_bitrate_param(&self, state: &EncodingJobInfo, video_codec: &str) -> String {
@@ -378,7 +403,9 @@ impl<C: EncoderCapabilities> EncodingHelper<C> {
     /// quality argument for `video_encoder`.
     ///
     /// Port of the **software slice** of `GetVideoQualityParam`. The hardware
-    /// low-power/i915-workaround preamble is deferred (it is inert when the
+    /// low-power/i915-workaround preamble belongs to `PLAN_HWACCEL.md` phases
+    /// 4-5 — low-power covers vaapi and qsv, and the `-async_depth 1` i915
+    /// workaround is qsv-only (it is inert when the
     /// hardware-acceleration type is `none`, i.e. the software path); the
     /// libx264/libx265/libsvtav1 preset, CRF, profile, level, and codec-specific
     /// option strings are ported verbatim.
@@ -450,7 +477,8 @@ impl<C: EncoderCapabilities> EncodingHelper<C> {
     /// Decides whether `video_stream` can be stream-copied (direct-play video).
     ///
     /// Port of `CanStreamCopyVideo`. The DOVI dynamic-metadata-removal branch
-    /// (which consults a deferred hardware encoder capability) is handled
+    /// (which consults a hardware encoder capability that `PLAN_HWACCEL.md`
+    /// phase 8 wires in) is handled
     /// conservatively: if a static-HDR stream is not directly range-compatible
     /// the copy is refused (matching the C# refuse-when-uncertain intent).
     #[must_use]
@@ -748,10 +776,37 @@ fn codec_specific_quality_args(
     if let Some(level) =
         normalize_transcoding_level(state, state.requested_level(target_video_codec).as_deref())
     {
-        // libx264 accepts an adjustable -level, as do libsvtav1/other software
-        // encoders (bare -level). libx265 takes its level via -x265-params only,
-        // and the hardware-specific remaps are deferred.
-        if !video_encoder.eq_ignore_ascii_case("libx265") {
+        if video_encoder.eq_ignore_ascii_case("libsvtav1") {
+            // libsvtav1 does NOT take the AV1 level number as written: the
+            // spec's `major.minor` is packed two-bits-minor, so level 16 must
+            // be spelled `60`, and a raw `-level 16` aborts the encode with
+            // "Invalid or undefined level specified". Port of the shared
+            // `av1_qsv`/`libsvtav1` remap in `GetVideoQualityParam`.
+            // A zero fraction is still an integer to `NumberStyles.Any`
+            // ("5.0" is 5); a real fraction fails the int parse in both, and
+            // then neither side emits a level. Done on the string so no float
+            // cast is involved. (`NumberStyles.Any` also allows exponent
+            // notation, which this does not — no client sends "1e1" as a
+            // level, and treating it as unparseable is the safe direction.)
+            let integral = match level.trim().split_once('.') {
+                Some((int, frac)) if frac.bytes().all(|b| b == b'0') => int,
+                _ => level.trim(),
+            };
+            if let Ok(av1_level) = integral.parse::<i32>() {
+                let x = 2 + (av1_level >> 2);
+                let y = av1_level & 3;
+                // Wrapping rather than checked: C# computes this unchecked, and
+                // this is `pub`, so a caller pairing `libsvtav1` with an
+                // uncapped level must not panic a debug build.
+                let level = x.wrapping_mul(10).wrapping_add(y);
+                let _ = write!(param, " -level {level}");
+            }
+        } else if !video_encoder.eq_ignore_ascii_case("libx265") {
+            // libx264 (and any other software encoder reaching here) accepts
+            // the level as written. libx265 takes its level through
+            // `-x265-params` only. The per-vendor hardware remaps are the work
+            // items of `PLAN_HWACCEL.md` phases 4-7 — NVENC deliberately emits
+            // no level at all, since it cannot adjust one and errors instead.
             let _ = write!(param, " -level {level}");
         }
     }
@@ -769,8 +824,14 @@ fn codec_specific_quality_args(
         }
     }
 
-    // libsvtav1 svtav1-params depends on an ffmpeg-version gate that is part of
-    // the deferred encoder-capability plumbing — omitted on the software path.
+    // TODO(PLAN_HWACCEL work item 7): ` -svtav1-params:0 rc=1:tune=0:
+    // film-grain=0:enable-overlays=1:enable-tf=0` is a *software* libsvtav1
+    // argument gated on ffmpeg >= 5.1. Both halves it needs already exist —
+    // `hw::versions::MIN_FFMPEG_SVT_AV1_PARAMS` and
+    // `FfmpegCapabilities::ffmpeg_at_least` — but `EncodingHelper` still holds
+    // only the one-method `EncoderCapabilities` seam and so cannot read a
+    // version. Threading the full capabilities in is what unblocks it; it has
+    // no vendor phase because it is not hardware work.
 
     param
 }
@@ -834,7 +895,8 @@ fn encoder_param(
         };
         param.push_str(preset);
     }
-    // Hardware encoder branches (vaapi/qsv/nvenc/amf/videotoolbox) are deferred.
+    // Hardware encoder branches (vaapi/qsv/nvenc/amf/videotoolbox) are the
+    // per-vendor work items of `PLAN_HWACCEL.md` phases 3-7.
 
     param
 }
@@ -1234,7 +1296,7 @@ fn profile_range_rotation_copy_ok(
 /// The video-range portion of the copy decision.
 ///
 /// Port of the range-type block of `CanStreamCopyVideo`; the DOVI
-/// dynamic-metadata-removal escape hatch (a deferred hardware helper) is
+/// dynamic-metadata-removal escape hatch (`PLAN_HWACCEL.md` phase 8) is
 /// replaced by a conservative refusal, matching the C# refuse-when-uncertain
 /// intent.
 fn range_type_copy_ok(video_stream: &MediaStream, requested: &[String]) -> bool {
@@ -1355,6 +1417,8 @@ mod tests {
     //! were derived by hand from the ported source, not transliterated from an
     //! xUnit fixture. Each asserts a single, self-evident branch outcome.
 
+    use rstest::rstest;
+
     use ferrofin_model::dto::MediaSourceInfo;
     use ferrofin_model::entities::MediaStreamType;
 
@@ -1448,11 +1512,26 @@ mod tests {
 
     // ----- video_encoder (software path) -------------------------------------
 
-    #[test]
-    fn video_encoder_h264_maps_to_libx264() {
+    #[rstest]
+    // Every codec C# dispatches on gets its software encoder named explicitly.
+    #[case("h264", "libx264")]
+    #[case("H264", "libx264")]
+    #[case("hevc", "libx265")]
+    // `h265` is the case that was broken: ffmpeg has NO encoder of that name,
+    // so passing it through would emit `-c:v h265` and fail with
+    // `Unknown encoder 'h265'`. Latent until the dispatcher routes real codecs
+    // to this method, but a hard failure once it does.
+    #[case("h265", "libx265")]
+    #[case("H265", "libx265")]
+    #[case("av1", "libsvtav1")]
+    #[case("mjpeg", "mjpeg")]
+    fn video_encoder_names_the_software_encoder_for_each_dispatched_codec(
+        #[case] codec: &str,
+        #[case] expected: &str,
+    ) {
         let mut state = job(&[video_stream("h264", 0)]);
-        state.output_video_codec = Some("h264".to_owned());
-        assert_eq!(helper(vec![]).video_encoder(&state), "libx264");
+        state.output_video_codec = Some(codec.to_owned());
+        assert_eq!(helper(vec![]).video_encoder(&state), expected);
     }
 
     #[test]
@@ -1684,6 +1763,72 @@ mod tests {
             param.contains(" -x264opts:0 subme=0:me_range=16:rc_lookahead=10:me=hex:open_gop=0"),
             "{param}"
         );
+    }
+
+    #[rstest]
+    // AV1 levels are packed two-bits-minor, so the number a client asks for is
+    // NOT the number libsvtav1 takes. Verified against ffmpeg n9.0.1: a raw
+    // `-level 15` aborts with "Invalid or undefined level specified: 1.5",
+    // while the remapped `-level 53` encodes.
+    //
+    // Note the cap runs BEFORE the remap: `normalize_transcoding_level` clamps
+    // AV1 to 15, so 53 is the highest level this path can ever emit and
+    // upstream's illustrative "level 16 -> 60" is unreachable through it.
+    #[case("15", " -level 53")]
+    #[case("16", " -level 53")]
+    #[case("99", " -level 53")]
+    #[case("12", " -level 50")]
+    #[case("9", " -level 41")]
+    #[case("0", " -level 20")]
+    // `NumberStyles.Any` accepts a zero fraction, so "5.0" IS the integer 5 and
+    // remaps like one. Rust's plain `parse::<i32>` would have rejected it and
+    // silently emitted no level at all.
+    #[case("5.0", " -level 31")]
+    fn video_quality_param_remaps_the_av1_level_for_libsvtav1(
+        #[case] requested: &str,
+        #[case] expected: &str,
+    ) {
+        let mut state = job(&[video_stream("h264", 0)]);
+        state.output_video_codec = Some("av1".to_owned());
+        state.base_request.level = Some(requested.to_owned());
+        let opts = default_encoding_options(0);
+        let param =
+            helper(vec![]).video_quality_param(&state, "libsvtav1", &opts, EncoderPreset::veryfast);
+        assert!(param.contains(expected), "{param}");
+    }
+
+    #[test]
+    fn video_quality_param_omits_the_av1_level_it_cannot_parse() {
+        // A level with a real fraction fails an integer parse in C# too, and
+        // then neither side emits `-level`. This is the branch the six remap
+        // cases do not reach.
+        let mut state = job(&[video_stream("h264", 0)]);
+        state.output_video_codec = Some("av1".to_owned());
+        state.base_request.level = Some("5.1".to_owned());
+        let opts = default_encoding_options(0);
+        let param =
+            helper(vec![]).video_quality_param(&state, "libsvtav1", &opts, EncoderPreset::veryfast);
+        assert!(!param.contains(" -level "), "{param}");
+    }
+
+    #[test]
+    fn video_quality_param_passes_the_level_through_for_libx264() {
+        // Only AV1 is remapped; H.264's level is already the number ffmpeg
+        // wants, and libx265 takes its level through `-x265-params` instead.
+        let mut state = job(&[video_stream("h264", 0)]);
+        state.output_video_codec = Some("h264".to_owned());
+        state.base_request.level = Some("41".to_owned());
+        let opts = default_encoding_options(0);
+        let param =
+            helper(vec![]).video_quality_param(&state, "libx264", &opts, EncoderPreset::veryfast);
+        assert!(param.contains(" -level 41"), "{param}");
+
+        let mut state = job(&[video_stream("hevc", 0)]);
+        state.output_video_codec = Some("hevc".to_owned());
+        state.base_request.level = Some("120".to_owned());
+        let param =
+            helper(vec![]).video_quality_param(&state, "libx265", &opts, EncoderPreset::veryfast);
+        assert!(!param.contains(" -level "), "{param}");
     }
 
     #[test]
