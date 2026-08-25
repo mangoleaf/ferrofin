@@ -9,9 +9,10 @@
 //! a caller-supplied directory.
 //!
 //! Departures from the C# (documented per the port rules):
-//! - The hardware-acceleration / keyframe-only branches ride the deferred
-//!   hw-accel matrix (see the crate docs) and are not ported; the software
-//!   encoder is always used.
+//! - The hardware-acceleration / keyframe-only branches ride the hardware
+//!   matrix, which `brain/plans/PLAN_HWACCEL.md` ports (its phase 9 covers the
+//!   accelerated trickplay path specifically); until then the software encoder
+//!   is always used.
 //! - The `setpts=N/frame_rate/TB` PTS normalisation the C# splices in front of
 //!   the `fps` filter guards against containers with broken timestamps and
 //!   needs the probed input frame rate, which this seam does not carry; ffmpeg's

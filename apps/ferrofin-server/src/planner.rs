@@ -35,7 +35,7 @@ use async_trait::async_trait;
 use ferrofin_core::FerrofinServerApplicationPaths;
 use ferrofin_hls::{PlaylistKind, StreamStatePlanner, TranscodePlan};
 use ferrofin_mediaencoding::{
-    BaseEncodingJobOptions, EncodingHelper, EncodingJobInfo, ProbedEncoders,
+    BaseEncodingJobOptions, EncodingHelper, EncodingJobInfo, FfmpegCapabilities,
 };
 use ferrofin_model::configuration::EncodingOptions;
 use ferrofin_model::dlna::SubtitleDeliveryMethod;
@@ -109,7 +109,7 @@ const MS_PER_SECOND: i32 = 1000;
 pub struct FerrofinStreamStatePlanner {
     media_sources: Arc<dyn MediaSourceManager>,
     encoder: Arc<dyn MediaEncoder>,
-    encoding_helper: EncodingHelper<ProbedEncoders>,
+    encoding_helper: EncodingHelper<FfmpegCapabilities>,
     /// The server config manager — read for the persisted `encoding` options
     /// (hardware-acceleration type, presets) on each plan.
     config: Arc<dyn ServerConfigurationManager>,
@@ -135,7 +135,7 @@ impl FerrofinStreamStatePlanner {
     /// * `media_sources` — resolves an item id into its [`MediaSourceInfo`].
     /// * `encoder` — formats the ffmpeg input argument and the `-ss` seek time.
     /// * `encoding_helper` — builds the encoder/map/bitrate/quality/thread args
-    ///   and the stream-copy decision (its [`ProbedEncoders`] carrying the
+    ///   and the stream-copy decision (its [`FfmpegCapabilities`] carrying the
     ///   `-encoders` probe, so e.g. `libfdk_aac` is preferred when present).
     /// * `config` — the server configuration (persisted encoding options).
     /// * `paths` — the application paths (the transcode cache root).
@@ -146,7 +146,7 @@ impl FerrofinStreamStatePlanner {
     pub fn new(
         media_sources: Arc<dyn MediaSourceManager>,
         encoder: Arc<dyn MediaEncoder>,
-        encoding_helper: EncodingHelper<ProbedEncoders>,
+        encoding_helper: EncodingHelper<FfmpegCapabilities>,
         config: Arc<dyn ServerConfigurationManager>,
         paths: Arc<FerrofinServerApplicationPaths>,
         subtitles: Arc<dyn SubtitleEncoder>,
@@ -1742,7 +1742,9 @@ mod tests {
     ) -> FerrofinStreamStatePlanner {
         let encoder: Arc<dyn MediaEncoder> = Arc::new(FakeEncoder);
         let helper = EncodingHelper::with_processor_count(
-            ProbedEncoders::new(encoders.iter().map(|e| (*e).to_owned()).collect()),
+            FfmpegCapabilities::builder()
+                .encoders(encoders.iter().copied())
+                .build(),
             8,
         );
         let paths = Arc::new(FerrofinServerApplicationPaths::new(

@@ -69,8 +69,7 @@ async fn wasm_plugin_surfaces_on_plugins_api_and_its_task_runs() {
     let ffmpeg = ferrofin_server::bootstrap::FfmpegPaths {
         ffmpeg: std::path::PathBuf::from("ffmpeg"),
         ffprobe: std::path::PathBuf::from("ffprobe"),
-        filters: Vec::new(),
-        encoders: Vec::new(),
+        capabilities: ferrofin_mediaencoding::FfmpegCapabilities::default(),
         chromaprint_muxer: false,
     };
     let (shutdown_tx, _shutdown_rx) = tokio::sync::oneshot::channel();
@@ -379,8 +378,7 @@ async fn repository_install_stages_plugin_and_flags_restart() {
     let ffmpeg = ferrofin_server::bootstrap::FfmpegPaths {
         ffmpeg: std::path::PathBuf::from("ffmpeg"),
         ffprobe: std::path::PathBuf::from("ffprobe"),
-        filters: Vec::new(),
-        encoders: Vec::new(),
+        capabilities: ferrofin_mediaencoding::FfmpegCapabilities::default(),
         chromaprint_muxer: false,
     };
     let (shutdown_tx, _shutdown_rx) = tokio::sync::oneshot::channel();

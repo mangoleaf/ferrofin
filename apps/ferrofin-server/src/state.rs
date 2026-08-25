@@ -1713,8 +1713,7 @@ mod tests {
         let ffmpeg = FfmpegPaths {
             ffmpeg: PathBuf::from("ffmpeg"),
             ffprobe: PathBuf::from("ffprobe"),
-            filters: Vec::new(),
-            encoders: Vec::new(),
+            capabilities: ferrofin_mediaencoding::FfmpegCapabilities::default(),
             chromaprint_muxer: false,
         };
         let (tx, _rx) = tokio::sync::oneshot::channel();

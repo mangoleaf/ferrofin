@@ -23,8 +23,8 @@ use ferrofin_mediaencoding::subtitles::{
     SubtitleEditParser, SubtitleEncoder as PureSubtitleEncoder, SubtitleEncoderImpl, SubtitleIo,
 };
 use ferrofin_mediaencoding::{
-    AttachmentExtractorImpl, EncodingHelper, NoopSessionReporter, ProbedEncoders,
-    TokioSegmentTranscoder, TranscodeManagerImpl,
+    AttachmentExtractorImpl, EncodingHelper, NoopSessionReporter, TokioSegmentTranscoder,
+    TranscodeManagerImpl,
 };
 use ferrofin_model::configuration::EncodingOptions;
 use ferrofin_model::dto::MediaSourceInfo;
@@ -152,10 +152,12 @@ impl<R: LiveStreamReleaser> ferrofin_mediaencoding::SessionReporter
 /// reporting is deferred; killed-job partial-file cleanup is handled by the
 /// manager's `FsFileCleaner`).
 ///
-/// `ffmpeg` carries the startup capability probes: the `-filters` list gates
-/// the jellyfin-ffmpeg-only `tonemapx` software tonemap (the planner falls
-/// back to the vanilla zscale chain without it), and the `-encoders` list lets
-/// the audio path prefer `aac_at`/`libfdk_aac` over native `aac` when present.
+/// `ffmpeg` carries the startup capability probes, which the planner reads for
+/// every encoding decision: the `-filters` list gates the jellyfin-ffmpeg-only
+/// `tonemapx` software tonemap (the planner falls back to the vanilla zscale
+/// chain without it), the `-encoders` list lets the audio path prefer
+/// `aac_at`/`libfdk_aac` over native `aac`, and the hardware lists and version
+/// gates drive the whole hardware-acceleration matrix.
 #[must_use]
 pub fn build_media_encoding(
     media_sources: Arc<dyn MediaSourceManager>,
@@ -190,7 +192,7 @@ pub fn build_media_encoding(
     let planner = FerrofinStreamStatePlanner::new(
         Arc::clone(&media_sources),
         Arc::clone(&encoder),
-        EncodingHelper::new(ProbedEncoders::new(ffmpeg.encoders.clone())),
+        EncodingHelper::new(ffmpeg.capabilities.clone()),
         config,
         Arc::clone(&paths),
         Arc::clone(&subtitles),
@@ -786,8 +788,7 @@ mod tests {
         let ffmpeg = FfmpegPaths {
             ffmpeg: "ffmpeg".into(),
             ffprobe: "ffprobe".into(),
-            filters: Vec::new(),
-            encoders: Vec::new(),
+            capabilities: ferrofin_mediaencoding::FfmpegCapabilities::default(),
             chromaprint_muxer: false,
         };
         let (_hls, _attachments, _subtitles) = build_media_encoding(
@@ -1027,8 +1028,7 @@ mod tests {
         let ffmpeg = FfmpegPaths {
             ffmpeg: "ffmpeg".into(),
             ffprobe: "ffprobe".into(),
-            filters: Vec::new(),
-            encoders: Vec::new(),
+            capabilities: ferrofin_mediaencoding::FfmpegCapabilities::default(),
             chromaprint_muxer: false,
         };
         let (hls, _attachments, _subtitles) = build_media_encoding(

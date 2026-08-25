@@ -5,11 +5,14 @@
 //! bitrate/quality/thread params, and the `CanStreamCopy{Video,Audio}`
 //! direct-play-vs-transcode decision.
 //!
-//! **Deferred:** the entire hardware-acceleration
-//! matrix (nvenc/qsv/vaapi/videotoolbox/rkmpp/amf), tonemapping/HDR filters, and
-//! hardware scale/filter chains. Where a software-path branch would consult a
-//! deferred hardware helper (e.g. the DOVI dynamic-metadata-removal check in
-//! `CanStreamCopyVideo`), this port takes the conservative branch and documents
+//! **Not yet ported here:** the hardware-acceleration matrix
+//! (nvenc/qsv/vaapi/videotoolbox/rkmpp/amf), tonemapping/HDR filters, and
+//! hardware scale/filter chains — the work items of
+//! `brain/plans/PLAN_HWACCEL.md`, whose foundation (the probed environment and
+//! the version gates) already lives in [`hw`](super::hw). Where a software-path
+//! branch would consult one of those hardware helpers (e.g. the DOVI
+//! dynamic-metadata-removal check in `CanStreamCopyVideo`, which that plan's
+//! phase 8 completes), this port takes the conservative branch and documents
 //! the omission inline.
 //!
 //! There is **no parity oracle in this test project** — the upstream

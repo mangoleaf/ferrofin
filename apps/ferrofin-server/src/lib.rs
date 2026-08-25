@@ -123,8 +123,7 @@ fn encoder_or_disabled(discovered: anyhow::Result<FfmpegPaths>) -> FfmpegPaths {
             FfmpegPaths {
                 ffmpeg: "ffmpeg".into(),
                 ffprobe: "ffprobe".into(),
-                filters: Vec::new(),
-                encoders: Vec::new(),
+                capabilities: ferrofin_mediaencoding::FfmpegCapabilities::default(),
                 chromaprint_muxer: false,
             }
         }

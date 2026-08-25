@@ -46,6 +46,23 @@ impl FfmpegVersion {
         }
     }
 
+    /// Creates a fully specified four-component version.
+    ///
+    /// This is the shape .NET's `Environment.OSVersion.Version` always has on
+    /// Unix — it fills every component, using `0` for the ones the release
+    /// string did not supply — which is why it sorts *after* a
+    /// [`with_build`](Self::with_build) version of the same three leading
+    /// numbers.
+    #[must_use]
+    pub const fn with_revision(major: i32, minor: i32, build: i32, revision: i32) -> Self {
+        Self {
+            major,
+            minor,
+            build,
+            revision,
+        }
+    }
+
     /// Parses a dotted version string the way .NET `Version.TryParse` does.
     ///
     /// Accepts 2–4 numeric components separated by `.`; each must be a

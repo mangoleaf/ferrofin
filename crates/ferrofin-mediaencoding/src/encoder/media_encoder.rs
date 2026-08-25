@@ -7,9 +7,11 @@
 //! the `Extract*Image` frame grabbers, `ConvertImage`, and the tested
 //! `GetExtraArguments` User-Agent/probe oracle.
 //!
-//! The hardware-acceleration matrix, HDR tonemapping, and Blu-ray (`BdInfo`)
-//! paths are deferred (see the crate docs). Every ffmpeg/ffprobe process spawn
-//! sits behind the [`Transcoder`] seam so unit tests inject a fake.
+//! The hardware-acceleration matrix and HDR tonemapping are the work items of
+//! `brain/plans/PLAN_HWACCEL.md` (this unit gains its accelerated trickplay
+//! path in that plan's phase 9); Blu-ray (`BdInfo`) has no plan yet and belongs
+//! to disc-image playback rather than encoding. Every ffmpeg/ffprobe process
+//! spawn sits behind the [`Transcoder`] seam so unit tests inject a fake.
 
 use std::fmt::Write as _;
 use std::sync::Arc;
@@ -173,7 +175,13 @@ impl<T: Transcoder> MediaEncoderImpl<T> {
     ///
     /// Port of the core of `ExtractImageInternal`: the deinterlace + scale
     /// filter chain, optional thumbnail sampling, stream `-map`, and `-ss`
-    /// offset. The HDR tonemap and image-resolution branches are deferred.
+    /// offset.
+    ///
+    /// Two branches of the C# are missing here and are tracked separately: the
+    /// HDR tonemap branch belongs to `brain/plans/PLAN_HWACCEL.md` phase 2, and
+    /// `GetImageResolutionParameter` (the `ChapterImageResolution` setting →
+    /// `-s WxH`) is not hardware work at all — it is open work item 4 in that
+    /// plan's list, because the dashboard setting currently has no effect.
     #[allow(clippy::too_many_arguments)]
     fn extract_image_arguments(
         input_path: &str,
