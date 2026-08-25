@@ -18,14 +18,17 @@
 //! - [`encoder`] — hardware encoder selection.
 //! - [`decoder`] — hardware decoder selection: `-hwaccel` and `-c:v`.
 //! - [`input_args`] — the dispatcher that assembles everything before `-i`.
+//! - [`tonemap`] — the five tonemapping paths and the colour-property params.
+//! - [`filters`] — the shared filter fragments the chains are built from.
 //!
-//! Everything before ffmpeg's `-i` is therefore ported. Still to come, as named
-//! work items in `brain/plans/PLAN_HWACCEL.md`: the shared filter helpers and
-//! tonemapping (phase 2), the per-vendor filter chains (phases 3–7), the
-//! Dolby Vision / HDR10+ bitstream handling (phase 8), and the accelerated
-//! trickplay path (phase 9). Nothing here is wired into the planner yet —
-//! phase 3 does that, and until then the software path in [`super::helper`] is
-//! what runs.
+//! That covers everything before ffmpeg's `-i`, plus the individual filter
+//! fragments the graphs after it are built from. Still to come, as named work
+//! items in `brain/plans/PLAN_HWACCEL.md`: the software filter chain and the
+//! `GetVideoProcessingFilterParam` dispatcher that assembles the fragments
+//! (phase 2b), the per-vendor filter chains (phases 3–7), the Dolby Vision /
+//! HDR10+ bitstream handling (phase 8), and the accelerated trickplay path
+//! (phase 9). Nothing here is wired into the planner yet — phase 3 does that,
+//! and until then the software path in [`super::helper`] is what runs.
 //!
 //! Two rules shape everything in this module:
 //!
@@ -43,8 +46,10 @@ pub mod capabilities;
 pub mod decoder;
 pub mod device_init;
 pub mod encoder;
+pub mod filters;
 pub mod input_args;
 pub mod support;
+pub mod tonemap;
 pub mod versions;
 
 pub use capabilities::{

@@ -723,6 +723,23 @@ pub fn fixed_output_size(
     (Some(2 * (output_width / 2)), Some(2 * (output_height / 2)))
 }
 
+/// Whether the output size has to be stated on a scale filter.
+///
+/// Port of the `isSizeFixed` expression `GetHwScaleFilter` and
+/// `GetLibplaceboFilter` each spell identically: true when the output differs
+/// from the input in either dimension, **or** the input size is unknown. When
+/// it is false the filter is left to keep the source dimensions rather than
+/// being told them.
+#[must_use]
+pub fn is_size_fixed(
+    video_width: Option<i32>,
+    video_height: Option<i32>,
+    out_width: i32,
+    out_height: i32,
+) -> bool {
+    video_width != Some(out_width) || video_height != Some(out_height)
+}
+
 /// Whether a hardware scaler limited to `max_scale_ratio` can produce the
 /// requested size. Port of `IsScaleRatioSupported`.
 #[must_use]
