@@ -25,6 +25,7 @@ pub mod metrics_wiring;
 pub mod planner;
 pub mod seed;
 pub mod state;
+pub mod vaapi_probe;
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};

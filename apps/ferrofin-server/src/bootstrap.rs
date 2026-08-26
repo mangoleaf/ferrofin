@@ -453,14 +453,13 @@ fn spawn_pool_sampler(db: &Database) {
 ///   read at this point in boot — `discover_ffmpeg` sees only [`Config`], and
 ///   the configuration manager is not built until `build_app_state` — and it is
 ///   mutable at runtime from the dashboard, so a value captured here could go
-///   stale. `PLAN_HWACCEL.md` phase 4 (VAAPI) therefore
-///   probes them lazily, once per device path, at the point of first VAAPI use.
-///   Their pure decision functions
-///   ([`EncoderValidator::check_vaapi_driver_internal`],
-///   [`EncoderValidator::check_vulkan_extensions_internal`]) are already ported
-///   and tested; only the spawn is outstanding. Until then
-///   `is_vaapi_device_*` and `vaapi_vulkan_*` read `false`, which routes VAAPI
-///   down its unknown-vendor branch.
+///   stale. [`crate::vaapi_probe`] therefore probes them lazily, once per
+///   device path, at the point of first VAAPI use. **That spawn has landed**;
+///   what is still outstanding is wiring its result into the planner, which
+///   arrives with the VAAPI filter chains in `PLAN_HWACCEL.md` phase 4b. Until
+///   then `is_vaapi_device_*` and `vaapi_vulkan_*` read `false` on the planning
+///   path — moot for now, since VAAPI is gated out of the hardware path
+///   entirely.
 /// - The VideoToolbox AV1-decode probe is not an ffmpeg spawn at all: upstream
 ///   asks macOS directly through Objective-C. It belongs to `PLAN_HWACCEL.md`
 ///   phase 6, alongside reading the macOS release in [`read_os_version`].

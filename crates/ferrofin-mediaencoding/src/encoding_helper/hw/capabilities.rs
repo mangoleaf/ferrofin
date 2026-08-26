@@ -324,6 +324,29 @@ impl FfmpegCapabilities {
         self.is_arm64
     }
 
+    /// Returns these capabilities with the three VAAPI driver flags replaced.
+    ///
+    /// The flags come from probing a configured render node, which is not
+    /// readable at boot and can change while the server runs, so they are
+    /// overlaid onto the boot capabilities rather than built into them. See the
+    /// server's `vaapi_probe` module.
+    #[must_use]
+    pub fn with_vaapi_driver(mut self, amd: bool, intel_ihd: bool, intel_i965: bool) -> Self {
+        self.is_vaapi_device_amd = amd;
+        self.is_vaapi_device_intel_ihd = intel_ihd;
+        self.is_vaapi_device_intel_i965 = intel_i965;
+        self
+    }
+
+    /// Returns these capabilities with the two VAAPI/Vulkan interop flags
+    /// replaced. Companion to [`Self::with_vaapi_driver`].
+    #[must_use]
+    pub fn with_vaapi_vulkan(mut self, drm_modifier: bool, drm_interop: bool) -> Self {
+        self.vaapi_vulkan_drm_modifier = drm_modifier;
+        self.vaapi_vulkan_drm_interop = drm_interop;
+        self
+    }
+
     /// Whether the configured VAAPI render node is an AMD (Mesa Gallium)
     /// device. Port of `IMediaEncoder.IsVaapiDeviceAmd`.
     #[must_use]
