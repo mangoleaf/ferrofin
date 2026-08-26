@@ -52,6 +52,7 @@ pub mod encoder;
 pub mod filters;
 pub mod input_args;
 pub mod nvidia;
+pub mod qsv;
 pub mod quality;
 pub mod support;
 pub mod sw_chain;
