@@ -296,7 +296,9 @@ fn split_codecs(param: Option<&str>) -> Vec<String> {
 fn hardware_path_is_ported(options: &EncodingOptions) -> bool {
     matches!(
         options.hardware_acceleration_type,
-        HardwareAccelerationType::nvenc | HardwareAccelerationType::vaapi
+        HardwareAccelerationType::nvenc
+            | HardwareAccelerationType::vaapi
+            | HardwareAccelerationType::qsv
     )
 }
 
@@ -1333,6 +1335,7 @@ impl FerrofinStreamStatePlanner {
             // itself when its own pipeline cannot run.
             let vendor_chain = match options.hardware_acceleration_type {
                 HardwareAccelerationType::vaapi => hw::vaapi::vaapi_vid_filter_chain(&chain_input),
+                HardwareAccelerationType::qsv => hw::qsv::intel_vid_filter_chain(&chain_input),
                 _ => hw::nvidia::nvidia_vid_filter_chain(&chain_input),
             };
             hw_graph = hw::sw_chain::video_processing_filter_args(
@@ -3325,8 +3328,7 @@ mod tests {
         // all, and no `-hwaccel_flags`.
         assert!(
             args.contains(
-                "-init_hw_device cuda=cu:0 -filter_hw_device cu -hwaccel cuda \
-                 -hwaccel_output_format cuda"
+                "-init_hw_device cuda=cu:0 -filter_hw_device cu -hwaccel cuda -hwaccel_output_format cuda"
             ),
             "{args}"
         );
@@ -3475,7 +3477,6 @@ mod tests {
         // phases 5-7 deletes its own entry here; nvenc and vaapi are gone
         // because their chains and encoder-parameter arms both landed.
         for accel in [
-            HardwareAccelerationType::qsv,
             HardwareAccelerationType::amf,
             HardwareAccelerationType::videotoolbox,
             HardwareAccelerationType::rkmpp,
@@ -3641,6 +3642,133 @@ mod tests {
         // ...but the VAAPI pipeline itself still runs.
         assert!(args.contains("-c:v h264_vaapi"), "{args}");
         assert!(args.contains("scale_vaapi="), "{args}");
+    }
+
+    /// A QSV-capable ffmpeg on `platform`.
+    fn qsv_caps(
+        platform: ferrofin_mediaencoding::encoding_helper::hw::Platform,
+    ) -> FfmpegCapabilities {
+        FfmpegCapabilities::builder()
+            .platform(platform)
+            .encoders(["h264_qsv", "hevc_qsv", "libx264"])
+            .hwaccels(["qsv", "vaapi", "d3d11va", "opencl", "drm"])
+            .filters(ferrofin_mediaencoding::encoder::REQUIRED_FILTERS)
+            .all_filter_options(true)
+            // Inside the i915 hang range (5.18 - 6.1.3), which the workaround
+            // below depends on.
+            .os_version(ferrofin_mediaencoding::encoder::FfmpegVersion::new(6, 1))
+            .ffmpeg_version(ferrofin_mediaencoding::encoder::FfmpegVersion::with_build(
+                7, 0, 1,
+            ))
+            .build()
+    }
+
+    async fn qsv_plan(
+        platform: ferrofin_mediaencoding::encoding_helper::hw::Platform,
+        tonemap: bool,
+    ) -> String {
+        let mut video = nvdec_decodable_video_stream();
+        if tonemap {
+            video.pixel_format = Some("yuv420p10le".to_owned());
+            video.bit_depth = Some(10);
+            video.video_range = Some(ferrofin_model::data::VideoRange::Hdr);
+            video.color_transfer = Some("smpte2084".to_owned());
+            video.codec = Some("hevc".to_owned());
+        }
+        let p = planner_over_caps(
+            Arc::new(FakeMediaSources {
+                sources: vec![source("abc", vec![video, audio_stream("aac")])],
+                live_streams: HashMap::new(),
+            }),
+            false,
+            qsv_caps(platform),
+            EncodingOptions {
+                enable_hardware_encoding: true,
+                hardware_acceleration_type: HardwareAccelerationType::qsv,
+                qsv_device: Some("/dev/dri/renderD128".to_owned()),
+                enable_tonemapping: tonemap,
+                enable_intel_low_power_h264_hw_encoder: true,
+                hardware_decoding_codecs: vec!["h264".to_owned(), "hevc".to_owned()],
+                ..EncodingOptions::default()
+            },
+        );
+        let mut req = request("abc");
+        req.video_codec = Some("h264".to_owned());
+        req.allow_video_stream_copy = false;
+        req.max_width = Some(1280);
+        req.video_bitrate = Some(3_000_000);
+        p.plan(&req, false, None, PlaylistKind::Vod)
+            .await
+            .unwrap()
+            .arguments
+            .join(" ")
+    }
+
+    #[tokio::test]
+    async fn linux_qsv_derives_its_device_from_the_vaapi_one() {
+        use ferrofin_mediaencoding::encoding_helper::hw::Platform;
+        let args = qsv_plan(Platform::Linux, false).await;
+        // QSV is a layer over VAAPI here, and the device graph says so — the
+        // configured render node reaches the VAAPI device, and QSV derives.
+        assert!(
+            args.contains(
+                "-init_hw_device vaapi=va:/dev/dri/renderD128,driver=iHD -init_hw_device qsv=qs@va -filter_hw_device qs"
+            ),
+            "{args}"
+        );
+        assert!(
+            args.contains("scale_vaapi=w=1280:h=720:format=nv12:extra_hw_frames=24"),
+            "{args}"
+        );
+        assert!(
+            args.contains("hwmap=derive_device=qsv,format=qsv"),
+            "{args}"
+        );
+        assert!(args.contains("-c:v h264_qsv -low_power 1"), "{args}");
+        // The QSV rate-control shape, VBR via maxrate = bitrate + 1.
+        assert!(
+            args.contains(
+                "-mbbrc 1 -b:v 3000000 -maxrate 3000001 -rc_init_occupancy 6000000 -bufsize 12000000"
+            ),
+            "{args}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_i915_workaround_reaches_the_command_line_at_last() {
+        use ferrofin_mediaencoding::encoding_helper::hw::Platform;
+        // Ported in phase 4c but unreachable until QSV was wired: the hang
+        // needs an Intel decode feeding an OpenCL tonemap on kernel 5.18-6.1.3.
+        let args = qsv_plan(Platform::Linux, true).await;
+        assert!(args.contains("-async_depth 1"), "{args}");
+        assert!(args.contains("tonemap_opencl="), "{args}");
+        assert!(
+            args.contains("hwmap=derive_device=qsv:mode=write:reverse=1:extra_hw_frames=16"),
+            "{args}"
+        );
+
+        // Without the tonemap there is nothing to work around.
+        let plain = qsv_plan(Platform::Linux, false).await;
+        assert!(!plain.contains("-async_depth"), "{plain}");
+    }
+
+    #[tokio::test]
+    async fn windows_qsv_sits_on_d3d11_instead() {
+        use ferrofin_mediaencoding::encoding_helper::hw::Platform;
+        let args = qsv_plan(Platform::Windows, false).await;
+        assert!(
+            args.contains(
+                "-init_hw_device d3d11va=dx11:,vendor=0x8086 -init_hw_device qsv=qs@dx11 -filter_hw_device qs"
+            ),
+            "{args}"
+        );
+        // The relay into QSV, and the pool-forcing option d3d11va needs.
+        assert!(
+            args.contains("hwmap=derive_device=qsv,vpp_qsv=w=1280:h=720:format=nv12:passthrough=0"),
+            "{args}"
+        );
+        // No VAAPI anywhere on this platform.
+        assert!(!args.contains("vaapi"), "{args}");
     }
 
     #[tokio::test]

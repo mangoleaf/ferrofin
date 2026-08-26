@@ -245,9 +245,13 @@ impl<C: EncoderCapabilities> EncodingHelper<C> {
     /// bitrate is set.
     #[must_use]
     pub fn video_bitrate_param(&self, state: &EncodingJobInfo, video_codec: &str) -> String {
-        let Some(bitrate) = state.output_video_bitrate else {
+        let Some(mut bitrate) = state.output_video_bitrate else {
             return String::new();
         };
+        // Below 1 Mbps `h264_qsv` refuses the encode outright.
+        if video_codec.eq_ignore_ascii_case("h264_qsv") {
+            bitrate = bitrate.max(1000);
+        }
 
         // Use i64 arithmetic then clamp to i32, matching the C# overflow guard.
         let bufsize =
@@ -261,6 +265,41 @@ impl<C: EncoderCapabilities> EncodingHelper<C> {
             || video_codec.eq_ignore_ascii_case("libx265")
         {
             return format!(" -maxrate {bitrate} -bufsize {bufsize}");
+        }
+
+        if eq_any(video_codec, &["h264_qsv", "hevc_qsv", "av1_qsv"]) {
+            // MacroBlock-level rate control, for subjective quality. AV1 QSV
+            // does not take it.
+            let mbbrc = if eq_any(video_codec, &["h264_qsv", "hevc_qsv"]) {
+                " -mbbrc 1"
+            } else {
+                ""
+            };
+            // Some weaker H.264 hardware decoders need a strict CPB, so the
+            // buffer optimisation is withheld below level 5.1.
+            let factor = if state
+                .actual_output_video_codec()
+                .is_some_and(|c| c.eq_ignore_ascii_case("h264"))
+                && state
+                    .requested_level("h264")
+                    .and_then(|l| l.parse::<f64>().ok())
+                    .is_some_and(|l| l < 51.0)
+            {
+                1
+            } else {
+                2
+            };
+            // `maxrate = bitrate + 1` is what puts QSV into VBR rather than
+            // CBR; the occupancy and buffer sizes are what let it ride out a
+            // scene change without starving.
+            let clamp = |v: i64| i32::try_from(min(v, i64::from(i32::MAX))).unwrap_or(i32::MAX);
+            let maxrate = clamp(i64::from(bitrate) + 1);
+            let init_occupancy = clamp(i64::from(bitrate) * i64::from(factor));
+            let bufsize = clamp(i64::from(bitrate) * 2 * i64::from(factor));
+            return format!(
+                "{mbbrc} -b:v {bitrate} -maxrate {maxrate} \
+                 -rc_init_occupancy {init_occupancy} -bufsize {bufsize}"
+            );
         }
 
         // The generic fallback every encoder with no arm of its own takes —
@@ -1793,6 +1832,102 @@ mod tests {
     fn negative_map_args_need_a_video_stream_to_cancel() {
         let state = job(&[]);
         assert_eq!(negative_map_args_by_filters(&state, "-filter_complex"), "");
+    }
+
+    // ----- video_bitrate_param (QSV) -----------------------------------------
+
+    #[rstest]
+    // `-mbbrc 1` keys on the ENCODER name; `factor` keys on the output CODEC
+    // name — two different strings decided in the same block. AV1 QSV takes no
+    // mbbrc.
+    #[case(
+        "h264_qsv",
+        "h264",
+        None,
+        " -mbbrc 1 -b:v 3000000 -maxrate 3000001 -rc_init_occupancy 6000000 -bufsize 12000000"
+    )]
+    // Below level 5.1 some weaker H.264 decoders need a strict CPB, so the
+    // buffer optimisation is withheld — halving both derived sizes.
+    #[case(
+        "h264_qsv",
+        "h264",
+        Some("40"),
+        " -mbbrc 1 -b:v 3000000 -maxrate 3000001 -rc_init_occupancy 3000000 -bufsize 6000000"
+    )]
+    // The boundary is strict: 51 itself does NOT get the tighter factor.
+    #[case(
+        "h264_qsv",
+        "h264",
+        Some("51"),
+        " -mbbrc 1 -b:v 3000000 -maxrate 3000001 -rc_init_occupancy 6000000 -bufsize 12000000"
+    )]
+    // Parsed as a double, so the dotted spelling works too — and 4.0 < 51.
+    #[case(
+        "h264_qsv",
+        "h264",
+        Some("4.0"),
+        " -mbbrc 1 -b:v 3000000 -maxrate 3000001 -rc_init_occupancy 3000000 -bufsize 6000000"
+    )]
+    #[case(
+        "hevc_qsv",
+        "hevc",
+        None,
+        " -mbbrc 1 -b:v 3000000 -maxrate 3000001 -rc_init_occupancy 6000000 -bufsize 12000000"
+    )]
+    #[case(
+        "av1_qsv",
+        "av1",
+        None,
+        " -b:v 3000000 -maxrate 3000001 -rc_init_occupancy 6000000 -bufsize 12000000"
+    )]
+    fn video_bitrate_param_qsv_targets_vbr_with_a_generous_buffer(
+        #[case] encoder: &str,
+        #[case] codec: &str,
+        #[case] level: Option<&str>,
+        #[case] expected: &str,
+    ) {
+        // `maxrate = bitrate + 1` is what puts QSV into VBR rather than CBR.
+        let mut state = job(&[video_stream("h264", 0)]);
+        state.output_video_codec = Some(codec.to_owned());
+        state.output_video_bitrate = Some(3_000_000);
+        state.base_request.level = level.map(str::to_owned);
+        assert_eq!(
+            helper(vec![]).video_bitrate_param(&state, encoder),
+            expected,
+            "{encoder}/{codec}/{level:?}"
+        );
+    }
+
+    #[test]
+    fn the_h264_qsv_bitrate_floor_is_in_bits_not_kilobits() {
+        // Upstream's comment says "Bit rate under 1000k is not allowed in
+        // h264_qsv", but the clamp is `Math.Max(bitrate, 1000)` against a value
+        // in BITS per second -- so it is a no-op for any real request and only
+        // bites below 1000 bps. Ported as written, comment and all: correcting
+        // the units here would diverge from every Jellyfin server.
+        let mut state = job(&[video_stream("h264", 0)]);
+        state.output_video_codec = Some("h264".to_owned());
+        state.output_video_bitrate = Some(500_000);
+        assert!(
+            helper(vec![])
+                .video_bitrate_param(&state, "h264_qsv")
+                .contains(" -b:v 500000"),
+        );
+
+        // Below 1000 bps it does fire...
+        state.output_video_bitrate = Some(800);
+        assert!(
+            helper(vec![])
+                .video_bitrate_param(&state, "h264_qsv")
+                .contains(" -b:v 1000"),
+        );
+        // ...and only for h264_qsv.
+        state.output_video_codec = Some("hevc".to_owned());
+        assert!(
+            helper(vec![])
+                .video_bitrate_param(&state, "hevc_qsv")
+                .contains(" -b:v 800"),
+        );
     }
 
     // ----- video_quality_param (NVENC) ---------------------------------------
