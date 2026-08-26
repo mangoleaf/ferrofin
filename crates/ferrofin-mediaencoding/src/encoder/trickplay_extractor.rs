@@ -779,7 +779,12 @@ mod accelerated_tests {
         EncodingOptions {
             hardware_acceleration_type: HardwareAccelerationType::vaapi,
             enable_hardware_encoding: true,
-            vaapi_device: Some("/dev/dri/renderD128".to_owned()),
+            // `/dev/null` rather than a real `/dev/dri/renderD*`: the node is
+            // resolved with `fs::metadata`, so naming a real render node makes
+            // the expected argument depend on whether the machine running the
+            // tests has a GPU. It does not on CI. `/dev/null` is a character
+            // device, the same class of node, and exists everywhere.
+            vaapi_device: Some("/dev/null".to_owned()),
             hardware_decoding_codecs: vec!["h264".to_owned()],
             ..EncodingOptions::default()
         }
@@ -800,7 +805,7 @@ mod accelerated_tests {
         // The speedup: only keyframes are decoded at all.
         assert!(args.contains("-skip_frame nokey"), "{args}");
         assert!(
-            args.contains("-init_hw_device vaapi=va:/dev/dri/renderD128,driver=iHD"),
+            args.contains("-init_hw_device vaapi=va:/dev/null,driver=iHD"),
             "{args}"
         );
         // The interval, expressed as the frame rate at the head of the chain.
@@ -936,6 +941,31 @@ mod accelerated_tests {
         assert_eq!(mjpeg_quality("mjpeg", 99), ("-qscale:v", 31));
         // The match is case-insensitive and substring, as upstream's is.
         assert_eq!(mjpeg_quality("MJPEG_VAAPI", 4), ("-global_quality:v", 91));
+    }
+
+    #[test]
+    fn an_absent_render_node_still_builds_a_device() {
+        // What a container with no `/dev/dri` produces, which is what CI is and
+        // what an operator with a mistyped device path gets. The node is
+        // resolved with `fs::metadata`, so it drops out of the device string
+        // and ffmpeg is left to pick a device by driver -- a bare `va:`, not a
+        // broken argument and not a crash. Untested until a CI run on a
+        // GPU-less machine turned three green tests red.
+        let caps = caps(Platform::Linux, true);
+        let options = EncodingOptions {
+            vaapi_device: Some("/dev/dri/renderD-absent".to_owned()),
+            ..vaapi_options()
+        };
+        let (args, _) = build_accelerated_trickplay_args(
+            &caps,
+            &options,
+            &job(&stream(1920, 1080, None), "/tmp/o/%08d.jpg"),
+        )
+        .expect("vaapi chain");
+        assert!(
+            args.contains("-init_hw_device vaapi=va:,driver=iHD"),
+            "{args}"
+        );
     }
 
     #[test]

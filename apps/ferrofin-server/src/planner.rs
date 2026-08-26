@@ -3621,7 +3621,12 @@ mod tests {
         EncodingOptions {
             enable_hardware_encoding: true,
             hardware_acceleration_type: HardwareAccelerationType::vaapi,
-            vaapi_device: Some("/dev/dri/renderD128".to_owned()),
+            // `/dev/null` rather than a real `/dev/dri/renderD*`: the node is
+            // resolved with `fs::metadata`, so naming a real render node makes
+            // the expected argument depend on whether the machine running the
+            // tests has a GPU. It does not on CI. `/dev/null` is a character
+            // device, the same class of node, and exists everywhere.
+            vaapi_device: Some("/dev/null".to_owned()),
             enable_intel_low_power_h264_hw_encoder: true,
             hardware_decoding_codecs: vec!["h264".to_owned(), "hevc".to_owned()],
             ..EncodingOptions::default()
@@ -3658,7 +3663,7 @@ mod tests {
         // The configured render node reaches the device argument -- it was
         // empty until the node was resolved from the options.
         assert!(
-            args.contains("-init_hw_device vaapi=va:/dev/dri/renderD128,driver=iHD"),
+            args.contains("-init_hw_device vaapi=va:/dev/null,driver=iHD"),
             "{args}"
         );
         assert!(args.contains("-c:v h264_vaapi"), "{args}");
@@ -3742,7 +3747,9 @@ mod tests {
             EncodingOptions {
                 enable_hardware_encoding: true,
                 hardware_acceleration_type: HardwareAccelerationType::qsv,
-                qsv_device: Some("/dev/dri/renderD128".to_owned()),
+                // See the note in `vaapi_options`: a real render node would
+                // make this assertion depend on the test machine having a GPU.
+                qsv_device: Some("/dev/null".to_owned()),
                 enable_tonemapping: tonemap,
                 enable_intel_low_power_h264_hw_encoder: true,
                 hardware_decoding_codecs: vec!["h264".to_owned(), "hevc".to_owned()],
@@ -3769,7 +3776,7 @@ mod tests {
         // configured render node reaches the VAAPI device, and QSV derives.
         assert!(
             args.contains(
-                "-init_hw_device vaapi=va:/dev/dri/renderD128,driver=iHD -init_hw_device qsv=qs@va -filter_hw_device qs"
+                "-init_hw_device vaapi=va:/dev/null,driver=iHD -init_hw_device qsv=qs@va -filter_hw_device qs"
             ),
             "{args}"
         );
