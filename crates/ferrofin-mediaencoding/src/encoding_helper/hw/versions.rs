@@ -17,6 +17,12 @@ use crate::encoder::FfmpegVersion;
 /// explicitly (`-c:v av1`). Port of `_minFFmpegImplicitHwaccel` (6.0).
 pub const MIN_FFMPEG_IMPLICIT_HWACCEL: FfmpegVersion = FfmpegVersion::new(6, 0);
 
+/// `-vsync` is deprecated from here on and `-fps_mode` replaces it. Port of the
+/// inline `new Version(5, 1)` in `EncodingHelper.GetVideoSyncOption` — upstream
+/// writes the literal rather than naming a field, but it is the same kind of
+/// gate as its neighbours here.
+pub const MIN_FFMPEG_FPS_MODE_OPTION: FfmpegVersion = FfmpegVersion::new(5, 1);
+
 /// nvdec can skip its internal frame copy via `-hwaccel_flags +unsafe_output`.
 /// Port of `_minFFmpegHwaUnsafeOutput` (6.0).
 pub const MIN_FFMPEG_HWA_UNSAFE_OUTPUT: FfmpegVersion = FfmpegVersion::new(6, 0);

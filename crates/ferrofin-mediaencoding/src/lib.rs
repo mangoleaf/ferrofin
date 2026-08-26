@@ -33,7 +33,8 @@ pub use configuration::{
     DirChecker, EncodingConfigurationFactory, EncodingConfigurationStore, RealDirChecker,
 };
 pub use encoder::{
-    MediaEncoderConfig, MediaEncoderImpl, TokioTranscoder, Transcoder, TrickplayFrameExtractorImpl,
+    EncoderValidator, FfmpegVersion, MediaEncoderConfig, MediaEncoderImpl, TokioTranscoder,
+    Transcoder, TrickplayFrameExtractorImpl,
 };
 pub use encoding_helper::hw::{
     BsfOption, FfmpegCapabilities, FfmpegCapabilitiesBuilder, FilterOption, Platform,

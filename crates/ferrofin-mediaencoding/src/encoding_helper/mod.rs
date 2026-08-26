@@ -9,10 +9,11 @@
 //! - [`helper`] holds [`EncodingHelper`] — the software path: encoder
 //!   selection, stream mapping, bitrate/quality/thread params, and
 //!   `can_stream_copy_{video,audio}`.
-//! - [`hw`] holds the hardware-acceleration half. Landed so far: the probed
-//!   environment and the version gates. The device-init graphs, hardware
-//!   decoder selection, and the per-vendor filter chains are the named work
-//!   items in `brain/plans/PLAN_HWACCEL.md`; see that module's own docs.
+//! - [`hw`] holds the hardware-acceleration half: the probed environment, the
+//!   version gates, the device-init graphs, decoder/encoder selection, and the
+//!   NVENC, VAAPI and QSV filter chains. See that module's own docs.
+//! - [`bitstream`] holds the Dolby Vision / HDR10+ metadata removal the
+//!   stream-copy decision and the copy path both consult.
 //!
 //! There is **no upstream parity oracle** for this unit — the `EncodingHelper`
 //! tests live in the out-of-scope `Jellyfin.Controller` test project, and

@@ -12,8 +12,26 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use ferrofin_mediaencoding::{TokioTranscoder, TrickplayFrameExtractorImpl};
+use ferrofin_mediaencoding::{
+    EncoderValidator, FfmpegVersion, TokioTranscoder, TrickplayFrameExtractorImpl,
+};
 use ferrofin_traits::media_encoding::TrickplayFrameExtractor as _;
+
+/// The version of the `ffmpeg` on `PATH`, probed the way the composition root
+/// probes it.
+///
+/// Passing `None` here instead would be a lie the test tells itself: the
+/// unprobed branch emits the deprecated `-vsync`, which ffmpeg **removed** in
+/// 8.0, so on a modern build the run dies with "Unrecognized option 'vsync'"
+/// — a failure production never sees, because production always probes.
+fn probed_ffmpeg_version() -> Option<FfmpegVersion> {
+    let out = std::process::Command::new("ffmpeg")
+        .arg("-version")
+        .output()
+        .ok()?;
+    EncoderValidator::new("ffmpeg")
+        .get_ffmpeg_version_internal(&String::from_utf8_lossy(&out.stdout))
+}
 
 /// Whether a program is on `PATH` (via `<prog> -version`).
 fn on_path(program: &str) -> bool {
@@ -76,7 +94,11 @@ async fn extracts_interval_frames_from_a_real_clip() {
     make_clip(&clip);
 
     let out_dir = tmp.path().join("frames");
-    let extractor = TrickplayFrameExtractorImpl::new(Arc::new(TokioTranscoder::new()), "ffmpeg");
+    let extractor = TrickplayFrameExtractorImpl::new(
+        Arc::new(TokioTranscoder::new()),
+        "ffmpeg",
+        probed_ffmpeg_version(),
+    );
 
     // A 6 s clip sampled every 2 s at 64 px max width.
     let frames = extractor
@@ -116,7 +138,11 @@ async fn missing_input_is_an_error() {
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let out_dir = tmp.path().join("frames");
-    let extractor = TrickplayFrameExtractorImpl::new(Arc::new(TokioTranscoder::new()), "ffmpeg");
+    let extractor = TrickplayFrameExtractorImpl::new(
+        Arc::new(TokioTranscoder::new()),
+        "ffmpeg",
+        probed_ffmpeg_version(),
+    );
 
     let err = extractor
         .extract_trickplay_frames(

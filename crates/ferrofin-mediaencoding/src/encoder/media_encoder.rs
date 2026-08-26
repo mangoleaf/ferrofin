@@ -26,8 +26,8 @@ use ferrofin_model::media_info::{MediaInfo, MediaProtocol};
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::media_encoding::{MediaEncoder, MediaInfoRequest};
 
-use super::Transcoder;
 use super::encoding_utils::get_input_argument;
+use super::{FfmpegVersion, Transcoder};
 use crate::probing::dtos::InternalMediaInfoResult;
 use crate::probing::localization::PassthroughLocalization;
 use crate::probing::probe_result_normalizer::ProbeResultNormalizer;
@@ -56,6 +56,10 @@ pub struct MediaEncoderConfig {
     /// Must be a server-writable path: media directories are often read-only
     /// mounts, so extraction output can never go next to the input file.
     pub temp_dir: std::path::PathBuf,
+    /// The probed ffmpeg version, which decides `-fps_mode` versus the
+    /// deprecated `-vsync` (`GetVideoSyncOption`). `None` means "unprobed" and
+    /// takes `-vsync`, which every supported build still understands.
+    pub ffmpeg_version: Option<FfmpegVersion>,
 }
 
 /// The resolved ffmpeg/ffprobe binary paths.
@@ -192,6 +196,7 @@ impl<T: Transcoder> MediaEncoderImpl<T> {
         offset_ticks: Option<i64>,
         use_iframe: bool,
         output_path: &str,
+        ffmpeg_version: Option<FfmpegVersion>,
         threads: i32,
     ) -> String {
         let mut filters: Vec<String> = Vec::new();
@@ -240,8 +245,11 @@ impl<T: Transcoder> MediaEncoderImpl<T> {
         // always empty — an unreadable input, an unwritable output directory
         // and a truly frameless offset all render as the same blank message.
         // `error` adds nothing on the happy path.
+        // `-fps_mode auto` (`-vsync -1` below ffmpeg 5.1): let ffmpeg decide,
+        // which is what upstream passes here.
+        let sync = crate::encoding_helper::helper::video_sync_option("-1", ffmpeg_version);
         let mut args = format!(
-            "-i {input_path}{map_arg} -threads {threads} -v error -vframes 1 -vf {vf} -f image2 \"{output_path}\""
+            "-i {input_path}{map_arg} -threads {threads} -v error -vframes 1 -vf {vf}{sync} -f image2 \"{output_path}\""
         );
 
         if let Some(offset) = offset_ticks {
@@ -358,6 +366,7 @@ impl<T: Transcoder> MediaEncoder for MediaEncoderImpl<T> {
             None,
             false,
             &output_path,
+            self.config.ffmpeg_version,
             self.config.threads,
         );
         let ffmpeg = self.encoder_path();
@@ -420,6 +429,7 @@ impl<T: Transcoder> MediaEncoder for MediaEncoderImpl<T> {
             offset_ticks,
             true,
             &output_path,
+            self.config.ffmpeg_version,
             self.config.threads,
         );
         let ffmpeg = self.encoder_path();
@@ -481,6 +491,7 @@ impl<T: Transcoder> MediaEncoder for MediaEncoderImpl<T> {
 
 #[cfg(test)]
 mod tests {
+    use super::FfmpegVersion;
     use ferrofin_model::entities::Video3DFormat;
     use rstest::rstest;
 
@@ -747,10 +758,39 @@ mod tests {
             None,
             true,
             "/tmp/out.jpg",
+            None,
             0,
         );
         assert!(args.contains("-v error"), "got: {args}");
         assert!(!args.contains("-v quiet"), "got: {args}");
+    }
+
+    // Upstream passes `GetVideoSyncOption("-1")` here -- "let ffmpeg decide" --
+    // between the filter and the muxer. It is a single frame either way, but
+    // the option is version-gated and lands in the middle of the line, so the
+    // position is worth pinning.
+    #[rstest]
+    #[case(None, " -vsync -1 -f image2")]
+    #[case(Some(FfmpegVersion::new(5, 0)), " -vsync -1 -f image2")]
+    #[case(Some(FfmpegVersion::new(5, 1)), " -fps_mode auto -f image2")]
+    #[case(Some(FfmpegVersion::with_build(7, 0, 1)), " -fps_mode auto -f image2")]
+    fn extraction_lets_ffmpeg_decide_the_frame_rate_mode(
+        #[case] version: Option<FfmpegVersion>,
+        #[case] expected: &str,
+    ) {
+        let args = MediaEncoderImpl::<NoopTranscoder>::extract_image_arguments(
+            "file:\"/media/episode.mkv\"",
+            "",
+            None,
+            None,
+            None,
+            None,
+            true,
+            "/tmp/out.jpg",
+            version,
+            0,
+        );
+        assert!(args.contains(expected), "got: {args}");
     }
 
     #[rstest]
@@ -789,6 +829,7 @@ mod tests {
             None,
             true,
             "/tmp/out.jpg",
+            None,
             0,
         );
         assert!(args.contains(expected_prefix), "got: {args}");
@@ -817,6 +858,7 @@ mod tests {
                 None,
                 true,
                 "/tmp/out.jpg",
+                None,
                 0,
             );
             assert_eq!(

@@ -30,6 +30,8 @@ use ferrofin_model::entities::EncoderPreset;
 use ferrofin_model::entities_media::MediaStream;
 use ferrofin_model::session::TranscodeReasons;
 
+use crate::encoder::FfmpegVersion;
+
 use super::transcode_state::{BaseEncodingJobOptions, EncoderCapabilities, EncodingJobInfo};
 
 /// The container/codec-name validation pattern.
@@ -1167,6 +1169,37 @@ pub const SOFTWARE_TONEMAP_FILTER: &str = "zscale=t=linear:npl=100,format=gbrpf3
 /// in jellyfin-ffmpeg builds, so callers must gate on the probed filter list.
 pub const SOFTWARE_TONEMAPX_FILTER: &str =
     "tonemapx=tonemap=bt2390:desat=0:peak=100:t=bt709:m=bt709:p=bt709:format=yuv420p";
+
+/// The frame-rate handling option for an ffmpeg run, `-fps_mode` or `-vsync`.
+///
+/// Port of `EncodingHelper.GetVideoSyncOption`. `-vsync` was deprecated in
+/// ffmpeg 5.1 in favour of `-fps_mode`, which takes a word where `-vsync` took
+/// a number; below 5.1 the number is passed through unchanged. An unrecognised
+/// number yields nothing at all rather than a flag ffmpeg would reject.
+///
+/// Returns the option **with a leading space**, or the empty string — the same
+/// shape as the rest of the argument fragments, so callers concatenate and
+/// `trim()` once at the end.
+#[must_use]
+pub fn video_sync_option(video_sync: &str, ffmpeg_version: Option<FfmpegVersion>) -> String {
+    if video_sync.is_empty() {
+        return String::new();
+    }
+
+    if ffmpeg_version.is_some_and(|v| v >= super::hw::versions::MIN_FFMPEG_FPS_MODE_OPTION) {
+        // Anything unparseable or outside the table is dropped, matching
+        // upstream: it would rather emit no option than an invalid one.
+        return match video_sync.parse::<i32>() {
+            Ok(-1) => " -fps_mode auto".to_owned(),
+            Ok(0) => " -fps_mode passthrough".to_owned(),
+            Ok(1) => " -fps_mode cfr".to_owned(),
+            Ok(2) => " -fps_mode vfr".to_owned(),
+            _ => String::new(),
+        };
+    }
+
+    format!(" -vsync {video_sync}")
+}
 
 /// The `setparams` filter tagging input frames with their HDR colour metadata,
 /// emitted ahead of a `tonemapx` so untagged streams still tonemap correctly.
@@ -2399,5 +2432,25 @@ mod tests {
         assert!(super::input_hdr_setparams(Some("arib-std-b67")).contains("arib-std-b67"));
         assert!(super::input_hdr_setparams(Some("smpte2084")).contains("smpte2084"));
         assert!(super::input_hdr_setparams(None).contains("smpte2084"));
+    }
+    #[test]
+    fn the_frame_sync_option_follows_the_ffmpeg_version() {
+        // `-vsync` was deprecated in 5.1 in favour of a word-valued option.
+        let v = |maj, min| Some(crate::encoder::FfmpegVersion::new(maj, min));
+        assert_eq!(video_sync_option("0", v(7, 0)), " -fps_mode passthrough");
+        assert_eq!(video_sync_option("0", v(5, 1)), " -fps_mode passthrough");
+        assert_eq!(video_sync_option("0", v(5, 0)), " -vsync 0");
+        // Unprobed: the option every supported build still understands.
+        assert_eq!(video_sync_option("0", None), " -vsync 0");
+        // The rest of the table.
+        assert_eq!(video_sync_option("-1", v(7, 0)), " -fps_mode auto");
+        assert_eq!(video_sync_option("1", v(7, 0)), " -fps_mode cfr");
+        assert_eq!(video_sync_option("2", v(7, 0)), " -fps_mode vfr");
+        // Nothing at all beats an option ffmpeg would reject.
+        assert_eq!(video_sync_option("9", v(7, 0)), "");
+        assert_eq!(video_sync_option("passthrough", v(7, 0)), "");
+        assert_eq!(video_sync_option("", v(7, 0)), "");
+        // Below the gate the number is passed through unexamined.
+        assert_eq!(video_sync_option("9", v(4, 4)), " -vsync 9");
     }
 }

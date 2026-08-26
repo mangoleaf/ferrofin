@@ -180,9 +180,10 @@ impl<R: LiveStreamReleaser> ferrofin_mediaencoding::SessionReporter
 ///   filesystem [`AttachmentIo`] and a [`MediaSourceResolver`] adapting the
 ///   [`MediaSourceManager`] (not the `DisabledAttachmentExtractor` stub).
 ///
-/// The `NoopSessionReporter` is used for job teardown (progress → session-layer
-/// reporting is deferred; killed-job partial-file cleanup is handled by the
-/// manager's `FsFileCleaner`).
+/// The `NoopSessionReporter` stands in only when no session manager was
+/// injected. With one, [`LiveStreamReleasingReporter`] publishes a starting
+/// job to the session layer and releases its live stream on teardown;
+/// killed-job partial-file cleanup is the manager's `FsFileCleaner`.
 ///
 /// `ffmpeg` carries the startup capability probes, which the planner reads for
 /// every encoding decision: the `-filters` list gates the jellyfin-ffmpeg-only

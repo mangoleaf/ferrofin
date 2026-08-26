@@ -523,6 +523,7 @@ pub async fn build_app_state(
                 // path comes from `ServerApplicationPaths` so the chapter-image
                 // task's pre-flight probes the same directory this writes to.
                 temp_dir: std::path::PathBuf::from(paths.temp_path()),
+                ffmpeg_version: ffmpeg.capabilities.ffmpeg_version(),
             },
         ));
 
@@ -604,6 +605,7 @@ pub async fn build_app_state(
         Arc::new(TrickplayFrameExtractorImpl::new(
             Arc::new(TokioTranscoder::new()),
             ffmpeg.ffmpeg.to_string_lossy().into_owned(),
+            ffmpeg.capabilities.ffmpeg_version(),
         )),
         Arc::new(ImageCrateEncoder::new()),
     ));

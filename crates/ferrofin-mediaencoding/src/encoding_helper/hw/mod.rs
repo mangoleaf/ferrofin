@@ -7,7 +7,8 @@
 //! That logic is ~5,900 lines of C# spread across `EncodingHelper`,
 //! `EncoderValidator`, and `MediaEncoder`.
 //!
-//! **What lives here today** is the foundation the rest of that port stands on:
+//! **All of it is ported and wired**, for the three accelerators Ferrofin
+//! supports:
 //!
 //! - [`capabilities`] — the resolved environment: what the running ffmpeg can
 //!   do, which OS it is on, and which kernel is underneath.
@@ -23,15 +24,18 @@
 //! - [`sw_chain`] — the software filter chain, the shared chain input, and the
 //!   assembly that turns any chain into ffmpeg arguments.
 //! - [`nvidia`] — the NVENC / CUDA filter chain.
+//! - [`vaapi`] — the three VAAPI chains (Intel iHD, limited/AMD, and the AMD
+//!   Vulkan one).
+//! - [`qsv`] — the QSV chains, Linux (VAAPI-derived) and Windows (D3D11).
+//! - [`quality`] — the encoder quality preamble: low-power encoding, the i915
+//!   hang workaround, and the per-encoder quality/bitrate arms.
 //!
-//! That covers everything before ffmpeg's `-i`, the filter fragments the graphs
-//! after it are built from, the software chain itself, and the assembly that
-//! turns any chain into arguments. Still to come, as named work items in
-//! `brain/plans/PLAN_HWACCEL.md`: five more per-vendor filter chains and the
-//! switch that selects between them (phases 4–7), the Dolby Vision / HDR10+
-//! bitstream handling (phase 8), and the accelerated trickplay path (phase 9).
-//! Nothing here is wired into the planner yet — phase 3b does that, and until
-//! then the software path in [`super::helper`] is what runs.
+//! `apps/ferrofin-server`'s planner dispatches to these per accelerator, and
+//! [`super::bitstream`] handles the Dolby Vision / HDR10+ metadata the copy
+//! path has to strip. **AMF, VideoToolbox, RKMPP and V4L2M2M have no chain
+//! here** — see CLAUDE.md's "Current scope": there is no hardware to verify
+//! them on, so selecting one falls back to a full software transcode and logs
+//! a warning rather than emitting a pipeline nobody has run.
 //!
 //! Two rules shape everything in this module:
 //!

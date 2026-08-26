@@ -178,6 +178,7 @@ async fn scan_bench() {
                     probe_size: None,
                     threads: 0,
                     temp_dir: tmp.path().join("temp"),
+                    ffmpeg_version: None,
                 },
             )),
             Arc::new(
