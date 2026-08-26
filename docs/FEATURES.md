@@ -58,6 +58,11 @@ Deep-verified against a real Jellyfin server:
   guide refresh and the hidden channel refresh) plus the trigger scheduler.
 - **Observability** — Prometheus `/metrics` (Jellyfin-parity names), OTLP traces (opt-in).
 - **Media detail** — trickplay, chapters, lyrics, media segments.
+  - **Accepted divergence (a fix, not a gap):** Jellyfin's scaler for *half
+    top-and-bottom* 3D sources carries an unbalanced bracket (`scale=(iw*2):ih)`), which
+    ffmpeg's expression parser rejects outright — so chapter and thumbnail images cannot
+    be extracted for that layout there at all. Ferrofin emits the balanced form, the same
+    shape Jellyfin's own half-side-by-side case already has.
 - **Photos & books** — a home-videos library resolves its images into `Photo` items with
   their EXIF read off the file (camera, exposure, GPS, orientation, date taken); a books
   library resolves `.epub`/`.cbz`/… into `Book` items with `ComicInfo`/`ComicBookInfo`/OPF

@@ -208,7 +208,14 @@ impl<T: Transcoder> MediaEncoderImpl<T> {
                 "crop=iw/2:ih:0:0,setdar=dar=a,crop=min(iw\\,ih*dar):min(ih\\,iw/dar):(iw-min(iw\\,iw*sar))/2:(ih - min (ih\\,ih/sar))/2,setsar=sar=1"
             }
             Some(Video3DFormat::HalfTopAndBottom) => {
-                "crop=iw:ih/2:0:0,scale=(iw*2):ih),setdar=dar=a,crop=min(iw\\,ih*dar):min(ih\\,iw/dar):(iw-min(iw\\,iw*sar))/2:(ih - min (ih\\,ih/sar))/2,setsar=sar=1"
+                // Accepted divergence: upstream writes `scale=(iw*2):ih)` here,
+                // with one closing bracket too many. ffmpeg's expression parser
+                // rejects it (`[Eval] Invalid chars ')' at the end of expression 'ih)'`) and the extraction fails,
+                // so chapter and thumbnail images cannot be produced for this
+                // 3D layout on Jellyfin. Verified both forms against ffmpeg
+                // n9.0.1. The balanced form below is what the sibling
+                // half-side-by-side case two arms up already has.
+                "crop=iw:ih/2:0:0,scale=(iw*2):ih,setdar=dar=a,crop=min(iw\\,ih*dar):min(ih\\,iw/dar):(iw-min(iw\\,iw*sar))/2:(ih - min (ih\\,ih/sar))/2,setsar=sar=1"
             }
             Some(Video3DFormat::FullTopAndBottom) => {
                 "crop=iw:ih/2:0:0,setdar=dar=a,crop=min(iw\\,ih*dar):min(ih\\,iw/dar):(iw-min(iw\\,iw*sar))/2:(ih - min (ih\\,ih/sar))/2,setsar=sar=1"
@@ -474,6 +481,9 @@ impl<T: Transcoder> MediaEncoder for MediaEncoderImpl<T> {
 
 #[cfg(test)]
 mod tests {
+    use ferrofin_model::entities::Video3DFormat;
+    use rstest::rstest;
+
     use std::sync::Arc;
 
     use ferrofin_model::dto::MediaSourceInfo;
@@ -741,6 +751,80 @@ mod tests {
         );
         assert!(args.contains("-v error"), "got: {args}");
         assert!(!args.contains("-v quiet"), "got: {args}");
+    }
+
+    #[rstest]
+    // The five scaler shapes `ExtractImageInternal` chooses between. These
+    // strings are the only 3D handling on a path that actually ships — chapter
+    // and thumbnail image extraction — so they are pinned in full.
+    #[case(
+        Some(Video3DFormat::HalfSideBySide),
+        "crop=iw/2:ih:0:0,scale=(iw*2):ih,setdar=dar=a,"
+    )]
+    #[case(Some(Video3DFormat::FullSideBySide), "crop=iw/2:ih:0:0,setdar=dar=a,")]
+    // The corrected bracket: upstream writes `scale=(iw*2):ih)`, which ffmpeg's
+    // expression parser rejects outright, so no image is produced at all.
+    #[case(
+        Some(Video3DFormat::HalfTopAndBottom),
+        "crop=iw:ih/2:0:0,scale=(iw*2):ih,setdar=dar=a,"
+    )]
+    #[case(
+        Some(Video3DFormat::FullTopAndBottom),
+        "crop=iw:ih/2:0:0,setdar=dar=a,"
+    )]
+    // MVC is not frame-packed, so it falls to the same plain even-dimension
+    // scaler a non-3D source gets.
+    #[case(Some(Video3DFormat::Mvc), "scale=round(iw*sar/2)*2:round(ih/2)*2")]
+    #[case(None, "scale=round(iw*sar/2)*2:round(ih/2)*2")]
+    fn each_3d_layout_selects_its_own_scaler(
+        #[case] threed_format: Option<Video3DFormat>,
+        #[case] expected_prefix: &str,
+    ) {
+        let args = MediaEncoderImpl::<NoopTranscoder>::extract_image_arguments(
+            "file:\"/media/movie.mkv\"",
+            "",
+            None,
+            None,
+            threed_format,
+            None,
+            true,
+            "/tmp/out.jpg",
+            0,
+        );
+        assert!(args.contains(expected_prefix), "got: {args}");
+    }
+
+    #[test]
+    fn every_3d_scaler_has_balanced_brackets() {
+        // The failure this guards is a single stray `)` — upstream carries one
+        // in the half-top-and-bottom arm, and ffmpeg refuses the whole filter
+        // graph over it rather than degrading. Any future re-sync from upstream
+        // that reintroduces it fails here.
+        for threed_format in [
+            Some(Video3DFormat::HalfSideBySide),
+            Some(Video3DFormat::FullSideBySide),
+            Some(Video3DFormat::HalfTopAndBottom),
+            Some(Video3DFormat::FullTopAndBottom),
+            Some(Video3DFormat::Mvc),
+            None,
+        ] {
+            let args = MediaEncoderImpl::<NoopTranscoder>::extract_image_arguments(
+                "file:\"/media/movie.mkv\"",
+                "",
+                None,
+                None,
+                threed_format,
+                None,
+                true,
+                "/tmp/out.jpg",
+                0,
+            );
+            assert_eq!(
+                args.matches('(').count(),
+                args.matches(')').count(),
+                "{threed_format:?} produced unbalanced brackets: {args}"
+            );
+        }
     }
 
     // An extraction temp directory the process cannot write fails every frame
