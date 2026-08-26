@@ -1424,6 +1424,29 @@ impl FerrofinStreamStatePlanner {
             push_split(&mut args, "-tag:v:0");
             args.push("hvc1".to_owned());
         }
+        // ---- bitstream filters -----------------------------------------------
+        // Only on a stream copy: a re-encode produces a fresh bitstream that
+        // needs neither the container fixup nor the metadata strip. This is what
+        // lets a Dolby Vision file copy through to a client that cannot play it
+        // — the alternative is re-encoding a 4K HDR source.
+        //
+        // The `NalLengthSize == "0"` gate is upstream's and it suppresses the
+        // metadata removal as well as the `mp4toannexb` conversion: a source
+        // already in Annex B form gets no `-bsf:v` at all, so its Dolby Vision
+        // RPU survives even when the client asked for it gone.
+        if copying_video
+            && state
+                .video_stream
+                .as_ref()
+                .is_some_and(|v| v.nal_length_size.as_deref() != Some("0"))
+            && let Some(bsf) = ferrofin_mediaencoding::encoding_helper::bitstream::bit_stream_args(
+                caps,
+                state,
+                MediaStreamType::Video,
+            )
+        {
+            push_split(&mut args, &bsf);
+        }
         if !copying_video {
             // One quality path for every encoder. `video_quality_param` carries
             // the preset, the bitrate (`-b:v`/`-maxrate`/`-bufsize`) and `-r`
@@ -3803,6 +3826,71 @@ mod tests {
         );
         // No VAAPI anywhere on this platform.
         assert!(!args.contains("vaapi"), "{args}");
+    }
+
+    #[tokio::test]
+    async fn a_dolby_vision_copy_strips_the_metadata_the_client_cannot_play() {
+        // The whole point of the bitstream filters: this file copies through to
+        // an HDR10 client instead of being re-encoded.
+        let mut video = video_stream("hevc");
+        video.video_range = Some(ferrofin_model::data::VideoRange::Hdr);
+        video.video_range_type = Some(ferrofin_model::data::VideoRangeType::DoviInvalid);
+        video.nal_length_size = Some("4".to_owned());
+        let p = planner(vec![source("abc", vec![video, audio_stream("aac")])]);
+        let mut req = request("abc");
+        req.video_codec = Some("copy".to_owned());
+        // The client declares its range support per codec in the query string,
+        // which is how a real player says "I can play DOVI".
+        req.query_string = "hevc-rangetype=DOVI".to_owned();
+        let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
+        let args = plan.arguments.join(" ");
+        assert!(args.contains("-c:v copy"), "{args}");
+        // The generic stripper, because this ffmpeg was probed without
+        // `hevc_metadata=remove_dovi`. Both spellings are pinned in
+        // `bitstream.rs`; what matters here is that the removal reaches the
+        // command line at all, appended to the same `-bsf:v` as a filter chain.
+        assert!(
+            args.contains("-bsf:v hevc_mp4toannexb,dovi_rpu=strip=1"),
+            "{args}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stream_already_in_annex_b_gets_no_bitstream_filter() {
+        // Upstream's `NalLengthSize == "0"` gate, which suppresses the metadata
+        // removal as well as the container fixup — so the Dolby Vision RPU
+        // survives here even though the client asked for it gone.
+        let mut video = video_stream("hevc");
+        video.video_range = Some(ferrofin_model::data::VideoRange::Hdr);
+        video.video_range_type = Some(ferrofin_model::data::VideoRangeType::DoviInvalid);
+        video.nal_length_size = Some("0".to_owned());
+        let p = planner(vec![source("abc", vec![video, audio_stream("aac")])]);
+        let mut req = request("abc");
+        req.video_codec = Some("copy".to_owned());
+        // The client declares its range support per codec in the query string,
+        // which is how a real player says "I can play DOVI".
+        req.query_string = "hevc-rangetype=DOVI".to_owned();
+        let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
+        assert!(!plan.arguments.join(" ").contains("-bsf:v"));
+    }
+
+    #[tokio::test]
+    async fn a_re_encode_never_gets_a_bitstream_filter() {
+        // A fresh bitstream needs neither the fixup nor the strip.
+        let mut video = nvdec_decodable_video_stream();
+        video.codec = Some("hevc".to_owned());
+        video.video_range = Some(ferrofin_model::data::VideoRange::Hdr);
+        video.video_range_type = Some(ferrofin_model::data::VideoRangeType::DoviInvalid);
+        video.nal_length_size = Some("4".to_owned());
+        let p = planner(vec![source("abc", vec![video, audio_stream("aac")])]);
+        let mut req = request("abc");
+        req.video_codec = Some("h264".to_owned());
+        req.allow_video_stream_copy = false;
+        // The client declares its range support per codec in the query string,
+        // which is how a real player says "I can play DOVI".
+        req.query_string = "hevc-rangetype=DOVI".to_owned();
+        let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
+        assert!(!plan.arguments.join(" ").contains("-bsf:v"));
     }
 
     #[tokio::test]

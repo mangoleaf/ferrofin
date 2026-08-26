@@ -19,6 +19,7 @@
 //! upstream ships none at all for the hardware builders — so the tests here
 //! transliterate hand-derived expectations from the C# logic.
 
+pub mod bitstream;
 pub mod helper;
 pub mod hw;
 pub mod transcode_state;
