@@ -305,7 +305,7 @@ impl FerrofinItemRepository {
 }
 
 /// A by-name row plus its in-scope item count, read from the joined by-name
-/// aggregate query (the `cnt` column is the aggregate's `COUNT(DISTINCT ItemId)`).
+/// aggregate query (the `cnt` column is the aggregate's per-value `COUNT(*)`).
 /// `total_count` carries the `COUNT(*) OVER()` window-function total when the
 /// caller needs pagination metadata, avoiding a separate COUNT round-trip.
 #[derive(sqlx::FromRow)]
@@ -329,8 +329,17 @@ fn push_value_aggregate<'a>(
     exclude_content_types: &'a [String],
     ancestors: &'a [String],
 ) {
+    // `COUNT(*)`, not `COUNT(DISTINCT ivm."ItemId")`: `ItemValuesMap`'s primary
+    // key IS `("ItemValueId", "ItemId")`, so within one `GROUP BY
+    // iv."ItemValueId"` every `ItemId` is already distinct, and the `ci` join is
+    // 1:1 on `BaseItems`'s primary key so it cannot duplicate a map row either.
+    // The `DISTINCT` was therefore never able to remove a row — it only bought
+    // SQLite a `USE TEMP B-TREE FOR count(DISTINCT)` per group, whose cost grows
+    // with the number of items sharing a genre/studio. Row-identical on the
+    // bench library; the statement behind `/Studios` measures 0.407 ms → 0.366,
+    // `/Items/Filters2` 0.566 → 0.490.
     qb.push(
-        r#"(SELECT iv."ItemValueId" AS vid, COUNT(DISTINCT ivm."ItemId") AS cnt
+        r#"(SELECT iv."ItemValueId" AS vid, COUNT(*) AS cnt
            FROM "ItemValues" iv
            JOIN "ItemValuesMap" ivm ON ivm."ItemValueId" = iv."ItemValueId"
            JOIN "BaseItems" ci ON ci."Id" = ivm."ItemId"
@@ -675,12 +684,36 @@ impl ItemRepository for FerrofinItemRepository {
     ) -> Result<QueryResult<BaseItemEntity>, ServiceError> {
         let items = self.fetch_rows(filter, QueryShape::FullRows).await?;
         let start_index = filter.start_index.unwrap_or(0);
-        let total =
-            if filter.enable_total_record_count && (filter.limit.is_some() || start_index > 0) {
-                self.fetch_count(filter).await?
-            } else {
-                i32::try_from(items.len()).unwrap_or(i32::MAX) + start_index
-            };
+        let page_len = i32::try_from(items.len()).unwrap_or(i32::MAX);
+        // A page that came back SHORT of its own `LIMIT` has nothing after it,
+        // so the total is already in hand: `start_index + page_len`, exactly what
+        // the `COUNT(*)` would return. `fetch_rows` hands back precisely what SQL
+        // produced — no Rust-side dedup or filtering — so a short page can only
+        // mean the result set is exhausted.
+        //
+        // The count is otherwise a second full pass over the page query's
+        // predicate, and unlike the page it cannot stop at `LIMIT` rows: 2.367 ms
+        // of an 8.73 ms `/Items?limit=50` on the bench library. Skipping it costs
+        // nothing when it fires and changes no response — the total is exact
+        // either way. It fires for every browse whose filtered result is smaller
+        // than one page, which is most of them in a real client: a genre with a
+        // dozen titles, a season's episodes, a folder listing.
+        // …but only when the page actually LANDED in the result set. An empty
+        // page at a non-zero offset is the one short page that proves nothing:
+        // it means the caller paged past the end, and `start_index + 0` is a
+        // number above the real total, not the total. That case still counts.
+        // (`by_name_total_survives_offset_past_end` records the same trap on the
+        // by-name path.)
+        let count_is_known = filter.limit.is_some_and(|limit| page_len < limit)
+            && (page_len > 0 || start_index == 0);
+        let total = if filter.enable_total_record_count
+            && (filter.limit.is_some() || start_index > 0)
+            && !count_is_known
+        {
+            self.fetch_count(filter).await?
+        } else {
+            page_len + start_index
+        };
         Ok(QueryResult::new(Some(start_index), Some(total), items))
     }
 
@@ -1262,6 +1295,54 @@ mod tests {
             .expect("get_items");
         assert_eq!(res.total_record_count, 1);
         assert_eq!(res.items.len(), 1);
+    }
+
+    /// A page shorter than its own `LIMIT` skips the `COUNT(*)` and derives the
+    /// total from the page — which must still be the TOTAL, not the page length.
+    /// Every case below is one the short-circuit can get wrong: a short first
+    /// page, a short page at an offset (where the answer is `start_index + len`
+    /// and not `len`), an exactly-full page (which must still count, because
+    /// there may be more), and an offset past the end.
+    #[tokio::test]
+    async fn short_pages_derive_the_total_without_counting() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        for i in 0..12u128 {
+            seed_named_item(
+                &db,
+                Uuid::from_u128(0x7100 + i),
+                BaseItemKind::Movie,
+                &format!("Film {i:02}"),
+            )
+            .await;
+        }
+        let page = |limit: i32, start: i32| InternalItemsQuery {
+            limit: Some(limit),
+            start_index: if start > 0 { Some(start) } else { None },
+            enable_total_record_count: true,
+            ..InternalItemsQuery::default()
+        };
+        for (limit, start, want_len, want_total) in [
+            (20, 0, 12, 12), // short first page: nothing follows it
+            (5, 10, 2, 12),  // short page at an offset: total is start + len
+            (5, 0, 5, 12),   // exactly full: there may be more, so it must count
+            (12, 0, 12, 12), // full to the row: likewise
+            (5, 20, 0, 12),  // past the end
+        ] {
+            let res = repository
+                .get_items(&page(limit, start))
+                .await
+                .expect("get_items");
+            assert_eq!(
+                res.items.len(),
+                want_len,
+                "page length for limit={limit} start={start}"
+            );
+            assert_eq!(
+                res.total_record_count, want_total,
+                "total for limit={limit} start={start}"
+            );
+        }
     }
 
     /// The locked-item read must SEEK the partial index, never scan `BaseItems`.
