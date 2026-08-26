@@ -57,6 +57,9 @@ pub struct StartFfMpegRequest<'a> {
     pub log_path: PathBuf,
     /// The process working directory, if any (`workingDirectory`).
     pub working_dir: Option<PathBuf>,
+    /// Environment variables for the ffmpeg child, from the hardware input
+    /// arguments. Empty for every path that configures itself by argument.
+    pub env: Vec<(String, String)>,
 }
 
 /// The kill-timer duration for a progressive stream, in milliseconds.
@@ -363,6 +366,7 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
             arguments,
             log_path,
             working_dir,
+            env,
         } = request;
 
         // Identify the job on its span (inherited by every event below) and log
@@ -403,6 +407,7 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
             working_dir,
             output_dir: directory.clone(),
             log_path,
+            env,
         };
 
         let segment_extension = segment_file_extension(state.segment_container.as_deref());
@@ -1298,6 +1303,7 @@ mod start_ffmpeg_tests {
         args: Vec<String>,
     ) -> StartFfMpegRequest<'a> {
         StartFfMpegRequest {
+            env: Vec::new(),
             program: "ffmpeg",
             state,
             output_path,

@@ -434,6 +434,12 @@ pub fn fixed_sw_scale_filter(
 /// Turns a filter chain into the ffmpeg argument that carries it. Port of the
 /// assembly half of `GetVideoProcessingFilterParam`.
 ///
+/// Ferrofin spawns ffmpeg by argv, so nothing in the server consumes this
+/// shell-quoted form — [`video_processing_filter_args`] is what callers use.
+/// It is kept because it is the literal shape the C# produces, and its tests
+/// are the goldens that pin that shape; the argv version is the adaptation, and
+/// checking the adaptation against nothing would leave the port unverified.
+///
 /// The shape depends entirely on whether anything has to be composited. With no
 /// overlay the whole chain is one `-vf`; with an overlay it becomes a
 /// `-filter_complex` with named pads, because the subtitle and the video are
@@ -441,12 +447,34 @@ pub fn fixed_sw_scale_filter(
 /// pad entirely — `alphasrc` generates its own source rather than reading one.
 #[must_use]
 pub fn video_processing_filter_param(
-    mut chain: FilterChain,
+    chain: FilterChain,
     framerate: Option<f64>,
     pads: StreamPads,
     has_subtitle: bool,
     subtitle_is_text: bool,
 ) -> String {
+    match video_processing_filter_args(chain, framerate, pads, has_subtitle, subtitle_is_text) {
+        Some((flag, graph)) => format!(" {flag} \"{graph}\""),
+        None => String::new(),
+    }
+}
+
+/// The same graph as [`video_processing_filter_param`], split into the two argv
+/// tokens it consists of: the flag and the graph itself.
+///
+/// C# builds one shell string because it hands the whole command line to a
+/// shell. A caller that spawns ffmpeg by argv needs the graph as a single
+/// unquoted token instead — quoting it there would make the quotes part of a
+/// filename, and splitting it on whitespace would break any path containing a
+/// space. `None` means no filtering applies.
+#[must_use]
+pub fn video_processing_filter_args(
+    mut chain: FilterChain,
+    framerate: Option<f64>,
+    pads: StreamPads,
+    has_subtitle: bool,
+    subtitle_is_text: bool,
+) -> Option<(&'static str, String)> {
     chain.prune();
 
     if let Some(framerate) = framerate {
@@ -457,14 +485,14 @@ pub fn video_processing_filter_param(
 
     if chain.overlay.is_empty() {
         return if main.is_empty() {
-            String::new()
+            None
         } else {
-            format!(" -vf \"{main}\"")
+            Some(("-vf", main))
         };
     }
 
     if chain.sub.is_empty() || !has_subtitle {
-        return String::new();
+        return None;
     }
 
     let sub = chain.sub.join(",");
@@ -490,7 +518,7 @@ pub fn video_processing_filter_param(
             pads.subtitle_index
         )
     };
-    format!(" -filter_complex \"{graph}\"")
+    Some(("-filter_complex", graph))
 }
 
 #[cfg(test)]

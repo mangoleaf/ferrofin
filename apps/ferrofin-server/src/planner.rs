@@ -36,13 +36,16 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use ferrofin_core::FerrofinServerApplicationPaths;
 use ferrofin_hls::{PlaylistKind, StreamStatePlanner, TranscodePlan};
+use ferrofin_mediaencoding::encoding_helper::hw;
 use ferrofin_mediaencoding::{
     BaseEncodingJobOptions, EncodingHelper, EncodingJobInfo, FfmpegCapabilities,
 };
 use ferrofin_model::configuration::EncodingOptions;
 use ferrofin_model::dlna::SubtitleDeliveryMethod;
 use ferrofin_model::dto::MediaSourceInfo;
-use ferrofin_model::entities::{EncoderPreset, HardwareAccelerationType, MediaStreamType};
+use ferrofin_model::entities::{
+    EncoderPreset, HardwareAccelerationType, MediaStreamType, VideoType,
+};
 use ferrofin_model::entities_media::MediaStream;
 use ferrofin_traits::configuration::ServerConfigurationManager;
 use ferrofin_traits::error::ServiceError;
@@ -274,91 +277,51 @@ fn split_codecs(param: Option<&str>) -> Vec<String> {
         .collect()
 }
 
-/// Whether NVENC hardware transcoding is enabled by the encoding options.
-fn nvenc_enabled(options: &EncodingOptions) -> bool {
-    options.enable_hardware_encoding
-        && options.hardware_acceleration_type == HardwareAccelerationType::nvenc
-}
-
-/// The NVENC encoder for an output codec, or `None` when NVENC can't encode it.
+/// Whether the configured accelerator's full pipeline is ported.
 ///
-/// NVENC (RTX-class GPUs) encodes H.264, HEVC and AV1; VP9 has no NVENC encoder.
-fn nvenc_encoder(codec: &str) -> Option<&'static str> {
-    match codec.to_ascii_lowercase().as_str() {
-        "h264" => Some("h264_nvenc"),
-        "hevc" | "h265" => Some("hevc_nvenc"),
-        "av1" => Some("av1_nvenc"),
-        _ => None,
-    }
+/// Naming a vendor encoder is not enough on its own — the filter chain and the
+/// encoder-parameter arms have to exist too, or the job gets an encoder with no
+/// preset, no rate control and no scaler. Only NVENC has all three today;
+/// `PLAN_HWACCEL.md` phases 4-7 add the rest, and each removes itself from here.
+fn hardware_path_is_ported(options: &EncodingOptions) -> bool {
+    options.hardware_acceleration_type == HardwareAccelerationType::nvenc
 }
 
-/// The NVENC constant-quality target (`-cq`). Lower = higher quality/bitrate;
-/// 24 is visually near-transparent for 4K while keeping segments reasonable.
-// TODO(config): expose as an encoding setting (Jellyfin's quality/CRF knob).
-const NVENC_CQ: i32 = 24;
-
-/// Maps an x264-style [`EncoderPreset`] to the nearest NVENC preset (`p1` fastest
-/// … `p7` best quality). `auto` and unmapped presets use the balanced `p5`.
-fn nvenc_preset(preset: EncoderPreset) -> &'static str {
-    match preset {
-        EncoderPreset::ultrafast => "p1",
-        EncoderPreset::superfast => "p2",
-        EncoderPreset::veryfast => "p3",
-        EncoderPreset::faster | EncoderPreset::fast => "p4",
-        EncoderPreset::slow => "p6",
-        EncoderPreset::slower | EncoderPreset::veryslow | EncoderPreset::placebo => "p7",
-        EncoderPreset::medium | EncoderPreset::auto => "p5",
-    }
-}
-
-/// The NVENC video-encode tokens (quality + rate control) for `encoder`.
+/// Whether hardware transcoding is enabled and the running ffmpeg has an
+/// encoder for `codec` on the configured accelerator.
 ///
-/// Constant-quality VBR (`-cq`) so 4K keeps its detail without a guessed bitrate
-/// cap; a client-negotiated bitrate becomes `-maxrate`/`-bufsize` on top (the
-/// cap Jellyfin applies) and a resolution bound becomes a GPU-side
-/// `scale_cuda` downscale. A 10-bit HDR source targeting H.264 (browsers
-/// decode only 8-bit H.264) is down-converted to `nv12` on the GPU; AV1/HEVC
-/// keep the source's 10-bit HDR untouched. The subtitle-burn paths keep their
-/// own in-graph conversions (a `-vf` can't coexist with `-filter_complex`).
-fn nvenc_video_args(
-    encoder: &str,
+/// Asks the ported encoder dispatch rather than a hand-kept table: a codec is
+/// hardware-encodable exactly when that dispatch returns something other than
+/// the software encoder it would otherwise pick.
+fn hardware_encodes(
+    codec: &str,
+    caps: &FfmpegCapabilities,
     options: &EncodingOptions,
-    burn_sub: bool,
-    output_size: Option<(i32, i32)>,
-    output_bitrate: Option<i32>,
-) -> Vec<String> {
-    let mut a: Vec<String> = Vec::new();
-    if !burn_sub {
-        let mut ops: Vec<String> = Vec::new();
-        if let Some((w, h)) = output_size {
-            ops.push(format!("w={w}:h={h}"));
-        }
-        if encoder == "h264_nvenc" {
-            ops.push("format=nv12".to_owned());
-        }
-        if !ops.is_empty() {
-            a.push("-vf".to_owned());
-            a.push(format!("scale_cuda={}", ops.join(":")));
-        }
+    video_type: Option<VideoType>,
+) -> bool {
+    if !options.enable_hardware_encoding || !hardware_path_is_ported(options) {
+        return false;
     }
-    a.push("-preset".to_owned());
-    a.push(nvenc_preset(options.encoder_preset).to_owned());
-    a.push("-rc".to_owned());
-    a.push("vbr".to_owned());
-    a.push("-cq".to_owned());
-    a.push(NVENC_CQ.to_string());
-    a.push("-b:v".to_owned());
-    a.push("0".to_owned());
-    if let Some(bitrate) = output_bitrate {
-        let bufsize = i64::from(bitrate)
-            .saturating_mul(2)
-            .min(i64::from(i32::MAX));
-        a.push("-maxrate".to_owned());
-        a.push(bitrate.to_string());
-        a.push("-bufsize".to_owned());
-        a.push(bufsize.to_string());
-    }
-    a
+    // The video type is load-bearing, not decoration: hardware encoding is
+    // refused for some disc/folder rips, and answering "yes" for one of those
+    // lets a codec be chosen on the strength of a hardware encoder and then
+    // land on software libsvtav1/libx265 — the sub-realtime stall this
+    // function exists to avoid.
+    let hw = hw::encoder::video_encoder(
+        Some(codec),
+        caps,
+        options.hardware_acceleration_type,
+        video_type,
+        true,
+    );
+    let sw = hw::encoder::video_encoder(
+        Some(codec),
+        caps,
+        HardwareAccelerationType::none,
+        video_type,
+        false,
+    );
+    hw != sw
 }
 
 /// The transcode **target** video codec: the first client preference Ferrofin can
@@ -370,14 +333,18 @@ fn nvenc_video_args(
 /// only software libx264 (h264) is realtime-viable — software av1/vp9/hevc
 /// (libaom-av1 etc.) run far below realtime and stall the player — so we fall
 /// back to the broadly-compatible h264. A bare `copy` request is honoured.
-fn preferred_transcode_video_codec(codecs: &[String], options: &EncodingOptions) -> String {
-    let hw = nvenc_enabled(options);
+fn preferred_transcode_video_codec(
+    codecs: &[String],
+    caps: &FfmpegCapabilities,
+    options: &EncodingOptions,
+    video_type: Option<VideoType>,
+) -> String {
     codecs
         .iter()
         .find(|c| {
             EncodingJobInfo::is_copy_codec(Some(c))
                 || c.eq_ignore_ascii_case("h264")
-                || (hw && nvenc_encoder(c).is_some())
+                || hardware_encodes(c, caps, options, video_type)
         })
         .cloned()
         .unwrap_or_else(|| DEFAULT_VIDEO_CODEC.to_owned())
@@ -624,11 +591,17 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
         // The requested/target codecs (defaulting to the broadly-compatible
         // h264/aac). A `copy` request is honoured verbatim. The video target is
         // NOT simply the client's first preference: browsers list av1/vp9 ahead
-        // of h264 for efficiency, but Ferrofin's hardware-encoder matrix is
-        // not yet wired, so encoding to av1/vp9 in software (libaom-av1 etc.) runs far
-        // slower than realtime and stalls HLS (fragLoadTimeOut). Pick the first
-        // preference Ferrofin can actually encode in realtime instead.
-        let requested_video_codec = preferred_transcode_video_codec(&video_codecs, &options);
+        // of h264 for efficiency, but encoding either in software (libaom-av1
+        // etc.) runs far slower than realtime and stalls HLS
+        // (fragLoadTimeOut). Pick the first preference the running ffmpeg can
+        // actually encode in realtime — which now includes the hardware
+        // encoders, so a client asking for av1 on an NVENC server gets it.
+        let requested_video_codec = preferred_transcode_video_codec(
+            &video_codecs,
+            self.encoding_helper.capabilities(),
+            &options,
+            media_source.video_type,
+        );
         let requested_audio_codec = audio_codecs
             .first()
             .cloned()
@@ -884,7 +857,7 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
         };
 
         // ---- (4) BUILD FFMPEG ARGS (GetCommandLineArguments) ----------------
-        let arguments = self.build_arguments(
+        let (arguments, ffmpeg_env) = self.build_arguments(
             &state,
             &media_path,
             segment_id,
@@ -905,6 +878,7 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
             state,
             playlist_path,
             arguments,
+            ffmpeg_env,
             media_path,
             run_time_ticks,
             segment_length_ms: segment_length_secs.saturating_mul(MS_PER_SECOND),
@@ -917,20 +891,93 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
 }
 
 impl FerrofinStreamStatePlanner {
-    /// The ffmpeg video encoder for `state`: the NVENC hardware encoder when
-    /// hardware acceleration is enabled and the target codec has one, else the
-    /// software [`EncodingHelper`] choice (`copy` / `libx264`).
+    /// The `subtitles` filter that burns a text subtitle in, in one of its two
+    /// spellings. Port of `GetTextSubtitlesFilter`, with three divergences.
+    ///
+    /// Upstream always pre-extracts the track to its own file; Ferrofin keeps a
+    /// fallback that reads it straight out of the media (`si=` selects among the
+    /// embedded subtitle streams) for when no extraction is cached, which is
+    /// correct but re-demuxes the source.
+    ///
+    /// The second is an open work item, not a choice: upstream appends
+    /// `:fontsdir='{attachment folder}'` on both branches, and `:charenc=` on
+    /// the external one. Ferrofin emits neither, so an ASS/SSA subtitle that
+    /// ships its own fonts as attachments renders in a system font instead.
+    /// Un-defer path: `GetAttachmentFolderPath(MediaSource.Id)` → `:fontsdir=`,
+    /// and the subtitle encoder's detected character set → `:charenc=`.
+    ///
+    /// The third, the `setpts` wrapper, is Ferrofin's and is why `offset_secs`
+    /// exists.
+    /// Upstream emits none for HLS because it seeks once, streams, and copies
+    /// timestamps, so its frames carry absolute PTS throughout. Ferrofin spawns
+    /// one ffmpeg per segment with its own `-ss` and no `-copyts`, so frames
+    /// arrive at PTS ≈ 0 while the filter picks cues by absolute PTS. Shifting
+    /// forward for the filter and back for the muxer keeps both right.
+    ///
+    /// Both spellings need it, for the same reason by two routes: the plain one
+    /// runs on decoder frames that restart at zero, and the `alpha`/`sub2video`
+    /// one runs on an `alphasrc` source that is likewise started at zero,
+    /// because a source started at the seek position would sit in a time range
+    /// the video never reaches.
+    fn text_subtitle_filter(
+        state: &EncodingJobInfo,
+        sub: &MediaStream,
+        media_path: &str,
+        burn_subtitle_path: Option<&str>,
+        alpha_sub2video: bool,
+        offset_secs: Option<i64>,
+    ) -> String {
+        use std::fmt::Write as _;
+        let mut chain = String::new();
+        if let Some(off) = offset_secs {
+            let _ = write!(chain, "setpts=PTS+{off}/TB,");
+        }
+        let external_path =
+            burn_subtitle_path.or_else(|| sub.path.as_deref().filter(|_| sub.is_external));
+        if let Some(path) = external_path {
+            let _ = write!(chain, "subtitles=f='{}'", escape_subtitle_filter_path(path));
+        } else {
+            let si = state
+                .media_source
+                .media_streams
+                .iter()
+                .filter(|s| s.stream_type == MediaStreamType::Subtitle && !s.is_external)
+                .position(|s| s.index == sub.index)
+                .unwrap_or(0);
+            let _ = write!(
+                chain,
+                "subtitles=f='{}':si={si}",
+                escape_subtitle_filter_path(media_path)
+            );
+        }
+        if alpha_sub2video {
+            chain.push_str(":alpha=1:sub2video=1");
+        }
+        if let Some(off) = offset_secs {
+            let _ = write!(chain, ",setpts=PTS-{off}/TB");
+        }
+        chain
+    }
+
+    /// The ffmpeg video encoder for `state`. Port of `GetVideoEncoder`.
+    ///
+    /// One dispatch decides software and hardware alike — it returns the
+    /// vendor encoder when the configured accelerator has one for the target
+    /// codec and the running ffmpeg was built with it, and the software encoder
+    /// otherwise. A copy request short-circuits ahead of it, since `copy` is
+    /// not an encoder at all.
     fn resolve_video_encoder(&self, state: &EncodingJobInfo, options: &EncodingOptions) -> String {
         let codec = state.output_video_codec.as_deref().unwrap_or("copy");
         if EncodingJobInfo::is_copy_codec(Some(codec)) {
             return "copy".to_owned();
         }
-        if nvenc_enabled(options)
-            && let Some(nv) = nvenc_encoder(codec)
-        {
-            return nv.to_owned();
-        }
-        self.encoding_helper.video_encoder(state)
+        hw::encoder::video_encoder(
+            Some(codec),
+            self.encoding_helper.capabilities(),
+            options.hardware_acceleration_type,
+            state.media_source.video_type,
+            options.enable_hardware_encoding && hardware_path_is_ported(options),
+        )
     }
 
     /// Builds the full ffmpeg HLS command line (`GetCommandLineArguments`).
@@ -955,7 +1002,7 @@ impl FerrofinStreamStatePlanner {
         options: &EncodingOptions,
         burn_subtitle_path: Option<&str>,
         kind: PlaylistKind,
-    ) -> Vec<String> {
+    ) -> (Vec<String>, Vec<(String, String)>) {
         let mut args: Vec<String> = Vec::new();
         let is_event_playlist = kind == PlaylistKind::Event;
 
@@ -964,7 +1011,73 @@ impl FerrofinStreamStatePlanner {
         // `EncodingHelper` path (libx264 / copy) is used.
         let video_encoder = self.resolve_video_encoder(state, options);
         let copying_video = EncodingJobInfo::is_copy_codec(Some(&video_encoder));
+        // The encoder is NVENC. Distinct from `hw_filters` below and used only
+        // where a fact about the *encoder* is what matters.
         let nvenc_video = video_encoder.ends_with("_nvenc");
+        // Everything the ported hardware matrix reads about the job. The
+        // render-node arguments are VAAPI/QSV territory and unused by the CUDA
+        // branch; `PLAN_HWACCEL.md` phase 4 resolves them from the encoding
+        // options, which are not readable this early today.
+        let caps = self.encoding_helper.capabilities();
+        let requested = hw::decoder::RequestedSize {
+            width: state.base_request.width,
+            height: state.base_request.height,
+            max_width: state.base_request.max_width,
+            max_height: state.base_request.max_height,
+        };
+        let decode_ctx = hw::decoder::DecodeContext {
+            caps,
+            options,
+            video_stream: state.video_stream.as_ref(),
+            video_type: state.media_source.video_type,
+            output_video_codec: state.output_video_codec.as_deref(),
+            requested,
+        };
+        // Only NVENC has a ported filter chain today, so only NVENC may take
+        // the hardware path at all. This is a **scope gate, not a capability
+        // gate**: `input_video_hwaccel_args` happily produces a device graph
+        // for every vendor, and `resolve_video_encoder` happily names their
+        // encoders, but the chain behind them lands with phases 4-7. Letting a
+        // VAAPI or QSV server through today gives it a vendor encoder with no
+        // encoder parameters, no filter graph at all — so the client's
+        // `MaxWidth` is silently ignored and it receives a full-resolution
+        // encode — and a silently dropped subtitle burn-in. That is worse than
+        // the software transcode it has now, not merely less optimal.
+        //
+        // Each vendor's phase removes itself from this gate as its chain and
+        // its `GetEncoderParam`/`GetVideoBitrateParam` arms land.
+        let hw_ported = hardware_path_is_ported(options);
+        let unresolved_node = hw::device_init::RenderNode::new(None, false);
+        let hwaccel_input = if hw_ported {
+            hw::input_args::input_video_hwaccel_args(
+                &decode_ctx,
+                &video_encoder,
+                unresolved_node,
+                unresolved_node,
+                state.is_input_video,
+            )
+        } else {
+            hw::input_args::InputHwaccelArgs::default()
+        };
+        let video_decoder = hw::decoder::hardware_video_decoder(&decode_ctx).unwrap_or_default();
+        // Whether the ported vendor chain owns this job's filter graph.
+        //
+        // Keyed on the configured **accelerator**, which is what upstream
+        // dispatches `GetVideoProcessingFilterParam` on — not on the encoder's
+        // name and not on whether device arguments came out. Both of those are
+        // wrong in a way that breaks real jobs:
+        //
+        // * Hardware *decoding* is selected for the accelerator, so it happens
+        //   with a software encoder too (hardware encoding switched off, or a
+        //   build with no vendor encoder). Handing those GPU frames to a
+        //   software `-vf` makes ffmpeg refuse the graph outright — "Impossible
+        //   to convert between the formats supported by the filter ... and
+        //   auto_scale_0". The vendor chain handles that pairing itself, by
+        //   downloading the frames back with `hwdownload,format=yuv420p`.
+        // * A build too old for the vendor's filters produces no device
+        //   arguments, but the chain still has a software fallback of its own,
+        //   and that fallback is the ported one.
+        let hw_filters = !copying_video && hw_ported;
         // Burning a graphical subtitle needs the decoded frames in system memory
         // for the `overlay` filter, so we can't keep them on the GPU
         // (`-hwaccel_output_format cuda`); NVENC still uploads the filtered frames.
@@ -979,9 +1092,9 @@ impl FerrofinStreamStatePlanner {
         // downscale first (tonemap/burn-in then run on fewer pixels), then the
         // HDR→SDR tonemap chain — or a bare 8-bit down-convert for 10-bit SDR
         // sources (libx264 would otherwise emit High10, undecodable in browser
-        // MSE). NVENC keeps its existing GPU-side handling (the hw filter
-        // matrix lands with `PLAN_HWACCEL.md` phases 2-7).
-        let sw_filters: Vec<String> = if !copying_video && !nvenc_video {
+        // MSE). This is the software path only — a job the hardware matrix
+        // claimed builds its whole graph above.
+        let sw_filters: Vec<String> = if !copying_video && !hw_filters {
             let mut filters = Vec::new();
             let tonemap =
                 ferrofin_mediaencoding::encoding_helper::helper::requires_software_tonemap(
@@ -1048,20 +1161,13 @@ impl FerrofinStreamStatePlanner {
                 args.push("-noaccurate_seek".to_owned());
             }
         }
-        // Decode the source on the GPU too (NVDEC) when we're NVENC-encoding, so
-        // the whole pipeline stays on the card — this is what makes 4K transcode
-        // run several× realtime instead of stalling on CPU HEVC decode.
-        if nvenc_video {
-            push_split(&mut args, "-hwaccel");
-            args.push("cuda".to_owned());
-            // Keep frames on the GPU for the pure transcode path; but when burning
-            // a graphical subtitle, let them land in system memory so `overlay` can
-            // composite the bitmap subtitle onto the video.
-            if !burn_sub {
-                push_split(&mut args, "-hwaccel_output_format");
-                args.push("cuda".to_owned());
-            }
-        }
+        // The device graph and the hardware decoder, straight from the ported
+        // matrix — `-init_hw_device`, `-filter_hw_device`, `-hwaccel` and
+        // `-hwaccel_output_format` in upstream's order. Splitting on whitespace
+        // is safe because nothing it produces contains any: the device
+        // arguments phase 4 adds do carry paths, but they are render nodes
+        // (`/dev/dri/renderD*`), which cannot contain a space.
+        push_split(&mut args, &hwaccel_input.args);
         // GetInputArgument yields the full `-i file:"…"` fragment.
         push_split(&mut args, "-analyzeduration");
         args.push("200M".to_owned());
@@ -1078,8 +1184,149 @@ impl FerrofinStreamStatePlanner {
         // containing a space. Unquote it back into a single argv token with shlex.
         args.extend(shlex::split(&input).unwrap_or_else(|| vec![input]));
 
+        // ---- hardware video filters ------------------------------------------
+        // The ported vendor chain owns the whole graph on the hardware path —
+        // scaling, tonemapping, deinterlacing and the subtitle composite alike —
+        // so the software blocks further down are skipped entirely for it.
+        //
+        // Built before the maps are emitted because the negative map depends on
+        // its shape, which is upstream's order too
+        // (`negativeMapArgs + args + videoProcessParam`).
+        let mut hw_graph: Option<(&'static str, String)> = None;
+        if hw_filters {
+            let seek_offset = segment_id
+                .filter(|&id| id > 0)
+                .map(|id| i64::from(id) * i64::from(state.segment_length_secs));
+            let sub_stream = state.subtitle_stream.as_ref().filter(|_| burn_sub);
+            let (plain, alpha_sub2video) = sub_stream
+                .filter(|_| burn_text)
+                .map(|sub| {
+                    (
+                        Self::text_subtitle_filter(
+                            state,
+                            sub,
+                            media_path,
+                            burn_subtitle_path,
+                            false,
+                            seek_offset,
+                        ),
+                        Self::text_subtitle_filter(
+                            state,
+                            sub,
+                            media_path,
+                            burn_subtitle_path,
+                            true,
+                            seek_offset,
+                        ),
+                    )
+                })
+                .unwrap_or_default();
+            let subtitle = if burn_text {
+                hw::sw_chain::SubtitleOverlay::Text {
+                    plain: &plain,
+                    alpha_sub2video: &alpha_sub2video,
+                    is_ass: sub_stream
+                        .and_then(|s| s.codec.as_deref())
+                        .is_some_and(|c| {
+                            c.eq_ignore_ascii_case("ass") || c.eq_ignore_ascii_case("ssa")
+                        }),
+                }
+            } else if let Some(sub) = sub_stream.filter(|_| burn_graphical) {
+                hw::sw_chain::SubtitleOverlay::Graphical {
+                    width: sub.width,
+                    height: sub.height,
+                }
+            } else {
+                hw::sw_chain::SubtitleOverlay::None
+            };
+            let video_stream = state.video_stream.as_ref();
+            let chain_input = hw::sw_chain::ChainInput {
+                caps,
+                options,
+                video_encoder: &video_encoder,
+                video_decoder: &video_decoder,
+                video_width: video_stream.and_then(|v| v.width),
+                video_height: video_stream.and_then(|v| v.height),
+                requested,
+                three_d_format: state.media_source.video3d_format,
+                rotation: video_stream.and_then(|v| v.rotation),
+                color_transfer: video_stream.and_then(|v| v.color_transfer.as_deref()),
+                reference_frame_rate: video_stream.and_then(MediaStream::reference_frame_rate),
+                real_frame_rate: video_stream.and_then(|v| v.real_frame_rate),
+                // Zero, NOT the seek position — see `text_subtitle_filter`.
+                // Upstream can start `alphasrc` at the seek because its HLS
+                // copies timestamps, so its decoded frames keep absolute PTS.
+                // Ferrofin seeks per segment without `-copyts`, so decoded
+                // frames restart at ~0 (verified: `-ss 3` gives pts_time 0,
+                // and 3 only with `-copyts`). Starting the generated source at
+                // the seek would put it in a time range the video never
+                // reaches, and nothing would be drawn at all.
+                start_time_ticks: 0,
+                // `doDeintH264 || doDeintHevc` — upstream asks under each
+                // spelling of the two codecs it deinterlaces.
+                deinterlace: ["h264", "avc", "h265", "hevc"]
+                    .iter()
+                    .any(|c| state.deinterlace(Some(c), true)),
+                // Computed, not assumed: the vendor chain falls back to the
+                // software chain on a build without the vendor's tonemap
+                // filter, and that fallback is the only tonemap an HDR source
+                // gets there — the planner's own software tonemap block is
+                // skipped for a job the matrix claimed.
+                do_sw_tonemap: hw::tonemap::is_sw_tonemap_available(caps, video_stream),
+                do_hw_tonemap: hw::input_args::is_hw_tonemap_available(&decode_ctx, &video_decoder),
+                is_dovi: hw::tonemap::is_dovi(video_stream),
+                is_hevc_rext: hw::decoder::is_video_stream_hevc_rext(video_stream),
+                subtitle,
+            };
+            // `find_index`, not the stream's own `index` — the pads have to
+            // name the same numbers `map_args` does, and the two diverge as soon
+            // as a source's streams are not contiguously indexed. It matters
+            // most for an external subtitle, which is input 1 with a single
+            // stream at index 0 whatever its index in the parent source.
+            let streams = &state.media_source.media_streams;
+            let pads = hw::sw_chain::StreamPads {
+                subtitle_is_external: sub_stream.is_some_and(|s| s.is_external),
+                subtitle_index: sub_stream.map_or(0, |s| {
+                    ferrofin_mediaencoding::encoding_helper::helper::find_index(streams, s)
+                }),
+                video_index: video_stream.map_or(0, |v| {
+                    ferrofin_mediaencoding::encoding_helper::helper::find_index(streams, v)
+                }),
+            };
+            hw_graph = hw::sw_chain::video_processing_filter_args(
+                hw::nvidia::nvidia_vid_filter_chain(&chain_input),
+                self.encoding_helper.framerate_param(state).map(f64::from),
+                pads,
+                burn_sub,
+                burn_text,
+            );
+        }
+
         // ---- map -------------------------------------------------------------
-        push_split(&mut args, &self.encoding_helper.map_args(state));
+        // The negative map cancels the positively-mapped video whenever the
+        // graph is a `-filter_complex`, because ffmpeg adds that graph's
+        // unlabeled output to the muxer by itself. Without it the output
+        // carries the raw video AND the filtered one.
+        let hw_graph_flag = hw_graph.as_ref().map_or("", |(flag, _)| *flag);
+        push_split(&mut args, &self.encoding_helper.map_args(state, hw_filters));
+        // After the positive maps, which is where upstream puts it too: C#
+        // prepends it to the *video arguments* fragment, and that fragment
+        // lands after `GetMapArgs` in the command-line template, so both emit
+        // `-map 0:v -map 0:a -map -0:v -codec:v:0 …`. The order is not
+        // cosmetic — ffmpeg rejects a leading negative map outright ("Stream
+        // map '' matches no streams"), since it can only subtract from a set
+        // that already exists.
+        push_split(
+            &mut args,
+            &ferrofin_mediaencoding::encoding_helper::helper::negative_map_args_by_filters(
+                state,
+                hw_graph_flag,
+            ),
+        );
+        if let Some((flag, graph)) = hw_graph {
+            args.push(flag.to_owned());
+            args.push(graph);
+        }
 
         // ---- video -----------------------------------------------------------
         push_split(&mut args, "-c:v");
@@ -1099,47 +1346,24 @@ impl FerrofinStreamStatePlanner {
             args.push("hvc1".to_owned());
         }
         if !copying_video {
-            if nvenc_video {
-                // NVENC has its own rate-control/quality flags (no `-crf`); the
-                // software `video_quality_param` would emit libx264-only args.
-                let output_size = ferrofin_mediaencoding::encoding_helper::helper::output_size(
-                    state.video_stream.as_ref(),
-                    state.base_request.max_width,
-                    state.base_request.max_height,
-                );
-                for tok in nvenc_video_args(
+            // One quality path for every encoder. `video_quality_param` carries
+            // the preset, the bitrate (`-b:v`/`-maxrate`/`-bufsize`) and `-r`
+            // together, mirroring `GetVideoQualityParam` — pushing any of them
+            // again here would hand ffmpeg the same flag twice.
+            push_split(
+                &mut args,
+                &self.encoding_helper.video_quality_param(
+                    state,
                     &video_encoder,
                     options,
-                    burn_sub,
-                    output_size,
-                    state.output_video_bitrate,
-                ) {
-                    args.push(tok);
-                }
-            } else {
-                // `video_quality_param` already includes the bitrate (`-maxrate/
-                // -bufsize`) and `-r` params, mirroring `GetVideoQualityParam` —
-                // no separate pushes, or ffmpeg gets them twice.
-                push_split(
-                    &mut args,
-                    &self.encoding_helper.video_quality_param(
-                        state,
-                        &video_encoder,
-                        options,
-                        if is_event_playlist {
-                            DEFAULT_EVENT_ENCODER_PRESET
-                        } else {
-                            DEFAULT_ENCODER_PRESET
-                        },
-                    ),
-                );
-            }
+                    if is_event_playlist {
+                        DEFAULT_EVENT_ENCODER_PRESET
+                    } else {
+                        DEFAULT_ENCODER_PRESET
+                    },
+                ),
+            );
             let output_framerate = self.encoding_helper.framerate_param(state);
-            if nvenc_video && let Some(framerate) = output_framerate {
-                // NVENC skips `video_quality_param`, so it emits `-r` itself.
-                push_split(&mut args, "-r");
-                args.push(framerate.to_string());
-            }
             // Force a keyframe at every segment boundary so the HLS muxer cuts
             // exactly on `-hls_time`. Without this, ffmpeg can only cut at the
             // encoder's natural GOP (libx264 keyint ≈250 frames ≈10 s), so the
@@ -1239,6 +1463,7 @@ impl FerrofinStreamStatePlanner {
         // whole source to find cues — correct, but slow on every start.
         if burn_text
             && !copying_video
+            && !hw_filters
             && let Some(sub) = state.subtitle_stream.as_ref()
         {
             use std::fmt::Write as _;
@@ -1248,41 +1473,17 @@ impl FerrofinStreamStatePlanner {
             for filter in &sw_filters {
                 let _ = write!(chain, "{filter},");
             }
-            // An input `-ss` seek resets frame PTS to ~0, but the filter picks
-            // cues by PTS — shift PTS to the absolute position for the filter,
-            // then back so the muxer's `-output_ts_offset` numbering still holds.
             let offset_secs = segment_id
                 .filter(|&id| id > 0)
                 .map(|id| i64::from(id) * i64::from(state.segment_length_secs));
-            if let Some(off) = offset_secs {
-                let _ = write!(chain, "setpts=PTS+{off}/TB,");
-            }
-            let external_path =
-                burn_subtitle_path.or_else(|| sub.path.as_deref().filter(|_| sub.is_external));
-            if let Some(path) = external_path {
-                let _ = write!(chain, "subtitles=f='{}'", escape_subtitle_filter_path(path));
-            } else {
-                let si = state
-                    .media_source
-                    .media_streams
-                    .iter()
-                    .filter(|s| s.stream_type == MediaStreamType::Subtitle && !s.is_external)
-                    .position(|s| s.index == sub.index)
-                    .unwrap_or(0);
-                let _ = write!(
-                    chain,
-                    "subtitles=f='{}':si={si}",
-                    escape_subtitle_filter_path(media_path)
-                );
-            }
-            if let Some(off) = offset_secs {
-                let _ = write!(chain, ",setpts=PTS-{off}/TB");
-            }
-            // h264 is 8-bit only; the burn path bypassed the `-vf scale_cuda`
-            // down-convert, so do it inside this chain.
-            if video_encoder == "h264_nvenc" {
-                chain.push_str(",format=nv12");
-            }
+            chain.push_str(&Self::text_subtitle_filter(
+                state,
+                sub,
+                media_path,
+                burn_subtitle_path,
+                false,
+                offset_secs,
+            ));
             args.push("-vf".to_owned());
             args.push(chain);
         }
@@ -1291,25 +1492,23 @@ impl FerrofinStreamStatePlanner {
         // Composite the (bitmap) subtitle stream onto the video: `overlay` takes
         // the base video and the decoded subtitle as its two inputs and emits the
         // labelled `[v]` that `map_args` maps in place of the raw video.
-        if burn_graphical && let Some(sub) = state.subtitle_stream.as_ref() {
+        if burn_graphical
+            && !hw_filters
+            && let Some(sub) = state.subtitle_stream.as_ref()
+        {
             let sub_idx = sub.index.max(0);
             let vid_idx = state.video_stream.as_ref().map_or(0, |v| v.index.max(0));
-            // h264 (8-bit only) needs the overlaid frames down-converted to nv12 —
-            // done inside the graph here since the separate `-vf scale_cuda` is
-            // suppressed while burning (they can't coexist).
-            let fmt = if video_encoder == "h264_nvenc" {
-                ",format=nv12"
-            } else {
-                ""
-            };
+            // No hardware format conversion here: this block runs only when
+            // the matrix did not claim the job, so the frames are in system
+            // memory and the software chain above has already set the format.
             push_split(&mut args, "-filter_complex");
             if sw_filters.is_empty() {
-                args.push(format!("[0:{vid_idx}][0:{sub_idx}]overlay{fmt}[v]"));
+                args.push(format!("[0:{vid_idx}][0:{sub_idx}]overlay[v]"));
             } else {
                 // Downscale/tonemap the base video before compositing, so the
                 // bitmap subtitle is overlaid in SDR at output resolution.
                 args.push(format!(
-                    "[0:{vid_idx}]{}[base];[base][0:{sub_idx}]overlay{fmt}[v]",
+                    "[0:{vid_idx}]{}[base];[base][0:{sub_idx}]overlay[v]",
                     sw_filters.join(",")
                 ));
             }
@@ -1383,7 +1582,7 @@ impl FerrofinStreamStatePlanner {
         args.push("0".to_owned());
         args.push(playlist_path.to_string_lossy().into_owned());
 
-        args
+        (args, hwaccel_input.env)
     }
 }
 
@@ -1742,13 +1941,42 @@ mod tests {
         supports_tonemapx: bool,
         encoders: &[&str],
     ) -> FerrofinStreamStatePlanner {
-        let encoder: Arc<dyn MediaEncoder> = Arc::new(FakeEncoder);
-        let helper = EncodingHelper::with_processor_count(
+        planner_over_with(
+            media_sources,
+            supports_tonemapx,
+            encoders,
+            EncodingOptions::default(),
+        )
+    }
+
+    /// The same planner with explicit encoding options, so a test can select a
+    /// hardware accelerator the way the dashboard does.
+    fn planner_over_with(
+        media_sources: Arc<dyn MediaSourceManager>,
+        supports_tonemapx: bool,
+        encoders: &[&str],
+        options: EncodingOptions,
+    ) -> FerrofinStreamStatePlanner {
+        planner_over_caps(
+            media_sources,
+            supports_tonemapx,
             FfmpegCapabilities::builder()
                 .encoders(encoders.iter().copied())
                 .build(),
-            8,
-        );
+            options,
+        )
+    }
+
+    /// The planner over an explicit capability probe — what a test needs when
+    /// the hardware path depends on more than the encoder list.
+    fn planner_over_caps(
+        media_sources: Arc<dyn MediaSourceManager>,
+        supports_tonemapx: bool,
+        caps: FfmpegCapabilities,
+        options: EncodingOptions,
+    ) -> FerrofinStreamStatePlanner {
+        let encoder: Arc<dyn MediaEncoder> = Arc::new(FakeEncoder);
+        let helper = EncodingHelper::with_processor_count(caps, 8);
         let paths = Arc::new(FerrofinServerApplicationPaths::new(
             "/data",
             std::path::PathBuf::from("/data/log"),
@@ -1756,7 +1984,8 @@ mod tests {
             "/cache",
             "/web",
         ));
-        let config: Arc<dyn ServerConfigurationManager> = Arc::new(FakeConfig(Arc::clone(&paths)));
+        let config: Arc<dyn ServerConfigurationManager> =
+            Arc::new(FakeConfig(Arc::clone(&paths), options));
         // The disabled stub always errors, exercising the `si=` burn fallback.
         let subtitles: Arc<dyn SubtitleEncoder> =
             Arc::new(ferrofin_traits::stubs::DisabledSubtitleEncoder);
@@ -1772,10 +2001,13 @@ mod tests {
     }
 
     /// A fake [`ServerConfigurationManager`] exposing only the application paths.
-    struct FakeConfig(Arc<FerrofinServerApplicationPaths>);
+    struct FakeConfig(Arc<FerrofinServerApplicationPaths>, EncodingOptions);
 
     #[async_trait]
     impl ServerConfigurationManager for FakeConfig {
+        async fn get_encoding_options(&self) -> Result<EncodingOptions, ServiceError> {
+            Ok(self.1.clone())
+        }
         fn application_paths(&self) -> Arc<dyn ferrofin_traits::system::ServerApplicationPaths> {
             Arc::clone(&self.0) as Arc<_>
         }
@@ -1860,24 +2092,44 @@ mod tests {
         );
     }
 
+    /// An ffmpeg build with every NVENC encoder, so the ported dispatch has
+    /// something to find. Selection is a probe result now, not a fixed table:
+    /// a build without `av1_nvenc` must fall back even with NVENC configured.
+    fn nvenc_caps() -> FfmpegCapabilities {
+        FfmpegCapabilities::builder()
+            .encoders(["h264_nvenc", "hevc_nvenc", "av1_nvenc", "libx264"])
+            .build()
+    }
+
     #[test]
     fn transcode_target_skips_codecs_ferrofin_cannot_encode() {
         // Software-only: browsers list av1/vp9 first, but only libx264 (h264) is
         // realtime-viable — picking av1 would launch libaom-av1 and stall HLS.
         let sw = EncodingOptions::default();
         let av1_first = vec!["av1".to_owned(), "h264".to_owned(), "vp9".to_owned()];
-        assert_eq!(preferred_transcode_video_codec(&av1_first, &sw), "h264");
+        assert_eq!(
+            preferred_transcode_video_codec(&av1_first, &nvenc_caps(), &sw, None),
+            "h264"
+        );
         // A bare `copy` request is honoured verbatim.
         assert_eq!(
-            preferred_transcode_video_codec(&["copy".to_owned()], &sw),
+            preferred_transcode_video_codec(&["copy".to_owned()], &nvenc_caps(), &sw, None),
             "copy"
         );
         // No encodable preference (or none at all) → the h264 default.
         assert_eq!(
-            preferred_transcode_video_codec(&["av1".to_owned(), "vp9".to_owned()], &sw),
+            preferred_transcode_video_codec(
+                &["av1".to_owned(), "vp9".to_owned()],
+                &nvenc_caps(),
+                &sw,
+                None,
+            ),
             "h264"
         );
-        assert_eq!(preferred_transcode_video_codec(&[], &sw), "h264");
+        assert_eq!(
+            preferred_transcode_video_codec(&[], &nvenc_caps(), &sw, None),
+            "h264"
+        );
     }
 
     #[test]
@@ -1890,10 +2142,18 @@ mod tests {
             ..EncodingOptions::default()
         };
         let av1_first = vec!["av1".to_owned(), "h264".to_owned(), "vp9".to_owned()];
-        assert_eq!(preferred_transcode_video_codec(&av1_first, &nv), "av1");
+        assert_eq!(
+            preferred_transcode_video_codec(&av1_first, &nvenc_caps(), &nv, None),
+            "av1"
+        );
         // vp9 has no NVENC encoder → skipped in favour of the next encodable.
         assert_eq!(
-            preferred_transcode_video_codec(&["vp9".to_owned(), "hevc".to_owned()], &nv),
+            preferred_transcode_video_codec(
+                &["vp9".to_owned(), "hevc".to_owned()],
+                &nvenc_caps(),
+                &nv,
+                None,
+            ),
             "hevc"
         );
     }
@@ -2931,39 +3191,523 @@ mod tests {
         assert!(args.contains("-maxrate 8000000"), "cap expected: {args}");
     }
 
-    #[test]
-    fn nvenc_args_carry_negotiated_cap_and_gpu_downscale() {
-        let options = EncodingOptions::default();
-        // A negotiated 8 Mbps / 1080p bound: GPU downscale + rate cap on top of
-        // the CQ-VBR quality target.
-        let args = nvenc_video_args(
-            "av1_nvenc",
-            &options,
+    /// An 8-bit 1080p H.264 source. The pixel format is load-bearing: NVDEC is
+    /// selected per format, and upstream declines hardware decoding outright
+    /// when the probe reported none.
+    fn nvdec_decodable_video_stream() -> MediaStream {
+        MediaStream {
+            pixel_format: Some("yuv420p".to_owned()),
+            width: Some(1920),
+            height: Some(1080),
+            ..video_stream("h264")
+        }
+    }
+
+    /// A real CUDA build: the encoders alone are not enough, the chain also
+    /// needs the hwaccel and the CUDA filters to be present.
+    fn nvenc_caps_full() -> FfmpegCapabilities {
+        FfmpegCapabilities::builder()
+            .platform(ferrofin_mediaencoding::encoding_helper::hw::Platform::Linux)
+            .encoders(["h264_nvenc", "hevc_nvenc", "av1_nvenc", "libx264"])
+            .hwaccels(["cuda"])
+            .filters(ferrofin_mediaencoding::encoder::REQUIRED_FILTERS)
+            .all_filter_options(true)
+            .ffmpeg_version(ferrofin_mediaencoding::encoder::FfmpegVersion::with_build(
+                7, 0, 1,
+            ))
+            .build()
+    }
+
+    /// A planner with NVENC selected and an ffmpeg that has the encoders.
+    fn nvenc_planner(sources: Vec<MediaSourceInfo>) -> FerrofinStreamStatePlanner {
+        planner_over_caps(
+            Arc::new(FakeMediaSources {
+                sources,
+                live_streams: HashMap::new(),
+            }),
             false,
-            Some((1920, 1080)),
-            Some(7_616_000),
+            nvenc_caps_full(),
+            EncodingOptions {
+                enable_hardware_encoding: true,
+                hardware_acceleration_type: HardwareAccelerationType::nvenc,
+                encoder_preset: EncoderPreset::medium,
+                ..EncodingOptions::default()
+            },
         )
-        .join(" ");
-        assert!(args.contains("-vf scale_cuda=w=1920:h=1080"), "{args}");
+    }
+
+    #[tokio::test]
+    async fn nvenc_now_takes_jellyfins_argument_shapes() {
+        // These replace Ferrofin's former bespoke NVENC arguments, which had no
+        // device initialisation and a hand-rolled `-vf scale_cuda`. Everything
+        // here now comes from the ported matrix.
+        let src = source(
+            "abc",
+            vec![nvdec_decodable_video_stream(), audio_stream("aac")],
+        );
+        let p = nvenc_planner(vec![src]);
+        let mut req = request("abc");
+        req.video_codec = Some("h264".to_owned());
+        req.video_bitrate = Some(7_616_000);
+        req.allow_video_stream_copy = false;
+        let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
+        let args = plan.arguments.join(" ");
+
+        assert!(args.contains("-c:v h264_nvenc"), "{args}");
+        // The whole pipeline stays on the card: a device is created, the
+        // decoder writes into it, and the frames never come back to memory.
+        // Ferrofin previously passed a bare `-hwaccel cuda` with no device at
+        // all, and no `-hwaccel_flags`.
         assert!(
-            args.contains("-maxrate 7616000 -bufsize 15232000"),
+            args.contains(
+                "-init_hw_device cuda=cu:0 -filter_hw_device cu -hwaccel cuda \
+                 -hwaccel_output_format cuda"
+            ),
             "{args}"
         );
-        // h264 adds the 8-bit convert inside the same scale_cuda.
-        let args =
-            nvenc_video_args("h264_nvenc", &options, false, Some((1280, 720)), None).join(" ");
+        assert!(args.contains("-hwaccel_flags +unsafe_output"), "{args}");
+        // The CUDA scaler, not the software one.
+        assert!(args.contains("-vf setparams="), "{args}");
+        assert!(args.contains("scale_cuda=format=yuv420p"), "{args}");
+        assert!(!args.contains("hwdownload"), "{args}");
+        // NVENC's own preset ladder: p4 for `medium`, not an x264 name.
+        assert!(args.contains("-preset p4"), "{args}");
+        // The generic bitrate shape — targeted, not merely capped.
         assert!(
-            args.contains("scale_cuda=w=1280:h=720:format=nv12"),
+            args.contains("-b:v 7616000 -maxrate 7616000 -bufsize 15232000"),
             "{args}"
         );
-        assert!(!args.contains("-maxrate"), "{args}");
-        // No caps: h264 keeps its bare format convert, others no -vf at all.
-        let args = nvenc_video_args("hevc_nvenc", &options, false, None, None).join(" ");
-        assert!(!args.contains("-vf"), "{args}");
-        // Burning suppresses the -vf (the burn graph owns the conversion).
-        let args =
-            nvenc_video_args("h264_nvenc", &options, true, Some((1920, 1080)), None).join(" ");
-        assert!(!args.contains("-vf"), "{args}");
+        // Gone with the bolt-on: the fixed constant-quality target and `-crf`.
+        assert!(!args.contains("-cq"), "{args}");
+        assert!(!args.contains("-crf"), "{args}");
+    }
+
+    /// This machine's actual ffmpeg n9.0.1: the CUDA filters are present but
+    /// `tonemap_cuda` and `alphasrc` are not — they are jellyfin-ffmpeg
+    /// additions. `IsCudaFullSupported` therefore fails and upstream degrades
+    /// to GPU encode only, which is why Jellyfin ships its own ffmpeg build.
+    #[tokio::test]
+    async fn a_stock_ffmpeg_degrades_to_gpu_encode_only() {
+        let stock = FfmpegCapabilities::builder()
+            .platform(ferrofin_mediaencoding::encoding_helper::hw::Platform::Linux)
+            .encoders(["h264_nvenc", "hevc_nvenc", "av1_nvenc", "libx264"])
+            .hwaccels(["cuda", "vaapi", "qsv", "vulkan", "opencl"])
+            .filters(
+                ferrofin_mediaencoding::encoder::REQUIRED_FILTERS
+                    .into_iter()
+                    .filter(|f| *f != "tonemap_cuda" && *f != "alphasrc"),
+            )
+            .all_filter_options(true)
+            // The option probe is separate from the filter list, so an absent
+            // filter has to be said twice to be modelled honestly.
+            .filter_option(
+                ferrofin_mediaencoding::encoding_helper::hw::FilterOption::TonemapCudaName,
+                false,
+            )
+            .ffmpeg_version(ferrofin_mediaencoding::encoder::FfmpegVersion::with_build(
+                9, 0, 1,
+            ))
+            .build();
+        let p = planner_over_caps(
+            Arc::new(FakeMediaSources {
+                sources: vec![source(
+                    "abc",
+                    vec![nvdec_decodable_video_stream(), audio_stream("aac")],
+                )],
+                live_streams: HashMap::new(),
+            }),
+            false,
+            stock,
+            EncodingOptions {
+                enable_hardware_encoding: true,
+                hardware_acceleration_type: HardwareAccelerationType::nvenc,
+                encoder_preset: EncoderPreset::medium,
+                ..EncodingOptions::default()
+            },
+        );
+        let mut req = request("abc");
+        req.video_codec = Some("h264".to_owned());
+        req.allow_video_stream_copy = false;
+        req.max_width = Some(1280);
+        let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
+        let args = plan.arguments.join(" ");
+        // GPU encode is kept...
+        assert!(args.contains("-c:v h264_nvenc -preset p4"), "{args}");
+        // ...but nothing is asked of a device that cannot do the filtering:
+        // no device graph, no hardware decode, no CUDA filter.
+        assert!(!args.contains("-init_hw_device"), "{args}");
+        assert!(!args.contains("-hwaccel"), "{args}");
+        assert!(!args.contains("_cuda"), "{args}");
+        assert!(args.contains("-vf setparams="), "{args}");
+        assert!(args.contains("format=yuv420p"), "{args}");
+    }
+
+    #[tokio::test]
+    async fn the_software_graphical_burn_still_maps_its_own_labelled_output() {
+        // The other direction of `map_args`'s switch. Ferrofin's software
+        // overlay graph DOES label its output, so this path must keep asking
+        // for `[v]` — dropping it here fails live with "Output with label 'v'
+        // does not exist in any defined filter graph".
+        let p = planner(vec![source(
+            "abc",
+            vec![
+                nvdec_decodable_video_stream(),
+                audio_stream("aac"),
+                subtitle_stream("pgssub", 2),
+            ],
+        )]);
+        let mut req = request("abc");
+        req.video_codec = Some("h264".to_owned());
+        req.allow_video_stream_copy = false;
+        req.subtitle_stream_index = Some(2);
+        req.subtitle_method = Some("Encode".to_owned());
+        let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
+        let args = plan.arguments.join(" ");
+        assert!(args.contains("-map [v]"), "{args}");
+        assert!(args.contains("[0:0][0:2]overlay[v]"), "{args}");
+        // ...and no negative map, because this graph's output IS labelled.
+        assert!(!args.contains("-map -0:0"), "{args}");
+    }
+
+    #[tokio::test]
+    async fn filter_pads_use_the_mapped_index_not_the_streams_own() {
+        // ffmpeg numbers streams by position, so a source whose stream indices
+        // are not contiguous makes the two disagree. Every other fixture here
+        // is contiguous, which hides it.
+        // Every stream's own index differs from its position, including the
+        // video's — a fixture where the video sits at 0 makes the two spellings
+        // agree for it and hides half the question.
+        let mut video = nvdec_decodable_video_stream();
+        video.index = 2;
+        let mut audio = audio_stream("aac");
+        audio.index = 5;
+        let mut sub = subtitle_stream("pgssub", 9);
+        sub.index = 9;
+        let p = nvenc_planner(vec![source("abc", vec![video, audio, sub])]);
+        let mut req = request("abc");
+        req.video_codec = Some("h264".to_owned());
+        req.allow_video_stream_copy = false;
+        req.subtitle_stream_index = Some(9);
+        req.subtitle_method = Some("Encode".to_owned());
+        let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
+        let args = plan.arguments.join(" ");
+        // The subtitle is the third stream, so its pad is 2 — not 9.
+        assert!(args.contains("[0:2]scale,scale="), "{args}");
+        assert!(!args.contains("[0:9]"), "{args}");
+        // The video pad and the negative map agree with each other, and both
+        // use the position (0) rather than the video's own index (2).
+        assert!(args.contains("[0:0]setparams="), "{args}");
+        assert!(args.contains("-map -0:0"), "{args}");
+        assert!(!args.contains("-map -0:2"), "{args}");
+    }
+
+    #[tokio::test]
+    async fn an_unported_accelerator_keeps_the_software_transcode() {
+        // Every accelerator whose chain is not ported yet. Naming its encoder
+        // without the chain behind it gave a vendor encoder with no preset, no
+        // rate control, no scaler and a silently dropped subtitle — strictly
+        // worse than the software transcode these servers have today. Each of
+        // phases 4-7 deletes its own entry here.
+        for accel in [
+            HardwareAccelerationType::vaapi,
+            HardwareAccelerationType::qsv,
+            HardwareAccelerationType::amf,
+            HardwareAccelerationType::videotoolbox,
+            HardwareAccelerationType::rkmpp,
+            HardwareAccelerationType::v4l2m2m,
+        ] {
+            let caps = FfmpegCapabilities::builder()
+                .platform(ferrofin_mediaencoding::encoding_helper::hw::Platform::Linux)
+                .encoders([
+                    "libx264",
+                    "h264_vaapi",
+                    "h264_qsv",
+                    "h264_amf",
+                    "h264_rkmpp",
+                ])
+                .hwaccels(["cuda", "vaapi", "qsv", "d3d11va", "opencl", "vulkan"])
+                .filters(ferrofin_mediaencoding::encoder::REQUIRED_FILTERS)
+                .all_filter_options(true)
+                .ffmpeg_version(ferrofin_mediaencoding::encoder::FfmpegVersion::with_build(
+                    7, 0, 1,
+                ))
+                .build();
+            let p = planner_over_caps(
+                Arc::new(FakeMediaSources {
+                    sources: vec![source(
+                        "abc",
+                        vec![nvdec_decodable_video_stream(), audio_stream("aac")],
+                    )],
+                    live_streams: HashMap::new(),
+                }),
+                false,
+                caps,
+                EncodingOptions {
+                    enable_hardware_encoding: true,
+                    hardware_acceleration_type: accel,
+                    ..EncodingOptions::default()
+                },
+            );
+            let mut req = request("abc");
+            req.video_codec = Some("h264".to_owned());
+            req.allow_video_stream_copy = false;
+            req.max_width = Some(1280);
+            let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
+            let args = plan.arguments.join(" ");
+            assert!(args.contains("-c:v libx264"), "{accel:?}: {args}");
+            // The bound the client asked for still reaches the scaler...
+            assert!(args.contains("scale="), "{accel:?}: {args}");
+            // ...and no half-wired device pipeline is emitted.
+            assert!(!args.contains("-init_hw_device"), "{accel:?}: {args}");
+            assert!(!args.contains("-hwaccel"), "{accel:?}: {args}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_graphical_subtitle_maps_the_graph_output_not_the_video() {
+        // The `[v]` pad belongs to Ferrofin's own software overlay graph. The
+        // ported chains leave their output unlabeled for ffmpeg to pick up, so
+        // naming `[v]` here would abort with "Output with label 'v' does not
+        // exist in any defined filter graph".
+        let p = nvenc_planner(vec![source(
+            "abc",
+            vec![
+                nvdec_decodable_video_stream(),
+                audio_stream("aac"),
+                subtitle_stream("pgssub", 2),
+            ],
+        )]);
+        let mut req = request("abc");
+        req.video_codec = Some("h264".to_owned());
+        req.allow_video_stream_copy = false;
+        req.subtitle_stream_index = Some(2);
+        req.subtitle_method = Some("Encode".to_owned());
+        let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
+        let args = plan.arguments.join(" ");
+        assert!(!args.contains("-map [v]"), "{args}");
+        assert!(args.contains("-map 0:0 -map 0:1 -map -0:0"), "{args}");
+        // The bitmap is pre-processed and uploaded, then composited on the GPU.
+        assert!(args.contains("[0:2]scale,scale="), "{args}");
+        assert!(args.contains("hwupload=derive_device=cuda[sub]"), "{args}");
+        assert!(
+            args.contains("overlay_cuda=eof_action=pass:repeatlast=0"),
+            "{args}"
+        );
+        // ...and NOT with the premultiplied option, which is text-only.
+        assert!(!args.contains("alpha_format"), "{args}");
+    }
+
+    #[tokio::test]
+    async fn an_exact_requested_size_reaches_the_hardware_scaler() {
+        // `Width`/`Height` are a different request from `MaxWidth`/`MaxHeight`:
+        // one pins the output, the other bounds it. Dropping the exact pair
+        // silently gives the client a different resolution than it asked for.
+        let p = nvenc_planner(vec![source(
+            "abc",
+            vec![nvdec_decodable_video_stream(), audio_stream("aac")],
+        )]);
+        let mut req = request("abc");
+        req.video_codec = Some("h264".to_owned());
+        req.allow_video_stream_copy = false;
+        req.width = Some(1280);
+        req.height = Some(720);
+        let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
+        let args = plan.arguments.join(" ");
+        assert!(args.contains("scale_cuda=w=1280:h=720"), "{args}");
+    }
+
+    #[tokio::test]
+    async fn a_seek_shifts_the_subtitle_clock_on_the_hardware_path_too() {
+        // The one that bit: a per-segment `-ss` restarts decoded frames at
+        // PTS 0 (Ferrofin passes no `-copyts`), so the generated subtitle
+        // source must start at zero and the `subtitles` filter be shifted
+        // around instead. Starting the source at the seek would put it in a
+        // time range the video never reaches and nothing would be drawn.
+        // Verified against real ffmpeg: with the shift the burned frame is
+        // byte-identical to the same moment rendered without a seek; without
+        // it, it is not.
+        let p = nvenc_planner(vec![source(
+            "abc",
+            vec![
+                nvdec_decodable_video_stream(),
+                audio_stream("aac"),
+                subtitle_stream("subrip", 2),
+            ],
+        )]);
+        let mut req = request("abc");
+        req.video_codec = Some("h264".to_owned());
+        req.allow_video_stream_copy = false;
+        req.subtitle_stream_index = Some(2);
+        req.subtitle_method = Some("Encode".to_owned());
+        let plan = p
+            .plan(&req, false, Some(10), PlaylistKind::Vod)
+            .await
+            .unwrap();
+        let args = plan.arguments.join(" ");
+        // Segment 10 of 3 s segments = 30 s in.
+        assert!(args.contains("setpts=PTS+30/TB,subtitles="), "{args}");
+        assert!(args.contains(",setpts=PTS-30/TB,hwupload"), "{args}");
+        assert!(
+            args.contains("alphasrc=s=1920x1080:r=10:start='0'"),
+            "{args}"
+        );
+
+        // Segment 0 needs no shift at all.
+        let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
+        assert!(!plan.arguments.join(" ").contains("setpts"));
+    }
+
+    #[tokio::test]
+    async fn an_interlaced_source_deinterlaces_on_the_gpu() {
+        let mut video = nvdec_decodable_video_stream();
+        video.is_interlaced = true;
+        let p = nvenc_planner(vec![source("abc", vec![video, audio_stream("aac")])]);
+        let mut req = request("abc");
+        req.video_codec = Some("h264".to_owned());
+        req.allow_video_stream_copy = false;
+        let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
+        let args = plan.arguments.join(" ");
+        assert!(args.contains("yadif_cuda="), "{args}");
+    }
+
+    #[tokio::test]
+    async fn an_hdr_source_tonemaps_on_the_gpu() {
+        let mut video = hdr_4k_video_stream("hevc");
+        video.pixel_format = Some("yuv420p10le".to_owned());
+        video.video_range = Some(ferrofin_model::data::VideoRange::Hdr);
+        // Both switches are off by default and both are load-bearing here:
+        // HEVC is not in the default hardware-decode list, and tonemapping is
+        // opt-in.
+        let p = planner_over_caps(
+            Arc::new(FakeMediaSources {
+                sources: vec![source("abc", vec![video, audio_stream("aac")])],
+                live_streams: HashMap::new(),
+            }),
+            false,
+            nvenc_caps_full(),
+            EncodingOptions {
+                enable_hardware_encoding: true,
+                hardware_acceleration_type: HardwareAccelerationType::nvenc,
+                encoder_preset: EncoderPreset::medium,
+                enable_tonemapping: true,
+                hardware_decoding_codecs: vec!["h264".to_owned(), "hevc".to_owned()],
+                ..EncodingOptions::default()
+            },
+        );
+        let mut req = request("abc");
+        req.video_codec = Some("h264".to_owned());
+        req.allow_video_stream_copy = false;
+        let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
+        let args = plan.arguments.join(" ");
+        assert!(args.contains("tonemap_cuda="), "{args}");
+        // The colour properties describe the HDR source entering the graph.
+        assert!(
+            args.contains("setparams=color_primaries=bt2020:color_trc=smpte2084"),
+            "{args}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_burned_in_subtitle_becomes_a_cuda_overlay() {
+        // Verified live against ffmpeg n9.0.1 + an RTX 5090 in the shape below,
+        // modulo `alphasrc`, which is a jellyfin-ffmpeg filter that stock
+        // ffmpeg does not carry (and which the gate above declines without).
+        let p = nvenc_planner(vec![source(
+            "abc",
+            vec![
+                nvdec_decodable_video_stream(),
+                audio_stream("aac"),
+                subtitle_stream("subrip", 2),
+            ],
+        )]);
+        let mut req = request("abc");
+        req.video_codec = Some("h264".to_owned());
+        req.allow_video_stream_copy = false;
+        req.max_width = Some(1280);
+        req.subtitle_stream_index = Some(2);
+        req.subtitle_method = Some("Encode".to_owned());
+        let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
+        let args = plan.arguments.join(" ");
+
+        // The raw video is mapped and then cancelled: ffmpeg adds the graph's
+        // unlabeled output by itself, so without the negative map the output
+        // carries two video streams — verified against real ffmpeg, as was the
+        // ordering (a leading negative map is an error).
+        assert!(args.contains("-map 0:0 -map 0:1 -map -0:0"), "{args}");
+        // ...and no `[v]` pad, which the ported graph never defines.
+        assert!(!args.contains("-map [v]"), "{args}");
+
+        // The text is drawn onto a generated transparent source sized to the
+        // OUTPUT, uploaded, and composited by the CUDA overlay — the frames
+        // never come back to system memory.
+        let graph = args
+            .split("-filter_complex ")
+            .nth(1)
+            .unwrap_or_default()
+            .to_owned();
+        assert_eq!(
+            graph.split(" -c:v").next().unwrap(),
+            "alphasrc=s=1280x720:r=10:start='0',format=yuva420p,\
+             subtitles=f='/media/movie.mkv':si=0:alpha=1:sub2video=1,\
+             hwupload=derive_device=cuda[sub];\
+             [0:0]setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709,\
+             scale_cuda=w=1280:h=720:format=yuv420p[main];\
+             [main][sub]overlay_cuda=eof_action=pass:repeatlast=0:\
+             alpha_format=premultiplied"
+        );
+        assert!(!args.contains("hwdownload"), "{args}");
+        // The old bolt-on emitted a separate `-vf` here; the two cannot coexist.
+        assert!(!args.contains("-vf "), "{args}");
+    }
+
+    #[tokio::test]
+    async fn nvenc_falls_back_when_ffmpeg_lacks_the_encoder() {
+        // Selection is a probe result, not a table: an ffmpeg built without
+        // `av1_nvenc` must not be handed one just because NVENC is configured.
+        let src = source(
+            "abc",
+            vec![nvdec_decodable_video_stream(), audio_stream("aac")],
+        );
+        // A *complete* CUDA build that simply has no NVENC encoder — the
+        // interesting case. Building caps with no hwaccel at all would make
+        // this pass for the wrong reason, since nothing hardware would be
+        // emitted regardless of the encoder.
+        let caps = FfmpegCapabilities::builder()
+            .platform(ferrofin_mediaencoding::encoding_helper::hw::Platform::Linux)
+            .encoders(["libx264"])
+            .hwaccels(["cuda"])
+            .filters(ferrofin_mediaencoding::encoder::REQUIRED_FILTERS)
+            .all_filter_options(true)
+            .ffmpeg_version(ferrofin_mediaencoding::encoder::FfmpegVersion::with_build(
+                7, 0, 1,
+            ))
+            .build();
+        let p = planner_over_caps(
+            Arc::new(FakeMediaSources {
+                sources: vec![src],
+                live_streams: HashMap::new(),
+            }),
+            false,
+            caps,
+            EncodingOptions {
+                enable_hardware_encoding: true,
+                hardware_acceleration_type: HardwareAccelerationType::nvenc,
+                ..EncodingOptions::default()
+            },
+        );
+        let mut req = request("abc");
+        req.video_codec = Some("h264".to_owned());
+        req.allow_video_stream_copy = false;
+        let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
+        let args = plan.arguments.join(" ");
+        assert!(args.contains("-c:v libx264"), "{args}");
+        // Hardware DECODE still happens — it is selected for the accelerator,
+        // not the encoder — so the graph must bring the frames back down rather
+        // than hand GPU surfaces to a software encoder, which ffmpeg rejects
+        // with "Impossible to convert between the formats supported by the
+        // filter ... and auto_scale_0".
+        assert!(args.contains("-hwaccel cuda"), "{args}");
+        assert!(args.contains("hwdownload,format=yuv420p"), "{args}");
     }
 
     /// The parity fixture (320x240 h264 @ ~6 Mbps container bitrate, mono aac)
