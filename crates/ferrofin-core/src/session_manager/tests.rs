@@ -255,6 +255,84 @@ async fn empty_device_name_falls_back_to_network_device() {
 }
 
 #[tokio::test]
+async fn a_non_admin_sees_the_transcode_but_not_the_silicon() {
+    // Upstream zeroes only the accelerator, so a user still sees that their own
+    // stream is transcoding and to what. Dropping the whole object would hide
+    // more than Jellyfin does.
+    let db = test_db().await;
+    // A non-admin only sees sessions connected to the bus, so this one has to
+    // be registered for the redaction to be observable at all.
+    let bus: Arc<dyn ferrofin_traits::session_bus::SessionMessageBus> =
+        Arc::new(crate::FerrofinSessionMessageBus::new());
+    let mgr = Arc::new(
+        manager(&db)
+            .as_ref()
+            .clone()
+            .with_session_bus(Arc::clone(&bus)),
+    );
+    let user_id = Uuid::new_v4();
+    let user = seed_named_user(&db, user_id, "viewer").await;
+    let dto = mgr
+        .log_session_activity("Web", "1.0", "dev-1", "TV", "e", &user)
+        .await
+        .unwrap();
+    let session_id = dto.id.clone().unwrap();
+    mgr.report_capabilities(
+        &session_id,
+        &ClientCapabilities {
+            supports_media_control: true,
+            ..ClientCapabilities::default()
+        },
+    )
+    .await
+    .unwrap();
+    bus.register(session_id, Box::new(|_| {}));
+
+    mgr.report_transcoding_info(
+        "dev-1",
+        &ferrofin_model::session::TranscodingInfo {
+            video_codec: Some("h264".to_owned()),
+            hardware_acceleration_type: Some(
+                ferrofin_model::entities::HardwareAccelerationType::nvenc,
+            ),
+            ..ferrofin_model::session::TranscodingInfo::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let admin_view = mgr
+        .get_sessions(Uuid::nil(), None, None, None, true)
+        .await
+        .unwrap();
+    let seen = admin_view
+        .iter()
+        .find(|s| s.id == dto.id)
+        .and_then(|s| s.transcoding_info.as_ref())
+        .expect("admin sees the transcode");
+    assert_eq!(
+        seen.hardware_acceleration_type,
+        Some(ferrofin_model::entities::HardwareAccelerationType::nvenc)
+    );
+
+    let user_view = mgr
+        .get_sessions(user_id, None, None, Some(user_id), false)
+        .await
+        .unwrap();
+    let seen = user_view
+        .iter()
+        .find(|s| s.id == dto.id)
+        .and_then(|s| s.transcoding_info.as_ref())
+        .expect("the user still sees their own transcode");
+    assert_eq!(seen.video_codec.as_deref(), Some("h264"));
+    assert_eq!(
+        seen.hardware_acceleration_type,
+        Some(ferrofin_model::entities::HardwareAccelerationType::none),
+        "the accelerator must be zeroed for a non-admin"
+    );
+}
+
+#[tokio::test]
 async fn additional_users_add_and_remove() {
     let db = test_db().await;
     let mgr = manager(&db);

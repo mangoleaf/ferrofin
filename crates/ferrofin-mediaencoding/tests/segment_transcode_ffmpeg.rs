@@ -203,6 +203,7 @@ fn start_req<'a>(
 ) -> StartFfMpegRequest<'a> {
     StartFfMpegRequest {
         env: Vec::new(),
+        hardware_acceleration_type: ferrofin_model::entities::HardwareAccelerationType::none,
         program: "ffmpeg",
         state,
         output_path,

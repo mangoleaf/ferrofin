@@ -561,6 +561,7 @@ where
             log_path,
             working_dir: None,
             env: plan.ffmpeg_env.clone(),
+            hardware_acceleration_type: plan.encoding_options.hardware_acceleration_type,
         };
         let handle = match self.manager.start_ffmpeg(&self.transcoder, start).await {
             Ok(handle) => handle,
@@ -695,6 +696,7 @@ where
                     log_path,
                     working_dir: None,
                     env: plan.ffmpeg_env.clone(),
+                    hardware_acceleration_type: plan.encoding_options.hardware_acceleration_type,
                 };
                 if let Err(e) = self
                     .manager
@@ -858,6 +860,7 @@ where
                     log_path: log_path.clone(),
                     working_dir: None,
                     env: plan.ffmpeg_env.clone(),
+                    hardware_acceleration_type: plan.encoding_options.hardware_acceleration_type,
                 };
                 let handle = match self.manager.start_ffmpeg(&self.transcoder, start).await {
                     Ok(handle) => handle,
@@ -975,6 +978,7 @@ where
             log_path,
             working_dir: None,
             env: plan.ffmpeg_env.clone(),
+            hardware_acceleration_type: plan.encoding_options.hardware_acceleration_type,
         };
         self.manager
             .start_ffmpeg(&self.transcoder, start)
