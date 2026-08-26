@@ -53,6 +53,22 @@ pub struct RequestedSize {
     pub max_height: Option<i32>,
 }
 
+impl RequestedSize {
+    /// This request with its height bound replaced.
+    ///
+    /// The VAAPI overlay path needs it: `overlay_vaapi` scales the subtitle
+    /// itself, so upstream deliberately generates a *smaller* subtitle surface
+    /// than the video and lets the GPU stretch it, which is less to move across
+    /// the bus. That is the only place a bound differs from the video's.
+    #[must_use]
+    pub fn with_max_height(self, max_height: i32) -> Self {
+        Self {
+            max_height: Some(max_height),
+            ..self
+        }
+    }
+}
+
 /// Everything the decoder selection reads about a job.
 ///
 /// C# reaches through `EncodingJobInfo` for these; gathering them keeps the

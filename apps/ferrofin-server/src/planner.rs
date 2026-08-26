@@ -1274,6 +1274,14 @@ impl FerrofinStreamStatePlanner {
                 // skipped for a job the matrix claimed.
                 do_sw_tonemap: hw::tonemap::is_sw_tonemap_available(caps, video_stream),
                 do_hw_tonemap: hw::input_args::is_hw_tonemap_available(&decode_ctx, &video_decoder),
+                // Read by the VAAPI chain only, which prefers Intel's VPP
+                // tonemap and falls back to the OpenCL one.
+                vpp_tonemap_available: hw::tonemap::is_intel_vpp_tonemap_available(
+                    caps,
+                    options,
+                    video_stream,
+                ),
+                source_codec: video_stream.and_then(|v| v.codec.as_deref()),
                 is_dovi: hw::tonemap::is_dovi(video_stream),
                 is_hevc_rext: hw::decoder::is_video_stream_hevc_rext(video_stream),
                 subtitle,

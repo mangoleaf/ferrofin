@@ -55,6 +55,7 @@ pub mod nvidia;
 pub mod support;
 pub mod sw_chain;
 pub mod tonemap;
+pub mod vaapi;
 pub mod versions;
 
 /// `string.Contains(x, StringComparison.OrdinalIgnoreCase)`.

@@ -160,6 +160,18 @@ pub struct ChainInput<'a> {
     /// Whether a hardware tonemap applies (see
     /// [`super::input_args::is_hw_tonemap_available`]).
     pub do_hw_tonemap: bool,
+    /// Whether Intel's VPP tonemap is available (see
+    /// [`super::tonemap::is_intel_vpp_tonemap_available`]).
+    ///
+    /// Separate from [`Self::do_hw_tonemap`] because the VAAPI chain prefers
+    /// it and falls back to the OpenCL one, so it has to be able to tell them
+    /// apart. Computed by the caller for the same reason the others are: a
+    /// chain that recomputed it could disagree with the device arguments
+    /// already emitted.
+    pub vpp_tonemap_available: bool,
+    /// The **source** video codec, which decides whether VAAPI can decode it
+    /// at all — upstream's `IsVaapiSupported` rejects `mpeg4` outright.
+    pub source_codec: Option<&'a str>,
     /// Whether the source is Dolby Vision, which the software tonemap reshapes.
     pub is_dovi: bool,
     /// Whether the source is HEVC Range Extensions, which decodes to a 10-bit
@@ -570,6 +582,8 @@ mod tests {
             deinterlace: false,
             do_sw_tonemap: false,
             do_hw_tonemap: false,
+            vpp_tonemap_available: false,
+            source_codec: Some("h264"),
             is_dovi: false,
             is_hevc_rext: false,
             subtitle: SubtitleOverlay::None,
