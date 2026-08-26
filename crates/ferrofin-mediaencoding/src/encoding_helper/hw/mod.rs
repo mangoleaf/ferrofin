@@ -20,16 +20,17 @@
 //! - [`input_args`] — the dispatcher that assembles everything before `-i`.
 //! - [`tonemap`] — the five tonemapping paths and the colour-property params.
 //! - [`filters`] — the shared filter fragments the chains are built from.
-//! - [`sw_chain`] — the software filter chain, and the assembly that turns any
-//!   chain into ffmpeg arguments.
+//! - [`sw_chain`] — the software filter chain, the shared chain input, and the
+//!   assembly that turns any chain into ffmpeg arguments.
+//! - [`nvidia`] — the NVENC / CUDA filter chain.
 //!
 //! That covers everything before ffmpeg's `-i`, the filter fragments the graphs
 //! after it are built from, the software chain itself, and the assembly that
 //! turns any chain into arguments. Still to come, as named work items in
-//! `brain/plans/PLAN_HWACCEL.md`: the six per-vendor filter chains and the
-//! switch that selects between them (phases 3–7), the Dolby Vision / HDR10+
+//! `brain/plans/PLAN_HWACCEL.md`: five more per-vendor filter chains and the
+//! switch that selects between them (phases 4–7), the Dolby Vision / HDR10+
 //! bitstream handling (phase 8), and the accelerated trickplay path (phase 9).
-//! Nothing here is wired into the planner yet — phase 3 does that, and until
+//! Nothing here is wired into the planner yet — phase 3b does that, and until
 //! then the software path in [`super::helper`] is what runs.
 //!
 //! Two rules shape everything in this module:
@@ -50,10 +51,21 @@ pub mod device_init;
 pub mod encoder;
 pub mod filters;
 pub mod input_args;
+pub mod nvidia;
 pub mod support;
 pub mod sw_chain;
 pub mod tonemap;
 pub mod versions;
+
+/// `string.Contains(x, StringComparison.OrdinalIgnoreCase)`.
+///
+/// Every chain identifies decoders and encoders by substring the way the C#
+/// does, so this lives here rather than being copied into each vendor module.
+pub(super) fn contains(haystack: &str, needle: &str) -> bool {
+    haystack
+        .to_ascii_lowercase()
+        .contains(&needle.to_ascii_lowercase())
+}
 
 pub use capabilities::{
     BsfOption, FfmpegCapabilities, FfmpegCapabilitiesBuilder, FilterOption, Platform,

@@ -22,6 +22,8 @@ use std::fmt::Write as _;
 use ferrofin_model::configuration::EncodingOptions;
 use ferrofin_model::entities::{TonemappingRange, Video3DFormat};
 
+use super::capabilities::FfmpegCapabilities;
+use super::contains;
 use super::decoder::RequestedSize;
 use super::filters::graphical_sub_preprocess_filters;
 use super::tonemap::overwrite_color_properties_param;
@@ -75,10 +77,22 @@ pub struct StreamPads {
 pub enum SubtitleOverlay<'a> {
     /// No subtitle is being burned in.
     None,
-    /// A text subtitle, already resolved to its `subtitles=…` filter by the
-    /// caller — building it needs the extracted file path, the character set
-    /// and the font directory, all of which are I/O.
-    Text(&'a str),
+    /// A text subtitle. Both `subtitles=…` spellings are supplied by the
+    /// caller, because building either needs the extracted file path, the
+    /// character set and the font directory — all of which are I/O.
+    Text {
+        /// `GetTextSubtitlesFilter(state, enableAlpha: false, enableSub2video:
+        /// false)` — drawn straight onto the video on the software path.
+        plain: &'a str,
+        /// `GetTextSubtitlesFilter(state, enableAlpha: true, enableSub2video:
+        /// true)` — drawn onto a transparent `alphasrc` source so a hardware
+        /// overlay filter can composite it.
+        alpha_sub2video: &'a str,
+        /// Whether the subtitle is ASS/SSA. Those carry their own positioning
+        /// and animation, so the generated source has to run at the video's
+        /// frame rate; anything else is static enough for 10fps.
+        is_ass: bool,
+    },
     /// A bitmap subtitle, with its own dimensions when known.
     Graphical {
         /// The subtitle bitmap's width.
@@ -88,7 +102,20 @@ pub enum SubtitleOverlay<'a> {
     },
 }
 
-/// Everything the software chain reads.
+impl SubtitleOverlay<'_> {
+    /// Whether any subtitle is being burned in. Port of C#'s `hasSubs`.
+    #[must_use]
+    pub fn is_some(self) -> bool {
+        !matches!(self, Self::None)
+    }
+}
+
+/// Everything a filter chain reads about a job.
+///
+/// One struct serves the software chain and all six vendor chains, because the
+/// C# builders all read the same slice of `EncodingJobInfo` — and several of
+/// them fall back to the software chain, so they must be callable with exactly
+/// the same input.
 #[derive(Debug, Clone, Copy)]
 #[allow(
     clippy::struct_excessive_bools,
@@ -96,11 +123,16 @@ pub enum SubtitleOverlay<'a> {
               its job state; grouping them would invent a taxonomy upstream \
               does not have"
 )]
-pub struct SwChainInput<'a> {
+pub struct ChainInput<'a> {
+    /// What the running ffmpeg can do.
+    pub caps: &'a FfmpegCapabilities,
     /// The persisted encoding options.
     pub options: &'a EncodingOptions,
     /// The selected video encoder name.
     pub video_encoder: &'a str,
+    /// The selected hardware decoder arguments, empty for a software decode.
+    /// The chains test it for their vendor's name rather than re-deriving it.
+    pub video_decoder: &'a str,
     /// Source dimensions.
     pub video_width: Option<i32>,
     /// Source dimensions.
@@ -113,24 +145,42 @@ pub struct SwChainInput<'a> {
     pub rotation: Option<i32>,
     /// The source's colour transfer characteristic.
     pub color_transfer: Option<&'a str>,
-    /// Whether the job decodes in software (no hardware decoder was selected).
-    pub is_sw_decoder: bool,
-    /// Whether an H.264/HEVC source is being deinterlaced.
-    pub deinterlace: bool,
     /// The source's reference frame rate, for the deinterlacer's rate choice.
     pub reference_frame_rate: Option<f32>,
+    /// The source's real frame rate, for the generated subtitle source.
+    pub real_frame_rate: Option<f32>,
+    /// The seek position in .NET ticks, which the generated subtitle source
+    /// must start from.
+    pub start_time_ticks: i64,
+    /// Whether an H.264/HEVC source is being deinterlaced.
+    pub deinterlace: bool,
     /// Whether the software tonemap applies (see
     /// [`super::tonemap::is_sw_tonemap_available`]).
-    pub do_tonemap: bool,
-    /// Whether the source is Dolby Vision, which the tonemap reshapes.
+    pub do_sw_tonemap: bool,
+    /// Whether a hardware tonemap applies (see
+    /// [`super::input_args::is_hw_tonemap_available`]).
+    pub do_hw_tonemap: bool,
+    /// Whether the source is Dolby Vision, which the software tonemap reshapes.
     pub is_dovi: bool,
+    /// Whether the source is HEVC Range Extensions, which decodes to a 10-bit
+    /// surface and so changes the hardware scaler's output format.
+    pub is_hevc_rext: bool,
     /// The subtitle to burn in, if any.
     pub subtitle: SubtitleOverlay<'a>,
 }
 
+impl ChainInput<'_> {
+    /// Whether the job decodes in software. Port of
+    /// `string.IsNullOrEmpty(vidDecoder)`.
+    #[must_use]
+    pub fn is_sw_decoder(&self) -> bool {
+        self.video_decoder.is_empty()
+    }
+}
+
 /// The software filter chain. Port of `GetSwVidFilterChain`.
 #[must_use]
-pub fn sw_vid_filter_chain(input: &SwChainInput<'_>) -> FilterChain {
+pub fn sw_vid_filter_chain(input: &ChainInput<'_>) -> FilterChain {
     let options = input.options;
     let encoder = input.video_encoder;
     let is_vaapi_encoder = contains(encoder, "vaapi");
@@ -150,7 +200,7 @@ pub fn sw_vid_filter_chain(input: &SwChainInput<'_>) -> FilterChain {
     // State what colour space the frames are in before anything reads them.
     chain.main.push(overwrite_color_properties_param(
         input.color_transfer,
-        input.do_tonemap,
+        input.do_sw_tonemap,
     ));
 
     if input.deinterlace {
@@ -165,7 +215,7 @@ pub fn sw_vid_filter_chain(input: &SwChainInput<'_>) -> FilterChain {
     // frames back as nv12.
     let out_format = if is_vaapi_encoder {
         "nv12"
-    } else if is_v4l2_encoder || input.is_sw_decoder {
+    } else if is_v4l2_encoder || input.is_sw_decoder() {
         "yuv420p"
     } else {
         "nv12"
@@ -179,7 +229,7 @@ pub fn sw_vid_filter_chain(input: &SwChainInput<'_>) -> FilterChain {
         input.requested,
     ));
 
-    if input.do_tonemap {
+    if input.do_sw_tonemap {
         chain
             .main
             .push(sw_tonemap_filter(options, out_format, input.is_dovi));
@@ -188,10 +238,10 @@ pub fn sw_vid_filter_chain(input: &SwChainInput<'_>) -> FilterChain {
     }
 
     match input.subtitle {
-        SubtitleOverlay::Text(filter) => {
+        SubtitleOverlay::Text { plain, .. } => {
             // A text subtitle is drawn straight onto the video, so it joins the
             // main chain and needs no overlay pass.
-            chain.main.push(filter.to_owned());
+            chain.main.push(plain.to_owned());
         }
         SubtitleOverlay::Graphical { width, height } => {
             chain.sub.push(graphical_sub_preprocess_filters(
@@ -443,13 +493,6 @@ pub fn video_processing_filter_param(
     format!(" -filter_complex \"{graph}\"")
 }
 
-/// `string.Contains(x, StringComparison.OrdinalIgnoreCase)`.
-fn contains(haystack: &str, needle: &str) -> bool {
-    haystack
-        .to_ascii_lowercase()
-        .contains(&needle.to_ascii_lowercase())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -467,8 +510,23 @@ mod tests {
         }
     }
 
-    fn base_input<'a>(options: &'a EncodingOptions, encoder: &'a str) -> SwChainInput<'a> {
-        SwChainInput {
+    /// A build carrying every filter. The software chain reads nothing from it
+    /// — the field exists on [`ChainInput`] so the vendor chains, which do
+    /// probe for their filters, can share one input struct with it.
+    fn caps() -> FfmpegCapabilities {
+        FfmpegCapabilities::builder()
+            .filters(crate::encoder::REQUIRED_FILTERS)
+            .all_filter_options(true)
+            .build()
+    }
+
+    fn base_input<'a>(
+        caps: &'a FfmpegCapabilities,
+        options: &'a EncodingOptions,
+        encoder: &'a str,
+    ) -> ChainInput<'a> {
+        ChainInput {
+            caps,
             options,
             video_encoder: encoder,
             video_width: Some(1920),
@@ -477,11 +535,15 @@ mod tests {
             three_d_format: None,
             rotation: None,
             color_transfer: None,
-            is_sw_decoder: true,
-            deinterlace: false,
+            video_decoder: "",
             reference_frame_rate: Some(25.0),
-            do_tonemap: false,
+            real_frame_rate: Some(25.0),
+            start_time_ticks: 0,
+            deinterlace: false,
+            do_sw_tonemap: false,
+            do_hw_tonemap: false,
             is_dovi: false,
+            is_hevc_rext: false,
             subtitle: SubtitleOverlay::None,
         }
     }
@@ -731,7 +793,8 @@ scale=1280:trunc(1280/dar/2)*2"
     #[test]
     fn the_plain_chain_states_the_colour_space_and_the_output_format() {
         let options = EncodingOptions::default();
-        let chain = sw_vid_filter_chain(&base_input(&options, "libx264"));
+        let caps = caps();
+        let chain = sw_vid_filter_chain(&base_input(&caps, &options, "libx264"));
         assert_eq!(
             chain.main,
             vec![
@@ -757,8 +820,9 @@ scale=1280:trunc(1280/dar/2)*2"
         #[case] expected: &str,
     ) {
         let options = EncodingOptions::default();
-        let mut input = base_input(&options, encoder);
-        input.is_sw_decoder = is_sw_decoder;
+        let caps = caps();
+        let mut input = base_input(&caps, &options, encoder);
+        input.video_decoder = if is_sw_decoder { "" } else { " -hwaccel cuda" };
         let chain = sw_vid_filter_chain(&input);
         assert!(
             chain.main.contains(&expected.to_owned()),
@@ -772,7 +836,8 @@ scale=1280:trunc(1280/dar/2)*2"
         // The scaler sees the frame the source declares, which for a rotated
         // source is the transpose of what will be displayed.
         let options = EncodingOptions::default();
-        let mut input = base_input(&options, "libx264");
+        let caps = caps();
+        let mut input = base_input(&caps, &options, "libx264");
         input.rotation = Some(90);
         input.subtitle = SubtitleOverlay::Graphical {
             width: Some(1920),
@@ -807,8 +872,13 @@ scale=1280:trunc(1280/dar/2)*2"
     #[test]
     fn a_text_subtitle_joins_the_main_chain_with_no_overlay_pass() {
         let options = EncodingOptions::default();
-        let mut input = base_input(&options, "libx264");
-        input.subtitle = SubtitleOverlay::Text("subtitles=f='/media/a.ass'");
+        let caps = caps();
+        let mut input = base_input(&caps, &options, "libx264");
+        input.subtitle = SubtitleOverlay::Text {
+            plain: "subtitles=f='/media/a.ass'",
+            alpha_sub2video: "subtitles=f='/media/a.ass':alpha=1:sub2video=1",
+            is_ass: true,
+        };
         let chain = sw_vid_filter_chain(&input);
         assert_eq!(chain.main.last().unwrap(), "subtitles=f='/media/a.ass'");
         assert!(chain.sub.is_empty());
@@ -818,7 +888,8 @@ scale=1280:trunc(1280/dar/2)*2"
     #[test]
     fn a_graphical_subtitle_gets_its_own_chain_and_an_overlay() {
         let options = EncodingOptions::default();
-        let mut input = base_input(&options, "libx264");
+        let caps = caps();
+        let mut input = base_input(&caps, &options, "libx264");
         input.subtitle = SubtitleOverlay::Graphical {
             width: Some(1920),
             height: Some(1080),
@@ -833,7 +904,8 @@ scale=1280:trunc(1280/dar/2)*2"
     #[test]
     fn deinterlacing_is_inserted_before_the_scale() {
         let options = EncodingOptions::default();
-        let mut input = base_input(&options, "libx264");
+        let caps = caps();
+        let mut input = base_input(&caps, &options, "libx264");
         input.deinterlace = true;
         let chain = sw_vid_filter_chain(&input);
         assert_eq!(chain.main[1], "yadif=0:-1:0");
@@ -842,8 +914,9 @@ scale=1280:trunc(1280/dar/2)*2"
     #[test]
     fn tonemapping_replaces_the_plain_format_filter() {
         let options = EncodingOptions::default();
-        let mut input = base_input(&options, "libx264");
-        input.do_tonemap = true;
+        let caps = caps();
+        let mut input = base_input(&caps, &options, "libx264");
+        input.do_sw_tonemap = true;
         let chain = sw_vid_filter_chain(&input);
         assert!(!chain.main.iter().any(|f| f == "format=yuv420p"));
         assert_eq!(
@@ -859,10 +932,11 @@ scale=1280:trunc(1280/dar/2)*2"
         // `tonemapx` needs yuv420p10 input to reshape a DV stream, so the
         // format is forced even when the rest of the chain would use nv12.
         let options = EncodingOptions::default();
-        let mut input = base_input(&options, "libx264");
-        input.do_tonemap = true;
+        let caps = caps();
+        let mut input = base_input(&caps, &options, "libx264");
+        input.do_sw_tonemap = true;
         input.is_dovi = true;
-        input.is_sw_decoder = false; // would otherwise be nv12
+        input.video_decoder = " -hwaccel cuda"; // would otherwise be nv12
         let chain = sw_vid_filter_chain(&input);
         assert!(
             chain.main.last().unwrap().ends_with("format=yuv420p"),
@@ -879,8 +953,9 @@ scale=1280:trunc(1280/dar/2)*2"
             tonemapping_range: TonemappingRange::tv,
             ..EncodingOptions::default()
         };
-        let mut input = base_input(&options, "libx264");
-        input.do_tonemap = true;
+        let caps = caps();
+        let mut input = base_input(&caps, &options, "libx264");
+        input.do_sw_tonemap = true;
         let chain = sw_vid_filter_chain(&input);
         let filter = chain.main.last().unwrap();
         assert!(filter.contains("tonemap=reinhard"), "{filter}");
