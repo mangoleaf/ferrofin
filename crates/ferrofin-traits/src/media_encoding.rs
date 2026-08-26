@@ -207,14 +207,14 @@ fn _assert_object_safe_media_encoder(_: &dyn MediaEncoder) {}
 /// trickplay manager in `ferrofin-core` can depend on exactly this capability.
 #[async_trait]
 pub trait TrickplayFrameExtractor: Send + Sync {
-    /// Extracts one thumbnail every `interval_ms` milliseconds from
-    /// `input_path`, scaled to at most `max_width` (forced even) pixels wide
-    /// with the display aspect ratio preserved, writing numbered JPEGs into
-    /// `output_dir` (created if absent) and returning their paths sorted by
-    /// file name.
+    /// Extracts one thumbnail every `interval_ms` milliseconds, scaled to at
+    /// most `max_width` (forced even) pixels wide with the display aspect
+    /// ratio preserved, writing numbered JPEGs into the request's output
+    /// directory and returning their paths sorted by file name.
     ///
-    /// `qscale` is the ffmpeg `-qscale:v` quality (1 best – 31 worst, clamped);
-    /// `threads` is the ffmpeg thread count (`0` lets ffmpeg decide).
+    /// Takes the hardware path when the request allows it, the configured
+    /// accelerator has a ported filter chain, and a video stream is available
+    /// to size it from; otherwise the software path.
     ///
     /// # Errors
     ///
@@ -222,13 +222,44 @@ pub trait TrickplayFrameExtractor: Send + Sync {
     /// frames, or when `interval_ms`/`max_width` are not positive.
     async fn extract_trickplay_frames(
         &self,
-        input_path: &str,
-        interval_ms: i32,
-        max_width: i32,
-        qscale: i32,
-        threads: i32,
-        output_dir: &str,
+        request: &TrickplayExtraction<'_>,
     ) -> Result<Vec<String>, ServiceError>;
+}
+
+/// One trickplay extraction run, as the extractor reads it.
+///
+/// Mirrors the parameter list of `MediaEncoder.ExtractVideoImagesOnInterval\
+/// Accelerated`. The `video_stream` is what makes hardware possible: choosing
+/// a decoder needs the codec, and a hardware scaler takes fixed pixel sizes,
+/// so an anamorphic source has to be un-stretched from its aspect ratio first.
+/// Without it the extractor can only take the software path.
+#[derive(Debug, Clone, Copy)]
+pub struct TrickplayExtraction<'a> {
+    /// The source media path.
+    pub input_path: &'a str,
+    /// The source video stream, or `None` when the item has none recorded —
+    /// which forces the software path.
+    pub video_stream: Option<&'a MediaStream>,
+    /// Milliseconds between thumbnails.
+    pub interval_ms: i32,
+    /// The thumbnail width bound in pixels, forced even, aspect preserved.
+    pub max_width: i32,
+    /// The ffmpeg `-qscale:v` quality, 1 (best) to 31 (worst), clamped.
+    pub qscale: i32,
+    /// The ffmpeg thread count; `0` lets ffmpeg decide.
+    pub threads: i32,
+    /// Where the numbered JPEGs are written; created if absent.
+    pub output_dir: &'a str,
+    /// `TrickplayOptions.EnableHwAcceleration` — the trickplay-specific
+    /// hardware switch, separate from the playback encoding options.
+    pub allow_hw_accel: bool,
+    /// `TrickplayOptions.EnableHwEncoding` — whether the MJPEG encoder may be
+    /// a hardware one. Independent of `allow_hw_accel`.
+    pub enable_hw_encoding: bool,
+    /// `TrickplayOptions.EnableKeyFrameOnlyExtraction` — decode keyframes
+    /// only. Most of the speedup, and the one thing that can fail on a file
+    /// with a broken keyframe index; the extractor retries without it.
+    pub keyframe_only: bool,
 }
 
 /// Compile-time assertion that [`TrickplayFrameExtractor`] is object-safe.

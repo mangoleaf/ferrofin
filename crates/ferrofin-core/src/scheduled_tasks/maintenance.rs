@@ -1342,12 +1342,7 @@ mod tests {
         impl TrickplayFrameExtractor for NoExtract {
             async fn extract_trickplay_frames(
                 &self,
-                _input_path: &str,
-                _interval_ms: i32,
-                _max_width: i32,
-                _qscale: i32,
-                _threads: i32,
-                _output_dir: &str,
+                _request: &ferrofin_traits::media_encoding::TrickplayExtraction<'_>,
             ) -> Result<Vec<String>, ServiceError> {
                 unimplemented!("not used")
             }
@@ -1362,9 +1357,10 @@ mod tests {
             Arc::new(crate::FerrofinPathManager::new(app_paths)),
             config,
             Arc::new(crate::FerrofinItemRepository::new(
-                db,
+                db.clone(),
                 Arc::new(crate::ItemTypeLookup::new()),
             )),
+            Arc::new(crate::FerrofinMediaStreamRepository::new(db)),
             Arc::new(NoExtract),
             Arc::new(ferrofin_drawing::ImageCrateEncoder::new()),
         ));

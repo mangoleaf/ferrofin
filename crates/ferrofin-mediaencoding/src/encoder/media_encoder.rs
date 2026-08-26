@@ -27,7 +27,7 @@ use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::media_encoding::{MediaEncoder, MediaInfoRequest};
 
 use super::encoding_utils::get_input_argument;
-use super::{FfmpegVersion, Transcoder};
+use super::{FfmpegVersion, ProcessOutput, Transcoder};
 use crate::probing::dtos::InternalMediaInfoResult;
 use crate::probing::localization::PassthroughLocalization;
 use crate::probing::probe_result_normalizer::ProbeResultNormalizer;
@@ -333,8 +333,9 @@ impl<T: Transcoder> MediaEncoder for MediaEncoderImpl<T> {
         let probe = self.probe_path();
         let output = self
             .transcoder
-            .get_process_output(&probe, &args, false, None)
+            .get_process_output(&probe, &args, false, None, &[])
             .await
+            .map(ProcessOutput::into_output)
             .map_err(MediaEncodingError::process)?;
 
         let data = Self::parse_probe(&output)?;
@@ -371,8 +372,9 @@ impl<T: Transcoder> MediaEncoder for MediaEncoderImpl<T> {
         );
         let ffmpeg = self.encoder_path();
         self.transcoder
-            .get_process_output(&ffmpeg, &args, true, None)
+            .get_process_output(&ffmpeg, &args, true, None, &[])
             .await
+            .map(ProcessOutput::into_output)
             .map_err(MediaEncodingError::process)?;
         Ok(output_path)
     }
@@ -435,8 +437,9 @@ impl<T: Transcoder> MediaEncoder for MediaEncoderImpl<T> {
         let ffmpeg = self.encoder_path();
         let stderr = self
             .transcoder
-            .get_process_output(&ffmpeg, &args, true, None)
+            .get_process_output(&ffmpeg, &args, true, None, &[])
             .await
+            .map(ProcessOutput::into_output)
             .map_err(MediaEncodingError::process)?;
         // The process runner mirrors the C# `GetProcessOutput` and ignores the
         // exit code, so a failed ffmpeg (unreadable input, no frame at the
@@ -491,7 +494,7 @@ impl<T: Transcoder> MediaEncoder for MediaEncoderImpl<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::FfmpegVersion;
+    use super::{FfmpegVersion, ProcessOutput};
     use ferrofin_model::entities::Video3DFormat;
     use rstest::rstest;
 
@@ -516,8 +519,12 @@ mod tests {
             _arguments: &str,
             _read_stderr: bool,
             _test_key: Option<&str>,
-        ) -> Result<String, String> {
-            Ok(String::new())
+            _env: &[(String, String)],
+        ) -> Result<ProcessOutput, String> {
+            Ok(ProcessOutput {
+                output: String::new(),
+                success: true,
+            })
         }
 
         async fn get_process_exit_code(&self, _path: &str, _arguments: &str) -> bool {
@@ -650,13 +657,17 @@ mod tests {
             arguments: &str,
             _read_stderr: bool,
             _test_key: Option<&str>,
-        ) -> Result<String, String> {
+            _env: &[(String, String)],
+        ) -> Result<ProcessOutput, String> {
             let out = arguments
                 .rsplit('"')
                 .nth(1)
                 .expect("quoted output path is the last argument");
             std::fs::write(out, b"jpg").expect("write frame");
-            Ok(String::new())
+            Ok(ProcessOutput {
+                output: String::new(),
+                success: true,
+            })
         }
 
         async fn get_process_exit_code(&self, _path: &str, _arguments: &str) -> bool {

@@ -10,18 +10,15 @@
 //!
 //! The **hardware** path is [`build_accelerated_trickplay_args`], a port of the
 //! rest of the same C# function: it runs the synthetic MJPEG job through the
-//! hardware matrix in [`crate::encoding_helper::hw`]. It is not yet reachable
-//! from [`TrickplayFrameExtractorImpl`] — the [`TrickplayFrameExtractor`] trait
-//! carries width and height where the hardware path needs the whole
-//! [`MediaStream`] (codec, DAR, interlacing) to pick a decoder. Widening that
-//! trait and the trickplay manager's refresh context is the named work item
-//! that lands it; see `brain/plans/PLAN_HWACCEL.md`.
+//! hardware matrix in [`crate::encoding_helper::hw`]. It is chosen per job when
+//! the request allows hardware, the configured accelerator has a ported filter
+//! chain, and a video stream is available to size it from — otherwise the
+//! software path, which is also where a failed keyframe-only run retries.
 //!
-//! The same widening owes the **software** path two things it cannot express
-//! today: `TrickplayOptions.EnableKeyFrameOnlyExtraction` (the builder takes
-//! it, the trait impl can only pass `false`), and upstream's retry — an ffmpeg
-//! failure with `-skip_frame nokey` is retried once without it, because a file
-//! with a broken keyframe index fails only that way.
+//! The three switches come from `TrickplayOptions`, **not** from the playback
+//! encoding options: an operator can run playback on a GPU and trickplay on the
+//! CPU, or the reverse. Reading the wrong one is how a setting silently stops
+//! meaning anything, so the request carries them explicitly.
 //!
 //! Departures from the C# (documented per the port rules):
 //! - The `fps=` filter is emitted unconditionally. Upstream routes the
@@ -50,8 +47,9 @@ use async_trait::async_trait;
 use ferrofin_model::configuration::EncodingOptions;
 use ferrofin_model::entities::HardwareAccelerationType;
 use ferrofin_model::entities_media::MediaStream;
+use ferrofin_traits::configuration::ServerConfigurationManager;
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::media_encoding::TrickplayFrameExtractor;
+use ferrofin_traits::media_encoding::{TrickplayExtraction, TrickplayFrameExtractor};
 
 use super::Transcoder;
 
@@ -62,6 +60,8 @@ pub struct TrickplayFrameExtractorImpl<T: Transcoder> {
     transcoder: Arc<T>,
     ffmpeg_path: String,
     ffmpeg_version: Option<FfmpegVersion>,
+    caps: Arc<FfmpegCapabilities>,
+    config: Option<Arc<dyn ServerConfigurationManager>>,
 }
 
 impl<T: Transcoder> std::fmt::Debug for TrickplayFrameExtractorImpl<T> {
@@ -74,11 +74,16 @@ impl<T: Transcoder> std::fmt::Debug for TrickplayFrameExtractorImpl<T> {
 }
 
 impl<T: Transcoder> TrickplayFrameExtractorImpl<T> {
-    /// Creates an extractor spawning `ffmpeg_path` through `transcoder`.
+    /// Creates a **software-only** extractor spawning `ffmpeg_path` through
+    /// `transcoder`.
     ///
     /// `ffmpeg_version` is the probed version, which decides `-fps_mode` versus
     /// the deprecated `-vsync`; `None` means "unprobed" and takes the
     /// conservative `-vsync`, which every supported build still understands.
+    ///
+    /// Without capabilities and a configuration handle there is nothing to
+    /// build a hardware pipeline from, so every job takes the software path.
+    /// Use [`Self::with_hardware`] to enable the accelerated one.
     pub fn new(
         transcoder: Arc<T>,
         ffmpeg_path: impl Into<String>,
@@ -88,6 +93,53 @@ impl<T: Transcoder> TrickplayFrameExtractorImpl<T> {
             transcoder,
             ffmpeg_path: ffmpeg_path.into(),
             ffmpeg_version,
+            caps: Arc::new(FfmpegCapabilities::default()),
+            config: None,
+        }
+    }
+
+    /// Enables the hardware path, using `caps` (the startup probe) and reading
+    /// [`EncodingOptions`] from `config` on **every** job.
+    ///
+    /// Read per job, not captured: the encoding options are runtime-mutable
+    /// from the dashboard, so an operator who switches accelerator mid-scan
+    /// must not have the old choice baked into this extractor. Upstream reads
+    /// them the same way, inside `ExtractVideoImagesOnIntervalAccelerated`.
+    #[must_use]
+    pub fn with_hardware(
+        mut self,
+        caps: Arc<FfmpegCapabilities>,
+        config: Arc<dyn ServerConfigurationManager>,
+    ) -> Self {
+        // The probed capabilities carry the ffmpeg version, so adopt it and
+        // keep one source. Otherwise a hardware run and its software retry can
+        // disagree about `-fps_mode` versus `-vsync` inside the same job.
+        if let Some(version) = caps.ffmpeg_version() {
+            self.ffmpeg_version = Some(version);
+        }
+        self.caps = caps;
+        self.config = Some(config);
+        self
+    }
+
+    /// The encoding options to plan against, or `None` when this extractor was
+    /// built without a configuration handle (software only).
+    async fn encoding_options(&self) -> Option<EncodingOptions> {
+        let config = self.config.as_ref()?;
+        match config.get_encoding_options().await {
+            Ok(options) => Some(options),
+            Err(e) => {
+                // Debug, not warn: this runs once per (item x width), so a
+                // malformed `encoding.json` would otherwise emit one warning
+                // per job for a whole library pass. LOGGING.md forbids a level
+                // above `debug` whose volume scales with library size.
+                //
+                // Failing the job would be worse than degrading: trickplay
+                // must not stop because a config file cannot be parsed, and
+                // the software path needs none of it.
+                tracing::debug!("cannot read encoding options for trickplay: {e}");
+                None
+            }
         }
     }
 }
@@ -497,67 +549,219 @@ fn jpg_files_sorted(dir: &Path) -> Result<Vec<String>, ServiceError> {
 impl<T: Transcoder> TrickplayFrameExtractor for TrickplayFrameExtractorImpl<T> {
     async fn extract_trickplay_frames(
         &self,
-        input_path: &str,
-        interval_ms: i32,
-        max_width: i32,
-        qscale: i32,
-        threads: i32,
-        output_dir: &str,
+        request: &TrickplayExtraction<'_>,
     ) -> Result<Vec<String>, ServiceError> {
-        if interval_ms <= 0 {
+        if request.interval_ms <= 0 {
             return Err(ServiceError::invalid_input(
                 "trickplay interval must be positive",
             ));
         }
-        if max_width <= 0 {
+        if request.max_width <= 0 {
             return Err(ServiceError::invalid_input(
                 "trickplay width must be positive",
             ));
         }
 
-        let dir = Path::new(output_dir);
+        let dir = Path::new(request.output_dir);
         std::fs::create_dir_all(dir).map_err(|e| {
-            MediaEncodingError::io(format!("cannot create frame directory {output_dir}"), e)
+            MediaEncodingError::io(
+                format!("cannot create frame directory {}", request.output_dir),
+                e,
+            )
         })?;
-
         let output_pattern = dir.join("%08d.jpg");
-        let args = build_trickplay_args(
-            input_path,
-            interval_ms,
-            max_width,
-            qscale,
-            threads,
-            &output_pattern.to_string_lossy(),
-            self.ffmpeg_version,
-            // The trait carries no trickplay options, so keyframe-only
-            // extraction cannot be requested here yet -- the named work item
-            // in this module's docs is what makes it expressible.
-            false,
-        );
+        let output_pattern = output_pattern.to_string_lossy();
 
-        // The Transcoder seam captures output regardless of exit status, so
-        // failure is detected by an empty frame directory; stderr (read here)
-        // carries ffmpeg's error text for the diagnostic.
-        let stderr = self
-            .transcoder
-            .get_process_output(&self.ffmpeg_path, &args, true, None)
-            .await
-            .map_err(MediaEncodingError::process)?;
-
-        let frames = jpg_files_sorted(dir)?;
-        if frames.is_empty() {
-            return Err(ServiceError::backend(format!(
-                "ffmpeg produced no trickplay frames for {input_path}: {}",
-                stderr.trim()
-            )));
+        let plan = self.plan(request, &output_pattern).await;
+        let first = self.run(&plan).await?;
+        if let Some(frames) = Self::frames_of(dir, &first)? {
+            return Ok(frames);
         }
-        Ok(frames)
+
+        // Upstream retries when the keyframe-only run fails, with the *same*
+        // input, filter and encoder arguments minus `-skip_frame nokey` — a
+        // hardware job retries on hardware. A file whose keyframe index is
+        // broken fails only that way, and decoding every frame still works.
+        if request.keyframe_only {
+            tracing::warn!(
+                path = request.input_path,
+                "I-frame trickplay extraction failed, retrying the standard way: {}",
+                first.output.trim()
+            );
+            // Upstream discards the failed run's directory and extracts into a
+            // fresh one. The caller owns this directory, so clear it instead:
+            // ffmpeg that dies partway leaves frames behind, and mixing them
+            // with the retry's would splice two decodes into one tile strip.
+            Self::clear_frames(dir)?;
+            let retry = self
+                .plan(
+                    &TrickplayExtraction {
+                        keyframe_only: false,
+                        ..*request
+                    },
+                    &output_pattern,
+                )
+                .await;
+            let second = self.run(&retry).await?;
+            if let Some(frames) = Self::frames_of(dir, &second)? {
+                return Ok(frames);
+            }
+            // The standard run is the one that explains why the file cannot be
+            // read at all; the keyframe-only failure was already logged above.
+            return Err(Self::no_frames(request, &second));
+        }
+
+        Err(Self::no_frames(request, &first))
+    }
+}
+
+/// One resolved ffmpeg invocation: the argument line plus the environment it
+/// has to run under.
+#[derive(Debug)]
+struct ExtractionPlan {
+    args: String,
+    env: Vec<(String, String)>,
+    /// Whether this came from the hardware builder. Recorded when the plan is
+    /// built rather than sniffed back out of the argument string: an
+    /// unknown-vendor VAAPI job is hardware-decoded but carries neither
+    /// `-init_hw_device` nor any environment, so the string does not say.
+    hardware: bool,
+}
+
+impl<T: Transcoder> TrickplayFrameExtractorImpl<T> {
+    /// Chooses the hardware plan when everything it needs is present, and the
+    /// software one otherwise.
+    async fn plan(
+        &self,
+        request: &TrickplayExtraction<'_>,
+        output_pattern: &str,
+    ) -> ExtractionPlan {
+        if request.allow_hw_accel
+            && let Some(stream) = request.video_stream
+            && let Some(options) = self.encoding_options().await
+            && let Some((args, env)) = build_accelerated_trickplay_args(
+                &self.caps,
+                &options,
+                &TrickplayJob {
+                    input_path: request.input_path,
+                    stream,
+                    interval_ms: request.interval_ms,
+                    max_width: request.max_width,
+                    qscale: request.qscale,
+                    threads: request.threads,
+                    output_pattern,
+                    allow_hw_accel: request.allow_hw_accel,
+                    enable_hw_encoding: request.enable_hw_encoding,
+                    keyframe_only: request.keyframe_only,
+                },
+            )
+        {
+            return ExtractionPlan {
+                args,
+                env,
+                hardware: true,
+            };
+        }
+        self.software_plan(request, output_pattern)
+    }
+
+    /// The software plan, which needs nothing probed.
+    fn software_plan(
+        &self,
+        request: &TrickplayExtraction<'_>,
+        output_pattern: &str,
+    ) -> ExtractionPlan {
+        ExtractionPlan {
+            args: build_trickplay_args(
+                request.input_path,
+                request.interval_ms,
+                request.max_width,
+                request.qscale,
+                request.threads,
+                output_pattern,
+                self.ffmpeg_version,
+                request.keyframe_only,
+            ),
+            env: Vec::new(),
+            hardware: false,
+        }
+    }
+
+    /// The frames a finished run produced, or `None` if it did not succeed.
+    ///
+    /// Both halves matter. Upstream keys on `!ranToCompletion || ExitCode != 0`
+    /// and notes in its own comment that a failed ffmpeg is *not* guaranteed to
+    /// leave the directory empty — so a non-zero exit with frames on disk is a
+    /// truncated extraction, not a success, and treating it as one would splice
+    /// a half-decoded strip into the scrub bar with nothing logged.
+    fn frames_of(
+        dir: &Path,
+        run: &crate::encoder::ProcessOutput,
+    ) -> Result<Option<Vec<String>>, ServiceError> {
+        if !run.success {
+            return Ok(None);
+        }
+        let frames = jpg_files_sorted(dir)?;
+        Ok((!frames.is_empty()).then_some(frames))
+    }
+
+    /// Removes the JPEGs a failed run left behind, before a retry reuses the
+    /// directory.
+    fn clear_frames(dir: &Path) -> Result<(), ServiceError> {
+        for frame in jpg_files_sorted(dir)? {
+            if let Err(e) = std::fs::remove_file(&frame) {
+                return Err(MediaEncodingError::io(
+                    format!("cannot clear partial trickplay frame {frame}"),
+                    e,
+                )
+                .into());
+            }
+        }
+        Ok(())
+    }
+
+    /// The error for a run that produced nothing usable.
+    fn no_frames(
+        request: &TrickplayExtraction<'_>,
+        run: &crate::encoder::ProcessOutput,
+    ) -> ServiceError {
+        ServiceError::backend(format!(
+            "ffmpeg produced no trickplay frames for {}: {}",
+            request.input_path,
+            run.output.trim()
+        ))
+    }
+
+    /// Runs one plan, returning its captured stderr and exit status.
+    async fn run(
+        &self,
+        plan: &ExtractionPlan,
+    ) -> Result<crate::encoder::ProcessOutput, ServiceError> {
+        // The same convention the transcode manager follows: at debug, the
+        // exact argument line. Whether a job took the hardware path is
+        // otherwise invisible from the outside -- a software fallback and a
+        // GPU run produce the same JPEGs, just at different speeds.
+        tracing::debug!(
+            ffmpeg_args = %plan.args,
+            hardware = plan.hardware,
+            "trickplay ffmpeg arguments"
+        );
+        self.transcoder
+            .get_process_output(&self.ffmpeg_path, &plan.args, true, None, &plan.env)
+            .await
+            .map_err(|e| MediaEncodingError::process(e).into())
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::jpg_files_sorted;
+    use super::{
+        EncodingOptions, HardwareAccelerationType, MediaStream, ServerConfigurationManager,
+        ServiceError, TrickplayExtraction,
+    };
     use crate::encoder::FfmpegVersion;
+    use crate::encoder::ProcessOutput;
     use std::sync::Arc;
     use std::sync::Mutex;
 
@@ -571,21 +775,39 @@ mod tests {
     /// given frame files by touching them in the parsed output directory.
     struct RecordingTranscoder {
         args: Mutex<Vec<String>>,
+        env: Mutex<Vec<Vec<(String, String)>>>,
         frames_to_write: usize,
         stderr: String,
+        /// Whether the fake ffmpeg exits `0`. Independent of how many frames
+        /// it wrote, because that is the case that matters: ffmpeg dying
+        /// partway exits non-zero **with** frames already on disk.
+        exit_ok: bool,
     }
 
     impl RecordingTranscoder {
         fn new(frames_to_write: usize, stderr: &str) -> Self {
             Self {
                 args: Mutex::new(Vec::new()),
+                env: Mutex::new(Vec::new()),
                 frames_to_write,
                 stderr: stderr.to_owned(),
+                exit_ok: true,
             }
+        }
+
+        /// The same fake, but the process exits non-zero.
+        fn failing(mut self) -> Self {
+            self.exit_ok = false;
+            self
         }
 
         fn recorded(&self) -> Vec<String> {
             self.args.lock().expect("args lock").clone()
+        }
+
+        /// The environment each recorded run was given.
+        fn recorded_env(&self) -> Vec<Vec<(String, String)>> {
+            self.env.lock().expect("env lock").clone()
         }
     }
 
@@ -597,11 +819,13 @@ mod tests {
             arguments: &str,
             _read_stderr: bool,
             _test_key: Option<&str>,
-        ) -> Result<String, String> {
+            env: &[(String, String)],
+        ) -> Result<ProcessOutput, String> {
             self.args
                 .lock()
                 .expect("args lock")
                 .push(arguments.to_owned());
+            self.env.lock().expect("env lock").push(env.to_vec());
             // Recover the output dir from the trailing `"{dir}/%08d.jpg"`.
             let pattern = arguments
                 .rsplit('"')
@@ -610,10 +834,15 @@ mod tests {
             let dir = std::path::Path::new(pattern)
                 .parent()
                 .expect("pattern has a parent dir");
+            // A keyframe-only run that writes nothing is how upstream's retry
+            // is triggered; `frames_to_write` of 0 models exactly that.
             for i in 1..=self.frames_to_write {
                 std::fs::write(dir.join(format!("{i:08}.jpg")), b"jpg").expect("write frame");
             }
-            Ok(self.stderr.clone())
+            Ok(ProcessOutput {
+                output: self.stderr.clone(),
+                success: self.exit_ok,
+            })
         }
 
         async fn get_process_exit_code(&self, _path: &str, _arguments: &str) -> bool {
@@ -663,6 +892,22 @@ mod tests {
         assert!(args.contains("-qscale:v 31 "), "high clamp in {args}");
     }
 
+    /// A software-path request: no video stream, hardware switched off.
+    fn request<'a>(input_path: &'a str, output_dir: &'a str) -> TrickplayExtraction<'a> {
+        TrickplayExtraction {
+            input_path,
+            video_stream: None,
+            interval_ms: 10_000,
+            max_width: 320,
+            qscale: 4,
+            threads: 1,
+            output_dir,
+            allow_hw_accel: false,
+            enable_hw_encoding: false,
+            keyframe_only: false,
+        }
+    }
+
     #[tokio::test]
     async fn extraction_returns_sorted_frames() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -671,7 +916,7 @@ mod tests {
         let extractor = TrickplayFrameExtractorImpl::new(Arc::clone(&transcoder), "ffmpeg", None);
 
         let frames = extractor
-            .extract_trickplay_frames("/m/v.mkv", 10_000, 320, 4, 1, &out.to_string_lossy())
+            .extract_trickplay_frames(&request("/m/v.mkv", &out.to_string_lossy()))
             .await
             .expect("frames");
 
@@ -697,10 +942,441 @@ mod tests {
         );
 
         let err = extractor
-            .extract_trickplay_frames("/m/v.mkv", 10_000, 320, 4, 1, &out.to_string_lossy())
+            .extract_trickplay_frames(&request("/m/v.mkv", &out.to_string_lossy()))
             .await
             .expect_err("no frames should error");
         assert!(err.to_string().contains("boom: no such codec"), "{err}");
+    }
+
+    /// A config handle returning fixed encoding options.
+    #[derive(Debug)]
+    struct FixedEncoding(EncodingOptions);
+
+    #[async_trait]
+    impl ServerConfigurationManager for FixedEncoding {
+        async fn get_encoding_options(&self) -> Result<EncodingOptions, ServiceError> {
+            Ok(self.0.clone())
+        }
+
+        // The extractor reads exactly one thing off this trait. The rest are
+        // unreachable here, and saying so is better than inventing plausible
+        // values a future test might accidentally rely on.
+        fn application_paths(&self) -> Arc<dyn ferrofin_traits::system::ServerApplicationPaths> {
+            unimplemented!("trickplay reads only the encoding options")
+        }
+        async fn configuration(
+            &self,
+        ) -> Result<Arc<ferrofin_model::configuration::ServerConfiguration>, ServiceError> {
+            unimplemented!("trickplay reads only the encoding options")
+        }
+        async fn update_configuration(
+            &self,
+            _configuration: &ferrofin_model::configuration::ServerConfiguration,
+        ) -> Result<(), ServiceError> {
+            unimplemented!("trickplay reads only the encoding options")
+        }
+        async fn get_branding(
+            &self,
+        ) -> Result<ferrofin_model::branding::BrandingOptions, ServiceError> {
+            unimplemented!("trickplay reads only the encoding options")
+        }
+        async fn update_branding(
+            &self,
+            _branding: &ferrofin_model::branding::BrandingOptions,
+        ) -> Result<(), ServiceError> {
+            unimplemented!("trickplay reads only the encoding options")
+        }
+    }
+
+    /// The VAAPI-on-Linux extractor the wiring tests run against.
+    fn hardware_extractor(
+        transcoder: Arc<RecordingTranscoder>,
+    ) -> TrickplayFrameExtractorImpl<RecordingTranscoder> {
+        let caps = crate::encoding_helper::hw::FfmpegCapabilities::builder()
+            .platform(crate::encoding_helper::hw::Platform::Linux)
+            .encoders(["mjpeg_vaapi", "mjpeg"])
+            .hwaccels(["vaapi"])
+            .filters(crate::encoder::REQUIRED_FILTERS)
+            .all_filter_options(true)
+            .vaapi_driver(false, true, false)
+            .ffmpeg_version(FfmpegVersion::with_build(7, 0, 1))
+            .build();
+        let options = EncodingOptions {
+            hardware_acceleration_type: HardwareAccelerationType::vaapi,
+            enable_hardware_encoding: true,
+            // See the fixture note in `accelerated_tests`: a real render node
+            // would make this depend on the test machine having a GPU.
+            vaapi_device: Some("/dev/null".to_owned()),
+            hardware_decoding_codecs: vec!["h264".to_owned()],
+            ..EncodingOptions::default()
+        };
+        TrickplayFrameExtractorImpl::new(transcoder, "ffmpeg", None)
+            .with_hardware(Arc::new(caps), Arc::new(FixedEncoding(options)))
+    }
+
+    /// A request that asks for everything the hardware path offers.
+    fn hardware_request<'a>(
+        stream: &'a MediaStream,
+        output_dir: &'a str,
+    ) -> TrickplayExtraction<'a> {
+        TrickplayExtraction {
+            video_stream: Some(stream),
+            allow_hw_accel: true,
+            enable_hw_encoding: true,
+            keyframe_only: true,
+            ..request("/m/v.mkv", output_dir)
+        }
+    }
+
+    fn h264_stream() -> MediaStream {
+        MediaStream {
+            codec: Some("h264".to_owned()),
+            index: 0,
+            stream_type: ferrofin_model::entities::MediaStreamType::Video,
+            pixel_format: Some("yuv420p".to_owned()),
+            width: Some(1920),
+            height: Some(1080),
+            ..MediaStream::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_wired_hardware_job_runs_on_the_gpu() {
+        // The whole point of the wiring: with the trickplay hardware switch on
+        // and a video stream to size from, the extractor must actually spawn
+        // the accelerated command -- not merely be capable of building it.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let out = tmp.path().join("frames");
+        let transcoder = Arc::new(RecordingTranscoder::new(2, ""));
+        let extractor = hardware_extractor(Arc::clone(&transcoder));
+        let stream = h264_stream();
+
+        extractor
+            .extract_trickplay_frames(&hardware_request(&stream, &out.to_string_lossy()))
+            .await
+            .expect("frames");
+
+        let recorded = transcoder.recorded();
+        assert_eq!(recorded.len(), 1, "one run, no retry");
+        assert!(
+            recorded[0].contains("-init_hw_device vaapi=va:"),
+            "{}",
+            recorded[0]
+        );
+        assert!(recorded[0].contains("-c:v mjpeg_vaapi"), "{}", recorded[0]);
+        assert!(recorded[0].contains("-skip_frame nokey"), "{}", recorded[0]);
+    }
+
+    #[tokio::test]
+    async fn the_libva_driver_reaches_the_spawned_child() {
+        // The end-to-end half of the unit golden: building the environment is
+        // useless if the extractor drops it on the way to the process. An
+        // i965 host that loses `LIBVA_DRIVER_NAME` silently runs on iHD.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let out = tmp.path().join("frames");
+        let transcoder = Arc::new(RecordingTranscoder::new(2, ""));
+        let caps = crate::encoding_helper::hw::FfmpegCapabilities::builder()
+            .platform(crate::encoding_helper::hw::Platform::Linux)
+            .encoders(["mjpeg_vaapi", "mjpeg"])
+            .hwaccels(["vaapi"])
+            .filters(crate::encoder::REQUIRED_FILTERS)
+            .all_filter_options(true)
+            .vaapi_driver(false, false, true)
+            .ffmpeg_version(FfmpegVersion::with_build(7, 0, 1))
+            .build();
+        let options = EncodingOptions {
+            hardware_acceleration_type: HardwareAccelerationType::vaapi,
+            enable_hardware_encoding: true,
+            vaapi_device: Some("/dev/null".to_owned()),
+            hardware_decoding_codecs: vec!["h264".to_owned()],
+            ..EncodingOptions::default()
+        };
+        let extractor = TrickplayFrameExtractorImpl::new(Arc::clone(&transcoder), "ffmpeg", None)
+            .with_hardware(Arc::new(caps), Arc::new(FixedEncoding(options)));
+        let stream = h264_stream();
+
+        extractor
+            .extract_trickplay_frames(&hardware_request(&stream, &out.to_string_lossy()))
+            .await
+            .expect("frames");
+
+        let env = transcoder.recorded_env();
+        assert_eq!(env.len(), 1);
+        assert!(
+            env[0].contains(&("LIBVA_DRIVER_NAME".to_owned(), "i965".to_owned())),
+            "{:?}",
+            env[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_job_with_no_video_stream_falls_back_to_software() {
+        // Hardware is allowed, but nothing describes the source, so a decoder
+        // cannot be chosen. Degrading is correct; refusing the job is not.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let out = tmp.path().join("frames");
+        let transcoder = Arc::new(RecordingTranscoder::new(2, ""));
+        let extractor = hardware_extractor(Arc::clone(&transcoder));
+
+        extractor
+            .extract_trickplay_frames(&TrickplayExtraction {
+                allow_hw_accel: true,
+                ..request("/m/v.mkv", &out.to_string_lossy())
+            })
+            .await
+            .expect("frames");
+
+        let recorded = transcoder.recorded();
+        assert!(!recorded[0].contains("-init_hw_device"), "{}", recorded[0]);
+        assert!(recorded[0].contains("-c:v mjpeg "), "{}", recorded[0]);
+    }
+
+    #[tokio::test]
+    async fn the_trickplay_switch_overrides_the_playback_one() {
+        // Playback runs on VAAPI, but trickplay hardware is switched off. The
+        // job must stay on the CPU: these are separate settings and reading
+        // the wrong one is how an operator's choice gets ignored.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let out = tmp.path().join("frames");
+        let transcoder = Arc::new(RecordingTranscoder::new(2, ""));
+        let extractor = hardware_extractor(Arc::clone(&transcoder));
+        let stream = h264_stream();
+
+        extractor
+            .extract_trickplay_frames(&TrickplayExtraction {
+                allow_hw_accel: false,
+                ..hardware_request(&stream, &out.to_string_lossy())
+            })
+            .await
+            .expect("frames");
+
+        assert!(!transcoder.recorded()[0].contains("-init_hw_device"));
+    }
+
+    #[tokio::test]
+    async fn a_broken_keyframe_index_retries_without_skip_frame() {
+        // Upstream's fallback: a file whose keyframe index is broken produces
+        // no frames under `-skip_frame nokey` and only that way, so the same
+        // job is retried once without it before the run is called a failure.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let out = tmp.path().join("frames");
+        let transcoder = Arc::new(RecordingTranscoder::new(0, "no frames decoded").failing());
+        let extractor = hardware_extractor(Arc::clone(&transcoder));
+        let stream = h264_stream();
+
+        let err = extractor
+            .extract_trickplay_frames(&hardware_request(&stream, &out.to_string_lossy()))
+            .await
+            .expect_err("both runs produce nothing");
+
+        let recorded = transcoder.recorded();
+        assert_eq!(recorded.len(), 2, "the retry ran: {recorded:?}");
+        assert!(recorded[0].contains("-skip_frame nokey"), "{}", recorded[0]);
+        assert!(!recorded[1].contains("-skip_frame"), "{}", recorded[1]);
+        // The retry stays on hardware. Upstream passes the same input, filter
+        // and encoder arguments to its second run -- dropping to software here
+        // would quietly give up the GPU on every file with a bad index.
+        assert!(recorded[1].contains("-hwaccel vaapi"), "{}", recorded[1]);
+        assert!(err.to_string().contains("no frames decoded"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_truncated_run_is_a_failure_even_though_it_wrote_frames() {
+        // The case an empty-directory check cannot see: ffmpeg decodes a few
+        // keyframes, dies, and exits non-zero with frames already on disk.
+        // Upstream keys its retry on the exit code and deletes the partial
+        // output; treating "some JPEGs exist" as success would splice a
+        // half-decoded strip into the scrub bar with nothing logged.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let out = tmp.path().join("frames");
+        let transcoder = Arc::new(RecordingTranscoder::new(2, "decoder gave up").failing());
+        let extractor = hardware_extractor(Arc::clone(&transcoder));
+        let stream = h264_stream();
+
+        extractor
+            .extract_trickplay_frames(&hardware_request(&stream, &out.to_string_lossy()))
+            .await
+            .expect_err("a non-zero exit is a failure whatever it wrote");
+
+        assert_eq!(transcoder.recorded().len(), 2, "the retry still ran");
+        // Both runs wrote `00000001.jpg`/`00000002.jpg`; only the retry's
+        // survive, because the first run's were cleared before it started.
+        let frames = jpg_files_sorted(&out).expect("list frames");
+        assert_eq!(frames.len(), 2, "no frames from the failed run remain");
+    }
+
+    #[tokio::test]
+    async fn a_failed_run_without_keyframe_only_does_not_retry() {
+        // Upstream rethrows immediately when keyframe-only was not in play:
+        // there is no second thing to try.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let out = tmp.path().join("frames");
+        let transcoder = Arc::new(RecordingTranscoder::new(0, "bad input").failing());
+        let extractor = hardware_extractor(Arc::clone(&transcoder));
+        let stream = h264_stream();
+
+        extractor
+            .extract_trickplay_frames(&TrickplayExtraction {
+                keyframe_only: false,
+                ..hardware_request(&stream, &out.to_string_lossy())
+            })
+            .await
+            .expect_err("the run failed");
+
+        assert_eq!(transcoder.recorded().len(), 1, "no retry");
+    }
+
+    #[tokio::test]
+    async fn the_reported_error_is_the_standard_runs_not_the_keyframe_one() {
+        // The standard run explains why the file cannot be read at all; the
+        // keyframe-only failure is already known and logged as a warning.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let out = tmp.path().join("frames");
+        let transcoder = Arc::new(RecordingTranscoder::new(0, "second run says why").failing());
+        let extractor = hardware_extractor(Arc::clone(&transcoder));
+        let stream = h264_stream();
+
+        let err = extractor
+            .extract_trickplay_frames(&hardware_request(&stream, &out.to_string_lossy()))
+            .await
+            .expect_err("both runs fail");
+        assert!(err.to_string().contains("second run says why"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn an_accelerator_that_cannot_skip_keyframes_keeps_the_flag_in_software() {
+        // Upstream turns *hardware* off when the decoder cannot skip to
+        // keyframes -- it does not turn keyframe-only off. The software run
+        // must still carry `-skip_frame nokey`.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let out = tmp.path().join("frames");
+        let transcoder = Arc::new(RecordingTranscoder::new(2, ""));
+        let caps = crate::encoding_helper::hw::FfmpegCapabilities::builder()
+            .platform(crate::encoding_helper::hw::Platform::Linux)
+            .encoders(["h264_nvenc", "mjpeg"])
+            .hwaccels(["cuda"])
+            .filters(crate::encoder::REQUIRED_FILTERS)
+            .all_filter_options(true)
+            .ffmpeg_version(FfmpegVersion::with_build(7, 0, 1))
+            .build();
+        let options = EncodingOptions {
+            hardware_acceleration_type: HardwareAccelerationType::nvenc,
+            // The gate: nvenc needs the enhanced decoder to skip to keyframes.
+            enable_enhanced_nvdec_decoder: false,
+            enable_hardware_encoding: true,
+            hardware_decoding_codecs: vec!["h264".to_owned()],
+            ..EncodingOptions::default()
+        };
+        let extractor = TrickplayFrameExtractorImpl::new(Arc::clone(&transcoder), "ffmpeg", None)
+            .with_hardware(Arc::new(caps), Arc::new(FixedEncoding(options)));
+        let stream = h264_stream();
+
+        extractor
+            .extract_trickplay_frames(&hardware_request(&stream, &out.to_string_lossy()))
+            .await
+            .expect("frames");
+
+        let args = &transcoder.recorded()[0];
+        assert!(!args.contains("-init_hw_device"), "software: {args}");
+        assert!(
+            args.contains("-skip_frame nokey"),
+            "keyframe-only kept: {args}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hardware_decode_with_a_software_encoder_is_expressible() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let out = tmp.path().join("frames");
+        let transcoder = Arc::new(RecordingTranscoder::new(2, ""));
+        let extractor = hardware_extractor(Arc::clone(&transcoder));
+        let stream = h264_stream();
+
+        extractor
+            .extract_trickplay_frames(&TrickplayExtraction {
+                enable_hw_encoding: false,
+                ..hardware_request(&stream, &out.to_string_lossy())
+            })
+            .await
+            .expect("frames");
+
+        let args = &transcoder.recorded()[0];
+        assert!(args.contains("-hwaccel vaapi"), "decode on the GPU: {args}");
+        assert!(args.contains("-c:v mjpeg "), "encode on the CPU: {args}");
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_encoding_config_degrades_to_software() {
+        /// A config handle whose encoding options cannot be read.
+        #[derive(Debug)]
+        struct BrokenEncoding;
+
+        #[async_trait]
+        impl ServerConfigurationManager for BrokenEncoding {
+            async fn get_encoding_options(&self) -> Result<EncodingOptions, ServiceError> {
+                Err(ServiceError::backend("encoding.json is not readable"))
+            }
+            fn application_paths(
+                &self,
+            ) -> Arc<dyn ferrofin_traits::system::ServerApplicationPaths> {
+                unimplemented!("trickplay reads only the encoding options")
+            }
+            async fn configuration(
+                &self,
+            ) -> Result<Arc<ferrofin_model::configuration::ServerConfiguration>, ServiceError>
+            {
+                unimplemented!("trickplay reads only the encoding options")
+            }
+            async fn update_configuration(
+                &self,
+                _configuration: &ferrofin_model::configuration::ServerConfiguration,
+            ) -> Result<(), ServiceError> {
+                unimplemented!("trickplay reads only the encoding options")
+            }
+            async fn get_branding(
+                &self,
+            ) -> Result<ferrofin_model::branding::BrandingOptions, ServiceError> {
+                unimplemented!("trickplay reads only the encoding options")
+            }
+            async fn update_branding(
+                &self,
+                _branding: &ferrofin_model::branding::BrandingOptions,
+            ) -> Result<(), ServiceError> {
+                unimplemented!("trickplay reads only the encoding options")
+            }
+        }
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let out = tmp.path().join("frames");
+        let transcoder = Arc::new(RecordingTranscoder::new(2, ""));
+        let caps = crate::encoding_helper::hw::FfmpegCapabilities::default();
+        let extractor = TrickplayFrameExtractorImpl::new(Arc::clone(&transcoder), "ffmpeg", None)
+            .with_hardware(Arc::new(caps), Arc::new(BrokenEncoding));
+        let stream = h264_stream();
+
+        // Trickplay must not die because a config file is unreadable.
+        extractor
+            .extract_trickplay_frames(&hardware_request(&stream, &out.to_string_lossy()))
+            .await
+            .expect("frames");
+        assert!(!transcoder.recorded()[0].contains("-init_hw_device"));
+    }
+
+    #[tokio::test]
+    async fn a_run_that_succeeds_first_time_does_not_retry() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let out = tmp.path().join("frames");
+        let transcoder = Arc::new(RecordingTranscoder::new(3, ""));
+        let extractor = hardware_extractor(Arc::clone(&transcoder));
+        let stream = h264_stream();
+
+        let frames = extractor
+            .extract_trickplay_frames(&hardware_request(&stream, &out.to_string_lossy()))
+            .await
+            .expect("frames");
+
+        assert_eq!(frames.len(), 3);
+        assert_eq!(transcoder.recorded().len(), 1);
     }
 
     #[tokio::test]
@@ -712,13 +1388,19 @@ mod tests {
         );
         assert!(
             extractor
-                .extract_trickplay_frames("/m/v.mkv", 0, 320, 4, 1, "/tmp/x")
+                .extract_trickplay_frames(&TrickplayExtraction {
+                    interval_ms: 0,
+                    ..request("/m/v.mkv", "/tmp/x")
+                })
                 .await
                 .is_err()
         );
         assert!(
             extractor
-                .extract_trickplay_frames("/m/v.mkv", 10_000, 0, 4, 1, "/tmp/x")
+                .extract_trickplay_frames(&TrickplayExtraction {
+                    max_width: 0,
+                    ..request("/m/v.mkv", "/tmp/x")
+                })
                 .await
                 .is_err()
         );

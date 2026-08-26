@@ -27,6 +27,6 @@ pub use encoder_validator::{
 pub use encoding_utils::{get_input_argument, get_input_argument_multi, normalize_path};
 pub use media_encoder::{MediaEncoderConfig, MediaEncoderImpl};
 pub use tokio_transcoder::TokioTranscoder;
-pub use transcoder::Transcoder;
+pub use transcoder::{ProcessOutput, Transcoder};
 pub use trickplay_extractor::TrickplayFrameExtractorImpl;
 pub use version::FfmpegVersion;

@@ -45,18 +45,21 @@ use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_db::entities::playback::TrickplayInfoEntity;
 use ferrofin_db::store::guid_to_db;
 use ferrofin_model::configuration::{LibraryOptions, TrickplayOptions};
+use ferrofin_model::entities::MediaStreamType;
+use ferrofin_model::entities_media::MediaStream;
 use uuid::Uuid;
 
 use ferrofin_traits::configuration::ServerConfigurationManager;
 use ferrofin_traits::drawing::ImageEncoder;
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::media_encoding::TrickplayFrameExtractor;
+use ferrofin_traits::media_encoding::{TrickplayExtraction, TrickplayFrameExtractor};
 use ferrofin_traits::options::ImageCollageOptions;
-use ferrofin_traits::persistence::ItemRepository;
+use ferrofin_traits::persistence::{ItemRepository, MediaStreamQuery, MediaStreamRepository};
 use ferrofin_traits::system::PathManager;
 use ferrofin_traits::trickplay::TrickplayManager;
 
 use crate::db_error::db_err;
+use crate::media_source_manager::stream_to_dto;
 
 /// The number of 100-nanosecond ticks per millisecond
 /// (`TimeSpan.TicksPerMillisecond`).
@@ -74,6 +77,7 @@ pub struct FerrofinTrickplayManager {
     path_manager: Arc<dyn PathManager>,
     config: Arc<dyn ServerConfigurationManager>,
     items: Arc<dyn ItemRepository>,
+    streams: Arc<dyn MediaStreamRepository>,
     frame_extractor: Arc<dyn TrickplayFrameExtractor>,
     image_encoder: Arc<dyn ImageEncoder>,
 }
@@ -95,11 +99,42 @@ struct WidthRefreshContext<'a> {
     media_path: &'a str,
     /// The item's stored video width in pixels, when probed.
     video_width: Option<i64>,
+    /// The item's video stream, when it has one recorded.
+    ///
+    /// Upstream reads `mediaSource.VideoStream`. It is what the hardware
+    /// trickplay path needs and the software one does not: picking a decoder
+    /// needs the codec, and a hardware scaler takes fixed pixel dimensions, so
+    /// an anamorphic source has to be un-stretched from its aspect ratio.
+    video_stream: Option<MediaStream>,
     /// The internal trickplay directory for the item.
     trickplay_dir: &'a str,
 }
 
 impl FerrofinTrickplayManager {
+    /// The item's video stream, or `None` when it has none recorded or the
+    /// lookup fails.
+    ///
+    /// Upstream takes `mediaSource.VideoStream`, which is the item's first
+    /// video stream; the same choice here. A failure is logged and degrades to
+    /// the software path rather than failing the refresh — trickplay without
+    /// hardware is slow, trickplay that errors is absent.
+    async fn video_stream(&self, item_id: Uuid) -> Option<MediaStream> {
+        let query = MediaStreamQuery {
+            item_id,
+            stream_type: Some(MediaStreamType::Video),
+            ..MediaStreamQuery::default()
+        };
+        match self.streams.get_media_streams(&query).await {
+            Ok(rows) => rows.into_iter().next().map(stream_to_dto),
+            Err(e) => {
+                // Debug for the same reason as the encoding-options read: one
+                // line per item across a library pass (LOGGING.md).
+                tracing::debug!(item_id = %item_id, "cannot read video stream for trickplay: {e}");
+                None
+            }
+        }
+    }
+
     /// Creates a trickplay manager over the given database, path manager,
     /// server configuration (for [`TrickplayOptions`]), item repository (media
     /// path/runtime lookup), frame-extraction seam (ffmpeg), and image encoder
@@ -110,6 +145,7 @@ impl FerrofinTrickplayManager {
         path_manager: Arc<dyn PathManager>,
         config: Arc<dyn ServerConfigurationManager>,
         items: Arc<dyn ItemRepository>,
+        streams: Arc<dyn MediaStreamRepository>,
         frame_extractor: Arc<dyn TrickplayFrameExtractor>,
         image_encoder: Arc<dyn ImageEncoder>,
     ) -> Self {
@@ -118,6 +154,7 @@ impl FerrofinTrickplayManager {
             path_manager,
             config,
             items,
+            streams,
             frame_extractor,
             image_encoder,
         }
@@ -260,14 +297,18 @@ impl FerrofinTrickplayManager {
     ) -> Result<(), ServiceError> {
         let images = self
             .frame_extractor
-            .extract_trickplay_frames(
-                ctx.media_path,
-                options.interval,
-                actual_width,
-                options.qscale,
-                options.process_threads,
-                &frames_dir.to_string_lossy(),
-            )
+            .extract_trickplay_frames(&TrickplayExtraction {
+                input_path: ctx.media_path,
+                video_stream: ctx.video_stream.as_ref(),
+                interval_ms: options.interval,
+                max_width: actual_width,
+                qscale: options.qscale,
+                threads: options.process_threads,
+                output_dir: &frames_dir.to_string_lossy(),
+                allow_hw_accel: options.enable_hw_acceleration,
+                enable_hw_encoding: options.enable_hw_encoding,
+                keyframe_only: options.enable_key_frame_only_extraction,
+            })
             .await?;
 
         let mut info = self
@@ -605,6 +646,7 @@ impl TrickplayManager for FerrofinTrickplayManager {
             item_id,
             media_path: &media_path,
             video_width: entity.width,
+            video_stream: self.video_stream(item_id).await,
             trickplay_dir: &trickplay_dir,
         };
         for width in &options.width_resolutions {
@@ -951,6 +993,8 @@ fn move_content(src: &Path, dst: &Path) -> Result<(), ServiceError> {
 
 #[cfg(test)]
 mod tests {
+    use ferrofin_model::entities_media::MediaStream;
+    use ferrofin_traits::media_encoding::TrickplayExtraction;
 
     use ferrofin_db::entities::playback::TrickplayInfoEntity;
     use ferrofin_db::store::guid_to_db;
@@ -1031,6 +1075,9 @@ mod tests {
         frame_height: u32,
         calls: AtomicUsize,
         last_request: Mutex<Option<(i32, i32)>>,
+        /// The video stream the last request carried, which is what decides
+        /// whether the extractor can take the hardware path at all.
+        last_stream: Mutex<Option<MediaStream>>,
     }
 
     impl FakeExtractor {
@@ -1040,6 +1087,7 @@ mod tests {
                 frame_height,
                 calls: AtomicUsize::new(0),
                 last_request: Mutex::new(None),
+                last_stream: Mutex::new(None),
             }
         }
 
@@ -1051,21 +1099,25 @@ mod tests {
         fn last_request(&self) -> Option<(i32, i32)> {
             *self.last_request.lock().expect("lock")
         }
+
+        /// The video stream the last extraction request carried.
+        fn last_stream(&self) -> Option<MediaStream> {
+            self.last_stream.lock().expect("lock").clone()
+        }
     }
 
     #[async_trait]
     impl TrickplayFrameExtractor for FakeExtractor {
         async fn extract_trickplay_frames(
             &self,
-            _input_path: &str,
-            interval_ms: i32,
-            max_width: i32,
-            _qscale: i32,
-            _threads: i32,
-            output_dir: &str,
+            request: &TrickplayExtraction<'_>,
         ) -> Result<Vec<String>, ServiceError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            *self.last_request.lock().expect("lock") = Some((interval_ms, max_width));
+            *self.last_request.lock().expect("lock") =
+                Some((request.interval_ms, request.max_width));
+            *self.last_stream.lock().expect("lock") = request.video_stream.cloned();
+            let output_dir = request.output_dir;
+            let max_width = request.max_width;
             std::fs::create_dir_all(output_dir).expect("create frames dir");
             let width = u32::try_from(max_width).expect("positive width");
             let mut paths = Vec::new();
@@ -1107,6 +1159,7 @@ mod tests {
             Arc::clone(&pm),
             Arc::new(FixedConfig { options }),
             items,
+            Arc::new(crate::FerrofinMediaStreamRepository::new(db.clone())),
             Arc::clone(&extractor) as Arc<dyn TrickplayFrameExtractor>,
             Arc::new(ImageCrateEncoder::new()),
         );
@@ -1223,6 +1276,70 @@ mod tests {
                 .expect("res3")
                 .is_empty()
         );
+    }
+
+    /// Writes a video stream row for `item`, the way a real scan would.
+    async fn seed_video_stream(db: &Database, item: Uuid, codec: &str, dar: Option<&str>) {
+        use ferrofin_traits::persistence::MediaStreamRepository as _;
+        let repo = crate::FerrofinMediaStreamRepository::new(db.clone());
+        let row = ferrofin_db::entities::base_items::MediaStreamInfoEntity {
+            item_id: guid_to_db(item),
+            stream_index: 0,
+            stream_type: crate::db_error::media_stream_type_to_disc(
+                ferrofin_model::entities::MediaStreamType::Video,
+            ),
+            codec: Some(codec.to_owned()),
+            width: Some(1920),
+            height: Some(1080),
+            aspect_ratio: dar.map(str::to_owned),
+            ..Default::default()
+        };
+        repo.save_media_streams(item, std::slice::from_ref(&row))
+            .await
+            .expect("save video stream");
+    }
+
+    #[tokio::test]
+    async fn refresh_hands_the_extractor_the_video_stream() {
+        // The hardware trickplay path cannot exist without this: choosing a
+        // decoder needs the codec, and a hardware scaler takes fixed pixel
+        // sizes, so an anamorphic source has to be un-stretched from its
+        // aspect ratio. Upstream reads `mediaSource.VideoStream`; if this
+        // stops arriving, every job silently falls back to software and the
+        // only symptom is that trickplay is slow.
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        let r = rig(&db, options_2x2(&[320]), FakeExtractor::new(4, 180));
+        seed_video(&db, &r, item, Some(HOUR_TICKS), None).await;
+        seed_video_stream(&db, item, "hevc", Some("16:9")).await;
+
+        r.mgr
+            .refresh_trickplay_data(item, false, &extraction_on())
+            .await
+            .expect("refresh");
+
+        let stream = r.extractor.last_stream().expect("the video stream arrived");
+        assert_eq!(stream.codec.as_deref(), Some("hevc"));
+        assert_eq!(stream.width, Some(1920));
+        assert_eq!(stream.aspect_ratio.as_deref(), Some("16:9"));
+    }
+
+    #[tokio::test]
+    async fn refresh_without_a_video_stream_still_extracts() {
+        // An item whose streams were never probed still gets trickplay, on the
+        // software path. Degrading is correct; failing the refresh is not.
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        let r = rig(&db, options_2x2(&[320]), FakeExtractor::new(4, 180));
+        seed_video(&db, &r, item, Some(HOUR_TICKS), None).await;
+
+        r.mgr
+            .refresh_trickplay_data(item, false, &extraction_on())
+            .await
+            .expect("refresh");
+
+        assert_eq!(r.extractor.calls(), 1);
+        assert!(r.extractor.last_stream().is_none());
     }
 
     #[tokio::test]

@@ -15,7 +15,7 @@ use std::sync::Arc;
 use ferrofin_mediaencoding::{
     EncoderValidator, FfmpegVersion, TokioTranscoder, TrickplayFrameExtractorImpl,
 };
-use ferrofin_traits::media_encoding::TrickplayFrameExtractor as _;
+use ferrofin_traits::media_encoding::{TrickplayExtraction, TrickplayFrameExtractor as _};
 
 /// The version of the `ffmpeg` on `PATH`, probed the way the composition root
 /// probes it.
@@ -31,6 +31,28 @@ fn probed_ffmpeg_version() -> Option<FfmpegVersion> {
         .ok()?;
     EncoderValidator::new("ffmpeg")
         .get_ffmpeg_version_internal(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// A 2 s-interval, 64 px-wide software extraction request.
+///
+/// Hardware is off here deliberately: this test runs on whatever ffmpeg and
+/// whatever GPU (or none) the machine has, so the accelerated path is not
+/// reproducible enough to assert on. The hardware argument builders are
+/// covered by unit goldens; this proves the process spawn and the software
+/// filter chain against a live ffmpeg.
+fn extraction<'a>(input_path: &'a str, output_dir: &'a str) -> TrickplayExtraction<'a> {
+    TrickplayExtraction {
+        input_path,
+        video_stream: None,
+        interval_ms: 2_000,
+        max_width: 64,
+        qscale: 4,
+        threads: 1,
+        output_dir,
+        allow_hw_accel: false,
+        enable_hw_encoding: false,
+        keyframe_only: false,
+    }
 }
 
 /// Whether a program is on `PATH` (via `<prog> -version`).
@@ -102,14 +124,10 @@ async fn extracts_interval_frames_from_a_real_clip() {
 
     // A 6 s clip sampled every 2 s at 64 px max width.
     let frames = extractor
-        .extract_trickplay_frames(
+        .extract_trickplay_frames(&extraction(
             &clip.to_string_lossy(),
-            2_000,
-            64,
-            4,
-            1,
             &out_dir.to_string_lossy(),
-        )
+        ))
         .await
         .expect("frame extraction succeeds");
 
@@ -145,14 +163,10 @@ async fn missing_input_is_an_error() {
     );
 
     let err = extractor
-        .extract_trickplay_frames(
+        .extract_trickplay_frames(&extraction(
             &tmp.path().join("nope.mp4").to_string_lossy(),
-            2_000,
-            64,
-            4,
-            1,
             &out_dir.to_string_lossy(),
-        )
+        ))
         .await
         .expect_err("missing input must fail");
     assert!(
