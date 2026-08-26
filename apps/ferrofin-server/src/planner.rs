@@ -287,12 +287,23 @@ fn split_codecs(param: Option<&str>) -> Vec<String> {
         .collect()
 }
 
-/// Whether the configured accelerator's full pipeline is ported.
+/// Whether the configured accelerator is one Ferrofin supports.
 ///
 /// Naming a vendor encoder is not enough on its own — the filter chain and the
 /// encoder-parameter arms have to exist too, or the job gets an encoder with no
-/// preset, no rate control and no scaler. Only NVENC has all three today;
-/// `PLAN_HWACCEL.md` phases 4-7 add the rest, and each removes itself from here.
+/// preset, no rate control and no scaler, which is worse than the software
+/// transcode it would otherwise have had.
+///
+/// **NVENC, VAAPI and QSV are supported. AMF, VideoToolbox, RKMPP and V4L2M2M
+/// are not**, and that is a project decision rather than a gap waiting to be
+/// filled: their chains cannot be verified without the hardware to run them on,
+/// and shipping an unverified hardware pipeline is how you get silent green
+/// frames. Owner's call, 2026-08-26. Un-supporting path: port the vendor's
+/// chain and its `GetEncoderParam`/`GetVideoBitrateParam` arms, verify on real
+/// hardware, then add it here.
+///
+/// Selecting an unsupported accelerator is safe — the job takes the software
+/// path — but it is not silent; see [`warn_unsupported_accelerator`].
 fn hardware_path_is_ported(options: &EncodingOptions) -> bool {
     matches!(
         options.hardware_acceleration_type,
@@ -300,6 +311,28 @@ fn hardware_path_is_ported(options: &EncodingOptions) -> bool {
             | HardwareAccelerationType::vaapi
             | HardwareAccelerationType::qsv
     )
+}
+
+/// Says once, loudly, that a configured accelerator will not be used.
+///
+/// Without this the operator picks AMF in the dashboard, gets a working but
+/// software transcode, and has nothing to tell them why their GPU is idle —
+/// which is indistinguishable from hardware acceleration being broken.
+fn warn_unsupported_accelerator(options: &EncodingOptions) {
+    use std::sync::OnceLock;
+    static WARNED: OnceLock<()> = OnceLock::new();
+    if options.hardware_acceleration_type == HardwareAccelerationType::none
+        || hardware_path_is_ported(options)
+    {
+        return;
+    }
+    if WARNED.set(()).is_ok() {
+        tracing::warn!(
+            accelerator = ?options.hardware_acceleration_type,
+            "this hardware accelerator is not supported by Ferrofin; transcoding \
+             in software instead. Supported: nvenc, vaapi, qsv."
+        );
+    }
 }
 
 /// Whether hardware transcoding is enabled and the running ffmpeg has an
@@ -1068,6 +1101,7 @@ impl FerrofinStreamStatePlanner {
         // Each vendor's phase removes itself from this gate as its chain and
         // its `GetEncoderParam`/`GetVideoBitrateParam` arms land.
         let hw_ported = hardware_path_is_ported(options);
+        warn_unsupported_accelerator(options);
         // The configured render node, resolved against the filesystem. An
         // absent or unusable path falls through to vendor/kernel pinning
         // rather than emitting a device argument ffmpeg cannot open.
@@ -3469,13 +3503,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unported_accelerator_keeps_the_software_transcode() {
-        // Every accelerator whose chain is not ported yet. Naming its encoder
-        // without the chain behind it gives a vendor encoder with no preset, no
-        // rate control, no scaler and a silently dropped subtitle — strictly
-        // worse than the software transcode these servers have today. Each of
-        // phases 5-7 deletes its own entry here; nvenc and vaapi are gone
-        // because their chains and encoder-parameter arms both landed.
+    async fn an_unsupported_accelerator_keeps_the_software_transcode() {
+        // The accelerators Ferrofin does not support. Naming a vendor encoder
+        // without its chain gives no preset, no rate control, no scaler and a
+        // silently dropped subtitle — strictly worse than the software
+        // transcode these servers get instead. Unsupported by decision, not by
+        // omission: without the hardware to verify them on, an unverified
+        // hardware pipeline is how you ship silent green frames.
         for accel in [
             HardwareAccelerationType::amf,
             HardwareAccelerationType::videotoolbox,

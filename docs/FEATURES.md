@@ -50,6 +50,13 @@ Deep-verified against a real Jellyfin server:
   `Data`-JSON shape so they survive a swap back to Jellyfin.
 - **Playback delivery** — direct play, and **live HLS transcode** including subtitle burn-in
   and fMP4 HEVC/AV1.
+- **Hardware transcoding** — **NVENC, VAAPI and QSV**. Decode, scale, deinterlace, rotate,
+  HDR→SDR tonemap and subtitle compositing all run on the GPU where the driver supports
+  it, with the pipeline chosen from a runtime probe of the device rather than from
+  configuration. NVENC is verified on real hardware; VAAPI and QSV are verified against
+  the upstream argument shapes but **have not yet been run on an Intel or AMD GPU**.
+  **AMF, VideoToolbox, RKMPP and V4L2M2M are not supported** — see the note in
+  `CLAUDE.md`; selecting one falls back to a software transcode and logs a warning.
 - **Live TV** — M3U tuners + XMLTV guide, channels/programs, DB-backed DVR timers &
   recordings. Deep-verified at the API level only — **not yet exercised end-to-end with a
   real tuner/guide by a human**; treat as less battle-tested than the rest of this list.
