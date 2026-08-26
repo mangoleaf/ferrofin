@@ -331,6 +331,7 @@ mod tests {
             do_sw_tonemap: false,
             do_hw_tonemap: false,
             vpp_tonemap_available: false,
+            vulkan_tonemap_available: false,
             source_codec: Some("h264"),
             is_dovi: false,
             is_hevc_rext: false,

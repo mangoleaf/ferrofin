@@ -160,6 +160,13 @@ pub struct ChainInput<'a> {
     /// Whether a hardware tonemap applies (see
     /// [`super::input_args::is_hw_tonemap_available`]).
     pub do_hw_tonemap: bool,
+    /// Whether the Vulkan `libplacebo` tonemap is available (see
+    /// [`super::tonemap::is_vulkan_hw_tonemap_available`]).
+    ///
+    /// A third tonemap flag rather than a shared one because upstream's three
+    /// predicates genuinely differ — the Vulkan one requires a bit depth of
+    /// **exactly** 10, where the others accept 10 or more.
+    pub vulkan_tonemap_available: bool,
     /// Whether Intel's VPP tonemap is available (see
     /// [`super::tonemap::is_intel_vpp_tonemap_available`]).
     ///
@@ -583,6 +590,7 @@ mod tests {
             do_sw_tonemap: false,
             do_hw_tonemap: false,
             vpp_tonemap_available: false,
+            vulkan_tonemap_available: false,
             source_codec: Some("h264"),
             is_dovi: false,
             is_hevc_rext: false,

@@ -127,6 +127,12 @@ pub struct FerrofinStreamStatePlanner {
     /// (jellyfin-ffmpeg builds only). Selects the fast single-pass software
     /// HDR→SDR tonemap over the vanilla zscale chain; probed once at startup.
     supports_tonemapx: bool,
+    /// Resolves the VAAPI device's driver and Vulkan interop on first use.
+    ///
+    /// Built here rather than injected because everything it needs — the
+    /// ffmpeg path and the boot capabilities — is already held, and it is
+    /// pure cache in front of a probe.
+    vaapi_prober: crate::vaapi_probe::VaapiProber,
     /// Resolves item/series/library display names onto the plan's
     /// [`TranscodeDisplayNames`] so transcode logs name what they play.
     /// Optional: `None` (the composition unit test) leaves the names empty —
@@ -158,6 +164,10 @@ impl FerrofinStreamStatePlanner {
         supports_tonemapx: bool,
     ) -> Self {
         Self {
+            vaapi_prober: crate::vaapi_probe::VaapiProber::new(
+                std::path::PathBuf::from(encoder.encoder_path()),
+                encoding_helper.capabilities().clone(),
+            ),
             media_sources,
             encoder,
             encoding_helper,
@@ -284,7 +294,10 @@ fn split_codecs(param: Option<&str>) -> Vec<String> {
 /// preset, no rate control and no scaler. Only NVENC has all three today;
 /// `PLAN_HWACCEL.md` phases 4-7 add the rest, and each removes itself from here.
 fn hardware_path_is_ported(options: &EncodingOptions) -> bool {
-    options.hardware_acceleration_type == HardwareAccelerationType::nvenc
+    matches!(
+        options.hardware_acceleration_type,
+        HardwareAccelerationType::nvenc | HardwareAccelerationType::vaapi
+    )
 }
 
 /// Whether hardware transcoding is enabled and the running ffmpeg has an
@@ -857,6 +870,10 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
         };
 
         // ---- (4) BUILD FFMPEG ARGS (GetCommandLineArguments) ----------------
+        // The VAAPI driver behind the configured render node, probed once per
+        // device path. For every other accelerator this is the boot
+        // capabilities untouched.
+        let probed_caps = self.vaapi_prober.capabilities(&options).await;
         let (arguments, ffmpeg_env) = self.build_arguments(
             &state,
             &media_path,
@@ -866,6 +883,7 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
             &options,
             burn_subtitle_path.as_deref(),
             kind,
+            &probed_caps,
         );
 
         // ---- (5) RETURN the TranscodePlan -----------------------------------
@@ -1002,6 +1020,7 @@ impl FerrofinStreamStatePlanner {
         options: &EncodingOptions,
         burn_subtitle_path: Option<&str>,
         kind: PlaylistKind,
+        probed_caps: &FfmpegCapabilities,
     ) -> (Vec<String>, Vec<(String, String)>) {
         let mut args: Vec<String> = Vec::new();
         let is_event_playlist = kind == PlaylistKind::Event;
@@ -1018,7 +1037,7 @@ impl FerrofinStreamStatePlanner {
         // render-node arguments are VAAPI/QSV territory and unused by the CUDA
         // branch; `PLAN_HWACCEL.md` phase 4 resolves them from the encoding
         // options, which are not readable this early today.
-        let caps = self.encoding_helper.capabilities();
+        let caps = probed_caps;
         let requested = hw::decoder::RequestedSize {
             width: state.base_request.width,
             height: state.base_request.height,
@@ -1047,13 +1066,17 @@ impl FerrofinStreamStatePlanner {
         // Each vendor's phase removes itself from this gate as its chain and
         // its `GetEncoderParam`/`GetVideoBitrateParam` arms land.
         let hw_ported = hardware_path_is_ported(options);
-        let unresolved_node = hw::device_init::RenderNode::new(None, false);
+        // The configured render node, resolved against the filesystem. An
+        // absent or unusable path falls through to vendor/kernel pinning
+        // rather than emitting a device argument ffmpeg cannot open.
+        let render_node = hw::device_init::RenderNode::resolve(options.vaapi_device.as_deref());
+        let qsv_node = hw::device_init::RenderNode::resolve(options.qsv_device.as_deref());
         let hwaccel_input = if hw_ported {
             hw::input_args::input_video_hwaccel_args(
                 &decode_ctx,
                 &video_encoder,
-                unresolved_node,
-                unresolved_node,
+                render_node,
+                qsv_node,
                 state.is_input_video,
             )
         } else {
@@ -1276,6 +1299,10 @@ impl FerrofinStreamStatePlanner {
                 do_hw_tonemap: hw::input_args::is_hw_tonemap_available(&decode_ctx, &video_decoder),
                 // Read by the VAAPI chain only, which prefers Intel's VPP
                 // tonemap and falls back to the OpenCL one.
+                vulkan_tonemap_available: hw::tonemap::is_vulkan_hw_tonemap_available(
+                    options,
+                    video_stream,
+                ),
                 vpp_tonemap_available: hw::tonemap::is_intel_vpp_tonemap_available(
                     caps,
                     options,
@@ -1301,8 +1328,15 @@ impl FerrofinStreamStatePlanner {
                     ferrofin_mediaencoding::encoding_helper::helper::find_index(streams, v)
                 }),
             };
+            // Upstream dispatches `GetVideoProcessingFilterParam` on the
+            // accelerator, and each vendor chain falls back to the software one
+            // itself when its own pipeline cannot run.
+            let vendor_chain = match options.hardware_acceleration_type {
+                HardwareAccelerationType::vaapi => hw::vaapi::vaapi_vid_filter_chain(&chain_input),
+                _ => hw::nvidia::nvidia_vid_filter_chain(&chain_input),
+            };
             hw_graph = hw::sw_chain::video_processing_filter_args(
-                hw::nvidia::nvidia_vid_filter_chain(&chain_input),
+                vendor_chain,
                 self.encoding_helper.framerate_param(state).map(f64::from),
                 pads,
                 burn_sub,
@@ -1358,6 +1392,13 @@ impl FerrofinStreamStatePlanner {
             // the preset, the bitrate (`-b:v`/`-maxrate`/`-bufsize`) and `-r`
             // together, mirroring `GetVideoQualityParam` — pushing any of them
             // again here would hand ffmpeg the same flag twice.
+            // Upstream computes these inside `GetVideoQualityParam`, ahead of
+            // everything else it emits; they are split out because deciding
+            // them needs the concrete capabilities.
+            push_split(
+                &mut args,
+                &hw::quality::hardware_quality_preamble(&decode_ctx, options, &video_encoder),
+            );
             push_split(
                 &mut args,
                 &self.encoding_helper.video_quality_param(
@@ -1803,13 +1844,29 @@ mod tests {
         }
     }
 
+    // The ffmpeg path the planner hands its VAAPI prober. Tests that need a
+    // specific probe result point this at a stub script; everything else
+    // leaves it as `ffmpeg`, which fails to open any render node and so leaves
+    // every VAAPI flag clear.
+    thread_local! {
+        static FAKE_FFMPEG: std::cell::RefCell<String> =
+            const { std::cell::RefCell::new(String::new()) };
+    }
+
     /// A fake [`MediaEncoder`]: only the arg-building methods are exercised.
     struct FakeEncoder;
 
     #[async_trait]
     impl MediaEncoder for FakeEncoder {
         fn encoder_path(&self) -> String {
-            "ffmpeg".to_owned()
+            FAKE_FFMPEG.with(|p| {
+                let p = p.borrow();
+                if p.is_empty() {
+                    "ffmpeg".to_owned()
+                } else {
+                    p.clone()
+                }
+            })
         }
         fn probe_path(&self) -> String {
             "ffprobe".to_owned()
@@ -3412,12 +3469,12 @@ mod tests {
     #[tokio::test]
     async fn an_unported_accelerator_keeps_the_software_transcode() {
         // Every accelerator whose chain is not ported yet. Naming its encoder
-        // without the chain behind it gave a vendor encoder with no preset, no
+        // without the chain behind it gives a vendor encoder with no preset, no
         // rate control, no scaler and a silently dropped subtitle — strictly
         // worse than the software transcode these servers have today. Each of
-        // phases 4-7 deletes its own entry here.
+        // phases 5-7 deletes its own entry here; nvenc and vaapi are gone
+        // because their chains and encoder-parameter arms both landed.
         for accel in [
-            HardwareAccelerationType::vaapi,
             HardwareAccelerationType::qsv,
             HardwareAccelerationType::amf,
             HardwareAccelerationType::videotoolbox,
@@ -3469,6 +3526,121 @@ mod tests {
             assert!(!args.contains("-init_hw_device"), "{accel:?}: {args}");
             assert!(!args.contains("-hwaccel"), "{accel:?}: {args}");
         }
+    }
+
+    /// Writes an ffmpeg stub that reports `driver` on stderr and points the
+    /// planner's VAAPI prober at it.
+    fn stub_vaapi_ffmpeg(dir: &std::path::Path, driver: &str) {
+        let path = dir.join("stub-ffmpeg");
+        std::fs::write(
+            &path,
+            format!("#!/bin/sh\necho 'VAAPI driver: {driver}' >&2\n"),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        FAKE_FFMPEG.with(|p| *p.borrow_mut() = path.to_string_lossy().into_owned());
+    }
+
+    fn vaapi_caps() -> FfmpegCapabilities {
+        FfmpegCapabilities::builder()
+            .platform(ferrofin_mediaencoding::encoding_helper::hw::Platform::Linux)
+            .encoders(["h264_vaapi", "hevc_vaapi", "libx264"])
+            .hwaccels(["vaapi", "drm", "opencl", "vulkan"])
+            .filters(ferrofin_mediaencoding::encoder::REQUIRED_FILTERS)
+            .all_filter_options(true)
+            .os_version(ferrofin_mediaencoding::encoder::FfmpegVersion::new(6, 1))
+            .ffmpeg_version(ferrofin_mediaencoding::encoder::FfmpegVersion::with_build(
+                7, 0, 1,
+            ))
+            .build()
+    }
+
+    fn vaapi_options() -> EncodingOptions {
+        EncodingOptions {
+            enable_hardware_encoding: true,
+            hardware_acceleration_type: HardwareAccelerationType::vaapi,
+            vaapi_device: Some("/dev/dri/renderD128".to_owned()),
+            enable_intel_low_power_h264_hw_encoder: true,
+            hardware_decoding_codecs: vec!["h264".to_owned(), "hevc".to_owned()],
+            ..EncodingOptions::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_probed_ihd_device_reaches_the_command_line() {
+        // The probe is the ONLY source of the driver, and this is what
+        // connects it: without the prober wired in, the planner reads boot
+        // capabilities where every VAAPI flag is false, and every Intel server
+        // silently takes the unknown-vendor branch.
+        let dir = tempfile::tempdir().unwrap();
+        stub_vaapi_ffmpeg(dir.path(), "Intel iHD driver");
+        let p = planner_over_caps(
+            Arc::new(FakeMediaSources {
+                sources: vec![source(
+                    "abc",
+                    vec![nvdec_decodable_video_stream(), audio_stream("aac")],
+                )],
+                live_streams: HashMap::new(),
+            }),
+            false,
+            vaapi_caps(),
+            vaapi_options(),
+        );
+        let mut req = request("abc");
+        req.video_codec = Some("h264".to_owned());
+        req.allow_video_stream_copy = false;
+        req.max_width = Some(1280);
+        let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
+        let args = plan.arguments.join(" ");
+
+        // The configured render node reaches the device argument -- it was
+        // empty until the node was resolved from the options.
+        assert!(
+            args.contains("-init_hw_device vaapi=va:/dev/dri/renderD128,driver=iHD"),
+            "{args}"
+        );
+        assert!(args.contains("-c:v h264_vaapi"), "{args}");
+        assert!(
+            args.contains("scale_vaapi=w=1280:h=720:format=nv12"),
+            "{args}"
+        );
+        // Intel's low-power encoder block, which only iHD/i965 have.
+        assert!(args.contains("-low_power 1"), "{args}");
+    }
+
+    #[tokio::test]
+    async fn an_unrecognised_vaapi_driver_gets_no_device_and_no_low_power() {
+        // Real hardware lands here: NVIDIA's VAAPI shim reports a driver name
+        // none of the three match. The chain still runs, but nothing Intel-only
+        // is asked for.
+        let dir = tempfile::tempdir().unwrap();
+        stub_vaapi_ffmpeg(dir.path(), "VA-API NVDEC driver");
+        let p = planner_over_caps(
+            Arc::new(FakeMediaSources {
+                sources: vec![source(
+                    "abc",
+                    vec![nvdec_decodable_video_stream(), audio_stream("aac")],
+                )],
+                live_streams: HashMap::new(),
+            }),
+            false,
+            vaapi_caps(),
+            vaapi_options(),
+        );
+        let mut req = request("abc");
+        req.video_codec = Some("h264".to_owned());
+        req.allow_video_stream_copy = false;
+        let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
+        let args = plan.arguments.join(" ");
+        assert!(!args.contains("driver=iHD"), "{args}");
+        assert!(!args.contains("-low_power"), "{args}");
+        // ...but the VAAPI pipeline itself still runs.
+        assert!(args.contains("-c:v h264_vaapi"), "{args}");
+        assert!(args.contains("scale_vaapi="), "{args}");
     }
 
     #[tokio::test]

@@ -24,6 +24,18 @@ pub struct FfmpegVersion {
 }
 
 impl FfmpegVersion {
+    /// The major component.
+    #[must_use]
+    pub const fn major(self) -> i32 {
+        self.major
+    }
+
+    /// The minor component.
+    #[must_use]
+    pub const fn minor(self) -> i32 {
+        self.minor
+    }
+
     /// Creates a two-component version (`build`/`revision` unspecified, i.e. `-1`).
     #[must_use]
     pub const fn new(major: i32, minor: i32) -> Self {

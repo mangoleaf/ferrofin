@@ -13,17 +13,12 @@
 //! | AMD + Vulkan interop | the libplacebo path | tonemaps and scales in one Vulkan filter |
 //! | Intel i965, legacy AMD | [`vaapi_limited_vid_filters_prefered`] | scale and deinterlace only |
 //!
-//! The AMD path is the work item of `PLAN_HWACCEL.md` phase 4c; until it lands
-//! [`vaapi_vid_filter_chain`] routes an AMD device to the limited chain, which
-//! is where upstream sends it anyway whenever the Vulkan preconditions fail.
-//!
-//! **That is not free.** Most of what the limited chain loses is performance —
-//! subtitles composite in system memory instead of `overlay_vulkan`, and the
-//! tonemap round-trips — but **a rotated video decoded in hardware comes out
-//! sideways**: upstream's Vulkan chain transposes with `transpose_vulkan` and
-//! swaps the dimensions, and the limited chain has no transpose at all and
-//! swaps only for a software decode. Until 4c lands, an AMD user with a rotated
-//! phone video and hardware decoding gets wrong output, not merely slow output.
+//! An AMD device reaches the Vulkan chain only when every precondition holds —
+//! ffmpeg with full Vulkan, a device advertising DMA-BUF interop, and a kernel
+//! new enough to import the frames. Any of them failing drops it to the limited
+//! chain, which is what upstream does too; that costs performance, and on a
+//! hardware-decoded rotated source it also loses the rotation, because the
+//! limited chain has no transpose at all.
 //!
 //! The two chains here differ in more than their filter names, and the
 //! differences are the whole point of having both:
@@ -58,7 +53,7 @@ use super::nvidia::{MAX_ASS_SUBTITLE_FRAMERATE, STATIC_SUBTITLE_FRAMERATE};
 use super::sw_chain::{
     ChainInput, FilterChain, SubtitleOverlay, sw_scale_filter, sw_vid_filter_chain,
 };
-use super::tonemap::{hw_tonemap_filter, overwrite_color_properties_param};
+use super::tonemap::{hw_tonemap_filter, libplacebo_filter, overwrite_color_properties_param};
 
 /// The height a subtitle surface is generated at for `overlay_vaapi`.
 ///
@@ -119,11 +114,23 @@ pub fn vaapi_vid_filter_chain(input: &ChainInput<'_>) -> FilterChain {
         return intel_vaapi_full_vid_filters_prefered(input);
     }
 
-    // The AMD Vulkan/libplacebo pipeline is phase 4c. Until then an AMD device
-    // takes the limited chain — the shape upstream itself emits whenever the
-    // Vulkan preconditions fail. Mostly that costs only speed, but see the
-    // module docs: a hardware-decoded ROTATED video loses its rotation here,
-    // which is wrong output rather than slow output.
+    // AMD gets the Vulkan/libplacebo pipeline, but only when every one of its
+    // preconditions holds: ffmpeg with full Vulkan, a device that advertises
+    // DMA-BUF interop, and a kernel new enough to import the frames. Any of
+    // those failing drops it to the limited chain, which is exactly what
+    // upstream does.
+    if caps.is_vaapi_device_amd()
+        && vaapi_full
+        && super::support::is_vulkan_full_supported(caps)
+        && caps.vaapi_vulkan_drm_interop()
+        && caps
+            .os_version()
+            .is_some_and(|v| v >= super::versions::MIN_KERNEL_VERSION_AMD_VK_FMT_MODIFIER)
+    {
+        return amd_vaapi_full_vid_filters_prefered(input);
+    }
+
+    // Intel i965, and any AMD device that missed one of those.
     vaapi_limited_vid_filters_prefered(input)
 }
 
@@ -465,6 +472,259 @@ pub fn intel_vaapi_full_vid_filters_prefered(input: &ChainInput<'_>) -> FilterCh
     chain
 }
 
+/// The AMD Vulkan/libplacebo pipeline. Port of
+/// `GetAmdVaapiFullVidFiltersPrefered`.
+///
+/// Structurally unlike the other two: **libplacebo scales and tonemaps in one
+/// filter**, so there is no separate scaler on the Vulkan path at all. The
+/// chain's job is mostly to get frames into a Vulkan image and back out again.
+///
+/// Getting them there is the fiddly part, and it is version- and
+/// device-dependent. Modern ffmpeg can hand libplacebo a `drm_prime` frame
+/// directly, but only when the device advertises DRM format modifiers and
+/// nothing needs to transpose first; otherwise the frame goes the long way
+/// (`vaapi` → `drm` → `vulkan`). A device without modifiers additionally needs
+/// a bare `scale_vulkan` inserted, because libplacebo mishandles an imported
+/// frame on gfx8.
+///
+/// The deinterlacer can appear in **three** places — before the scaler on the
+/// plain VAAPI path, after the map back from Vulkan, or in the overlay chain —
+/// because it always runs on the VAAPI surface, and which end of the graph that
+/// is depends on where the frames went.
+#[must_use]
+#[allow(
+    clippy::too_many_lines,
+    reason = "same linear-pipeline rationale as the other two chains"
+)]
+pub fn amd_vaapi_full_vid_filters_prefered(input: &ChainInput<'_>) -> FilterChain {
+    let job = VaapiJob::new(input);
+    let caps = input.caps;
+    let options = input.options;
+
+    let do_vk_tonemap = input.vulkan_tonemap_available;
+
+    let rotation = input.rotation.unwrap_or(0);
+    let transpose_dir = if rotation == 0 {
+        ""
+    } else {
+        video_transpose_direction(input.rotation)
+    };
+    // Note the decoder test, which the iHD chain does not have: there is
+    // nothing to transpose on the Vulkan side unless the frames arrived there.
+    let do_vk_transpose = job.is_vaapi_decoder && !transpose_dir.is_empty();
+    let swap =
+        rotation.abs() == 90 && (job.is_sw_decoder || (job.is_vaapi_decoder && do_vk_transpose));
+    let (in_w, in_h) = if swap {
+        (input.video_height, input.video_width)
+    } else {
+        (input.video_width, input.video_height)
+    };
+    // libplacebo and the subtitle overlay both live in Vulkan, so either one
+    // pulls the whole job onto that path.
+    let needs_vulkan = do_vk_tonemap || job.has_subs;
+
+    let mut chain = FilterChain::default();
+    chain.main.push(overwrite_color_properties_param(
+        input.color_transfer,
+        do_vk_tonemap,
+    ));
+
+    if job.is_sw_decoder {
+        if job.deinterlace {
+            chain
+                .main
+                .push(sw_deinterlace_filter(options, input.reference_frame_rate));
+        }
+        if needs_vulkan {
+            chain.main.push("hwupload=derive_device=vulkan".to_owned());
+            chain.main.push("format=vulkan".to_owned());
+        } else {
+            // Nothing needs Vulkan, so the frames stay on the CPU and scale
+            // there — cheaper than a round trip for a plain resize.
+            chain.main.push(sw_scale_filter(
+                input.video_encoder,
+                in_w,
+                in_h,
+                input.three_d_format,
+                input.requested,
+            ));
+            chain.main.push("format=nv12".to_owned());
+        }
+    } else if job.is_vaapi_decoder {
+        if do_vk_transpose || needs_vulkan {
+            if caps
+                .ffmpeg_version()
+                .is_some_and(|v| v >= super::versions::MIN_FFMPEG_ALTERED_VA_VK_INTEROP)
+            {
+                if do_vk_transpose || !caps.vaapi_vulkan_drm_modifier() {
+                    // The indirect VA→DRM→Vulkan mapping, which newer ffmpeg
+                    // no longer maps reliably in one step.
+                    chain.main.push("hwmap=derive_device=drm".to_owned());
+                    chain.main.push("format=drm_prime".to_owned());
+                    chain.main.push("hwmap=derive_device=vulkan".to_owned());
+                    chain.main.push("format=vulkan".to_owned());
+                    if !caps.vaapi_vulkan_drm_modifier() {
+                        // gfx8 workaround: libplacebo mishandles an imported
+                        // Vulkan frame unless something touches it first.
+                        chain.main.push("scale_vulkan".to_owned());
+                    }
+                } else if needs_vulkan {
+                    // libplacebo takes drm_prime directly, so the Vulkan hop
+                    // can be skipped entirely.
+                    chain.main.push("hwmap=derive_device=drm".to_owned());
+                    chain.main.push("format=drm_prime".to_owned());
+                }
+            } else {
+                // The one-step mapping, which only ever worked on ffmpeg 6.
+                chain.main.push("hwmap=derive_device=vulkan".to_owned());
+                chain.main.push("format=vulkan".to_owned());
+            }
+        } else {
+            if job.deinterlace {
+                chain.main.push(hw_deinterlace_filter(
+                    caps,
+                    options,
+                    input.reference_frame_rate,
+                    "vaapi",
+                ));
+            }
+            // The UNSWAPPED dimensions, as upstream: this branch runs only when
+            // nothing transposes, so the two agree.
+            let mut scale = hw_scale_filter(
+                "scale",
+                "vaapi",
+                Some("nv12"),
+                false,
+                input.video_width,
+                input.video_height,
+                input.requested,
+            );
+            // Note: no `extra_hw_frames` here, unlike the other two chains.
+            if !scale.is_empty() && job.is_mjpeg_encoder && !do_vk_tonemap {
+                scale.push_str(":out_range=pc:mode=hq");
+            }
+            chain.main.push(scale);
+        }
+    }
+
+    if do_vk_transpose {
+        // A half turn is a flip, not a transpose — `transpose_vulkan` has no
+        // reversal direction.
+        if transpose_dir.eq_ignore_ascii_case("reversal") {
+            chain.main.push("flip_vulkan".to_owned());
+        } else {
+            chain
+                .main
+                .push(format!("transpose_vulkan=dir={transpose_dir}"));
+        }
+    }
+
+    if needs_vulkan {
+        // The one filter that does the scaling AND the tonemapping.
+        chain.main.push(libplacebo_filter(
+            options,
+            Some("bgra"),
+            do_vk_tonemap,
+            in_w,
+            in_h,
+            input.requested,
+            job.is_mjpeg_encoder,
+        ));
+        chain.main.push("format=vulkan".to_owned());
+    }
+
+    if do_vk_tonemap && !job.has_subs {
+        chain.main.push("hwmap=derive_device=vaapi".to_owned());
+        chain.main.push("format=vaapi".to_owned());
+        // Clears the surface's meta_offset and settles the output format.
+        chain.main.push("scale_vaapi=format=nv12".to_owned());
+        if job.deinterlace {
+            chain.main.push(hw_deinterlace_filter(
+                caps,
+                options,
+                input.reference_frame_rate,
+                "vaapi",
+            ));
+        }
+    }
+
+    if !job.has_subs {
+        if !job.is_vaapi_encoder && (do_vk_tonemap || job.is_vaapi_decoder) {
+            chain.main.push("hwdownload".to_owned());
+            chain.main.push("format=nv12".to_owned());
+        }
+        if job.is_sw_decoder && job.is_vaapi_encoder && !do_vk_tonemap {
+            chain.main.push("hwupload_vaapi".to_owned());
+        }
+    }
+
+    if job.has_subs {
+        match input.subtitle {
+            SubtitleOverlay::Graphical { width, height } => {
+                chain.sub.push(graphical_sub_preprocess_filters(
+                    in_w,
+                    in_h,
+                    width,
+                    height,
+                    input.requested,
+                ));
+                chain.sub.push("format=bgra".to_owned());
+            }
+            SubtitleOverlay::Text {
+                alpha_sub2video,
+                is_ass,
+                ..
+            } => {
+                let sub_framerate = if is_ass {
+                    input
+                        .real_frame_rate
+                        .unwrap_or(25.0)
+                        .min(MAX_ASS_SUBTITLE_FRAMERATE)
+                } else {
+                    STATIC_SUBTITLE_FRAMERATE
+                };
+                // Unlike the iHD chain, no reduced height: `overlay_vulkan`
+                // does not rescale, so the plane is generated at output size.
+                chain.sub.push(alpha_src_filter(
+                    in_w,
+                    in_h,
+                    input.requested,
+                    Some(sub_framerate),
+                    input.start_time_ticks,
+                ));
+                chain.sub.push("format=bgra".to_owned());
+                chain.sub.push(alpha_sub2video.to_owned());
+            }
+            SubtitleOverlay::None => {}
+        }
+        chain.sub.push("hwupload=derive_device=vulkan".to_owned());
+        chain.sub.push("format=vulkan".to_owned());
+        chain
+            .overlay
+            .push("overlay_vulkan=eof_action=pass:repeatlast=0".to_owned());
+
+        if job.is_vaapi_encoder {
+            chain.overlay.push("hwmap=derive_device=vaapi".to_owned());
+            chain.overlay.push("format=vaapi".to_owned());
+            chain.overlay.push("scale_vaapi=format=nv12".to_owned());
+            if job.deinterlace {
+                chain.overlay.push(hw_deinterlace_filter(
+                    caps,
+                    options,
+                    input.reference_frame_rate,
+                    "vaapi",
+                ));
+            }
+        } else {
+            chain.overlay.push("scale_vulkan=format=nv12".to_owned());
+            chain.overlay.push("hwdownload".to_owned());
+            chain.overlay.push("format=nv12".to_owned());
+        }
+    }
+
+    chain
+}
+
 /// The i965 / legacy-AMD pipeline. Port of `GetVaapiLimitedVidFiltersPrefered`.
 ///
 /// "Limited" is the driver's capability, not a policy, and not ffmpeg's: the
@@ -705,6 +965,7 @@ mod tests {
             do_sw_tonemap: false,
             do_hw_tonemap: false,
             vpp_tonemap_available: false,
+            vulkan_tonemap_available: false,
             source_codec: Some("h264"),
             is_dovi: false,
             is_hevc_rext: false,
@@ -1381,6 +1642,344 @@ mod tests {
         );
     }
 
+    // ----- AMD (Vulkan / libplacebo) -----------------------------------------
+
+    const LIBPLACEBO_SDR: &str = "libplacebo=upscaler=none:downscaler=none:format=bgra";
+    const LIBPLACEBO_TONEMAP: &str = "libplacebo=upscaler=none:downscaler=none:format=bgra:\
+                                      tonemapping=bt.2390:peak_detect=0:color_primaries=bt709:\
+                                      color_trc=bt709:colorspace=bt709";
+
+    fn amd_caps(drm_modifier: bool, ffmpeg: FfmpegVersion) -> FfmpegCapabilities {
+        FfmpegCapabilities::builder()
+            .platform(Platform::Linux)
+            .hwaccels(["vaapi", "drm", "opencl", "vulkan"])
+            .filters(REQUIRED_FILTERS)
+            .all_filter_options(true)
+            .vaapi_driver(true, false, false)
+            .vaapi_vulkan(drm_modifier, true)
+            .os_version(FfmpegVersion::new(6, 1))
+            .ffmpeg_version(ffmpeg)
+            .build()
+    }
+
+    #[test]
+    fn amd_scales_on_vaapi_when_nothing_needs_vulkan() {
+        // The plain path, and the one place this chain touches `scale_vaapi` —
+        // note NO `extra_hw_frames`, which both other chains always append.
+        let caps = amd_caps(true, FfmpegVersion::with_build(7, 0, 1));
+        let options = options();
+        let mut inp = input(&caps, &options, VAAPI_DECODER, "h264_vaapi");
+        inp.requested = bounded(1280, 720);
+        assert_eq!(
+            amd_vaapi_full_vid_filters_prefered(&inp).main,
+            vec![
+                SDR_PARAMS.to_owned(),
+                "scale_vaapi=w=1280:h=720:format=nv12".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn amd_hands_libplacebo_a_drm_frame_directly_when_it_can() {
+        // Modern ffmpeg lets libplacebo take drm_prime, so the Vulkan hop is
+        // skipped — one fewer mapping than the gfx8 path below.
+        let caps = amd_caps(true, FfmpegVersion::with_build(7, 0, 1));
+        let options = EncodingOptions {
+            enable_tonemapping: true,
+            ..options()
+        };
+        let mut inp = input(&caps, &options, VAAPI_DECODER, "h264_vaapi");
+        inp.color_transfer = Some("smpte2084");
+        inp.vulkan_tonemap_available = true;
+        assert_eq!(
+            amd_vaapi_full_vid_filters_prefered(&inp).main,
+            vec![
+                HDR_PARAMS.to_owned(),
+                "hwmap=derive_device=drm".to_owned(),
+                "format=drm_prime".to_owned(),
+                LIBPLACEBO_TONEMAP.replace(' ', ""),
+                "format=vulkan".to_owned(),
+                "hwmap=derive_device=vaapi".to_owned(),
+                "format=vaapi".to_owned(),
+                "scale_vaapi=format=nv12".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_device_without_drm_modifiers_takes_the_long_way_and_a_workaround() {
+        // gfx8: the frame has to reach Vulkan explicitly, and libplacebo
+        // mishandles an imported frame unless a bare `scale_vulkan` touches it
+        // first.
+        let caps = amd_caps(false, FfmpegVersion::with_build(7, 0, 1));
+        let options = EncodingOptions {
+            enable_tonemapping: true,
+            ..options()
+        };
+        let mut inp = input(&caps, &options, VAAPI_DECODER, "h264_vaapi");
+        inp.color_transfer = Some("smpte2084");
+        inp.vulkan_tonemap_available = true;
+        assert_eq!(
+            amd_vaapi_full_vid_filters_prefered(&inp).main,
+            vec![
+                HDR_PARAMS.to_owned(),
+                "hwmap=derive_device=drm".to_owned(),
+                "format=drm_prime".to_owned(),
+                "hwmap=derive_device=vulkan".to_owned(),
+                "format=vulkan".to_owned(),
+                "scale_vulkan".to_owned(),
+                LIBPLACEBO_TONEMAP.replace(' ', ""),
+                "format=vulkan".to_owned(),
+                "hwmap=derive_device=vaapi".to_owned(),
+                "format=vaapi".to_owned(),
+                "scale_vaapi=format=nv12".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_older_ffmpeg_maps_vaapi_to_vulkan_in_one_step() {
+        // The one-step mapping only ever worked on ffmpeg 6, and the gfx8
+        // workaround is not consulted at all on that path.
+        let caps = amd_caps(false, FfmpegVersion::new(6, 0));
+        let options = EncodingOptions {
+            enable_tonemapping: true,
+            ..options()
+        };
+        let mut inp = input(&caps, &options, VAAPI_DECODER, "h264_vaapi");
+        inp.color_transfer = Some("smpte2084");
+        inp.vulkan_tonemap_available = true;
+        let main = amd_vaapi_full_vid_filters_prefered(&inp).main;
+        assert_eq!(main[1], "hwmap=derive_device=vulkan");
+        assert_eq!(main[2], "format=vulkan");
+        assert!(!main.iter().any(|f| f == "scale_vulkan"), "{main:?}");
+        assert!(!main.iter().any(|f| f == "format=drm_prime"), "{main:?}");
+    }
+
+    #[test]
+    fn a_half_turn_flips_rather_than_transposing() {
+        // `transpose_vulkan` has no reversal direction, so upstream reaches for
+        // a different filter entirely.
+        let caps = amd_caps(true, FfmpegVersion::with_build(7, 0, 1));
+        let options = options();
+        let mut inp = input(&caps, &options, VAAPI_DECODER, "h264_vaapi");
+        inp.rotation = Some(90);
+        assert_eq!(
+            amd_vaapi_full_vid_filters_prefered(&inp)
+                .main
+                .last()
+                .unwrap(),
+            "transpose_vulkan=dir=cclock"
+        );
+        inp.rotation = Some(180);
+        assert_eq!(
+            amd_vaapi_full_vid_filters_prefered(&inp)
+                .main
+                .last()
+                .unwrap(),
+            "flip_vulkan"
+        );
+    }
+
+    #[test]
+    fn a_rotation_only_job_ends_in_a_vulkan_frame() {
+        // Upstream leaves the frame in Vulkan and hands it to a VAAPI encoder.
+        // That looks wrong, and may well be an upstream bug -- but it is what
+        // the C# emits, and a port that "fixed" it would diverge silently.
+        let caps = amd_caps(true, FfmpegVersion::with_build(7, 0, 1));
+        let options = options();
+        let mut inp = input(&caps, &options, VAAPI_DECODER, "h264_vaapi");
+        inp.rotation = Some(90);
+        let chain = amd_vaapi_full_vid_filters_prefered(&inp);
+        assert_eq!(
+            chain.main,
+            vec![
+                SDR_PARAMS.to_owned(),
+                "hwmap=derive_device=drm".to_owned(),
+                "format=drm_prime".to_owned(),
+                "hwmap=derive_device=vulkan".to_owned(),
+                "format=vulkan".to_owned(),
+                "transpose_vulkan=dir=cclock".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn amd_lets_libplacebo_do_all_the_scaling_when_vulkan_is_involved() {
+        // The software branch emits NO scale filter at all once anything needs
+        // Vulkan — not even an empty one. Every other chain adds it
+        // unconditionally.
+        let caps = amd_caps(true, FfmpegVersion::with_build(7, 0, 1));
+        let options = options();
+        let mut inp = input(&caps, &options, "", "h264_vaapi");
+        inp.subtitle = SubtitleOverlay::Text {
+            plain: "subtitles=f='/media/a.srt'",
+            alpha_sub2video: "subtitles=f='/media/a.srt':alpha=1:sub2video=1",
+            is_ass: false,
+        };
+        let chain = amd_vaapi_full_vid_filters_prefered(&inp);
+        assert_eq!(
+            chain.main,
+            vec![
+                SDR_PARAMS.to_owned(),
+                "hwupload=derive_device=vulkan".to_owned(),
+                "format=vulkan".to_owned(),
+                LIBPLACEBO_SDR.to_owned(),
+                "format=vulkan".to_owned(),
+            ]
+        );
+        assert!(
+            !chain.main.iter().any(|f| f.starts_with("scale")),
+            "{:?}",
+            chain.main
+        );
+    }
+
+    #[test]
+    fn amd_composites_subtitles_in_vulkan_and_maps_back_for_the_encoder() {
+        let caps = amd_caps(true, FfmpegVersion::with_build(7, 0, 1));
+        let options = options();
+        let mut inp = input(&caps, &options, VAAPI_DECODER, "h264_vaapi");
+        inp.requested = bounded(1280, 720);
+        inp.subtitle = SubtitleOverlay::Graphical {
+            width: Some(1920),
+            height: Some(1080),
+        };
+        let chain = amd_vaapi_full_vid_filters_prefered(&inp);
+        assert_eq!(
+            chain.sub,
+            vec![
+                "scale,scale=1280:720:fast_bilinear".to_owned(),
+                "format=bgra".to_owned(),
+                "hwupload=derive_device=vulkan".to_owned(),
+                "format=vulkan".to_owned(),
+            ]
+        );
+        // No `:w=:h=` suffix here, unlike `overlay_vaapi` on the iHD chain.
+        assert_eq!(
+            chain.overlay,
+            vec![
+                "overlay_vulkan=eof_action=pass:repeatlast=0".to_owned(),
+                "hwmap=derive_device=vaapi".to_owned(),
+                "format=vaapi".to_owned(),
+                "scale_vaapi=format=nv12".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_subtitle_moves_the_map_back_out_of_the_main_chain() {
+        // Tonemap and subtitles interact by subtraction: `hasSubs` suppresses
+        // the tonemap's own remap block, so the vaapi trio moves to the overlay
+        // and main stays in Vulkan for the composite.
+        let caps = amd_caps(true, FfmpegVersion::with_build(7, 0, 1));
+        let options = EncodingOptions {
+            enable_tonemapping: true,
+            ..options()
+        };
+        let mut inp = input(&caps, &options, VAAPI_DECODER, "h264_vaapi");
+        inp.color_transfer = Some("smpte2084");
+        inp.vulkan_tonemap_available = true;
+        inp.subtitle = SubtitleOverlay::Graphical {
+            width: Some(1920),
+            height: Some(1080),
+        };
+        let chain = amd_vaapi_full_vid_filters_prefered(&inp);
+        assert_eq!(
+            chain.main,
+            vec![
+                HDR_PARAMS.to_owned(),
+                "hwmap=derive_device=drm".to_owned(),
+                "format=drm_prime".to_owned(),
+                LIBPLACEBO_TONEMAP.replace(' ', ""),
+                "format=vulkan".to_owned(),
+            ]
+        );
+        assert!(
+            chain
+                .overlay
+                .contains(&"scale_vaapi=format=nv12".to_owned())
+        );
+    }
+
+    #[test]
+    fn amd_downloads_for_a_software_encoder() {
+        let caps = amd_caps(true, FfmpegVersion::with_build(7, 0, 1));
+        let options = options();
+        assert_eq!(
+            amd_vaapi_full_vid_filters_prefered(&input(&caps, &options, VAAPI_DECODER, "libx264"))
+                .main,
+            vec![
+                SDR_PARAMS.to_owned(),
+                "scale_vaapi=format=nv12".to_owned(),
+                "hwdownload".to_owned(),
+                "format=nv12".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_software_decode_can_deinterlace_twice() {
+        // An upstream artifact, not a mistake in the port: the software
+        // deinterlacer runs on the way in, and the VAAPI one runs again after
+        // the frame is mapped back. Reproduced deliberately.
+        let caps = amd_caps(true, FfmpegVersion::with_build(7, 0, 1));
+        let options = EncodingOptions {
+            enable_tonemapping: true,
+            ..options()
+        };
+        let mut inp = input(&caps, &options, "", "h264_vaapi");
+        inp.color_transfer = Some("smpte2084");
+        inp.vulkan_tonemap_available = true;
+        inp.deinterlace = true;
+        let main = amd_vaapi_full_vid_filters_prefered(&inp).main;
+        assert_eq!(main[1], "yadif=0:-1:0");
+        assert_eq!(main.last().unwrap(), "deinterlace_vaapi=rate=frame");
+    }
+
+    #[test]
+    fn the_deinterlacer_lands_in_the_overlay_when_a_subtitle_does() {
+        let caps = amd_caps(true, FfmpegVersion::with_build(7, 0, 1));
+        let options = options();
+        let mut inp = input(&caps, &options, VAAPI_DECODER, "h264_vaapi");
+        inp.deinterlace = true;
+        inp.subtitle = SubtitleOverlay::Graphical {
+            width: Some(1920),
+            height: Some(1080),
+        };
+        let chain = amd_vaapi_full_vid_filters_prefered(&inp);
+        assert_eq!(
+            chain.overlay.last().unwrap(),
+            "deinterlace_vaapi=rate=frame"
+        );
+        // ...and not in the main chain, which never left Vulkan.
+        assert!(
+            !chain.main.iter().any(|f| f.contains("deinterlace")),
+            "{:?}",
+            chain.main
+        );
+    }
+
+    #[test]
+    fn amds_subtitle_plane_keeps_the_full_requested_size() {
+        // The opposite of the iHD chain, which caps it at 1080 because
+        // `overlay_vaapi` rescales. `overlay_vulkan` does not, so the plane is
+        // generated at output size.
+        let caps = amd_caps(true, FfmpegVersion::with_build(7, 0, 1));
+        let options = options();
+        let mut inp = input(&caps, &options, VAAPI_DECODER, "h264_vaapi");
+        inp.video_width = Some(3840);
+        inp.video_height = Some(2160);
+        inp.subtitle = SubtitleOverlay::Graphical {
+            width: Some(3840),
+            height: Some(2160),
+        };
+        assert_eq!(
+            amd_vaapi_full_vid_filters_prefered(&inp).sub[0],
+            "scale,scale=3840:2160:fast_bilinear"
+        );
+    }
+
     // ----- the gate ----------------------------------------------------------
 
     #[test]
@@ -1460,6 +2059,83 @@ mod tests {
     }
 
     #[test]
+    fn an_amd_device_with_vulkan_reaches_its_own_chain_through_the_gate() {
+        let caps = amd_caps(true, FfmpegVersion::with_build(7, 0, 1));
+        let options = EncodingOptions {
+            enable_tonemapping: true,
+            ..options()
+        };
+        let mut inp = input(&caps, &options, VAAPI_DECODER, "h264_vaapi");
+        inp.color_transfer = Some("smpte2084");
+        inp.vulkan_tonemap_available = true;
+        // libplacebo is the marker no other chain emits.
+        assert!(
+            vaapi_vid_filter_chain(&inp)
+                .main
+                .iter()
+                .any(|f| f.starts_with("libplacebo=")),
+            "{:?}",
+            vaapi_vid_filter_chain(&inp).main
+        );
+    }
+
+    #[test]
+    fn each_amd_precondition_drops_the_job_to_the_limited_chain() {
+        // Four conjuncts, and any one failing is enough. The limited chain's
+        // `scale_vaapi=...:extra_hw_frames=24` is the marker: the AMD chain
+        // never emits that suffix.
+        let options = options();
+        let full = FfmpegVersion::with_build(7, 0, 1);
+        let cases: [(&str, FfmpegCapabilities); 3] = [
+            ("no vulkan hwaccel", {
+                FfmpegCapabilities::builder()
+                    .platform(Platform::Linux)
+                    .hwaccels(["vaapi", "drm", "opencl"])
+                    .filters(REQUIRED_FILTERS)
+                    .all_filter_options(true)
+                    .vaapi_driver(true, false, false)
+                    .vaapi_vulkan(true, true)
+                    .os_version(FfmpegVersion::new(6, 1))
+                    .ffmpeg_version(full)
+                    .build()
+            }),
+            ("no dma-buf interop", {
+                FfmpegCapabilities::builder()
+                    .platform(Platform::Linux)
+                    .hwaccels(["vaapi", "drm", "opencl", "vulkan"])
+                    .filters(REQUIRED_FILTERS)
+                    .all_filter_options(true)
+                    .vaapi_driver(true, false, false)
+                    .vaapi_vulkan(true, false)
+                    .os_version(FfmpegVersion::new(6, 1))
+                    .ffmpeg_version(full)
+                    .build()
+            }),
+            ("kernel below 5.15", {
+                FfmpegCapabilities::builder()
+                    .platform(Platform::Linux)
+                    .hwaccels(["vaapi", "drm", "opencl", "vulkan"])
+                    .filters(REQUIRED_FILTERS)
+                    .all_filter_options(true)
+                    .vaapi_driver(true, false, false)
+                    .vaapi_vulkan(true, true)
+                    .os_version(FfmpegVersion::new(5, 14))
+                    .ffmpeg_version(full)
+                    .build()
+            }),
+        ];
+        for (why, caps) in cases {
+            let chain =
+                vaapi_vid_filter_chain(&input(&caps, &options, VAAPI_DECODER, "h264_vaapi"));
+            assert!(
+                chain.main.iter().any(|f| f.contains("extra_hw_frames=24")),
+                "{why}: {:?}",
+                chain.main
+            );
+        }
+    }
+
+    #[test]
     fn a_different_accelerator_yields_nothing_at_all() {
         let caps = caps_for("ihd");
         let options = EncodingOptions {
@@ -1491,11 +2167,9 @@ mod tests {
     }
 
     #[test]
-    fn an_amd_device_takes_the_limited_chain_until_its_own_lands() {
-        // Phase 4c adds the Vulkan/libplacebo path. Until then AMD gets the
-        // limited chain — the shape upstream emits whenever the Vulkan
-        // preconditions fail. Note this is not purely a capability narrowing:
-        // a hardware-decoded rotated video loses its rotation until 4c.
+    fn an_amd_device_without_vulkan_falls_back_to_the_limited_chain() {
+        // The AMD chain has four preconditions; these caps have neither the
+        // vulkan hwaccel nor the interop flag, so upstream drops to limited.
         let caps = caps_for("amd");
         let options = options();
         let chain = vaapi_vid_filter_chain(&input(&caps, &options, VAAPI_DECODER, "h264_vaapi"));
