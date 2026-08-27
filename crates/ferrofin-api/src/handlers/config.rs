@@ -251,6 +251,23 @@ async fn get_named_configuration(
         return Ok(Json(value));
     }
     if let Some(value) = saved {
+        // A `network.json` written by an older Ferrofin spells four keys the
+        // way `PascalCase` derived them (`EnableIpv4`, `RemoteIpFilter`, …),
+        // not the way the contract does. Served verbatim, jellyfin-web would
+        // not recognise them: the network page would render an empty remote-IP
+        // filter, and the operator's next Save would write that emptiness back.
+        // Round-tripping through the typed struct — whose serde aliases read
+        // the old names — hands the page the contract's spelling instead.
+        if key.eq_ignore_ascii_case("network") {
+            match serde_json::from_value::<ferrofin_networking::NetworkConfiguration>(value.clone())
+            {
+                Ok(config) => return Ok(Json(to_value(serde_json::to_value(config))?)),
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "the saved network configuration could not be read; serving it unchanged"
+                ),
+            }
+        }
         return Ok(Json(value));
     }
     let value = match key.to_ascii_lowercase().as_str() {

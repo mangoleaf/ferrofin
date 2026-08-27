@@ -641,6 +641,80 @@ async fn missing_named_configuration_is_silent() {
     );
 }
 
+#[tokio::test]
+async fn a_saved_network_configuration_is_served_under_the_contract_names() {
+    // A `network.json` an older Ferrofin wrote, with the four names a
+    // `PascalCase` derive produced. Served verbatim, jellyfin-web would not
+    // recognise them — the network page would show an empty remote-IP filter,
+    // and the operator's next Save would persist that emptiness.
+    let dir = tempfile::tempdir().unwrap();
+    write_named_config(
+        dir.path(),
+        "network",
+        br#"{"BaseUrl":"/jf","EnableIpv4":false,"EnableIpv6":true,
+            "RemoteIpFilter":["192.168.1.5"],"IsRemoteIpFilterBlacklist":true,
+            "KnownProxies":["10.1.2.3"]}"#,
+    );
+    let state = state_with_paths(StubPaths {
+        log_dir: String::new(),
+        config_dir: dir.path().to_string_lossy().into_owned(),
+    });
+
+    let (status, body) = get(state, "/System/Configuration/network").await;
+    assert_eq!(status, StatusCode::OK);
+    let value = json(&body);
+    let object = value.as_object().expect("an object");
+
+    assert_eq!(object["RemoteIPFilter"], serde_json::json!(["192.168.1.5"]));
+    assert_eq!(object["IsRemoteIPFilterBlacklist"], serde_json::json!(true));
+    assert_eq!(object["EnableIPv4"], serde_json::json!(false));
+    assert_eq!(object["EnableIPv6"], serde_json::json!(true));
+    for old in [
+        "RemoteIpFilter",
+        "IsRemoteIpFilterBlacklist",
+        "EnableIpv4",
+        "EnableIpv6",
+    ] {
+        assert!(!object.contains_key(old), "{old} must not reach the client");
+    }
+    // The values around them survive the normalization, and the fields the old
+    // document never had come back as defaults.
+    assert_eq!(object["BaseUrl"], serde_json::json!("/jf"));
+    assert_eq!(object["KnownProxies"], serde_json::json!(["10.1.2.3"]));
+    assert_eq!(object["EnableUPnP"], serde_json::json!(false));
+}
+
+#[tokio::test]
+async fn a_network_configuration_that_cannot_be_read_is_served_unchanged_and_warned() {
+    // Normalization must not become a way to lose a document: if it will not
+    // parse, hand the client exactly what is on disk and say so.
+    let dir = tempfile::tempdir().unwrap();
+    write_named_config(
+        dir.path(),
+        "network",
+        br#"{"InternalHttpPort":"not a port"}"#,
+    );
+    let state = state_with_paths(StubPaths {
+        log_dir: String::new(),
+        config_dir: dir.path().to_string_lossy().into_owned(),
+    });
+
+    let ((status, body), logs) =
+        with_captured_logs(get(state, "/System/Configuration/network")).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        json(&body)["InternalHttpPort"],
+        serde_json::json!("not a port")
+    );
+    assert_eq!(
+        logs.warnings_matching("network configuration").len(),
+        1,
+        "the unreadable configuration must be reported: {:?}",
+        logs.0.lock().unwrap()
+    );
+}
+
 /// A Live TV manager whose two configuration reads fail (backend down).
 struct FailingLiveTv;
 

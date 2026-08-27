@@ -30,16 +30,16 @@
 //! ## The rest of `config/`
 //!
 //! - **`network.xml` is not imported yet, and that is an open work item, not a
-//!   decision.** It carries `KnownProxies`, `EnableRemoteAccess`, `BaseUrl` and
-//!   — the reason it matters — `RemoteIPFilter`/`IsRemoteIPFilterBlacklist`,
-//!   which are an access-control list. It is blocked on a separate bug:
-//!   `ferrofin-networking`'s `NetworkConfiguration` serves `EnableIpv4`,
-//!   `EnableIpv6`, `RemoteIpFilter` and `IsRemoteIpFilterBlacklist` where both
-//!   the vendored contract and `MediaBrowser.Common/Net/NetworkConfiguration.cs`
-//!   say `EnableIPv4`, `EnableIPv6`, `RemoteIPFilter` and
-//!   `IsRemoteIPFilterBlacklist`. Importing before that is fixed would drop
-//!   exactly the security-relevant fields. Fix the names, then add
-//!   `network.xml` here with a deny list for the deployment-specific ports.
+//!   decision.** It carries `BaseUrl` (a client-visible path prefix, so losing
+//!   it on adoption breaks every bookmark into a `/jellyfin`-style
+//!   deployment), `KnownProxies`, `EnableRemoteAccess`, and
+//!   `RemoteIPFilter`/`IsRemoteIPFilterBlacklist` — the last two being settings
+//!   nothing currently enforces, since `ferrofin-networking`'s `NetworkManager`
+//!   is not wired into request handling. It was blocked on that crate serving
+//!   four of those names in the wrong capitalization; that is fixed. What
+//!   remains is the import itself, and deciding which fields are
+//!   deployment-specific enough to deny — the ports are the open question,
+//!   `BaseUrl` should be carried.
 //! - **`database.xml` is deliberately skipped**: it selects Jellyfin's database
 //!   provider, and Ferrofin is SQLite-only, so there is nothing to carry over.
 
@@ -215,10 +215,13 @@ where
         let mut candidate = obj.clone();
         candidate.insert(child.name.clone(), value);
         match serde_json::from_value::<T>(Value::Object(candidate.clone())) {
-            // A name that differs from ours only in casing (Jellyfin's
-            // `EnableIPv4` against our `EnableIpv4`) deserializes without error
-            // and is then silently dropped, so an unfamiliar name has to
-            // survive a round trip before it counts as imported.
+            // A name that differs from ours only in casing deserializes
+            // without error and is then silently dropped, so an unfamiliar name
+            // has to survive a round trip before it counts as imported. This
+            // is not hypothetical: `ferrofin-networking` served four network
+            // settings as `EnableIpv4`/`RemoteIpFilter` where Jellyfin writes
+            // `EnableIPv4`/`RemoteIPFilter`, and nothing noticed until a test
+            // compared the served names against the vendored contract.
             //
             // Asking this of a *familiar* name would be wrong, not merely
             // redundant: a field skipped by `skip_serializing_if` — an
@@ -593,9 +596,10 @@ mod tests {
 
     #[test]
     fn a_field_ferrofin_does_not_have_is_reported_and_the_rest_still_imports() {
-        // Jellyfin writes `EnableIPv4`; Ferrofin serves `EnableIpv4`. Serde
-        // ignores the odd casing silently, so the round-trip check has to catch
-        // it — and the fields around it must still import.
+        // The casing class, using the shape that actually bit us elsewhere:
+        // Jellyfin writes `EnableIPv4`, a `PascalCase` derive gives
+        // `EnableIpv4`. Serde ignores the mismatch silently, so the round-trip
+        // check has to catch it — and the fields around it must still import.
         let mut obj = match serde_json::to_value(default_server_configuration()) {
             Ok(Value::Object(m)) => m,
             other => panic!("expected a JSON object, got {other:?}"),
