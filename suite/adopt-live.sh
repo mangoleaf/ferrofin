@@ -198,12 +198,14 @@ kill "$SRV_PID" 2>/dev/null; wait "$SRV_PID" 2>/dev/null; SRV_PID=
 echo ">> [5/5] the database after ferrofin's tenure"
 FK=$(sq 'PRAGMA foreign_key_check;' | head -3)
 [ -z "$FK" ] && pass "foreign keys intact" || fail "foreign key violations: $FK"
+# `ok` outright, with no special case. There used to be one here for
+# `FerrofinIX_Peoples_LowerName_Cover`, whose `LOWER("Name")` key is ASCII-only
+# in Ferrofin's bundled SQLite and Unicode-aware in an ICU-enabled sqlite3, so
+# the two engines disagreed about 22 of 25,722 people. Migration 0022 replaced
+# it with a `COLLATE NOCASE` key, which no build overrides — so a mismatch here
+# is now a real finding again, not a known wart to be excused.
 IC=$(sq 'PRAGMA integrity_check;')
 if [ "$IC" = ok ]; then pass "integrity_check"
-elif ! grep -qv 'FerrofinIX_Peoples_LowerName_Cover' <<<"$IC"; then
-  # LOWER() is ASCII-only in Ferrofin's bundled SQLite and Unicode-aware in an
-  # ICU-enabled sqlite3; the expression index disagrees on non-ASCII names.
-  fail "integrity_check: $(wc -l <<<"$IC") rows missing from FerrofinIX_Peoples_LowerName_Cover (LOWER() collation mismatch)"
 else fail "integrity_check: $(head -3 <<<"$IC")"; fi
 
 if [ "$VERIFY_JF" = 1 ]; then
