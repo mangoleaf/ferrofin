@@ -29,3 +29,7 @@ __pycache__/
 
 # toolchain-island build dirs (root /target anchor does not reach them)
 examples/*/target/
+
+# Benchmark result backups — `runs.json` is the record; a `.bak` beside it
+# is a scratch copy of the same runs and must never be committed.
+suite/results/*.bak

@@ -65,11 +65,15 @@ suite_build_libraries
 echo ">> libraries: $LIBRARIES"
 suite_gen_fixtures
 
-# Wait for container start -> first 200, return elapsed seconds (cold-start metric).
+# Wait for container start -> the server can actually SERVE, return elapsed
+# seconds (cold-start metric). Gated on SUITE_READY_PATH, never
+# /System/Info/Public: Jellyfin's SetupServer stub answers that one route while
+# the real app is still booting, so the old probe timed the stub and reported a
+# cold-start several times faster than the truth (see suite/lib.sh).
 coldstart() {  # $1=base url
   local start now; start=$(date +%s.%N)
   for _ in $(seq 1 120); do
-    curl -sf "$1/System/Info/Public" >/dev/null 2>&1 && { now=$(date +%s.%N); awk -v a="$start" -v b="$now" 'BEGIN{printf "%.1f", b-a}'; return; }
+    curl -sf "$1$SUITE_READY_PATH" >/dev/null 2>&1 && { now=$(date +%s.%N); awk -v a="$start" -v b="$now" 'BEGIN{printf "%.1f", b-a}'; return; }
     sleep 0.5
   done
   echo "NaN"
@@ -165,7 +169,7 @@ bench() {  # $1=service $2=port $3=TARGET
       # cancelled, FTL loop) — observed live, whole cold leg lost.
       docker compose stop -t 60 "$svc" >/dev/null 2>&1
       docker compose start "$svc" >/dev/null 2>&1
-      for _ in $(seq 1 240); do curl -sf "$base/System/Info/Public" >/dev/null 2>&1 && break; sleep 0.5; done
+      for _ in $(seq 1 240); do curl -sf "$base$SUITE_READY_PATH" >/dev/null 2>&1 && break; sleep 0.5; done
       # A failed probe leaves its endpoint missing — merge.py's manifest check
       # fails the run rather than shipping a record with a silent cold hole.
       python3 cold_probe.py --target "$target" --base "$base" --endpoint "$name" || true

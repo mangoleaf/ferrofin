@@ -34,7 +34,7 @@ export BENCH_VUS BENCH_DURATION BENCH_WARMUP_SECONDS
 
 mkdir -p results/raw
 
-wait200() { for _ in $(seq 1 240); do curl -sf "$BASE/System/Info/Public" >/dev/null 2>&1 && return 0; sleep 1; done; echo "ferrofin never came up"; return 1; }
+wait200() { for _ in $(seq 1 240); do curl -sf "$BASE$SUITE_READY_PATH" >/dev/null 2>&1 && return 0; sleep 1; done; echo "ferrofin never came up"; return 1; }
 
 echo ">> clean start (fresh volume — the one scan of the sweep)"
 docker compose down -v >/dev/null 2>&1 || true

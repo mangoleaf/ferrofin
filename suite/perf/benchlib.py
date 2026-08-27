@@ -219,9 +219,18 @@ def provision(base, target, ctx):
     """Add the libraries from the LIBRARIES env (real media and/or synthetic
     padding) and kick a scan."""
     h = token_headers(ctx["token"])
-    # Fairness: Ferrofin's remote metadata providers are inert (feature-gated /
-    # no keys), so Jellyfin's must be off too — else its TMDB/OMDb fetchers stay
-    # on (slower, network-dependent, richer DTOs = a different workload).
+    # Fairness: BOTH servers get these options, never just one. Ferrofin's
+    # remote providers used to be inert (feature-gated / no keys) so only
+    # Jellyfin needed muzzling — that premise died when TMDB/TVDB/MusicBrainz/
+    # AudioDb/fanart/Studio-Images shipped on-by-default with a built-in key.
+    # Sending this to Jellyfin alone then meant: Ferrofin fetched remote
+    # metadata for every item over the network while Jellyfin fetched none, so
+    # Ferrofin carried richer DTOs (bigger bodies to serialize on every browse
+    # row) AND ran a realtime filesystem watcher Jellyfin had switched off —
+    # measuring two different workloads and flattering Jellyfin on both.
+    # Empty fetcher lists gate only the NAMED remote fetchers (and embedded
+    # image extraction) on either server; local NFO and on-disk images are
+    # ungated in Ferrofin's scanner and unaffected in Jellyfin.
     no_remote = {
         "LibraryOptions": {
             "EnableRealtimeMonitor": False,
@@ -245,9 +254,8 @@ def provision(base, target, ctx):
         q = (f"name={urllib.parse.quote(lib['name'])}&collectionType={lib['type']}"
              f"&paths={urllib.parse.quote(lib['path'])}")
         # Always send a real JSON body: an empty body with a JSON content-type is a 400 on Ferrofin.
-        body = no_remote if target == "jellyfin" else {}
         refresh = "&refreshLibrary=true" if target == "jellyfin" else ""
-        status, resp = request("POST", f"{base}/Library/VirtualFolders?{q}{refresh}", body, h)
+        status, resp = request("POST", f"{base}/Library/VirtualFolders?{q}{refresh}", no_remote, h)
         if status >= 300:
             raise RuntimeError(f"[{target}] add library {lib['name']!r} failed: {status} {resp[:200]!r}")
     if target != "jellyfin":

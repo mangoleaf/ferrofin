@@ -51,7 +51,12 @@ every other row. The write rows dodge that by construction (rules enforced in `e
 
 Plus **footprint**, which is a bigger Rust-vs-.NET story than percentiles:
 
-- **Cold start** — container launch → first `200 /System/Info/Public`
+- **Cold start** — container launch → the server can actually serve, measured as the
+  first `200` on `$SUITE_READY_PATH` (`/Users/Public`). Deliberately NOT
+  `/System/Info/Public`: Jellyfin's SetupServer stub answers that one route — and only
+  that route — while the real app is still booting, so gating on it timed the stub and
+  understated Jellyfin's cold start ~9× (measured: stub 200 at 0.31s, real server at
+  2.83s, matching Jellyfin's own `Startup complete 0:00:02.79`). See `suite/lib.sh`.
 - **Peak RSS** under load
 
 ### Warm and cold, side by side (never blended)

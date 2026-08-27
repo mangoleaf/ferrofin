@@ -21,7 +21,7 @@ bringup_scan() {
     rm -f "results/raw/$target-ctx.json"
     if [ "${BENCH_SKIP_BUILD:-0}" = "1" ]; then docker compose up -d "$svc"; else docker compose up -d --build "$svc"; fi
     up=0
-    for _ in $(seq 1 120); do curl -sf "$base/System/Info/Public" >/dev/null 2>&1 && { up=1; break; }; sleep 1; done
+    for _ in $(seq 1 120); do curl -sf "$base$SUITE_READY_PATH" >/dev/null 2>&1 && { up=1; break; }; sleep 1; done
     if [ "$up" = 1 ] && python3 bootstrap.py --target "$target" --base "$base"; then return 0; fi
     echo "   [$target] scan attempt $attempt failed (container likely OOM'd at ${BENCH_MEM}) — retrying"
   done

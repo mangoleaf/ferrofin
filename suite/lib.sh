@@ -84,9 +84,23 @@ suite_gen_fixtures() {
 }
 
 # Poll a base URL until its first 200, or die. Cold-start / readiness gate for a stage.
+# The ONE readiness route for every poll in the suite. NOT /System/Info/Public:
+# Jellyfin 10.11 binds a SetupServer stub that serves exactly that one route —
+# and nothing else — while the real ApplicationHost is still starting, then
+# drops the socket. Polling it reports "ready" before the server can serve
+# anything (measured on an empty DB: stub 200 at t=1.3s, socket gone at 1.5s,
+# real server at 2.7s; the gap scales to ~20s on a populated DB). That
+# understated Jellyfin's cold-start and raced bring-up into `auth failed: 0`.
+# /Users/Public is unauthenticated, absent from the stub, 503 while the real app
+# starts and 200 only once it can serve; Ferrofin answers it and
+# /System/Info/Public simultaneously, so this costs Ferrofin nothing. It is also
+# absent from BENCH_COLD_ENDPOINTS, so polling it cannot pre-warm a cold
+# sentinel — which the old probe did to info_public, its own sentinel.
+SUITE_READY_PATH="/Users/Public"
+
 suite_wait200() {  # $1=base url $2=name
   local _
-  for _ in $(seq 1 120); do curl -sf "$1/System/Info/Public" >/dev/null 2>&1 && return 0; sleep 0.5; done
+  for _ in $(seq 1 120); do curl -sf "$1$SUITE_READY_PATH" >/dev/null 2>&1 && return 0; sleep 0.5; done
   echo "$2 never came up" >&2; exit 1
 }
 
