@@ -1,0 +1,6921 @@
+{
+  "meta": {
+    "ferrofin": "v0.37.1-42-g446f0ae",
+    "ferrofin_sha": "446f0ae",
+    "jellyfin_image": "jellyfin/jellyfin:10.11.8",
+    "fixture_hash": "07da0d9873bd64e5",
+    "cpus": 4,
+    "mem": "4g",
+    "load": {
+      "model": "open-loop",
+      "duration_secs": 30
+    },
+    "engine": "vegeta v12.12.0",
+    "ping_ceiling_rps": 31978.6,
+    "bench_config": {
+      "values": {
+        "BENCH_RUNS": 5,
+        "BENCH_NOISE_FLOOR_MS": 1.0,
+        "BENCH_MIN_SAMPLES": 1000,
+        "BENCH_MIN_WINDOW_SECS": 5,
+        "BENCH_DURATION_SECS": 30,
+        "BENCH_RATE": 25,
+        "BENCH_RATE_FRACTION": 0.5,
+        "BENCH_RATE_MAX": 2000,
+        "BENCH_RATE_TOLERANCE": 0.99,
+        "BENCH_GLOBAL_WARMUP_SECS": 60,
+        "BENCH_WARMUP_SECS": 10,
+        "BENCH_WARMUP_MIN_CALLS": 30,
+        "BENCH_COLD_REQUESTS": 10,
+        "BENCH_COLD_READY_TIMEOUT_SECS": 120,
+        "BENCH_COLD_ENDPOINTS": "info_public user_me items_sortname items_mixed item_detail persons studios suggestions movie_recommendations items_filters2 image_primary",
+        "BENCH_KNEE_P99_MS": 250.0,
+        "BENCH_LOGIN_RATE": 10,
+        "BENCH_LOGIN_DURATION_SECS": 15,
+        "PERF_GATE_FACTOR": 1.5,
+        "PERF_GATE_SECONDS": 10,
+        "PERF_GATE_RATE": 25
+      },
+      "sources": {
+        "BENCH_RUNS": "env",
+        "BENCH_NOISE_FLOOR_MS": "env",
+        "BENCH_MIN_SAMPLES": "env",
+        "BENCH_MIN_WINDOW_SECS": "env",
+        "BENCH_DURATION_SECS": "env",
+        "BENCH_RATE": "env",
+        "BENCH_RATE_FRACTION": "env",
+        "BENCH_RATE_MAX": "env",
+        "BENCH_RATE_TOLERANCE": "env",
+        "BENCH_GLOBAL_WARMUP_SECS": "env",
+        "BENCH_WARMUP_SECS": "env",
+        "BENCH_WARMUP_MIN_CALLS": "env",
+        "BENCH_COLD_REQUESTS": "env",
+        "BENCH_COLD_READY_TIMEOUT_SECS": "env",
+        "BENCH_COLD_ENDPOINTS": "env",
+        "BENCH_KNEE_P99_MS": "bench.conf",
+        "BENCH_LOGIN_RATE": "env",
+        "BENCH_LOGIN_DURATION_SECS": "env",
+        "PERF_GATE_FACTOR": "env",
+        "PERF_GATE_SECONDS": "env",
+        "PERF_GATE_RATE": "env"
+      }
+    },
+    "perf_source": "raw-summary",
+    "footprint": {
+      "f_cold_s": "0.5",
+      "f_rss_peak_mib": 527,
+      "f_items": "2674",
+      "f_ttfs_copy": {
+        "med": 73,
+        "min": 61,
+        "max": 140,
+        "runs": 3
+      },
+      "f_ttfs_encode": {
+        "med": 5001,
+        "min": 4737,
+        "max": 5076,
+        "runs": 3
+      },
+      "j_cold_s": "5.8",
+      "j_rss_peak_mib": 1362,
+      "j_items": "2674",
+      "j_ttfs_copy": {
+        "med": 137,
+        "min": 130,
+        "max": 286,
+        "runs": 3
+      },
+      "j_ttfs_encode": {
+        "med": 3990,
+        "min": 3895,
+        "max": 4368,
+        "runs": 3
+      }
+    },
+    "server_build": "v0.37.1-42-g446f0ae30693-dirty",
+    "skipped_variants": null,
+    "incomplete": null,
+    "shape_baseline_reset": "fixture changed b2dad4084fffa07c \u2192 07da0d9873bd64e5",
+    "when": "2026-08-25T04:45Z",
+    "run_seq": 1,
+    "run_label": "v0.37.1-42-g446f0ae"
+  },
+  "headline": {
+    "comparable_rows": 88,
+    "dropped_rows": 51,
+    "dropped_by_reason": {
+      "not deep-verified": 51
+    },
+    "shape_divergences_vs_jellyfin": 30,
+    "median_speedup": 0.77,
+    "win_rate": 0.216,
+    "tail_losses": [
+      "system_info",
+      "nextup",
+      "genres",
+      "persons",
+      "shows_episodes",
+      "playlist_detail",
+      "channels_features"
+    ],
+    "parity_coverage": 0.608,
+    "owners": {
+      "core": {
+        "rows": 139,
+        "comparable_rows": 88,
+        "median_speedup": 0.77,
+        "win_rate": 0.216,
+        "parity_coverage": 0.633
+      }
+    }
+  },
+  "operations": [
+    {
+      "op": "GET /System/ActivityLog/Entries",
+      "tag": "ActivityLog",
+      "shape": {
+        "f": "8e225721dd124875",
+        "j": "9b004fe6546f0503",
+        "matches_jellyfin": false,
+        "diff_vs_jellyfin": {
+          "missing": [
+            "Items[].ShortOverview"
+          ],
+          "extra": []
+        },
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": false,
+        "classification": "instance: activity-log entries differ per instance/run."
+      },
+      "perf": {
+        "variant": "activity_log",
+        "f_p50": 0.44,
+        "f_p95": 1.42,
+        "f_p99": 2.64,
+        "f_rps": 2000.0,
+        "f_ok": 100.0,
+        "j_p50": 0.44,
+        "j_p95": 0.76,
+        "j_p99": 2.43,
+        "j_rps": 2000.0,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 2000.0,
+        "j_achieved": 2000.0,
+        "speedup": 1.0,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "win",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "not deep-verified"
+      }
+    },
+    {
+      "op": "GET /Artists/AlbumArtists",
+      "tag": "Artists",
+      "shape": {
+        "f": "40d76722d82205a7",
+        "j": "40d76722d82205a7",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": false,
+        "classification": "flagged: read diff vs Jellyfin (verify)"
+      },
+      "perf": {
+        "variant": "album_artists",
+        "f_p50": 0.41,
+        "f_p95": 1.16,
+        "f_p99": 1.92,
+        "f_rps": 741.0,
+        "f_ok": 100.0,
+        "j_p50": 1.13,
+        "j_p95": 2.38,
+        "j_p99": 3.7,
+        "j_rps": 741.0,
+        "j_ok": 100.0,
+        "rate": 741,
+        "rate_source": "calibrated",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 741,
+        "f_achieved": 741.0,
+        "j_achieved": 741.0,
+        "speedup": 2.76,
+        "win_all_three": true,
+        "verdicts": {
+          "p50": "win",
+          "p95": "win",
+          "p99": "win"
+        },
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "not deep-verified"
+      }
+    },
+    {
+      "op": "GET /Artists",
+      "tag": "Artists",
+      "shape": {
+        "f": "40d76722d82205a7",
+        "j": "40d76722d82205a7",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": false,
+        "classification": "flagged: read diff vs Jellyfin (verify)"
+      },
+      "perf": {
+        "variant": "artists",
+        "f_p50": 0.4,
+        "f_p95": 1.08,
+        "f_p99": 1.99,
+        "f_rps": 809.0,
+        "f_ok": 100.0,
+        "j_p50": 1.11,
+        "j_p95": 2.26,
+        "j_p99": 3.51,
+        "j_rps": 809.0,
+        "j_ok": 100.0,
+        "rate": 809,
+        "rate_source": "calibrated",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 809,
+        "f_achieved": 809.0,
+        "j_achieved": 809.0,
+        "speedup": 2.77,
+        "win_all_three": true,
+        "verdicts": {
+          "p50": "win",
+          "p95": "win",
+          "p99": "win"
+        },
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "not deep-verified"
+      }
+    },
+    {
+      "op": "GET /Auth/Keys",
+      "tag": "ApiKey",
+      "shape": {
+        "f": "40d76722d82205a7",
+        "j": "40d76722d82205a7",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "auth_keys",
+        "f_p50": 0.33,
+        "f_p95": 1.16,
+        "f_p99": 2.35,
+        "f_rps": 2000.0,
+        "f_ok": 100.0,
+        "j_p50": 0.28,
+        "j_p95": 0.48,
+        "j_p99": 0.84,
+        "j_rps": 1999.8,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 2000.0,
+        "j_achieved": 1999.8,
+        "speedup": 0.85,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "POST /Users/AuthenticateByName",
+      "tag": "User",
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "auth_login",
+        "f_p50": 68.63,
+        "f_p95": 75.6,
+        "f_p99": 77.82,
+        "f_rps": 10.0,
+        "f_ok": 100.0,
+        "j_p50": 54.95,
+        "j_p95": 61.88,
+        "j_p99": 108.42,
+        "j_rps": 10.0,
+        "j_ok": 100.0,
+        "rate": 10,
+        "rate_source": "login",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 10,
+        "f_achieved": 10.0,
+        "j_achieved": 10.0,
+        "speedup": 0.8,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "win"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Auth/Providers",
+      "tag": "Session",
+      "shape": {
+        "f": "8249b99aab46f98c",
+        "j": "8249b99aab46f98c",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "auth_providers",
+        "f_p50": 0.24,
+        "f_p95": 1.02,
+        "f_p99": 2.35,
+        "f_rps": 2000.0,
+        "f_ok": 100.0,
+        "j_p50": 0.18,
+        "j_p95": 0.33,
+        "j_p99": 0.48,
+        "j_rps": 1999.8,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 2000.0,
+        "j_achieved": 1999.8,
+        "speedup": 0.75,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Auth/PasswordResetProviders",
+      "tag": "Session",
+      "shape": {
+        "f": "8249b99aab46f98c",
+        "j": "8249b99aab46f98c",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "auth_pw_providers",
+        "f_p50": 0.24,
+        "f_p95": 0.85,
+        "f_p99": 1.82,
+        "f_rps": 2000.0,
+        "f_ok": 100.0,
+        "j_p50": 0.18,
+        "j_p95": 0.33,
+        "j_p99": 0.48,
+        "j_rps": 2000.0,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 2000.0,
+        "j_achieved": 2000.0,
+        "speedup": 0.75,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Libraries/AvailableOptions",
+      "tag": "Library",
+      "shape": {
+        "f": "80c903a357b01435",
+        "j": "7de14de685dcb09d",
+        "matches_jellyfin": false,
+        "diff_vs_jellyfin": {
+          "missing": [],
+          "extra": [
+            "MediaSegmentProviders[].DefaultEnabled",
+            "MediaSegmentProviders[].Name",
+            "SubtitleFetchers[].DefaultEnabled",
+            "SubtitleFetchers[].Name",
+            "TypeOptions[].SimilarItemProviders",
+            "TypeOptions[].SimilarItemProviders[].DefaultEnabled",
+            "TypeOptions[].SimilarItemProviders[].Name"
+          ]
+        },
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": false,
+        "classification": "verified 2026-08-11: LibraryOptionsResultDto (MetadataReaders/MetadataSavers/SubtitleFetchers/LyricFetchers/MediaSegmentProviders/TypeOptions), status+schema conformant."
+      },
+      "perf": {
+        "variant": "available_options",
+        "f_p50": 0.86,
+        "f_p95": 1.57,
+        "f_p99": 3.03,
+        "f_rps": 138.0,
+        "f_ok": 100.0,
+        "j_p50": 2.98,
+        "j_p95": 5.08,
+        "j_p99": 6.52,
+        "j_rps": 138.0,
+        "j_ok": 100.0,
+        "rate": 138,
+        "rate_source": "calibrated",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 138,
+        "f_achieved": 138.0,
+        "j_achieved": 138.0,
+        "speedup": 3.47,
+        "win_all_three": true,
+        "verdicts": {
+          "p50": "win",
+          "p95": "win",
+          "p99": "win"
+        },
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "not deep-verified"
+      }
+    },
+    {
+      "op": "GET /Backup",
+      "tag": "Backup",
+      "shape": {
+        "f": "e3b0c44298fc1c14",
+        "j": "e3b0c44298fc1c14",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "backup_list",
+        "f_p50": 0.28,
+        "f_p95": 0.93,
+        "f_p99": 1.97,
+        "f_rps": 2000.0,
+        "f_ok": 100.0,
+        "j_p50": 0.19,
+        "j_p95": 0.34,
+        "j_p99": 0.48,
+        "j_rps": 2000.0,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 2000.0,
+        "j_achieved": 2000.0,
+        "speedup": 0.68,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Branding/Configuration",
+      "tag": "Branding",
+      "shape": {
+        "f": "d24c63a34811df5d",
+        "j": "d24c63a34811df5d",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "branding",
+        "f_p50": 0.23,
+        "f_p95": 0.86,
+        "f_p99": 1.84,
+        "f_rps": 2000.0,
+        "f_ok": 100.0,
+        "j_p50": 0.17,
+        "j_p95": 0.32,
+        "j_p99": 0.51,
+        "j_rps": 2000.0,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 2000.0,
+        "j_achieved": 2000.0,
+        "speedup": 0.74,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Branding/Css",
+      "tag": "Branding",
+      "shape": {
+        "f": "non-json",
+        "j": "non-json",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "branding_css",
+        "f_p50": 0.21,
+        "f_p95": 0.71,
+        "f_p99": 1.42,
+        "f_rps": 2000.0,
+        "f_ok": 100.0,
+        "j_p50": 0.14,
+        "j_p95": 0.24,
+        "j_p99": 0.35,
+        "j_rps": 2000.0,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 2000.0,
+        "j_achieved": 2000.0,
+        "speedup": 0.67,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Branding/Css.css",
+      "tag": "Branding",
+      "shape": {
+        "f": "non-json",
+        "j": "non-json",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "branding_css_ext",
+        "f_p50": 0.21,
+        "f_p95": 0.71,
+        "f_p99": 1.34,
+        "f_rps": 2000.0,
+        "f_ok": 100.0,
+        "j_p50": 0.14,
+        "j_p95": 0.25,
+        "j_p99": 0.38,
+        "j_rps": 2000.0,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 2000.0,
+        "j_achieved": 2000.0,
+        "speedup": 0.67,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Channels",
+      "tag": "Channels",
+      "shape": {
+        "f": "40d76722d82205a7",
+        "j": "40d76722d82205a7",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "channels",
+        "f_p50": 0.23,
+        "f_p95": 0.8,
+        "f_p99": 1.61,
+        "f_rps": 2000.0,
+        "f_ok": 100.0,
+        "j_p50": 0.19,
+        "j_p95": 0.34,
+        "j_p99": 0.51,
+        "j_rps": 2000.0,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 2000.0,
+        "j_achieved": 2000.0,
+        "speedup": 0.83,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Channels/Features",
+      "tag": "Channels",
+      "shape": {
+        "f": "e3b0c44298fc1c14",
+        "j": "e3b0c44298fc1c14",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "channels_features",
+        "f_p50": 0.21,
+        "f_p95": 0.69,
+        "f_p99": 1.42,
+        "f_rps": 2000.0,
+        "f_ok": 100.0,
+        "j_p50": 0.44,
+        "j_p95": 0.73,
+        "j_p99": 1.21,
+        "j_rps": 1999.8,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 2000.0,
+        "j_achieved": 1999.8,
+        "speedup": 2.1,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "win",
+          "p95": "win",
+          "p99": "loss"
+        },
+        "tail_loss": true,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Channels/Items/Latest",
+      "tag": "Channels",
+      "shape": {
+        "f": "40d76722d82205a7",
+        "j": "40d76722d82205a7",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "channels_latest",
+        "f_p50": 0.22,
+        "f_p95": 0.73,
+        "f_p99": 1.73,
+        "f_rps": 1999.8,
+        "f_ok": 100.0,
+        "j_p50": 0.18,
+        "j_p95": 0.33,
+        "j_p99": 0.49,
+        "j_rps": 1999.8,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 1999.8,
+        "j_achieved": 1999.8,
+        "speedup": 0.82,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /web/ConfigurationPages",
+      "tag": "Dashboard",
+      "shape": {
+        "f": "e3b0c44298fc1c14",
+        "j": "cbd459253a6d1d45",
+        "matches_jellyfin": false,
+        "diff_vs_jellyfin": {
+          "missing": [
+            "[].DisplayName",
+            "[].EnableInMainMenu",
+            "[].Name",
+            "[].PluginId"
+          ],
+          "extra": []
+        },
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": false,
+        "classification": "expected-extension: plugin configuration pages come from external plugins Ferrofin doesn't host."
+      },
+      "perf": {
+        "variant": "config_pages",
+        "f_p50": 1.0,
+        "f_p95": 1.75,
+        "f_p99": 2.52,
+        "f_rps": 25.0,
+        "f_ok": 100.0,
+        "j_p50": 0.68,
+        "j_p95": 1.06,
+        "j_p99": 1.55,
+        "j_rps": 25.0,
+        "j_ok": 100.0,
+        "rate": 25,
+        "rate_source": "flat-default",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 25,
+        "f_achieved": 25.0,
+        "j_achieved": 25.0,
+        "speedup": 0.68,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "not deep-verified"
+      }
+    },
+    {
+      "op": "GET /Devices",
+      "tag": "Devices",
+      "shape": {
+        "f": "bef6e47d29aea858",
+        "j": "bef6e47d29aea858",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "devices",
+        "f_p50": 0.56,
+        "f_p95": 1.88,
+        "f_p99": 3.54,
+        "f_rps": 2000.0,
+        "f_ok": 100.0,
+        "j_p50": 0.2,
+        "j_p95": 0.35,
+        "j_p99": 0.52,
+        "j_rps": 2000.0,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 2000.0,
+        "j_achieved": 2000.0,
+        "speedup": 0.36,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Devices/Info",
+      "tag": "Devices",
+      "shape": {
+        "f": "52d49a0392edaa9b",
+        "j": "52d49a0392edaa9b",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "devices_info",
+        "f_p50": 0.44,
+        "f_p95": 1.35,
+        "f_p99": 2.65,
+        "f_rps": 2000.0,
+        "f_ok": 100.0,
+        "j_p50": 0.2,
+        "j_p95": 0.35,
+        "j_p99": 0.53,
+        "j_rps": 1999.8,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 2000.0,
+        "j_achieved": 1999.8,
+        "speedup": 0.45,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /DisplayPreferences/{displayPreferencesId}",
+      "tag": "DisplayPreferences",
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": false,
+        "classification": "verified 2026-08-11: the auto-flag was a harness artifact (literal unresolved {displayPreferencesId}); with a real client key (e.g. usersettings?client=emby) Ferrofin returns 200 DisplayPreferencesDto (Id/Client/SortBy/CustomPrefs) \u2014 the by-client resolution Jellyfin uses."
+      },
+      "perf": {
+        "variant": "display_preferences",
+        "f_p50": 1.49,
+        "f_p95": 2.39,
+        "f_p99": 3.25,
+        "f_rps": 25.0,
+        "f_ok": 100.0,
+        "j_p50": 1.72,
+        "j_p95": 2.78,
+        "j_p99": 3.97,
+        "j_rps": 25.0,
+        "j_ok": 100.0,
+        "rate": 25,
+        "rate_source": "flat-default",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 25,
+        "f_achieved": 25.0,
+        "j_achieved": 25.0,
+        "speedup": 1.15,
+        "win_all_three": true,
+        "verdicts": {
+          "p50": "win",
+          "p95": "win",
+          "p99": "win"
+        },
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "not deep-verified"
+      }
+    },
+    {
+      "op": "GET /Environment/DefaultDirectoryBrowser",
+      "tag": "Environment",
+      "shape": {
+        "f": "e3b0c44298fc1c14",
+        "j": "e3b0c44298fc1c14",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "env_default_browser",
+        "f_p50": 0.2,
+        "f_p95": 0.69,
+        "f_p99": 1.28,
+        "f_rps": 1999.8,
+        "f_ok": 100.0,
+        "j_p50": 0.18,
+        "j_p95": 0.33,
+        "j_p99": 0.5,
+        "j_rps": 2000.0,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 1999.8,
+        "j_achieved": 2000.0,
+        "speedup": 0.9,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Environment/Drives",
+      "tag": "Environment",
+      "shape": {
+        "f": "0dc88b47bc3dc855",
+        "j": "0dc88b47bc3dc855",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": false,
+        "classification": "instance: per-host filesystem drives."
+      },
+      "perf": {
+        "variant": "env_drives",
+        "f_p50": 0.92,
+        "f_p95": 1.48,
+        "f_p99": 2.29,
+        "f_rps": 25.0,
+        "f_ok": 100.0,
+        "j_p50": 0.87,
+        "j_p95": 1.21,
+        "j_p99": 1.55,
+        "j_rps": 25.0,
+        "j_ok": 100.0,
+        "rate": 25,
+        "rate_source": "flat-default",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 25,
+        "f_achieved": 25.0,
+        "j_achieved": 25.0,
+        "speedup": 0.95,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "not deep-verified"
+      }
+    },
+    {
+      "op": "GET /Environment/NetworkShares",
+      "tag": "Environment",
+      "shape": {
+        "f": "e3b0c44298fc1c14",
+        "j": "e3b0c44298fc1c14",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "env_network_shares",
+        "f_p50": 0.21,
+        "f_p95": 0.7,
+        "f_p99": 1.56,
+        "f_rps": 2000.0,
+        "f_ok": 100.0,
+        "j_p50": 0.2,
+        "j_p95": 0.36,
+        "j_p99": 0.53,
+        "j_rps": 2000.0,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 2000.0,
+        "j_achieved": 2000.0,
+        "speedup": 0.95,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Environment/ParentPath",
+      "tag": "Environment",
+      "shape": {
+        "f": "e3b0c44298fc1c14",
+        "j": "e3b0c44298fc1c14",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "env_parent_path",
+        "f_p50": 0.95,
+        "f_p95": 1.62,
+        "f_p99": 2.73,
+        "f_rps": 25.0,
+        "f_ok": 100.0,
+        "j_p50": 0.73,
+        "j_p95": 1.14,
+        "j_p99": 1.4,
+        "j_rps": 25.0,
+        "j_ok": 100.0,
+        "rate": 25,
+        "rate_source": "flat-default",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 25,
+        "f_achieved": 25.0,
+        "j_achieved": 25.0,
+        "speedup": 0.77,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /FallbackFont/Fonts",
+      "tag": "Subtitle",
+      "shape": {
+        "f": "e3b0c44298fc1c14",
+        "j": "e3b0c44298fc1c14",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "fallback_fonts",
+        "f_p50": 0.22,
+        "f_p95": 0.77,
+        "f_p99": 1.65,
+        "f_rps": 2000.0,
+        "f_ok": 100.0,
+        "j_p50": 0.21,
+        "j_p95": 0.36,
+        "j_p99": 0.52,
+        "j_rps": 2000.0,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 2000.0,
+        "j_achieved": 2000.0,
+        "speedup": 0.95,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Items/Filters",
+      "tag": "Filter",
+      "shape": {
+        "f": "03596b1a725cdbe3",
+        "j": "03596b1a725cdbe3",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "filters",
+        "f_p50": 2.97,
+        "f_p95": 4.88,
+        "f_p99": 6.37,
+        "f_rps": 98.0,
+        "f_ok": 100.0,
+        "j_p50": 20.72,
+        "j_p95": 24.69,
+        "j_p99": 26.8,
+        "j_rps": 98.0,
+        "j_ok": 100.0,
+        "rate": 98,
+        "rate_source": "calibrated",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 98,
+        "f_achieved": 98.0,
+        "j_achieved": 98.0,
+        "speedup": 6.98,
+        "win_all_three": true,
+        "verdicts": {
+          "p50": "win",
+          "p95": "win",
+          "p99": "win"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Genres/{genreName}",
+      "tag": "Genres",
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": false,
+        "classification": "accepted-divergence: same no-lazy-create-on-GET family as /Studios/{name}. Existing genre\u2192200 BaseItemDto (both servers), absent\u2192Ferrofin 404 vs Jellyfin auto-created 200. Shape verified."
+      },
+      "perf": {
+        "variant": "genre_detail",
+        "f_p50": 3.0,
+        "f_p95": 4.83,
+        "f_p99": 6.24,
+        "f_rps": 25.0,
+        "f_ok": 100.0,
+        "j_p50": 6.76,
+        "j_p95": 9.16,
+        "j_p99": 10.41,
+        "j_rps": 25.0,
+        "j_ok": 100.0,
+        "rate": 25,
+        "rate_source": "flat-default",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 25,
+        "f_achieved": 25.0,
+        "j_achieved": 25.0,
+        "speedup": 2.25,
+        "win_all_three": true,
+        "verdicts": {
+          "p50": "win",
+          "p95": "win",
+          "p99": "win"
+        },
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "not deep-verified"
+      }
+    },
+    {
+      "op": "GET /Genres",
+      "tag": "Genres",
+      "shape": {
+        "f": "664c07048c79b8a4",
+        "j": "664c07048c79b8a4",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "verified 2026-08-11: QueryResult<BaseItemDto> (Items array + TotalRecordCount + StartIndex), status+schema conformant; empty-library returns the well-formed empty result."
+      },
+      "perf": {
+        "variant": "genres",
+        "f_p50": 1.81,
+        "f_p95": 4.09,
+        "f_p99": 6.55,
+        "f_rps": 618.0,
+        "f_ok": 100.0,
+        "j_p50": 2.87,
+        "j_p95": 4.91,
+        "j_p99": 6.41,
+        "j_rps": 618.0,
+        "j_ok": 100.0,
+        "rate": 618,
+        "rate_source": "calibrated",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 618,
+        "f_achieved": 618.0,
+        "j_achieved": 618.0,
+        "speedup": 1.59,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "win",
+          "p95": "win",
+          "p99": "loss"
+        },
+        "tail_loss": true,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /UserViews/GroupingOptions",
+      "tag": "UserViews",
+      "shape": {
+        "f": "8249b99aab46f98c",
+        "j": "8249b99aab46f98c",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "grouping_options",
+        "f_p50": 1.35,
+        "f_p95": 5.43,
+        "f_p99": 10.05,
+        "f_rps": 2000.0,
+        "f_ok": 100.0,
+        "j_p50": 0.21,
+        "j_p95": 0.39,
+        "j_p99": 0.72,
+        "j_rps": 2000.0,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 2000.0,
+        "j_achieved": 2000.0,
+        "speedup": 0.16,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Items/{itemId}/Images/{imageType}",
+      "tag": "Image",
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": false,
+        "classification": "flagged: asset property diff vs Jellyfin (verify)"
+      },
+      "perf": {
+        "variant": "image_primary",
+        "f_p50": 0.61,
+        "f_p95": 2.35,
+        "f_p99": 4.78,
+        "f_rps": 1999.8,
+        "f_ok": 100.0,
+        "j_p50": 0.24,
+        "j_p95": 0.42,
+        "j_p99": 0.63,
+        "j_rps": 2000.0,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 1999.8,
+        "j_achieved": 2000.0,
+        "speedup": 0.39,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "not deep-verified",
+        "cold": {
+          "f_first": 10.15,
+          "f_p50": 2.02,
+          "f_max": 10.15,
+          "f_ready_ms": 0.0,
+          "j_first": 55.67,
+          "j_p50": 0.74,
+          "j_max": 55.67,
+          "j_ready_ms": 0.0
+        }
+      }
+    },
+    {
+      "op": "GET /System/Info/Public",
+      "tag": "System",
+      "shape": {
+        "f": "dde70150e8d53eb4",
+        "j": "dde70150e8d53eb4",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "info_public",
+        "f_p50": 0.22,
+        "f_p95": 0.77,
+        "f_p99": 1.56,
+        "f_rps": 1999.8,
+        "f_ok": 100.0,
+        "j_p50": 0.17,
+        "j_p95": 0.34,
+        "j_p99": 0.48,
+        "j_rps": 2000.0,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 1999.8,
+        "j_achieved": 2000.0,
+        "speedup": 0.77,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null,
+        "cold": {
+          "f_first": 12.43,
+          "f_p50": 1.0,
+          "f_max": 12.43,
+          "f_ready_ms": 0.0,
+          "j_first": 13.52,
+          "j_p50": 1.28,
+          "j_max": 13.52,
+          "j_ready_ms": 0.0
+        }
+      }
+    },
+    {
+      "op": "GET /Items/{itemId}/Ancestors",
+      "tag": "Library",
+      "shape": {
+        "f": "7bc85c862aff9c80",
+        "j": "dcef518805bfa87a",
+        "matches_jellyfin": false,
+        "diff_vs_jellyfin": {
+          "missing": [
+            "[].CollectionType",
+            "[].DateLastMediaAdded"
+          ],
+          "extra": [
+            "[].UserData.UnplayedItemCount"
+          ]
+        },
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": false,
+        "classification": "instance: ancestor chain now includes the UserRootFolder hop as Jellyfin's does; residual diff is /config-vs-/data path-derived ids only."
+      },
+      "perf": {
+        "variant": "item_ancestors",
+        "f_p50": 1.1,
+        "f_p95": 4.42,
+        "f_p99": 8.08,
+        "f_rps": 2000.0,
+        "f_ok": 100.0,
+        "j_p50": 0.3,
+        "j_p95": 0.54,
+        "j_p99": 0.86,
+        "j_rps": 1999.8,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 2000.0,
+        "j_achieved": 1999.8,
+        "speedup": 0.27,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "not deep-verified"
+      }
+    },
+    {
+      "op": "GET /Items/{itemId}/CriticReviews",
+      "tag": "Library",
+      "shape": {
+        "f": "40d76722d82205a7",
+        "j": "40d76722d82205a7",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "item_critic_reviews",
+        "f_p50": 0.23,
+        "f_p95": 0.82,
+        "f_p99": 1.57,
+        "f_rps": 2000.0,
+        "f_ok": 100.0,
+        "j_p50": 0.18,
+        "j_p95": 0.34,
+        "j_p99": 0.5,
+        "j_rps": 2000.0,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 2000.0,
+        "j_achieved": 2000.0,
+        "speedup": 0.78,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Items/{itemId}",
+      "tag": "UserLibrary",
+      "shape": {
+        "f": "751e9863e12d5d6d",
+        "j": "de509786b6652a88",
+        "matches_jellyfin": false,
+        "diff_vs_jellyfin": {
+          "missing": [
+            "Height",
+            "IsHD",
+            "MediaSources[].MediaStreams[].Hdr10PlusPresentFlag",
+            "MediaSources[].MediaStreams[].IsAVC",
+            "MediaSources[].MediaStreams[].VideoDoViTitle",
+            "MediaStreams[].Hdr10PlusPresentFlag",
+            "MediaStreams[].IsAVC",
+            "MediaStreams[].VideoDoViTitle",
+            "PremiereDate",
+            "Width"
+          ],
+          "extra": [
+            "MediaSources[].MediaStreams[].LocalizedLanguage",
+            "MediaStreams[].LocalizedLanguage"
+          ]
+        },
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": false,
+        "classification": "instance/probe-noise: residual diffs are MediaStream probe values (BitRate/IsAVC/Level/RealFrameRate) that vary per independent probe. The Localized* labels that used to diff are now served on read-back (MediaSourceManager::with_localization)."
+      },
+      "perf": {
+        "variant": "item_detail",
+        "f_p50": 1.13,
+        "f_p95": 3.18,
+        "f_p99": 5.9,
+        "f_rps": 1180.0,
+        "f_ok": 100.0,
+        "j_p50": 1.32,
+        "j_p95": 3.54,
+        "j_p99": 6.18,
+        "j_rps": 1179.8,
+        "j_ok": 100.0,
+        "rate": 1180,
+        "rate_source": "calibrated",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 1180,
+        "f_achieved": 1180.0,
+        "j_achieved": 1179.8,
+        "speedup": 1.17,
+        "win_all_three": true,
+        "verdicts": {
+          "p50": "win",
+          "p95": "win",
+          "p99": "win"
+        },
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "not deep-verified",
+        "cold": {
+          "f_first": 17.33,
+          "f_p50": 2.68,
+          "f_max": 17.33,
+          "f_ready_ms": 0.0,
+          "j_first": 154.64,
+          "j_p50": 4.4,
+          "j_max": 154.64,
+          "j_ready_ms": 0.0
+        }
+      }
+    },
+    {
+      "op": "GET /Items/{itemId}/ExternalIdInfos",
+      "tag": "ItemLookup",
+      "shape": {
+        "f": "2050be258840975e",
+        "j": "2050be258840975e",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": false,
+        "classification": "flagged: read diff vs Jellyfin (sweep single-item align)"
+      },
+      "perf": {
+        "variant": "item_external_ids",
+        "f_p50": 0.44,
+        "f_p95": 1.5,
+        "f_p99": 2.95,
+        "f_rps": 1999.8,
+        "f_ok": 100.0,
+        "j_p50": 0.21,
+        "j_p95": 0.39,
+        "j_p99": 0.59,
+        "j_rps": 2000.0,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 1999.8,
+        "j_achieved": 2000.0,
+        "speedup": 0.48,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "not deep-verified"
+      }
+    },
+    {
+      "op": "GET /Items/{itemId}/Images/{imageType}/{imageIndex}",
+      "tag": "Image",
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": false,
+        "classification": "flagged: asset property diff vs Jellyfin (verify)"
+      },
+      "perf": {
+        "variant": "item_image_indexed",
+        "f_p50": 0.53,
+        "f_p95": 1.67,
+        "f_p99": 3.12,
+        "f_rps": 2000.0,
+        "f_ok": 100.0,
+        "j_p50": 0.23,
+        "j_p95": 0.42,
+        "j_p99": 0.64,
+        "j_rps": 2000.0,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 2000.0,
+        "j_achieved": 2000.0,
+        "speedup": 0.43,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "not deep-verified"
+      }
+    },
+    {
+      "op": "GET /Items/{itemId}/Images/{imageType}/{imageIndex}/{tag}/{format}/{maxWidth}/{maxHeight}/{percentPlayed}/{unplayedCount}",
+      "tag": "Image",
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": false,
+        "classification": "flagged: asset property diff vs Jellyfin (verify)"
+      },
+      "perf": {
+        "variant": "item_image_parametrized",
+        "f_p50": 0.56,
+        "f_p95": 2.25,
+        "f_p99": 4.73,
+        "f_rps": 2000.0,
+        "f_ok": 100.0,
+        "j_p50": 0.3,
+        "j_p95": 0.55,
+        "j_p99": 0.79,
+        "j_rps": 1999.8,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 2000.0,
+        "j_achieved": 1999.8,
+        "speedup": 0.54,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "not deep-verified"
+      }
+    },
+    {
+      "op": "GET /Items/{itemId}/Images",
+      "tag": "Image",
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "item_images",
+        "f_p50": 0.42,
+        "f_p95": 1.32,
+        "f_p99": 2.47,
+        "f_rps": 2000.0,
+        "f_ok": 100.0,
+        "j_p50": 0.22,
+        "j_p95": 0.41,
+        "j_p99": 0.72,
+        "j_rps": 2000.0,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 2000.0,
+        "j_achieved": 2000.0,
+        "speedup": 0.52,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Items/{itemId}/InstantMix",
+      "tag": "InstantMix",
+      "shape": {
+        "f": "40d76722d82205a7",
+        "j": "40d76722d82205a7",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "item_instant_mix",
+        "f_p50": 0.58,
+        "f_p95": 1.84,
+        "f_p99": 3.46,
+        "f_rps": 2000.0,
+        "f_ok": 100.0,
+        "j_p50": 0.23,
+        "j_p95": 0.43,
+        "j_p99": 0.74,
+        "j_rps": 2000.0,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 2000.0,
+        "j_achieved": 2000.0,
+        "speedup": 0.4,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Items/{itemId}/Intros",
+      "tag": "UserLibrary",
+      "shape": {
+        "f": "40d76722d82205a7",
+        "j": "40d76722d82205a7",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "item_intros",
+        "f_p50": 0.39,
+        "f_p95": 1.39,
+        "f_p99": 3.07,
+        "f_rps": 2000.0,
+        "f_ok": 100.0,
+        "j_p50": 0.22,
+        "j_p95": 0.39,
+        "j_p99": 0.57,
+        "j_rps": 2000.0,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 2000.0,
+        "j_achieved": 2000.0,
+        "speedup": 0.56,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Items/{itemId}/LocalTrailers",
+      "tag": "UserLibrary",
+      "shape": {
+        "f": "e3b0c44298fc1c14",
+        "j": "e3b0c44298fc1c14",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "item_local_trailers",
+        "f_p50": 0.49,
+        "f_p95": 1.53,
+        "f_p99": 2.65,
+        "f_rps": 1999.8,
+        "f_ok": 100.0,
+        "j_p50": 0.21,
+        "j_p95": 0.39,
+        "j_p99": 0.63,
+        "j_rps": 2000.0,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 1999.8,
+        "j_achieved": 2000.0,
+        "speedup": 0.43,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Items/{itemId}/MetadataEditor",
+      "tag": "ItemUpdate",
+      "shape": {
+        "f": "bb50971e478297fa",
+        "j": "bb50971e478297fa",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": false,
+        "classification": "flagged: read diff vs Jellyfin (sweep single-item align)"
+      },
+      "perf": {
+        "variant": "item_metadata_editor",
+        "f_p50": 2.33,
+        "f_p95": 3.74,
+        "f_p99": 5.17,
+        "f_rps": 25.0,
+        "f_ok": 100.0,
+        "j_p50": 1.16,
+        "j_p95": 1.57,
+        "j_p99": 1.83,
+        "j_rps": 25.0,
+        "j_ok": 100.0,
+        "rate": 25,
+        "rate_source": "flat-default",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 25,
+        "f_achieved": 25.0,
+        "j_achieved": 25.0,
+        "speedup": 0.5,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "not deep-verified"
+      }
+    },
+    {
+      "op": "GET /Items/{itemId}/PlaybackInfo",
+      "tag": "MediaInfo",
+      "shape": {
+        "f": "32252f55f2d4b0fb",
+        "j": "d293001cd01e5171",
+        "matches_jellyfin": false,
+        "diff_vs_jellyfin": {
+          "missing": [
+            "MediaSources[].MediaStreams[].Hdr10PlusPresentFlag",
+            "MediaSources[].MediaStreams[].IsAVC",
+            "MediaSources[].MediaStreams[].VideoDoViTitle"
+          ],
+          "extra": [
+            "MediaSources[].MediaStreams[].LocalizedLanguage"
+          ]
+        },
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": false,
+        "classification": "instance/probe-noise: same MediaStream probe-value residual as Items/{itemId}."
+      },
+      "perf": {
+        "variant": "item_playbackinfo",
+        "f_p50": 0.83,
+        "f_p95": 2.6,
+        "f_p99": 5.29,
+        "f_rps": 1617.0,
+        "f_ok": 100.0,
+        "j_p50": 0.87,
+        "j_p95": 1.78,
+        "j_p99": 3.21,
+        "j_rps": 1617.0,
+        "j_ok": 100.0,
+        "rate": 1617,
+        "rate_source": "calibrated",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 1617,
+        "f_achieved": 1617.0,
+        "j_achieved": 1617.0,
+        "speedup": 1.05,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "win",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "not deep-verified"
+      }
+    },
+    {
+      "op": "POST /Items/{itemId}/PlaybackInfo",
+      "tag": "MediaInfo",
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "item_playbackinfo_post",
+        "f_p50": 1.07,
+        "f_p95": 2.89,
+        "f_p99": 5.13,
+        "f_rps": 1278.0,
+        "f_ok": 100.0,
+        "j_p50": 1.02,
+        "j_p95": 1.91,
+        "j_p99": 3.05,
+        "j_rps": 1278.0,
+        "j_ok": 100.0,
+        "rate": 1278,
+        "rate_source": "calibrated",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 1278,
+        "f_achieved": 1278.0,
+        "j_achieved": 1278.0,
+        "speedup": 0.95,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Items/{itemId}/RemoteImages/Providers",
+      "tag": "RemoteImage",
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": false,
+        "classification": "flagged: read diff vs Jellyfin (sweep single-item align)"
+      },
+      "perf": {
+        "variant": "item_remote_image_providers",
+        "f_p50": 1.51,
+        "f_p95": 2.64,
+        "f_p99": 4.05,
+        "f_rps": 25.0,
+        "f_ok": 100.0,
+        "j_p50": 0.83,
+        "j_p95": 1.1,
+        "j_p99": 1.38,
+        "j_rps": 25.0,
+        "j_ok": 100.0,
+        "rate": 25,
+        "rate_source": "flat-default",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 25,
+        "f_achieved": 25.0,
+        "j_achieved": 25.0,
+        "speedup": 0.55,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "not deep-verified"
+      }
+    },
+    {
+      "op": "GET /Items/{itemId}/Similar",
+      "tag": "Library",
+      "shape": {
+        "f": "40d76722d82205a7",
+        "j": "4e8c17857565336c",
+        "matches_jellyfin": false,
+        "diff_vs_jellyfin": {
+          "missing": [
+            "Items[].BackdropImageTags",
+            "Items[].ChannelId",
+            "Items[].Container",
+            "Items[].HasSubtitles",
+            "Items[].Id",
+            "Items[].ImageBlurHashes",
+            "Items[].ImageBlurHashes.Primary",
+            "Items[].ImageBlurHashes.Primary.*",
+            "Items[].ImageTags",
+            "Items[].ImageTags.Primary",
+            "Items[].IsFolder",
+            "Items[].LocationType",
+            "Items[].MediaType",
+            "Items[].Name",
+            "Items[].ProductionYear",
+            "Items[].RunTimeTicks",
+            "Items[].ServerId",
+            "Items[].Type",
+            "Items[].UserData",
+            "Items[].UserData.IsFavorite",
+            "Items[].UserData.ItemId",
+            "Items[].UserData.Key",
+            "Items[].UserData.PlayCount",
+            "Items[].UserData.PlaybackPositionTicks",
+            "Items[].UserData.Played",
+            "Items[].VideoType"
+          ],
+          "extra": []
+        },
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": false,
+        "classification": "instance/methodology: Jellyfin 10.11.8 serves /Similar from a flat Genres/Tags query ordered Random (non-deterministic, not diffable); Ferrofin implements upstream master's weighted SimilarItemsManager (genre 10/tag 5/studio 5/director 50/actor 15 + IsPlayed/user-access phase-2 filter, Episode/by-name short-circuit). Verified by unit tests against the C# weights."
+      },
+      "perf": {
+        "variant": "item_similar",
+        "f_p50": 1.75,
+        "f_p95": 4.59,
+        "f_p99": 7.06,
+        "f_rps": 521.0,
+        "f_ok": 100.0,
+        "j_p50": 2.79,
+        "j_p95": 5.01,
+        "j_p99": 6.57,
+        "j_rps": 521.0,
+        "j_ok": 100.0,
+        "rate": 521,
+        "rate_source": "calibrated",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 521,
+        "f_achieved": 521.0,
+        "j_achieved": 521.0,
+        "speedup": 1.59,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "win",
+          "p95": "win",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "not deep-verified"
+      }
+    },
+    {
+      "op": "GET /Movies/{itemId}/Similar",
+      "tag": "Library",
+      "shape": {
+        "f": "40d76722d82205a7",
+        "j": "b89c1e2138d90c4d",
+        "matches_jellyfin": false,
+        "diff_vs_jellyfin": {
+          "missing": [
+            "Items[].BackdropImageTags",
+            "Items[].ChannelId",
+            "Items[].Container",
+            "Items[].HasSubtitles",
+            "Items[].Id",
+            "Items[].ImageBlurHashes",
+            "Items[].ImageBlurHashes.Primary",
+            "Items[].ImageBlurHashes.Primary.*",
+            "Items[].ImageTags",
+            "Items[].ImageTags.Primary",
+            "Items[].IsFolder",
+            "Items[].LocationType",
+            "Items[].MediaType",
+            "Items[].Name",
+            "Items[].PremiereDate",
+            "Items[].ProductionYear",
+            "Items[].RunTimeTicks",
+            "Items[].ServerId",
+            "Items[].Type",
+            "Items[].UserData",
+            "Items[].UserData.IsFavorite",
+            "Items[].UserData.ItemId",
+            "Items[].UserData.Key",
+            "Items[].UserData.PlayCount",
+            "Items[].UserData.PlaybackPositionTicks",
+            "Items[].UserData.Played",
+            "Items[].VideoType"
+          ],
+          "extra": []
+        },
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": false,
+        "classification": "instance/methodology: Jellyfin 10.11.8 serves /Similar from a flat Genres/Tags query ordered Random (non-deterministic, not diffable); Ferrofin implements upstream master's weighted SimilarItemsManager (genre 10/tag 5/studio 5/director 50/actor 15 + IsPlayed/user-access phase-2 filter, Episode/by-name short-circuit). Verified by unit tests against the C# weights."
+      },
+      "perf": {
+        "variant": "item_similar_movie",
+        "f_p50": 1.8,
+        "f_p95": 4.47,
+        "f_p99": 6.55,
+        "f_rps": 538.0,
+        "f_ok": 100.0,
+        "j_p50": 2.88,
+        "j_p95": 5.15,
+        "j_p99": 6.63,
+        "j_rps": 538.0,
+        "j_ok": 100.0,
+        "rate": 538,
+        "rate_source": "calibrated",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 538,
+        "f_achieved": 538.0,
+        "j_achieved": 538.0,
+        "speedup": 1.6,
+        "win_all_three": true,
+        "verdicts": {
+          "p50": "win",
+          "p95": "win",
+          "p99": "win"
+        },
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "not deep-verified"
+      }
+    },
+    {
+      "op": "GET /Items/{itemId}/SpecialFeatures",
+      "tag": "UserLibrary",
+      "shape": {
+        "f": "e3b0c44298fc1c14",
+        "j": "e3b0c44298fc1c14",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "item_special_features",
+        "f_p50": 0.54,
+        "f_p95": 1.7,
+        "f_p99": 3.18,
+        "f_rps": 2000.0,
+        "f_ok": 100.0,
+        "j_p50": 0.22,
+        "j_p95": 0.39,
+        "j_p99": 0.67,
+        "j_rps": 1999.8,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 2000.0,
+        "j_achieved": 1999.8,
+        "speedup": 0.41,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Items/{itemId}/ThemeMedia",
+      "tag": "Library",
+      "shape": {
+        "f": "ef0175f43a929f44",
+        "j": "ef0175f43a929f44",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "item_theme_media",
+        "f_p50": 0.64,
+        "f_p95": 2.06,
+        "f_p99": 4.03,
+        "f_rps": 2000.0,
+        "f_ok": 100.0,
+        "j_p50": 0.23,
+        "j_p95": 0.41,
+        "j_p99": 0.61,
+        "j_rps": 1999.8,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 2000.0,
+        "j_achieved": 1999.8,
+        "speedup": 0.36,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Items/{itemId}/ThemeSongs",
+      "tag": "Library",
+      "shape": {
+        "f": "0fbd397b7cdba3a6",
+        "j": "0fbd397b7cdba3a6",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "item_theme_songs",
+        "f_p50": 0.5,
+        "f_p95": 1.51,
+        "f_p99": 2.58,
+        "f_rps": 2000.0,
+        "f_ok": 100.0,
+        "j_p50": 0.23,
+        "j_p95": 0.39,
+        "j_p99": 0.6,
+        "j_rps": 2000.0,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 2000.0,
+        "j_achieved": 2000.0,
+        "speedup": 0.46,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Items/{itemId}/ThemeVideos",
+      "tag": "Library",
+      "shape": {
+        "f": "0fbd397b7cdba3a6",
+        "j": "0fbd397b7cdba3a6",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "item_theme_videos",
+        "f_p50": 0.52,
+        "f_p95": 1.65,
+        "f_p99": 3.27,
+        "f_rps": 2000.0,
+        "f_ok": 100.0,
+        "j_p50": 0.22,
+        "j_p95": 0.4,
+        "j_p99": 0.6,
+        "j_rps": 2000.0,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 2000.0,
+        "j_achieved": 2000.0,
+        "speedup": 0.42,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /UserItems/{itemId}/UserData",
+      "tag": "Items",
+      "shape": {
+        "f": "2d687537b99b5482",
+        "j": "2d687537b99b5482",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "item_userdata",
+        "f_p50": 0.45,
+        "f_p95": 1.37,
+        "f_p99": 2.66,
+        "f_rps": 2000.0,
+        "f_ok": 100.0,
+        "j_p50": 0.25,
+        "j_p95": 0.98,
+        "j_p99": 2.69,
+        "j_rps": 2000.0,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 2000.0,
+        "j_achieved": 2000.0,
+        "speedup": 0.56,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "win"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "POST /UserItems/{itemId}/UserData",
+      "tag": "Items",
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "item_userdata_post",
+        "f_p50": 1.09,
+        "f_p95": 27.18,
+        "f_p99": 40.64,
+        "f_rps": 998.0,
+        "f_ok": 100.0,
+        "j_p50": 0.63,
+        "j_p95": 150.71,
+        "j_p99": 300.87,
+        "j_rps": 998.0,
+        "j_ok": 100.0,
+        "rate": 998,
+        "rate_source": "calibrated",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 998,
+        "f_achieved": 998.0,
+        "j_achieved": 998.0,
+        "speedup": 0.58,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "win",
+          "p99": "win"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Items",
+      "tag": "Items",
+      "shape": {
+        "f": "40d76722d82205a7",
+        "j": "40d76722d82205a7",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "items_boxset",
+        "f_p50": 0.49,
+        "f_p95": 1.38,
+        "f_p99": 2.55,
+        "f_rps": 715.0,
+        "f_ok": 100.0,
+        "j_p50": 0.98,
+        "j_p95": 1.95,
+        "j_p99": 2.87,
+        "j_rps": 715.0,
+        "j_ok": 100.0,
+        "rate": 715,
+        "rate_source": "calibrated",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 715,
+        "f_achieved": 715.0,
+        "j_achieved": 715.0,
+        "speedup": 2.0,
+        "win_all_three": true,
+        "verdicts": {
+          "p50": "win",
+          "p95": "win",
+          "p99": "win"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Items/Counts",
+      "tag": "Library",
+      "shape": {
+        "f": "28c26659b76d6712",
+        "j": "28c26659b76d6712",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": false,
+        "classification": "flagged: read diff vs Jellyfin (sweep single-item align)"
+      },
+      "perf": {
+        "variant": "items_counts",
+        "f_p50": 3.7,
+        "f_p95": 5.07,
+        "f_p99": 6.51,
+        "f_rps": 19.0,
+        "f_ok": 100.0,
+        "j_p50": 113.75,
+        "j_p95": 121.87,
+        "j_p99": 126.48,
+        "j_rps": 19.0,
+        "j_ok": 100.0,
+        "rate": 19,
+        "rate_source": "calibrated",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 19,
+        "f_achieved": 19.0,
+        "j_achieved": 19.0,
+        "speedup": 30.74,
+        "win_all_three": true,
+        "verdicts": {
+          "p50": "win",
+          "p95": "win",
+          "p99": "win"
+        },
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "not deep-verified"
+      }
+    },
+    {
+      "op": "GET /Items",
+      "tag": "Items",
+      "shape": {
+        "f": "4e8c17857565336c",
+        "j": "4e8c17857565336c",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "items_datesort",
+        "f_p50": 4.29,
+        "f_p95": 6.61,
+        "f_p99": 8.48,
+        "f_rps": 62.0,
+        "f_ok": 100.0,
+        "j_p50": 29.62,
+        "j_p95": 33.83,
+        "j_p99": 36.27,
+        "j_rps": 62.0,
+        "j_ok": 100.0,
+        "rate": 62,
+        "rate_source": "calibrated",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 62,
+        "f_achieved": 62.0,
+        "j_achieved": 62.0,
+        "speedup": 6.9,
+        "win_all_three": true,
+        "verdicts": {
+          "p50": "win",
+          "p95": "win",
+          "p99": "win"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Items",
+      "tag": "Items",
+      "shape": {
+        "f": "a7c0eb16779458ad",
+        "j": "e2c18094a28fabb8",
+        "matches_jellyfin": false,
+        "diff_vs_jellyfin": {
+          "missing": [
+            "Items[].PremiereDate",
+            "Items[].ProductionYear"
+          ],
+          "extra": []
+        },
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "items_episodes",
+        "f_p50": 8.54,
+        "f_p95": 10.96,
+        "f_p99": 11.64,
+        "f_rps": 5.0,
+        "f_ok": 100.0,
+        "j_p50": 823.28,
+        "j_p95": 997.61,
+        "j_p99": 1059.95,
+        "j_rps": 5.0,
+        "j_ok": 100.0,
+        "rate": 5,
+        "rate_source": "calibrated",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 5,
+        "f_achieved": 5.0,
+        "j_achieved": 5.0,
+        "speedup": 96.4,
+        "win_all_three": true,
+        "verdicts": {
+          "p50": "win",
+          "p95": "win",
+          "p99": "win"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Items",
+      "tag": "Items",
+      "shape": {
+        "f": "40d76722d82205a7",
+        "j": "40d76722d82205a7",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "items_favorite",
+        "f_p50": 0.6,
+        "f_p95": 1.61,
+        "f_p99": 2.57,
+        "f_rps": 574.0,
+        "f_ok": 100.0,
+        "j_p50": 1.39,
+        "j_p95": 2.75,
+        "j_p99": 4.17,
+        "j_rps": 574.0,
+        "j_ok": 100.0,
+        "rate": 574,
+        "rate_source": "calibrated",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 574,
+        "f_achieved": 574.0,
+        "j_achieved": 574.0,
+        "speedup": 2.32,
+        "win_all_three": true,
+        "verdicts": {
+          "p50": "win",
+          "p95": "win",
+          "p99": "win"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Items/Filters2",
+      "tag": "Filter",
+      "shape": {
+        "f": "4a3f29dd86fc6379",
+        "j": "4a3f29dd86fc6379",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "items_filters2",
+        "f_p50": 1.5,
+        "f_p95": 2.6,
+        "f_p99": 3.81,
+        "f_rps": 455.0,
+        "f_ok": 100.0,
+        "j_p50": 2.86,
+        "j_p95": 4.52,
+        "j_p99": 5.71,
+        "j_rps": 455.0,
+        "j_ok": 100.0,
+        "rate": 455,
+        "rate_source": "calibrated",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 455,
+        "f_achieved": 455.0,
+        "j_achieved": 455.0,
+        "speedup": 1.91,
+        "win_all_three": true,
+        "verdicts": {
+          "p50": "win",
+          "p95": "win",
+          "p99": "win"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null,
+        "cold": {
+          "f_first": 10.19,
+          "f_p50": 2.71,
+          "f_max": 10.19,
+          "f_ready_ms": 0.0,
+          "j_first": 159.05,
+          "j_p50": 6.19,
+          "j_max": 159.05,
+          "j_ready_ms": 0.0
+        }
+      }
+    },
+    {
+      "op": "GET /Items/Latest",
+      "tag": "UserLibrary",
+      "shape": {
+        "f": "d0d0bac1f0a8fcc3",
+        "j": "1b9c51b36e683e23",
+        "matches_jellyfin": false,
+        "diff_vs_jellyfin": {
+          "missing": [
+            "[].HasSubtitles",
+            "[].ImageBlurHashes.Primary",
+            "[].ImageBlurHashes.Primary.*",
+            "[].ImageTags.Primary",
+            "[].ProductionYear",
+            "[].RunTimeTicks",
+            "[].VideoType"
+          ],
+          "extra": [
+            "[].UserData.UnplayedItemCount"
+          ]
+        },
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": false,
+        "classification": "flagged: read diff vs Jellyfin (verify)"
+      },
+      "perf": {
+        "variant": "items_latest",
+        "f_p50": 10.46,
+        "f_p95": 14.44,
+        "f_p99": 16.46,
+        "f_rps": 17.0,
+        "f_ok": 100.0,
+        "j_p50": 152.66,
+        "j_p95": 163.15,
+        "j_p99": 167.36,
+        "j_rps": 17.0,
+        "j_ok": 100.0,
+        "rate": 17,
+        "rate_source": "calibrated",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 17,
+        "f_achieved": 17.0,
+        "j_achieved": 17.0,
+        "speedup": 14.59,
+        "win_all_three": true,
+        "verdicts": {
+          "p50": "win",
+          "p95": "win",
+          "p99": "win"
+        },
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "not deep-verified"
+      }
+    },
+    {
+      "op": "GET /Items",
+      "tag": "Items",
+      "shape": {
+        "f": "58233f627add39f6",
+        "j": "004dc3ecf02484c3",
+        "matches_jellyfin": false,
+        "diff_vs_jellyfin": {
+          "missing": [
+            "Items[].PremiereDate",
+            "Items[].ProductionYear"
+          ],
+          "extra": []
+        },
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "items_mixed",
+        "f_p50": 7.7,
+        "f_p95": 11.45,
+        "f_p99": 12.78,
+        "f_rps": 8.0,
+        "f_ok": 100.0,
+        "j_p50": 212.63,
+        "j_p95": 225.46,
+        "j_p99": 229.52,
+        "j_rps": 8.0,
+        "j_ok": 100.0,
+        "rate": 8,
+        "rate_source": "calibrated",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 8,
+        "f_achieved": 8.0,
+        "j_achieved": 8.0,
+        "speedup": 27.61,
+        "win_all_three": true,
+        "verdicts": {
+          "p50": "win",
+          "p95": "win",
+          "p99": "win"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null,
+        "cold": {
+          "f_first": 21.63,
+          "f_p50": 5.58,
+          "f_max": 21.63,
+          "f_ready_ms": 0.0,
+          "j_first": 651.59,
+          "j_p50": 222.32,
+          "j_max": 651.59,
+          "j_ready_ms": 0.0
+        }
+      }
+    },
+    {
+      "op": "GET /Items",
+      "tag": "Items",
+      "shape": {
+        "f": "4e8c17857565336c",
+        "j": "4e8c17857565336c",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "items_paged",
+        "f_p50": 4.35,
+        "f_p95": 6.43,
+        "f_p99": 8.37,
+        "f_rps": 58.0,
+        "f_ok": 100.0,
+        "j_p50": 30.03,
+        "j_p95": 34.21,
+        "j_p99": 36.18,
+        "j_rps": 58.0,
+        "j_ok": 100.0,
+        "rate": 58,
+        "rate_source": "calibrated",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 58,
+        "f_achieved": 58.0,
+        "j_achieved": 58.0,
+        "speedup": 6.9,
+        "win_all_three": true,
+        "verdicts": {
+          "p50": "win",
+          "p95": "win",
+          "p99": "win"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Items",
+      "tag": "Items",
+      "shape": {
+        "f": "4e8c17857565336c",
+        "j": "b89c1e2138d90c4d",
+        "matches_jellyfin": false,
+        "diff_vs_jellyfin": {
+          "missing": [
+            "Items[].PremiereDate"
+          ],
+          "extra": []
+        },
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "items_random",
+        "f_p50": 4.67,
+        "f_p95": 7.33,
+        "f_p99": 9.31,
+        "f_rps": 63.0,
+        "f_ok": 100.0,
+        "j_p50": 29.83,
+        "j_p95": 34.31,
+        "j_p99": 36.7,
+        "j_rps": 63.0,
+        "j_ok": 100.0,
+        "rate": 63,
+        "rate_source": "calibrated",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 63,
+        "f_achieved": 63.0,
+        "j_achieved": 63.0,
+        "speedup": 6.39,
+        "win_all_three": true,
+        "verdicts": {
+          "p50": "win",
+          "p95": "win",
+          "p99": "win"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Items",
+      "tag": "Items",
+      "shape": {
+        "f": "4e8c17857565336c",
+        "j": "b89c1e2138d90c4d",
+        "matches_jellyfin": false,
+        "diff_vs_jellyfin": {
+          "missing": [
+            "Items[].PremiereDate"
+          ],
+          "extra": []
+        },
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "items_rating",
+        "f_p50": 4.21,
+        "f_p95": 6.61,
+        "f_p99": 8.68,
+        "f_rps": 64.0,
+        "f_ok": 100.0,
+        "j_p50": 29.57,
+        "j_p95": 33.65,
+        "j_p99": 35.7,
+        "j_rps": 64.0,
+        "j_ok": 100.0,
+        "rate": 64,
+        "rate_source": "calibrated",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 64,
+        "f_achieved": 64.0,
+        "j_achieved": 64.0,
+        "speedup": 7.02,
+        "win_all_three": true,
+        "verdicts": {
+          "p50": "win",
+          "p95": "win",
+          "p99": "win"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /UserItems/Resume",
+      "tag": "Items",
+      "shape": {
+        "f": "40d76722d82205a7",
+        "j": "40d76722d82205a7",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "items_resume",
+        "f_p50": 0.67,
+        "f_p95": 1.66,
+        "f_p99": 2.86,
+        "f_rps": 464.0,
+        "f_ok": 100.0,
+        "j_p50": 3.82,
+        "j_p95": 6.54,
+        "j_p99": 7.94,
+        "j_rps": 464.0,
+        "j_ok": 100.0,
+        "rate": 464,
+        "rate_source": "calibrated",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 464,
+        "f_achieved": 464.0,
+        "j_achieved": 464.0,
+        "speedup": 5.7,
+        "win_all_three": true,
+        "verdicts": {
+          "p50": "win",
+          "p95": "win",
+          "p99": "win"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Items",
+      "tag": "Items",
+      "shape": {
+        "f": "b5b8467b78d2a342",
+        "j": "bf6b53b6b4904da8",
+        "matches_jellyfin": false,
+        "diff_vs_jellyfin": {
+          "missing": [
+            "Items[].AirDays"
+          ],
+          "extra": [
+            "Items[].Container"
+          ]
+        },
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "items_series",
+        "f_p50": 6.37,
+        "f_p95": 8.3,
+        "f_p99": 9.74,
+        "f_rps": 30.0,
+        "f_ok": 100.0,
+        "j_p50": 42.2,
+        "j_p95": 47.05,
+        "j_p99": 50.14,
+        "j_rps": 30.0,
+        "j_ok": 100.0,
+        "rate": 30,
+        "rate_source": "calibrated",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 30,
+        "f_achieved": 30.0,
+        "j_achieved": 30.0,
+        "speedup": 6.62,
+        "win_all_three": true,
+        "verdicts": {
+          "p50": "win",
+          "p95": "win",
+          "p99": "win"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Items",
+      "tag": "Items",
+      "shape": {
+        "f": "4e8c17857565336c",
+        "j": "b89c1e2138d90c4d",
+        "matches_jellyfin": false,
+        "diff_vs_jellyfin": {
+          "missing": [
+            "Items[].PremiereDate"
+          ],
+          "extra": []
+        },
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "items_sortname",
+        "f_p50": 4.08,
+        "f_p95": 6.37,
+        "f_p99": 8.46,
+        "f_rps": 69.0,
+        "f_ok": 100.0,
+        "j_p50": 30.29,
+        "j_p95": 35.16,
+        "j_p99": 38.25,
+        "j_rps": 69.0,
+        "j_ok": 100.0,
+        "rate": 69,
+        "rate_source": "calibrated",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 69,
+        "f_achieved": 69.0,
+        "j_achieved": 69.0,
+        "speedup": 7.42,
+        "win_all_three": true,
+        "verdicts": {
+          "p50": "win",
+          "p95": "win",
+          "p99": "win"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null,
+        "cold": {
+          "f_first": 15.22,
+          "f_p50": 4.2,
+          "f_max": 15.22,
+          "f_ready_ms": 0.0,
+          "j_first": 231.23,
+          "j_p50": 9.22,
+          "j_max": 231.23,
+          "j_ready_ms": 0.0
+        }
+      }
+    },
+    {
+      "op": "GET /LiveTv/ChannelMappingOptions",
+      "tag": "LiveTv",
+      "shape": {
+        "f": "ab970a334a59b15e",
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": false,
+        "classification": "requires-livetv-tuner: the fixture tuner (M3U + XMLTV, two channels) exists, but no probe exercises this op yet \u2014 needs a channel-mapping probe against the fixture's listings provider."
+      },
+      "perf": {
+        "variant": "livetv_channel_mapping_options",
+        "f_p50": 0.88,
+        "f_p95": 1.47,
+        "f_p99": 2.25,
+        "f_rps": 25.0,
+        "f_ok": 100.0,
+        "j_p50": null,
+        "j_p95": null,
+        "j_p99": null,
+        "j_rps": 0.0,
+        "j_ok": 0.0,
+        "rate": 25,
+        "rate_source": "flat-default",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 25,
+        "f_achieved": 25.0,
+        "j_achieved": 25.0,
+        "speedup": null,
+        "win_all_three": false,
+        "verdicts": null,
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "not deep-verified"
+      }
+    },
+    {
+      "op": "GET /LiveTv/Channels",
+      "tag": "LiveTv",
+      "shape": {
+        "f": "40d76722d82205a7",
+        "j": "40d76722d82205a7",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": false,
+        "classification": "flagged: read diff vs Jellyfin (verify)"
+      },
+      "perf": {
+        "variant": "livetv_channels",
+        "f_p50": 0.33,
+        "f_p95": 1.07,
+        "f_p99": 2.2,
+        "f_rps": 1999.8,
+        "f_ok": 100.0,
+        "j_p50": 0.58,
+        "j_p95": 1.17,
+        "j_p99": 2.58,
+        "j_rps": 2000.0,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 1999.8,
+        "j_achieved": 2000.0,
+        "speedup": 1.76,
+        "win_all_three": true,
+        "verdicts": {
+          "p50": "win",
+          "p95": "win",
+          "p99": "win"
+        },
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "not deep-verified"
+      }
+    },
+    {
+      "op": "GET /LiveTv/GuideInfo",
+      "tag": "LiveTv",
+      "shape": {
+        "f": "0aa7ba2f5c890ec1",
+        "j": "0aa7ba2f5c890ec1",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": false,
+        "classification": "instance: now-relative guide window (now .. now+7d) matches Jellyfin's behavior, but the exact StartDate/EndDate timestamps can't match across two independently-clocked servers."
+      },
+      "perf": {
+        "variant": "livetv_guide_info",
+        "f_p50": 0.92,
+        "f_p95": 1.74,
+        "f_p99": 2.89,
+        "f_rps": 25.0,
+        "f_ok": 100.0,
+        "j_p50": 0.64,
+        "j_p95": 1.06,
+        "j_p99": 1.35,
+        "j_rps": 25.0,
+        "j_ok": 100.0,
+        "rate": 25,
+        "rate_source": "flat-default",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 25,
+        "f_achieved": 25.0,
+        "j_achieved": 25.0,
+        "speedup": 0.7,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "not deep-verified"
+      }
+    },
+    {
+      "op": "GET /LiveTv/Info",
+      "tag": "LiveTv",
+      "shape": {
+        "f": "2138c53ef3b1a2fb",
+        "j": "2138c53ef3b1a2fb",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": false,
+        "classification": "flagged: read diff vs Jellyfin (verify)"
+      },
+      "perf": {
+        "variant": "livetv_info",
+        "f_p50": 0.32,
+        "f_p95": 1.1,
+        "f_p99": 2.61,
+        "f_rps": 2000.0,
+        "f_ok": 100.0,
+        "j_p50": 0.19,
+        "j_p95": 0.34,
+        "j_p99": 0.51,
+        "j_rps": 2000.0,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 2000.0,
+        "j_achieved": 2000.0,
+        "speedup": 0.59,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "not deep-verified"
+      }
+    },
+    {
+      "op": "GET /LiveTv/ListingProviders/Default",
+      "tag": "LiveTv",
+      "shape": {
+        "f": "5d9c7da75ac11af9",
+        "j": "5d9c7da75ac11af9",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "livetv_listing_default",
+        "f_p50": 0.23,
+        "f_p95": 0.74,
+        "f_p99": 1.55,
+        "f_rps": 2000.0,
+        "f_ok": 100.0,
+        "j_p50": 0.17,
+        "j_p95": 0.32,
+        "j_p99": 0.46,
+        "j_rps": 2000.0,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 2000.0,
+        "j_achieved": 2000.0,
+        "speedup": 0.74,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /LiveTv/ListingProviders/Lineups",
+      "tag": "LiveTv",
+      "shape": {
+        "f": "e3b0c44298fc1c14",
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": false,
+        "classification": "requires-livetv-tuner: the fixture tuner (M3U + XMLTV, two channels) exists, but no probe exercises this op yet \u2014 needs a lineup probe (needs a Schedules Direct-style provider; xmltv has none)."
+      },
+      "perf": {
+        "variant": "livetv_listing_lineups",
+        "f_p50": 0.89,
+        "f_p95": 1.33,
+        "f_p99": 2.72,
+        "f_rps": 25.0,
+        "f_ok": 100.0,
+        "j_p50": null,
+        "j_p95": null,
+        "j_p99": null,
+        "j_rps": 0.0,
+        "j_ok": 0.0,
+        "rate": 25,
+        "rate_source": "flat-default",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 25,
+        "f_achieved": 25.0,
+        "j_achieved": 25.0,
+        "speedup": null,
+        "win_all_three": false,
+        "verdicts": null,
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "not deep-verified"
+      }
+    },
+    {
+      "op": "GET /LiveTv/Programs",
+      "tag": "LiveTv",
+      "shape": {
+        "f": "40d76722d82205a7",
+        "j": "40d76722d82205a7",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": false,
+        "classification": "flagged: read diff vs Jellyfin (verify)"
+      },
+      "perf": {
+        "variant": "livetv_programs",
+        "f_p50": 0.35,
+        "f_p95": 1.15,
+        "f_p99": 2.31,
+        "f_rps": 2000.0,
+        "f_ok": 100.0,
+        "j_p50": 0.57,
+        "j_p95": 1.15,
+        "j_p99": 2.66,
+        "j_rps": 2000.0,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 2000.0,
+        "j_achieved": 2000.0,
+        "speedup": 1.63,
+        "win_all_three": true,
+        "verdicts": {
+          "p50": "win",
+          "p95": "win",
+          "p99": "win"
+        },
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "not deep-verified"
+      }
+    },
+    {
+      "op": "POST /LiveTv/Programs",
+      "tag": "LiveTv",
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": false,
+        "classification": "requires-livetv-tuner: the fixture tuner (M3U + XMLTV, two channels) exists, but no probe exercises this op yet \u2014 needs a programmes-by-body probe (the POST form of /LiveTv/Programs)."
+      },
+      "perf": {
+        "variant": "livetv_programs_post",
+        "f_p50": 1.4,
+        "f_p95": 2.61,
+        "f_p99": 4.04,
+        "f_rps": 25.0,
+        "f_ok": 100.0,
+        "j_p50": 1.61,
+        "j_p95": 2.39,
+        "j_p99": 2.93,
+        "j_rps": 25.0,
+        "j_ok": 100.0,
+        "rate": 25,
+        "rate_source": "flat-default",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 25,
+        "f_achieved": 25.0,
+        "j_achieved": 25.0,
+        "speedup": 1.15,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "win",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "not deep-verified"
+      }
+    },
+    {
+      "op": "GET /LiveTv/Programs/Recommended",
+      "tag": "LiveTv",
+      "shape": {
+        "f": "40d76722d82205a7",
+        "j": "40d76722d82205a7",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": false,
+        "classification": "flagged: read diff vs Jellyfin (verify)"
+      },
+      "perf": {
+        "variant": "livetv_programs_recommended",
+        "f_p50": 0.34,
+        "f_p95": 1.06,
+        "f_p99": 1.9,
+        "f_rps": 2000.0,
+        "f_ok": 100.0,
+        "j_p50": 0.56,
+        "j_p95": 1.13,
+        "j_p99": 2.69,
+        "j_rps": 2000.0,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 2000.0,
+        "j_achieved": 2000.0,
+        "speedup": 1.65,
+        "win_all_three": true,
+        "verdicts": {
+          "p50": "win",
+          "p95": "win",
+          "p99": "win"
+        },
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "not deep-verified"
+      }
+    },
+    {
+      "op": "GET /LiveTv/Recordings/Folders",
+      "tag": "LiveTv",
+      "shape": {
+        "f": "40d76722d82205a7",
+        "j": "40d76722d82205a7",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "livetv_recording_folders",
+        "f_p50": 0.22,
+        "f_p95": 0.7,
+        "f_p99": 1.26,
+        "f_rps": 2000.0,
+        "f_ok": 100.0,
+        "j_p50": 0.19,
+        "j_p95": 0.35,
+        "j_p99": 0.57,
+        "j_rps": 1999.8,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 2000.0,
+        "j_achieved": 1999.8,
+        "speedup": 0.86,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /LiveTv/Recordings/Groups",
+      "tag": "LiveTv",
+      "shape": {
+        "f": "40d76722d82205a7",
+        "j": "40d76722d82205a7",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "livetv_recording_groups",
+        "f_p50": 0.22,
+        "f_p95": 0.69,
+        "f_p99": 1.41,
+        "f_rps": 1999.8,
+        "f_ok": 100.0,
+        "j_p50": 0.17,
+        "j_p95": 0.33,
+        "j_p99": 0.55,
+        "j_rps": 2000.0,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 1999.8,
+        "j_achieved": 2000.0,
+        "speedup": 0.77,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /LiveTv/Recordings",
+      "tag": "LiveTv",
+      "shape": {
+        "f": "40d76722d82205a7",
+        "j": "40d76722d82205a7",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "livetv_recordings",
+        "f_p50": 0.36,
+        "f_p95": 1.18,
+        "f_p99": 2.23,
+        "f_rps": 2000.0,
+        "f_ok": 100.0,
+        "j_p50": 0.21,
+        "j_p95": 0.38,
+        "j_p99": 0.58,
+        "j_rps": 2000.0,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 2000.0,
+        "j_achieved": 2000.0,
+        "speedup": 0.58,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /LiveTv/Recordings/Series",
+      "tag": "LiveTv",
+      "shape": {
+        "f": "40d76722d82205a7",
+        "j": "40d76722d82205a7",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "livetv_recordings_series",
+        "f_p50": 0.22,
+        "f_p95": 0.8,
+        "f_p99": 1.63,
+        "f_rps": 2000.0,
+        "f_ok": 100.0,
+        "j_p50": 0.18,
+        "j_p95": 0.34,
+        "j_p99": 0.52,
+        "j_rps": 1999.8,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 2000.0,
+        "j_achieved": 1999.8,
+        "speedup": 0.82,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /LiveTv/SeriesTimers",
+      "tag": "LiveTv",
+      "shape": {
+        "f": "40d76722d82205a7",
+        "j": "40d76722d82205a7",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "livetv_series_timers",
+        "f_p50": 0.37,
+        "f_p95": 1.5,
+        "f_p99": 3.77,
+        "f_rps": 2000.0,
+        "f_ok": 100.0,
+        "j_p50": 0.2,
+        "j_p95": 0.35,
+        "j_p99": 0.53,
+        "j_rps": 2000.0,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 2000.0,
+        "j_achieved": 2000.0,
+        "speedup": 0.54,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /LiveTv/Timers/Defaults",
+      "tag": "LiveTv",
+      "shape": {
+        "f": "0f65bafb892f17de",
+        "j": "3567ff6ff1c87d61",
+        "matches_jellyfin": false,
+        "diff_vs_jellyfin": {
+          "missing": [
+            "Id",
+            "ServerId"
+          ],
+          "extra": []
+        },
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": false,
+        "classification": "verified 2026-08-11: SeriesTimerInfoDto defaults (ChannelId/Days/padding flags/\u2026), 200 + schema conformant."
+      },
+      "perf": {
+        "variant": "livetv_timer_defaults",
+        "f_p50": 1.02,
+        "f_p95": 1.92,
+        "f_p99": 2.98,
+        "f_rps": 25.0,
+        "f_ok": 100.0,
+        "j_p50": 2.16,
+        "j_p95": 3.46,
+        "j_p99": 4.49,
+        "j_rps": 25.0,
+        "j_ok": 100.0,
+        "rate": 25,
+        "rate_source": "flat-default",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 25,
+        "f_achieved": 25.0,
+        "j_achieved": 25.0,
+        "speedup": 2.12,
+        "win_all_three": true,
+        "verdicts": {
+          "p50": "win",
+          "p95": "win",
+          "p99": "win"
+        },
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "not deep-verified"
+      }
+    },
+    {
+      "op": "GET /LiveTv/Timers",
+      "tag": "LiveTv",
+      "shape": {
+        "f": "40d76722d82205a7",
+        "j": "40d76722d82205a7",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "livetv_timers",
+        "f_p50": 0.35,
+        "f_p95": 1.23,
+        "f_p99": 2.39,
+        "f_rps": 1999.8,
+        "f_ok": 100.0,
+        "j_p50": 0.19,
+        "j_p95": 0.35,
+        "j_p99": 0.54,
+        "j_rps": 1999.8,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 1999.8,
+        "j_achieved": 1999.8,
+        "speedup": 0.54,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /LiveTv/TunerHosts/Types",
+      "tag": "LiveTv",
+      "shape": {
+        "f": "8249b99aab46f98c",
+        "j": "8249b99aab46f98c",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": false,
+        "classification": "open-work (NOT accepted): Ferrofin advertises only the M3U tuner host; Jellyfin also lists HDHomeRun. Port of HdHomerunHost (~1.2K C# LOC: UDP discovery, lineup, legacy control protocol, HTTP/UDP streams) is an open work item \u2014 see brain/DEFERRED.md 2026-08-22 sweep."
+      },
+      "perf": {
+        "variant": "livetv_tuner_types",
+        "f_p50": 0.93,
+        "f_p95": 1.8,
+        "f_p99": 2.92,
+        "f_rps": 25.0,
+        "f_ok": 100.0,
+        "j_p50": 0.68,
+        "j_p95": 0.95,
+        "j_p99": 1.14,
+        "j_rps": 25.0,
+        "j_ok": 100.0,
+        "rate": 25,
+        "rate_source": "flat-default",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 25,
+        "f_achieved": 25.0,
+        "j_achieved": 25.0,
+        "speedup": 0.73,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "not deep-verified"
+      }
+    },
+    {
+      "op": "GET /Localization/Countries",
+      "tag": "Localization",
+      "shape": {
+        "f": "bae6a2fdcaee60f8",
+        "j": "bae6a2fdcaee60f8",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "loc_countries",
+        "f_p50": 0.52,
+        "f_p95": 1.99,
+        "f_p99": 4.35,
+        "f_rps": 2000.0,
+        "f_ok": 100.0,
+        "j_p50": 0.32,
+        "j_p95": 0.56,
+        "j_p99": 0.81,
+        "j_rps": 1999.8,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 2000.0,
+        "j_achieved": 1999.8,
+        "speedup": 0.62,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Localization/Options",
+      "tag": "Localization",
+      "shape": {
+        "f": "58648d8799d43ad2",
+        "j": "58648d8799d43ad2",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "loc_options",
+        "f_p50": 0.37,
+        "f_p95": 1.47,
+        "f_p99": 3.53,
+        "f_rps": 1999.8,
+        "f_ok": 100.0,
+        "j_p50": 0.22,
+        "j_p95": 0.4,
+        "j_p99": 0.58,
+        "j_rps": 1999.8,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 1999.8,
+        "j_achieved": 1999.8,
+        "speedup": 0.59,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Localization/ParentalRatings",
+      "tag": "Localization",
+      "shape": {
+        "f": "2f8d5f30cd1d910b",
+        "j": "2f8d5f30cd1d910b",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "loc_parental",
+        "f_p50": 0.35,
+        "f_p95": 1.24,
+        "f_p99": 2.43,
+        "f_rps": 1999.8,
+        "f_ok": 100.0,
+        "j_p50": 0.22,
+        "j_p95": 0.39,
+        "j_p99": 0.57,
+        "j_rps": 1999.8,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 1999.8,
+        "j_achieved": 1999.8,
+        "speedup": 0.63,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Localization/Cultures",
+      "tag": "Localization",
+      "shape": {
+        "f": "a9294d63eb729ee2",
+        "j": "a9294d63eb729ee2",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "localization_cultures",
+        "f_p50": 0.74,
+        "f_p95": 2.83,
+        "f_p99": 7.35,
+        "f_rps": 2000.0,
+        "f_ok": 100.0,
+        "j_p50": 0.39,
+        "j_p95": 0.69,
+        "j_p99": 0.92,
+        "j_rps": 2000.0,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 2000.0,
+        "j_achieved": 2000.0,
+        "speedup": 0.53,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Library/MediaFolders",
+      "tag": "Library",
+      "shape": {
+        "f": "e910f31d17bc8188",
+        "j": "6699b62c7b8fc13c",
+        "matches_jellyfin": false,
+        "diff_vs_jellyfin": {
+          "missing": [
+            "Items[].CollectionType"
+          ],
+          "extra": [
+            "Items[].Height",
+            "Items[].ImageTags.Primary",
+            "Items[].PrimaryImageAspectRatio",
+            "Items[].Width"
+          ]
+        },
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": false,
+        "classification": "instance: after WI-7 the folder COUNT matches; residual is /config-vs-/data path-alignment noise on the folder rows."
+      },
+      "perf": {
+        "variant": "media_folders",
+        "f_p50": 1.0,
+        "f_p95": 4.41,
+        "f_p99": 10.17,
+        "f_rps": 2000.0,
+        "f_ok": 100.0,
+        "j_p50": 0.27,
+        "j_p95": 0.49,
+        "j_p99": 0.77,
+        "j_rps": 2000.0,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 2000.0,
+        "j_achieved": 2000.0,
+        "speedup": 0.27,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "not deep-verified"
+      }
+    },
+    {
+      "op": "GET /MediaSegments/{itemId}",
+      "tag": "MediaSegments",
+      "shape": {
+        "f": "40d76722d82205a7",
+        "j": "40d76722d82205a7",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "media_segments",
+        "f_p50": 0.43,
+        "f_p95": 1.52,
+        "f_p99": 2.98,
+        "f_rps": 2000.0,
+        "f_ok": 100.0,
+        "j_p50": 0.23,
+        "j_p95": 0.42,
+        "j_p99": 0.66,
+        "j_rps": 2000.0,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 2000.0,
+        "j_achieved": 2000.0,
+        "speedup": 0.53,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /System/Configuration/MetadataOptions/Default",
+      "tag": "Configuration",
+      "shape": {
+        "f": "cd4e3d62103ac0e8",
+        "j": "cd4e3d62103ac0e8",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "metadata_options",
+        "f_p50": 0.23,
+        "f_p95": 0.88,
+        "f_p99": 2.02,
+        "f_rps": 2000.0,
+        "f_ok": 100.0,
+        "j_p50": 0.19,
+        "j_p95": 0.36,
+        "j_p99": 0.61,
+        "j_rps": 2000.0,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 2000.0,
+        "j_achieved": 2000.0,
+        "speedup": 0.83,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Movies/Recommendations",
+      "tag": "Movies",
+      "shape": {
+        "f": "e3b0c44298fc1c14",
+        "j": "e3b0c44298fc1c14",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "movie_recommendations",
+        "f_p50": 1.19,
+        "f_p95": 2.4,
+        "f_p99": 3.54,
+        "f_rps": 206.0,
+        "f_ok": 100.0,
+        "j_p50": 4.36,
+        "j_p95": 7.7,
+        "j_p99": 10.2,
+        "j_rps": 206.0,
+        "j_ok": 100.0,
+        "rate": 206,
+        "rate_source": "calibrated",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 206,
+        "f_achieved": 206.0,
+        "j_achieved": 206.0,
+        "speedup": 3.66,
+        "win_all_three": true,
+        "verdicts": {
+          "p50": "win",
+          "p95": "win",
+          "p99": "win"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null,
+        "cold": {
+          "f_first": 9.96,
+          "f_p50": 1.96,
+          "f_max": 9.96,
+          "f_ready_ms": 0.0,
+          "j_first": 177.2,
+          "j_p50": 3.9,
+          "j_max": 177.2,
+          "j_ready_ms": 0.0
+        }
+      }
+    },
+    {
+      "op": "GET /MusicGenres",
+      "tag": "MusicGenres",
+      "shape": {
+        "f": "40d76722d82205a7",
+        "j": "40d76722d82205a7",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": false,
+        "classification": "verified 2026-08-11: QueryResult<BaseItemDto>, status+schema conformant (same by-name list shape as /Genres)."
+      },
+      "perf": {
+        "variant": "music_genres",
+        "f_p50": 0.74,
+        "f_p95": 1.31,
+        "f_p99": 1.99,
+        "f_rps": 728.0,
+        "f_ok": 100.0,
+        "j_p50": 1.13,
+        "j_p95": 2.15,
+        "j_p99": 3.1,
+        "j_rps": 728.0,
+        "j_ok": 100.0,
+        "rate": 728,
+        "rate_source": "calibrated",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 728,
+        "f_achieved": 728.0,
+        "j_achieved": 728.0,
+        "speedup": 1.53,
+        "win_all_three": true,
+        "verdicts": {
+          "p50": "win",
+          "p95": "win",
+          "p99": "win"
+        },
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "not deep-verified"
+      }
+    },
+    {
+      "op": "GET /Shows/NextUp",
+      "tag": "TvShows",
+      "shape": {
+        "f": "40d76722d82205a7",
+        "j": "40d76722d82205a7",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "nextup",
+        "f_p50": 0.91,
+        "f_p95": 3.15,
+        "f_p99": 6.15,
+        "f_rps": 1849.0,
+        "f_ok": 100.0,
+        "j_p50": 1.27,
+        "j_p95": 2.23,
+        "j_p99": 3.43,
+        "j_rps": 1849.0,
+        "j_ok": 100.0,
+        "rate": 1849,
+        "rate_source": "calibrated",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 1849,
+        "f_achieved": 1849.0,
+        "j_achieved": 1849.0,
+        "speedup": 1.4,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "win",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": true,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Persons/{name}",
+      "tag": "Persons",
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": false,
+        "classification": "accepted-divergence: same no-lazy-create-on-GET family as /Studios/{name}. Existing person\u2192200 BaseItemDto, absent\u2192404 (both servers 404 in the harness run). Shape verified."
+      },
+      "perf": {
+        "variant": "person_detail",
+        "f_p50": 3.39,
+        "f_p95": 4.9,
+        "f_p99": 6.52,
+        "f_rps": 25.0,
+        "f_ok": 100.0,
+        "j_p50": 3.62,
+        "j_p95": 5.75,
+        "j_p99": 6.88,
+        "j_rps": 25.0,
+        "j_ok": 100.0,
+        "rate": 25,
+        "rate_source": "flat-default",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 25,
+        "f_achieved": 25.0,
+        "j_achieved": 25.0,
+        "speedup": 1.07,
+        "win_all_three": true,
+        "verdicts": {
+          "p50": "win",
+          "p95": "win",
+          "p99": "win"
+        },
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "not deep-verified"
+      }
+    },
+    {
+      "op": "GET /Persons",
+      "tag": "Persons",
+      "shape": {
+        "f": "9770f3cb6878e847",
+        "j": "9770f3cb6878e847",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "persons",
+        "f_p50": 0.89,
+        "f_p95": 2.3,
+        "f_p99": 3.94,
+        "f_rps": 608.0,
+        "f_ok": 100.0,
+        "j_p50": 1.21,
+        "j_p95": 2.28,
+        "j_p99": 3.75,
+        "j_rps": 608.0,
+        "j_ok": 100.0,
+        "rate": 608,
+        "rate_source": "calibrated",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 608,
+        "f_achieved": 608.0,
+        "j_achieved": 608.0,
+        "speedup": 1.36,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "win",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": true,
+        "comparable": true,
+        "reason": null,
+        "cold": {
+          "f_first": 12.55,
+          "f_p50": 2.82,
+          "f_max": 12.55,
+          "f_ready_ms": 0.0,
+          "j_first": 99.65,
+          "j_p50": 3.78,
+          "j_max": 99.65,
+          "j_ready_ms": 0.0
+        }
+      }
+    },
+    {
+      "op": "GET /Library/PhysicalPaths",
+      "tag": "Library",
+      "shape": {
+        "f": "e3b0c44298fc1c14",
+        "j": "e3b0c44298fc1c14",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": false,
+        "classification": "instance: data-dir-relative physical paths differ by container (/config vs /data)."
+      },
+      "perf": {
+        "variant": "physical_paths",
+        "f_p50": 1.33,
+        "f_p95": 5.69,
+        "f_p99": 10.0,
+        "f_rps": 1999.8,
+        "f_ok": 100.0,
+        "j_p50": 0.18,
+        "j_p95": 0.34,
+        "j_p99": 0.5,
+        "j_rps": 2000.0,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 1999.8,
+        "j_achieved": 2000.0,
+        "speedup": 0.14,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "not deep-verified"
+      }
+    },
+    {
+      "op": "GET /Playlists/{playlistId}",
+      "tag": "Playlists",
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "playlist_detail",
+        "f_p50": 0.48,
+        "f_p95": 1.49,
+        "f_p99": 3.2,
+        "f_rps": 1999.8,
+        "f_ok": 100.0,
+        "j_p50": 0.58,
+        "j_p95": 1.24,
+        "j_p99": 3.02,
+        "j_rps": 1999.6,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 1999.8,
+        "j_achieved": 1999.6,
+        "speedup": 1.21,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "win",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": true,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Playlists/{itemId}/InstantMix",
+      "tag": "InstantMix",
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": false,
+        "classification": "expected-extension: Ferrofin generates an instant mix for a playlist (H=200); stock Jellyfin returns 404 (playlists are not an instant-mix source). A harmless superset."
+      },
+      "perf": {
+        "variant": "playlist_instant_mix",
+        "f_p50": 1.92,
+        "f_p95": 3.34,
+        "f_p99": 4.64,
+        "f_rps": 25.0,
+        "f_ok": 100.0,
+        "j_p50": 2.0,
+        "j_p95": 2.73,
+        "j_p99": 3.3,
+        "j_rps": 25.0,
+        "j_ok": 100.0,
+        "rate": 25,
+        "rate_source": "flat-default",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 25,
+        "f_achieved": 25.0,
+        "j_achieved": 25.0,
+        "speedup": 1.04,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "win",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "not deep-verified"
+      }
+    },
+    {
+      "op": "GET /Playlists/{playlistId}/Items",
+      "tag": "Playlists",
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "playlist_items",
+        "f_p50": 0.61,
+        "f_p95": 1.87,
+        "f_p99": 3.51,
+        "f_rps": 2000.0,
+        "f_ok": 100.0,
+        "j_p50": 0.6,
+        "j_p95": 1.37,
+        "j_p99": 2.85,
+        "j_rps": 2000.0,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 2000.0,
+        "j_achieved": 2000.0,
+        "speedup": 0.98,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Playlists/{playlistId}/Users/{userId}",
+      "tag": "Playlists",
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "playlist_user",
+        "f_p50": 1.14,
+        "f_p95": 1.88,
+        "f_p99": 2.78,
+        "f_rps": 25.0,
+        "f_ok": 100.0,
+        "j_p50": 1.33,
+        "j_p95": 2.2,
+        "j_p99": 2.89,
+        "j_rps": 25.0,
+        "j_ok": 100.0,
+        "rate": 25,
+        "rate_source": "flat-default",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 25,
+        "f_achieved": 25.0,
+        "j_achieved": 25.0,
+        "speedup": 1.17,
+        "win_all_three": true,
+        "verdicts": {
+          "p50": "win",
+          "p95": "win",
+          "p99": "win"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Playlists/{playlistId}/Users",
+      "tag": "Playlists",
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "playlist_users",
+        "f_p50": 0.34,
+        "f_p95": 1.07,
+        "f_p99": 2.17,
+        "f_rps": 2000.0,
+        "f_ok": 100.0,
+        "j_p50": 0.58,
+        "j_p95": 1.23,
+        "j_p99": 3.21,
+        "j_rps": 2000.0,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 2000.0,
+        "j_achieved": 2000.0,
+        "speedup": 1.71,
+        "win_all_three": true,
+        "verdicts": {
+          "p50": "win",
+          "p95": "win",
+          "p99": "win"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "POST /Sessions/Playing/Progress",
+      "tag": "Playstate",
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "playstate_progress",
+        "f_p50": 1.8,
+        "f_p95": 32.36,
+        "f_p99": 43.71,
+        "f_rps": 1235.0,
+        "f_ok": 100.0,
+        "j_p50": 0.79,
+        "j_p95": 78.93,
+        "j_p99": 163.99,
+        "j_rps": 1235.0,
+        "j_ok": 100.0,
+        "rate": 1235,
+        "rate_source": "calibrated",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 1235,
+        "f_achieved": 1235.0,
+        "j_achieved": 1235.0,
+        "speedup": 0.44,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "win",
+          "p99": "win"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Plugins",
+      "tag": "Plugins",
+      "shape": {
+        "f": "75ab71414f3c59b6",
+        "j": "99e2e4ef77e3461d",
+        "matches_jellyfin": false,
+        "diff_vs_jellyfin": {
+          "missing": [
+            "[].ConfigurationFileName"
+          ],
+          "extra": []
+        },
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": false,
+        "classification": "expected-extension: lists Ferrofin's installed plugins (compiled-in extensions + staged WASM plugins) \u2014 the set necessarily differs from any stock Jellyfin instance. Route is real and schema-conformant (server HTTP tests)."
+      },
+      "perf": {
+        "variant": "plugins",
+        "f_p50": 0.23,
+        "f_p95": 0.98,
+        "f_p99": 2.25,
+        "f_rps": 1999.8,
+        "f_ok": 100.0,
+        "j_p50": 0.2,
+        "j_p95": 0.38,
+        "j_p99": 0.58,
+        "j_rps": 2000.0,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 1999.8,
+        "j_achieved": 2000.0,
+        "speedup": 0.87,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "not deep-verified"
+      }
+    },
+    {
+      "op": "GET /QuickConnect/Enabled",
+      "tag": "QuickConnect",
+      "shape": {
+        "f": "e3b0c44298fc1c14",
+        "j": "e3b0c44298fc1c14",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "quick_connect",
+        "f_p50": 0.22,
+        "f_p95": 0.91,
+        "f_p99": 2.22,
+        "f_rps": 2000.0,
+        "f_ok": 100.0,
+        "j_p50": 0.17,
+        "j_p95": 0.31,
+        "j_p99": 0.45,
+        "j_rps": 2000.0,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 2000.0,
+        "j_achieved": 2000.0,
+        "speedup": 0.77,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Repositories",
+      "tag": "Package",
+      "shape": {
+        "f": "e3b0c44298fc1c14",
+        "j": "1402e6fff6649f77",
+        "matches_jellyfin": false,
+        "diff_vs_jellyfin": {
+          "missing": [
+            "[].Enabled",
+            "[].Name",
+            "[].Url"
+          ],
+          "extra": []
+        },
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": false,
+        "classification": "instance: returns the admin-configured package repositories \u2014 instance-local state (harness instances configure none), nothing to diff. Verified 2026-08-14 by unit + handler tests."
+      },
+      "perf": {
+        "variant": "repositories",
+        "f_p50": 0.91,
+        "f_p95": 1.5,
+        "f_p99": 2.29,
+        "f_rps": 25.0,
+        "f_ok": 100.0,
+        "j_p50": 0.64,
+        "j_p95": 0.99,
+        "j_p99": 1.18,
+        "j_rps": 25.0,
+        "j_ok": 100.0,
+        "rate": 25,
+        "rate_source": "flat-default",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 25,
+        "f_achieved": 25.0,
+        "j_achieved": 25.0,
+        "speedup": 0.7,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "not deep-verified"
+      }
+    },
+    {
+      "op": "GET /ScheduledTasks/{taskId}",
+      "tag": "ScheduledTasks",
+      "shape": {
+        "f": "f2570d40292e3178",
+        "j": "f2570d40292e3178",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "scheduled_task_detail",
+        "f_p50": 0.22,
+        "f_p95": 0.79,
+        "f_p99": 1.52,
+        "f_rps": 2000.0,
+        "f_ok": 100.0,
+        "j_p50": 0.18,
+        "j_p95": 0.34,
+        "j_p99": 0.51,
+        "j_rps": 2000.0,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 2000.0,
+        "j_achieved": 2000.0,
+        "speedup": 0.82,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /ScheduledTasks",
+      "tag": "ScheduledTasks",
+      "shape": {
+        "f": "4d3552d92c980568",
+        "j": "4d3552d92c980568",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": false,
+        "classification": "instance: LastExecutionResult depends on whether/when a task last ran."
+      },
+      "perf": {
+        "variant": "scheduled_tasks",
+        "f_p50": 0.4,
+        "f_p95": 1.58,
+        "f_p99": 3.66,
+        "f_rps": 2000.0,
+        "f_ok": 100.0,
+        "j_p50": 0.28,
+        "j_p95": 0.49,
+        "j_p99": 0.72,
+        "j_rps": 2000.0,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 2000.0,
+        "j_achieved": 2000.0,
+        "speedup": 0.7,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "not deep-verified"
+      }
+    },
+    {
+      "op": "GET /Search/Hints",
+      "tag": "Search",
+      "shape": {
+        "f": "688422d9ca099db2",
+        "j": "34a1793d7d4a6545",
+        "matches_jellyfin": false,
+        "diff_vs_jellyfin": {
+          "missing": [
+            "SearchHints[].PrimaryImageAspectRatio",
+            "SearchHints[].PrimaryImageTag",
+            "SearchHints[].ProductionYear"
+          ],
+          "extra": []
+        },
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": false,
+        "classification": "flagged: read diff vs Jellyfin (verify)"
+      },
+      "perf": {
+        "variant": "search_hints",
+        "f_p50": 4.53,
+        "f_p95": 6.4,
+        "f_p99": 8.0,
+        "f_rps": 123.0,
+        "f_ok": 100.0,
+        "j_p50": 7.9,
+        "j_p95": 11.22,
+        "j_p99": 14.29,
+        "j_rps": 123.0,
+        "j_ok": 100.0,
+        "rate": 123,
+        "rate_source": "calibrated",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 123,
+        "f_achieved": 123.0,
+        "j_achieved": 123.0,
+        "speedup": 1.74,
+        "win_all_three": true,
+        "verdicts": {
+          "p50": "win",
+          "p95": "win",
+          "p99": "win"
+        },
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "not deep-verified"
+      }
+    },
+    {
+      "op": "GET /Sessions",
+      "tag": "Session",
+      "shape": {
+        "f": "8d686cc101956a4b",
+        "j": "36689c2119e55f5f",
+        "matches_jellyfin": false,
+        "diff_vs_jellyfin": {
+          "missing": [
+            "[].PlayState.MediaSourceId",
+            "[].PlayState.PlayMethod"
+          ],
+          "extra": [
+            "[].NowPlayingItem.CanDelete",
+            "[].NowPlayingItem.CanDownload",
+            "[].NowPlayingItem.DisplayPreferencesId",
+            "[].NowPlayingItem.Etag",
+            "[].NowPlayingItem.LockData",
+            "[].NowPlayingItem.LockedFields",
+            "[].NowPlayingItem.MediaSources",
+            "[].NowPlayingItem.MediaSources[].Bitrate",
+            "[].NowPlayingItem.MediaSources[].Container",
+            "[].NowPlayingItem.MediaSources[].DefaultAudioStreamIndex",
+            "[].NowPlayingItem.MediaSources[].ETag",
+            "[].NowPlayingItem.MediaSources[].Formats",
+            "[].NowPlayingItem.MediaSources[].GenPtsInput",
+            "[].NowPlayingItem.MediaSources[].HasSegments",
+            "[].NowPlayingItem.MediaSources[].Id",
+            "[].NowPlayingItem.MediaSources[].IgnoreDts",
+            "[].NowPlayingItem.MediaSources[].IgnoreIndex",
+            "[].NowPlayingItem.MediaSources[].IsInfiniteStream",
+            "[].NowPlayingItem.MediaSources[].IsRemote",
+            "[].NowPlayingItem.MediaSources[].MediaAttachments",
+            "[].NowPlayingItem.MediaSources[].MediaAttachments[].Codec",
+            "[].NowPlayingItem.MediaSources[].MediaAttachments[].FileName",
+            "[].NowPlayingItem.MediaSources[].MediaAttachments[].Index",
+            "[].NowPlayingItem.MediaSources[].MediaAttachments[].MimeType",
+            "[].NowPlayingItem.MediaSources[].MediaStreams",
+            "[].NowPlayingItem.MediaSources[].MediaStreams[].AspectRatio",
+            "[].NowPlayingItem.MediaSources[].MediaStreams[].AudioSpatialFormat",
+            "[].NowPlayingItem.MediaSources[].MediaStreams[].AverageFrameRate",
+            "[].NowPlayingItem.MediaSources[].MediaStreams[].BitDepth",
+            "[].NowPlayingItem.MediaSources[].MediaStreams[].BitRate",
+            "[].NowPlayingItem.MediaSources[].MediaStreams[].ChannelLayout",
+            "[].NowPlayingItem.MediaSources[].MediaStreams[].Channels",
+            "[].NowPlayingItem.MediaSources[].MediaStreams[].Codec",
+            "[].NowPlayingItem.MediaSources[].MediaStreams[].DisplayTitle",
+            "[].NowPlayingItem.MediaSources[].MediaStreams[].Height",
+            "[].NowPlayingItem.MediaSources[].MediaStreams[].Index",
+            "[].NowPlayingItem.MediaSources[].MediaStreams[].IsAVC",
+            "[].NowPlayingItem.MediaSources[].MediaStreams[].IsAnamorphic",
+            "[].NowPlayingItem.MediaSources[].MediaStreams[].IsDefault",
+            "[].NowPlayingItem.MediaSources[].MediaStreams[].IsExternal",
+            "\u2026 +53 more"
+          ]
+        },
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "sessions",
+        "f_p50": 1.72,
+        "f_p95": 7.93,
+        "f_p99": 12.54,
+        "f_rps": 2000.0,
+        "f_ok": 100.0,
+        "j_p50": 0.36,
+        "j_p95": 0.67,
+        "j_p99": 1.03,
+        "j_rps": 2000.0,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 2000.0,
+        "j_achieved": 2000.0,
+        "speedup": 0.21,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Shows/{seriesId}/Episodes",
+      "tag": "TvShows",
+      "shape": {
+        "f": "a7c0eb16779458ad",
+        "j": "e2c18094a28fabb8",
+        "matches_jellyfin": false,
+        "diff_vs_jellyfin": {
+          "missing": [
+            "Items[].PremiereDate",
+            "Items[].ProductionYear"
+          ],
+          "extra": []
+        },
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "shows_episodes",
+        "f_p50": 2.36,
+        "f_p95": 5.57,
+        "f_p99": 9.21,
+        "f_rps": 738.0,
+        "f_ok": 100.0,
+        "j_p50": 2.69,
+        "j_p95": 4.34,
+        "j_p99": 5.44,
+        "j_rps": 738.0,
+        "j_ok": 100.0,
+        "rate": 738,
+        "rate_source": "calibrated",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 738,
+        "f_achieved": 738.0,
+        "j_achieved": 738.0,
+        "speedup": 1.14,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "win",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": true,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Shows/{seriesId}/Seasons",
+      "tag": "TvShows",
+      "shape": {
+        "f": "91c6bcd9535414ea",
+        "j": "f32449e63f2e7cef",
+        "matches_jellyfin": false,
+        "diff_vs_jellyfin": {
+          "missing": [
+            "Items[].PremiereDate",
+            "Items[].ProductionYear"
+          ],
+          "extra": []
+        },
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "shows_seasons",
+        "f_p50": 1.85,
+        "f_p95": 3.33,
+        "f_p99": 4.55,
+        "f_rps": 200.0,
+        "f_ok": 100.0,
+        "j_p50": 9.9,
+        "j_p95": 14.27,
+        "j_p99": 18.59,
+        "j_rps": 200.0,
+        "j_ok": 100.0,
+        "rate": 200,
+        "rate_source": "calibrated",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 200,
+        "f_achieved": 200.0,
+        "j_achieved": 200.0,
+        "speedup": 5.35,
+        "win_all_three": true,
+        "verdicts": {
+          "p50": "win",
+          "p95": "win",
+          "p99": "win"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Shows/{itemId}/Similar",
+      "tag": "Library",
+      "shape": {
+        "f": "40d76722d82205a7",
+        "j": "781abdb1189d5865",
+        "matches_jellyfin": false,
+        "diff_vs_jellyfin": {
+          "missing": [
+            "Items[].AirDays",
+            "Items[].BackdropImageTags",
+            "Items[].ChannelId",
+            "Items[].Id",
+            "Items[].ImageBlurHashes",
+            "Items[].ImageTags",
+            "Items[].IsFolder",
+            "Items[].LocationType",
+            "Items[].MediaType",
+            "Items[].Name",
+            "Items[].ServerId",
+            "Items[].Type",
+            "Items[].UserData",
+            "Items[].UserData.IsFavorite",
+            "Items[].UserData.ItemId",
+            "Items[].UserData.Key",
+            "Items[].UserData.PlayCount",
+            "Items[].UserData.PlaybackPositionTicks",
+            "Items[].UserData.Played",
+            "Items[].UserData.UnplayedItemCount"
+          ],
+          "extra": []
+        },
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": false,
+        "classification": "instance/methodology: Jellyfin 10.11.8 serves /Similar from a flat Genres/Tags query ordered Random (non-deterministic, not diffable); Ferrofin implements upstream master's weighted SimilarItemsManager (genre 10/tag 5/studio 5/director 50/actor 15 + IsPlayed/user-access phase-2 filter, Episode/by-name short-circuit). Verified by unit tests against the C# weights."
+      },
+      "perf": {
+        "variant": "shows_similar",
+        "f_p50": 2.88,
+        "f_p95": 5.09,
+        "f_p99": 7.04,
+        "f_rps": 25.0,
+        "f_ok": 100.0,
+        "j_p50": 20.51,
+        "j_p95": 29.92,
+        "j_p99": 34.84,
+        "j_rps": 25.0,
+        "j_ok": 100.0,
+        "rate": 25,
+        "rate_source": "flat-default",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 25,
+        "f_achieved": 25.0,
+        "j_achieved": 25.0,
+        "speedup": 7.12,
+        "win_all_three": true,
+        "verdicts": {
+          "p50": "win",
+          "p95": "win",
+          "p99": "win"
+        },
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "not deep-verified"
+      }
+    },
+    {
+      "op": "GET /Startup/Configuration",
+      "tag": "Startup",
+      "shape": {
+        "f": "7140aab69386184a",
+        "j": "7140aab69386184a",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "startup_config",
+        "f_p50": 0.22,
+        "f_p95": 0.8,
+        "f_p99": 1.75,
+        "f_rps": 1999.8,
+        "f_ok": 100.0,
+        "j_p50": 0.19,
+        "j_p95": 0.32,
+        "j_p99": 0.45,
+        "j_rps": 1999.8,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 1999.8,
+        "j_achieved": 1999.8,
+        "speedup": 0.86,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Startup/FirstUser",
+      "tag": "Startup",
+      "shape": {
+        "f": "dcd1d5223f73b3a9",
+        "j": "dcd1d5223f73b3a9",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "startup_first_user",
+        "f_p50": 0.4,
+        "f_p95": 1.2,
+        "f_p99": 2.04,
+        "f_rps": 2000.0,
+        "f_ok": 100.0,
+        "j_p50": 0.18,
+        "j_p95": 0.33,
+        "j_p99": 0.49,
+        "j_rps": 1999.8,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 2000.0,
+        "j_achieved": 1999.8,
+        "speedup": 0.45,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Startup/User",
+      "tag": "Startup",
+      "shape": {
+        "f": "dcd1d5223f73b3a9",
+        "j": "dcd1d5223f73b3a9",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "startup_user",
+        "f_p50": 0.39,
+        "f_p95": 1.25,
+        "f_p99": 2.45,
+        "f_rps": 2000.0,
+        "f_ok": 100.0,
+        "j_p50": 0.18,
+        "j_p95": 0.32,
+        "j_p99": 0.46,
+        "j_rps": 2000.0,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 2000.0,
+        "j_achieved": 2000.0,
+        "speedup": 0.46,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Studios/{name}",
+      "tag": "Studios",
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": false,
+        "classification": "accepted-divergence: Ferrofin does not lazily CREATE a by-name item on a GET (Jellyfin's GetItemByName writes a row as a read side-effect \u2192 J=200 for an absent studio). Ferrofin returns the item if it exists (200, BaseItemDto) else 404 \u2014 a GET with no filesystem write. Verified live 2026-08-11: existing\u2192200, absent\u2192404."
+      },
+      "perf": {
+        "variant": "studio_detail",
+        "f_p50": 2.88,
+        "f_p95": 4.37,
+        "f_p99": 5.51,
+        "f_rps": 25.0,
+        "f_ok": 100.0,
+        "j_p50": 4.86,
+        "j_p95": 6.95,
+        "j_p99": 8.05,
+        "j_rps": 25.0,
+        "j_ok": 100.0,
+        "rate": 25,
+        "rate_source": "flat-default",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 25,
+        "f_achieved": 25.0,
+        "j_achieved": 25.0,
+        "speedup": 1.69,
+        "win_all_three": true,
+        "verdicts": {
+          "p50": "win",
+          "p95": "win",
+          "p99": "win"
+        },
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "not deep-verified"
+      }
+    },
+    {
+      "op": "GET /Studios",
+      "tag": "Studios",
+      "shape": {
+        "f": "9770f3cb6878e847",
+        "j": "9770f3cb6878e847",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "studios",
+        "f_p50": 1.01,
+        "f_p95": 2.22,
+        "f_p99": 3.46,
+        "f_rps": 641.0,
+        "f_ok": 100.0,
+        "j_p50": 2.58,
+        "j_p95": 4.5,
+        "j_p99": 5.85,
+        "j_rps": 641.0,
+        "j_ok": 100.0,
+        "rate": 641,
+        "rate_source": "calibrated",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 641,
+        "f_achieved": 641.0,
+        "j_achieved": 641.0,
+        "speedup": 2.55,
+        "win_all_three": true,
+        "verdicts": {
+          "p50": "win",
+          "p95": "win",
+          "p99": "win"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null,
+        "cold": {
+          "f_first": 15.69,
+          "f_p50": 2.4,
+          "f_max": 15.69,
+          "f_ready_ms": 0.0,
+          "j_first": 194.45,
+          "j_p50": 6.06,
+          "j_max": 194.45,
+          "j_ready_ms": 0.0
+        }
+      }
+    },
+    {
+      "op": "GET /Items/Suggestions",
+      "tag": "Suggestions",
+      "shape": {
+        "f": "88318981743eb6b7",
+        "j": "f93d316e03803319",
+        "matches_jellyfin": false,
+        "diff_vs_jellyfin": {
+          "missing": [
+            "Items[].AirDays",
+            "Items[].DateLastMediaAdded",
+            "Items[].IsHD",
+            "Items[].MediaSources[].DefaultSubtitleStreamIndex",
+            "Items[].MediaSources[].MediaAttachments[].CodecTag",
+            "Items[].MediaSources[].MediaStreams[].CodecTag",
+            "Items[].MediaSources[].MediaStreams[].Score",
+            "Items[].MediaStreams[].CodecTag",
+            "Items[].MediaStreams[].Score",
+            "Items[].PremiereDate",
+            "Items[].RecursiveItemCount",
+            "Items[].SeriesStudio",
+            "Items[].UserData.PlayedPercentage"
+          ],
+          "extra": [
+            "Items[].MediaSources[].MediaStreams[].LocalizedLanguage",
+            "Items[].MediaStreams[].LocalizedLanguage"
+          ]
+        },
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": false,
+        "classification": "instance/methodology: Jellyfin orders suggestions by Random, so the set is non-deterministic across independent scans (matches Jellyfin's behavior)."
+      },
+      "perf": {
+        "variant": "suggestions",
+        "f_p50": 7.94,
+        "f_p95": 11.24,
+        "f_p99": 12.82,
+        "f_rps": 38.0,
+        "f_ok": 100.0,
+        "j_p50": 32.82,
+        "j_p95": 71.76,
+        "j_p99": 317.76,
+        "j_rps": 38.0,
+        "j_ok": 100.0,
+        "rate": 38,
+        "rate_source": "calibrated",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 38,
+        "f_achieved": 38.0,
+        "j_achieved": 38.0,
+        "speedup": 4.13,
+        "win_all_three": true,
+        "verdicts": {
+          "p50": "win",
+          "p95": "win",
+          "p99": "win"
+        },
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "not deep-verified",
+        "cold": {
+          "f_first": 26.41,
+          "f_p50": 9.33,
+          "f_max": 26.41,
+          "f_ready_ms": 0.0,
+          "j_first": 370.7,
+          "j_p50": 75.73,
+          "j_max": 370.7,
+          "j_ready_ms": 0.0
+        }
+      }
+    },
+    {
+      "op": "GET /SyncPlay/List",
+      "tag": "SyncPlay",
+      "shape": {
+        "f": "e3b0c44298fc1c14",
+        "j": "e3b0c44298fc1c14",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "syncplay_list",
+        "f_p50": 0.32,
+        "f_p95": 1.05,
+        "f_p99": 2.0,
+        "f_rps": 2000.0,
+        "f_ok": 100.0,
+        "j_p50": 0.18,
+        "j_p95": 0.35,
+        "j_p99": 0.55,
+        "j_rps": 2000.0,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 2000.0,
+        "j_achieved": 2000.0,
+        "speedup": 0.56,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /System/Configuration",
+      "tag": "Configuration",
+      "shape": {
+        "f": "9ee4e4de0f5da9f4",
+        "j": "9ee4e4de0f5da9f4",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": false,
+        "classification": "instance/methodology: real default fields (PluginRepositories/EnableLegacyAuthorization/CacheSize) now match; residual IsStartupWizardCompleted/IsPortAuthorized reflect the harness completing Jellyfin's wizard during setup while Ferrofin auto-seeds \u2014 setup state, not a bug."
+      },
+      "perf": {
+        "variant": "system_config",
+        "f_p50": 0.36,
+        "f_p95": 1.27,
+        "f_p99": 2.7,
+        "f_rps": 2000.0,
+        "f_ok": 100.0,
+        "j_p50": 0.22,
+        "j_p95": 0.4,
+        "j_p99": 0.58,
+        "j_rps": 2000.0,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 2000.0,
+        "j_achieved": 2000.0,
+        "speedup": 0.61,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "not deep-verified"
+      }
+    },
+    {
+      "op": "GET /System/Configuration/{key}",
+      "tag": "Configuration",
+      "shape": {
+        "f": "4f8020efc28811e5",
+        "j": "aec567979b9db296",
+        "matches_jellyfin": false,
+        "diff_vs_jellyfin": {
+          "missing": [
+            "EncoderAppPathDisplay"
+          ],
+          "extra": [
+            "EncoderPreset",
+            "HlsAudioSeekStrategy",
+            "SubtitleExtractionTimeoutMinutes"
+          ]
+        },
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "system_config_key",
+        "f_p50": 0.31,
+        "f_p95": 1.02,
+        "f_p99": 2.31,
+        "f_rps": 2000.0,
+        "f_ok": 100.0,
+        "j_p50": 0.22,
+        "j_p95": 0.39,
+        "j_p99": 0.71,
+        "j_rps": 2000.0,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 2000.0,
+        "j_achieved": 2000.0,
+        "speedup": 0.71,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /System/Endpoint",
+      "tag": "System",
+      "shape": {
+        "f": "f6ebf6822a248686",
+        "j": "f6ebf6822a248686",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "system_endpoint",
+        "f_p50": 0.23,
+        "f_p95": 0.95,
+        "f_p99": 2.25,
+        "f_rps": 2000.0,
+        "f_ok": 100.0,
+        "j_p50": 0.18,
+        "j_p95": 0.35,
+        "j_p99": 0.52,
+        "j_rps": 2000.0,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 2000.0,
+        "j_achieved": 2000.0,
+        "speedup": 0.78,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /System/Info",
+      "tag": "System",
+      "shape": {
+        "f": "9e9540ee5e5e063e",
+        "j": "2141640aa89fa1fb",
+        "matches_jellyfin": false,
+        "diff_vs_jellyfin": {
+          "missing": [
+            "EncoderLocation",
+            "OperatingSystemDisplayName",
+            "SystemArchitecture"
+          ],
+          "extra": [
+            "PackageName"
+          ]
+        },
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "system_info",
+        "f_p50": 0.23,
+        "f_p95": 0.87,
+        "f_p99": 1.8,
+        "f_rps": 1999.8,
+        "f_ok": 100.0,
+        "j_p50": 0.23,
+        "j_p95": 0.45,
+        "j_p99": 0.74,
+        "j_rps": 2000.0,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 1999.8,
+        "j_achieved": 2000.0,
+        "speedup": 1.0,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "win",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": true,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /System/Logs",
+      "tag": "System",
+      "shape": {
+        "f": "234f38dd820bc7d7",
+        "j": "234f38dd820bc7d7",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": false,
+        "classification": "instance: log-file set differs per instance/run."
+      },
+      "perf": {
+        "variant": "system_logs",
+        "f_p50": 0.29,
+        "f_p95": 1.24,
+        "f_p99": 3.34,
+        "f_rps": 1999.8,
+        "f_ok": 100.0,
+        "j_p50": 0.21,
+        "j_p95": 0.38,
+        "j_p99": 0.59,
+        "j_rps": 2000.0,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 1999.8,
+        "j_achieved": 2000.0,
+        "speedup": 0.72,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "not deep-verified"
+      }
+    },
+    {
+      "op": "GET /System/Ping",
+      "tag": "System",
+      "shape": {
+        "f": "e3b0c44298fc1c14",
+        "j": "e3b0c44298fc1c14",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": false,
+        "classification": "instance: returns the server name string (ferrofin vs the Jellyfin instance name)."
+      },
+      "perf": {
+        "variant": "system_ping",
+        "f_p50": 0.21,
+        "f_p95": 0.67,
+        "f_p99": 1.49,
+        "f_rps": 2000.0,
+        "f_ok": 100.0,
+        "j_p50": 0.17,
+        "j_p95": 0.32,
+        "j_p99": 0.46,
+        "j_rps": 2000.0,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 2000.0,
+        "j_achieved": 2000.0,
+        "speedup": 0.81,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "not deep-verified"
+      }
+    },
+    {
+      "op": "GET /System/Info/Storage",
+      "tag": "System",
+      "shape": {
+        "f": "7d487d8de874e131",
+        "j": "eb436a69ea8e586d",
+        "matches_jellyfin": false,
+        "diff_vs_jellyfin": {
+          "missing": [
+            "CacheFolder.DeviceId",
+            "CacheFolder.StorageType",
+            "ImageCacheFolder.DeviceId",
+            "ImageCacheFolder.StorageType",
+            "InternalMetadataFolder.DeviceId",
+            "InternalMetadataFolder.StorageType",
+            "Libraries[].Folders[].DeviceId",
+            "Libraries[].Folders[].StorageType",
+            "LogFolder.DeviceId",
+            "LogFolder.StorageType",
+            "ProgramDataFolder.DeviceId",
+            "ProgramDataFolder.StorageType",
+            "TranscodingTempFolder.DeviceId",
+            "TranscodingTempFolder.StorageType",
+            "WebFolder.DeviceId",
+            "WebFolder.StorageType"
+          ],
+          "extra": []
+        },
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": false,
+        "classification": "instance: per-host disk paths and free/used space."
+      },
+      "perf": {
+        "variant": "system_storage",
+        "f_p50": 1.37,
+        "f_p95": 5.07,
+        "f_p99": 9.68,
+        "f_rps": 2000.0,
+        "f_ok": 100.0,
+        "j_p50": 0.3,
+        "j_p95": 0.51,
+        "j_p99": 0.75,
+        "j_rps": 2000.0,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 2000.0,
+        "j_achieved": 2000.0,
+        "speedup": 0.22,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "not deep-verified"
+      }
+    },
+    {
+      "op": "GET /Tmdb/ClientConfiguration",
+      "tag": "Tmdb",
+      "shape": {
+        "f": "482da317270c47d6",
+        "j": "482da317270c47d6",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "tmdb_config",
+        "f_p50": 0.22,
+        "f_p95": 0.73,
+        "f_p99": 1.48,
+        "f_rps": 2000.0,
+        "f_ok": 100.0,
+        "j_p50": 0.19,
+        "j_p95": 0.34,
+        "j_p99": 0.5,
+        "j_rps": 2000.0,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 2000.0,
+        "j_achieved": 2000.0,
+        "speedup": 0.86,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Trailers",
+      "tag": "Trailers",
+      "shape": {
+        "f": "40d76722d82205a7",
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": false,
+        "classification": "instance: Jellyfin 10.11.8 returns 500 here (its own error with no Trailers provider), while Ferrofin correctly returns 200 with an empty result. Kept correct per policy (do not port Jellyfin bugs); not a Ferrofin gap."
+      },
+      "perf": {
+        "variant": "trailers",
+        "f_p50": 1.44,
+        "f_p95": 2.58,
+        "f_p99": 3.54,
+        "f_rps": 25.0,
+        "f_ok": 100.0,
+        "j_p50": null,
+        "j_p95": null,
+        "j_p99": null,
+        "j_rps": 0.0,
+        "j_ok": 0.0,
+        "rate": 25,
+        "rate_source": "flat-default",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 25,
+        "f_achieved": 25.0,
+        "j_achieved": 25.0,
+        "speedup": null,
+        "win_all_three": false,
+        "verdicts": null,
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "not deep-verified"
+      }
+    },
+    {
+      "op": "GET /Trailers/{itemId}/Similar",
+      "tag": "Library",
+      "shape": {
+        "f": "40d76722d82205a7",
+        "j": "b89c1e2138d90c4d",
+        "matches_jellyfin": false,
+        "diff_vs_jellyfin": {
+          "missing": [
+            "Items[].BackdropImageTags",
+            "Items[].ChannelId",
+            "Items[].Container",
+            "Items[].HasSubtitles",
+            "Items[].Id",
+            "Items[].ImageBlurHashes",
+            "Items[].ImageBlurHashes.Primary",
+            "Items[].ImageBlurHashes.Primary.*",
+            "Items[].ImageTags",
+            "Items[].ImageTags.Primary",
+            "Items[].IsFolder",
+            "Items[].LocationType",
+            "Items[].MediaType",
+            "Items[].Name",
+            "Items[].PremiereDate",
+            "Items[].ProductionYear",
+            "Items[].RunTimeTicks",
+            "Items[].ServerId",
+            "Items[].Type",
+            "Items[].UserData",
+            "Items[].UserData.IsFavorite",
+            "Items[].UserData.ItemId",
+            "Items[].UserData.Key",
+            "Items[].UserData.PlayCount",
+            "Items[].UserData.PlaybackPositionTicks",
+            "Items[].UserData.Played",
+            "Items[].VideoType"
+          ],
+          "extra": []
+        },
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": false,
+        "classification": "instance/methodology: Jellyfin 10.11.8 serves /Similar from a flat Genres/Tags query ordered Random (non-deterministic, not diffable); Ferrofin implements upstream master's weighted SimilarItemsManager (genre 10/tag 5/studio 5/director 50/actor 15 + IsPlayed/user-access phase-2 filter, Episode/by-name short-circuit). Verified by unit tests against the C# weights."
+      },
+      "perf": {
+        "variant": "trailers_similar",
+        "f_p50": 3.12,
+        "f_p95": 5.98,
+        "f_p99": 7.89,
+        "f_rps": 25.0,
+        "f_ok": 100.0,
+        "j_p50": 4.07,
+        "j_p95": 6.28,
+        "j_p99": 7.85,
+        "j_rps": 25.0,
+        "j_ok": 100.0,
+        "rate": 25,
+        "rate_source": "flat-default",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 25,
+        "f_achieved": 25.0,
+        "j_achieved": 25.0,
+        "speedup": 1.3,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "win",
+          "p95": "win",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "not deep-verified"
+      }
+    },
+    {
+      "op": "GET /Shows/Upcoming",
+      "tag": "TvShows",
+      "shape": {
+        "f": "40d76722d82205a7",
+        "j": "40d76722d82205a7",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "upcoming",
+        "f_p50": 1.06,
+        "f_p95": 2.7,
+        "f_p99": 4.23,
+        "f_rps": 649.0,
+        "f_ok": 100.0,
+        "j_p50": 1.78,
+        "j_p95": 3.31,
+        "j_p99": 4.48,
+        "j_rps": 649.0,
+        "j_ok": 100.0,
+        "rate": 649,
+        "rate_source": "calibrated",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 649,
+        "f_achieved": 649.0,
+        "j_achieved": 649.0,
+        "speedup": 1.68,
+        "win_all_three": true,
+        "verdicts": {
+          "p50": "win",
+          "p95": "win",
+          "p99": "win"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Users/{userId}",
+      "tag": "User",
+      "shape": {
+        "f": "36747f210c24f0f5",
+        "j": "36747f210c24f0f5",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "user_by_id",
+        "f_p50": 0.46,
+        "f_p95": 1.48,
+        "f_p99": 3.02,
+        "f_rps": 2000.0,
+        "f_ok": 100.0,
+        "j_p50": 0.23,
+        "j_p95": 0.4,
+        "j_p99": 0.6,
+        "j_rps": 2000.0,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 2000.0,
+        "j_achieved": 2000.0,
+        "speedup": 0.5,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Users/Me",
+      "tag": "User",
+      "shape": {
+        "f": "36747f210c24f0f5",
+        "j": "36747f210c24f0f5",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "user_me",
+        "f_p50": 0.31,
+        "f_p95": 1.11,
+        "f_p99": 2.22,
+        "f_rps": 2000.0,
+        "f_ok": 100.0,
+        "j_p50": 0.22,
+        "j_p95": 0.41,
+        "j_p99": 0.61,
+        "j_rps": 1999.8,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 2000.0,
+        "j_achieved": 1999.8,
+        "speedup": 0.71,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null,
+        "cold": {
+          "f_first": 11.86,
+          "f_p50": 1.19,
+          "f_max": 11.86,
+          "f_ready_ms": 0.0,
+          "j_first": 105.78,
+          "j_p50": 1.67,
+          "j_max": 105.78,
+          "j_ready_ms": 0.0
+        }
+      }
+    },
+    {
+      "op": "GET /UserViews",
+      "tag": "UserViews",
+      "shape": {
+        "f": "46f5f72e5eb33998",
+        "j": "0b294cf6e4df78ff",
+        "matches_jellyfin": false,
+        "diff_vs_jellyfin": {
+          "missing": [
+            "Items[].DateLastMediaAdded"
+          ],
+          "extra": [
+            "Items[].Height",
+            "Items[].ImageTags.Primary",
+            "Items[].PrimaryImageAspectRatio",
+            "Items[].Width"
+          ]
+        },
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": false,
+        "classification": "instance: view Path (and path-derived id) differ only by /config vs /data data-dir; identical under a shared data-dir. (Historic note: until the with_all_fields(false) fix the views also lacked ~25 default fields Jellyfin emits \u2014 that was a real defect, not instance noise; re-verify on the next sweep.)"
+      },
+      "perf": {
+        "variant": "user_views",
+        "f_p50": 2.23,
+        "f_p95": 6.51,
+        "f_p99": 10.79,
+        "f_rps": 1011.0,
+        "f_ok": 100.0,
+        "j_p50": 0.81,
+        "j_p95": 1.56,
+        "j_p99": 2.18,
+        "j_rps": 1011.0,
+        "j_ok": 100.0,
+        "rate": 1011,
+        "rate_source": "calibrated",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 1011,
+        "f_achieved": 1011.0,
+        "j_achieved": 1011.0,
+        "speedup": 0.36,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "not deep-verified"
+      }
+    },
+    {
+      "op": "GET /Users",
+      "tag": "User",
+      "shape": {
+        "f": "958f8660e606260e",
+        "j": "958f8660e606260e",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "users_all",
+        "f_p50": 0.5,
+        "f_p95": 1.66,
+        "f_p99": 3.69,
+        "f_rps": 2000.0,
+        "f_ok": 100.0,
+        "j_p50": 0.22,
+        "j_p95": 0.4,
+        "j_p99": 0.58,
+        "j_rps": 2000.0,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 2000.0,
+        "j_achieved": 2000.0,
+        "speedup": 0.44,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Users/Public",
+      "tag": "User",
+      "shape": {
+        "f": "e3b0c44298fc1c14",
+        "j": "e3b0c44298fc1c14",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "users_public",
+        "f_p50": 0.36,
+        "f_p95": 1.22,
+        "f_p99": 2.38,
+        "f_rps": 1999.8,
+        "f_ok": 100.0,
+        "j_p50": 0.17,
+        "j_p95": 0.33,
+        "j_p99": 0.5,
+        "j_rps": 2000.0,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 1999.8,
+        "j_achieved": 2000.0,
+        "speedup": 0.47,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /GetUtcTime",
+      "tag": "TimeSync",
+      "shape": {
+        "f": "9fc800ae726a2f53",
+        "j": "9fc800ae726a2f53",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "utc_time",
+        "f_p50": 0.24,
+        "f_p95": 0.85,
+        "f_p99": 1.76,
+        "f_rps": 2000.0,
+        "f_ok": 100.0,
+        "j_p50": 0.17,
+        "j_p95": 0.32,
+        "j_p99": 0.46,
+        "j_rps": 2000.0,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 2000.0,
+        "j_achieved": 2000.0,
+        "speedup": 0.71,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Videos/{itemId}/AdditionalParts",
+      "tag": "Videos",
+      "shape": {
+        "f": "40d76722d82205a7",
+        "j": "40d76722d82205a7",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "video_additional_parts",
+        "f_p50": 0.37,
+        "f_p95": 1.11,
+        "f_p99": 2.26,
+        "f_rps": 2000.0,
+        "f_ok": 100.0,
+        "j_p50": 0.22,
+        "j_p95": 0.39,
+        "j_p99": 0.59,
+        "j_rps": 2000.0,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 2000.0,
+        "j_achieved": 2000.0,
+        "speedup": 0.59,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Library/VirtualFolders",
+      "tag": "LibraryStructure",
+      "shape": {
+        "f": "63093a838cb662cd",
+        "j": "63093a838cb662cd",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "virtual_folders",
+        "f_p50": 1.56,
+        "f_p95": 5.79,
+        "f_p99": 9.57,
+        "f_rps": 2000.0,
+        "f_ok": 100.0,
+        "j_p50": 0.3,
+        "j_p95": 0.54,
+        "j_p99": 0.81,
+        "j_rps": 1999.8,
+        "j_ok": 100.0,
+        "rate": 2000,
+        "rate_source": "calibrated-capped",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 2000,
+        "f_achieved": 2000.0,
+        "j_achieved": 1999.8,
+        "speedup": 0.19,
+        "win_all_three": false,
+        "verdicts": {
+          "p50": "loss",
+          "p95": "loss",
+          "p99": "loss"
+        },
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Years",
+      "tag": "Years",
+      "shape": {
+        "f": "9770f3cb6878e847",
+        "j": "9770f3cb6878e847",
+        "matches_jellyfin": true,
+        "baseline": "new"
+      },
+      "owner": "core",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": false,
+        "classification": "expected-extension: Ferrofin does not materialize Year items (documented out-of-scope)."
+      },
+      "perf": {
+        "variant": "years",
+        "f_p50": 3.43,
+        "f_p95": 5.61,
+        "f_p99": 7.27,
+        "f_rps": 84.0,
+        "f_ok": 100.0,
+        "j_p50": 8.91,
+        "j_p95": 12.61,
+        "j_p99": 21.3,
+        "j_rps": 84.0,
+        "j_ok": 100.0,
+        "rate": 84,
+        "rate_source": "calibrated",
+        "f_rate_held": true,
+        "j_rate_held": true,
+        "j_rate": 84,
+        "f_achieved": 84.0,
+        "j_achieved": 84.0,
+        "speedup": 2.6,
+        "win_all_three": true,
+        "verdicts": {
+          "p50": "win",
+          "p95": "win",
+          "p99": "win"
+        },
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "not deep-verified"
+      }
+    }
+  ]
+}

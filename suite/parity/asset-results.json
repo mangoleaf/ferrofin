@@ -1,6 +1,6 @@
 {
   "generated_by": "suite/parity/assets.py",
-  "last_verified": "a518834 2026-08-23",
+  "last_verified": "446f0ae 2026-08-24",
   "rows": {
     "DELETE /Branding/Splashscreen": {
       "classification": "",
@@ -48,39 +48,39 @@
       "note": "H=(2, 'none', False) J=(2, 'none', False)"
     },
     "GET /Genres/{name}/Images/{imageType}": {
-      "classification": "flagged: asset property diff vs Jellyfin (verify)",
-      "deep_verified": false,
-      "note": "H=(4, '') J=(2, 'image', 'png', 600, 600)"
+      "classification": "",
+      "deep_verified": true,
+      "note": "H=(2, 'image', 'png', 600, 600) J=(2, 'image', 'png', 600, 600)"
     },
     "GET /Genres/{name}/Images/{imageType}/{imageIndex}": {
-      "classification": "flagged: asset property diff vs Jellyfin (verify)",
-      "deep_verified": false,
-      "note": "H=(4, '') J=(2, 'image', 'png', 600, 600)"
+      "classification": "",
+      "deep_verified": true,
+      "note": "H=(2, 'image', 'png', 600, 600) J=(2, 'image', 'png', 600, 600)"
     },
     "GET /Items/{itemId}/Download": {
       "classification": "",
       "deep_verified": true,
-      "note": "H=(2, 'file', '89974f27e13bea94846a7b9027921b53b1e7d1021619790344b948238a041a75', 'video/x-matroska', 'bytes', 'attachment; filename=\"Movie 0001 (2020).mkv\"; filename*=UTF-8\\'\\'Movie%200001%20%282020%29.mkv') J=(2, 'file', '89974f27e13bea94846a7b9027921b53b1e7d1021619790344b948238a041a75', 'video/x-matroska', 'bytes', 'attachment; filename=\"Movie 0001 (2020).mkv\"; filename*=UTF-8\\'\\'Movie%200001%20%282020%29.mkv')"
+      "note": "H=(2, 'file', '2801fdb3955d4f5acf8822b4a3414a72eeecd9b68f4a0083d30e46f15ff58f7c', 'video/x-matroska', 'bytes', 'attachment; filename=\"Movie 0001 (2020).mkv\"; filename*=UTF-8\\'\\'Movie%200001%20%282020%29.mkv') J=(2, 'file', '2801fdb3955d4f5acf8822b4a3414a72eeecd9b68f4a0083d30e46f15ff58f7c', 'video/x-matroska', 'bytes', 'attachment; filename=\"Movie 0001 (2020).mkv\"; filename*=UTF-8\\'\\'Movie%200001%20%282020%29.mkv')"
     },
     "GET /Items/{itemId}/File": {
       "classification": "",
       "deep_verified": true,
-      "note": "H=(2, 'file', '89974f27e13bea94846a7b9027921b53b1e7d1021619790344b948238a041a75', 'video/x-matroska', 'bytes', '', 206, 'bytes 0-99/775041', '0fa10dd75a8fc97a9ee1370322440565a5eb6907ee7b2c6a60ccb6f8dba9c41d') J=(2, 'file', '89974f27e13bea94846a7b9027921b53b1e7d1021619790344b948238a041a75', 'video/x-matroska', 'bytes', '', 206, 'bytes 0-99/775041', '0fa10dd75a8fc97a9ee1370322440565a5eb6907ee7b2c6a60ccb6f8dba9c41d')"
+      "note": "H=(2, 'file', '2801fdb3955d4f5acf8822b4a3414a72eeecd9b68f4a0083d30e46f15ff58f7c', 'video/x-matroska', 'bytes', '', 206, 'bytes 0-99/775053', 'fd69399658b25b328773da41ebdbb9df83f303b7332d2fadb010235d40e71982') J=(2, 'file', '2801fdb3955d4f5acf8822b4a3414a72eeecd9b68f4a0083d30e46f15ff58f7c', 'video/x-matroska', 'bytes', '', 206, 'bytes 0-99/775053', 'fd69399658b25b328773da41ebdbb9df83f303b7332d2fadb010235d40e71982')"
     },
     "GET /Items/{itemId}/Images/{imageType}": {
-      "classification": "",
-      "deep_verified": true,
-      "note": "H=(2, 'image', 'jpeg', 320, 240) J=(2, 'image', 'jpeg', 320, 240)"
+      "classification": "flagged: asset property diff vs Jellyfin (verify)",
+      "deep_verified": false,
+      "note": "H=(2, 'image', 'jpeg', 2000, 3000) J=(2, 'image', 'jpeg', 320, 240)"
     },
     "GET /Items/{itemId}/Images/{imageType}/{imageIndex}": {
-      "classification": "",
-      "deep_verified": true,
-      "note": "H=(2, 'image', 'jpeg', 320, 240) J=(2, 'image', 'jpeg', 320, 240)"
+      "classification": "flagged: asset property diff vs Jellyfin (verify)",
+      "deep_verified": false,
+      "note": "H=(2, 'image', 'jpeg', 2000, 3000) J=(2, 'image', 'jpeg', 320, 240)"
     },
     "GET /Items/{itemId}/Images/{imageType}/{imageIndex}/{tag}/{format}/{maxWidth}/{maxHeight}/{percentPlayed}/{unplayedCount}": {
-      "classification": "",
-      "deep_verified": true,
-      "note": "H=(2, 'image', 'jpeg', 100, 75) J=(2, 'image', 'jpeg', 100, 75)"
+      "classification": "flagged: asset property diff vs Jellyfin (verify)",
+      "deep_verified": false,
+      "note": "H=(2, 'image', 'jpeg', 67, 100) J=(2, 'image', 'jpeg', 100, 75)"
     },
     "GET /MusicGenres/{name}/Images/{imageType}": {
       "classification": "",
@@ -128,9 +128,9 @@
       "note": "H=(4, '') J=(4, '')"
     },
     "GET /Videos/{videoId}/{mediaSourceId}/Attachments/{index}": {
-      "classification": "flagged: asset property diff vs Jellyfin (verify)",
-      "deep_verified": false,
-      "note": "H=(4, '') J=(2, 'file', '6038a160b491e121c1f12c7bccb4a9c8730296e3adc1086a059404ed84b7451c', 'application/x-truetype-font', '', '')"
+      "classification": "",
+      "deep_verified": true,
+      "note": "H=(2, 'file', '6038a160b491e121c1f12c7bccb4a9c8730296e3adc1086a059404ed84b7451c', 'application/x-truetype-font', '', '') J=(2, 'file', '6038a160b491e121c1f12c7bccb4a9c8730296e3adc1086a059404ed84b7451c', 'application/x-truetype-font', '', '')"
     },
     "HEAD /Artists/{name}/Images/{imageType}/{imageIndex}": {
       "classification": "",
@@ -138,14 +138,14 @@
       "note": "H=(4, '') J=(4, '')"
     },
     "HEAD /Genres/{name}/Images/{imageType}": {
-      "classification": "flagged: asset property diff vs Jellyfin (verify)",
-      "deep_verified": false,
-      "note": "H=(4, '') J=(2, 'image')"
+      "classification": "",
+      "deep_verified": true,
+      "note": "H=(2, 'image') J=(2, 'image')"
     },
     "HEAD /Genres/{name}/Images/{imageType}/{imageIndex}": {
-      "classification": "flagged: asset property diff vs Jellyfin (verify)",
-      "deep_verified": false,
-      "note": "H=(4, '') J=(2, 'image')"
+      "classification": "",
+      "deep_verified": true,
+      "note": "H=(2, 'image') J=(2, 'image')"
     },
     "HEAD /Items/{itemId}/Images/{imageType}": {
       "classification": "",

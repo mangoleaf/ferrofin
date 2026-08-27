@@ -1,7 +1,7 @@
 {
   "errors": {},
   "generated_by": "suite/parity/journeys.py",
-  "last_verified": "a518834 2026-08-23",
+  "last_verified": "446f0ae 2026-08-24",
   "rows": {
     "DELETE /Auth/Keys/{key}": {
       "classification": "ok",
@@ -39,9 +39,9 @@
       "note": "H=True J=True"
     },
     "DELETE /LiveTv/Recordings/{recordingId}": {
-      "classification": "flagged: Ferrofin read-back did not reflect the write (verify: real gap vs read-back method)",
-      "deep_verified": false,
-      "note": "H=False J=True"
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
     },
     "DELETE /LiveTv/Timers/{timerId}": {
       "classification": "ok",
@@ -64,9 +64,9 @@
       "note": "H=True J=False"
     },
     "DELETE /ScheduledTasks/Running/{taskId}": {
-      "classification": "ok",
-      "deep_verified": true,
-      "note": "H=True J=True"
+      "classification": "flagged: Jellyfin read-back differed (verify: oracle setup or Ferrofin extra)",
+      "deep_verified": false,
+      "note": "H=True J=False"
     },
     "DELETE /Sessions/{sessionId}/User/{userId}": {
       "classification": "ok",
@@ -124,14 +124,14 @@
       "note": "H=True J=True"
     },
     "GET /LiveTv/LiveRecordings/{recordingId}/stream": {
-      "classification": "flagged: Ferrofin read-back did not reflect the write (verify: real gap vs read-back method)",
-      "deep_verified": false,
-      "note": "H=False J=True"
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
     },
     "GET /LiveTv/LiveStreamFiles/{streamId}/stream.{container}": {
-      "classification": "flagged: Ferrofin read-back did not reflect the write (verify: real gap vs read-back method)",
-      "deep_verified": false,
-      "note": "H=False J=True"
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
     },
     "GET /LiveTv/Programs/{programId}": {
       "classification": "ok",
@@ -139,9 +139,9 @@
       "note": "H=True J=True"
     },
     "GET /LiveTv/Recordings/{recordingId}": {
-      "classification": "flagged: Ferrofin read-back did not reflect the write (verify: real gap vs read-back method)",
-      "deep_verified": false,
-      "note": "H=False J=True"
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
     },
     "GET /LiveTv/Timers/{timerId}": {
       "classification": "ok",
@@ -254,9 +254,9 @@
       "note": "H=True J=True"
     },
     "POST /Library/VirtualFolders/LibraryOptions": {
-      "classification": "ok",
-      "deep_verified": true,
-      "note": "H=True J=True"
+      "classification": "flagged: Ferrofin read-back did not reflect the write (verify: real gap vs read-back method)",
+      "deep_verified": false,
+      "note": "H=False J=True"
     },
     "POST /Library/VirtualFolders/Name": {
       "classification": "ok",
@@ -274,14 +274,14 @@
       "note": "H=True J=True"
     },
     "POST /LiveStreams/Close": {
-      "classification": "flagged: Ferrofin read-back did not reflect the write (verify: real gap vs read-back method)",
-      "deep_verified": false,
-      "note": "H=False J=True"
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
     },
     "POST /LiveStreams/Open": {
-      "classification": "flagged: Ferrofin read-back did not reflect the write (verify: real gap vs read-back method)",
-      "deep_verified": false,
-      "note": "H=False J=True"
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
     },
     "POST /LiveTv/ListingProviders": {
       "classification": "ok",
