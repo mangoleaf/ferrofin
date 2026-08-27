@@ -264,6 +264,17 @@ pub struct InternalItemsQuery {
     /// members. Used by delete-cascade so removing a box-set/playlist never deletes
     /// the referenced items (linked children are references, not owned children).
     pub physical_children_only: bool,
+    /// The physical folders [`Self::parent_id`] stands for, when it names a
+    /// Jellyfin `CollectionFolder`.
+    ///
+    /// **Derived, not set by callers** — the item repository fills it in from
+    /// `parent_id` before building the statement, and leaving it empty is
+    /// always correct. A Jellyfin `CollectionFolder` is virtual: nothing points
+    /// at it with `ParentId`, so a plain equality finds nothing and the
+    /// browse's children have to be matched against the library's physical
+    /// folders instead. Empty on a Ferrofin-written database, where items hang
+    /// off the collection folder directly.
+    pub parent_physical_folder_ids: Vec<Uuid>,
     /// The parent item kind, if known.
     pub parent_type: Option<BaseItemKind>,
     /// Restrict to descendants of these ancestors.
@@ -493,6 +504,7 @@ impl Default for InternalItemsQuery {
             is_virtual_item: None,
             parent_id: Uuid::nil(),
             physical_children_only: false,
+            parent_physical_folder_ids: Vec::new(),
             parent_type: None,
             ancestor_ids: Vec::new(),
             linked_child_ancestor_ids: Vec::new(),

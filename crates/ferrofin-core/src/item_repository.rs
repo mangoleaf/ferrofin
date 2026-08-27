@@ -38,7 +38,7 @@ use crate::db_error::{db_err, media_stream_type_disc};
 use crate::item_type_lookup::stored_type_name;
 use crate::translate_query::{
     PLACEHOLDER_ID, QueryShape, append_predicates, build_latest_item_list_query, build_query,
-    push_in_list,
+    push_in_list, to_guid_strings,
 };
 use sqlx::{FromRow, QueryBuilder, Row, Sqlite};
 
@@ -69,8 +69,108 @@ impl FerrofinItemRepository {
         }
     }
 
+    /// Resolves the virtual library views a browse names into the physical
+    /// folders its items actually hang off, returning `None` when there is
+    /// nothing to resolve.
+    ///
+    /// Port of `LibraryManager.GetTopParentIdsForQuery`'s `CollectionFolder`
+    /// arm and `CollectionFolder.GetActualChildren`. On a Jellyfin database a
+    /// `CollectionFolder` is virtual — measured on a real 10.11.8 library, **0**
+    /// rows carry one as `ParentId` and **0** carry one as `TopParentId` — so a
+    /// browse or a Latest query scoped to a view finds nothing until it is
+    /// translated. The link lives only in the item's serialized `Data` blob
+    /// (`PhysicalFolderIds`); the physical folders themselves hang off the
+    /// AggregateFolder, so there is no relational path to follow instead.
+    ///
+    /// A Ferrofin-written database keeps no `Data` blob and hangs items off the
+    /// collection folder directly, so every lookup here comes back empty and
+    /// the query is left exactly as it was.
+    async fn resolve_views(
+        &self,
+        filter: &InternalItemsQuery,
+    ) -> Result<Option<InternalItemsQuery>, ServiceError> {
+        // `physical_children_only` is the delete-cascade path: it must keep
+        // meaning "the rows this item owns", never widen to a library's whole
+        // contents.
+        let wants_parent =
+            filter.parent_id != Uuid::nil() && !filter.recursive && !filter.physical_children_only;
+        if !wants_parent && filter.top_parent_ids.is_empty() {
+            return Ok(None);
+        }
+
+        let mut resolved = None;
+        if wants_parent {
+            let folders = self
+                .physical_folders_by_view(&[filter.parent_id])
+                .await?
+                .remove(&filter.parent_id)
+                .unwrap_or_default();
+            if !folders.is_empty() {
+                resolved
+                    .get_or_insert_with(|| filter.clone())
+                    .parent_physical_folder_ids = folders;
+            }
+        }
+        if !filter.top_parent_ids.is_empty() {
+            // Per id, as C# does it: `TopParentIds = parents.SelectMany(i =>
+            // GetTopParentIdsForQuery(i, user))`. A collection folder
+            // contributes its physical folders; anything else — a `UserView`
+            // like Live TV or Playlists, or any id on a Ferrofin database,
+            // where the view IS the top parent — contributes itself. Replacing
+            // the whole set whenever *one* id expanded would silently drop the
+            // scopes that did not.
+            let by_view = self
+                .physical_folders_by_view(&filter.top_parent_ids)
+                .await?;
+            let mut expanded = Vec::with_capacity(filter.top_parent_ids.len());
+            let changed = !by_view.is_empty();
+            for id in &filter.top_parent_ids {
+                match by_view.get(id) {
+                    Some(folders) => expanded.extend(folders.iter().copied()),
+                    None => expanded.push(*id),
+                }
+            }
+            if changed {
+                resolved
+                    .get_or_insert_with(|| filter.clone())
+                    .top_parent_ids = expanded;
+            }
+        }
+        Ok(resolved)
+    }
+
+    /// The physical folders each of `ids` stands for, for those that are
+    /// Jellyfin collection folders. Ids that are not — every id on a
+    /// Ferrofin-written database — are simply absent from the map.
+    ///
+    /// One statement for the whole set, and restricted to the collection-folder
+    /// type: only those rows carry `PhysicalFolderIds` (7 of 7 on the real
+    /// library, no other type), so without the guard every ordinary browse of a
+    /// series or a folder would read and JSON-parse that item's `Data` blob to
+    /// learn nothing.
+    async fn physical_folders_by_view(
+        &self,
+        ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, Vec<Uuid>>, ServiceError> {
+        physical_folders_by_view(&self.db, ids).await
+    }
+
     /// Runs a translated query in the requested shape, returning full rows.
     async fn fetch_rows(
+        &self,
+        filter: &InternalItemsQuery,
+        shape: QueryShape,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        let resolved = self.resolve_views(filter).await?;
+        self.fetch_rows_resolved(resolved.as_ref().unwrap_or(filter), shape)
+            .await
+    }
+
+    /// [`Self::fetch_rows`] for a filter whose views are already resolved.
+    ///
+    /// Resolving twice is harmless — it is idempotent — but it is a wasted
+    /// round trip, and `get_items` runs both this and the count off one scope.
+    async fn fetch_rows_resolved(
         &self,
         filter: &InternalItemsQuery,
         shape: QueryShape,
@@ -93,6 +193,8 @@ impl FerrofinItemRepository {
         &self,
         filter: &InternalItemsQuery,
     ) -> Result<Vec<(String, Option<String>)>, ServiceError> {
+        let resolved = self.resolve_views(filter).await?;
+        let filter = resolved.as_ref().unwrap_or(filter);
         let mut qb = build_query(filter, QueryShape::IdAndCleanName);
         qb.build_query_as::<(String, Option<String>)>()
             .fetch_all(self.db.pool())
@@ -102,6 +204,8 @@ impl FerrofinItemRepository {
 
     /// Runs a translated query returning only the id column.
     async fn fetch_ids(&self, filter: &InternalItemsQuery) -> Result<Vec<Uuid>, ServiceError> {
+        let resolved = self.resolve_views(filter).await?;
+        let filter = resolved.as_ref().unwrap_or(filter);
         let mut qb = build_query(filter, QueryShape::IdsOnly);
         let ids: Vec<String> = qb
             .build_query_scalar::<String>()
@@ -111,8 +215,12 @@ impl FerrofinItemRepository {
         Ok(ids.iter().filter_map(|s| Uuid::parse_str(s).ok()).collect())
     }
 
-    /// Runs a `COUNT(*)` over the translated query.
-    async fn fetch_count(&self, filter: &InternalItemsQuery) -> Result<i32, ServiceError> {
+    /// Runs a `COUNT(*)` over the translated query, for a filter whose views
+    /// are already resolved.
+    ///
+    /// Its one caller — `get_items` — resolves once for both the page and the
+    /// count, so there is no resolving wrapper here to tempt a second lookup.
+    async fn fetch_count_resolved(&self, filter: &InternalItemsQuery) -> Result<i32, ServiceError> {
         let mut qb = build_query(filter, QueryShape::Count);
         let count: i64 = qb
             .build_query_scalar::<i64>()
@@ -170,6 +278,7 @@ impl FerrofinItemRepository {
     async fn count_by_name_total(
         &self,
         type_ints: &[i64],
+        return_type: &str,
         content_type_names: &[String],
         exclude_content_types: &[String],
         ancestors: &[String],
@@ -184,7 +293,7 @@ impl FerrofinItemRepository {
             exclude_content_types,
             ancestors,
         );
-        qb.push(r#" ON agg.vid = bi."Id" WHERE 1 = 1"#);
+        push_by_name_join(&mut qb, return_type);
         append_by_name_filters(&mut qb, filter);
         let count: i64 = qb
             .build_query_scalar()
@@ -207,10 +316,16 @@ impl FerrofinItemRepository {
     async fn item_values_with_counts(
         &self,
         value_types: &[ItemValueType],
+        return_type: BaseItemKind,
         filter: &InternalItemsQuery,
         include_content_types: &[String],
         exclude_content_types: &[String],
     ) -> Result<QueryResult<ItemWithCounts>, ServiceError> {
+        // Every kind the six callers pass (`Genre`, `MusicGenre`, `Studio`,
+        // `MusicArtist`) is in the lookup table. A kind that were not would
+        // fall back to `""`, which no `Type` column holds — an empty result,
+        // which is the right way for this to fail.
+        let return_type = stored_type_name(return_type).unwrap_or_default();
         let type_ints: Vec<i64> = value_types
             .iter()
             .map(|t| i64::from(i32::from(*t)))
@@ -245,7 +360,7 @@ impl FerrofinItemRepository {
             exclude_content_types,
             &ancestors,
         );
-        qb.push(r#" ON agg.vid = bi."Id" WHERE 1 = 1"#);
+        push_by_name_join(&mut qb, return_type);
         append_by_name_filters(&mut qb, filter);
         // ORDER BY Name (the key the old in-memory sort used); parity harness is the
         // oracle for divergences from Jellyfin's SortName ordering.
@@ -278,6 +393,7 @@ impl FerrofinItemRepository {
                 None if start_index > 0 => {
                     self.count_by_name_total(
                         &type_ints,
+                        return_type,
                         &content_type_names,
                         exclude_content_types,
                         &ancestors,
@@ -317,11 +433,18 @@ struct ByNameCountRow {
     total_count: i64,
 }
 
-/// Pushes the value-count aggregate as a derived table `agg(vid, cnt)`: for each
-/// `ItemValueId` of one of `type_ints`, the count of distinct in-scope content
-/// items that reference it, scoped by content-type include/exclude and the
+/// Pushes the value-count aggregate as a derived table `agg(cval, cnt)`: for
+/// each distinct `CleanValue` of one of `type_ints`, the count of in-scope
+/// content items that carry it, scoped by content-type include/exclude and the
 /// browse's `ancestors`. Shared by the page query and the total-count query so
 /// their WHERE stays identical (C# `GetItemValues` inner filter).
+///
+/// Grouped by `CleanValue`, not `ItemValueId`, because `CleanValue` is the key
+/// the by-name row is found by — see the `ON` clauses that consume this. Two
+/// `ItemValues` rows can differ only in capitalization (`IX_ItemValues_Type_Value`
+/// is unique on the raw `Value`), and they are one genre to a client, so
+/// collapsing them here is also what stops a single by-name row being joined
+/// twice.
 fn push_value_aggregate<'a>(
     qb: &mut QueryBuilder<'a, Sqlite>,
     type_ints: &'a [i64],
@@ -339,7 +462,7 @@ fn push_value_aggregate<'a>(
     // bench library; the statement behind `/Studios` measures 0.407 ms → 0.366,
     // `/Items/Filters2` 0.566 → 0.490.
     qb.push(
-        r#"(SELECT iv."ItemValueId" AS vid, COUNT(*) AS cnt
+        r#"(SELECT iv."CleanValue" AS cval, COUNT(*) AS cnt
            FROM "ItemValues" iv
            JOIN "ItemValuesMap" ivm ON ivm."ItemValueId" = iv."ItemValueId"
            JOIN "BaseItems" ci ON ci."Id" = ivm."ItemId"
@@ -363,7 +486,86 @@ fn push_value_aggregate<'a>(
         push_in_list(qb, r#"a."ParentItemId""#, ancestors);
         qb.push(")");
     }
-    qb.push(r#" GROUP BY iv."ItemValueId") AS agg"#);
+    qb.push(r#" GROUP BY iv."CleanValue") AS agg"#);
+}
+
+/// Joins the value aggregate to the by-name rows it describes.
+///
+/// Port of the C# outer filter, which is **two** clauses —
+/// `.Where(e => e.Type == returnType).Where(e => itemValuesQuery.Contains(e.CleanName))`
+/// (`BaseItemRepository.GetItemValues`). Both are load-bearing:
+///
+/// - `CleanName` is the only link on an adopted database, where
+///   `ItemValues.ItemValueId` is a synthetic guid matching no item at all.
+/// - `Type` is what keeps the answer to *this* browse. Without it a Movie or an
+///   Episode named "Drama" is returned by `/Genres` beside the real genre, and
+///   `/Genres` and `/MusicGenres` — which query the same `ItemValueType` and
+///   differ only by return kind — stop being distinguishable. It is also the
+///   leading column of `FerrofinIX_BaseItems_Type_CleanName`, so constraining
+///   it keeps this an index seek instead of a scan of every item.
+fn push_by_name_join(qb: &mut QueryBuilder<'_, Sqlite>, return_type: &str) {
+    qb.push(r#" ON agg.cval = bi."CleanName" AND bi."Type" = "#)
+        .push_bind(return_type.to_owned())
+        .push(" WHERE 1 = 1");
+}
+
+/// The physical folders each of `ids` stands for, for those that are Jellyfin
+/// collection folders — see
+/// [`FerrofinItemRepository::physical_folders_by_view`], which is the doc for
+/// why this translation exists at all.
+///
+/// A free function because the child-count service needs the same one: a
+/// library's `ChildCount` is its physical folders' children, and grouping on
+/// the raw `ParentId` reports 0 for every library on an adopted database.
+pub(crate) async fn physical_folders_by_view(
+    db: &Database,
+    ids: &[Uuid],
+) -> Result<HashMap<Uuid, Vec<Uuid>>, ServiceError> {
+    let Some(collection_folder) = stored_type_name(BaseItemKind::CollectionFolder) else {
+        return Ok(HashMap::new());
+    };
+    let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
+        r#"SELECT "Id", "Data" FROM "BaseItems" WHERE "Data" IS NOT NULL AND "Type" = "#,
+    );
+    qb.push_bind(collection_folder).push(" AND ");
+    push_in_list(&mut qb, r#""Id""#, &to_guid_strings(ids));
+    let rows: Vec<(String, String)> = qb
+        .build_query_as::<(String, String)>()
+        .fetch_all(db.pool())
+        .await
+        .map_err(db_err)?;
+    Ok(rows
+        .iter()
+        .filter_map(|(id, blob)| {
+            let folders = parse_physical_folder_ids(blob);
+            if folders.is_empty() {
+                return None;
+            }
+            Some((Uuid::parse_str(id).ok()?, folders))
+        })
+        .collect())
+}
+
+/// Reads `PhysicalFolderIds` out of a Jellyfin `BaseItems.Data` blob.
+///
+/// The ids are written N-format (32 lowercase hex, no hyphens) where the `Id`
+/// column is uppercase and hyphenated; `Uuid::parse_str` accepts both, and
+/// every comparison downstream goes through `guid_to_db`, so the two spellings
+/// never meet. A blob that is not a `CollectionFolder`'s — or is not JSON at
+/// all — simply yields nothing.
+fn parse_physical_folder_ids(blob: &str) -> Vec<Uuid> {
+    serde_json::from_str::<serde_json::Value>(blob)
+        .ok()
+        .as_ref()
+        .and_then(|v| v.get("PhysicalFolderIds"))
+        .and_then(serde_json::Value::as_array)
+        .map(|ids| {
+            ids.iter()
+                .filter_map(serde_json::Value::as_str)
+                .filter_map(|s| Uuid::parse_str(s).ok())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// The characters C# `BaseItemRepository.SearchWildcardTerms` treats as "the
@@ -682,7 +884,14 @@ impl ItemRepository for FerrofinItemRepository {
         &self,
         filter: &InternalItemsQuery,
     ) -> Result<QueryResult<BaseItemEntity>, ServiceError> {
-        let items = self.fetch_rows(filter, QueryShape::FullRows).await?;
+        // Resolve once for both statements below: the page and its count share
+        // one scope, and asking the database twice for the same library's
+        // folders is a round trip on every paged browse.
+        let resolved = self.resolve_views(filter).await?;
+        let filter = resolved.as_ref().unwrap_or(filter);
+        let items = self
+            .fetch_rows_resolved(filter, QueryShape::FullRows)
+            .await?;
         let start_index = filter.start_index.unwrap_or(0);
         let page_len = i32::try_from(items.len()).unwrap_or(i32::MAX);
         // A page that came back SHORT of its own `LIMIT` has nothing after it,
@@ -710,7 +919,7 @@ impl ItemRepository for FerrofinItemRepository {
             && (filter.limit.is_some() || start_index > 0)
             && !count_is_known
         {
-            self.fetch_count(filter).await?
+            self.fetch_count_resolved(filter).await?
         } else {
             page_len + start_index
         };
@@ -748,6 +957,12 @@ impl ItemRepository for FerrofinItemRepository {
             CollectionType::music => r#"bi."Album""#,
             _ => return Ok(Vec::new()),
         };
+        // This is the path jellyfin-web's per-library "Latest in …" rows take
+        // (grouping is on by default for tvshows and music), so it needs the
+        // same view translation as every other browse — without it, Latest for
+        // a TV or Music library on an adopted database comes back empty.
+        let resolved = self.resolve_views(filter).await?;
+        let filter = resolved.as_ref().unwrap_or(filter);
         // One statement: the newest `limit` groups' maxima set a DateCreated
         // threshold, and every row at or above it comes back in the caller's
         // order (`filter.limit` caps GROUPS, not rows — the outer query is
@@ -923,7 +1138,7 @@ impl ItemRepository for FerrofinItemRepository {
     ) -> Result<QueryResult<ItemWithCounts>, ServiceError> {
         // Plain genres exclude music items (those are the MusicGenres browse).
         let music = self.item_type_lookup.music_genre_types();
-        self.item_values_with_counts(GENRE_TYPES, filter, &[], &music)
+        self.item_values_with_counts(GENRE_TYPES, BaseItemKind::Genre, filter, &[], &music)
             .await
     }
 
@@ -933,7 +1148,7 @@ impl ItemRepository for FerrofinItemRepository {
     ) -> Result<QueryResult<ItemWithCounts>, ServiceError> {
         // Music genres come only from music items.
         let music = self.item_type_lookup.music_genre_types();
-        self.item_values_with_counts(GENRE_TYPES, filter, &music, &[])
+        self.item_values_with_counts(GENRE_TYPES, BaseItemKind::MusicGenre, filter, &music, &[])
             .await
     }
 
@@ -941,7 +1156,7 @@ impl ItemRepository for FerrofinItemRepository {
         &self,
         filter: &InternalItemsQuery,
     ) -> Result<QueryResult<ItemWithCounts>, ServiceError> {
-        self.item_values_with_counts(STUDIO_TYPES, filter, &[], &[])
+        self.item_values_with_counts(STUDIO_TYPES, BaseItemKind::Studio, filter, &[], &[])
             .await
     }
 
@@ -949,7 +1164,7 @@ impl ItemRepository for FerrofinItemRepository {
         &self,
         filter: &InternalItemsQuery,
     ) -> Result<QueryResult<ItemWithCounts>, ServiceError> {
-        self.item_values_with_counts(ARTIST_TYPES, filter, &[], &[])
+        self.item_values_with_counts(ARTIST_TYPES, BaseItemKind::MusicArtist, filter, &[], &[])
             .await
     }
 
@@ -957,16 +1172,28 @@ impl ItemRepository for FerrofinItemRepository {
         &self,
         filter: &InternalItemsQuery,
     ) -> Result<QueryResult<ItemWithCounts>, ServiceError> {
-        self.item_values_with_counts(ALBUM_ARTIST_TYPES, filter, &[], &[])
-            .await
+        self.item_values_with_counts(
+            ALBUM_ARTIST_TYPES,
+            BaseItemKind::MusicArtist,
+            filter,
+            &[],
+            &[],
+        )
+        .await
     }
 
     async fn get_all_artists(
         &self,
         filter: &InternalItemsQuery,
     ) -> Result<QueryResult<ItemWithCounts>, ServiceError> {
-        self.item_values_with_counts(ALL_ARTIST_TYPES, filter, &[], &[])
-            .await
+        self.item_values_with_counts(
+            ALL_ARTIST_TYPES,
+            BaseItemKind::MusicArtist,
+            filter,
+            &[],
+            &[],
+        )
+        .await
     }
 
     async fn get_music_genre_names(&self) -> Result<Vec<String>, ServiceError> {
@@ -1254,8 +1481,8 @@ mod tests {
     use super::*;
     use crate::item_type_lookup::ItemTypeLookup;
     use crate::test_support::{
-        seed_item, seed_item_genre, seed_named_item, seed_user, seed_user_data, set_clean_name,
-        test_db,
+        seed_child_item, seed_item, seed_item_genre, seed_item_with_data, seed_named_item,
+        seed_top_parented_item, seed_user, seed_user_data, set_clean_name, test_db,
     };
     use ferrofin_db::Database;
     use ferrofin_model::data::BaseItemKind;
@@ -2793,6 +3020,299 @@ mod tests {
         assert_eq!(
             z.total_record_count, 0,
             "genuine empty is 0, not a stale count"
+        );
+    }
+
+    /// The `PhysicalFolderIds` a Jellyfin `CollectionFolder` carries in its
+    /// `Data` blob: N-format guids (32 lowercase hex, no hyphens), where the
+    /// `Id` column is uppercase and hyphenated.
+    fn collection_folder_data(physical: Uuid) -> String {
+        format!(
+            r#"{{"PhysicalLocationsList":["/media/tv"],"PhysicalFolderIds":["{}"]}}"#,
+            physical.simple()
+        )
+    }
+
+    /// Browsing a library on an adopted Jellyfin database.
+    ///
+    /// Nothing there carries a `CollectionFolder`'s id as `ParentId` — measured
+    /// on a real 10.11.8 library, 0 rows of 40,610 — so the view has to be
+    /// translated into the physical folders named in its `Data` blob or the
+    /// browse comes back empty. This is the shape the Ferrofin-native fixtures
+    /// cannot produce, which is why the bug was invisible to a green suite.
+    #[tokio::test]
+    async fn browsing_a_jellyfin_collection_folder_finds_the_physical_folder_s_children() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let view = Uuid::from_u128(0x9001);
+        let physical = Uuid::from_u128(0x9002);
+        let episode = Uuid::from_u128(0x9003);
+
+        seed_item_with_data(
+            &db,
+            view,
+            BaseItemKind::CollectionFolder,
+            "TV",
+            &collection_folder_data(physical),
+        )
+        .await;
+        seed_named_item(&db, physical, BaseItemKind::Folder, "TV").await;
+        seed_child_item(&db, episode, BaseItemKind::Episode, "Pilot", physical).await;
+
+        let filter = InternalItemsQuery {
+            parent_id: view,
+            ..InternalItemsQuery::default()
+        };
+        let found = repository.get_item_list(&filter).await.expect("children");
+        assert_eq!(found.len(), 1, "the view's children hang off its folder");
+        assert_eq!(found[0].id, guid_to_db(episode));
+    }
+
+    /// The `TopParentId` half — what `Latest` scopes by.
+    ///
+    /// A Jellyfin row carries the *physical folder* as its `TopParentId`
+    /// (measured: 0 of 40,610 rows carry a collection folder), so scoping by
+    /// the view finds nothing until it is translated.
+    #[tokio::test]
+    async fn a_latest_query_scoped_to_a_jellyfin_view_finds_its_folder_s_items() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let view = Uuid::from_u128(0x9401);
+        let physical = Uuid::from_u128(0x9402);
+        let episode = Uuid::from_u128(0x9403);
+
+        seed_item_with_data(
+            &db,
+            view,
+            BaseItemKind::CollectionFolder,
+            "TV",
+            &collection_folder_data(physical),
+        )
+        .await;
+        seed_named_item(&db, physical, BaseItemKind::Folder, "TV").await;
+        seed_top_parented_item(&db, episode, BaseItemKind::Episode, "Pilot", physical).await;
+
+        let filter = InternalItemsQuery {
+            top_parent_ids: vec![view],
+            ..InternalItemsQuery::default()
+        };
+        let found = repository.get_item_list(&filter).await.expect("latest");
+        assert_eq!(found.len(), 1, "the view resolves to its physical folder");
+        assert_eq!(found[0].id, guid_to_db(episode));
+    }
+
+    /// A scope that is not a collection folder keeps its own id.
+    ///
+    /// Upstream resolves `TopParentIds` per id; replacing the whole set
+    /// whenever one entry expanded would silently drop the others — the Live TV
+    /// and Playlists `UserView`s that sit alongside the libraries in the same
+    /// query.
+    #[tokio::test]
+    async fn a_mixed_scope_keeps_the_ids_that_are_not_collection_folders() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let view = Uuid::from_u128(0x9501);
+        let physical = Uuid::from_u128(0x9502);
+        let from_library = Uuid::from_u128(0x9503);
+        let other_view = Uuid::from_u128(0x9504);
+        let from_other = Uuid::from_u128(0x9505);
+
+        seed_item_with_data(
+            &db,
+            view,
+            BaseItemKind::CollectionFolder,
+            "TV",
+            &collection_folder_data(physical),
+        )
+        .await;
+        seed_named_item(&db, physical, BaseItemKind::Folder, "TV").await;
+        seed_top_parented_item(&db, from_library, BaseItemKind::Episode, "Pilot", physical).await;
+        // A `UserView` — no `Data`, and its own id is the top parent.
+        seed_named_item(&db, other_view, BaseItemKind::UserView, "Live TV").await;
+        seed_top_parented_item(&db, from_other, BaseItemKind::TvChannel, "BBC", other_view).await;
+
+        let filter = InternalItemsQuery {
+            top_parent_ids: vec![view, other_view],
+            ..InternalItemsQuery::default()
+        };
+        let found = repository
+            .get_item_list(&filter)
+            .await
+            .expect("both scopes");
+        let mut ids: Vec<&str> = found.iter().map(|r| r.id.as_str()).collect();
+        ids.sort_unstable();
+        let mut want = vec![guid_to_db(from_library), guid_to_db(from_other)];
+        want.sort_unstable();
+        assert_eq!(ids, want, "the unexpanded scope must survive the expansion");
+    }
+
+    /// The translation must not disturb a Ferrofin-written database, where a
+    /// collection folder has no `Data` blob and owns its children directly.
+    #[tokio::test]
+    async fn browsing_a_ferrofin_collection_folder_is_unchanged() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let view = Uuid::from_u128(0x9101);
+        let episode = Uuid::from_u128(0x9102);
+
+        seed_named_item(&db, view, BaseItemKind::CollectionFolder, "TV").await;
+        seed_child_item(&db, episode, BaseItemKind::Episode, "Pilot", view).await;
+
+        let filter = InternalItemsQuery {
+            parent_id: view,
+            ..InternalItemsQuery::default()
+        };
+        let found = repository.get_item_list(&filter).await.expect("children");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, guid_to_db(episode));
+    }
+
+    /// Deleting a library must keep meaning "the rows it owns".
+    ///
+    /// `physical_children_only` is the delete-cascade path; widening it to the
+    /// library's physical folders would turn removing a view into removing the
+    /// media under it. Two things stop that — the guard in `resolve_views` and
+    /// the fact that `translate_query`'s `physical_children_only` branch never
+    /// reads `parent_physical_folder_ids` — so this passes even with the guard
+    /// removed. It is here to fail if the *branch* ever starts reading the
+    /// field, which is the change that would actually be dangerous.
+    #[tokio::test]
+    async fn the_delete_cascade_query_is_never_widened_to_physical_folders() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let view = Uuid::from_u128(0x9201);
+        let physical = Uuid::from_u128(0x9202);
+        let episode = Uuid::from_u128(0x9203);
+
+        seed_item_with_data(
+            &db,
+            view,
+            BaseItemKind::CollectionFolder,
+            "TV",
+            &collection_folder_data(physical),
+        )
+        .await;
+        seed_named_item(&db, physical, BaseItemKind::Folder, "TV").await;
+        seed_child_item(&db, episode, BaseItemKind::Episode, "Pilot", physical).await;
+
+        let filter = InternalItemsQuery {
+            parent_id: view,
+            physical_children_only: true,
+            ..InternalItemsQuery::default()
+        };
+        assert!(
+            repository
+                .get_item_list(&filter)
+                .await
+                .expect("owned rows")
+                .is_empty(),
+            "the episode belongs to the physical folder, not the view"
+        );
+    }
+
+    /// Genres on an adopted Jellyfin database.
+    ///
+    /// `ItemValues.ItemValueId` there is a synthetic guid unrelated to any item
+    /// — 0 of 3,279 matched a `BaseItems.Id` on the real library — so the
+    /// by-name row is found by name, as C# `GetItemValues` does
+    /// (`itemValuesQuery.Contains(e.CleanName)`).
+    #[tokio::test]
+    async fn genres_resolve_by_name_when_the_by_name_row_is_not_keyed_by_item_value_id() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let movie = Uuid::from_u128(0x9301);
+        // An id that is emphatically not the ItemValueId the value gets.
+        let genre_row = Uuid::from_u128(0x9302);
+
+        seed_named_item(&db, movie, BaseItemKind::Movie, "A Drama Film").await;
+        seed_item_genre(&db, movie, "Drama").await;
+        // Replace the scanner's by-name row with one keyed the Jellyfin way:
+        // an unrelated id, found only through `CleanName`.
+        sqlx::query(r#"DELETE FROM "BaseItems" WHERE "Type" LIKE '%Genre'"#)
+            .execute(db.writer())
+            .await
+            .expect("drop the ferrofin-keyed genre row");
+        seed_named_item(&db, genre_row, BaseItemKind::Genre, "Drama").await;
+        set_clean_name(&db, genre_row, "Drama").await;
+
+        let genres = repository
+            .get_genres(&InternalItemsQuery::default())
+            .await
+            .expect("genres");
+        assert_eq!(genres.items.len(), 1, "the genre is found by name");
+        assert_eq!(genres.items[0].item.id, guid_to_db(genre_row));
+        assert_eq!(genres.items[0].counts.item_count, 1);
+    }
+
+    /// Matching by name alone is not enough — the row's *kind* is the other
+    /// half of the C# filter.
+    ///
+    /// Without it, an ordinary item that happens to be named after a genre is
+    /// returned as one. On the real adopted library that turned 25 genres into
+    /// 35: four episodes, a folder and a collection folder joined the list.
+    #[tokio::test]
+    async fn an_item_merely_named_after_a_genre_is_not_a_genre() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let movie = Uuid::from_u128(0x9601);
+        let impostor = Uuid::from_u128(0x9602);
+
+        seed_named_item(&db, movie, BaseItemKind::Movie, "Some Film").await;
+        seed_item_genre(&db, movie, "Drama").await;
+        // A movie literally called "Drama": same `CleanName` as the genre.
+        seed_named_item(&db, impostor, BaseItemKind::Movie, "Drama").await;
+        set_clean_name(&db, impostor, "Drama").await;
+
+        let genres = repository
+            .get_genres(&InternalItemsQuery::default())
+            .await
+            .expect("genres");
+        assert_eq!(genres.items.len(), 1, "only the Genre row is a genre");
+        assert!(
+            genres
+                .items
+                .iter()
+                .all(|g| g.item.id != guid_to_db(impostor)),
+            "a Movie named after a genre must not be listed as one"
+        );
+    }
+
+    /// A music library's genres browse, on a Ferrofin-written database.
+    ///
+    /// `/Genres` and `/MusicGenres` share one `ItemValueType` and are told apart
+    /// only by the by-name row's kind, so the scanner has to materialize a
+    /// `MusicGenre` row for a music item's genre — otherwise selecting on that
+    /// kind (which is what upstream does) leaves the tab empty.
+    #[tokio::test]
+    async fn a_music_item_s_genre_is_browsable_under_music_genres() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let song = Uuid::from_u128(0x9701);
+
+        seed_named_item(&db, song, BaseItemKind::Audio, "A Song").await;
+        seed_item_genre(&db, song, "Metal").await;
+
+        let music = repository
+            .get_music_genres(&InternalItemsQuery::default())
+            .await
+            .expect("music genres");
+        assert_eq!(music.items.len(), 1, "the music genre is browsable");
+        assert_eq!(music.items[0].item.name.as_deref(), Some("Metal"));
+        assert_eq!(music.items[0].counts.item_count, 1);
+
+        // …and it is a MusicGenre row, not the Genre one borrowed.
+        assert_eq!(
+            music.items[0].item.type_,
+            stored_type_name(BaseItemKind::MusicGenre).expect("kind is known")
+        );
+        // The plain genres browse excludes music items, so it stays empty.
+        assert!(
+            repository
+                .get_genres(&InternalItemsQuery::default())
+                .await
+                .expect("genres")
+                .items
+                .is_empty()
         );
     }
 }

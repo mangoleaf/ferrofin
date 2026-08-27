@@ -212,6 +212,29 @@ pub async fn seed_child_item(
     .await;
 }
 
+/// Inserts a named `BaseItems` row stamped with `top_parent` as its
+/// `TopParentId` — the column a Jellyfin row carries the *physical* library
+/// folder in, and what `Latest` and the by-library scopes filter on.
+pub async fn seed_top_parented_item(
+    db: &Database,
+    id: Uuid,
+    kind: BaseItemKind,
+    name: &str,
+    top_parent: Uuid,
+) {
+    insert_base_item(
+        db,
+        id,
+        kind,
+        &ItemRow {
+            name,
+            top_parent: Some(top_parent),
+            ..ItemRow::default()
+        },
+    )
+    .await;
+}
+
 /// Inserts a minimal `BaseItems` row of the given kind.
 pub async fn seed_item(db: &Database, id: Uuid, kind: BaseItemKind) {
     seed_named_item(db, id, kind, "").await;

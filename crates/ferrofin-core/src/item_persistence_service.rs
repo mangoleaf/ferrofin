@@ -27,16 +27,17 @@ use ferrofin_model::data::BaseItemKind;
 
 use crate::db_error::db_err;
 use crate::item_repository::image_type_to_disc;
-use crate::item_type_lookup::stored_type_name;
+use crate::item_type_lookup::{MUSIC_GENRE_TYPES, stored_type_name};
 use crate::translate_query::PLACEHOLDER_ID;
 
 /// Maps an `ItemValues.Type` discriminant to the stored `BaseItems.Type` name of
 /// its browsable by-name item, or [`None`] for value types with no browse tab
 /// (tags, artists — handled elsewhere).
 ///
-/// ponytail: Genre (2) → `Genre` and Studios (3) → `Studio` only. Music genres
-/// share the Genre value type here, so a music-only library's MusicGenre tab
-/// would want its own mapping; add when a music library needs it.
+/// Genre (2) is the one that needs a companion: Jellyfin keeps a **separate**
+/// `MusicGenre` item for the same value when the owner is a music item — one
+/// `ItemValueType`, two browses — and `/MusicGenres` selects on that row type
+/// alone. See [`music_genre_row`], which materializes it.
 fn by_name_type_name(value_type: i32) -> Option<&'static str> {
     match value_type {
         // AlbumArtist (1) is the canonical artist identity — it materializes the
@@ -49,6 +50,50 @@ fn by_name_type_name(value_type: i32) -> Option<&'static str> {
         3 => stored_type_name(BaseItemKind::Studio),
         _ => None,
     }
+}
+
+/// Materializes the browsable `MusicGenre` row for a genre carried by a music
+/// item, if the database does not already have one under that name.
+///
+/// Jellyfin keeps `Genre` and `MusicGenre` as two separate items over the one
+/// `ItemValueType`, and `GetMusicGenres` selects on the row type alone
+/// (`BaseItemRepository.cs:221`), so without this row `/MusicGenres` is empty.
+/// Ferrofin's other by-name rows borrow the `ItemValueId` as their id, which
+/// this one cannot — that id already belongs to the `Genre` row for the same
+/// value — so it takes a derived id instead, the way Jellyfin derives every
+/// by-name id.
+///
+/// The existence check is by **type and name**, not by id: an adopted database
+/// already has Jellyfin's `MusicGenre` rows under Jellyfin's ids, and a scan
+/// must not lay a second row beside each of them.
+async fn music_genre_row(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    value: &str,
+    clean: &str,
+) -> Result<(), ServiceError> {
+    let (Some(type_name), Some(id)) = (
+        stored_type_name(BaseItemKind::MusicGenre),
+        crate::item_type_lookup::derive_item_id(BaseItemKind::MusicGenre, value),
+    ) else {
+        return Ok(());
+    };
+    sqlx::query(
+        r#"INSERT INTO "BaseItems"
+           ("Id","Type","Name","CleanName","SortName","IsFolder","IsInMixedFolder",
+            "IsLocked","IsMovie","IsRepeat","IsSeries","IsVirtualItem")
+           SELECT ?1,?2,?3,?4,?5,1,0,0,0,0,0,0
+           WHERE NOT EXISTS (
+               SELECT 1 FROM "BaseItems" WHERE "Type" = ?2 AND "CleanName" = ?4)"#,
+    )
+    .bind(guid_to_db(id))
+    .bind(type_name)
+    .bind(value)
+    .bind(clean)
+    .bind(ferrofin_util::sort_name::create_sort_name(value))
+    .execute(&mut **tx)
+    .await
+    .map_err(db_err)?;
+    Ok(())
 }
 
 /// The concrete item-persistence service.
@@ -387,6 +432,16 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
     ) -> Result<(), ServiceError> {
         let id = guid_to_db(item_id);
         let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        // Whether this item's genres are *music* genres, which get their own
+        // by-name row (see `music_genre_row`). One `SELECT` on the primary key,
+        // on a write path that already runs several statements per item.
+        let owner_type: Option<String> =
+            sqlx::query_scalar(r#"SELECT "Type" FROM "BaseItems" WHERE "Id" = ?1"#)
+                .bind(&id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(db_err)?;
+        let owner_is_music = owner_type.is_some_and(|t| MUSIC_GENRE_TYPES.contains(&t.as_str()));
         // Rewrite this item's links; the shared ItemValues rows are kept.
         sqlx::query(r#"DELETE FROM "ItemValuesMap" WHERE "ItemId" = ?1"#)
             .bind(&id)
@@ -452,6 +507,9 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
                 .execute(&mut *tx)
                 .await
                 .map_err(db_err)?;
+            }
+            if owner_is_music && *type_ == i32::from(ferrofin_db::enums::ItemValueType::Genre) {
+                music_genre_row(&mut tx, value, &clean).await?;
             }
         }
         tx.commit().await.map_err(db_err)

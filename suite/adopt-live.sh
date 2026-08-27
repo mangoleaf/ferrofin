@@ -114,6 +114,26 @@ DB_ITEMS=$(sq 'SELECT count(*) FROM BaseItems;')
 DB_EF=$(sq 'SELECT count(*) FROM __EFMigrationsHistory;')
 DB_USERS=$(sq 'SELECT count(*) FROM Users;')
 WIZARD=$(grep -o '<IsStartupWizardCompleted>[a-z]*' "$DIR/config/system.xml" | cut -d'>' -f2)
+# By-name rows, counted the way Jellyfin resolves them: a Genre/Studio item
+# whose CleanName is one of the ItemValues of that kind (ItemValueId is a
+# synthetic guid that matches no item, so it cannot be joined on). An exact
+# expectation, because "> 0" once passed on an answer that also returned four
+# episodes and a folder.
+# `/Genres` excludes music items (those are the MusicGenres tab), so the
+# expectation has to as well, or a genre carried only by music would make an
+# exact check fail correct behaviour.
+DB_GENRES=$(sq "SELECT count(*) FROM BaseItems b WHERE b.type='MediaBrowser.Controller.Entities.Genre'
+                AND b.CleanName IN (
+                    SELECT iv.CleanValue FROM ItemValues iv
+                    JOIN ItemValuesMap m ON m.ItemValueId = iv.ItemValueId
+                    JOIN BaseItems ci ON ci.Id = m.ItemId
+                    WHERE iv.Type=2 AND ci.type NOT IN (
+                        'MediaBrowser.Controller.Entities.Audio.Audio',
+                        'MediaBrowser.Controller.Entities.MusicVideo',
+                        'MediaBrowser.Controller.Entities.Audio.MusicAlbum',
+                        'MediaBrowser.Controller.Entities.Audio.MusicArtist'));")
+DB_STUDIOS=$(sq "SELECT count(*) FROM BaseItems b WHERE b.type='MediaBrowser.Controller.Entities.Studio'
+                 AND b.CleanName IN (SELECT CleanValue FROM ItemValues WHERE Type=3);")
 # A view (CollectionFolder) that actually has items under it, and its item count.
 VIEW_ID=$(sq "SELECT lower(a.ParentItemId) FROM AncestorIds a JOIN BaseItems b ON b.Id=a.ParentItemId
               WHERE b.type LIKE '%CollectionFolder' GROUP BY 1 ORDER BY count(*) DESC LIMIT 1;")
@@ -165,8 +185,10 @@ probes() {
   printf 'browse:children\t%s\n'  "$(get "$b" "/Items?userId=$USER_ID&parentId=$VIEW_ID&limit=1" .TotalRecordCount)"
   printf 'latest\t%s\n'           "$(get "$b" "/Users/$USER_ID/Items/Latest?limit=5" 'length')"
   printf 'genres\t%s\n'           "$(get "$b" "/Genres?userId=$USER_ID&limit=5" .TotalRecordCount)"
+  printf 'genres:all\t%s\n'       "$(get "$b" "/Genres?userId=$USER_ID" '.Items|length')"
   printf 'persons\t%s\n'          "$(get "$b" "/Persons?userId=$USER_ID&limit=5" '.Items|length')"
   printf 'studios\t%s\n'          "$(get "$b" "/Studios?userId=$USER_ID&limit=5" '.Items|length')"
+  printf 'studios:all\t%s\n'      "$(get "$b" "/Studios?userId=$USER_ID" '.Items|length')"
   printf 'resume\t%s\n'           "$(get "$b" "/Users/$USER_ID/Items/Resume?limit=5" '.Items|length')"
 }
 probes "http://127.0.0.1:$PORT" > "$WORK/ferrofin.probe"
@@ -174,6 +196,8 @@ probes "http://127.0.0.1:$PORT" > "$WORK/ferrofin.probe"
 # Jellyfin leg. The rest of the probe set is compare-only.
 while IFS=$'\t' read -r name value; do
   case $name in
+    genres:all) eq "every genre, and only genres" "$DB_GENRES" "$value";;
+    studios:all) eq "every studio, and only studios" "$DB_STUDIOS" "$value";;
     items:Movie|items:Episode|items:all|browse:*|latest|genres|persons) gt0 "$name" "$value";;
     views) [ -n "$value" ] && pass "views ($value)" || fail "views: empty";;
   esac

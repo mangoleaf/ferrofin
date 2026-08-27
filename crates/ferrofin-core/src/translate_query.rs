@@ -277,7 +277,23 @@ pub(crate) fn append_predicates<'a>(
                     r#" OR bi."Id" IN (SELECT "ChildId" FROM "FerrofinLinkedChildren" WHERE "ParentId" = "#,
                 )
                 .push_bind(guid_to_db(filter.parent_id))
-                .push(r#" AND "ChildType" = 0))"#);
+                .push(r#" AND "ChildType" = 0)"#);
+            // …and, on an adopted Jellyfin database, the children of the
+            // library's physical folders. A `CollectionFolder` there is
+            // virtual — nothing carries its id as `ParentId` — so the equality
+            // above matches nothing and this is the whole answer (C#
+            // `CollectionFolder.GetActualChildren`, which unions
+            // `GetPhysicalFolders().SelectMany(c => c.Children)`). Empty, and
+            // so a no-op, on a Ferrofin-written database.
+            if !filter.parent_physical_folder_ids.is_empty() {
+                qb.push(" OR ");
+                push_in_list(
+                    qb,
+                    r#"bi."ParentId""#,
+                    &to_guid_strings(&filter.parent_physical_folder_ids),
+                );
+            }
+            qb.push(")");
         }
     }
 
@@ -1406,7 +1422,7 @@ fn item_value_type_ints(types: &[ItemValueType]) -> Vec<i64> {
 
 /// Converts item ids to the canonical stored `Guid` `TEXT` form (UPPERCASE
 /// hyphenated) for binds.
-fn to_guid_strings(ids: &[Uuid]) -> Vec<String> {
+pub(crate) fn to_guid_strings(ids: &[Uuid]) -> Vec<String> {
     ids.iter().copied().map(guid_to_db).collect()
 }
 
