@@ -29,6 +29,26 @@ remote control and SyncPlay the observable behaviour *is* the pushed
 WebSocket message, so those ops were status-code-verified only. See
 [`ws/README.md`](ws/README.md).
 
+## Drop-in adoption tests (a real Jellyfin database)
+
+```
+suite/roundtrip.sh                              # synthetic: a fresh jellyfin container builds the DB
+suite/adopt-live.sh --src /path/to/jellyfin-config --verify-jellyfin
+```
+
+`roundtrip.sh` proves the adopt → serve → mutate → swap-back cycle on a library a
+Jellyfin container just scanned. `adopt-live.sh` proves it on a **real, lived-in**
+config directory — years of history, provider-keyed user data, an
+AggregateFolder/CollectionFolder hierarchy, plugins, non-ASCII people. It never
+writes to the source: it snapshots the directory into `target/adopt-live/`,
+injects a throwaway API key so it can authenticate without a password, boots
+Ferrofin on the copy, and (with `--verify-jellyfin`) boots Jellyfin 10.11.8 on the
+very same files and diffs the same probe set — **Jellyfin is the oracle, not a
+hand-written expectation**. Media does not need to exist; this is the database
+path, not playback. Images need `--with-metadata` *and* the data dir mounted at
+its original path, because Jellyfin stores image paths as absolute container
+paths.
+
 ## Where the old dashboards went (bookmark update)
 
 The parity ledger viewer (`:8123`) and the benchmark viewer (`:8124`) are **retired**; both
