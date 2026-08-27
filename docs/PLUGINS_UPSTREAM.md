@@ -65,4 +65,20 @@ Conventions:
   with one name, and the name-scoped key merged episodes across them —
   hiding each alternate from its own series' list and skewing season counts.
   The bulk episode task self-heals links whose key no longer matches their
-  primary's (unlink + regroup within the series).
+  primary's (unlink + regroup within the series). For the same reason movie
+  grouping is keyed by (owning library `TopParentId`, `Tmdb` id) rather than
+  the `Tmdb` id alone: the same film held in a cold (NAS) and a hot (local)
+  library is two intentional entries, and merging them hid one behind the
+  other. The bulk movie task self-heals existing cross-library links between
+  `Tmdb`-carrying movies, and a group's `GetAllAlternateVersions` expansion
+  drops any member it reaches outside that group's library, so a partner that
+  never reaches the scan (excluded location, inactive library) cannot be
+  re-merged through a stale pointer; such a member is unlinked only when it
+  points back into the scanned library, never when its own primary is also
+  outside (that is the other library's group, which this scan could not
+  repair). Accepted cost, deliberately not configurable: the
+  separate-4K-library setup that upstream's Tmdb-only key served — one item
+  offering the HD and 4K copies as versions — no longer merges, and a
+  cross-library group made by hand via `POST /Videos/MergeVersions` (which
+  is itself unscoped, by design) is undone by the next nightly run whenever
+  both copies carry a Tmdb id.

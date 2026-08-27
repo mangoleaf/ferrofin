@@ -20,6 +20,20 @@
 //!   [`MergeVersionsManager`] trait.
 //!
 //! Accepted divergences from the C# (see `docs/PLUGINS_UPSTREAM.md`):
+//! - Movie merging is scoped to the owning library (`TopParentId`): upstream
+//!   groups movies by `Tmdb` id alone, which merges the same film across two
+//!   libraries (e.g. hot/cold storage tiers) and hides one copy behind the
+//!   other. The bulk movie task self-heals existing cross-library links
+//!   between `Tmdb`-carrying movies, and a group's expansion drops any
+//!   member it reaches outside the group's library — unlinking it only when
+//!   it points back *into* that library, never breaking a group that lives
+//!   wholly elsewhere. Two consequences to know: the separate-4K-library
+//!   setup, where upstream's `Tmdb`-only key deliberately offered both
+//!   copies as versions of one item, is no longer served (there is no
+//!   opt-out — `LocationsExcluded` is the only knob the settings page has);
+//!   and a cross-library group made by hand through
+//!   `POST /Videos/MergeVersions` is undone by the next nightly run when
+//!   both copies carry a `Tmdb` id, which logs what it unlinked.
 //! - The episode merge key is scoped to the series *row*
 //!   (`SeriesPresentationUniqueKey`), not the series name: upstream's
 //!   name-scoped key merges episodes across the two series a show gets when it
@@ -38,7 +52,7 @@
 //! - The upstream movie loops run their async merges inside `Parallel.ForEach`
 //!   fire-and-forget lambdas (dropping errors); Ferrofin awaits sequentially.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -357,7 +371,13 @@ impl MergeVersionsService {
     /// `PrimaryVersionId` at it. Fewer than two resolvable items is a silent
     /// no-op (the C# returns), unlike the strict `POST /Videos/MergeVersions`
     /// route.
-    async fn merge_group(&self, ids: &[Uuid]) -> Result<(), ServiceError> {
+    ///
+    /// `scope`, when given, is the library (`TopParentId`) the group belongs
+    /// to: expansion can walk a stale pointer out of that library, and any
+    /// member it drags in from elsewhere is unlinked and dropped instead of
+    /// re-merged. Callers with no library scope (episodes, whose merge key is
+    /// already series-scoped) pass `None` for upstream's semantics.
+    async fn merge_group(&self, ids: &[Uuid], scope: Option<&str>) -> Result<(), ServiceError> {
         let mut items = Vec::new();
         for &id in ids {
             if let Some(row) = self.items.retrieve_item(id).await? {
@@ -370,7 +390,38 @@ impl MergeVersionsService {
             return Ok(());
         }
 
-        let group = self.expand_group(&items).await?;
+        let mut group = self.expand_group(&items).await?;
+        if let Some(scope) = scope {
+            let foreign: Vec<BaseItemEntity> = group
+                .values()
+                // The empty scope is the unscoped bucket: it matches exactly
+                // the movies with no `TopParentId`, the same way grouping
+                // keys them.
+                .filter(|item| item.top_parent_id.as_deref().unwrap_or("") != scope)
+                .cloned()
+                .collect();
+            for item in &foreign {
+                group.remove(&item.id);
+            }
+            for item in &foreign {
+                // Only the links that reach *into* this library are ours to
+                // cut: leaving one there would keep the foreign copy hidden
+                // in its own library, and unlinked its own scan regroups it.
+                // A foreign item pointing at another foreign item is a group
+                // in that library — expansion merely walked through it, and
+                // breaking it would strand rows this scan can never repair.
+                if let Some(pid) = item.primary_version_id.as_deref()
+                    && group.contains_key(pid)
+                    && let Ok(id) = Uuid::parse_str(&item.id)
+                {
+                    self.persistence.set_primary_version_id(id, None).await?;
+                }
+            }
+            items.retain(|item| group.contains_key(&item.id));
+            if items.len() < 2 {
+                return Ok(());
+            }
+        }
 
         // Primary selection: the first supplied item (id order) that already
         // owns alternates and is not itself an alternate — the C#
@@ -457,10 +508,78 @@ impl MergeVersionsManager for MergeVersionsService {
             .into_iter()
             .collect();
 
-        // Group the Tmdb-carrying movies by that id, tracking whether each
-        // group still has a member that is not already an alternate (the
-        // upstream duplicate filter).
-        let mut groups: HashMap<String, (Vec<Uuid>, bool)> = HashMap::new();
+        // The owning library (`TopParentId`) per movie — the merge scope. A
+        // movie with no `TopParentId` (never scanned into a library) is
+        // "unscoped": it groups under the empty key with its own kind, and is
+        // never itself healed, since it has no library to be in the wrong
+        // one of.
+        let library_of: HashMap<&str, &str> = movies
+            .iter()
+            .filter_map(|m| Some((m.id.as_str(), m.top_parent_id.as_deref()?)))
+            .collect();
+
+        // Self-heal before grouping: unlink any alternate whose library
+        // differs from its primary's (groups created before merging was
+        // library-scoped). Without this pass those links never converge —
+        // `expand_group` re-accretes them into every new group, and the
+        // foreign copy stays hidden behind a primary in the other library.
+        // Scoped to the Tmdb-carrying movies, the set this task manages: a
+        // link between two movies it would never merge is not its to cut.
+        // The primary may be outside the eligible set (excluded location,
+        // inactive library), so misses are resolved with a direct read,
+        // memoized — many alternates commonly share one primary.
+        let mut healed: HashSet<Uuid> = HashSet::new();
+        let mut fetched: HashMap<&str, Option<String>> = HashMap::new();
+        for movie in &movies {
+            let (Ok(id), Some(lib), Some(pid)) = (
+                Uuid::parse_str(&movie.id),
+                library_of.get(movie.id.as_str()),
+                movie.primary_version_id.as_deref(),
+            ) else {
+                continue;
+            };
+            if !tmdb.contains_key(&id) {
+                continue;
+            }
+            let primary_lib = if let Some(found) = library_of.get(pid) {
+                Some(*found)
+            } else {
+                if !fetched.contains_key(pid) {
+                    let row = match Uuid::parse_str(pid) {
+                        Ok(pid) => self.items.retrieve_item(pid).await?,
+                        Err(_) => None,
+                    };
+                    // A primary that exists but sits in no library is
+                    // "unscoped" — the same empty key grouping uses — so an
+                    // alternate in a real library is still healed.
+                    fetched.insert(pid, row.map(|p| p.top_parent_id.unwrap_or_default()));
+                }
+                fetched[pid].as_deref()
+            };
+            if let Some(primary_lib) = primary_lib
+                && *lib != primary_lib
+            {
+                self.persistence.set_primary_version_id(id, None).await?;
+                healed.insert(id);
+            }
+        }
+        if !healed.is_empty() {
+            tracing::info!(
+                healed = healed.len(),
+                "merge versions: unlinked movie versions merged across library boundaries"
+            );
+        }
+
+        // Group the Tmdb-carrying movies by (library, that id), tracking
+        // whether each group still has a member that is not already an
+        // alternate (the upstream duplicate filter) — a movie the heal just
+        // unlinked counts as unmerged, or its group would sit out until the
+        // next run a day later. Scoping the key to the owning library is a
+        // deliberate divergence from upstream, which groups by Tmdb id alone:
+        // the same movie held in two libraries (e.g. a slow archive plus a
+        // fast local copy) is two intentionally separate entries, and merging
+        // them hides one behind the other.
+        let mut groups: HashMap<(&str, &str), (Vec<Uuid>, bool)> = HashMap::new();
         for movie in &movies {
             let Ok(id) = Uuid::parse_str(&movie.id) else {
                 continue;
@@ -468,19 +587,20 @@ impl MergeVersionsManager for MergeVersionsService {
             let Some(value) = tmdb.get(&id) else {
                 continue; // no Tmdb id → skipped (`ProviderIds.ContainsKey`)
             };
-            let entry = groups.entry(value.clone()).or_default();
+            let library = library_of.get(movie.id.as_str()).copied().unwrap_or("");
+            let entry = groups.entry((library, value.as_str())).or_default();
             entry.0.push(id);
-            entry.1 |= movie.primary_version_id.is_none();
+            entry.1 |= movie.primary_version_id.is_none() || healed.contains(&id);
         }
-        let duplicates: Vec<Vec<Uuid>> = groups
-            .into_values()
-            .filter(|(ids, any_unmerged)| ids.len() > 1 && *any_unmerged)
-            .map(|(ids, _)| ids)
+        let duplicates: Vec<(&str, Vec<Uuid>)> = groups
+            .into_iter()
+            .filter(|(_, (ids, any_unmerged))| ids.len() > 1 && *any_unmerged)
+            .map(|((library, _), (ids, _))| (library, ids))
             .collect();
 
-        for (index, ids) in duplicates.iter().enumerate() {
+        for (index, (library, ids)) in duplicates.iter().enumerate() {
             report(progress, percent(index, duplicates.len()));
-            self.merge_group(ids).await?;
+            self.merge_group(ids, Some(library)).await?;
         }
         report(progress, 100.0);
         Ok(())
@@ -590,7 +710,7 @@ impl MergeVersionsManager for MergeVersionsService {
 
         for (index, ids) in duplicates.iter().enumerate() {
             report(progress, percent(index, duplicates.len()));
-            self.merge_group(ids).await?;
+            self.merge_group(ids, None).await?;
         }
         report(progress, 100.0);
         Ok(())
@@ -712,6 +832,7 @@ mod tests {
         FerrofinLibraryManager, FerrofinPeopleRepository,
     };
     use ferrofin_db::Database;
+    use ferrofin_db::store::guid_to_db;
     use ferrofin_model::updates::{PackageInfo, RepositoryInfo};
     use ferrofin_traits::plugins::PluginImage;
 
@@ -1115,6 +1236,218 @@ mod tests {
         assert_eq!(primary_of(&db, &svc, no_id).await, None);
     }
 
+    /// Seeds a movie owned by `library` (`TopParentId`). Unlike [`seed`],
+    /// this writes ids in the production `guid_to_db` casing, so the
+    /// library-scoping comparisons are exercised on realistic strings.
+    async fn seed_in_library(
+        db: &Database,
+        id: Uuid,
+        library: Uuid,
+        path: Option<&str>,
+        width: i64,
+    ) {
+        FerrofinItemPersistenceService::new(db.clone())
+            .save_items(&[BaseItemEntity {
+                id: guid_to_db(id),
+                type_: stored_type(BaseItemKind::Movie).to_owned(),
+                path: path.map(str::to_owned),
+                width: Some(width),
+                top_parent_id: Some(guid_to_db(library)),
+                ..BaseItemEntity::default()
+            }])
+            .await
+            .expect("seed item");
+    }
+
+    #[tokio::test]
+    async fn merge_movies_never_crosses_a_library_boundary() {
+        let db = test_db().await;
+        let cold = Uuid::from_u128(0xc01d);
+        let hot = Uuid::from_u128(0x8047);
+        // The same movie in two libraries, plus a genuine duplicate inside the
+        // hot one — and a stale cross-library link from before the scoping.
+        let cold_movie = Uuid::from_u128(0x4a1);
+        let hot_movie = Uuid::from_u128(0x4b2);
+        let hot_dupe = Uuid::from_u128(0x4c3);
+        // A cross-library pair carrying no Tmdb id: outside the set this task
+        // merges, so also outside the set it unlinks.
+        let cold_untracked = Uuid::from_u128(0x4d4);
+        let hot_untracked = Uuid::from_u128(0x4e5);
+        seed_in_library(&db, cold_movie, cold, None, 3840).await;
+        seed_in_library(&db, hot_movie, hot, None, 1920).await;
+        seed_in_library(&db, hot_dupe, hot, None, 640).await;
+        seed_in_library(&db, cold_untracked, cold, None, 3840).await;
+        seed_in_library(&db, hot_untracked, hot, None, 1920).await;
+        for id in [cold_movie, hot_movie, hot_dupe] {
+            set_provider_id(&db, id, "Tmdb", "603").await;
+        }
+        let svc = service_over(&db, FakePlugins::enabled(), Vec::new());
+        svc.persistence
+            .set_primary_version_id(hot_untracked, Some(cold_untracked))
+            .await
+            .expect("untracked link");
+        svc.merge_group(&[cold_movie, hot_movie], None)
+            .await
+            .expect("stale cross-library merge");
+        assert_eq!(
+            primary_of(&db, &svc, hot_movie).await.as_deref(),
+            Some(guid_to_db(cold_movie).as_str())
+        );
+
+        svc.merge_movies(None).await.expect("merge movies");
+
+        // The stale link is healed and the hot copy stays visible; the two
+        // hot-library copies merge with each other.
+        assert_eq!(primary_of(&db, &svc, cold_movie).await, None);
+        assert_eq!(primary_of(&db, &svc, hot_movie).await, None);
+        assert_eq!(
+            primary_of(&db, &svc, hot_dupe).await.as_deref(),
+            Some(guid_to_db(hot_movie).as_str())
+        );
+        assert_eq!(
+            primary_of(&db, &svc, hot_untracked).await.as_deref(),
+            Some(guid_to_db(cold_untracked).as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_movies_heals_and_regroups_in_one_run() {
+        let db = test_db().await;
+        let cold = Uuid::from_u128(0xc01d);
+        let hot = Uuid::from_u128(0x8047);
+        // Every hot copy is already an alternate of the cold one, so the
+        // pre-heal duplicate filter sees no unmerged member: without counting
+        // the just-healed items as unmerged, the hot pair would sit out until
+        // the next daily run.
+        let cold_movie = Uuid::from_u128(0x4d1);
+        let hot_a = Uuid::from_u128(0x4e2);
+        let hot_b = Uuid::from_u128(0x4f3);
+        seed_in_library(&db, cold_movie, cold, None, 3840).await;
+        seed_in_library(&db, hot_a, hot, None, 1920).await;
+        seed_in_library(&db, hot_b, hot, None, 640).await;
+        for id in [cold_movie, hot_a, hot_b] {
+            set_provider_id(&db, id, "Tmdb", "603").await;
+        }
+        let svc = service_over(&db, FakePlugins::enabled(), Vec::new());
+        for id in [hot_a, hot_b] {
+            svc.persistence
+                .set_primary_version_id(id, Some(cold_movie))
+                .await
+                .expect("stale link");
+        }
+
+        svc.merge_movies(None).await.expect("merge movies");
+
+        assert_eq!(primary_of(&db, &svc, cold_movie).await, None);
+        assert_eq!(primary_of(&db, &svc, hot_a).await, None);
+        assert_eq!(
+            primary_of(&db, &svc, hot_b).await.as_deref(),
+            Some(guid_to_db(hot_a).as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_movies_unlinks_partners_outside_the_scanned_set() {
+        let db = test_db().await;
+        let cold = Uuid::from_u128(0xc01d);
+        let hot = Uuid::from_u128(0x8047);
+        // The cold library is excluded from the scan, so its rows never reach
+        // the grouping pass — but the stale pointers in both directions still
+        // drag them into the hot group through `expand_group`.
+        let cold_primary = Uuid::from_u128(0x501);
+        let cold_alt = Uuid::from_u128(0x502);
+        let hot_a = Uuid::from_u128(0x503);
+        let hot_b = Uuid::from_u128(0x504);
+        // A second film with only one hot copy: no duplicate group forms, so
+        // nothing but the heal can ever free it.
+        let cold_solo = Uuid::from_u128(0x505);
+        let hot_solo = Uuid::from_u128(0x506);
+        // A purely intra-cold link that expansion only walks *through*.
+        let cold_chain = Uuid::from_u128(0x507);
+        seed_in_library(&db, cold_primary, cold, Some("/media/cold/a.mkv"), 3840).await;
+        seed_in_library(&db, cold_alt, cold, Some("/media/cold/b.mkv"), 2160).await;
+        seed_in_library(&db, hot_a, hot, Some("/media/hot/a.mkv"), 1920).await;
+        seed_in_library(&db, hot_b, hot, Some("/media/hot/b.mkv"), 640).await;
+        seed_in_library(&db, cold_solo, cold, Some("/media/cold/c.mkv"), 3840).await;
+        seed_in_library(&db, hot_solo, hot, Some("/media/hot/c.mkv"), 1920).await;
+        seed_in_library(&db, cold_chain, cold, Some("/media/cold/d.mkv"), 1080).await;
+        for id in [cold_primary, cold_alt, cold_chain, hot_a, hot_b] {
+            set_provider_id(&db, id, "Tmdb", "603").await;
+        }
+        for id in [cold_solo, hot_solo] {
+            set_provider_id(&db, id, "Tmdb", "604").await;
+        }
+        let svc = service_over(
+            &db,
+            FakePlugins::enabled_with(r#"{"LocationsExcluded":["/media/cold"]}"#),
+            vec!["/media".into()],
+        );
+        // Upward: a hot copy points at a cold primary. Downward: a cold copy
+        // points at a hot one.
+        svc.persistence
+            .set_primary_version_id(hot_a, Some(cold_primary))
+            .await
+            .expect("stale link up");
+        svc.persistence
+            .set_primary_version_id(cold_alt, Some(hot_b))
+            .await
+            .expect("stale link down");
+        svc.persistence
+            .set_primary_version_id(hot_solo, Some(cold_solo))
+            .await
+            .expect("stale link solo");
+        svc.persistence
+            .set_primary_version_id(cold_chain, Some(cold_alt))
+            .await
+            .expect("intra-cold link");
+
+        svc.merge_movies(None).await.expect("merge movies");
+
+        // Both cold rows come back free, and the hot pair merges together.
+        assert_eq!(primary_of(&db, &svc, cold_primary).await, None);
+        assert_eq!(primary_of(&db, &svc, cold_alt).await, None);
+        assert_eq!(primary_of(&db, &svc, hot_a).await, None);
+        assert_eq!(
+            primary_of(&db, &svc, hot_b).await.as_deref(),
+            Some(guid_to_db(hot_a).as_str())
+        );
+        assert_eq!(primary_of(&db, &svc, hot_solo).await, None);
+        // The cold library's own group is left alone — this scan cannot
+        // repair what it breaks there.
+        assert_eq!(
+            primary_of(&db, &svc, cold_chain).await.as_deref(),
+            Some(guid_to_db(cold_alt).as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_movies_groups_unscoped_movies_together() {
+        let db = test_db().await;
+        let hot = Uuid::from_u128(0x8047);
+        // Rows with no `TopParentId` belong to no library, so they keep
+        // upstream's Tmdb-only grouping among themselves and never join a
+        // real library's group.
+        let loose_a = Uuid::from_u128(0x511);
+        let loose_b = Uuid::from_u128(0x522);
+        let hot_movie = Uuid::from_u128(0x5c3);
+        seed(&db, loose_a, BaseItemKind::Movie, None, 1920).await;
+        seed(&db, loose_b, BaseItemKind::Movie, None, 640).await;
+        seed_in_library(&db, hot_movie, hot, None, 3840).await;
+        for id in [loose_a, loose_b, hot_movie] {
+            set_provider_id(&db, id, "Tmdb", "603").await;
+        }
+        let svc = service_over(&db, FakePlugins::enabled(), Vec::new());
+
+        svc.merge_movies(None).await.expect("merge movies");
+
+        assert_eq!(primary_of(&db, &svc, hot_movie).await, None);
+        assert_eq!(primary_of(&db, &svc, loose_a).await, None);
+        assert_eq!(
+            primary_of(&db, &svc, loose_b).await.as_deref(),
+            Some(loose_a.to_string().as_str())
+        );
+    }
+
     #[tokio::test]
     async fn merge_movies_keeps_an_existing_primary() {
         let db = test_db().await;
@@ -1129,7 +1462,9 @@ mod tests {
         }
         let svc = service_over(&db, FakePlugins::enabled(), Vec::new());
         // Pre-merge primary+alt: primary owns an alternate.
-        svc.merge_group(&[primary, alt]).await.expect("pre-merge");
+        svc.merge_group(&[primary, alt], None)
+            .await
+            .expect("pre-merge");
         assert_eq!(
             primary_of(&db, &svc, alt).await.as_deref(),
             Some(primary.to_string().as_str())
@@ -1162,10 +1497,10 @@ mod tests {
             seed(&db, id, BaseItemKind::Movie, None, w).await;
         }
         let svc = service_over(&db, FakePlugins::enabled(), Vec::new());
-        svc.merge_group(&[a1, a2]).await.expect("group a");
-        svc.merge_group(&[b1, b2]).await.expect("group b");
+        svc.merge_group(&[a1, a2], None).await.expect("group a");
+        svc.merge_group(&[b1, b2], None).await.expect("group b");
 
-        svc.merge_group(&[a2, b2]).await.expect("regroup");
+        svc.merge_group(&[a2, b2], None).await.expect("regroup");
 
         // One primary; every other member points straight at it.
         let mut primaries = Vec::new();
