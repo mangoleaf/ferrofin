@@ -37,6 +37,81 @@ use ferrofin_traits::library::UserDataManager;
 use crate::db_error::db_err;
 use crate::item_type_lookup::kind_from_type_name;
 use crate::kinds::{supports_played_status, supports_position_ticks_resume};
+use crate::user_data_keys::{KeySource, user_data_keys, uses_provider_ids};
+
+/// One item's identity fields, read once and reused for the item and (for a
+/// `Season`/`Episode`) its series.
+///
+/// Owns its strings because it outlives the query; [`Self::as_source`] hands
+/// the derivation the borrowed view it wants.
+#[derive(Debug, Clone)]
+struct KeyRow {
+    item_id: Uuid,
+    kind: BaseItemKind,
+    tmdb: Option<String>,
+    imdb: Option<String>,
+    tvdb: Option<String>,
+    custom: Option<String>,
+    musicbrainz_album: Option<String>,
+    musicbrainz_release_group: Option<String>,
+    musicbrainz_artist: Option<String>,
+    episode_title: Option<String>,
+    is_series: bool,
+    index_number: Option<i64>,
+    parent_index_number: Option<i64>,
+    name: Option<String>,
+    album: Option<String>,
+    album_artist: Option<String>,
+    extra_type: Option<String>,
+    run_time_ticks: Option<i64>,
+    series_id: Option<Uuid>,
+}
+
+impl KeyRow {
+    fn as_source(&self) -> KeySource<'_> {
+        KeySource {
+            item_id: self.item_id,
+            kind: self.kind,
+            tmdb: self.tmdb.as_deref(),
+            imdb: self.imdb.as_deref(),
+            tvdb: self.tvdb.as_deref(),
+            custom: self.custom.as_deref(),
+            musicbrainz_album: self.musicbrainz_album.as_deref(),
+            musicbrainz_release_group: self.musicbrainz_release_group.as_deref(),
+            musicbrainz_artist: self.musicbrainz_artist.as_deref(),
+            episode_title: self.episode_title.as_deref(),
+            is_series: self.is_series,
+            index_number: self.index_number,
+            parent_index_number: self.parent_index_number,
+            name: self.name.as_deref(),
+            album: self.album.as_deref(),
+            album_artist: self.album_artist.as_deref(),
+            extra_type: self.extra_type.as_deref(),
+            run_time_ticks: self.run_time_ticks,
+        }
+    }
+}
+
+/// The lowercase `ExtraType` name the C# key builder appends
+/// (`ExtraType.ToString().ToLowerInvariant()`), for a stored discriminant.
+fn extra_type_name(disc: i32) -> Option<&'static str> {
+    Some(match disc {
+        1 => "clip",
+        2 => "trailer",
+        3 => "behindthescenes",
+        4 => "deletedscene",
+        5 => "interview",
+        6 => "scene",
+        7 => "sample",
+        8 => "themesong",
+        9 => "themevideo",
+        10 => "featurette",
+        11 => "short",
+        // 0 is `Unknown`, which the C# never reaches: `ExtraType.HasValue` is
+        // false for a non-extra, so no key is built at all.
+        _ => return None,
+    })
+}
 
 /// One tick is 100 nanoseconds; there are 10,000,000 ticks per second (the
 /// .NET `TimeSpan.TicksPerSecond` the C# resume math uses).
@@ -63,26 +138,220 @@ impl FerrofinUserDataManager {
         Self { db, config }
     }
 
-    /// Reads the single user-data row for an item/user pair, keyed by the item
-    /// id (this port's `CustomDataKey`), or `None`.
+    /// Reads the user-data row for an item/user pair, or `None`.
+    ///
+    /// Port of `UserDataManager.GetUserDataInternal`: match **any** of the
+    /// item's derived keys, then prefer the row keyed by the item's own id and
+    /// fall back to the first match. An adopted item carries several rows (one
+    /// per key) and they can disagree — a stale provider-keyed row from before
+    /// a metadata change, say — so which one wins is not arbitrary.
+    ///
+    /// The guid row alone would answer correctly on a database Jellyfin wrote,
+    /// because the item id is always among the keys it saves. It would miss on
+    /// one where only a provider-keyed row exists.
     async fn read_row(
         &self,
         item_id: Uuid,
         user_id: Uuid,
     ) -> Result<Option<UserDataEntity>, ServiceError> {
+        let keys = self.keys_for(item_id).await?;
+        let placeholders = (3..3 + keys.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
         // ItemId/UserId are stored uppercase (Jellyfin's GUID casing) while
         // CustomDataKey keeps the lowercase hyphenated form — exactly what a
         // real 10.11.8 database contains, so the two need separate binds.
-        sqlx::query_as::<_, UserDataEntity>(
+        let sql = format!(
             r#"SELECT * FROM "UserData"
-               WHERE "ItemId" = ?1 AND "UserId" = ?2 AND "CustomDataKey" = ?3 LIMIT 1"#,
+               WHERE "ItemId" = ?1 AND "UserId" = ?2
+                 AND "CustomDataKey" IN ({placeholders})"#,
+        );
+        let mut query = sqlx::query_as::<_, UserDataEntity>(&sql)
+            .bind(guid_to_db(item_id))
+            .bind(guid_to_db(user_id));
+        for key in &keys {
+            query = query.bind(key.clone());
+        }
+        let rows = query.fetch_all(self.db.pool()).await.map_err(db_err)?;
+
+        Ok(Self::preferred_row(&rows, &keys, item_id))
+    }
+
+    /// Picks the row to answer with when an item carries several.
+    ///
+    /// The guid row first, then the highest-priority *key* that has a row —
+    /// **not** `rows.first()`, which is whatever order SQLite returned (PK
+    /// index order, i.e. alphabetical by `CustomDataKey`) and would make the
+    /// answer depend on how the provider ids happen to sort.
+    ///
+    /// A deliberate divergence: upstream's `directDataReference` compares
+    /// against `itemId.ToString("N")` while the keys it just built carry the
+    /// hyphenated `"D"` form, so that preference never actually fires and it
+    /// always falls through to `userData.First()`. Preferring the guid row is
+    /// what upstream evidently *meant*, and it is stable.
+    fn preferred_row(
+        rows: &[UserDataEntity],
+        keys: &[String],
+        item_id: Uuid,
+    ) -> Option<UserDataEntity> {
+        let own = item_id.to_string();
+        if let Some(row) = rows.iter().find(|r| r.custom_data_key == own) {
+            return Some(row.clone());
+        }
+        keys.iter()
+            .find_map(|key| rows.iter().find(|r| &r.custom_data_key == key))
+            .cloned()
+    }
+
+    /// The `CustomDataKey`s this item's rows are written under.
+    ///
+    /// Port of the `item.GetUserDataKeys()` that `UserDataManager.SaveUserData`
+    /// iterates. The key is **not** the item id: Jellyfin derives a list from
+    /// the item's metadata and writes one row per key, so an adopted database
+    /// holds provider-keyed rows — a movie under its TMDB id, an episode under
+    /// its series' TVDB id plus `SSSEEE`. Writing only the guid row leaves
+    /// those stale, and Jellyfin reads them, which is how a favourite set here
+    /// disappears on a swap back.
+    ///
+    /// An item with no `BaseItems` row has nothing to derive from and gets its
+    /// id alone — the same single key this manager used before.
+    ///
+    /// A **database error propagates** rather than degrading to that fallback.
+    /// Degrading looks safe and is not: on an adopted library it would write
+    /// the new value to the guid row while the provider rows Jellyfin actually
+    /// reads keep the old one — the split-brain the single transaction below
+    /// exists to prevent. A failed save the caller can retry beats a save that
+    /// half-succeeded silently.
+    async fn keys_for(&self, item_id: Uuid) -> Result<Vec<String>, ServiceError> {
+        Ok(self
+            .load_keys(item_id)
+            .await?
+            .unwrap_or_else(|| vec![item_id.to_string()]))
+    }
+
+    /// Reads the rows behind [`Self::keys_for`] — the item, and for a
+    /// `Season`/`Episode` its series — and derives the keys.
+    async fn load_keys(&self, item_id: Uuid) -> Result<Option<Vec<String>>, ServiceError> {
+        let Some(item) = self.key_row(item_id).await? else {
+            return Ok(None);
+        };
+        // Only a Season or an Episode consults its series, so only then is the
+        // second query worth making.
+        let series = match (item.kind, item.series_id) {
+            (BaseItemKind::Season | BaseItemKind::Episode, Some(series_id)) => {
+                self.key_row(series_id).await?
+            }
+            _ => None,
+        };
+        let series_source = series.as_ref().map(KeyRow::as_source);
+        Ok(Some(user_data_keys(
+            &item.as_source(),
+            series_source.as_ref(),
+        )))
+    }
+
+    /// One item's identity fields plus its provider ids.
+    #[allow(
+        clippy::type_complexity,
+        reason = "one row read positionally; naming a struct for it would not \
+                  be read anywhere else"
+    )]
+    async fn key_row(&self, item_id: Uuid) -> Result<Option<KeyRow>, ServiceError> {
+        let row: Option<(
+            String,
+            Option<i64>,
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<i32>,
+            Option<i64>,
+            Option<String>,
+            Option<bool>,
+        )> = sqlx::query_as(
+            r#"SELECT "Type", "IndexNumber", "ParentIndexNumber", "Name", "Album",
+                      "AlbumArtists", "SeriesId", "ExtraType", "RunTimeTicks",
+                      "EpisodeTitle", "IsSeries"
+               FROM "BaseItems" WHERE "Id" = ?1 LIMIT 1"#,
         )
         .bind(guid_to_db(item_id))
-        .bind(guid_to_db(user_id))
-        .bind(item_id.to_string())
         .fetch_optional(self.db.pool())
         .await
-        .map_err(db_err)
+        .map_err(db_err)?;
+
+        let Some((
+            type_name,
+            index_number,
+            parent_index_number,
+            name,
+            album,
+            album_artists,
+            series_id,
+            extra_type,
+            run_time_ticks,
+            episode_title,
+            is_series,
+        )) = row
+        else {
+            return Ok(None);
+        };
+
+        let kind = kind_from_type_name(&type_name).unwrap_or(BaseItemKind::Folder);
+        // Most kinds never look at a provider id, and this runs on the busiest
+        // write path, so do not pay for the second query unless the derivation
+        // will read it. An Episode is deliberately in the "no" list: it takes
+        // its keys from the series and ignores its own providers entirely
+        // (`EnableDefaultVideoUserDataKeys => false`), and episodes are the
+        // bulk of a TV library.
+        let providers: Vec<(String, String)> = if uses_provider_ids(kind) {
+            sqlx::query_as(
+                r#"SELECT "ProviderId", "ProviderValue" FROM "BaseItemProviders"
+                   WHERE "ItemId" = ?1"#,
+            )
+            .bind(guid_to_db(item_id))
+            .fetch_all(self.db.pool())
+            .await
+            .map_err(db_err)?
+        } else {
+            Vec::new()
+        };
+        let provider = |want: &str| {
+            providers
+                .iter()
+                .find(|(id, _)| id.eq_ignore_ascii_case(want))
+                .map(|(_, v)| v.clone())
+        };
+
+        Ok(Some(KeyRow {
+            item_id,
+            kind,
+            tmdb: provider("Tmdb"),
+            imdb: provider("Imdb"),
+            tvdb: provider("Tvdb"),
+            custom: provider("Custom"),
+            musicbrainz_album: provider("MusicBrainzAlbum"),
+            musicbrainz_release_group: provider("MusicBrainzReleaseGroup"),
+            musicbrainz_artist: provider("MusicBrainzArtist"),
+            episode_title,
+            is_series: is_series.unwrap_or(false),
+            index_number,
+            parent_index_number,
+            name,
+            album,
+            // `AlbumArtists` is a delimited list; the C# key uses the first.
+            album_artist: album_artists
+                .as_deref()
+                .and_then(|a| a.split('|').next())
+                .filter(|a| !a.is_empty())
+                .map(str::to_owned),
+            extra_type: extra_type
+                .and_then(extra_type_name)
+                .map(std::borrow::ToOwned::to_owned),
+            run_time_ticks,
+            series_id: series_id.as_deref().and_then(|s| Uuid::parse_str(s).ok()),
+        }))
     }
 
     /// Reads the item's runtime ticks and [`BaseItemKind`], for the play-state
@@ -109,8 +378,38 @@ impl FerrofinUserDataManager {
         }))
     }
 
-    /// Inserts or updates the row for an item/user pair from the supplied
-    /// [`UserDataEntity`] (keyed by the item id).
+    /// Inserts or updates the rows for an item/user pair from the supplied
+    /// [`UserDataEntity`] — **one row per `CustomDataKey`**.
+    ///
+    /// Port of `UserDataManager.SaveUserData`, which does
+    /// `foreach (var key in item.GetUserDataKeys())` inside one transaction.
+    /// Writing only the row the caller named would leave an adopted database's
+    /// provider-keyed rows holding stale values, and those are the rows
+    /// Jellyfin reads. The caller's `custom_data_key` is ignored in favour of
+    /// the derived set, which always ends with the item id — so the row a
+    /// caller expected is always among those written.
+    ///
+    /// All keys go in **one transaction**: a favourite that reached the TMDB
+    /// row but not the IMDb row is precisely the split-brain state this exists
+    /// to prevent.
+    async fn upsert_row(&self, row: &UserDataEntity) -> Result<(), ServiceError> {
+        let item_id = Uuid::parse_str(&row.item_id).ok();
+        let keys = match item_id {
+            Some(id) => self.keys_for(id).await?,
+            // An unparseable id cannot be looked up; honour what the caller
+            // asked for rather than dropping the write.
+            None => vec![row.custom_data_key.clone()],
+        };
+
+        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        for key in &keys {
+            Self::upsert_one(&mut tx, row, key).await?;
+        }
+        tx.commit().await.map_err(db_err)?;
+        Ok(())
+    }
+
+    /// One `(ItemId, UserId, CustomDataKey)` row.
     ///
     /// ONE statement, not a `SELECT EXISTS` followed by a branch: this is the
     /// busiest write path on the server (every playback progress report, every
@@ -120,7 +419,11 @@ impl FerrofinUserDataManager {
     /// playback report. `ON CONFLICT … DO UPDATE` resolves that inside SQLite.
     /// `RetentionDate` stays untouched on the update leg, exactly as the
     /// previous `UPDATE` did.
-    async fn upsert_row(&self, row: &UserDataEntity) -> Result<(), ServiceError> {
+    async fn upsert_one(
+        tx: &mut sqlx::SqliteConnection,
+        row: &UserDataEntity,
+        custom_data_key: &str,
+    ) -> Result<(), ServiceError> {
         sqlx::query(
             r#"INSERT INTO "UserData"
                 ("ItemId", "UserId", "CustomDataKey", "AudioStreamIndex",
@@ -140,7 +443,7 @@ impl FerrofinUserDataManager {
         )
         .bind(&row.item_id)
         .bind(&row.user_id)
-        .bind(&row.custom_data_key)
+        .bind(custom_data_key)
         .bind(row.audio_stream_index)
         .bind(row.is_favorite)
         .bind(opt_datetime_to_db(row.last_played_date))
@@ -150,7 +453,7 @@ impl FerrofinUserDataManager {
         .bind(row.played)
         .bind(row.rating)
         .bind(row.subtitle_stream_index)
-        .execute(self.db.writer())
+        .execute(&mut *tx)
         .await
         .map_err(db_err)?;
         Ok(())
@@ -254,22 +557,32 @@ impl UserDataManager for FerrofinUserDataManager {
         item_ids: &[Uuid],
         user_id: Uuid,
     ) -> Result<std::collections::HashMap<Uuid, UserItemDataDto>, ServiceError> {
-        let mut map = std::collections::HashMap::with_capacity(item_ids.len());
+        // The bool tracks whether the stored DTO came from the item's own guid
+        // row, so a later one can displace a provider-keyed stand-in.
+        let mut map: std::collections::HashMap<Uuid, (UserItemDataDto, bool)> =
+            std::collections::HashMap::with_capacity(item_ids.len());
         // One IN-query per chunk instead of one query per item.
         for chunk in item_ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
             let placeholders = (2..=chunk.len() + 1)
                 .map(|i| format!("?{i}"))
                 .collect::<Vec<_>>()
                 .join(",");
-            // `CustomDataKey = lower(ItemId)` selects the item's DEFAULT row
-            // (not alternate provider keys). A column-to-column equality would
-            // never match real Jellyfin rows: ItemId is stored uppercase but
-            // CustomDataKey lowercase; lower() is ASCII-only, which is exact
-            // for hex GUID text.
+            // Every row for these items, not just the guid-keyed one. An
+            // adopted item carries a row per `CustomDataKey`, and filtering to
+            // `lower(ItemId)` here made a page disagree with the per-item
+            // endpoint about the same item whenever the default row was absent
+            // — favourite on `/Items/{id}`, not favourite in the listing.
+            //
+            // The per-item path resolves ties by derived-key priority; doing
+            // that here would mean deriving keys for a whole page, which is the
+            // N+1 this batch exists to avoid. Instead: prefer the guid row,
+            // else take the lowest key deterministically. The two agree
+            // wherever a guid row exists, which is every item either server has
+            // ever written — the id is always the last key saved.
             let sql = format!(
                 r#"SELECT * FROM "UserData"
                    WHERE "UserId" = ?1 AND "ItemId" IN ({placeholders})
-                     AND "CustomDataKey" = lower("ItemId")"#,
+                   ORDER BY "CustomDataKey""#,
             );
             let mut query = sqlx::query_as::<_, UserDataEntity>(&sql).bind(guid_to_db(user_id));
             for id in chunk {
@@ -277,8 +590,20 @@ impl UserDataManager for FerrofinUserDataManager {
             }
             let rows = query.fetch_all(self.db.pool()).await.map_err(db_err)?;
             for row in rows {
-                if let Ok(item_id) = Uuid::parse_str(&row.item_id) {
-                    map.insert(item_id, to_dto(&row, item_id));
+                let Ok(item_id) = Uuid::parse_str(&row.item_id) else {
+                    continue;
+                };
+                let is_default = row.custom_data_key == item_id.to_string();
+                match map.entry(item_id) {
+                    std::collections::hash_map::Entry::Vacant(slot) => {
+                        slot.insert((to_dto(&row, item_id), is_default));
+                    }
+                    // A later guid row displaces an earlier provider-keyed one;
+                    // nothing displaces the guid row.
+                    std::collections::hash_map::Entry::Occupied(mut slot) if is_default => {
+                        slot.insert((to_dto(&row, item_id), true));
+                    }
+                    std::collections::hash_map::Entry::Occupied(_) => {}
                 }
             }
         }
@@ -286,9 +611,9 @@ impl UserDataManager for FerrofinUserDataManager {
         // per-item path's `unwrap_or_else(empty_row)` fallback.
         for &item_id in item_ids {
             map.entry(item_id)
-                .or_insert_with(|| to_dto(&Self::empty_row(item_id, user_id), item_id));
+                .or_insert_with(|| (to_dto(&Self::empty_row(item_id, user_id), item_id), true));
         }
-        Ok(map)
+        Ok(map.into_iter().map(|(id, (dto, _))| (id, dto)).collect())
     }
 
     async fn set_likes(
@@ -525,7 +850,7 @@ impl UserDataManager for FerrofinUserDataManager {
 mod tests {
     use super::*;
     use crate::configuration_manager::default_server_configuration;
-    use crate::test_support::{seed_item, seed_user, test_db};
+    use crate::test_support::{seed_item, seed_provider_id, seed_user, test_db};
     use ferrofin_model::configuration::ServerConfiguration;
 
     /// A config manager whose configuration is the factory default.
@@ -579,6 +904,270 @@ mod tests {
             .execute(db.writer())
             .await
             .expect("set runtime");
+    }
+
+    /// The update a client sends when a user taps the heart.
+    fn favorite_dto() -> UpdateUserItemDataDto {
+        UpdateUserItemDataDto {
+            is_favorite: Some(true),
+            ..UpdateUserItemDataDto::default()
+        }
+    }
+
+    /// Every `CustomDataKey` stored for an item, sorted.
+    async fn stored_keys(db: &Database, item: Uuid) -> Vec<String> {
+        sqlx::query_scalar::<_, String>(
+            r#"SELECT "CustomDataKey" FROM "UserData" WHERE "ItemId" = ?1 ORDER BY 1"#,
+        )
+        .bind(guid_to_db(item))
+        .fetch_all(db.pool())
+        .await
+        .expect("read keys")
+    }
+
+    /// A favourite must land on **every** key Jellyfin would read, not just the
+    /// item's guid row.
+    ///
+    /// This is the drop-in data-loss bug: measured on a real library, Ferrofin
+    /// wrote a third row under the guid while Jellyfin kept reading its TMDB
+    /// and IMDb rows, so the favourite was invisible the moment the user
+    /// swapped back.
+    #[tokio::test]
+    async fn a_favorite_is_written_under_every_provider_key() {
+        let db = test_db().await;
+        let user = Uuid::from_u128(1);
+        let item = Uuid::from_u128(2);
+        seed_user(&db, user).await;
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        seed_provider_id(&db, item, "Tmdb", "700391").await;
+        seed_provider_id(&db, item, "Imdb", "tt12261776").await;
+
+        let mgr = FerrofinUserDataManager::new(db.clone(), config());
+        mgr.save_user_data(user, item, &favorite_dto())
+            .await
+            .expect("favorite");
+
+        // Sorted by key, so the all-zero test guid leads.
+        assert_eq!(
+            stored_keys(&db, item).await,
+            vec![
+                item.to_string(),
+                "700391".to_owned(),
+                "tt12261776".to_owned(),
+            ]
+        );
+        let favorited: Vec<bool> =
+            sqlx::query_scalar(r#"SELECT "IsFavorite" FROM "UserData" WHERE "ItemId" = ?1"#)
+                .bind(guid_to_db(item))
+                .fetch_all(db.pool())
+                .await
+                .expect("read");
+        assert!(favorited.iter().all(|f| *f), "every row carries it");
+    }
+
+    /// A row written by Jellyfin under a provider key alone must be readable.
+    ///
+    /// The guid row is normally present too (the id is the last key Jellyfin
+    /// saves), so this is the case where it is not — an item whose default row
+    /// was never written, which a guid-only lookup misses entirely.
+    #[tokio::test]
+    async fn a_provider_keyed_row_is_found_without_a_guid_row() {
+        let db = test_db().await;
+        let user = Uuid::from_u128(1);
+        let item = Uuid::from_u128(2);
+        seed_user(&db, user).await;
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        seed_provider_id(&db, item, "Tmdb", "700391").await;
+
+        sqlx::query(
+            r#"INSERT INTO "UserData" ("ItemId","UserId","CustomDataKey","IsFavorite",
+                   "PlayCount","PlaybackPositionTicks","Played")
+               VALUES (?1, ?2, '700391', 1, 4, 0, 1)"#,
+        )
+        .bind(guid_to_db(item))
+        .bind(guid_to_db(user))
+        .execute(db.writer())
+        .await
+        .expect("seed jellyfin row");
+
+        let mgr = FerrofinUserDataManager::new(db.clone(), config());
+        let dto = mgr
+            .get_user_data_dto(item, user)
+            .await
+            .expect("read")
+            .expect("dto");
+        assert!(dto.is_favorite, "the provider-keyed favourite is visible");
+        assert_eq!(dto.play_count, 4);
+
+        // And the batch/listing path must agree with the per-item one — they
+        // disagreed while the batch filtered to `CustomDataKey = lower(ItemId)`.
+        let batch = mgr.get_user_data_dtos(&[item], user).await.expect("batch");
+        assert!(
+            batch[&item].is_favorite,
+            "listing agrees with the item view"
+        );
+        assert_eq!(batch[&item].play_count, 4);
+    }
+
+    /// An episode is keyed by its SERIES' provider ids plus `SSSEEE`, never its
+    /// own — the shape a real Jellyfin database holds
+    /// (`[<guid>, 273181001001, tt3032476001001]`).
+    #[tokio::test]
+    async fn an_episode_is_keyed_through_its_series() {
+        let db = test_db().await;
+        let user = Uuid::from_u128(1);
+        let series = Uuid::from_u128(2);
+        let episode = Uuid::from_u128(3);
+        seed_user(&db, user).await;
+        seed_item(&db, series, BaseItemKind::Series).await;
+        seed_provider_id(&db, series, "Tvdb", "273181").await;
+        seed_item(&db, episode, BaseItemKind::Episode).await;
+        sqlx::query(
+            r#"UPDATE "BaseItems" SET "SeriesId" = ?2, "ParentIndexNumber" = 1,
+                   "IndexNumber" = 1 WHERE "Id" = ?1"#,
+        )
+        .bind(guid_to_db(episode))
+        .bind(guid_to_db(series))
+        .execute(db.writer())
+        .await
+        .expect("link episode to series");
+
+        let mgr = FerrofinUserDataManager::new(db.clone(), config());
+        mgr.save_user_data(user, episode, &favorite_dto())
+            .await
+            .expect("favorite");
+
+        // The episode's OWN provider ids are absent by construction — its keys
+        // come from the series, suffixed with season/episode numbers.
+        assert_eq!(
+            stored_keys(&db, episode).await,
+            vec![episode.to_string(), "273181001001".to_owned()]
+        );
+    }
+
+    /// With several provider rows and no guid row, the highest-priority KEY
+    /// wins — not whatever order SQLite happened to return.
+    ///
+    /// The rows are seeded so that key order and storage order disagree: TMDB
+    /// leads the derived keys but `tt…` sorts first, so a `rows.first()` pick
+    /// would return the IMDb row.
+    #[tokio::test]
+    async fn the_highest_priority_key_wins_when_rows_disagree() {
+        let db = test_db().await;
+        let user = Uuid::from_u128(1);
+        let item = Uuid::from_u128(2);
+        seed_user(&db, user).await;
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        seed_provider_id(&db, item, "Tmdb", "700391").await;
+        seed_provider_id(&db, item, "Imdb", "tt12261776").await;
+
+        for (key, play_count) in [("700391", 7), ("tt12261776", 3)] {
+            sqlx::query(
+                r#"INSERT INTO "UserData" ("ItemId","UserId","CustomDataKey","IsFavorite",
+                       "PlayCount","PlaybackPositionTicks","Played")
+                   VALUES (?1, ?2, ?3, 0, ?4, 0, 0)"#,
+            )
+            .bind(guid_to_db(item))
+            .bind(guid_to_db(user))
+            .bind(key)
+            .bind(play_count)
+            .execute(db.writer())
+            .await
+            .expect("seed row");
+        }
+
+        let mgr = FerrofinUserDataManager::new(db.clone(), config());
+        let dto = mgr
+            .get_user_data_dto(item, user)
+            .await
+            .expect("read")
+            .expect("dto");
+        assert_eq!(dto.play_count, 7, "the TMDB row, which leads the keys");
+    }
+
+    /// A season is keyed through its series — the `SeriesId` hop plus the
+    /// series' own provider fetch, neither of which any other test exercises.
+    #[tokio::test]
+    async fn a_season_is_keyed_through_its_series() {
+        let db = test_db().await;
+        let user = Uuid::from_u128(1);
+        let series = Uuid::from_u128(2);
+        let season = Uuid::from_u128(3);
+        seed_user(&db, user).await;
+        seed_item(&db, series, BaseItemKind::Series).await;
+        seed_provider_id(&db, series, "Tvdb", "273181").await;
+        seed_item(&db, season, BaseItemKind::Season).await;
+        sqlx::query(r#"UPDATE "BaseItems" SET "SeriesId" = ?2, "IndexNumber" = 2 WHERE "Id" = ?1"#)
+            .bind(guid_to_db(season))
+            .bind(guid_to_db(series))
+            .execute(db.writer())
+            .await
+            .expect("link season to series");
+
+        let mgr = FerrofinUserDataManager::new(db.clone(), config());
+        mgr.save_user_data(user, season, &favorite_dto())
+            .await
+            .expect("favorite");
+
+        // A Season keeps the series' own guid key where an Episode drops it,
+        // so all three keys are present.
+        // Sorted by key: the series-derived guid key sorts before the season's
+        // own id, which sorts before the numeric TVDB one.
+        assert_eq!(
+            stored_keys(&db, season).await,
+            vec![
+                format!("{series}002"),
+                season.to_string(),
+                "273181002".to_owned(),
+            ]
+        );
+    }
+
+    /// A by-name item is keyed by type and name, read out of `BaseItems`.
+    ///
+    /// Covers the `Name` column reaching the derivation at all — the ten
+    /// by-name/music arms all depend on it and nothing else exercises it.
+    #[tokio::test]
+    async fn a_person_is_keyed_by_name_from_the_database() {
+        let db = test_db().await;
+        let user = Uuid::from_u128(1);
+        let person = Uuid::from_u128(2);
+        seed_user(&db, user).await;
+        seed_item(&db, person, BaseItemKind::Person).await;
+        sqlx::query(r#"UPDATE "BaseItems" SET "Name" = 'Beyoncé' WHERE "Id" = ?1"#)
+            .bind(guid_to_db(person))
+            .execute(db.writer())
+            .await
+            .expect("name the person");
+
+        let mgr = FerrofinUserDataManager::new(db.clone(), config());
+        mgr.save_user_data(user, person, &favorite_dto())
+            .await
+            .expect("favorite");
+
+        // Diacritic-stripped, so this row is the one Jellyfin reads for
+        // "Beyoncé". Sorted by key, so the all-zero test guid leads.
+        assert_eq!(
+            stored_keys(&db, person).await,
+            vec![person.to_string(), "Person-Beyonce".to_owned()]
+        );
+    }
+
+    /// An item with no providers still writes exactly one row, keyed by its id
+    /// — the pre-existing behaviour, which must not regress.
+    #[tokio::test]
+    async fn a_provider_less_item_still_writes_one_row() {
+        let db = test_db().await;
+        let user = Uuid::from_u128(1);
+        let item = Uuid::from_u128(2);
+        seed_user(&db, user).await;
+        seed_item(&db, item, BaseItemKind::Movie).await;
+
+        let mgr = FerrofinUserDataManager::new(db.clone(), config());
+        mgr.save_user_data(user, item, &favorite_dto())
+            .await
+            .expect("favorite");
+        assert_eq!(stored_keys(&db, item).await, vec![item.to_string()]);
     }
 
     /// Two concurrent first-time saves for the same `(item, user)` must both
