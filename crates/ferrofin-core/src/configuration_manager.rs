@@ -63,6 +63,7 @@ use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::system::ServerApplicationPaths;
 
 use crate::app_paths::FerrofinServerApplicationPaths;
+use crate::config_import;
 
 /// The per-item-type [`MetadataOptions`] `ServerConfiguration` ships with — the
 /// set the library metadata-options editor lists. Verbatim port of the C#
@@ -233,15 +234,20 @@ impl FerrofinServerConfigurationManager {
 
     /// Loads (or initializes) the configuration for the given paths.
     ///
-    /// If `{configuration-directory}/system.json` exists it is parsed; otherwise
-    /// a default configuration is written out. Either way the shared paths'
-    /// internal metadata path is synced to the loaded `MetadataPath`, matching
-    /// the C# constructor's `UpdateMetadataPath` call.
+    /// If `{configuration-directory}/system.json` exists it is parsed. If it
+    /// does not, this is either a fresh install or the adoption of a Jellyfin
+    /// data directory, so Jellyfin's `config/*.xml` is imported over the
+    /// defaults first (see [`crate::config_import`]) and the result written
+    /// out. Either way the shared paths' internal metadata path is synced to
+    /// the loaded `MetadataPath`, matching the C# constructor's
+    /// `UpdateMetadataPath` call.
     ///
     /// # Errors
     ///
-    /// Returns [`ServiceError`] if the configuration file cannot be read, parsed,
-    /// or (when absent) written.
+    /// Returns [`ServiceError`] if the configuration file cannot be read,
+    /// parsed, or (when absent) written, or if a Jellyfin `config/*.xml` is
+    /// present but cannot be imported — booting on defaults would silently
+    /// discard the operator's settings, `IsStartupWizardCompleted` among them.
     pub async fn load(paths: Arc<FerrofinServerApplicationPaths>) -> Result<Self, ServiceError> {
         let user_config_dir = PathBuf::from(paths.user_configuration_directory_path());
         let config_dir = user_config_dir.parent().map_or_else(
@@ -257,7 +263,64 @@ impl FerrofinServerConfigurationManager {
         let branding_file = named_dir.join(Self::BRANDING_FILE_NAME);
         let encoding_file = named_dir.join(Self::ENCODING_FILE_NAME);
 
-        let configuration = if config_file.exists() {
+        // The named configurations live in their own files and are read on
+        // demand, so adoption has to materialize them or the imported values
+        // are never seen. Seeding runs on EVERY boot, not just the adoption
+        // one: it is a no-op once the JSON exists, and running it
+        // unconditionally is what repairs an install adopted before this import
+        // existed — whose `encoding.json` is still missing and whose hardware
+        // transcoding is therefore still off. It also runs BEFORE `system.json`
+        // is written below, since that file is the sentinel for the adoption
+        // branch and crashing between the two would lose these for good.
+        let seeded = async {
+            seed_named(
+                &config_dir.join("encoding.xml"),
+                &encoding_file,
+                EncodingOptions::default(),
+                "EncodingOptions",
+                config_import::ENCODING_XML_DENY,
+            )
+            .await?;
+            seed_named(
+                &config_dir.join("branding.xml"),
+                &branding_file,
+                BrandingOptions::default(),
+                "BrandingOptions",
+                config_import::BRANDING_XML_DENY,
+            )
+            .await
+        };
+        if let Err(e) = seeded.await {
+            // Never fatal, on any boot. The line between refusing to start and
+            // carrying on is not "is this the adoption boot" — it is whether
+            // the next boot gets another chance. Seeding is skipped only once
+            // its JSON exists, so a failure here leaves the JSON absent and is
+            // retried forever; the cost of carrying on is hardware transcoding
+            // or a splash screen until the operator fixes the file. Refusing to
+            // start over that would be worse than the problem.
+            tracing::warn!(
+                error = %e,
+                "could not seed a named configuration from jellyfin's xml; the server is \
+                 starting on ferrofin's defaults for it, and will try again on the next boot"
+            );
+        }
+
+        // No `system.json` means this data directory has never been served by
+        // Ferrofin, so it may be a Jellyfin one we are adopting. Jellyfin kept
+        // the same settings as XML next to where the JSON goes; import them
+        // once, here, and never look at the XML again.
+        let adopting = !config_file.exists();
+        let configuration = if adopting {
+            let default = adopt_xml(
+                &config_dir.join("system.xml"),
+                default_server_configuration(),
+                "ServerConfiguration",
+                config_import::SYSTEM_XML_DENY,
+            )
+            .await?;
+            write_config(&config_file, &default).await?;
+            default
+        } else {
             let bytes = tokio::fs::read(&config_file)
                 .await
                 .map_err(|e| io_err("read configuration", &config_file, &e))?;
@@ -268,11 +331,14 @@ impl FerrofinServerConfigurationManager {
             if config.metadata_options.is_empty() {
                 config.metadata_options = default_metadata_options();
             }
+            // An install adopted before the XML import existed kept Ferrofin's
+            // defaults, and a lost `IsStartupWizardCompleted` leaves the
+            // `FirstTimeSetupOrAuth` endpoints open to anonymous callers. That
+            // combination — Jellyfin's XML saying the wizard was completed, our
+            // JSON saying it was not — cannot be a deliberate choice, because
+            // nothing in Ferrofin ever sets the flag back to false.
+            repair_lost_startup_flag(&config_dir, &config_file, &mut config).await;
             config
-        } else {
-            let default = default_server_configuration();
-            write_config(&config_file, &default).await?;
-            default
         };
 
         paths.set_internal_metadata_path(Some(configuration.metadata_path.as_str()));
@@ -435,6 +501,154 @@ impl ServerConfigurationManager for FerrofinServerConfigurationManager {
             .map_err(|e| io_err("read encoding options", &self.encoding_file, &e))?;
         serde_json::from_slice::<EncodingOptions>(&bytes)
             .map_err(|e| ServiceError::Backend(format!("invalid encoding options JSON: {e}")))
+    }
+}
+
+/// Applies the Jellyfin XML at `xml_path` over `default`, if it is there.
+///
+/// An absent document is the ordinary fresh-install case and returns `default`.
+/// A document that *is* there but cannot be read or imported is an error.
+///
+/// **This diverges from Jellyfin deliberately.**
+/// `Emby.Server.Implementations/AppBase/ConfigurationHelper.cs:33` catches every
+/// exception, substitutes `Activator.CreateInstance(type)`, and then — because
+/// the re-serialized defaults differ from what it read — *overwrites the file
+/// with them*. So an unreadable `system.xml` costs a Jellyfin operator every
+/// setting they had, silently, and takes the evidence with it.
+///
+/// Ferrofin refuses instead, because the caller that matters runs this exactly
+/// once (`system.json` does not exist yet) and persists the result immediately:
+/// there is no second chance to get it right, and one of the settings at stake
+/// is `IsStartupWizardCompleted`, whose loss leaves the `FirstTimeSetupOrAuth`
+/// endpoints open to anonymous callers. Where a failure *is* retried on the
+/// next boot — seeding a named configuration — [`load`] carries on with a
+/// warning instead, which is the same trade made the other way.
+///
+/// # Errors
+///
+/// Returns [`ServiceError`] if `xml_path` exists but cannot be read or imported.
+async fn adopt_xml<T>(
+    xml_path: &std::path::Path,
+    default: T,
+    root_name: &str,
+    deny: &[&str],
+) -> Result<T, ServiceError>
+where
+    T: serde::Serialize + serde::de::DeserializeOwned,
+{
+    if !xml_path.exists() {
+        return Ok(default);
+    }
+    let xml = tokio::fs::read_to_string(xml_path)
+        .await
+        .map_err(|e| io_err("read the jellyfin configuration", xml_path, &e))?;
+    let imported = config_import::import_over(&default, &xml, root_name, deny).map_err(|e| {
+        ServiceError::Backend(format!(
+            "could not adopt the jellyfin configuration at {}: {e}. \
+             Move or repair the file to start on ferrofin's defaults.",
+            xml_path.display()
+        ))
+    })?;
+    tracing::info!(path = %xml_path.display(), "adopted jellyfin configuration");
+    Ok(imported)
+}
+
+/// Writes `json_path` from the Jellyfin XML at `xml_path`, if that XML exists.
+///
+/// Named configurations (`encoding`, `branding`) are read on demand and fall
+/// back to their defaults when their file is absent, so adoption has to
+/// materialize them eagerly or the imported values would never be seen.
+///
+/// # Errors
+///
+/// Returns [`ServiceError`] if the XML cannot be imported or the JSON cannot be
+/// written — the same reasoning as [`adopt_xml`]: a silent miss here is how
+/// hardware transcoding turns itself off.
+async fn seed_named<T>(
+    xml_path: &std::path::Path,
+    json_path: &std::path::Path,
+    default: T,
+    root_name: &str,
+    deny: &[&str],
+) -> Result<(), ServiceError>
+where
+    T: serde::Serialize + serde::de::DeserializeOwned,
+{
+    if json_path.exists() || !xml_path.exists() {
+        return Ok(());
+    }
+    let imported = adopt_xml(xml_path, default, root_name, deny).await?;
+    if let Some(parent) = json_path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| io_err("create the named configuration directory", parent, &e))?;
+    }
+    let json = serde_json::to_vec_pretty(&imported)
+        .map_err(|e| ServiceError::Backend(format!("serialize the adopted configuration: {e}")))?;
+    tokio::fs::write(json_path, json)
+        .await
+        .map_err(|e| io_err("write the adopted configuration", json_path, &e))
+}
+
+/// Restores `IsStartupWizardCompleted` on an install adopted before the XML
+/// import existed, where losing it left the `FirstTimeSetupOrAuth` endpoints
+/// open to anonymous callers.
+///
+/// Only this one flag is touched, and only in the one direction: Jellyfin's XML
+/// says the wizard was completed while our JSON says it was not. Ferrofin never
+/// clears the flag, so that combination has no innocent explanation. Every
+/// other setting is left as the operator has it — a late, wholesale re-import
+/// would overwrite choices they made after adopting.
+async fn repair_lost_startup_flag(
+    config_dir: &std::path::Path,
+    config_file: &std::path::Path,
+    config: &mut ServerConfiguration,
+) {
+    if config.is_startup_wizard_completed {
+        return;
+    }
+    let system_xml = config_dir.join("system.xml");
+    if !system_xml.exists() {
+        return;
+    }
+    // Everything below stays non-fatal — unlike adoption, this runs on a server
+    // that boots fine today, and refusing to start would be the worse outcome.
+    // But it must not be *silent*: we are standing in the exact state the
+    // repair exists for, so an unreadable file gets said out loud.
+    let unverified = |reason: &str| {
+        tracing::warn!(
+            path = %system_xml.display(),
+            reason,
+            "the setup wizard is marked incomplete and jellyfin's configuration could not be \
+             read to check whether that is right; if this server was adopted from jellyfin, the \
+             first-time-setup endpoints are reachable anonymously until it is set"
+        );
+    };
+    let xml = match tokio::fs::read_to_string(&system_xml).await {
+        Ok(xml) => xml,
+        Err(e) => return unverified(&e.to_string()),
+    };
+    match config_import::import_over(
+        &default_server_configuration(),
+        &xml,
+        "ServerConfiguration",
+        config_import::SYSTEM_XML_DENY,
+    ) {
+        Ok(jellyfin) if jellyfin.is_startup_wizard_completed => {}
+        // Jellyfin agrees the wizard was never completed: nothing to repair.
+        Ok(_) => return,
+        Err(e) => return unverified(&e.to_string()),
+    }
+    config.is_startup_wizard_completed = true;
+    tracing::warn!(
+        path = %system_xml.display(),
+        "this install was adopted before ferrofin imported jellyfin's configuration, so the \
+         completed-setup flag was lost and the first-time-setup endpoints were reachable \
+         anonymously; restoring it. Other settings are left alone — delete system.json to \
+         re-import them all from jellyfin's xml."
+    );
+    if let Err(e) = write_config(config_file, config).await {
+        tracing::error!(error = %e, "could not persist the restored completed-setup flag");
     }
 }
 
@@ -748,5 +962,283 @@ mod tests {
             .await
             .expect_err("should reject");
         assert!(matches!(err, ServiceError::InvalidInput(_)));
+    }
+
+    /// Lays down a Jellyfin `config/` directory under `root` — the shape
+    /// [`load`](FerrofinServerConfigurationManager::load) meets when adopting.
+    fn write_jellyfin_config(root: &std::path::Path, system_xml: &str) {
+        let dir = root.join("config");
+        std::fs::create_dir_all(&dir).expect("config dir");
+        std::fs::write(dir.join("system.xml"), system_xml).expect("system.xml");
+        std::fs::write(
+            dir.join("encoding.xml"),
+            "<EncodingOptions>\
+             <HardwareAccelerationType>nvenc</HardwareAccelerationType>\
+             <TranscodingTempPath>/config/transcodes</TranscodingTempPath>\
+             </EncodingOptions>",
+        )
+        .expect("encoding.xml");
+        std::fs::write(
+            dir.join("branding.xml"),
+            "<BrandingOptions><SplashscreenEnabled>true</SplashscreenEnabled>\
+             <SplashscreenLocation>/config/splash.jpg</SplashscreenLocation>\
+             </BrandingOptions>",
+        )
+        .expect("branding.xml");
+    }
+
+    const COMPLETED_SYSTEM_XML: &str = "<ServerConfiguration>\
+         <IsStartupWizardCompleted>true</IsStartupWizardCompleted>\
+         <ServerName>basement</ServerName>\
+         <MetadataPath>/config/metadata</MetadataPath>\
+         </ServerConfiguration>";
+
+    #[tokio::test]
+    async fn adoption_imports_every_jellyfin_config_document() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_jellyfin_config(tmp.path(), COMPLETED_SYSTEM_XML);
+        let mgr = FerrofinServerConfigurationManager::load(test_paths(tmp.path()))
+            .await
+            .expect("load");
+
+        let cfg = mgr.snapshot();
+        // The security-critical one: without it `FirstTimeSetupOrAuth` serves
+        // anonymously.
+        assert!(cfg.is_startup_wizard_completed);
+        assert_eq!(cfg.server_name, "basement");
+        assert_eq!(
+            cfg.metadata_path, "",
+            "a container path must not be adopted"
+        );
+
+        // Named configs are read on demand from their own files, so this also
+        // pins that adoption wrote them where the readers look.
+        let encoding = mgr.get_encoding_options().await.expect("encoding");
+        assert_eq!(
+            encoding.hardware_acceleration_type,
+            ferrofin_model::entities::HardwareAccelerationType::nvenc
+        );
+        assert_eq!(
+            encoding.transcoding_temp_path,
+            EncodingOptions::default().transcoding_temp_path,
+            "a container path must not be adopted"
+        );
+        let branding = mgr.get_branding().await.expect("branding");
+        assert!(branding.splashscreen_enabled);
+        assert_eq!(
+            branding.splashscreen_location,
+            BrandingOptions::default().splashscreen_location,
+            "a container path must not be adopted"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fresh_install_with_no_jellyfin_xml_still_gets_the_defaults() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mgr = FerrofinServerConfigurationManager::load(test_paths(tmp.path()))
+            .await
+            .expect("load");
+        assert_eq!(mgr.snapshot(), default_server_configuration());
+    }
+
+    #[tokio::test]
+    async fn a_malformed_jellyfin_config_refuses_to_boot_rather_than_lose_it() {
+        // Falling back to defaults here would persist
+        // `IsStartupWizardCompleted: false` and re-open the anonymous
+        // first-time-setup endpoints — the exact failure the import prevents.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("config");
+        std::fs::create_dir_all(&dir).expect("config dir");
+        std::fs::write(dir.join("system.xml"), "<ServerConfiguration><A></B>").expect("system.xml");
+
+        let err = FerrofinServerConfigurationManager::load(test_paths(tmp.path()))
+            .await
+            .expect_err("must not boot on defaults");
+        assert!(format!("{err}").contains("system.xml"), "{err}");
+        assert!(
+            !dir.join("system.json").exists(),
+            "a failed adoption must not leave defaults behind as the sentinel"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_boot_does_not_re_import_over_the_operator_s_changes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_jellyfin_config(tmp.path(), COMPLETED_SYSTEM_XML);
+        let mgr = FerrofinServerConfigurationManager::load(test_paths(tmp.path()))
+            .await
+            .expect("first load");
+        let mut cfg = mgr.snapshot();
+        cfg.server_name = "renamed in ferrofin".to_owned();
+        mgr.update_configuration(&cfg).await.expect("update");
+
+        let reloaded = FerrofinServerConfigurationManager::load(test_paths(tmp.path()))
+            .await
+            .expect("second load");
+        assert_eq!(reloaded.snapshot().server_name, "renamed in ferrofin");
+    }
+
+    #[tokio::test]
+    async fn an_install_adopted_before_the_import_gets_its_completed_flag_back() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_jellyfin_config(tmp.path(), COMPLETED_SYSTEM_XML);
+        // What the buggy build left behind: Ferrofin defaults written over a
+        // Jellyfin directory, wizard flag lost.
+        let config_file = tmp.path().join("config").join("system.json");
+        let mut stale = default_server_configuration();
+        stale.server_name = "kept".to_owned();
+        write_config(&config_file, &stale)
+            .await
+            .expect("stale config");
+        assert!(!stale.is_startup_wizard_completed);
+
+        let mgr = FerrofinServerConfigurationManager::load(test_paths(tmp.path()))
+            .await
+            .expect("load");
+        let cfg = mgr.snapshot();
+        assert!(cfg.is_startup_wizard_completed, "the flag must be restored");
+        assert_eq!(cfg.server_name, "kept", "nothing else may be re-imported");
+
+        // Persisted, not just patched in memory.
+        let on_disk: ServerConfiguration =
+            serde_json::from_slice(&std::fs::read(&config_file).expect("read")).expect("parse");
+        assert!(on_disk.is_startup_wizard_completed);
+    }
+
+    #[tokio::test]
+    async fn the_completed_flag_is_not_invented_when_jellyfin_never_set_it() {
+        // Must go through the REPAIR path, not the adoption one, so a stale
+        // `system.json` has to already be there — otherwise this only proves
+        // that `import_over` carries `false` through.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_jellyfin_config(
+            tmp.path(),
+            "<ServerConfiguration>\
+             <IsStartupWizardCompleted>false</IsStartupWizardCompleted>\
+             </ServerConfiguration>",
+        );
+        let config_file = tmp.path().join("config").join("system.json");
+        write_config(&config_file, &default_server_configuration())
+            .await
+            .expect("stale config");
+
+        let mgr = FerrofinServerConfigurationManager::load(test_paths(tmp.path()))
+            .await
+            .expect("load");
+        assert!(!mgr.snapshot().is_startup_wizard_completed);
+        let on_disk: ServerConfiguration =
+            serde_json::from_slice(&std::fs::read(&config_file).expect("read")).expect("parse");
+        assert!(
+            !on_disk.is_startup_wizard_completed,
+            "nothing may be written back"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_system_xml_does_not_stop_an_already_running_install() {
+        // The repair path, unlike adoption, must never turn a booting server
+        // into a non-booting one — it only warns.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("config");
+        std::fs::create_dir_all(&dir).expect("config dir");
+        std::fs::write(dir.join("system.xml"), "<ServerConfiguration><A></B>").expect("system.xml");
+        write_config(&dir.join("system.json"), &default_server_configuration())
+            .await
+            .expect("stale config");
+
+        let mgr = FerrofinServerConfigurationManager::load(test_paths(tmp.path()))
+            .await
+            .expect("must still boot");
+        assert!(!mgr.snapshot().is_startup_wizard_completed);
+    }
+
+    /// A corrupt `encoding.xml` costs hardware transcoding, never uptime —
+    /// whether or not this is the adoption boot. Seeding is retried on every
+    /// boot until its JSON exists, so there is always another chance; that is
+    /// what separates it from `system.xml`, whose result is persisted at once.
+    #[rstest::rstest]
+    #[case::adopting(false)]
+    #[case::already_running(true)]
+    #[tokio::test]
+    async fn a_corrupt_encoding_xml_costs_transcoding_not_uptime(#[case] has_system_json: bool) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("config");
+        std::fs::create_dir_all(&dir).expect("config dir");
+        std::fs::write(dir.join("encoding.xml"), "<EncodingOptions><A></B>").expect("encoding.xml");
+        if has_system_json {
+            write_config(&dir.join("system.json"), &default_server_configuration())
+                .await
+                .expect("existing config");
+        }
+
+        let mgr = FerrofinServerConfigurationManager::load(test_paths(tmp.path()))
+            .await
+            .expect("must still boot");
+        assert_eq!(
+            mgr.get_encoding_options().await.expect("encoding"),
+            EncodingOptions::default()
+        );
+        assert!(
+            !mgr.encoding_file.exists(),
+            "nothing was written, so the next boot tries again"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_named_config_is_seeded_on_a_later_boot_too() {
+        // An install adopted before this import existed has `system.json` but
+        // no `encoding.json`, so its hardware transcoding is still off. Seeding
+        // is idempotent and runs every boot precisely to repair that.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_jellyfin_config(tmp.path(), COMPLETED_SYSTEM_XML);
+        write_config(
+            &tmp.path().join("config").join("system.json"),
+            &default_server_configuration(),
+        )
+        .await
+        .expect("stale config");
+
+        let mgr = FerrofinServerConfigurationManager::load(test_paths(tmp.path()))
+            .await
+            .expect("load");
+        assert_eq!(
+            mgr.get_encoding_options()
+                .await
+                .expect("encoding")
+                .hardware_acceleration_type,
+            ferrofin_model::entities::HardwareAccelerationType::nvenc
+        );
+    }
+
+    #[tokio::test]
+    async fn seeding_does_not_overwrite_a_named_config_the_operator_has_saved() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_jellyfin_config(tmp.path(), COMPLETED_SYSTEM_XML);
+        let mgr = FerrofinServerConfigurationManager::load(test_paths(tmp.path()))
+            .await
+            .expect("first load");
+        // What `POST /System/Configuration/encoding` leaves behind: the
+        // operator has since turned hardware transcoding back off.
+        let mut encoding = mgr.get_encoding_options().await.expect("encoding");
+        encoding.hardware_acceleration_type =
+            ferrofin_model::entities::HardwareAccelerationType::none;
+        std::fs::write(
+            &mgr.encoding_file,
+            serde_json::to_vec_pretty(&encoding).expect("serialize"),
+        )
+        .expect("save encoding");
+
+        let reloaded = FerrofinServerConfigurationManager::load(test_paths(tmp.path()))
+            .await
+            .expect("second load");
+        assert_eq!(
+            reloaded
+                .get_encoding_options()
+                .await
+                .expect("encoding")
+                .hardware_acceleration_type,
+            ferrofin_model::entities::HardwareAccelerationType::none,
+            "the operator turned it off; adoption must not turn it back on"
+        );
     }
 }
