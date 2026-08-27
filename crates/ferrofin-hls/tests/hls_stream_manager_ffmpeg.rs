@@ -249,6 +249,7 @@ impl StreamStatePlanner for FfmpegPlanner {
             device_id: Some("dev".to_owned()),
         };
         Ok(TranscodePlan {
+            ffmpeg_env: Vec::new(),
             arguments: self.hls_args(&playlist, kind),
             state,
             playlist_path: playlist,

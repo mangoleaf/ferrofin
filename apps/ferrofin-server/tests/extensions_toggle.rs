@@ -31,8 +31,7 @@ async fn wired_counts(disable_extensions: bool) -> (usize, usize) {
     let ffmpeg = ferrofin_server::bootstrap::FfmpegPaths {
         ffmpeg: std::path::PathBuf::from("ffmpeg"),
         ffprobe: std::path::PathBuf::from("ffprobe"),
-        filters: Vec::new(),
-        encoders: Vec::new(),
+        capabilities: ferrofin_mediaencoding::FfmpegCapabilities::default(),
         chromaprint_muxer: false,
     };
     let (shutdown_tx, _rx) = tokio::sync::oneshot::channel();

@@ -24,6 +24,18 @@ pub struct FfmpegVersion {
 }
 
 impl FfmpegVersion {
+    /// The major component.
+    #[must_use]
+    pub const fn major(self) -> i32 {
+        self.major
+    }
+
+    /// The minor component.
+    #[must_use]
+    pub const fn minor(self) -> i32 {
+        self.minor
+    }
+
     /// Creates a two-component version (`build`/`revision` unspecified, i.e. `-1`).
     #[must_use]
     pub const fn new(major: i32, minor: i32) -> Self {
@@ -43,6 +55,23 @@ impl FfmpegVersion {
             minor,
             build,
             revision: -1,
+        }
+    }
+
+    /// Creates a fully specified four-component version.
+    ///
+    /// This is the shape .NET's `Environment.OSVersion.Version` always has on
+    /// Unix — it fills every component, using `0` for the ones the release
+    /// string did not supply — which is why it sorts *after* a
+    /// [`with_build`](Self::with_build) version of the same three leading
+    /// numbers.
+    #[must_use]
+    pub const fn with_revision(major: i32, minor: i32, build: i32, revision: i32) -> Self {
+        Self {
+            major,
+            minor,
+            build,
+            revision,
         }
     }
 

@@ -23,8 +23,8 @@ use ferrofin_mediaencoding::subtitles::{
     SubtitleEditParser, SubtitleEncoder as PureSubtitleEncoder, SubtitleEncoderImpl, SubtitleIo,
 };
 use ferrofin_mediaencoding::{
-    AttachmentExtractorImpl, EncodingHelper, NoopSessionReporter, ProbedEncoders,
-    TokioSegmentTranscoder, TranscodeManagerImpl,
+    AttachmentExtractorImpl, EncodingHelper, NoopSessionReporter, TokioSegmentTranscoder,
+    TranscodeManagerImpl,
 };
 use ferrofin_model::configuration::EncodingOptions;
 use ferrofin_model::dto::MediaSourceInfo;
@@ -66,10 +66,25 @@ pub struct MediaEncodingExtras {
 trait LiveStreamReleaser: Send + Sync {
     /// Closes `live_stream_id` unless another session is still using it.
     async fn release(&self, live_stream_id: &str, session_id: &str) -> Result<(), ServiceError>;
+
+    /// Publishes a starting job's details against `device_id`.
+    async fn publish_transcoding_info(
+        &self,
+        device_id: &str,
+        info: &ferrofin_model::session::TranscodingInfo,
+    ) -> Result<(), ServiceError>;
 }
 
 #[async_trait]
 impl LiveStreamReleaser for Arc<dyn ferrofin_traits::session::SessionManager> {
+    async fn publish_transcoding_info(
+        &self,
+        device_id: &str,
+        info: &ferrofin_model::session::TranscodingInfo,
+    ) -> Result<(), ServiceError> {
+        self.report_transcoding_info(device_id, info).await
+    }
+
     async fn release(&self, live_stream_id: &str, session_id: &str) -> Result<(), ServiceError> {
         self.close_live_stream_if_needed(live_stream_id, session_id)
             .await
@@ -85,13 +100,12 @@ impl LiveStreamReleaser for Arc<dyn ferrofin_traits::session::SessionManager> {
 /// tab, a cast receiver that drops off the network — leaves its tuner open
 /// until the process exits, and the next tune fails on a busy tuner.
 ///
-/// `report_progress` is a no-op, and deliberately says so: upstream's
-/// `TranscodeManager.ReportTranscodingProgress` builds a `TranscodingInfo` from
-/// the encoding state and pushes it into the session, but nothing in Ferrofin
-/// produces progress in the first place (no ffmpeg progress reader), so
-/// `SessionInfo.TranscodingInfo` stays null and the dashboard shows no transcode
-/// details. Building that reader is its own piece of work — see the ledger — and
-/// this is the seam it will report through.
+/// `report_started` publishes what the job is — codecs, container, size,
+/// accelerator — the moment it spawns, which is what puts a transcode on the
+/// dashboard at all. `report_progress` stays a no-op: upstream fills the
+/// framerate and completion percentage from an ffmpeg progress reader that
+/// Ferrofin does not have yet. Building that reader is its own piece of work —
+/// see the ledger — and this is the seam it will report through.
 struct LiveStreamReleasingReporter<R: LiveStreamReleaser> {
     releaser: R,
 }
@@ -105,6 +119,24 @@ impl<R: LiveStreamReleaser> ferrofin_mediaencoding::SessionReporter
         _job: &ferrofin_traits::media_encoding::TranscodingJobHandle,
         _progress: ferrofin_traits::media_encoding::TranscodingProgress,
     ) {
+    }
+
+    async fn report_started(
+        &self,
+        job: &ferrofin_traits::media_encoding::TranscodingJobHandle,
+        info: ferrofin_model::session::TranscodingInfo,
+    ) {
+        let Some(device_id) = job.device_id.as_deref().filter(|d| !d.is_empty()) else {
+            return;
+        };
+        if let Err(error) = self
+            .releaser
+            .publish_transcoding_info(device_id, &info)
+            .await
+        {
+            // Best effort: a dashboard panel is not worth failing a transcode.
+            tracing::warn!(%device_id, %error, "reporting the transcode to the session failed");
+        }
     }
 
     async fn on_job_killed(
@@ -148,14 +180,17 @@ impl<R: LiveStreamReleaser> ferrofin_mediaencoding::SessionReporter
 ///   filesystem [`AttachmentIo`] and a [`MediaSourceResolver`] adapting the
 ///   [`MediaSourceManager`] (not the `DisabledAttachmentExtractor` stub).
 ///
-/// The `NoopSessionReporter` is used for job teardown (progress → session-layer
-/// reporting is deferred; killed-job partial-file cleanup is handled by the
-/// manager's `FsFileCleaner`).
+/// The `NoopSessionReporter` stands in only when no session manager was
+/// injected. With one, [`LiveStreamReleasingReporter`] publishes a starting
+/// job to the session layer and releases its live stream on teardown;
+/// killed-job partial-file cleanup is the manager's `FsFileCleaner`.
 ///
-/// `ffmpeg` carries the startup capability probes: the `-filters` list gates
-/// the jellyfin-ffmpeg-only `tonemapx` software tonemap (the planner falls
-/// back to the vanilla zscale chain without it), and the `-encoders` list lets
-/// the audio path prefer `aac_at`/`libfdk_aac` over native `aac` when present.
+/// `ffmpeg` carries the startup capability probes, which the planner reads for
+/// every encoding decision: the `-filters` list gates the jellyfin-ffmpeg-only
+/// `tonemapx` software tonemap (the planner falls back to the vanilla zscale
+/// chain without it), the `-encoders` list lets the audio path prefer
+/// `aac_at`/`libfdk_aac` over native `aac`, and the hardware lists and version
+/// gates drive the whole hardware-acceleration matrix.
 #[must_use]
 pub fn build_media_encoding(
     media_sources: Arc<dyn MediaSourceManager>,
@@ -190,7 +225,7 @@ pub fn build_media_encoding(
     let planner = FerrofinStreamStatePlanner::new(
         Arc::clone(&media_sources),
         Arc::clone(&encoder),
-        EncodingHelper::new(ProbedEncoders::new(ffmpeg.encoders.clone())),
+        EncodingHelper::new(ffmpeg.capabilities.clone()),
         config,
         Arc::clone(&paths),
         Arc::clone(&subtitles),
@@ -786,8 +821,7 @@ mod tests {
         let ffmpeg = FfmpegPaths {
             ffmpeg: "ffmpeg".into(),
             ffprobe: "ffprobe".into(),
-            filters: Vec::new(),
-            encoders: Vec::new(),
+            capabilities: ferrofin_mediaencoding::FfmpegCapabilities::default(),
             chromaprint_muxer: false,
         };
         let (_hls, _attachments, _subtitles) = build_media_encoding(
@@ -809,11 +843,28 @@ mod tests {
     #[derive(Default)]
     struct RecordingReleaser {
         released: std::sync::Mutex<Vec<(String, String)>>,
+        /// Every transcode reported to the session layer, as
+        /// `(device_id, hardware_acceleration_type)`.
+        reported:
+            std::sync::Mutex<Vec<(String, ferrofin_model::entities::HardwareAccelerationType)>>,
         fail: bool,
     }
 
     #[async_trait]
     impl LiveStreamReleaser for RecordingReleaser {
+        async fn publish_transcoding_info(
+            &self,
+            device_id: &str,
+            info: &ferrofin_model::session::TranscodingInfo,
+        ) -> Result<(), ServiceError> {
+            self.reported.lock().expect("lock").push((
+                device_id.to_owned(),
+                info.hardware_acceleration_type
+                    .unwrap_or(ferrofin_model::entities::HardwareAccelerationType::none),
+            ));
+            Ok(())
+        }
+
         async fn release(
             &self,
             live_stream_id: &str,
@@ -916,6 +967,41 @@ mod tests {
             .on_job_killed(&killed_job(Some("live-3"), Some("sess")), true, true)
             .await;
         assert_eq!(reporter.releaser.released.lock().expect("lock").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_starting_transcode_tells_the_session_what_hardware_it_uses() {
+        use ferrofin_mediaencoding::SessionReporter as _;
+        use ferrofin_model::entities::HardwareAccelerationType;
+        let reporter = LiveStreamReleasingReporter {
+            releaser: RecordingReleaser::default(),
+        };
+        let info = ferrofin_model::session::TranscodingInfo {
+            hardware_acceleration_type: Some(HardwareAccelerationType::nvenc),
+            ..ferrofin_model::session::TranscodingInfo::default()
+        };
+        reporter
+            .report_started(&killed_job(None, Some("sess")), info)
+            .await;
+        assert_eq!(
+            *reporter.releaser.reported.lock().expect("lock"),
+            vec![("dev".to_owned(), HardwareAccelerationType::nvenc)]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_job_with_no_device_reports_nothing() {
+        // There is nothing to attach the panel to.
+        use ferrofin_mediaencoding::SessionReporter as _;
+        let reporter = LiveStreamReleasingReporter {
+            releaser: RecordingReleaser::default(),
+        };
+        let mut job = killed_job(None, Some("sess"));
+        job.device_id = None;
+        reporter
+            .report_started(&job, ferrofin_model::session::TranscodingInfo::default())
+            .await;
+        assert!(reporter.releaser.reported.lock().expect("lock").is_empty());
     }
 
     /// A [`TrickplayManager`](ferrofin_traits::trickplay::TrickplayManager) with
@@ -1027,8 +1113,7 @@ mod tests {
         let ffmpeg = FfmpegPaths {
             ffmpeg: "ffmpeg".into(),
             ffprobe: "ffprobe".into(),
-            filters: Vec::new(),
-            encoders: Vec::new(),
+            capabilities: ferrofin_mediaencoding::FfmpegCapabilities::default(),
             chromaprint_muxer: false,
         };
         let (hls, _attachments, _subtitles) = build_media_encoding(

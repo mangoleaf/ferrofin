@@ -63,8 +63,7 @@ async fn boot() -> Harness {
     let ffmpeg = ferrofin_server::bootstrap::FfmpegPaths {
         ffmpeg: std::path::PathBuf::from("ffmpeg"),
         ffprobe: std::path::PathBuf::from("ffprobe"),
-        filters: Vec::new(),
-        encoders: Vec::new(),
+        capabilities: ferrofin_mediaencoding::FfmpegCapabilities::default(),
         chromaprint_muxer: false,
     };
     let (shutdown_tx, _shutdown_rx) = tokio::sync::oneshot::channel();
@@ -572,8 +571,7 @@ async fn wired_backend(fpcalc: Option<String>) -> Vec<String> {
     let ffmpeg = ferrofin_server::bootstrap::FfmpegPaths {
         ffmpeg: std::path::PathBuf::from("ffmpeg"),
         ffprobe: std::path::PathBuf::from("ffprobe"),
-        filters: Vec::new(),
-        encoders: Vec::new(),
+        capabilities: ferrofin_mediaencoding::FfmpegCapabilities::default(),
         // Force the fallback path: with the muxer present, `with_backends`
         // discards `fpcalc` by design and the test would prove nothing.
         chromaprint_muxer: false,

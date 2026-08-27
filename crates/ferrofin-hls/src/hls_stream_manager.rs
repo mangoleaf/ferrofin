@@ -72,6 +72,10 @@ pub struct TranscodePlan {
     pub playlist_path: PathBuf,
     /// The fully-built ffmpeg command-line arguments.
     pub arguments: Vec<String>,
+    /// Environment variables the ffmpeg child needs, from the hardware input
+    /// arguments. Empty unless the selected accelerator configures itself that
+    /// way (VAAPI's driver selection is the one that does).
+    pub ffmpeg_env: Vec<(String, String)>,
     /// The absolute source media path (for the playlist generator's
     /// `CreateMainPlaylistRequest.file_path`).
     pub media_path: String,
@@ -556,6 +560,8 @@ where
             arguments: plan.arguments.clone(),
             log_path,
             working_dir: None,
+            env: plan.ffmpeg_env.clone(),
+            hardware_acceleration_type: plan.encoding_options.hardware_acceleration_type,
         };
         let handle = match self.manager.start_ffmpeg(&self.transcoder, start).await {
             Ok(handle) => handle,
@@ -689,6 +695,8 @@ where
                     arguments: plan.arguments.clone(),
                     log_path,
                     working_dir: None,
+                    env: plan.ffmpeg_env.clone(),
+                    hardware_acceleration_type: plan.encoding_options.hardware_acceleration_type,
                 };
                 if let Err(e) = self
                     .manager
@@ -851,6 +859,8 @@ where
                     arguments: plan.arguments.clone(),
                     log_path: log_path.clone(),
                     working_dir: None,
+                    env: plan.ffmpeg_env.clone(),
+                    hardware_acceleration_type: plan.encoding_options.hardware_acceleration_type,
                 };
                 let handle = match self.manager.start_ffmpeg(&self.transcoder, start).await {
                     Ok(handle) => handle,
@@ -967,6 +977,8 @@ where
             arguments: plan.arguments.clone(),
             log_path,
             working_dir: None,
+            env: plan.ffmpeg_env.clone(),
+            hardware_acceleration_type: plan.encoding_options.hardware_acceleration_type,
         };
         self.manager
             .start_ffmpeg(&self.transcoder, start)
@@ -1403,6 +1415,7 @@ mod tests {
                 arguments.extend(["-hls_playlist_type".to_owned(), "event".to_owned()]);
             }
             Ok(TranscodePlan {
+                ffmpeg_env: Vec::new(),
                 state,
                 playlist_path: playlist,
                 arguments,

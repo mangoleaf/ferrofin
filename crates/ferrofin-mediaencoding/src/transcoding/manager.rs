@@ -11,6 +11,9 @@ use ferrofin_traits::media_encoding::{
     TranscodeManager, TranscodingJobHandle, TranscodingJobType, TranscodingProgress,
 };
 
+use ferrofin_model::entities::HardwareAccelerationType;
+use ferrofin_model::session::TranscodingInfo;
+
 use crate::encoding_helper::EncodingJobInfo;
 
 use super::fs_wait::FsWaiter;
@@ -57,6 +60,46 @@ pub struct StartFfMpegRequest<'a> {
     pub log_path: PathBuf,
     /// The process working directory, if any (`workingDirectory`).
     pub working_dir: Option<PathBuf>,
+    /// Environment variables for the ffmpeg child, from the hardware input
+    /// arguments. Empty for every path that configures itself by argument.
+    pub env: Vec<(String, String)>,
+    /// The accelerator this job runs on, for the dashboard's transcode panel.
+    pub hardware_acceleration_type: HardwareAccelerationType,
+}
+
+/// What a starting job is doing, for the session layer. Port of the
+/// `TranscodingInfo` literal in `TranscodeManager.ReportTranscodingProgress`.
+///
+/// `framerate` and `completion_percentage` are deliberately absent: upstream
+/// fills them from its ffmpeg progress reader, which Ferrofin does not have
+/// yet. Everything else is known the moment the job starts, and reporting it
+/// then is what puts the transcode on the dashboard at all — upstream's own
+/// panel stays blank until the first progress line arrives.
+fn transcoding_info(
+    state: &EncodingJobInfo,
+    hardware_acceleration_type: HardwareAccelerationType,
+) -> TranscodingInfo {
+    let bitrate = match (state.output_video_bitrate, state.output_audio_bitrate) {
+        (None, None) => None,
+        (v, a) => Some(v.unwrap_or(0).saturating_add(a.unwrap_or(0))),
+    };
+    TranscodingInfo {
+        audio_codec: state.actual_output_audio_codec().map(str::to_owned),
+        video_codec: state.actual_output_video_codec().map(str::to_owned),
+        container: state.output_container.clone(),
+        // "Direct" is about the STREAM, not the container: a copied stream is
+        // being remuxed, not transcoded, even though a job exists for it.
+        is_video_direct: EncodingJobInfo::is_copy_codec(state.output_video_codec.as_deref()),
+        is_audio_direct: EncodingJobInfo::is_copy_codec(state.output_audio_codec.as_deref()),
+        bitrate,
+        framerate: None,
+        completion_percentage: None,
+        width: state.output_width(),
+        height: state.output_height(),
+        audio_channels: state.output_audio_channels,
+        hardware_acceleration_type: Some(hardware_acceleration_type),
+        transcode_reasons: Vec::new(),
+    }
 }
 
 /// The kill-timer duration for a progressive stream, in milliseconds.
@@ -83,6 +126,16 @@ pub trait SessionReporter: Send + Sync {
     ///
     /// Port of `ReportTranscodingProgress`.
     async fn report_progress(&self, job: &TranscodingJobHandle, progress: TranscodingProgress);
+
+    /// Publishes what a starting job is doing, so the dashboard can show it.
+    ///
+    /// Port of the `ReportTranscodingInfo` call inside
+    /// `TranscodeManager.ReportTranscodingProgress`. Upstream only reaches that
+    /// from its ffmpeg progress reader, so a job reporting no progress never
+    /// appears at all. Ferrofin has no such reader yet, so it publishes the
+    /// **static** half here instead — everything except the framerate and
+    /// completion percentage, which stay absent until the reader lands.
+    async fn report_started(&self, job: &TranscodingJobHandle, info: TranscodingInfo);
 
     /// Tears a killed `job` down, deleting its partial output when
     /// `delete_files` is set.
@@ -113,6 +166,10 @@ impl<S: SessionReporter + ?Sized> SessionReporter for std::sync::Arc<S> {
         (**self).report_progress(job, progress).await;
     }
 
+    async fn report_started(&self, job: &TranscodingJobHandle, info: TranscodingInfo) {
+        (**self).report_started(job, info).await;
+    }
+
     async fn on_job_killed(
         &self,
         job: &TranscodingJobHandle,
@@ -132,6 +189,12 @@ pub struct NoopSessionReporter;
 #[async_trait]
 impl SessionReporter for NoopSessionReporter {
     async fn report_progress(&self, _job: &TranscodingJobHandle, _progress: TranscodingProgress) {}
+    async fn report_started(
+        &self,
+        _job: &TranscodingJobHandle,
+        _info: ferrofin_model::session::TranscodingInfo,
+    ) {
+    }
     async fn on_job_killed(
         &self,
         _job: &TranscodingJobHandle,
@@ -363,6 +426,8 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
             arguments,
             log_path,
             working_dir,
+            env,
+            hardware_acceleration_type,
         } = request;
 
         // Identify the job on its span (inherited by every event below) and log
@@ -403,6 +468,7 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
             working_dir,
             output_dir: directory.clone(),
             log_path,
+            env,
         };
 
         let segment_extension = segment_file_extension(state.segment_container.as_deref());
@@ -418,6 +484,14 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
         // plays so a later kill/reap log doesn't reduce to ids.
         self.register_job(handle.clone());
         self.set_job_display(&handle, &display);
+
+        // Tell the session layer what this job is, so the dashboard's transcode
+        // panel is not blank. Only meaningful with a device to attach it to.
+        if state.device_id.as_deref().is_some_and(|d| !d.is_empty()) {
+            self.reporter
+                .report_started(&handle, transcoding_info(state, hardware_acceleration_type))
+                .await;
+        }
 
         // 5. Spawn; on failure remove the job (OnTranscodeFailedToStart).
         let child = match transcoder.start_transcode(&req).await {
@@ -1156,13 +1230,27 @@ mod tests {
     }
 
     /// A reporter that records the kills it was asked to perform.
-    struct RecordingReporter {
+    pub(super) struct RecordingReporter {
         /// `(path, delete_files, close_live_stream)` per teardown.
-        killed: Mutex<Vec<(String, bool, bool)>>,
+        pub(super) killed: Mutex<Vec<(String, bool, bool)>>,
+        /// `(device_id, accelerator, video_codec)` per started job.
+        pub(super) started: Mutex<Vec<(String, super::HardwareAccelerationType, Option<String>)>>,
     }
 
     #[async_trait]
     impl SessionReporter for RecordingReporter {
+        async fn report_started(
+            &self,
+            job: &TranscodingJobHandle,
+            info: ferrofin_model::session::TranscodingInfo,
+        ) {
+            self.started.lock().unwrap().push((
+                job.device_id.clone().unwrap_or_default(),
+                info.hardware_acceleration_type
+                    .unwrap_or(super::HardwareAccelerationType::none),
+                info.video_codec,
+            ));
+        }
         async fn report_progress(
             &self,
             _job: &TranscodingJobHandle,
@@ -1186,6 +1274,7 @@ mod tests {
     async fn kill_notifies_reporter_with_delete_flag() {
         let reporter = Arc::new(RecordingReporter {
             killed: Mutex::new(Vec::new()),
+            started: Mutex::new(Vec::new()),
         });
         let m = TranscodeManagerImpl::new(ReporterHandle(Arc::clone(&reporter)));
         m.register_job(handle("s1", "/t/a.m3u8", TranscodingJobType::Hls, "dev1"));
@@ -1206,6 +1295,7 @@ mod tests {
         // `KillTranscodingJobs` passes `false`.
         let reporter = Arc::new(RecordingReporter {
             killed: Mutex::new(Vec::new()),
+            started: Mutex::new(Vec::new()),
         });
         let m = TranscodeManagerImpl::new(ReporterHandle(Arc::clone(&reporter)));
         let job = handle("s2", "/t/b.m3u8", TranscodingJobType::Hls, "dev2");
@@ -1223,10 +1313,17 @@ mod tests {
 
     /// Adapter so an `Arc<RecordingReporter>` satisfies the `SessionReporter`
     /// bound by value.
-    struct ReporterHandle(Arc<RecordingReporter>);
+    pub(super) struct ReporterHandle(pub(super) Arc<RecordingReporter>);
 
     #[async_trait]
     impl SessionReporter for ReporterHandle {
+        async fn report_started(
+            &self,
+            job: &TranscodingJobHandle,
+            info: ferrofin_model::session::TranscodingInfo,
+        ) {
+            self.0.report_started(job, info).await;
+        }
         async fn report_progress(&self, job: &TranscodingJobHandle, progress: TranscodingProgress) {
             self.0.report_progress(job, progress).await;
         }
@@ -1298,6 +1395,8 @@ mod start_ffmpeg_tests {
         args: Vec<String>,
     ) -> StartFfMpegRequest<'a> {
         StartFfMpegRequest {
+            env: Vec::new(),
+            hardware_acceleration_type: ferrofin_model::entities::HardwareAccelerationType::none,
             program: "ffmpeg",
             state,
             output_path,
@@ -1341,6 +1440,50 @@ mod start_ffmpeg_tests {
 
     fn manager() -> TranscodeManagerImpl<NoopSessionReporter> {
         TranscodeManagerImpl::new(NoopSessionReporter)
+    }
+
+    #[tokio::test]
+    async fn a_starting_job_publishes_itself_to_the_session_layer() {
+        // Without this the dashboard's transcode panel stays blank: the session
+        // layer can store and serve the info, but nothing produced it until the
+        // job start began reporting.
+        use ferrofin_model::entities::HardwareAccelerationType;
+        let tmp = tempfile::tempdir().unwrap();
+        let playlist = tmp.path().join("session").join("out.m3u8");
+        let fake = FakeSegmentTranscoder::new(FakeScript {
+            segment_files: vec!["out0.ts".to_owned()],
+            extra_files: vec!["out.m3u8".to_owned()],
+            ..FakeScript::default()
+        });
+        let reporter = Arc::new(super::tests::RecordingReporter {
+            killed: Mutex::new(Vec::new()),
+            started: Mutex::new(Vec::new()),
+        });
+        let m = TranscodeManagerImpl::new(super::tests::ReporterHandle(Arc::clone(&reporter)));
+
+        let mut st = state(&playlist, Some(&playlist));
+        st.output_video_codec = Some("h264".to_owned());
+        // `actual_output_video_codec` is None without a stream to describe,
+        // exactly as upstream's is.
+        st.video_stream = Some(ferrofin_model::entities_media::MediaStream {
+            codec: Some("hevc".to_owned()),
+            stream_type: ferrofin_model::entities::MediaStreamType::Video,
+            ..ferrofin_model::entities_media::MediaStream::default()
+        });
+        let mut req = ffmpeg_req(&st, &playlist, vec!["-i".to_owned(), "in.mkv".to_owned()]);
+        req.hardware_acceleration_type = HardwareAccelerationType::nvenc;
+        m.start_ffmpeg(&fake, req).await.expect("start_ffmpeg");
+
+        assert_eq!(
+            *reporter.started.lock().unwrap(),
+            vec![(
+                "dev".to_owned(),
+                HardwareAccelerationType::nvenc,
+                // The re-encode target, not the source: a copy would report
+                // `hevc` here instead.
+                Some("h264".to_owned())
+            )]
+        );
     }
 
     #[tokio::test]

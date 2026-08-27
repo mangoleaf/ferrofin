@@ -1587,9 +1587,14 @@ impl SessionManager for FerrofinSessionManager {
             }
 
             let mut dto = self.to_dto(session);
-            if !user_is_admin {
-                // Don't report hardware-acceleration detail to non-admins.
-                dto.transcoding_info = None;
+            if !user_is_admin && let Some(info) = dto.transcoding_info.as_mut() {
+                // Upstream zeroes the ACCELERATOR for non-admins and keeps the
+                // rest — a user still sees that their own stream is
+                // transcoding, and to what, just not what silicon the server
+                // owns. Dropping the whole object would hide more than
+                // Jellyfin does.
+                info.hardware_acceleration_type =
+                    Some(ferrofin_model::entities::HardwareAccelerationType::none);
             }
             result.push((dto, session.now_playing_item_id));
         }

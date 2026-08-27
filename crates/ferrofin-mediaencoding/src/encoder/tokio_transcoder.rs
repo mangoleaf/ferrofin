@@ -16,7 +16,7 @@ use std::process::Stdio;
 use async_trait::async_trait;
 use tokio::io::AsyncWriteExt as _;
 
-use super::transcoder::Transcoder;
+use super::transcoder::{ProcessOutput, Transcoder};
 
 /// The production [`Transcoder`]: spawns ffmpeg/ffprobe with `tokio::process`.
 ///
@@ -52,10 +52,12 @@ impl Transcoder for TokioTranscoder {
         arguments: &str,
         read_stderr: bool,
         test_key: Option<&str>,
-    ) -> Result<String, String> {
+        env: &[(String, String)],
+    ) -> Result<ProcessOutput, String> {
         let mut command = tokio::process::Command::new(path);
         command
             .args(split_args(arguments))
+            .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -89,7 +91,10 @@ impl Transcoder for TokioTranscoder {
         } else {
             &output.stdout
         };
-        Ok(String::from_utf8_lossy(bytes).into_owned())
+        Ok(ProcessOutput {
+            output: String::from_utf8_lossy(bytes).into_owned(),
+            success: output.status.success(),
+        })
     }
 
     async fn get_process_exit_code(&self, path: &str, arguments: &str) -> bool {
@@ -119,6 +124,49 @@ mod tests {
         })
     }
 
+    /// The environment has to reach the real child, not just the seam.
+    ///
+    /// The extractor-side test for this uses a fake transcoder, so it proves
+    /// the hand-off and nothing about the spawn; delete the `.envs()` call and
+    /// it still passes. This one spawns a process and reads back what it saw.
+    /// It matters because the variable carried here is the libva driver
+    /// selection: an i965 host that loses it silently runs on iHD.
+    #[tokio::test]
+    async fn the_child_process_receives_the_environment() {
+        use super::TokioTranscoder;
+        use crate::encoder::Transcoder as _;
+
+        let run = TokioTranscoder::new()
+            .get_process_output(
+                "sh",
+                r#"-c "printf %s \"$LIBVA_DRIVER_NAME\"""#,
+                false,
+                None,
+                &[("LIBVA_DRIVER_NAME".to_owned(), "i965".to_owned())],
+            )
+            .await
+            .expect("sh runs");
+        assert_eq!(run.output, "i965");
+        assert!(run.success);
+    }
+
+    /// A non-zero exit is reported as such, not folded into the output.
+    ///
+    /// The trickplay retry keys on this: ffmpeg that dies partway exits
+    /// non-zero having already written frames, so "produced output" and
+    /// "succeeded" have to stay separable.
+    #[tokio::test]
+    async fn a_non_zero_exit_is_reported_as_failure() {
+        use super::TokioTranscoder;
+        use crate::encoder::Transcoder as _;
+
+        let run = TokioTranscoder::new()
+            .get_process_output("sh", r#"-c "exit 3""#, false, None, &[])
+            .await
+            .expect("sh runs");
+        assert!(!run.success, "exit 3 is a failure");
+    }
+
     /// The scheduled-task cancel path is `JoinHandle::abort`, i.e. the future
     /// running the child is dropped. The child must die with it — otherwise a
     /// stopped trickplay task leaves its ffmpeg burning CPU to completion
@@ -136,7 +184,7 @@ mod tests {
             let marker = marker.clone();
             async move {
                 TokioTranscoder
-                    .get_process_output("sleep", &marker, false, None)
+                    .get_process_output("sleep", &marker, false, None, &[])
                     .await
             }
         });

@@ -574,7 +574,7 @@ fn source_etag(item: &BaseItemEntity) -> String {
 
 /// Maps a persisted media-stream row to the wire [`MediaStream`] DTO. Fields the
 /// entity does not carry are left at their [`Default`].
-fn stream_to_dto(row: MediaStreamInfoEntity) -> MediaStream {
+pub(crate) fn stream_to_dto(row: MediaStreamInfoEntity) -> MediaStream {
     let mut stream = MediaStream {
         index: i32::try_from(row.stream_index).unwrap_or(0),
         stream_type: media_stream_type_from_disc(row.stream_type),

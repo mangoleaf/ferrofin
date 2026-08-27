@@ -523,6 +523,7 @@ pub async fn build_app_state(
                 // path comes from `ServerApplicationPaths` so the chapter-image
                 // task's pre-flight probes the same directory this writes to.
                 temp_dir: std::path::PathBuf::from(paths.temp_path()),
+                ffmpeg_version: ffmpeg.capabilities.ffmpeg_version(),
             },
         ));
 
@@ -601,10 +602,22 @@ pub async fn build_app_state(
         Arc::clone(&path_manager),
         Arc::clone(&config_trait),
         Arc::clone(&item_repository),
-        Arc::new(TrickplayFrameExtractorImpl::new(
-            Arc::new(TokioTranscoder::new()),
-            ffmpeg.ffmpeg.to_string_lossy().into_owned(),
-        )),
+        Arc::clone(&media_stream_repository),
+        Arc::new(
+            TrickplayFrameExtractorImpl::new(
+                Arc::new(TokioTranscoder::new()),
+                ffmpeg.ffmpeg.to_string_lossy().into_owned(),
+                ffmpeg.capabilities.ffmpeg_version(),
+            )
+            // Trickplay decodes a whole file to produce a handful of frames,
+            // which is what a GPU is for and what makes a library-wide pass
+            // take hours in software. Gated by the dashboard's trickplay
+            // "hardware acceleration" switch, not the playback one.
+            .with_hardware(
+                Arc::new(ffmpeg.capabilities.clone()),
+                Arc::clone(&config_trait),
+            ),
+        ),
         Arc::new(ImageCrateEncoder::new()),
     ));
     let trickplay: Arc<dyn ferrofin_traits::trickplay::TrickplayManager> = trickplay_impl.clone();
@@ -1713,8 +1726,7 @@ mod tests {
         let ffmpeg = FfmpegPaths {
             ffmpeg: PathBuf::from("ffmpeg"),
             ffprobe: PathBuf::from("ffprobe"),
-            filters: Vec::new(),
-            encoders: Vec::new(),
+            capabilities: ferrofin_mediaencoding::FfmpegCapabilities::default(),
             chromaprint_muxer: false,
         };
         let (tx, _rx) = tokio::sync::oneshot::channel();

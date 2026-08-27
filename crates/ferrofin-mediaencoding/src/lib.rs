@@ -3,9 +3,15 @@
 //!
 //! Implements the `ferrofin-traits` `MediaEncoder` / `TranscodeManager` /
 //! `SubtitleEncoder` / `AttachmentExtractor` traits. The actual process spawn
-//! sits behind a `Transcoder` trait so unit tests use a fake. The full
-//! hardware-acceleration matrix (nvenc/qsv/vaapi/videotoolbox) and BdInfo are
-//! deferred; core software transcode + ffprobe parsing are ported.
+//! sits behind a `Transcoder` trait so unit tests use a fake.
+//!
+//! Ported: the software transcode path, ffprobe parsing, subtitle/attachment
+//! extraction, and the hardware environment probe ([`encoding_helper::hw`]).
+//! The hardware argument builders themselves — device-init graphs, hardware
+//! decoder selection, tonemapping, and the per-vendor filter chains — are the
+//! named work items of `brain/plans/PLAN_HWACCEL.md`. Blu-ray (`BdInfo`) is
+//! tracked separately as an open work item in that plan; it belongs to
+//! disc-image playback rather than to encoding, so it needs its own plan.
 
 pub mod analysis;
 pub mod attachments;
@@ -27,11 +33,16 @@ pub use configuration::{
     DirChecker, EncodingConfigurationFactory, EncodingConfigurationStore, RealDirChecker,
 };
 pub use encoder::{
-    MediaEncoderConfig, MediaEncoderImpl, TokioTranscoder, Transcoder, TrickplayFrameExtractorImpl,
+    EncoderValidator, FfmpegVersion, MediaEncoderConfig, MediaEncoderImpl, TokioTranscoder,
+    Transcoder, TrickplayFrameExtractorImpl,
+};
+pub use encoding_helper::hw::{
+    BsfOption, FfmpegCapabilities, FfmpegCapabilitiesBuilder, FilterOption, Platform,
+    parse_os_release,
 };
 pub use encoding_helper::{
     BaseEncodingJobOptions, EncoderCapabilities, EncodingHelper, EncodingJobInfo,
-    NoOptionalEncoders, ProbedEncoders, TranscodeDisplayNames,
+    NoOptionalEncoders, TranscodeDisplayNames,
 };
 pub use subtitles::{SubtitleEncoder, SubtitleEncoderImpl, SubtitleIo};
 pub use transcoding::{

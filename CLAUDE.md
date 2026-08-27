@@ -293,6 +293,15 @@ The real remaining gaps are **by design**, not un-ported routes:
   (`FERROFIN_WASM_GUEST_TESTS=1`).
 - **DLNA server discovery (SSDP)** — Ferrofin has the profile/StreamBuilder logic but no
   SSDP broadcast/discovery.
+- **Hardware transcoding is NVENC, VAAPI and QSV only.** AMF (AMD on Windows),
+  VideoToolbox (macOS), RKMPP (Rockchip) and V4L2M2M are **not supported** — an owner
+  decision (2026-08-26), not an un-ported route: their filter chains cannot be verified
+  without the hardware to run them on, and an unverified hardware pipeline is how you
+  ship silent green frames or a wedged GPU. Selecting one of them is safe — the job
+  falls back to a full software transcode — and the server logs a warning naming the
+  supported set, so an idle GPU is never a silent mystery. Supporting one means porting
+  its chain **and** its `GetEncoderParam`/`GetVideoBitrateParam` arms, verifying on real
+  hardware, and adding it to `hardware_path_is_ported`.
 - **OMDb** ships compiled in but **inert without an API key** (`FERROFIN_OMDB_KEY` /
   config `omdb_api_key`). Every other remote provider (TMDB/TVDB/MusicBrainz/AudioDb/
   fanart/Studio Images) is on by default with a built-in key, gated per library by the

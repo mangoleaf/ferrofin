@@ -13,7 +13,13 @@ use std::sync::OnceLock;
 
 use anyhow::Context as _;
 use ferrofin_db::Database;
-use ferrofin_mediaencoding::encoder::EncoderValidator;
+use ferrofin_mediaencoding::encoder::{
+    EncoderValidator, FfmpegVersion, bsf_option_probe, filter_option_probe,
+};
+use ferrofin_mediaencoding::{
+    BsfOption, EncoderCapabilities as _, FfmpegCapabilities, FilterOption, Platform,
+    parse_os_release,
+};
 use opentelemetry::KeyValue;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::WithExportConfig as _;
@@ -39,14 +45,15 @@ pub struct FfmpegPaths {
     pub ffmpeg: PathBuf,
     /// The validated `ffprobe` executable path.
     pub ffprobe: PathBuf,
-    /// The filter names the validated ffmpeg reported via `-filters` (empty
-    /// when the probe failed). Gates capability-specific arguments like the
-    /// jellyfin-ffmpeg-only `tonemapx` software tonemap.
-    pub filters: Vec<String>,
-    /// The encoder names the validated ffmpeg reported via `-encoders` (empty
-    /// when the probe failed). Gates encoder selection like preferring
-    /// `libfdk_aac` over native `aac`.
-    pub encoders: Vec<String>,
+    /// Everything the startup probe round learned about this ffmpeg and the
+    /// machine under it: the encoder/decoder/filter/hwaccel lists, the
+    /// filter and bitstream-filter option probes, the detected ffmpeg version,
+    /// the OS, and the kernel version.
+    ///
+    /// This is what the whole hardware-acceleration matrix reads. A probe that
+    /// failed contributes "absent", so a broken or minimal ffmpeg degrades to
+    /// software rather than producing arguments it cannot honour.
+    pub capabilities: FfmpegCapabilities,
     /// Whether the validated ffmpeg reports a `chromaprint` muxer (`-muxers`).
     ///
     /// Probed here, in the same concurrent round as `-filters`/`-encoders`, so
@@ -62,14 +69,14 @@ impl FfmpegPaths {
     /// `IMediaEncoder.SupportsFilter`.
     #[must_use]
     pub fn supports_filter(&self, name: &str) -> bool {
-        self.filters.iter().any(|f| f == name)
+        self.capabilities.supports_filter(name)
     }
 
     /// Whether the validated ffmpeg reports the encoder `name`. Port of
     /// `IMediaEncoder.SupportsEncoder`.
     #[must_use]
     pub fn supports_encoder(&self, name: &str) -> bool {
-        self.encoders.iter().any(|e| e == name)
+        self.capabilities.supports_encoder(name)
     }
 }
 
@@ -425,10 +432,41 @@ fn spawn_pool_sampler(db: &Database) {
 /// 3. `ffmpeg` resolved on `$PATH`.
 ///
 /// The chosen candidate is validated by running `<candidate> -version` and
-/// requiring exit `0` plus output beginning `ffmpeg version` (a First-Light
-/// smoke check — full decoder/encoder/hwaccel enumeration is deferred). The
-/// ffprobe path is `config.ffprobe_path` if set, else the ffmpeg basename with
-/// `ffmpeg` replaced by `ffprobe`; it is `-version`-validated the same way.
+/// requiring exit `0` plus output beginning `ffmpeg version`. The ffprobe path
+/// is `config.ffprobe_path` if set, else the ffmpeg basename with `ffmpeg`
+/// replaced by `ffprobe`; it is `-version`-validated the same way.
+///
+/// Alongside validation this runs the whole capability probe round — the
+/// enumerations (`-encoders`, `-decoders`, `-filters`, `-hwaccels`, `-muxers`),
+/// the per-filter and per-bitstream-filter option help pages, and the
+/// `-hwaccel_flags +low_priority` acceptance check — and folds them, the
+/// detected ffmpeg version, the OS, and the OS version into one
+/// [`FfmpegCapabilities`]. Port of the *enumeration* half of
+/// `MediaEncoder.SetFFmpegPath`.
+///
+/// Three probes `SetFFmpegPath` also runs are **not** here, each for a stated
+/// reason rather than for want of doing:
+///
+/// - The VAAPI driver-name and Vulkan DRM-extension probes need the configured
+///   render node, `EncodingOptions.vaapi_device`. That lives in the encoding
+///   configuration store (`{config_dir}/named/encoding.json`), which no one has
+///   read at this point in boot — `discover_ffmpeg` sees only [`Config`], and
+///   the configuration manager is not built until `build_app_state` — and it is
+///   mutable at runtime from the dashboard, so a value captured here could go
+///   stale. [`crate::vaapi_probe`] therefore probes them lazily, once per
+///   device path, at the point of first VAAPI use. **That spawn has landed**;
+///   what is still outstanding is wiring its result into the planner, which
+///   arrives with the VAAPI filter chains in `PLAN_HWACCEL.md` phase 4b. Until
+///   then `is_vaapi_device_*` and `vaapi_vulkan_*` read `false` on the planning
+///   path — moot for now, since VAAPI is gated out of the hardware path
+///   entirely.
+/// - The VideoToolbox AV1-decode probe is not an ffmpeg spawn at all: upstream
+///   asks macOS directly through Objective-C. It belongs to `PLAN_HWACCEL.md`
+///   phase 6, alongside reading the macOS release in [`read_os_version`].
+///
+/// `SetFFmpegPath`'s `CheckSupportedRuntimeKey` (the transcode-throttle pause
+/// key) and `CheckSupportedProberOption` calls are outside the hardware matrix
+/// and are recorded as numbered work items in `brain/plans/PLAN_HWACCEL.md`.
 ///
 /// # Errors
 ///
@@ -445,20 +483,27 @@ pub async fn discover_ffmpeg(
         None => derive_ffprobe_path(&ffmpeg),
     };
 
-    // All five probes are independent `-version`/capability reads of an already
-    // resolved path, so they run CONCURRENTLY: each ffmpeg spawn costs 30-60 ms
-    // and running them in series was 108 ms of a 188 ms cold start (58%),
-    // measured on a 9862-item library. Nothing is skipped — the same two
-    // validations still gate boot, and their errors are still reported
-    // ffmpeg-first, which is the order a sequential run produced.
-    let (ffmpeg_ok, ffprobe_ok, filters, encoders, chromaprint_muxer) = tokio::join!(
-        validate_binary(&ffmpeg, "ffmpeg"),
-        validate_binary(&ffprobe, "ffprobe"),
-        probe_list(&ffmpeg, "-filters", EncoderValidator::get_filters_internal),
-        probe_list(&ffmpeg, "-encoders", EncoderValidator::get_codecs_internal),
-        probe_has(&ffmpeg, "-muxers", "chromaprint"),
-    );
-    ffmpeg_ok.with_context(|| format!("ffmpeg validation failed (resolved via {method})"))?;
+    // Every probe is an independent read of an already resolved path, so they
+    // run CONCURRENTLY: each ffmpeg spawn costs 30-60 ms and running them in
+    // series was 108 ms of a 188 ms cold start (58%), measured on a 9862-item
+    // library. Nothing is skipped — the same two validations still gate boot,
+    // and their errors are still reported ffmpeg-first, which is the order a
+    // sequential run produced.
+    let (
+        ffmpeg_version,
+        ffprobe_ok,
+        filters,
+        encoders,
+        decoders,
+        hwaccels,
+        chromaprint_muxer,
+        filter_options,
+        bsf_options,
+        low_priority_hwaccel_flag,
+        os_version,
+    ) = Box::pin(probe_round(&ffmpeg, &ffprobe)).await;
+    let ffmpeg_version = ffmpeg_version
+        .with_context(|| format!("ffmpeg validation failed (resolved via {method})"))?;
     ffprobe_ok.with_context(|| {
         format!(
             "ffprobe validation failed (derived from `{}`)",
@@ -466,23 +511,244 @@ pub async fn discover_ffmpeg(
         )
     })?;
 
+    let mut builder = FfmpegCapabilities::builder()
+        .filters(filters)
+        .encoders(encoders)
+        .decoders(decoders)
+        .hwaccels(hwaccels)
+        .platform(Platform::current())
+        // `RuntimeInformation.OSArchitecture == Arm64`; only the Apple Silicon
+        // VideoToolbox decode branches read it.
+        .arm64(std::env::consts::ARCH == "aarch64")
+        .low_priority_hwaccel_flag(low_priority_hwaccel_flag);
+    if let Some(version) = ffmpeg_version {
+        builder = builder.ffmpeg_version(version);
+    }
+    if let Some(version) = os_version {
+        builder = builder.os_version(version);
+    }
+    for (option, supported) in FilterOption::ALL.into_iter().zip(filter_options) {
+        builder = builder.filter_option(option, supported);
+    }
+    for (option, supported) in BsfOption::ALL.into_iter().zip(bsf_options) {
+        builder = builder.bsf_option(option, supported);
+    }
+    let capabilities = builder.build();
+
     tracing::info!(
         ffmpeg = %ffmpeg.display(),
         ffprobe = %ffprobe.display(),
-        filters = filters.len(),
-        encoders = encoders.len(),
-        tonemapx = filters.iter().any(|f| f == "tonemapx"),
-        libfdk_aac = encoders.iter().any(|e| e == "libfdk_aac"),
+        version = ?capabilities.ffmpeg_version(),
+        os_version = ?capabilities.os_version(),
+        platform = ?capabilities.platform(),
+        tonemapx = capabilities.supports_filter("tonemapx"),
+        libfdk_aac = capabilities.supports_encoder("libfdk_aac"),
         chromaprint_muxer,
         "media encoder ready"
     );
+    // The full capability set is a debug-level detail: it is fixed for the
+    // lifetime of the process and only matters when diagnosing why a hardware
+    // path was not taken.
+    tracing::debug!(capabilities = ?capabilities, "media encoder capabilities");
     Ok(FfmpegPaths {
         ffmpeg,
         ffprobe,
-        filters,
-        encoders,
+        capabilities,
         chromaprint_muxer,
     })
+}
+
+/// Runs the whole startup probe round against an already-resolved pair of
+/// binaries, concurrently.
+///
+/// Split out and awaited behind a `Box::pin` so the eleven concurrent probe
+/// futures live on the heap for the moment they run, rather than inflating the
+/// state machine of every enclosing future up to `run()`. The probes are
+/// boot-only; one allocation is cheaper than carrying their combined size in
+/// the server's top-level future for the whole process lifetime.
+#[allow(
+    clippy::type_complexity,
+    reason = "a one-shot boot tuple destructured immediately at its single call \
+              site; naming a struct for it would add no clarity"
+)]
+async fn probe_round(
+    ffmpeg: &Path,
+    ffprobe: &Path,
+) -> (
+    anyhow::Result<Option<FfmpegVersion>>,
+    anyhow::Result<Option<FfmpegVersion>>,
+    Vec<String>,
+    Vec<String>,
+    Vec<String>,
+    Vec<String>,
+    bool,
+    [bool; FilterOption::ALL.len()],
+    [bool; BsfOption::ALL.len()],
+    bool,
+    Option<FfmpegVersion>,
+) {
+    tokio::join!(
+        validate_binary(ffmpeg, "ffmpeg"),
+        validate_binary(ffprobe, "ffprobe"),
+        probe_list(ffmpeg, "-filters", EncoderValidator::get_filters_internal),
+        probe_list(ffmpeg, "-encoders", EncoderValidator::get_encoders_internal),
+        probe_list(ffmpeg, "-decoders", EncoderValidator::get_decoders_internal),
+        probe_list(ffmpeg, "-hwaccels", EncoderValidator::get_hwaccels_internal),
+        probe_has(ffmpeg, "-muxers", "chromaprint"),
+        probe_filter_options(ffmpeg),
+        probe_bsf_options(ffmpeg),
+        probe_hwaccel_flag(ffmpeg, "low_priority"),
+        read_os_version(),
+    )
+}
+
+/// Runs the `-h filter=<name>` help page for every filter a [`FilterOption`]
+/// asks about, concurrently, and resolves each option from its page.
+///
+/// Port of `EncoderValidator.GetFiltersWithOption`. Upstream spawns ffmpeg once
+/// per *option*; several options share a filter (`overlay_opencl` and
+/// `overlay_cuda` are each asked two questions), so this spawns once per
+/// distinct *filter* and answers every question from that one page. Same
+/// answers, fewer processes on the startup path.
+async fn probe_filter_options(ffmpeg: &Path) -> [bool; FilterOption::ALL.len()] {
+    let pages = probe_help_pages(
+        ffmpeg,
+        "filter",
+        FilterOption::ALL.map(|option| filter_option_probe(option).0),
+    )
+    .await;
+    FilterOption::ALL.map(|option| {
+        let (filter, want) = filter_option_probe(option);
+        pages.get(filter).is_some_and(|page| {
+            EncoderValidator::check_filter_with_option_internal(page, filter, want)
+        })
+    })
+}
+
+/// Runs the `-h bsf=<name>` help page for every bitstream filter a
+/// [`BsfOption`] asks about, concurrently, and resolves each option from its
+/// page. Port of `EncoderValidator.GetBitStreamFiltersWithOption`.
+async fn probe_bsf_options(ffmpeg: &Path) -> [bool; BsfOption::ALL.len()] {
+    let pages = probe_help_pages(
+        ffmpeg,
+        "bsf",
+        BsfOption::ALL.map(|option| bsf_option_probe(option).0),
+    )
+    .await;
+    BsfOption::ALL.map(|option| {
+        let (filter, want) = bsf_option_probe(option);
+        pages.get(filter).is_some_and(|page| {
+            EncoderValidator::check_bsf_with_option_internal(page, filter, want)
+        })
+    })
+}
+
+/// Captures `ffmpeg -h <kind>=<name>` for each distinct `name`, concurrently.
+///
+/// A name whose probe fails is simply absent from the map, which reads as
+/// "option not supported" — the same catch-and-assume-none contract the other
+/// capability probes use.
+async fn probe_help_pages(
+    ffmpeg: &Path,
+    kind: &'static str,
+    names: impl IntoIterator<Item = &'static str>,
+) -> std::collections::HashMap<&'static str, String> {
+    let mut distinct: Vec<&'static str> = Vec::new();
+    for name in names {
+        if !distinct.contains(&name) {
+            distinct.push(name);
+        }
+    }
+
+    let mut set = tokio::task::JoinSet::new();
+    for name in distinct {
+        let ffmpeg = ffmpeg.to_path_buf();
+        set.spawn(async move {
+            let output = tokio::process::Command::new(&ffmpeg)
+                .args(["-hide_banner", "-h", &format!("{kind}={name}")])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .await;
+            // `-h` exits 0 even for an unknown filter (it prints generic help),
+            // so the status is not the signal here — the page content is, and
+            // the pure check requires the page to name what was asked about.
+            let page = match output {
+                Ok(out) => String::from_utf8_lossy(&out.stdout).into_owned(),
+                Err(e) => {
+                    tracing::debug!(error = %e, kind, name, "error running ffmpeg help probe");
+                    return None;
+                }
+            };
+            Some((name, page))
+        });
+    }
+
+    let mut pages = std::collections::HashMap::new();
+    while let Some(joined) = set.join_next().await {
+        match joined {
+            Ok(Some((name, page))) => {
+                pages.insert(name, page);
+            }
+            Ok(None) => {}
+            Err(e) => tracing::debug!(error = %e, kind, "ffmpeg help probe task failed"),
+        }
+    }
+    pages
+}
+
+/// Whether ffmpeg accepts `-hwaccel_flags +<flag>`, decided by exit status on a
+/// one-pixel null encode. Port of `EncoderValidator.CheckSupportedHwaccelFlag`.
+async fn probe_hwaccel_flag(ffmpeg: &Path, flag: &str) -> bool {
+    let status = tokio::process::Command::new(ffmpeg)
+        .args([
+            "-loglevel",
+            "quiet",
+            "-hwaccel_flags",
+            &format!("+{flag}"),
+            "-hide_banner",
+            "-f",
+            "lavfi",
+            "-i",
+            "nullsrc=s=1x1:d=100",
+            "-f",
+            "null",
+            "-",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await;
+    match status {
+        Ok(status) => status.success(),
+        Err(e) => {
+            tracing::debug!(error = %e, flag, "error probing ffmpeg hwaccel flag");
+            false
+        }
+    }
+}
+
+/// Reads the operating system's version. Port of `Environment.OSVersion.Version`.
+///
+/// Linux only for now: the kernel release from `/proc/sys/kernel/osrelease`,
+/// which is what the i915 hang workaround and the AMD VAAPI/Vulkan interop gate
+/// consult. `None` when the file cannot be read, which fails both gates — the
+/// same outcome .NET reaches from its unparseable-release `0.0.0.0`.
+///
+/// **Open work item (PLAN_HWACCEL phase 6):** on macOS this must return the
+/// macOS release, because `GetHardwareVideoDecoder` gates H.264 Hi10P
+/// VideoToolbox decoding on `>= 14.6`. Until that lands a Mac reports `None`
+/// and so declines Hi10P hardware decoding — correct, but conservative.
+async fn read_os_version() -> Option<FfmpegVersion> {
+    if !Platform::current().is_linux() {
+        return None;
+    }
+    let release = tokio::fs::read_to_string("/proc/sys/kernel/osrelease")
+        .await
+        .ok()?;
+    Some(parse_os_release(release.trim()))
 }
 
 /// Whether `ffmpeg <flag>` output contains `needle`.
@@ -502,23 +768,31 @@ async fn probe_has(ffmpeg: &Path, flag: &str, needle: &str) -> bool {
     match output {
         Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).contains(needle),
         Ok(out) => {
-            tracing::warn!(status = %out.status, flag, "ffmpeg capability probe failed; assuming none");
+            tracing::debug!(status = %out.status, flag, "ffmpeg capability probe failed; assuming none");
             false
         }
         Err(e) => {
-            tracing::warn!(error = %e, flag, "error running ffmpeg capability probe");
+            tracing::debug!(error = %e, flag, "error running ffmpeg capability probe");
             false
         }
     }
 }
 
-/// Captures `ffmpeg <flag>` (`-filters` / `-encoders`) and parses the names.
+/// Captures `ffmpeg <flag>` and parses the names it lists.
 ///
-/// Port of `EncoderValidator.GetFFmpegFilters` / `GetCodecs` (the process
-/// half; the parses are the `EncoderValidator::get_*_internal` pure fns). A
-/// probe failure is not fatal — capability-gated arguments are simply skipped —
-/// so errors log and return an empty list, matching the C#
-/// catch-and-return-empty.
+/// Every probe here uses `Command::output()` / `status()`, which drain stdout
+/// and stderr concurrently. This is a deliberate mechanism divergence from C#
+/// `EncoderValidator.GetProcessOutput`, which reads only one of the two pipes
+/// and can therefore deadlock if a probe fills the other pipe's buffer. The
+/// decisions taken from the captured text are identical; only the way it is
+/// captured differs.
+///
+/// Drives all four enumerations — `-filters`, `-encoders`, `-decoders`,
+/// `-hwaccels` — with the matching `EncoderValidator::get_*_internal` parser.
+/// Port of the process half of `EncoderValidator.GetFFmpegFilters` /
+/// `GetCodecs` / `GetHwaccelTypes`. A probe failure is not fatal —
+/// capability-gated arguments are simply skipped — so errors log and return an
+/// empty list, matching the C# catch-and-return-empty.
 async fn probe_list(ffmpeg: &Path, flag: &str, parse: fn(&str) -> Vec<String>) -> Vec<String> {
     let output = tokio::process::Command::new(ffmpeg)
         .args(["-hide_banner", flag])
@@ -530,11 +804,11 @@ async fn probe_list(ffmpeg: &Path, flag: &str, parse: fn(&str) -> Vec<String>) -
     match output {
         Ok(out) if out.status.success() => parse(&String::from_utf8_lossy(&out.stdout)),
         Ok(out) => {
-            tracing::warn!(status = %out.status, flag, "ffmpeg capability probe failed; assuming none");
+            tracing::debug!(status = %out.status, flag, "ffmpeg capability probe failed; assuming none");
             Vec::new()
         }
         Err(e) => {
-            tracing::warn!(error = %e, flag, "error running ffmpeg capability probe");
+            tracing::debug!(error = %e, flag, "error running ffmpeg capability probe");
             Vec::new()
         }
     }
@@ -604,7 +878,8 @@ fn which_in(program: &str, path_var: Option<&std::ffi::OsStr>) -> Option<PathBuf
     })
 }
 
-/// Runs `<binary> -version` and asserts it is a genuine ffmpeg-family tool.
+/// Runs `<binary> -version`, asserts it is a genuine ffmpeg-family tool, and
+/// returns the version it reported.
 ///
 /// Requires exit status `0` and stdout beginning with `<expected_prefix> version`
 /// (e.g. `ffmpeg version` / `ffprobe version`), matching the `EncoderValidator`
@@ -612,11 +887,19 @@ fn which_in(program: &str, path_var: Option<&std::ffi::OsStr>) -> Option<PathBuf
 /// [`EncoderValidator::validate_version_internal`] so an out-of-range or avconv
 /// build is rejected the same way the runtime validator would.
 ///
+/// The parsed version comes from the same captured output, so learning it costs
+/// no extra spawn. It is `None` only for a build that validated on its library
+/// versions alone without naming a version — every version gate then reads as
+/// unmet, which is the conservative direction.
+///
 /// # Errors
 ///
 /// Returns an error if the process cannot be spawned, exits non-zero, or its
 /// output is not recognised as a supported ffmpeg-family version.
-async fn validate_binary(binary: &Path, expected_prefix: &str) -> anyhow::Result<()> {
+async fn validate_binary(
+    binary: &Path,
+    expected_prefix: &str,
+) -> anyhow::Result<Option<FfmpegVersion>> {
     let output = tokio::process::Command::new(binary)
         .arg("-version")
         .stdin(Stdio::null())
@@ -650,7 +933,7 @@ async fn validate_binary(binary: &Path, expected_prefix: &str) -> anyhow::Result
         binary.display(),
         ferrofin_mediaencoding::encoder::MIN_VERSION
     );
-    Ok(())
+    Ok(validator.get_ffmpeg_version_internal(&stdout))
 }
 
 #[cfg(test)]
@@ -998,20 +1281,41 @@ mod tests {
         // First line satisfies our `<tool> version` prefix check; the `libav*`
         // lines satisfy `EncoderValidator`'s library-version cross-check for the
         // `ffprobe` banner (whose first line the `^ffmpeg version` regex skips).
-        // `-filters` / `-encoders` invocations instead answer with tiny
-        // capability tables so `probe_list` has something to parse.
+        // The capability flags instead answer with tiny tables so each probe in
+        // the startup round has something real to parse. Anything not matched
+        // falls through to the version banner, which is what an ffmpeg without
+        // that capability effectively produces for our purposes.
         let script = format!(
             "#!/bin/sh\n\
              if [ \"$2\" = -filters ]; then cat <<'EOF'\nFilters:\n\
              \x20 T.. = Timeline support\n\
              \x20T.C scale             V->V       Scale the input video size.\n\
              \x20... tonemapx          V->V       HDR to SDR tonemapping (SIMD).\n\
+             \x20... alphasrc          |->V       Provide an alpha channel source.\n\
+             \x20..C overlay_cuda      VV->V      Overlay one video on top of another using CUDA.\n\
              EOF\nexit 0; fi\n\
              if [ \"$2\" = -encoders ]; then cat <<'EOF'\nEncoders:\n\
              \x20A..... = Audio\n\
              \x20------\n\
              \x20A....D aac                  AAC (Advanced Audio Coding)\n\
              \x20A....D libfdk_aac           Fraunhofer FDK AAC (codec aac)\n\
+             \x20V....D h264_nvenc           NVIDIA NVENC H.264 encoder (codec h264)\n\
+             EOF\nexit 0; fi\n\
+             if [ \"$2\" = -decoders ]; then cat <<'EOF'\nDecoders:\n\
+             \x20V..... = Video\n\
+             \x20------\n\
+             \x20V....D h264_cuvid           Nvidia CUVID H264 decoder (codec h264)\n\
+             EOF\nexit 0; fi\n\
+             if [ \"$2\" = -hwaccels ]; then cat <<'EOF'\nHardware acceleration methods:\ncuda\nvaapi\n\
+             EOF\nexit 0; fi\n\
+             if [ \"$2\" = quiet ]; then\n\
+             \x20 if [ \"$4\" = +low_priority ]; then exit 1; else exit 0; fi\n\
+             fi\n\
+             if [ \"$3\" = filter=overlay_cuda ]; then cat <<'EOF'\nFilter overlay_cuda\n\
+             \x20 alpha_format <int> ..FV..... alpha format (default straight)\n\
+             EOF\nexit 0; fi\n\
+             if [ \"$3\" = bsf=hevc_metadata ]; then cat <<'EOF'\nBit stream filter hevc_metadata\n\
+             \x20 remove_dovi <boolean> ....... Remove Dolby Vision metadata\n\
              EOF\nexit 0; fi\n\
              cat <<'EOF'\n{banner_tool} version 6.1.1 Copyright (c) 2000-2023\n\
              libavutil      58. 29.100\nlibavcodec     60. 31.102\nlibavformat    60. 16.100\n\
@@ -1040,12 +1344,53 @@ mod tests {
             .expect("discovery succeeds");
         assert_eq!(paths.ffmpeg, ffmpeg);
         assert_eq!(paths.ffprobe, tmp.path().join("ffprobe"));
-        // The `-filters` / `-encoders` probes parsed the fake's tables.
+        // Every leg of the capability round parsed the fake's tables.
+        let caps = &paths.capabilities;
         assert!(paths.supports_filter("tonemapx"));
-        assert!(paths.supports_filter("scale"));
+        assert!(paths.supports_filter("alphasrc"));
+        // `scale` parses but is not on the allowlist, so it reads as absent —
+        // the same intersection C# applies.
+        assert!(!paths.supports_filter("scale"));
         assert!(!paths.supports_filter("tonemap_cuda"));
         assert!(paths.supports_encoder("libfdk_aac"));
+        assert!(paths.supports_encoder("h264_nvenc"));
         assert!(!paths.supports_encoder("aac_at"));
+        // Decoders come from `-decoders`, not `-encoders`: an encoder-only name
+        // must not leak into the decoder list or the reverse.
+        assert!(caps.supports_decoder("h264_cuvid"));
+        assert!(!caps.supports_decoder("h264_nvenc"));
+        assert!(!paths.supports_encoder("h264_cuvid"));
+        assert!(caps.supports_hwaccel("cuda"));
+        assert!(caps.supports_hwaccel("vaapi"));
+        assert!(!caps.supports_hwaccel("qsv"));
+        // The `-h filter=`/`-h bsf=` help pages resolved their options, and an
+        // option whose page was never produced stays false.
+        assert!(caps.supports_filter_with_option(FilterOption::OverlayCudaAlphaFormat));
+        assert!(!caps.supports_filter_with_option(FilterOption::ScaleCudaFormat));
+        assert!(caps.supports_bsf_with_option(BsfOption::HevcMetadataRemoveDovi));
+        assert!(!caps.supports_bsf_with_option(BsfOption::HevcMetadataRemoveHdr10Plus));
+        assert!(!caps.supports_bsf_with_option(BsfOption::DoviRpuStrip));
+        // The version came off the same `-version` output that gated boot.
+        assert_eq!(
+            caps.ffmpeg_version(),
+            Some(ferrofin_mediaencoding::encoder::FfmpegVersion::with_build(
+                6, 1, 1
+            ))
+        );
+        // `-hwaccel_flags +low_priority` is decided by exit status, not output.
+        // The fake refuses exactly that flag and accepts anything else, so a
+        // false reading here is the ONLY way to pass: an inverted status check,
+        // a mistyped flag, or a probe that stopped running (and so fell through
+        // to the version banner's exit 0) all report true and fail this.
+        assert!(!caps.low_priority_hwaccel_flag());
+        // Populated from the host rather than left at the "nothing probed"
+        // default; on Linux the OS version is read too.
+        assert_eq!(caps.platform(), Platform::current());
+        assert_eq!(
+            caps.os_version().is_some(),
+            cfg!(target_os = "linux"),
+            "the OS version is read on Linux and, until phase 6, nowhere else"
+        );
     }
 
     #[cfg(unix)]

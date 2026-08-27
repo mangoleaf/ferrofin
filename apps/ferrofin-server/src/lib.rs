@@ -25,6 +25,7 @@ pub mod metrics_wiring;
 pub mod planner;
 pub mod seed;
 pub mod state;
+pub mod vaapi_probe;
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -123,8 +124,7 @@ fn encoder_or_disabled(discovered: anyhow::Result<FfmpegPaths>) -> FfmpegPaths {
             FfmpegPaths {
                 ffmpeg: "ffmpeg".into(),
                 ffprobe: "ffprobe".into(),
-                filters: Vec::new(),
-                encoders: Vec::new(),
+                capabilities: ferrofin_mediaencoding::FfmpegCapabilities::default(),
                 chromaprint_muxer: false,
             }
         }

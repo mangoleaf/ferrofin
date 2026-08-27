@@ -41,6 +41,15 @@ pub struct SpawnRequest {
     pub output_dir: PathBuf,
     /// The `FFmpeg.Transcode-*.log` target that ffmpeg's stderr is streamed to.
     pub log_path: PathBuf,
+    /// Environment variables to set **on the ffmpeg child**, from
+    /// [`InputHwaccelArgs::env`](crate::encoding_helper::hw::input_args::InputHwaccelArgs::env).
+    ///
+    /// Some hardware paths are configured by environment rather than by
+    /// argument — the VAAPI driver selection among them — and upstream sets
+    /// these on the server process. Carrying them per-spawn instead keeps one
+    /// job's driver choice from leaking into another's, and keeps the server's
+    /// own environment untouched.
+    pub env: Vec<(String, String)>,
 }
 
 /// A live handle to a spawned transcode process.
@@ -262,6 +271,7 @@ mod tests {
 
     fn req(dir: &std::path::Path) -> SpawnRequest {
         SpawnRequest {
+            env: Vec::new(),
             program: "ffmpeg".to_owned(),
             arguments: vec!["-i".to_owned(), "in.mkv".to_owned()],
             working_dir: None,

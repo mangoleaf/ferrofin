@@ -7,9 +7,11 @@
 //! the `Extract*Image` frame grabbers, `ConvertImage`, and the tested
 //! `GetExtraArguments` User-Agent/probe oracle.
 //!
-//! The hardware-acceleration matrix, HDR tonemapping, and Blu-ray (`BdInfo`)
-//! paths are deferred (see the crate docs). Every ffmpeg/ffprobe process spawn
-//! sits behind the [`Transcoder`] seam so unit tests inject a fake.
+//! The hardware-acceleration matrix and HDR tonemapping are the work items of
+//! `brain/plans/PLAN_HWACCEL.md` (this unit gains its accelerated trickplay
+//! path in that plan's phase 9); Blu-ray (`BdInfo`) has no plan yet and belongs
+//! to disc-image playback rather than encoding. Every ffmpeg/ffprobe process
+//! spawn sits behind the [`Transcoder`] seam so unit tests inject a fake.
 
 use std::fmt::Write as _;
 use std::sync::Arc;
@@ -24,8 +26,8 @@ use ferrofin_model::media_info::{MediaInfo, MediaProtocol};
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::media_encoding::{MediaEncoder, MediaInfoRequest};
 
-use super::Transcoder;
 use super::encoding_utils::get_input_argument;
+use super::{FfmpegVersion, ProcessOutput, Transcoder};
 use crate::probing::dtos::InternalMediaInfoResult;
 use crate::probing::localization::PassthroughLocalization;
 use crate::probing::probe_result_normalizer::ProbeResultNormalizer;
@@ -54,6 +56,10 @@ pub struct MediaEncoderConfig {
     /// Must be a server-writable path: media directories are often read-only
     /// mounts, so extraction output can never go next to the input file.
     pub temp_dir: std::path::PathBuf,
+    /// The probed ffmpeg version, which decides `-fps_mode` versus the
+    /// deprecated `-vsync` (`GetVideoSyncOption`). `None` means "unprobed" and
+    /// takes `-vsync`, which every supported build still understands.
+    pub ffmpeg_version: Option<FfmpegVersion>,
 }
 
 /// The resolved ffmpeg/ffprobe binary paths.
@@ -173,7 +179,13 @@ impl<T: Transcoder> MediaEncoderImpl<T> {
     ///
     /// Port of the core of `ExtractImageInternal`: the deinterlace + scale
     /// filter chain, optional thumbnail sampling, stream `-map`, and `-ss`
-    /// offset. The HDR tonemap and image-resolution branches are deferred.
+    /// offset.
+    ///
+    /// Two branches of the C# are missing here and are tracked separately: the
+    /// HDR tonemap branch belongs to `brain/plans/PLAN_HWACCEL.md` phase 2, and
+    /// `GetImageResolutionParameter` (the `ChapterImageResolution` setting →
+    /// `-s WxH`) is not hardware work at all — it is open work item 4 in that
+    /// plan's list, because the dashboard setting currently has no effect.
     #[allow(clippy::too_many_arguments)]
     fn extract_image_arguments(
         input_path: &str,
@@ -184,6 +196,7 @@ impl<T: Transcoder> MediaEncoderImpl<T> {
         offset_ticks: Option<i64>,
         use_iframe: bool,
         output_path: &str,
+        ffmpeg_version: Option<FfmpegVersion>,
         threads: i32,
     ) -> String {
         let mut filters: Vec<String> = Vec::new();
@@ -200,7 +213,14 @@ impl<T: Transcoder> MediaEncoderImpl<T> {
                 "crop=iw/2:ih:0:0,setdar=dar=a,crop=min(iw\\,ih*dar):min(ih\\,iw/dar):(iw-min(iw\\,iw*sar))/2:(ih - min (ih\\,ih/sar))/2,setsar=sar=1"
             }
             Some(Video3DFormat::HalfTopAndBottom) => {
-                "crop=iw:ih/2:0:0,scale=(iw*2):ih),setdar=dar=a,crop=min(iw\\,ih*dar):min(ih\\,iw/dar):(iw-min(iw\\,iw*sar))/2:(ih - min (ih\\,ih/sar))/2,setsar=sar=1"
+                // Accepted divergence: upstream writes `scale=(iw*2):ih)` here,
+                // with one closing bracket too many. ffmpeg's expression parser
+                // rejects it (`[Eval] Invalid chars ')' at the end of expression 'ih)'`) and the extraction fails,
+                // so chapter and thumbnail images cannot be produced for this
+                // 3D layout on Jellyfin. Verified both forms against ffmpeg
+                // n9.0.1. The balanced form below is what the sibling
+                // half-side-by-side case two arms up already has.
+                "crop=iw:ih/2:0:0,scale=(iw*2):ih,setdar=dar=a,crop=min(iw\\,ih*dar):min(ih\\,iw/dar):(iw-min(iw\\,iw*sar))/2:(ih - min (ih\\,ih/sar))/2,setsar=sar=1"
             }
             Some(Video3DFormat::FullTopAndBottom) => {
                 "crop=iw:ih/2:0:0,setdar=dar=a,crop=min(iw\\,ih*dar):min(ih\\,iw/dar):(iw-min(iw\\,iw*sar))/2:(ih - min (ih\\,ih/sar))/2,setsar=sar=1"
@@ -225,8 +245,11 @@ impl<T: Transcoder> MediaEncoderImpl<T> {
         // always empty — an unreadable input, an unwritable output directory
         // and a truly frameless offset all render as the same blank message.
         // `error` adds nothing on the happy path.
+        // `-fps_mode auto` (`-vsync -1` below ffmpeg 5.1): let ffmpeg decide,
+        // which is what upstream passes here.
+        let sync = crate::encoding_helper::helper::video_sync_option("-1", ffmpeg_version);
         let mut args = format!(
-            "-i {input_path}{map_arg} -threads {threads} -v error -vframes 1 -vf {vf} -f image2 \"{output_path}\""
+            "-i {input_path}{map_arg} -threads {threads} -v error -vframes 1 -vf {vf}{sync} -f image2 \"{output_path}\""
         );
 
         if let Some(offset) = offset_ticks {
@@ -310,8 +333,9 @@ impl<T: Transcoder> MediaEncoder for MediaEncoderImpl<T> {
         let probe = self.probe_path();
         let output = self
             .transcoder
-            .get_process_output(&probe, &args, false, None)
+            .get_process_output(&probe, &args, false, None, &[])
             .await
+            .map(ProcessOutput::into_output)
             .map_err(MediaEncodingError::process)?;
 
         let data = Self::parse_probe(&output)?;
@@ -343,12 +367,14 @@ impl<T: Transcoder> MediaEncoder for MediaEncoderImpl<T> {
             None,
             false,
             &output_path,
+            self.config.ffmpeg_version,
             self.config.threads,
         );
         let ffmpeg = self.encoder_path();
         self.transcoder
-            .get_process_output(&ffmpeg, &args, true, None)
+            .get_process_output(&ffmpeg, &args, true, None, &[])
             .await
+            .map(ProcessOutput::into_output)
             .map_err(MediaEncodingError::process)?;
         Ok(output_path)
     }
@@ -405,13 +431,15 @@ impl<T: Transcoder> MediaEncoder for MediaEncoderImpl<T> {
             offset_ticks,
             true,
             &output_path,
+            self.config.ffmpeg_version,
             self.config.threads,
         );
         let ffmpeg = self.encoder_path();
         let stderr = self
             .transcoder
-            .get_process_output(&ffmpeg, &args, true, None)
+            .get_process_output(&ffmpeg, &args, true, None, &[])
             .await
+            .map(ProcessOutput::into_output)
             .map_err(MediaEncodingError::process)?;
         // The process runner mirrors the C# `GetProcessOutput` and ignores the
         // exit code, so a failed ffmpeg (unreadable input, no frame at the
@@ -466,6 +494,10 @@ impl<T: Transcoder> MediaEncoder for MediaEncoderImpl<T> {
 
 #[cfg(test)]
 mod tests {
+    use super::{FfmpegVersion, ProcessOutput};
+    use ferrofin_model::entities::Video3DFormat;
+    use rstest::rstest;
+
     use std::sync::Arc;
 
     use ferrofin_model::dto::MediaSourceInfo;
@@ -487,8 +519,12 @@ mod tests {
             _arguments: &str,
             _read_stderr: bool,
             _test_key: Option<&str>,
-        ) -> Result<String, String> {
-            Ok(String::new())
+            _env: &[(String, String)],
+        ) -> Result<ProcessOutput, String> {
+            Ok(ProcessOutput {
+                output: String::new(),
+                success: true,
+            })
         }
 
         async fn get_process_exit_code(&self, _path: &str, _arguments: &str) -> bool {
@@ -621,13 +657,17 @@ mod tests {
             arguments: &str,
             _read_stderr: bool,
             _test_key: Option<&str>,
-        ) -> Result<String, String> {
+            _env: &[(String, String)],
+        ) -> Result<ProcessOutput, String> {
             let out = arguments
                 .rsplit('"')
                 .nth(1)
                 .expect("quoted output path is the last argument");
             std::fs::write(out, b"jpg").expect("write frame");
-            Ok(String::new())
+            Ok(ProcessOutput {
+                output: String::new(),
+                success: true,
+            })
         }
 
         async fn get_process_exit_code(&self, _path: &str, _arguments: &str) -> bool {
@@ -729,10 +769,115 @@ mod tests {
             None,
             true,
             "/tmp/out.jpg",
+            None,
             0,
         );
         assert!(args.contains("-v error"), "got: {args}");
         assert!(!args.contains("-v quiet"), "got: {args}");
+    }
+
+    // Upstream passes `GetVideoSyncOption("-1")` here -- "let ffmpeg decide" --
+    // between the filter and the muxer. It is a single frame either way, but
+    // the option is version-gated and lands in the middle of the line, so the
+    // position is worth pinning.
+    #[rstest]
+    #[case(None, " -vsync -1 -f image2")]
+    #[case(Some(FfmpegVersion::new(5, 0)), " -vsync -1 -f image2")]
+    #[case(Some(FfmpegVersion::new(5, 1)), " -fps_mode auto -f image2")]
+    #[case(Some(FfmpegVersion::with_build(7, 0, 1)), " -fps_mode auto -f image2")]
+    fn extraction_lets_ffmpeg_decide_the_frame_rate_mode(
+        #[case] version: Option<FfmpegVersion>,
+        #[case] expected: &str,
+    ) {
+        let args = MediaEncoderImpl::<NoopTranscoder>::extract_image_arguments(
+            "file:\"/media/episode.mkv\"",
+            "",
+            None,
+            None,
+            None,
+            None,
+            true,
+            "/tmp/out.jpg",
+            version,
+            0,
+        );
+        assert!(args.contains(expected), "got: {args}");
+    }
+
+    #[rstest]
+    // The five scaler shapes `ExtractImageInternal` chooses between. These
+    // strings are the only 3D handling on a path that actually ships — chapter
+    // and thumbnail image extraction — so they are pinned in full.
+    #[case(
+        Some(Video3DFormat::HalfSideBySide),
+        "crop=iw/2:ih:0:0,scale=(iw*2):ih,setdar=dar=a,"
+    )]
+    #[case(Some(Video3DFormat::FullSideBySide), "crop=iw/2:ih:0:0,setdar=dar=a,")]
+    // The corrected bracket: upstream writes `scale=(iw*2):ih)`, which ffmpeg's
+    // expression parser rejects outright, so no image is produced at all.
+    #[case(
+        Some(Video3DFormat::HalfTopAndBottom),
+        "crop=iw:ih/2:0:0,scale=(iw*2):ih,setdar=dar=a,"
+    )]
+    #[case(
+        Some(Video3DFormat::FullTopAndBottom),
+        "crop=iw:ih/2:0:0,setdar=dar=a,"
+    )]
+    // MVC is not frame-packed, so it falls to the same plain even-dimension
+    // scaler a non-3D source gets.
+    #[case(Some(Video3DFormat::Mvc), "scale=round(iw*sar/2)*2:round(ih/2)*2")]
+    #[case(None, "scale=round(iw*sar/2)*2:round(ih/2)*2")]
+    fn each_3d_layout_selects_its_own_scaler(
+        #[case] threed_format: Option<Video3DFormat>,
+        #[case] expected_prefix: &str,
+    ) {
+        let args = MediaEncoderImpl::<NoopTranscoder>::extract_image_arguments(
+            "file:\"/media/movie.mkv\"",
+            "",
+            None,
+            None,
+            threed_format,
+            None,
+            true,
+            "/tmp/out.jpg",
+            None,
+            0,
+        );
+        assert!(args.contains(expected_prefix), "got: {args}");
+    }
+
+    #[test]
+    fn every_3d_scaler_has_balanced_brackets() {
+        // The failure this guards is a single stray `)` — upstream carries one
+        // in the half-top-and-bottom arm, and ffmpeg refuses the whole filter
+        // graph over it rather than degrading. Any future re-sync from upstream
+        // that reintroduces it fails here.
+        for threed_format in [
+            Some(Video3DFormat::HalfSideBySide),
+            Some(Video3DFormat::FullSideBySide),
+            Some(Video3DFormat::HalfTopAndBottom),
+            Some(Video3DFormat::FullTopAndBottom),
+            Some(Video3DFormat::Mvc),
+            None,
+        ] {
+            let args = MediaEncoderImpl::<NoopTranscoder>::extract_image_arguments(
+                "file:\"/media/movie.mkv\"",
+                "",
+                None,
+                None,
+                threed_format,
+                None,
+                true,
+                "/tmp/out.jpg",
+                None,
+                0,
+            );
+            assert_eq!(
+                args.matches('(').count(),
+                args.matches(')').count(),
+                "{threed_format:?} produced unbalanced brackets: {args}"
+            );
+        }
     }
 
     // An extraction temp directory the process cannot write fails every frame

@@ -1185,6 +1185,7 @@ mod tests {
 
     fn plan(state: EncodingJobInfo) -> TranscodePlan {
         TranscodePlan {
+            ffmpeg_env: Vec::new(),
             state,
             playlist_path: PathBuf::from("/cache/transcodes/out.m3u8"),
             arguments: Vec::new(),

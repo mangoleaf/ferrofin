@@ -7,7 +7,8 @@
 //! methods actually read. The full C# types carry ~150 members spanning the
 //! hardware-acceleration matrix, HDR/tonemap plumbing, and session wiring; only
 //! the fields the *core software transcode + direct-play decision* touches are
-//! ported here. The remainder is deferred.
+//! ported here. The rest arrive with the phases of
+//! `brain/plans/PLAN_HWACCEL.md` that need them.
 //!
 //! Value types (`MediaStream`, `MediaSourceInfo`, codec/range/context enums) are
 //! **reused from `ferrofin-model`** rather than re-declared, per
@@ -49,29 +50,6 @@ pub struct NoOptionalEncoders;
 impl EncoderCapabilities for NoOptionalEncoders {
     fn supports_encoder(&self, _encoder: &str) -> bool {
         false
-    }
-}
-
-/// [`EncoderCapabilities`] backed by the startup `ffmpeg -encoders` probe.
-///
-/// The composition root parses the discovered binary's encoder list once
-/// (`EncoderValidator::get_codecs_internal`) and wires it here, so the software
-/// audio path prefers `aac_at`/`libfdk_aac` exactly when the running ffmpeg
-/// actually has them (jellyfin-ffmpeg does; stock builds don't).
-#[derive(Debug, Clone, Default)]
-pub struct ProbedEncoders(Vec<String>);
-
-impl ProbedEncoders {
-    /// Wraps the probed encoder names.
-    #[must_use]
-    pub fn new(encoders: Vec<String>) -> Self {
-        Self(encoders)
-    }
-}
-
-impl EncoderCapabilities for ProbedEncoders {
-    fn supports_encoder(&self, encoder: &str) -> bool {
-        self.0.iter().any(|e| e == encoder)
     }
 }
 

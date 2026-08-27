@@ -153,6 +153,7 @@ fn hls_fmp4_args(clip: &Path, out_dir: &Path) -> Vec<String> {
 /// A [`SpawnRequest`] for `program`/`args` writing into `out_dir`.
 fn spawn_req(program: &str, args: Vec<String>, out_dir: &Path) -> SpawnRequest {
     SpawnRequest {
+        env: Vec::new(),
         program: program.to_owned(),
         arguments: args,
         working_dir: None,
@@ -201,6 +202,8 @@ fn start_req<'a>(
     args: Vec<String>,
 ) -> StartFfMpegRequest<'a> {
     StartFfMpegRequest {
+        env: Vec::new(),
+        hardware_acceleration_type: ferrofin_model::entities::HardwareAccelerationType::none,
         program: "ffmpeg",
         state,
         output_path,

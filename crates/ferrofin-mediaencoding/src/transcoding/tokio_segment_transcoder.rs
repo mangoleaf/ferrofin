@@ -46,6 +46,9 @@ impl SegmentTranscoder for TokioSegmentTranscoder {
         if let Some(dir) = &req.working_dir {
             command.current_dir(dir);
         }
+        for (key, value) in &req.env {
+            command.env(key, value);
+        }
 
         let mut child = command
             .spawn()
@@ -135,5 +138,52 @@ impl TranscodeChild for TokioTranscodeChild {
             .map_err(|e| format!("failed to kill ffmpeg: {e}"))?;
         self.exited.store(true, Ordering::SeqCst);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transcoding::SpawnRequest;
+
+    /// The environment has to reach the **child**, not the server.
+    ///
+    /// No hardware path sets one yet — NVENC configures itself entirely by
+    /// argument — so without this the seam would sit unexercised until the
+    /// VAAPI driver selection needs it, which is exactly when a silent break
+    /// would be hardest to attribute.
+    #[tokio::test]
+    async fn the_spawned_child_gets_the_requested_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("t.log");
+        let req = SpawnRequest {
+            program: "sh".to_owned(),
+            // stderr, because that is what the transcoder pumps into the log.
+            arguments: vec![
+                "-c".to_owned(),
+                "printf %s \"$FERROFIN_TEST_VAR\" >&2".to_owned(),
+            ],
+            working_dir: None,
+            output_dir: dir.path().to_path_buf(),
+            log_path: log.clone(),
+            env: vec![("FERROFIN_TEST_VAR".to_owned(), "libcuda".to_owned())],
+        };
+        let child = TokioSegmentTranscoder::new()
+            .start_transcode(&req)
+            .await
+            .unwrap();
+        assert_eq!(child.wait().await, 0);
+
+        // The pump is detached, so give it a moment to flush.
+        for _ in 0..50 {
+            if std::fs::read_to_string(&log).is_ok_and(|s| s.contains("libcuda")) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!(
+            "child never saw the variable; log: {:?}",
+            std::fs::read_to_string(&log)
+        );
     }
 }

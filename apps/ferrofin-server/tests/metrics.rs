@@ -36,8 +36,7 @@ async fn boot() -> (WiredApp, Database, tempfile::TempDir) {
     let ffmpeg = ferrofin_server::bootstrap::FfmpegPaths {
         ffmpeg: "ffmpeg".into(),
         ffprobe: "ffprobe".into(),
-        filters: Vec::new(),
-        encoders: Vec::new(),
+        capabilities: ferrofin_mediaencoding::FfmpegCapabilities::default(),
         chromaprint_muxer: false,
     };
     let (tx, _rx) = tokio::sync::oneshot::channel();
