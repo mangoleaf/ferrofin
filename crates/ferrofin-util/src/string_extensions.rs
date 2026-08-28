@@ -35,10 +35,14 @@ fn ligature_map() -> &'static HashMap<char, &'static str> {
         m.insert('Ø', "O");
         m.insert('ł', "l");
         m.insert('Ł', "L");
-        m.insert('ð', "d");
-        m.insert('Ð', "D");
-        m.insert('þ', "th");
-        m.insert('Þ', "TH");
+        // NOT `ð`/`þ`: Jellyfin's `Diacritics.Extensions` leaves them alone, and
+        // a real 10.11.8 library proves it — it stores `Person-Gisli Orn
+        // Garðarsson` and `Person-Þorsteinn Bachmann`, folding every *other*
+        // accent in the same name. Folding them here made those people
+        // unfindable by name on an adopted database, which is the exact bug
+        // this column exists to avoid. (`ø`, `æ`, `œ` and `ł` ARE folded there
+        // — same library, same rows. `ß` is unverified either way: no name in
+        // the library carries one and upstream's own test suite has no case.)
         m.insert('ß', "ss");
         m
     })
@@ -312,6 +316,20 @@ mod tests {
     #[case("\0after", "")] // leading null -> empty
     fn truncate_at_null_cuts_at_first_null(#[case] input: &str, #[case] expected: &str) {
         assert_eq!(expected, truncate_at_null(input));
+    }
+
+    /// Folded and unfolded characters, taken from a real Jellyfin 10.11.8
+    /// library: every expected value here is a `PresentationUniqueKey` or
+    /// `CleanName` that database actually stores.
+    #[rstest]
+    #[case("Gísli Örn Garðarsson", "Gisli Orn Garðarsson")] // eth survives
+    #[case("Þorsteinn Bachmann", "Þorsteinn Bachmann")] // thorn survives
+    #[case("Árni Þór Lárusson", "Arni Þor Larusson")] // …while its neighbours fold
+    #[case("Pilou Asbæk", "Pilou Asbaek")]
+    #[case("Roland Møller", "Roland Moller")]
+    #[case("Kasia Kołeczek", "Kasia Koleczek")]
+    fn remove_diacritics_matches_what_jellyfin_stored(#[case] input: &str, #[case] expected: &str) {
+        assert_eq!(expected, remove_diacritics(input));
     }
 
     #[rstest]

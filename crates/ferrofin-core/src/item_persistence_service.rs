@@ -39,6 +39,16 @@ use crate::translate_query::PLACEHOLDER_ID;
 /// `MusicGenre` item for the same value when the owner is a music item — one
 /// `ItemValueType`, two browses — and `/MusicGenres` selects on that row type
 /// alone. See [`music_genre_row`], which materializes it.
+fn by_name_kind(value_type: i32) -> Option<BaseItemKind> {
+    match value_type {
+        1 => Some(BaseItemKind::MusicArtist),
+        2 => Some(BaseItemKind::Genre),
+        3 => Some(BaseItemKind::Studio),
+        _ => None,
+    }
+}
+
+/// The stored CLR type name of the row [`by_name_kind`] names.
 fn by_name_type_name(value_type: i32) -> Option<&'static str> {
     match value_type {
         // AlbumArtist (1) is the canonical artist identity — it materializes the
@@ -725,16 +735,32 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
                     // `people_repository`. Without it the Genres/Studios tabs
                     // (which sort on it) come back unsorted and
                     // `nameStartsWith` matches nothing.
+                    // `PresentationUniqueKey` too: a by-name row's key is
+                    // `{Type}-{Name}` (see `kinds::presentation_unique_key`),
+                    // and this insert bypasses `upsert_item`, so without it
+                    // the column stays NULL where Jellyfin writes
+                    // `Genre-Action` — 23,186 such rows on a real library.
                     r#"INSERT OR IGNORE INTO "BaseItems"
-                       ("Id","Type","Name","CleanName","SortName","IsFolder","IsInMixedFolder",
+                       ("Id","Type","Name","CleanName","SortName","PresentationUniqueKey",
+                        "IsFolder","IsInMixedFolder",
                         "IsLocked","IsMovie","IsRepeat","IsSeries","IsVirtualItem")
-                       VALUES (?1,?2,?3,?4,?5,1,0,0,0,0,0,0)"#,
+                       VALUES (?1,?2,?3,?4,?5,?6,1,0,0,0,0,0,0)"#,
                 )
                 .bind(&value_id)
                 .bind(type_name)
                 .bind(value)
                 .bind(&clean)
                 .bind(ferrofin_util::sort_name::create_sort_name(value))
+                .bind(by_name_kind(*type_).map(|kind| {
+                    crate::kinds::presentation_unique_key(
+                        kind,
+                        Uuid::parse_str(&value_id).unwrap_or_default(),
+                        Some(value),
+                        None,
+                        None,
+                        None,
+                    )
+                }))
                 .execute(&mut *tx)
                 .await
                 .map_err(db_err)?;
@@ -1190,19 +1216,63 @@ pub async fn backfill_missing_sort_names(db: &Database) -> Result<usize, Service
 /// A row whose stored type or id cannot be parsed keeps whatever it arrived
 /// with rather than losing its key.
 fn derive_presentation_key(item: &BaseItemEntity) -> Option<String> {
-    crate::item_type_lookup::kind_from_type_name(&item.type_)
+    let stored = item
+        .presentation_unique_key
+        .as_deref()
+        .filter(|k| !k.is_empty());
+    let Some((kind, id)) = crate::item_type_lookup::kind_from_type_name(&item.type_)
         .zip(Uuid::parse_str(&item.id).ok())
-        .map(|(kind, id)| {
-            crate::kinds::presentation_unique_key(
-                kind,
-                id,
-                item.name.as_deref(),
-                item.primary_version_id.as_deref(),
-                item.series_presentation_unique_key.as_deref(),
-                item.index_number,
-            )
-        })
-        .or_else(|| item.presentation_unique_key.clone())
+    else {
+        return stored.map(str::to_owned);
+    };
+    // A `Series` keeps whatever is stored. Upstream's key depends on
+    // `LibraryOptions.EnableAutomaticSeriesGrouping` — which defaults to TRUE
+    // (`LibraryOptions.cs:34`) and then derives the key from the provider ids,
+    // the metadata language and the library folders (`Series.cs:81`). That
+    // option is not ported, so recomputing here would flip every re-saved
+    // series on such a server to its own id and orphan its seasons'
+    // `SeriesPresentationUniqueKey`. (The verification library has the option
+    // off on every TV folder, which is why its 126 series all store own-id and
+    // the adoption suite cannot see this.)
+    if kind == BaseItemKind::Series && stored.is_some() {
+        return stored.map(str::to_owned);
+    }
+    let derived = crate::kinds::presentation_unique_key(
+        kind,
+        id,
+        item.name.as_deref(),
+        item.primary_version_id.as_deref(),
+        item.series_presentation_unique_key.as_deref(),
+        item.index_number,
+    );
+    // Where the per-kind inputs were incomplete the rule falls back to the
+    // row's own id, which is a *guess* — a season with no series key, a
+    // by-name row with no name. Never overwrite a stored key with a guess:
+    // upstream would have resolved the missing half rather than given up.
+    let guessed = derived == id.as_simple().to_string()
+        && !matches!(kind, BaseItemKind::Movie | BaseItemKind::Episode)
+        && incomplete_inputs(kind, item);
+    if guessed {
+        return stored.map(str::to_owned).or(Some(derived));
+    }
+    Some(derived)
+}
+
+/// Whether the per-kind rule had to fall back for `item` because an input it
+/// needed was absent — see [`derive_presentation_key`].
+fn incomplete_inputs(kind: BaseItemKind, item: &BaseItemEntity) -> bool {
+    let blank = |v: Option<&String>| v.is_none_or(String::is_empty);
+    match kind {
+        BaseItemKind::Season => {
+            blank(item.series_presentation_unique_key.as_ref()) || item.index_number.is_none()
+        }
+        BaseItemKind::Genre
+        | BaseItemKind::MusicGenre
+        | BaseItemKind::Person
+        | BaseItemKind::Studio
+        | BaseItemKind::MusicArtist => blank(item.name.as_ref()),
+        _ => false,
+    }
 }
 
 /// Whether `stored` is what Ferrofin's OLD clean rule would have produced for
@@ -1934,5 +2004,59 @@ mod tests {
 
         // Once only: the marker means a second boot does no work.
         assert_eq!(service.repair_clean_values().await.expect("repair"), 0);
+    }
+
+    /// A stored key that the per-kind rule cannot reproduce is never
+    /// overwritten with a guess.
+    ///
+    /// Two cases the verification library cannot show, because it has neither:
+    /// a `Series` on a server with `EnableAutomaticSeriesGrouping` on (upstream
+    /// default TRUE, and its key then derives from provider ids + language +
+    /// library folders, none of which is ported), and a `Season` whose
+    /// `SeriesPresentationUniqueKey` is missing. Overwriting either with the
+    /// row's own id orphans every season that points at it.
+    #[tokio::test]
+    async fn a_key_the_rule_cannot_reproduce_survives_a_save() {
+        async fn key(db: &ferrofin_db::Database, id: Uuid) -> Option<String> {
+            crate::test_support::fetch_item(db, id)
+                .await
+                .presentation_unique_key
+        }
+        let db = test_db().await;
+        let service = FerrofinItemPersistenceService::new(db.clone());
+        let series = Uuid::from_u128(0x5E01);
+        let season = Uuid::from_u128(0x5E02);
+        let movie = Uuid::from_u128(0x5E03);
+        crate::test_support::seed_named_item(&db, series, BaseItemKind::Series, "Breaking Bad")
+            .await;
+        crate::test_support::seed_named_item(&db, season, BaseItemKind::Season, "Season 2").await;
+        crate::test_support::seed_named_item(&db, movie, BaseItemKind::Movie, "Heat").await;
+        for id in [series, season, movie] {
+            super::seed_presentation_key(&db, id, "grouped-key-from-jellyfin").await;
+        }
+
+        for id in [series, season, movie] {
+            let row = crate::test_support::fetch_item(&db, id).await;
+            service
+                .save_items(std::slice::from_ref(&row))
+                .await
+                .expect("save");
+        }
+
+        assert_eq!(
+            key(&db, series).await.as_deref(),
+            Some("grouped-key-from-jellyfin"),
+            "a series keeps the key the server that wrote it derived"
+        );
+        assert_eq!(
+            key(&db, season).await.as_deref(),
+            Some("grouped-key-from-jellyfin"),
+            "…and so does a season with no series key to rebuild from"
+        );
+        assert_eq!(
+            key(&db, movie).await.as_deref(),
+            Some("00000000000000000000000000005e03"),
+            "but a movie's key IS reproducible, so it is recomputed"
+        );
     }
 }

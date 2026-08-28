@@ -119,16 +119,28 @@ impl FerrofinPeopleRepository {
                 // no-op for these rows AND makes `nameStartsWith` — which
                 // filters `lower(SortName)`, faithfully to C# `ApplyNameFilters`
                 // — match nothing at all.
+                // `PresentationUniqueKey` too — `Person-{Name}` with the
+                // diacritics removed, exactly as Jellyfin writes it. This
+                // insert bypasses `upsert_item`, so nothing else would set it.
                 r#"INSERT OR IGNORE INTO "BaseItems"
-                   ("Id","Type","Name","CleanName","SortName","IsFolder","IsInMixedFolder",
+                   ("Id","Type","Name","CleanName","SortName","PresentationUniqueKey",
+                    "IsFolder","IsInMixedFolder",
                     "IsLocked","IsMovie","IsRepeat","IsSeries","IsVirtualItem")
-                   VALUES (?1,?2,?3,?4,?5,0,0,0,0,0,0,0)"#,
+                   VALUES (?1,?2,?3,?4,?5,?6,0,0,0,0,0,0,0)"#,
             )
             .bind(target)
             .bind(person_type)
             .bind(name)
             .bind(&clean)
             .bind(create_sort_name(name))
+            .bind(crate::kinds::presentation_unique_key(
+                BaseItemKind::Person,
+                Uuid::parse_str(target).unwrap_or_default(),
+                Some(name),
+                None,
+                None,
+                None,
+            ))
             .execute(&mut **tx)
             .await
             .map_err(db_err)?;
