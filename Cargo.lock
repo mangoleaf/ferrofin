@@ -1168,6 +1168,7 @@ dependencies = [
  "ferrofin-keyframes",
  "ferrofin-model",
  "ferrofin-naming",
+ "ferrofin-networking",
  "ferrofin-providers",
  "ferrofin-traits",
  "ferrofin-util",
