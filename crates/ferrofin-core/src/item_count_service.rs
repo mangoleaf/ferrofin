@@ -169,6 +169,12 @@ impl FerrofinItemCountService {
 #[async_trait]
 impl ItemCountService for FerrofinItemCountService {
     async fn get_count(&self, filter: &InternalItemsQuery) -> Result<i32, ServiceError> {
+        // Same `AddUserToQuery` confinement the item queries get: a user who may
+        // see one library must be counted over that library, not the server.
+        // Without it `/Items/Counts` handed a restricted account the whole
+        // catalogue's totals — numbers it could not then browse to.
+        let scoped = crate::item_repository::scope_to_user_libraries(&self.db, filter).await?;
+        let filter = scoped.as_ref().unwrap_or(filter);
         let mut qb = build_query(filter, QueryShape::Count);
         let count: i64 = qb
             .build_query_scalar::<i64>()
@@ -186,6 +192,8 @@ impl ItemCountService for FerrofinItemCountService {
         // (type, count) rows — instead of materializing every matching full row
         // (all ~60 columns) and counting them in Rust, which dominated this
         // endpoint's CPU on a large library.
+        let scoped = crate::item_repository::scope_to_user_libraries(&self.db, filter).await?;
+        let filter = scoped.as_ref().unwrap_or(filter);
         let mut qb = build_query(filter, QueryShape::TypeCounts);
         let rows = qb
             .build_query_as::<(String, i64)>()

@@ -123,7 +123,7 @@ impl FerrofinItemRepository {
             }
         }
         if !wants_parent && filter.top_parent_ids.is_empty() {
-            return self.scope_to_user_libraries(filter).await;
+            return scope_to_user_libraries(&self.db, filter).await;
         }
 
         let mut resolved = None;
@@ -165,191 +165,6 @@ impl FerrofinItemRepository {
             }
         }
         Ok(resolved)
-    }
-
-    /// Scopes a query that carries **no scope at all** to the libraries its
-    /// user can see.
-    ///
-    /// Port of `LibraryManager.AddUserToQuery`. Without it an unscoped
-    /// `/Items?recursive=true` answers with every row in the table, including
-    /// the ones that are under no library at all — on a real adopted library
-    /// that is 23,809 rows of people, studios and genres, and it is how
-    /// `items:all` came back 38,004 where Jellyfin says 14,347.
-    ///
-    /// The seven fields checked are exactly the seven the C# checks; any one of
-    /// them already narrows the query, and Jellyfin leaves it alone then.
-    ///
-    /// An empty scope means the user can see nothing, and C# guards it with a
-    /// fresh guid so the query matches nothing rather than everything. This
-    /// uses the placeholder id for the same purpose — deterministic, and a row
-    /// every query already excludes.
-    async fn scope_to_user_libraries(
-        &self,
-        filter: &InternalItemsQuery,
-    ) -> Result<Option<InternalItemsQuery>, ServiceError> {
-        let Some(user) = filter.user.as_ref() else {
-            return Ok(None);
-        };
-        let unscoped = filter.ancestor_ids.is_empty()
-            && filter.parent_id == Uuid::nil()
-            && filter.channel_ids.is_empty()
-            && filter.top_parent_ids.is_empty()
-            && non_blank(filter.ancestor_with_presentation_unique_key.as_ref()).is_none()
-            && non_blank(filter.series_presentation_unique_key.as_ref()).is_none()
-            && filter.item_ids.is_empty();
-        if !unscoped {
-            return Ok(None);
-        }
-
-        let views = self.visible_views(user).await?;
-        let by_view = physical_folders_by_view(&self.db, &views).await?;
-        // `GetTopParentIdsForQuery` per view: a collection folder becomes its
-        // physical folders, and anything else — a Live TV view, or any view on
-        // a Ferrofin-written database — stands for itself.
-        let mut scope: Vec<Uuid> = views
-            .iter()
-            .flat_map(|v| match by_view.get(v) {
-                Some(folders) => folders.clone(),
-                None => vec![*v],
-            })
-            .collect();
-        if scope.is_empty() {
-            scope.push(Uuid::parse_str(PLACEHOLDER_ID).unwrap_or_else(|_| Uuid::nil()));
-        }
-        let mut resolved = filter.clone();
-        resolved.top_parent_ids = scope;
-        Ok(Some(resolved))
-    }
-
-    /// The library views `user` may see, as item ids.
-    ///
-    /// The `Folder.IsVisible` half of `AddUserToQuery`: a non-empty
-    /// `BlockedMediaFolders` preference hides exactly those; otherwise a user
-    /// without `EnableAllFolders` sees only their `EnabledFolders`.
-    ///
-    /// `AddUserToQuery` scopes to `GetUserViews(IncludeExternalContent: true)`,
-    /// so the Live TV view is in scope exactly when that call yields it — which
-    /// is only while Live TV is available (see
-    /// [`user_entity_ext::live_tv_enabled_for`]).
-    async fn visible_views(&self, user: &UserEntity) -> Result<Vec<Uuid>, ServiceError> {
-        let Some(collection_folder) = stored_type_name(BaseItemKind::CollectionFolder) else {
-            return Ok(Vec::new());
-        };
-        let Some(user_view) = stored_type_name(BaseItemKind::UserView) else {
-            return Ok(Vec::new());
-        };
-        // What `GET /Library/MediaFolders` lists, which is Jellyfin's
-        // `GetUserRootFolder().Children` — the libraries, the views, and the
-        // playlists folder created playlists hang off.
-        //
-        // BOTH playlists-folder kinds. An adopted database stores
-        // `PlaylistsFolder` (10.11.8 has no `ManualPlaylistsFolder` class —
-        // that name is only its client type), while Ferrofin has historically
-        // provisioned the other, and both are legitimate rows at
-        // `{data}/playlists`. Accepting one and not the other is how a playlist
-        // ends up parented to a row that is not in scope, and so invisible.
-        let playlists_folder = stored_type_name(BaseItemKind::PlaylistsFolder).unwrap_or_default();
-        let manual_playlists_folder =
-            stored_type_name(BaseItemKind::ManualPlaylistsFolder).unwrap_or_default();
-        let rows: Vec<(String, String)> = sqlx::query_as(
-            r#"SELECT "Id", "Type" FROM "BaseItems" WHERE "Type" IN (?1, ?2, ?3, ?4)"#,
-        )
-        .bind(collection_folder)
-        .bind(user_view)
-        .bind(playlists_folder)
-        .bind(manual_playlists_folder)
-        .fetch_all(self.db.pool())
-        .await
-        .map_err(db_err)?;
-
-        // Live TV is a view only while Live TV exists — see
-        // `live_tv_enabled_for`. Jellyfin leaves it out of `GetUserViews`
-        // otherwise, so it is out of this scope too. The row is looked for
-        // first: most databases have none, and then neither of the gate's two
-        // queries needs to run at all.
-        let live_tv_view = match self.live_tv_view_id().await? {
-            Some(id) if !live_tv_enabled_for(&self.db, &user.id).await? => Some(id),
-            _ => None,
-        };
-        let blocked = self
-            .folder_preference(user, PreferenceKind::BlockedMediaFolders)
-            .await?;
-        let enabled = if blocked.is_empty()
-            && !has_permission(self.db.pool(), &user.id, PermissionKind::EnableAllFolders).await?
-        {
-            Some(
-                self.folder_preference(user, PreferenceKind::EnabledFolders)
-                    .await?,
-            )
-        } else {
-            None
-        };
-
-        Ok(rows
-            .iter()
-            .filter_map(|(id, type_)| {
-                let id = Uuid::parse_str(id).ok()?;
-                // Neither a `UserView` (Live TV, Playlists) nor the playlists
-                // folder is a media folder, so neither carries a visibility
-                // preference.
-                if live_tv_view == Some(id) {
-                    return None;
-                }
-                if type_ == user_view
-                    || type_ == playlists_folder
-                    || type_ == manual_playlists_folder
-                {
-                    return Some(id);
-                }
-                if blocked.contains(&id) {
-                    return None;
-                }
-                match &enabled {
-                    Some(allowed) if !allowed.contains(&id) => None,
-                    _ => Some(id),
-                }
-            })
-            .collect())
-    }
-
-    /// The `UserView` row that is the Live TV view, if this database has one.
-    ///
-    /// Identified by its **path** — see
-    /// [`crate::user_view_manager::LIVE_TV_VIEW_PATH_SUFFIX`]. The name is the
-    /// localized `HeaderLiveTV` string ("TV en direct", "ライブTV", …), so
-    /// matching on it would silently do nothing on most servers and would
-    /// misfire on a library a user happened to call "Live TV".
-    async fn live_tv_view_id(&self) -> Result<Option<Uuid>, ServiceError> {
-        let Some(user_view) = stored_type_name(BaseItemKind::UserView) else {
-            return Ok(None);
-        };
-        // Both separators: C# builds the path with `Path.Combine`, so a
-        // database adopted from a Windows Jellyfin stores `…\views\livetv`
-        // and a POSIX-only pattern would never fire — on exactly the adoption
-        // case this gate exists for. (`LIKE` is `%`/`_` only, so a backslash
-        // needs no escaping.)
-        let suffix = crate::user_view_manager::LIVE_TV_VIEW_PATH_SUFFIX;
-        let id: Option<String> = sqlx::query_scalar(
-            r#"SELECT "Id" FROM "BaseItems"
-               WHERE "Type" = ?1 AND ("Path" LIKE ?2 OR "Path" LIKE ?3)
-               ORDER BY "Id" LIMIT 1"#,
-        )
-        .bind(user_view)
-        .bind(format!("%{suffix}"))
-        .bind(format!("%{}", suffix.replace('/', "\\")))
-        .fetch_optional(self.db.pool())
-        .await
-        .map_err(db_err)?;
-        Ok(id.and_then(|id| Uuid::parse_str(&id).ok()))
-    }
-
-    /// One of the user's guid-list folder preferences.
-    async fn folder_preference(
-        &self,
-        user: &UserEntity,
-        kind: PreferenceKind,
-    ) -> Result<Vec<Uuid>, ServiceError> {
-        guid_preference(self.db.pool(), &user.id, kind).await
     }
 
     /// The physical folders each of `ids` stands for, for those that are
@@ -490,22 +305,13 @@ impl FerrofinItemRepository {
     /// built, so the filter shape can never drift.
     async fn count_by_name_total(
         &self,
-        type_ints: &[i64],
+        scope: &ByNameScope<'_>,
         return_type: &str,
-        content_type_names: &[String],
-        exclude_content_types: &[String],
-        ancestors: &[String],
         filter: &InternalItemsQuery,
     ) -> Result<i32, ServiceError> {
         let mut qb: QueryBuilder<Sqlite> =
             QueryBuilder::new(r#"SELECT COUNT(*) FROM "BaseItems" AS bi JOIN "#);
-        push_value_aggregate(
-            &mut qb,
-            type_ints,
-            content_type_names,
-            exclude_content_types,
-            ancestors,
-        );
+        push_value_aggregate(&mut qb, scope);
         push_by_name_join(&mut qb, return_type);
         append_by_name_filters(&mut qb, filter);
         let count: i64 = qb
@@ -557,6 +363,13 @@ impl FerrofinItemRepository {
             .copied()
             .map(guid_to_db)
             .collect();
+        // `AddUserToQuery` for the by-name tabs. A no-op for a query that is
+        // already scoped (a browse under one library passes `ancestor_ids`).
+        let scoped = scope_to_user_libraries(&self.db, filter).await?;
+        let top_parents: Vec<String> = scoped
+            .as_ref()
+            .map(|f| f.top_parent_ids.iter().copied().map(guid_to_db).collect())
+            .unwrap_or_default();
 
         let want_total = filter.enable_total_record_count && filter.limit.is_some();
         let mut qb: QueryBuilder<Sqlite> = if want_total {
@@ -566,13 +379,14 @@ impl FerrofinItemRepository {
         } else {
             QueryBuilder::new(r#"SELECT bi.*, agg.cnt FROM "BaseItems" AS bi JOIN "#)
         };
-        push_value_aggregate(
-            &mut qb,
-            &type_ints,
-            &content_type_names,
+        let scope = ByNameScope {
+            type_ints: &type_ints,
+            content_type_names: &content_type_names,
             exclude_content_types,
-            &ancestors,
-        );
+            ancestors: &ancestors,
+            top_parents: &top_parents,
+        };
+        push_value_aggregate(&mut qb, &scope);
         push_by_name_join(&mut qb, return_type);
         append_by_name_filters(&mut qb, filter);
         // ORDER BY Name (the key the old in-memory sort used); parity harness is the
@@ -604,15 +418,8 @@ impl FerrofinItemRepository {
             match rows.first() {
                 Some(r) => i32::try_from(r.total_count).unwrap_or(i32::MAX),
                 None if start_index > 0 => {
-                    self.count_by_name_total(
-                        &type_ints,
-                        return_type,
-                        &content_type_names,
-                        exclude_content_types,
-                        &ancestors,
-                        filter,
-                    )
-                    .await?
+                    self.count_by_name_total(&scope, return_type, filter)
+                        .await?
                 }
                 None => 0,
             }
@@ -658,13 +465,14 @@ struct ByNameCountRow {
 /// is unique on the raw `Value`), and they are one genre to a client, so
 /// collapsing them here is also what stops a single by-name row being joined
 /// twice.
-fn push_value_aggregate<'a>(
-    qb: &mut QueryBuilder<'a, Sqlite>,
-    type_ints: &'a [i64],
-    content_type_names: &'a [String],
-    exclude_content_types: &'a [String],
-    ancestors: &'a [String],
-) {
+fn push_value_aggregate<'a>(qb: &mut QueryBuilder<'a, Sqlite>, scope: &'a ByNameScope<'a>) {
+    let ByNameScope {
+        type_ints,
+        content_type_names,
+        exclude_content_types,
+        ancestors,
+        top_parents,
+    } = scope;
     // `COUNT(*)`, not `COUNT(DISTINCT ivm."ItemId")`: `ItemValuesMap`'s primary
     // key IS `("ItemValueId", "ItemId")`, so within one `GROUP BY
     // iv."ItemValueId"` every `ItemId` is already distinct, and the `ci` join is
@@ -689,7 +497,7 @@ fn push_value_aggregate<'a>(
     if !exclude_content_types.is_empty() {
         qb.push(r#" AND ci."Type" NOT IN ("#);
         let mut sep = qb.separated(", ");
-        for n in exclude_content_types {
+        for n in *exclude_content_types {
             sep.push_bind(n.clone());
         }
         qb.push(")");
@@ -699,7 +507,35 @@ fn push_value_aggregate<'a>(
         push_in_list(qb, r#"a."ParentItemId""#, ancestors);
         qb.push(")");
     }
+    // The user's libraries. Upstream reaches this through `TranslateQuery` on
+    // the inner item query, which `AddUserToQuery` has already confined; here
+    // the caller resolves the scope and passes it down. Without it the
+    // by-name tabs aggregate over the WHOLE server, so a restricted account is
+    // offered a genre or a studio that `/Items` will then refuse to return —
+    // a filter list that lies about what is behind it.
+    if !top_parents.is_empty() {
+        qb.push(" AND ");
+        push_in_list(qb, r#"ci."TopParentId""#, top_parents);
+    }
     qb.push(r#" GROUP BY iv."CleanValue") AS agg"#);
+}
+
+/// The pre-computed vectors that shape a by-name aggregate.
+///
+/// One struct so the page query and the paging-fallback count cannot drift
+/// apart: they take the SAME value, and a filter added to one is a filter in
+/// both.
+struct ByNameScope<'a> {
+    /// The `ItemValues.Type` numbers this tab aggregates.
+    type_ints: &'a [i64],
+    /// Stored type names of the content items that may contribute.
+    content_type_names: &'a [String],
+    /// Stored type names that may not (music genres vs plain genres).
+    exclude_content_types: &'a [String],
+    /// The browse's ancestor scope, if it is under a parent.
+    ancestors: &'a [String],
+    /// The user's libraries (`AddUserToQuery`), empty when unconfined.
+    top_parents: &'a [String],
 }
 
 /// Joins the value aggregate to the by-name rows it describes.
@@ -988,6 +824,182 @@ fn image_info_from_row(row: BaseItemImageInfoEntity) -> ItemImageInfo {
 /// `DateModified` (C# leaves the `default(DateTime)`).
 fn default_epoch() -> DateTime<Utc> {
     DateTime::<Utc>::from_timestamp(0, 0).unwrap_or_else(Utc::now)
+}
+
+/// Scopes a query that carries **no scope at all** to the libraries its
+/// user can see.
+///
+/// Port of `LibraryManager.AddUserToQuery`. Without it an unscoped
+/// `/Items?recursive=true` answers with every row in the table, including
+/// the ones that are under no library at all — on a real adopted library
+/// that is 23,809 rows of people, studios and genres, and it is how
+/// `items:all` came back 38,004 where Jellyfin says 14,347.
+///
+/// The seven fields checked are exactly the seven the C# checks; any one of
+/// them already narrows the query, and Jellyfin leaves it alone then.
+///
+/// An empty scope means the user can see nothing, and C# guards it with a
+/// fresh guid so the query matches nothing rather than everything. This
+/// uses the placeholder id for the same purpose — deterministic, and a row
+/// every query already excludes.
+pub(crate) async fn scope_to_user_libraries(
+    db: &Database,
+    filter: &InternalItemsQuery,
+) -> Result<Option<InternalItemsQuery>, ServiceError> {
+    let Some(user) = filter.user.as_ref() else {
+        return Ok(None);
+    };
+    let unscoped = filter.ancestor_ids.is_empty()
+        && filter.parent_id == Uuid::nil()
+        && filter.channel_ids.is_empty()
+        && filter.top_parent_ids.is_empty()
+        && non_blank(filter.ancestor_with_presentation_unique_key.as_ref()).is_none()
+        && non_blank(filter.series_presentation_unique_key.as_ref()).is_none()
+        && filter.item_ids.is_empty();
+    if !unscoped {
+        return Ok(None);
+    }
+
+    let views = visible_views(db, user).await?;
+    let by_view = physical_folders_by_view(db, &views).await?;
+    // `GetTopParentIdsForQuery` per view: a collection folder becomes its
+    // physical folders, and anything else — a Live TV view, or any view on
+    // a Ferrofin-written database — stands for itself.
+    let mut scope: Vec<Uuid> = views
+        .iter()
+        .flat_map(|v| match by_view.get(v) {
+            Some(folders) => folders.clone(),
+            None => vec![*v],
+        })
+        .collect();
+    if scope.is_empty() {
+        scope.push(Uuid::parse_str(PLACEHOLDER_ID).unwrap_or_else(|_| Uuid::nil()));
+    }
+    let mut resolved = filter.clone();
+    resolved.top_parent_ids = scope;
+    Ok(Some(resolved))
+}
+
+/// The library views `user` may see, as item ids.
+///
+/// The `Folder.IsVisible` half of `AddUserToQuery`: a non-empty
+/// `BlockedMediaFolders` preference hides exactly those; otherwise a user
+/// without `EnableAllFolders` sees only their `EnabledFolders`.
+///
+/// `AddUserToQuery` scopes to `GetUserViews(IncludeExternalContent: true)`,
+/// so the Live TV view is in scope exactly when that call yields it — which
+/// is only while Live TV is available (see
+/// [`user_entity_ext::live_tv_enabled_for`]).
+async fn visible_views(db: &Database, user: &UserEntity) -> Result<Vec<Uuid>, ServiceError> {
+    let Some(collection_folder) = stored_type_name(BaseItemKind::CollectionFolder) else {
+        return Ok(Vec::new());
+    };
+    let Some(user_view) = stored_type_name(BaseItemKind::UserView) else {
+        return Ok(Vec::new());
+    };
+    // What `GET /Library/MediaFolders` lists, which is Jellyfin's
+    // `GetUserRootFolder().Children` — the libraries, the views, and the
+    // playlists folder created playlists hang off.
+    //
+    // BOTH playlists-folder kinds. An adopted database stores
+    // `PlaylistsFolder` (10.11.8 has no `ManualPlaylistsFolder` class —
+    // that name is only its client type), while Ferrofin has historically
+    // provisioned the other, and both are legitimate rows at
+    // `{data}/playlists`. Accepting one and not the other is how a playlist
+    // ends up parented to a row that is not in scope, and so invisible.
+    let playlists_folder = stored_type_name(BaseItemKind::PlaylistsFolder).unwrap_or_default();
+    let manual_playlists_folder =
+        stored_type_name(BaseItemKind::ManualPlaylistsFolder).unwrap_or_default();
+    let rows: Vec<(String, String)> =
+        sqlx::query_as(r#"SELECT "Id", "Type" FROM "BaseItems" WHERE "Type" IN (?1, ?2, ?3, ?4)"#)
+            .bind(collection_folder)
+            .bind(user_view)
+            .bind(playlists_folder)
+            .bind(manual_playlists_folder)
+            .fetch_all(db.pool())
+            .await
+            .map_err(db_err)?;
+
+    // Live TV is a view only while Live TV exists — see
+    // `live_tv_enabled_for`. Jellyfin leaves it out of `GetUserViews`
+    // otherwise, so it is out of this scope too. The row is looked for
+    // first: most databases have none, and then neither of the gate's two
+    // queries needs to run at all.
+    let live_tv_view = match live_tv_view_id(db).await? {
+        Some(id) if !live_tv_enabled_for(db, &user.id).await? => Some(id),
+        _ => None,
+    };
+    let blocked = folder_preference(db, user, PreferenceKind::BlockedMediaFolders).await?;
+    let enabled = if blocked.is_empty()
+        && !has_permission(db.pool(), &user.id, PermissionKind::EnableAllFolders).await?
+    {
+        Some(folder_preference(db, user, PreferenceKind::EnabledFolders).await?)
+    } else {
+        None
+    };
+
+    Ok(rows
+        .iter()
+        .filter_map(|(id, type_)| {
+            let id = Uuid::parse_str(id).ok()?;
+            // Neither a `UserView` (Live TV, Playlists) nor the playlists
+            // folder is a media folder, so neither carries a visibility
+            // preference.
+            if live_tv_view == Some(id) {
+                return None;
+            }
+            if type_ == user_view || type_ == playlists_folder || type_ == manual_playlists_folder {
+                return Some(id);
+            }
+            if blocked.contains(&id) {
+                return None;
+            }
+            match &enabled {
+                Some(allowed) if !allowed.contains(&id) => None,
+                _ => Some(id),
+            }
+        })
+        .collect())
+}
+
+/// The `UserView` row that is the Live TV view, if this database has one.
+///
+/// Identified by its **path** — see
+/// [`crate::user_view_manager::LIVE_TV_VIEW_PATH_SUFFIX`]. The name is the
+/// localized `HeaderLiveTV` string ("TV en direct", "ライブTV", …), so
+/// matching on it would silently do nothing on most servers and would
+/// misfire on a library a user happened to call "Live TV".
+async fn live_tv_view_id(db: &Database) -> Result<Option<Uuid>, ServiceError> {
+    let Some(user_view) = stored_type_name(BaseItemKind::UserView) else {
+        return Ok(None);
+    };
+    // Both separators: C# builds the path with `Path.Combine`, so a
+    // database adopted from a Windows Jellyfin stores `…\views\livetv`
+    // and a POSIX-only pattern would never fire — on exactly the adoption
+    // case this gate exists for. (`LIKE` is `%`/`_` only, so a backslash
+    // needs no escaping.)
+    let suffix = crate::user_view_manager::LIVE_TV_VIEW_PATH_SUFFIX;
+    let id: Option<String> = sqlx::query_scalar(
+        r#"SELECT "Id" FROM "BaseItems"
+           WHERE "Type" = ?1 AND ("Path" LIKE ?2 OR "Path" LIKE ?3)
+           ORDER BY "Id" LIMIT 1"#,
+    )
+    .bind(user_view)
+    .bind(format!("%{suffix}"))
+    .bind(format!("%{}", suffix.replace('/', "\\")))
+    .fetch_optional(db.pool())
+    .await
+    .map_err(db_err)?;
+    Ok(id.and_then(|id| Uuid::parse_str(&id).ok()))
+}
+
+/// One of the user's guid-list folder preferences.
+async fn folder_preference(
+    user_db: &Database,
+    user: &UserEntity,
+    kind: PreferenceKind,
+) -> Result<Vec<Uuid>, ServiceError> {
+    guid_preference(user_db.pool(), &user.id, kind).await
 }
 
 #[async_trait]
@@ -2569,15 +2581,29 @@ mod tests {
 
         // Two movies carrying one genre each; seeding materializes the browsable
         // by-name Genre rows (id = ItemValueId).
+        //
+        // They hang off a library, and the user holds the default permissions,
+        // because the by-name tabs are confined to the user's libraries now
+        // (`AddUserToQuery`): a permission-less account, or one on a server with
+        // no library rows at all, is correctly offered no genres.
+        let library = Uuid::from_u128(0xFA00);
+        seed_named_item(&db, library, BaseItemKind::CollectionFolder, "Movies").await;
         let action_movie = Uuid::from_u128(0xFA01);
-        seed_named_item(&db, action_movie, BaseItemKind::Movie, "Action Film").await;
+        seed_top_parented_item(
+            &db,
+            action_movie,
+            BaseItemKind::Movie,
+            "Action Film",
+            library,
+        )
+        .await;
         seed_item_genre(&db, action_movie, "Action").await;
         let drama_movie = Uuid::from_u128(0xFA02);
-        seed_named_item(&db, drama_movie, BaseItemKind::Movie, "Drama Film").await;
+        seed_top_parented_item(&db, drama_movie, BaseItemKind::Movie, "Drama Film", library).await;
         seed_item_genre(&db, drama_movie, "Drama").await;
 
         let user_id = Uuid::from_u128(0xFA10);
-        let user = seed_user(&db, user_id).await;
+        let user = seed_user_with_defaults(&db, user_id).await;
 
         // Favorite the "Action" genre: the state lives in the by-name row's OWN
         // UserData (C# joins UserData on the by-name item id), so the row is
@@ -3465,6 +3491,81 @@ mod tests {
             ["In First", "In Second"],
             "the windows-pathed Live TV view is out of scope too"
         );
+    }
+
+    /// The by-name tabs and the counts are confined to the user's libraries,
+    /// exactly as a browse is.
+    ///
+    /// Without it a restricted account was offered a genre from a library it
+    /// cannot see — and `/Items` would then return nothing for it, so the
+    /// filter list advertised something that did not exist. `/Items/Counts` had
+    /// the same shape of bug: whole-server totals handed to someone who can
+    /// browse a fraction of them.
+    #[tokio::test]
+    async fn the_by_name_tabs_and_counts_see_only_the_user_s_libraries() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let (first, _second, user_id, user) = two_libraries(&db).await;
+        seed_item_genre(&db, Uuid::from_u128(0x9803), "Adventure").await;
+        seed_item_genre(&db, Uuid::from_u128(0x9804), "Mystery").await;
+
+        let query = InternalItemsQuery {
+            user: Some(user.clone()),
+            ..InternalItemsQuery::default()
+        };
+        let names = |result: QueryResult<ItemWithCounts>| {
+            let mut names: Vec<String> = result
+                .items
+                .iter()
+                .filter_map(|i| i.item.name.clone())
+                .collect();
+            names.sort();
+            names
+        };
+        assert_eq!(
+            names(repository.get_genres(&query).await.expect("genres")),
+            ["Adventure", "Mystery"],
+            "both libraries are visible to start with"
+        );
+        let counts = crate::item_count_service::FerrofinItemCountService::new(db.clone());
+        {
+            use ferrofin_traits::persistence::ItemCountService;
+            assert_eq!(
+                counts
+                    .get_item_counts(&query)
+                    .await
+                    .expect("counts")
+                    .movie_count,
+                2
+            );
+        }
+
+        // Restrict the user to the first library.
+        sqlx::query(r#"UPDATE "Permissions" SET "Value" = 0 WHERE "UserId" = ?1 AND "Kind" = ?2"#)
+            .bind(guid_to_db(user_id))
+            .bind(i32::from(PermissionKind::EnableAllFolders))
+            .execute(db.writer())
+            .await
+            .expect("revoke");
+        set_folder_preference(&db, user_id, PreferenceKind::EnabledFolders, &[first]).await;
+
+        assert_eq!(
+            names(repository.get_genres(&query).await.expect("genres")),
+            ["Adventure"],
+            "the genre carried only by the hidden library is gone"
+        );
+        {
+            use ferrofin_traits::persistence::ItemCountService;
+            assert_eq!(
+                counts
+                    .get_item_counts(&query)
+                    .await
+                    .expect("counts")
+                    .movie_count,
+                1,
+                "and the counts agree with what the user can browse"
+            );
+        }
     }
 
     /// `BlockedMediaFolders` hides exactly the libraries it names.
