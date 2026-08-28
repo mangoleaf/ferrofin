@@ -132,7 +132,8 @@ impl FerrofinItemRepository {
             && filter.parent_id != Uuid::nil()
             && !filter.physical_children_only
             && let Some(mut folders) =
-                Self::top_parent_ids_for_query(&self.db, filter.parent_id, 0).await?
+                Self::top_parent_ids_for_query(&self.db, filter.parent_id, filter.user.as_ref(), 0)
+                    .await?
         {
             // A view that resolves to nothing matches nothing — upstream
             // substitutes a fresh guid for exactly this reason ("Prevent
@@ -226,6 +227,7 @@ impl FerrofinItemRepository {
     async fn top_parent_ids_for_query(
         db: &Database,
         id: Uuid,
+        user: Option<&UserEntity>,
         depth: u8,
     ) -> Result<Option<Vec<Uuid>>, ServiceError> {
         // A `DisplayParentId`/`ParentId` chain is data, so it can be a cycle.
@@ -317,12 +319,97 @@ impl FerrofinItemRepository {
             // A dangling pointer resolves to nothing, NOT to the ancestor closure:
             // upstream returns `[]` when `GetItemById` misses.
             return Ok(Some(
-                Box::pin(Self::top_parent_ids_for_query(db, next, depth + 1))
+                Box::pin(Self::top_parent_ids_for_query(db, next, user, depth + 1))
                     .await?
                     .unwrap_or_default(),
             ));
         }
-        Ok(Some(Vec::new()))
+
+        Box::pin(Self::grouped_library_ids(db, &blob, user, depth)).await
+    }
+
+    /// The libraries a user has GROUPED into this view — C#
+    /// `GetTopParentIdsForQuery`'s fifth arm, reached by a `UserView` that has
+    /// no `DisplayParentId` and no `ParentId` of its own.
+    ///
+    /// `user is not null && ViewType != unknown && IsEligibleForGrouping(ViewType)
+    /// && user.GetPreference(GroupedFolders).Length > 0`, then the user's
+    /// collection folders whose type matches the view (or that have none),
+    /// keeping the ones the user actually grouped, each resolved in turn.
+    ///
+    /// Everything short of that resolves to nothing, which is upstream's answer
+    /// too — a view that groups no library stands for no library.
+    async fn grouped_library_ids(
+        db: &Database,
+        blob: &serde_json::Value,
+        user: Option<&UserEntity>,
+        depth: u8,
+    ) -> Result<Option<Vec<Uuid>>, ServiceError> {
+        let Some(user) = user else {
+            return Ok(Some(Vec::new()));
+        };
+        let view_type = blob
+            .get("ViewType")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_ascii_lowercase);
+        // `movies`, `tvshows`, and an untyped view — `UserView.cs:22`. A view of any
+        // other type is never a grouping of libraries.
+        if !matches!(view_type.as_deref(), Some("movies" | "tvshows")) {
+            return Ok(Some(Vec::new()));
+        }
+        let grouped = guid_preference(db.pool(), &user.id, PreferenceKind::GroupedFolders).await?;
+        if grouped.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+
+        let mut scope = Vec::new();
+        for folder in visible_views(db, user).await? {
+            if !grouped.contains(&folder) {
+                continue;
+            }
+            // `CollectionType is null || CollectionType == view.ViewType` — an
+            // untyped library groups into any view.
+            let folder_type = Self::collection_type_of(db, folder).await?;
+            if folder_type.is_some() && folder_type != view_type {
+                continue;
+            }
+            match Box::pin(Self::top_parent_ids_for_query(
+                db,
+                folder,
+                Some(user),
+                depth + 1,
+            ))
+            .await?
+            {
+                Some(ids) if !ids.is_empty() => scope.extend(ids),
+                // A library that resolves to nothing stands for ITSELF — the
+                // same accommodation `scope_to_user_libraries` makes, and for
+                // the same reason: a Ferrofin-written collection folder has no
+                // `PhysicalFolderIds`, and its items hang off it directly.
+                _ => scope.push(folder),
+            }
+        }
+        Ok(Some(scope))
+    }
+
+    /// A library's `CollectionType`, from the same `Data` blob that carries its
+    /// `PhysicalFolderIds` — `movies`, `tvshows`, … or `None` for an untyped
+    /// library, which upstream treats as matching any view.
+    async fn collection_type_of(db: &Database, id: Uuid) -> Result<Option<String>, ServiceError> {
+        let data: Option<Option<String>> =
+            sqlx::query_scalar(r#"SELECT "Data" FROM "BaseItems" WHERE "Id" = ?1"#)
+                .bind(guid_to_db(id))
+                .fetch_optional(db.pool())
+                .await
+                .map_err(db_err)?;
+        Ok(data
+            .flatten()
+            .and_then(|d| serde_json::from_str::<serde_json::Value>(&d).ok())
+            .and_then(|v| {
+                v.get("CollectionType")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_ascii_lowercase)
+            }))
     }
 
     /// The physical folders each of `ids` stands for, for those that are
@@ -3468,6 +3555,17 @@ mod tests {
         .expect("merge versions");
     }
 
+    /// Stamps a library's `CollectionType` into its `Data` blob, where both
+    /// Jellyfin and the grouping arm read it from.
+    async fn set_collection_type(db: &Database, id: Uuid, collection_type: &str) {
+        sqlx::query(r#"UPDATE "BaseItems" SET "Data" = ?2 WHERE "Id" = ?1"#)
+            .bind(guid_to_db(id))
+            .bind(format!(r#"{{"CollectionType":"{collection_type}"}}"#))
+            .execute(db.writer())
+            .await
+            .expect("set collection type");
+    }
+
     /// Stamps a row's `ProductionYear`, the column the year facet reads.
     async fn set_production_year(db: &Database, id: Uuid, year: i64) {
         let mut row = crate::test_support::fetch_item(db, id).await;
@@ -3896,6 +3994,91 @@ mod tests {
         assert!(
             browse(dangling).await.is_empty(),
             "a dangling view matches nothing, not everything"
+        );
+    }
+
+    /// A view the user has GROUPED libraries into stands for those libraries —
+    /// C# `GetTopParentIdsForQuery`'s fifth arm.
+    ///
+    /// Only reachable for a user whose `GroupedFolders` preference is
+    /// non-empty, which is why neither the default install nor the adoption
+    /// oracle can see it: the view had been resolving to nothing, so browsing a
+    /// combined view returned an empty library instead of the union.
+    #[tokio::test]
+    async fn a_grouping_view_stands_for_the_libraries_grouped_into_it() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let (first, second, user_id, user) = two_libraries(&db).await;
+        set_collection_type(&db, first, "movies").await;
+        set_collection_type(&db, second, "movies").await;
+
+        // A `movies` view with no pointer of its own — the shape the arm is for.
+        let view = Uuid::from_u128(0x9F81);
+        seed_item_with_data(
+            &db,
+            view,
+            BaseItemKind::UserView,
+            "Movies",
+            r#"{"ViewType":"movies"}"#,
+        )
+        .await;
+
+        let browse = |parent: Uuid, user: UserEntity| {
+            let repository = &repository;
+            async move {
+                let mut names: Vec<String> = repository
+                    .get_item_list(&InternalItemsQuery {
+                        parent_id: parent,
+                        recursive: true,
+                        user: Some(user),
+                        include_item_types: vec![BaseItemKind::Movie],
+                        ..InternalItemsQuery::default()
+                    })
+                    .await
+                    .expect("browse")
+                    .into_iter()
+                    .filter_map(|r| r.name)
+                    .collect();
+                names.sort();
+                names
+            }
+        };
+
+        // With no `GroupedFolders` preference the view groups nothing, so it
+        // resolves to nothing — which is upstream's answer too.
+        assert!(
+            browse(view, user.clone()).await.is_empty(),
+            "an ungrouped view stands for no library"
+        );
+
+        // Group only the first library into it.
+        set_folder_preference(&db, user_id, PreferenceKind::GroupedFolders, &[first]).await;
+        assert_eq!(
+            browse(view, user.clone()).await,
+            ["In First"],
+            "the view now stands for the library grouped into it"
+        );
+
+        // Group both.
+        set_folder_preference(
+            &db,
+            user_id,
+            PreferenceKind::GroupedFolders,
+            &[first, second],
+        )
+        .await;
+        assert_eq!(
+            browse(view, user.clone()).await,
+            ["In First", "In Second"],
+            "…and for both once both are grouped"
+        );
+
+        // A library of a DIFFERENT type is not pulled into a movies view.
+        set_collection_type(&db, second, "music").await;
+        assert_eq!(
+            browse(view, user).await,
+            ["In First"],
+            "a music library does not group into a movies view"
         );
     }
 
