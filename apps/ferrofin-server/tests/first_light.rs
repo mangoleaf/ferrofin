@@ -212,15 +212,30 @@ async fn boot() -> Harness {
     // production write path). Ids avoid `1` (the query translator's placeholder).
     let movie_id = Uuid::from_u128(0x0F1);
     let second_id = Uuid::from_u128(0x0F2);
+    // …inside a library. A query that names no scope is confined to the user's
+    // libraries (C# `LibraryManager.AddUserToQuery`), and on a real server every
+    // scanned item has one above it, so seeding bare items would be modelling a
+    // state the scanner cannot produce.
+    let library_id = Uuid::from_u128(0x0F0);
+    let mut library = movie_item(library_id, "Movies", &media_path);
+    ferrofin_core::item_type_lookup::stored_type_name(
+        ferrofin_model::data::BaseItemKind::CollectionFolder,
+    )
+    .expect("CollectionFolder has a stored type name")
+    .clone_into(&mut library.type_);
+    library.is_movie = false;
+    library.is_folder = true;
+    let mut movie = movie_item(movie_id, "Big Buck Bunny", &media_path);
+    movie.top_parent_id = Some(ferrofin_db::store::guid_to_db(library_id));
+    // The second item has no on-disk path; it still shows up in `/Items`.
+    let mut second = movie_item(second_id, "Sintel", &media_path);
+    second.top_parent_id = Some(ferrofin_db::store::guid_to_db(library_id));
+
     let persistence: Arc<dyn ItemPersistenceService> = Arc::new(
         ferrofin_core::FerrofinItemPersistenceService::new(db.clone()),
     );
     persistence
-        .save_items(&[
-            movie_item(movie_id, "Big Buck Bunny", &media_path),
-            // The second item has no on-disk path; it still shows up in `/Items`.
-            movie_item(second_id, "Sintel", &media_path),
-        ])
+        .save_items(&[library, movie, second])
         .await
         .expect("save seeded items");
 

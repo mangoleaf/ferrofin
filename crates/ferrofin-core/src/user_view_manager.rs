@@ -212,7 +212,12 @@ impl UserViewManager for FerrofinUserViewManager {
             include_item_types: vec![
                 BaseItemKind::CollectionFolder,
                 BaseItemKind::UserView,
+                // Both spellings of the playlists folder: Ferrofin provisions
+                // one, an adopted database carries the other, and this list has
+                // to mean the same set as the query scope in
+                // `item_repository::visible_views`.
                 BaseItemKind::ManualPlaylistsFolder,
+                BaseItemKind::PlaylistsFolder,
             ],
             order_by: vec![(ItemSortBy::SortName, SortOrder::Ascending)],
             ..Default::default()

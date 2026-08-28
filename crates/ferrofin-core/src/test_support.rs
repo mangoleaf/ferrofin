@@ -235,6 +235,59 @@ pub async fn seed_top_parented_item(
     .await;
 }
 
+/// Puts `items` into a library and returns the library's id.
+///
+/// A query that names no scope is confined to the user's libraries (C#
+/// `LibraryManager.AddUserToQuery`), so a fixture that seeds bare items and
+/// then queries as a user gets nothing back — correctly, because on a real
+/// server every scanned item has a library above it. Pair with
+/// [`seed_user_with_defaults`], whose user can actually see it.
+///
+/// Goes through the real upsert rather than an `UPDATE` of its own, per this
+/// module's rule about production write paths.
+pub async fn seed_library_over(db: &Database, items: &[Uuid]) -> Uuid {
+    let library = Uuid::from_u128(0x0011_B000_01B0);
+    seed_named_item(db, library, BaseItemKind::CollectionFolder, "Library").await;
+
+    let mut stamped = Vec::with_capacity(items.len());
+    for id in items {
+        let mut row = fetch_item(db, *id).await;
+        row.top_parent_id = Some(guid_to_db(library));
+        stamped.push(row);
+    }
+    persistence_over(db)
+        .save_items(&stamped)
+        .await
+        .expect("put the seeded items in the library");
+    library
+}
+
+/// Stamps an item's `Path`, the column the container lookups match on.
+///
+/// Through the real upsert, per this module's rule about production write
+/// paths.
+pub async fn set_item_path(db: &Database, id: Uuid, path: &str) {
+    let mut row = fetch_item(db, id).await;
+    row.path = Some(path.to_owned());
+    persistence_over(db)
+        .save_items(std::slice::from_ref(&row))
+        .await
+        .expect("set item path");
+}
+
+/// How many rows sit at `path` — one, for a container that was reused rather
+/// than duplicated.
+pub async fn items_at_path(db: &Database, path: &str) -> usize {
+    item_repository_over(db.clone())
+        .get_item_list(&ferrofin_traits::options::InternalItemsQuery {
+            path: Some(path.to_owned()),
+            ..Default::default()
+        })
+        .await
+        .expect("items at path")
+        .len()
+}
+
 /// Inserts a minimal `BaseItems` row of the given kind.
 pub async fn seed_item(db: &Database, id: Uuid, kind: BaseItemKind) {
     seed_named_item(db, id, kind, "").await;
@@ -425,6 +478,29 @@ pub async fn seed_provider_id(db: &Database, item_id: Uuid, provider: &str, valu
 /// [`seed_named_user`].
 pub async fn seed_user(db: &Database, id: Uuid) -> UserEntity {
     seed_named_user(db, id, "u").await
+}
+
+/// Gives an already-seeded user the permissions `create_user` would have.
+///
+/// [`seed_user`] deliberately leaves the `Permissions` table empty — several
+/// tests assert on a user who has none, and a missing row reads as `false`. But
+/// that also makes such a user maximally *restricted*: without
+/// `EnableAllFolders` they can see no library, so any query confined to their
+/// libraries comes back empty. Tests that browse as a real user want this.
+pub async fn grant_default_permissions(db: &Database, id: Uuid) {
+    let mut tx = db.writer().begin().await.expect("begin");
+    crate::user_entity_ext::seed_defaults(&mut tx, &guid_to_db(id))
+        .await
+        .expect("default permissions");
+    tx.commit().await.expect("commit");
+}
+
+/// [`seed_user`] plus [`grant_default_permissions`] — a user as the real
+/// `create_user` makes one.
+pub async fn seed_user_with_defaults(db: &Database, id: Uuid) -> UserEntity {
+    let user = seed_user(db, id).await;
+    grant_default_permissions(db, id).await;
+    user
 }
 
 /// [`seed_user`] with an explicit `Username`, for tests that need to tell two

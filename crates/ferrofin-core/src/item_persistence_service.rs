@@ -96,6 +96,145 @@ async fn music_genre_row(
     Ok(())
 }
 
+/// Inserts a minimal `BaseItems` row of the given folder-ish kind and returns
+/// the persisted row. Only the schema-required columns are set; richer metadata
+/// is populated by later refreshes (mirrors how the C# path creates a stub item
+/// then refreshes it).
+pub(crate) async fn insert_named_item(
+    db: &Database,
+    id: Uuid,
+    kind: BaseItemKind,
+    name: &str,
+    is_folder: bool,
+    container: Option<Uuid>,
+) -> Result<BaseItemEntity, ServiceError> {
+    let type_name = stored_type_name(kind)
+        .ok_or_else(|| ServiceError::backend(format!("no stored type name for {kind:?}")))?;
+    sqlx::query(
+        // `SortName` persisted, not derived on read. jellyfin-web's Collections
+        // and Playlists tabs both send `SortBy=SortName`; with the column NULL
+        // they came back in creation order while each DTO still carried a
+        // correctly COMPUTED SortName, which is what made this hard to see.
+        // `ParentId`/`TopParentId` are what make the item reachable: a query
+        // that names no scope is confined to the user's libraries (C#
+        // `AddUserToQuery`), so a row with neither is invisible to every user
+        // browse. Upstream never creates one — a playlist lands in the
+        // `ManualPlaylistsFolder` and a collection in the auto-provisioned
+        // "Collections" library — and neither should this.
+        r#"INSERT INTO "BaseItems"
+           ("Id", "Type", "IsFolder", "IsInMixedFolder", "IsLocked", "IsMovie",
+            "IsRepeat", "IsSeries", "IsVirtualItem", "Name", "SortName",
+            "ParentId", "TopParentId")
+           VALUES (?1, ?2, ?3, 0, 0, 0, 0, 0, 0, ?4, ?5, ?6, ?6)"#,
+    )
+    .bind(guid_to_db(id))
+    .bind(type_name)
+    .bind(i64::from(is_folder))
+    .bind(name)
+    .bind(ferrofin_util::sort_name::create_sort_name(name))
+    .bind(container.map(guid_to_db))
+    .execute(db.writer())
+    .await
+    .map_err(db_err)?;
+
+    sqlx::query_as::<_, BaseItemEntity>(r#"SELECT * FROM "BaseItems" WHERE "Id" = ?1"#)
+        .bind(guid_to_db(id))
+        .fetch_one(db.pool())
+        .await
+        .map_err(db_err)
+}
+
+/// The `BaseItems` row a user-created container hangs off, provisioning it if
+/// this server has never had one.
+///
+/// Upstream never leaves a created item parentless: `CreateCollectionAsync`
+/// goes through `EnsureLibraryFolder`, which auto-creates a container at
+/// `{data}/collections` on first use, and a playlist lands in the one at
+/// `{data}/playlists`. Ferrofin had neither link, so every collection and
+/// playlist it created was an orphan — reachable only by a query that names no
+/// scope, and invisible the moment one does.
+///
+/// **Matched by exact path**, the way `EnsureLibraryFolder` does
+/// (`FindFolders(path)`), and never by type: `CollectionFolder` is the type of
+/// *every* library, so a type match would file collections into whichever one
+/// sorted first. Two spellings are accepted because Jellyfin writes the
+/// literal `%AppDataPath%` token where Ferrofin writes the resolved path —
+/// both are equalities, not patterns, so a user library that happens to be
+/// called `collections` cannot be mistaken for this.
+pub(crate) async fn ensure_container(
+    db: &Database,
+    kind: BaseItemKind,
+    name: &str,
+    path: &str,
+) -> Result<Option<Uuid>, ServiceError> {
+    let leaf = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    let jellyfin_form = format!("{JELLYFIN_DATA_PATH_TOKEN}/{leaf}");
+    let existing: Option<String> = sqlx::query_scalar(
+        r#"SELECT "Id" FROM "BaseItems" WHERE "Path" IN (?1, ?2) ORDER BY "Id" LIMIT 1"#,
+    )
+    .bind(path)
+    .bind(&jellyfin_form)
+    .fetch_optional(db.pool())
+    .await
+    .map_err(db_err)?;
+    if let Some(id) = existing {
+        return Uuid::parse_str(&id).map(Some).map_err(|e| {
+            ServiceError::backend(format!("container row {id} has an unusable id: {e}"))
+        });
+    }
+
+    // Derived from the path, like every other folder id on both sides, so the
+    // same directory yields the same id wherever it is scanned.
+    let Some(id) = crate::item_type_lookup::derive_item_id(kind, path) else {
+        return Ok(None);
+    };
+    insert_named_item(db, id, kind, name, true, None).await?;
+    set_container_path(db, id, path).await?;
+    Ok(Some(id))
+}
+
+/// The literal Jellyfin writes into `BaseItems.Path` in place of the data
+/// directory (`%AppDataPath%/collections`), which Ferrofin stores resolved.
+const JELLYFIN_DATA_PATH_TOKEN: &str = "%AppDataPath%";
+
+/// Stamps a provisioned container with its directory and makes it its own top
+/// parent, the shape Jellyfin's `%AppDataPath%/collections` row has.
+async fn set_container_path(db: &Database, id: Uuid, path: &str) -> Result<(), ServiceError> {
+    sqlx::query(r#"UPDATE "BaseItems" SET "Path" = ?2, "TopParentId" = ?1 WHERE "Id" = ?1"#)
+        .bind(guid_to_db(id))
+        .bind(path)
+        .execute(db.writer())
+        .await
+        .map_err(db_err)?;
+    Ok(())
+}
+
+/// Puts the orphans an older Ferrofin created into `container`.
+///
+/// Only rows with **neither** a parent nor a top parent are touched: those can
+/// only have come from `insert_named_item` before it linked anything. A row
+/// adopted from Jellyfin already sits somewhere real and is left alone.
+pub(crate) async fn adopt_orphans(
+    db: &Database,
+    kind: BaseItemKind,
+    container: Uuid,
+) -> Result<(), ServiceError> {
+    let Some(type_name) = stored_type_name(kind) else {
+        return Ok(());
+    };
+    sqlx::query(
+        r#"UPDATE "BaseItems" SET "ParentId" = ?2, "TopParentId" = ?2
+           WHERE "Type" = ?1 AND "ParentId" IS NULL AND "TopParentId" IS NULL
+             AND "Id" <> ?2"#,
+    )
+    .bind(type_name)
+    .bind(guid_to_db(container))
+    .execute(db.writer())
+    .await
+    .map_err(db_err)?;
+    Ok(())
+}
+
 /// The concrete item-persistence service.
 #[derive(Clone)]
 pub struct FerrofinItemPersistenceService {

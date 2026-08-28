@@ -11,28 +11,13 @@ use ferrofin_db::entities::users::UserEntity;
 use ferrofin_db::enums::{PermissionKind, PreferenceKind};
 use ferrofin_db::store::guid_to_db;
 use ferrofin_model::data::BaseItemKind;
-use sqlx::sqlite::SqlitePool;
 use uuid::Uuid;
 
 use ferrofin_traits::error::ServiceError;
 
 use crate::db_error::db_err;
 use crate::item_type_lookup::stored_type_name;
-use crate::user_entity_ext::{get_preference, has_permission};
-
-/// A `Guid`-list preference, parsed (C# `GetPreferenceValues<Guid>`); values
-/// that are not GUIDs are skipped, as `Guid.TryParse` skips them.
-async fn guid_preference(
-    pool: &SqlitePool,
-    user_id: &str,
-    kind: PreferenceKind,
-) -> Result<Vec<Uuid>, ServiceError> {
-    Ok(get_preference(pool, user_id, kind)
-        .await?
-        .iter()
-        .filter_map(|v| Uuid::parse_str(v).ok())
-        .collect())
-}
+use crate::user_entity_ext::{guid_preference, has_permission};
 
 /// Raw-SQL data access for similar items and movie recommendations.
 #[derive(Clone)]

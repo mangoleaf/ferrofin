@@ -74,6 +74,23 @@ const ALL_PREFERENCE_KINDS: &[PreferenceKind] = &[
     PreferenceKind::AllowedTags,
 ];
 
+/// A `Guid`-list preference, parsed (C# `GetPreferenceValues<Guid>`); values
+/// that are not GUIDs are skipped, as `Guid.TryParse` skips them.
+///
+/// # Errors
+/// Returns [`ServiceError::Db`] if the query fails.
+pub async fn guid_preference(
+    pool: &sqlx::SqlitePool,
+    user_id: &str,
+    kind: PreferenceKind,
+) -> Result<Vec<uuid::Uuid>, ServiceError> {
+    Ok(get_preference(pool, user_id, kind)
+        .await?
+        .iter()
+        .filter_map(|v| uuid::Uuid::parse_str(v).ok())
+        .collect())
+}
+
 /// Whether the user has the given permission (C# `HasPermission`).
 ///
 /// A missing `Permissions` row means the permission is unset, which reads as

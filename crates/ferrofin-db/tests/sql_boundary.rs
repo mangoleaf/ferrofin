@@ -28,7 +28,7 @@ const CEILINGS: &[(&str, usize)] = &[
     ("crates/ferrofin-core/src/activity_manager.rs", 5),
     ("crates/ferrofin-core/src/api_key_manager.rs", 3),
     ("crates/ferrofin-core/src/authorization_context.rs", 6),
-    ("crates/ferrofin-core/src/collection_manager.rs", 16),
+    ("crates/ferrofin-core/src/collection_manager.rs", 14),
     ("crates/ferrofin-core/src/device_manager.rs", 10),
     (
         "crates/ferrofin-core/src/display_preferences_manager.rs",

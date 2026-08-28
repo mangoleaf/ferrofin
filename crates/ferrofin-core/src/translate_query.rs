@@ -1434,7 +1434,7 @@ fn media_type_name(media: ferrofin_model::data::MediaType) -> String {
 
 /// Returns the inner string when the option holds a non-blank value, else
 /// [`None`] (mirrors the C# `!string.IsNullOrWhiteSpace` guards).
-fn non_blank(value: Option<&String>) -> Option<&str> {
+pub(crate) fn non_blank(value: Option<&String>) -> Option<&str> {
     value.map(String::as_str).filter(|s| !s.trim().is_empty())
 }
 

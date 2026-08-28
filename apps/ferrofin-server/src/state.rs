@@ -1045,11 +1045,14 @@ pub async fn build_app_state(
         task_manager.register(task);
     }
     wasm_host.subscribe_events(&event_bus, &plugins);
+    let collection_paths: Arc<dyn ferrofin_traits::system::ServerApplicationPaths> =
+        Arc::clone(&paths) as Arc<_>;
     let collections: Arc<dyn ferrofin_traits::collections::CollectionManager> =
         Arc::new(FerrofinCollectionManager::new(
             db.clone(),
             Arc::clone(&library),
             Arc::clone(&linked_children_service),
+            Arc::clone(&collection_paths),
         ));
     let playlists: Arc<dyn ferrofin_traits::collections::PlaylistManager> =
         Arc::new(FerrofinPlaylistManager::new(
@@ -1057,6 +1060,7 @@ pub async fn build_app_state(
             Arc::clone(&library),
             Arc::clone(&linked_children_service),
             Arc::clone(&item_repository),
+            Arc::clone(&collection_paths),
         ));
 
     // The full Jellyfin dashboard task set (Library + Maintenance categories),

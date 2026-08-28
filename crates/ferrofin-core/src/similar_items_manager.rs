@@ -2065,6 +2065,9 @@ mod tests {
         seed_movie(&db, played, "Played", "SciFi|Horror").await;
         seed_movie(&db, similar, "Similar", "SciFi").await;
         seed_user_data(&db, user_id, played, true, None).await;
+        // The recently-played lookup names no scope, so it is confined to the
+        // user's libraries (C# `AddUserToQuery`).
+        crate::test_support::seed_library_over(&db, &[played, similar]).await;
 
         let recs = manager(&db)
             .get_movie_recommendations(Some(user_id), Uuid::nil(), 6, 5, &DtoOptions::default())

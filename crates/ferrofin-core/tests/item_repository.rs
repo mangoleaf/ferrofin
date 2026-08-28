@@ -627,12 +627,20 @@ async fn user_data_sorts_order_by_play_state() {
     let user_id = Uuid::from_u128(0x9);
     let often = Uuid::from_u128(0x901);
     let rarely = Uuid::from_u128(0x902);
+    // A query naming no scope is confined to the user's libraries (C#
+    // `AddUserToQuery`), so these need a library above them — as every scanned
+    // item on a real server has.
+    let library = Uuid::from_u128(0x900);
+    let mut library_row = item(library, BaseItemKind::CollectionFolder, "Library");
+    library_row.id = library_row.id.to_uppercase();
     let mut often_row = item(often, BaseItemKind::Movie, "Often");
     often_row.id = often_row.id.to_uppercase();
+    often_row.top_parent_id = Some(library.to_string().to_uppercase());
     let mut rarely_row = item(rarely, BaseItemKind::Movie, "Rarely");
     rarely_row.id = rarely_row.id.to_uppercase();
+    rarely_row.top_parent_id = Some(library.to_string().to_uppercase());
     persist
-        .save_items(&[often_row, rarely_row])
+        .save_items(&[library_row, often_row, rarely_row])
         .await
         .expect("save");
     // Seed the user + play state directly (this file's fixtures are raw rows;
@@ -653,6 +661,19 @@ async fn user_data_sorts_order_by_play_state() {
     .execute(db.writer())
     .await
     .expect("seed user");
+    // …and the permission `create_user` grants, without which the user can see
+    // no library at all.
+    sqlx::query(
+        r#"INSERT INTO "Permissions" ("Kind", "RowVersion", "UserId", "Value")
+           VALUES (?1, 1, ?2, 1)"#,
+    )
+    .bind(i32::from(
+        ferrofin_db::enums::PermissionKind::EnableAllFolders,
+    ))
+    .bind(user_id.to_string().to_uppercase())
+    .execute(db.writer())
+    .await
+    .expect("grant library access");
     for (item_id, count, date) in [
         (often, 9_i64, "2026-08-10 00:00:00.0000000"),
         (rarely, 1, "2026-01-01 00:00:00.0000000"),
@@ -950,4 +971,154 @@ async fn sort_name_browse_uses_the_index_and_the_pinned_shapes_do_not() {
             "the pinned ordering must keep its sort, got: {pinned}\n  for: {sql}"
         );
     }
+}
+
+/// A collection created the way a user creates one stays visible to that user.
+///
+/// A query naming no scope is confined to the user's libraries (C#
+/// `AddUserToQuery`). Before `create_collection` put the box set in a
+/// "Collections" library, it had no parent and no top parent, so scoping the
+/// query made every collection a user had ever made disappear from `/Items`.
+#[tokio::test]
+async fn a_created_collection_survives_an_unscoped_user_query() {
+    use ferrofin_traits::collections::{CollectionCreationOptions, CollectionManager};
+
+    let db = fresh_db().await;
+    let persist = FerrofinItemPersistenceService::new(db.clone());
+    let repository = repo(&db);
+
+    // One scanned movie in a library, as a real server has.
+    let library = Uuid::from_u128(0xAB01);
+    let movie = Uuid::from_u128(0xAB02);
+    let mut library_row = item(library, BaseItemKind::CollectionFolder, "Library");
+    library_row.id = library_row.id.to_uppercase();
+    let mut movie_row = item(movie, BaseItemKind::Movie, "A Movie");
+    movie_row.id = movie_row.id.to_uppercase();
+    movie_row.top_parent_id = Some(library.to_string().to_uppercase());
+    persist
+        .save_items(&[library_row, movie_row])
+        .await
+        .expect("save");
+
+    // …and a collection made through the real manager.
+    let collections = collection_manager_over(&db);
+    collections
+        .create_collection(&CollectionCreationOptions {
+            name: "My Collection".to_owned(),
+            ..Default::default()
+        })
+        .await
+        .expect("create collection");
+
+    let user = seed_user_who_sees_everything(&db, Uuid::from_u128(0xABCD)).await;
+    let rows = repository
+        .get_item_list(&InternalItemsQuery {
+            user: Some(user),
+            recursive: true,
+            ..Default::default()
+        })
+        .await
+        .expect("query");
+    let names: Vec<&str> = rows.iter().filter_map(|r| r.name.as_deref()).collect();
+    assert!(
+        names.contains(&"My Collection"),
+        "a user-created collection must still be listed, got {names:?}"
+    );
+    assert!(
+        names.contains(&"A Movie"),
+        "and so must the library's items"
+    );
+
+    // …and it went into the *Collections* container, not into whichever media
+    // library happened to sort first. A media library already exists above, so
+    // a by-type match would have filed it under "Library".
+    let boxset = rows
+        .iter()
+        .find(|r| r.name.as_deref() == Some("My Collection"))
+        .expect("the collection row");
+    let parent = boxset.parent_id.clone().expect("a collection has a parent");
+    assert_ne!(
+        parent,
+        library.to_string().to_uppercase(),
+        "a collection must not be filed into a media library"
+    );
+    let container: (Option<String>, Option<String>) =
+        sqlx::query_as(r#"SELECT "Name", "Path" FROM "BaseItems" WHERE "Id" = ?1"#)
+            .bind(&parent)
+            .fetch_one(db.pool())
+            .await
+            .expect("container row");
+    assert_eq!(container.0.as_deref(), Some("Collections"));
+    assert!(
+        container.1.is_some_and(|p| p.ends_with("/collections")),
+        "the container is the folder under the data directory"
+    );
+}
+
+/// Seeds a user with the one permission that decides whether they can see any
+/// library at all — a missing `Permissions` row reads as `false`, which makes a
+/// bare fixture user maximally restricted rather than minimal.
+async fn seed_user_who_sees_everything(
+    db: &ferrofin_db::Database,
+    id: Uuid,
+) -> ferrofin_db::entities::users::UserEntity {
+    let key = id.to_string().to_uppercase();
+    sqlx::query(
+        r#"INSERT INTO "Users"
+           ("Id", "AuthenticationProviderId", "DisplayCollectionsView",
+            "DisplayMissingEpisodes", "EnableAutoLogin", "EnableLocalPassword",
+            "EnableNextEpisodeAutoPlay", "EnableUserPreferenceAccess",
+            "HidePlayedInLatest", "InternalId", "InvalidLoginAttemptCount",
+            "MaxActiveSessions", "MustUpdatePassword",
+            "PasswordResetProviderId", "PlayDefaultAudioTrack",
+            "RememberAudioSelections", "RememberSubtitleSelections",
+            "RowVersion", "SubtitleMode", "SyncPlayAccess", "Username")
+           VALUES (?1, '', 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, '', 1, 1, 1, 0, 0, 0, 'bob')"#,
+    )
+    .bind(key.clone())
+    .execute(db.writer())
+    .await
+    .expect("seed user");
+    sqlx::query(
+        r#"INSERT INTO "Permissions" ("Kind", "RowVersion", "UserId", "Value")
+           VALUES (?1, 1, ?2, 1)"#,
+    )
+    .bind(i32::from(
+        ferrofin_db::enums::PermissionKind::EnableAllFolders,
+    ))
+    .bind(key.clone())
+    .execute(db.writer())
+    .await
+    .expect("grant library access");
+    sqlx::query_as(r#"SELECT * FROM "Users" WHERE "Id" = ?1"#)
+        .bind(key.clone())
+        .fetch_one(db.pool())
+        .await
+        .expect("read user")
+}
+
+/// The real collection manager over `db`, with throwaway application paths.
+fn collection_manager_over(db: &ferrofin_db::Database) -> ferrofin_core::FerrofinCollectionManager {
+    ferrofin_core::FerrofinCollectionManager::new(
+        db.clone(),
+        std::sync::Arc::new(ferrofin_core::FerrofinLibraryManager::new(
+            std::sync::Arc::new(ferrofin_core::FerrofinItemRepository::new(
+                db.clone(),
+                std::sync::Arc::new(ferrofin_core::item_type_lookup::ItemTypeLookup::new()),
+            )),
+            std::sync::Arc::new(ferrofin_core::FerrofinItemCountService::new(db.clone())),
+            std::sync::Arc::new(FerrofinItemPersistenceService::new(db.clone())),
+            std::sync::Arc::new(ferrofin_core::FerrofinPeopleRepository::new(db.clone())),
+        )),
+        std::sync::Arc::new(ferrofin_core::FerrofinLinkedChildrenService::new(
+            db.clone(),
+        )),
+        std::sync::Arc::new(ferrofin_core::FerrofinServerApplicationPaths::new(
+            "/tmp/ferrofin-test",
+            "/tmp/ferrofin-test/log",
+            "/tmp/ferrofin-test/config",
+            "/tmp/ferrofin-test/cache",
+            "/tmp/ferrofin-test/web",
+        )),
+    )
 }
