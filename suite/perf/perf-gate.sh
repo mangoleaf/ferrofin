@@ -47,6 +47,10 @@ trap 'docker compose down -v >/dev/null 2>&1 || true' EXIT
 # Library list — the ONE construction in suite/lib.sh (this script used to
 # duplicate it inline; the copies drifted being the risk, not a bug yet).
 suite_build_libraries
+# …and refuse to start if that library does not exist on disk. Docker would
+# otherwise CREATE the missing mount point (root-owned, which then needs sudo to
+# clear), scan nothing, and report it as a memory problem.
+suite_require_media
 
 BASE="http://localhost:$FERROFIN_HOST_PORT"
 

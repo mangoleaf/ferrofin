@@ -17,10 +17,58 @@ suite_load_env() {  # $1=env file (relative to suite/perf/), default .env
   local envf="${1:-.env}"
   suite_load_bench_conf
   [ -f "$envf" ] || cp .env.example "$envf"
+  # What the caller already set wins. Sourcing overwrote it, so a fresh
+  # worktree — whose `.env` is the copied TEMPLATE, with
+  # `REAL_MEDIA_DIR=/path/to/your/movies` — silently beat an explicit
+  # `REAL_MEDIA_DIR=... ./perf-gate.sh`, mounted a path that does not exist, and
+  # scanned an empty library. Same "set-ness, not non-emptiness" rule as
+  # `suite_load_bench_conf`; the file is still SOURCED (it has comments and
+  # quoting), the caller's values are just put back afterwards.
+  local preset=() k
+  while IFS='=' read -r k _; do
+    case "$k" in ''|\#*) continue ;; esac
+    k="${k%"${k##*[![:space:]]}"}"
+    [ -n "${!k+x}" ] && preset+=("$k=${!k}")
+  done < <(grep -E '^[A-Z_]+=' "$envf")
   set -a
   # shellcheck disable=SC1090
   . "./$envf"
   set +a
+  local kv
+  for kv in ${preset+"${preset[@]}"}; do export "${kv?}"; done
+}
+
+# Fail NOW, with the path in hand, if the configured media is not there. Every
+# way of getting this wrong used to surface 3 minutes later as "scan never
+# started"/"container likely OOM'd", which sends the reader to look at memory
+# while the real answer is an empty directory.
+suite_require_media() {
+  local missing=0 p
+  for p in "${REAL_MEDIA_DIR:-}" "${REAL_TV_DIR:-}"; do
+    [ -z "$p" ] && continue
+    # EMPTY counts as missing, and that is the whole point: docker CREATES a
+    # bind-mount source that is not there, so a run with the template `.env`
+    # leaves a real, root-owned, empty `/path/to/your/movies` behind — and every
+    # later run then passes an existence check and scans nothing.
+    if [ ! -d "$p" ] || [ -z "$(ls -A "$p" 2>/dev/null)" ]; then
+      echo "media path is missing or empty: $p" >&2
+      echo "  (set REAL_MEDIA_DIR / REAL_TV_DIR in suite/perf/.env — a fresh" >&2
+      echo "   worktree gets .env.example, whose values are placeholders that" >&2
+      echo "   docker will happily create as empty directories)" >&2
+      missing=1
+    fi
+  done
+  local synth=0
+  [ "${FIXTURE_MOVIES:-0}" -gt 0 ] && synth=1
+  [ "${FIXTURE_SERIES:-0}" -gt 0 ] && synth=1
+  [ "${FIXTURE_ARTISTS:-0}" -gt 0 ] && synth=1
+  if [ "$synth" = 1 ] && [ -z "$(ls -A fixtures/media 2>/dev/null)" ]; then
+    echo "synthetic fixtures are requested but suite/perf/fixtures/media is empty" >&2
+    echo "  (run suite/perf/run.sh once to generate them, or point" >&2
+    echo "   REAL_MEDIA_DIR at real media and set FIXTURE_*=0)" >&2
+    missing=1
+  fi
+  [ "$missing" = 0 ] || exit 1
 }
 
 # Export every bench.conf KEY=value that the process environment doesn't already
