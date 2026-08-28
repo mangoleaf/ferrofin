@@ -28,6 +28,7 @@ use ferrofin_model::data::BaseItemKind;
 use crate::db_error::db_err;
 use crate::item_repository::image_type_to_disc;
 use crate::item_type_lookup::{MUSIC_GENRE_TYPES, stored_type_name};
+use crate::text_util::get_clean_value;
 use crate::translate_query::PLACEHOLDER_ID;
 
 /// Maps an `ItemValues.Type` discriminant to the stored `BaseItems.Type` name of
@@ -255,6 +256,96 @@ impl FerrofinItemPersistenceService {
         Self { db }
     }
 
+    /// One-shot startup pass: rewrites every stored `CleanName` / `CleanValue`
+    /// that disagrees with [`get_clean_value`], recording completion in
+    /// `FerrofinMeta` so later boots skip it.
+    ///
+    /// Ferrofin used to compute the clean columns by also replacing punctuation
+    /// with spaces and collapsing whitespace, where C# `GetCleanValue` only
+    /// removes diacritics and lowercases. Databases written by those versions
+    /// hold `'h jon benjamin'` where the lookups now compute `'h. jon
+    /// benjamin'`, so every by-name resolution of a punctuated name — person,
+    /// studio, genre, tag — would miss until the next full scan rewrote the
+    /// row. A database adopted from Jellyfin already agrees, and this pass
+    /// leaves it untouched.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ServiceError`] when a query or the rewrite transaction
+    /// fails; the marker is written inside that transaction, so a failure
+    /// simply retries on the next boot.
+    pub async fn repair_clean_values(&self) -> Result<u64, ServiceError> {
+        const META_KEY: &str = "clean_values_keep_punctuation_v1";
+        let done = self
+            .db
+            .meta_get(META_KEY)
+            .await
+            .map_err(|e| ServiceError::Backend(e.to_string()))?;
+        if done.as_deref() == Some("1") {
+            return Ok(0);
+        }
+
+        let items: Vec<(String, Option<String>, Option<String>)> =
+            // The migration's placeholder row is excluded here as it is
+            // everywhere else — it has no name, and rewriting it would report
+            // work on a database that has nothing to repair.
+            sqlx::query_as(r#"SELECT "Id", "Name", "CleanName" FROM "BaseItems" WHERE "Id" <> ?1"#)
+                .bind(PLACEHOLDER_ID)
+                .fetch_all(self.db.pool())
+                .await
+                .map_err(db_err)?;
+        let values: Vec<(String, Option<String>, Option<String>)> =
+            sqlx::query_as(r#"SELECT "ItemValueId", "Value", "CleanValue" FROM "ItemValues""#)
+                .fetch_all(self.db.pool())
+                .await
+                .map_err(db_err)?;
+
+        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        let mut repaired: u64 = 0;
+        for (id, name, stored) in items {
+            let want = name.as_deref().map(get_clean_value);
+            if want.as_deref() == stored.as_deref()
+                || !was_written_by_the_old_rule(name.as_deref(), stored.as_deref())
+            {
+                continue;
+            }
+            sqlx::query(r#"UPDATE "BaseItems" SET "CleanName" = ?2 WHERE "Id" = ?1"#)
+                .bind(&id)
+                .bind(&want)
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?;
+            repaired += 1;
+        }
+        for (id, value, stored) in values {
+            // `CleanValue` is NOT NULL; a null `Value` cleans to the empty
+            // string rather than dropping the column.
+            let want = get_clean_value(value.as_deref().unwrap_or_default());
+            if Some(want.as_str()) == stored.as_deref()
+                || !was_written_by_the_old_rule(value.as_deref(), stored.as_deref())
+            {
+                continue;
+            }
+            sqlx::query(r#"UPDATE "ItemValues" SET "CleanValue" = ?2 WHERE "ItemValueId" = ?1"#)
+                .bind(&id)
+                .bind(&want)
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?;
+            repaired += 1;
+        }
+        sqlx::query(
+            r#"INSERT INTO "FerrofinMeta" ("Key", "Value") VALUES (?1, '1')
+               ON CONFLICT("Key") DO UPDATE SET "Value" = '1'"#,
+        )
+        .bind(META_KEY)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
+        Ok(repaired)
+    }
+
     /// Upserts a single item row (`INSERT … ON CONFLICT("Id") DO UPDATE`) using
     /// `sql` — [`UPSERT_SQL`] for a full-row replace, [`scan_upsert_sql`] for
     /// the library scan's ownership-respecting variant. Both bind the same
@@ -268,6 +359,7 @@ impl FerrofinItemPersistenceService {
             .as_deref()
             .filter(|n| !n.is_empty())
             .map(crate::text_util::get_clean_value);
+        let presentation_unique_key = derive_presentation_key(item);
         // Same reasoning for `SortName`, and it is why this belongs here rather
         // than at each call site. In C# `SortName` is not a field a caller can
         // forget: `BaseItem.SortName` is a lazy property that resolves to
@@ -344,7 +436,7 @@ impl FerrofinItemPersistenceService {
             .bind(&item.preferred_metadata_country_code)
             .bind(&item.preferred_metadata_language)
             .bind(opt_datetime_to_db(item.premiere_date))
-            .bind(&item.presentation_unique_key)
+            .bind(&presentation_unique_key)
             .bind(&item.primary_version_id)
             .bind(&item.production_locations)
             .bind(item.production_year)
@@ -1084,6 +1176,84 @@ pub async fn backfill_missing_sort_names(db: &Database) -> Result<usize, Service
     Ok(rows.len())
 }
 
+/// The `PresentationUniqueKey` to store for `item`.
+///
+/// Derived at write time for the same reason `CleanName` and `SortName` are:
+/// upstream recomputes it on every refresh (`MetadataService.cs:335`), so no
+/// caller can forget it. It is the column a query groups on, and Ferrofin left
+/// it null on nearly every row — which is why merging two versions of a film
+/// stopped hiding the alternate the moment the grouping was ported. On a first
+/// merge, `merge_versions` only touches the alternates (upstream does the
+/// same), so the primary's key has to have been right all along: null on the
+/// primary and the primary's id on the alternate are two different groups.
+///
+/// A row whose stored type or id cannot be parsed keeps whatever it arrived
+/// with rather than losing its key.
+fn derive_presentation_key(item: &BaseItemEntity) -> Option<String> {
+    crate::item_type_lookup::kind_from_type_name(&item.type_)
+        .zip(Uuid::parse_str(&item.id).ok())
+        .map(|(kind, id)| {
+            crate::kinds::presentation_unique_key(
+                kind,
+                id,
+                item.name.as_deref(),
+                item.primary_version_id.as_deref(),
+                item.series_presentation_unique_key.as_deref(),
+                item.index_number,
+            )
+        })
+        .or_else(|| item.presentation_unique_key.clone())
+}
+
+/// Whether `stored` is what Ferrofin's OLD clean rule would have produced for
+/// `source` — diacritics removed, lowercased, every other character collapsed
+/// to a single space, trimmed.
+///
+/// The repair pass rewrites a column only when this says yes, so it undoes
+/// Ferrofin's own damage and touches nothing else. Without the guard it would
+/// rewrite any row where the two implementations of diacritic folding disagree
+/// at all — including rows a Jellyfin install wrote, which is a silent mutation
+/// of someone else's data and breaks the two-way adoption guarantee.
+fn was_written_by_the_old_rule(source: Option<&str>, stored: Option<&str>) -> bool {
+    let (Some(source), Some(stored)) = (source, stored) else {
+        // A null clean column was never written by the old rule for a named
+        // row; filling it in is safe and is what a save would do anyway.
+        return stored.is_none();
+    };
+    let cleaned = get_clean_value(source);
+    let old: String = {
+        let mut out = String::with_capacity(cleaned.len());
+        let mut last_was_space = false;
+        for ch in cleaned.chars() {
+            if ch.is_alphabetic() || ch.is_numeric() {
+                out.push(ch);
+                last_was_space = false;
+            } else if !last_was_space {
+                out.push(' ');
+                last_was_space = true;
+            }
+        }
+        out.trim().to_owned()
+    };
+    stored == old
+}
+
+/// Stamps a row's `PresentationUniqueKey` directly, for tests that need a
+/// specific key rather than the one [`crate::kinds::presentation_unique_key`]
+/// derives (the writer always recomputes it, exactly as C# `MetadataService`
+/// does, so a fixture cannot express a shared key by saving one).
+///
+/// It lives here so the raw SQL stays inside the repository boundary.
+#[cfg(test)]
+pub(crate) async fn seed_presentation_key(db: &Database, id: Uuid, key: &str) {
+    sqlx::query(r#"UPDATE "BaseItems" SET "PresentationUniqueKey" = ?2 WHERE "Id" = ?1"#)
+        .bind(guid_to_db(id))
+        .bind(key)
+        .execute(db.writer())
+        .await
+        .expect("seed presentation key");
+}
+
 #[cfg(test)]
 mod tests {
     use ferrofin_model::data::BaseItemKind;
@@ -1720,5 +1890,49 @@ mod tests {
                 .await
                 .expect("row");
         assert_eq!(name.as_deref(), Some("Renamed.File.2011"));
+    }
+
+    /// A database written by a Ferrofin version whose `get_clean_value`
+    /// stripped punctuation is repaired in place on the next boot — otherwise a
+    /// person, studio or genre with a `.` or `-` in its name stays unreachable
+    /// by name until someone runs a full rescan.
+    #[tokio::test]
+    async fn the_clean_value_repair_rewrites_stale_columns_once() {
+        let db = test_db().await;
+        let service = FerrofinItemPersistenceService::new(db.clone());
+        let id = Uuid::from_u128(0xC1EA);
+        crate::test_support::seed_named_item(&db, id, BaseItemKind::Person, "H. Jon Benjamin")
+            .await;
+        // The stale spelling the old rule produced.
+        sqlx::query(r#"UPDATE "BaseItems" SET "CleanName" = 'h jon benjamin' WHERE "Id" = ?1"#)
+            .bind(ferrofin_db::store::guid_to_db(id))
+            .execute(db.writer())
+            .await
+            .expect("stale clean name");
+        sqlx::query(
+            r#"INSERT INTO "ItemValues" ("ItemValueId","Type","Value","CleanValue")
+               VALUES (1, 3, 'Warner Bros. Pictures', 'warner bros pictures')"#,
+        )
+        .execute(db.writer())
+        .await
+        .expect("stale clean value");
+
+        assert_eq!(service.repair_clean_values().await.expect("repair"), 2);
+        let clean: Option<String> =
+            sqlx::query_scalar(r#"SELECT "CleanName" FROM "BaseItems" WHERE "Id" = ?1"#)
+                .bind(ferrofin_db::store::guid_to_db(id))
+                .fetch_one(db.pool())
+                .await
+                .expect("read back");
+        assert_eq!(clean.as_deref(), Some("h. jon benjamin"));
+        let value: String =
+            sqlx::query_scalar(r#"SELECT "CleanValue" FROM "ItemValues" WHERE "ItemValueId" = 1"#)
+                .fetch_one(db.pool())
+                .await
+                .expect("read back");
+        assert_eq!(value, "warner bros. pictures");
+
+        // Once only: the marker means a second boot does no work.
+        assert_eq!(service.repair_clean_values().await.expect("repair"), 0);
     }
 }

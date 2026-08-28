@@ -9,7 +9,6 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-use regex::Regex;
 use unicode_normalization::UnicodeNormalization;
 
 /// Environment variable name that (in upstream Jellyfin) overrides the ICU
@@ -188,8 +187,14 @@ pub fn truncate_at_null(text: &str) -> &str {
     }
 }
 
-/// Normalizes a string for comparison: removes diacritics, lowercases, replaces
-/// punctuation/special characters with spaces, and collapses whitespace.
+/// Normalizes a string for comparison, the way the item repository's stored
+/// `CleanName` / `CleanValue` columns are written.
+///
+/// Exactly C# `BaseItemRepository.GetCleanValue` — remove diacritics, then
+/// lowercase, and nothing else. **Punctuation is kept**: a real Jellyfin
+/// 10.11.8 database stores `'h. jon benjamin'` and
+/// `'spider-man: across the spider-verse'`, so stripping it makes every
+/// by-name lookup miss on an adopted database.
 ///
 /// Returns the original string unchanged if it is null/whitespace.
 #[must_use]
@@ -197,29 +202,7 @@ pub fn get_clean_value(value: &str) -> String {
     if value.trim().is_empty() {
         return value.to_owned();
     }
-
-    // Remove diacritics and convert to lowercase.
-    let cleaned = remove_diacritics(value).to_lowercase();
-
-    // Replace all punctuation and special characters with spaces.
-    let cleaned = non_alnum_regex().replace_all(&cleaned, " ");
-
-    // Collapse multiple whitespace into a single space and trim.
-    whitespace_regex()
-        .replace_all(cleaned.trim(), " ")
-        .into_owned()
-}
-
-/// Regex matching any character that is not a letter, number, or whitespace.
-fn non_alnum_regex() -> &'static Regex {
-    static NON_ALNUM: OnceLock<Regex> = OnceLock::new();
-    NON_ALNUM.get_or_init(|| Regex::new(r"[^\p{L}\p{N}\s]").expect("valid static regex"))
-}
-
-/// Regex matching one or more whitespace characters.
-fn whitespace_regex() -> &'static Regex {
-    static WS: OnceLock<Regex> = OnceLock::new();
-    WS.get_or_init(|| Regex::new(r"\s+").expect("valid static regex"))
+    remove_diacritics(value).to_lowercase()
 }
 
 #[cfg(test)]
@@ -334,9 +317,15 @@ mod tests {
     #[rstest]
     #[case("", "")] // whitespace/empty passes through unchanged
     #[case("   ", "   ")] // all-whitespace passes through unchanged
-    #[case("Béla   Tarr!!", "bela tarr")] // fold + lowercase + punct->space + collapse
-    #[case("A,B;C", "a b c")] // punctuation replaced with single spaces
-    #[case("  Hello,  World  ", "hello world")] // trim + collapse
+    #[case("Béla   Tarr!!", "bela   tarr!!")] // fold + lowercase, nothing else
+    #[case("A,B;C", "a,b;c")] // punctuation survives
+    // Read verbatim out of a real Jellyfin 10.11.8 database.
+    #[case("H. Jon Benjamin", "h. jon benjamin")]
+    #[case("Warner Bros. Pictures", "warner bros. pictures")]
+    #[case(
+        "Spider-Man: Across the Spider-Verse",
+        "spider-man: across the spider-verse"
+    )]
     fn get_clean_value_normalizes(#[case] input: &str, #[case] expected: &str) {
         assert_eq!(expected, get_clean_value(input));
     }

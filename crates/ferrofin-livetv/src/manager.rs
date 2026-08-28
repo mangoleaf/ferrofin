@@ -657,17 +657,10 @@ impl LiveTvManager for FerrofinLiveTvManager {
         }
         let data = serde_json::to_string(&info)
             .map_err(|e| LiveTvError::serialize("serialize tuner host", e))?;
-        sqlx::query(
-            r#"INSERT INTO "FerrofinLiveTvTunerHosts" ("Id","Url","Type","Data") VALUES (?1,?2,?3,?4)
-               ON CONFLICT("Id") DO UPDATE SET "Url"=excluded."Url","Type"=excluded."Type","Data"=excluded."Data""#,
-        )
-        .bind(&id)
-        .bind(&url)
-        .bind(info.type_.as_deref().unwrap_or("m3u"))
-        .bind(&data)
-        .execute(self.db.writer())
-        .await
-        .map_err(db_err)?;
+        self.db
+            .upsert_live_tv_tuner_host(&id, &url, info.type_.as_deref().unwrap_or("m3u"), &data)
+            .await
+            .map_err(ServiceError::from)?;
         self.tuner_flag.store(true, Ordering::Relaxed);
         Ok(info)
     }

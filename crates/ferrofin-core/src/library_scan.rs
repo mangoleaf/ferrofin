@@ -2027,7 +2027,6 @@ impl LibraryScanner {
                 && updated.name.as_deref() != Some(tagged.as_str())
             {
                 updated.sort_name = Some(create_sort_name(&tagged));
-                updated.presentation_unique_key = Some(tagged.clone());
                 updated.name = Some(tagged);
                 changed = true;
             }
@@ -5009,7 +5008,7 @@ impl LibraryScanner {
             return;
         }
         let album_name = file_stem(dir);
-        let Some((album_id, mut album)) = self.base_item(
+        let Some((album_id, album)) = self.base_item(
             BaseItemKind::MusicAlbum,
             cf,
             cf,
@@ -5019,10 +5018,12 @@ impl LibraryScanner {
         ) else {
             return;
         };
-        // Upstream keys an album by "{AlbumArtist}-{Name}"; the album-artist is
-        // only known once the tracks are tagged, so the artist folder's name
-        // stands in when there is one (`enrich_one_album` owns the rest).
-        album.presentation_unique_key = Some(album_name.clone());
+        // The presentation key is NOT the album name: a real 10.11.8 stores
+        // the album's own id in `N` form here, the same as every other media
+        // row ("{AlbumArtist}-{Name}" is its *user data* key,
+        // `MusicAlbum.cs:106`). Writing the name grouped every "Greatest Hits"
+        // in the library into one row. The writer derives it — see
+        // `kinds::presentation_unique_key`.
         out.push(Planned {
             id: album_id,
             entity: album,

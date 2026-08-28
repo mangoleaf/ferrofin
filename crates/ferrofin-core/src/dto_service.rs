@@ -4509,18 +4509,24 @@ mod tests {
         // that cleans to it.
         let pf = Prefetched {
             value_ids: pf.value_ids,
-            clean_values: [("warner  bros!".to_owned(), clean.clone())]
+            clean_values: [("WARNER BROS.".to_owned(), clean.clone())]
                 .into_iter()
                 .collect(),
             ..Prefetched::default()
         };
-        assert_eq!(pf.value_id(3, "warner  bros!"), vid);
+        assert_eq!(pf.value_id(3, "WARNER BROS."), vid);
     }
 
     /// Studios/genres/artists must resolve to the SAME `ItemValues` ids the
     /// per-name lookup found, for names whose clean form differs from the stored
     /// spelling — the page's cached clean keys are the join key against
     /// `ItemValues.CleanValue`, so any normalization drift empties these fields.
+    ///
+    /// The spellings below differ only in case and diacritics, which is exactly
+    /// what the clean value folds: C# `GetCleanValue` is
+    /// `RemoveDiacritics().ToLowerInvariant()` and keeps punctuation and
+    /// whitespace, so `'WARNER   BROS!'` is NOT another spelling of
+    /// `'Warner Bros.'` — to Jellyfin those are two different studios.
     #[tokio::test]
     async fn value_ids_resolve_end_to_end_for_awkward_names() {
         let db = test_db().await;
@@ -4555,7 +4561,7 @@ mod tests {
         let movie = Uuid::from_u128(0xA_1234);
         seed_named_item(&db, movie, BaseItemKind::Movie, "M").await;
         sqlx::query(
-            r#"UPDATE "BaseItems" SET "Studios" = 'WARNER   BROS!', "Genres" = 'sci fi'
+            r#"UPDATE "BaseItems" SET "Studios" = 'WARNER BROS.', "Genres" = 'sci-fi'
                WHERE "Id" = ?1"#,
         )
         .bind(guid_to_db(movie))
@@ -4589,7 +4595,7 @@ mod tests {
             .unwrap();
 
         let studios = dtos[0].studios.as_ref().expect("studios");
-        assert_eq!(studios[0].name.as_deref(), Some("WARNER   BROS!"));
+        assert_eq!(studios[0].name.as_deref(), Some("WARNER BROS."));
         assert_eq!(studios[0].id, studio_id, "studio id");
         let genres = dtos[0].genre_items.as_ref().expect("genre items");
         assert_eq!(genres[0].id, genre_id, "genre id");
@@ -4707,19 +4713,29 @@ mod tests {
     /// Credit spellings whose *stored* form differs from every "tidy" convention
     /// a test would otherwise use: mixed case, leading/trailing and doubled
     /// internal whitespace, punctuation, accents, and non-Latin script. Paired
-    /// with the name of the ONE by-name `Person` item that backs each — the
-    /// clean value folds case/diacritics/punctuation, so the two spellings of a
-    /// pair legitimately differ.
+    /// with the name of the ONE by-name `Person` item that backs each.
+    ///
+    /// The clean value folds case and diacritics and NOTHING else (C#
+    /// `GetCleanValue` is `RemoveDiacritics().ToLowerInvariant()`), so each
+    /// pair differs only in those two dimensions — punctuation is carried
+    /// through verbatim, and a pair that differed in it would be two different
+    /// people to Jellyfin as much as to Ferrofin.
+    ///
+    /// The one exception is the surrounding whitespace on the Meryl Streep
+    /// row: `LibraryManager::get_named_item` trims the name it looks up, where
+    /// C# `TranslateQuery` passes `filter.Name` to `GetCleanValue` untrimmed.
+    /// That trim is a Ferrofin divergence, and this row is what pins it.
     const AWKWARD_CREDITS: &[(&str, &str)] = &[
         // Mixed case: `to_lowercase()` is not the identity here.
         ("Robert De Niro", "Robert De Niro"),
-        ("Andie MacDowell", "Andie MacDowell"),
-        // Leading/trailing whitespace on the credit row.
+        ("Andie MacDowell", "ANDIE MACDOWELL"),
+        // Leading/trailing whitespace on the credit row: `get_named_item`
+        // trims the name it looks up, so this still resolves to the tidy item.
         ("  Meryl Streep  ", "Meryl Streep"),
-        // Doubled internal whitespace + an apostrophe.
-        ("Conan  O'Brien", "Conan O'Brien"),
+        // Doubled internal whitespace + an apostrophe, both carried through.
+        ("Conan  O'Brien", "CONAN  O'BRIEN"),
         // Hyphenated given name.
-        ("Jean-Luc Godard", "Jean-Luc Godard"),
+        ("Jean-Luc Godard", "jean-luc godard"),
         // Accent on the credit, folded on the by-name item.
         ("Renée Zellweger", "Renee Zellweger"),
         // Accent on both sides — lowercasing this is NOT a no-op.

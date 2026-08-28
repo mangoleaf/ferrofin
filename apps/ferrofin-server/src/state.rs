@@ -289,8 +289,9 @@ pub async fn build_app_state(
     );
     let item_count_service: Arc<dyn ferrofin_traits::persistence::ItemCountService> =
         Arc::new(FerrofinItemCountService::new(db.clone()));
+    let item_persistence_impl = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
     let item_persistence_service: Arc<dyn ferrofin_traits::persistence::ItemPersistenceService> =
-        Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        Arc::clone(&item_persistence_impl) as _;
     // The per-database item-id derivation mode: Jellyfin 10.11.8 parity
     // (case-sensitive + data-dir-relative rewrite) for fresh and adopted
     // databases, grandfathered lowercase for pre-parity Ferrofin ones
@@ -303,6 +304,18 @@ pub async fn build_app_state(
             .as_deref(),
         Some(paths.program_data_path()),
     );
+    // One-shot: rewrite clean columns written by a Ferrofin version whose
+    // `get_clean_value` stripped punctuation, so by-name lookups of a
+    // punctuated name resolve without waiting for a full rescan.
+    match item_persistence_impl.repair_clean_values().await {
+        Ok(0) => {}
+        Ok(repaired) => {
+            tracing::info!(repaired, "rewrote clean name/value columns");
+        }
+        Err(err) => {
+            tracing::warn!(%err, "clean-value repair failed; punctuated by-name lookups may miss until the next scan");
+        }
+    }
     let people_repository_impl = Arc::new(
         FerrofinPeopleRepository::new(db.clone())
             .with_identity(id_derivation.clone(), paths.people_path()),
@@ -644,7 +657,8 @@ pub async fn build_app_state(
         FerrofinUserViewManager::new(Arc::clone(&item_repository))
             .with_playlists_store(Arc::clone(&item_persistence_service), playlists_path)
             .with_id_derivation(id_derivation.clone())
-            .with_virtual_folders(Arc::clone(&virtual_folders)),
+            .with_virtual_folders(Arc::clone(&virtual_folders))
+            .with_database(db.clone()),
     );
     // Similar items: the local weighted-overlap scorer always runs; the remote
     // providers below run only for a library that ticked them in its

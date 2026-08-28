@@ -23,6 +23,7 @@
 
 use ferrofin_model::data::{BaseItemKind, CollectionType};
 use ferrofin_model::entities::CollectionTypeOptions;
+use uuid::Uuid;
 
 /// Whether items of this kind are folders (C# `BaseItem.IsFolder`, overridden to
 /// `true` by every `Folder` subclass).
@@ -78,6 +79,76 @@ pub fn is_video(kind: BaseItemKind) -> bool {
             | BaseItemKind::MusicVideo
             | BaseItemKind::Trailer
     )
+}
+
+/// The `PresentationUniqueKey` a row of `kind` is stored with — C#
+/// `BaseItem.CreatePresentationUniqueKey` and its overrides, which
+/// `MetadataService` stamps on every refresh.
+///
+/// Every value below was read back out of a real Jellyfin 10.11.8 database:
+///
+/// | kind | stored key |
+/// |---|---|
+/// | `Movie`, `Episode`, `Series`, `MusicAlbum`, … | own id, `N` form (32 lowercase hex) |
+/// | a merged alternate version | the *primary's* id, same form (`Video.cs:327`) |
+/// | `Season` | `{series key}-{index:000}` (`Season.cs:131`) |
+/// | `Genre`, `MusicGenre`, `Person`, `Studio` | `{Type}-{Name}`, diacritics removed (`Genre.cs:45` → `GetUserDataKeys()[0]`) |
+/// | `MusicArtist` | `Artist-{Name}`, diacritics removed (`MusicArtist.cs:152`) |
+/// | `Year`, and every other by-name kind | own id — C# gives them no override |
+///
+/// The key is what a query groups on, so it is how one title with four cuts
+/// lists once. Ferrofin used to leave it null on most rows and write the bare
+/// album *name* on albums — which grouped two same-named albums by different
+/// artists into one.
+#[must_use]
+pub fn presentation_unique_key(
+    kind: BaseItemKind,
+    id: Uuid,
+    name: Option<&str>,
+    primary_version_id: Option<&str>,
+    series_key: Option<&str>,
+    index_number: Option<i64>,
+) -> String {
+    let own = id.as_simple().to_string();
+    if is_video(kind)
+        && let Some(primary) = primary_version_id.filter(|p| !p.is_empty())
+    {
+        // Already stored in the `N` form by `set_primary_version_id`; a value
+        // that arrives hyphenated is normalized so the alternate lands in the
+        // primary's group rather than a group of one.
+        return Uuid::parse_str(primary)
+            .map_or_else(|_| primary.to_owned(), |p| p.as_simple().to_string());
+    }
+    // The by-name prefix is the CLR *type* name, not the stored CLR path — and
+    // `MusicArtist` is spelled `Artist` (`MusicArtist.cs:152`). Only these five
+    // kinds override the key; `Year` and everything else keep their own id,
+    // which is why the list is spelled out rather than derived from
+    // `is_item_by_name`.
+    let by_name_prefix = match kind {
+        BaseItemKind::Genre => Some("Genre"),
+        BaseItemKind::MusicGenre => Some("MusicGenre"),
+        BaseItemKind::Person => Some("Person"),
+        BaseItemKind::Studio => Some("Studio"),
+        BaseItemKind::MusicArtist => Some("Artist"),
+        _ => None,
+    };
+    match (kind, by_name_prefix) {
+        (BaseItemKind::Season, _) => match (series_key.filter(|k| !k.is_empty()), index_number) {
+            (Some(series), Some(index)) => format!("{series}-{index:03}"),
+            _ => own,
+        },
+        (_, Some(prefix)) => match name.filter(|n| !n.is_empty()) {
+            // Diacritics are removed and the case is kept, exactly as
+            // `GetUserDataKeys()[0]` builds it — a real 10.11.8 stores
+            // `Person-H. Jon Benjamin` and `Artist-Red Hot Chili Peppers`.
+            Some(name) => format!(
+                "{prefix}-{}",
+                ferrofin_util::string_extensions::remove_diacritics(name)
+            ),
+            None => own,
+        },
+        _ => own,
+    }
 }
 
 /// Whether this kind is an "item by name" — a genre, studio, year, person, or
@@ -301,12 +372,156 @@ pub fn collection_type_of(options: CollectionTypeOptions) -> Option<CollectionTy
 mod tests {
     use super::{
         collection_type_of, is_displayed_as_folder, is_folder, is_item_by_name, is_video,
-        latest_items_index_container_kind, supports_ancestors, supports_inherited_parent_images,
-        supports_people, supports_played_status, supports_similarity, supports_theme_media,
+        latest_items_index_container_kind, presentation_unique_key, supports_ancestors,
+        supports_inherited_parent_images, supports_people, supports_played_status,
+        supports_similarity, supports_theme_media,
     };
     use ferrofin_model::data::{BaseItemKind, CollectionType};
     use ferrofin_model::entities::CollectionTypeOptions;
     use rstest::rstest;
+
+    /// The series key a `Season` case carries.
+    const SERIES_KEY: Option<&str> = Some("595f611d217e8273327033dd5d500d81");
+
+    /// The presentation keys a real Jellyfin 10.11.8 database stores, read out
+    /// of one row per kind and pinned here.
+    ///
+    /// The spellings are not guessable: `MusicArtist` is prefixed `Artist`, not
+    /// `MusicArtist`; `Year` has no override at all despite being an item by
+    /// name; and the by-name prefix keeps the display case while dropping
+    /// diacritics. A wrong key is invisible until a query groups on it and
+    /// silently merges two titles.
+    #[rstest]
+    // media rows: their own id, `N` form
+    #[case(
+        BaseItemKind::Movie,
+        None,
+        None,
+        None,
+        "0000000000000000000000000000002a"
+    )]
+    #[case(
+        BaseItemKind::Episode,
+        None,
+        None,
+        None,
+        "0000000000000000000000000000002a"
+    )]
+    #[case(
+        BaseItemKind::MusicAlbum,
+        Some("Californication"),
+        None,
+        None,
+        "0000000000000000000000000000002a"
+    )]
+    #[case(
+        BaseItemKind::Series,
+        Some("Breaking Bad"),
+        None,
+        None,
+        "0000000000000000000000000000002a"
+    )]
+    // by-name rows: `{Type}-{Name}`, diacritics removed, case kept
+    #[case(BaseItemKind::Genre, Some("Action"), None, None, "Genre-Action")]
+    #[case(
+        BaseItemKind::MusicGenre,
+        Some("Death Metal"),
+        None,
+        None,
+        "MusicGenre-Death Metal"
+    )]
+    #[case(
+        BaseItemKind::Person,
+        Some("H. Jon Benjamin"),
+        None,
+        None,
+        "Person-H. Jon Benjamin"
+    )]
+    #[case(
+        BaseItemKind::Studio,
+        Some("1.21 Entertainment"),
+        None,
+        None,
+        "Studio-1.21 Entertainment"
+    )]
+    #[case(
+        BaseItemKind::MusicArtist,
+        Some("Red Hot Chili Peppers"),
+        None,
+        None,
+        "Artist-Red Hot Chili Peppers"
+    )]
+    #[case(BaseItemKind::MusicArtist, Some("Björk"), None, None, "Artist-Bjork")]
+    // …but `Year` is NOT one of them
+    #[case(
+        BaseItemKind::Year,
+        Some("1999"),
+        None,
+        None,
+        "0000000000000000000000000000002a"
+    )]
+    // a season keys off its series and its index, zero-padded to three
+    #[case(
+        BaseItemKind::Season,
+        Some("Season 2"),
+        SERIES_KEY,
+        Some(2),
+        "595f611d217e8273327033dd5d500d81-002"
+    )]
+    // …and falls back to its own id when either half is missing
+    #[case(
+        BaseItemKind::Season,
+        Some("Season 2"),
+        None,
+        Some(2),
+        "0000000000000000000000000000002a"
+    )]
+    #[case(
+        BaseItemKind::Season,
+        Some("Specials"),
+        SERIES_KEY,
+        None,
+        "0000000000000000000000000000002a"
+    )]
+    fn presentation_keys_match_the_ones_jellyfin_stores(
+        #[case] kind: BaseItemKind,
+        #[case] name: Option<&str>,
+        #[case] series_key: Option<&str>,
+        #[case] index_number: Option<i64>,
+        #[case] expected: &str,
+    ) {
+        assert_eq!(
+            presentation_unique_key(
+                kind,
+                uuid::Uuid::from_u128(0x2a),
+                name,
+                None,
+                series_key,
+                index_number
+            ),
+            expected
+        );
+    }
+
+    /// A merged alternate keys off the PRIMARY, which is what puts the two rows
+    /// in one group (`Video.cs:327`) — in `N` form whichever form the pointer
+    /// column happens to hold.
+    #[rstest]
+    #[case("0000000000000000000000000000007b")]
+    #[case("00000000-0000-0000-0000-00000000007B")]
+    fn a_merged_alternate_keys_off_its_primary(#[case] primary: &str) {
+        assert_eq!(
+            presentation_unique_key(
+                BaseItemKind::Movie,
+                uuid::Uuid::from_u128(0x2a),
+                Some("Blade Runner"),
+                Some(primary),
+                None,
+                None,
+            ),
+            "0000000000000000000000000000007b"
+        );
+    }
 
     /// The `LatestItemsIndexContainer` override table: only `Episode`, `Audio`
     /// and `Photo` group; `MusicVideo` in particular does NOT (it inherits the

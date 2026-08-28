@@ -40,7 +40,7 @@ use crate::translate_query::{
     PLACEHOLDER_ID, QueryShape, append_predicates, build_latest_item_list_query, build_query,
     non_blank, push_in_list, to_guid_strings,
 };
-use crate::user_entity_ext::{guid_preference, has_permission};
+use crate::user_entity_ext::{guid_preference, has_permission, live_tv_enabled_for};
 use sqlx::{FromRow, QueryBuilder, Row, Sqlite};
 
 /// The concrete item repository.
@@ -95,6 +95,33 @@ impl FerrofinItemRepository {
         // contents.
         let wants_parent =
             filter.parent_id != Uuid::nil() && !filter.recursive && !filter.physical_children_only;
+        // A *recursive* browse of a library is scoped by top parent, not by the
+        // ancestor closure — C# `SetTopParentIdsOrAncestors`, which swaps a
+        // `CollectionFolder`/`UserView` parent for its top parents and leaves
+        // anything else to the closure. Measured against a live 10.11.8 on the
+        // same database, the two differ: the closure misses the library's own
+        // physical folder row, and the top-parent scope is what reproduces
+        // Jellyfin's count exactly.
+        // `physical_children_only` is excluded for the same reason it is
+        // excluded from `wants_parent`: that shape is the delete cascade's
+        // ("every row directly under this folder on disk"), and widening it to
+        // the library's whole top-parent scope would delete the library.
+        if filter.recursive && filter.parent_id != Uuid::nil() && !filter.physical_children_only {
+            let folders = self
+                .physical_folders_by_view(&[filter.parent_id])
+                .await?
+                .remove(&filter.parent_id)
+                .unwrap_or_default();
+            if !folders.is_empty() {
+                let mut resolved = filter.clone();
+                resolved.top_parent_ids = folders;
+                // …and the `ParentId` equality has to go with it, or the two
+                // scopes intersect to nothing: no row carries a collection
+                // folder as its parent.
+                resolved.parent_id = Uuid::nil();
+                return Ok(Some(resolved));
+            }
+        }
         if !wants_parent && filter.top_parent_ids.is_empty() {
             return self.scope_to_user_libraries(filter).await;
         }
@@ -198,10 +225,12 @@ impl FerrofinItemRepository {
     ///
     /// The `Folder.IsVisible` half of `AddUserToQuery`: a non-empty
     /// `BlockedMediaFolders` preference hides exactly those; otherwise a user
-    /// without `EnableAllFolders` sees only their `EnabledFolders`. Live TV
-    /// comes along regardless, because `AddUserToQuery` asks for the views with
-    /// `IncludeExternalContent = true` — which is why Jellyfin's `items:all`
-    /// counts one row more than the libraries alone account for.
+    /// without `EnableAllFolders` sees only their `EnabledFolders`.
+    ///
+    /// `AddUserToQuery` scopes to `GetUserViews(IncludeExternalContent: true)`,
+    /// so the Live TV view is in scope exactly when that call yields it — which
+    /// is only while Live TV is available (see
+    /// [`user_entity_ext::live_tv_enabled_for`]).
     async fn visible_views(&self, user: &UserEntity) -> Result<Vec<Uuid>, ServiceError> {
         let Some(collection_folder) = stored_type_name(BaseItemKind::CollectionFolder) else {
             return Ok(Vec::new());
@@ -233,6 +262,15 @@ impl FerrofinItemRepository {
         .await
         .map_err(db_err)?;
 
+        // Live TV is a view only while Live TV exists — see
+        // `live_tv_enabled_for`. Jellyfin leaves it out of `GetUserViews`
+        // otherwise, so it is out of this scope too. The row is looked for
+        // first: most databases have none, and then neither of the gate's two
+        // queries needs to run at all.
+        let live_tv_view = match self.live_tv_view_id().await? {
+            Some(id) if !live_tv_enabled_for(&self.db, &user.id).await? => Some(id),
+            _ => None,
+        };
         let blocked = self
             .folder_preference(user, PreferenceKind::BlockedMediaFolders)
             .await?;
@@ -254,6 +292,9 @@ impl FerrofinItemRepository {
                 // Neither a `UserView` (Live TV, Playlists) nor the playlists
                 // folder is a media folder, so neither carries a visibility
                 // preference.
+                if live_tv_view == Some(id) {
+                    return None;
+                }
                 if type_ == user_view
                     || type_ == playlists_folder
                     || type_ == manual_playlists_folder
@@ -269,6 +310,37 @@ impl FerrofinItemRepository {
                 }
             })
             .collect())
+    }
+
+    /// The `UserView` row that is the Live TV view, if this database has one.
+    ///
+    /// Identified by its **path** — see
+    /// [`crate::user_view_manager::LIVE_TV_VIEW_PATH_SUFFIX`]. The name is the
+    /// localized `HeaderLiveTV` string ("TV en direct", "ライブTV", …), so
+    /// matching on it would silently do nothing on most servers and would
+    /// misfire on a library a user happened to call "Live TV".
+    async fn live_tv_view_id(&self) -> Result<Option<Uuid>, ServiceError> {
+        let Some(user_view) = stored_type_name(BaseItemKind::UserView) else {
+            return Ok(None);
+        };
+        // Both separators: C# builds the path with `Path.Combine`, so a
+        // database adopted from a Windows Jellyfin stores `…\views\livetv`
+        // and a POSIX-only pattern would never fire — on exactly the adoption
+        // case this gate exists for. (`LIKE` is `%`/`_` only, so a backslash
+        // needs no escaping.)
+        let suffix = crate::user_view_manager::LIVE_TV_VIEW_PATH_SUFFIX;
+        let id: Option<String> = sqlx::query_scalar(
+            r#"SELECT "Id" FROM "BaseItems"
+               WHERE "Type" = ?1 AND ("Path" LIKE ?2 OR "Path" LIKE ?3)
+               ORDER BY "Id" LIMIT 1"#,
+        )
+        .bind(user_view)
+        .bind(format!("%{suffix}"))
+        .bind(format!("%{}", suffix.replace('/', "\\")))
+        .fetch_optional(self.db.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(id.and_then(|id| Uuid::parse_str(&id).ok()))
     }
 
     /// One of the user's guid-list folder preferences.
@@ -362,7 +434,7 @@ impl FerrofinItemRepository {
     /// Its one caller — `get_items` — resolves once for both the page and the
     /// count, so there is no resolving wrapper here to tempt a second lookup.
     async fn fetch_count_resolved(&self, filter: &InternalItemsQuery) -> Result<i32, ServiceError> {
-        let mut qb = build_query(filter, QueryShape::Count);
+        let mut qb = build_query(filter, QueryShape::GroupedCount);
         let count: i64 = qb
             .build_query_scalar::<i64>()
             .fetch_one(self.db.pool())
@@ -3177,6 +3249,49 @@ mod tests {
         );
     }
 
+    /// Stamps a row's `PresentationUniqueKey` — the column the grouping keys
+    /// off, written through the production writer.
+    /// Merges `ids` through the real `LibraryManager::merge_versions`, so the
+    /// fixture goes through the same path a client's
+    /// `POST /Videos/MergeVersions` does.
+    async fn merge_versions_over(db: &Database, ids: &[Uuid]) {
+        use ferrofin_traits::library::LibraryManager;
+        let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
+            Arc::new(crate::item_type_lookup::ItemTypeLookup::new());
+        crate::library_manager::FerrofinLibraryManager::new(
+            Arc::new(FerrofinItemRepository::new(db.clone(), lookup)),
+            Arc::new(crate::item_count_service::FerrofinItemCountService::new(
+                db.clone(),
+            )),
+            Arc::new(
+                crate::item_persistence_service::FerrofinItemPersistenceService::new(db.clone()),
+            ),
+            Arc::new(crate::people_repository::FerrofinPeopleRepository::new(
+                db.clone(),
+            )),
+        )
+        .merge_versions(ids)
+        .await
+        .expect("merge versions");
+    }
+
+    /// These tests exercise what the QUERY does with a key, so the key is
+    /// written straight to the column — the writer recomputes its own (see
+    /// `kinds::presentation_unique_key`) and would overwrite the shape being
+    /// probed.
+    async fn set_presentation_key(db: &Database, id: Uuid, key: &str) {
+        crate::item_persistence_service::seed_presentation_key(db, id, key).await;
+    }
+
+    /// What `/Items/Counts` reports for a filter.
+    async fn count_over(db: &Database, filter: &InternalItemsQuery) -> i32 {
+        use ferrofin_traits::persistence::ItemCountService;
+        crate::item_count_service::FerrofinItemCountService::new(db.clone())
+            .get_count(filter)
+            .await
+            .expect("count")
+    }
+
     /// The `PhysicalFolderIds` a Jellyfin `CollectionFolder` carries in its
     /// `Data` blob: N-format guids (32 lowercase hex, no hyphens), where the
     /// `Id` column is uppercase and hyphenated.
@@ -3271,6 +3386,87 @@ mod tests {
         assert_eq!(unscoped_names(&repository, &user).await, ["In First"]);
     }
 
+    /// A Live TV view left behind in an adopted database is not part of the
+    /// scope while no tuner is configured — Jellyfin drops it from
+    /// `GetUserViews`, so the items under it are outside what an unscoped
+    /// query sees. Measured on a real 10.11.8: including it put the
+    /// unscoped item count one over upstream's.
+    #[tokio::test]
+    async fn a_tuner_less_live_tv_view_is_left_out_of_the_scope() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let (_first, _second, _user_id, user) = two_libraries(&db).await;
+        let live_tv = Uuid::from_u128(0x9806);
+        // Named in the server's language (`HeaderLiveTV`) and identified by its
+        // path — see `user_view_manager::LIVE_TV_VIEW_PATH_SUFFIX`.
+        seed_named_item(&db, live_tv, BaseItemKind::UserView, "TV en direct").await;
+        crate::test_support::set_item_path(
+            &db,
+            live_tv,
+            &format!(
+                "/meta/views{}",
+                crate::user_view_manager::LIVE_TV_VIEW_PATH_SUFFIX
+            ),
+        )
+        .await;
+        seed_top_parented_item(
+            &db,
+            Uuid::from_u128(0x9807),
+            BaseItemKind::Movie,
+            "On Live TV",
+            live_tv,
+        )
+        .await;
+
+        assert_eq!(
+            unscoped_names(&repository, &user).await,
+            ["In First", "In Second"],
+            "no tuner configured: the Live TV view is not a scope"
+        );
+
+        db.upsert_live_tv_tuner_host("t1", "http://tuner", "m3u", "{}")
+            .await
+            .expect("tuner");
+
+        assert_eq!(
+            unscoped_names(&repository, &user).await,
+            ["In First", "In Second", "On Live TV"],
+            "with a tuner, Live TV is a view like any other"
+        );
+    }
+
+    /// A database adopted from a Windows Jellyfin stores the view path with
+    /// backslashes, and the gate has to find it there too — otherwise it
+    /// silently does nothing on one of the two platforms it exists for.
+    #[tokio::test]
+    async fn the_live_tv_view_is_found_under_a_windows_path() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let (_first, _second, _user_id, user) = two_libraries(&db).await;
+        let live_tv = Uuid::from_u128(0x9808);
+        seed_named_item(&db, live_tv, BaseItemKind::UserView, "Live TV").await;
+        crate::test_support::set_item_path(
+            &db,
+            live_tv,
+            r"C:\ProgramData\Jellyfin\metadata\views\livetv",
+        )
+        .await;
+        seed_top_parented_item(
+            &db,
+            Uuid::from_u128(0x9809),
+            BaseItemKind::Movie,
+            "On Live TV",
+            live_tv,
+        )
+        .await;
+
+        assert_eq!(
+            unscoped_names(&repository, &user).await,
+            ["In First", "In Second"],
+            "the windows-pathed Live TV view is out of scope too"
+        );
+    }
+
     /// `BlockedMediaFolders` hides exactly the libraries it names.
     #[tokio::test]
     async fn a_blocked_library_is_hidden_even_from_a_user_who_may_see_everything() {
@@ -3339,6 +3535,266 @@ mod tests {
         let found = repository.get_item_list(&filter).await.expect("children");
         assert_eq!(found.len(), 1, "the view's children hang off its folder");
         assert_eq!(found[0].id, guid_to_db(episode));
+    }
+
+    /// A *recursive* browse of a library is scoped by its physical folders'
+    /// `TopParentId`, not by the ancestor closure — C#
+    /// `SetTopParentIdsOrAncestors`. The two differ by exactly the folder row
+    /// itself, which the closure misses: measured against a live 10.11.8 on the
+    /// same 40,610-item database, 6,988 rows by top parent vs 6,987 by closure.
+    #[tokio::test]
+    async fn a_recursive_browse_of_a_library_is_scoped_by_its_physical_folders() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let view = Uuid::from_u128(0x9A01);
+        let physical = Uuid::from_u128(0x9A02);
+        let episode = Uuid::from_u128(0x9A03);
+
+        seed_item_with_data(
+            &db,
+            view,
+            BaseItemKind::CollectionFolder,
+            "TV",
+            &collection_folder_data(physical),
+        )
+        .await;
+        seed_named_item(&db, physical, BaseItemKind::Folder, "TV").await;
+        // Top-parented but NOT in the view's ancestor closure — only the
+        // translated scope reaches it.
+        seed_top_parented_item(&db, episode, BaseItemKind::Episode, "Pilot", physical).await;
+
+        let found = repository
+            .get_item_list(&InternalItemsQuery {
+                parent_id: view,
+                recursive: true,
+                ..InternalItemsQuery::default()
+            })
+            .await
+            .expect("recursive browse");
+        let names: Vec<&str> = found.iter().filter_map(|r| r.name.as_deref()).collect();
+        assert!(
+            names.contains(&"Pilot"),
+            "the library's physical folder is the scope, got {names:?}"
+        );
+    }
+
+    /// The delete cascade asks for a parent's physical children, recursively —
+    /// and must NOT be widened to the library's whole top-parent scope, or
+    /// "delete this folder's contents" becomes "delete the library".
+    #[tokio::test]
+    async fn a_physical_children_query_is_never_widened_to_the_library() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let view = Uuid::from_u128(0x9B01);
+        let physical = Uuid::from_u128(0x9B02);
+        let elsewhere = Uuid::from_u128(0x9B03);
+
+        seed_item_with_data(
+            &db,
+            view,
+            BaseItemKind::CollectionFolder,
+            "TV",
+            &collection_folder_data(physical),
+        )
+        .await;
+        seed_named_item(&db, physical, BaseItemKind::Folder, "TV").await;
+        seed_top_parented_item(&db, elsewhere, BaseItemKind::Episode, "Pilot", physical).await;
+
+        let found = repository
+            .get_item_list(&InternalItemsQuery {
+                parent_id: view,
+                recursive: true,
+                physical_children_only: true,
+                ..InternalItemsQuery::default()
+            })
+            .await
+            .expect("physical children");
+        assert!(
+            found.is_empty(),
+            "nothing is a physical child of the collection folder itself, got {:?}",
+            found
+                .iter()
+                .filter_map(|r| r.name.as_deref())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Two versions of one film share a `PresentationUniqueKey`, so a browse
+    /// lists the title once — C# `ApplyGroupingFilter` — and the row it lists
+    /// is the *primary* version, not whichever cut sorts first.
+    ///
+    /// The whole point of the merge is that the alternate stops showing up on
+    /// its own, so this drives the real `merge_versions` end to end: the
+    /// grouping replaced a blunt `PrimaryVersionId IS NULL` predicate that used
+    /// to hide alternates, and if the two rows do not actually land in one
+    /// group, merging silently stops working.
+    #[tokio::test]
+    async fn merged_versions_collapse_to_the_primary_row() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let library = Uuid::from_u128(0x9C01);
+        let cut_a = Uuid::from_u128(0x9C02);
+        let cut_b = Uuid::from_u128(0x9C03);
+        seed_named_item(&db, library, BaseItemKind::CollectionFolder, "Movies").await;
+        seed_top_parented_item(&db, cut_a, BaseItemKind::Movie, "Blade Runner", library).await;
+        seed_top_parented_item(
+            &db,
+            cut_b,
+            BaseItemKind::Movie,
+            "Blade Runner (Director's Cut)",
+            library,
+        )
+        .await;
+        // `seed_*` writes a deliberately minimal row straight to the table, so
+        // the two go through the real writer first — that is what stamps the
+        // presentation key (`kinds::presentation_unique_key`), and a scanned
+        // library has been through it.
+        let persistence =
+            crate::item_persistence_service::FerrofinItemPersistenceService::new(db.clone());
+        for id in [cut_a, cut_b] {
+            let row = crate::test_support::fetch_item(&db, id).await;
+            persistence
+                .save_items(std::slice::from_ref(&row))
+                .await
+                .expect("write through the production writer");
+        }
+        // Merged through `LibraryManager::merge_versions` itself, not through
+        // the writer it happens to call: on a FIRST merge that method touches
+        // only the alternates (the primary's `PrimaryVersionId` is already
+        // null, so it is skipped), and a test that stamps the primary by hand
+        // would hide exactly the case where the two rows fail to meet.
+        merge_versions_over(&db, &[cut_a, cut_b]).await;
+        let user = seed_user_with_defaults(&db, Uuid::from_u128(0x9C05)).await;
+
+        let filter = InternalItemsQuery {
+            user: Some(user.clone()),
+            recursive: true,
+            include_item_types: vec![BaseItemKind::Movie],
+            ..InternalItemsQuery::default()
+        };
+        // Which of the two `merge_versions` elected is its business (widest
+        // video stream, then id order), so the expectation is read back rather
+        // than assumed — what matters is that the browse lists exactly that
+        // row.
+        let mut elected_name = None;
+        for id in [cut_a, cut_b] {
+            let row = crate::test_support::fetch_item(&db, id).await;
+            if row.primary_version_id.is_none() {
+                elected_name = row.name;
+            }
+        }
+        let elected_name = elected_name.expect("one of the two is the primary");
+
+        let found = repository.get_item_list(&filter).await.expect("browse");
+        assert_eq!(
+            found
+                .iter()
+                .filter_map(|r| r.name.as_deref())
+                .collect::<Vec<_>>(),
+            [elected_name.as_str()],
+            "one row per title, and it is the primary version"
+        );
+        // The total that labels a *page* counts the same grouped rows
+        // (`GetItems` counts `dbQuery` after `ApplyGroupingFilter`).
+        let paged = repository
+            .get_items(&InternalItemsQuery {
+                limit: Some(10),
+                enable_total_record_count: true,
+                ..filter.clone()
+            })
+            .await
+            .expect("page");
+        assert_eq!(paged.total_record_count, 1);
+    }
+
+    /// The grouping *gate* — C# `EnableGroupByPresentationUniqueKey`, which
+    /// needs a user and either no kind filter or one of the six kinds that can
+    /// have versions.
+    ///
+    /// Probed with two rows that merely SHARE a key and have no
+    /// `PrimaryVersionId`: an alternate version would be dropped by the
+    /// ungrouped path's own predicate, so it could not tell the two states
+    /// apart.
+    #[tokio::test]
+    async fn grouping_needs_a_user_and_a_versionable_kind() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let library = Uuid::from_u128(0x9D01);
+        seed_named_item(&db, library, BaseItemKind::CollectionFolder, "Movies").await;
+        // Two rows per kind, each pair sharing one key. `Audio` is outside the
+        // six kinds that can have versions, so it is the gate's negative side.
+        for (i, kind) in [BaseItemKind::Movie, BaseItemKind::Audio]
+            .into_iter()
+            .enumerate()
+        {
+            for j in 0..2u128 {
+                let id = Uuid::from_u128(0x9D02 + (i as u128) * 8 + j);
+                seed_top_parented_item(&db, id, kind, &format!("{kind:?} {j}"), library).await;
+                set_presentation_key(&db, id, &format!("shared-{i}")).await;
+            }
+        }
+        let user = seed_user_with_defaults(&db, Uuid::from_u128(0x9D05)).await;
+        let grouped = InternalItemsQuery {
+            user: Some(user),
+            recursive: true,
+            include_item_types: vec![BaseItemKind::Movie],
+            ..InternalItemsQuery::default()
+        };
+
+        assert_eq!(
+            repository
+                .get_item_list(&grouped)
+                .await
+                .expect("browse")
+                .len(),
+            1,
+            "one row per key"
+        );
+        assert_eq!(
+            repository
+                .get_item_list(&InternalItemsQuery {
+                    user: None,
+                    ..grouped.clone()
+                })
+                .await
+                .expect("browse")
+                .len(),
+            2,
+            "without a user nothing is grouped"
+        );
+        assert_eq!(
+            repository
+                .get_item_list(&InternalItemsQuery {
+                    include_item_types: vec![BaseItemKind::Audio],
+                    ..grouped.clone()
+                })
+                .await
+                .expect("browse")
+                .len(),
+            2,
+            "a kind list with none of the six turns grouping off"
+        );
+        // …but upstream's rule is `Contains(Episode) || Contains(Video) || …`,
+        // so a list that merely INCLUDES one of the six keeps it on.
+        assert_eq!(
+            repository
+                .get_item_list(&InternalItemsQuery {
+                    include_item_types: vec![BaseItemKind::Audio, BaseItemKind::Movie],
+                    ..grouped.clone()
+                })
+                .await
+                .expect("browse")
+                .len(),
+            2,
+            "grouping stays on and collapses BOTH pairs to their key"
+        );
+        // `/Items/Counts` reports ROWS, not titles: C# `GetCount` runs
+        // `TranslateQuery` without `ApplyGroupingFilter`.
+        assert_eq!(
+            count_over(&db, &grouped).await,
+            2,
+            "the counts endpoint is ungrouped"
+        );
     }
 
     /// The `TopParentId` half — what `Latest` scopes by.

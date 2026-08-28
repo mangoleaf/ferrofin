@@ -1128,13 +1128,14 @@ mod tests {
             .expect("empty person ids");
         assert!(empty_people.is_empty());
 
-        // Three separate Genre by-name rows that all clean to "drama", plus one
-        // that doesn't. Dedupe binds "drama" once; all three rows must still
-        // report the movie.
+        // Three separate Genre by-name rows that all clean to "drama" — case
+        // and diacritics are exactly what `GetCleanValue` folds — plus one that
+        // doesn't. Dedupe binds "drama" once; all three rows must still report
+        // the movie.
         let dupes = [
             (Uuid::from_u128(0x0D01), "Drama"),
             (Uuid::from_u128(0x0D02), "drama"),
-            (Uuid::from_u128(0x0D03), "DRAMA!"),
+            (Uuid::from_u128(0x0D03), "Dráma"),
         ];
         for (id, raw) in dupes {
             seed_named_item(&db, id, BaseItemKind::Genre, raw).await;

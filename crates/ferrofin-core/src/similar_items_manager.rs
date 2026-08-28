@@ -1272,7 +1272,6 @@ mod tests {
         presentation_unique_key: Option<&str>,
     ) {
         let movie = ferrofin_db::entities::base_items::BaseItemEntity {
-            presentation_unique_key: presentation_unique_key.map(str::to_owned),
             // The DB GUID form, as every writer in the crate uses — a display
             // form here only agrees with the rest of the schema for ids that
             // happen to contain no hex letters.
@@ -1292,6 +1291,11 @@ mod tests {
             .save_items(&[movie])
             .await
             .expect("seed movie");
+        if let Some(key) = presentation_unique_key {
+            // After the save: the writer recomputes the key from the row (C#
+            // `MetadataService`), so a shared key has to be stamped on top.
+            crate::item_persistence_service::seed_presentation_key(db, id, key).await;
+        }
         for genre in genres.split('|').filter(|g| !g.is_empty()) {
             seed_item_genre(db, id, genre).await;
         }

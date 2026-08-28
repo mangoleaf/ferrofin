@@ -242,6 +242,48 @@ impl Database {
         Ok(rows)
     }
 
+    /// How many Live TV tuner hosts are configured.
+    ///
+    /// The Live TV availability gate reads this — C#
+    /// `LiveTvManager.IsLiveTvEnabled` tests `TunerHosts.Length > 0`, and with
+    /// no tuner Jellyfin leaves the Live TV view out of `GetUserViews`
+    /// entirely.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub async fn live_tv_tuner_count(&self) -> Result<i64> {
+        let count: i64 = sqlx::query_scalar(r#"SELECT COUNT(*) FROM "FerrofinLiveTvTunerHosts""#)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(count)
+    }
+
+    /// Writes a Live TV tuner host, replacing any row with the same id.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the write fails.
+    pub async fn upsert_live_tv_tuner_host(
+        &self,
+        id: &str,
+        url: &str,
+        kind: &str,
+        data: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"INSERT INTO "FerrofinLiveTvTunerHosts" ("Id","Url","Type","Data") VALUES (?1,?2,?3,?4)
+               ON CONFLICT("Id") DO UPDATE SET "Url"=excluded."Url","Type"=excluded."Type","Data"=excluded."Data""#,
+        )
+        .bind(id)
+        .bind(url)
+        .bind(kind)
+        .bind(data)
+        .execute(&self.writer)
+        .await?;
+        Ok(())
+    }
+
     /// Every `(item id, provider key, provider value)` recorded for `ids`, with
     /// each id in its stored (uppercase, hyphenated) GUID form.
     ///
