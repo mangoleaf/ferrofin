@@ -148,22 +148,31 @@ impl Extension for MergeVersionsExtension {
 /// One day as scheduler ticks (100 ns) — the upstream tasks' default interval.
 const DAY_TICKS: i64 = 24 * 3600 * 10_000_000;
 
-/// The merge tasks' shared default triggers: every 24 hours (upstream's
-/// default) plus at startup. The startup trigger is a deliberate divergence
-/// from upstream: the interval clock resets on every boot, so a server that
-/// restarts more often than daily would otherwise never run the merge at all.
+/// The merge tasks' shared default trigger: every 24 hours, as upstream.
+///
+/// There used to be a `StartupTrigger` here as well, justified by "the interval
+/// clock resets on every boot, so a server that restarts more often than daily
+/// would otherwise never run the merge at all". That was true, and it was a
+/// scheduler bug rather than a reason to diverge: `trigger_due` anchored the
+/// interval on the scheduler's own start time, which is always "now" at boot.
+/// The anchor is the last completion now, so a daily task stays daily across
+/// restarts and this trigger needs no help.
+///
+/// Merging alternate versions REWRITES the library, so running it on every boot
+/// is a mutation nobody asked for — but be precise about what removing the
+/// trigger buys. This extension is enabled by default, and a data directory
+/// adopted from Jellyfin carries no Ferrofin task-result file, so on the FIRST
+/// boot after adoption both tasks still run unasked: at `boot + ~1h` (the
+/// never-run branch) instead of `boot + 3s`. It is the second and every
+/// subsequent boot that stops rewriting the library. Preventing the first run
+/// outright would mean gating library-mutating tasks out of the never-run
+/// branch entirely — a bigger decision than this change.
 fn default_triggers() -> Vec<TaskTriggerInfo> {
-    vec![
-        TaskTriggerInfo {
-            type_: TaskTriggerInfoType::IntervalTrigger,
-            interval_ticks: Some(DAY_TICKS),
-            ..TaskTriggerInfo::default()
-        },
-        TaskTriggerInfo {
-            type_: TaskTriggerInfoType::StartupTrigger,
-            ..TaskTriggerInfo::default()
-        },
-    ]
+    vec![TaskTriggerInfo {
+        type_: TaskTriggerInfoType::IntervalTrigger,
+        interval_ticks: Some(DAY_TICKS),
+        ..TaskTriggerInfo::default()
+    }]
 }
 
 /// Whether the Merge Versions plugin is currently enabled (live toggle).
@@ -1834,9 +1843,16 @@ mod tests {
             assert_eq!(task.category(), "Merge Versions");
             let triggers = task.default_triggers();
             assert_eq!(triggers[0].interval_ticks, Some(DAY_TICKS));
-            // Startup trigger: the interval clock resets each boot, so without
-            // this a frequently-restarted server never merges at all.
-            assert_eq!(triggers[1].type_, TaskTriggerInfoType::StartupTrigger);
+            // Daily and ONLY daily, as upstream. A `StartupTrigger` used to sit
+            // beside it, compensating for an interval clock that restarted on
+            // every boot; the scheduler anchors on the last completion now, so
+            // the compensation is gone and merging — which rewrites the library
+            // — no longer runs unasked on every boot of an adopted database.
+            assert_eq!(
+                triggers.len(),
+                1,
+                "no startup trigger: merging must not run unasked on every boot"
+            );
             // Disabled plugin → the task is a silent no-op, not a failure.
             let progress = TaskProgress::default();
             task.execute(&progress).await.expect("skip when disabled");

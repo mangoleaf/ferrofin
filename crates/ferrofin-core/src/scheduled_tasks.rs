@@ -57,6 +57,36 @@ pub(crate) fn interval_hours(hours: i64) -> TaskTriggerInfo {
 /// task's first run off the boot critical path.
 const STARTUP_TRIGGER_DELAY: Duration = Duration::from_secs(3);
 
+/// How long after startup an interval task that has **never completed** first
+/// becomes due — upstream's `IntervalTrigger.Start` arms `now.AddHours(1)` when
+/// `lastResult is null`, rather than waiting a whole interval.
+const FIRST_RUN_DELAY: chrono::TimeDelta = chrono::TimeDelta::hours(1);
+
+/// How far past [`FIRST_RUN_DELAY`] the never-run tasks are spread.
+///
+/// On a fresh install — and on the first boot of an **adopted Jellyfin
+/// database**, which has no Ferrofin task-result file — every interval task
+/// takes the never-run branch at once. That is thirteen of them, including the
+/// library scan, media-segment scan, audio normalization and both
+/// merge-versions passes, and `queue_with_trigger` spawns each without any
+/// global serialisation. Upstream never sees this because its timers are armed
+/// per task from a running process; here they all become due on one sweep.
+const FIRST_RUN_SPREAD_MINUTES: i64 = 55;
+
+/// When a never-run interval task first becomes due, offset deterministically
+/// by task key so the whole set does not start together.
+///
+/// Deterministic rather than random: a restart must not re-roll the offset, or
+/// a task whose slot keeps moving could be starved by repeated reboots.
+fn first_run_delay(task_key: &str) -> chrono::TimeDelta {
+    let hash = task_key.bytes().fold(0u64, |acc, b| {
+        acc.wrapping_mul(31).wrapping_add(u64::from(b))
+    });
+    let offset =
+        i64::try_from(hash % u64::try_from(FIRST_RUN_SPREAD_MINUTES).unwrap_or(1)).unwrap_or(0);
+    FIRST_RUN_DELAY + chrono::TimeDelta::minutes(offset)
+}
+
 /// A live handle a running task uses to report its completion percentage.
 ///
 /// Port of the C# `IProgress<double>` each `IScheduledTask.ExecuteAsync`
@@ -836,6 +866,7 @@ impl FerrofinTaskManager {
                     let last_fire = reg.trigger_fires.get(&idx).copied();
                     if trigger_due(
                         trigger,
+                        key,
                         now,
                         last_fire,
                         last_run_end,
@@ -886,18 +917,22 @@ fn weekday_of(day: DayOfWeek) -> chrono::Weekday {
 /// - `DailyTrigger`: due once per day at `time_of_day_ticks` (local time).
 /// - `WeeklyTrigger`: as daily, but only on `day_of_week`.
 /// - `IntervalTrigger`: due `interval_ticks` after the most recent of its last
-///   fire, the task's last run end, or scheduler start (so a fresh boot waits a
-///   full interval rather than firing everything at once).
+///   fire or the task's last run end — **not** scheduler start, which would
+///   restart the cadence on every boot. A task with no recorded result is due
+///   [`first_run_delay`] after startup. See the arm itself: this is an accepted
+///   divergence from upstream, which does re-anchor on boot.
 /// - `StartupTrigger`: handled at scheduler start, never due in a sweep.
 ///
 /// `triggers_since` is when the task's trigger set was last reconfigured (see
 /// [`Registration::triggers_since`]); a daily/weekly occurrence older than that
 /// belongs to the previous configuration and never fires, matching upstream's
 /// `DailyTrigger.Start`, which always arms the next future occurrence. Interval
-/// triggers ignore it — upstream's `IntervalTrigger.Start` re-arms a due
-/// interval shortly after a reload rather than restarting the cadence.
+/// triggers ignore it, so saving a schedule whose new interval has already
+/// elapsed since the last run fires the task on the next sweep — upstream's
+/// `ReloadTriggerEvents(false)` re-arms `now + 1min + interval` instead.
 fn trigger_due(
     trigger: &TaskTriggerInfo,
+    task_key: &str,
     now: DateTime<Utc>,
     last_fire: Option<DateTime<Utc>>,
     last_run_end: Option<DateTime<Utc>>,
@@ -910,11 +945,42 @@ fn trigger_due(
             let Some(interval) = trigger.interval_ticks.filter(|t| *t > 0) else {
                 return false;
             };
-            let base = [Some(scheduler_start), last_fire, last_run_end]
-                .into_iter()
-                .flatten()
-                .max()
-                .unwrap_or(scheduler_start);
+            // ACCEPTED DIVERGENCE — anchored on the last COMPLETION, where
+            // upstream re-anchors on every process start.
+            //
+            // `IntervalTrigger.Start`:
+            //
+            //   if (lastResult is null) triggerDate = now.AddHours(1);
+            //   else triggerDate = new[] { lastResult.EndTimeUtc, _lastStartDate,
+            //                              now.AddMinutes(1) }.Max().Add(_interval);
+            //
+            // Read that `Max()` carefully: the two stored instants are always in
+            // the past, so `now.AddMinutes(1)` ALWAYS wins and the else-branch
+            // is unconditionally `now + 1min + interval`. `Start` runs at boot
+            // (`InitTriggerEvents` → `ReloadTriggerEvents(true)`), so Jellyfin
+            // restarts the cadence on every boot too — a 24-hour task on a
+            // server rebooted every 12 hours never fires **in Jellyfin either**.
+            //
+            // Ferrofin does not reproduce that (`docs`: do not port Jellyfin
+            // bugs). Anchoring on the persisted completion is what makes a
+            // "daily" task actually daily. Three consequences, all deliberate:
+            //
+            //  1. an overdue task fires on the next sweep, where upstream would
+            //     wait a further `interval + 1min`;
+            //  2. there is no 1-minute floor, so the cadence is
+            //     `run_end + interval` rather than `fire + 1min + interval` —
+            //     a 6-hour scan repeats every 24h here, every ~30h upstream;
+            //  3. `set_triggers` clears `trigger_fires` but not `last_run_end`,
+            //     so saving a schedule whose new interval has already elapsed
+            //     launches the task on the next sweep.
+            //
+            // A task that has never completed is due `FIRST_RUN_DELAY` after
+            // startup — upstream's `AddHours(1)` — spread per task so a fresh
+            // or freshly-adopted install does not start thirteen of them at
+            // once. See `first_run_due_at`.
+            let Some(base) = [last_fire, last_run_end].into_iter().flatten().max() else {
+                return now - scheduler_start >= first_run_delay(task_key);
+            };
             now - base >= ticks_to_chrono(interval)
         }
         TaskTriggerInfoType::DailyTrigger | TaskTriggerInfoType::WeeklyTrigger => {
@@ -1044,6 +1110,7 @@ impl ferrofin_traits::tasks::TaskManager for FerrofinTaskManager {
 
 #[cfg(test)]
 mod tests {
+    use super::{FIRST_RUN_DELAY, first_run_delay};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -1675,45 +1742,192 @@ mod tests {
         assert_eq!(restored.status, TaskCompletionStatus::Cancelled);
     }
 
+    /// A restart must not reset the interval clock.
+    ///
+    /// The cadence is anchored on the last COMPLETION, which is persisted, so a
+    /// task that is overdue when the process starts fires immediately and one
+    /// that ran recently does not fire early. Including the scheduler's own
+    /// start time in that anchor meant a 24-hour task on a server rebooted
+    /// every 12 hours never ran at all — and that is the bug the merge-versions
+    /// tasks work around with a `StartupTrigger` they call a deliberate
+    /// divergence.
+    #[test]
+    fn a_restart_does_not_restart_the_interval_cadence() {
+        let boot = Utc
+            .with_ymd_and_hms(2026, 7, 1, 12, 0, 0)
+            .single()
+            .expect("ts");
+        let daily = TaskTriggerInfo {
+            type_: TaskTriggerInfoType::IntervalTrigger,
+            interval_ticks: Some(24 * 3600 * TICKS_PER_SECOND),
+            ..TaskTriggerInfo::default()
+        };
+        let now = boot + chrono::Duration::minutes(1);
+
+        // Completed 25 hours ago: overdue, so it fires a minute after boot
+        // rather than 24 hours later.
+        let stale = boot - chrono::Duration::hours(25);
+        assert!(
+            trigger_due(&daily, "TestTask", now, None, Some(stale), boot, None),
+            "an overdue task must fire despite the restart"
+        );
+
+        // Completed an hour ago: NOT due, however many times we reboot. The old
+        // anchor made this fire 24h after boot, i.e. 25h after the last run.
+        let recent = boot - chrono::Duration::hours(1);
+        assert!(
+            !trigger_due(&daily, "TestTask", now, None, Some(recent), boot, None),
+            "a recently-run task must not fire early after a restart"
+        );
+        // The anchor is the run, not the boot: the run was an hour BEFORE boot,
+        // so the next fire is 23h after boot — not 24h after it.
+        assert!(
+            !trigger_due(
+                &daily,
+                "TestTask",
+                boot + chrono::Duration::hours(22),
+                None,
+                Some(recent),
+                boot,
+                None
+            ),
+            "23h since the run is not yet a day"
+        );
+        assert!(
+            trigger_due(
+                &daily,
+                "TestTask",
+                boot + chrono::Duration::hours(23),
+                None,
+                Some(recent),
+                boot,
+                None
+            ),
+            "24h since the run, which is 23h after boot"
+        );
+    }
+
+    /// The never-run tasks are spread, not released together.
+    ///
+    /// A fresh install — and the first boot of an adopted Jellyfin database,
+    /// which carries no Ferrofin task-result file — puts every interval task on
+    /// the never-run branch at once. Thirteen of them, including the library
+    /// scan and both merge passes, all spawned from one sweep.
+    #[test]
+    fn never_run_tasks_do_not_all_become_due_at_the_same_moment() {
+        let keys = [
+            "RefreshLibrary",
+            "MediaSegmentScan",
+            "AudioNormalization",
+            "DownloadSubtitles",
+            "RefreshPeople",
+            "OptimizeDatabase",
+            "MergeMoviesTask",
+            "MergeEpisodesTask",
+        ];
+        let delays: Vec<_> = keys.iter().map(|k| first_run_delay(k)).collect();
+        let distinct: std::collections::HashSet<_> = delays.iter().collect();
+        assert!(
+            distinct.len() > keys.len() / 2,
+            "the spread must actually separate them: {delays:?}"
+        );
+        for d in &delays {
+            assert!(
+                *d >= FIRST_RUN_DELAY && *d < FIRST_RUN_DELAY + chrono::TimeDelta::hours(1),
+                "within the hour after the base delay: {d:?}"
+            );
+        }
+        // Deterministic: a restart must not re-roll a task's slot, or repeated
+        // reboots could starve whichever task keeps landing late.
+        assert_eq!(first_run_delay("RefreshLibrary"), delays[0]);
+    }
+
+    /// A task that has never completed is due about an hour after startup, not
+    /// a whole interval later (upstream's `lastResult is null` branch).
+    #[test]
+    fn a_never_run_interval_task_is_due_an_hour_after_startup() {
+        let boot = Utc
+            .with_ymd_and_hms(2026, 7, 1, 12, 0, 0)
+            .single()
+            .expect("ts");
+        let daily = TaskTriggerInfo {
+            type_: TaskTriggerInfoType::IntervalTrigger,
+            interval_ticks: Some(24 * 3600 * TICKS_PER_SECOND),
+            ..TaskTriggerInfo::default()
+        };
+        // Its own jittered slot, not a bare hour — see `first_run_delay`.
+        let due_at = first_run_delay("TestTask");
+        assert!(!trigger_due(
+            &daily,
+            "TestTask",
+            boot + due_at - chrono::Duration::minutes(1),
+            None,
+            None,
+            boot,
+            None
+        ));
+        assert!(
+            trigger_due(&daily, "TestTask", boot + due_at, None, None, boot, None),
+            "about an hour, not a whole interval"
+        );
+        // And emphatically not a whole interval later.
+        assert!(due_at < chrono::TimeDelta::hours(2), "{due_at:?}");
+    }
+
     #[test]
     fn interval_trigger_due_after_interval_from_latest_reference() {
         let start = Utc
             .with_ymd_and_hms(2026, 7, 1, 0, 0, 0)
             .single()
             .expect("ts");
+        // TWO hours, deliberately not one: with a 1-hour interval these
+        // assertions were indistinguishable from the never-run
+        // `first_run_delay` branch, and passed whether or not the interval
+        // logic worked at all.
         let trigger = TaskTriggerInfo {
             type_: TaskTriggerInfoType::IntervalTrigger,
-            interval_ticks: Some(3600 * TICKS_PER_SECOND), // 1 hour
+            interval_ticks: Some(2 * 3600 * TICKS_PER_SECOND),
             ..TaskTriggerInfo::default()
         };
 
-        // Not due 30 minutes after scheduler start.
-        let now = start + chrono::Duration::minutes(30);
-        assert!(!trigger_due(&trigger, now, None, None, start, None));
-
-        // Due one hour after scheduler start.
-        let now = start + chrono::Duration::hours(1);
-        assert!(trigger_due(&trigger, now, None, None, start, None));
-
         // A recent run end pushes the next fire out.
         let run_end = start + chrono::Duration::minutes(45);
+        let now = start + chrono::Duration::hours(1);
         assert!(!trigger_due(
             &trigger,
+            "TestTask",
             now,
             None,
             Some(run_end),
             start,
             None
         ));
-        let now = run_end + chrono::Duration::hours(1);
-        assert!(trigger_due(&trigger, now, None, Some(run_end), start, None));
+        // Due exactly one interval after the run END — not after the boot.
+        let now = run_end + chrono::Duration::hours(2);
+        assert!(trigger_due(
+            &trigger,
+            "TestTask",
+            now,
+            None,
+            Some(run_end),
+            start,
+            None
+        ));
 
         // Missing/zero interval never fires.
         let no_interval = TaskTriggerInfo {
             type_: TaskTriggerInfoType::IntervalTrigger,
             ..TaskTriggerInfo::default()
         };
-        assert!(!trigger_due(&no_interval, now, None, None, start, None));
+        assert!(!trigger_due(
+            &no_interval,
+            "TestTask",
+            now,
+            None,
+            None,
+            start,
+            None
+        ));
     }
 
     #[test]
@@ -1736,6 +1950,7 @@ mod tests {
         // Before 03:00 local — not due.
         assert!(!trigger_due(
             &trigger,
+            "TestTask",
             scheduled - chrono::Duration::minutes(5),
             None,
             None,
@@ -1744,13 +1959,24 @@ mod tests {
         ));
         // After 03:00 local, never fired — due.
         let now = scheduled + chrono::Duration::minutes(5);
-        assert!(trigger_due(&trigger, now, None, None, start, None));
+        assert!(trigger_due(
+            &trigger, "TestTask", now, None, None, start, None
+        ));
         // Already fired for this occurrence — not due again.
-        assert!(!trigger_due(&trigger, now, Some(now), None, start, None));
+        assert!(!trigger_due(
+            &trigger,
+            "TestTask",
+            now,
+            Some(now),
+            None,
+            start,
+            None
+        ));
         // Next day, same wall time — due again.
         let tomorrow = now + chrono::Duration::days(1);
         assert!(trigger_due(
             &trigger,
+            "TestTask",
             tomorrow,
             Some(now),
             None,
@@ -1762,6 +1988,7 @@ mod tests {
         let late_start = scheduled + chrono::Duration::hours(9);
         assert!(!trigger_due(
             &trigger,
+            "TestTask",
             late_start + chrono::Duration::minutes(5),
             None,
             None,
@@ -1796,12 +2023,13 @@ mod tests {
         // Without the save floor the cleared history makes this morning's
         // occurrence look due again — the bug this guards.
         assert!(
-            trigger_due(&trigger, now, None, None, start, None),
+            trigger_due(&trigger, "TestTask", now, None, None, start, None),
             "precondition: a cleared fire history alone makes the past occurrence due"
         );
         // With it, today's occurrence stays spent.
         assert!(!trigger_due(
             &trigger,
+            "TestTask",
             now,
             None,
             None,
@@ -1812,6 +2040,7 @@ mod tests {
         let tomorrow = scheduled + chrono::Duration::days(1) + chrono::Duration::minutes(5);
         assert!(trigger_due(
             &trigger,
+            "TestTask",
             tomorrow,
             None,
             None,
@@ -1827,6 +2056,7 @@ mod tests {
         };
         assert!(trigger_due(
             &interval,
+            "TestTask",
             now,
             None,
             None,
@@ -1856,20 +2086,26 @@ mod tests {
             day_of_week: Some(DayOfWeek::Wednesday),
             ..TaskTriggerInfo::default()
         };
-        assert!(trigger_due(&wednesday, now, None, None, start, None));
+        assert!(trigger_due(
+            &wednesday, "TestTask", now, None, None, start, None
+        ));
 
         let thursday = TaskTriggerInfo {
             day_of_week: Some(DayOfWeek::Thursday),
             ..wednesday
         };
-        assert!(!trigger_due(&thursday, now, None, None, start, None));
+        assert!(!trigger_due(
+            &thursday, "TestTask", now, None, None, start, None
+        ));
 
         // Weekly without a day never fires.
         let dayless = TaskTriggerInfo {
             day_of_week: None,
             ..wednesday
         };
-        assert!(!trigger_due(&dayless, now, None, None, start, None));
+        assert!(!trigger_due(
+            &dayless, "TestTask", now, None, None, start, None
+        ));
     }
 
     #[tokio::test]

@@ -1168,6 +1168,7 @@ dependencies = [
  "ferrofin-keyframes",
  "ferrofin-model",
  "ferrofin-naming",
+ "ferrofin-networking",
  "ferrofin-providers",
  "ferrofin-traits",
  "ferrofin-util",
@@ -1176,6 +1177,7 @@ dependencies = [
  "notify",
  "opentelemetry",
  "opentelemetry_sdk",
+ "quick-xml",
  "reqwest",
  "rstest",
  "serde",
@@ -1399,6 +1401,7 @@ dependencies = [
  "ferrofin-util",
  "rstest",
  "serde",
+ "serde_json",
  "thiserror 2.0.19",
  "tracing",
 ]

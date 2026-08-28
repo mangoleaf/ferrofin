@@ -1802,7 +1802,10 @@ async fn casting_a_plain_item_passes_through_unexpanded() {
 async fn casting_a_genre_expands_to_the_items_tagged_with_it() {
     let db = test_db().await;
     let (mgr, bus) = cast_manager(&db);
-    let user = seed_named_user(&db, Uuid::new_v4(), "alice").await;
+    let user_uuid = Uuid::new_v4();
+    let user = seed_named_user(&db, user_uuid, "alice").await;
+    // Before `allow_playback`, which upserts over the default set.
+    crate::test_support::grant_default_permissions(&db, user_uuid).await;
     allow_playback(&db, &user).await;
 
     // A genre is stored as a by-name folder row; tagged items reference it.
@@ -1827,6 +1830,9 @@ async fn casting_a_genre_expands_to_the_items_tagged_with_it() {
     // The by-name filter joins the item's `ItemValues.CleanValue` to the genre
     // row's `CleanName`, which the scanner writes and the fixture must too.
     crate::test_support::set_clean_name(&db, genre, "jazz").await;
+    // Expanding the genre queries with no scope but with a user, so the track
+    // needs a library above it and the user needs to be able to see it.
+    crate::test_support::seed_library_over(&db, &[track]).await;
 
     let (session_id, received) = cast_target(&mgr, bus.as_ref(), &user, "dev-cast").await;
     mgr.send_play_command("", &session_id, &play_now(vec![genre]))

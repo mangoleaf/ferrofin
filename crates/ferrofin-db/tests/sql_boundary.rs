@@ -28,7 +28,7 @@ const CEILINGS: &[(&str, usize)] = &[
     ("crates/ferrofin-core/src/activity_manager.rs", 5),
     ("crates/ferrofin-core/src/api_key_manager.rs", 3),
     ("crates/ferrofin-core/src/authorization_context.rs", 6),
-    ("crates/ferrofin-core/src/collection_manager.rs", 16),
+    ("crates/ferrofin-core/src/collection_manager.rs", 14),
     ("crates/ferrofin-core/src/device_manager.rs", 10),
     (
         "crates/ferrofin-core/src/display_preferences_manager.rs",
@@ -55,7 +55,7 @@ const CEILINGS: &[(&str, usize)] = &[
     ("crates/ferrofin-core/src/user_entity_ext.rs", 11),
     ("crates/ferrofin-core/src/user_manager.rs", 26),
     ("crates/ferrofin-core/src/virtual_folder_manager.rs", 4),
-    ("crates/ferrofin-livetv/src/manager.rs", 14),
+    ("crates/ferrofin-livetv/src/manager.rs", 13),
 ];
 
 /// Collects every `.rs` file under `dir`, recursively.

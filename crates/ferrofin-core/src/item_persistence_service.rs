@@ -27,16 +27,28 @@ use ferrofin_model::data::BaseItemKind;
 
 use crate::db_error::db_err;
 use crate::item_repository::image_type_to_disc;
-use crate::item_type_lookup::stored_type_name;
+use crate::item_type_lookup::{MUSIC_GENRE_TYPES, stored_type_name};
+use crate::text_util::get_clean_value;
 use crate::translate_query::PLACEHOLDER_ID;
 
 /// Maps an `ItemValues.Type` discriminant to the stored `BaseItems.Type` name of
 /// its browsable by-name item, or [`None`] for value types with no browse tab
 /// (tags, artists — handled elsewhere).
 ///
-/// ponytail: Genre (2) → `Genre` and Studios (3) → `Studio` only. Music genres
-/// share the Genre value type here, so a music-only library's MusicGenre tab
-/// would want its own mapping; add when a music library needs it.
+/// Genre (2) is the one that needs a companion: Jellyfin keeps a **separate**
+/// `MusicGenre` item for the same value when the owner is a music item — one
+/// `ItemValueType`, two browses — and `/MusicGenres` selects on that row type
+/// alone. See [`music_genre_row`], which materializes it.
+fn by_name_kind(value_type: i32) -> Option<BaseItemKind> {
+    match value_type {
+        1 => Some(BaseItemKind::MusicArtist),
+        2 => Some(BaseItemKind::Genre),
+        3 => Some(BaseItemKind::Studio),
+        _ => None,
+    }
+}
+
+/// The stored CLR type name of the row [`by_name_kind`] names.
 fn by_name_type_name(value_type: i32) -> Option<&'static str> {
     match value_type {
         // AlbumArtist (1) is the canonical artist identity — it materializes the
@@ -49,6 +61,250 @@ fn by_name_type_name(value_type: i32) -> Option<&'static str> {
         3 => stored_type_name(BaseItemKind::Studio),
         _ => None,
     }
+}
+
+/// Materializes the browsable `MusicGenre` row for a genre carried by a music
+/// item, if the database does not already have one under that name.
+///
+/// Jellyfin keeps `Genre` and `MusicGenre` as two separate items over the one
+/// `ItemValueType`, and `GetMusicGenres` selects on the row type alone
+/// (`BaseItemRepository.cs:221`), so without this row `/MusicGenres` is empty.
+/// Ferrofin's other by-name rows borrow the `ItemValueId` as their id, which
+/// this one cannot — that id already belongs to the `Genre` row for the same
+/// value — so it takes a derived id instead, the way Jellyfin derives every
+/// by-name id.
+///
+/// The existence check is by **type and name**, not by id: an adopted database
+/// already has Jellyfin's `MusicGenre` rows under Jellyfin's ids, and a scan
+/// must not lay a second row beside each of them.
+async fn music_genre_row(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    value: &str,
+    clean: &str,
+) -> Result<(), ServiceError> {
+    let (Some(type_name), Some(id)) = (
+        stored_type_name(BaseItemKind::MusicGenre),
+        crate::item_type_lookup::derive_item_id(BaseItemKind::MusicGenre, value),
+    ) else {
+        return Ok(());
+    };
+    sqlx::query(
+        r#"INSERT INTO "BaseItems"
+           ("Id","Type","Name","CleanName","SortName","IsFolder","IsInMixedFolder",
+            "IsLocked","IsMovie","IsRepeat","IsSeries","IsVirtualItem")
+           SELECT ?1,?2,?3,?4,?5,1,0,0,0,0,0,0
+           WHERE NOT EXISTS (
+               SELECT 1 FROM "BaseItems" WHERE "Type" = ?2 AND "CleanName" = ?4)"#,
+    )
+    .bind(guid_to_db(id))
+    .bind(type_name)
+    .bind(value)
+    .bind(clean)
+    .bind(ferrofin_util::sort_name::create_sort_name(value))
+    .execute(&mut **tx)
+    .await
+    .map_err(db_err)?;
+    Ok(())
+}
+
+/// Inserts a minimal `BaseItems` row of the given folder-ish kind and returns
+/// the persisted row. Only the schema-required columns are set; richer metadata
+/// is populated by later refreshes (mirrors how the C# path creates a stub item
+/// then refreshes it).
+pub(crate) async fn insert_named_item(
+    db: &Database,
+    id: Uuid,
+    kind: BaseItemKind,
+    name: &str,
+    is_folder: bool,
+    container: Option<Uuid>,
+) -> Result<BaseItemEntity, ServiceError> {
+    let type_name = stored_type_name(kind)
+        .ok_or_else(|| ServiceError::backend(format!("no stored type name for {kind:?}")))?;
+    sqlx::query(
+        // `SortName` persisted, not derived on read. jellyfin-web's Collections
+        // and Playlists tabs both send `SortBy=SortName`; with the column NULL
+        // they came back in creation order while each DTO still carried a
+        // correctly COMPUTED SortName, which is what made this hard to see.
+        // `ParentId`/`TopParentId` are what make the item reachable: a query
+        // that names no scope is confined to the user's libraries (C#
+        // `AddUserToQuery`), so a row with neither is invisible to every user
+        // browse. Upstream never creates one — a playlist lands in the
+        // `ManualPlaylistsFolder` and a collection in the auto-provisioned
+        // "Collections" library — and neither should this.
+        r#"INSERT INTO "BaseItems"
+           ("Id", "Type", "IsFolder", "IsInMixedFolder", "IsLocked", "IsMovie",
+            "IsRepeat", "IsSeries", "IsVirtualItem", "Name", "SortName",
+            "ParentId", "TopParentId")
+           VALUES (?1, ?2, ?3, 0, 0, 0, 0, 0, 0, ?4, ?5, ?6, ?6)"#,
+    )
+    .bind(guid_to_db(id))
+    .bind(type_name)
+    .bind(i64::from(is_folder))
+    .bind(name)
+    .bind(ferrofin_util::sort_name::create_sort_name(name))
+    .bind(container.map(guid_to_db))
+    .execute(db.writer())
+    .await
+    .map_err(db_err)?;
+
+    sqlx::query_as::<_, BaseItemEntity>(r#"SELECT * FROM "BaseItems" WHERE "Id" = ?1"#)
+        .bind(guid_to_db(id))
+        .fetch_one(db.pool())
+        .await
+        .map_err(db_err)
+}
+
+/// The `BaseItems` row a user-created container hangs off, provisioning it if
+/// this server has never had one.
+///
+/// Upstream never leaves a created item parentless: `CreateCollectionAsync`
+/// goes through `EnsureLibraryFolder`, which auto-creates a container at
+/// `{data}/collections` on first use, and a playlist lands in the one at
+/// `{data}/playlists`. Ferrofin had neither link, so every collection and
+/// playlist it created was an orphan — reachable only by a query that names no
+/// scope, and invisible the moment one does.
+///
+/// **Matched by exact path**, the way `EnsureLibraryFolder` does
+/// (`FindFolders(path)`), and never by type: `CollectionFolder` is the type of
+/// *every* library, so a type match would file collections into whichever one
+/// sorted first. Two spellings are accepted because Jellyfin writes the
+/// literal `%AppDataPath%` token where Ferrofin writes the resolved path —
+/// both are equalities, not patterns, so a user library that happens to be
+/// called `collections` cannot be mistaken for this.
+pub(crate) async fn ensure_container(
+    db: &Database,
+    kind: BaseItemKind,
+    name: &str,
+    path: &str,
+    mode: &crate::item_type_lookup::IdDerivation,
+    parent: Option<Uuid>,
+) -> Result<Option<Uuid>, ServiceError> {
+    let leaf = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    let jellyfin_form = format!("{JELLYFIN_DATA_PATH_TOKEN}/{leaf}");
+    let existing: Option<String> = sqlx::query_scalar(
+        r#"SELECT "Id" FROM "BaseItems" WHERE "Path" IN (?1, ?2) ORDER BY "Id" LIMIT 1"#,
+    )
+    .bind(path)
+    .bind(&jellyfin_form)
+    .fetch_optional(db.pool())
+    .await
+    .map_err(db_err)?;
+    if let Some(id) = existing {
+        let id = Uuid::parse_str(&id).map_err(|e| {
+            ServiceError::backend(format!("container row {id} has an unusable id: {e}"))
+        })?;
+        // Adopt a row that was created before the user root existed — the
+        // parent is set on the first provision that CAN set it, rather than
+        // staying null forever because the row is already there.
+        if let Some(root) = parent {
+            attach_to_root(db, id, root).await?;
+        }
+        return Ok(Some(id));
+    }
+
+    // Derived from the path, like every other folder id on both sides, so the
+    // same directory yields the same id wherever it is scanned — under the
+    // database's CONFIGURED derivation, not a hardcoded one. Getting that wrong
+    // is not cosmetic: Jellyfin computes its own id for
+    // `%AppDataPath%/collections`, and if ours differs it does not recognise
+    // the row, creates a SECOND Collections library beside it, and the two-way
+    // swap this project rests on stops being clean.
+    let Some(id) = crate::item_type_lookup::derive_item_id_with(mode, kind, path) else {
+        return Ok(None);
+    };
+    // Jellyfin's row describes a directory that exists; the scanner and the
+    // library-structure endpoints both expect to find it.
+    if let Err(e) = tokio::fs::create_dir_all(path).await {
+        tracing::warn!(path, %e, "could not create the container directory");
+    }
+    // …and it hangs off the user root, which is what puts it in
+    // `GetUserRootFolder().Children`.
+    //
+    // Only if that row is actually there: `BaseItems.ParentId` is a foreign key
+    // to `BaseItems.Id`, and the root is provisioned lazily too, so a container
+    // created before it would fail the insert outright. Going without the parent
+    // is recoverable — `attach_to_root` above sets it on the first provision
+    // that finds the root in place — where a failed creation is not.
+    let parent = match parent {
+        Some(p) if row_exists(db, p).await? => Some(p),
+        _ => None,
+    };
+    insert_named_item(db, id, kind, name, true, parent).await?;
+    set_container_path(db, id, path).await?;
+    Ok(Some(id))
+}
+
+/// Parents a container to the user root, if it has no parent yet and the root
+/// row exists.
+///
+/// Both guards matter: a row that already has a parent is not ours to move, and
+/// `BaseItems.ParentId` is a foreign key, so pointing at a root that has not
+/// been provisioned yet would fail the statement.
+async fn attach_to_root(db: &Database, id: Uuid, root: Uuid) -> Result<(), ServiceError> {
+    if !row_exists(db, root).await? {
+        return Ok(());
+    }
+    sqlx::query(r#"UPDATE "BaseItems" SET "ParentId" = ?2 WHERE "Id" = ?1 AND "ParentId" IS NULL"#)
+        .bind(guid_to_db(id))
+        .bind(guid_to_db(root))
+        .execute(db.writer())
+        .await
+        .map_err(db_err)?;
+    Ok(())
+}
+
+/// Whether a `BaseItems` row with this id exists.
+async fn row_exists(db: &Database, id: Uuid) -> Result<bool, ServiceError> {
+    let found: Option<String> =
+        sqlx::query_scalar(r#"SELECT "Id" FROM "BaseItems" WHERE "Id" = ?1"#)
+            .bind(guid_to_db(id))
+            .fetch_optional(db.pool())
+            .await
+            .map_err(db_err)?;
+    Ok(found.is_some())
+}
+
+/// The literal Jellyfin writes into `BaseItems.Path` in place of the data
+/// directory (`%AppDataPath%/collections`), which Ferrofin stores resolved.
+const JELLYFIN_DATA_PATH_TOKEN: &str = "%AppDataPath%";
+
+/// Stamps a provisioned container with its directory and makes it its own top
+/// parent, the shape Jellyfin's `%AppDataPath%/collections` row has.
+async fn set_container_path(db: &Database, id: Uuid, path: &str) -> Result<(), ServiceError> {
+    sqlx::query(r#"UPDATE "BaseItems" SET "Path" = ?2, "TopParentId" = ?1 WHERE "Id" = ?1"#)
+        .bind(guid_to_db(id))
+        .bind(path)
+        .execute(db.writer())
+        .await
+        .map_err(db_err)?;
+    Ok(())
+}
+
+/// Puts the orphans an older Ferrofin created into `container`.
+///
+/// Only rows with **neither** a parent nor a top parent are touched: those can
+/// only have come from `insert_named_item` before it linked anything. A row
+/// adopted from Jellyfin already sits somewhere real and is left alone.
+pub(crate) async fn adopt_orphans(
+    db: &Database,
+    kind: BaseItemKind,
+    container: Uuid,
+) -> Result<(), ServiceError> {
+    let Some(type_name) = stored_type_name(kind) else {
+        return Ok(());
+    };
+    sqlx::query(
+        r#"UPDATE "BaseItems" SET "ParentId" = ?2, "TopParentId" = ?2
+           WHERE "Type" = ?1 AND "ParentId" IS NULL AND "TopParentId" IS NULL
+             AND "Id" <> ?2"#,
+    )
+    .bind(type_name)
+    .bind(guid_to_db(container))
+    .execute(db.writer())
+    .await
+    .map_err(db_err)?;
+    Ok(())
 }
 
 /// The concrete item-persistence service.
@@ -71,6 +327,96 @@ impl FerrofinItemPersistenceService {
         Self { db }
     }
 
+    /// One-shot startup pass: rewrites every stored `CleanName` / `CleanValue`
+    /// that disagrees with [`get_clean_value`], recording completion in
+    /// `FerrofinMeta` so later boots skip it.
+    ///
+    /// Ferrofin used to compute the clean columns by also replacing punctuation
+    /// with spaces and collapsing whitespace, where C# `GetCleanValue` only
+    /// removes diacritics and lowercases. Databases written by those versions
+    /// hold `'h jon benjamin'` where the lookups now compute `'h. jon
+    /// benjamin'`, so every by-name resolution of a punctuated name — person,
+    /// studio, genre, tag — would miss until the next full scan rewrote the
+    /// row. A database adopted from Jellyfin already agrees, and this pass
+    /// leaves it untouched.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ServiceError`] when a query or the rewrite transaction
+    /// fails; the marker is written inside that transaction, so a failure
+    /// simply retries on the next boot.
+    pub async fn repair_clean_values(&self) -> Result<u64, ServiceError> {
+        const META_KEY: &str = "clean_values_keep_punctuation_v1";
+        let done = self
+            .db
+            .meta_get(META_KEY)
+            .await
+            .map_err(|e| ServiceError::Backend(e.to_string()))?;
+        if done.as_deref() == Some("1") {
+            return Ok(0);
+        }
+
+        let items: Vec<(String, Option<String>, Option<String>)> =
+            // The migration's placeholder row is excluded here as it is
+            // everywhere else — it has no name, and rewriting it would report
+            // work on a database that has nothing to repair.
+            sqlx::query_as(r#"SELECT "Id", "Name", "CleanName" FROM "BaseItems" WHERE "Id" <> ?1"#)
+                .bind(PLACEHOLDER_ID)
+                .fetch_all(self.db.pool())
+                .await
+                .map_err(db_err)?;
+        let values: Vec<(String, Option<String>, Option<String>)> =
+            sqlx::query_as(r#"SELECT "ItemValueId", "Value", "CleanValue" FROM "ItemValues""#)
+                .fetch_all(self.db.pool())
+                .await
+                .map_err(db_err)?;
+
+        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        let mut repaired: u64 = 0;
+        for (id, name, stored) in items {
+            let want = name.as_deref().map(get_clean_value);
+            if want.as_deref() == stored.as_deref()
+                || !was_written_by_the_old_rule(name.as_deref(), stored.as_deref())
+            {
+                continue;
+            }
+            sqlx::query(r#"UPDATE "BaseItems" SET "CleanName" = ?2 WHERE "Id" = ?1"#)
+                .bind(&id)
+                .bind(&want)
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?;
+            repaired += 1;
+        }
+        for (id, value, stored) in values {
+            // `CleanValue` is NOT NULL; a null `Value` cleans to the empty
+            // string rather than dropping the column.
+            let want = get_clean_value(value.as_deref().unwrap_or_default());
+            if Some(want.as_str()) == stored.as_deref()
+                || !was_written_by_the_old_rule(value.as_deref(), stored.as_deref())
+            {
+                continue;
+            }
+            sqlx::query(r#"UPDATE "ItemValues" SET "CleanValue" = ?2 WHERE "ItemValueId" = ?1"#)
+                .bind(&id)
+                .bind(&want)
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?;
+            repaired += 1;
+        }
+        sqlx::query(
+            r#"INSERT INTO "FerrofinMeta" ("Key", "Value") VALUES (?1, '1')
+               ON CONFLICT("Key") DO UPDATE SET "Value" = '1'"#,
+        )
+        .bind(META_KEY)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
+        Ok(repaired)
+    }
+
     /// Upserts a single item row (`INSERT … ON CONFLICT("Id") DO UPDATE`) using
     /// `sql` — [`UPSERT_SQL`] for a full-row replace, [`scan_upsert_sql`] for
     /// the library scan's ownership-respecting variant. Both bind the same
@@ -84,6 +430,7 @@ impl FerrofinItemPersistenceService {
             .as_deref()
             .filter(|n| !n.is_empty())
             .map(crate::text_util::get_clean_value);
+        let presentation_unique_key = derive_presentation_key(item);
         // Same reasoning for `SortName`, and it is why this belongs here rather
         // than at each call site. In C# `SortName` is not a field a caller can
         // forget: `BaseItem.SortName` is a lazy property that resolves to
@@ -160,7 +507,7 @@ impl FerrofinItemPersistenceService {
             .bind(&item.preferred_metadata_country_code)
             .bind(&item.preferred_metadata_language)
             .bind(opt_datetime_to_db(item.premiere_date))
-            .bind(&item.presentation_unique_key)
+            .bind(&presentation_unique_key)
             .bind(&item.primary_version_id)
             .bind(&item.production_locations)
             .bind(item.production_year)
@@ -387,6 +734,16 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
     ) -> Result<(), ServiceError> {
         let id = guid_to_db(item_id);
         let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        // Whether this item's genres are *music* genres, which get their own
+        // by-name row (see `music_genre_row`). One `SELECT` on the primary key,
+        // on a write path that already runs several statements per item.
+        let owner_type: Option<String> =
+            sqlx::query_scalar(r#"SELECT "Type" FROM "BaseItems" WHERE "Id" = ?1"#)
+                .bind(&id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(db_err)?;
+        let owner_is_music = owner_type.is_some_and(|t| MUSIC_GENRE_TYPES.contains(&t.as_str()));
         // Rewrite this item's links; the shared ItemValues rows are kept.
         sqlx::query(r#"DELETE FROM "ItemValuesMap" WHERE "ItemId" = ?1"#)
             .bind(&id)
@@ -439,19 +796,38 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
                     // `people_repository`. Without it the Genres/Studios tabs
                     // (which sort on it) come back unsorted and
                     // `nameStartsWith` matches nothing.
+                    // `PresentationUniqueKey` too: a by-name row's key is
+                    // `{Type}-{Name}` (see `kinds::presentation_unique_key`),
+                    // and this insert bypasses `upsert_item`, so without it
+                    // the column stays NULL where Jellyfin writes
+                    // `Genre-Action` — 23,186 such rows on a real library.
                     r#"INSERT OR IGNORE INTO "BaseItems"
-                       ("Id","Type","Name","CleanName","SortName","IsFolder","IsInMixedFolder",
+                       ("Id","Type","Name","CleanName","SortName","PresentationUniqueKey",
+                        "IsFolder","IsInMixedFolder",
                         "IsLocked","IsMovie","IsRepeat","IsSeries","IsVirtualItem")
-                       VALUES (?1,?2,?3,?4,?5,1,0,0,0,0,0,0)"#,
+                       VALUES (?1,?2,?3,?4,?5,?6,1,0,0,0,0,0,0)"#,
                 )
                 .bind(&value_id)
                 .bind(type_name)
                 .bind(value)
                 .bind(&clean)
                 .bind(ferrofin_util::sort_name::create_sort_name(value))
+                .bind(by_name_kind(*type_).map(|kind| {
+                    crate::kinds::presentation_unique_key(
+                        kind,
+                        Uuid::parse_str(&value_id).unwrap_or_default(),
+                        Some(value),
+                        None,
+                        None,
+                        None,
+                    )
+                }))
                 .execute(&mut *tx)
                 .await
                 .map_err(db_err)?;
+            }
+            if owner_is_music && *type_ == i32::from(ferrofin_db::enums::ItemValueType::Genre) {
+                music_genre_row(&mut tx, value, &clean).await?;
             }
         }
         tx.commit().await.map_err(db_err)
@@ -885,6 +1261,128 @@ pub async fn backfill_missing_sort_names(db: &Database) -> Result<usize, Service
     }
     tx.commit().await.map_err(db_err)?;
     Ok(rows.len())
+}
+
+/// The `PresentationUniqueKey` to store for `item`.
+///
+/// Derived at write time for the same reason `CleanName` and `SortName` are:
+/// upstream recomputes it on every refresh (`MetadataService.cs:335`), so no
+/// caller can forget it. It is the column a query groups on, and Ferrofin left
+/// it null on nearly every row — which is why merging two versions of a film
+/// stopped hiding the alternate the moment the grouping was ported. On a first
+/// merge, `merge_versions` only touches the alternates (upstream does the
+/// same), so the primary's key has to have been right all along: null on the
+/// primary and the primary's id on the alternate are two different groups.
+///
+/// A row whose stored type or id cannot be parsed keeps whatever it arrived
+/// with rather than losing its key.
+fn derive_presentation_key(item: &BaseItemEntity) -> Option<String> {
+    let stored = item
+        .presentation_unique_key
+        .as_deref()
+        .filter(|k| !k.is_empty());
+    let Some((kind, id)) = crate::item_type_lookup::kind_from_type_name(&item.type_)
+        .zip(Uuid::parse_str(&item.id).ok())
+    else {
+        return stored.map(str::to_owned);
+    };
+    // A `Series` keeps whatever is stored. Upstream's key depends on
+    // `LibraryOptions.EnableAutomaticSeriesGrouping` — which defaults to TRUE
+    // (`LibraryOptions.cs:34`) and then derives the key from the provider ids,
+    // the metadata language and the library folders (`Series.cs:81`). That
+    // option is not ported, so recomputing here would flip every re-saved
+    // series on such a server to its own id and orphan its seasons'
+    // `SeriesPresentationUniqueKey`. (The verification library has the option
+    // off on every TV folder, which is why its 126 series all store own-id and
+    // the adoption suite cannot see this.)
+    if kind == BaseItemKind::Series && stored.is_some() {
+        return stored.map(str::to_owned);
+    }
+    let derived = crate::kinds::presentation_unique_key(
+        kind,
+        id,
+        item.name.as_deref(),
+        item.primary_version_id.as_deref(),
+        item.series_presentation_unique_key.as_deref(),
+        item.index_number,
+    );
+    // Where the per-kind inputs were incomplete the rule falls back to the
+    // row's own id, which is a *guess* — a season with no series key, a
+    // by-name row with no name. Never overwrite a stored key with a guess:
+    // upstream would have resolved the missing half rather than given up.
+    let guessed = derived == id.as_simple().to_string()
+        && !matches!(kind, BaseItemKind::Movie | BaseItemKind::Episode)
+        && incomplete_inputs(kind, item);
+    if guessed {
+        return stored.map(str::to_owned).or(Some(derived));
+    }
+    Some(derived)
+}
+
+/// Whether the per-kind rule had to fall back for `item` because an input it
+/// needed was absent — see [`derive_presentation_key`].
+fn incomplete_inputs(kind: BaseItemKind, item: &BaseItemEntity) -> bool {
+    let blank = |v: Option<&String>| v.is_none_or(String::is_empty);
+    match kind {
+        BaseItemKind::Season => {
+            blank(item.series_presentation_unique_key.as_ref()) || item.index_number.is_none()
+        }
+        BaseItemKind::Genre
+        | BaseItemKind::MusicGenre
+        | BaseItemKind::Person
+        | BaseItemKind::Studio
+        | BaseItemKind::MusicArtist => blank(item.name.as_ref()),
+        _ => false,
+    }
+}
+
+/// Whether `stored` is what Ferrofin's OLD clean rule would have produced for
+/// `source` — diacritics removed, lowercased, every other character collapsed
+/// to a single space, trimmed.
+///
+/// The repair pass rewrites a column only when this says yes, so it undoes
+/// Ferrofin's own damage and touches nothing else. Without the guard it would
+/// rewrite any row where the two implementations of diacritic folding disagree
+/// at all — including rows a Jellyfin install wrote, which is a silent mutation
+/// of someone else's data and breaks the two-way adoption guarantee.
+fn was_written_by_the_old_rule(source: Option<&str>, stored: Option<&str>) -> bool {
+    let (Some(source), Some(stored)) = (source, stored) else {
+        // A null clean column was never written by the old rule for a named
+        // row; filling it in is safe and is what a save would do anyway.
+        return stored.is_none();
+    };
+    let cleaned = get_clean_value(source);
+    let old: String = {
+        let mut out = String::with_capacity(cleaned.len());
+        let mut last_was_space = false;
+        for ch in cleaned.chars() {
+            if ch.is_alphabetic() || ch.is_numeric() {
+                out.push(ch);
+                last_was_space = false;
+            } else if !last_was_space {
+                out.push(' ');
+                last_was_space = true;
+            }
+        }
+        out.trim().to_owned()
+    };
+    stored == old
+}
+
+/// Stamps a row's `PresentationUniqueKey` directly, for tests that need a
+/// specific key rather than the one [`crate::kinds::presentation_unique_key`]
+/// derives (the writer always recomputes it, exactly as C# `MetadataService`
+/// does, so a fixture cannot express a shared key by saving one).
+///
+/// It lives here so the raw SQL stays inside the repository boundary.
+#[cfg(test)]
+pub(crate) async fn seed_presentation_key(db: &Database, id: Uuid, key: &str) {
+    sqlx::query(r#"UPDATE "BaseItems" SET "PresentationUniqueKey" = ?2 WHERE "Id" = ?1"#)
+        .bind(guid_to_db(id))
+        .bind(key)
+        .execute(db.writer())
+        .await
+        .expect("seed presentation key");
 }
 
 #[cfg(test)]
@@ -1523,5 +2021,103 @@ mod tests {
                 .await
                 .expect("row");
         assert_eq!(name.as_deref(), Some("Renamed.File.2011"));
+    }
+
+    /// A database written by a Ferrofin version whose `get_clean_value`
+    /// stripped punctuation is repaired in place on the next boot — otherwise a
+    /// person, studio or genre with a `.` or `-` in its name stays unreachable
+    /// by name until someone runs a full rescan.
+    #[tokio::test]
+    async fn the_clean_value_repair_rewrites_stale_columns_once() {
+        let db = test_db().await;
+        let service = FerrofinItemPersistenceService::new(db.clone());
+        let id = Uuid::from_u128(0xC1EA);
+        crate::test_support::seed_named_item(&db, id, BaseItemKind::Person, "H. Jon Benjamin")
+            .await;
+        // The stale spelling the old rule produced.
+        sqlx::query(r#"UPDATE "BaseItems" SET "CleanName" = 'h jon benjamin' WHERE "Id" = ?1"#)
+            .bind(ferrofin_db::store::guid_to_db(id))
+            .execute(db.writer())
+            .await
+            .expect("stale clean name");
+        sqlx::query(
+            r#"INSERT INTO "ItemValues" ("ItemValueId","Type","Value","CleanValue")
+               VALUES (1, 3, 'Warner Bros. Pictures', 'warner bros pictures')"#,
+        )
+        .execute(db.writer())
+        .await
+        .expect("stale clean value");
+
+        assert_eq!(service.repair_clean_values().await.expect("repair"), 2);
+        let clean: Option<String> =
+            sqlx::query_scalar(r#"SELECT "CleanName" FROM "BaseItems" WHERE "Id" = ?1"#)
+                .bind(ferrofin_db::store::guid_to_db(id))
+                .fetch_one(db.pool())
+                .await
+                .expect("read back");
+        assert_eq!(clean.as_deref(), Some("h. jon benjamin"));
+        let value: String =
+            sqlx::query_scalar(r#"SELECT "CleanValue" FROM "ItemValues" WHERE "ItemValueId" = 1"#)
+                .fetch_one(db.pool())
+                .await
+                .expect("read back");
+        assert_eq!(value, "warner bros. pictures");
+
+        // Once only: the marker means a second boot does no work.
+        assert_eq!(service.repair_clean_values().await.expect("repair"), 0);
+    }
+
+    /// A stored key that the per-kind rule cannot reproduce is never
+    /// overwritten with a guess.
+    ///
+    /// Two cases the verification library cannot show, because it has neither:
+    /// a `Series` on a server with `EnableAutomaticSeriesGrouping` on (upstream
+    /// default TRUE, and its key then derives from provider ids + language +
+    /// library folders, none of which is ported), and a `Season` whose
+    /// `SeriesPresentationUniqueKey` is missing. Overwriting either with the
+    /// row's own id orphans every season that points at it.
+    #[tokio::test]
+    async fn a_key_the_rule_cannot_reproduce_survives_a_save() {
+        async fn key(db: &ferrofin_db::Database, id: Uuid) -> Option<String> {
+            crate::test_support::fetch_item(db, id)
+                .await
+                .presentation_unique_key
+        }
+        let db = test_db().await;
+        let service = FerrofinItemPersistenceService::new(db.clone());
+        let series = Uuid::from_u128(0x5E01);
+        let season = Uuid::from_u128(0x5E02);
+        let movie = Uuid::from_u128(0x5E03);
+        crate::test_support::seed_named_item(&db, series, BaseItemKind::Series, "Breaking Bad")
+            .await;
+        crate::test_support::seed_named_item(&db, season, BaseItemKind::Season, "Season 2").await;
+        crate::test_support::seed_named_item(&db, movie, BaseItemKind::Movie, "Heat").await;
+        for id in [series, season, movie] {
+            super::seed_presentation_key(&db, id, "grouped-key-from-jellyfin").await;
+        }
+
+        for id in [series, season, movie] {
+            let row = crate::test_support::fetch_item(&db, id).await;
+            service
+                .save_items(std::slice::from_ref(&row))
+                .await
+                .expect("save");
+        }
+
+        assert_eq!(
+            key(&db, series).await.as_deref(),
+            Some("grouped-key-from-jellyfin"),
+            "a series keeps the key the server that wrote it derived"
+        );
+        assert_eq!(
+            key(&db, season).await.as_deref(),
+            Some("grouped-key-from-jellyfin"),
+            "…and so does a season with no series key to rebuild from"
+        );
+        assert_eq!(
+            key(&db, movie).await.as_deref(),
+            Some("00000000000000000000000000005e03"),
+            "but a movie's key IS reproducible, so it is recomputed"
+        );
     }
 }

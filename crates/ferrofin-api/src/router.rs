@@ -72,6 +72,12 @@ pub fn create_router(state: AppState) -> Router {
         state.clone(),
         auth_context_layer,
     ))
+    // The IP filter runs BEFORE authentication, as upstream's does: a peer the
+    // operator has excluded should not reach a login attempt at all.
+    .layer(middleware::from_fn_with_state(
+        state.clone(),
+        crate::ip_access::ip_access_layer,
+    ))
     .with_state(state)
     .merge(ferrofin_health::health_router(Vec::new()))
     .merge(spec_router())

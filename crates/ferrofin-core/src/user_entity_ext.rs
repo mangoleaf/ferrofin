@@ -14,6 +14,7 @@
 //! caller's transaction. `Guid` identity is the hyphenated `UserEntity::id`
 //! string, matching the stored `UserId` foreign keys.
 
+use ferrofin_db::Database;
 use ferrofin_db::enums::{PermissionKind, PreferenceKind};
 use sqlx::sqlite::SqlitePool;
 use sqlx::{Sqlite, SqliteExecutor};
@@ -73,6 +74,41 @@ const ALL_PREFERENCE_KINDS: &[PreferenceKind] = &[
     PreferenceKind::OrderedViews,
     PreferenceKind::AllowedTags,
 ];
+
+/// A `Guid`-list preference, parsed (C# `GetPreferenceValues<Guid>`); values
+/// that are not GUIDs are skipped, as `Guid.TryParse` skips them.
+///
+/// # Errors
+/// Returns [`ServiceError::Db`] if the query fails.
+pub async fn guid_preference(
+    pool: &sqlx::SqlitePool,
+    user_id: &str,
+    kind: PreferenceKind,
+) -> Result<Vec<uuid::Uuid>, ServiceError> {
+    Ok(get_preference(pool, user_id, kind)
+        .await?
+        .iter()
+        .filter_map(|v| uuid::Uuid::parse_str(v).ok())
+        .collect())
+}
+
+/// Whether Live TV is available to this user — C# `LiveTvManager.IsLiveTvEnabled`.
+///
+/// `user.HasPermission(EnableLiveTvAccess) && (Services.Count > 1 ||
+/// TunerHosts.Length > 0)`. Ferrofin ships one Live TV service (M3U), so the
+/// service half is never what enables it: a server with no tuner configured has
+/// no Live TV, and Jellyfin then leaves the view out of `GetUserViews`
+/// entirely — which is why it is absent both from `/Users/{id}/Views` and from
+/// the library scope an unscoped query is confined to.
+///
+/// # Errors
+/// Returns [`ServiceError::Db`] if either query fails.
+pub async fn live_tv_enabled_for(db: &Database, user_id: &str) -> Result<bool, ServiceError> {
+    if !has_permission(db.pool(), user_id, PermissionKind::EnableLiveTvAccess).await? {
+        return Ok(false);
+    }
+    Ok(db.live_tv_tuner_count().await.map_err(ServiceError::from)? > 0)
+}
 
 /// Whether the user has the given permission (C# `HasPermission`).
 ///
@@ -469,5 +505,39 @@ mod tests {
                 .await
                 .expect("allowed")
         );
+    }
+
+    /// Live TV is a permission AND a tuner: neither half alone turns it on.
+    /// A `EnableLiveTvAccess`-holding user on a tuner-less server has no Live
+    /// TV — which is what keeps an adopted server's view list at Jellyfin's 8
+    /// rather than 9.
+    #[tokio::test]
+    async fn live_tv_needs_both_the_permission_and_a_tuner() {
+        let db = test_db().await;
+        let id = Uuid::from_u128(77);
+        seed_user(&db, id).await;
+        let user = guid_to_db(id);
+        let mut tx = db.writer().begin().await.expect("begin");
+        seed_defaults(&mut tx, &user).await.expect("seed");
+        tx.commit().await.expect("commit");
+
+        // Permission granted, no tuner configured.
+        assert!(
+            has_permission(db.pool(), &user, PermissionKind::EnableLiveTvAccess)
+                .await
+                .expect("has perm")
+        );
+        assert!(!live_tv_enabled_for(&db, &user).await.expect("gate"));
+
+        db.upsert_live_tv_tuner_host("t1", "http://tuner", "m3u", "{}")
+            .await
+            .expect("tuner");
+        assert!(live_tv_enabled_for(&db, &user).await.expect("gate"));
+
+        // …and a tuner does not override a revoked permission.
+        set_permission(db.pool(), &user, PermissionKind::EnableLiveTvAccess, false)
+            .await
+            .expect("revoke");
+        assert!(!live_tv_enabled_for(&db, &user).await.expect("gate"));
     }
 }

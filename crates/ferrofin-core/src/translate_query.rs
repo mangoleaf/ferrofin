@@ -68,11 +68,67 @@ pub enum QueryShape {
     /// the by-name resolvers' projection, which needs the join key back but not
     /// the row.
     IdAndCleanName,
-    /// Select `COUNT(*)` — no `ORDER BY` / paging is appended.
+    /// Select `COUNT(*)` over the ungrouped row set — no `ORDER BY` / paging.
+    ///
+    /// This is C# `GetCount` / `GetItemCounts`, which run `TranslateQuery`
+    /// **without** `ApplyGroupingFilter` ("Hack for right now since we
+    /// currently don't support filtering out these duplicates within a
+    /// query"), so `/Items/Counts` reports rows, not titles.
     Count,
+    /// Select `COUNT(*)` over the same row set the paged query returns — the
+    /// `TotalRecordCount` of C# `GetItems`, which counts `dbQuery` *after*
+    /// `ApplyGroupingFilter`. It must agree with the page it labels.
+    GroupedCount,
     /// Select `bi."Type", COUNT(*)` grouped by type — the per-type counts in one
     /// query, without materializing every matching row. No `ORDER BY` / paging.
     TypeCounts,
+}
+
+/// Whether this query collapses merged versions into one row — C#
+/// `BaseItemRepository.EnableGroupByPresentationUniqueKey`.
+///
+/// A `PresentationUniqueKey` is shared by every version of the same title, so
+/// grouping on it is how upstream shows one entry for a movie that exists in
+/// four cuts. The conditions are upstream's, in order: the caller must not have
+/// turned grouping off, must not be grouping by *series* key instead, must not
+/// have asked for one specific key, and there must be a user — and then either
+/// no kind filter at all, or one of the six kinds that can have versions.
+pub(crate) fn group_by_presentation_unique_key(filter: &InternalItemsQuery) -> bool {
+    // A resume query surfaces the version that was actually PLAYED, which may be
+    // an alternate sharing the primary's presentation key — and the predicate
+    // above deliberately keeps alternates for exactly that reason. Grouping
+    // would then collapse the surfaced version straight back onto the primary,
+    // whose user data has no playback position, and the row would come back
+    // with no progress on it.
+    //
+    // 10.11.8 has this bug; upstream fixed it afterwards, in the released
+    // `EnableGroupByPresentationUniqueKey` on master, with the same reasoning
+    // (and `0fb042b740` for the predicate half, which Ferrofin already had).
+    // Taken deliberately, under the project's "don't port Jellyfin bugs" rule
+    // — Ferrofin diverges from 10.11.8 here, toward the answer upstream itself
+    // now gives.
+    if filter.is_resumable == Some(true) {
+        return false;
+    }
+    if !filter.group_by_presentation_unique_key
+        || filter.group_by_series_presentation_unique_key
+        || non_blank(filter.presentation_unique_key.as_ref()).is_some()
+        || filter.user.is_none()
+    {
+        return false;
+    }
+    filter.include_item_types.is_empty()
+        || filter.include_item_types.iter().any(|k| {
+            matches!(
+                k,
+                BaseItemKind::Episode
+                    | BaseItemKind::Video
+                    | BaseItemKind::Movie
+                    | BaseItemKind::MusicVideo
+                    | BaseItemKind::Series
+                    | BaseItemKind::Season
+            )
+        })
 }
 
 /// Builds the full translated statement for `filter` in the requested shape.
@@ -80,31 +136,42 @@ pub enum QueryShape {
 /// The returned [`QueryBuilder`] is ready to `.build_query_as()` /
 /// `.build_query_scalar()`. Ordering and paging are appended for
 /// [`QueryShape::FullRows`], [`QueryShape::IdsOnly`] and
-/// [`QueryShape::IdAndCleanName`]; [`QueryShape::Count`] stops after the
-/// `WHERE` clause.
+/// [`QueryShape::IdAndCleanName`]; the count shapes stop after the `WHERE`
+/// clause.
 #[must_use]
 pub fn build_query<'a>(
     filter: &'a InternalItemsQuery,
     shape: QueryShape,
 ) -> QueryBuilder<'a, Sqlite> {
-    let mut qb: QueryBuilder<'a, Sqlite> = QueryBuilder::new(match shape {
-        QueryShape::FullRows => r#"SELECT bi.* FROM "BaseItems" AS bi WHERE bi."Id" <> "#,
-        QueryShape::IdsOnly => r#"SELECT bi."Id" FROM "BaseItems" AS bi WHERE bi."Id" <> "#,
+    let projection = match shape {
+        QueryShape::FullRows => r#"SELECT bi.* FROM "BaseItems" AS bi WHERE "#,
+        QueryShape::IdsOnly => r#"SELECT bi."Id" FROM "BaseItems" AS bi WHERE "#,
         QueryShape::IdAndCleanName => {
-            r#"SELECT bi."Id", bi."CleanName" FROM "BaseItems" AS bi WHERE bi."Id" <> "#
+            r#"SELECT bi."Id", bi."CleanName" FROM "BaseItems" AS bi WHERE "#
         }
-        QueryShape::Count => r#"SELECT COUNT(*) FROM "BaseItems" AS bi WHERE bi."Id" <> "#,
-        QueryShape::TypeCounts => {
-            r#"SELECT bi."Type", COUNT(*) FROM "BaseItems" AS bi WHERE bi."Id" <> "#
+        QueryShape::Count | QueryShape::GroupedCount => {
+            r#"SELECT COUNT(*) FROM "BaseItems" AS bi WHERE "#
         }
-    });
-    qb.push_bind(PLACEHOLDER_ID);
+        QueryShape::TypeCounts => r#"SELECT bi."Type", COUNT(*) FROM "BaseItems" AS bi WHERE "#,
+    };
+    let mut qb: QueryBuilder<'a, Sqlite> = QueryBuilder::new(projection);
 
-    append_predicates(&mut qb, filter);
+    // Grouping belongs to the row-returning shapes and to the total that
+    // labels them; see [`QueryShape::Count`] for why the count shapes are out.
+    let groups = !matches!(shape, QueryShape::Count | QueryShape::TypeCounts)
+        && group_by_presentation_unique_key(filter);
+    if groups {
+        push_group_head(&mut qb);
+        append_predicates(&mut qb, filter);
+        push_group_tail(&mut qb);
+    } else {
+        qb.push(r#"bi."Id" <> "#).push_bind(PLACEHOLDER_ID);
+        append_predicates(&mut qb, filter);
+    }
 
     match shape {
         // Aggregate shapes take no ORDER BY / paging (they collapse the row set).
-        QueryShape::Count => {}
+        QueryShape::Count | QueryShape::GroupedCount => {}
         QueryShape::TypeCounts => {
             qb.push(r#" GROUP BY bi."Type""#);
         }
@@ -115,6 +182,37 @@ pub fn build_query<'a>(
     }
 
     qb
+}
+
+/// Opens the grouped-representative subquery: everything up to (but not
+/// including) the predicates that select the rows being grouped.
+///
+/// One row per `PresentationUniqueKey`, chosen from the rows the query actually
+/// matches — C# groups `dbQuery` (already filtered) and then re-selects
+/// `BaseItems` by the representative ids, so a predicate can never leave a
+/// group represented by a row it excluded, and the outer query carries no
+/// predicates of its own.
+///
+/// The representative is the group's *primary* version where there is one.
+/// SQLite reports the bare `"Id"` from whichever row produced the `MIN`, so the
+/// aggregate is what picks it; without that a merged movie could be listed
+/// under an alternate cut's title.
+fn push_group_head(qb: &mut QueryBuilder<'_, Sqlite>) {
+    qb.push(r#"bi."Id" IN (SELECT "rep" FROM (SELECT bi."Id" AS "rep", MIN("#)
+        .push(r#"CASE WHEN bi."PrimaryVersionId" IS NULL THEN 0 ELSE 1 END) FROM "BaseItems" AS bi WHERE bi."Id" <> "#)
+        .push_bind(PLACEHOLDER_ID);
+}
+
+/// Closes the subquery [`push_group_head`] opened.
+///
+/// `COALESCE` because a row without a key groups with nothing but itself.
+/// Jellyfin always writes one (2 nulls in 40,610 on a real library) and so does
+/// Ferrofin wherever versions are merged
+/// (`ItemPersistenceService::set_primary_version_id`), but a row written before
+/// that has none, and a bare `GROUP BY` would fold every keyless row into a
+/// single result.
+fn push_group_tail(qb: &mut QueryBuilder<'_, Sqlite>) {
+    qb.push(r#" GROUP BY COALESCE(bi."PresentationUniqueKey", bi."Id")))"#);
 }
 
 /// Builds the "latest media" statement for a tvshows/music library — C#
@@ -139,8 +237,17 @@ pub(crate) fn build_latest_item_list_query<'a>(
     group_column: &'static str,
 ) -> QueryBuilder<'a, Sqlite> {
     let mut qb: QueryBuilder<'a, Sqlite> =
-        QueryBuilder::new(r#"SELECT bi.* FROM "BaseItems" AS bi WHERE bi."Id" <> "#);
-    qb.push_bind(PLACEHOLDER_ID);
+        QueryBuilder::new(r#"SELECT bi.* FROM "BaseItems" AS bi WHERE "#);
+    // `GetLatestItemList` runs `ApplyGroupingFilter` over the main query too
+    // (`BaseItemRepository.cs:363`), so "latest" collapses merged versions the
+    // same way a browse does — otherwise the two paths disagree about what a
+    // duplicate is, and a four-cut film fills the row.
+    let groups = group_by_presentation_unique_key(filter);
+    if groups {
+        push_group_head(&mut qb);
+    } else {
+        qb.push(r#"bi."Id" <> "#).push_bind(PLACEHOLDER_ID);
+    }
     append_predicates(&mut qb, filter);
 
     // `mainquery.Where(g => g.DateCreated >= subqueryGrouped.Min(s => s.MaxDateCreated))`
@@ -155,6 +262,9 @@ pub(crate) fn build_latest_item_list_query<'a>(
         qb.push(" LIMIT ").push_bind(i64::from(limit));
     }
     qb.push(") AS g)");
+    if groups {
+        push_group_tail(&mut qb);
+    }
 
     append_order_by(&mut qb, filter);
     // `filter.Limit = null` upstream — only a start index can page this query.
@@ -277,7 +387,23 @@ pub(crate) fn append_predicates<'a>(
                     r#" OR bi."Id" IN (SELECT "ChildId" FROM "FerrofinLinkedChildren" WHERE "ParentId" = "#,
                 )
                 .push_bind(guid_to_db(filter.parent_id))
-                .push(r#" AND "ChildType" = 0))"#);
+                .push(r#" AND "ChildType" = 0)"#);
+            // …and, on an adopted Jellyfin database, the children of the
+            // library's physical folders. A `CollectionFolder` there is
+            // virtual — nothing carries its id as `ParentId` — so the equality
+            // above matches nothing and this is the whole answer (C#
+            // `CollectionFolder.GetActualChildren`, which unions
+            // `GetPhysicalFolders().SelectMany(c => c.Children)`). Empty, and
+            // so a no-op, on a Ferrofin-written database.
+            if !filter.parent_physical_folder_ids.is_empty() {
+                qb.push(" OR ");
+                push_in_list(
+                    qb,
+                    r#"bi."ParentId""#,
+                    &to_guid_strings(&filter.parent_physical_folder_ids),
+                );
+            }
+            qb.push(")");
         }
     }
 
@@ -372,11 +498,23 @@ pub(crate) fn append_predicates<'a>(
         && !filter.include_owned_items
     {
         // Exclude alternate versions + owned non-extra items from general queries.
-        if filter.is_resumable == Some(true) {
+        //
+        // Two reasons to leave the alternates in, and they are the same
+        // predicate: a resume query wants the version that was actually
+        // played, and a grouped query collapses the versions itself. Upstream
+        // has no `PrimaryVersionId` predicate at all, and dropping the rows
+        // before the grouping removes 1,399 of them on a real library where
+        // the grouping merges only 299 — the other 1,100 are separate titles
+        // that simply have a primary version recorded.
+        if filter.is_resumable == Some(true) || group_by_presentation_unique_key(filter) {
             qb.push(" AND (")
                 .push(NO_OWNER)
                 .push(r#" OR bi."ExtraType" IS NOT NULL)"#);
         } else {
+            // Without a user there is no grouping (upstream's rule), so the
+            // alternates still have to be excluded somehow. Upstream carries no
+            // such predicate; this is the remaining divergence, and it only
+            // affects queries no user-facing endpoint issues.
             qb.push(r#" AND bi."PrimaryVersionId" IS NULL AND ("#)
                 .push(NO_OWNER)
                 .push(r#" OR bi."ExtraType" IS NOT NULL)"#);
@@ -1406,7 +1544,7 @@ fn item_value_type_ints(types: &[ItemValueType]) -> Vec<i64> {
 
 /// Converts item ids to the canonical stored `Guid` `TEXT` form (UPPERCASE
 /// hyphenated) for binds.
-fn to_guid_strings(ids: &[Uuid]) -> Vec<String> {
+pub(crate) fn to_guid_strings(ids: &[Uuid]) -> Vec<String> {
     ids.iter().copied().map(guid_to_db).collect()
 }
 
@@ -1418,7 +1556,7 @@ fn media_type_name(media: ferrofin_model::data::MediaType) -> String {
 
 /// Returns the inner string when the option holds a non-blank value, else
 /// [`None`] (mirrors the C# `!string.IsNullOrWhiteSpace` guards).
-fn non_blank(value: Option<&String>) -> Option<&str> {
+pub(crate) fn non_blank(value: Option<&String>) -> Option<&str> {
     value.map(String::as_str).filter(|s| !s.trim().is_empty())
 }
 

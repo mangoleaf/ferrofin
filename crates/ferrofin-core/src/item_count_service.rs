@@ -169,6 +169,12 @@ impl FerrofinItemCountService {
 #[async_trait]
 impl ItemCountService for FerrofinItemCountService {
     async fn get_count(&self, filter: &InternalItemsQuery) -> Result<i32, ServiceError> {
+        // Same `AddUserToQuery` confinement the item queries get: a user who may
+        // see one library must be counted over that library, not the server.
+        // Without it `/Items/Counts` handed a restricted account the whole
+        // catalogue's totals — numbers it could not then browse to.
+        let scoped = crate::item_repository::scope_to_user_libraries(&self.db, filter).await?;
+        let filter = scoped.as_ref().unwrap_or(filter);
         let mut qb = build_query(filter, QueryShape::Count);
         let count: i64 = qb
             .build_query_scalar::<i64>()
@@ -186,6 +192,8 @@ impl ItemCountService for FerrofinItemCountService {
         // (type, count) rows — instead of materializing every matching full row
         // (all ~60 columns) and counting them in Rust, which dominated this
         // endpoint's CPU on a large library.
+        let scoped = crate::item_repository::scope_to_user_libraries(&self.db, filter).await?;
+        let filter = scoped.as_ref().unwrap_or(filter);
         let mut qb = build_query(filter, QueryShape::TypeCounts);
         let rows = qb
             .build_query_as::<(String, i64)>()
@@ -478,7 +486,22 @@ impl ItemCountService for FerrofinItemCountService {
         // C# `ItemCountService.GetChildCountBatch`: one grouped count of direct
         // `BaseItems` children plus one of `FerrofinLinkedChildren` rows; a parent with
         // linked children reports those instead of its hierarchical children.
-        let ids: Vec<String> = parent_ids.iter().copied().map(guid_to_db).collect();
+        //
+        // A Jellyfin library is virtual, so its children hang off its physical
+        // folders and grouping on the raw `ParentId` would report 0 for every
+        // library on an adopted database — the same translation the item
+        // repository does for a browse (`physical_folders_by_view`). Empty, and
+        // so a no-op, on a Ferrofin-written database.
+        let by_view =
+            crate::item_repository::physical_folders_by_view(&self.db, parent_ids).await?;
+        let counted: Vec<Uuid> = parent_ids
+            .iter()
+            .flat_map(|p| match by_view.get(p) {
+                Some(folders) => folders.clone(),
+                None => vec![*p],
+            })
+            .collect();
+        let ids: Vec<String> = counted.iter().copied().map(guid_to_db).collect();
         let grouped_count = |table: &str| {
             let mut sql =
                 format!(r#"SELECT "ParentId", COUNT(*) FROM "{table}" WHERE "ParentId" IN ("#);
@@ -509,13 +532,22 @@ impl ItemCountService for FerrofinItemCountService {
         }
 
         let mut out = HashMap::with_capacity(parent_ids.len());
-        for (parent, key) in parent_ids.iter().zip(&ids) {
-            let linked_count = linked.get(key).copied().unwrap_or(0);
-            let count = if linked_count > 0 {
-                linked_count
-            } else {
-                hierarchical.get(key).copied().unwrap_or(0)
-            };
+        for parent in parent_ids {
+            // A library sums its folders'; everything else counts its own row.
+            let count: i64 = by_view
+                .get(parent)
+                .map_or_else(|| vec![*parent], Clone::clone)
+                .iter()
+                .map(|id| {
+                    let key = guid_to_db(*id);
+                    let linked_count = linked.get(&key).copied().unwrap_or(0);
+                    if linked_count > 0 {
+                        linked_count
+                    } else {
+                        hierarchical.get(&key).copied().unwrap_or(0)
+                    }
+                })
+                .sum();
             out.insert(*parent, i32::try_from(count).unwrap_or(i32::MAX));
         }
         Ok(out)
@@ -658,8 +690,8 @@ fn placeholders(n: usize) -> String {
 mod tests {
     use super::*;
     use crate::test_support::{
-        fetch_item, seed_item, seed_item_genre, seed_named_item, seed_user, seed_user_data,
-        set_clean_name, test_db,
+        fetch_item, seed_child_item, seed_item, seed_item_genre, seed_item_with_data,
+        seed_named_item, seed_user, seed_user_data, set_clean_name, test_db,
     };
     use ferrofin_db::Database;
     use ferrofin_db::entities::base_items::BaseItemEntity;
@@ -768,6 +800,63 @@ mod tests {
             .await
             .expect("empty");
         assert_eq!(empty.total, 0);
+    }
+
+    /// A Jellyfin library's `ChildCount` is its physical folders' children.
+    ///
+    /// Nothing carries a `CollectionFolder`'s id as `ParentId` on an adopted
+    /// database, so grouping on the raw column reports 0 while the very same
+    /// browse returns the items — the two would disagree in one response.
+    #[tokio::test]
+    async fn a_jellyfin_library_counts_its_physical_folder_s_children() {
+        let db = test_db().await;
+        let service = svc(&db);
+        let view = Uuid::from_u128(0xE101);
+        let physical = Uuid::from_u128(0xE102);
+        let plain = Uuid::from_u128(0xE105);
+
+        seed_item_with_data(
+            &db,
+            view,
+            BaseItemKind::CollectionFolder,
+            "TV",
+            &format!(r#"{{"PhysicalFolderIds":["{}"]}}"#, physical.simple()),
+        )
+        .await;
+        seed_named_item(&db, physical, BaseItemKind::Folder, "TV").await;
+        seed_child_item(
+            &db,
+            Uuid::from_u128(0xE103),
+            BaseItemKind::Episode,
+            "a",
+            physical,
+        )
+        .await;
+        seed_child_item(
+            &db,
+            Uuid::from_u128(0xE104),
+            BaseItemKind::Episode,
+            "b",
+            physical,
+        )
+        .await;
+        // An ordinary folder alongside it, to prove the translation is scoped.
+        seed_named_item(&db, plain, BaseItemKind::Folder, "Other").await;
+        seed_child_item(
+            &db,
+            Uuid::from_u128(0xE106),
+            BaseItemKind::Movie,
+            "m",
+            plain,
+        )
+        .await;
+
+        let counts = service
+            .get_child_count_batch(&[view, plain], None)
+            .await
+            .expect("child counts");
+        assert_eq!(counts[&view], 2, "the view counts through its folder");
+        assert_eq!(counts[&plain], 1, "an ordinary parent counts its own");
     }
 
     #[tokio::test]
@@ -1047,13 +1136,14 @@ mod tests {
             .expect("empty person ids");
         assert!(empty_people.is_empty());
 
-        // Three separate Genre by-name rows that all clean to "drama", plus one
-        // that doesn't. Dedupe binds "drama" once; all three rows must still
-        // report the movie.
+        // Three separate Genre by-name rows that all clean to "drama" — case
+        // and diacritics are exactly what `GetCleanValue` folds — plus one that
+        // doesn't. Dedupe binds "drama" once; all three rows must still report
+        // the movie.
         let dupes = [
             (Uuid::from_u128(0x0D01), "Drama"),
             (Uuid::from_u128(0x0D02), "drama"),
-            (Uuid::from_u128(0x0D03), "DRAMA!"),
+            (Uuid::from_u128(0x0D03), "Dráma"),
         ];
         for (id, raw) in dupes {
             seed_named_item(&db, id, BaseItemKind::Genre, raw).await;

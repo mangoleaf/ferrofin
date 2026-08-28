@@ -1251,16 +1251,26 @@ mod tests {
         let library = library_manager_over(db.clone());
         let linked: Arc<dyn LinkedChildrenService> =
             Arc::new(FerrofinLinkedChildrenService::new(db.clone()));
+        let task_paths: Arc<dyn ferrofin_traits::system::ServerApplicationPaths> =
+            Arc::new(crate::app_paths::FerrofinServerApplicationPaths::new(
+                media_dir.path(),
+                media_dir.path(),
+                media_dir.path(),
+                media_dir.path(),
+                media_dir.path(),
+            ));
         let collections: Arc<dyn CollectionManager> = Arc::new(FerrofinCollectionManager::new(
             db.clone(),
             Arc::clone(&library),
             Arc::clone(&linked),
+            Arc::clone(&task_paths),
         ));
         let playlists: Arc<dyn PlaylistManager> = Arc::new(FerrofinPlaylistManager::new(
             db.clone(),
             Arc::clone(&library),
             Arc::clone(&linked),
             item_repository_over(db.clone()),
+            Arc::clone(&task_paths),
         ));
 
         // A box set with one live child (file on disk) and one dead child

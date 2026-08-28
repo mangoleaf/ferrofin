@@ -119,16 +119,28 @@ impl FerrofinPeopleRepository {
                 // no-op for these rows AND makes `nameStartsWith` — which
                 // filters `lower(SortName)`, faithfully to C# `ApplyNameFilters`
                 // — match nothing at all.
+                // `PresentationUniqueKey` too — `Person-{Name}` with the
+                // diacritics removed, exactly as Jellyfin writes it. This
+                // insert bypasses `upsert_item`, so nothing else would set it.
                 r#"INSERT OR IGNORE INTO "BaseItems"
-                   ("Id","Type","Name","CleanName","SortName","IsFolder","IsInMixedFolder",
+                   ("Id","Type","Name","CleanName","SortName","PresentationUniqueKey",
+                    "IsFolder","IsInMixedFolder",
                     "IsLocked","IsMovie","IsRepeat","IsSeries","IsVirtualItem")
-                   VALUES (?1,?2,?3,?4,?5,0,0,0,0,0,0,0)"#,
+                   VALUES (?1,?2,?3,?4,?5,?6,0,0,0,0,0,0,0)"#,
             )
             .bind(target)
             .bind(person_type)
             .bind(name)
             .bind(&clean)
             .bind(create_sort_name(name))
+            .bind(crate::kinds::presentation_unique_key(
+                BaseItemKind::Person,
+                Uuid::parse_str(target).unwrap_or_default(),
+                Some(name),
+                None,
+                None,
+                None,
+            ))
             .execute(&mut **tx)
             .await
             .map_err(db_err)?;
@@ -396,7 +408,7 @@ fn base_query<'a>(cols: &str, filter: &InternalPeopleQuery) -> QueryBuilder<'a, 
 
 /// Restricts a plain `"Peoples"` scan to one representative row per lower-cased
 /// name: the `MIN("Id")` row, exactly the representative the earlier
-/// `GROUP BY LOWER("Name")` derived table selected (verified row-identical,
+/// `GROUP BY` on the case-insensitive name selected (verified row-identical,
 /// ids included, on the bench library).
 ///
 /// As a *predicate* rather than a derived table, the page can be driven from
@@ -406,18 +418,18 @@ fn base_query<'a>(cols: &str, filter: &InternalPeopleQuery) -> QueryBuilder<'a, 
 /// B-tree before the `LIMIT` could discard 98% of the result: 1.26 ms → 0.31 ms
 /// per query on the bench library (7.5k people, `limit=100`). The dedup test
 /// per candidate row is a covering-index seek on
-/// `FerrofinIX_Peoples_LowerName_Cover`.
+/// `FerrofinIX_Peoples_NameNoCase_Cover`.
 const DEDUP_PEOPLE_PREDICATE: &str = r#" AND p."Id" = (SELECT MIN(d."Id") FROM "Peoples" d
-     WHERE LOWER(d."Name") = LOWER(p."Name"))"#;
+     WHERE d."Name" = p."Name" COLLATE NOCASE)"#;
 
 /// The total column for an **unnarrowed** by-name listing: the deduped set is
 /// then exactly the distinct lower-cased names, so the total comes off
-/// `FerrofinIX_Peoples_LowerName_Cover` as a plain index-only distinct count —
+/// `FerrofinIX_Peoples_NameNoCase_Cover` as a plain index-only distinct count —
 /// no `MIN("Id")` aggregation, no row materialization, and (being an
 /// uncorrelated scalar sub-select) evaluated **once** per statement rather
 /// than per row.
 const TOTAL_ALL_NAMES: &str =
-    r#"(SELECT COUNT(DISTINCT LOWER("Name")) FROM "Peoples") AS "TotalCount""#;
+    r#"(SELECT COUNT(DISTINCT "Name" COLLATE NOCASE) FROM "Peoples") AS "TotalCount""#;
 
 /// The total column for a **narrowed** by-name listing: the predicates apply to
 /// the deduped representative row, so the total can only be counted over the
@@ -501,10 +513,12 @@ impl FerrofinPeopleRepository {
     /// aggregate over the representative rows.
     async fn count_people_total(&self, filter: &InternalPeopleQuery) -> Result<i64, ServiceError> {
         if !narrows_by_name(filter) {
-            return sqlx::query_scalar(r#"SELECT COUNT(DISTINCT LOWER("Name")) FROM "Peoples""#)
-                .fetch_one(self.db.pool())
-                .await
-                .map_err(db_err);
+            return sqlx::query_scalar(
+                r#"SELECT COUNT(DISTINCT "Name" COLLATE NOCASE) FROM "Peoples""#,
+            )
+            .fetch_one(self.db.pool())
+            .await
+            .map_err(db_err);
         }
         let mut qb = base_query_from("COUNT(*)", r#""Peoples""#, filter);
         qb.push(DEDUP_PEOPLE_PREDICATE);
@@ -712,9 +726,14 @@ impl PeopleRepository for FerrofinPeopleRepository {
         let mut written: Vec<WrittenPerson> = Vec::with_capacity(deduped.len());
         for person in &deduped {
             let name = person.name.trim();
+            // `COLLATE NOCASE`, not `LOWER(…) = LOWER(…)`: the latter is an
+            // expression whose meaning depends on whether SQLite was built with
+            // ICU, so an index written by one engine and probed by another
+            // misses rows — and a MISS here mints a duplicate person. See
+            // migration 0022.
             let existing: Option<String> = sqlx::query_scalar(
                 r#"SELECT "Id" FROM "Peoples"
-                   WHERE LOWER("Name") = LOWER(?1)
+                   WHERE "Name" = ?1 COLLATE NOCASE
                      AND ("PersonType" IS ?2 OR "PersonType" = ?2)
                    LIMIT 1"#,
             )
@@ -1307,8 +1326,16 @@ mod tests {
                 "unnarrowed page must not window-count every deduped row: {sql}"
             );
             assert!(
-                sql.contains(r#"COUNT(DISTINCT LOWER("Name"))"#),
+                sql.contains(r#"COUNT(DISTINCT "Name" COLLATE NOCASE)"#),
                 "unnarrowed total must come off the covering index: {sql}"
+            );
+            assert!(
+                !sql.contains("LOWER("),
+                "this query must not fold case with LOWER(): its meaning depends \
+                 on whether SQLite was built with ICU, so an index keyed on it \
+                 is unportable between engines (migration 0022). Only the \
+                 persisted index key is portability-sensitive — the UPPER() on \
+                 the narrowed path is a transient comparison and is fine: {sql}"
             );
         }
 
@@ -1332,7 +1359,7 @@ mod tests {
         assert!(
             details
                 .iter()
-                .any(|d| d.contains("FerrofinIX_Peoples_LowerName_Cover")),
+                .any(|d| d.contains("FerrofinIX_Peoples_NameNoCase_Cover")),
             "the dedup pass must stay index-only, got {details:?}"
         );
         assert!(
@@ -1361,6 +1388,13 @@ mod tests {
     /// the filter matches — never the page length. A repository that reported
     /// `items.len()` would look right on page 0 of a short library and lie on
     /// every real page.
+    ///
+    /// This is also the test that guards the **read-path case folding**
+    /// (`COLLATE NOCASE`, migration 0022): the `Dan`/`dan` pair below differs in
+    /// `PersonType`, which is what lets it reach SQL as two rows at all — the
+    /// write path's `dedupe_people` folds same-type variants away in Rust before
+    /// any query runs. Revert the three `COLLATE NOCASE` sites to a plain `=`
+    /// and this fails 6 vs 5.
     #[tokio::test]
     async fn by_name_total_is_the_deduped_match_count_not_the_page_length() {
         let db = test_db().await;

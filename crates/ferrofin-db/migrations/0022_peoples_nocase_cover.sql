@@ -1,0 +1,41 @@
+-- Replace the `LOWER("Name")` expression index on `Peoples` with a
+-- `COLLATE NOCASE` one, because the expression index is not portable between
+-- SQLite builds and can make people INVISIBLE.
+--
+-- `lower()` is ASCII-only in the bundled SQLite but Unicode-aware when
+-- `SQLITE_ENABLE_ICU` is compiled in (the `sqlite3` CLI on many distributions).
+-- An index whose key is `LOWER("Name")` therefore stores different keys
+-- depending on which engine wrote it, and the two disagree for any name with an
+-- uppercase non-ASCII letter. On a real 25,722-row library that is 22 people
+-- (Icelandic, Spanish and Slavic names). `PRAGMA integrity_check` reports them
+-- as "row missing from index", and it is not cosmetic: an index built by one
+-- engine and probed by the other returns NO ROW where the row exists, so
+--
+--   * `/Persons` silently omits those people, and
+--   * the scanner's `WHERE LOWER("Name") = LOWER(?)` existence probe misses
+--     them and mints DUPLICATE `Peoples` rows on the next scan.
+--
+-- One `REINDEX`, `VACUUM`, or dump-and-reload with the other engine is all it
+-- takes — plausibly performed by an admin reacting to that very
+-- integrity_check warning.
+--
+-- `COLLATE NOCASE` is ASCII-only case folding too, so the *behaviour* on the
+-- engine Ferrofin ships is unchanged; what changes is that the key no longer
+-- depends on how SQLite was built. `SQLITE_ENABLE_ICU` overrides `lower()` but
+-- it does not override `NOCASE`.
+--
+-- Dropping the index instead is not an option: it is the covering index behind
+-- both hot `/Persons` paths (the dedup predicate and the distinct-name count).
+-- Measured on the 25,722-row library, the by-name page query runs in 9 ms with
+-- the index and 398 ms without it — ~44x, not the "roughly 4x" first assumed.
+-- `EXPLAIN QUERY PLAN` confirms the replacement is still chosen as a COVERING
+-- index for the dedup predicate, the distinct count and the scanner's write
+-- probe, with no TEMP B-TREE.
+--
+-- Jellyfin has no equivalent index and no `LOWER(` in any of its migrations, so
+-- nothing here affects the pinned Jellyfin-owned shape — `FerrofinIX_*` is
+-- Ferrofin's own namespace.
+DROP INDEX IF EXISTS "FerrofinIX_Peoples_LowerName_Cover";
+
+CREATE INDEX IF NOT EXISTS "FerrofinIX_Peoples_NameNoCase_Cover"
+    ON "Peoples" ("Name" COLLATE NOCASE, "PersonType", "Id");

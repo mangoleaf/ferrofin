@@ -39,7 +39,29 @@ use ferrofin_traits::persistence::{ItemPersistenceService, ItemRepository};
 
 use crate::item_type_lookup;
 use crate::kinds;
+use crate::user_entity_ext;
+use ferrofin_db::Database;
 use ferrofin_util::sort_name::create_sort_name;
+
+/// The tail of the Live TV view's `Path`, which is how the view is
+/// identified.
+///
+/// C# `GetNamedView` builds it as `{InternalMetadataPath}/views/livetv`
+/// (`LibraryManager.cs:2423`) and names the row from the localized
+/// `HeaderLiveTV` string — so the name is "TV en direct" or "ライブTV"
+/// depending on the server's language, and only the path is stable. A real
+/// 10.11.8 database stores `%MetadataPath%/views/livetv`; Ferrofin resolves the
+/// token, hence the suffix match.
+pub(crate) const LIVE_TV_VIEW_PATH_SUFFIX: &str = "/views/livetv";
+
+/// Whether `path` is the Live TV view's, in either separator — C# builds it
+/// with `Path.Combine`, so a database adopted from a Windows Jellyfin stores
+/// `…\\views\\livetv` and a POSIX-only match would silently never fire on
+/// exactly the case the gate exists for.
+#[must_use]
+pub(crate) fn is_live_tv_view_path(path: &str) -> bool {
+    path.replace('\\', "/").ends_with(LIVE_TV_VIEW_PATH_SUFFIX)
+}
 
 /// The display name of the auto-provisioned playlists media folder
 /// (C# `ManualPlaylistsFolder.Name`).
@@ -68,6 +90,10 @@ pub struct FerrofinUserViewManager {
     /// `CollectionFolder.CollectionType`, which the latest-items rules key
     /// off). `None` in unit tests: every parent is then a type-less folder.
     virtual_folders: Option<Arc<dyn VirtualFolderManager>>,
+    /// The database, for the Live TV gate (see
+    /// [`user_entity_ext::live_tv_enabled_for`]). `None` in unit tests: the
+    /// Live TV view is then listed unconditionally, as it was before.
+    db: Option<Database>,
 }
 
 impl std::fmt::Debug for FerrofinUserViewManager {
@@ -90,7 +116,16 @@ impl FerrofinUserViewManager {
             playlists_path: None,
             id_derivation: item_type_lookup::IdDerivation::LegacyLowercase,
             virtual_folders: None,
+            db: None,
         }
+    }
+
+    /// Attaches the database so the Live TV view can be gated on Live TV
+    /// actually being available. Called once by the composition root.
+    #[must_use]
+    pub fn with_database(mut self, db: Database) -> Self {
+        self.db = Some(db);
+        self
     }
 
     /// Attaches the virtual-folder manager so the latest-items rules can read
@@ -122,6 +157,36 @@ impl FerrofinUserViewManager {
         self.persistence = Some(persistence);
         self.playlists_path = Some(playlists_path.into());
         self
+    }
+
+    /// Drops the Live TV view unless Live TV is actually available to this
+    /// user — C# `UserViewManager.GetUserViews`, whose Live TV arm is guarded
+    /// by `_liveTvManager.GetEnabledUsers()`. A server with no tuner
+    /// configured has no Live TV, and Jellyfin then omits the view entirely
+    /// even though the row is still in the database from when a tuner last
+    /// existed. Verified against a live 10.11.8 on an adopted 40k-item
+    /// library: it serves 8 views where Ferrofin served 9.
+    async fn without_disabled_live_tv(
+        &self,
+        user_id: Uuid,
+        views: Vec<BaseItemEntity>,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        let Some(db) = &self.db else {
+            return Ok(views);
+        };
+        let user_view = item_type_lookup::stored_type_name(BaseItemKind::UserView);
+        let is_live_tv = |v: &BaseItemEntity| {
+            Some(v.type_.as_str()) == user_view
+                && v.path.as_deref().is_some_and(is_live_tv_view_path)
+        };
+        if !views.iter().any(is_live_tv) {
+            return Ok(views);
+        }
+        let user_id = ferrofin_db::store::guid_to_db(user_id);
+        if user_entity_ext::live_tv_enabled_for(db, &user_id).await? {
+            return Ok(views);
+        }
+        Ok(views.into_iter().filter(|v| !is_live_tv(v)).collect())
     }
 
     /// The deterministic `ManualPlaylistsFolder` item id (`GetNewItemIdInternal`
@@ -188,7 +253,7 @@ impl FerrofinUserViewManager {
 
 #[async_trait]
 impl UserViewManager for FerrofinUserViewManager {
-    async fn get_user_views(&self, _user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError> {
+    async fn get_user_views(&self, user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError> {
         // The user's top-level views are the library collection folders. Per-user
         // access filtering (which libraries the user may see) rides on the
         // InternalItemsQuery.user field in the full pipeline; the base set is every
@@ -198,10 +263,11 @@ impl UserViewManager for FerrofinUserViewManager {
             order_by: vec![(ItemSortBy::SortName, SortOrder::Ascending)],
             ..Default::default()
         };
-        self.items.get_item_list(&query).await
+        let views = self.items.get_item_list(&query).await?;
+        self.without_disabled_live_tv(user_id, views).await
     }
 
-    async fn get_media_folders(&self, _user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError> {
+    async fn get_media_folders(&self, user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError> {
         // Jellyfin's LibraryController.GetMediaFolders returns
         // GetUserRootFolder().Children sorted by SortName — the library collection
         // folders plus the auto-provisioned ManualPlaylistsFolder. Provision the
@@ -212,12 +278,23 @@ impl UserViewManager for FerrofinUserViewManager {
             include_item_types: vec![
                 BaseItemKind::CollectionFolder,
                 BaseItemKind::UserView,
+                // Both spellings of the playlists folder: Ferrofin provisions
+                // one, an adopted database carries the other, and this list has
+                // to mean the same set as the query scope in
+                // `item_repository::visible_views`.
                 BaseItemKind::ManualPlaylistsFolder,
+                BaseItemKind::PlaylistsFolder,
             ],
             order_by: vec![(ItemSortBy::SortName, SortOrder::Ascending)],
             ..Default::default()
         };
-        self.items.get_item_list(&query).await
+        // Upstream returns `GetUserRootFolder().Children`, which never contains
+        // the Live TV view: that one is created parentless under
+        // `{InternalMetadataPath}/views/`. Gating it here keeps this list
+        // meaning the same set as `item_repository::visible_views`, which the
+        // comment above depends on.
+        let folders = self.items.get_item_list(&query).await?;
+        self.without_disabled_live_tv(user_id, folders).await
     }
 
     async fn get_latest_items(
@@ -673,7 +750,9 @@ mod tests {
     use crate::item_persistence_service::FerrofinItemPersistenceService;
     use crate::item_repository::FerrofinItemRepository;
     use crate::item_type_lookup::{ItemTypeLookup, stored_type_name};
-    use crate::test_support::{seed_item, seed_named_item, seed_user, seed_user_data, test_db};
+    use crate::test_support::{
+        seed_item, seed_named_item, seed_user, seed_user_data, set_item_path, test_db,
+    };
     use ferrofin_db::Database;
     use ferrofin_db::store::guid_to_db;
     use ferrofin_model::configuration::{LibraryOptions, MediaPathInfo};
@@ -694,6 +773,64 @@ mod tests {
         let persistence: Arc<dyn ItemPersistenceService> =
             Arc::new(FerrofinItemPersistenceService::new(db.clone()));
         manager(db).with_playlists_store(persistence, playlists_path)
+    }
+
+    /// The Live TV view is served only while Live TV is available. An adopted
+    /// database keeps the row from whenever a tuner last existed; Jellyfin
+    /// still leaves it out of `/Users/{id}/Views` (verified against a live
+    /// 10.11.8, which served 8 views where Ferrofin served 9).
+    #[tokio::test]
+    async fn the_live_tv_view_is_served_only_once_a_tuner_exists() {
+        let db = test_db().await;
+        let user_id = Uuid::from_u128(0x5101);
+        seed_user(&db, user_id).await;
+        let user = guid_to_db(user_id);
+        let mut tx = db.writer().begin().await.expect("begin");
+        crate::user_entity_ext::seed_defaults(&mut tx, &user)
+            .await
+            .expect("permissions");
+        tx.commit().await.expect("commit");
+        seed_named_item(
+            &db,
+            Uuid::from_u128(0x5102),
+            BaseItemKind::CollectionFolder,
+            "Movies",
+        )
+        .await;
+        // The view is identified by its path, and its NAME is whatever
+        // `HeaderLiveTV` says in the server's language — so the fixture uses a
+        // localized name on purpose: matching on "Live TV" would pass here and
+        // do nothing on a French server.
+        let live_tv = Uuid::from_u128(0x5103);
+        seed_named_item(&db, live_tv, BaseItemKind::UserView, "TV en direct").await;
+        set_item_path(
+            &db,
+            live_tv,
+            &format!("/meta/views{LIVE_TV_VIEW_PATH_SUFFIX}"),
+        )
+        .await;
+        let manager = manager(&db).with_database(db.clone());
+
+        let names = |views: Vec<BaseItemEntity>| {
+            views
+                .into_iter()
+                .filter_map(|v| v.name)
+                .collect::<Vec<String>>()
+        };
+        assert_eq!(
+            names(manager.get_user_views(user_id).await.expect("views")),
+            ["Movies"],
+            "no tuner configured: no Live TV view"
+        );
+
+        db.upsert_live_tv_tuner_host("t1", "http://tuner", "m3u", "{}")
+            .await
+            .expect("tuner");
+        assert_eq!(
+            names(manager.get_user_views(user_id).await.expect("views")),
+            ["Movies", "TV en direct"],
+            "with a tuner the view comes back"
+        );
     }
 
     /// A [`VirtualFolderManager`] serving a canned `(folder item id, type)` list.

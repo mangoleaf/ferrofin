@@ -132,11 +132,17 @@ async fn update_initial_configuration(
 
 /// `POST /Startup/RemoteAccess` — toggle remote access.
 ///
-/// Port of `StartupController.SetRemoteAccess`: persists `EnableRemoteAccess` /
-/// `EnableUPnP` onto the `NetworkConfiguration`. Ferrofin keeps that config in the
-/// named-config store (`{config}/named/network.json`, the same file
-/// `GET/POST /System/Configuration/network` reads), so the wizard toggle now
-/// actually takes effect rather than being dropped.
+/// Port of `StartupController.SetRemoteAccess`: persists `EnableRemoteAccess`
+/// onto the `NetworkConfiguration` — and only that, as upstream does. Ferrofin
+/// keeps the config in the named-config store (`{config}/named/network.json`,
+/// the same file `GET/POST /System/Configuration/network` reads), so the wizard
+/// toggle actually takes effect rather than being dropped.
+///
+/// Note the shape: this reads the whole document, changes one field, and writes
+/// the whole document back. Every field therefore has to survive
+/// deserialization, or this handler quietly resets it — which is why
+/// `NetworkConfiguration` carries `#[serde(default)]` and aliases for the names
+/// older versions wrote.
 #[utoipa::path(
     post,
     path = "/Startup/RemoteAccess",
@@ -152,15 +158,42 @@ async fn set_remote_access(
             "network config path unavailable",
         ))
     })?;
-    // Load the persisted network config (or its defaults), flip the flags, save.
-    let mut config: ferrofin_networking::NetworkConfiguration = tokio::fs::read(&path)
-        .await
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default();
+    // Load the persisted network config (or its defaults), set the flag, save.
+    // Every settle-for-defaults branch here overwrites the operator's whole
+    // document a few lines below, so none of them may be silent. Upstream
+    // substitutes defaults too, but logs first
+    // (`BaseConfigurationManager.LoadConfiguration`).
+    let mut config = match tokio::fs::read(&path).await {
+        Ok(bytes) => match serde_json::from_slice(&bytes) {
+            Ok(config) => config,
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "the saved network configuration could not be read; it is being replaced \
+                     with defaults"
+                );
+                ferrofin_networking::NetworkConfiguration::default()
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            ferrofin_networking::NetworkConfiguration::default()
+        }
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "the saved network configuration could not be read; it is being replaced \
+                 with defaults"
+            );
+            ferrofin_networking::NetworkConfiguration::default()
+        }
+    };
     config.enable_remote_access = body.enable_remote_access;
-    // `EnableUPnP` is deprecated and not modelled on the config, so the
-    // automatic-port-mapping flag is accepted but not persisted.
+    // Accepted and dropped, exactly as upstream does it: `SetRemoteAccess`
+    // (`Jellyfin.Api/Controllers/StartupController.cs:94`) assigns
+    // `EnableRemoteAccess` and nothing else, so the wizard's port-mapping
+    // checkbox never reaches `EnableUPnP` there either.
     let _ = body.enable_automatic_port_mapping;
 
     if let Some(parent) = path.parent() {

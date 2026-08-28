@@ -10,7 +10,7 @@
 ///
 /// Only the `warn` level is asserted by the ported tests; other C# log levels
 /// (`Debug`/`Information`/`Error`) are not observable behavior and are dropped.
-pub trait Logger {
+pub trait Logger: Send + Sync {
     /// Records a warning-level message.
     fn warn(&self, message: &str);
 }

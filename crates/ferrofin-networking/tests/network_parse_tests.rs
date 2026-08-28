@@ -10,7 +10,7 @@ use ferrofin_networking::{
     NetworkConfiguration, NetworkManager, RemoteAccessPolicyResult, StartupConfig,
 };
 use rstest::rstest;
-use std::rc::Rc;
+use std::sync::Arc;
 
 /// Splits a `,`/`;`-separated list, matching the C# `String.Split` calls.
 fn split(s: &str, sep: char) -> Vec<String> {
@@ -555,7 +555,7 @@ fn startup_published_server_url_override_wins() {
         conf,
         startup,
         MOCK_INTERFACES,
-        Rc::new(ferrofin_networking::NullLogger),
+        Arc::new(ferrofin_networking::NullLogger),
     );
     let (intf, _) = nm.get_bind_address("192.168.1.1");
     assert_eq!(intf, "http://startup.example");

@@ -114,6 +114,26 @@ DB_ITEMS=$(sq 'SELECT count(*) FROM BaseItems;')
 DB_EF=$(sq 'SELECT count(*) FROM __EFMigrationsHistory;')
 DB_USERS=$(sq 'SELECT count(*) FROM Users;')
 WIZARD=$(grep -o '<IsStartupWizardCompleted>[a-z]*' "$DIR/config/system.xml" | cut -d'>' -f2)
+# By-name rows, counted the way Jellyfin resolves them: a Genre/Studio item
+# whose CleanName is one of the ItemValues of that kind (ItemValueId is a
+# synthetic guid that matches no item, so it cannot be joined on). An exact
+# expectation, because "> 0" once passed on an answer that also returned four
+# episodes and a folder.
+# `/Genres` excludes music items (those are the MusicGenres tab), so the
+# expectation has to as well, or a genre carried only by music would make an
+# exact check fail correct behaviour.
+DB_GENRES=$(sq "SELECT count(*) FROM BaseItems b WHERE b.type='MediaBrowser.Controller.Entities.Genre'
+                AND b.CleanName IN (
+                    SELECT iv.CleanValue FROM ItemValues iv
+                    JOIN ItemValuesMap m ON m.ItemValueId = iv.ItemValueId
+                    JOIN BaseItems ci ON ci.Id = m.ItemId
+                    WHERE iv.Type=2 AND ci.type NOT IN (
+                        'MediaBrowser.Controller.Entities.Audio.Audio',
+                        'MediaBrowser.Controller.Entities.MusicVideo',
+                        'MediaBrowser.Controller.Entities.Audio.MusicAlbum',
+                        'MediaBrowser.Controller.Entities.Audio.MusicArtist'));")
+DB_STUDIOS=$(sq "SELECT count(*) FROM BaseItems b WHERE b.type='MediaBrowser.Controller.Entities.Studio'
+                 AND b.CleanName IN (SELECT CleanValue FROM ItemValues WHERE Type=3);")
 # A view (CollectionFolder) that actually has items under it, and its item count.
 VIEW_ID=$(sq "SELECT lower(a.ParentItemId) FROM AncestorIds a JOIN BaseItems b ON b.Id=a.ParentItemId
               WHERE b.type LIKE '%CollectionFolder' GROUP BY 1 ORDER BY count(*) DESC LIMIT 1;")
@@ -165,8 +185,10 @@ probes() {
   printf 'browse:children\t%s\n'  "$(get "$b" "/Items?userId=$USER_ID&parentId=$VIEW_ID&limit=1" .TotalRecordCount)"
   printf 'latest\t%s\n'           "$(get "$b" "/Users/$USER_ID/Items/Latest?limit=5" 'length')"
   printf 'genres\t%s\n'           "$(get "$b" "/Genres?userId=$USER_ID&limit=5" .TotalRecordCount)"
+  printf 'genres:all\t%s\n'       "$(get "$b" "/Genres?userId=$USER_ID" '.Items|length')"
   printf 'persons\t%s\n'          "$(get "$b" "/Persons?userId=$USER_ID&limit=5" '.Items|length')"
   printf 'studios\t%s\n'          "$(get "$b" "/Studios?userId=$USER_ID&limit=5" '.Items|length')"
+  printf 'studios:all\t%s\n'      "$(get "$b" "/Studios?userId=$USER_ID" '.Items|length')"
   printf 'resume\t%s\n'           "$(get "$b" "/Users/$USER_ID/Items/Resume?limit=5" '.Items|length')"
 }
 probes "http://127.0.0.1:$PORT" > "$WORK/ferrofin.probe"
@@ -174,6 +196,8 @@ probes "http://127.0.0.1:$PORT" > "$WORK/ferrofin.probe"
 # Jellyfin leg. The rest of the probe set is compare-only.
 while IFS=$'\t' read -r name value; do
   case $name in
+    genres:all) eq "every genre, and only genres" "$DB_GENRES" "$value";;
+    studios:all) eq "every studio, and only studios" "$DB_STUDIOS" "$value";;
     items:Movie|items:Episode|items:all|browse:*|latest|genres|persons) gt0 "$name" "$value";;
     views) [ -n "$value" ] && pass "views ($value)" || fail "views: empty";;
   esac
@@ -198,12 +222,14 @@ kill "$SRV_PID" 2>/dev/null; wait "$SRV_PID" 2>/dev/null; SRV_PID=
 echo ">> [5/5] the database after ferrofin's tenure"
 FK=$(sq 'PRAGMA foreign_key_check;' | head -3)
 [ -z "$FK" ] && pass "foreign keys intact" || fail "foreign key violations: $FK"
+# `ok` outright, with no special case. There used to be one here for
+# `FerrofinIX_Peoples_LowerName_Cover`, whose `LOWER("Name")` key is ASCII-only
+# in Ferrofin's bundled SQLite and Unicode-aware in an ICU-enabled sqlite3, so
+# the two engines disagreed about 22 of 25,722 people. Migration 0022 replaced
+# it with a `COLLATE NOCASE` key, which no build overrides — so a mismatch here
+# is now a real finding again, not a known wart to be excused.
 IC=$(sq 'PRAGMA integrity_check;')
 if [ "$IC" = ok ]; then pass "integrity_check"
-elif ! grep -qv 'FerrofinIX_Peoples_LowerName_Cover' <<<"$IC"; then
-  # LOWER() is ASCII-only in Ferrofin's bundled SQLite and Unicode-aware in an
-  # ICU-enabled sqlite3; the expression index disagrees on non-ASCII names.
-  fail "integrity_check: $(wc -l <<<"$IC") rows missing from FerrofinIX_Peoples_LowerName_Cover (LOWER() collation mismatch)"
 else fail "integrity_check: $(head -3 <<<"$IC")"; fi
 
 if [ "$VERIFY_JF" = 1 ]; then

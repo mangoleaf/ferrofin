@@ -51,6 +51,37 @@ use crate::config::Config;
 use crate::media_encoding::build_media_encoding;
 
 /// The plugin-analysis decode budget: a quarter of the visible cores.
+/// Reads the saved network configuration, or the default when there is none.
+///
+/// The same `{config}/named/network.json` that
+/// `GET/POST /System/Configuration/network` reads and writes — so what the
+/// dashboard shows is what the policy enforces. A file that cannot be parsed is
+/// reported and the defaults are used: an unreadable filter must not silently
+/// become a permissive one, and it must not stop the server from booting either
+/// (the operator would then have no way in to fix it).
+async fn load_network_configuration(
+    paths: &impl ferrofin_traits::system::ServerApplicationPaths,
+) -> ferrofin_networking::NetworkConfiguration {
+    let path = std::path::Path::new(&paths.user_configuration_directory_path())
+        .join("named")
+        .join("network.json");
+    let Ok(bytes) = tokio::fs::read(&path).await else {
+        return ferrofin_networking::NetworkConfiguration::default();
+    };
+    match serde_json::from_slice(&bytes) {
+        Ok(config) => config,
+        Err(err) => {
+            tracing::warn!(
+                path = %path.display(),
+                %err,
+                "the saved network configuration could not be read; \
+                 falling back to the defaults, so no remote-IP filter is enforced"
+            );
+            ferrofin_networking::NetworkConfiguration::default()
+        }
+    }
+}
+
 fn num_cpus_for_analysis() -> usize {
     std::thread::available_parallelism().map_or(1, |n| n.get() / 4)
 }
@@ -289,8 +320,9 @@ pub async fn build_app_state(
     );
     let item_count_service: Arc<dyn ferrofin_traits::persistence::ItemCountService> =
         Arc::new(FerrofinItemCountService::new(db.clone()));
+    let item_persistence_impl = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
     let item_persistence_service: Arc<dyn ferrofin_traits::persistence::ItemPersistenceService> =
-        Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        Arc::clone(&item_persistence_impl) as _;
     // The per-database item-id derivation mode: Jellyfin 10.11.8 parity
     // (case-sensitive + data-dir-relative rewrite) for fresh and adopted
     // databases, grandfathered lowercase for pre-parity Ferrofin ones
@@ -303,6 +335,18 @@ pub async fn build_app_state(
             .as_deref(),
         Some(paths.program_data_path()),
     );
+    // One-shot: rewrite clean columns written by a Ferrofin version whose
+    // `get_clean_value` stripped punctuation, so by-name lookups of a
+    // punctuated name resolve without waiting for a full rescan.
+    match item_persistence_impl.repair_clean_values().await {
+        Ok(0) => {}
+        Ok(repaired) => {
+            tracing::info!(repaired, "rewrote clean name/value columns");
+        }
+        Err(err) => {
+            tracing::warn!(%err, "clean-value repair failed; punctuated by-name lookups may miss until the next scan");
+        }
+    }
     let people_repository_impl = Arc::new(
         FerrofinPeopleRepository::new(db.clone())
             .with_identity(id_derivation.clone(), paths.people_path()),
@@ -644,7 +688,8 @@ pub async fn build_app_state(
         FerrofinUserViewManager::new(Arc::clone(&item_repository))
             .with_playlists_store(Arc::clone(&item_persistence_service), playlists_path)
             .with_id_derivation(id_derivation.clone())
-            .with_virtual_folders(Arc::clone(&virtual_folders)),
+            .with_virtual_folders(Arc::clone(&virtual_folders))
+            .with_database(db.clone()),
     );
     // Similar items: the local weighted-overlap scorer always runs; the remote
     // providers below run only for a library that ticked them in its
@@ -1045,11 +1090,14 @@ pub async fn build_app_state(
         task_manager.register(task);
     }
     wasm_host.subscribe_events(&event_bus, &plugins);
+    let collection_paths: Arc<dyn ferrofin_traits::system::ServerApplicationPaths> =
+        Arc::clone(&paths) as Arc<_>;
     let collections: Arc<dyn ferrofin_traits::collections::CollectionManager> =
         Arc::new(FerrofinCollectionManager::new(
             db.clone(),
             Arc::clone(&library),
             Arc::clone(&linked_children_service),
+            Arc::clone(&collection_paths),
         ));
     let playlists: Arc<dyn ferrofin_traits::collections::PlaylistManager> =
         Arc::new(FerrofinPlaylistManager::new(
@@ -1057,6 +1105,7 @@ pub async fn build_app_state(
             Arc::clone(&library),
             Arc::clone(&linked_children_service),
             Arc::clone(&item_repository),
+            Arc::clone(&collection_paths),
         ));
 
     // The full Jellyfin dashboard task set (Library + Maintenance categories),
@@ -1581,6 +1630,39 @@ pub async fn build_app_state(
     let state = state
         .with_media_encoding(hls, attachments)
         .with_subtitle_encoder(subtitle_encoder);
+
+    // One-shot: carry Jellyfin's Live TV configuration across on adoption.
+    // Ferrofin keeps tuners and listing providers in the database rather than a
+    // config file, so nothing else would pick them up — and with no tuner
+    // configured Live TV is OFF (`live_tv_enabled_for`), which means adopting a
+    // server that had Live TV would silently lose the tuner, the guide and the
+    // view.
+    match ferrofin_core::live_tv_import::import_live_tv_config(
+        db,
+        std::path::Path::new(&paths.configuration_directory_path()),
+    )
+    .await
+    {
+        Ok(0) => {}
+        Ok(rows) => tracing::info!(rows, "imported jellyfin's live tv configuration"),
+        Err(err) => {
+            tracing::warn!(%err, "live tv configuration import failed; live tv starts unconfigured");
+        }
+    }
+
+    // ---- network policy ---------------------------------------------------
+    // `LocalNetworkSubnets` / `RemoteIPFilter` / `EnableRemoteAccess` decide
+    // which peers count as local and which may reach the server at all. The
+    // policy was ported and tested in `ferrofin-networking` but never
+    // constructed, so every one of those settings was persisted, served back to
+    // the dashboard, and enforced nowhere. Built from the saved `network.json`
+    // (the same file `GET/POST /System/Configuration/network` reads and
+    // writes), and re-read into the running policy on every save.
+    let network_config = load_network_configuration(paths.as_ref()).await;
+    let network = Arc::new(std::sync::RwLock::new(
+        ferrofin_networking::NetworkManager::with_defaults(network_config, ""),
+    ));
+    let state = state.with_network(network);
 
     // ---- virtual-folder (library-structure) store -------------------------
     // The `/Library/VirtualFolders*` + `/Library/PhysicalPaths` admin surface is

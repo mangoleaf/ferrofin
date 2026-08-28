@@ -242,6 +242,137 @@ impl Database {
         Ok(rows)
     }
 
+    /// How many Live TV tuner hosts are configured.
+    ///
+    /// The Live TV availability gate reads this — C#
+    /// `LiveTvManager.IsLiveTvEnabled` tests `TunerHosts.Length > 0`, and with
+    /// no tuner Jellyfin leaves the Live TV view out of `GetUserViews`
+    /// entirely.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub async fn live_tv_tuner_count(&self) -> Result<i64> {
+        let count: i64 = sqlx::query_scalar(r#"SELECT COUNT(*) FROM "FerrofinLiveTvTunerHosts""#)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(count)
+    }
+
+    /// Writes a `FerrofinMeta` value, replacing any existing one.
+    ///
+    /// The table is Ferrofin's own bookkeeping — one-shot import and repair
+    /// markers — never anything Jellyfin reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the write fails.
+    pub async fn meta_set(&self, key: &str, value: &str) -> Result<()> {
+        sqlx::query(
+            r#"INSERT INTO "FerrofinMeta" ("Key", "Value") VALUES (?1, ?2)
+               ON CONFLICT("Key") DO UPDATE SET "Value" = excluded."Value""#,
+        )
+        .bind(key)
+        .bind(value)
+        .execute(&self.writer)
+        .await?;
+        Ok(())
+    }
+
+    /// Writes a Live TV listing provider, replacing any row with the same id.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the write fails.
+    pub async fn upsert_live_tv_listing_provider(
+        &self,
+        id: &str,
+        kind: &str,
+        path: &str,
+        data: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"INSERT INTO "FerrofinLiveTvListingProviders" ("Id","Type","Path","Data") VALUES (?1,?2,?3,?4)
+               ON CONFLICT("Id") DO UPDATE SET "Type"=excluded."Type","Path"=excluded."Path","Data"=excluded."Data""#,
+        )
+        .bind(id)
+        .bind(kind)
+        .bind(path)
+        .bind(data)
+        .execute(&self.writer)
+        .await?;
+        Ok(())
+    }
+
+    /// Every Live TV tuner host as `(id, url, type, data)`, id-ordered.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub async fn live_tv_tuner_hosts(&self) -> Result<Vec<(String, String, String, String)>> {
+        let rows = sqlx::query_as(
+            r#"SELECT "Id", "Url", "Type", "Data" FROM "FerrofinLiveTvTunerHosts" ORDER BY "Id""#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Every Live TV listing provider as `(id, type, path)`, id-ordered.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub async fn live_tv_listing_providers(&self) -> Result<Vec<(String, String, String)>> {
+        let rows = sqlx::query_as(
+            r#"SELECT "Id", "Type", "Path" FROM "FerrofinLiveTvListingProviders" ORDER BY "Id""#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Removes every Live TV tuner host.
+    ///
+    /// Deliberately unconditional rather than `#[cfg(test)]`: its caller is a
+    /// test in ANOTHER crate, and `cfg(test)` only applies while this one is
+    /// being tested.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the delete fails.
+    pub async fn delete_all_live_tv_tuner_hosts(&self) -> Result<()> {
+        sqlx::query(r#"DELETE FROM "FerrofinLiveTvTunerHosts""#)
+            .execute(&self.writer)
+            .await?;
+        Ok(())
+    }
+
+    /// Writes a Live TV tuner host, replacing any row with the same id.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the write fails.
+    pub async fn upsert_live_tv_tuner_host(
+        &self,
+        id: &str,
+        url: &str,
+        kind: &str,
+        data: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"INSERT INTO "FerrofinLiveTvTunerHosts" ("Id","Url","Type","Data") VALUES (?1,?2,?3,?4)
+               ON CONFLICT("Id") DO UPDATE SET "Url"=excluded."Url","Type"=excluded."Type","Data"=excluded."Data""#,
+        )
+        .bind(id)
+        .bind(url)
+        .bind(kind)
+        .bind(data)
+        .execute(&self.writer)
+        .await?;
+        Ok(())
+    }
+
     /// Every `(item id, provider key, provider value)` recorded for `ids`, with
     /// each id in its stored (uppercase, hyphenated) GUID form.
     ///

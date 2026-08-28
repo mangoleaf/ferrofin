@@ -18,7 +18,7 @@ use ferrofin_traits::persistence::ItemTypeLookup as ItemTypeLookupTrait;
 
 /// The fully-qualified stored type names for the music-related kinds
 /// (C# `ItemTypeLookup.MusicGenreTypes`).
-const MUSIC_GENRE_TYPES: &[&str] = &[
+pub(crate) const MUSIC_GENRE_TYPES: &[&str] = &[
     "MediaBrowser.Controller.Entities.Audio.Audio",
     "MediaBrowser.Controller.Entities.MusicVideo",
     "MediaBrowser.Controller.Entities.Audio.MusicAlbum",

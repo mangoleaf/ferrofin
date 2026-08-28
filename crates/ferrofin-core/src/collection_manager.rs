@@ -54,6 +54,7 @@ use ferrofin_traits::collections::{
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::LibraryManager;
 use ferrofin_traits::persistence::{ItemRepository, LinkedChildrenService};
+use ferrofin_traits::system::ServerApplicationPaths;
 
 use crate::db_error::db_err;
 use crate::item_data;
@@ -105,43 +106,80 @@ fn decide_access(
     Some(PlaylistAccess { level, open_access })
 }
 
-/// Inserts a minimal `BaseItems` row of the given folder-ish kind and returns
-/// the persisted row. Only the schema-required columns are set; richer metadata
-/// is populated by later refreshes (mirrors how the C# path creates a stub item
-/// then refreshes it).
-async fn insert_named_item(
+/// The id derivation this database uses, and the user-root row a provisioned
+/// container hangs off.
+///
+/// Both come from the database rather than a default: the derivation is
+/// whatever `FerrofinMeta.item_id_derivation` says (an adopted or fresh
+/// database is Jellyfin-parity, a pre-parity Ferrofin one is grandfathered),
+/// and using the wrong one gives the container an id Jellyfin will not
+/// recognise as its own.
+async fn container_identity(
     db: &Database,
-    id: Uuid,
-    kind: BaseItemKind,
-    name: &str,
-    is_folder: bool,
-) -> Result<BaseItemEntity, ServiceError> {
-    let type_name = stored_type_name(kind)
-        .ok_or_else(|| ServiceError::backend(format!("no stored type name for {kind:?}")))?;
-    sqlx::query(
-        // `SortName` persisted, not derived on read. jellyfin-web's Collections
-        // and Playlists tabs both send `SortBy=SortName`; with the column NULL
-        // they came back in creation order while each DTO still carried a
-        // correctly COMPUTED SortName, which is what made this hard to see.
-        r#"INSERT INTO "BaseItems"
-           ("Id", "Type", "IsFolder", "IsInMixedFolder", "IsLocked", "IsMovie",
-            "IsRepeat", "IsSeries", "IsVirtualItem", "Name", "SortName")
-           VALUES (?1, ?2, ?3, 0, 0, 0, 0, 0, 0, ?4, ?5)"#,
-    )
-    .bind(guid_to_db(id))
-    .bind(type_name)
-    .bind(i64::from(is_folder))
-    .bind(name)
-    .bind(ferrofin_util::sort_name::create_sort_name(name))
-    .execute(db.writer())
-    .await
-    .map_err(db_err)?;
-
-    sqlx::query_as::<_, BaseItemEntity>(r#"SELECT * FROM "BaseItems" WHERE "Id" = ?1"#)
-        .bind(guid_to_db(id))
-        .fetch_one(db.pool())
+    paths: &Arc<dyn ServerApplicationPaths>,
+) -> Result<(crate::item_type_lookup::IdDerivation, Option<Uuid>), ServiceError> {
+    let stored = db
+        .meta_get("item_id_derivation")
         .await
-        .map_err(db_err)
+        .map_err(|e| ServiceError::Backend(e.to_string()))?;
+    let mode = crate::item_type_lookup::IdDerivation::from_meta(
+        stored.as_deref(),
+        Some(paths.program_data_path()),
+    );
+    let root =
+        crate::item_type_lookup::user_root_folder_id(&mode, &paths.default_user_views_path());
+    Ok((mode, root))
+}
+
+/// The "Collections" library a created box set belongs to, adopting any
+/// orphans a previous version left behind.
+async fn collections_folder(
+    db: &Database,
+    paths: &Arc<dyn ServerApplicationPaths>,
+) -> Result<Option<Uuid>, ServiceError> {
+    let path = format!("{}/collections", paths.data_path());
+    let (mode, root) = container_identity(db, paths).await?;
+    let container = crate::item_persistence_service::ensure_container(
+        db,
+        BaseItemKind::CollectionFolder,
+        "Collections",
+        &path,
+        &mode,
+        root,
+    )
+    .await?;
+    if let Some(id) = container {
+        crate::item_persistence_service::adopt_orphans(db, BaseItemKind::BoxSet, id).await?;
+    }
+    Ok(container)
+}
+
+/// The playlists folder a created playlist belongs to, adopting any orphans a
+/// previous version left behind.
+async fn playlists_folder(
+    db: &Database,
+    paths: &Arc<dyn ServerApplicationPaths>,
+) -> Result<Option<Uuid>, ServiceError> {
+    // `PlaylistsFolder`, not `ManualPlaylistsFolder`: 10.11.8 has no class of
+    // the latter name — it is only `PlaylistsFolder.GetClientTypeName()` — and
+    // the row an adopted database carries is stored as
+    // `…Playlists.PlaylistsFolder`. Asking for the other one would never find
+    // Jellyfin's folder and would quietly create a second beside it.
+    let path = format!("{}/playlists", paths.data_path());
+    let (mode, root) = container_identity(db, paths).await?;
+    let container = crate::item_persistence_service::ensure_container(
+        db,
+        BaseItemKind::PlaylistsFolder,
+        "Playlists",
+        &path,
+        &mode,
+        root,
+    )
+    .await?;
+    if let Some(id) = container {
+        crate::item_persistence_service::adopt_orphans(db, BaseItemKind::Playlist, id).await?;
+    }
+    Ok(container)
 }
 
 /// The concrete (minimal) collection (box-set) manager.
@@ -150,6 +188,7 @@ pub struct FerrofinCollectionManager {
     db: Database,
     library_manager: Arc<dyn LibraryManager>,
     linked_children: Arc<dyn LinkedChildrenService>,
+    paths: Arc<dyn ServerApplicationPaths>,
 }
 
 impl std::fmt::Debug for FerrofinCollectionManager {
@@ -166,11 +205,13 @@ impl FerrofinCollectionManager {
         db: Database,
         library_manager: Arc<dyn LibraryManager>,
         linked_children: Arc<dyn LinkedChildrenService>,
+        paths: Arc<dyn ServerApplicationPaths>,
     ) -> Self {
         Self {
             db,
             library_manager,
             linked_children,
+            paths,
         }
     }
 }
@@ -182,8 +223,15 @@ impl CollectionManager for FerrofinCollectionManager {
         options: &CollectionCreationOptions,
     ) -> Result<BaseItemEntity, ServiceError> {
         let id = Uuid::new_v4();
-        let row =
-            insert_named_item(&self.db, id, BaseItemKind::BoxSet, &options.name, true).await?;
+        let row = crate::item_persistence_service::insert_named_item(
+            &self.db,
+            id,
+            BaseItemKind::BoxSet,
+            &options.name,
+            true,
+            collections_folder(&self.db, &self.paths).await?,
+        )
+        .await?;
         for item_id in &options.item_id_list {
             self.linked_children
                 .upsert_linked_child(id, *item_id, LINKED_CHILD_MANUAL)
@@ -266,6 +314,7 @@ pub struct FerrofinPlaylistManager {
     library_manager: Arc<dyn LibraryManager>,
     linked_children: Arc<dyn LinkedChildrenService>,
     items: Arc<dyn ItemRepository>,
+    paths: Arc<dyn ServerApplicationPaths>,
 }
 
 impl std::fmt::Debug for FerrofinPlaylistManager {
@@ -283,12 +332,14 @@ impl FerrofinPlaylistManager {
         library_manager: Arc<dyn LibraryManager>,
         linked_children: Arc<dyn LinkedChildrenService>,
         items: Arc<dyn ItemRepository>,
+        paths: Arc<dyn ServerApplicationPaths>,
     ) -> Self {
         Self {
             db,
             library_manager,
             linked_children,
             items,
+            paths,
         }
     }
 
@@ -356,7 +407,15 @@ impl PlaylistManager for FerrofinPlaylistManager {
     ) -> Result<PlaylistCreationResult, ServiceError> {
         let id = Uuid::new_v4();
         let name = request.name.clone().unwrap_or_default();
-        insert_named_item(&self.db, id, BaseItemKind::Playlist, &name, true).await?;
+        crate::item_persistence_service::insert_named_item(
+            &self.db,
+            id,
+            BaseItemKind::Playlist,
+            &name,
+            true,
+            playlists_folder(&self.db, &self.paths).await?,
+        )
+        .await?;
         // The ownership meta row (C# `OwnerUserId`/`OpenAccess`). A nil user id
         // (API-key create) stores NULL — unowned, visible to all.
         sqlx::query(
@@ -738,6 +797,339 @@ mod tests {
 
     use super::{FerrofinCollectionManager, FerrofinPlaylistManager};
 
+    /// Test paths under a temp root, so the provisioned containers land
+    /// somewhere harmless.
+    fn test_paths() -> Arc<dyn ferrofin_traits::system::ServerApplicationPaths> {
+        Arc::new(crate::app_paths::FerrofinServerApplicationPaths::new(
+            "/tmp/ferrofin-collections-test",
+            "/tmp/ferrofin-collections-test/log",
+            "/tmp/ferrofin-collections-test/config",
+            "/tmp/ferrofin-collections-test/cache",
+            "/tmp/ferrofin-collections-test/web",
+        ))
+    }
+
+    fn collection_manager_over(db: &ferrofin_db::Database) -> FerrofinCollectionManager {
+        FerrofinCollectionManager::new(
+            db.clone(),
+            library_manager_over(db.clone()),
+            Arc::new(FerrofinLinkedChildrenService::new(db.clone())),
+            test_paths(),
+        )
+    }
+
+    /// A created playlist has to stay reachable too, and must reuse the
+    /// playlists folder the user-view manager already provisions.
+    ///
+    /// Ferrofin writes that folder as `ManualPlaylistsFolder` and an adopted
+    /// database carries a `PlaylistsFolder` — at the same path. If the two
+    /// provisioners disagreed there would be two rows, and a playlist parented
+    /// to the one the query scope does not accept simply vanishes.
+    /// A container provisioned before the user root existed is adopted by it
+    /// later, rather than staying parentless forever because the row is already
+    /// there.
+    #[tokio::test]
+    async fn a_parentless_container_is_attached_once_the_root_appears() {
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root_dir = tmp.path().to_string_lossy().into_owned();
+        let paths: Arc<dyn ferrofin_traits::system::ServerApplicationPaths> =
+            Arc::new(crate::app_paths::FerrofinServerApplicationPaths::new(
+                root_dir.clone(),
+                format!("{root_dir}/log"),
+                format!("{root_dir}/config"),
+                format!("{root_dir}/cache"),
+                format!("{root_dir}/web"),
+            ));
+        let mode = crate::item_type_lookup::IdDerivation::from_meta(
+            Some("jellyfin-10.11.8"),
+            Some(paths.program_data_path()),
+        );
+        let root =
+            crate::item_type_lookup::user_root_folder_id(&mode, &paths.default_user_views_path())
+                .expect("root id");
+        let path = format!("{}/collections", paths.data_path());
+
+        // First provision: the root does not exist yet, so the row is created
+        // without a parent rather than failing the foreign key.
+        let id = crate::item_persistence_service::ensure_container(
+            &db,
+            BaseItemKind::CollectionFolder,
+            "Collections",
+            &path,
+            &mode,
+            Some(root),
+        )
+        .await
+        .expect("provision")
+        .expect("an id");
+        assert!(
+            crate::test_support::fetch_item(&db, id)
+                .await
+                .parent_id
+                .is_none(),
+            "nothing to parent to yet"
+        );
+
+        // The root appears, and the next provision adopts the existing row.
+        crate::test_support::seed_named_item(
+            &db,
+            root,
+            BaseItemKind::UserRootFolder,
+            "Media Folders",
+        )
+        .await;
+        let again = crate::item_persistence_service::ensure_container(
+            &db,
+            BaseItemKind::CollectionFolder,
+            "Collections",
+            &path,
+            &mode,
+            Some(root),
+        )
+        .await
+        .expect("provision")
+        .expect("an id");
+        assert_eq!(again, id, "the same row, not a second one");
+        assert_eq!(
+            crate::test_support::fetch_item(&db, id).await.parent_id,
+            Some(ferrofin_db::store::guid_to_db(root)),
+            "…now attached to the root"
+        );
+    }
+
+    /// The provisioned container carries the id JELLYFIN would compute for that
+    /// directory, its directory exists, and it hangs off the user root.
+    ///
+    /// The id is the one that matters for drop-in: `ensure_container` used to
+    /// derive it with `IdDerivation::LegacyLowercase` whatever the database
+    /// said, so on an adopted (Jellyfin-parity) database Jellyfin would look for
+    /// its own id, miss, and create a SECOND Collections library beside ours —
+    /// with the round-trip guarantee going with it.
+    #[tokio::test]
+    async fn a_provisioned_container_is_shaped_the_way_jellyfin_expects() {
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root_dir = tmp.path().to_string_lossy().into_owned();
+        let paths: Arc<dyn ferrofin_traits::system::ServerApplicationPaths> =
+            Arc::new(crate::app_paths::FerrofinServerApplicationPaths::new(
+                root_dir.clone(),
+                format!("{root_dir}/log"),
+                format!("{root_dir}/config"),
+                format!("{root_dir}/cache"),
+                format!("{root_dir}/web"),
+            ));
+
+        // A parity database, as a fresh or adopted one is.
+        db.meta_set("item_id_derivation", "jellyfin-10.11.8")
+            .await
+            .expect("mode");
+        // The user root has to exist for the container to be parented to it.
+        let mode = crate::item_type_lookup::IdDerivation::from_meta(
+            Some("jellyfin-10.11.8"),
+            Some(paths.program_data_path()),
+        );
+        let root =
+            crate::item_type_lookup::user_root_folder_id(&mode, &paths.default_user_views_path())
+                .expect("root id");
+        crate::test_support::seed_named_item(
+            &db,
+            root,
+            BaseItemKind::UserRootFolder,
+            "Media Folders",
+        )
+        .await;
+
+        let path = format!("{}/collections", paths.data_path());
+        let id = crate::item_persistence_service::ensure_container(
+            &db,
+            BaseItemKind::CollectionFolder,
+            "Collections",
+            &path,
+            &mode,
+            Some(root),
+        )
+        .await
+        .expect("provision")
+        .expect("an id");
+
+        // The id Jellyfin derives for that directory, under the same rule.
+        let expected = crate::item_type_lookup::derive_item_id_with(
+            &mode,
+            BaseItemKind::CollectionFolder,
+            &path,
+        )
+        .expect("expected id");
+        assert_eq!(id, expected, "the container carries Jellyfin's id");
+        assert_ne!(
+            id,
+            crate::item_type_lookup::derive_item_id(BaseItemKind::CollectionFolder, &path)
+                .expect("legacy id"),
+            "…which is NOT the legacy-lowercase one, or this test proves nothing"
+        );
+
+        assert!(
+            tokio::fs::metadata(&path).await.is_ok(),
+            "the directory the row describes exists"
+        );
+        let row = crate::test_support::fetch_item(&db, id).await;
+        assert_eq!(
+            row.parent_id.as_deref(),
+            Some(ferrofin_db::store::guid_to_db(root).as_str()),
+            "and it hangs off the user root"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_created_playlist_reuses_the_existing_playlists_folder() {
+        let db = test_db().await;
+        // What `user_view_manager::ensure_playlists_folder` leaves behind.
+        let existing = Uuid::from_u128(0xF0DE);
+        crate::item_persistence_service::insert_named_item(
+            &db,
+            existing,
+            BaseItemKind::ManualPlaylistsFolder,
+            "Playlists",
+            true,
+            None,
+        )
+        .await
+        .expect("seed the existing folder");
+        crate::test_support::set_item_path(
+            &db,
+            existing,
+            "/tmp/ferrofin-collections-test/data/playlists",
+        )
+        .await;
+
+        let mgr = playlist_manager(&db);
+        let created = mgr
+            .create_playlist(&PlaylistCreationRequest {
+                name: Some("My Playlist".to_owned()),
+                ..Default::default()
+            })
+            .await
+            .expect("create playlist");
+
+        let row = crate::test_support::fetch_item(
+            &db,
+            Uuid::parse_str(&created.id).expect("playlist id"),
+        )
+        .await;
+        assert_eq!(
+            row.parent_id,
+            Some(ferrofin_db::store::guid_to_db(existing)),
+            "the playlist reuses the folder already there, rather than a second one"
+        );
+
+        let folders = crate::test_support::items_at_path(
+            &db,
+            "/tmp/ferrofin-collections-test/data/playlists",
+        )
+        .await;
+        assert_eq!(folders, 1, "exactly one playlists folder at that path");
+    }
+
+    /// A created collection has to stay reachable.
+    ///
+    /// A query naming no scope is confined to the user's libraries, so an item
+    /// with no parent and no top parent is invisible to every user browse.
+    /// Upstream never creates one: `CreateCollectionAsync` goes through
+    /// `EnsureLibraryFolder`, which auto-provisions the "Collections" library.
+    #[tokio::test]
+    async fn a_created_collection_lands_in_the_collections_library() {
+        let db = test_db().await;
+        let mgr = collection_manager_over(&db);
+        let row = mgr
+            .create_collection(&CollectionCreationOptions {
+                name: "My Collection".to_owned(),
+                ..Default::default()
+            })
+            .await
+            .expect("create");
+
+        let parent = row.parent_id.expect("a collection has a parent");
+        assert_eq!(
+            row.top_parent_id.as_deref(),
+            Some(parent.as_str()),
+            "the library is also the top parent"
+        );
+        let container = crate::test_support::fetch_item(
+            &db,
+            Uuid::parse_str(&parent).expect("the parent id is a guid"),
+        )
+        .await;
+        assert_eq!(container.name.as_deref(), Some("Collections"));
+        assert_eq!(
+            container.type_,
+            crate::item_type_lookup::stored_type_name(BaseItemKind::CollectionFolder)
+                .expect("kind is known")
+        );
+    }
+
+    /// The container is provisioned once, and an existing one is reused — an
+    /// adopted database keeps Jellyfin's rather than gaining a second.
+    #[tokio::test]
+    async fn the_collections_library_is_provisioned_once() {
+        let db = test_db().await;
+        let mgr = collection_manager_over(&db);
+        let mut parents = Vec::new();
+        for name in ["First", "Second"] {
+            parents.push(
+                mgr.create_collection(&CollectionCreationOptions {
+                    name: name.to_owned(),
+                    ..Default::default()
+                })
+                .await
+                .expect("create")
+                .parent_id
+                .expect("parent"),
+            );
+        }
+        assert_eq!(parents[0], parents[1]);
+        let containers = crate::test_support::item_repository_over(db.clone())
+            .get_item_list(&ferrofin_traits::options::InternalItemsQuery {
+                include_item_types: vec![BaseItemKind::CollectionFolder],
+                ..Default::default()
+            })
+            .await
+            .expect("libraries");
+        assert_eq!(containers.len(), 1, "provisioned once, then reused");
+    }
+
+    /// The orphans an older Ferrofin created are adopted on the next create.
+    #[tokio::test]
+    async fn an_orphaned_collection_is_taken_into_the_library() {
+        let db = test_db().await;
+        let mgr = collection_manager_over(&db);
+        // What the previous code wrote: no parent, no top parent.
+        let orphan = Uuid::from_u128(0xB0C5);
+        crate::item_persistence_service::insert_named_item(
+            &db,
+            orphan,
+            BaseItemKind::BoxSet,
+            "Old Collection",
+            true,
+            None,
+        )
+        .await
+        .expect("orphan");
+
+        mgr.create_collection(&CollectionCreationOptions {
+            name: "New Collection".to_owned(),
+            ..Default::default()
+        })
+        .await
+        .expect("create");
+
+        let adopted = crate::test_support::fetch_item(&db, orphan).await;
+        assert!(
+            adopted.parent_id.is_some(),
+            "the orphan was taken into the library"
+        );
+        assert_eq!(adopted.parent_id, adopted.top_parent_id);
+    }
+
     #[tokio::test]
     async fn create_collection_persists_row_and_members() {
         let db = test_db().await;
@@ -746,11 +1138,7 @@ mod tests {
         seed_item(&db, movie_a, BaseItemKind::Movie).await;
         seed_item(&db, movie_b, BaseItemKind::Movie).await;
 
-        let mgr = FerrofinCollectionManager::new(
-            db.clone(),
-            library_manager_over(db.clone()),
-            Arc::new(FerrofinLinkedChildrenService::new(db.clone())),
-        );
+        let mgr = collection_manager_over(&db);
 
         let options = CollectionCreationOptions {
             name: "Favourites".to_owned(),
@@ -796,11 +1184,7 @@ mod tests {
         seed_item(&db, movie_b, BaseItemKind::Movie).await;
 
         let library = library_manager_over(db.clone());
-        let mgr = FerrofinCollectionManager::new(
-            db.clone(),
-            library_manager_over(db.clone()),
-            Arc::new(FerrofinLinkedChildrenService::new(db.clone())),
-        );
+        let mgr = collection_manager_over(&db);
         let created = mgr
             .create_collection(&CollectionCreationOptions {
                 name: "Watchlist".to_owned(),
@@ -843,11 +1227,7 @@ mod tests {
         seed_item(&db, movie_b, BaseItemKind::Movie).await;
 
         let library = library_manager_over(db.clone());
-        let mgr = FerrofinCollectionManager::new(
-            db.clone(),
-            library_manager_over(db.clone()),
-            Arc::new(FerrofinLinkedChildrenService::new(db.clone())),
-        );
+        let mgr = collection_manager_over(&db);
         let created = mgr
             .create_collection(&CollectionCreationOptions {
                 name: "Doomed".to_owned(),
@@ -881,12 +1261,7 @@ mod tests {
         let track = Uuid::new_v4();
         seed_item(&db, track, BaseItemKind::Audio).await;
 
-        let mgr = FerrofinPlaylistManager::new(
-            db.clone(),
-            library_manager_over(db.clone()),
-            Arc::new(FerrofinLinkedChildrenService::new(db.clone())),
-            item_repository_over(db.clone()),
-        );
+        let mgr = playlist_manager(&db);
 
         // Reads below must come from the owner: playlists are visible only to
         // their owner / shared users now.
@@ -939,12 +1314,7 @@ mod tests {
         seed_item(&db, track_a, BaseItemKind::Audio).await;
         seed_item(&db, track_b, BaseItemKind::Audio).await;
 
-        let mgr = FerrofinPlaylistManager::new(
-            db.clone(),
-            library_manager_over(db.clone()),
-            Arc::new(FerrofinLinkedChildrenService::new(db.clone())),
-            item_repository_over(db.clone()),
-        );
+        let mgr = playlist_manager(&db);
 
         let owner = Uuid::new_v4();
         let created = mgr
@@ -983,12 +1353,7 @@ mod tests {
         for id in [a, b, c] {
             seed_item(&db, id, BaseItemKind::Audio).await;
         }
-        let mgr = FerrofinPlaylistManager::new(
-            db.clone(),
-            library_manager_over(db.clone()),
-            Arc::new(FerrofinLinkedChildrenService::new(db.clone())),
-            item_repository_over(db.clone()),
-        );
+        let mgr = playlist_manager(&db);
         let owner = Uuid::new_v4();
         let created = mgr
             .create_playlist(&PlaylistCreationRequest {
@@ -1020,12 +1385,7 @@ mod tests {
         let track = Uuid::new_v4();
         seed_item(&db, track, BaseItemKind::Audio).await;
 
-        let mgr = FerrofinPlaylistManager::new(
-            db.clone(),
-            library_manager_over(db.clone()),
-            Arc::new(FerrofinLinkedChildrenService::new(db.clone())),
-            item_repository_over(db.clone()),
-        );
+        let mgr = playlist_manager(&db);
 
         let owner = Uuid::new_v4();
         let created = mgr
@@ -1069,12 +1429,7 @@ mod tests {
         for id in [a, b, c] {
             seed_item(&db, id, BaseItemKind::Audio).await;
         }
-        let mgr = FerrofinPlaylistManager::new(
-            db.clone(),
-            library_manager_over(db.clone()),
-            Arc::new(FerrofinLinkedChildrenService::new(db.clone())),
-            item_repository_over(db.clone()),
-        );
+        let mgr = playlist_manager(&db);
         let owner = Uuid::new_v4();
         let created = mgr
             .create_playlist(&PlaylistCreationRequest {
@@ -1419,12 +1774,7 @@ mod tests {
     #[tokio::test]
     async fn get_playlist_items_missing_is_not_found() {
         let db = test_db().await;
-        let mgr = FerrofinPlaylistManager::new(
-            db.clone(),
-            library_manager_over(db.clone()),
-            Arc::new(FerrofinLinkedChildrenService::new(db.clone())),
-            item_repository_over(db.clone()),
-        );
+        let mgr = playlist_manager(&db);
         let err = mgr
             .get_playlist_items(Uuid::new_v4(), Uuid::new_v4())
             .await
@@ -1438,12 +1788,7 @@ mod tests {
     #[tokio::test]
     async fn get_missing_playlist_is_not_found() {
         let db = test_db().await;
-        let mgr = FerrofinPlaylistManager::new(
-            db.clone(),
-            library_manager_over(db.clone()),
-            Arc::new(FerrofinLinkedChildrenService::new(db.clone())),
-            item_repository_over(db.clone()),
-        );
+        let mgr = playlist_manager(&db);
         let err = mgr
             .get_playlist_for_user(Uuid::new_v4(), Uuid::new_v4())
             .await
@@ -1460,12 +1805,7 @@ mod tests {
         use ferrofin_model::playlists::PlaylistUserUpdateRequest;
 
         let db = test_db().await;
-        let mgr = FerrofinPlaylistManager::new(
-            db.clone(),
-            library_manager_over(db.clone()),
-            Arc::new(FerrofinLinkedChildrenService::new(db.clone())),
-            item_repository_over(db.clone()),
-        );
+        let mgr = playlist_manager(&db);
         let playlist_id = Uuid::parse_str(
             &mgr.create_playlist(&PlaylistCreationRequest {
                 name: Some("Shared".to_owned()),
@@ -1528,6 +1868,7 @@ mod tests {
             library_manager_over(db.clone()),
             Arc::new(FerrofinLinkedChildrenService::new(db.clone())),
             item_repository_over(db.clone()),
+            test_paths(),
         )
     }
 

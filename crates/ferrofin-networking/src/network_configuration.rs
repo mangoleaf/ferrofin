@@ -1,8 +1,37 @@
 //! Port of `MediaBrowser.Common.Net.NetworkConfiguration` and its store key.
 //!
-//! This is the settings DTO the network manager reads. Deprecated `EnableUPnP`
-//! is dropped per the port charter. `BaseUrl` carries the leading/trailing
-//! slash normalization from the C# property setter.
+//! This is the settings DTO the network manager reads. `BaseUrl` carries the
+//! leading/trailing slash normalization from the C# property setter.
+//!
+//! The serialized names are the contract's, and several of them are pinned
+//! with an explicit `rename` because `PascalCase` over `snake_case` does not
+//! reproduce Jellyfin's capitalization (`EnableIPv4`, not `EnableIpv4`).
+//! `served_field_names_match_the_vendored_contract` in
+//! `tests/network_configuration_tests.rs` holds the whole set to the spec, so
+//! adding a field means adding it there too — a name jellyfin-web does not
+//! recognise is a setting that silently never arrives. Each corrected name
+//! also carries a serde `alias` for the spelling Ferrofin used to write, or an
+//! existing `network.json` would stop parsing.
+//!
+//! ## What actually acts on these settings
+//!
+//! Almost nothing, yet. This document is persisted and served so the dashboard
+//! round-trips, and it is consumed by [`crate::manager::NetworkManager`] — the
+//! ported LAN / remote-access / bind resolver — which **the server does not
+//! construct** (`crates/ferrofin-api/src/auth.rs` explains why: its
+//! `Rc<dyn Logger>` is not `Send`). Request handling uses a fixed RFC1918
+//! check instead, so `LocalNetworkSubnets`, `KnownProxies`, `RemoteIPFilter`
+//! and `IsRemoteIPFilterBlacklist` are all settable and unenforced today.
+//! Wiring the manager into `AppState` is open work, and it is what makes these
+//! real — do not read a field's presence here as evidence it is applied.
+//!
+//! `EnableUPnP` is a different case, and not a Ferrofin gap: upstream marks it
+//! `[Obsolete("No longer supported")]`
+//! (`MediaBrowser.Common/Net/NetworkConfiguration.cs:113`) and reads it nowhere
+//! outside its own pre-startup migration DTOs. Jellyfin 10.11 does no UPnP port
+//! forwarding either. The field is vestigial in both, carried because the
+//! contract and the dashboard expect the key; ignoring it is exact parity, so
+//! there is nothing here to warn about.
 
 use serde::{Deserialize, Serialize};
 
@@ -21,7 +50,14 @@ pub const DEFAULT_HTTPS_PORT: u16 = 8920;
 /// Field names use `snake_case`; the serde representation is `PascalCase` to
 /// match the on-disk / OpenAPI contract Jellyfin uses.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "PascalCase")]
+// `default` at the container: this document is only ever written by Ferrofin
+// itself, and the one caller that reads it typed
+// (`POST /Startup/RemoteAccess`) writes the WHOLE struct back afterwards. So a
+// field this version does not find must fall back to its default, never fail
+// the parse — a failed parse there is silently replaced by defaults and
+// persisted, which would wipe `RemoteIPFilter` and every other setting. That is
+// how adding `EnableUPnP` alone would have broken every existing install.
+#[serde(rename_all = "PascalCase", default)]
 // The DTO faithfully mirrors the C# `NetworkConfiguration`, which carries this
 // many independent boolean toggles; collapsing them into enums would diverge
 // from the on-disk contract for no behavioral gain.
@@ -61,10 +97,30 @@ pub struct NetworkConfiguration {
     /// Whether auto-discovery is enabled.
     pub auto_discovery: bool,
 
+    /// Whether to open the public ports with UPnP.
+    ///
+    /// Vestigial in both implementations — upstream marks it
+    /// `[Obsolete("No longer supported")]` and never reads it. Carried so the
+    /// served key set matches the contract; nothing acts on it here either.
+    #[serde(rename = "EnableUPnP")]
+    pub enable_upnp: bool,
+
     /// Whether IPv4 is enabled.
+    ///
+    /// `PascalCase` would give `EnableIpv4`; the contract and the C#
+    /// `MediaBrowser.Common/Net/NetworkConfiguration.cs` both spell it
+    /// `EnableIPv4`, so the name is pinned explicitly. Same for the three
+    /// below.
+    ///
+    /// The `alias` reads a document Ferrofin wrote under the old, wrong name.
+    /// Without it the parse fails and `POST /Startup/RemoteAccess` — which
+    /// discards the error and writes the whole struct back — would reset every
+    /// setting on the first upgraded boot.
+    #[serde(rename = "EnableIPv4", alias = "EnableIpv4")]
     pub enable_ipv4: bool,
 
     /// Whether IPv6 is enabled.
+    #[serde(rename = "EnableIPv6", alias = "EnableIpv6")]
     pub enable_ipv6: bool,
 
     /// Whether access from outside the LAN is permitted.
@@ -94,9 +150,20 @@ pub struct NetworkConfiguration {
 
     /// Filter for remote IP connectivity (see
     /// [`Self::is_remote_ip_filter_blacklist`]).
+    ///
+    /// Persisted and served, but **not yet enforced**: the code that applies it
+    /// lives in [`crate::manager::NetworkManager`], which the server does not
+    /// construct — request handling falls back to a fixed RFC1918 check. Wiring
+    /// the manager in is open work; until then this is a setting the dashboard
+    /// can save and the server does not act on.
+    #[serde(rename = "RemoteIPFilter", alias = "RemoteIpFilter")]
     pub remote_ip_filter: Vec<String>,
 
     /// Whether [`Self::remote_ip_filter`] is a blacklist (default is allowlist).
+    #[serde(
+        rename = "IsRemoteIPFilterBlacklist",
+        alias = "IsRemoteIpFilterBlacklist"
+    )]
     pub is_remote_ip_filter_blacklist: bool,
 }
 
@@ -113,6 +180,8 @@ impl Default for NetworkConfiguration {
             public_http_port: DEFAULT_HTTP_PORT,
             public_https_port: DEFAULT_HTTPS_PORT,
             auto_discovery: true,
+            // C# `EnableUPnP` has no initializer, so a fresh instance is false.
+            enable_upnp: false,
             enable_ipv4: true,
             enable_ipv6: false,
             enable_remote_access: true,

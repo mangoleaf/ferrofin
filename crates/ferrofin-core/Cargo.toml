@@ -18,12 +18,14 @@ ferrofin-common.workspace = true
 ferrofin-naming.workspace = true
 ferrofin-providers.workspace = true
 ferrofin-keyframes.workspace = true
+ferrofin-networking.workspace = true
 async-trait.workspace = true
 tokio = { workspace = true }
 notify.workspace = true
 sqlx.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+quick-xml.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
 chrono.workspace = true

@@ -890,7 +890,11 @@ mod tests {
         assert!(music.iter().all(|p| p == &cover));
 
         let report = fx.providers.refresh_all().await.expect("pass");
-        assert_eq!(report.generated, 1);
+        // Two by-name rows carry "Jazz" and both earn a collage: the `Genre`
+        // row seeded above, and the `MusicGenre` row the scanner materializes
+        // for a music item's genre (see `item_persistence_service`). Jellyfin
+        // keeps the same pair, and `/MusicGenres` browses the second one.
+        assert_eq!(report.generated, 2);
         let genre_id = Uuid::parse_str(&genre.id).expect("id");
         let primary = fx.primary_of(genre_id).await.expect("music genre primary");
         let decoded = image::open(&primary.path).expect("png");
