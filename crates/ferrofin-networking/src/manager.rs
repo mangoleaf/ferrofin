@@ -16,7 +16,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::rc::Rc;
+use std::sync::Arc;
 
 use ferrofin_model::net::{AddressFamily, IpData, IpNetwork, PublishedServerUriOverride};
 
@@ -70,7 +70,7 @@ impl StartupConfig {
 
 /// Network interface manager — port of `NetworkManager` (`INetworkManager`).
 pub struct NetworkManager {
-    logger: Rc<dyn Logger>,
+    logger: Arc<dyn Logger>,
     config: NetworkConfiguration,
     startup_config: StartupConfig,
     published_server_urls: Vec<PublishedServerUriOverride>,
@@ -96,7 +96,7 @@ impl NetworkManager {
         config: NetworkConfiguration,
         startup_config: StartupConfig,
         mock_network_settings: impl Into<String>,
-        logger: Rc<dyn Logger>,
+        logger: Arc<dyn Logger>,
     ) -> Self {
         let mut manager = Self {
             logger,
@@ -126,7 +126,7 @@ impl NetworkManager {
             config,
             StartupConfig::new(),
             mock_network_settings,
-            Rc::new(NullLogger),
+            Arc::new(NullLogger),
         )
     }
 

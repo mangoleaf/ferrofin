@@ -331,6 +331,19 @@ async fn update_named_configuration(
     tokio::fs::write(&path, bytes)
         .await
         .map_err(|e| io_err(&e))?;
+    // The network policy caches its parsed subnets, so a saved
+    // `LocalNetworkSubnets` / `RemoteIPFilter` has to be pushed into it or it
+    // would keep enforcing the configuration the server booted with until a
+    // restart. C# `NetworkManager` subscribes to the same configuration event.
+    if key.eq_ignore_ascii_case("network") {
+        match serde_json::from_value::<ferrofin_networking::NetworkConfiguration>(body) {
+            Ok(config) => state.update_network_settings(&config),
+            Err(e) => tracing::warn!(
+                error = %e,
+                "the saved network configuration could not be read back; the running policy is unchanged"
+            ),
+        }
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 

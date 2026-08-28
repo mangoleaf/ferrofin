@@ -46,6 +46,15 @@ use ferrofin_traits::tv::TvSeriesManager;
 /// object so the concrete type is chosen at the composition root, not baked into
 /// this crate.
 pub struct Inner {
+    /// The network policy — which peers count as local, and which remote ones
+    /// may reach the server at all (`RemoteIPFilter`).
+    ///
+    /// `None` in tests and until the composition root wires it, in which case
+    /// the private-range fallback in `handlers::system::is_in_local_network`
+    /// applies and no remote filter is enforced. Behind a lock because
+    /// `NetworkManager::update_settings` rewrites its caches when an admin
+    /// saves the network configuration.
+    pub network: Option<Arc<std::sync::RwLock<ferrofin_networking::NetworkManager>>>,
     /// Library catalogue queries and item resolution.
     pub library: Arc<dyn LibraryManager>,
     /// User accounts, authentication policy, and profiles.
@@ -250,6 +259,8 @@ impl AppState {
         tasks: Arc<dyn TaskManager>,
     ) -> Self {
         Self::from_inner(Inner {
+            // Wired by the composition root via `with_network`.
+            network: None,
             library,
             users,
             user_views,
@@ -463,6 +474,69 @@ impl AppState {
             .expect("with_live_tv must be called before the state is shared");
         inner.live_tv = Some(live_tv);
         self
+    }
+
+    /// Wires the network policy so the local-network test and the remote-IP
+    /// filter are the CONFIGURED ones rather than a private-range guess.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the inner state is already shared (cloned).
+    #[must_use]
+    pub fn with_network(
+        mut self,
+        network: Arc<std::sync::RwLock<ferrofin_networking::NetworkManager>>,
+    ) -> Self {
+        let inner = Arc::get_mut(&mut self.inner)
+            .expect("with_network must be called before the state is shared");
+        inner.network = Some(network);
+        self
+    }
+
+    /// Whether `ip` is on the local network.
+    ///
+    /// The configured answer (`NetworkManager::IsInLocalNetwork`, which
+    /// intersects `LocalNetworkSubnets` and subtracts the `!`-prefixed
+    /// exclusions) when the policy is wired; otherwise the private-range
+    /// fallback, which is what the whole server used before.
+    #[must_use]
+    pub fn is_in_local_network(&self, ip: std::net::IpAddr) -> bool {
+        match self.inner.network.as_ref() {
+            Some(network) => network.read().map_or_else(
+                |e| e.into_inner().is_in_local_network(ip),
+                |n| n.is_in_local_network(ip),
+            ),
+            None => crate::handlers::system::is_in_local_network(ip),
+        }
+    }
+
+    /// Whether a request from `ip` may be served at all — C#
+    /// `NetworkManager.ShouldAllowServerAccess`, the `RemoteIPFilter` /
+    /// `EnableRemoteAccess` gate. `Allow` when no policy is wired.
+    #[must_use]
+    pub fn remote_access_policy(
+        &self,
+        ip: std::net::IpAddr,
+    ) -> ferrofin_networking::RemoteAccessPolicyResult {
+        match self.inner.network.as_ref() {
+            Some(network) => network.read().map_or_else(
+                |e| e.into_inner().should_allow_server_access(ip),
+                |n| n.should_allow_server_access(ip),
+            ),
+            None => ferrofin_networking::RemoteAccessPolicyResult::Allow,
+        }
+    }
+
+    /// Re-reads the network configuration into the policy after an admin saves
+    /// it, so a changed `LocalNetworkSubnets` / `RemoteIPFilter` takes effect
+    /// without a restart (C# `NetworkManager` subscribes to the config event).
+    pub fn update_network_settings(&self, config: &ferrofin_networking::NetworkConfiguration) {
+        if let Some(network) = self.inner.network.as_ref() {
+            match network.write() {
+                Ok(mut n) => n.update_settings(config),
+                Err(poisoned) => poisoned.into_inner().update_settings(config),
+            }
+        }
     }
 
     /// Wires the web-file transformation pipeline (the File Transformation

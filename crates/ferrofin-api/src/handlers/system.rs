@@ -227,10 +227,11 @@ async fn get_log_file(
 ///
 /// Port of `SystemController.GetEndpointInfo`. `IsLocal` is true for a loopback
 /// peer (the same-machine web client); `IsInNetwork` additionally covers the
-/// RFC1918 / unique-local private ranges — a faithful approximation of Jellyfin's
-/// `NetworkManager.IsInLocalNetwork` without the configured-subnet list. The peer
-/// address comes from the connection ([`ConnectInfo`]); a proxied request that
-/// hides it (no `ConnectInfo`) falls back to the non-local answer.
+/// `IsInNetwork` is the CONFIGURED answer (`NetworkManager.IsInLocalNetwork`,
+/// via [`AppState::is_in_local_network`]) once the composition root has wired
+/// the policy, and the RFC1918 / unique-local approximation below otherwise.
+/// The peer address comes from the connection ([`ConnectInfo`]); a proxied
+/// request that hides it (no `ConnectInfo`) falls back to the non-local answer.
 #[utoipa::path(
     get,
     path = "/System/Endpoint",
@@ -238,6 +239,7 @@ async fn get_log_file(
     tag = "ferrofin"
 )]
 async fn get_endpoint_info(
+    State(state): State<AppState>,
     _auth: RequireAuth,
     parts: axum::http::request::Parts,
 ) -> Json<EndPointInfo> {
@@ -249,7 +251,7 @@ async fn get_endpoint_info(
         .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
         .map(|ci| ci.0.ip());
     let is_local = ip.is_some_and(|ip| ip.is_loopback());
-    let is_in_network = ip.is_some_and(is_in_local_network);
+    let is_in_network = ip.is_some_and(|ip| state.is_in_local_network(ip));
     Json(EndPointInfo {
         is_local,
         is_in_network,

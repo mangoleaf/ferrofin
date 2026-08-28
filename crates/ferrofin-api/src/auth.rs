@@ -205,14 +205,12 @@ impl FromRequestParts<AppState> for RequireAdmin {
 ///   account". Upstream needs `KnownProxies` configured to do better;
 ///   `NetworkConfiguration::known_proxies` exists here but nothing reads it
 ///   yet.
-/// - **Configured subnets.** `NetworkManager.IsInLocalNetwork` intersects
-///   `LocalNetworkSubnets` and subtracts `!`-prefixed exclusions; this uses only
-///   the private-range fallback. An operator who has *narrowed*
-///   `LocalNetworkSubnets`, or excluded a range, gets "remote" from Jellyfin and
-///   "local" from here — so the hosts they deliberately excluded are still
-///   allowed. [`ferrofin_networking::NetworkManager`] implements the faithful
-///   test, but it is not constructible into [`AppState`] today: its
-///   `Rc<dyn Logger>` is not `Send`.
+/// - **Configured subnets.** This now asks
+///   [`AppState::is_in_local_network`], which is
+///   `NetworkManager.IsInLocalNetwork` — `LocalNetworkSubnets` intersected and
+///   the `!`-prefixed exclusions subtracted — whenever the composition root has
+///   wired the policy. Without it (unit tests) the private-range fallback still
+///   applies.
 #[derive(Debug, Clone)]
 pub struct RequireLocalAccessOrAdmin(pub AuthorizationInfo);
 
@@ -227,7 +225,7 @@ impl FromRequestParts<AppState> for RequireLocalAccessOrAdmin {
         let local = parts
             .extensions
             .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-            .is_some_and(|ci| crate::handlers::system::is_in_local_network(ci.0.ip()));
+            .is_some_and(|ci| state.is_in_local_network(ci.0.ip()));
         if local {
             let RequireAuth(info) = RequireAuth::from_request_parts(parts, state).await?;
             return Ok(Self(info));

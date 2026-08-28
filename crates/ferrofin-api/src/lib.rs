@@ -22,6 +22,7 @@ pub mod compression;
 mod contract_routes;
 pub mod error;
 pub mod handlers;
+pub mod ip_access;
 pub mod openapi;
 pub mod router;
 pub mod routes;
