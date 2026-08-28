@@ -94,6 +94,22 @@ pub enum QueryShape {
 /// have asked for one specific key, and there must be a user — and then either
 /// no kind filter at all, or one of the six kinds that can have versions.
 pub(crate) fn group_by_presentation_unique_key(filter: &InternalItemsQuery) -> bool {
+    // A resume query surfaces the version that was actually PLAYED, which may be
+    // an alternate sharing the primary's presentation key — and the predicate
+    // above deliberately keeps alternates for exactly that reason. Grouping
+    // would then collapse the surfaced version straight back onto the primary,
+    // whose user data has no playback position, and the row would come back
+    // with no progress on it.
+    //
+    // 10.11.8 has this bug; upstream fixed it afterwards, in the released
+    // `EnableGroupByPresentationUniqueKey` on master, with the same reasoning
+    // (and `0fb042b740` for the predicate half, which Ferrofin already had).
+    // Taken deliberately, under the project's "don't port Jellyfin bugs" rule
+    // — Ferrofin diverges from 10.11.8 here, toward the answer upstream itself
+    // now gives.
+    if filter.is_resumable == Some(true) {
+        return false;
+    }
     if !filter.group_by_presentation_unique_key
         || filter.group_by_series_presentation_unique_key
         || non_blank(filter.presentation_unique_key.as_ref()).is_some()

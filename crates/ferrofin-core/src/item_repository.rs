@@ -3555,6 +3555,23 @@ mod tests {
         .expect("merge versions");
     }
 
+    /// Gives `user` a playback position on `item`, which is what makes a row
+    /// resumable.
+    async fn set_playback_position(db: &Database, item: Uuid, user_id: &str, ticks: i64) {
+        sqlx::query(
+            r#"INSERT INTO "UserData"
+               ("ItemId", "UserId", "CustomDataKey", "IsFavorite", "PlayCount",
+                "PlaybackPositionTicks", "Played")
+               VALUES (?1, ?2, ?1, 0, 0, ?3, 0)"#,
+        )
+        .bind(guid_to_db(item))
+        .bind(user_id)
+        .bind(ticks)
+        .execute(db.writer())
+        .await
+        .expect("set playback position");
+    }
+
     /// Stamps a library's `CollectionType` into its `Data` blob, where both
     /// Jellyfin and the grouping arm read it from.
     async fn set_collection_type(db: &Database, id: Uuid, collection_type: &str) {
@@ -4320,6 +4337,85 @@ mod tests {
             .await
             .expect("page");
         assert_eq!(paged.total_record_count, 1);
+    }
+
+    /// Resume surfaces the version that was actually PLAYED, not the primary.
+    ///
+    /// Deliberate divergence from 10.11.8, which has this bug: the resume
+    /// predicate keeps alternate versions on purpose, and then the presentation
+    /// grouping collapsed the surfaced one back onto the primary — whose user
+    /// data has no playback position, so the row came back with no progress on
+    /// it. Upstream's released `EnableGroupByPresentationUniqueKey` now returns
+    /// early for a resumable query, with the same reasoning.
+    #[tokio::test]
+    async fn resume_returns_the_version_that_was_played() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let library = Uuid::from_u128(0x9C41);
+        let primary = Uuid::from_u128(0x9C42);
+        let alternate = Uuid::from_u128(0x9C43);
+        seed_named_item(&db, library, BaseItemKind::CollectionFolder, "Movies").await;
+        seed_top_parented_item(&db, primary, BaseItemKind::Movie, "Blade Runner", library).await;
+        seed_top_parented_item(
+            &db,
+            alternate,
+            BaseItemKind::Movie,
+            "Blade Runner 4K",
+            library,
+        )
+        .await;
+        let persistence =
+            crate::item_persistence_service::FerrofinItemPersistenceService::new(db.clone());
+        for id in [primary, alternate] {
+            let row = crate::test_support::fetch_item(&db, id).await;
+            persistence
+                .save_items(std::slice::from_ref(&row))
+                .await
+                .expect("write");
+        }
+        merge_versions_over(&db, &[primary, alternate]).await;
+
+        // The user watched half of the ALTERNATE — whichever row the merge left
+        // pointing at the other.
+        let mut alternate_id = None;
+        for id in [primary, alternate] {
+            if crate::test_support::fetch_item(&db, id)
+                .await
+                .primary_version_id
+                .is_some()
+            {
+                alternate_id = Some(id);
+            }
+        }
+        let alternate_id = alternate_id.expect("one of the two is the alternate");
+
+        // BOTH carry progress. That is what makes this discriminating: with one
+        // resumable row the grouping has nothing to collapse and the bug is
+        // invisible, which is exactly how it survived.
+        let user = seed_user_with_defaults(&db, Uuid::from_u128(0x9C45)).await;
+        for id in [primary, alternate] {
+            set_playback_position(&db, id, &user.id, 42_000_000).await;
+        }
+
+        let resumed = repository
+            .get_item_list(&InternalItemsQuery {
+                user: Some(user),
+                recursive: true,
+                is_resumable: Some(true),
+                ..InternalItemsQuery::default()
+            })
+            .await
+            .expect("resume");
+        let ids: Vec<String> = resumed.iter().map(|r| r.id.clone()).collect();
+        assert!(
+            ids.contains(&guid_to_db(alternate_id)),
+            "the played alternate must be surfaced, not collapsed onto the primary (got {ids:?})"
+        );
+        assert_eq!(
+            ids.len(),
+            2,
+            "and both versions with progress are resumable"
+        );
     }
 
     /// The grouping *gate* — C# `EnableGroupByPresentationUniqueKey`, which
