@@ -18,6 +18,7 @@ ferrofin-common.workspace = true
 ferrofin-naming.workspace = true
 ferrofin-providers.workspace = true
 ferrofin-keyframes.workspace = true
+ferrofin-networking.workspace = true
 async-trait.workspace = true
 tokio = { workspace = true }
 notify.workspace = true

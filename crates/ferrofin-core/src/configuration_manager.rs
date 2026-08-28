@@ -232,6 +232,11 @@ impl FerrofinServerConfigurationManager {
     /// `encoding` configuration, stored as a sibling JSON document).
     const ENCODING_FILE_NAME: &'static str = "encoding.json";
 
+    /// The on-disk network configuration file name (Jellyfin's named
+    /// `network` configuration). This one is not merely served back: the
+    /// request path enforces it (`ferrofin_api::ip_access`).
+    const NETWORK_FILE_NAME: &'static str = "network.json";
+
     /// Loads (or initializes) the configuration for the given paths.
     ///
     /// If `{configuration-directory}/system.json` exists it is parsed. If it
@@ -287,6 +292,20 @@ impl FerrofinServerConfigurationManager {
                 BrandingOptions::default(),
                 "BrandingOptions",
                 config_import::BRANDING_XML_DENY,
+            )
+            .await?;
+            // The network policy is enforced from this file (see
+            // `ferrofin_api::ip_access`), so dropping it on adoption would
+            // quietly take down an operator's remote-IP filter and widen their
+            // `LocalNetworkSubnets` back to every private range — the server
+            // would come up more permissive than the one it replaced, and
+            // nothing would say so.
+            seed_named(
+                &config_dir.join("network.xml"),
+                &named_dir.join(Self::NETWORK_FILE_NAME),
+                ferrofin_networking::NetworkConfiguration::default(),
+                "NetworkConfiguration",
+                config_import::NETWORK_XML_DENY,
             )
             .await
         };
@@ -985,6 +1004,77 @@ mod tests {
              </BrandingOptions>",
         )
         .expect("branding.xml");
+        std::fs::write(dir.join("network.xml"), REAL_NETWORK_XML).expect("network.xml");
+    }
+
+    /// A `network.xml` as a real Jellyfin 10.11.8 writes it — element names,
+    /// casing, the `<string>` list wrapper and the self-closing empty elements
+    /// all copied verbatim from a live deployment, because those are exactly
+    /// what an import gets wrong.
+    const REAL_NETWORK_XML: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<NetworkConfiguration xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <BaseUrl />
+  <EnableHttps>false</EnableHttps>
+  <CertificatePath>/config/cert.pfx</CertificatePath>
+  <CertificatePassword>hunter2</CertificatePassword>
+  <InternalHttpPort>8096</InternalHttpPort>
+  <AutoDiscovery>true</AutoDiscovery>
+  <EnableIPv4>true</EnableIPv4>
+  <EnableIPv6>false</EnableIPv6>
+  <EnableRemoteAccess>true</EnableRemoteAccess>
+  <LocalNetworkSubnets>
+    <string>192.168.1.0/24</string>
+  </LocalNetworkSubnets>
+  <LocalNetworkAddresses />
+  <KnownProxies>
+    <string>10.0.0.0/8</string>
+  </KnownProxies>
+  <IgnoreVirtualInterfaces>true</IgnoreVirtualInterfaces>
+  <VirtualInterfaceNames>
+    <string>veth</string>
+  </VirtualInterfaceNames>
+  <PublishedServerUriBySubnet />
+  <RemoteIPFilter>
+    <string>203.0.113.0/24</string>
+  </RemoteIPFilter>
+  <IsRemoteIPFilterBlacklist>true</IsRemoteIPFilterBlacklist>
+</NetworkConfiguration>"#;
+
+    /// Adoption must carry the operator's network policy across, because the
+    /// request path now ENFORCES it: dropping the file would silently retire
+    /// their remote-IP filter and widen `LocalNetworkSubnets` back to every
+    /// private range — a server that comes up more permissive than the one it
+    /// replaced, saying nothing.
+    #[tokio::test]
+    async fn adoption_imports_the_network_policy_but_not_the_certificate() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_jellyfin_config(tmp.path(), COMPLETED_SYSTEM_XML);
+        let _mgr = FerrofinServerConfigurationManager::load(test_paths(tmp.path()))
+            .await
+            .expect("load");
+
+        let written = std::fs::read_to_string(
+            tmp.path()
+                .join("config")
+                .join("users")
+                .join("named")
+                .join("network.json"),
+        )
+        .expect("network.json");
+        let config: ferrofin_networking::NetworkConfiguration =
+            serde_json::from_str(&written).expect("parses back");
+
+        assert_eq!(config.remote_ip_filter, ["203.0.113.0/24"]);
+        assert!(config.is_remote_ip_filter_blacklist);
+        assert_eq!(config.local_network_subnets, ["192.168.1.0/24"]);
+        assert_eq!(config.known_proxies, ["10.0.0.0/8"]);
+        assert_eq!(config.virtual_interface_names, ["veth"]);
+        assert!(config.enable_remote_access);
+        assert!(!config.enable_ipv6, "a false element is not a missing one");
+        // …and NOT the certificate: its path is inside the Jellyfin container
+        // and its password unlocks nothing we kept.
+        assert_eq!(config.certificate_path, "");
+        assert_eq!(config.certificate_password, "");
     }
 
     const COMPLETED_SYSTEM_XML: &str = "<ServerConfiguration>\

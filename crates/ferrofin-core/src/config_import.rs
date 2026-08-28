@@ -76,6 +76,15 @@ pub const ENCODING_XML_DENY: &[&str] = &[
 /// stored by path, and that path is inside the Jellyfin container.
 pub const BRANDING_XML_DENY: &[&str] = &["SplashscreenLocation"];
 
+/// Fields of `network.xml` that must not be carried over: the certificate lives
+/// at a path inside the Jellyfin container, and its password is a secret with
+/// nothing left to unlock once the path is gone.
+///
+/// Everything else is the operator's own network policy — `RemoteIPFilter`,
+/// `LocalNetworkSubnets`, `KnownProxies`, `EnableRemoteAccess` — and is exactly
+/// what adoption must not silently drop.
+pub const NETWORK_XML_DENY: &[&str] = &["CertificatePath", "CertificatePassword"];
+
 /// How deep an imported document may nest.
 ///
 /// The real documents are three levels deep. The cap exists because both
