@@ -1631,6 +1631,25 @@ pub async fn build_app_state(
         .with_media_encoding(hls, attachments)
         .with_subtitle_encoder(subtitle_encoder);
 
+    // One-shot: carry Jellyfin's Live TV configuration across on adoption.
+    // Ferrofin keeps tuners and listing providers in the database rather than a
+    // config file, so nothing else would pick them up — and with no tuner
+    // configured Live TV is OFF (`live_tv_enabled_for`), which means adopting a
+    // server that had Live TV would silently lose the tuner, the guide and the
+    // view.
+    match ferrofin_core::live_tv_import::import_live_tv_config(
+        db,
+        std::path::Path::new(&paths.configuration_directory_path()),
+    )
+    .await
+    {
+        Ok(0) => {}
+        Ok(rows) => tracing::info!(rows, "imported jellyfin's live tv configuration"),
+        Err(err) => {
+            tracing::warn!(%err, "live tv configuration import failed; live tv starts unconfigured");
+        }
+    }
+
     // ---- network policy ---------------------------------------------------
     // `LocalNetworkSubnets` / `RemoteIPFilter` / `EnableRemoteAccess` decide
     // which peers count as local and which may reach the server at all. The

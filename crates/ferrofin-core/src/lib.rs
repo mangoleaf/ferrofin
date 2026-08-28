@@ -182,6 +182,7 @@ pub mod library_manager;
 pub mod library_monitor;
 pub mod library_scan;
 pub mod linked_children_service;
+pub mod live_tv_import;
 pub mod localization_manager;
 pub mod lyric_manager;
 pub mod media_attachment_repository;
