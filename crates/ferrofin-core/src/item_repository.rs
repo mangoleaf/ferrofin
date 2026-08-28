@@ -1514,6 +1514,12 @@ impl ItemRepository for FerrofinItemRepository {
         &self,
         filter: &InternalItemsQuery,
     ) -> Result<QueryFiltersLegacy, ServiceError> {
+        // `AddUserToQuery` first, and once: every facet below runs the same
+        // filter, so scoping here scopes all four. A filter dialog that offers a
+        // genre, tag, rating or year from a library the account cannot see is
+        // offering a choice that returns nothing.
+        let scoped = scope_to_user_libraries(&self.db, filter).await?;
+        let filter = scoped.as_ref().unwrap_or(filter);
         // Each facet runs the filter once as its own WHERE (via `append_predicates`)
         // instead of materializing the whole matching id set and binding it back as a
         // giant `IN` per facet. The old "resolve every matching id in the app, then
@@ -1542,8 +1548,11 @@ impl ItemRepository for FerrofinItemRepository {
     ) -> Result<Vec<i32>, ServiceError> {
         // `/Years` wants the years and nothing else. Going through
         // `get_query_filters_legacy` for them also ran the official-ratings
-        // scan and both `ItemValues` MIN aggregates and dropped all three.
-        self.distinct_years(filter).await
+        // scan and both `ItemValues` MIN aggregates and dropped all three — but
+        // it does share that method's user scoping, which has to be applied
+        // here too.
+        let scoped = scope_to_user_libraries(&self.db, filter).await?;
+        self.distinct_years(scoped.as_ref().unwrap_or(filter)).await
     }
 
     async fn get_is_played(
@@ -3301,6 +3310,16 @@ mod tests {
         .expect("merge versions");
     }
 
+    /// Stamps a row's `ProductionYear`, the column the year facet reads.
+    async fn set_production_year(db: &Database, id: Uuid, year: i64) {
+        let mut row = crate::test_support::fetch_item(db, id).await;
+        row.production_year = Some(year);
+        crate::item_persistence_service::FerrofinItemPersistenceService::new(db.clone())
+            .save_items(std::slice::from_ref(&row))
+            .await
+            .expect("set production year");
+    }
+
     /// These tests exercise what the QUERY does with a key, so the key is
     /// written straight to the column — the writer recomputes its own (see
     /// `kinds::presentation_unique_key`) and would overwrite the shape being
@@ -3566,6 +3585,58 @@ mod tests {
                 "and the counts agree with what the user can browse"
             );
         }
+    }
+
+    /// `/Items/Filters` and `/Years` are confined the same way.
+    ///
+    /// These are the lists a client renders as the filter dialog, so an
+    /// unscoped facet is a choice the user can pick that then returns nothing.
+    #[tokio::test]
+    async fn the_filter_facets_see_only_the_user_s_libraries() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let (first, _second, user_id, user) = two_libraries(&db).await;
+        seed_item_genre(&db, Uuid::from_u128(0x9803), "Adventure").await;
+        seed_item_genre(&db, Uuid::from_u128(0x9804), "Mystery").await;
+        set_production_year(&db, Uuid::from_u128(0x9803), 1999).await;
+        set_production_year(&db, Uuid::from_u128(0x9804), 2018).await;
+
+        let query = InternalItemsQuery {
+            user: Some(user.clone()),
+            ..InternalItemsQuery::default()
+        };
+        let filters = repository
+            .get_query_filters_legacy(&query)
+            .await
+            .expect("filters");
+        assert_eq!(filters.genres, ["Adventure", "Mystery"]);
+        assert_eq!(
+            repository.get_distinct_years(&query).await.expect("years"),
+            [1999, 2018]
+        );
+
+        sqlx::query(r#"UPDATE "Permissions" SET "Value" = 0 WHERE "UserId" = ?1 AND "Kind" = ?2"#)
+            .bind(guid_to_db(user_id))
+            .bind(i32::from(PermissionKind::EnableAllFolders))
+            .execute(db.writer())
+            .await
+            .expect("revoke");
+        set_folder_preference(&db, user_id, PreferenceKind::EnabledFolders, &[first]).await;
+
+        let filters = repository
+            .get_query_filters_legacy(&query)
+            .await
+            .expect("filters");
+        assert_eq!(
+            filters.genres,
+            ["Adventure"],
+            "the hidden library's genre is no longer offered"
+        );
+        assert_eq!(
+            repository.get_distinct_years(&query).await.expect("years"),
+            [1999],
+            "nor its year"
+        );
     }
 
     /// `BlockedMediaFolders` hides exactly the libraries it names.
