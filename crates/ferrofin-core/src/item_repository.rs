@@ -60,6 +60,28 @@ impl std::fmt::Debug for FerrofinItemRepository {
     }
 }
 
+/// The columns [`FerrofinItemRepository::top_parent_ids_for_query`] reads to
+/// resolve one view.
+#[derive(sqlx::FromRow)]
+struct ViewRow {
+    /// The stored CLR type name.
+    #[sqlx(rename = "Type")]
+    type_name: String,
+    /// The relational parent, the third arm's pointer.
+    #[sqlx(rename = "ParentId")]
+    parent_id: Option<String>,
+    /// The view's path, which identifies a Live TV view written without a
+    /// `Data` blob.
+    #[sqlx(rename = "Path")]
+    path: Option<String>,
+    /// The serialized blob carrying `ViewType` and `DisplayParentId`.
+    #[sqlx(rename = "Data")]
+    data: Option<String>,
+    /// Where `GetTopParent` lands for a followed pointer.
+    #[sqlx(rename = "TopParentId")]
+    top_parent_id: Option<String>,
+}
+
 impl FerrofinItemRepository {
     /// Creates a repository over the given database and kind-lookup tables.
     #[must_use]
@@ -106,21 +128,27 @@ impl FerrofinItemRepository {
         // excluded from `wants_parent`: that shape is the delete cascade's
         // ("every row directly under this folder on disk"), and widening it to
         // the library's whole top-parent scope would delete the library.
-        if filter.recursive && filter.parent_id != Uuid::nil() && !filter.physical_children_only {
-            let folders = self
-                .physical_folders_by_view(&[filter.parent_id])
-                .await?
-                .remove(&filter.parent_id)
-                .unwrap_or_default();
-            if !folders.is_empty() {
-                let mut resolved = filter.clone();
-                resolved.top_parent_ids = folders;
-                // …and the `ParentId` equality has to go with it, or the two
-                // scopes intersect to nothing: no row carries a collection
-                // folder as its parent.
-                resolved.parent_id = Uuid::nil();
-                return Ok(Some(resolved));
+        if filter.recursive
+            && filter.parent_id != Uuid::nil()
+            && !filter.physical_children_only
+            && let Some(mut folders) =
+                Self::top_parent_ids_for_query(&self.db, filter.parent_id, 0).await?
+        {
+            // A view that resolves to nothing matches nothing — upstream
+            // substitutes a fresh guid for exactly this reason ("Prevent
+            // searching in all libraries due to empty filter"). Falling through
+            // instead would answer a browse of an empty library with the whole
+            // server.
+            if folders.is_empty() {
+                folders.push(Uuid::parse_str(PLACEHOLDER_ID).unwrap_or_else(|_| Uuid::nil()));
             }
+            let mut resolved = filter.clone();
+            resolved.top_parent_ids = folders;
+            // …and the `ParentId` equality has to go with it, or the two scopes
+            // intersect to nothing: no row carries a collection folder as its
+            // parent.
+            resolved.parent_id = Uuid::nil();
+            return Ok(Some(resolved));
         }
         if !wants_parent && filter.top_parent_ids.is_empty() {
             return scope_to_user_libraries(&self.db, filter).await;
@@ -165,6 +193,136 @@ impl FerrofinItemRepository {
             }
         }
         Ok(resolved)
+    }
+
+    /// The top parents a query scoped to `id` should use — C#
+    /// `GetTopParentIdsForQuery` (`LibraryManager.cs:1728`).
+    ///
+    /// `None` means "leave this to the ancestor closure" — the item is not a view
+    /// at all (which is what `SetTopParentIdsOrAncestors` does when the parents are
+    /// not all `ICollectionFolder`/`UserView`), or it is a collection folder with no
+    /// physical folders, which on a Ferrofin-written database is every one of them.
+    /// `Some(vec![])` is different and deliberate: a *view* that resolves to
+    /// nothing, which upstream turns into a match-nothing scope rather than letting
+    /// the query widen to every library.
+    ///
+    /// The arms, in upstream's order:
+    ///
+    /// 1. a Live TV view stands for itself;
+    /// 2. a `DisplayParentId` is followed (and a dangling one resolves to nothing);
+    /// 3. so is a `ParentId`;
+    /// 4. a `CollectionFolder` becomes its `PhysicalFolderIds`;
+    /// 5. anything else a view could be resolves to nothing.
+    ///
+    /// Both of the views a real 10.11.8 database carries take one of the first two
+    /// arms: its Live TV view is `ViewType: livetv`, and its Playlists view carries
+    /// a `DisplayParentId` pointing at the real `PlaylistsFolder`.
+    ///
+    /// NOT ported: upstream's fifth arm, which groups libraries when the user has a
+    /// non-empty `GroupedFolders` preference. That needs each collection folder's
+    /// `CollectionType`, which this layer has no access to — see the task filed
+    /// against it. A user without that preference (every user of a default install,
+    /// and both users of the verification deployment) never reaches it.
+    async fn top_parent_ids_for_query(
+        db: &Database,
+        id: Uuid,
+        depth: u8,
+    ) -> Result<Option<Vec<Uuid>>, ServiceError> {
+        // A `DisplayParentId`/`ParentId` chain is data, so it can be a cycle.
+        // Upstream recurses without a guard and would stack-overflow; refusing to
+        // follow a long chain is the same answer for every shape that is not a bug.
+        if depth > 8 {
+            return Ok(Some(Vec::new()));
+        }
+        let row: Option<ViewRow> = sqlx::query_as(
+            r#"SELECT "Type", "ParentId", "Path", "Data", "TopParentId"
+               FROM "BaseItems" WHERE "Id" = ?1"#,
+        )
+        .bind(guid_to_db(id))
+        .fetch_optional(db.pool())
+        .await
+        .map_err(db_err)?;
+        let Some(ViewRow {
+            type_name,
+            parent_id,
+            path,
+            data,
+            top_parent_id,
+        }) = row
+        else {
+            return Ok(None);
+        };
+        let kind = crate::item_type_lookup::kind_from_type_name(&type_name);
+        if kind == Some(BaseItemKind::CollectionFolder) {
+            let folders = physical_folders_by_view(db, &[id])
+                .await?
+                .remove(&id)
+                .unwrap_or_default();
+            // A collection folder with NO physical folders means two different
+            // things, and only one of them is "an empty library". On a
+            // Ferrofin-written database no collection folder has them — items hang
+            // off the folder directly and there is no `Data` blob — so answering
+            // "match nothing" here would empty every native browse. Deliberate
+            // divergence, same as the one `resolve_views` already documents: an
+            // unresolvable collection folder falls through to the ancestor closure,
+            // which is right for both database shapes.
+            return Ok((!folders.is_empty()).then_some(folders));
+        }
+        if kind != Some(BaseItemKind::UserView) {
+            // C#'s last arm — `item.GetTopParent()` — but only when we got here by
+            // FOLLOWING a view's pointer. At the top level
+            // `SetTopParentIdsOrAncestors` checks the type first and sends anything
+            // that is not a view to the ancestor closure instead, so returning a
+            // top parent there would silently change what an ordinary folder browse
+            // scopes by.
+            if depth == 0 {
+                return Ok(None);
+            }
+            let top = top_parent_id
+                .as_deref()
+                .and_then(|v| Uuid::parse_str(v).ok())
+                .filter(|v| !v.is_nil())
+                // A row with no top parent IS the top: `GetTopParent` walks up and
+                // stops at the first item with no parent, which is the row itself.
+                .unwrap_or(id);
+            return Ok(Some(vec![top]));
+        }
+
+        let blob: serde_json::Value = data
+            .as_deref()
+            .and_then(|d| serde_json::from_str(d).ok())
+            .unwrap_or(serde_json::Value::Null);
+        // `ViewType` is what C# tests; the path is the fallback for a view written
+        // without a `Data` blob.
+        let is_live_tv = blob
+            .get("ViewType")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|v| v.eq_ignore_ascii_case("livetv"))
+            || path
+                .as_deref()
+                .is_some_and(crate::user_view_manager::is_live_tv_view_path);
+        if is_live_tv {
+            return Ok(Some(vec![id]));
+        }
+        let display_parent = blob
+            .get("DisplayParentId")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|v| Uuid::parse_str(v).ok())
+            .filter(|v| !v.is_nil());
+        let parent = parent_id
+            .as_deref()
+            .and_then(|v| Uuid::parse_str(v).ok())
+            .filter(|v| !v.is_nil());
+        if let Some(next) = display_parent.or(parent) {
+            // A dangling pointer resolves to nothing, NOT to the ancestor closure:
+            // upstream returns `[]` when `GetItemById` misses.
+            return Ok(Some(
+                Box::pin(Self::top_parent_ids_for_query(db, next, depth + 1))
+                    .await?
+                    .unwrap_or_default(),
+            ));
+        }
+        Ok(Some(Vec::new()))
     }
 
     /// The physical folders each of `ids` stands for, for those that are
@@ -3636,6 +3794,108 @@ mod tests {
             repository.get_distinct_years(&query).await.expect("years"),
             [1999],
             "nor its year"
+        );
+    }
+
+    /// A `UserView` resolves through its `DisplayParentId` — C#
+    /// `GetTopParentIdsForQuery`'s second arm.
+    ///
+    /// This is the shape a real 10.11.8 database ships: its Playlists view
+    /// carries no `ParentId` and no children of its own, only a
+    /// `DisplayParentId` pointing at the actual `PlaylistsFolder`. Without the
+    /// hop, browsing that view finds nothing.
+    #[tokio::test]
+    async fn a_user_view_resolves_through_its_display_parent() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let view = Uuid::from_u128(0x9E01);
+        let folder = Uuid::from_u128(0x9E02);
+        let playlist = Uuid::from_u128(0x9E03);
+
+        seed_item_with_data(
+            &db,
+            view,
+            BaseItemKind::UserView,
+            "Playlists",
+            &format!(
+                r#"{{"ViewType":"playlists","DisplayParentId":"{}"}}"#,
+                folder.simple()
+            ),
+        )
+        .await;
+        seed_named_item(&db, folder, BaseItemKind::PlaylistsFolder, "Playlists").await;
+        seed_top_parented_item(&db, playlist, BaseItemKind::Playlist, "Road Trip", folder).await;
+
+        let found = repository
+            .get_item_list(&InternalItemsQuery {
+                parent_id: view,
+                recursive: true,
+                ..InternalItemsQuery::default()
+            })
+            .await
+            .expect("browse");
+        assert!(
+            found.iter().any(|r| r.name.as_deref() == Some("Road Trip")),
+            "the view's display parent is the scope, got {:?}",
+            found
+                .iter()
+                .filter_map(|r| r.name.as_deref())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// A Live TV view stands for itself (the first arm), and a view that
+    /// resolves to nothing matches nothing rather than widening to the whole
+    /// server — upstream substitutes a fresh guid for exactly that reason.
+    #[tokio::test]
+    async fn a_live_tv_view_is_its_own_scope_and_a_dangling_one_matches_nothing() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let live_tv = Uuid::from_u128(0x9F01);
+        let programme = Uuid::from_u128(0x9F02);
+        let dangling = Uuid::from_u128(0x9F03);
+        let elsewhere = Uuid::from_u128(0x9F04);
+
+        seed_item_with_data(
+            &db,
+            live_tv,
+            BaseItemKind::UserView,
+            "Live TV",
+            r#"{"ViewType":"livetv"}"#,
+        )
+        .await;
+        seed_top_parented_item(&db, programme, BaseItemKind::Movie, "On Live TV", live_tv).await;
+        // A view whose display parent is not there at all.
+        seed_item_with_data(
+            &db,
+            dangling,
+            BaseItemKind::UserView,
+            "Ghost",
+            r#"{"ViewType":"movies","DisplayParentId":"ffffffffffffffffffffffffffffffff"}"#,
+        )
+        .await;
+        seed_named_item(&db, elsewhere, BaseItemKind::Movie, "Somewhere Else").await;
+
+        let browse = |parent: Uuid| {
+            let repository = &repository;
+            async move {
+                repository
+                    .get_item_list(&InternalItemsQuery {
+                        parent_id: parent,
+                        recursive: true,
+                        ..InternalItemsQuery::default()
+                    })
+                    .await
+                    .expect("browse")
+                    .iter()
+                    .filter_map(|r| r.name.clone())
+                    .collect::<Vec<String>>()
+            }
+        };
+        assert_eq!(browse(live_tv).await, ["On Live TV"]);
+        assert!(
+            browse(dangling).await.is_empty(),
+            "a dangling view matches nothing, not everything"
         );
     }
 
