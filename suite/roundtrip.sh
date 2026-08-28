@@ -89,14 +89,29 @@ enc_movies=$(python3 -c "import urllib.parse,sys;print(urllib.parse.quote('$MEDI
 enc_tv=$(python3 -c "import urllib.parse,sys;print(urllib.parse.quote('$MEDIA_DIR/tv',safe=''))")
 post "$JF" "/Library/VirtualFolders?name=Movies&collectionType=movies&paths=$enc_movies&refreshLibrary=true" "$TOK" "$NOREMOTE" >/dev/null
 post "$JF" "/Library/VirtualFolders?name=TV&collectionType=tvshows&paths=$enc_tv&refreshLibrary=true" "$TOK" "$NOREMOTE" >/dev/null
+# Adding the second library CANCELS the first one's in-flight scan ("Scan Media
+# Library Cancelled after 0 minutes", observed 2026-08-28 on a loaded host), and
+# nothing restarts it — the fixture then settles at a couple of items and every
+# later step fails somewhere far from the cause. One explicit full refresh after
+# both libraries exist is what makes this deterministic instead of a race the
+# fast machine happens to win.
+sleep 2
+post "$JF" "/Library/Refresh" "$TOK" >/dev/null
+# Settle on a count that holds for 40s — but never on an implausibly small one.
+# A busy host can stall Jellyfin's scan long enough to look finished at 2 items,
+# and everything downstream then fails somewhere far from the cause (observed
+# 2026-08-28). The fixture tree is 500 movies; the same floor step 2 asserts.
+SCAN_FLOOR=${ROUNDTRIP_SCAN_FLOOR:-100}
 last=-1; stable=0
 for _ in $(seq 1 480); do
   n=$(api "$JF" "/Items?userId=$UID_&recursive=true&limit=0" "$TOK" | jq -r .TotalRecordCount) || n=-1
-  [ "$n" = "$last" ] && [ "$n" -gt 0 ] 2>/dev/null && stable=$((stable+1)) || stable=0
+  [ "$n" = "$last" ] && [ "$n" -ge "$SCAN_FLOOR" ] 2>/dev/null && stable=$((stable+1)) || stable=0
   [ "$stable" -ge 8 ] && break
   last="$n"; sleep 5
 done
 echo "   scanned: $last items"
+[ "$last" -ge "$SCAN_FLOOR" ] 2>/dev/null \
+  || fail "the fixture scan never reached $SCAN_FLOOR items (got $last) — jellyfin's scan stalled or the media mount is empty"
 M1=$(movie_id "$JF" "$TOK" "$UID_" "Movie 0001")
 M2=$(movie_id "$JF" "$TOK" "$UID_" "Movie 0002")
 post "$JF" "/UserPlayedItems/$M1?userId=$UID_" "$TOK" >/dev/null
@@ -127,6 +142,15 @@ PL=$(api "$HB" "/Items?userId=$HUID&recursive=true&includeItemTypes=Playlist&lim
 post "$HB" "/Playlists/$PL/Items?ids=$HM3&userId=$HUID" "$HTOK" >/dev/null
 pl_n=$(api "$HB" "/Playlists/$PL/Items?userId=$HUID" "$HTOK" | jq '.Items | length')
 [ "$pl_n" = 3 ] || fail "ferrofin playlist edit: expected 3 items, got $pl_n"
+# Creating a collection is what PROVISIONS the "Collections" library row, and
+# that row has to be the one Jellyfin would have made: same id (derived under
+# the database's configured mode), a real directory, parented to the user root.
+# Get the id wrong and Jellyfin does not recognise it, makes a SECOND
+# Collections library, and the swap back is no longer clean — checked in step 3.
+post "$HB" "/Collections?name=Ferrofin%20Collection&ids=$HM3,$HM4" "$HTOK" >/dev/null
+h_colls=$(api "$HB" "/Items?userId=$HUID&recursive=true&includeItemTypes=BoxSet&limit=10" "$HTOK" \
+  | jq -r '[.Items[].Name] | sort | join(",")')
+grep -q 'Ferrofin Collection' <<<"$h_colls" || fail "ferrofin collection not created (got: $h_colls)"
 pkill -f "ferrofin-server .*--port 18111"; sleep 2
 
 # ── 3. Jellyfin boots on the result and must see everything ────────────────
@@ -145,6 +169,14 @@ grep -q 'Movie 0004' <<<"$favs" || fail "ferrofin's favorite lost (favorites: $f
 VPL=$(api "$VB" "/Items?userId=$VUID&recursive=true&includeItemTypes=Playlist&limit=1" "$VTOK" | jq -r '.Items[0].Id')
 vpl_items=$(api "$VB" "/Playlists/$VPL/Items?userId=$VUID" "$VTOK" | jq -r '[.Items[].Name] | join(",")')
 grep -q 'Movie 0003' <<<"$vpl_items" || fail "ferrofin's playlist edit lost (items: $vpl_items)"
+v_colls=$(api "$VB" "/Items?userId=$VUID&recursive=true&includeItemTypes=BoxSet&limit=10" "$VTOK" \
+  | jq -r '[.Items[].Name] | sort | join(",")')
+grep -q 'Ferrofin Collection' <<<"$v_colls" || fail "the collection ferrofin created is gone (got: $v_colls)"
+grep -q 'RT Collection' <<<"$v_colls" || fail "jellyfin's own collection is gone (got: $v_colls)"
+# The point of the id derivation: exactly ONE Collections library, not one per
+# server that has run against this directory.
+v_lib_n=$(api "$VB" "/Library/VirtualFolders" "$VTOK" | jq '[.[] | select(.Name == "Collections")] | length')
+[ "$v_lib_n" -le 1 ] || fail "jellyfin sees $v_lib_n Collections libraries — ferrofin's container id is not the one it derives"
 docker logs rt-verify 2>&1 | grep -qiE '\[ERR\]|fatal' && fail "jellyfin logged errors on the adopted-then-mutated database"
 
 echo "ROUNDTRIP PASS: adopt -> serve -> mutate -> swap back, nothing lost"

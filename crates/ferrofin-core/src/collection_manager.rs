@@ -106,6 +106,31 @@ fn decide_access(
     Some(PlaylistAccess { level, open_access })
 }
 
+/// The id derivation this database uses, and the user-root row a provisioned
+/// container hangs off.
+///
+/// Both come from the database rather than a default: the derivation is
+/// whatever `FerrofinMeta.item_id_derivation` says (an adopted or fresh
+/// database is Jellyfin-parity, a pre-parity Ferrofin one is grandfathered),
+/// and using the wrong one gives the container an id Jellyfin will not
+/// recognise as its own.
+async fn container_identity(
+    db: &Database,
+    paths: &Arc<dyn ServerApplicationPaths>,
+) -> Result<(crate::item_type_lookup::IdDerivation, Option<Uuid>), ServiceError> {
+    let stored = db
+        .meta_get("item_id_derivation")
+        .await
+        .map_err(|e| ServiceError::Backend(e.to_string()))?;
+    let mode = crate::item_type_lookup::IdDerivation::from_meta(
+        stored.as_deref(),
+        Some(paths.program_data_path()),
+    );
+    let root =
+        crate::item_type_lookup::user_root_folder_id(&mode, &paths.default_user_views_path());
+    Ok((mode, root))
+}
+
 /// The "Collections" library a created box set belongs to, adopting any
 /// orphans a previous version left behind.
 async fn collections_folder(
@@ -113,11 +138,14 @@ async fn collections_folder(
     paths: &Arc<dyn ServerApplicationPaths>,
 ) -> Result<Option<Uuid>, ServiceError> {
     let path = format!("{}/collections", paths.data_path());
+    let (mode, root) = container_identity(db, paths).await?;
     let container = crate::item_persistence_service::ensure_container(
         db,
         BaseItemKind::CollectionFolder,
         "Collections",
         &path,
+        &mode,
+        root,
     )
     .await?;
     if let Some(id) = container {
@@ -138,11 +166,14 @@ async fn playlists_folder(
     // `…Playlists.PlaylistsFolder`. Asking for the other one would never find
     // Jellyfin's folder and would quietly create a second beside it.
     let path = format!("{}/playlists", paths.data_path());
+    let (mode, root) = container_identity(db, paths).await?;
     let container = crate::item_persistence_service::ensure_container(
         db,
         BaseItemKind::PlaylistsFolder,
         "Playlists",
         &path,
+        &mode,
+        root,
     )
     .await?;
     if let Some(id) = container {
@@ -794,6 +825,161 @@ mod tests {
     /// database carries a `PlaylistsFolder` — at the same path. If the two
     /// provisioners disagreed there would be two rows, and a playlist parented
     /// to the one the query scope does not accept simply vanishes.
+    /// A container provisioned before the user root existed is adopted by it
+    /// later, rather than staying parentless forever because the row is already
+    /// there.
+    #[tokio::test]
+    async fn a_parentless_container_is_attached_once_the_root_appears() {
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root_dir = tmp.path().to_string_lossy().into_owned();
+        let paths: Arc<dyn ferrofin_traits::system::ServerApplicationPaths> =
+            Arc::new(crate::app_paths::FerrofinServerApplicationPaths::new(
+                root_dir.clone(),
+                format!("{root_dir}/log"),
+                format!("{root_dir}/config"),
+                format!("{root_dir}/cache"),
+                format!("{root_dir}/web"),
+            ));
+        let mode = crate::item_type_lookup::IdDerivation::from_meta(
+            Some("jellyfin-10.11.8"),
+            Some(paths.program_data_path()),
+        );
+        let root =
+            crate::item_type_lookup::user_root_folder_id(&mode, &paths.default_user_views_path())
+                .expect("root id");
+        let path = format!("{}/collections", paths.data_path());
+
+        // First provision: the root does not exist yet, so the row is created
+        // without a parent rather than failing the foreign key.
+        let id = crate::item_persistence_service::ensure_container(
+            &db,
+            BaseItemKind::CollectionFolder,
+            "Collections",
+            &path,
+            &mode,
+            Some(root),
+        )
+        .await
+        .expect("provision")
+        .expect("an id");
+        assert!(
+            crate::test_support::fetch_item(&db, id)
+                .await
+                .parent_id
+                .is_none(),
+            "nothing to parent to yet"
+        );
+
+        // The root appears, and the next provision adopts the existing row.
+        crate::test_support::seed_named_item(
+            &db,
+            root,
+            BaseItemKind::UserRootFolder,
+            "Media Folders",
+        )
+        .await;
+        let again = crate::item_persistence_service::ensure_container(
+            &db,
+            BaseItemKind::CollectionFolder,
+            "Collections",
+            &path,
+            &mode,
+            Some(root),
+        )
+        .await
+        .expect("provision")
+        .expect("an id");
+        assert_eq!(again, id, "the same row, not a second one");
+        assert_eq!(
+            crate::test_support::fetch_item(&db, id).await.parent_id,
+            Some(ferrofin_db::store::guid_to_db(root)),
+            "…now attached to the root"
+        );
+    }
+
+    /// The provisioned container carries the id JELLYFIN would compute for that
+    /// directory, its directory exists, and it hangs off the user root.
+    ///
+    /// The id is the one that matters for drop-in: `ensure_container` used to
+    /// derive it with `IdDerivation::LegacyLowercase` whatever the database
+    /// said, so on an adopted (Jellyfin-parity) database Jellyfin would look for
+    /// its own id, miss, and create a SECOND Collections library beside ours —
+    /// with the round-trip guarantee going with it.
+    #[tokio::test]
+    async fn a_provisioned_container_is_shaped_the_way_jellyfin_expects() {
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root_dir = tmp.path().to_string_lossy().into_owned();
+        let paths: Arc<dyn ferrofin_traits::system::ServerApplicationPaths> =
+            Arc::new(crate::app_paths::FerrofinServerApplicationPaths::new(
+                root_dir.clone(),
+                format!("{root_dir}/log"),
+                format!("{root_dir}/config"),
+                format!("{root_dir}/cache"),
+                format!("{root_dir}/web"),
+            ));
+
+        // A parity database, as a fresh or adopted one is.
+        db.meta_set("item_id_derivation", "jellyfin-10.11.8")
+            .await
+            .expect("mode");
+        // The user root has to exist for the container to be parented to it.
+        let mode = crate::item_type_lookup::IdDerivation::from_meta(
+            Some("jellyfin-10.11.8"),
+            Some(paths.program_data_path()),
+        );
+        let root =
+            crate::item_type_lookup::user_root_folder_id(&mode, &paths.default_user_views_path())
+                .expect("root id");
+        crate::test_support::seed_named_item(
+            &db,
+            root,
+            BaseItemKind::UserRootFolder,
+            "Media Folders",
+        )
+        .await;
+
+        let path = format!("{}/collections", paths.data_path());
+        let id = crate::item_persistence_service::ensure_container(
+            &db,
+            BaseItemKind::CollectionFolder,
+            "Collections",
+            &path,
+            &mode,
+            Some(root),
+        )
+        .await
+        .expect("provision")
+        .expect("an id");
+
+        // The id Jellyfin derives for that directory, under the same rule.
+        let expected = crate::item_type_lookup::derive_item_id_with(
+            &mode,
+            BaseItemKind::CollectionFolder,
+            &path,
+        )
+        .expect("expected id");
+        assert_eq!(id, expected, "the container carries Jellyfin's id");
+        assert_ne!(
+            id,
+            crate::item_type_lookup::derive_item_id(BaseItemKind::CollectionFolder, &path)
+                .expect("legacy id"),
+            "…which is NOT the legacy-lowercase one, or this test proves nothing"
+        );
+
+        assert!(
+            tokio::fs::metadata(&path).await.is_ok(),
+            "the directory the row describes exists"
+        );
+        let row = crate::test_support::fetch_item(&db, id).await;
+        assert_eq!(
+            row.parent_id.as_deref(),
+            Some(ferrofin_db::store::guid_to_db(root).as_str()),
+            "and it hangs off the user root"
+        );
+    }
+
     #[tokio::test]
     async fn a_created_playlist_reuses_the_existing_playlists_folder() {
         let db = test_db().await;

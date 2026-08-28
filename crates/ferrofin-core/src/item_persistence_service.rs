@@ -177,6 +177,8 @@ pub(crate) async fn ensure_container(
     kind: BaseItemKind,
     name: &str,
     path: &str,
+    mode: &crate::item_type_lookup::IdDerivation,
+    parent: Option<Uuid>,
 ) -> Result<Option<Uuid>, ServiceError> {
     let leaf = path.rsplit(['/', '\\']).next().unwrap_or(path);
     let jellyfin_form = format!("{JELLYFIN_DATA_PATH_TOKEN}/{leaf}");
@@ -189,19 +191,78 @@ pub(crate) async fn ensure_container(
     .await
     .map_err(db_err)?;
     if let Some(id) = existing {
-        return Uuid::parse_str(&id).map(Some).map_err(|e| {
+        let id = Uuid::parse_str(&id).map_err(|e| {
             ServiceError::backend(format!("container row {id} has an unusable id: {e}"))
-        });
+        })?;
+        // Adopt a row that was created before the user root existed — the
+        // parent is set on the first provision that CAN set it, rather than
+        // staying null forever because the row is already there.
+        if let Some(root) = parent {
+            attach_to_root(db, id, root).await?;
+        }
+        return Ok(Some(id));
     }
 
     // Derived from the path, like every other folder id on both sides, so the
-    // same directory yields the same id wherever it is scanned.
-    let Some(id) = crate::item_type_lookup::derive_item_id(kind, path) else {
+    // same directory yields the same id wherever it is scanned — under the
+    // database's CONFIGURED derivation, not a hardcoded one. Getting that wrong
+    // is not cosmetic: Jellyfin computes its own id for
+    // `%AppDataPath%/collections`, and if ours differs it does not recognise
+    // the row, creates a SECOND Collections library beside it, and the two-way
+    // swap this project rests on stops being clean.
+    let Some(id) = crate::item_type_lookup::derive_item_id_with(mode, kind, path) else {
         return Ok(None);
     };
-    insert_named_item(db, id, kind, name, true, None).await?;
+    // Jellyfin's row describes a directory that exists; the scanner and the
+    // library-structure endpoints both expect to find it.
+    if let Err(e) = tokio::fs::create_dir_all(path).await {
+        tracing::warn!(path, %e, "could not create the container directory");
+    }
+    // …and it hangs off the user root, which is what puts it in
+    // `GetUserRootFolder().Children`.
+    //
+    // Only if that row is actually there: `BaseItems.ParentId` is a foreign key
+    // to `BaseItems.Id`, and the root is provisioned lazily too, so a container
+    // created before it would fail the insert outright. Going without the parent
+    // is recoverable — `attach_to_root` above sets it on the first provision
+    // that finds the root in place — where a failed creation is not.
+    let parent = match parent {
+        Some(p) if row_exists(db, p).await? => Some(p),
+        _ => None,
+    };
+    insert_named_item(db, id, kind, name, true, parent).await?;
     set_container_path(db, id, path).await?;
     Ok(Some(id))
+}
+
+/// Parents a container to the user root, if it has no parent yet and the root
+/// row exists.
+///
+/// Both guards matter: a row that already has a parent is not ours to move, and
+/// `BaseItems.ParentId` is a foreign key, so pointing at a root that has not
+/// been provisioned yet would fail the statement.
+async fn attach_to_root(db: &Database, id: Uuid, root: Uuid) -> Result<(), ServiceError> {
+    if !row_exists(db, root).await? {
+        return Ok(());
+    }
+    sqlx::query(r#"UPDATE "BaseItems" SET "ParentId" = ?2 WHERE "Id" = ?1 AND "ParentId" IS NULL"#)
+        .bind(guid_to_db(id))
+        .bind(guid_to_db(root))
+        .execute(db.writer())
+        .await
+        .map_err(db_err)?;
+    Ok(())
+}
+
+/// Whether a `BaseItems` row with this id exists.
+async fn row_exists(db: &Database, id: Uuid) -> Result<bool, ServiceError> {
+    let found: Option<String> =
+        sqlx::query_scalar(r#"SELECT "Id" FROM "BaseItems" WHERE "Id" = ?1"#)
+            .bind(guid_to_db(id))
+            .fetch_optional(db.pool())
+            .await
+            .map_err(db_err)?;
+    Ok(found.is_some())
 }
 
 /// The literal Jellyfin writes into `BaseItems.Path` in place of the data
