@@ -37,12 +37,16 @@ pub async fn ip_access_layer(
     request: Request,
     next: Next,
 ) -> Response {
-    let ip = request
+    let peer = request
         .extensions()
         .get::<ConnectInfo<std::net::SocketAddr>>()
         .map_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), |ci| {
-            normalize(ci.0.ip())
+            crate::state::normalize_ip(ci.0.ip())
         });
+    // Behind a reverse proxy the peer is the PROXY, so filtering it would
+    // filter the wrong host — and let every real client through. The forwarded
+    // chain is consulted only when the peer is a configured `KnownProxy`.
+    let ip = state.client_address_for(peer, &crate::state::forwarded_for(request.headers()));
     if ip.is_loopback() {
         return next.run(request).await;
     }
@@ -62,29 +66,19 @@ pub async fn ip_access_layer(
         .unwrap_or_default()
 }
 
-/// C# `GetNormalizedRemoteIP`: an IPv4-mapped IPv6 peer is compared as the IPv4
-/// address it actually is, so `::ffff:192.168.1.5` matches a `192.168.1.0/24`
-/// rule.
-fn normalize(ip: std::net::IpAddr) -> std::net::IpAddr {
-    match ip {
-        std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, std::net::IpAddr::V4),
-        std::net::IpAddr::V4(_) => ip,
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::normalize;
+    use crate::state::normalize_ip;
 
     #[test]
     fn an_ipv4_mapped_peer_is_compared_as_ipv4() {
         let mapped: std::net::IpAddr = "::ffff:192.168.1.5".parse().expect("valid");
-        assert_eq!(normalize(mapped).to_string(), "192.168.1.5");
+        assert_eq!(normalize_ip(mapped).to_string(), "192.168.1.5");
     }
 
     #[test]
     fn a_real_ipv6_peer_is_left_alone() {
         let v6: std::net::IpAddr = "2001:db8::1".parse().expect("valid");
-        assert_eq!(normalize(v6), v6);
+        assert_eq!(normalize_ip(v6), v6);
     }
 }

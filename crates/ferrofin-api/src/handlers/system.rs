@@ -246,12 +246,15 @@ async fn get_endpoint_info(
     // The peer socket address is inserted as a request extension by the server's
     // `with_connect_info`; it survives the outer routing middleware. Absent (a
     // proxied request or a test) → the conservative non-local answer.
-    let ip = parts
+    let peer = parts
         .extensions
         .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
         .map(|ci| ci.0.ip());
-    let is_local = ip.is_some_and(|ip| ip.is_loopback());
-    let is_in_network = ip.is_some_and(|ip| state.is_in_local_network(ip));
+    // `IsLocal` stays the transport peer — it answers "is the caller on this
+    // machine", and a proxied request is not, whatever it forwards. `IsInNetwork`
+    // is about the client, so it resolves the chain.
+    let is_local = peer.is_some_and(|ip| ip.is_loopback());
+    let is_in_network = peer.is_some() && state.is_in_local_network(state.client_address(&parts));
     Json(EndPointInfo {
         is_local,
         is_in_network,

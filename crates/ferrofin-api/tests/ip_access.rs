@@ -25,10 +25,16 @@ fn state_with_network(config: NetworkConfiguration) -> AppState {
 /// `GET /System/Info/Public` from `peer` — an unauthenticated route, so what
 /// the status reports is the IP gate and nothing else.
 async fn public_info_from(app: AppState, peer: &str) -> StatusCode {
-    let mut request = Request::builder()
-        .uri("/System/Info/Public")
-        .body(Body::empty())
-        .expect("request");
+    public_info_forwarded(app, peer, None).await
+}
+
+/// [`public_info_from`] with an `X-Forwarded-For` header.
+async fn public_info_forwarded(app: AppState, peer: &str, xff: Option<&str>) -> StatusCode {
+    let mut builder = Request::builder().uri("/System/Info/Public");
+    if let Some(xff) = xff {
+        builder = builder.header("X-Forwarded-For", xff);
+    }
+    let mut request = builder.body(Body::empty()).expect("request");
     request.extensions_mut().insert(axum::extract::ConnectInfo(
         peer.parse::<std::net::SocketAddr>().expect("peer address"),
     ));
@@ -145,5 +151,136 @@ async fn no_configured_policy_filters_nothing() {
     assert_eq!(
         public_info_from(authed_fake_state(), "203.0.113.9:5000").await,
         StatusCode::OK
+    );
+}
+
+/// Behind a reverse proxy the peer is the proxy, so the filter has to read the
+/// forwarded chain — otherwise the rules an operator writes apply to their own
+/// ingress and to nobody else.
+#[tokio::test]
+async fn a_known_proxy_s_forwarded_client_is_what_gets_filtered() {
+    let config = NetworkConfiguration {
+        known_proxies: vec!["10.0.0.0/8".to_owned()],
+        remote_ip_filter: vec!["198.51.100.0/24".to_owned()],
+        is_remote_ip_filter_blacklist: true,
+        ..NetworkConfiguration::default()
+    };
+    assert_eq!(
+        public_info_forwarded(
+            state_with_network(config.clone()),
+            "10.4.0.9:5000",
+            Some("198.51.100.4")
+        )
+        .await,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "the blocklisted CLIENT is refused, though the peer is the proxy"
+    );
+    assert_eq!(
+        public_info_forwarded(
+            state_with_network(config),
+            "10.4.0.9:5000",
+            Some("203.0.113.7")
+        )
+        .await,
+        StatusCode::OK,
+        "and an unlisted client still gets through the same proxy"
+    );
+}
+
+/// The header is trusted ONLY from a configured proxy. Any client can send one,
+/// so honouring it from an arbitrary peer would let anyone walk straight through
+/// the filter by naming an address the operator allows.
+#[tokio::test]
+async fn a_forwarded_header_from_a_stranger_is_ignored() {
+    let config = NetworkConfiguration {
+        known_proxies: vec!["10.0.0.0/8".to_owned()],
+        remote_ip_filter: vec!["198.51.100.0/24".to_owned()],
+        is_remote_ip_filter_blacklist: true,
+        ..NetworkConfiguration::default()
+    };
+    assert_eq!(
+        public_info_forwarded(
+            state_with_network(config),
+            // The blocklisted host itself, claiming to be someone else.
+            "198.51.100.4:5000",
+            Some("203.0.113.7")
+        )
+        .await,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a peer that is not a known proxy cannot forge its own address"
+    );
+}
+
+/// …and a client that prepends entries of its own cannot push its real address
+/// out of view: the walk stops at the first hop that is not a known proxy.
+#[tokio::test]
+async fn a_forged_chain_stops_at_the_first_unknown_hop() {
+    let config = NetworkConfiguration {
+        known_proxies: vec!["10.0.0.0/8".to_owned()],
+        remote_ip_filter: vec!["198.51.100.0/24".to_owned()],
+        is_remote_ip_filter_blacklist: true,
+        ..NetworkConfiguration::default()
+    };
+    assert_eq!(
+        public_info_forwarded(
+            state_with_network(config),
+            "10.4.0.9:5000",
+            // The blocklisted client claimed a friendly address ahead of itself.
+            Some("203.0.113.7, 198.51.100.4")
+        )
+        .await,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "the rightmost entry is the one the known proxy vouched for"
+    );
+}
+
+/// With no `KnownProxies` configured the header is ignored entirely — upstream
+/// sets `ForwardedHeaders.None`, which is the only safe default.
+#[tokio::test]
+async fn without_known_proxies_the_header_is_ignored() {
+    let config = NetworkConfiguration {
+        remote_ip_filter: vec!["198.51.100.0/24".to_owned()],
+        is_remote_ip_filter_blacklist: true,
+        ..NetworkConfiguration::default()
+    };
+    assert_eq!(
+        public_info_forwarded(
+            state_with_network(config.clone()),
+            "203.0.113.9:5000",
+            Some("198.51.100.4")
+        )
+        .await,
+        StatusCode::OK,
+        "a blocklisted address in an untrusted header changes nothing"
+    );
+    assert_eq!(
+        public_info_forwarded(
+            state_with_network(config),
+            "198.51.100.4:5000",
+            Some("203.0.113.7")
+        )
+        .await,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "…and cannot excuse a blocklisted peer either"
+    );
+}
+
+/// Real proxies write ports and brackets; both spellings are read.
+#[tokio::test]
+async fn a_forwarded_entry_may_carry_a_port() {
+    let config = NetworkConfiguration {
+        known_proxies: vec!["10.0.0.0/8".to_owned()],
+        remote_ip_filter: vec!["198.51.100.0/24".to_owned()],
+        is_remote_ip_filter_blacklist: true,
+        ..NetworkConfiguration::default()
+    };
+    assert_eq!(
+        public_info_forwarded(
+            state_with_network(config),
+            "10.4.0.9:5000",
+            Some("198.51.100.4:41234")
+        )
+        .await,
+        StatusCode::SERVICE_UNAVAILABLE
     );
 }

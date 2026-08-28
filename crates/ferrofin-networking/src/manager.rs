@@ -75,6 +75,7 @@ pub struct NetworkManager {
     startup_config: StartupConfig,
     published_server_urls: Vec<PublishedServerUriOverride>,
     remote_address_filter: Vec<IpNetwork>,
+    known_proxies: Vec<IpNetwork>,
     interfaces: Vec<IpData>,
     lan_subnets: Vec<IpNetwork>,
     excluded_subnets: Vec<IpNetwork>,
@@ -104,6 +105,7 @@ impl NetworkManager {
             startup_config,
             published_server_urls: Vec::new(),
             remote_address_filter: Vec::new(),
+            known_proxies: Vec::new(),
             interfaces: Vec::new(),
             lan_subnets: Vec::new(),
             excluded_subnets: Vec::new(),
@@ -193,6 +195,7 @@ impl NetworkManager {
             self.interfaces = interfaces;
         }
 
+        self.initialize_known_proxies(config);
         self.enforce_bind_settings(config);
         self.initialize_overrides(config);
     }
@@ -324,6 +327,75 @@ impl NetworkManager {
 
         // Only return one IP per address for binding; let the OS handle the rest.
         distinct_by_address(interfaces)
+    }
+
+    /// Parses `KnownProxies` into the networks a forwarded header may be
+    /// trusted from — C# `AddProxyAddresses`, which turns a bare address into a
+    /// single-host subnet (`/32`, `/128`) and takes a CIDR as written.
+    fn initialize_known_proxies(&mut self, config: &NetworkConfiguration) {
+        let mut parsed: Vec<IpNetwork> = Vec::new();
+        let cidrs: Vec<String> = config
+            .known_proxies
+            .iter()
+            .filter(|x| x.contains('/'))
+            .cloned()
+            .collect();
+        if let Some(subnets) = net_utils::try_parse_to_subnets(&cidrs, false, None) {
+            parsed.extend(subnets.iter().map(|x| x.subnet));
+        }
+        for proxy in config.known_proxies.iter().filter(|x| !x.contains('/')) {
+            if let Ok(ip) = proxy.trim().parse::<IpAddr>() {
+                let prefix = match ip {
+                    IpAddr::V4(_) => net_constants::MINIMUM_IPV4_PREFIX_SIZE,
+                    IpAddr::V6(_) => net_constants::MINIMUM_IPV6_PREFIX_SIZE,
+                };
+                parsed.push(IpNetwork::new(ip, prefix));
+            }
+        }
+        self.known_proxies = parsed;
+    }
+
+    /// Whether `address` is one of the configured `KnownProxies`.
+    #[must_use]
+    pub fn is_known_proxy(&self, address: IpAddr) -> bool {
+        let address = match address {
+            IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(address, IpAddr::V4),
+            IpAddr::V4(_) => address,
+        };
+        self.known_proxies
+            .iter()
+            .any(|network| net_utils::subnet_contains_address(*network, address))
+    }
+
+    /// The address of the client that actually made the request, given the
+    /// transport `peer` and the `X-Forwarded-For` chain (left to right, as
+    /// sent).
+    ///
+    /// Port of what ASP.NET's `ForwardedHeadersMiddleware` does with the options
+    /// C# `ConfigureForwardHeaders` builds:
+    ///
+    /// - with NO `KnownProxies` configured the header is ignored completely
+    ///   (`ForwardedHeaders.None`) — which is the only safe default, since any
+    ///   client can send one;
+    /// - otherwise the chain is walked from the RIGHT, and a hop is taken only
+    ///   while the address currently being trusted is a known proxy. The walk
+    ///   stops at the first address that is not, so a client cannot forge its
+    ///   way past the proxy by prepending entries of its own.
+    ///
+    /// `ForwardLimit` is null upstream once any proxy is configured, so the
+    /// whole chain is walkable.
+    #[must_use]
+    pub fn client_address(&self, peer: IpAddr, forwarded_for: &[IpAddr]) -> IpAddr {
+        if self.known_proxies.is_empty() {
+            return peer;
+        }
+        let mut current = peer;
+        let mut remaining = forwarded_for.len();
+        while remaining > 0 && self.is_known_proxy(current) {
+            remaining -= 1;
+            current = forwarded_for[remaining];
+        }
+        current
     }
 
     /// Initializes the remote address filter (`InitializeRemote`).

@@ -222,10 +222,20 @@ impl FromRequestParts<AppState> for RequireLocalAccessOrAdmin {
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
         // Read the peer before `RequireAuth` borrows `parts` mutably.
+        // The CLIENT's address, not the transport peer: behind a proxy the peer
+        // is always the proxy, which is private, so every caller would read as
+        // local and this gate would degrade to "any authenticated account".
+        //
+        // The `is_some` is load-bearing and stays: `client_address` defaults a
+        // MISSING peer to loopback (C# `GetNormalizedRemoteIP` does), and
+        // "there was no connection to ask" must keep reading as remote here —
+        // the deliberate divergence documented on this extractor, and the only
+        // one of the two directions that is safe to be wrong in.
         let local = parts
             .extensions
             .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-            .is_some_and(|ci| state.is_in_local_network(ci.0.ip()));
+            .is_some()
+            && state.is_in_local_network(state.client_address(parts));
         if local {
             let RequireAuth(info) = RequireAuth::from_request_parts(parts, state).await?;
             return Ok(Self(info));
