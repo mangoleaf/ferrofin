@@ -116,26 +116,16 @@ async fn get_user_views(
     // `with_all_fields(false)` served views with NO fields — strict-SDK clients
     // (Android TV et al.) assume Jellyfin's always-present view fields exist.
     let options = DtoOptions::with_all_fields(true);
-    let mut dtos = state
+    // `CollectionType` needs no backfill here: the DTO service sets it for every
+    // `IHasCollectionType` row off the row's own stored type, on every endpoint,
+    // as `DtoService.AttachBasicFields` does (DtoService.cs:1061-1064). This
+    // handler used to patch it in after the fact, which left
+    // `/Library/MediaFolders`, `/Items` and `/Items/{id}/Ancestors` serving a
+    // null type for the same folders.
+    let dtos = state
         .dto
         .get_base_item_dtos(&folders, &options, Some(&user), None, true)
         .await?;
-
-    // The per-library collection type is not stored on the `CollectionFolder`
-    // rows, so the DTO projection leaves `CollectionType` unset. jellyfin-web
-    // keys a library's presentation off this field — a `tvshows` library with no
-    // type renders as a plain folder and its series never surface as shows.
-    // Backfill it from the virtual-folder options (matched by item id), which
-    // already carry the collection type (as `/Library/VirtualFolders` returns).
-    if let Ok(by_id) = collection_types_by_id(&state).await {
-        for dto in &mut dtos {
-            if dto.collection_type.is_none()
-                && let Some(Some(ct)) = by_id.get(&dto.id)
-            {
-                dto.collection_type = Some(*ct);
-            }
-        }
-    }
 
     Ok(Json(QueryResult::from_items(dtos)))
 }

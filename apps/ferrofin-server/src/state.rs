@@ -671,22 +671,28 @@ pub async fn build_app_state(
     // the filesystem scanner the library manager runs on `queue_library_scan`.
     // Kept concrete so the library monitor can take it as its `WatchRootsSource`
     // (the roots of every library with realtime monitoring enabled).
+    // The playlists media folder lives at `{data}/playlists` (C#
+    // `ManualPlaylistsFolder`); the user-view seam provisions it lazily. Both
+    // seams need the path: the user-view manager creates the folder, and the
+    // virtual-folder manager reports it among the root's physical locations
+    // (`LibraryManager.CreateRootFolder` adds it as a virtual child of the
+    // root, so `GET /Library/PhysicalPaths` lists it).
+    let playlists_path = std::path::PathBuf::from(paths.data_path()).join("playlists");
     let virtual_folders_impl = Arc::new(
         ferrofin_core::FerrofinVirtualFolderManager::new(paths.default_user_views_path())
             .with_item_store(Arc::clone(&item_persistence_service))
-            .with_id_derivation(id_derivation.clone()),
+            .with_id_derivation(id_derivation.clone())
+            .with_playlists_path(playlists_path.clone()),
     );
     let virtual_folders: Arc<dyn ferrofin_traits::library::VirtualFolderManager> =
         virtual_folders_impl.clone();
-    // The playlists media folder lives at `{data}/playlists` (C#
-    // `ManualPlaylistsFolder`); the user-view seam provisions it lazily. The
-    // virtual-folder manager gives `/Items/Latest` each library's collection
-    // type (C# `CollectionFolder.CollectionType`), which is why this is built
-    // after it.
-    let playlists_path = std::path::PathBuf::from(paths.data_path()).join("playlists");
+    // The virtual-folder manager gives `/Items/Latest` each library's collection
+    // type (C# `CollectionFolder.CollectionType`), which is why the user-view
+    // manager is built after it.
     let user_views: Arc<dyn ferrofin_traits::library::UserViewManager> = Arc::new(
         FerrofinUserViewManager::new(Arc::clone(&item_repository))
             .with_playlists_store(Arc::clone(&item_persistence_service), playlists_path)
+            .with_metadata_path(paths.internal_metadata_path())
             .with_id_derivation(id_derivation.clone())
             .with_virtual_folders(Arc::clone(&virtual_folders))
             .with_database(db.clone()),

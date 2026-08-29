@@ -143,9 +143,13 @@ pub fn default_server_configuration() -> ServerConfiguration {
         inactive_session_threshold: 0,
         library_monitor_delay: 60,
         library_update_duration: 30,
-        // C# leaves CacheSize null on a fresh instance (computed lazily), which
-        // serializes to 0 on the wire; match that fresh-instance value.
-        cache_size: 0,
+        // `ServerConfiguration.CacheSize` (ServerConfiguration.cs:183) is an
+        // eager, non-nullable `Environment.ProcessorCount * 100` — 400 in a
+        // four-core container, never 0. `usable_cores` is the cgroup-aware
+        // ProcessorCount (a bare `available_parallelism` would report the HOST's
+        // cores inside a cpu-limited container).
+        cache_size: i32::try_from(ferrofin_db::database::usable_cores().saturating_mul(100))
+            .unwrap_or(i32::MAX),
         image_saving_convention: ferrofin_model::configuration::ImageSavingConvention::default(),
         metadata_options: default_metadata_options(),
         skip_deserialization_for_basic_types: true,
@@ -329,7 +333,7 @@ impl FerrofinServerConfigurationManager {
         // the same settings as XML next to where the JSON goes; import them
         // once, here, and never look at the XML again.
         let adopting = !config_file.exists();
-        let configuration = if adopting {
+        let mut configuration = if adopting {
             let default = adopt_xml(
                 &config_dir.join("system.xml"),
                 default_server_configuration(),
@@ -359,6 +363,21 @@ impl FerrofinServerConfigurationManager {
             repair_lost_startup_flag(&config_dir, &config_file, &mut config).await;
             config
         };
+
+        // `ApplicationHost.FindParts` (ApplicationHost.cs:720-726) sets
+        // `IsPortAuthorized = true` and saves it on EVERY startup; only a change
+        // of the HTTP/HTTPS port clears it again (`OnConfigurationUpdated`,
+        // ApplicationHost.cs:810-818). It is startup state, not first-run setup
+        // state, so a fresh install reports it true from its first request.
+        if !configuration.is_port_authorized {
+            configuration.is_port_authorized = true;
+            // Non-fatal, like the startup-flag repair above: a server that boots
+            // fine must not be refused a start over a config write, and the next
+            // boot simply writes it again.
+            if let Err(e) = write_config(&config_file, &configuration).await {
+                tracing::warn!(error = %e, "could not persist the port-authorized flag");
+            }
+        }
 
         paths.set_internal_metadata_path(Some(configuration.metadata_path.as_str()));
 
@@ -714,11 +733,36 @@ mod tests {
 
         // Legacy authorization is enabled by default.
         assert!(cfg.enable_legacy_authorization);
-        // Cache size is the fresh-instance wire value (0).
-        assert_eq!(cfg.cache_size, 0);
-        // Fresh-instance runtime state is left untouched.
+        // `CacheSize = Environment.ProcessorCount * 100` (ServerConfiguration.cs:183).
+        assert_eq!(
+            cfg.cache_size,
+            i32::try_from(ferrofin_db::database::usable_cores().saturating_mul(100))
+                .unwrap_or(i32::MAX)
+        );
+        assert!(cfg.cache_size >= 100);
+        // The bare document's runtime state — `load` is what turns
+        // `IsPortAuthorized` on (see `load_authorizes_the_port_and_persists_it`).
         assert!(!cfg.is_startup_wizard_completed);
         assert!(!cfg.is_port_authorized);
+    }
+
+    /// `ApplicationHost.FindParts` (ApplicationHost.cs:720-726) sets
+    /// `IsPortAuthorized` on every startup and saves; a fresh Jellyfin therefore
+    /// reports it `true`, and so must a fresh Ferrofin.
+    #[tokio::test]
+    async fn load_authorizes_the_port_and_persists_it() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = test_paths(tmp.path());
+
+        let mgr = FerrofinServerConfigurationManager::load(Arc::clone(&paths))
+            .await
+            .expect("load");
+        assert!(mgr.snapshot().is_port_authorized);
+
+        // Persisted, not just in memory: reading the file back sees it.
+        let bytes = std::fs::read(&mgr.config_file).expect("read config");
+        let persisted: ServerConfiguration = serde_json::from_slice(&bytes).expect("parse config");
+        assert!(persisted.is_port_authorized);
     }
 
     #[tokio::test]
@@ -1128,7 +1172,11 @@ mod tests {
         let mgr = FerrofinServerConfigurationManager::load(test_paths(tmp.path()))
             .await
             .expect("load");
-        assert_eq!(mgr.snapshot(), default_server_configuration());
+        // `load` authorizes the port on every startup (ApplicationHost.cs:720-726);
+        // everything else is the untouched default document.
+        let mut expected = default_server_configuration();
+        expected.is_port_authorized = true;
+        assert_eq!(mgr.snapshot(), expected);
     }
 
     #[tokio::test]

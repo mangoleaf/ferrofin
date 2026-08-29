@@ -485,6 +485,16 @@ impl SessionManager for NoopSessions {
 
 /// Assembles an [`AppState`] from the batch-6 fakes plus panic fakes elsewhere.
 fn state(users: Arc<MemUsers>, config: Arc<MemConfig>) -> AppState {
+    state_with_auth(users, config, Arc::new(AdminAuth))
+}
+
+/// `state`, with the auth service chosen by the caller — the anonymous case
+/// needs one that REJECTS, since `AdminAuth` authenticates every request.
+fn state_with_auth(
+    users: Arc<MemUsers>,
+    config: Arc<MemConfig>,
+    auth: Arc<dyn ferrofin_traits::net::AuthService>,
+) -> AppState {
     AppState::new(
         Arc::new(FakeLibrary),
         users,
@@ -501,7 +511,7 @@ fn state(users: Arc<MemUsers>, config: Arc<MemConfig>) -> AppState {
         Arc::new(FakeSearch),
         Arc::new(FakeDto),
         Arc::new(FakeAuthContext),
-        Arc::new(AdminAuth),
+        auth,
         Arc::new(OkQuickConnect),
         Arc::new(ferrofin_api::test_support::FakePlaylists),
         Arc::new(ferrofin_api::test_support::FakeCollections),
@@ -577,6 +587,47 @@ async fn startup_configuration_round_trip_and_complete() {
         .unwrap();
     assert_eq!(complete.status(), StatusCode::NO_CONTENT);
     assert!(config.config.lock().unwrap().is_startup_wizard_completed);
+}
+
+/// C# gates the whole `StartupController` with
+/// `[Authorize(Policy = Policies.FirstTimeSetupOrElevated)]`
+/// (StartupController.cs:18): anonymous while the wizard is incomplete,
+/// administrator-only once it is complete. Ungated, an anonymous caller could
+/// rename the first administrator and set its password on a configured server.
+#[tokio::test]
+async fn startup_endpoints_close_once_the_wizard_is_complete() {
+    let router = create_router(state_with_auth(
+        Arc::new(MemUsers::default()),
+        Arc::new(MemConfig::new(true)),
+        // No credentials on the request — the anonymous case the policy closes.
+        Arc::new(ferrofin_api::test_support::FakeAuthService),
+    ));
+
+    for (method, uri) in [
+        ("GET", "/Startup/Configuration"),
+        ("GET", "/Startup/User"),
+        ("GET", "/Startup/FirstUser"),
+        ("POST", "/Startup/Complete"),
+        ("POST", "/Startup/RemoteAccess"),
+    ] {
+        let res = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::UNAUTHORIZED,
+            "{method} {uri} must not be anonymous once setup is complete"
+        );
+    }
 }
 
 #[tokio::test]

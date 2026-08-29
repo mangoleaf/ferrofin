@@ -63,9 +63,40 @@ pub(crate) fn is_live_tv_view_path(path: &str) -> bool {
     path.replace('\\', "/").ends_with(LIVE_TV_VIEW_PATH_SUFFIX)
 }
 
+/// Whether this row is the Live TV `UserView` — a `UserView` whose `Path` is
+/// `{InternalMetadataPath}/views/livetv`. The Live TV view is the one view that
+/// is not a child of the user root, so the media-folder list has to drop it.
+fn is_live_tv_view_row(row: &BaseItemEntity) -> bool {
+    Some(row.type_.as_str()) == item_type_lookup::stored_type_name(BaseItemKind::UserView)
+        && row.path.as_deref().is_some_and(is_live_tv_view_path)
+}
+
+/// The Live TV `UserView`'s deterministic id under `mode` — free-standing so it
+/// can be asserted without a database (see [`FerrofinUserViewManager::live_tv_view_id`]).
+fn live_tv_view_id_with(
+    mode: &item_type_lookup::IdDerivation,
+    view_path: &std::path::Path,
+) -> Option<Uuid> {
+    item_type_lookup::derive_item_id_with(
+        mode,
+        BaseItemKind::UserView,
+        &format!(
+            "{}_namedview_{LIVE_TV_VIEW_NAME}",
+            view_path.to_string_lossy()
+        ),
+    )
+}
+
+/// The display name of the auto-provisioned Live TV view — C#
+/// `_localization.GetLocalizedString("HeaderLiveTV")` (LiveTvManager.cs:1263),
+/// which is "Live TV" in the `en-US` default culture Ferrofin ships. It is part
+/// of the view's id key (`… + "_namedview_" + name`), so changing it changes the
+/// id.
+const LIVE_TV_VIEW_NAME: &str = "Live TV";
+
 /// The display name of the auto-provisioned playlists media folder
 /// (C# `ManualPlaylistsFolder.Name`).
-const PLAYLISTS_FOLDER_NAME: &str = "Playlists";
+pub(crate) const PLAYLISTS_FOLDER_NAME: &str = "Playlists";
 
 /// The concrete user-view manager.
 #[derive(Clone)]
@@ -94,6 +125,10 @@ pub struct FerrofinUserViewManager {
     /// [`user_entity_ext::live_tv_enabled_for`]). `None` in unit tests: the
     /// Live TV view is then listed unconditionally, as it was before.
     db: Option<Database>,
+    /// `{InternalMetadataPath}`, under which the Live TV `UserView` row lives at
+    /// `views/livetv`. Set by the composition root; `None` in unit tests keeps
+    /// the manager from provisioning the view.
+    metadata_path: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for FerrofinUserViewManager {
@@ -102,6 +137,7 @@ impl std::fmt::Debug for FerrofinUserViewManager {
             .field("has_item_store", &self.persistence.is_some())
             .field("playlists_path", &self.playlists_path)
             .field("has_virtual_folders", &self.virtual_folders.is_some())
+            .field("metadata_path", &self.metadata_path)
             .finish_non_exhaustive()
     }
 }
@@ -117,7 +153,16 @@ impl FerrofinUserViewManager {
             id_derivation: item_type_lookup::IdDerivation::LegacyLowercase,
             virtual_folders: None,
             db: None,
+            metadata_path: None,
         }
+    }
+
+    /// Attaches `{InternalMetadataPath}` so the Live TV `UserView` row can be
+    /// provisioned at `views/livetv`. Called once by the composition root.
+    #[must_use]
+    pub fn with_metadata_path(mut self, metadata_path: impl Into<PathBuf>) -> Self {
+        self.metadata_path = Some(metadata_path.into());
+        self
     }
 
     /// Attaches the database so the Live TV view can be gated on Live TV
@@ -249,11 +294,93 @@ impl FerrofinUserViewManager {
             .await?;
         Ok(())
     }
+
+    /// The deterministic Live TV `UserView` item id — `GetNewItemId(path +
+    /// "_namedview_" + name, typeof(UserView))` over
+    /// `{InternalMetadataPath}/views/livetv`.
+    ///
+    /// `GetNewItemIdInternal` strips the program-data path before hashing, so
+    /// this id is the SAME on two servers with different data directories; the
+    /// value it produces for `Live TV` is Jellyfin's
+    /// `2b2bca16aacc8a14d53a11bb829eafa5`.
+    fn live_tv_view_id(&self, view_path: &std::path::Path) -> Option<Uuid> {
+        live_tv_view_id_with(&self.id_derivation, view_path)
+    }
+
+    /// Upserts the Live TV `UserView` row (and its directory) when Live TV is
+    /// available to this user (idempotent). No-op without an item store, a
+    /// metadata path and a database wired.
+    ///
+    /// Port of the Live TV arm of `UserViewManager.GetUserViews`
+    /// (UserViewManager.cs:128-133): when the user is in
+    /// `_liveTvManager.GetEnabledUsers()` it appends
+    /// `GetInternalLiveTvFolder()`, which is `GetNamedView(name,
+    /// CollectionType.livetv, name)` (LiveTvManager.cs:1263) — and
+    /// `GetNamedView` (LibraryManager.cs:2856-2898) CREATES the directory and
+    /// the row on first read. Ferrofin only ever read such a row, so the view
+    /// never existed and `/UserViews` served one fewer view than Jellyfin.
+    async fn ensure_live_tv_view(&self, user_id: Uuid) -> Result<(), ServiceError> {
+        let (Some(persistence), Some(metadata_path), Some(db)) =
+            (&self.persistence, &self.metadata_path, &self.db)
+        else {
+            return Ok(());
+        };
+        // The C# `GetEnabledUsers()` guard: a user without Live TV access never
+        // materializes the view.
+        if !user_entity_ext::live_tv_enabled_for(db, &ferrofin_db::store::guid_to_db(user_id))
+            .await?
+        {
+            return Ok(());
+        }
+        let view_path = metadata_path.join("views").join("livetv");
+        let Some(id) = self.live_tv_view_id(&view_path) else {
+            return Ok(());
+        };
+        if persistence.item_exists(id).await? {
+            return Ok(());
+        }
+        // C# `Directory.CreateDirectory(path)` inside `GetNamedView`.
+        tokio::fs::create_dir_all(&view_path)
+            .await
+            .map_err(|e| ServiceError::backend(format!("create live tv view directory: {e}")))?;
+        let entity = BaseItemEntity {
+            // `guid_to_db`, not `to_string()`: `BaseItems."Id"` is plain TEXT
+            // with no COLLATE NOCASE, so a lowercase id is a different row.
+            id: ferrofin_db::store::guid_to_db(id),
+            type_: item_type_lookup::stored_type_name(BaseItemKind::UserView)
+                .unwrap_or_default()
+                .to_owned(),
+            name: Some(LIVE_TV_VIEW_NAME.to_owned()),
+            // C# `ForcedSortName = sortName` (= the name), and `BaseItem.SortName`
+            // then short-circuits to `ModifySortChunks(ForcedSortName)
+            // .ToLowerInvariant()` — the digit padding and lower-casing only.
+            sort_name: Some(ferrofin_util::sort_name::forced_sort_key(LIVE_TV_VIEW_NAME)),
+            forced_sort_name: Some(LIVE_TV_VIEW_NAME.to_owned()),
+            path: Some(view_path.to_string_lossy().into_owned()),
+            // Parentless, exactly as upstream: `GetUserRootFolder().Children`
+            // never contains it, which is why `get_media_folders` must not
+            // provision it.
+            parent_id: None,
+            is_folder: true,
+            date_created: Some(Utc::now()),
+            // `UserView.ViewType` backs `IHasCollectionType.CollectionType`
+            // (UserView.cs:58) and is what the DTO projection reads.
+            data: Some(r#"{"ViewType":"livetv"}"#.to_owned()),
+            ..BaseItemEntity::default()
+        };
+        persistence
+            .save_items(std::slice::from_ref(&entity))
+            .await?;
+        Ok(())
+    }
 }
 
 #[async_trait]
 impl UserViewManager for FerrofinUserViewManager {
     async fn get_user_views(&self, user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        // Upstream materializes the Live TV view on read, from inside
+        // `GetUserViews` itself (UserViewManager.cs:128-133).
+        self.ensure_live_tv_view(user_id).await?;
         // The user's top-level views are the library collection folders. Per-user
         // access filtering (which libraries the user may see) rides on the
         // InternalItemsQuery.user field in the full pipeline; the base set is every
@@ -289,12 +416,18 @@ impl UserViewManager for FerrofinUserViewManager {
             ..Default::default()
         };
         // Upstream returns `GetUserRootFolder().Children`, which never contains
-        // the Live TV view: that one is created parentless under
-        // `{InternalMetadataPath}/views/`. Gating it here keeps this list
-        // meaning the same set as `item_repository::visible_views`, which the
-        // comment above depends on.
+        // the Live TV view — that one is created parentless under
+        // `{InternalMetadataPath}/views/` and only `GetUserViews` appends it.
+        // The exclusion is UNCONDITIONAL, not the Live-TV-disabled gate
+        // `get_user_views` applies: an enabled tuner puts the view in
+        // `/UserViews`, never in `/Library/MediaFolders`. (`user_id` still
+        // selects the user whose libraries these are.)
+        let _ = user_id;
         let folders = self.items.get_item_list(&query).await?;
-        self.without_disabled_live_tv(user_id, folders).await
+        Ok(folders
+            .into_iter()
+            .filter(|f| !is_live_tv_view_row(f))
+            .collect())
     }
 
     async fn get_latest_items(
@@ -759,6 +892,27 @@ mod tests {
     use ferrofin_model::entities::CollectionTypeOptions;
     use ferrofin_model::entities_media::VirtualFolderInfo;
     use rstest::rstest;
+
+    /// The Live TV view's id is derived from a key the C# strips the
+    /// program-data path out of, so two servers with different data directories
+    /// agree on it. The expected value is the one a live Jellyfin 10.11.8 serves.
+    #[test]
+    fn live_tv_view_id_is_jellyfins_and_is_data_dir_independent() {
+        for data_dir in ["/config", "/data", "/var/lib/ferrofin"] {
+            let mode = item_type_lookup::IdDerivation::Jellyfin {
+                program_data_path: Some(data_dir.to_owned()),
+            };
+            let path = std::path::Path::new(data_dir).join("metadata/views/livetv");
+            assert_eq!(
+                live_tv_view_id_with(&mode, &path)
+                    .expect("id")
+                    .simple()
+                    .to_string(),
+                "2b2bca16aacc8a14d53a11bb829eafa5",
+                "{data_dir}"
+            );
+        }
+    }
 
     fn manager(db: &Database) -> FerrofinUserViewManager {
         let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =

@@ -11,8 +11,8 @@
       "classification": "instance/methodology: Jellyfin orders suggestions by Random, so the set is non-deterministic across independent scans (matches Jellyfin's behavior)."
     },
     "GET /Items/{itemId}/Ancestors": {
-      "category": "instance",
-      "classification": "instance: ancestor chain now includes the UserRootFolder hop as Jellyfin's does; residual diff is /config-vs-/data path-derived ids only."
+      "category": "open-work",
+      "classification": "open-work (NOT accepted): with both containers on the same data dir the ancestor rows now align by Path and every field matches except two, BOTH on the UserRootFolder hop. (1) ChildCount J=4 H=3 — UserRootFolder.GetEligibleChildrenForRecursiveChildren (UserRootFolder.cs:96-102) concatenates LibraryManager.RootFolder.VirtualChildren, which is the PlaylistsFolder CreateRootFolder adds at {data}/playlists (LibraryManager.cs:1090-1120); Ferrofin stores that folder parentless and has no AggregateFolder root with virtual children, so the user root counts 3 libraries instead of 4 and /Items?parentId=<root> returns 3. (2) PrimaryImageAspectRatio present on Jellyfin, absent on Ferrofin — FolderImageProvider generates a collage for the user root (Supports() rejects only PhotoAlbum/MusicAlbum and IsTopParent folders); Ferrofin ports CollectionFolderImageProvider (the library tiles) but not FolderImageProvider, so the user root has no Primary image. Un-defer path: port UserRootFolder's virtual-children concat (the direct-children query AND the ChildCount prefetch) and FolderImageProvider. The previous text on this row claimed the residual was '/config-vs-/data path-derived ids only'; that was measurably false — the ids were already identical on both servers and only the Path STRING differed, which is the array align key, so no field was ever compared."
     },
     "GET /Items/{itemId}/Similar": {
       "category": "instance",
@@ -21,14 +21,6 @@
     "GET /Movies/{itemId}/Similar": {
       "category": "instance",
       "classification": "instance/methodology: Jellyfin 10.11.8 serves /Similar from a flat Genres/Tags query ordered Random (non-deterministic, not diffable); Ferrofin implements upstream master's weighted SimilarItemsManager (genre 10/tag 5/studio 5/director 50/actor 15 + IsPlayed/user-access phase-2 filter, Episode/by-name short-circuit). Verified by unit tests against the C# weights."
-    },
-    "GET /UserViews": {
-      "category": "instance",
-      "classification": "instance: view Path (and path-derived id) differ only by /config vs /data data-dir; identical under a shared data-dir. (Historic note: until the with_all_fields(false) fix the views also lacked ~25 default fields Jellyfin emits — that was a real defect, not instance noise; re-verify on the next sweep.)"
-    },
-    "GET /Library/MediaFolders": {
-      "category": "instance",
-      "classification": "instance: after WI-7 the folder COUNT matches; residual is /config-vs-/data path-alignment noise on the folder rows."
     },
     "GET /Albums/{itemId}/Similar": {
       "category": "instance",
@@ -90,10 +82,6 @@
       "category": "instance",
       "classification": "instance: per-host filesystem drives."
     },
-    "GET /Library/PhysicalPaths": {
-      "category": "instance",
-      "classification": "instance: data-dir-relative physical paths differ by container (/config vs /data)."
-    },
     "GET /System/Logs": {
       "category": "instance",
       "classification": "instance: log-file set differs per instance/run."
@@ -105,10 +93,6 @@
     "GET /LiveTv/GuideInfo": {
       "category": "instance",
       "classification": "instance: now-relative guide window (now .. now+7d) matches Jellyfin's behavior, but the exact StartDate/EndDate timestamps can't match across two independently-clocked servers."
-    },
-    "GET /System/Configuration": {
-      "category": "instance",
-      "classification": "instance/methodology: real default fields (PluginRepositories/EnableLegacyAuthorization/CacheSize) now match; residual IsStartupWizardCompleted/IsPortAuthorized reflect the harness completing Jellyfin's wizard during setup while Ferrofin auto-seeds — setup state, not a bug."
     },
     "GET /LiveTv/TunerHosts/Types": {
       "category": "open-work",

@@ -11,9 +11,12 @@
 //! - `POST /Startup/User` — set the first user's name and password.
 //!
 //! Port notes:
-//! - `[Authorize(Policy = FirstTimeSetupOrElevated)]` is not enforced by a policy
-//!   middleware here; these routes are reachable during first-run exactly as the
-//!   wizard needs.
+//! - Every action carries C#'s `[Authorize(Policy = Policies.FirstTimeSetupOrElevated)]`
+//!   (StartupController.cs:18), as the [`FirstTimeSetupOrElevated`] extractor:
+//!   anonymous while the wizard is incomplete (the first-run wizard has no
+//!   account to authenticate with), administrator-only once setup is complete.
+//!   Ungated, `POST /Startup/User` let an anonymous caller rename the first
+//!   administrator and set its password on a fully configured server.
 //! - `RemoteAccess` writes the separate `NetworkConfiguration` store in C#; here
 //!   that config lives in the named-config store (`named/network.json`), so the
 //!   toggle persists `EnableRemoteAccess` there.
@@ -24,6 +27,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
+use crate::auth::FirstTimeSetupOrElevated;
 use crate::error::ApiError;
 use crate::handlers::items::user_uuid;
 use crate::state::AppState;
@@ -79,7 +83,10 @@ struct StartupUserDto {
     responses((status = 204, description = "Startup wizard completed")),
     tag = "ferrofin"
 )]
-async fn complete_wizard(State(state): State<AppState>) -> Result<StatusCode, ApiError> {
+async fn complete_wizard(
+    State(state): State<AppState>,
+    FirstTimeSetupOrElevated(_): FirstTimeSetupOrElevated,
+) -> Result<StatusCode, ApiError> {
     let mut config = (*state.config.configuration().await?).clone();
     config.is_startup_wizard_completed = true;
     state.config.update_configuration(&config).await?;
@@ -97,6 +104,7 @@ async fn complete_wizard(State(state): State<AppState>) -> Result<StatusCode, Ap
 )]
 async fn get_startup_configuration(
     State(state): State<AppState>,
+    FirstTimeSetupOrElevated(_): FirstTimeSetupOrElevated,
 ) -> Result<Json<StartupConfigurationDto>, ApiError> {
     let config = state.config.configuration().await?;
     Ok(Json(StartupConfigurationDto {
@@ -119,6 +127,7 @@ async fn get_startup_configuration(
 )]
 async fn update_initial_configuration(
     State(state): State<AppState>,
+    FirstTimeSetupOrElevated(_): FirstTimeSetupOrElevated,
     Json(body): Json<StartupConfigurationDto>,
 ) -> Result<StatusCode, ApiError> {
     let mut config = (*state.config.configuration().await?).clone();
@@ -151,6 +160,7 @@ async fn update_initial_configuration(
 )]
 async fn set_remote_access(
     State(state): State<AppState>,
+    FirstTimeSetupOrElevated(_): FirstTimeSetupOrElevated,
     Json(body): Json<StartupRemoteAccessDto>,
 ) -> Result<StatusCode, ApiError> {
     let path = crate::handlers::config::named_config_file(&state, "network").ok_or_else(|| {
@@ -220,7 +230,10 @@ async fn set_remote_access(
     responses((status = 200, description = "First user returned")),
     tag = "ferrofin"
 )]
-async fn get_first_user(State(state): State<AppState>) -> Result<Json<StartupUserDto>, ApiError> {
+async fn get_first_user(
+    State(state): State<AppState>,
+    FirstTimeSetupOrElevated(_): FirstTimeSetupOrElevated,
+) -> Result<Json<StartupUserDto>, ApiError> {
     state.users.initialize().await?;
     let user = state.users.get_first_user().await?.ok_or_else(|| {
         ApiError::from(ferrofin_traits::error::ServiceError::backend(
@@ -251,6 +264,7 @@ async fn get_first_user(State(state): State<AppState>) -> Result<Json<StartupUse
 )]
 async fn update_startup_user(
     State(state): State<AppState>,
+    FirstTimeSetupOrElevated(_): FirstTimeSetupOrElevated,
     Json(body): Json<StartupUserDto>,
 ) -> Result<StatusCode, ApiError> {
     let user = state

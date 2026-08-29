@@ -279,6 +279,19 @@ def selfcheck():
     # clean vs dirty diff
     assert dc({"A": 1, "Id": "x"}, {"A": 1, "Id": "y"})[0] == 0    # Id volatile → clean
     assert dc({"A": 1}, {"A": 2})[0] == 1                          # real mismatch
+    # ChildCount is scrubbed ONLY on the types whose upstream value is
+    # `Random.Shared.Next(1, 10)` (DtoService.cs:649-656) — and stays comparable
+    # everywhere else, so a Season that lost its episodes still diffs.
+    assert dc({"Type": "CollectionFolder", "ChildCount": 4},
+              {"Type": "CollectionFolder", "ChildCount": 1})[0] == 0
+    assert dc({"Type": "UserView", "ChildCount": 2},
+              {"Type": "UserView", "ChildCount": 9})[0] == 0
+    assert dc({"Type": "Season", "ChildCount": 4},
+              {"Type": "Season", "ChildCount": 1})[0] == 1, \
+        "ChildCount must still diff on a real folder"
+    assert dc({"Type": "UserRootFolder", "ChildCount": 4},
+              {"Type": "UserRootFolder", "ChildCount": 3})[0] == 1, \
+        "the user root is not ICollectionFolder/UserView — its ChildCount is real"
     # array align by Path across divergent ids
     j = {"Items": [{"Path": "/m/a.mkv", "Id": "j1", "Name": "A"}]}
     h = {"Items": [{"Path": "/m/a.mkv", "Id": "h1", "Name": "A"}]}

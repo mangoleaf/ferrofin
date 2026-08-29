@@ -727,6 +727,53 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         Ok(())
     }
 
+    async fn set_collection_type(
+        &self,
+        item_id: Uuid,
+        collection_type: &str,
+    ) -> Result<(), ServiceError> {
+        let id = guid_to_db(item_id);
+        // Read on the pool first: the steady state (already recorded) must not
+        // touch the single writer connection.
+        let current: Option<Option<String>> =
+            sqlx::query_scalar(r#"SELECT "Data" FROM "BaseItems" WHERE "Id" = ?1"#)
+                .bind(&id)
+                .fetch_optional(self.db.pool())
+                .await
+                .map_err(db_err)?;
+        let Some(stored) = current else {
+            return Ok(()); // no such row
+        };
+        // Merge into whatever the blob already holds — `Data` also carries
+        // `PhysicalFolderIds`/`ViewType`/`DisplayParentId` on some rows, and
+        // replacing it wholesale would drop them.
+        let mut data = stored
+            .as_deref()
+            .and_then(|d| serde_json::from_str::<serde_json::Value>(d).ok())
+            .filter(serde_json::Value::is_object)
+            .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+        if data
+            .get("CollectionType")
+            .and_then(serde_json::Value::as_str)
+            == Some(collection_type)
+        {
+            return Ok(());
+        }
+        if let Some(obj) = data.as_object_mut() {
+            obj.insert(
+                "CollectionType".to_owned(),
+                serde_json::Value::String(collection_type.to_owned()),
+            );
+        }
+        sqlx::query(r#"UPDATE "BaseItems" SET "Data" = ?2 WHERE "Id" = ?1"#)
+            .bind(&id)
+            .bind(data.to_string())
+            .execute(self.db.writer())
+            .await
+            .map_err(db_err)?;
+        Ok(())
+    }
+
     async fn save_item_values(
         &self,
         item_id: Uuid,

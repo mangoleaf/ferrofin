@@ -281,6 +281,47 @@ impl FromRequestParts<AppState> for FirstTimeSetupOrAuth {
     }
 }
 
+/// Extractor for handlers behind Jellyfin's `FirstTimeSetupOrElevated` policy.
+///
+/// Port of `FirstTimeSetupHandler` with `RequireAdmin` set
+/// (Jellyfin.Api/Auth/FirstTimeSetupPolicy/FirstTimeSetupHandler.cs:27-44):
+/// while the startup wizard is **not** complete the endpoint is reachable
+/// anonymously — the first-run web wizard has no account to authenticate with —
+/// and once setup is complete it requires an ADMINISTRATOR, not merely a valid
+/// token.
+///
+/// This is what gates the whole `StartupController` upstream
+/// (`[Authorize(Policy = Policies.FirstTimeSetupOrElevated)]`,
+/// StartupController.cs:18). Ungated, `POST /Startup/User` lets an anonymous
+/// caller rename the first administrator and set its password on a fully
+/// configured server.
+#[derive(Debug, Clone)]
+pub struct FirstTimeSetupOrElevated(pub Option<AuthorizationInfo>);
+
+impl FromRequestParts<AppState> for FirstTimeSetupOrElevated {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let ctx = request_context(&parts.headers, parts.uri.query(), None);
+        // A config read error reads as "not complete", exactly as in
+        // `FirstTimeSetupOrAuth`: a fresh install must never be able to lock
+        // itself out of its own setup wizard.
+        let wizard_complete = state
+            .config
+            .configuration()
+            .await
+            .is_ok_and(|c| c.is_startup_wizard_completed);
+        if !wizard_complete {
+            return Ok(Self(state.auth_service().authenticate(&ctx).await.ok()));
+        }
+        let RequireAdmin(info) = RequireAdmin::from_request_parts(parts, state).await?;
+        Ok(Self(Some(info)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::request_context;

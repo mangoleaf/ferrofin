@@ -493,6 +493,27 @@ pub trait ItemPersistenceService: Send + Sync {
     /// `GET /Library/VirtualFolders`.
     async fn set_parent_id(&self, item_id: Uuid, parent_id: Uuid) -> Result<(), ServiceError>;
 
+    /// Records a library folder's collection type (`movies`, `tvshows`, …) in
+    /// the row's `Data` blob, leaving every other column and every other key in
+    /// the blob alone — a no-op when the value is already there.
+    ///
+    /// `Data.CollectionType` is where Jellyfin keeps a `CollectionFolder`'s
+    /// type, and `DtoService` emits it for every `IHasCollectionType` item on
+    /// every endpoint (DtoService.cs:1061-1064). It is therefore the row's job
+    /// to carry it: reading the on-disk `<type>.collection` marker is not
+    /// available to the DTO projection, and a per-handler backfill leaves the
+    /// other endpoints (`/Library/MediaFolders`, `/Items`, `/Items/{id}`,
+    /// `/Items/{id}/Ancestors`) reporting a null type.
+    ///
+    /// Column-scoped like [`set_parent_id`](Self::set_parent_id) and for the
+    /// same reason: the callers hold no full row, so a whole-row save would
+    /// revert whatever a scan or edit changed in between.
+    async fn set_collection_type(
+        &self,
+        item_id: Uuid,
+        collection_type: &str,
+    ) -> Result<(), ServiceError>;
+
     /// Replaces an item's `ItemValues` links (genres/studios/tags) with `values`,
     /// each a `(type discriminant, display value)` pair. Get-or-creates the shared
     /// `ItemValues` row per (type, value) and rewrites this item's `ItemValuesMap`

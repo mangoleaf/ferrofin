@@ -838,6 +838,19 @@ async fn foreign_key_check(conn: &mut sqlx::SqliteConnection) -> Result<()> {
 /// resize from single-endpoint (or polluted-host) evidence. Raw curves:
 /// `suite/perf/results/pool-sweep-c11f1ce.json`.
 fn default_pool_size() -> u32 {
+    usable_cores()
+}
+
+/// The number of CPUs this process may actually use — thread affinity capped by
+/// the cgroup CFS quota, never below 1, defaulting to 4 when neither is legible.
+///
+/// This is Ferrofin's `Environment.ProcessorCount`: .NET reports the *container's*
+/// core budget, not the host's, so anything ported from a C# expression over
+/// `ProcessorCount` (the pool size here, `ServerConfiguration.CacheSize`) must
+/// read the quota too — `std::thread::available_parallelism()` alone answers with
+/// the host core count inside a `cpus: 4` container and silently diverges.
+#[must_use]
+pub fn usable_cores() -> u32 {
     let affinity = std::thread::available_parallelism()
         .ok()
         .and_then(|n| u32::try_from(n.get()).ok());

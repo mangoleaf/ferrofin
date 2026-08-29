@@ -110,9 +110,51 @@ def diff(j, h, path, out, volatile=VOLATILE):
         out["mismatch"].append({"path": path, "j": _brief(j), "h": _brief(h)})
 
 
+# `DtoService.GetChildCount` (Emby.Server.Implementations/Dto/DtoService.cs:649-656):
+#
+#     // Right now this is too slow to calculate for top level folders on a per-user basis
+#     // Just return something so that apps that are expecting a value won't think the
+#     // folders are empty
+#     if (folder is ICollectionFolder || folder is UserView) { return Random.Shared.Next(1, 10); }
+#
+# so for exactly these client Types the field is a random draw in 1..9 on EVERY
+# request and cannot be compared between two servers — five consecutive calls to
+# one Jellyfin for the same folder returned 9, 2, 7, 2, 3. Ferrofin honours the
+# same contract deterministically (`attach_child_count`, an id-derived 1..=9).
+# `ICollectionFolder` also covers `BasePluginFolder` (BasePluginFolder.cs:12),
+# hence the playlists folder.
+#
+# This is deliberately NOT a `VOLATILE` entry: `ChildCount` is a real, comparable
+# value on a Series/Season/MusicAlbum/Playlist/Folder, and blanking it globally
+# would stop the diff noticing a season that lost its episodes. The scrub is
+# keyed on the sibling `Type`, so it can only ever reach the rows the C# randomizes.
+RANDOM_CHILD_COUNT_TYPES = frozenset({"CollectionFolder", "UserView", "ManualPlaylistsFolder"})
+
+
+def scrub_random_child_count(doc):
+    """Drop `ChildCount` from the DTOs whose upstream value is `Random.Shared.Next(1, 10)`.
+
+    Walks `doc` in place (and returns it) so the caller can wrap a parsed body
+    directly. Apply to BOTH sides of a diff, never to one.
+    """
+    if isinstance(doc, dict):
+        if doc.get("Type") in RANDOM_CHILD_COUNT_TYPES:
+            doc.pop("ChildCount", None)
+        for v in doc.values():
+            scrub_random_child_count(v)
+    elif isinstance(doc, list):
+        for v in doc:
+            scrub_random_child_count(v)
+    return doc
+
+
 def diff_counts(j, h):
-    """Convenience: diff two docs, return (total_diffs, buckets_dict)."""
+    """Convenience: diff two docs, return (total_diffs, buckets_dict).
+
+    Both sides go through [`scrub_random_child_count`] first — see its comment
+    for why that one field is not diffable and why it is not in `VOLATILE`.
+    """
     out = {"mismatch": [], "missing": [], "extra": []}
-    diff(j, h, "", out)
+    diff(scrub_random_child_count(j), scrub_random_child_count(h), "", out)
     n = len(out["mismatch"]) + len(out["missing"]) + len(out["extra"])
     return n, out

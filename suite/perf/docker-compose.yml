@@ -25,7 +25,18 @@ services:
     environment:
       FERROFIN_ADMIN_USER: ${BENCH_ADMIN_USER}
       FERROFIN_ADMIN_PASSWORD: ${BENCH_ADMIN_PASSWORD}
-      FERROFIN_DATA_DIR: /data
+      # SAME data directory as the Jellyfin leg. The official jellyfin image
+      # pins its data dir at /config, so Ferrofin is the side that moves: with
+      # the two containers on different roots every data-dir-derived value
+      # (library Path, playlists path, the metadata views path) differed by
+      # deployment, and the parity harness — which correlates array elements by
+      # Path — scored whole items as missing+extra without ever comparing a
+      # field. Identical roots means a diff measures code, not deployment.
+      # Container-internal only: no perf script reads this path (grep /data and
+      # FERROFIN_DATA_DIR across suite/), so the shared perf leg is unaffected —
+      # but the named volume stores absolute paths, so changing it needs the
+      # volume re-provisioned, not just a container restart.
+      FERROFIN_DATA_DIR: /config
       FERROFIN_BIND_ADDR: 0.0.0.0
       FERROFIN_PORT: "8096"
       # Pool-sweep knob (benchmark/pool-sweep.sh): empty ⇒ Ferrofin's own default.
@@ -41,7 +52,7 @@ services:
       - ${REAL_MEDIA_DIR:-./fixtures/empty}:/media/movies-real:ro
       - ${REAL_TV_DIR:-./fixtures/empty}:/media/tv-real:ro
       - ./fixtures/media:/media/synth:ro
-      - ferrofin-data:/data
+      - ferrofin-data:/config
 
   jellyfin:
     image: ${JELLYFIN_IMAGE}

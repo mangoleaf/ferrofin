@@ -59,7 +59,7 @@ use ferrofin_db::Database;
 use ferrofin_db::entities::base_items::{BaseItemEntity, BaseItemImageInfoEntity};
 use ferrofin_db::entities::users::UserEntity;
 use ferrofin_db::store::guid_to_db;
-use ferrofin_model::data::{BaseItemKind, MediaType};
+use ferrofin_model::data::{BaseItemKind, CollectionType, MediaType};
 use ferrofin_model::dto::{
     BaseItemDto, BaseItemPerson, ItemCounts, NameGuidPair, TrickplayInfoDto, UserItemDataDto,
 };
@@ -494,22 +494,53 @@ fn empty_user_data_dto(item_id: Uuid) -> UserItemDataDto {
 ///
 /// Port of the `AttachUserSpecificInfo` ChildCount attach + `GetChildCount`:
 /// only folders get a count, and an already-set value is kept (`??=`).
-/// Collection folders and user views skip the count: C# returns
-/// `Random.Shared.Next(1, 10)` there ("too slow to calculate for top level
-/// folders on a per-user basis — just return something so that apps that are
-/// expecting a value won't think the folders are empty"); an id-derived 1..=9
-/// honors the same contract (nonzero, meaningless) without a rand dependency.
+/// `ICollectionFolder` and `UserView` rows skip the count: C# returns
+/// `Random.Shared.Next(1, 10)` there (DtoService.cs:649-656, "too slow to
+/// calculate for top level folders on a per-user basis — just return something
+/// so that apps that are expecting a value won't think the folders are empty");
+/// an id-derived 1..=9 honors the same contract (nonzero, meaningless) without a
+/// rand dependency. `ICollectionFolder` covers `BasePluginFolder`
+/// (BasePluginFolder.cs:12) too, hence the playlists folder.
 fn attach_child_count(dto: &mut BaseItemDto, item: &BaseItemEntity, counts: &HashMap<Uuid, i32>) {
     if dto.child_count.is_some() || !item.is_folder {
         return;
     }
     let id = row_id(item);
     dto.child_count = Some(match row_kind(item) {
-        BaseItemKind::CollectionFolder | BaseItemKind::UserView => {
-            i32::from(id.as_bytes()[15] % 9) + 1
-        }
+        BaseItemKind::CollectionFolder
+        | BaseItemKind::UserView
+        | BaseItemKind::BasePluginFolder
+        | BaseItemKind::ManualPlaylistsFolder
+        | BaseItemKind::PlaylistsFolder => i32::from(id.as_bytes()[15] % 9) + 1,
         _ => counts.get(&id).copied().unwrap_or(0),
     });
+}
+
+/// The `CollectionType` of an `IHasCollectionType` row (`DtoService`
+/// AttachBasicFields, DtoService.cs:1061-1064), or `None` for every other kind.
+///
+/// The three implementors Ferrofin models:
+/// - `CollectionFolder` (CollectionFolder.cs:32) — the library's own type,
+///   persisted in the row's `Data` blob as `CollectionType`, the same place
+///   `ItemRepository::collection_type_of` and a real Jellyfin database keep it;
+/// - `UserView` (UserView.cs:58, `CollectionType => ViewType`) — its `ViewType`,
+///   persisted in `Data` as `ViewType`;
+/// - `PlaylistsFolder`/`ManualPlaylistsFolder` (PlaylistsFolder.cs:29) — the
+///   constant `playlists`, a property on the type with nothing stored.
+///
+/// An unparseable or absent value leaves the field unset, exactly as a C# null.
+fn collection_type_of(item: &BaseItemEntity, kind: BaseItemKind) -> Option<CollectionType> {
+    let key = match kind {
+        BaseItemKind::ManualPlaylistsFolder | BaseItemKind::PlaylistsFolder => {
+            return Some(CollectionType::playlists);
+        }
+        BaseItemKind::CollectionFolder => "CollectionType",
+        BaseItemKind::UserView => "ViewType",
+        _ => return None,
+    };
+    let parsed: serde_json::Value = serde_json::from_str(item.data.as_deref()?).ok()?;
+    let name = parsed.get(key)?.as_str()?.to_ascii_lowercase();
+    serde_json::from_value(serde_json::Value::String(name)).ok()
 }
 
 /// Splits a stored pipe-delimited multi-value column into a list, dropping
@@ -1059,12 +1090,13 @@ impl FerrofinDtoService {
                 // (C# AttachUserSpecificInfo folder branch); leaf items leave it unset.
                 // The branch keys on the runtime C# `IsFolder` (`folder_emits_counts`):
                 // pure by-name kinds never enter it, a MusicArtist only when
-                // physically parented.
+                // physically parented. `Folder.FillUserDataDtoValues`
+                // (Folder.cs:1973) then gates the count itself on
+                // `SupportsPlayedStatus`, which the top-level containers
+                // (UserRootFolder/CollectionFolder/UserView/AggregateFolder) and
+                // MusicAlbum/PhotoAlbum override to false.
                 if folder_emits_counts(item)
-                    && !matches!(
-                        kind,
-                        BaseItemKind::CollectionFolder | BaseItemKind::UserView
-                    )
+                    && kinds::supports_played_status(kind)
                     && let Some(c) = prefetched.played_counts.get(&item_id).copied()
                 {
                     let ud = dto
@@ -1158,8 +1190,20 @@ impl FerrofinDtoService {
         let live_tv = is_live_tv_channel(kind) || is_live_tv_program(kind);
         if options.contains_field(ItemFields::CanDelete) {
             // By-name items (Genre/Studio/Person/…) have no file — C# `CanDelete()`
-            // returns false (default `IsFileProtocol`, plus explicit overrides).
-            let file_deletable = !item.is_virtual_item && !kinds::is_item_by_name(kind) && !live_tv;
+            // returns false (default `IsFileProtocol`, plus explicit overrides) —
+            // and so do the library containers: `CollectionFolder.CanDelete()`
+            // (CollectionFolder.cs:107) and `BasePluginFolder.CanDelete()`
+            // hard-return false, and `Folder.CanDelete()` (Folder.cs:187) returns
+            // false for an `IsRoot` folder (`UserRootFolder`/`AggregateFolder`).
+            // `kinds::can_delete` is that override table; `has_parent` carries
+            // `MusicArtist.CanDelete => !IsAccessedByName`.
+            let has_parent = item
+                .parent_id
+                .as_deref()
+                .and_then(|p| Uuid::parse_str(p).ok())
+                .is_some_and(|p| !p.is_nil());
+            let file_deletable =
+                !item.is_virtual_item && kinds::can_delete(kind, has_parent) && !live_tv;
             dto.can_delete = Some(file_deletable && perms.is_none_or(|p| p.can_delete));
         }
         if options.contains_field(ItemFields::CanDownload) {
@@ -1187,6 +1231,13 @@ impl FerrofinDtoService {
         repeated: bool,
     ) -> Result<(), ServiceError> {
         let item_id = row_id(item);
+
+        // `if (item is IHasCollectionType hasCollectionType) dto.CollectionType =
+        // hasCollectionType.CollectionType;` (DtoService.cs:1061-1064) — set for
+        // EVERY endpoint and gated by no `ItemFields` flag, which is why it must
+        // live here and not be backfilled per handler. jellyfin-web keys a
+        // library's whole presentation off it.
+        dto.collection_type = collection_type_of(item, kind);
 
         if options.contains_field(ItemFields::DateCreated) {
             dto.date_created = item.date_created;
@@ -1276,15 +1327,22 @@ impl FerrofinDtoService {
         // Images (single-type tags + backdrops).
         self.attach_images(dto, item_id, images, options).await;
 
-        // Width/Height come from the primary image (C# reads item.GetImageInfo(Primary, 0)),
-        // gated by their own ItemFields. Zero dims (unscanned image) are treated as unknown.
-        if let Some(primary) = images.iter().find(|i| i.image_type == ImageType::Primary) {
-            if options.contains_field(ItemFields::Width) && primary.width > 0 {
-                dto.width = Some(primary.width);
-            }
-            if options.contains_field(ItemFields::Height) && primary.height > 0 {
-                dto.height = Some(primary.height);
-            }
+        // Width/Height are the item's OWN stored dimensions — the video/photo
+        // frame size on `BaseItem.Width`/`Height` (BaseItem.cs:405/407) — read
+        // straight off the row by `DtoService` (DtoService.cs:1478-1494) and
+        // emitted only when positive. NOT the primary image's dimensions: a
+        // folder stores 0 and upstream therefore omits both, where sourcing them
+        // from the generated poster made every library folder claim the poster's
+        // size.
+        if options.contains_field(ItemFields::Width)
+            && let Some(width) = item.width.filter(|w| *w > 0)
+        {
+            dto.width = i32::try_from(width).ok();
+        }
+        if options.contains_field(ItemFields::Height)
+            && let Some(height) = item.height.filter(|h| *h > 0)
+        {
+            dto.height = i32::try_from(height).ok();
         }
 
         if options.contains_field(ItemFields::Genres) {
@@ -2780,6 +2838,7 @@ mod tests {
         let genre = fetch_item(&db, genre_id).await;
         let byname_artist = fetch_item(&db, byname_artist_id).await;
         let physical_artist = fetch_item(&db, physical_artist_id).await;
+        let db2 = db.clone();
         let svc = service(db);
         let options = DtoOptions::default(); // enables user data
 
@@ -2881,8 +2940,12 @@ mod tests {
             None
         );
 
-        // A physically-parented MusicArtist IS a folder at runtime — it carries
-        // the count like any other folder (FakeCounts: 1/4 played → 3 unplayed).
+        // A physically-parented MusicArtist IS a folder at runtime, but
+        // `MusicArtist.SupportsPlayedStatus => false` (MusicArtist.cs:48) is
+        // unconditional, and `Folder.FillUserDataDtoValues` (Folder.cs:1973)
+        // gates the count on it — so it carries none either. Verified against a
+        // live 10.11.8 whose three physically-parented artists all come back
+        // with no `UnplayedItemCount`.
         let physical_single = svc
             .get_base_item_dto(&physical_artist, &options, Some(&user), None)
             .await
@@ -2893,7 +2956,7 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .unplayed_item_count,
-            Some(3)
+            None
         );
         let physical_batch = svc
             .get_base_item_dtos(
@@ -2911,8 +2974,34 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .unplayed_item_count,
-            Some(3)
+            None
         );
+
+        // The library containers that override `SupportsPlayedStatus` to false
+        // (CollectionFolder.cs:74, UserRootFolder.cs:39, UserView.cs:66,
+        // AggregateFolder.cs:50, MusicAlbum.cs:51, PhotoAlbum.cs:14) carry no
+        // count either, however many played descendants they have.
+        for kind in [
+            BaseItemKind::CollectionFolder,
+            BaseItemKind::UserRootFolder,
+            BaseItemKind::UserView,
+            BaseItemKind::AggregateFolder,
+            BaseItemKind::MusicAlbum,
+            BaseItemKind::PhotoAlbum,
+        ] {
+            let id = Uuid::new_v4();
+            seed_folder_item(&db2, id, kind, "Container", Some(folder_id)).await;
+            let row = fetch_item(&db2, id).await;
+            let dto = svc
+                .get_base_item_dto(&row, &options, Some(&user), None)
+                .await
+                .unwrap();
+            assert_eq!(
+                dto.user_data.as_ref().unwrap().unplayed_item_count,
+                None,
+                "{kind:?}"
+            );
+        }
     }
 
     /// An [`ItemCountService`] fake returning fixed name-item counts.

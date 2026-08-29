@@ -1,7 +1,7 @@
 {
   "correlated_items": 5,
   "generated_by": "suite/parity/reads.py",
-  "last_verified": "446f0ae 2026-08-24",
+  "last_verified": "",
   "rows": {
     "GET /Artists": {
       "classification": "flagged: read diff vs Jellyfin (verify)",
@@ -10,9 +10,9 @@
         "extra": [],
         "mismatch": [],
         "missing": [
-          "Items[Name=Artist 01] (whole item)",
-          "Items[Name=Artist 02] (whole item)",
-          "Items[Name=Artist 03] (whole item)"
+          "Items[Name=Artist 01].RunTimeTicks",
+          "Items[Name=Artist 02].RunTimeTicks",
+          "Items[Name=Artist 03].RunTimeTicks"
         ]
       },
       "note": "0/1 clean; mismatch:0 missing:3 extra:0 | "
@@ -32,64 +32,51 @@
       "note": "0/1 clean; mismatch:0 missing:3 extra:0 | "
     },
     "GET /Artists/InstantMix": {
-      "classification": "",
-      "deep_verified": null,
-      "note": "no comparable response (both empty/non-200)"
+      "classification": "flagged: read diff vs Jellyfin (verify)",
+      "deep_verified": false,
+      "diffs": {
+        "extra": [
+          "Items[Path=/media/synth/music/Artist 01/Album 01/01 - Artist 01 Album 01 Track 01.flac] (whole item)",
+          "Items[Path=/media/synth/music/Artist 01/Album 01/02 - Artist 01 Album 01 Track 02.flac] (whole item)",
+          "Items[Path=/media/synth/music/Artist 01/Album 01/03 - Artist 01 Album 01 Track 03.flac] (whole item)",
+          "Items[Path=/media/synth/music/Artist 02/Album 01/01 - Artist 02 Album 01 Track 01.flac] (whole item)",
+          "Items[Path=/media/synth/music/Artist 02/Album 01/02 - Artist 02 Album 01 Track 02.flac] (whole item)",
+          "Items[Path=/media/synth/music/Artist 02/Album 01/03 - Artist 02 Album 01 Track 03.flac] (whole item)",
+          "Items[Path=/media/synth/music/Artist 03/Album 01/01 - Artist 03 Album 01 Track 01.flac] (whole item)",
+          "Items[Path=/media/synth/music/Artist 03/Album 01/02 - Artist 03 Album 01 Track 02.flac] (whole item)",
+          "Items[Path=/media/synth/music/Artist 03/Album 01/03 - Artist 03 Album 01 Track 03.flac] (whole item)"
+        ],
+        "mismatch": [],
+        "missing": [
+          "Items[Name=Artist 01 Album 01 Track 01] (whole item)",
+          "Items[Name=Artist 01 Album 01 Track 02] (whole item)",
+          "Items[Name=Artist 01 Album 01 Track 03] (whole item)",
+          "Items[Name=Artist 02 Album 01 Track 01] (whole item)",
+          "Items[Name=Artist 02 Album 01 Track 02] (whole item)",
+          "Items[Name=Artist 02 Album 01 Track 03] (whole item)",
+          "Items[Name=Artist 03 Album 01 Track 01] (whole item)",
+          "Items[Name=Artist 03 Album 01 Track 02] (whole item)",
+          "Items[Name=Artist 03 Album 01 Track 03] (whole item)"
+        ]
+      },
+      "note": "0/1 clean; mismatch:0 missing:9 extra:9 | "
     },
     "GET /Artists/{name}": {
       "classification": "flagged: read diff vs Jellyfin (verify)",
       "deep_verified": false,
       "diffs": {
-        "extra": [
-          "Items",
-          "StartIndex",
-          "TotalRecordCount"
+        "extra": [],
+        "mismatch": [
+          "CanDelete"
         ],
-        "mismatch": [],
         "missing": [
-          "AlbumCount",
-          "ArtistCount",
-          "BackdropImageTags",
-          "CanDelete",
-          "CanDownload",
-          "ChannelId",
-          "ChildCount",
           "CumulativeRunTimeTicks",
-          "EnableMediaSourceDisplay",
-          "EpisodeCount",
-          "ExternalUrls",
-          "GenreItems",
-          "Genres",
-          "IsFolder",
-          "LocalTrailerCount",
-          "LocationType",
-          "LockData",
-          "LockedFields",
-          "MediaType",
-          "MovieCount",
-          "MusicVideoCount",
-          "Name",
           "Path",
-          "People",
-          "PlayAccess",
-          "ProgramCount",
-          "ProviderIds",
           "RecursiveItemCount",
-          "RemoteTrailers",
-          "RunTimeTicks",
-          "SeriesCount",
-          "SongCount",
-          "SortName",
-          "SpecialFeatureCount",
-          "Studios",
-          "Taglines",
-          "Tags",
-          "TrailerCount",
-          "Type",
-          "UserData"
+          "RunTimeTicks"
         ]
       },
-      "note": "0/1 clean; mismatch:0 missing:40 extra:3 | "
+      "note": "0/1 clean; mismatch:1 missing:4 extra:0 | CanDelete(J=true H=false)"
     },
     "GET /Devices/Info": {
       "classification": "ok",
@@ -127,16 +114,13 @@
       "classification": "flagged: read diff vs Jellyfin (verify)",
       "deep_verified": false,
       "diffs": {
-        "extra": [
-          "Height",
-          "Width"
-        ],
+        "extra": [],
         "mismatch": [],
         "missing": [
           "Path"
         ]
       },
-      "note": "0/1 clean; mismatch:0 missing:1 extra:2 | "
+      "note": "0/1 clean; mismatch:0 missing:1 extra:0 | "
     },
     "GET /Items": {
       "classification": "ok",
@@ -157,9 +141,7 @@
       "classification": "flagged: read diff vs Jellyfin (verify)",
       "deep_verified": false,
       "diffs": {
-        "extra": [
-          "UserData.UnplayedItemCount"
-        ],
+        "extra": [],
         "mismatch": [],
         "missing": [
           "AirDays",
@@ -169,58 +151,39 @@
           "RunTimeTicks"
         ]
       },
-      "note": "0/1 clean; mismatch:0 missing:13 extra:3 | "
+      "note": "0/1 clean; mismatch:0 missing:13 extra:0 | "
     },
     "GET /Items/Suggestions": {
       "classification": "flagged: read diff vs Jellyfin (verify)",
       "deep_verified": false,
       "diffs": {
         "extra": [
-          "Items[Path=/media/synth/movies/Movie 0014 (2020)/Movie 0014 (2020).mkv].MediaSources[Path=/media/synth/movies/Movie 0014 (2020)/Movie 0014 (2020).mkv].MediaStreams[2].LocalizedLanguage",
-          "Items[Path=/media/synth/movies/Movie 0014 (2020)/Movie 0014 (2020).mkv].MediaStreams[2].LocalizedLanguage",
-          "Items[Path=/media/synth/movies/Movie 0047 (2020)/Movie 0047 (2020).mkv] (whole item)",
-          "Items[Path=/media/synth/movies/Movie 0211 (2020)/Movie 0211 (2020).mkv] (whole item)",
-          "Items[Path=/media/synth/movies/Movie 0316 (2020)/Movie 0316 (2020).mkv] (whole item)",
-          "Items[Path=/media/synth/movies/Movie 0369 (2020)/Movie 0369 (2020).mkv] (whole item)",
-          "Items[Path=/media/synth/movies/Movie 0374 (2020)/Movie 0374 (2020).mkv] (whole item)",
-          "Items[Path=/media/synth/movies/Movie 0420 (2020)/Movie 0420 (2020).mkv] (whole item)",
-          "Items[Path=/media/synth/movies/Movie 0434 (2020)/Movie 0434 (2020).mkv] (whole item)",
-          "Items[Path=/media/synth/tv/Series 01/Season 01] (whole item)",
-          "Items[Path=/media/synth/tv/Series 07/Season 01/Series 07 S01E02.mkv] (whole item)"
+          "Items[Path=/media/synth/movies/Movie 0049 (2020)/Movie 0049 (2020).mkv] (whole item)",
+          "Items[Path=/media/synth/movies/Movie 0147 (2020)/Movie 0147 (2020).mkv] (whole item)",
+          "Items[Path=/media/synth/movies/Movie 0240 (2020)/Movie 0240 (2020).mkv] (whole item)",
+          "Items[Path=/media/synth/movies/Movie 0247 (2020)/Movie 0247 (2020).mkv] (whole item)",
+          "Items[Path=/media/synth/movies/Movie 0252 (2020)/Movie 0252 (2020).mkv] (whole item)",
+          "Items[Path=/media/synth/movies/Movie 0270 (2020)/Movie 0270 (2020).mkv] (whole item)",
+          "Items[Path=/media/synth/movies/Movie 0387 (2020)/Movie 0387 (2020).mkv] (whole item)",
+          "Items[Path=/media/synth/movies/Movie 0393 (2020)/Movie 0393 (2020).mkv] (whole item)",
+          "Items[Path=/media/synth/movies/Movie 0431 (2020)/Movie 0431 (2020).mkv] (whole item)",
+          "Items[Path=/media/synth/movies/Movie 0433 (2020)/Movie 0433 (2020).mkv] (whole item)"
         ],
-        "mismatch": [
-          "Items[Path=/media/synth/movies/Movie 0014 (2020)/Movie 0014 (2020).mkv].MediaSources[Path=/media/synth/movies/Movie 0014 (2020)/Movie 0014 (2020).mkv].Bitrate",
-          "Items[Path=/media/synth/movies/Movie 0014 (2020)/Movie 0014 (2020).mkv].MediaSources[Path=/media/synth/movies/Movie 0014 (2020)/Movie 0014 (2020).mkv].MediaStreams[0].BitRate",
-          "Items[Path=/media/synth/movies/Movie 0014 (2020)/Movie 0014 (2020).mkv].MediaSources[Path=/media/synth/movies/Movie 0014 (2020)/Movie 0014 (2020).mkv].Name",
-          "Items[Path=/media/synth/movies/Movie 0014 (2020)/Movie 0014 (2020).mkv].MediaStreams[0].BitRate"
-        ],
+        "mismatch": [],
         "missing": [
-          "Items[Path=/media/synth/movies/Movie 0014 (2020)/Movie 0014 (2020).mkv].MediaSources[Path=/media/synth/movies/Movie 0014 (2020)/Movie 0014 (2020).mkv].MediaAttachments[0].CodecTag",
-          "Items[Path=/media/synth/movies/Movie 0014 (2020)/Movie 0014 (2020).mkv].MediaSources[Path=/media/synth/movies/Movie 0014 (2020)/Movie 0014 (2020).mkv].MediaStreams[1].IsAVC",
-          "Items[Path=/media/synth/movies/Movie 0014 (2020)/Movie 0014 (2020).mkv].MediaSources[Path=/media/synth/movies/Movie 0014 (2020)/Movie 0014 (2020).mkv].MediaStreams[1].Level",
-          "Items[Path=/media/synth/movies/Movie 0014 (2020)/Movie 0014 (2020).mkv].MediaSources[Path=/media/synth/movies/Movie 0014 (2020)/Movie 0014 (2020).mkv].MediaStreams[2].Height",
-          "Items[Path=/media/synth/movies/Movie 0014 (2020)/Movie 0014 (2020).mkv].MediaSources[Path=/media/synth/movies/Movie 0014 (2020)/Movie 0014 (2020).mkv].MediaStreams[2].IsAVC",
-          "Items[Path=/media/synth/movies/Movie 0014 (2020)/Movie 0014 (2020).mkv].MediaSources[Path=/media/synth/movies/Movie 0014 (2020)/Movie 0014 (2020).mkv].MediaStreams[2].Level",
-          "Items[Path=/media/synth/movies/Movie 0014 (2020)/Movie 0014 (2020).mkv].MediaSources[Path=/media/synth/movies/Movie 0014 (2020)/Movie 0014 (2020).mkv].MediaStreams[2].Width",
-          "Items[Path=/media/synth/movies/Movie 0014 (2020)/Movie 0014 (2020).mkv].MediaStreams[1].IsAVC",
-          "Items[Path=/media/synth/movies/Movie 0014 (2020)/Movie 0014 (2020).mkv].MediaStreams[1].Level",
-          "Items[Path=/media/synth/movies/Movie 0014 (2020)/Movie 0014 (2020).mkv].MediaStreams[2].Height",
-          "Items[Path=/media/synth/movies/Movie 0014 (2020)/Movie 0014 (2020).mkv].MediaStreams[2].IsAVC",
-          "Items[Path=/media/synth/movies/Movie 0014 (2020)/Movie 0014 (2020).mkv].MediaStreams[2].Level",
-          "Items[Path=/media/synth/movies/Movie 0014 (2020)/Movie 0014 (2020).mkv].MediaStreams[2].Width",
-          "Items[Path=/media/synth/movies/Movie 0014 (2020)/Movie 0014 (2020).mkv].People[Name=Alice Parity].Role",
-          "Items[Path=/media/synth/movies/Movie 0173 (2020)/Movie 0173 (2020).mkv] (whole item)",
-          "Items[Path=/media/synth/movies/Movie 0207 (2020)/Movie 0207 (2020).mkv] (whole item)",
-          "Items[Path=/media/synth/movies/Movie 0278 (2020)/Movie 0278 (2020).mkv] (whole item)",
-          "Items[Path=/media/synth/movies/Movie 0289 (2020)/Movie 0289 (2020).mkv] (whole item)",
-          "Items[Path=/media/synth/movies/Movie 0394 (2020)/Movie 0394 (2020).mkv] (whole item)",
-          "Items[Path=/media/synth/movies/Movie 0408 (2020)/Movie 0408 (2020).mkv] (whole item)",
-          "Items[Path=/media/synth/movies/Movie 0418 (2020)/Movie 0418 (2020).mkv] (whole item)",
-          "Items[Path=/media/synth/movies/Movie 0424 (2020)/Movie 0424 (2020).mkv] (whole item)",
-          "Items[Path=/media/synth/music] (whole item)"
+          "Items[Path=/media/synth/movies/Movie 0045 (2020)/Movie 0045 (2020).mkv] (whole item)",
+          "Items[Path=/media/synth/movies/Movie 0086 (2020)/Movie 0086 (2020).mkv] (whole item)",
+          "Items[Path=/media/synth/movies/Movie 0097 (2020)/Movie 0097 (2020).mkv] (whole item)",
+          "Items[Path=/media/synth/movies/Movie 0130 (2020)/Movie 0130 (2020).mkv] (whole item)",
+          "Items[Path=/media/synth/movies/Movie 0193 (2020)/Movie 0193 (2020).mkv] (whole item)",
+          "Items[Path=/media/synth/movies/Movie 0218 (2020)/Movie 0218 (2020).mkv] (whole item)",
+          "Items[Path=/media/synth/movies/Movie 0285 (2020)/Movie 0285 (2020).mkv] (whole item)",
+          "Items[Path=/media/synth/movies/Movie 0359 (2020)/Movie 0359 (2020).mkv] (whole item)",
+          "Items[Path=/media/synth/movies/Movie 0455 (2020)/Movie 0455 (2020).mkv] (whole item)",
+          "Items[Path=/media/synth/tv/Series 03/Season 01] (whole item)"
         ]
       },
-      "note": "0/1 clean; mismatch:4 missing:23 extra:11 | Items[Path=/media/synth/movies/Movie 0014 (2020)/Movie 0014 (2020).mkv].MediaStreams[0].BitRate(J=6061020 H=5869020); Items[Path=/media/synth/movies/Movie 0014 (2020)/Movie 0014 (2020).mkv].MediaSources[Path=/media/synth/movies/Movie 0014 (2020)/Movie 0014 (2020).mkv].Name(J=\"Movie 0014 (2020)\" H=\"Movie 0014\"); Items[Path=/media/synth/movies/Movie 0014 (2020)/Movie 0014 (2020).mkv].MediaSources[Path=/media/synth/movies/Movie 0014 (2020)/Movie 0014 (2020).mkv].MediaStreams[0].BitRate(J=6061020 H=5869020)"
+      "note": "0/1 clean; mismatch:0 missing:10 extra:10 | "
     },
     "GET /Items/{itemId}": {
       "classification": "flagged: read diff vs Jellyfin (verify)",
@@ -305,15 +268,15 @@
       "classification": "flagged: read diff vs Jellyfin (verify)",
       "deep_verified": false,
       "diffs": {
-        "extra": [
-          " (whole item)"
+        "extra": [],
+        "mismatch": [
+          "ChildCount"
         ],
-        "mismatch": [],
         "missing": [
-          " (whole item)"
+          "PrimaryImageAspectRatio"
         ]
       },
-      "note": "0/5 clean; mismatch:0 missing:10 extra:10 | "
+      "note": "0/5 clean; mismatch:5 missing:5 extra:0 | [Path=/config/root/default].ChildCount(J=4 H=3); [Path=/config/root/default].ChildCount(J=4 H=3); [Path=/config/root/default].ChildCount(J=4 H=3)"
     },
     "GET /Items/{itemId}/Images": {
       "classification": "ok",
@@ -406,6 +369,8 @@
           "Items[Name=Movie 0091] (whole item)",
           "Items[Name=Movie 0092] (whole item)",
           "Items[Name=Movie 0093] (whole item)",
+          "Items[Name=Movie 0094] (whole item)",
+          "Items[Name=Movie 0095] (whole item)",
           "Items[Name=Movie 0121] (whole item)",
           "Items[Name=Movie 0122] (whole item)",
           "Items[Name=Movie 0123] (whole item)",
@@ -434,9 +399,11 @@
           "Items[Name=Movie 0271] (whole item)",
           "Items[Name=Movie 0272] (whole item)",
           "Items[Name=Movie 0273] (whole item)",
+          "Items[Name=Movie 0274] (whole item)",
           "Items[Name=Movie 0275] (whole item)",
           "Items[Name=Movie 0301] (whole item)",
           "Items[Name=Movie 0302] (whole item)",
+          "Items[Name=Movie 0303] (whole item)",
           "Items[Name=Movie 0304] (whole item)",
           "Items[Name=Movie 0305] (whole item)",
           "Items[Name=Movie 0331] (whole item)",
@@ -454,99 +421,88 @@
           "TotalRecordCount"
         ],
         "missing": [
-          "Items[Name=Movie 0004] (whole item)",
-          "Items[Name=Movie 0013] (whole item)",
-          "Items[Name=Movie 0016] (whole item)",
-          "Items[Name=Movie 0017] (whole item)",
-          "Items[Name=Movie 0018] (whole item)",
-          "Items[Name=Movie 0038] (whole item)",
-          "Items[Name=Movie 0040] (whole item)",
-          "Items[Name=Movie 0072] (whole item)",
-          "Items[Name=Movie 0078] (whole item)",
-          "Items[Name=Movie 0082] (whole item)",
-          "Items[Name=Movie 0083] (whole item)",
-          "Items[Name=Movie 0098] (whole item)",
-          "Items[Name=Movie 0106] (whole item)",
-          "Items[Name=Movie 0108] (whole item)",
-          "Items[Name=Movie 0110] (whole item)",
-          "Items[Name=Movie 0112] (whole item)",
-          "Items[Name=Movie 0117] (whole item)",
-          "Items[Name=Movie 0130] (whole item)",
-          "Items[Name=Movie 0139] (whole item)",
-          "Items[Name=Movie 0141] (whole item)",
-          "Items[Name=Movie 0146] (whole item)",
-          "Items[Name=Movie 0147] (whole item)",
-          "Items[Name=Movie 0151] (whole item)",
-          "Items[Name=Movie 0161] (whole item)",
+          "Items[Name=Movie 0001] (whole item)",
+          "Items[Name=Movie 0006] (whole item)",
+          "Items[Name=Movie 0022] (whole item)",
+          "Items[Name=Movie 0029] (whole item)",
+          "Items[Name=Movie 0030] (whole item)",
+          "Items[Name=Movie 0043] (whole item)",
+          "Items[Name=Movie 0054] (whole item)",
+          "Items[Name=Movie 0057] (whole item)",
+          "Items[Name=Movie 0065] (whole item)",
+          "Items[Name=Movie 0071] (whole item)",
+          "Items[Name=Movie 0077] (whole item)",
+          "Items[Name=Movie 0079] (whole item)",
+          "Items[Name=Movie 0090] (whole item)",
+          "Items[Name=Movie 0091] (whole item)",
+          "Items[Name=Movie 0096] (whole item)",
+          "Items[Name=Movie 0100] (whole item)",
+          "Items[Name=Movie 0101] (whole item)",
+          "Items[Name=Movie 0120] (whole item)",
+          "Items[Name=Movie 0122] (whole item)",
+          "Items[Name=Movie 0127] (whole item)",
+          "Items[Name=Movie 0140] (whole item)",
+          "Items[Name=Movie 0149] (whole item)",
+          "Items[Name=Movie 0152] (whole item)",
+          "Items[Name=Movie 0157] (whole item)",
+          "Items[Name=Movie 0166] (whole item)",
+          "Items[Name=Movie 0167] (whole item)",
           "Items[Name=Movie 0171] (whole item)",
-          "Items[Name=Movie 0173] (whole item)",
-          "Items[Name=Movie 0176] (whole item)",
-          "Items[Name=Movie 0177] (whole item)",
           "Items[Name=Movie 0178] (whole item)",
-          "Items[Name=Movie 0188] (whole item)",
-          "Items[Name=Movie 0199] (whole item)",
-          "Items[Name=Movie 0202] (whole item)",
-          "Items[Name=Movie 0216] (whole item)",
-          "Items[Name=Movie 0243] (whole item)",
-          "Items[Name=Movie 0249] (whole item)",
-          "Items[Name=Movie 0251] (whole item)",
+          "Items[Name=Movie 0189] (whole item)",
+          "Items[Name=Movie 0190] (whole item)",
+          "Items[Name=Movie 0192] (whole item)",
+          "Items[Name=Movie 0201] (whole item)",
+          "Items[Name=Movie 0205] (whole item)",
+          "Items[Name=Movie 0224] (whole item)",
+          "Items[Name=Movie 0231] (whole item)",
+          "Items[Name=Movie 0235] (whole item)",
           "Items[Name=Movie 0256] (whole item)",
-          "Items[Name=Movie 0263] (whole item)",
-          "Items[Name=Movie 0280] (whole item)",
+          "Items[Name=Movie 0258] (whole item)",
+          "Items[Name=Movie 0268] (whole item)",
           "Items[Name=Movie 0282] (whole item)",
-          "Items[Name=Movie 0289] (whole item)",
-          "Items[Name=Movie 0306] (whole item)",
+          "Items[Name=Movie 0290] (whole item)",
+          "Items[Name=Movie 0300] (whole item)",
+          "Items[Name=Movie 0308] (whole item)",
+          "Items[Name=Movie 0309] (whole item)",
           "Items[Name=Movie 0312] (whole item)",
-          "Items[Name=Movie 0323] (whole item)",
-          "Items[Name=Movie 0337] (whole item)",
-          "Items[Name=Movie 0348] (whole item)",
-          "Items[Name=Movie 0351] (whole item)",
-          "Items[Name=Movie 0377] (whole item)",
-          "Items[Name=Movie 0378] (whole item)",
-          "Items[Name=Movie 0385] (whole item)",
-          "Items[Name=Movie 0388] (whole item)",
-          "Items[Name=Movie 0394] (whole item)",
-          "Items[Name=Movie 0398] (whole item)",
-          "Items[Name=Movie 0402] (whole item)",
-          "Items[Name=Movie 0422] (whole item)",
-          "Items[Name=Movie 0426] (whole item)",
-          "Items[Name=Movie 0427] (whole item)",
-          "Items[Name=Movie 0442] (whole item)",
-          "Items[Name=Movie 0452] (whole item)",
-          "Items[Name=Movie 0466] (whole item)",
-          "Items[Name=Movie 0467] (whole item)",
-          "Items[Name=Movie 0469] (whole item)",
+          "Items[Name=Movie 0316] (whole item)",
+          "Items[Name=Movie 0318] (whole item)",
+          "Items[Name=Movie 0319] (whole item)",
+          "Items[Name=Movie 0339] (whole item)",
+          "Items[Name=Movie 0343] (whole item)",
+          "Items[Name=Movie 0346] (whole item)",
+          "Items[Name=Movie 0366] (whole item)",
+          "Items[Name=Movie 0367] (whole item)",
+          "Items[Name=Movie 0372] (whole item)",
+          "Items[Name=Movie 0376] (whole item)",
+          "Items[Name=Movie 0384] (whole item)",
+          "Items[Name=Movie 0391] (whole item)",
+          "Items[Name=Movie 0392] (whole item)",
+          "Items[Name=Movie 0393] (whole item)",
+          "Items[Name=Movie 0404] (whole item)",
+          "Items[Name=Movie 0429] (whole item)",
+          "Items[Name=Movie 0431] (whole item)",
+          "Items[Name=Movie 0432] (whole item)",
+          "Items[Name=Movie 0439] (whole item)",
+          "Items[Name=Movie 0448] (whole item)",
+          "Items[Name=Movie 0453] (whole item)",
+          "Items[Name=Movie 0458] (whole item)",
+          "Items[Name=Movie 0463] (whole item)",
           "Items[Name=Movie 0470] (whole item)",
-          "Items[Name=Movie 0476] (whole item)",
+          "Items[Name=Movie 0472] (whole item)",
           "Items[Name=Movie 0480] (whole item)",
-          "Items[Name=Movie 0481] (whole item)",
+          "Items[Name=Movie 0487] (whole item)",
           "Items[Name=Movie 0488] (whole item)",
-          "Items[Name=Movie 0490] (whole item)",
-          "Items[Name=Movie 0493] (whole item)",
-          "Items[Name=Movie 0495] (whole item)"
+          "Items[Name=Movie 0499] (whole item)"
         ]
       },
-      "note": "0/5 clean; mismatch:5 missing:76 extra:56 | TotalRecordCount(J=16 H=12); TotalRecordCount(J=16 H=12); TotalRecordCount(J=16 H=12)"
+      "note": "0/5 clean; mismatch:5 missing:80 extra:60 | TotalRecordCount(J=16 H=12); TotalRecordCount(J=16 H=12); TotalRecordCount(J=16 H=12)"
     },
     "GET /Library/MediaFolders": {
-      "classification": "flagged: read diff vs Jellyfin (verify)",
-      "deep_verified": false,
-      "diffs": {
-        "extra": [
-          "Items[Path=/data/data/playlists] (whole item)",
-          "Items[Path=/data/root/default/Movies (synth)] (whole item)",
-          "Items[Path=/data/root/default/Music (synth)] (whole item)",
-          "Items[Path=/data/root/default/Shows (synth)] (whole item)"
-        ],
-        "mismatch": [],
-        "missing": [
-          "Items[Path=/config/data/playlists] (whole item)",
-          "Items[Path=/config/root/default/Movies (synth)] (whole item)",
-          "Items[Path=/config/root/default/Music (synth)] (whole item)",
-          "Items[Path=/config/root/default/Shows (synth)] (whole item)"
-        ]
-      },
-      "note": "0/1 clean; mismatch:0 missing:4 extra:4 | "
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "1/1 clean"
     },
     "GET /Library/VirtualFolders": {
       "classification": "ok",
@@ -564,7 +520,7 @@
         ],
         "missing": []
       },
-      "note": "0/1 clean; mismatch:2 missing:0 extra:0 | Items[Name=Parity Two].CurrentProgram.ChannelId(J=\"dcd04dcd7fa074c3b728a1fa49acd10e\" H=\"74be0aa04bbf5cac932103d20c6fcb68\"); Items[Name=Parity One].CurrentProgram.ChannelId(J=\"d53240a11ffc0b1a0c165896a3bdf7f4\" H=\"a78b28c8b8595a24aaa3152900614e2d\")"
+      "note": "0/1 clean; mismatch:2 missing:0 extra:0 | Items[Name=Parity Two].CurrentProgram.ChannelId(J=\"dcd04dcd7fa074c3b728a1fa49acd10e\" H=\"18386a0e6be65ec79b5bedd61eff1b78\"); Items[Name=Parity One].CurrentProgram.ChannelId(J=\"d53240a11ffc0b1a0c165896a3bdf7f4\" H=\"9127e1e4487f50f38ba93896ec696a5b\")"
     },
     "GET /LiveTv/Channels/{channelId}": {
       "classification": "flagged: read diff vs Jellyfin (verify)",
@@ -576,7 +532,7 @@
         ],
         "missing": []
       },
-      "note": "0/1 clean; mismatch:1 missing:0 extra:0 | CurrentProgram.ChannelId(J=\"d53240a11ffc0b1a0c165896a3bdf7f4\" H=\"a78b28c8b8595a24aaa3152900614e2d\")"
+      "note": "0/1 clean; mismatch:1 missing:0 extra:0 | CurrentProgram.ChannelId(J=\"d53240a11ffc0b1a0c165896a3bdf7f4\" H=\"9127e1e4487f50f38ba93896ec696a5b\")"
     },
     "GET /LiveTv/Info": {
       "classification": "flagged: read diff vs Jellyfin (verify)",
@@ -588,7 +544,7 @@
         ],
         "missing": []
       },
-      "note": "0/1 clean; mismatch:1 missing:0 extra:0 | EnabledUsers[0](J=\"116860a250614f5fbcb0dca5a7b23787\" H=\"79b9ba39042a4c83a02d162519d3bc89\")"
+      "note": "0/1 clean; mismatch:1 missing:0 extra:0 | EnabledUsers[0](J=\"db4c740776fc4f88b5bc35989ca70f93\" H=\"dfbdc7e88e0845289b77a128a74321f8\")"
     },
     "GET /LiveTv/Programs": {
       "classification": "flagged: read diff vs Jellyfin (verify)",
@@ -596,11 +552,11 @@
       "diffs": {
         "extra": [],
         "mismatch": [
-          "Items[Name=Parity Show 00 on parity1].ChannelId"
+          "Items[Name=Parity Show 20 on parity1].ChannelId"
         ],
         "missing": []
       },
-      "note": "0/1 clean; mismatch:1 missing:0 extra:0 | Items[Name=Parity Show 00 on parity1].ChannelId(J=\"d53240a11ffc0b1a0c165896a3bdf7f4\" H=\"a78b28c8b8595a24aaa3152900614e2d\")"
+      "note": "0/1 clean; mismatch:1 missing:0 extra:0 | Items[Name=Parity Show 20 on parity1].ChannelId(J=\"d53240a11ffc0b1a0c165896a3bdf7f4\" H=\"9127e1e4487f50f38ba93896ec696a5b\")"
     },
     "GET /LiveTv/Programs/Recommended": {
       "classification": "flagged: read diff vs Jellyfin (verify)",
@@ -608,12 +564,12 @@
       "diffs": {
         "extra": [],
         "mismatch": [
-          "Items[Name=Parity Show 00 on parity1].ChannelId",
-          "Items[Name=Parity Show 00 on parity2].ChannelId"
+          "Items[Name=Parity Show 20 on parity1].ChannelId",
+          "Items[Name=Parity Show 20 on parity2].ChannelId"
         ],
         "missing": []
       },
-      "note": "0/1 clean; mismatch:2 missing:0 extra:0 | Items[Name=Parity Show 00 on parity1].ChannelId(J=\"d53240a11ffc0b1a0c165896a3bdf7f4\" H=\"a78b28c8b8595a24aaa3152900614e2d\"); Items[Name=Parity Show 00 on parity2].ChannelId(J=\"dcd04dcd7fa074c3b728a1fa49acd10e\" H=\"74be0aa04bbf5cac932103d20c6fcb68\")"
+      "note": "0/1 clean; mismatch:2 missing:0 extra:0 | Items[Name=Parity Show 20 on parity1].ChannelId(J=\"d53240a11ffc0b1a0c165896a3bdf7f4\" H=\"9127e1e4487f50f38ba93896ec696a5b\"); Items[Name=Parity Show 20 on parity2].ChannelId(J=\"dcd04dcd7fa074c3b728a1fa49acd10e\" H=\"18386a0e6be65ec79b5bedd61eff1b78\")"
     },
     "GET /LiveTv/TunerHosts/Types": {
       "classification": "flagged: read diff vs Jellyfin (verify)",
@@ -660,8 +616,8 @@
           "Items[Name=Movie 0121] (whole item)",
           "Items[Name=Movie 0122] (whole item)",
           "Items[Name=Movie 0123] (whole item)",
+          "Items[Name=Movie 0124] (whole item)",
           "Items[Name=Movie 0125] (whole item)",
-          "Items[Name=Movie 0151] (whole item)",
           "Items[Name=Movie 0152] (whole item)",
           "Items[Name=Movie 0153] (whole item)",
           "Items[Name=Movie 0154] (whole item)",
@@ -672,7 +628,6 @@
           "Items[Name=Movie 0184] (whole item)",
           "Items[Name=Movie 0185] (whole item)",
           "Items[Name=Movie 0211] (whole item)",
-          "Items[Name=Movie 0212] (whole item)",
           "Items[Name=Movie 0213] (whole item)",
           "Items[Name=Movie 0214] (whole item)",
           "Items[Name=Movie 0215] (whole item)",
@@ -684,13 +639,12 @@
           "Items[Name=Movie 0271] (whole item)",
           "Items[Name=Movie 0272] (whole item)",
           "Items[Name=Movie 0273] (whole item)",
-          "Items[Name=Movie 0274] (whole item)",
           "Items[Name=Movie 0275] (whole item)",
           "Items[Name=Movie 0301] (whole item)",
           "Items[Name=Movie 0302] (whole item)",
           "Items[Name=Movie 0303] (whole item)",
-          "Items[Name=Movie 0304] (whole item)",
           "Items[Name=Movie 0305] (whole item)",
+          "Items[Name=Movie 0331] (whole item)",
           "Items[Name=Movie 0332] (whole item)",
           "Items[Name=Movie 0333] (whole item)",
           "Items[Name=Movie 0334] (whole item)",
@@ -705,99 +659,87 @@
           "TotalRecordCount"
         ],
         "missing": [
+          "Items[Name=Movie 0006] (whole item)",
+          "Items[Name=Movie 0007] (whole item)",
+          "Items[Name=Movie 0008] (whole item)",
+          "Items[Name=Movie 0015] (whole item)",
+          "Items[Name=Movie 0019] (whole item)",
+          "Items[Name=Movie 0021] (whole item)",
+          "Items[Name=Movie 0025] (whole item)",
+          "Items[Name=Movie 0031] (whole item)",
           "Items[Name=Movie 0037] (whole item)",
-          "Items[Name=Movie 0039] (whole item)",
-          "Items[Name=Movie 0040] (whole item)",
-          "Items[Name=Movie 0042] (whole item)",
-          "Items[Name=Movie 0043] (whole item)",
-          "Items[Name=Movie 0047] (whole item)",
-          "Items[Name=Movie 0063] (whole item)",
+          "Items[Name=Movie 0038] (whole item)",
+          "Items[Name=Movie 0044] (whole item)",
+          "Items[Name=Movie 0048] (whole item)",
+          "Items[Name=Movie 0052] (whole item)",
+          "Items[Name=Movie 0062] (whole item)",
+          "Items[Name=Movie 0068] (whole item)",
           "Items[Name=Movie 0076] (whole item)",
-          "Items[Name=Movie 0084] (whole item)",
-          "Items[Name=Movie 0087] (whole item)",
-          "Items[Name=Movie 0090] (whole item)",
+          "Items[Name=Movie 0085] (whole item)",
           "Items[Name=Movie 0096] (whole item)",
-          "Items[Name=Movie 0104] (whole item)",
-          "Items[Name=Movie 0105] (whole item)",
-          "Items[Name=Movie 0106] (whole item)",
-          "Items[Name=Movie 0108] (whole item)",
+          "Items[Name=Movie 0102] (whole item)",
+          "Items[Name=Movie 0109] (whole item)",
+          "Items[Name=Movie 0110] (whole item)",
           "Items[Name=Movie 0113] (whole item)",
           "Items[Name=Movie 0116] (whole item)",
           "Items[Name=Movie 0120] (whole item)",
-          "Items[Name=Movie 0135] (whole item)",
-          "Items[Name=Movie 0137] (whole item)",
-          "Items[Name=Movie 0139] (whole item)",
+          "Items[Name=Movie 0132] (whole item)",
+          "Items[Name=Movie 0141] (whole item)",
           "Items[Name=Movie 0144] (whole item)",
-          "Items[Name=Movie 0158] (whole item)",
-          "Items[Name=Movie 0168] (whole item)",
+          "Items[Name=Movie 0156] (whole item)",
+          "Items[Name=Movie 0161] (whole item)",
+          "Items[Name=Movie 0164] (whole item)",
           "Items[Name=Movie 0179] (whole item)",
-          "Items[Name=Movie 0190] (whole item)",
-          "Items[Name=Movie 0203] (whole item)",
-          "Items[Name=Movie 0218] (whole item)",
-          "Items[Name=Movie 0224] (whole item)",
-          "Items[Name=Movie 0232] (whole item)",
-          "Items[Name=Movie 0236] (whole item)",
-          "Items[Name=Movie 0249] (whole item)",
-          "Items[Name=Movie 0253] (whole item)",
-          "Items[Name=Movie 0256] (whole item)",
-          "Items[Name=Movie 0265] (whole item)",
-          "Items[Name=Movie 0267] (whole item)",
-          "Items[Name=Movie 0270] (whole item)",
-          "Items[Name=Movie 0281] (whole item)",
-          "Items[Name=Movie 0289] (whole item)",
-          "Items[Name=Movie 0299] (whole item)",
-          "Items[Name=Movie 0300] (whole item)",
-          "Items[Name=Movie 0310] (whole item)",
-          "Items[Name=Movie 0317] (whole item)",
-          "Items[Name=Movie 0321] (whole item)",
-          "Items[Name=Movie 0322] (whole item)",
-          "Items[Name=Movie 0334] (whole item)",
-          "Items[Name=Movie 0347] (whole item)",
-          "Items[Name=Movie 0350] (whole item)",
-          "Items[Name=Movie 0372] (whole item)",
-          "Items[Name=Movie 0375] (whole item)",
-          "Items[Name=Movie 0389] (whole item)",
-          "Items[Name=Movie 0394] (whole item)",
-          "Items[Name=Movie 0396] (whole item)",
-          "Items[Name=Movie 0400] (whole item)",
-          "Items[Name=Movie 0403] (whole item)",
-          "Items[Name=Movie 0412] (whole item)",
-          "Items[Name=Movie 0415] (whole item)",
-          "Items[Name=Movie 0429] (whole item)",
-          "Items[Name=Movie 0434] (whole item)",
-          "Items[Name=Movie 0435] (whole item)",
-          "Items[Name=Movie 0444] (whole item)",
-          "Items[Name=Movie 0445] (whole item)",
-          "Items[Name=Movie 0450] (whole item)",
-          "Items[Name=Movie 0456] (whole item)",
-          "Items[Name=Movie 0461] (whole item)",
-          "Items[Name=Movie 0468] (whole item)",
-          "Items[Name=Movie 0470] (whole item)",
+          "Items[Name=Movie 0183] (whole item)",
+          "Items[Name=Movie 0185] (whole item)",
+          "Items[Name=Movie 0186] (whole item)",
+          "Items[Name=Movie 0197] (whole item)",
+          "Items[Name=Movie 0201] (whole item)",
+          "Items[Name=Movie 0208] (whole item)",
+          "Items[Name=Movie 0210] (whole item)",
+          "Items[Name=Movie 0211] (whole item)",
+          "Items[Name=Movie 0214] (whole item)",
+          "Items[Name=Movie 0220] (whole item)",
+          "Items[Name=Movie 0225] (whole item)",
+          "Items[Name=Movie 0230] (whole item)",
+          "Items[Name=Movie 0234] (whole item)",
+          "Items[Name=Movie 0247] (whole item)",
+          "Items[Name=Movie 0257] (whole item)",
+          "Items[Name=Movie 0260] (whole item)",
+          "Items[Name=Movie 0274] (whole item)",
+          "Items[Name=Movie 0295] (whole item)",
+          "Items[Name=Movie 0297] (whole item)",
+          "Items[Name=Movie 0302] (whole item)",
+          "Items[Name=Movie 0306] (whole item)",
+          "Items[Name=Movie 0315] (whole item)",
+          "Items[Name=Movie 0349] (whole item)",
+          "Items[Name=Movie 0352] (whole item)",
+          "Items[Name=Movie 0355] (whole item)",
+          "Items[Name=Movie 0367] (whole item)",
+          "Items[Name=Movie 0369] (whole item)",
+          "Items[Name=Movie 0370] (whole item)",
+          "Items[Name=Movie 0380] (whole item)",
+          "Items[Name=Movie 0387] (whole item)",
+          "Items[Name=Movie 0397] (whole item)",
+          "Items[Name=Movie 0419] (whole item)",
+          "Items[Name=Movie 0424] (whole item)",
+          "Items[Name=Movie 0432] (whole item)",
+          "Items[Name=Movie 0441] (whole item)",
+          "Items[Name=Movie 0457] (whole item)",
+          "Items[Name=Movie 0459] (whole item)",
+          "Items[Name=Movie 0462] (whole item)",
           "Items[Name=Movie 0471] (whole item)",
-          "Items[Name=Movie 0473] (whole item)",
-          "Items[Name=Movie 0481] (whole item)",
-          "Items[Name=Movie 0482] (whole item)",
-          "Items[Name=Movie 0486] (whole item)",
-          "Items[Name=Movie 0496] (whole item)"
+          "Items[Name=Movie 0476] (whole item)",
+          "Items[Name=Movie 0492] (whole item)",
+          "Items[Name=Movie 0500] (whole item)"
         ]
       },
-      "note": "0/5 clean; mismatch:5 missing:78 extra:58 | TotalRecordCount(J=16 H=12); TotalRecordCount(J=16 H=12); TotalRecordCount(J=16 H=12)"
+      "note": "0/5 clean; mismatch:5 missing:76 extra:56 | TotalRecordCount(J=16 H=12); TotalRecordCount(J=16 H=12); TotalRecordCount(J=16 H=12)"
     },
     "GET /MusicGenres": {
-      "classification": "flagged: read diff vs Jellyfin (verify)",
-      "deep_verified": false,
-      "diffs": {
-        "extra": [],
-        "mismatch": [
-          "Items[Name=Ambient].Type",
-          "Items[Name=Jazz].Type",
-          "Items[Name=Rock].Type"
-        ],
-        "missing": [
-          "Items[Name=Action] (whole item)"
-        ]
-      },
-      "note": "0/1 clean; mismatch:3 missing:1 extra:0 | Items[Name=Jazz].Type(J=\"MusicGenre\" H=\"Genre\"); Items[Name=Rock].Type(J=\"MusicGenre\" H=\"Genre\"); Items[Name=Ambient].Type(J=\"MusicGenre\" H=\"Genre\")"
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "1/1 clean"
     },
     "GET /MusicGenres/InstantMix": {
       "classification": "",
@@ -805,9 +747,19 @@
       "note": "no comparable response (both empty/non-200)"
     },
     "GET /MusicGenres/{genreName}": {
-      "classification": "",
-      "deep_verified": null,
-      "note": "no comparable response (both empty/non-200)"
+      "classification": "flagged: read diff vs Jellyfin (verify)",
+      "deep_verified": false,
+      "diffs": {
+        "extra": [],
+        "mismatch": [
+          "AlbumCount",
+          "ChildCount"
+        ],
+        "missing": [
+          "Path"
+        ]
+      },
+      "note": "0/1 clean; mismatch:2 missing:1 extra:0 | AlbumCount(J=1 H=0); ChildCount(J=4 H=3)"
     },
     "GET /Persons": {
       "classification": "ok",
@@ -839,11 +791,11 @@
       "diffs": {
         "extra": [
           "SearchHints[0].IsFolder",
-          "SearchHints[10].IsFolder",
-          "SearchHints[11].Album",
-          "SearchHints[11].IndexNumber",
-          "SearchHints[11].ProductionYear",
-          "SearchHints[11].RunTimeTicks",
+          "SearchHints[10].Album",
+          "SearchHints[10].IndexNumber",
+          "SearchHints[10].ProductionYear",
+          "SearchHints[10].RunTimeTicks",
+          "SearchHints[11].IsFolder",
           "SearchHints[12].Album",
           "SearchHints[12].IndexNumber",
           "SearchHints[12].ProductionYear",
@@ -852,16 +804,17 @@
           "SearchHints[13].IndexNumber",
           "SearchHints[13].ProductionYear",
           "SearchHints[13].RunTimeTicks",
-          "SearchHints[15].Album",
-          "SearchHints[15].IndexNumber",
+          "SearchHints[14].Album",
+          "SearchHints[14].IndexNumber",
           "SearchHints[16].Album",
           "SearchHints[16].IndexNumber",
           "SearchHints[17].Album",
           "SearchHints[17].IndexNumber",
           "SearchHints[17].ProductionYear",
           "SearchHints[17].RunTimeTicks",
+          "SearchHints[18].Album",
           "SearchHints[18].IndexNumber",
-          "SearchHints[18].Series",
+          "SearchHints[18].ProductionYear",
           "SearchHints[19].IndexNumber",
           "SearchHints[19].Series",
           "SearchHints[1].IsFolder",
@@ -869,6 +822,7 @@
           "SearchHints[3].IsFolder",
           "SearchHints[5].IsFolder",
           "SearchHints[6].IsFolder",
+          "SearchHints[7].IsFolder",
           "SearchHints[9].Album",
           "SearchHints[9].IndexNumber",
           "SearchHints[9].ProductionYear",
@@ -879,11 +833,10 @@
           "SearchHints[0].MediaType",
           "SearchHints[0].Name",
           "SearchHints[0].Type",
+          "SearchHints[10].Artists[]",
+          "SearchHints[10].MediaType",
           "SearchHints[10].Name",
           "SearchHints[10].Type",
-          "SearchHints[11].Artists[]",
-          "SearchHints[11].MediaType",
-          "SearchHints[11].Name",
           "SearchHints[11].Type",
           "SearchHints[12].Artists[]",
           "SearchHints[12].MediaType",
@@ -893,12 +846,13 @@
           "SearchHints[13].MediaType",
           "SearchHints[13].Name",
           "SearchHints[13].Type",
-          "SearchHints[14].Artists[]",
+          "SearchHints[14].Artists[0]",
+          "SearchHints[14].MediaType",
           "SearchHints[14].Name",
+          "SearchHints[14].RunTimeTicks",
           "SearchHints[14].Type",
-          "SearchHints[15].MediaType",
+          "SearchHints[15].Artists[]",
           "SearchHints[15].Name",
-          "SearchHints[15].RunTimeTicks",
           "SearchHints[15].Type",
           "SearchHints[16].Artists[0]",
           "SearchHints[16].MediaType",
@@ -909,7 +863,10 @@
           "SearchHints[17].MediaType",
           "SearchHints[17].Name",
           "SearchHints[17].Type",
+          "SearchHints[18].Artists[]",
+          "SearchHints[18].MediaType",
           "SearchHints[18].Name",
+          "SearchHints[18].RunTimeTicks",
           "SearchHints[18].Type",
           "SearchHints[19].Name",
           "SearchHints[19].Type",
@@ -937,9 +894,10 @@
           "SearchHints[6].MediaType",
           "SearchHints[6].Name",
           "SearchHints[6].Type",
-          "SearchHints[7].Artists[0]",
-          "SearchHints[7].IndexNumber",
+          "SearchHints[7].Artists[]",
+          "SearchHints[7].MediaType",
           "SearchHints[7].Name",
+          "SearchHints[7].Type",
           "SearchHints[8].Artists[0]",
           "SearchHints[8].IndexNumber",
           "SearchHints[8].Name",
@@ -957,13 +915,13 @@
           "SearchHints[13].PrimaryImageAspectRatio",
           "SearchHints[13].PrimaryImageTag",
           "SearchHints[14].AlbumArtist",
-          "SearchHints[14].ProductionYear",
-          "SearchHints[14].RunTimeTicks",
+          "SearchHints[14].IsFolder",
           "SearchHints[15].AlbumArtist",
-          "SearchHints[15].IsFolder",
+          "SearchHints[15].ProductionYear",
+          "SearchHints[15].RunTimeTicks",
           "SearchHints[16].AlbumArtist",
           "SearchHints[16].IsFolder",
-          "SearchHints[18].RunTimeTicks",
+          "SearchHints[18].IsFolder",
           "SearchHints[19].RunTimeTicks",
           "SearchHints[1].Album",
           "SearchHints[1].AlbumArtist",
@@ -992,16 +950,27 @@
           "SearchHints[6].IndexNumber",
           "SearchHints[6].ProductionYear",
           "SearchHints[6].RunTimeTicks",
+          "SearchHints[7].Album",
           "SearchHints[7].AlbumArtist",
+          "SearchHints[7].IndexNumber",
+          "SearchHints[7].ProductionYear",
+          "SearchHints[7].RunTimeTicks",
           "SearchHints[8].AlbumArtist"
         ]
       },
-      "note": "0/1 clean; mismatch:72 missing:45 extra:35 | SearchHints[0].Type(J=\"Audio\" H=\"Genre\"); SearchHints[0].Artists[](J=len 1 H=len 0); SearchHints[0].Name(J=\"Artist 01 Album 01 Track 01\" H=\"Action\")"
+      "note": "0/1 clean; mismatch:76 missing:49 extra:37 | SearchHints[0].Type(J=\"Audio\" H=\"Genre\"); SearchHints[0].Name(J=\"Artist 01 Album 01 Track 01\" H=\"Action\"); SearchHints[0].MediaType(J=\"Audio\" H=\"Unknown\")"
     },
     "GET /Sessions": {
-      "classification": "ok",
-      "deep_verified": true,
-      "note": "1/1 clean"
+      "classification": "flagged: read diff vs Jellyfin (verify)",
+      "deep_verified": false,
+      "diffs": {
+        "extra": [],
+        "mismatch": [],
+        "missing": [
+          " (whole item)"
+        ]
+      },
+      "note": "0/1 clean; mismatch:0 missing:5 extra:0 | "
     },
     "GET /Shows/NextUp": {
       "classification": "ok",
@@ -1056,25 +1025,9 @@
       "note": "1/1 clean"
     },
     "GET /UserViews": {
-      "classification": "flagged: read diff vs Jellyfin (verify)",
-      "deep_verified": false,
-      "diffs": {
-        "extra": [
-          "Items[Path=/data/root/default/Movies (synth)] (whole item)",
-          "Items[Path=/data/root/default/Music (synth)] (whole item)",
-          "Items[Path=/data/root/default/Shows (synth)] (whole item)"
-        ],
-        "mismatch": [
-          "TotalRecordCount"
-        ],
-        "missing": [
-          "Items[Path=/config/metadata/views/livetv] (whole item)",
-          "Items[Path=/config/root/default/Movies (synth)] (whole item)",
-          "Items[Path=/config/root/default/Music (synth)] (whole item)",
-          "Items[Path=/config/root/default/Shows (synth)] (whole item)"
-        ]
-      },
-      "note": "0/1 clean; mismatch:1 missing:4 extra:3 | TotalRecordCount(J=4 H=3)"
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "1/1 clean"
     },
     "GET /Users/Me": {
       "classification": "ok",

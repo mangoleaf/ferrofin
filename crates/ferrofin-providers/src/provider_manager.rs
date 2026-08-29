@@ -3542,6 +3542,13 @@ mod tests {
         ) -> Result<(), ServiceError> {
             unimplemented!()
         }
+        async fn set_collection_type(
+            &self,
+            _item_id: Uuid,
+            _collection_type: &str,
+        ) -> Result<(), ServiceError> {
+            unimplemented!()
+        }
         async fn set_ancestors(
             &self,
             _item_id: Uuid,

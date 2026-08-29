@@ -86,6 +86,12 @@ pub struct FerrofinVirtualFolderManager {
     /// every listing, which is a hot read path; once a row is known to be
     /// parented the two extra probes (root exists, parent set) are skipped.
     parented: Arc<std::sync::Mutex<std::collections::HashSet<uuid::Uuid>>>,
+    /// `{data}/playlists` — the `PlaylistsFolder` `LibraryManager.CreateRootFolder`
+    /// adds to the root as a virtual child, set by the composition root. It is a
+    /// root child like any library, so its location is part of
+    /// [`get_physical_paths`](VirtualFolderManager::get_physical_paths). `None`
+    /// in unit tests keeps the manager library-only.
+    playlists_path: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for FerrofinVirtualFolderManager {
@@ -94,6 +100,7 @@ impl std::fmt::Debug for FerrofinVirtualFolderManager {
             .field("root", &self.root)
             .field("has_item_store", &self.persistence.is_some())
             .field("id_derivation", &self.id_derivation)
+            .field("playlists_path", &self.playlists_path)
             .finish_non_exhaustive()
     }
 }
@@ -110,6 +117,7 @@ impl FerrofinVirtualFolderManager {
             persistence: None,
             id_derivation: item_type_lookup::IdDerivation::LegacyLowercase,
             parented: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            playlists_path: None,
         }
     }
 
@@ -126,6 +134,15 @@ impl FerrofinVirtualFolderManager {
     #[must_use]
     pub fn with_id_derivation(mut self, mode: item_type_lookup::IdDerivation) -> Self {
         self.id_derivation = mode;
+        self
+    }
+
+    /// Sets the `{data}/playlists` folder's path, so it is reported among the
+    /// root's physical locations. Called once by the composition root with the
+    /// same path the user-view manager provisions the folder at.
+    #[must_use]
+    pub fn with_playlists_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.playlists_path = Some(path.into());
         self
     }
 
@@ -178,12 +195,29 @@ impl FerrofinVirtualFolderManager {
         ) else {
             return Ok(());
         };
+        // The library's own collection type, from its `<type>.collection`
+        // marker. It has to reach the ROW: `DtoService` emits `CollectionType`
+        // for every `IHasCollectionType` item on every endpoint
+        // (DtoService.cs:1061-1064) and reads it off the item, not off the
+        // filesystem, so a row without it serves `CollectionType: null` to
+        // `/Library/MediaFolders`, `/Items`, `/Items/{id}` and
+        // `/Items/{id}/Ancestors` alike.
+        let collection_type = Self::read_collection_type(folder_path)
+            .await
+            .map(Self::collection_type_marker);
         if persistence.item_exists(id).await? {
             if self.parented.lock().is_ok_and(|set| set.contains(&id)) {
                 return Ok(());
             }
             let root_id = root.ensure().await?;
             persistence.set_parent_id(id, root_id).await?;
+            // Backfill for a row written before the type was stored (an older
+            // Ferrofin database, or one adopted from Jellyfin mid-migration).
+            // Guarded by the same in-process `parented` set, so it costs one
+            // read per library per boot, not one per request.
+            if let Some(marker) = collection_type {
+                persistence.set_collection_type(id, marker).await?;
+            }
             if let Ok(mut set) = self.parented.lock() {
                 set.insert(id);
             }
@@ -201,6 +235,7 @@ impl FerrofinVirtualFolderManager {
             parent_id: Some(guid_to_db(root_id)),
             is_folder: true,
             date_created: Some(Utc::now()),
+            data: collection_type.map(|marker| format!(r#"{{"CollectionType":"{marker}"}}"#)),
             ..BaseItemEntity::default()
         };
         persistence
@@ -475,6 +510,42 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
         // the response deterministic (Jellyfin sorts by directory listing too).
         folders.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(folders)
+    }
+
+    /// Port of `LibraryController.GetPhysicalPaths`
+    /// (`RootFolder.Children.SelectMany(c => c.PhysicalLocations)`).
+    ///
+    /// Overridden — rather than left on the trait default, which walks only the
+    /// configured libraries — because the root's children are NOT just the
+    /// libraries: `LibraryManager.CreateRootFolder` (LibraryManager.cs:1090-1120)
+    /// unconditionally adds a `PlaylistsFolder` at `{data}/playlists` with
+    /// `rootFolder.AddVirtualChild(folder)`, and it appears in this list. Its
+    /// path is emitted whenever the composition root has wired one, not gated on
+    /// the directory existing: upstream creates it in `CreateRootFolder`, before
+    /// any request, so gating would make the answer depend on whether
+    /// `/Library/MediaFolders` had been called first.
+    ///
+    /// The order is `SortName` ascending: `Folder.GetCachedChildren` issues an
+    /// `InternalItemsQuery` with no `OrderBy`, and `BaseItemRepository.ApplyOrder`
+    /// falls back to `query.OrderBy(e => e.SortName)`
+    /// (BaseItemRepository.QueryBuilding.cs:328-331).
+    async fn get_physical_paths(&self) -> Result<Vec<String>, ServiceError> {
+        let mut rows: Vec<(String, Vec<String>)> = Vec::new();
+        for folder in self.get_virtual_folders().await? {
+            let key =
+                ferrofin_util::sort_name::create_sort_name(folder.name.as_deref().unwrap_or(""));
+            rows.push((key, folder.locations));
+        }
+        if let Some(path) = &self.playlists_path {
+            rows.push((
+                ferrofin_util::sort_name::create_sort_name(
+                    crate::user_view_manager::PLAYLISTS_FOLDER_NAME,
+                ),
+                vec![path.to_string_lossy().into_owned()],
+            ));
+        }
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(rows.into_iter().flat_map(|(_, l)| l).collect())
     }
 
     async fn add_virtual_folder(
@@ -896,6 +967,49 @@ mod tests {
         assert!(folder.library_options.as_ref().unwrap().enable_photos);
         // Physical paths are the union of resolved locations.
         assert_eq!(mgr.get_physical_paths().await.unwrap(), vec![media]);
+    }
+
+    /// `GetPhysicalPaths` walks the ROOT's children, and
+    /// `LibraryManager.CreateRootFolder` adds the `PlaylistsFolder` at
+    /// `{data}/playlists` as one of them — SortName-ordered with the libraries,
+    /// not appended after them.
+    #[tokio::test]
+    async fn physical_paths_include_the_playlists_folder_in_sort_name_order() {
+        let (tmp, mgr) = manager();
+        let movies = media_dir(&tmp, "movies");
+        let shows = media_dir(&tmp, "shows");
+        mgr.add_virtual_folder(
+            "Movies",
+            Some(CollectionTypeOptions::movies),
+            &opts_with_paths(std::slice::from_ref(&movies)),
+        )
+        .await
+        .unwrap();
+        mgr.add_virtual_folder(
+            "Shows",
+            Some(CollectionTypeOptions::tvshows),
+            &opts_with_paths(std::slice::from_ref(&shows)),
+        )
+        .await
+        .unwrap();
+
+        // Without a playlists path wired the list is libraries only.
+        assert_eq!(
+            mgr.get_physical_paths().await.unwrap(),
+            vec![movies.clone(), shows.clone()]
+        );
+
+        let playlists = tmp.path().join("data").join("playlists");
+        let mgr = mgr.with_playlists_path(&playlists);
+        // Movies < Playlists < Shows by SortName, so it interleaves.
+        assert_eq!(
+            mgr.get_physical_paths().await.unwrap(),
+            vec![
+                movies,
+                playlists.to_string_lossy().into_owned(),
+                shows.clone(),
+            ]
+        );
     }
 
     #[tokio::test]

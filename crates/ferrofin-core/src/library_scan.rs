@@ -2326,6 +2326,20 @@ impl LibraryScanner {
         let source = &probed.media_source;
         entity.run_time_ticks = source.run_time_ticks.or(entity.run_time_ticks);
         entity.size = source.size.or(entity.size);
+        // The item row's own Width/Height are the PRIMARY VIDEO STREAM's, written
+        // by the video prober on every probe (`FFProbeVideoInfo.Fetch`,
+        // FFProbeVideoInfo.cs:265-266: `video.Height = videoStream?.Height ?? 0;
+        // video.Width = videoStream?.Width ?? 0;`). `AudioFileProber` never
+        // touches them, so an audio item keeps whatever the row had. These are
+        // what `DtoService` emits as `Width`/`Height` — not the poster's size.
+        if !media_is_audio {
+            let video = source
+                .media_streams
+                .iter()
+                .find(|s| s.stream_type == ferrofin_model::entities::MediaStreamType::Video);
+            entity.width = video.and_then(|s| s.width).map(i64::from);
+            entity.height = video.and_then(|s| s.height).map(i64::from);
+        }
         // Embedded audio tags (album/artists/track/disc/year/genres + the
         // MusicBrainz ids) — the port of `AudioFileProber`. Fill-if-empty so an
         // NFO/prior scan wins; the ids are returned for persistence.

@@ -247,11 +247,30 @@ pub fn can_delete(kind: BaseItemKind, has_parent: bool) -> bool {
 }
 
 /// Whether items of this kind track played/unplayed status
-/// (C# `BaseItem.SupportsPlayedStatus`). Real playable media and the folders
-/// that aggregate it support it; the by-name grouping kinds do not.
+/// (C# `BaseItem.SupportsPlayedStatus`).
+///
+/// `BaseItem` defaults to `false` and `Folder` overrides it to `true`
+/// (`Folder.cs:84`), so ordinary media and the folders that aggregate it
+/// support it — but seven container kinds override it back to `false`:
+/// `CollectionFolder.cs:74`, `AggregateFolder.cs:50`, `UserRootFolder.cs:39`,
+/// `UserView.cs:66`, `PhotoAlbum.cs:14`, `MusicAlbum.cs:51` and
+/// `MusicArtist.cs:48`. The by-name grouping kinds are plain `BaseItem`s and
+/// keep the `false` default.
+///
+/// This is the guard `Folder.FillUserDataDtoValues` (`Folder.cs:1973`) puts on
+/// `UserData.UnplayedItemCount`, so a kind listed here as `false` must not
+/// carry that count.
 #[must_use]
 pub fn supports_played_status(kind: BaseItemKind) -> bool {
-    !is_item_by_name(kind)
+    !matches!(
+        kind,
+        BaseItemKind::CollectionFolder
+            | BaseItemKind::AggregateFolder
+            | BaseItemKind::UserRootFolder
+            | BaseItemKind::UserView
+            | BaseItemKind::PhotoAlbum
+            | BaseItemKind::MusicAlbum
+    ) && !is_item_by_name(kind)
 }
 
 /// Whether items of this kind can resume from a saved position tick
@@ -698,5 +717,36 @@ mod tests {
         }
         assert!(supports_ancestors(BaseItemKind::Movie));
         assert!(supports_played_status(BaseItemKind::Movie));
+    }
+
+    /// The seven container kinds that override `SupportsPlayedStatus` back to
+    /// `false` (`CollectionFolder.cs:74`, `AggregateFolder.cs:50`,
+    /// `UserRootFolder.cs:39`, `UserView.cs:66`, `PhotoAlbum.cs:14`,
+    /// `MusicAlbum.cs:51`, `MusicArtist.cs:48`) — the ones whose DTOs must not
+    /// carry `UserData.UnplayedItemCount`.
+    #[test]
+    fn container_kinds_override_played_status_off() {
+        for kind in [
+            BaseItemKind::CollectionFolder,
+            BaseItemKind::AggregateFolder,
+            BaseItemKind::UserRootFolder,
+            BaseItemKind::UserView,
+            BaseItemKind::PhotoAlbum,
+            BaseItemKind::MusicAlbum,
+            BaseItemKind::MusicArtist,
+        ] {
+            assert!(!supports_played_status(kind), "{kind:?}");
+        }
+        // `Folder.SupportsPlayedStatus => true` still holds for the aggregating
+        // kinds that do not override it.
+        for kind in [
+            BaseItemKind::Series,
+            BaseItemKind::Season,
+            BaseItemKind::BoxSet,
+            BaseItemKind::Folder,
+            BaseItemKind::ManualPlaylistsFolder,
+        ] {
+            assert!(supports_played_status(kind), "{kind:?}");
+        }
     }
 }

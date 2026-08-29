@@ -286,6 +286,58 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Marks setup complete when the wizard flag says it is not but a configured
+/// administrator already exists.
+///
+/// Port of `ApplicationHost.EnsureStartupWizardIntegrity`
+/// (ApplicationHost.cs:443-459), and it is a security fix, not cosmetics: the
+/// `FirstTimeSetupOrAuth`/`FirstTimeSetupOrElevated` policies open the
+/// `/Startup/*` endpoints to ANONYMOUS callers while the flag is false, so a
+/// headless install that seeded its administrator from
+/// `FERROFIN_ADMIN_PASSWORD` — never touching the web wizard — served its setup
+/// endpoints unauthenticated for the rest of its life. It also feeds
+/// `/System/Info/Public`'s `StartupWizardCompleted`, which is how a client
+/// decides whether to route the user into the wizard.
+///
+/// A passwordless seed (no configured administrator yet) deliberately leaves the
+/// flag false, so the browser wizard still works on a fresh install.
+async fn ensure_startup_wizard_integrity(
+    users: &dyn ferrofin_traits::library::UserManager,
+    config: &dyn ferrofin_traits::configuration::ServerConfigurationManager,
+) -> anyhow::Result<()> {
+    let current = config.configuration().await?;
+    if current.is_startup_wizard_completed {
+        return Ok(());
+    }
+    let mut has_configured_administrator = false;
+    for user in users.get_users().await? {
+        // C# `!string.IsNullOrEmpty(user.Password)` — a row with an empty
+        // password hash is not a configured administrator.
+        if user.password.as_deref().is_none_or(str::is_empty) {
+            continue;
+        }
+        if users
+            .get_user_dto(&user, None)
+            .await?
+            .policy
+            .is_some_and(|p| p.is_administrator)
+        {
+            has_configured_administrator = true;
+            break;
+        }
+    }
+    if !has_configured_administrator {
+        return Ok(());
+    }
+    tracing::warn!(
+        "the startup wizard is marked incomplete but a configured administrator already          exists; marking setup as completed to prevent the unauthenticated setup endpoints          from being reachable"
+    );
+    let mut updated = (*current).clone();
+    updated.is_startup_wizard_completed = true;
+    config.update_configuration(&updated).await?;
+    Ok(())
+}
+
 /// The process-lifetime half of the metrics wiring (see [`run`]).
 struct ProcessMetrics {
     handle: ferrofin_metrics::MetricsHandle,
@@ -368,6 +420,10 @@ async fn serve_once(
             );
         }
     }
+
+    ensure_startup_wizard_integrity(wired.state.users.as_ref(), wired.state.config.as_ref())
+        .await
+        .context("failed to verify the startup-wizard flag")?;
 
     boot_stage(started, "admin seeded");
     let mut router = mount_web(
