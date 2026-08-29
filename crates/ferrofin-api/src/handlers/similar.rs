@@ -51,6 +51,31 @@ struct SimilarParams {
     fields: Option<String>,
 }
 
+/// Resolves the seed id the C# controller would use.
+///
+/// Port of the `LibraryController.GetSimilarItems` first two lines: a nil
+/// `itemId` is not an error but a fallback to the root folder
+/// (`itemId.IsEmpty() ? (user is null ? RootFolder : GetUserRootFolder()) :
+/// GetItemById(itemId, user)`). A non-nil id passes through untouched and its
+/// existence is checked by the manager, which reports the miss so the handler
+/// can `404`.
+///
+/// C#'s two roots (`AggregateFolder` without a user, `UserRootFolder` with one)
+/// collapse to one here: neither is a kind any similarity provider serves, so
+/// both answer with the same empty `QueryResult`, and Ferrofin only persists the
+/// user root. `Ok(None)` — a nil id on a server with no root row at all — takes
+/// that same empty answer.
+pub(crate) async fn resolve_similar_seed(
+    state: &AppState,
+    item_id: Uuid,
+) -> Result<Option<Uuid>, ApiError> {
+    if !item_id.is_nil() {
+        return Ok(Some(item_id));
+    }
+    let root = state.library.get_user_root_folder().await?;
+    Ok(root.and_then(|row| Uuid::parse_str(&row.id).ok()))
+}
+
 /// Shared body of every `/{kind}/{itemId}/Similar` route.
 ///
 /// Port of `LibraryController.GetSimilarItems`. Resolves the (optional) user,
@@ -77,10 +102,18 @@ async fn similar_items(
         ..DtoOptions::default()
     };
 
+    // C# resolves the seed BEFORE any provider runs: a nil id is the documented
+    // root-folder fallback (`itemId.IsEmpty() ? (user is null ? RootFolder :
+    // GetUserRootFolder()) : GetItemById(itemId, user)`), and a seed that does
+    // not resolve is a `404`, not an empty page.
+    let Some(seed_id) = resolve_similar_seed(state, item_id).await? else {
+        return Ok(Json(QueryResult::new(Some(0), Some(0), Vec::new())));
+    };
     let items = state
         .similar_items
-        .get_similar_items(item_id, &exclude_artist_ids, user_id, &options, query.limit)
-        .await?;
+        .get_similar_items(seed_id, &exclude_artist_ids, user_id, &options, query.limit)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?;
     let total = i32::try_from(items.len()).unwrap_or(i32::MAX);
     let dtos = state
         .dto

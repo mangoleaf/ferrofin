@@ -43,6 +43,10 @@ const SEED_ID: Uuid = Uuid::from_u128(0xBEEF);
 /// The item id the `Similar` routes resolve (from the batch-16 similar-items test).
 const ITEM_ID: Uuid = Uuid::from_u128(0x00A1_7E11);
 
+/// The stub library's single `UserRootFolder` row — what a nil `itemId` on a
+/// `/Similar` route resolves to, the way C# falls back to `GetUserRootFolder()`.
+const ROOT_FOLDER_ID: Uuid = Uuid::from_u128(0x0000_0007);
+
 /// Builds a minimal [`UserEntity`] with the given id/name; every other field is a
 /// neutral zero value ([`UserEntity`] has no `Default`).
 fn user_entity(id: Uuid, username: &str) -> UserEntity {
@@ -412,6 +416,14 @@ impl LibraryManager for StubLibrary {
         &self,
         _q: &InternalItemsQuery,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        // The one query these tests reach here with is the default
+        // `LibraryManager::get_user_root_folder` lookup (C#
+        // `GetUserRootFolder()`), which a nil `/Similar` seed falls back to.
+        if _q.include_item_types == vec![ferrofin_model::data::BaseItemKind::UserRootFolder] {
+            let mut row = item_entity(ROOT_FOLDER_ID, "root");
+            "MediaBrowser.Controller.Entities.UserRootFolder".clone_into(&mut row.type_);
+            return Ok(vec![row]);
+        }
         unimplemented!()
     }
     async fn get_latest_item_list(
@@ -533,11 +545,21 @@ impl SimilarItemsManager for StubSimilar {
         _user_id: Option<Uuid>,
         _dto_options: &DtoOptions,
         _limit: Option<i32>,
-    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        Ok(vec![
+    ) -> Result<Option<Vec<BaseItemEntity>>, ServiceError> {
+        // `None` is the C# `item is null` miss the controller 404s; every other
+        // seed resolves, including the root folder a nil id falls back to.
+        if _item_id == Uuid::from_u128(0xDEAD) {
+            return Ok(None);
+        }
+        // The root folder resolves, but no similarity provider serves a folder
+        // kind, so C# answers an empty page for it.
+        if _item_id == ROOT_FOLDER_ID {
+            return Ok(Some(Vec::new()));
+        }
+        Ok(Some(vec![
             item_entity(Uuid::from_u128(0xA1), "Similar A"),
             item_entity(Uuid::from_u128(0xA2), "Similar B"),
-        ])
+        ]))
     }
     async fn get_movie_recommendations(
         &self,
@@ -738,6 +760,32 @@ async fn similar_items_returns_two() {
         let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).expect("similar");
         assert_eq!(result.items.len(), 2, "{kind}");
         assert_eq!(result.items[0].name.as_deref(), Some("Similar A"));
+    }
+}
+
+#[tokio::test]
+async fn similar_items_404s_for_a_seed_that_does_not_exist() {
+    // C# `LibraryController.GetSimilarItems`: `if (item is null) return
+    // NotFound();`. Ferrofin used to answer 200 with an empty page, which a
+    // client cannot tell apart from "nothing is similar".
+    let missing = Uuid::from_u128(0xDEAD);
+    for kind in ["Albums", "Artists", "Items", "Movies", "Trailers", "Shows"] {
+        let (status, _) = get(&format!("/{kind}/{missing}/Similar")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{kind}");
+    }
+}
+
+#[tokio::test]
+async fn similar_items_treats_a_nil_seed_as_the_root_folder() {
+    // C#: `itemId.IsEmpty() ? (user is null ? RootFolder : GetUserRootFolder())
+    // : GetItemById(...)` — a nil id is a documented fallback, never a 400.
+    let nil = Uuid::nil();
+    for kind in ["Albums", "Artists", "Items", "Movies", "Trailers", "Shows"] {
+        let (status, body) = get(&format!("/{kind}/{nil}/Similar")).await;
+        assert_eq!(status, StatusCode::OK, "{kind}");
+        let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).expect("similar");
+        assert_eq!(result.start_index, 0, "{kind}");
+        assert!(result.items.is_empty(), "{kind}");
     }
 }
 

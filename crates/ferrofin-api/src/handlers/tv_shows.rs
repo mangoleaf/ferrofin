@@ -590,10 +590,17 @@ async fn get_similar_shows(
     let exclude_artist_ids = parse_csv_uuids(query.exclude_artist_ids.as_deref())?;
     let options = build_dto_options(query.fields.as_deref(), None, None, None, None);
 
+    // Same C# seed resolution as the other five aliases: a nil id falls back to
+    // the root folder, and an id that resolves to nothing is a `404`.
+    let Some(seed_id) = crate::handlers::similar::resolve_similar_seed(&state, item_id).await?
+    else {
+        return Ok(Json(QueryResult::new(Some(0), Some(0), Vec::new())));
+    };
     let items = state
         .similar_items
-        .get_similar_items(item_id, &exclude_artist_ids, user_id, &options, query.limit)
-        .await?;
+        .get_similar_items(seed_id, &exclude_artist_ids, user_id, &options, query.limit)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?;
     let total = i32::try_from(items.len()).unwrap_or(i32::MAX);
     let dtos = state
         .dto

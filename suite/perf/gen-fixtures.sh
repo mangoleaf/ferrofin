@@ -111,11 +111,16 @@ done
 # endpoints (Artists/{name}, MusicGenres/{name}, the instant mixes) and the /Audio/*
 # stream family testable against a real audio item. Tags differ per file, so these are
 # re-muxed copies (`-c copy`, milliseconds each) rather than hardlinks.
-MGENRES=(Rock Jazz Ambient)
+# Two genres over three artists on purpose, NOT three: with one genre per artist the
+# album/artist similarity universe is empty by construction on BOTH servers, so
+# GET /Albums/{itemId}/Similar answers `{"Items":[],"TotalRecordCount":0}` on each and
+# diffs "clean" while proving nothing. Sharing a genre between Artist 01 and Artist 03
+# makes those endpoints actually return rows. (Takes effect at the next provision.)
+MGENRES=(Jazz Rock Jazz)
 if [ "$ARTISTS" -gt 0 ]; then
   echo "generating $ARTISTS artists x $ALBUMS albums x $TRACKS tracks..."
   for a in $(seq 1 "$ARTISTS"); do
-    an=$(printf '%02d' "$a"); artist="Artist $an"; genre="${MGENRES[$((a % 3))]}"
+    an=$(printf '%02d' "$a"); artist="Artist $an"; genre="${MGENRES[$(((a - 1) % 3))]}"
     for b in $(seq 1 "$ALBUMS"); do
       bn=$(printf '%02d' "$b"); album="Album $bn"; d="$ROOT/music/$artist/$album"
       mkdir -p "$d"

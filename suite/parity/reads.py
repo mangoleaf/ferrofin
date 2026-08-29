@@ -56,6 +56,176 @@ def item(op, tmpl):
     return {"op": op, "kind": "item", "url": lambda c, i: tmpl.format(u=c["user"], i=i)}
 
 
+def multi(op, urls):
+    """Several URLs folded into ONE ledger row (rows are keyed by op, so a second
+    entry would clobber the first). Every leg is diffed; the buckets are unioned."""
+    return {"op": op, "kind": "multi",
+            "urls": [(lambda c, u=u: u.format(**c)) for u in urls]}
+
+
+def invariant(op, fn):
+    """A row verified by PROPERTIES rather than a body diff, for an endpoint whose
+    body genuinely cannot match (see `similar_invariants`). `fn(base, token, ctx)`
+    returns a flat dict of named facts; the row is clean when both servers report
+    the identical dict AND no fact is False."""
+    return {"op": op, "kind": "invariant", "fn": fn}
+
+
+# ------------------------------------------------------- /Similar invariants
+#
+# A movie seed's /Similar body cannot diff, for TWO independent reasons, both
+# measured on this lab pair:
+#   1. Jellyfin 10.11.8 orders the result Random (LibraryController.cs:801,
+#      `OrderBy = [(ItemSortBy.Random, Ascending)]`). Five identical calls at
+#      limit=12 returned five different SETS, because limit < |universe|.
+#   2. The two servers run DIFFERENT ALGORITHMS on purpose. 10.11.8 builds one
+#      flat `InternalItemsQuery { Genres = item.Genres, Tags = item.Tags }`;
+#      Ferrofin ports upstream master's weighted `MovieSimilarItemsProvider`
+#      (genre 10 / tag 5 / studio 5 / director 50 / actor 15). At limit=1000 the
+#      universes measured 299 (J) vs 432 (F), with J a STRICT SUBSET of F.
+#
+# Widening the denylist or comparing fewer fields would "fix" that dishonestly —
+# and a set comparison would still pass if Ferrofin returned seven random
+# unrelated movies. These are the properties that DO hold on both servers today,
+# each of which such an answer would break.
+SIMILAR_KINDS = {"Movie", "Trailer", "LiveTvProgram"}
+SIMILAR_FIELDS = "Genres,Tags,Studios,People,SortName"
+
+# upstream master `MovieSimilarItemsProvider.cs:27-31` — the weights Ferrofin ports.
+GENRE_WEIGHT, TAG_WEIGHT, STUDIO_WEIGHT, DIRECTOR_WEIGHT, ACTOR_WEIGHT = 10, 5, 5, 50, 15
+
+
+def _related_keys(dto):
+    """The seed-relatedness dimensions of one DTO: its genres, tags, studios and
+    people. The union of 10.11.8's query (genres+tags) and master's scored
+    dimensions (+studios+people) — an item sharing NONE of them with the seed is
+    unreachable by either algorithm."""
+    keys = set()
+    keys |= {("g", g) for g in dto.get("Genres") or []}
+    keys |= {("t", t) for t in dto.get("Tags") or []}
+    keys |= {("s", (s or {}).get("Name")) for s in dto.get("Studios") or []}
+    keys |= {("p", (p or {}).get("Name")) for p in dto.get("People") or []}
+    return {k for k in keys if k[1]}
+
+
+def _people(dto):
+    """The (Name, Type) pairs master's scorer matches on."""
+    return {((p or {}).get("Name"), (p or {}).get("Type")) for p in dto.get("People") or []}
+
+
+def _master_score(seed, cand):
+    """One candidate's score under master's `MovieSimilarItemsProvider`."""
+    g = len({g for g in seed.get("Genres") or []} & {g for g in cand.get("Genres") or []})
+    t = len({t for t in seed.get("Tags") or []} & {t for t in cand.get("Tags") or []})
+    st = len({(s or {}).get("Name") for s in seed.get("Studios") or []}
+             & {(s or {}).get("Name") for s in cand.get("Studios") or []})
+    people = _people(seed) & _people(cand)
+    p = sum(DIRECTOR_WEIGHT if kind == "Director" else ACTOR_WEIGHT
+            for _, kind in people if kind in ("Director", "Actor", "GuestStar"))
+    return GENRE_WEIGHT * g + TAG_WEIGHT * t + STUDIO_WEIGHT * st + p
+
+
+def _obeys_own_candidate_rule(base, token, ctx, seed_dto, items, limit):
+    """Whether `items` is what THIS server's documented algorithm must produce.
+
+    The two servers run different algorithms on purpose, so each is held to its
+    own — and each rule is sharp enough that a page of unrelated movies fails it.
+
+    - Jellyfin 10.11.8 (`LibraryController.cs:791-801`) queries `Genres = item
+      .Genres, Tags = item.Tags`. Every row must therefore share a genre or a
+      tag with the seed. On this fixture only 299 of the 500 movies qualify, so
+      the clause discriminates.
+    - Ferrofin ports master's weighted `MovieSimilarItemsProvider`, which is
+      deterministic here: the answer must be the model's top-N, IN ORDER, by
+      (score desc, SortName asc), recomputed independently from the DTO fields.
+      Nothing weaker would notice a scorer that quietly stopped weighting.
+    """
+    if ctx.get("server") != "ferrofin":
+        seed_gt = {("g", g) for g in seed_dto.get("Genres") or []} \
+            | {("t", t) for t in seed_dto.get("Tags") or []}
+        return all(({("g", g) for g in i.get("Genres") or []}
+                    | {("t", t) for t in i.get("Tags") or []}) & seed_gt for i in items)
+    _, allb = token_get(base, f"/Items?userId={ctx['user']}&recursive=true"
+                              f"&includeItemTypes=Movie&limit=100000&sortBy=SortName"
+                              f"&fields={SIMILAR_FIELDS}", token)
+    pool = [i for i in ((allb or {}).get("Items") or []) if i.get("Id") != seed_dto.get("Id")]
+    scored = [(-_master_score(seed_dto, c), c.get("SortName") or "", c.get("Name"))
+              for c in pool]
+    expected = [n for s, _, n in sorted(x for x in scored if x[0] < 0)][:limit]
+    return [i.get("Name") for i in items] == expected
+
+
+def similar_invariants(base, token, ctx):
+    """The properties a /{kind}/{itemId}/Similar answer must have on BOTH servers.
+
+    Every value is comparable across servers, so a divergence surfaces as a
+    normal diff row. Bounds that must tolerate a Jellyfin quirk say so and cite
+    the C#; nothing here is widened to make Ferrofin pass."""
+    u, seed = ctx["user"], ctx["movie"]
+    facts = {}
+    st, sb = token_get(base, f"/Items/{seed}?userId={u}&fields={SIMILAR_FIELDS}", token)
+    if sb is None:
+        return {"seed_readable": False}
+    seed_keys = _related_keys(sb)
+    facts["seed_has_related_keys"] = bool(seed_keys)
+
+    limit = 12
+    st, b = token_get(base, f"/Movies/{seed}/Similar?userId={u}&limit={limit}"
+                            f"&fields={SIMILAR_FIELDS}", token)
+    items = (b or {}).get("Items") or []
+    facts["status_200"] = st == 200
+    facts["start_index_0"] = (b or {}).get("StartIndex") == 0
+    facts["total_equals_len"] = (b or {}).get("TotalRecordCount") == len(items)
+    facts["seed_not_returned"] = all(i.get("Id") != seed for i in items)
+    facts["kinds_restricted"] = all(i.get("Type") in SIMILAR_KINDS for i in items)
+    # THE clause that rejects "seven random unrelated movies": every row must
+    # share a genre, tag, studio or person with the seed.
+    # NOTE: on the synthetic loop fixture EVERY movie shares at least one of
+    # these dimensions with the seed (measured: 0 of 500 fall outside), so this
+    # clause alone is vacuous HERE and is kept only as the cheap floor for a
+    # real library. `obeys_own_candidate_rule` below is the one that bites.
+    facts["all_rows_related_to_seed"] = all(_related_keys(i) & seed_keys for i in items)
+    facts["obeys_own_candidate_rule"] = _obeys_own_candidate_rule(
+        base, token, ctx, sb, items, limit)
+    facts["page_is_full"] = len(items) >= limit
+    # Ferrofin returns exactly `limit`; 10.11.8 returns limit+4 because
+    # BaseItemRepository.PrepareFilterQuery (v10.11.8:1427-1430) adds 4 when
+    # EnableGroupByMetadataKey and never trims back. The +4 is the ONLY slack
+    # here and it is a named Jellyfin bug, not a tolerance for Ferrofin.
+    facts["limit_honoured_within_jellyfin_plus_4"] = len(items) <= limit + 4
+
+    # The controller's own status contract, identical in 10.11.8 and master:
+    #   `if (item is null) { return NotFound(); }`
+    #   `itemId.IsEmpty() ? (user is null ? RootFolder : GetUserRootFolder()) : ...`
+    missing = "aaaaaaaaaaaaaaaaaaaaaaaaaaaa0099"
+    st, _ = http("GET", base + f"/Movies/{missing}/Similar?userId={u}", token)
+    facts["unknown_seed_is_404"] = st == 404
+    st, nb = token_get(base, f"/Movies/00000000000000000000000000000000/Similar?userId={u}", token)
+    facts["nil_seed_is_200_empty"] = st == 200 and not ((nb or {}).get("Items") or [])
+
+    # `if (item is Episode || (item is IItemByName && item is not MusicArtist))
+    #  return new QueryResult<BaseItemDto>();`
+    if ctx.get("episode"):
+        st, eb = token_get(base, f"/Items/{ctx['episode']}/Similar?userId={u}", token)
+        facts["episode_seed_short_circuits"] = st == 200 and not ((eb or {}).get("Items") or [])
+
+    # Every alias is ONE C# method (`LibraryController.GetSimilarItems`, six
+    # [HttpGet] attributes), so the five non-/Shows routes must answer with the
+    # same rows for the same seed. Compared as SETS at a limit above the
+    # universe: below it, Jellyfin's Random draws a different random SUBSET per
+    # call and no two aliases could ever agree. Measured: at limit=1000 both
+    # servers are set-stable across repeated draws.
+    wide = 1000
+    sets = []
+    for alias in ("Items", "Movies", "Trailers", "Albums", "Artists"):
+        _, ab = token_get(base, f"/{alias}/{seed}/Similar?userId={u}&limit={wide}", token)
+        sets.append(tuple(sorted(i.get("Name") or i.get("Id") or ""
+                                 for i in ((ab or {}).get("Items") or []))))
+    facts["aliases_agree"] = len(set(sets)) == 1
+    facts["aliases_non_empty"] = bool(sets and sets[0])
+    return facts
+
+
 READS = [
     plain("GET /System/Info", "/System/Info"),
     plain("GET /System/Endpoint", "/System/Endpoint"),
@@ -75,16 +245,49 @@ READS = [
     user("GET /Studios", "/Studios?userId={u}"),
     user("GET /Items/Filters", "/Items/Filters?userId={u}&includeItemTypes=Movie"),
     user("GET /Items/Filters2", "/Items/Filters2?userId={u}&includeItemTypes=Movie"),
-    user("GET /Items/Suggestions", "/Items/Suggestions?userId={u}&limit=10"),
+    # `SuggestionsController` orders Random too, but unlike /Similar it runs the
+    # SAME query on both servers — Random only PERMUTES, it does not change the
+    # set. At limit >= |universe| the answer is fully determined, and
+    # parity_diff aligns Items by Path, so this is a real whole-DTO diff of all
+    # 500 movies. limit=10 sampled 10 of 552 at random and could never be clean.
+    multi("GET /Items/Suggestions", [
+        "/Items/Suggestions?userId={u}&type=Movie&limit=100000&enableTotalRecordCount=true",
+        "/Items/Suggestions?userId={u}&mediaType=Audio&limit=100000&enableTotalRecordCount=true",
+        "/Items/Suggestions?userId={u}&type=Series&limit=100000&enableTotalRecordCount=true",
+        "/Items/Suggestions?userId={u}&type=Episode&limit=100000&enableTotalRecordCount=true",
+        "/Items/Suggestions?userId={u}&type=MusicAlbum&limit=100000&enableTotalRecordCount=true",
+        # The kinds Ferrofin's recursive user-root universe is missing entirely
+        # (MusicArtist/Folder/TvChannel/UserView: F 0 vs J 3/3/2/1). Kept in the
+        # probe on purpose — the client-visible answer for those types really is
+        # wrong, and dropping the leg would only hide it.
+        "/Items/Suggestions?userId={u}&type=MusicArtist&limit=100000&enableTotalRecordCount=true",
+        "/Items/Suggestions?userId={u}&type=TvChannel&limit=100000&enableTotalRecordCount=true",
+        # Paging contract: StartIndex echoes and TotalRecordCount is page-independent.
+        "/Items/Suggestions?userId={u}&type=Movie&limit=3&startIndex=7&enableTotalRecordCount=true",
+    ]),
     user("GET /Movies/Recommendations", "/Movies/Recommendations?userId={u}"),
     user("GET /Search/Hints", "/Search/Hints?userId={u}&searchTerm=a&limit=20"),
     # item-scoped — correlated by Path, each server queried with its own id
     item("GET /Items/{itemId}", "/Items/{i}?userId={u}&fields=Path,MediaSources,MediaStreams,Overview,Genres"),
-    item("GET /Items/{itemId}/Similar", "/Items/{i}/Similar?userId={u}&limit=12"),
+    # A movie seed cannot be body-diffed (Random order + a deliberately different
+    # candidate algorithm) — verified by properties instead, see
+    # `similar_invariants`.
+    invariant("GET /Items/{itemId}/Similar", similar_invariants),
     item("GET /Items/{itemId}/Ancestors", "/Items/{i}/Ancestors?userId={u}"),
     item("GET /Items/{itemId}/PlaybackInfo", "/Items/{i}/PlaybackInfo?userId={u}"),
     item("GET /Items/{itemId}/Images", "/Items/{i}/Images"),
-    item("GET /Movies/{itemId}/Similar", "/Movies/{i}/Similar?userId={u}&limit=12"),
+    invariant("GET /Movies/{itemId}/Similar", similar_invariants),
+    invariant("GET /Trailers/{itemId}/Similar", similar_invariants),
+    # The NON-movie seeds ARE diffable: upstream master serves Series/MusicAlbum/
+    # MusicArtist from the same flat Genres/Tags query 10.11.8 builds, so the two
+    # servers run the same algorithm. `limit` is far above the fixture's pool, so
+    # Jellyfin's Random cannot return a random SUBSET, and parity_diff aligns the
+    # array by Name — order is invisible, the SET and TotalRecordCount are not.
+    # These rows were never probed at all before (sweep fed all six aliases a
+    # MOVIE id), which is why the music/series similarity path went unverified.
+    user("GET /Shows/{itemId}/Similar", "/Shows/{series}/Similar?userId={u}&limit=1000"),
+    user("GET /Albums/{itemId}/Similar", "/Albums/{album_id}/Similar?userId={u}&limit=1000"),
+    user("GET /Artists/{itemId}/Similar", "/Artists/{artist_id}/Similar?userId={u}&limit=1000"),
     # by-name + shows (need the NFO metadata + shows fixture); {genre}/{studio}/{person} are
     # URL-encoded names shared across servers, {series} is the per-server first-series id.
     user("GET /Genres/{genreName}", "/Genres/{genre}?userId={u}"),
@@ -180,6 +383,10 @@ def resolve_named(base, token, user_id):
         "studio": first_name("/Studios"),
         "person": first_name("/Persons"),
         "series": first_id("Series"),
+        # Kind-correct seeds for the /Similar aliases and the invariant probe.
+        "album_id": first_id("MusicAlbum"),
+        "movie": first_id("Movie"),
+        "episode": first_id("Episode"),
         "task": first_task(),
         "device": first_device(),
         "artist": urllib.parse.quote(artist.get("Name") or ""),
@@ -192,6 +399,8 @@ def run(ferrofin_url, jellyfin_url):
     ht, hu = bring_up(ferrofin_url, "ferrofin")
     jt, ju = bring_up(jellyfin_url, "jellyfin")
     hc, jc = resolve_named(ferrofin_url, ht, hu), resolve_named(jellyfin_url, jt, ju)
+    # `similar_invariants` holds each server to ITS OWN documented algorithm.
+    hc["server"], jc["server"] = "ferrofin", "jellyfin"
 
     pairs = correlate(path_id_map(ferrofin_url, ht, hu), path_id_map(jellyfin_url, jt, ju))
     rows = {}
@@ -227,7 +436,38 @@ def run(ferrofin_url, jellyfin_url):
                         }}
 
     for ep in READS:
-        if ep["kind"] in ("plain", "user"):
+        if ep["kind"] == "invariant":
+            hf = ep["fn"](ferrofin_url, ht, hc)
+            jf = ep["fn"](jellyfin_url, jt, jc)
+            buckets = {"mismatch": [], "missing": [], "extra": []}
+            for key in sorted(set(hf) | set(jf)):
+                h, j = hf.get(key), jf.get(key)
+                if key not in hf:
+                    buckets["missing"].append({"path": key, "j": j, "h": None})
+                elif key not in jf:
+                    buckets["extra"].append({"path": key, "j": None, "h": h})
+                elif h != j or h is False:
+                    # `h is False` also fails a fact BOTH servers get wrong —
+                    # agreeing on a broken invariant is not parity.
+                    buckets["mismatch"].append({"path": key, "j": j, "h": h})
+            n = sum(len(v) for v in buckets.values())
+            record(ep["op"], 1 if n == 0 else 0, 1, buckets)
+        elif ep["kind"] == "multi":
+            agg = {"mismatch": [], "missing": [], "extra": []}
+            clean = tested = 0
+            for url in ep["urls"]:
+                hs, hb = token_get(ferrofin_url, url(hc), ht)
+                js, jb = token_get(jellyfin_url, url(jc), jt)
+                if hb is None or jb is None:
+                    continue
+                tested += 1
+                n, b = diff_counts(jb, hb)
+                if n == 0:
+                    clean += 1
+                for k in agg:
+                    agg[k].extend(b[k])
+            record(ep["op"], clean, tested, agg)
+        elif ep["kind"] in ("plain", "user"):
             path = ep["url"](hc if ep["kind"] == "user" else {})
             jpath = ep["url"](jc if ep["kind"] == "user" else {})
             hs, hb = token_get(ferrofin_url, path, ht)
@@ -314,11 +554,27 @@ def selfcheck():
     # {u} vs "user" KeyError). Format each with a fully-populated context; a KeyError fails here.
     ctx = {"user": "U", "u": "U", "genre": "G", "studio": "S", "person": "P", "series": "SE",
            "task": "T", "device": "D", "artist": "A", "artist_id": "AID", "musicgenre": "MG",
-           "channel": "CH"}
+           "channel": "CH", "album_id": "ALB", "movie": "MOV", "episode": "EP"}
+    # The context keys the self-check invents must be the ones resolve_named
+    # actually produces, or this guard passes while the live run KeyErrors.
+    import inspect
+    produced = set(re.findall(r'"(\w+)":', inspect.getsource(resolve_named).split("return {", 1)[1]))
+    assert produced <= set(ctx), f"self-check context missing resolve_named keys: {produced - set(ctx)}"
     for ep in READS:
         if ep["kind"] == "user":
             ep["url"](ctx)  # raises KeyError if a placeholder has no context key
-    print(f"ok: diff, Path-align, correlation, {len(READS)} read op-keys valid, user templates fillable")
+        elif ep["kind"] == "multi":
+            for u in ep["urls"]:
+                u(ctx)
+    # The invariant rows must carry a callable, and the diff-shaped folding of
+    # its facts must flag both a disagreement AND a fact both servers fail.
+    assert all(callable(ep["fn"]) for ep in READS if ep["kind"] == "invariant")
+    hf, jf = {"a": True, "b": True, "c": False}, {"a": True, "b": False, "c": False}
+    bad = [k for k in sorted(set(hf) | set(jf))
+           if hf.get(k) != jf.get(k) or hf.get(k) is False]
+    assert bad == ["b", "c"], f"invariant folding wrong: {bad}"
+    print(f"ok: diff, Path-align, correlation, {len(READS)} read op-keys valid, "
+          f"user/multi templates fillable, invariant folding")
 
 
 if __name__ == "__main__":

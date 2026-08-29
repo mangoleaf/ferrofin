@@ -522,7 +522,7 @@ impl SimilarItemsManager for StubSimilar {
         _user_id: Option<Uuid>,
         _dto_options: &DtoOptions,
         _limit: Option<i32>,
-    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+    ) -> Result<Option<Vec<BaseItemEntity>>, ServiceError> {
         unimplemented!()
     }
     async fn get_movie_recommendations(

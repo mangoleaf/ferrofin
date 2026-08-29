@@ -1601,9 +1601,16 @@ impl FerrofinDtoService {
             dto.series_name = item.series_name.clone();
         }
 
-        // Series air-time.
+        // Series air days/time — C# `DtoService.cs:1421-1423`
+        // (`dto.AirDays = series.AirDays; dto.AirTime = series.AirTime;`).
+        // `Series.AirDays` is a runtime-only property (`Series.cs:31` sets it to
+        // `Array.Empty<DayOfWeek>()` in the constructor and 10.11.8 persists no
+        // `AirDays` column), so a DB-loaded series always serializes `[]` —
+        // never null. Ferrofin omitted the field entirely, which is the
+        // null-where-Jellyfin-sends-non-null shape strict clients crash on.
         if kind == BaseItemKind::Series {
-            dto.air_time = None; // no flat column at this layer
+            dto.air_days = Some(Vec::new());
+            dto.air_time = None; // no flat column at this layer, as upstream
         }
 
         // Production locations.
@@ -3545,6 +3552,39 @@ mod tests {
     // round trips proving it. Upstream never asks — a C# `Folder` has no
     // streams in memory — and `/Library/MediaFolders`, `/Persons` and
     // `/Items/{id}/Ancestors` are exactly such pages.
+    #[tokio::test]
+    async fn a_series_dto_carries_an_empty_air_days_array_never_null() {
+        // C# `DtoService.cs:1421` `dto.AirDays = series.AirDays`, and
+        // `Series.cs:31` initialises `AirDays = Array.Empty<DayOfWeek>()` — a
+        // non-nullable array 10.11.8 never persists, so every Series DTO
+        // serializes `"AirDays": []`. Ferrofin omitted the key entirely, the
+        // null-where-Jellyfin-sends-non-null shape strict clients crash on.
+        let db = test_db().await;
+        let series = Uuid::new_v4();
+        let movie = Uuid::new_v4();
+        seed_named_item(&db, series, BaseItemKind::Series, "Firefly").await;
+        seed_named_item(&db, movie, BaseItemKind::Movie, "Serenity").await;
+        let svc = FerrofinDtoService::new(
+            db.clone(),
+            "server-1".into(),
+            Arc::new(FakeLibrary::default()),
+            Arc::new(FakeUserData),
+            Arc::new(FakeCounts),
+            Arc::new(FakeImages),
+            Arc::new(FakeSources::default()),
+            Arc::new(FakeChapters),
+            Arc::new(FakeTrickplay),
+        );
+        let rows = vec![fetch_item(&db, series).await, fetch_item(&db, movie).await];
+        let dtos = svc
+            .get_base_item_dtos(&rows, &DtoOptions::default(), None, None, true)
+            .await
+            .unwrap();
+        assert_eq!(dtos[0].air_days.as_deref(), Some(&[][..]));
+        // Only a Series carries it — C# guards on `item is Series tmp`.
+        assert_eq!(dtos[1].air_days, None);
+    }
+
     #[tokio::test]
     async fn a_page_that_cannot_own_media_sources_is_never_asked_for_them() {
         let db = test_db().await;

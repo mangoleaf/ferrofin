@@ -498,11 +498,15 @@ impl SimilarItemsManager for StubSimilar {
         _user_id: Option<Uuid>,
         _dto_options: &DtoOptions,
         _limit: Option<i32>,
-    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        Ok(vec![
+    ) -> Result<Option<Vec<BaseItemEntity>>, ServiceError> {
+        // `None` is the C# `item is null` miss the controller 404s.
+        if _item_id == Uuid::from_u128(0xDEAD) {
+            return Ok(None);
+        }
+        Ok(Some(vec![
             item_entity(Uuid::from_u128(0xA1), "Similar A", "Series"),
             item_entity(Uuid::from_u128(0xA2), "Similar B", "Series"),
-        ])
+        ]))
     }
     async fn get_movie_recommendations(
         &self,

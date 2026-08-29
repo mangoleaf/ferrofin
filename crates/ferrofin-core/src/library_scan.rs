@@ -1998,38 +1998,7 @@ impl LibraryScanner {
                 })
                 .await?;
 
-            // Aggregate album-artist + year from the tracks onto the album row.
-            let mut updated = album.clone();
-            let mut changed = false;
-            if updated
-                .album_artists
-                .as_deref()
-                .unwrap_or_default()
-                .is_empty()
-                && let Some(aa) = tracks
-                    .iter()
-                    .find_map(|t| t.album_artists.clone().filter(|s| !s.is_empty()))
-            {
-                updated.album_artists = Some(aa);
-                changed = true;
-            }
-            if updated.production_year.is_none()
-                && let Some(year) = tracks.iter().filter_map(|t| t.production_year).min()
-            {
-                updated.production_year = Some(year);
-                changed = true;
-            }
-            // The album row's name starts as the folder stem, which is usually
-            // release noise ("RHCP - Californication (1999) FLAC"). The tracks'
-            // ALBUM tag is authoritative when they agree — upstream's album
-            // metadata comes from the tags, not the directory.
-            if let Some(tagged) = album_name_consensus(&tracks)
-                && updated.name.as_deref() != Some(tagged.as_str())
-            {
-                updated.sort_name = Some(create_sort_name(&tagged));
-                updated.name = Some(tagged);
-                changed = true;
-            }
+            let (mut updated, changed) = apply_album_child_metadata(album, &tracks);
             if changed {
                 self.persistence
                     .save_items(std::slice::from_ref(&updated))
@@ -6415,6 +6384,144 @@ fn tvdb_people(people: &[ferrofin_providers::TvdbPerson]) -> Vec<PeopleEntity> {
         .collect()
 }
 
+/// Applies C# `AlbumMetadataService`'s child-metadata aggregation to one album,
+/// returning the updated row and whether anything changed.
+///
+/// `AlbumMetadataService` turns on `EnableUpdatingPremiereDateFromChildren`,
+/// `EnableUpdatingGenresFromChildren` and `EnableUpdatingStudiosFromChildren`
+/// over `GetChildrenForMetadataUpdates => GetRecursiveChildren(i => i is
+/// Audio)`, so an album's genres, studios and premiere date are the
+/// union/minimum of its tracks'. Ferrofin used to aggregate only the album
+/// artist and the year, which left every scanned album with `Genres: []` —
+/// invisible to a `Genres=` query, and therefore unmatchable by
+/// `/Albums/{id}/Similar`, which is exactly such a query.
+fn apply_album_child_metadata(
+    album: &BaseItemEntity,
+    tracks: &[BaseItemEntity],
+) -> (BaseItemEntity, bool) {
+    // Aggregate album-artist + year from the tracks onto the album row.
+    let mut updated = album.clone();
+    let mut changed = false;
+    if updated
+        .album_artists
+        .as_deref()
+        .unwrap_or_default()
+        .is_empty()
+        && let Some(aa) = tracks
+            .iter()
+            .find_map(|t| t.album_artists.clone().filter(|s| !s.is_empty()))
+    {
+        updated.album_artists = Some(aa);
+        changed = true;
+    }
+    // The item-level lock stands in for C#'s per-field
+    // `LockedFields.Contains(MetadataField.Genres|Studios)`: Ferrofin
+    // does not model field-level locks anywhere (see the photo pass's
+    // `name_locked`), and the item lock is the stricter guard.
+    if !album.is_locked {
+        // `MetadataService.UpdateGenres`: `children.SelectMany(i =>
+        // i.Genres).Distinct(OrdinalIgnoreCase)` — an unconditional
+        // assignment, so an album whose tracks lost their genre tags
+        // loses the genres too.
+        changed |= assign_from_children(
+            &mut updated.genres,
+            &distinct_ignoring_case(tracks.iter().map(|t| t.genres.as_deref())),
+        );
+        // `MetadataService.UpdateStudios`, same shape.
+        changed |= assign_from_children(
+            &mut updated.studios,
+            &distinct_ignoring_case(tracks.iter().map(|t| t.studios.as_deref())),
+        );
+    }
+    // `MetadataService.UpdatePremiereDate`: the earliest child premiere
+    // date wins and re-derives the production year; only when NO child
+    // carries one does it fall back to the minimum child production
+    // year (and `Select(i => i.ProductionYear ?? 0).Min()` means one
+    // undated track suppresses that fallback entirely). This overwrites
+    // — C# does not merely fill a null.
+    if !tracks.is_empty() {
+        if let Some(date) = tracks.iter().filter_map(|t| t.premiere_date).min() {
+            let year = i64::from(date.year());
+            if updated.premiere_date != Some(date) || updated.production_year != Some(year) {
+                updated.premiere_date = Some(date);
+                updated.production_year = Some(year);
+                changed = true;
+            }
+        } else {
+            let year = tracks
+                .iter()
+                .map(|t| t.production_year.unwrap_or(0))
+                .min()
+                .unwrap_or(0);
+            if year > 0 && updated.production_year != Some(year) {
+                updated.production_year = Some(year);
+                changed = true;
+            }
+        }
+    }
+    // The album row's name starts as the folder stem, which is usually
+    // release noise ("RHCP - Californication (1999) FLAC"). The tracks'
+    // ALBUM tag is authoritative when they agree — upstream's album
+    // metadata comes from the tags, not the directory.
+    if let Some(tagged) = album_name_consensus(tracks)
+        && updated.name.as_deref() != Some(tagged.as_str())
+    {
+        updated.sort_name = Some(create_sort_name(&tagged));
+        updated.name = Some(tagged);
+        changed = true;
+    }
+    (updated, changed)
+}
+
+/// The distinct values of a `|`-joined column across a set of children, deduped
+/// case-insensitively with the first-seen casing kept.
+///
+/// Port of the `children.SelectMany(i => i.<Field>).Distinct(StringComparer.
+/// OrdinalIgnoreCase)` that `MetadataService.UpdateGenres`/`UpdateStudios` run.
+fn distinct_ignoring_case<'a>(columns: impl Iterator<Item = Option<&'a str>>) -> Vec<String> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out: Vec<String> = Vec::new();
+    for value in columns
+        .flatten()
+        .flat_map(|column| column.split('|'))
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        if seen.insert(value.to_lowercase()) {
+            out.push(value.to_owned());
+        }
+    }
+    out
+}
+
+/// Writes an aggregated child value list onto a parent's `|`-joined column,
+/// reporting whether it changed.
+///
+/// The comparison is C#'s: same length, and the same members ignoring case and
+/// order (`currentList.Order().SequenceEqual(item.Genres.Order(), Ordinal
+/// IgnoreCase)`). An empty aggregate clears the column, because the C#
+/// assignment is unconditional.
+fn assign_from_children(column: &mut Option<String>, values: &[String]) -> bool {
+    let normalize = |v: &[String]| {
+        let mut n: Vec<String> = v.iter().map(|s| s.to_lowercase()).collect();
+        n.sort_unstable();
+        n
+    };
+    let current: Vec<String> = column
+        .as_deref()
+        .unwrap_or_default()
+        .split('|')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect();
+    if normalize(&current) == normalize(values) {
+        return false;
+    }
+    *column = (!values.is_empty()).then(|| values.join("|"));
+    true
+}
+
 /// Collects an item's genres/studios/tags as `(ItemValueType discriminant, value)`
 /// pairs for the `ItemValues` filter tables (Genre = 2, Studios = 3, Tags = 4).
 pub(crate) fn item_values_of(entity: &BaseItemEntity) -> Vec<(i32, String)> {
@@ -7812,6 +7919,120 @@ mod tests {
             None
         );
         assert_eq!(super::album_name_consensus(&[track(None)]), None);
+    }
+
+    #[tokio::test]
+    async fn an_album_inherits_genres_studios_and_premiere_date_from_its_tracks() {
+        // C# `AlbumMetadataService`: `EnableUpdatingGenresFromChildren`,
+        // `EnableUpdatingStudiosFromChildren` and
+        // `EnableUpdatingPremiereDateFromChildren` are all `true` over
+        // `GetRecursiveChildren(i => i is Audio)`, and
+        // `MetadataService.UpdateGenres`/`UpdateStudios` take the
+        // case-insensitive distinct union while `UpdatePremiereDate` takes the
+        // minimum child date and re-derives the year from it.
+        //
+        // Ferrofin aggregated only the album artist and the year, so every
+        // scanned album had `Genres: []` — which made an album unreachable by
+        // the `Genres=` query behind `/Albums/{id}/Similar`.
+        use crate::item_persistence_service::FerrofinItemPersistenceService;
+        use crate::item_repository::FerrofinItemRepository;
+        use crate::item_type_lookup::{ItemTypeLookup, stored_type_name};
+        use crate::test_support::test_db;
+        use ferrofin_db::entities::base_items::BaseItemEntity;
+        use ferrofin_model::data::BaseItemKind;
+        use ferrofin_traits::persistence::{ItemPersistenceService, ItemRepository};
+
+        let db = test_db().await;
+        let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
+            Arc::new(ItemTypeLookup::new());
+        let items: Arc<dyn ItemRepository> =
+            Arc::new(FerrofinItemRepository::new(db.clone(), lookup));
+
+        let album_id = uuid::Uuid::new_v4();
+        let stored = |k| stored_type_name(k).unwrap().to_owned();
+        let track = |name: &str, genres: &str, month: u32| BaseItemEntity {
+            id: ferrofin_db::store::guid_to_db(uuid::Uuid::new_v4()),
+            type_: stored(BaseItemKind::Audio),
+            name: Some(name.to_owned()),
+            parent_id: Some(ferrofin_db::store::guid_to_db(album_id)),
+            genres: Some(genres.to_owned()),
+            studios: Some("Blue Note".to_owned()),
+            premiere_date: chrono::DateTime::parse_from_rfc3339(&format!(
+                "2020-{month:02}-01T00:00:00Z"
+            ))
+            .ok()
+            .map(|d| d.with_timezone(&chrono::Utc)),
+            production_year: Some(2020),
+            ..Default::default()
+        };
+        persistence
+            .save_items(&[
+                BaseItemEntity {
+                    id: ferrofin_db::store::guid_to_db(album_id),
+                    type_: stored(BaseItemKind::MusicAlbum),
+                    name: Some("Kind of Blue".into()),
+                    ..Default::default()
+                },
+                // Two tracks share a genre with different casing (C# dedupes
+                // `OrdinalIgnoreCase`), a third adds a second genre.
+                track("So What", "Jazz", 6),
+                track("Blue in Green", "jazz", 3),
+                track("Flamenco Sketches", "Jazz|Modal", 9),
+            ])
+            .await
+            .expect("seed");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+            FerrofinVirtualFolderManager::new(tmp.path().join("default"))
+                .with_item_store(persistence.clone()),
+        );
+        LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence)
+            .with_music(
+                Arc::new(ferrofin_providers::MusicBrainzClient::new("", "test")),
+                Arc::clone(&items),
+            )
+            .enrich_music(&std::collections::HashMap::new())
+            .await
+            .expect("enrich");
+
+        let album = items.retrieve_item(album_id).await.unwrap().unwrap();
+        // Deduped case-insensitively (`Jazz` and `jazz` are one genre), with
+        // whichever casing the first child carried — as C#'s
+        // `Distinct(StringComparer.OrdinalIgnoreCase)` keeps it.
+        let mut genres: Vec<String> = album
+            .genres
+            .as_deref()
+            .unwrap_or_default()
+            .split('|')
+            .map(str::to_lowercase)
+            .collect();
+        genres.sort();
+        assert_eq!(genres, vec!["jazz".to_owned(), "modal".to_owned()]);
+        assert_eq!(album.studios.as_deref(), Some("Blue Note"));
+        // The EARLIEST track date, and the year re-derived from it.
+        assert_eq!(
+            album.premiere_date.map(|d| d.to_rfc3339()),
+            Some("2020-03-01T00:00:00+00:00".to_owned())
+        );
+        assert_eq!(album.production_year, Some(2020));
+
+        // The genres must also reach `ItemValues`, or the `Genres=` query
+        // behind `/Albums/{id}/Similar` still cannot find the album — the row
+        // column alone is not what that query reads.
+        let by_genre = items
+            .get_item_list(&ferrofin_traits::options::InternalItemsQuery {
+                include_item_types: vec![BaseItemKind::MusicAlbum],
+                genres: vec!["Modal".to_owned()],
+                ..Default::default()
+            })
+            .await
+            .expect("genre query");
+        assert_eq!(
+            by_genre.iter().map(|r| r.id.clone()).collect::<Vec<_>>(),
+            vec![ferrofin_db::store::guid_to_db(album_id)]
+        );
     }
 
     #[tokio::test]

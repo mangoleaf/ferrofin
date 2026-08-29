@@ -14,23 +14,32 @@
 //! orders by recommendation type. With no user or empty history it returns nothing,
 //! matching C# (every category query is user-scoped).
 //!
-//! The local provider runs in two phases, as C# `MovieSimilarItemsProvider`
+//! The weighted path runs in two phases, as C# `MovieSimilarItemsProvider`
 //! does: the score pass above, then **one** `InternalItemsQuery` over the scored
-//! ids carrying the per-kind filter set of the C# provider that serves the seed
-//! (`Movie`/`Trailer`: movie kinds — plus `Trailer`/`LiveTvProgram` when
-//! `EnableExternalContentInSuggestions` — `IsMovie`, unplayed only; `Series`;
-//! `MusicAlbum`/`MusicArtist`/`Audio` honouring `ExcludeArtistIds`;
-//! `LiveTvProgram` by its movie/series flag) and the user's library access, so
-//! the watch-state and access rules are the query layer's, not a second copy.
-//! A kind C# has no local provider for scores nothing, and the controller's
-//! `Episode` / by-name short-circuit lives in [`SimilarItemsManager::get_similar_items`].
+//! ids carrying that provider's filter set (movie kinds — plus
+//! `Trailer`/`LiveTvProgram` when `EnableExternalContentInSuggestions` —
+//! `IsMovie`, unplayed only) and the user's library access, so the watch-state
+//! and access rules are the query layer's, not a second copy. A kind C# has no
+//! local provider for scores nothing, and the controller's `Episode` / by-name
+//! short-circuit lives in [`SimilarItemsManager::get_similar_items`].
 //!
-//! Accepted divergences from C#: one weighted scorer serves every kind (C#'s
-//! `Series`/music/Live TV providers run a plain genre-or-tag match in random
-//! order); `IsFavoriteOrLiked` is approximated as favorite-only (as elsewhere in
-//! the query layer); the person-recommendation IMDb de-dup is dropped; and ties
-//! are broken **deterministically** (`SortName`, then `Id`) rather than by C#'s
-//! `Random`, so results are stable.
+//! Which scorer runs is chosen per kind, exactly as C#'s
+//! `ILocalSimilarItemsProvider.Supports(type)` routing does: a `Movie`/`Trailer`
+//! seed gets the weighted scorer above (`MovieSimilarItemsProvider`, the only
+//! weighted provider upstream has), while `Series`, `MusicAlbum`, `MusicArtist`,
+//! `Audio` and `LiveTvProgram` seeds get the plain genre-or-tag
+//! `InternalItemsQuery` their own providers build (`SeriesSimilarItemsProvider`
+//! and friends: `Genres = item.Genres`, `Tags = item.Tags`, their
+//! `IncludeItemTypes`, `ExcludeItemIds`, plus `ExcludeArtistIds` for the music
+//! ones). An empty `Genres`/`Tags` pair is NOT a predicate there, so an untagged
+//! seed matches every other item of its kind — as it does in C#.
+//!
+//! Accepted divergences from C#: `IsFavoriteOrLiked` is approximated as
+//! favorite-only (as elsewhere in the query layer); the person-recommendation
+//! IMDb de-dup is dropped; and results are ordered **deterministically**
+//! rather than by C#'s `Random` — the weighted path by score then
+//! (`SortName`, `Id`), the flat path by `SortName` — so a client sees a stable
+//! answer instead of a fresh shuffle per request.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -116,6 +125,22 @@ fn write_reference_cache(path: &Path, references: &[SimilarItemReference], ttl: 
     {
         tracing::warn!(%err, path = %path.display(), "could not write similar-items cache");
     }
+}
+
+/// Splits one of the `|`-joined `BaseItems` value columns (`Genres`, `Tags`)
+/// into the string list the C# `BaseItem.Genres`/`BaseItem.Tags` arrays hold.
+///
+/// Empty and whitespace-only entries drop out, so a row whose column is `""`
+/// or `NULL` yields an empty list — which the flat provider then treats as "no
+/// predicate", exactly as an empty C# array does.
+fn pipe_values(field: Option<&str>) -> Vec<String> {
+    field
+        .unwrap_or_default()
+        .split('|')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 /// The similarity score of one result — port of
@@ -254,7 +279,10 @@ fn provider_rank(order: &[String], name: &str) -> usize {
 const LOCAL_SIMILARITY_PROVIDER: &str = "Local Genre/Tag";
 
 /// The default number of similar items returned when the caller gives no limit.
-const DEFAULT_SIMILAR_LIMIT: i32 = 10;
+///
+/// C# `SimilarItemsManager.GetSimilarItemsAsync`: `var requestedLimit = limit ?? 50;`
+/// (and `MovieSimilarItemsProvider`: `var limit = query.Limit ?? 50;`).
+const DEFAULT_SIMILAR_LIMIT: i32 = 50;
 
 /// How many scored candidates the score pass keeps per result wanted, so the
 /// access/played filter that follows can drop rows without under-filling the
@@ -268,6 +296,8 @@ const CANDIDATE_OVERSAMPLE: i32 = 3;
 /// by [`FerrofinSimilarItemsManager::configure_user_access`].
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct LocalFilter {
+    /// Which C# provider shape serves this seed's kind.
+    scorer: LocalScorer,
     /// The kinds a result may be (C# `IncludeItemTypes`); empty when no C#
     /// provider serves the seed's kind, in which case nothing is scored.
     include_item_types: Vec<BaseItemKind>,
@@ -278,6 +308,24 @@ struct LocalFilter {
     unplayed_only: bool,
     /// Whether the request's `ExcludeArtistIds` apply (the music providers).
     honours_exclude_artist_ids: bool,
+}
+
+/// Which C# local similarity provider serves a seed's kind — the two shapes
+/// upstream ships.
+///
+/// `MovieSimilarItemsProvider` (the `Movie`/`Trailer` seeds) is the only
+/// weighted one; `SeriesSimilarItemsProvider`,
+/// `MusicAlbum`/`MusicArtist`/`AudioSimilarItemsProvider` and
+/// `LiveTvProgramSimilarItemsProvider` are each one flat `InternalItemsQuery`
+/// over the seed's genres and tags.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum LocalScorer {
+    /// The flat `Genres`/`Tags` query — and the default, so a kind no provider
+    /// serves stays governed by its (empty) `IncludeItemTypes`.
+    #[default]
+    GenreTag,
+    /// `MovieSimilarItemsProvider`'s weighted overlap scorer.
+    Weighted,
 }
 
 /// One similar-items request as the local provider sees it.
@@ -297,7 +345,8 @@ struct LocalRequest<'a> {
 }
 
 impl LocalFilter {
-    /// A provider that only restricts the result kinds (`Series`, Live TV).
+    /// A flat genre/tag provider that only restricts the result kinds
+    /// (`SeriesSimilarItemsProvider`, `LiveTvProgramSimilarItemsProvider`).
     fn of_kinds(include_item_types: Vec<BaseItemKind>) -> Self {
         Self {
             include_item_types,
@@ -305,7 +354,8 @@ impl LocalFilter {
         }
     }
 
-    /// A music provider: one result kind, and the caller's artist exclusions.
+    /// A flat genre/tag music provider: one result kind, and the caller's
+    /// artist exclusions (`MusicAlbum`/`MusicArtist`/`AudioSimilarItemsProvider`).
     fn music(kind: BaseItemKind) -> Self {
         Self {
             include_item_types: vec![kind],
@@ -512,6 +562,7 @@ impl FerrofinSimilarItemsManager {
             // `MovieSimilarItemsProvider` (Movie + Trailer seeds): movie kinds,
             // `IsMovie = true`, `IsPlayed = false`.
             BaseItemKind::Movie | BaseItemKind::Trailer => LocalFilter {
+                scorer: LocalScorer::Weighted,
                 include_item_types: self.movie_candidate_kinds().await,
                 is_movie: Some(true),
                 unplayed_only: true,
@@ -564,6 +615,61 @@ impl FerrofinSimilarItemsManager {
         Ok(true)
     }
 
+    /// The flat genre-or-tag providers' results for `seed` — one
+    /// `InternalItemsQuery`, as C# `SeriesSimilarItemsProvider`,
+    /// `MusicAlbumSimilarItemsProvider`, `MusicArtistSimilarItemsProvider`,
+    /// `AudioSimilarItemsProvider` and `LiveTvProgramSimilarItemsProvider` each
+    /// build it:
+    ///
+    /// ```text
+    /// new InternalItemsQuery(query.User) {
+    ///     Genres = item.Genres, Tags = item.Tags, Limit = query.Limit,
+    ///     ExcludeItemIds = [..query.ExcludeItemIds], IncludeItemTypes = [<kind>],
+    ///     EnableGroupByMetadataKey = false, EnableTotalRecordCount = true,
+    ///     OrderBy = [(ItemSortBy.Random, SortOrder.Ascending)] }
+    /// ```
+    ///
+    /// A seed with no genres AND no tags therefore carries **no** value
+    /// predicate at all and matches every other item of the kind — C# leaves
+    /// both collections empty, and an empty `InternalItemsQuery.Genres` is not
+    /// a filter. The one divergence is the ordering: `SortName` (tiebroken by
+    /// `Name`) instead of `Random`, so the answer is stable across requests.
+    async fn flat_similar(
+        &self,
+        request: &LocalRequest<'_>,
+        filter: &LocalFilter,
+        exclude_ids: &[Uuid],
+        wanted: i32,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        let mut exclude = exclude_ids.to_vec();
+        if !exclude.contains(&request.seed_id) {
+            exclude.push(request.seed_id);
+        }
+        let mut query = InternalItemsQuery {
+            genres: pipe_values(request.seed.genres.as_deref()),
+            tags: pipe_values(request.seed.tags.as_deref()),
+            include_item_types: filter.include_item_types.clone(),
+            exclude_item_ids: exclude,
+            exclude_artist_ids: if filter.honours_exclude_artist_ids {
+                request.exclude_artist_ids.to_vec()
+            } else {
+                Vec::new()
+            },
+            limit: Some(wanted),
+            // C# orders these providers `Random`; Ferrofin orders them
+            // `SortName` (which the query layer tiebreaks with `Name`, as C#'s
+            // `ApplyOrder` does) so the same request answers the same way twice.
+            order_by: vec![(ItemSortBy::SortName, SortOrder::Ascending)],
+            ..InternalItemsQuery::default()
+        };
+        if let Some(user_id) = request.user_id
+            && !self.configure_user_access(&mut query, user_id).await?
+        {
+            return Ok(Vec::new());
+        }
+        self.items.get_item_list(&query).await
+    }
+
     /// The local provider's results for `seed`, in score order, over-sampled
     /// for `wanted`: the score pass, then ONE access/played query over the
     /// scored ids (C# phases 1–2 of `GetBatchSimilarItemsAsync`). The caller
@@ -584,6 +690,14 @@ impl FerrofinSimilarItemsManager {
             return Ok(Vec::new());
         }
         let filter = self.local_filter(request.seed, request.kind).await;
+        if filter.include_item_types.is_empty() {
+            return Ok(Vec::new());
+        }
+        if filter.scorer == LocalScorer::GenreTag {
+            return self
+                .flat_similar(request, &filter, exclude_ids, wanted)
+                .await;
+        }
         let candidate_types: Vec<&str> = filter
             .include_item_types
             .iter()
@@ -965,16 +1079,19 @@ impl SimilarItemsManager for FerrofinSimilarItemsManager {
         user_id: Option<Uuid>,
         _dto_options: &DtoOptions,
         limit: Option<i32>,
-    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+    ) -> Result<Option<Vec<BaseItemEntity>>, ServiceError> {
+        // C# `LibraryController.GetSimilarItems`: a seed that does not resolve
+        // is a `404`, not an empty page — so the miss stays distinguishable
+        // from the short-circuit below.
         let Some(seed) = self.items.retrieve_item(item_id).await? else {
-            return Ok(Vec::new());
+            return Ok(None);
         };
         let kind = kind_of(&seed);
         // C# `LibraryController.GetSimilarItems`: an `Episode`, or an
         // `IItemByName` other than a `MusicArtist`, answers with an empty
         // result before any provider runs.
         if !supports_similarity(kind) {
-            return Ok(Vec::new());
+            return Ok(Some(Vec::new()));
         }
         let wanted = limit.unwrap_or(DEFAULT_SIMILAR_LIMIT);
         // The local scorer is always enabled, but it takes its place in the
@@ -1052,7 +1169,7 @@ impl SimilarItemsManager for FerrofinSimilarItemsManager {
         // most relevant results.
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         scored.truncate(usize::try_from(wanted.max(0)).unwrap_or(0));
-        Ok(scored.into_iter().map(|(entity, _)| entity).collect())
+        Ok(Some(scored.into_iter().map(|(entity, _)| entity).collect()))
     }
 
     async fn get_movie_recommendations(
@@ -1556,7 +1673,8 @@ mod tests {
         );
         mgr.get_similar_items(seed, &[], None, &DtoOptions::default(), None)
             .await
-            .expect("similar");
+            .expect("similar")
+            .expect("seed resolves");
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
@@ -1595,7 +1713,8 @@ mod tests {
         let similar = mgr
             .get_similar_items(seed, &[], None, &DtoOptions::default(), None)
             .await
-            .expect("similar");
+            .expect("similar")
+            .expect("seed resolves");
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         let names: Vec<_> = similar.iter().filter_map(|r| r.name.clone()).collect();
         assert!(
@@ -1665,6 +1784,7 @@ mod tests {
             .get_similar_items(seed, &[], None, &DtoOptions::default(), Some(1))
             .await
             .expect("similar")
+            .expect("seed resolves")
             .iter()
             .filter_map(|r| r.name.clone())
             .collect();
@@ -1738,6 +1858,7 @@ mod tests {
             .get_similar_items(seed, &[], None, &DtoOptions::default(), Some(10))
             .await
             .expect("similar")
+            .expect("seed resolves")
             .iter()
             .filter_map(|r| r.name.clone())
             .collect();
@@ -1760,6 +1881,7 @@ mod tests {
             .get_similar_items(seed, &[], None, &DtoOptions::default(), Some(10))
             .await
             .expect("similar")
+            .expect("seed resolves")
             .iter()
             .filter_map(|r| r.name.clone())
             .collect();
@@ -1827,6 +1949,7 @@ mod tests {
             .get_similar_items(seed, &[], None, &DtoOptions::default(), Some(1))
             .await
             .expect("similar")
+            .expect("seed resolves")
             .iter()
             .filter_map(|r| r.name.clone())
             .collect();
@@ -1910,6 +2033,7 @@ mod tests {
             .get_similar_items(seed, &[], None, &DtoOptions::default(), Some(1))
             .await
             .expect("similar")
+            .expect("seed resolves")
             .iter()
             .filter_map(|r| r.name.clone())
             .collect();
@@ -1942,7 +2066,8 @@ mod tests {
         let similar = mgr
             .get_similar_items(seed, &[], None, &DtoOptions::default(), None)
             .await
-            .expect("similar");
+            .expect("similar")
+            .expect("seed resolves");
         assert!(similar.is_empty());
     }
 
@@ -1985,7 +2110,8 @@ mod tests {
         let similar = mgr
             .get_similar_items(seed, &[], None, &DtoOptions::default(), None)
             .await
-            .expect("similar");
+            .expect("similar")
+            .expect("seed resolves");
         let names: Vec<_> = similar.iter().filter_map(|r| r.name.clone()).collect();
         assert!(names.contains(&"Aliens".to_owned()));
         assert!(!names.contains(&"Alien".to_owned()));
@@ -2013,7 +2139,8 @@ mod tests {
         let similar = mgr
             .get_similar_items(seed, &[], None, &DtoOptions::default(), None)
             .await
-            .expect("similar");
+            .expect("similar")
+            .expect("seed resolves");
         let names: Vec<_> = similar.iter().filter_map(|r| r.name.clone()).collect();
         assert_eq!(
             names,
@@ -2023,14 +2150,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_seed_yields_no_similar_items() {
+    async fn a_missing_seed_is_reported_as_absent_not_empty() {
+        // C# `LibraryController.GetSimilarItems`: `if (item is null) return
+        // NotFound();`. An empty `Vec` would make the handler answer 200 to a
+        // seed that does not exist, which Jellyfin 404s.
         let db = test_db().await;
         let mgr = manager(&db);
         let similar = mgr
             .get_similar_items(Uuid::from_u128(99), &[], None, &DtoOptions::default(), None)
             .await
             .expect("similar");
-        assert!(similar.is_empty());
+        assert!(similar.is_none());
     }
 
     #[tokio::test]
@@ -2113,7 +2243,8 @@ mod tests {
         let for_user = mgr
             .get_similar_items(seed, &[], Some(user_id), &DtoOptions::default(), None)
             .await
-            .expect("similar");
+            .expect("similar")
+            .expect("seed resolves");
         assert_eq!(names(&for_user), vec!["Unplayed".to_owned()]);
 
         // Without a user there is no watch state to filter on (C# skips the
@@ -2125,7 +2256,8 @@ mod tests {
         let anonymous = mgr
             .get_similar_items(seed, &[], None, &DtoOptions::default(), None)
             .await
-            .expect("similar");
+            .expect("similar")
+            .expect("seed resolves");
         assert_eq!(
             names(&anonymous),
             vec!["Played".to_owned(), "Unplayed".to_owned()]
@@ -2160,7 +2292,8 @@ mod tests {
         let for_user = mgr
             .get_similar_items(seed, &[], Some(user_id), &DtoOptions::default(), None)
             .await
-            .expect("similar");
+            .expect("similar")
+            .expect("seed resolves");
         assert_eq!(
             names(&for_user),
             vec!["SharesDirector".to_owned(), "SharesGenre".to_owned()]
@@ -2179,7 +2312,8 @@ mod tests {
                 None,
             )
             .await
-            .expect("similar");
+            .expect("similar")
+            .expect("seed resolves");
         assert_eq!(
             names(&for_admin),
             vec![
@@ -2231,7 +2365,8 @@ mod tests {
                 None,
             )
             .await
-            .expect("similar");
+            .expect("similar")
+            .expect("seed resolves");
         assert_eq!(names(&rows), vec!["Visible".to_owned()]);
     }
 
@@ -2257,7 +2392,8 @@ mod tests {
         let rows = manager(&db)
             .get_similar_items(seed, &[], Some(user_id), &DtoOptions::default(), Some(2))
             .await
-            .expect("similar");
+            .expect("similar")
+            .expect("seed resolves");
         assert_eq!(names(&rows), vec!["Y".to_owned(), "Z".to_owned()]);
     }
 
@@ -2302,7 +2438,8 @@ mod tests {
             let rows = mgr
                 .get_similar_items(seed, &[], None, &DtoOptions::default(), None)
                 .await
-                .expect("similar");
+                .expect("similar")
+                .expect("seed resolves");
             assert!(
                 rows.is_empty(),
                 "{seed} must short-circuit; got {:?}",
@@ -2312,8 +2449,196 @@ mod tests {
         let rows = mgr
             .get_similar_items(artist, &[], None, &DtoOptions::default(), None)
             .await
-            .expect("similar");
+            .expect("similar")
+            .expect("seed resolves");
         assert_eq!(names(&rows), vec!["The Other Band".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn an_untagged_artist_seed_still_matches_every_other_artist() {
+        // C# `MusicArtistSimilarItemsProvider` is a flat
+        // `InternalItemsQuery { Genres = item.Genres, Tags = item.Tags, ... }`.
+        // Both are empty on an untagged artist, and an empty collection is NOT
+        // a predicate — so every other `MusicArtist` qualifies. The weighted
+        // movie scorer needs a positive overlap and returned nothing here,
+        // which is what made a real untagged music library answer empty where
+        // Jellyfin answered with the rest of the library.
+        let db = test_db().await;
+        let seed = Uuid::from_u128(0x5A1);
+        seed_kind(&db, seed, BaseItemKind::MusicArtist, "Artist 01", "").await;
+        seed_kind(
+            &db,
+            Uuid::from_u128(0x5A2),
+            BaseItemKind::MusicArtist,
+            "Artist 02",
+            "",
+        )
+        .await;
+        seed_kind(
+            &db,
+            Uuid::from_u128(0x5A3),
+            BaseItemKind::MusicArtist,
+            "Artist 03",
+            "",
+        )
+        .await;
+        // A different kind must not leak in: `IncludeItemTypes = [MusicArtist]`.
+        seed_kind(
+            &db,
+            Uuid::from_u128(0x5A4),
+            BaseItemKind::MusicAlbum,
+            "Album 01",
+            "",
+        )
+        .await;
+        let rows = manager(&db)
+            .get_similar_items(seed, &[], None, &DtoOptions::default(), None)
+            .await
+            .expect("similar")
+            .expect("seed resolves");
+        assert_eq!(
+            names(&rows),
+            vec!["Artist 02".to_owned(), "Artist 03".to_owned()]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_series_seed_matches_on_genre_only_never_on_studio_or_people() {
+        // `SeriesSimilarItemsProvider` filters on `Genres`/`Tags` alone. The
+        // weighted movie scorer also credits a shared studio (+5) and shared
+        // people, which pulled genre-unrelated series into the answer — a
+        // divergence from BOTH 10.11.8 and upstream master.
+        let db = test_db().await;
+        let seed = Uuid::from_u128(0x5B1);
+        seed_kind(&db, seed, BaseItemKind::Series, "Series 01", "Drama").await;
+        let same_genre = Uuid::from_u128(0x5B2);
+        seed_kind(&db, same_genre, BaseItemKind::Series, "Series 06", "Drama").await;
+        let studio_only = Uuid::from_u128(0x5B3);
+        seed_kind(
+            &db,
+            studio_only,
+            BaseItemKind::Series,
+            "Series 03",
+            "Thriller",
+        )
+        .await;
+        for item in [seed, studio_only] {
+            seed_item_value(
+                &db,
+                item,
+                ferrofin_db::enums::ItemValueType::Studios,
+                "Ferrofin Studios",
+            )
+            .await;
+        }
+        let rows = manager(&db)
+            .get_similar_items(seed, &[], None, &DtoOptions::default(), None)
+            .await
+            .expect("similar")
+            .expect("seed resolves");
+        assert_eq!(names(&rows), vec!["Series 06".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn an_album_seed_matches_albums_sharing_a_genre_only() {
+        // `MusicAlbumSimilarItemsProvider`: the same flat `Genres`/`Tags` query
+        // with `IncludeItemTypes = [MusicAlbum]` and `ExcludeArtistIds`. The
+        // fixture's albums each had a UNIQUE genre, so this endpoint answered
+        // empty on both servers and diffed "clean" while proving nothing —
+        // hence a unit test with two albums that DO share one.
+        let db = test_db().await;
+        let seed = Uuid::from_u128(0x5D1);
+        seed_kind(&db, seed, BaseItemKind::MusicAlbum, "Album A", "Jazz").await;
+        let same = Uuid::from_u128(0x5D2);
+        seed_kind(&db, same, BaseItemKind::MusicAlbum, "Album C", "Jazz").await;
+        seed_kind(
+            &db,
+            Uuid::from_u128(0x5D3),
+            BaseItemKind::MusicAlbum,
+            "Album B",
+            "Rock",
+        )
+        .await;
+        // A track sharing the genre must NOT come back: IncludeItemTypes is
+        // [MusicAlbum] alone.
+        seed_kind(
+            &db,
+            Uuid::from_u128(0x5D4),
+            BaseItemKind::Audio,
+            "A Track",
+            "Jazz",
+        )
+        .await;
+        let mgr = manager(&db);
+        let rows = mgr
+            .get_similar_items(seed, &[], None, &DtoOptions::default(), None)
+            .await
+            .expect("similar")
+            .expect("seed resolves");
+        assert_eq!(names(&rows), vec!["Album C".to_owned()]);
+
+        // `ExcludeArtistIds` is honoured for the music providers (and only
+        // them): excluding Album C's artist empties the result.
+        seed_album_artist(&db, same, "The Band").await;
+        let artist_id = mgr
+            .items
+            .get_item_list(&InternalItemsQuery {
+                include_item_types: vec![BaseItemKind::MusicArtist],
+                ..InternalItemsQuery::default()
+            })
+            .await
+            .expect("artists")
+            .first()
+            .and_then(|r| Uuid::parse_str(&r.id).ok())
+            .expect("the album artist materialized a MusicArtist row");
+        // Still returned when nothing is excluded — so the assertion below is
+        // about the exclusion, not about the album having vanished.
+        let rows = mgr
+            .get_similar_items(seed, &[], None, &DtoOptions::default(), None)
+            .await
+            .expect("similar")
+            .expect("seed resolves");
+        assert_eq!(names(&rows), vec!["Album C".to_owned()]);
+        let rows = mgr
+            .get_similar_items(seed, &[artist_id], None, &DtoOptions::default(), None)
+            .await
+            .expect("similar")
+            .expect("seed resolves");
+        assert!(rows.is_empty(), "got {:?}", names(&rows));
+    }
+
+    #[tokio::test]
+    async fn a_seed_with_no_limit_returns_up_to_the_csharp_default_of_fifty() {
+        // C# `SimilarItemsManager`: `var requestedLimit = limit ?? 50;`
+        // (`MovieSimilarItemsProvider`: `query.Limit ?? 50`). Ferrofin capped
+        // an unlimited request at 10, so a client that omits `limit` saw a
+        // fifth of the results Jellyfin sends.
+        let db = test_db().await;
+        let seed = Uuid::from_u128(0x5C0);
+        seed_kind(&db, seed, BaseItemKind::Series, "Series 00", "Drama").await;
+        for i in 1..=60u128 {
+            seed_kind(
+                &db,
+                Uuid::from_u128(0x5C0 + i),
+                BaseItemKind::Series,
+                &format!("Series {i:03}"),
+                "Drama",
+            )
+            .await;
+        }
+        let rows = manager(&db)
+            .get_similar_items(seed, &[], None, &DtoOptions::default(), None)
+            .await
+            .expect("similar")
+            .expect("seed resolves");
+        assert_eq!(rows.len(), 50);
+        // And an explicit limit still wins.
+        let rows = manager(&db)
+            .get_similar_items(seed, &[], None, &DtoOptions::default(), Some(12))
+            .await
+            .expect("similar")
+            .expect("seed resolves");
+        assert_eq!(rows.len(), 12);
     }
 
     #[tokio::test]
@@ -2334,7 +2659,8 @@ mod tests {
         let rows = manager(&db)
             .get_similar_items(seed, &[], None, &DtoOptions::default(), None)
             .await
-            .expect("similar");
+            .expect("similar")
+            .expect("seed resolves");
         assert!(rows.is_empty(), "got {:?}", names(&rows));
     }
 
@@ -2366,7 +2692,8 @@ mod tests {
         let all = mgr
             .get_similar_items(seed, &[], None, &DtoOptions::default(), None)
             .await
-            .expect("similar");
+            .expect("similar")
+            .expect("seed resolves");
         assert_eq!(
             names(&all),
             vec!["Band Album".to_owned(), "Other Album".to_owned()]
@@ -2374,7 +2701,8 @@ mod tests {
         let without_band = mgr
             .get_similar_items(seed, &[band], None, &DtoOptions::default(), None)
             .await
-            .expect("similar");
+            .expect("similar")
+            .expect("seed resolves");
         assert_eq!(names(&without_band), vec!["Other Album".to_owned()]);
     }
 
@@ -2390,7 +2718,8 @@ mod tests {
         let rows = manager(&db)
             .get_similar_items(seed, &[other], None, &DtoOptions::default(), None)
             .await
-            .expect("similar");
+            .expect("similar")
+            .expect("seed resolves");
         assert_eq!(names(&rows), vec!["Other".to_owned()]);
     }
 
@@ -2423,14 +2752,16 @@ mod tests {
         let rows = on
             .get_similar_items(seed, &[], None, &DtoOptions::default(), None)
             .await
-            .expect("similar");
+            .expect("similar")
+            .expect("seed resolves");
         assert_eq!(names(&rows), vec!["Trailer".to_owned()]);
 
         let off = manager(&db).with_configuration(Arc::new(FakeConfig { external: false }));
         let rows = off
             .get_similar_items(seed, &[], None, &DtoOptions::default(), None)
             .await
-            .expect("similar");
+            .expect("similar")
+            .expect("seed resolves");
         assert!(rows.is_empty(), "got {:?}", names(&rows));
     }
 

@@ -348,6 +348,12 @@ def resolve_fixtures(base, token, user):
     season = first("Season")
     episode = first("Episode")
     audio = first("Audio")
+    album = first("MusicAlbum")
+    # NOT /Items?includeItemTypes=MusicArtist: Ferrofin serves artists as
+    # parentless by-name rows, so that query is empty on one server and not the
+    # other. /Artists returns all three on both.
+    artists = get_json(base, f"/Artists?userId={user}&limit=1", token) or {}
+    artist = ((artists.get("Items") or [{}])[0]).get("Id")
     any_item = movie or series or episode
     genres = get_json(base, f"/Genres?userId={user}&limit=1", token) or {}
     genre = (genres.get("Items") or [{}])[0].get("Name") or "Action"
@@ -380,6 +386,8 @@ def resolve_fixtures(base, token, user):
         # Not a path param: the first track, so the /Audio/* ops probe a real audio item
         # (see `audio_fixtures`).
         "_audio": audio, "_audio_src": source_id(audio),
+        # Kind-correct seeds for the /Similar aliases (see `similar_fixtures`).
+        "_album": album, "_artist": artist, "_series": series,
     }
     return {k: v for k, v in fx.items() if v is not None}
 
@@ -391,6 +399,25 @@ def audio_fixtures(fixtures):
     if not audio:
         return fixtures
     return {**fixtures, "itemId": audio, "mediaSourceId": fixtures.get("_audio_src") or audio}
+
+
+# The `{itemId}` seed each /{kind}/{itemId}/Similar alias is ABOUT. Without this
+# every alias was probed with `any_item` (a Movie), so /Albums, /Artists and
+# /Shows Similar were byte-identical copies of the /Movies row and proved
+# nothing about their own controller path — they never touched an album, an
+# artist or a series seed at all.
+SIMILAR_SEEDS = {
+    "/Albums/{itemId}/Similar": "_album",
+    "/Artists/{itemId}/Similar": "_artist",
+    "/Shows/{itemId}/Similar": "_series",
+}
+
+
+def similar_fixtures(path, fixtures):
+    """The fixtures with `itemId` swapped for the kind-correct seed of a /Similar
+    alias. Unchanged for every other path, and when the fixture lacks that kind."""
+    seed = fixtures.get(SIMILAR_SEEDS.get(path, ""))
+    return {**fixtures, "itemId": seed} if seed else fixtures
 
 
 # REQUIRED query params the breadth sweep can fill from the shared fixture — the query-side
@@ -512,6 +539,8 @@ def sweep(ferrofin_url, jellyfin_url):
                 continue
             fx_h = audio_fixtures(fixtures) if path.startswith("/Audio/") else fixtures
             fx_j = audio_fixtures(fixtures_j) if path.startswith("/Audio/") else fixtures_j
+            fx_h = similar_fixtures(path, fx_h)
+            fx_j = similar_fixtures(path, fx_j)
             hurl, skip = build_url(path, fx_h)   # per-server ids: Ferrofin's on Ferrofin
             if skip:
                 results[opkey] = {"status_conformant": None, "schema_valid": None, "note": skip}
@@ -601,6 +630,17 @@ def selfcheck():
     # the /Audio/* ops swap in the first track; no music library → unchanged.
     assert audio_fixtures({"itemId": "m", "_audio": "a"})["itemId"] == "a"
     assert audio_fixtures({"itemId": "m"})["itemId"] == "m"
+    # A /Similar alias is probed with ITS OWN kind, not the shared movie id.
+    assert similar_fixtures("/Albums/{itemId}/Similar",
+                            {"itemId": "m", "_album": "al"})["itemId"] == "al"
+    assert similar_fixtures("/Artists/{itemId}/Similar",
+                            {"itemId": "m", "_artist": "ar"})["itemId"] == "ar"
+    assert similar_fixtures("/Shows/{itemId}/Similar",
+                            {"itemId": "m", "_series": "se"})["itemId"] == "se"
+    # No such kind in the fixture, or a route that is not a /Similar alias: unchanged.
+    assert similar_fixtures("/Albums/{itemId}/Similar", {"itemId": "m"})["itemId"] == "m"
+    assert similar_fixtures("/Movies/{itemId}/Similar",
+                            {"itemId": "m", "_album": "al"})["itemId"] == "m"
     # status-class comparison is by hundreds bucket.
     assert (200 // 100) == (204 // 100) and (404 // 100) != (500 // 100)
     print("ok: nullable, $ref, param-fill, skip, query-inject, required-fill, status-class")

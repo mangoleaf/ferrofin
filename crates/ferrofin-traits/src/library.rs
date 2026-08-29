@@ -1411,6 +1411,13 @@ fn _assert_object_safe_remote_similar_items_provider(_: &dyn RemoteSimilarItemsP
 #[async_trait]
 pub trait SimilarItemsManager: Send + Sync {
     /// Gets items similar to `item_id`.
+    ///
+    /// `Ok(None)` means the seed does not exist — C#
+    /// `LibraryController.GetSimilarItems` answers `404` for it
+    /// (`if (item is null) { return NotFound(); }`), which an empty `Vec` could
+    /// not be told apart from. `Ok(Some(vec![]))` is the legitimate empty
+    /// result: the controller's `Episode`/by-name short-circuit, or a seed
+    /// nothing resembles.
     async fn get_similar_items(
         &self,
         item_id: Uuid,
@@ -1418,7 +1425,7 @@ pub trait SimilarItemsManager: Send + Sync {
         user_id: Option<Uuid>,
         dto_options: &DtoOptions,
         limit: Option<i32>,
-    ) -> Result<Vec<BaseItemEntity>, ServiceError>;
+    ) -> Result<Option<Vec<BaseItemEntity>>, ServiceError>;
 
     /// Builds movie recommendation categories for a user.
     async fn get_movie_recommendations(
