@@ -417,6 +417,20 @@ def main():
         # them (a probe would mutate state), so their honesty gate is the parity
         # WRITE JOURNEY's effect verdict plus the 100% expected-status check below.
         is_write = not op.startswith("GET ")
+        # No default. A row with no method never said what it compared, and the
+        # ledger's own --check now rejects it; admitting one here as "comparable
+        # work" would restore exactly the default this gate exists to distrust.
+        # A write can only ever be `effect` (no body diff exists for a 204), which
+        # is the documented gate for writes; a GET must be a real body diff. Every
+        # other method — property, status-class, empty-corpus — stays
+        # non-comparable, `empty-corpus` most sharply of all: both servers returned
+        # nothing, so timing them measures the harness, not the work.
+        method = pr.get("verification_method")
+        deep = bool(pr.get("deep_verified")) and (
+            method == "body-diff" or (is_write and method == "effect"))
+        benched_ops.add(op)
+        if deep:
+            deep_ops.add(op)
         f_e = None if is_write else fp_entry(fp_h, variant, op)
         j_e = None if is_write else fp_entry(fp_j, variant, op)
         base_e = ((baseline or {}).get("variants") or {}).get(variant)
