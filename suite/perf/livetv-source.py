@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The Live TV fixture's broadcast: an endless, real-time-paced MPEG-TS over HTTP.
+"""The lab fixture server: an endless MPEG-TS broadcast, plus a plugin repository.
 
 A tuner stream never ends, and both servers treat a source that does end as a dead
 channel (Jellyfin deletes its live-stream buffer the moment the HTTP body completes), so
@@ -11,8 +11,20 @@ number of concurrent clients (the two servers plus their recorders).
 
 Runs inside the `livetv-source` compose service (python:3-alpine, stdlib only); the clip
 length comes from docker-compose.yml, next to where gen-fixtures.sh's 60 s is noted.
+
+It also serves two FIXED plugin-repository manifests at /manifest.json and
+/manifest-b.json. `GET /Packages` aggregates whatever the configured repositories
+publish, so diffing it against the live repo.jellyfin.org would make the row
+depend on upstream content that changes without notice; pointing BOTH servers at
+a manifest on this container instead makes the catalogue deterministic and
+network-independent. The fixture is shaped to exercise the parts of
+`InstallationManager.GetPackages`/`GetAvailablePackages` the row exists to prove:
+no server-stamped repositoryName/repositoryUrl keys (no real manifest has them),
+a version whose targetAbi is above 10.11.8, a version whose targetAbi does not
+parse, and one package listed by BOTH manifests so the same-guid merge runs.
 """
 import http.server
+import json
 import os
 import socketserver
 import sys
@@ -25,11 +37,95 @@ CHUNK = 188 * 64           # a whole number of TS packets per write
 CLIENT_TIMEOUT_S = 30      # a client that stops reading (killed container) is dropped
 
 
+# The plugin-repository fixture. Keys match a real repo.jellyfin.org manifest
+# exactly — in particular NEITHER "repositoryName" NOR "repositoryUrl" appears,
+# because the server stamps those after the fetch
+# (`InstallationManager.GetPackages`: `ver.RepositoryName = manifestName;`). A
+# manifest that carried them would not test the deserialization path any client
+# actually hits.
+MANIFEST_A = [
+    {
+        "category": "Metadata",
+        "guid": "9c4e63f1-031b-4f25-988b-4f7d78a8b53e",
+        "name": "Parity Bookshelf",
+        "description": "Book metadata for the parity fixture.",
+        "overview": "Book metadata.",
+        "owner": "parity",
+        "imageUrl": "http://livetv-source:8000/bookshelf.png",
+        "versions": [
+            # Above 10.11.8: `GetPackages` removes it. Its presence proves the
+            # ABI filter runs; its absence from the response is the assertion.
+            {"version": "3.0.0.0", "targetAbi": "10.11.9.0", "changelog": "too new",
+             "sourceUrl": "http://livetv-source:8000/a.zip", "checksum": "aaa",
+             "timestamp": "2025-03-01T00:00:00Z"},
+            # Built for EXACTLY this release. `ApplicationVersion` is an assembly
+            # version, so 10.11.8 is (10,11,8,0) and this is compatible — the
+            # boundary case the 10.11.8 oracle lists 9 real plugin versions at.
+            {"version": "2.5.0.0", "targetAbi": "10.11.8.0", "changelog": "exact release",
+             "sourceUrl": "http://livetv-source:8000/f.zip", "checksum": "fff",
+             "timestamp": "2025-02-15T00:00:00Z"},
+            {"version": "2.0.0.0", "targetAbi": "10.11.0.0", "changelog": "ok",
+             "sourceUrl": "http://livetv-source:8000/b.zip", "checksum": "bbb",
+             "timestamp": "2025-02-01T00:00:00Z"},
+            # Unparseable targetAbi falls back to Version(0,0,0,1) and is KEPT.
+            {"version": "1.0.0.0", "targetAbi": "not-a-version", "changelog": "kept",
+             "sourceUrl": "http://livetv-source:8000/c.zip", "checksum": "ccc",
+             "timestamp": "2025-01-01T00:00:00Z"},
+        ],
+    },
+    {
+        # Every version too new ⇒ the whole package is dropped
+        # ("Don't add a package that doesn't have any compatible versions").
+        "category": "General",
+        "guid": "1f0e3dad-9990-4b2b-8d0e-3dad99904b2b",
+        "name": "Parity TooNew",
+        "description": "Never listed.",
+        "overview": "Never listed.",
+        "owner": "parity",
+        "versions": [
+            {"version": "9.0.0.0", "targetAbi": "12.0.0.0",
+             "sourceUrl": "http://livetv-source:8000/d.zip", "checksum": "ddd"},
+        ],
+    },
+]
+
+# Manifest B lists the SAME guid as manifest A's first package, with a version
+# that slots between A's two survivors — so the same-guid merge (`MergeSortedList`)
+# is exercised, not just asserted about.
+MANIFEST_B = [
+    {
+        "category": "Metadata",
+        "guid": "9c4e63f1-031b-4f25-988b-4f7d78a8b53e",
+        "name": "Parity Bookshelf",
+        "description": "The SECOND repository's copy — the first repository wins.",
+        "overview": "Second copy.",
+        "owner": "parity-b",
+        "versions": [
+            {"version": "1.5.0.0", "targetAbi": "10.11.0.0", "changelog": "from repo B",
+             "sourceUrl": "http://livetv-source:8000/e.zip", "checksum": "eee",
+             "timestamp": "2025-01-15T00:00:00Z"},
+        ],
+    },
+]
+
+MANIFESTS = {"/manifest.json": MANIFEST_A, "/manifest-b.json": MANIFEST_B}
+
+
 class Broadcast(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     timeout = CLIENT_TIMEOUT_S
 
     def do_GET(self):   # noqa: N802 — BaseHTTPRequestHandler's naming
+        manifest = MANIFESTS.get(self.path.split("?")[0])
+        if manifest is not None:
+            body = json.dumps(manifest).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if not self.path.startswith("/live"):
             self.send_error(404)
             return

@@ -124,9 +124,50 @@ pub trait PluginManager: Send + Sync {
     async fn set_repositories(&self, repositories: Vec<RepositoryInfo>)
     -> Result<(), ServiceError>;
 
-    /// Lists the packages available from the enabled repositories, merged
-    /// with catalog entries for the compiled-in plugins.
+    /// Lists the packages available from the enabled repositories.
+    ///
+    /// Port of `IInstallationManager.GetAvailablePackages`: each enabled
+    /// repository's manifest, with `repositoryName`/`repositoryUrl` stamped from
+    /// the repository actually fetched, versions built against a newer
+    /// `targetAbi` removed, packages left with no compatible version dropped, and
+    /// same-identity packages from different repositories merged into one entry.
+    ///
+    /// This is the *installable* catalogue and nothing else — upstream's
+    /// `PackageController.GetPackages` returns exactly this. Installed plugins
+    /// are `/Plugins`; a compiled-in extension is resolvable through
+    /// [`find_package`](Self::find_package) but is not listed here.
     async fn list_packages(&self) -> Result<Vec<PackageInfo>, ServiceError>;
+
+    /// Resolves one package by name and/or assembly guid — what
+    /// `GET /Packages/{name}` serves.
+    ///
+    /// Port of `InstallationManager.FilterPackages`, whose two predicates are
+    /// **alternatives**:
+    ///
+    /// ```text
+    /// if (!id.IsEmpty())          … Where(x => x.Id.Equals(id));
+    /// else if (name is not null)  … Where(x => x.Name.Equals(name, OrdinalIgnoreCase));
+    /// ```
+    ///
+    /// So a non-empty guid selects on its own and the name is ignored; an
+    /// all-zeros guid is `IsEmpty()` and falls through to the name branch.
+    ///
+    /// # Errors
+    /// Backend errors from reading the catalogue.
+    async fn find_package(
+        &self,
+        name: Option<&str>,
+        assembly_guid: Option<Uuid>,
+    ) -> Result<Option<PackageInfo>, ServiceError> {
+        let catalog = self.list_packages().await?;
+        if let Some(id) = assembly_guid.filter(|g| !g.is_nil()) {
+            return Ok(catalog.into_iter().find(|p| p.id == id));
+        }
+        let Some(name) = name else { return Ok(None) };
+        Ok(catalog
+            .into_iter()
+            .find(|p| p.name.to_lowercase() == name.to_lowercase()))
+    }
 
     /// The installed plugins for which a newer, installable version exists in
     /// the configured repositories.

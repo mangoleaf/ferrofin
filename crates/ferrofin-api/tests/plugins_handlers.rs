@@ -117,7 +117,20 @@ impl PluginManager for RecordingPlugins {
         Ok(())
     }
     async fn list_packages(&self) -> Result<Vec<PackageInfo>, ServiceError> {
-        Ok(Vec::new())
+        Ok(vec![PackageInfo {
+            name: "Demo".to_owned(),
+            description: "a demo plugin".to_owned(),
+            overview: "a demo plugin".to_owned(),
+            owner: "someone".to_owned(),
+            category: "General".to_owned(),
+            id: known_id(),
+            versions: vec![ferrofin_model::updates::VersionInfo {
+                version: "1.2.3".to_owned(),
+                version_number: "1.2.3".to_owned(),
+                ..ferrofin_model::updates::VersionInfo::default()
+            }],
+            image_url: None,
+        }])
     }
 }
 
@@ -343,14 +356,18 @@ async fn repositories_round_trip() {
 }
 
 #[tokio::test]
-async fn packages_are_empty_and_install_rejected() {
+async fn packages_are_listed_and_install_rejected() {
     let fake = Arc::new(RecordingPlugins::default());
     let list = router(fake.clone())
         .oneshot(authed("GET", "/Packages", Body::empty()))
         .await
         .expect("resp");
     assert_eq!(list.status(), StatusCode::OK);
-    assert_eq!(body_string(list).await, "[]");
+    let body = body_string(list).await;
+    assert!(body.contains("\"name\":\"Demo\""), "{body}");
+    // `VersionNumber` is a C# getter, so it is on the wire for every entry (the
+    // vendored contract declares it non-nullable readOnly).
+    assert!(body.contains("\"VersionNumber\":\"1.2.3\""), "{body}");
 
     let by_name = router(fake.clone())
         .oneshot(authed("GET", "/Packages/Anything", Body::empty()))
@@ -534,5 +551,99 @@ async fn plugin_route_strips_credentials_and_reserved_headers() {
         ))
         .await
         .expect("resp");
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+// ── GET /Packages/{name} — InstallationManager.FilterPackages semantics ─────
+//
+// The C# is `FilterPackages(packages, name, assemblyGuid ?? default)`, whose two
+// predicates are ALTERNATIVES with the guid winning, over an `assemblyGuid` bound
+// by ASP.NET as a `Guid?` (N/D/B/P spellings all accepted, anything else a 400).
+// Ferrofin used to AND them and string-compare the guid in its hyphenated
+// spelling — which never matched, because every guid Ferrofin serialises is
+// dashless. That is the exact shape jellyfin-web's plugin-detail page sends.
+
+/// The dashless (`"N"`) spelling — the one Ferrofin itself emits from
+/// `/Plugins[].Id` and `/Packages[].guid`, and the one the dashboard echoes back.
+#[tokio::test]
+async fn package_by_name_accepts_the_dashless_guid_it_emits() {
+    let app = router(Arc::new(RecordingPlugins::default()));
+    let uri = format!("/Packages/Demo?assemblyGuid={}", known_id().simple());
+    let resp = app
+        .oneshot(authed("GET", &uri, Body::empty()))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(body_string(resp).await.contains("\"Demo\""));
+}
+
+/// The hyphenated (`"D"`) spelling resolves too — ASP.NET's `Guid` binder takes
+/// either.
+#[tokio::test]
+async fn package_by_name_accepts_the_hyphenated_guid() {
+    let app = router(Arc::new(RecordingPlugins::default()));
+    let uri = format!("/Packages/Demo?assemblyGuid={}", known_id().hyphenated());
+    let resp = app
+        .oneshot(authed("GET", &uri, Body::empty()))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+/// `if (!id.IsEmpty()) … else if (name is not null) …` — the guid selects on its
+/// own and the name is ignored, so a wrong name still resolves the guid's package.
+#[tokio::test]
+async fn package_guid_wins_over_the_path_name() {
+    let app = router(Arc::new(RecordingPlugins::default()));
+    let uri = format!(
+        "/Packages/zzz-no-such-package?assemblyGuid={}",
+        known_id().simple()
+    );
+    let resp = app
+        .oneshot(authed("GET", &uri, Body::empty()))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(body_string(resp).await.contains("\"Demo\""));
+}
+
+/// An all-zeros guid is `Guid.IsEmpty()`, so it falls through to the name branch.
+#[tokio::test]
+async fn package_nil_guid_falls_through_to_the_name() {
+    let app = router(Arc::new(RecordingPlugins::default()));
+    let resp = app
+        .oneshot(authed(
+            "GET",
+            "/Packages/Demo?assemblyGuid=00000000000000000000000000000000",
+            Body::empty(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+/// An unparseable guid is rejected by C# model binding before the action runs.
+#[tokio::test]
+async fn package_unparseable_guid_is_a_bad_request() {
+    let app = router(Arc::new(RecordingPlugins::default()));
+    let resp = app
+        .oneshot(authed(
+            "GET",
+            "/Packages/Demo?assemblyGuid=notaguid",
+            Body::empty(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+/// An unknown name with no guid is still a 404.
+#[tokio::test]
+async fn package_unknown_name_is_not_found() {
+    let app = router(Arc::new(RecordingPlugins::default()));
+    let resp = app
+        .oneshot(authed("GET", "/Packages/zzz-nope", Body::empty()))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }

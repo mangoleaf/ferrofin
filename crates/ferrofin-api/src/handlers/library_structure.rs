@@ -280,7 +280,21 @@ async fn rename_virtual_folder(
         .virtual_folders
         .rename_virtual_folder(&name, &new_name)
         .await?;
-    after_structure_change(&state, query.refresh_library, None).await;
+    // Deliberate divergence from `LibraryStructureController.RenameVirtualFolder`,
+    // which only refreshes when `refreshLibrary` is set. Ferrofin derives a
+    // library's item id from its directory path, so the rename necessarily
+    // re-keys the row: the manager deletes the row the vacated directory backed
+    // (upstream's `ValidateTopLibraryFolders` leg) and the new path mints a fresh
+    // one, which cascades the old row's children away. Upstream can skip the
+    // refresh because it keeps the stale row (and its children) until the next
+    // scan; here, skipping it would leave the renamed library empty. So the
+    // rescan is unconditional, and scoped to the renamed library.
+    tracing::debug!(
+        refresh_library = query.refresh_library,
+        "renamed a library; rescanning it regardless, because its item id is derived from its path"
+    );
+    let scope = library_id_by_name(&state, &new_name).await;
+    after_structure_change(&state, true, scope).await;
     Ok(StatusCode::NO_CONTENT)
 }
 

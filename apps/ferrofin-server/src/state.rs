@@ -673,6 +673,7 @@ pub async fn build_app_state(
     let virtual_folders_impl = Arc::new(
         ferrofin_core::FerrofinVirtualFolderManager::new(paths.default_user_views_path())
             .with_item_store(Arc::clone(&item_persistence_service))
+            .with_items(Arc::clone(&item_repository))
             .with_id_derivation(id_derivation.clone())
             .with_playlists_path(playlists_path.clone()),
     );
@@ -1045,7 +1046,12 @@ pub async fn build_app_state(
             Arc::clone(&wasm_validator),
             Arc::clone(&lifecycle),
         )
-        .with_download_cap_mb(config.max_plugin_download_mb),
+        .with_download_cap_mb(config.max_plugin_download_mb)
+        // The package repositories live in the server configuration — the single
+        // store upstream keeps them in — so `/Repositories`, `/Packages` and
+        // `/System/Configuration` can never disagree.
+        .with_configuration(Arc::clone(&config_trait))
+        .with_application_version(JELLYFIN_API_VERSION),
     );
     let subtitle_providers: Vec<Arc<dyn ferrofin_traits::subtitles::SubtitleProvider>> =
         vec![Arc::new(ferrofin_providers::OpenSubtitlesProvider::new(

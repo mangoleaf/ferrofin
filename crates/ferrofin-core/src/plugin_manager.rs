@@ -18,10 +18,11 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use ferrofin_model::updates::{PackageInfo, RepositoryInfo};
+use ferrofin_model::updates::{PackageInfo, RepositoryInfo, VersionInfo};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use ferrofin_traits::configuration::ServerConfigurationManager;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::plugins::{
     PluginArtifactValidator, PluginDescriptor, PluginImage, PluginManager, PluginUpdateInfo,
@@ -172,6 +173,17 @@ pub fn merge_plugin_registrations(
 /// interpreter-language guests bundling their runtime; an abuse guard, not a
 /// tuning knob.
 const DEFAULT_PLUGIN_DOWNLOAD_MB: u32 = 128;
+
+/// The application version assumed when the composition root wires none — the
+/// Jellyfin API version Ferrofin reports from `/System/Info` (kept in step with
+/// `JELLYFIN_API_VERSION` in `apps/ferrofin-server/src/state.rs`, which is what
+/// a live server passes to
+/// [`with_application_version`](FerrofinPluginManager::with_application_version)).
+///
+/// It is the left-hand side of upstream's compatibility test
+/// `_applicationHost.ApplicationVersion < targetAbi`, so it decides which
+/// manifest versions a client is offered.
+const DEFAULT_APPLICATION_VERSION: &str = "10.11.8";
 
 /// Whether `url` points at a loopback host (`localhost`, `127.x`, `[::1]`).
 fn is_loopback_url(url: &str) -> bool {
@@ -391,6 +403,26 @@ pub struct FerrofinPluginManager {
     lifecycle: Option<Arc<dyn LifecycleController>>,
     /// The plugin-download size cap, in bytes (`FERROFIN_MAX_PLUGIN_DOWNLOAD_MB`).
     max_download_bytes: u64,
+    /// The server configuration — the **single** store for the package
+    /// repositories, exactly as upstream keeps them:
+    /// `PackageController.GetRepositories` returns
+    /// `Configuration.PluginRepositories`, `SetRepositories` writes it and calls
+    /// `SaveConfiguration()`, and `InstallationManager.GetAvailablePackages`
+    /// iterates the same array. One field, three consumers.
+    ///
+    /// `None` only at the unit-test seam (and the web-transformation helper),
+    /// where the manager falls back to the legacy private
+    /// `PersistedState::repositories`; the composition root always wires this, so
+    /// a live server has exactly one store.
+    config: Option<Arc<dyn ServerConfigurationManager>>,
+    /// The application version compared against a manifest version's
+    /// `targetAbi` (`_applicationHost.ApplicationVersion` in
+    /// `InstallationManager.GetPackages`). Set by the composition root from the
+    /// same constant `/System/Info` reports.
+    application_version: String,
+    /// Runs the one-shot `state.json` → `ServerConfiguration` repository
+    /// migration at most once, on first use.
+    legacy_repositories_migrated: tokio::sync::OnceCell<()>,
 }
 
 impl std::fmt::Debug for FerrofinPluginManager {
@@ -422,7 +454,27 @@ impl FerrofinPluginManager {
             validator: None,
             lifecycle: None,
             max_download_bytes: u64::from(DEFAULT_PLUGIN_DOWNLOAD_MB) * 1024 * 1024,
+            config: None,
+            application_version: DEFAULT_APPLICATION_VERSION.to_owned(),
+            legacy_repositories_migrated: tokio::sync::OnceCell::new(),
         }
+    }
+
+    /// Attaches the server configuration — the store the package repositories
+    /// actually live in. Called once by the composition root.
+    #[must_use]
+    pub fn with_configuration(mut self, config: Arc<dyn ServerConfigurationManager>) -> Self {
+        self.config = Some(config);
+        self
+    }
+
+    /// Sets the application version used for the `targetAbi` compatibility
+    /// filter. Called once by the composition root with the same version
+    /// `/System/Info` reports; defaults to [`DEFAULT_APPLICATION_VERSION`].
+    #[must_use]
+    pub fn with_application_version(mut self, version: impl Into<String>) -> Self {
+        self.application_version = version.into();
+        self
     }
 
     /// Arms runtime installation: the staging directory the WASM host loads
@@ -580,6 +632,178 @@ impl FerrofinPluginManager {
         state.enabled.insert(id.to_string(), enabled);
         self.persist(&state)
     }
+}
+
+impl FerrofinPluginManager {
+    /// The configured package repositories, read from the single store.
+    ///
+    /// Port of `PackageController.GetRepositories`
+    /// (`_serverConfigurationManager.Configuration.PluginRepositories`). Falls
+    /// back to the legacy private state only when no configuration manager is
+    /// wired (the unit-test seam).
+    async fn configured_repositories(&self) -> Result<Vec<RepositoryInfo>, ServiceError> {
+        let Some(config) = &self.config else {
+            let state = self.state.lock().expect("plugin state lock poisoned");
+            return Ok(state.repositories.clone());
+        };
+        self.migrate_legacy_repositories(config.as_ref()).await?;
+        Ok(config.configuration().await?.plugin_repositories.clone())
+    }
+
+    /// One-shot: folds any repository an admin configured on an older build
+    /// (which wrote them to `{config_dir}/plugins/state.json`) into
+    /// `ServerConfiguration.PluginRepositories`, then clears the legacy list.
+    ///
+    /// Without this, moving to the single store would silently drop a
+    /// repository the admin had already added. Entries already present by URL
+    /// are not duplicated.
+    async fn migrate_legacy_repositories(
+        &self,
+        config: &dyn ServerConfigurationManager,
+    ) -> Result<(), ServiceError> {
+        self.legacy_repositories_migrated
+            .get_or_try_init(|| async {
+                let legacy = {
+                    let mut state = self.state.lock().expect("plugin state lock poisoned");
+                    std::mem::take(&mut state.repositories)
+                };
+                if legacy.is_empty() {
+                    return Ok(());
+                }
+                let current = config.configuration().await?;
+                let mut merged = current.plugin_repositories.clone();
+                for repo in legacy {
+                    if !merged.iter().any(|existing| existing.url == repo.url) {
+                        merged.push(repo);
+                    }
+                }
+                tracing::info!(
+                    count = merged.len(),
+                    "migrated plugin repositories from state.json into the server configuration"
+                );
+                let mut updated = (*current).clone();
+                updated.plugin_repositories = merged;
+                config.update_configuration(&updated).await?;
+                let state = self.state.lock().expect("plugin state lock poisoned");
+                self.persist(&state)
+            })
+            .await?;
+        Ok(())
+    }
+}
+
+/// Parses a .NET `System.Version` string (`Version.TryParse`): two to four
+/// dot-separated non-negative integers. Components the string omits stay at
+/// `absent`, and that value is the whole subtlety of this comparison — see
+/// [`abi_is_compatible`].
+///
+/// Returns `None` for anything `Version.TryParse` would reject, which is what
+/// makes upstream fall back to its `new Version(0, 0, 0, 1)` minimum.
+fn parse_dotnet_version(value: &str, absent: i64) -> Option<[i64; 4]> {
+    let parts: Vec<&str> = value.trim().split('.').collect();
+    if parts.len() < 2 || parts.len() > 4 {
+        return None;
+    }
+    let mut out = [absent; 4];
+    for (slot, part) in out.iter_mut().zip(parts) {
+        let parsed: i64 = part.parse().ok()?;
+        if parsed < 0 {
+            return None;
+        }
+        *slot = parsed;
+    }
+    Some(out)
+}
+
+/// Whether a manifest version built against `target_abi` may be offered to an
+/// application at `application_version`.
+///
+/// Port of `InstallationManager.GetPackages`:
+///
+/// ```text
+/// var minimumVersion = new Version(0, 0, 0, 1);
+/// if (!Version.TryParse(ver.TargetAbi, out var targetAbi)) { targetAbi = minimumVersion; }
+/// if (_applicationHost.ApplicationVersion >= targetAbi) { continue; }
+/// entry.Versions.Remove(ver);
+/// ```
+///
+/// Note the direction of the unparseable case: a missing or malformed
+/// `targetAbi` becomes `0.0.0.1`, so the version is **kept**, not dropped.
+fn abi_is_compatible(application_version: &str, target_abi: Option<&str>) -> bool {
+    let minimum = [0_i64, 0, 0, 1];
+    // `targetAbi` reaches C# through `Version.TryParse`, where a component the
+    // string omits is -1 — that is how .NET orders `10.11` BELOW `10.11.0`.
+    let target = target_abi
+        .and_then(|abi| parse_dotnet_version(abi, -1))
+        .unwrap_or(minimum);
+    // The application version does NOT come from a string: it is
+    // `typeof(ApplicationHost).Assembly.GetName().Version`, and an assembly
+    // version always carries four components — `[assembly: AssemblyVersion("10.11.8")]`
+    // (SharedVersion.cs, both trees) is `Version(10, 11, 8, 0)`, NOT
+    // `Version(10, 11, 8, -1)`. Parsing our "10.11.8" with the ABI's -1 rule
+    // would leave the server one notch below itself and silently hide every
+    // plugin built for the exact release it is — measured against the 10.11.8
+    // oracle on the live repo.jellyfin.org manifest: 9 versions with `targetAbi`
+    // 10.11.8.0 that Jellyfin lists and this filter had dropped.
+    //
+    // An unparseable application version cannot be compared; upstream always has
+    // a real one, so treat it as compatible rather than emptying the catalogue.
+    let Some(app) = parse_dotnet_version(application_version, 0) else {
+        return true;
+    };
+    app >= target
+}
+
+/// Merges `incoming` into `existing`, both descending by version, keeping
+/// `existing`'s entry on a tie.
+///
+/// Port of `InstallationManager.MergeSortedList`, which is how upstream folds a
+/// second repository's listing of the same plugin guid into one catalogue entry
+/// ("Where repositories have the same content, the details from the first is
+/// taken"). Ferrofin previously pushed a duplicate entry per repository.
+fn merge_sorted_versions(existing: &mut Vec<VersionInfo>, incoming: Vec<VersionInfo>) {
+    let mut merged: Vec<VersionInfo> = Vec::with_capacity(existing.len() + incoming.len());
+    let mut left = std::mem::take(existing).into_iter().peekable();
+    let mut right = incoming.into_iter().peekable();
+    loop {
+        match (left.peek(), right.peek()) {
+            (Some(l), Some(r)) => {
+                if version_sort_key(&l.version) >= version_sort_key(&r.version) {
+                    merged.push(left.next().expect("peeked"));
+                } else {
+                    merged.push(right.next().expect("peeked"));
+                }
+            }
+            (Some(_), None) => merged.push(left.next().expect("peeked")),
+            (None, Some(_)) => merged.push(right.next().expect("peeked")),
+            (None, None) => break,
+        }
+    }
+    *existing = merged;
+}
+
+/// `InstallationManager.FilterPackages` — the by-name / by-guid catalogue lookup.
+///
+/// ```text
+/// if (!id.IsEmpty())          availablePackages = availablePackages.Where(x => x.Id.Equals(id));
+/// else if (name is not null)  availablePackages = availablePackages.Where(x => x.Name.Equals(name, OrdinalIgnoreCase));
+/// ```
+///
+/// The two are **alternatives**, not conjuncts, and the guid wins: a non-empty
+/// guid selects on its own and the name is ignored entirely. An all-zeros guid
+/// is `IsEmpty()`, so it falls through to the name branch.
+fn filter_packages<'a>(
+    packages: &'a [PackageInfo],
+    name: Option<&str>,
+    assembly_guid: Option<Uuid>,
+) -> Option<&'a PackageInfo> {
+    if let Some(id) = assembly_guid.filter(|g| !g.is_nil()) {
+        return packages.iter().find(|p| p.id == id);
+    }
+    let name = name?;
+    packages
+        .iter()
+        .find(|p| p.name.to_lowercase() == name.to_lowercase())
 }
 
 #[async_trait]
@@ -750,11 +974,14 @@ impl PluginManager for FerrofinPluginManager {
         // 1. Resolve the package (guid beats name — names collide across
         //    repositories) and the version (pinned, else newest).
         let catalog = self.list_packages().await?;
-        // EVERY catalog entry for this identity, not just the first: two
-        // repositories may list the same plugin, and `list_packages` keeps
-        // their entries separate. Picking only the first would make a version
-        // published by the second repository unreachable — including the one a
-        // caller pinned by `version`/`repository_url`.
+        // EVERY catalog entry for this identity, not just the first. Since
+        // `list_packages` merges same-guid packages across repositories
+        // (`MergeSortedList`) this is normally one entry carrying every
+        // repository's versions, each with its own `repositoryUrl` — but a
+        // manifest that omits `guid` is matched by name instead, and those stay
+        // separate. Scanning all of them keeps a version published only by the
+        // second repository reachable, including one a caller pinned by
+        // `version`/`repository_url`.
         let matching: Vec<&PackageInfo> = catalog
             .iter()
             .filter(|p| match assembly_guid {
@@ -911,17 +1138,31 @@ impl PluginManager for FerrofinPluginManager {
     }
 
     async fn get_repositories(&self) -> Result<Vec<RepositoryInfo>, ServiceError> {
-        let state = self.state.lock().expect("plugin state lock poisoned");
-        Ok(state.repositories.clone())
+        self.configured_repositories().await
     }
 
+    /// Port of `PackageController.SetRepositories`:
+    ///
+    /// ```text
+    /// _serverConfigurationManager.Configuration.PluginRepositories = repositoryInfos;
+    /// _serverConfigurationManager.SaveConfiguration();
+    /// ```
+    ///
+    /// The write lands in the SAME document `GET|POST /System/Configuration`
+    /// serves, so the two surfaces can no longer disagree.
     async fn set_repositories(
         &self,
         repositories: Vec<RepositoryInfo>,
     ) -> Result<(), ServiceError> {
-        let mut state = self.state.lock().expect("plugin state lock poisoned");
-        state.repositories = repositories;
-        self.persist(&state)
+        let Some(config) = &self.config else {
+            let mut state = self.state.lock().expect("plugin state lock poisoned");
+            state.repositories = repositories;
+            return self.persist(&state);
+        };
+        self.migrate_legacy_repositories(config.as_ref()).await?;
+        let mut updated = (*config.configuration().await?).clone();
+        updated.plugin_repositories = repositories;
+        config.update_configuration(&updated).await
     }
 
     async fn list_packages(&self) -> Result<Vec<PackageInfo>, ServiceError> {
@@ -930,15 +1171,12 @@ impl PluginManager for FerrofinPluginManager {
         // A repository that is unreachable or serves malformed JSON is skipped with
         // a warning rather than failing the whole catalog. What this lists is
         // installable via `install_package` when the installer is armed.
-        let repos: Vec<RepositoryInfo> = {
-            let state = self.state.lock().expect("plugin state lock poisoned");
-            state
-                .repositories
-                .iter()
-                .filter(|r| r.enabled)
-                .cloned()
-                .collect()
-        };
+        let repos: Vec<RepositoryInfo> = self
+            .configured_repositories()
+            .await?
+            .into_iter()
+            .filter(|r| r.enabled)
+            .collect();
         let mut packages: Vec<PackageInfo> = Vec::new();
         // Manifests are small JSON documents: a total deadline plus a
         // streamed size cap, so a hostile/hung repository can neither OOM
@@ -951,7 +1189,12 @@ impl PluginManager for FerrofinPluginManager {
             let Some(url) = repo.url.as_deref().filter(|u| !u.is_empty()) else {
                 continue;
             };
-            let repo_name = repo.name.clone().unwrap_or_default();
+            // `GetAvailablePackages` passes `repository.Name ?? "Unnamed Repo"`.
+            let repo_name = repo
+                .name
+                .clone()
+                .filter(|n| !n.is_empty())
+                .unwrap_or_else(|| "Unnamed Repo".to_owned());
             let body = match client.get(url).send().await {
                 Ok(resp) => match read_capped(resp, MAX_MANIFEST_BYTES, url).await {
                     Ok(body) => body,
@@ -965,57 +1208,102 @@ impl PluginManager for FerrofinPluginManager {
                     continue;
                 }
             };
-            match serde_json::from_slice::<Vec<PackageInfo>>(&body) {
-                // Stamp provenance from the repository we actually fetched
-                // from — the manifest's own repositoryName/Url claims are
-                // attacker-controlled, and the install path's repositoryUrl
-                // filter + loopback exemption rely on these fields being
-                // true (Jellyfin stamps them the same way in
-                // `InstallationManager.GetPackages`).
-                Ok(list) => packages.extend(list.into_iter().map(|mut p| {
-                    for v in &mut p.versions {
-                        v.repository_name.clone_from(&repo_name);
-                        url.clone_into(&mut v.repository_url);
-                    }
-                    p
-                })),
+            let list = match serde_json::from_slice::<Vec<PackageInfo>>(&body) {
+                Ok(list) => list,
                 Err(e) => {
                     tracing::warn!(url, error = %e, "plugin repository manifest was not valid JSON");
+                    continue;
+                }
+            };
+            for mut package in list {
+                package.versions.retain_mut(|v| {
+                    // Stamp provenance from the repository we actually fetched
+                    // from — the manifest's own repositoryName/Url claims are
+                    // attacker-controlled, and the install path's repositoryUrl
+                    // filter + loopback exemption rely on these fields being
+                    // true (Jellyfin stamps them the same way in
+                    // `InstallationManager.GetPackages`).
+                    v.repository_name.clone_from(&repo_name);
+                    url.clone_into(&mut v.repository_url);
+                    // `VersionNumber` is a computed getter in C#, so it is on the
+                    // wire for every entry; a manifest never carries the key.
+                    v.fill_version_number();
+                    // "Only show plugins that are greater than or equal to
+                    // targetAbi" — the compatibility filter Ferrofin was missing,
+                    // which over-listed versions built for a newer server.
+                    abi_is_compatible(&self.application_version, v.target_abi.as_deref())
+                });
+                // "Don't add a package that doesn't have any compatible versions."
+                if package.versions.is_empty() {
+                    continue;
+                }
+                // "Where repositories have the same content, the details from the
+                // first is taken": a second repository listing the same plugin
+                // merges its versions into the existing entry rather than adding a
+                // duplicate package.
+                let existing = packages.iter_mut().find(|p| {
+                    if package.id.is_nil() {
+                        p.name.to_lowercase() == package.name.to_lowercase()
+                    } else {
+                        p.id == package.id
+                    }
+                });
+                if let Some(existing) = existing {
+                    merge_sorted_versions(&mut existing.versions, package.versions);
+                } else {
+                    packages.push(package);
                 }
             }
         }
-        // The compiled-in plugins are real installed packages even when no
-        // repository lists them — synthesize a catalog entry for each so
-        // `GET /Packages/{name}?assemblyGuid=…` (the dashboard's plugin detail
-        // page) resolves instead of 404ing. A repository entry with the same
-        // guid wins (it carries richer version/changelog data).
-        for plugin in &self.plugins {
-            if packages.iter().any(|p| p.id == plugin.descriptor.id) {
-                continue;
-            }
-            packages.push(PackageInfo {
+        // NOTE: the compiled-in plugins are deliberately NOT appended here.
+        // `PackageController.GetPackages` returns `GetAvailablePackages()` and
+        // nothing else — the catalogue is what is available to INSTALL from a
+        // repository, while installed plugins live at `/Plugins`. Ferrofin used
+        // to synthesize an entry per compiled-in extension so the dashboard's
+        // plugin-detail page could resolve one, but that advertised a package
+        // `install_package` then refuses ("belongs to a compiled-in extension")
+        // and was the only remaining body difference against Jellyfin on an
+        // identically-configured repository. The detail-page lookup keeps
+        // working: the synthesis moved to `find_package`, which is the only
+        // caller that needed it.
+        Ok(packages)
+    }
+
+    /// Port of `InstallationManager.FilterPackages` over the aggregated
+    /// catalogue, with a fallback to the compiled-in plugins.
+    async fn find_package(
+        &self,
+        name: Option<&str>,
+        assembly_guid: Option<Uuid>,
+    ) -> Result<Option<PackageInfo>, ServiceError> {
+        let catalog = self.list_packages().await?;
+        if let Some(found) = filter_packages(&catalog, name, assembly_guid) {
+            return Ok(Some(found.clone()));
+        }
+        // A compiled-in extension is a real, installed package that no
+        // repository lists. The dashboard's plugin-detail page asks for it by
+        // name + assemblyGuid, so resolve it here rather than 404ing — without
+        // putting it in the installable catalogue.
+        let synthesized: Vec<PackageInfo> = self
+            .plugins
+            .iter()
+            .map(|plugin| PackageInfo {
                 name: plugin.descriptor.name.clone(),
                 description: plugin.descriptor.description.clone(),
                 overview: plugin.descriptor.description.clone(),
                 owner: "Ferrofin (compiled-in)".to_owned(),
                 category: "General".to_owned(),
                 id: plugin.descriptor.id,
-                versions: vec![ferrofin_model::updates::VersionInfo {
+                versions: vec![VersionInfo {
                     version: plugin.descriptor.version.clone(),
-                    version_number: Some(plugin.descriptor.version.clone()),
-                    changelog: None,
-                    target_abi: None,
-                    source_url: None,
-                    checksum: None,
-                    sha256: None,
-                    timestamp: None,
+                    version_number: plugin.descriptor.version.clone(),
                     repository_name: "Ferrofin built-in".to_owned(),
-                    repository_url: String::new(),
+                    ..VersionInfo::default()
                 }],
                 image_url: None,
-            });
-        }
-        Ok(packages)
+            })
+            .collect();
+        Ok(filter_packages(&synthesized, name, assembly_guid).cloned())
     }
 
     async fn get_configuration_pages(
@@ -1099,7 +1387,10 @@ fn merge_config(defaults: &[u8], stored: &[u8]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{FerrofinPluginManager, RegisteredPlugin, merge_config};
+    use super::{
+        FerrofinPluginManager, RegisteredPlugin, abi_is_compatible, merge_config,
+        parse_dotnet_version,
+    };
     use ferrofin_model::updates::RepositoryInfo;
     use ferrofin_traits::error::ServiceError;
     use ferrofin_traits::plugins::{PluginDescriptor, PluginImage, PluginManager};
@@ -1247,6 +1538,135 @@ mod tests {
         assert_eq!(mgr.get_repositories().await.expect("repos"), vec![repo]);
     }
 
+    // ── the package repositories live in the server configuration ───────
+
+    /// An in-memory [`ServerConfigurationManager`], so a test can watch the
+    /// document `/System/Configuration` serves.
+    use ferrofin_traits::configuration::ServerConfigurationManager;
+
+    struct MemConfig(std::sync::Mutex<ferrofin_model::configuration::ServerConfiguration>);
+
+    impl MemConfig {
+        fn new(repositories: Vec<RepositoryInfo>) -> std::sync::Arc<Self> {
+            let config = ferrofin_model::configuration::ServerConfiguration {
+                plugin_repositories: repositories,
+                ..ferrofin_model::configuration::ServerConfiguration::default()
+            };
+            std::sync::Arc::new(Self(std::sync::Mutex::new(config)))
+        }
+
+        fn repositories(&self) -> Vec<RepositoryInfo> {
+            self.0.lock().unwrap().plugin_repositories.clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ServerConfigurationManager for MemConfig {
+        fn application_paths(
+            &self,
+        ) -> std::sync::Arc<dyn ferrofin_traits::system::ServerApplicationPaths> {
+            unreachable!("not used by the plugin manager")
+        }
+        async fn configuration(
+            &self,
+        ) -> Result<std::sync::Arc<ferrofin_model::configuration::ServerConfiguration>, ServiceError>
+        {
+            Ok(std::sync::Arc::new(self.0.lock().unwrap().clone()))
+        }
+        async fn update_configuration(
+            &self,
+            configuration: &ferrofin_model::configuration::ServerConfiguration,
+        ) -> Result<(), ServiceError> {
+            *self.0.lock().unwrap() = configuration.clone();
+            Ok(())
+        }
+        async fn get_branding(
+            &self,
+        ) -> Result<ferrofin_model::branding::BrandingOptions, ServiceError> {
+            Ok(ferrofin_model::branding::BrandingOptions::default())
+        }
+        async fn update_branding(
+            &self,
+            _branding: &ferrofin_model::branding::BrandingOptions,
+        ) -> Result<(), ServiceError> {
+            Ok(())
+        }
+    }
+
+    fn repo(name: &str, url: &str) -> RepositoryInfo {
+        RepositoryInfo {
+            name: Some(name.to_owned()),
+            url: Some(url.to_owned()),
+            enabled: true,
+        }
+    }
+
+    /// `GET /Repositories` reads `ServerConfiguration.PluginRepositories` — the
+    /// same single store `PackageController.GetRepositories` reads. Ferrofin used
+    /// to keep a private list in `{config_dir}/plugins/state.json`, so the same
+    /// process answered `/Repositories` with `[]` while its own
+    /// `/System/Configuration` reported the seeded default feed.
+    #[tokio::test]
+    async fn repositories_are_read_from_the_server_configuration() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = MemConfig::new(vec![repo("Jellyfin Stable", "https://example.test/m.json")]);
+        let mgr = FerrofinPluginManager::new(Vec::new(), dir.path().to_path_buf())
+            .with_configuration(config.clone());
+        assert_eq!(
+            mgr.get_repositories().await.expect("repos"),
+            vec![repo("Jellyfin Stable", "https://example.test/m.json")],
+            "the seeded configuration default must be visible on /Repositories"
+        );
+    }
+
+    /// `POST /Repositories` writes that same document, so `/System/Configuration`
+    /// follows — the read-back that catches the two-store split.
+    #[tokio::test]
+    async fn set_repositories_is_visible_in_the_server_configuration() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = MemConfig::new(Vec::new());
+        let mgr = FerrofinPluginManager::new(Vec::new(), dir.path().to_path_buf())
+            .with_configuration(config.clone());
+        mgr.set_repositories(vec![repo("Parity", "https://example.test/p.json")])
+            .await
+            .expect("set");
+        assert_eq!(
+            config.repositories(),
+            vec![repo("Parity", "https://example.test/p.json")]
+        );
+        assert_eq!(
+            mgr.get_repositories().await.expect("repos"),
+            config.repositories()
+        );
+    }
+
+    /// A repository an admin added on the old build lived in `state.json`; the
+    /// move to the single store must fold it in, not drop it.
+    #[tokio::test]
+    async fn legacy_state_json_repositories_migrate_into_the_configuration() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Write the old-shaped state.json directly.
+        std::fs::write(
+            dir.path().join("state.json"),
+            br#"{"enabled":{},"repositories":[{"Name":"Legacy","Url":"https://legacy.test/m.json","Enabled":true}]}"#,
+        )
+        .unwrap();
+        let config = MemConfig::new(vec![repo("Seeded", "https://seeded.test/m.json")]);
+        let mgr = FerrofinPluginManager::new(Vec::new(), dir.path().to_path_buf())
+            .with_configuration(config.clone());
+
+        let repos = mgr.get_repositories().await.expect("repos");
+        assert_eq!(repos.len(), 2, "{repos:?}");
+        assert!(repos.contains(&repo("Seeded", "https://seeded.test/m.json")));
+        assert!(repos.contains(&repo("Legacy", "https://legacy.test/m.json")));
+        // Idempotent: a second read does not re-add it.
+        assert_eq!(mgr.get_repositories().await.expect("repos").len(), 2);
+        // And the legacy list is cleared on disk.
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("state.json")).unwrap()).unwrap();
+        assert_eq!(persisted["repositories"], serde_json::json!([]));
+    }
+
     #[tokio::test]
     async fn plugin_image_returned_when_present() {
         let id = Uuid::from_u128(5);
@@ -1337,6 +1757,273 @@ mod tests {
                 }
             })
         })
+    }
+
+    /// Serves one fixed JSON body at every path.
+    fn manifest_server(body: String) -> (String, std::sync::mpsc::Sender<()>) {
+        raw_server(move |_base| {
+            Box::new(move |_request| http_ok("application/json", body.as_bytes()))
+        })
+    }
+
+    /// A manager pointed at the given repository URLs through the single store.
+    fn catalog_manager(
+        dir: &tempfile::TempDir,
+        plugins: Vec<RegisteredPlugin>,
+        repos: Vec<RepositoryInfo>,
+        application_version: &str,
+    ) -> FerrofinPluginManager {
+        FerrofinPluginManager::new(plugins, dir.path().to_path_buf())
+            .with_configuration(MemConfig::new(repos))
+            .with_application_version(application_version)
+    }
+
+    /// The regression that made the whole feature inert: a REAL manifest carries
+    /// no `repositoryName`/`repositoryUrl` (the server stamps them after the
+    /// fetch), so serde rejected the document and the catalogue was always empty.
+    ///
+    /// Every pre-existing fixture in this file hand-writes both keys, which is
+    /// exactly why a green test suite never caught it — so this fixture
+    /// deliberately omits them, as repo.jellyfin.org does.
+    #[tokio::test]
+    async fn manifest_without_server_stamped_fields_is_listed_and_stamped() {
+        let (base, _stop) = manifest_server(
+            r#"[{"name":"Bookshelf","description":"d","overview":"o","owner":"jellyfin",
+                 "category":"Metadata","guid":"9c4e63f1-031b-4f25-988b-4f7d78a8b53e",
+                 "versions":[{"version":"13.0.0.0","targetAbi":"10.11.0.0",
+                              "sourceUrl":"https://x/y.zip","checksum":"abc",
+                              "changelog":"-","timestamp":"2025-01-01T00:00:00Z"}]}]"#
+                .to_owned(),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("{base}/manifest.json");
+        let mgr = catalog_manager(&dir, Vec::new(), vec![repo("Stable", &url)], "10.11.8");
+
+        let packages = mgr.list_packages().await.expect("packages");
+        assert_eq!(packages.len(), 1, "{packages:?}");
+        let version = &packages[0].versions[0];
+        assert_eq!(version.repository_name, "Stable", "provenance is stamped");
+        assert_eq!(version.repository_url, url);
+        // `VersionNumber` is a C# getter — always on the wire.
+        assert_eq!(version.version_number, "13.0.0.0");
+    }
+
+    /// `InstallationManager.GetPackages` drops a version whose `targetAbi` is
+    /// above the application version, and `GetAvailablePackages` drops a package
+    /// left with none. An UNPARSEABLE `targetAbi` falls back to `0.0.0.1` and is
+    /// therefore KEPT — that fallback is what keeps Ferrofin's own
+    /// `ferrofin:plugin@x.y.z` WASM entries listed.
+    #[tokio::test]
+    async fn target_abi_above_the_application_version_is_filtered_out() {
+        let (base, _stop) = manifest_server(
+            r#"[{"name":"Mixed","guid":"11111111-1111-1111-1111-111111111111","versions":[
+                   {"version":"3.0.0.0","targetAbi":"10.11.9.0"},
+                   {"version":"2.0.0.0","targetAbi":"10.11.0.0"},
+                   {"version":"1.0.0.0","targetAbi":"ferrofin:plugin@0.5.0"}]},
+                {"name":"AllTooNew","guid":"22222222-2222-2222-2222-222222222222","versions":[
+                   {"version":"9.0.0.0","targetAbi":"12.0.0.0"}]}]"#
+                .to_owned(),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = catalog_manager(
+            &dir,
+            Vec::new(),
+            vec![repo("Stable", &format!("{base}/manifest.json"))],
+            "10.11.8",
+        );
+
+        let packages = mgr.list_packages().await.expect("packages");
+        let names: Vec<&str> = packages.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["Mixed"],
+            "a package with no compatible version is dropped"
+        );
+        let versions: Vec<&str> = packages[0]
+            .versions
+            .iter()
+            .map(|v| v.version.as_str())
+            .collect();
+        assert_eq!(
+            versions,
+            ["2.0.0.0", "1.0.0.0"],
+            "10.11.9.0 is above this server; an unparseable abi falls back to 0.0.0.1 and stays"
+        );
+    }
+
+    /// "Where repositories have the same content, the details from the first is
+    /// taken" — `GetAvailablePackages` merges a second repository's listing of
+    /// the same guid into the existing entry (`MergeSortedList`) rather than
+    /// emitting a duplicate package, which is what Ferrofin used to do.
+    #[tokio::test]
+    async fn same_package_in_two_repositories_merges_into_one_entry() {
+        let (base_a, _stop_a) = manifest_server(
+            r#"[{"name":"Dup","guid":"33333333-3333-3333-3333-333333333333","versions":[
+                   {"version":"3.0.0.0"},{"version":"1.0.0.0"}]}]"#
+                .to_owned(),
+        );
+        let (base_b, _stop_b) = manifest_server(
+            r#"[{"name":"Dup","guid":"33333333-3333-3333-3333-333333333333","versions":[
+                   {"version":"2.0.0.0"}]}]"#
+                .to_owned(),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let url_a = format!("{base_a}/manifest.json");
+        let url_b = format!("{base_b}/manifest.json");
+        let mgr = catalog_manager(
+            &dir,
+            Vec::new(),
+            vec![repo("A", &url_a), repo("B", &url_b)],
+            "10.11.8",
+        );
+
+        let packages = mgr.list_packages().await.expect("packages");
+        assert_eq!(packages.len(), 1, "one entry per identity: {packages:?}");
+        let versions: Vec<&str> = packages[0]
+            .versions
+            .iter()
+            .map(|v| v.version.as_str())
+            .collect();
+        assert_eq!(
+            versions,
+            ["3.0.0.0", "2.0.0.0", "1.0.0.0"],
+            "descending merge"
+        );
+        // Each version keeps the provenance of the repository it came from, which
+        // the install path's repositoryUrl filter depends on.
+        assert_eq!(packages[0].versions[1].repository_url, url_b);
+        assert_eq!(packages[0].versions[0].repository_url, url_a);
+    }
+
+    /// `PackageController.GetPackages` returns `GetAvailablePackages()` and
+    /// nothing else. A compiled-in extension is INSTALLED, not installable, so it
+    /// must not appear in the catalogue — but the dashboard's plugin-detail page
+    /// must still resolve it by name/guid through `FilterPackages`.
+    #[tokio::test]
+    async fn compiled_in_plugins_are_not_listed_but_are_resolvable() {
+        let id = Uuid::from_u128(0x5EED);
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = catalog_manager(
+            &dir,
+            vec![RegisteredPlugin::new(descriptor(id, "Demo", true), None)],
+            Vec::new(),
+            "10.11.8",
+        );
+        assert!(
+            mgr.list_packages().await.expect("packages").is_empty(),
+            "the catalogue advertises only installable packages"
+        );
+        let found = mgr
+            .find_package(Some("Demo"), None)
+            .await
+            .expect("find")
+            .expect("resolves by name");
+        assert_eq!(found.owner, "Ferrofin (compiled-in)");
+        assert_eq!(found.versions[0].version_number, "1.0.0");
+        // …and by guid alone, ignoring a wrong name (FilterPackages: guid wins).
+        let by_guid = mgr
+            .find_package(Some("no-such-package"), Some(id))
+            .await
+            .expect("find")
+            .expect("resolves by guid");
+        assert_eq!(by_guid.name, "Demo");
+    }
+
+    /// `FilterPackages`' two predicates are ALTERNATIVES and the guid wins; an
+    /// all-zeros guid is `IsEmpty()` and falls through to the name.
+    #[tokio::test]
+    async fn find_package_matches_the_c_sharp_filter_semantics() {
+        let (base, _stop) = manifest_server(
+            r#"[{"name":"Alpha","guid":"44444444-4444-4444-4444-444444444444","versions":[{"version":"1.0.0.0"}]},
+                {"name":"Beta","guid":"55555555-5555-5555-5555-555555555555","versions":[{"version":"1.0.0.0"}]}]"#
+                .to_owned(),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = catalog_manager(
+            &dir,
+            Vec::new(),
+            vec![repo("Stable", &format!("{base}/manifest.json"))],
+            "10.11.8",
+        );
+        let beta = Uuid::parse_str("55555555-5555-5555-5555-555555555555").unwrap();
+
+        // Name, case-insensitively.
+        assert_eq!(
+            mgr.find_package(Some("aLpHa"), None)
+                .await
+                .unwrap()
+                .unwrap()
+                .name,
+            "Alpha"
+        );
+        // Guid wins outright — the name is ignored, not ANDed.
+        assert_eq!(
+            mgr.find_package(Some("Alpha"), Some(beta))
+                .await
+                .unwrap()
+                .unwrap()
+                .name,
+            "Beta"
+        );
+        // An all-zeros guid is empty: fall through to the name.
+        assert_eq!(
+            mgr.find_package(Some("Alpha"), Some(Uuid::nil()))
+                .await
+                .unwrap()
+                .unwrap()
+                .name,
+            "Alpha"
+        );
+        assert!(
+            mgr.find_package(Some("nope"), None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn dotnet_version_parsing_matches_version_try_parse() {
+        assert_eq!(parse_dotnet_version("10.11.8", -1), Some([10, 11, 8, -1]));
+        assert_eq!(parse_dotnet_version("1.2.3.4", -1), Some([1, 2, 3, 4]));
+        // Version.TryParse needs 2-4 components, all non-negative integers.
+        assert_eq!(parse_dotnet_version("1", -1), None);
+        assert_eq!(parse_dotnet_version("1.2.3.4.5", -1), None);
+        assert_eq!(parse_dotnet_version("-1.2", -1), None);
+        assert_eq!(parse_dotnet_version("ferrofin:plugin@0.5.0", -1), None);
+        assert_eq!(parse_dotnet_version("", -1), None);
+        // .NET orders an omitted component below an explicit zero…
+        assert!(
+            parse_dotnet_version("10.11", -1).unwrap()
+                < parse_dotnet_version("10.11.0", -1).unwrap()
+        );
+        // …but an ASSEMBLY version pads with zero, so 10.11.8 IS 10.11.8.0.
+        assert_eq!(parse_dotnet_version("10.11.8", 0), Some([10, 11, 8, 0]));
+    }
+
+    /// The exact boundary that decides which manifest versions a client is
+    /// offered. Measured against the 10.11.8 oracle on repo.jellyfin.org's live
+    /// manifest: it lists every version whose `targetAbi` is `10.11.8.0`, and
+    /// drops `10.11.9.0` / `12.0.0.0`.
+    #[test]
+    fn abi_compatibility_boundary_matches_the_10_11_8_oracle() {
+        assert!(abi_is_compatible("10.11.8", Some("10.11.0.0")));
+        // THE case: a plugin built for exactly this release. The application
+        // version is an ASSEMBLY version (…, 0), so this is compatible; treating
+        // it as Version.Parse("10.11.8") = (…, -1) drops it — which is the bug
+        // this test was written for, after the oracle listed 9 such versions
+        // Ferrofin did not.
+        assert!(abi_is_compatible("10.11.8", Some("10.11.8.0")));
+        assert!(!abi_is_compatible("10.11.8", Some("10.11.9.0")));
+        assert!(!abi_is_compatible("10.11.8", Some("12.0.0.0")));
+        assert!(
+            abi_is_compatible("10.11.8", None),
+            "unset falls back to 0.0.0.1"
+        );
+        assert!(
+            abi_is_compatible("10.11.8", Some("ferrofin:plugin@0.5.0")),
+            "an unparseable abi falls back to 0.0.0.1 and is KEPT"
+        );
     }
 
     /// Validator stub: reports a fixed id (or an error).

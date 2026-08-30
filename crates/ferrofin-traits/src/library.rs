@@ -1262,6 +1262,22 @@ pub trait VirtualFolderManager: Send + Sync {
     /// temporary directory, matching the C# case-insensitive handling.
     async fn rename_virtual_folder(&self, name: &str, new_name: &str) -> Result<(), ServiceError>;
 
+    /// Removes every library row whose directory no longer exists, returning how
+    /// many were removed.
+    ///
+    /// Port of the tail of `LibraryManager.ValidateTopLibraryFolders`: the pass
+    /// that deletes a `CollectionFolder` child of the user root when
+    /// `!Directory.Exists(collectionFolder.Path)`. Upstream runs it after every
+    /// structural change and at the start of a library validation; implementations
+    /// here call it from the mutators and the scanner does so at scan start, so a
+    /// library directory that disappears behind the API's back stops haunting
+    /// `/UserViews`.
+    ///
+    /// The default is a no-op, for seams with no item store attached.
+    async fn prune_orphan_collection_folders(&self) -> Result<usize, ServiceError> {
+        Ok(0)
+    }
+
     /// Adds a media path (and its `.mblink` shortcut) to an existing library.
     ///
     /// Port of `ILibraryManager.AddMediaPath`: the library must exist and the

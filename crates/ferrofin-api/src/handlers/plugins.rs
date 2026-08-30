@@ -349,8 +349,9 @@ async fn set_repositories(
 
 /// `GET /Packages` — packages available from the enabled repositories.
 ///
-/// Tier-1 does not fetch repository manifests, so the catalog is empty (faithful,
-/// never a faked package).
+/// Port of `PackageController.GetPackages`, which returns
+/// `_installationManager.GetAvailablePackages()` and nothing else: the enabled
+/// repositories' manifests, ABI-filtered and merged by package identity.
 #[utoipa::path(
     get,
     path = "/Packages",
@@ -366,9 +367,22 @@ async fn get_packages(
 
 /// `GET /Packages/{name}` — a package by name or assembly GUID.
 ///
-/// Port of `PackageController.GetPackageInfo`: looks the package up in the
-/// aggregated repository catalog by (case-insensitive) name, or by `?assemblyGuid=`
-/// when supplied. `404` when the catalog has no match.
+/// Port of `PackageController.GetPackageInfo`:
+///
+/// ```text
+/// var packages = await _installationManager.GetAvailablePackages();
+/// var result = _installationManager.FilterPackages(packages, name, assemblyGuid ?? default).FirstOrDefault();
+/// if (result is null) return NotFound();
+/// ```
+///
+/// `FilterPackages` treats guid and name as **alternatives** and the guid wins,
+/// so a supplied `assemblyGuid` selects on its own; an all-zeros guid is
+/// `IsEmpty()` and falls through to the name. The guid is bound by ASP.NET as a
+/// `Guid?`, which accepts the N/D/B/P spellings alike and rejects anything else
+/// with a `400` — matched here by parsing it before the lookup rather than
+/// string-comparing it against one particular spelling. That comparison was a
+/// live bug: Ferrofin serialises every guid dashless, so the value the dashboard
+/// echoes back out of `/Plugins` never matched.
 #[utoipa::path(
     get,
     path = "/Packages/{name}",
@@ -385,16 +399,16 @@ async fn get_package_info(
     Path(name): Path<String>,
     Query(query): Query<PackageInfoQuery>,
 ) -> Result<Json<PackageInfo>, ApiError> {
-    let guid = query.assembly_guid.as_deref().filter(|g| !g.is_empty());
+    let assembly_guid = match query.assembly_guid.as_deref().filter(|g| !g.is_empty()) {
+        Some(raw) => Some(uuid::Uuid::parse_str(raw).map_err(|_| {
+            ApiError::BadRequest(format!("assemblyGuid `{raw}` is not a valid GUID"))
+        })?),
+        None => None,
+    };
     let package = state
         .plugins
-        .list_packages()
+        .find_package(Some(name.as_str()), assembly_guid)
         .await?
-        .into_iter()
-        .find(|p| {
-            p.name.eq_ignore_ascii_case(&name)
-                && guid.is_none_or(|g| p.id.to_string().eq_ignore_ascii_case(g))
-        })
         .ok_or_else(|| ApiError::NotFound(format!("package {name}")))?;
     Ok(Json(package))
 }

@@ -104,7 +104,7 @@ fn package_info_and_version_info_use_camel_case() {
 
     let version = VersionInfo {
         version: "1.2.3".into(),
-        version_number: None,
+        version_number: String::new(),
         changelog: Some("notes".into()),
         target_abi: Some("10.9.0.0".into()),
         source_url: None,

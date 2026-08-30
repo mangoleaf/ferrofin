@@ -52,10 +52,18 @@ pub struct VersionInfo {
     #[serde(rename = "version")]
     pub version: String,
 
-    /// Gets the version as a structured value (mirrors the read-only
-    /// `VersionNumber` property).
-    #[serde(rename = "VersionNumber", skip_serializing_if = "Option::is_none")]
-    pub version_number: Option<String>,
+    /// The version as a structured value — the C# read-only computed property
+    /// `public SysVersion VersionNumber => _version ?? new SysVersion(0, 0, 0);`.
+    ///
+    /// It is a *getter*, so it is on the wire on every response and the vendored
+    /// 10.11.8 contract declares it non-nullable `readOnly` — hence a plain
+    /// `String` that always serializes, never a skipped `Option`. A repository
+    /// manifest never carries the key (it is server-computed), so it is
+    /// `#[serde(default)]` on the way in and
+    /// [`fill_version_number`](Self::fill_version_number) derives it from
+    /// [`version`](Self::version) on the way out.
+    #[serde(rename = "VersionNumber", default)]
+    pub version_number: String,
 
     /// Gets or sets the changelog for this version.
     #[serde(rename = "changelog", skip_serializing_if = "Option::is_none")]
@@ -85,45 +93,75 @@ pub struct VersionInfo {
     pub timestamp: Option<String>,
 
     /// Gets or sets the repository name.
-    #[serde(rename = "repositoryName")]
+    ///
+    /// `#[serde(default)]` mirrors the C# `= string.Empty` initialiser, and it is
+    /// load-bearing rather than cosmetic: this field and `repositoryUrl` are
+    /// stamped by the SERVER after the fetch
+    /// (`InstallationManager.GetPackages`: `ver.RepositoryName = manifestName;`),
+    /// so **no real manifest contains either key** — 0 of the 278 version entries
+    /// in repo.jellyfin.org's live manifest do. Without the default, serde
+    /// rejected the whole document and every repository catalogue came back empty.
+    #[serde(rename = "repositoryName", default)]
     pub repository_name: String,
 
-    /// Gets or sets the repository url.
-    #[serde(rename = "repositoryUrl")]
+    /// Gets or sets the repository url. Server-stamped; see
+    /// [`repository_name`](Self::repository_name).
+    #[serde(rename = "repositoryUrl", default)]
     pub repository_url: String,
 }
 
+impl VersionInfo {
+    /// Derives [`version_number`](Self::version_number) from
+    /// [`version`](Self::version), as the C# computed property does.
+    ///
+    /// `VersionInfo.Version`'s setter is `_version = SysVersion.Parse(value)` and
+    /// its getter is `_version.ToString()`, so the two are the same normalized
+    /// string; an entry with no version at all reports `SysVersion(0, 0, 0)`.
+    pub fn fill_version_number(&mut self) {
+        if self.version.is_empty() {
+            "0.0.0".clone_into(&mut self.version_number);
+        } else {
+            self.version_number.clone_from(&self.version);
+        }
+    }
+}
+
 /// Information about a plugin package available from a repository.
+///
+/// Every field is `#[serde(default)]`, mirroring the C# parameterless
+/// constructor that initialises each property (`Name = string.Empty`, …): a
+/// third-party manifest that omits one key must not take the whole catalogue
+/// down with it.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
 pub struct PackageInfo {
     /// Gets or sets the name.
-    #[serde(rename = "name")]
+    #[serde(rename = "name", default)]
     pub name: String,
 
     /// Gets or sets a long description of the plugin.
-    #[serde(rename = "description")]
+    #[serde(rename = "description", default)]
     pub description: String,
 
     /// Gets or sets a short overview of what the plugin does.
-    #[serde(rename = "overview")]
+    #[serde(rename = "overview", default)]
     pub overview: String,
 
     /// Gets or sets the owner.
-    #[serde(rename = "owner")]
+    #[serde(rename = "owner", default)]
     pub owner: String,
 
     /// Gets or sets the category.
-    #[serde(rename = "category")]
+    #[serde(rename = "category", default)]
     pub category: String,
 
     /// Gets or sets the guid of the assembly associated with this plugin.
-    #[serde(rename = "guid")]
+    #[serde(rename = "guid", default)]
     #[schema(value_type = String, format = "uuid")]
     #[serde(with = "crate::json::guid")]
     pub id: Uuid,
 
     /// Gets or sets the versions.
-    #[serde(rename = "versions")]
+    #[serde(rename = "versions", default)]
     pub versions: Vec<VersionInfo>,
 
     /// Gets or sets the image url for the package.
@@ -178,11 +216,80 @@ mod tests {
         assert_eq!(value, back);
     }
 
+    /// A REAL repository manifest entry — the exact key set repo.jellyfin.org
+    /// publishes — must deserialize.
+    ///
+    /// `repositoryName`/`repositoryUrl` are stamped by the server after the
+    /// fetch (`InstallationManager.GetPackages`), so no manifest carries them;
+    /// before they were `#[serde(default)]` serde failed the whole document with
+    /// "missing field `repositoryName`" and Ferrofin's plugin catalogue was
+    /// permanently empty against every real repository. Every fixture in the
+    /// plugin-manager tests hand-wrote the two keys, which is why a green test
+    /// suite never caught it.
+    #[test]
+    fn real_repository_manifest_entry_deserializes_without_server_stamped_fields() {
+        let manifest = serde_json::json!([{
+            "category": "Metadata",
+            "guid": "9c4e63f1-031b-4f25-988b-4f7d78a8b53e",
+            "name": "Bookshelf",
+            "description": "Book metadata",
+            "overview": "Book metadata",
+            "owner": "jellyfin",
+            "versions": [{
+                "checksum": "d41d8cd98f00b204e9800998ecf8427e",
+                "changelog": "-",
+                "targetAbi": "10.11.0.0",
+                "sourceUrl": "https://repo.jellyfin.org/files/plugin/bookshelf/x.zip",
+                "timestamp": "2025-01-01T00:00:00Z",
+                "version": "13.0.0.0"
+            }]
+        }]);
+        let packages: Vec<PackageInfo> = serde_json::from_value(manifest).expect("manifest parses");
+        assert_eq!(packages.len(), 1);
+        let version = &packages[0].versions[0];
+        assert_eq!(version.repository_name, "");
+        assert_eq!(version.repository_url, "");
+        assert_eq!(version.version, "13.0.0.0");
+    }
+
+    /// A manifest entry missing optional descriptive keys still parses (the C#
+    /// parameterless constructor initialises every property).
+    #[test]
+    fn manifest_entry_missing_optional_keys_parses_to_defaults() {
+        let packages: Vec<PackageInfo> =
+            serde_json::from_value(serde_json::json!([{ "name": "Sparse" }]))
+                .expect("sparse manifest parses");
+        assert_eq!(packages[0].name, "Sparse");
+        assert_eq!(packages[0].owner, "");
+        assert!(packages[0].versions.is_empty());
+        assert!(packages[0].id.is_nil());
+    }
+
+    /// `VersionNumber` is a C# getter, so it is always on the wire; the vendored
+    /// contract declares it non-nullable `readOnly`.
+    #[test]
+    fn version_number_is_derived_from_version_and_always_serialized() {
+        let mut version = VersionInfo {
+            version: "13.0.0.0".to_owned(),
+            ..VersionInfo::default()
+        };
+        version.fill_version_number();
+        assert_eq!(version.version_number, "13.0.0.0");
+
+        let mut empty = VersionInfo::default();
+        empty.fill_version_number();
+        assert_eq!(empty.version_number, "0.0.0", "SysVersion(0, 0, 0)");
+
+        let json = serde_json::to_value(&empty).unwrap();
+        assert_eq!(json["VersionNumber"], "0.0.0");
+        assert!(json.get("VersionNumber").is_some_and(|v| !v.is_null()));
+    }
+
     #[test]
     fn version_info_uses_camel_case_field_names() {
         let value = VersionInfo {
             version: "1.0.0".to_owned(),
-            version_number: Some("1.0.0".to_owned()),
+            version_number: "1.0.0".to_owned(),
             changelog: Some("Initial".to_owned()),
             target_abi: Some("10.9.0.0".to_owned()),
             source_url: Some("https://example.com/x.zip".to_owned()),

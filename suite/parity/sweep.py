@@ -388,6 +388,11 @@ def resolve_fixtures(base, token, user):
         "_audio": audio, "_audio_src": source_id(audio),
         # Kind-correct seeds for the /Similar aliases (see `similar_fixtures`).
         "_album": album, "_artist": artist, "_series": series,
+        # This server's own first package name, for `/Packages/{name}` (see
+        # `package_fixtures`). The generic `{name}` fill is a GENRE, so without
+        # this the probe was literally `GET /Packages/Action` — 404 on both
+        # servers, scored status-conformant, and the lookup never exercised.
+        "_package": first_package_name(base, token),
     }
     return {k: v for k, v in fx.items() if v is not None}
 
@@ -417,6 +422,41 @@ SIMILAR_SEEDS = {
     "/Artists/{itemId}/Similar": "_artist",
     "/Shows/{itemId}/Similar": "_series",
 }
+
+
+def first_package_name(base, token):
+    """The first entry of this server's own plugin catalogue, or None.
+
+    `GET /Packages` is admin-only and repository-dependent; a server with no
+    reachable repository has an empty catalogue, and then `/Packages/{name}` has
+    nothing to resolve and the sweep skips it with a reason (which is honest)
+    rather than probing an unrelated string."""
+    body = get_json(base, "/Packages", token)
+    if isinstance(body, list) and body:
+        return body[0].get("name")
+    return None
+
+
+# Paths whose `{name}` is NOT the generic by-name (genre) seed. `/Packages/{name}`
+# names a PACKAGE; filling it with a genre made the row a permanent 404/404.
+NAME_SEEDS = {"/Packages/{name}": "_package"}
+
+
+def package_fixtures(path, fixtures):
+    """The fixtures with `name` swapped for the path-appropriate seed.
+
+    Drops `name` entirely when the server has no such seed, so `build_url`
+    reports "unresolved path param: name" instead of probing a wrong one."""
+    key = NAME_SEEDS.get(path)
+    if key is None:
+        return fixtures
+    seed = fixtures.get(key)
+    out = {**fixtures}
+    if seed:
+        out["name"] = seed
+    else:
+        out.pop("name", None)
+    return out
 
 
 def similar_fixtures(path, fixtures):
@@ -546,8 +586,8 @@ def sweep(ferrofin_url, jellyfin_url):
                 continue
             fx_h = audio_fixtures(fixtures) if path.startswith("/Audio/") else fixtures
             fx_j = audio_fixtures(fixtures_j) if path.startswith("/Audio/") else fixtures_j
-            fx_h = similar_fixtures(path, fx_h)
-            fx_j = similar_fixtures(path, fx_j)
+            fx_h = package_fixtures(path, similar_fixtures(path, fx_h))
+            fx_j = package_fixtures(path, similar_fixtures(path, fx_j))
             hurl, skip = build_url(path, fx_h)   # per-server ids: Ferrofin's on Ferrofin
             if skip:
                 results[opkey] = {"status_conformant": None, "schema_valid": None, "note": skip}
@@ -657,6 +697,11 @@ def selfcheck():
     # the /Audio/* ops swap in the first track; no music library → unchanged.
     assert audio_fixtures({"itemId": "m", "_audio": "a"})["itemId"] == "a"
     assert audio_fixtures({"itemId": "m"})["itemId"] == "m"
+    # `/Packages/{name}` names a PACKAGE, not a genre.
+    assert package_fixtures("/Packages/{name}",
+                            {"name": "Action", "_package": "Bookshelf"})["name"] == "Bookshelf"
+    assert "name" not in package_fixtures("/Packages/{name}", {"name": "Action"})
+    assert package_fixtures("/Genres/{name}", {"name": "Action"})["name"] == "Action"
     # A /Similar alias is probed with ITS OWN kind, not the shared movie id.
     assert similar_fixtures("/Albums/{itemId}/Similar",
                             {"itemId": "m", "_album": "al"})["itemId"] == "al"

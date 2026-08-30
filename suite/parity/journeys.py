@@ -148,6 +148,7 @@ JOURNEY_METHOD.update({op: verification.EFFECT for op in (
     "POST /Library/VirtualFolders",
     "POST /Library/VirtualFolders/LibraryOptions",
     "POST /Library/VirtualFolders/Name",
+    "POST /Repositories",
     "POST /Library/VirtualFolders/Paths",
     "POST /Library/VirtualFolders/Paths/Update",
     "POST /LiveStreams/Close",
@@ -591,19 +592,129 @@ def j_playing_items(base, token, user, mid, _m2):
     return r
 
 
+def root_collection_folders(base, token, user):
+    """The library rows the CLIENT sees at the root, as {name: id}.
+
+    Two DB-derived surfaces, unioned: a root `/Items` browse and `/UserViews`.
+    Deliberately NOT `/Library/VirtualFolders`, which upstream builds by walking
+    the user-views DIRECTORY (`LibraryManager.GetVirtualFolders`) — so it is the
+    one surface a stale row cannot corrupt, and asserting on it is how a real
+    orphan-view leak stayed green here for a whole campaign.
+    """
+    out = {}
+    items = (q(base, "/Items", token, user) or {}).get("Items", []) or []
+    for it in items:
+        if it.get("Type") == "CollectionFolder":
+            out[it.get("Name")] = it.get("Id")
+    for v in ((get_json(base, f"/UserViews?userId={user}", token) or {}).get("Items", []) or []):
+        if v.get("Type") == "CollectionFolder":
+            out.setdefault(v.get("Name"), v.get("Id"))
+    return out
+
+
 def j_virtualfolder_rename(base, token, user, _m, _m2):
+    """Rename a library and assert the ROOT VIEW converges — on both servers.
+
+    Renaming moves the library's directory. Upstream's
+    `LibraryStructureController.RenameVirtualFolder` moves the directory and
+    nothing else; the stale row is deleted by the remove leg of
+    `LibraryManager.ValidateTopLibraryFolders` ("If the user has somehow deleted
+    the collection directory, remove the metadata from the database" — identical
+    in v10.11.8 and master). Either way the converged root holds exactly ONE row
+    for the library.
+
+    This used to assert only `any(f["Name"] == new for f in /Library/VirtualFolders)`,
+    which is filesystem-derived and therefore passes on both servers even when one
+    of them has left a phantom `CollectionFolder` behind in `/Items` + `/UserViews`.
+    So the assertions here are:
+      * after the rename: no root row still carries the OLD name,
+      * after the restore: no root row carries the NEW name,
+      * and the root's CollectionFolder COUNT is unchanged end to end.
+    """
     r = {}
     folders = get_json(base, "/Library/VirtualFolders", token) or []
-    if folders:
-        old = folders[0].get("Name") or ""
-        new = f"{old} Renamed"
-        qo, qn = urllib.parse.quote(old), urllib.parse.quote(new)
-        st, _ = http("POST", f"{base}/Library/VirtualFolders/Name?name={qo}&newName={qn}", token, "")
-        after = get_json(base, "/Library/VirtualFolders", token) or []
-        renamed = any(f.get("Name") == new for f in after)
-        r["POST /Library/VirtualFolders/Name"] = st < 300 and renamed
-        if renamed:  # restore original name so library state is unchanged
-            http("POST", f"{base}/Library/VirtualFolders/Name?name={qn}&newName={qo}", token, "")
+    if not folders:
+        return r
+    old = folders[0].get("Name") or ""
+    new = f"{old} Renamed"
+    qo, qn = urllib.parse.quote(old), urllib.parse.quote(new)
+    before = root_collection_folders(base, token, user)
+
+    st, _ = http("POST", f"{base}/Library/VirtualFolders/Name?name={qo}&newName={qn}", token, "")
+    listed = any(f.get("Name") == new for f in (get_json(base, "/Library/VirtualFolders", token) or []))
+    mid = root_collection_folders(base, token, user)
+    renamed_cleanly = (
+        st < 300
+        and listed
+        and old not in mid                 # the vacated name must not linger as a row
+        and new in mid                     # …and the new name must be materialized
+        and len(mid) == len(before)        # no row gained, none lost
+    )
+
+    restored_cleanly = False
+    if listed:  # restore original name so library state is unchanged
+        http("POST", f"{base}/Library/VirtualFolders/Name?name={qn}&newName={qo}", token, "")
+        end = root_collection_folders(base, token, user)
+        restored_cleanly = (
+            new not in end and old in end and len(end) == len(before)
+        )
+    r["POST /Library/VirtualFolders/Name"] = renamed_cleanly and restored_cleanly
+    return r
+
+
+def j_repositories(base, token, user, _m, _m2):
+    """Replace the package repositories and read the effect back on BOTH surfaces.
+
+    Upstream backs `/Repositories` and `/System/Configuration.PluginRepositories`
+    with ONE field:
+
+        [HttpGet("Repositories")]  => Ok(_serverConfigurationManager.Configuration.PluginRepositories…)
+        [HttpPost("Repositories")] => Configuration.PluginRepositories = repositoryInfos; SaveConfiguration();
+
+    Ferrofin used to keep a second, private copy in `{config_dir}/plugins/state.json`,
+    so the write landed where `/System/Configuration` and `/Packages` could not see
+    it. A `/Repositories`-only read-back passes in that state and proves nothing —
+    hence both surfaces are asserted, and they must agree with each other.
+
+    Restores the server's own prior list at the end, so the pair is left as found.
+    """
+    r = {}
+    before = get_json(base, "/Repositories", token)
+    before = before if isinstance(before, list) else []
+    wanted = [
+        {"Name": "Parity Journey A", "Url": "http://livetv-source:8000/manifest.json",
+         "Enabled": True},
+        {"Name": "Parity Journey B", "Url": "http://livetv-source:8000/manifest-b.json",
+         "Enabled": False},
+    ]
+    st, _ = http("POST", f"{base}/Repositories", token, json.dumps(wanted))
+
+    listed = get_json(base, "/Repositories", token)
+    in_config = (get_json(base, "/System/Configuration", token) or {}).get("PluginRepositories")
+
+    def normalized(rows):
+        return [
+            {"Name": x.get("Name"), "Url": x.get("Url"), "Enabled": x.get("Enabled")}
+            for x in (rows or [])
+        ]
+
+    applied = (
+        st < 300
+        and normalized(listed) == wanted
+        and normalized(in_config) == wanted   # the one store, not two
+    )
+
+    # Restore, and confirm the restore also reached both surfaces.
+    st_back, _ = http("POST", f"{base}/Repositories", token, json.dumps(before))
+    restored = (
+        st_back < 300
+        and normalized(get_json(base, "/Repositories", token)) == normalized(before)
+        and normalized((get_json(base, "/System/Configuration", token) or {})
+                       .get("PluginRepositories")) == normalized(before)
+    )
+    if not restored:
+        print(f"  WARN: {base}: could not restore the repository list")
+    r["POST /Repositories"] = applied and restored
     return r
 
 
@@ -1574,6 +1685,7 @@ JOURNEYS = [j_startup,   # first: see its docstring
             j_playlist_share, j_item_delete, j_capabilities_query, j_environment_validate,
             j_merge_versions, j_playing_items, j_virtualfolder_rename,
             j_users_password, j_virtualfolder_crud, j_sessions, j_config_writes,
+            j_repositories,
             j_scheduled_run, j_playbackinfo_post, j_active_encodings, j_clientlog,
             j_authenticate, j_user_update, j_devices_delete, j_bulk_item_delete,
             j_subtitles_upload, j_lyrics, j_quickconnect, j_system_and_refresh,

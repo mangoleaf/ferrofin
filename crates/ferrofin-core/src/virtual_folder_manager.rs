@@ -49,7 +49,8 @@ use ferrofin_db::store::guid_to_db;
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::VirtualFolderManager;
-use ferrofin_traits::persistence::ItemPersistenceService;
+use ferrofin_traits::options::InternalItemsQuery;
+use ferrofin_traits::persistence::{ItemPersistenceService, ItemRepository};
 
 use crate::item_type_lookup;
 use crate::user_root_folder::UserRootFolderStore;
@@ -78,6 +79,14 @@ pub struct FerrofinVirtualFolderManager {
     /// library with a null `ItemId`) and that `/UserViews` returns. `None` in unit
     /// tests keeps the manager filesystem-only.
     persistence: Option<Arc<dyn ItemPersistenceService>>,
+    /// The item *reader*, set by the composition root alongside
+    /// [`persistence`](Self::persistence). Only the orphan prune needs it: it has
+    /// to enumerate the `UserRootFolder`'s existing `CollectionFolder` children to
+    /// find the rows whose directory has vanished, and
+    /// [`ItemPersistenceService`] is write-only. `None` in unit tests makes
+    /// [`prune_orphan_collection_folders`](FerrofinVirtualFolderManager::prune_orphan_collection_folders)
+    /// a no-op.
+    items: Option<Arc<dyn ItemRepository>>,
     /// The per-database item-id derivation mode (see
     /// [`item_type_lookup::IdDerivation`]).
     id_derivation: item_type_lookup::IdDerivation,
@@ -99,6 +108,7 @@ impl std::fmt::Debug for FerrofinVirtualFolderManager {
         f.debug_struct("FerrofinVirtualFolderManager")
             .field("root", &self.root)
             .field("has_item_store", &self.persistence.is_some())
+            .field("has_item_reader", &self.items.is_some())
             .field("id_derivation", &self.id_derivation)
             .field("playlists_path", &self.playlists_path)
             .finish_non_exhaustive()
@@ -115,6 +125,7 @@ impl FerrofinVirtualFolderManager {
         Self {
             root: default_user_views_path.into(),
             persistence: None,
+            items: None,
             id_derivation: item_type_lookup::IdDerivation::LegacyLowercase,
             parented: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             playlists_path: None,
@@ -126,6 +137,16 @@ impl FerrofinVirtualFolderManager {
     #[must_use]
     pub fn with_item_store(mut self, persistence: Arc<dyn ItemPersistenceService>) -> Self {
         self.persistence = Some(persistence);
+        self
+    }
+
+    /// Attaches the item reader used by
+    /// [`prune_orphan_collection_folders`](Self::prune_orphan_collection_folders)
+    /// to enumerate the user root's existing library rows. Called once by the
+    /// composition root, alongside [`with_item_store`](Self::with_item_store).
+    #[must_use]
+    pub fn with_items(mut self, items: Arc<dyn ItemRepository>) -> Self {
+        self.items = Some(items);
         self
     }
 
@@ -253,6 +274,109 @@ impl FerrofinVirtualFolderManager {
             set.insert(id);
         }
         Ok(())
+    }
+
+    /// Deletes every `CollectionFolder` row under the `UserRootFolder` whose
+    /// directory no longer exists, and reports how many were removed.
+    ///
+    /// Port of the tail of `LibraryManager.ValidateTopLibraryFolders`
+    /// (`Emby.Server.Implementations/Library/LibraryManager.cs`, byte-identical in
+    /// `v10.11.8` and `master`):
+    ///
+    /// ```text
+    /// foreach (var child in rootFolder.Children!.OfType<Folder>())
+    /// {
+    ///     // If the user has somehow deleted the collection directory, remove the metadata from the database.
+    ///     if (child is CollectionFolder collectionFolder && !Directory.Exists(collectionFolder.Path))
+    ///     {
+    ///         toDelete.Add(collectionFolder.Id);
+    ///     }
+    /// }
+    /// if (toDelete.Count > 0) { _itemRepository.DeleteItem(toDelete.ToArray()); }
+    /// ```
+    ///
+    /// This is the leg Ferrofin was missing. `CollectionFolder` ids are derived
+    /// from the directory path, and
+    /// [`get_virtual_folders`](VirtualFolderManager::get_virtual_folders) mints a
+    /// row for every directory it finds, so any operation that MOVES or removes a
+    /// library directory behind the DB's back (a rename, a `rm -rf` of the
+    /// user-views directory, a half-migrated adopted database) leaves a row whose
+    /// path points at nothing. Without this pass the stale row survives forever
+    /// and shows up as a phantom library in `/UserViews` and `/Items`.
+    ///
+    /// The `Directory.Exists` test is the whole guard, exactly as upstream: a
+    /// `CollectionFolder` whose directory is still there is never touched — which
+    /// is what keeps the manual-collections folder (whose directory lives outside
+    /// the user-views root) safe. Two extra safety stances, neither of which
+    /// upstream needs because it holds the folders in memory:
+    /// - a row with no `Path` at all is left alone (upstream cannot have one), and
+    /// - if the user-views root itself is unreadable the pass is skipped entirely,
+    ///   because every library would otherwise look deleted at once (the same
+    ///   stance `LibraryScanner`'s unreachable-location guard takes).
+    ///
+    /// A no-op without both an item store and an item reader wired.
+    ///
+    /// # Errors
+    /// Propagates the item store's failure to list the root's children or to
+    /// delete the stale rows.
+    pub async fn prune_orphan_collection_folders(&self) -> Result<usize, ServiceError> {
+        let (Some(items), Some(persistence), Some(root)) =
+            (&self.items, &self.persistence, self.user_root())
+        else {
+            return Ok(0);
+        };
+        // Safety valve: an unreadable root makes every library look deleted.
+        if let Err(err) = tokio::fs::read_dir(&self.root).await {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    root = %self.root.display(),
+                    %err,
+                    "skipping the orphan-library prune: the user-views root is unreadable"
+                );
+            }
+            return Ok(0);
+        }
+        let root_id = root.ensure().await?;
+        let query = InternalItemsQuery {
+            parent_id: root_id,
+            include_item_types: vec![BaseItemKind::CollectionFolder],
+            ..InternalItemsQuery::default()
+        };
+        let mut stale = Vec::new();
+        for row in items.get_item_list(&query).await? {
+            let Some(path) = row.path.as_deref().filter(|p| !p.is_empty()) else {
+                continue;
+            };
+            let gone = match tokio::fs::metadata(path).await {
+                Ok(meta) => !meta.is_dir(),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
+                // Unreadable for any other reason (permissions, a stalled mount):
+                // leave it be rather than delete a library we cannot see.
+                Err(_) => false,
+            };
+            if !gone {
+                continue;
+            }
+            let Ok(id) = uuid::Uuid::parse_str(&row.id) else {
+                continue;
+            };
+            tracing::info!(
+                item_id = %id,
+                path,
+                "removing the library row whose directory no longer exists"
+            );
+            stale.push(id);
+        }
+        if stale.is_empty() {
+            return Ok(0);
+        }
+        persistence.delete_items(&stale).await?;
+        if let Ok(mut set) = self.parented.lock() {
+            for id in &stale {
+                set.remove(id);
+            }
+        }
+        Ok(stale.len())
     }
 
     /// The on-disk directory of the named virtual folder.
@@ -631,7 +755,15 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
         }
         tokio::fs::remove_dir_all(&folder_path)
             .await
-            .map_err(|e| Self::io_err("remove virtual folder", &e))
+            .map_err(|e| Self::io_err("remove virtual folder", &e))?;
+        // Same convergence pass the rename does: upstream's
+        // `ValidateTopLibraryFolders` runs after every structural change.
+        self.prune_orphan_collection_folders().await?;
+        Ok(())
+    }
+
+    async fn prune_orphan_collection_folders(&self) -> Result<usize, ServiceError> {
+        FerrofinVirtualFolderManager::prune_orphan_collection_folders(self).await
     }
 
     async fn rename_virtual_folder(&self, name: &str, new_name: &str) -> Result<(), ServiceError> {
@@ -662,6 +794,11 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
             )));
         }
 
+        // The row that the directory ABOUT to move backs. Captured before the
+        // case-only hop reassigns `current` to a temporary uuid directory, whose
+        // id is not the one to delete.
+        let vacated = self.collection_folder_id(&current);
+
         // A case-only rename hops through a temporary directory so a
         // case-insensitive filesystem does not treat it as a no-op (C# path).
         if same_case_insensitive {
@@ -677,6 +814,24 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
                 .await
                 .map_err(|e| Self::io_err("rename virtual folder", &e))?;
         }
+
+        // The directory the old row pointed at is gone, so the row is now an
+        // orphan: `get_virtual_folders` will mint a SECOND row for the new path on
+        // the very next read (ids are path-derived), and nothing would ever remove
+        // the first. This is what `LibraryManager.ValidateTopLibraryFolders` does
+        // for upstream after a rename; do it eagerly here so a caller that passed
+        // `refreshLibrary=false` still converges. Deleting the row takes its
+        // children with it (`FK_BaseItems_BaseItems_ParentId … ON DELETE CASCADE`),
+        // which is why the API layer rescans the renamed library unconditionally.
+        if let (Some(persistence), Some(id)) = (&self.persistence, vacated) {
+            persistence.delete_items(std::slice::from_ref(&id)).await?;
+            if let Ok(mut set) = self.parented.lock() {
+                set.remove(&id);
+            }
+        }
+        // …and sweep anything else whose directory has since vanished, so a rename
+        // also converges a root that drifted for some other reason.
+        self.prune_orphan_collection_folders().await?;
 
         Ok(())
     }
@@ -788,9 +943,166 @@ mod tests {
         let db = Database::connect_in_memory().await.expect("db");
         db.run_migrations().await.expect("migrate");
         let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
+            Arc::new(crate::item_type_lookup::ItemTypeLookup::new());
+        let items = Arc::new(crate::item_repository::FerrofinItemRepository::new(
+            db.clone(),
+            lookup,
+        ));
         let mgr = FerrofinVirtualFolderManager::new(tmp.path().join("default"))
-            .with_item_store(persistence);
+            .with_item_store(persistence)
+            .with_items(items);
         (tmp, db, mgr)
+    }
+
+    /// Every `CollectionFolder` row currently parented to the user root, as
+    /// `(name, path)` — the surface `/UserViews` and a root `/Items` browse read.
+    async fn root_libraries(mgr: &FerrofinVirtualFolderManager) -> Vec<(String, String)> {
+        let root_id = mgr
+            .user_root()
+            .expect("store")
+            .ensure()
+            .await
+            .expect("root");
+        let rows = mgr
+            .items
+            .as_ref()
+            .expect("items")
+            .get_item_list(&ferrofin_traits::options::InternalItemsQuery {
+                parent_id: root_id,
+                include_item_types: vec![ferrofin_model::data::BaseItemKind::CollectionFolder],
+                ..Default::default()
+            })
+            .await
+            .expect("list");
+        let mut out: Vec<(String, String)> = rows
+            .into_iter()
+            .map(|r| (r.name.unwrap_or_default(), r.path.unwrap_or_default()))
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// A rename must leave exactly ONE library row, keyed on the NEW path.
+    ///
+    /// Regression guard for the orphan-view leak: `get_virtual_folders` mints a
+    /// `CollectionFolder` row per directory it sees (ids are path-derived), so
+    /// before the `ValidateTopLibraryFolders` prune was ported the row backing the
+    /// vacated directory survived forever and `/UserViews` served a phantom
+    /// library under the OLD name. `/Library/VirtualFolders` is filesystem-derived
+    /// and never showed it, which is exactly why the parity journey stayed green.
+    #[tokio::test]
+    async fn rename_leaves_exactly_one_library_row_keyed_on_the_new_path() {
+        let (tmp, _db, mgr) = manager_with_store().await;
+        let media = media_dir(&tmp, "movies");
+        mgr.add_virtual_folder(
+            "Movies",
+            Some(CollectionTypeOptions::movies),
+            &opts_with_paths(&[media]),
+        )
+        .await
+        .expect("add");
+        // The listing is the self-heal that mints the row.
+        let before = mgr.get_virtual_folders().await.expect("get");
+        let old_id = before[0].item_id.clone().expect("ItemId");
+        assert_eq!(root_libraries(&mgr).await.len(), 1);
+
+        mgr.rename_virtual_folder("Movies", "Films")
+            .await
+            .expect("rename");
+        // Read back through the same self-healing listing the journey uses.
+        let after = mgr.get_virtual_folders().await.expect("get");
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].name.as_deref(), Some("Films"));
+        let new_id = after[0].item_id.clone().expect("ItemId");
+        assert_ne!(old_id, new_id, "the id is derived from the path");
+
+        let rows = root_libraries(&mgr).await;
+        assert_eq!(
+            rows.len(),
+            1,
+            "the vacated directory's row must be gone, not orphaned: {rows:?}"
+        );
+        assert_eq!(rows[0].0, "Films");
+        assert!(rows[0].1.ends_with("Films"), "{rows:?}");
+    }
+
+    /// A case-only rename hops through a temp directory; the row deleted must be
+    /// the ORIGINAL path's, never the temp uuid directory's.
+    #[tokio::test]
+    async fn case_only_rename_leaves_exactly_one_library_row() {
+        let (tmp, _db, mgr) = manager_with_store().await;
+        let media = media_dir(&tmp, "movies");
+        mgr.add_virtual_folder("Movies", None, &opts_with_paths(&[media]))
+            .await
+            .expect("add");
+        mgr.get_virtual_folders().await.expect("get");
+
+        mgr.rename_virtual_folder("Movies", "MOVIES")
+            .await
+            .expect("rename");
+        let after = mgr.get_virtual_folders().await.expect("get");
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].name.as_deref(), Some("MOVIES"));
+        let rows = root_libraries(&mgr).await;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].0, "MOVIES");
+    }
+
+    /// A library directory removed behind the API's back converges on the next
+    /// prune — the systemic leg (`ValidateTopLibraryFolders` runs it at scan
+    /// start), which also covers an adopted database carrying a stale row.
+    #[tokio::test]
+    async fn prune_removes_the_row_of_an_externally_deleted_library_only() {
+        let (tmp, _db, mgr) = manager_with_store().await;
+        let media = media_dir(&tmp, "movies");
+        mgr.add_virtual_folder(
+            "Movies",
+            None,
+            &opts_with_paths(std::slice::from_ref(&media)),
+        )
+        .await
+        .expect("add");
+        mgr.add_virtual_folder("Shows", None, &opts_with_paths(&[media]))
+            .await
+            .expect("add");
+        mgr.get_virtual_folders().await.expect("get");
+        assert_eq!(root_libraries(&mgr).await.len(), 2);
+
+        std::fs::remove_dir_all(tmp.path().join("default").join("Shows")).expect("rm");
+        assert_eq!(
+            mgr.prune_orphan_collection_folders().await.expect("prune"),
+            1
+        );
+        let rows = root_libraries(&mgr).await;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].0, "Movies");
+        // Idempotent.
+        assert_eq!(
+            mgr.prune_orphan_collection_folders().await.expect("prune"),
+            0
+        );
+    }
+
+    /// The prune must never fire on a root it cannot read — otherwise a
+    /// transiently missing user-views directory would delete every library at
+    /// once. A missing root yields zero removals, not a wipe.
+    #[tokio::test]
+    async fn prune_skips_when_the_user_views_root_is_unreadable() {
+        let (tmp, _db, mgr) = manager_with_store().await;
+        let media = media_dir(&tmp, "movies");
+        mgr.add_virtual_folder("Movies", None, &opts_with_paths(&[media]))
+            .await
+            .expect("add");
+        mgr.get_virtual_folders().await.expect("get");
+
+        std::fs::remove_dir_all(tmp.path().join("default")).expect("rm root");
+        assert_eq!(
+            mgr.prune_orphan_collection_folders().await.expect("prune"),
+            0,
+            "an unreadable root must not delete every library"
+        );
+        assert_eq!(root_libraries(&mgr).await.len(), 1);
     }
 
     #[tokio::test]

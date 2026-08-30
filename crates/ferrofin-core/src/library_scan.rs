@@ -1159,6 +1159,17 @@ impl LibraryScanner {
     /// Propagates the item-store failure if listing libraries, saving an item,
     /// or writing its ancestor closure fails.
     pub async fn scan(&self, only: Option<Uuid>) -> Result<usize, ServiceError> {
+        // `LibraryManager.PerformLibraryValidation` opens with
+        // `ValidateTopLibraryFolders`, whose tail deletes the library rows whose
+        // directory no longer exists. Do the same here so a library removed
+        // behind the API's back (or an adopted database carrying a stale row)
+        // converges on the next scan instead of haunting `/UserViews` forever.
+        match self.virtual_folders.prune_orphan_collection_folders().await {
+            Ok(0) => {}
+            Ok(removed) => tracing::info!(removed, "pruned libraries whose directory is gone"),
+            // Never fail a scan over the convergence pass.
+            Err(err) => tracing::warn!(%err, "failed to prune orphan library rows"),
+        }
         let folders = self.scoped_folders(only).await?;
         let planned = self.plan(&folders); // sync: NamingOptions never crosses an await
         self.run_scan(&folders, planned, None).await

@@ -459,6 +459,136 @@ def _obeys_own_candidate_rule(base, token, ctx, seed_dto, items, limit):
 SIMILAR_ALIASES = ("Items", "Movies", "Trailers", "Albums", "Artists")
 
 
+# ---------------------------------------------------------------- package repositories
+#
+# The repository list is admin-settable to the same value on both servers and the
+# catalogue is derived from it, so these rows ARE diffable — they are not
+# instance state, which is what the old classification claimed.
+#
+# Both servers ship exactly ONE repository by default and it is the SAME one
+# (Jellyfin seeds it from the `RunMigrationOnSetup` routines
+# `Add/Readd/UpdateDefaultPluginRepository`; Ferrofin seeds the post-migration
+# value directly in `default_server_configuration`), so `GET /Repositories` diffs
+# as an ordinary body.
+#
+# `GET /Packages` aggregates what those repositories publish. Diffing it against
+# the live repo.jellyfin.org would make the row depend on upstream content that
+# changes without notice, so this seed points BOTH servers at the fixed manifests
+# the lab's fixture container serves (see suite/perf/livetv-source.py) and the
+# reap puts each server's own list back. Nothing is added to
+# `parity_diff.VOLATILE` for these rows: with the same manifest on both, the
+# bodies are byte-comparable.
+
+FIXTURE_REPOS = [
+    {"Name": "Parity Fixture A", "Url": "http://livetv-source:8000/manifest.json",
+     "Enabled": True},
+    {"Name": "Parity Fixture B", "Url": "http://livetv-source:8000/manifest-b.json",
+     "Enabled": True},
+    # A disabled repository must be skipped entirely
+    # (`if (repository.Enabled && repository.Url is not null)`); pointing it at a
+    # dead URL proves the skip happens BEFORE the fetch — if either server tried
+    # it, the row would stall rather than quietly pass.
+    {"Name": "Parity Fixture Disabled", "Url": "http://livetv-source:8000/nope.json",
+     "Enabled": False},
+]
+
+
+def with_package_order(body):
+    """ADDITIVE projection: attach the catalogue's ORDER as lists of plain strings.
+
+    `parity_diff` aligns arrays of objects by Name/Id and never compares
+    position, so the two things `GetAvailablePackages` actually decides about
+    ORDER would diff clean whatever they were: which package comes first, and
+    where a second repository's version lands inside an existing package's list
+    (`MergeSortedList`, descending). A list of plain strings is the one array
+    shape parity_diff compares positionally, so this makes both gateable.
+
+    Additive — every original field is still compared. Non-list bodies pass
+    through untouched (the selfcheck exercises the row-agnostic shape)."""
+    if not isinstance(body, list):
+        return body
+    return {
+        "_Packages": body,
+        "_PackageOrder": [p.get("name") for p in body],
+        "_VersionOrder": {
+            p.get("name"): [v.get("version") for v in (p.get("versions") or [])]
+            for p in body
+        },
+    }
+
+
+def seed_package_repositories(base, token, ctx):
+    """Points both servers at the lab's fixed manifests, remembering what was there."""
+    st, before = token_get(base, "/Repositories", token)
+    ctx["_repos_before"] = before if isinstance(before, list) else []
+    st, _ = http("POST", base + "/Repositories", token, json.dumps(FIXTURE_REPOS))
+    return {"read_before": st, "set_repositories": st}
+
+
+def reap_package_repositories(base, token, ctx):
+    """Restores each server's own repository list, so later layers see it as found."""
+    st, _ = http("POST", base + "/Repositories", token,
+                 json.dumps(ctx.get("_repos_before") or []))
+    if st >= 300:
+        print(f"  WARN: could not restore /Repositories on {base} (status {st})")
+    return {"restore": st}
+
+
+def packages_by_name_invariants(base, token, ctx):
+    """Every branch of `InstallationManager.FilterPackages`, as booleans.
+
+    `GET /Packages/{name}` is scored by Layer-1 today with `{name}` filled from a
+    GENRE (sweep.py's generic path-param fill), so the live probe was
+    `GET /Packages/Action` — 404 on both servers, "status conformant", and the
+    lookup itself never exercised. These facts are each derived from the SERVER'S
+    OWN catalogue entry, so the row diffs without ever comparing two catalogues,
+    and every one of them is a branch of the C#:
+
+        if (!id.IsEmpty())          … Where(x => x.Id.Equals(id));
+        else if (name is not null)  … Where(x => x.Name.Equals(name, OrdinalIgnoreCase));
+
+    The guid is bound as `Guid?`, so the N/D/B spellings must all resolve and
+    anything else must be a 400 from model binding. The N (dashless) spelling is
+    the one both servers emit and jellyfin-web echoes back.
+    """
+    facts = {}
+    st, catalog = token_get(base, "/Packages", token)
+    facts["packages_status_200"] = st == 200
+    if not isinstance(catalog, list) or not catalog:
+        facts["catalog_non_empty"] = False
+        return facts
+    facts["catalog_non_empty"] = True
+    pkg = catalog[0]
+    name, guid = pkg.get("name") or "", pkg.get("guid") or ""
+    hyphenated = "-".join([guid[0:8], guid[8:12], guid[12:16], guid[16:20], guid[20:32]])
+    qn = urllib.parse.quote(name)
+
+    def status(path):
+        st, _ = http("GET", base + path, token)
+        return st
+
+    facts["exact_name_200"] = status(f"/Packages/{qn}") == 200
+    facts["case_insensitive_name_200"] = (
+        status(f"/Packages/{urllib.parse.quote(name.swapcase())}") == 200)
+    facts["guid_n_format_200"] = status(f"/Packages/{qn}?assemblyGuid={guid}") == 200
+    facts["guid_d_format_200"] = status(f"/Packages/{qn}?assemblyGuid={hyphenated}") == 200
+    facts["guid_b_format_200"] = status(
+        f"/Packages/{qn}?assemblyGuid=%7B{hyphenated}%7D") == 200
+    # `!id.IsEmpty()` short-circuits the name entirely, so a wrong name still
+    # resolves the guid's package.
+    st, body = token_get(base, f"/Packages/zzz-no-such-package?assemblyGuid={guid}", token)
+    facts["guid_beats_name"] = st == 200 and (body or {}).get("guid") == guid
+    facts["empty_guid_ignored_200"] = status(f"/Packages/{qn}?assemblyGuid=") == 200
+    facts["nil_guid_falls_through_200"] = status(
+        f"/Packages/{qn}?assemblyGuid=00000000000000000000000000000000") == 200
+    facts["bad_guid_is_400"] = status(f"/Packages/{qn}?assemblyGuid=notaguid") == 400
+    facts["unknown_name_is_404"] = status("/Packages/zzz-no-such-package") == 404
+    # The single-package body must be exactly the catalogue's entry for it.
+    st, one = token_get(base, f"/Packages/{qn}", token)
+    facts["body_equals_catalog_entry"] = one == pkg
+    return facts
+
+
 def similar_invariants_for(alias):
     """The invariant probe bound to ONE alias.
 
@@ -757,6 +887,22 @@ READS = [
         "/Audio/{lyric_elrc}/Lyrics",
         "/Audio/{lyric_txt}/Lyrics",
     ], seed=seed_lyrics, reap=reap_lyrics),
+    # Package repositories + the catalogue derived from them. Both servers ship
+    # the same single default repository, so this is an ordinary body diff.
+    plain("GET /Repositories", "/Repositories"),
+    # Seeded onto the lab's fixed manifests so the catalogue is deterministic.
+    # ONE leg, deliberately: a `multi` row unions its legs' comparable-field
+    # counts, so pairing /Packages with a second, always-populated endpoint would
+    # let the row score `body-diff` on the strength of the other leg even when
+    # the catalogue came back empty on BOTH servers — the hollow-body shape this
+    # harness exists to catch. Alone, an unreachable fixture leaves the row with
+    # nothing compared and `verification.read_method` refuses to call it verified,
+    # which is the honest outcome. (`/Repositories` has its own row above, and the
+    # write's effect on both surfaces is the `j_repositories` journey.)
+    multi("GET /Packages", [
+        ("/Packages", with_package_order),
+    ], seed=seed_package_repositories, reap=reap_package_repositories),
+    invariant("GET /Packages/{name}", packages_by_name_invariants),
 ]
 
 # ---------------------------------------------------------------- correlation
@@ -1151,9 +1297,13 @@ def selfcheck():
     # The invariant rows must carry a callable, and the diff-shaped folding of
     # its facts must flag both a disagreement AND a fact both servers fail.
     assert all(callable(ep["fn"]) for ep in READS if ep["kind"] == "invariant")
-    # ...and each invariant row must own a DISTINCT alias, or three ledger rows
-    # are one measurement of the same route.
-    aliases = [ep["fn"].alias for ep in READS if ep["kind"] == "invariant"]
+    # ...and each ALIASED invariant row (the /{kind}/{itemId}/Similar family, one
+    # C# method behind six routes) must own a DISTINCT alias, or three ledger
+    # rows are one measurement of the same route. An invariant row that is not
+    # part of an alias family carries no `alias` and is exempt — its op key is
+    # already its identity.
+    aliases = [ep["fn"].alias for ep in READS
+               if ep["kind"] == "invariant" and hasattr(ep["fn"], "alias")]
     assert len(aliases) == len(set(aliases)), f"invariant rows share an alias: {aliases}"
     assert set(aliases) <= set(SIMILAR_ALIASES), aliases
     # Every invariant row is stamped `property`, never the body-diff method the
