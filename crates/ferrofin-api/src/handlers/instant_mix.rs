@@ -13,6 +13,13 @@
 //! [`MusicManager`](ferrofin_traits::library::MusicManager) seam, applies the
 //! caller's `limit`, and projects the songs to [`BaseItemDto`]s wrapped in a
 //! [`QueryResult`] whose total is the pre-limit count (mirroring C# `GetResult`).
+//!
+//! Every route builds its projection from the request's `fields`/image
+//! parameters, exactly as the C# controller does
+//! (`new DtoOptions { Fields = fields }.AddAdditionalDtoOptions(…)`). That is an
+//! object initializer, so a request with no `fields=` projects an EMPTY field
+//! list — not [`DtoOptions::default`], which is Jellyfin's *parameterless*
+//! constructor with all 47 fields on.
 
 use axum::extract::{Path, Query, State};
 use axum::routing::get;
@@ -30,10 +37,6 @@ use crate::handlers::items::resolve_user_opt;
 use crate::state::AppState;
 
 /// The query parameters common to every InstantMix route.
-///
-/// The wider Jellyfin query (`fields`, image/user-data toggles) is accepted but
-/// only `user_id` and `limit` change the response here; the projection uses the
-/// default (all-fields) [`DtoOptions`].
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct InstantMixQuery {
@@ -43,6 +46,21 @@ struct InstantMixQuery {
     /// The maximum number of records to return.
     #[serde(default)]
     limit: Option<i32>,
+    /// Comma-delimited additional [`ItemFields`](ferrofin_model::querying::ItemFields).
+    #[serde(default)]
+    fields: Option<String>,
+    /// Include image information in the output (defaults on).
+    #[serde(default)]
+    enable_images: Option<bool>,
+    /// Include user data in the output (defaults on).
+    #[serde(default)]
+    enable_user_data: Option<bool>,
+    /// The maximum number of images to return per image type.
+    #[serde(default)]
+    image_type_limit: Option<i32>,
+    /// Comma-delimited [`ImageType`](ferrofin_model::entities::ImageType)s to include.
+    #[serde(default)]
+    enable_image_types: Option<String>,
 }
 
 /// The query parameters for the obsolete `?id=` InstantMix variants.
@@ -58,7 +76,45 @@ struct InstantMixByIdQuery {
     /// The maximum number of records to return.
     #[serde(default)]
     limit: Option<i32>,
+    /// Comma-delimited additional [`ItemFields`](ferrofin_model::querying::ItemFields).
+    #[serde(default)]
+    fields: Option<String>,
+    /// Include image information in the output (defaults on).
+    #[serde(default)]
+    enable_images: Option<bool>,
+    /// Include user data in the output (defaults on).
+    #[serde(default)]
+    enable_user_data: Option<bool>,
+    /// The maximum number of images to return per image type.
+    #[serde(default)]
+    image_type_limit: Option<i32>,
+    /// Comma-delimited [`ImageType`](ferrofin_model::entities::ImageType)s to include.
+    #[serde(default)]
+    enable_image_types: Option<String>,
 }
+
+/// Builds the projection C# builds from these parameters —
+/// `new DtoOptions { Fields = fields }.AddAdditionalDtoOptions(...)`. Shared by
+/// both query shapes through a macro so the two stay in step.
+macro_rules! impl_dto_options {
+    ($t:ty) => {
+        impl $t {
+            /// The [`DtoOptions`] this request asks for.
+            fn dto_options(&self) -> DtoOptions {
+                crate::handlers::tv_shows::build_dto_options(
+                    self.fields.as_deref(),
+                    self.enable_images,
+                    self.image_type_limit,
+                    self.enable_image_types.as_deref(),
+                    self.enable_user_data,
+                )
+            }
+        }
+    };
+}
+
+impl_dto_options!(InstantMixQuery);
+impl_dto_options!(InstantMixByIdQuery);
 
 /// Applies the caller's `limit`, projects the mix to DTOs, and wraps the page in
 /// a [`QueryResult`] whose total record count is the pre-limit song count.
@@ -69,6 +125,7 @@ async fn build_result(
     mut items: Vec<BaseItemEntity>,
     user: Option<&UserEntity>,
     limit: Option<i32>,
+    options: &DtoOptions,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     let total = i32::try_from(items.len()).unwrap_or(i32::MAX);
     if let Some(limit) = limit
@@ -77,10 +134,9 @@ async fn build_result(
     {
         items.truncate(limit);
     }
-    let options = DtoOptions::default();
     let dtos = state
         .dto
-        .get_base_item_dtos(&items, &options, user, None, true)
+        .get_base_item_dtos(&items, options, user, None, true)
         .await?;
     Ok(Json(QueryResult::new(Some(0), Some(total), dtos)))
 }
@@ -93,6 +149,7 @@ async fn instant_mix_from_item(
     item_id: Uuid,
     user_id: Option<Uuid>,
     limit: Option<i32>,
+    options: &DtoOptions,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     let user = resolve_user_opt(state, auth, user_id).await?;
     state
@@ -103,9 +160,9 @@ async fn instant_mix_from_item(
     let user_uuid = user.as_ref().and_then(|u| Uuid::parse_str(&u.id).ok());
     let items = state
         .music
-        .get_instant_mix_from_item(item_id, user_uuid, &DtoOptions::default())
+        .get_instant_mix_from_item(item_id, user_uuid, options)
         .await?;
-    build_result(state, items, user.as_ref(), limit).await
+    build_result(state, items, user.as_ref(), limit, options).await
 }
 
 /// `GET /Songs/{itemId}/InstantMix`.
@@ -125,7 +182,8 @@ async fn from_song(
     Path(item_id): Path<Uuid>,
     Query(query): Query<InstantMixQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
-    instant_mix_from_item(&state, &auth, item_id, query.user_id, query.limit).await
+    let options = query.dto_options();
+    instant_mix_from_item(&state, &auth, item_id, query.user_id, query.limit, &options).await
 }
 
 /// `GET /Albums/{itemId}/InstantMix`.
@@ -145,7 +203,8 @@ async fn from_album(
     Path(item_id): Path<Uuid>,
     Query(query): Query<InstantMixQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
-    instant_mix_from_item(&state, &auth, item_id, query.user_id, query.limit).await
+    let options = query.dto_options();
+    instant_mix_from_item(&state, &auth, item_id, query.user_id, query.limit, &options).await
 }
 
 /// `GET /Playlists/{itemId}/InstantMix`.
@@ -165,7 +224,8 @@ async fn from_playlist(
     Path(item_id): Path<Uuid>,
     Query(query): Query<InstantMixQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
-    instant_mix_from_item(&state, &auth, item_id, query.user_id, query.limit).await
+    let options = query.dto_options();
+    instant_mix_from_item(&state, &auth, item_id, query.user_id, query.limit, &options).await
 }
 
 /// `GET /Artists/{itemId}/InstantMix`.
@@ -185,7 +245,8 @@ async fn from_artist(
     Path(item_id): Path<Uuid>,
     Query(query): Query<InstantMixQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
-    instant_mix_from_item(&state, &auth, item_id, query.user_id, query.limit).await
+    let options = query.dto_options();
+    instant_mix_from_item(&state, &auth, item_id, query.user_id, query.limit, &options).await
 }
 
 /// `GET /Items/{itemId}/InstantMix`.
@@ -205,7 +266,8 @@ async fn from_item(
     Path(item_id): Path<Uuid>,
     Query(query): Query<InstantMixQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
-    instant_mix_from_item(&state, &auth, item_id, query.user_id, query.limit).await
+    let options = query.dto_options();
+    instant_mix_from_item(&state, &auth, item_id, query.user_id, query.limit, &options).await
 }
 
 /// `GET /MusicGenres/{genreName}/InstantMix` — a mix seeded by a genre name.
@@ -222,13 +284,14 @@ async fn from_music_genre_name(
     Path(name): Path<String>,
     Query(query): Query<InstantMixQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
+    let options = query.dto_options();
     let user = resolve_user_opt(&state, &auth, query.user_id).await?;
     let user_uuid = user.as_ref().and_then(|u| Uuid::parse_str(&u.id).ok());
     let items = state
         .music
-        .get_instant_mix_from_genres(&[name], user_uuid, &DtoOptions::default())
+        .get_instant_mix_from_genres(&[name], user_uuid, &options)
         .await?;
-    build_result(&state, items, user.as_ref(), query.limit).await
+    build_result(&state, items, user.as_ref(), query.limit, &options).await
 }
 
 /// `GET /Artists/InstantMix` — the obsolete `?id=` artist variant.
@@ -249,7 +312,8 @@ async fn from_artist_by_id(
     let id = query
         .id
         .ok_or_else(|| ApiError::BadRequest("missing id".to_owned()))?;
-    instant_mix_from_item(&state, &auth, id, query.user_id, query.limit).await
+    let options = query.dto_options();
+    instant_mix_from_item(&state, &auth, id, query.user_id, query.limit, &options).await
 }
 
 /// `GET /MusicGenres/InstantMix` — the obsolete `?id=` genre variant.
@@ -270,7 +334,8 @@ async fn from_music_genre_by_id(
     let id = query
         .id
         .ok_or_else(|| ApiError::BadRequest("missing id".to_owned()))?;
-    instant_mix_from_item(&state, &auth, id, query.user_id, query.limit).await
+    let options = query.dto_options();
+    instant_mix_from_item(&state, &auth, id, query.user_id, query.limit, &options).await
 }
 
 /// Registers this controller's real routes onto `router`.

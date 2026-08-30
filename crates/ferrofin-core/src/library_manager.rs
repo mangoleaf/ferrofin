@@ -86,6 +86,10 @@ pub struct FerrofinLibraryManager {
     /// The `Year` by-name item provisioner (`GetYear`), set by the composition
     /// root. `None` (unit tests) resolves only persisted `Year` rows.
     years: Option<crate::years::YearStore>,
+    /// The `Genre`/`MusicGenre`/`Studio`/`MusicArtist` by-name provisioner
+    /// (`CreateItemByName<T>`), set by the composition root. `None` (unit
+    /// tests) resolves only persisted rows.
+    by_name: Option<crate::by_name_store::ByNameStore>,
 }
 
 /// What a queued scan covers.
@@ -142,6 +146,7 @@ impl FerrofinLibraryManager {
             chapters: None,
             user_root: None,
             years: None,
+            by_name: None,
         }
     }
 
@@ -203,6 +208,45 @@ impl FerrofinLibraryManager {
                 None => self.items.retrieve_item(id).await?,
             };
             *slot = row;
+        }
+        Ok(())
+    }
+
+    /// Attaches the `Genre`/`MusicGenre`/`Studio`/`MusicArtist` provisioner so a
+    /// by-name lookup creates the item on demand — the rest of the
+    /// `CreateItemByName<T>` family [`with_years`](Self::with_years) covers for
+    /// `Year`. Without it those lookups 404 a name the library does not carry,
+    /// where Jellyfin answers 200 with a freshly created row.
+    #[must_use]
+    pub fn with_by_name_store(mut self, store: crate::by_name_store::ByNameStore) -> Self {
+        self.by_name = Some(store);
+        self
+    }
+
+    /// `CreateItemByName<T>` for every by-name slot that came back empty.
+    ///
+    /// `Year` keeps its own provisioner (its names must parse as a positive
+    /// year); the other four go through [`ByNameStore`](crate::by_name_store::ByNameStore).
+    async fn create_missing_by_name(
+        &self,
+        kind: BaseItemKind,
+        names: &[String],
+        resolved: &mut [Option<BaseItemEntity>],
+    ) -> Result<(), ServiceError> {
+        if kind == BaseItemKind::Year {
+            return self.create_missing_years(names, resolved).await;
+        }
+        let Some(store) = &self.by_name else {
+            return Ok(());
+        };
+        for (name, slot) in names.iter().zip(resolved.iter_mut()) {
+            if slot.is_some() || name.is_empty() {
+                continue;
+            }
+            let Some(id) = store.ensure(kind, name).await? else {
+                continue;
+            };
+            *slot = self.items.retrieve_item(id).await?;
         }
         Ok(())
     }
@@ -386,9 +430,13 @@ impl LibraryManager for FerrofinLibraryManager {
                 }
             })
             .collect();
-        if kind == BaseItemKind::Year {
-            self.create_missing_years(&trimmed, &mut resolved).await?;
-        }
+        // `CreateItemByName<T>`: a by-name lookup MATERIALIZES the item
+        // upstream (directory + row) rather than reporting it missing, so this
+        // is the read path's write. Deliberately not done in
+        // `get_named_item_ids`, the per-credit hot path — C# splits it the same
+        // way (`GetItemByNameId` derives, `CreateItemByName` writes).
+        self.create_missing_by_name(kind, &trimmed, &mut resolved)
+            .await?;
         Ok(resolved)
     }
 
@@ -1093,6 +1141,87 @@ mod tests {
             Arc::new(FerrofinItemPersistenceService::new(db.clone())),
             Arc::new(FerrofinPeopleRepository::new(db.clone())),
         )
+    }
+
+    /// `GET /MusicGenres/{name}` (and its `/Genres`, `/Studios`, `/Artists`
+    /// siblings) is `CreateItemByName<T>` upstream: the row is MATERIALIZED by
+    /// the lookup, which is why Jellyfin answers 200 for a name the library does
+    /// not carry and Ferrofin used to answer 404.
+    #[tokio::test]
+    async fn a_by_name_lookup_materializes_the_item_the_way_create_item_by_name_does() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = test_db().await;
+        let meta = tmp.path().join("metadata");
+        let store = crate::by_name_store::ByNameStore::new(
+            Arc::new(FerrofinItemPersistenceService::new(db.clone())),
+            meta.join("Genre"),
+            meta.join("MusicGenre"),
+            meta.join("Studio"),
+            meta.join("artists"),
+        );
+        let mgr = manager(&db).with_by_name_store(store);
+
+        for (kind, dir) in [
+            (BaseItemKind::MusicGenre, "MusicGenre"),
+            (BaseItemKind::Genre, "Genre"),
+            (BaseItemKind::Studio, "Studio"),
+            (BaseItemKind::MusicArtist, "artists"),
+        ] {
+            let row = mgr
+                .get_named_item(kind, "Zzznope")
+                .await
+                .expect("lookup")
+                .unwrap_or_else(|| panic!("{kind:?} materialized"));
+            assert_eq!(row.name.as_deref(), Some("Zzznope"));
+            assert_eq!(
+                row.path.as_deref(),
+                Some(meta.join(dir).join("Zzznope").to_string_lossy().as_ref()),
+                "{kind:?} carries its metadata path"
+            );
+        }
+
+        // Person is NOT a `CreateItemByName` kind — `GetPerson` is a plain
+        // query, and Jellyfin 404s an unknown person. Materializing one here
+        // would invent an item Jellyfin does not have.
+        assert!(
+            mgr.get_named_item(BaseItemKind::Person, "Zzznope")
+                .await
+                .expect("lookup")
+                .is_none()
+        );
+    }
+
+    /// The id-only resolution is the per-credit hot path (every credited name on
+    /// every DTO page). C# splits it the same way — `GetItemByNameId` derives,
+    /// only `CreateItemByName` writes — so this must stay read-only.
+    #[tokio::test]
+    async fn the_by_name_id_lookup_never_writes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = test_db().await;
+        let meta = tmp.path().join("metadata");
+        let mgr = manager(&db).with_by_name_store(crate::by_name_store::ByNameStore::new(
+            Arc::new(FerrofinItemPersistenceService::new(db.clone())),
+            meta.join("Genre"),
+            meta.join("MusicGenre"),
+            meta.join("Studio"),
+            meta.join("artists"),
+        ));
+
+        let ids = mgr
+            .get_named_item_ids(BaseItemKind::Genre, &["Zzznope".to_owned()])
+            .await
+            .expect("ids");
+        assert_eq!(ids, vec![None], "an unknown name resolves to nothing");
+        assert!(
+            mgr.get_item_list(&InternalItemsQuery {
+                include_item_types: vec![BaseItemKind::Genre],
+                ..InternalItemsQuery::default()
+            })
+            .await
+            .expect("list")
+            .is_empty(),
+            "no row was written on the id path"
+        );
     }
 
     #[tokio::test]

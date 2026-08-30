@@ -313,14 +313,22 @@ pub fn by_name_item_id(mode: &IdDerivation, kind: BaseItemKind, path: &str) -> O
     )))
 }
 
-/// The metadata path identifying a `Year` by-name item — port of
-/// `Year.GetPath(name)`: the filename-sanitized name (invalid path chars →
-/// space, trimmed, trailing periods dropped) directly under the Year metadata
-/// dir (`{metadata}/Year/{name}`; no first-letter subfolder, unlike people).
+/// The metadata path identifying a by-name item — port of the
+/// `Genre`/`MusicGenre`/`Studio`/`MusicArtist`/`Year` `GetPath(name)` family,
+/// every one of which is
+/// `Path.Combine(<Kind>Path, FileSystem.GetValidFilename(name).Trim().TrimEnd('.'))`:
+/// the filename-sanitized name directly under the kind's metadata dir, with no
+/// first-letter subfolder (unlike people).
+#[must_use]
+pub fn by_name_path(root: &str, name: &str) -> String {
+    let valid = valid_filename(name);
+    format!("{root}/{valid}")
+}
+
+/// [`by_name_path`] for the `Year` metadata dir — `Year.GetPath(name)`.
 #[must_use]
 pub fn year_path(year_root: &str, name: &str) -> String {
-    let valid = valid_filename(name);
-    format!("{year_root}/{valid}")
+    by_name_path(year_root, name)
 }
 
 /// The deterministic by-name `Year` item id for `name` (the production year

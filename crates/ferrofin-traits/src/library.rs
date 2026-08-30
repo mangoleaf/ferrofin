@@ -1028,6 +1028,24 @@ pub trait MediaSourceManager: Send + Sync {
             .collect())
     }
 
+    /// The subset of `item_ids` that carry at least one lyric stream.
+    ///
+    /// Backs the DTO builder's `HasLyrics` (C# `DtoService.cs:421` emits it on
+    /// every Audio DTO, outside the `ItemFields` system). Same seam and same
+    /// cost model as [`Self::get_item_ids_with_subtitles`].
+    async fn get_item_ids_with_lyrics(&self, item_ids: &[Uuid]) -> Result<Vec<Uuid>, ServiceError> {
+        let map = self.get_media_streams_batch(item_ids).await?;
+        Ok(map
+            .into_iter()
+            .filter(|(_, streams)| {
+                streams
+                    .iter()
+                    .any(|s| s.stream_type == ferrofin_model::entities::MediaStreamType::Lyric)
+            })
+            .map(|(id, _)| id)
+            .collect())
+    }
+
     /// The merged alternate-version rows for a page of primary item ids, keyed
     /// by primary id; primaries with no alternates are absent.
     ///

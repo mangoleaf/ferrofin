@@ -48,6 +48,19 @@ fn by_name_kind(value_type: i32) -> Option<BaseItemKind> {
     }
 }
 
+/// The `ItemValues.Type` discriminant whose value space a by-name kind lives in
+/// — the inverse of [`by_name_kind`]. `MusicGenre` is deliberately absent: it
+/// shares `Genre`'s value space, so its row takes a derived id instead of the
+/// (already claimed) `ItemValueId`. See [`music_genre_row`].
+fn by_name_value_type(kind: BaseItemKind) -> Option<i32> {
+    match kind {
+        BaseItemKind::MusicArtist => Some(1),
+        BaseItemKind::Genre => Some(2),
+        BaseItemKind::Studio => Some(3),
+        _ => None,
+    }
+}
+
 /// The stored CLR type name of the row [`by_name_kind`] names.
 fn by_name_type_name(value_type: i32) -> Option<&'static str> {
     match value_type {
@@ -878,6 +891,135 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
             }
         }
         tx.commit().await.map_err(db_err)
+    }
+
+    async fn ensure_by_name_item(
+        &self,
+        kind: BaseItemKind,
+        name: &str,
+        path: &str,
+    ) -> Result<Option<Uuid>, ServiceError> {
+        let name = name.trim();
+        let (Some(type_name), false) = (stored_type_name(kind), name.is_empty()) else {
+            return Ok(None);
+        };
+        let clean = get_clean_value(name);
+        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        // An existing row wins, whatever id it carries — Jellyfin's own on an
+        // adopted database, or the one a scan materialized.
+        let existing: Option<String> = sqlx::query_scalar(
+            r#"SELECT "Id" FROM "BaseItems" WHERE "Type" = ?1 AND "CleanName" = ?2 LIMIT 1"#,
+        )
+        .bind(type_name)
+        .bind(&clean)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        if let Some(id) = existing {
+            tx.rollback().await.map_err(db_err)?;
+            return Ok(Uuid::parse_str(&id).ok());
+        }
+        // Mint the id the SCANNER would mint for this name, not a fresh one, so
+        // that a later scan of content carrying this value converges on THIS
+        // row instead of inserting a second one beside it: the `ItemValues` id
+        // for the value-backed kinds (what `save_item_values` uses), the
+        // derived id for `MusicGenre` (what `music_genre_row` uses).
+        let id = match by_name_value_type(kind) {
+            Some(value_type) => {
+                let fresh = guid_to_db(Uuid::new_v4());
+                sqlx::query(
+                    r#"INSERT OR IGNORE INTO "ItemValues" ("ItemValueId","CleanValue","Type","Value")
+                       VALUES (?1,?2,?3,?4)"#,
+                )
+                .bind(&fresh)
+                .bind(&clean)
+                .bind(value_type)
+                .bind(name)
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?;
+                let value_id: String = sqlx::query_scalar(
+                    r#"SELECT "ItemValueId" FROM "ItemValues" WHERE "Type" = ?1 AND "Value" = ?2"#,
+                )
+                .bind(value_type)
+                .bind(name)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(db_err)?;
+                Uuid::parse_str(&value_id).ok()
+            }
+            None if kind == BaseItemKind::MusicGenre => {
+                crate::item_type_lookup::derive_item_id(BaseItemKind::MusicGenre, name)
+            }
+            None => None,
+        };
+        let Some(id) = id else {
+            tx.rollback().await.map_err(db_err)?;
+            return Ok(None);
+        };
+        sqlx::query(
+            // `IsFolder` is 0: `Genre`, `MusicGenre` and `Studio` all derive
+            // from `BaseItem`, not `Folder`, and a parentless `MusicArtist` is
+            // `IsAccessedByName`, whose `IsFolder` is `!IsAccessedByName`
+            // (`MusicArtist.cs:33`). A real 10.11.8 stores 0 on the row a GET
+            // lazily creates.
+            r#"INSERT OR IGNORE INTO "BaseItems"
+               ("Id","Type","Name","CleanName","SortName","PresentationUniqueKey","Path",
+                "DateCreated","DateModified",
+                "IsFolder","IsInMixedFolder","IsLocked","IsMovie","IsRepeat","IsSeries","IsVirtualItem")
+               VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?8,0,0,0,0,0,0,0)"#,
+        )
+        .bind(guid_to_db(id))
+        .bind(type_name)
+        .bind(name)
+        .bind(&clean)
+        .bind(ferrofin_util::sort_name::create_sort_name(name))
+        .bind(crate::kinds::presentation_unique_key(
+            kind,
+            id,
+            Some(name),
+            None,
+            None,
+            None,
+        ))
+        .bind(path)
+        .bind(chrono::Utc::now())
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
+        Ok(Some(id))
+    }
+
+    async fn by_name_rows_without_path(
+        &self,
+        kind: BaseItemKind,
+    ) -> Result<Vec<(Uuid, String)>, ServiceError> {
+        let Some(type_name) = stored_type_name(kind) else {
+            return Ok(Vec::new());
+        };
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            r#"SELECT "Id", "Name" FROM "BaseItems"
+               WHERE "Type" = ?1 AND "Path" IS NULL AND "Name" IS NOT NULL"#,
+        )
+        .bind(type_name)
+        .fetch_all(self.db.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(id, name)| Uuid::parse_str(&id).ok().map(|id| (id, name)))
+            .collect())
+    }
+
+    async fn set_item_path(&self, id: Uuid, path: &str) -> Result<(), ServiceError> {
+        sqlx::query(r#"UPDATE "BaseItems" SET "Path" = ?2 WHERE "Id" = ?1"#)
+            .bind(guid_to_db(id))
+            .bind(path)
+            .execute(self.db.writer())
+            .await
+            .map_err(db_err)?;
+        Ok(())
     }
 
     async fn item_exists(&self, id: Uuid) -> Result<bool, ServiceError> {

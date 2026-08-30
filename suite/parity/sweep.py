@@ -357,6 +357,9 @@ def resolve_fixtures(base, token, user):
     any_item = movie or series or episode
     genres = get_json(base, f"/Genres?userId={user}&limit=1", token) or {}
     genre = (genres.get("Items") or [{}])[0].get("Name") or "Action"
+    # A MUSIC genre for the /MusicGenres/* routes (see `music_genre_fixtures`).
+    music_genres = get_json(base, f"/MusicGenres?userId={user}&limit=1&sortBy=SortName", token) or {}
+    music_genre = (music_genres.get("Items") or [{}])[0].get("Name")
     sessions = get_json(base, "/Sessions", token) or []
     session = sessions[0]["Id"] if sessions else None
     logs = get_json(base, "/System/Logs", token) or []
@@ -388,6 +391,8 @@ def resolve_fixtures(base, token, user):
         "_audio": audio, "_audio_src": source_id(audio),
         # Kind-correct seeds for the /Similar aliases (see `similar_fixtures`).
         "_album": album, "_artist": artist, "_series": series,
+        # The music-genre seed for the /MusicGenres/* routes (see `music_genre_fixtures`).
+        "_musicgenre": music_genre,
     }
     return {k: v for k, v in fx.items() if v is not None}
 
@@ -417,6 +422,25 @@ SIMILAR_SEEDS = {
     "/Artists/{itemId}/Similar": "_artist",
     "/Shows/{itemId}/Similar": "_series",
 }
+
+
+def music_genre_fixtures(path, fixtures):
+    """The fixtures with the by-name seed swapped for a real MUSIC genre on the
+    /MusicGenres/* routes.
+
+    Both `{genreName}` and `{name}` were seeded from `/Genres` — a MOVIE genre
+    — which made this sweep a WRITE against Jellyfin: `GetMusicGenre` is
+    `CreateItemByName<MusicGenre>`, so probing `/MusicGenres/Action`
+    materializes a `MusicGenre` row named after a movie genre, permanently, on
+    every run. That row then showed up in Jellyfin's `/MusicGenres` listing and
+    nowhere else, turning the `GET /MusicGenres` row red for the rest of the
+    campaign. Seeding from `/MusicGenres` probes the route with something it is
+    actually about and leaves no residue. Unchanged when the fixture has no
+    music library."""
+    seed = fixtures.get("_musicgenre")
+    if not seed or not path.startswith("/MusicGenres/"):
+        return fixtures
+    return {**fixtures, "genreName": seed, "name": seed}
 
 
 def similar_fixtures(path, fixtures):
@@ -547,6 +571,8 @@ def sweep(ferrofin_url, jellyfin_url):
             fx_j = audio_fixtures(fixtures_j) if path.startswith("/Audio/") else fixtures_j
             fx_h = similar_fixtures(path, fx_h)
             fx_j = similar_fixtures(path, fx_j)
+            fx_h = music_genre_fixtures(path, fx_h)
+            fx_j = music_genre_fixtures(path, fx_j)
             hurl, skip = build_url(path, fx_h)   # per-server ids: Ferrofin's on Ferrofin
             if skip:
                 results[opkey] = {"status_conformant": None, "schema_valid": None, "note": skip}
@@ -645,6 +671,16 @@ def selfcheck():
                             {"itemId": "m", "_series": "se"})["itemId"] == "se"
     # No such kind in the fixture, or a route that is not a /Similar alias: unchanged.
     assert similar_fixtures("/Albums/{itemId}/Similar", {"itemId": "m"})["itemId"] == "m"
+    # The music-genre routes must be probed with a music genre, and nothing else
+    # may be rewritten (a movie-genre seed on /MusicGenres/{genreName} is a
+    # WRITE against Jellyfin — see `music_genre_fixtures`).
+    mg = music_genre_fixtures("/MusicGenres/{genreName}",
+                              {"genreName": "Action", "name": "Action", "_musicgenre": "Jazz"})
+    assert mg["genreName"] == "Jazz" and mg["name"] == "Jazz", mg
+    assert music_genre_fixtures("/Genres/{genreName}",
+                                {"genreName": "Action", "_musicgenre": "Jazz"})["genreName"] == "Action"
+    assert music_genre_fixtures("/MusicGenres/{genreName}",
+                                {"genreName": "Action"})["genreName"] == "Action"
     assert similar_fixtures("/Movies/{itemId}/Similar",
                             {"itemId": "m", "_album": "al"})["itemId"] == "m"
     # status-class comparison is by hundreds bucket.

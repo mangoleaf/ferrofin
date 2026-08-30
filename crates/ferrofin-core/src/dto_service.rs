@@ -148,6 +148,10 @@ struct Prefetched {
     /// unconditional `HasSubtitles` on video DTOs (C# emits it outside the
     /// `ItemFields` system) via one ids-only query per page.
     has_subtitles: std::collections::HashSet<Uuid>,
+    /// The page's audio item ids that carry a lyric stream. Backs the
+    /// unconditional `HasLyrics` on Audio DTOs (C# `DtoService.cs:421` emits it
+    /// outside the `ItemFields` system) via one ids-only query per page.
+    has_lyrics: std::collections::HashSet<Uuid>,
     /// The requesting user's content permissions (populated only when the
     /// `CanDelete`/`CanDownload` fields are requested and a user is present),
     /// so the whole page gates on one `Permissions` query.
@@ -1248,6 +1252,14 @@ impl FerrofinDtoService {
             dto.date_last_media_added = item.date_last_media_added;
         }
 
+        // `AttachUserSpecificInfo` (`DtoService.cs:594`), inside its
+        // `if (item.IsFolder)`: the cumulative ticks ARE the folder's own
+        // `RunTimeTicks` column — the sum is computed once at scan time
+        // (`MetadataService.UpdateCumulativeRunTimeTicks`), not per request.
+        if options.contains_field(ItemFields::CumulativeRunTimeTicks) && item.is_folder {
+            dto.cumulative_run_time_ticks = item.run_time_ticks;
+        }
+
         if options.contains_field(ItemFields::Etag) {
             dto.etag = Some(compute_etag(item.date_last_saved));
         }
@@ -1493,6 +1505,14 @@ impl FerrofinDtoService {
         // MusicVideo) carry them; Jellyfin never emits artist fields elsewhere.
         if kinds::has_artist_fields(kind) {
             Self::attach_artists(dto, item, prefetched);
+        }
+
+        // C# `DtoService.cs:421`: `if (item is Audio audio) { dto.HasLyrics =
+        // audio.GetMediaStreams().Any(s => s.Type == MediaStreamType.Lyric); }`
+        // — assigned unconditionally (true AND false), outside every field gate,
+        // which is why Jellyfin sends `"HasLyrics": false` on a plain track.
+        if kind == BaseItemKind::Audio {
+            dto.has_lyrics = Some(prefetched.has_lyrics.contains(&item_id));
         }
 
         // Video extras.
@@ -2435,6 +2455,37 @@ impl FerrofinDtoService {
                 .into_iter()
                 .collect()
         };
+        // Lyric presence for the page's audio items — C# `DtoService.cs:421`
+        // sets `HasLyrics` on every `Audio` DTO, ungated by `ItemFields`.
+        let audio_ids: Vec<Uuid> = items
+            .iter()
+            .filter(|i| row_kind(i) == BaseItemKind::Audio)
+            .map(row_id)
+            .collect();
+        let has_lyrics: std::collections::HashSet<Uuid> = if audio_ids.is_empty() {
+            std::collections::HashSet::new()
+        } else if want_streams {
+            // Same reasoning as `has_subtitles`: the page's streams already
+            // cover every page id, so this is a scan of what was read rather
+            // than a second round trip.
+            audio_ids
+                .iter()
+                .copied()
+                .filter(|id| {
+                    media_streams.get(id).is_some_and(|streams| {
+                        streams.iter().any(|s| {
+                            s.stream_type == ferrofin_model::entities::MediaStreamType::Lyric
+                        })
+                    })
+                })
+                .collect()
+        } else {
+            self.media_sources
+                .get_item_ids_with_lyrics(&audio_ids)
+                .await?
+                .into_iter()
+                .collect()
+        };
         // One Permissions read gates the whole page's CanDelete/CanDownload
         // (C# `BaseItem.CanDelete(user)`/`CanDownload(user)` per item).
         let content_permissions = match user {
@@ -2471,6 +2522,7 @@ impl FerrofinDtoService {
             played_counts,
             alternates,
             has_subtitles,
+            has_lyrics,
             content_permissions,
             person_ids_by_name,
             alt_referenced,
@@ -3183,6 +3235,11 @@ mod tests {
     struct FakeSources {
         /// Ids whose canned stream list carries no subtitle stream.
         without_subtitles: std::collections::HashSet<Uuid>,
+        /// Ids whose canned stream list carries a lyric stream. The ids-only
+        /// `get_item_ids_with_lyrics` reports EVERY id, mirroring the subtitle
+        /// fake, so a projection reading the query instead of the prefetched
+        /// streams marks a lyricless track as having lyrics and is caught.
+        with_lyrics: std::collections::HashSet<Uuid>,
     }
 
     #[async_trait]
@@ -3193,6 +3250,12 @@ mod tests {
         ) -> Result<Vec<Uuid>, ServiceError> {
             // Every video in these fixtures "has subtitles", so the DTO's
             // HasSubtitles emit path is exercised.
+            Ok(item_ids.to_vec())
+        }
+        async fn get_item_ids_with_lyrics(
+            &self,
+            item_ids: &[Uuid],
+        ) -> Result<Vec<Uuid>, ServiceError> {
             Ok(item_ids.to_vec())
         }
         async fn get_media_streams(
@@ -3224,6 +3287,14 @@ mod tests {
                             index: 1,
                             stream_type: ferrofin_model::entities::MediaStreamType::Subtitle,
                             codec: Some("subrip".to_owned()),
+                            ..MediaStream::default()
+                        });
+                    }
+                    if self.with_lyrics.contains(id) {
+                        streams.push(MediaStream {
+                            index: 2,
+                            stream_type: ferrofin_model::entities::MediaStreamType::Lyric,
+                            codec: Some("lrc".to_owned()),
                             ..MediaStream::default()
                         });
                     }
@@ -3831,6 +3902,7 @@ mod tests {
             db,
             FakeSources {
                 without_subtitles: std::iter::once(bare).collect(),
+                ..FakeSources::default()
             },
         );
 
@@ -3846,6 +3918,105 @@ mod tests {
         );
     }
 
+    /// `DtoService.cs:594`, inside `AttachUserSpecificInfo`'s `if (item.IsFolder)`:
+    /// `CumulativeRunTimeTicks` IS the folder's own `RunTimeTicks` column (the
+    /// sum `MetadataService.UpdateCumulativeRunTimeTicks` wrote at scan time),
+    /// field-gated, and only for folders.
+    #[tokio::test]
+    async fn a_folder_dto_emits_cumulative_run_time_ticks_from_its_own_column() {
+        let db = test_db().await;
+        let album = Uuid::from_u128(0x5D01);
+        let track = Uuid::from_u128(0x5D02);
+        seed_named_item(&db, album, BaseItemKind::MusicAlbum, "Album").await;
+        seed_named_item(&db, track, BaseItemKind::Audio, "Track").await;
+        let svc = service_with_sources(db.clone(), FakeSources::default());
+        let mut album_row = fetch_item(&db, album).await;
+        album_row.is_folder = true;
+        album_row.run_time_ticks = Some(60_000_000);
+        let mut track_row = fetch_item(&db, track).await;
+        track_row.run_time_ticks = Some(20_000_000);
+        let items = vec![album_row, track_row];
+
+        let dtos = svc
+            .get_base_item_dtos(&items, &DtoOptions::default(), None, None, true)
+            .await
+            .unwrap();
+        assert_eq!(dtos[0].cumulative_run_time_ticks, Some(60_000_000));
+        assert_eq!(dtos[0].run_time_ticks, Some(60_000_000), "and RunTimeTicks");
+        assert_eq!(
+            dtos[1].cumulative_run_time_ticks, None,
+            "not a folder, so no cumulative field"
+        );
+
+        // Field-gated, unlike `RunTimeTicks`.
+        let lean = DtoOptions::with_all_fields(false);
+        let dtos = svc
+            .get_base_item_dtos(&items, &lean, None, None, true)
+            .await
+            .unwrap();
+        assert_eq!(dtos[0].cumulative_run_time_ticks, None);
+        assert_eq!(dtos[0].run_time_ticks, Some(60_000_000));
+    }
+
+    /// C# `DtoService.cs:421`: `if (item is Audio audio) { dto.HasLyrics =
+    /// audio.GetMediaStreams().Any(s => s.Type == MediaStreamType.Lyric); }` —
+    /// assigned for EVERY Audio DTO, true or false, outside the `ItemFields`
+    /// system. Ferrofin never assigned it at all, so `HasLyrics` was missing
+    /// from every audio response Jellyfin sends it on.
+    #[tokio::test]
+    async fn audio_dto_emits_has_lyrics_from_the_prefetched_streams() {
+        let db = test_db().await;
+        let sung = Uuid::from_u128(0x5C01);
+        let bare = Uuid::from_u128(0x5C02);
+        let movie = Uuid::from_u128(0x5C03);
+        seed_named_item(&db, sung, BaseItemKind::Audio, "Sung").await;
+        seed_named_item(&db, bare, BaseItemKind::Audio, "Bare").await;
+        seed_named_item(&db, movie, BaseItemKind::Movie, "A Movie").await;
+        let items = vec![
+            fetch_item(&db, sung).await,
+            fetch_item(&db, bare).await,
+            fetch_item(&db, movie).await,
+        ];
+        let svc = service_with_sources(
+            db,
+            FakeSources {
+                with_lyrics: std::iter::once(sung).collect(),
+                ..FakeSources::default()
+            },
+        );
+
+        let dtos = svc
+            .get_base_item_dtos(&items, &DtoOptions::default(), None, None, true)
+            .await
+            .unwrap();
+
+        assert_eq!(dtos[0].has_lyrics, Some(true), "lyric stream present");
+        // False, not absent: Jellyfin sends `"HasLyrics": false` on a plain track.
+        assert_eq!(dtos[1].has_lyrics, Some(false));
+        assert_eq!(dtos[2].has_lyrics, None, "not an Audio item");
+    }
+
+    /// The lean-DTO path: with no stream field requested nothing is prefetched,
+    /// so the ids-only lyric query is the answer — and `HasLyrics` must still be
+    /// emitted, because C# does not gate it on `ItemFields`.
+    #[tokio::test]
+    async fn has_lyrics_falls_back_to_the_query_when_streams_are_not_prefetched() {
+        let db = test_db().await;
+        let track = Uuid::from_u128(0x5C04);
+        seed_named_item(&db, track, BaseItemKind::Audio, "Track").await;
+        let items = vec![fetch_item(&db, track).await];
+        let svc = service_with_sources(db, FakeSources::default());
+
+        let lean = DtoOptions::with_all_fields(false);
+        let dtos = svc
+            .get_base_item_dtos(&items, &lean, None, None, true)
+            .await
+            .unwrap();
+
+        // The fake's ids-only probe reports every id, so this is the query path.
+        assert_eq!(dtos[0].has_lyrics, Some(true));
+    }
+
     /// With no stream-bearing field requested nothing is prefetched to read, so
     /// the ids-only query is still the answer — dropping it outright would nil
     /// `HasSubtitles` for every caller asking for a lean DTO.
@@ -3859,6 +4030,7 @@ mod tests {
             db,
             FakeSources {
                 without_subtitles: std::iter::once(bare).collect(),
+                ..FakeSources::default()
             },
         );
 

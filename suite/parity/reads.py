@@ -396,7 +396,12 @@ READS = [
     # Instant mixes are shuffled: the diff aligns by Name, so the SET of tracks is what is
     # compared (with the whole fixture under `limit`, both sides hold every track).
     user("GET /Artists/InstantMix", "/Artists/InstantMix?id={artist_id}&userId={u}&limit=100"),
-    user("GET /MusicGenres/InstantMix", "/MusicGenres/InstantMix?name={musicgenre}&userId={u}&limit=100"),
+    # `/MusicGenres/InstantMix` takes `id`, not `name` (C#
+    # `GetInstantMixFromMusicGenreById([FromQuery, Required] Guid id)`). Probed with
+    # `name=` both servers 400 on the missing `id`, the harness recorded "H=400 J=400"
+    # as agreement, and the route was never actually compared.
+    user("GET /MusicGenres/InstantMix",
+         "/MusicGenres/InstantMix?id={musicgenre_id}&userId={u}&limit=100"),
     # Live TV (needs the tuner fixture): channels are keyed by Name across servers; the
     # airing programmes by Name too (the guide is identical on both).
     user("GET /LiveTv/Channels", "/LiveTv/Channels?userId={u}"),
@@ -465,6 +470,8 @@ def resolve_named(base, token, user_id):
         return items[0]["Id"] if items and items[0].get("Id") else ""
 
     artist = first_named("/Artists")
+    # By-name ids are per-server (each derives its own), like `artist_id`.
+    musicgenre = first_named("/MusicGenres")
     channels = (get_json(base, f"/LiveTv/Channels?userId={user_id}&limit=1", token) or {}).get("Items") or []
     return {
         "channel": channels[0]["Id"] if channels else "",
@@ -482,7 +489,8 @@ def resolve_named(base, token, user_id):
         "device": first_device(),
         "artist": urllib.parse.quote(artist.get("Name") or ""),
         "artist_id": artist.get("Id") or "",
-        "musicgenre": first_name("/MusicGenres"),
+        "musicgenre": urllib.parse.quote(musicgenre.get("Name") or ""),
+        "musicgenre_id": musicgenre.get("Id") or "",
     }
 
 
@@ -676,7 +684,8 @@ def selfcheck():
     # {u} vs "user" KeyError). Format each with a fully-populated context; a KeyError fails here.
     ctx = {"user": "U", "u": "U", "genre": "G", "studio": "S", "person": "P", "series": "SE",
            "task": "T", "device": "D", "artist": "A", "artist_id": "AID", "musicgenre": "MG",
-           "channel": "CH", "album_id": "ALB", "movie": "MOV", "episode": "EP"}
+           "channel": "CH", "album_id": "ALB", "movie": "MOV", "episode": "EP",
+           "musicgenre_id": "MGID"}
     # The context keys the self-check invents must be the ones resolve_named
     # actually produces, or this guard passes while the live run KeyErrors.
     import inspect

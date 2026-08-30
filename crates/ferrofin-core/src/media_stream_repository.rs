@@ -26,9 +26,9 @@ use ferrofin_traits::persistence::{MediaStreamQuery, MediaStreamRepository};
 
 use crate::db_error::{db_err, media_stream_type_disc};
 
-/// The DTO builder's `HasSubtitles` probe: the subset of `ids` that carry at
-/// least one subtitle stream. `?1` is the stream-type discriminant, `?2..` the
-/// item ids.
+/// The DTO builder's `HasSubtitles`/`HasLyrics` probe: the subset of `ids`
+/// that carry at least one stream of a given type. `?1` is the stream-type
+/// discriminant, `?2..` the item ids.
 ///
 /// The table's primary key is `(ItemId, StreamIndex)`, so this *looks* like a
 /// per-id seek — but it is not one off the PK. `StreamType = ?1` is an equality
@@ -40,7 +40,7 @@ use crate::db_error::{db_err, media_stream_type_disc};
 /// `FerrofinIX_MediaStreamInfos_ItemId_StreamType` (migration 0016) gives the
 /// planner a leading-`ItemId` alternative that also covers the projection, and
 /// `subtitle_probe_uses_the_item_id_index` pins that it stays chosen.
-fn subtitle_probe_sql(ids: usize) -> String {
+fn stream_type_probe_sql(ids: usize) -> String {
     let ph = (2..=ids + 1)
         .map(|i| format!("?{i}"))
         .collect::<Vec<_>>()
@@ -155,7 +155,7 @@ impl MediaStreamRepository for FerrofinMediaStreamRepository {
         // not the table's primary key.
         let mut with_subs = Vec::new();
         for chunk in item_ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
-            let sql = subtitle_probe_sql(chunk.len());
+            let sql = stream_type_probe_sql(chunk.len());
             let mut query = sqlx::query_scalar::<_, String>(&sql)
                 .bind(i64::from(media_stream_type_disc(MediaStreamType::Subtitle)));
             for id in chunk {
@@ -168,6 +168,27 @@ impl MediaStreamRepository for FerrofinMediaStreamRepository {
             }
         }
         Ok(with_subs)
+    }
+
+    async fn get_item_ids_with_lyrics(&self, item_ids: &[Uuid]) -> Result<Vec<Uuid>, ServiceError> {
+        // Same ids-only page query as the subtitle probe, off the same
+        // `FerrofinIX_MediaStreamInfos_ItemId_StreamType` index — see
+        // [`stream_type_probe_sql`].
+        let mut with_lyrics = Vec::new();
+        for chunk in item_ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+            let sql = stream_type_probe_sql(chunk.len());
+            let mut query = sqlx::query_scalar::<_, String>(&sql)
+                .bind(i64::from(media_stream_type_disc(MediaStreamType::Lyric)));
+            for id in chunk {
+                query = query.bind(guid_to_db(*id));
+            }
+            for row in query.fetch_all(self.db.pool()).await.map_err(db_err)? {
+                if let Ok(id) = Uuid::parse_str(&row) {
+                    with_lyrics.push(id);
+                }
+            }
+        }
+        Ok(with_lyrics)
     }
 
     async fn get_media_stream_languages(
@@ -385,7 +406,7 @@ mod tests {
     #[tokio::test]
     async fn subtitle_probe_uses_the_item_id_index() {
         let db = test_db().await;
-        let sql = super::subtitle_probe_sql(50);
+        let sql = super::stream_type_probe_sql(50);
         let explain = format!("EXPLAIN QUERY PLAN {sql}");
         let mut query = sqlx::query_as::<_, (i64, i64, i64, String)>(&explain);
         for _ in 0..51 {

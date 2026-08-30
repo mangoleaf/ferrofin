@@ -835,6 +835,11 @@ pub struct LibraryScanner {
     /// row per distinct scanned `ProductionYear`, so `/Years` lists every
     /// year without a write on the read path). Absent → no year pass.
     years: Option<crate::years::YearStore>,
+    /// The `Genre`/`MusicGenre`/`Studio`/`MusicArtist` by-name provisioner. The
+    /// scan uses it only to backfill the metadata `Path` of the by-name rows it
+    /// materialized itself — Jellyfin's carry one and the DTO emits it
+    /// unconditionally. Absent → those rows keep a `NULL` `Path`.
+    by_name: Option<crate::by_name_store::ByNameStore>,
     /// Studio artwork-repository client for the post-scan studio-thumb pass.
     /// Absent → Studio rows keep whatever images they already have.
     studios_client: Option<Arc<ferrofin_providers::StudiosClient>>,
@@ -901,6 +906,7 @@ impl LibraryScanner {
             audiodb: None,
             item_repository: None,
             years: None,
+            by_name: None,
             studios_client: None,
             metadata_dir: None,
             people: None,
@@ -942,6 +948,15 @@ impl LibraryScanner {
     #[must_use]
     pub fn with_years(mut self, years: crate::years::YearStore) -> Self {
         self.years = Some(years);
+        self
+    }
+
+    /// Attaches the by-name provisioner so every scan ends by filling in the
+    /// metadata `Path` of the `Genre`/`MusicGenre`/`Studio`/`MusicArtist` rows
+    /// the item-values step materialized without one.
+    #[must_use]
+    pub fn with_by_name_store(mut self, store: crate::by_name_store::ByNameStore) -> Self {
+        self.by_name = Some(store);
         self
     }
 
@@ -1584,6 +1599,21 @@ impl LibraryScanner {
         if let Err(err) = self.materialize_years().await {
             tracing::warn!(%err, "year pass failed");
         }
+        // Cumulative runtime for the folder kinds that support it, once every
+        // track has been probed — an album/artist reports the summed runtime of
+        // its children, which is a stored column, not a per-request rollup.
+        if let Err(err) = self.update_cumulative_run_time_ticks().await {
+            tracing::warn!(%err, "cumulative run time ticks pass failed");
+        }
+        // The metadata `Path` of the by-name rows the item-values step wrote
+        // (`{metadata}/Genre/Action`, …). Jellyfin's `CreateItemByName` sets it
+        // at insert time; here the row is a by-product of `save_item_values`,
+        // which has no notion of the metadata root, so it is filled once here.
+        if let Some(store) = &self.by_name
+            && let Err(err) = store.backfill_paths().await
+        {
+            tracing::warn!(%err, "by-name path backfill failed");
+        }
         // Studio thumbs from the artwork repository for the by-name Studio
         // rows the item-values step materialized, so the TV Networks /
         // Studios tabs carry artwork.
@@ -1617,6 +1647,71 @@ impl LibraryScanner {
                 tracing::warn!(%err, "dynamic image pass failed");
             }
         }
+    }
+
+    /// Port of `MetadataService.UpdateCumulativeRunTimeTicks`
+    /// (`MediaBrowser.Providers/Manager/MetadataService.cs:451`): a folder whose
+    /// `SupportsCumulativeRunTimeTicks` is true stores the summed runtime of its
+    /// **non-folder recursive children** in its own `RunTimeTicks` column —
+    /// `foreach (child) if (!child.IsFolder) ticks += child.RunTimeTicks ?? 0;`,
+    /// written even when the sum is zero (`Folder.cs:97` makes it false by
+    /// default; `MusicAlbum.cs:54` and `MusicArtist.cs:39` override it to true).
+    ///
+    /// That column is what `DtoService` emits as both `RunTimeTicks`
+    /// (`DtoService.cs:1111`, ungated) and `CumulativeRunTimeTicks`
+    /// (`DtoService.cs:594`), so with it `NULL` an album reported no runtime at
+    /// all while Jellyfin reported the sum of its tracks.
+    ///
+    /// The children come from the base
+    /// `MetadataService.GetChildrenForMetadataUpdates` — `GetRecursiveChildren()`
+    /// over the item hierarchy. `ArtistMetadataService`'s tagged-items override
+    /// for an `IsAccessedByName` artist is NOT ported here: it only has meaning
+    /// once an artist folder is resolved into the library, which is the
+    /// `MusicArtistResolver` work item.
+    ///
+    /// `Playlist` is the third `SupportsCumulativeRunTimeTicks` kind
+    /// (`Playlist.cs:79`); its children are `LinkedChildren`, not scanned
+    /// descendants, so it belongs to the playlist write path rather than this
+    /// scan pass — an open work item, not a skipped one.
+    async fn update_cumulative_run_time_ticks(&self) -> Result<(), ServiceError> {
+        let Some(items) = &self.item_repository else {
+            return Ok(());
+        };
+        for kind in [BaseItemKind::MusicArtist, BaseItemKind::MusicAlbum] {
+            let folders = items
+                .get_item_list(&InternalItemsQuery {
+                    include_item_types: vec![kind],
+                    ..InternalItemsQuery::default()
+                })
+                .await?;
+            for folder in folders {
+                let Ok(id) = Uuid::parse_str(&folder.id) else {
+                    continue;
+                };
+                let children = items
+                    .get_item_list(&InternalItemsQuery {
+                        ancestor_ids: vec![id],
+                        recursive: true,
+                        ..InternalItemsQuery::default()
+                    })
+                    .await?;
+                let ticks: i64 = children
+                    .iter()
+                    .filter(|child| !child.is_folder)
+                    .map(|child| child.run_time_ticks.unwrap_or(0))
+                    .sum();
+                // `if (!folder.RunTimeTicks.HasValue || folder.RunTimeTicks.Value != ticks)`
+                if folder.run_time_ticks == Some(ticks) {
+                    continue;
+                }
+                let mut row = folder;
+                row.run_time_ticks = Some(ticks);
+                self.persistence
+                    .save_items(std::slice::from_ref(&row))
+                    .await?;
+            }
+        }
+        Ok(())
     }
 
     /// The post-scan year pass: reads the distinct `ProductionYear`s across
@@ -4957,12 +5052,38 @@ impl LibraryScanner {
     /// `MusicAlbumResolver`), or a container to walk through — an artist folder
     /// or one of its release subfolders (`albums`, `live`, …).
     ///
-    /// An artist folder is walked, not turned into a row: the browsable
-    /// `MusicArtist` item comes from the by-name materializer, keyed by its
-    /// `ItemValues` id, and emitting a second path-keyed row here would list
-    /// every artist twice (the duplicate-identity trap the person work had to
-    /// unwind). Unifying the two identities is the prerequisite for resolving
-    /// the folder itself — see `brain/plans/PLAN_MUSIC_LIBRARY.md`.
+    /// TODO(work item): port `MusicArtistResolver`
+    /// (`Emby.Server.Implementations/Library/Resolvers/Audio/MusicArtistResolver.cs:54`).
+    /// Today an artist folder is walked, not turned into a row: the browsable
+    /// `MusicArtist` comes from the by-name materializer
+    /// (`item_persistence_service::save_item_values`), so it is parentless —
+    /// which is why `/Artists/{name}` still reports `Path` as the artist's
+    /// METADATA directory where Jellyfin reports the media folder, `CanDelete`
+    /// false where Jellyfin says true (`MusicArtist.cs:85`,
+    /// `CanDelete() => !IsAccessedByName`), no `RecursiveItemCount`, and why
+    /// `/Items?recursive=true&includeItemTypes=MusicArtist` is empty (a
+    /// parentless row has no `TopParentId`, and `scope_to_user_libraries` — a
+    /// faithful `AddUserToQuery` — filters those out; do NOT relax that
+    /// filter, fix the scanner).
+    ///
+    /// The un-defer path: resolve the directory here (music collection type, no
+    /// `MusicArtist`/`MusicAlbum` ancestor, `artist.nfo` shortcut,
+    /// `NamingOptions.ArtistSubfolders`, multi-disc exclusion, contains-an-album
+    /// test), parent the album to it, and suppress the by-name insert when a
+    /// folder-backed row of the same `CleanName` exists — otherwise every artist
+    /// lists twice, since `item_repository::push_by_name_join` joins on
+    /// `CleanName` (that join is ALREADY name-keyed; an older note claiming it
+    /// had to move first is stale). It also needs a migration for databases
+    /// holding `ItemValues`-keyed artist rows, and it changes the user-scoped
+    /// recursive item universe server-wide, so it carries its own perf gate.
+    ///
+    /// Held out of the by-name/cumulative-ticks change deliberately: with the
+    /// artist resolved as a folder its recursive non-folder children become its
+    /// tracks, so `MetadataService.UpdateCumulativeRunTimeTicks` yields
+    /// 60000000 where the 10.11.8 oracle stores 0 — Jellyfin's own value there
+    /// is a first-scan race (its `DateLastRefreshed` shows the artist refreshed
+    /// BEFORE its tracks were probed), so the two must be settled together on a
+    /// freshly scanned pair rather than landing half of it.
     fn plan_music_node(&self, dir: &str, cf: Uuid, naming: &NamingOptions, out: &mut Vec<Planned>) {
         if self.is_music_album(dir, naming, true) {
             self.plan_music_album(dir, cf, naming, out);
@@ -11895,6 +12016,96 @@ mod tests {
         let seasons = by_kind(ferrofin_model::data::BaseItemKind::Season).await;
         assert_eq!(seasons.len(), 1);
         assert_eq!(seasons[0].sort_name.as_deref(), Some("0001"));
+    }
+
+    /// Port check for `MetadataService.UpdateCumulativeRunTimeTicks`: the
+    /// folder kinds whose `SupportsCumulativeRunTimeTicks` is true store the
+    /// summed runtime of their non-folder recursive children — the column both
+    /// `RunTimeTicks` and `CumulativeRunTimeTicks` are emitted from.
+    #[tokio::test]
+    async fn cumulative_run_time_ticks_sums_non_folder_recursive_children() {
+        let db = Database::connect_in_memory().await.unwrap();
+        db.run_migrations().await.unwrap();
+        let persistence: Arc<dyn ferrofin_traits::persistence::ItemPersistenceService> =
+            Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let items = crate::test_support::item_repository_over(db.clone());
+
+        let album = uuid::Uuid::from_u128(0x1001);
+        let artist = uuid::Uuid::from_u128(0x1002);
+        let series = uuid::Uuid::from_u128(0x1003);
+        let row =
+            |id: uuid::Uuid, kind: BaseItemKind, folder: bool, ticks: Option<i64>| BaseItemEntity {
+                id: ferrofin_db::store::guid_to_db(id),
+                type_: crate::item_type_lookup::stored_type_name(kind)
+                    .unwrap_or_default()
+                    .to_owned(),
+                name: Some(format!("{kind:?} {id}")),
+                is_folder: folder,
+                run_time_ticks: ticks,
+                ..BaseItemEntity::default()
+            };
+        let mut rows = vec![
+            row(album, BaseItemKind::MusicAlbum, true, None),
+            // A by-name artist: no children in the hierarchy, so its sum is 0 —
+            // and the C# writes 0 rather than leaving the column NULL.
+            row(artist, BaseItemKind::MusicArtist, true, None),
+            // Not a `SupportsCumulativeRunTimeTicks` kind (`Folder.cs:97`).
+            row(series, BaseItemKind::Series, true, None),
+        ];
+        for i in 0..3u128 {
+            let track = uuid::Uuid::from_u128(0x2000 + i);
+            let mut t = row(track, BaseItemKind::Audio, false, Some(20_000_000));
+            t.parent_id = Some(ferrofin_db::store::guid_to_db(album));
+            rows.push(t);
+        }
+        // A folder child must NOT be counted, only recursed through.
+        let inner = uuid::Uuid::from_u128(0x3001);
+        let mut disc = row(inner, BaseItemKind::Folder, true, Some(999));
+        disc.parent_id = Some(ferrofin_db::store::guid_to_db(album));
+        rows.push(disc);
+        persistence.save_items(&rows).await.unwrap();
+        for i in 0..3u128 {
+            persistence
+                .set_ancestors(uuid::Uuid::from_u128(0x2000 + i), &[album])
+                .await
+                .unwrap();
+        }
+        persistence.set_ancestors(inner, &[album]).await.unwrap();
+
+        let vf: Arc<dyn VirtualFolderManager> = Arc::new(FerrofinVirtualFolderManager::new(
+            std::path::PathBuf::from("/nonexistent"),
+        ));
+        let scanner = LibraryScanner::new(
+            vf,
+            Arc::new(FerrofinFileSystem::new()),
+            Arc::new(FerrofinItemPersistenceService::new(db.clone())),
+        )
+        .with_items(Arc::clone(&items));
+
+        scanner.update_cumulative_run_time_ticks().await.unwrap();
+
+        let ticks = |id: uuid::Uuid| {
+            let items = Arc::clone(&items);
+            async move {
+                items
+                    .retrieve_item(id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .run_time_ticks
+            }
+        };
+        assert_eq!(
+            ticks(album).await,
+            Some(60_000_000),
+            "3 tracks, not the disc folder"
+        );
+        assert_eq!(ticks(artist).await, Some(0), "written as 0, not left NULL");
+        assert_eq!(ticks(series).await, None, "Series does not support it");
+
+        // Idempotent: a second pass finds nothing to change.
+        scanner.update_cumulative_run_time_ticks().await.unwrap();
+        assert_eq!(ticks(album).await, Some(60_000_000));
     }
 
     #[tokio::test]

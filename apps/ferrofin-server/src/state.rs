@@ -635,8 +635,9 @@ pub async fn build_app_state(
         Arc::new(FerrofinApiKeyManager::new(db.clone()));
     let display_preferences: Arc<dyn ferrofin_traits::configuration::DisplayPreferencesManager> =
         Arc::new(FerrofinDisplayPreferencesManager::new(db.clone()));
-    let music: Arc<dyn ferrofin_traits::library::MusicManager> =
-        Arc::new(FerrofinMusicManager::new(Arc::clone(&item_repository)));
+    let music: Arc<dyn ferrofin_traits::library::MusicManager> = Arc::new(
+        FerrofinMusicManager::new(Arc::clone(&item_repository)).with_users(Arc::clone(&users)),
+    );
     let search: Arc<dyn ferrofin_traits::library::SearchManager> =
         Arc::new(FerrofinSearchManager::new(Arc::clone(&item_repository)));
     // Kept concrete so the "Migrate Trickplay Image Location" task can call the
@@ -734,6 +735,18 @@ pub async fn build_app_state(
         id_derivation.clone(),
         paths.year_path(),
     );
+    // The rest of the `CreateItemByName<T>` family (`GetGenre`/`GetMusicGenre`/
+    // `GetStudio`/`GetArtist`): a by-name lookup upstream MATERIALIZES the row
+    // at `{metadata}/<Kind>/{name}` rather than 404-ing. Shared by the scan's
+    // post-pass (which backfills the `Path` on rows the scan itself wrote) and
+    // the library manager's on-demand `/MusicGenres/{name}` resolution.
+    let by_name_store = ferrofin_core::by_name_store::ByNameStore::new(
+        Arc::clone(&item_persistence_service),
+        paths.genre_path(),
+        paths.music_genre_path(),
+        paths.studio_path(),
+        paths.artists_path(),
+    );
     // The `UserRootFolder` provisioner (`GetUserRootFolder()`): the row
     // `Items/Root` resolves to and the parent of every library's
     // `CollectionFolder` (the virtual-folder manager builds its own over the
@@ -752,6 +765,7 @@ pub async fn build_app_state(
     // Materialize a `Year` item per distinct ProductionYear at the end of
     // every scan (needs the item repository wired via `with_music` below).
     .with_years(year_store.clone())
+    .with_by_name_store(by_name_store.clone())
     // OfficialRating → numeric parental score on each scanned row (the
     // Parental Rating sort and max-rating filters read the numeric column).
     .with_localization(Arc::new(LocalizationManager::new(
@@ -835,7 +849,8 @@ pub async fn build_app_state(
         // `Items/Root` creates the root on first use; `/Years/{year}` creates
         // the year on first use — both as Jellyfin does.
         .with_user_root(user_root_store)
-        .with_years(year_store),
+        .with_years(year_store)
+        .with_by_name_store(by_name_store),
     );
     let library: Arc<dyn ferrofin_traits::library::LibraryManager> = library_impl.clone();
     // The library monitor drives refreshes from two change sources: the

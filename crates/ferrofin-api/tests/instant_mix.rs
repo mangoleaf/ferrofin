@@ -282,9 +282,23 @@ impl UserManager for OkUsers {
 struct OkDto;
 
 fn to_dto(item: &BaseItemEntity) -> BaseItemDto {
+    to_dto_with(item, &DtoOptions::default())
+}
+
+/// Projects the row the way the real `DtoService` does for the one field these
+/// tests assert on: `Path` rides only when the caller asked for it. That is what
+/// makes the `fields` plumbing observable end-to-end — the InstantMix handlers
+/// used to hardcode `DtoOptions::default()` (Jellyfin's *parameterless*
+/// constructor, all 47 fields on), so a fields-less request over-populated every
+/// mix item with ~20 fields Jellyfin omits.
+fn to_dto_with(item: &BaseItemEntity, options: &DtoOptions) -> BaseItemDto {
     BaseItemDto {
         id: Uuid::parse_str(&item.id).unwrap_or_else(|_| Uuid::nil()),
         name: item.name.clone(),
+        path: options
+            .contains_field(ferrofin_model::querying::ItemFields::Path)
+            .then(|| item.path.clone())
+            .flatten(),
         ..BaseItemDto::default()
     }
 }
@@ -309,12 +323,12 @@ impl DtoService for OkDto {
     async fn get_base_item_dtos(
         &self,
         items: &[BaseItemEntity],
-        _options: &DtoOptions,
+        options: &DtoOptions,
         _user: Option<&UserEntity>,
         _owner_id: Option<Uuid>,
         _skip_visibility_check: bool,
     ) -> Result<Vec<BaseItemDto>, ServiceError> {
-        Ok(items.iter().map(to_dto).collect())
+        Ok(items.iter().map(|i| to_dto_with(i, options)).collect())
     }
     async fn get_item_by_name_dto(
         &self,
@@ -477,9 +491,22 @@ struct StubMusic;
 
 fn mix() -> Vec<BaseItemEntity> {
     vec![
-        item_entity(Uuid::from_u128(0x31), "Song A"),
-        item_entity(Uuid::from_u128(0x32), "Song B"),
+        with_path(
+            item_entity(Uuid::from_u128(0x31), "Song A"),
+            "/music/a.flac",
+        ),
+        with_path(
+            item_entity(Uuid::from_u128(0x32), "Song B"),
+            "/music/b.flac",
+        ),
     ]
+}
+
+/// Gives a mix row a `Path`, so a projection that ignores the caller's `fields`
+/// leaks it (see [`to_dto_with`]).
+fn with_path(mut item: BaseItemEntity, path: &str) -> BaseItemEntity {
+    item.path = Some(path.to_owned());
+    item
 }
 
 #[async_trait]
@@ -681,4 +708,59 @@ async fn artists_instant_mix_by_id_returns_songs() {
     assert_eq!(status, StatusCode::OK);
     let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).expect("mix");
     assert_eq!(result.items.len(), 2);
+}
+
+/// C# builds the projection with the object initializer
+/// `new DtoOptions { Fields = fields }.AddAdditionalDtoOptions(...)`, so a
+/// request with no `fields=` projects an EMPTY field list. Ferrofin hardcoded
+/// `DtoOptions::default()` — the *parameterless* C# constructor, all fields on —
+/// and every InstantMix item came back with ~20 fields Jellyfin omits.
+#[tokio::test]
+async fn instant_mix_projects_only_the_requested_fields() {
+    let (status, body) = get(&format!("/Items/{SEED_ID}/InstantMix")).await;
+    assert_eq!(status, StatusCode::OK);
+    let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).expect("mix");
+    assert!(
+        result.items.iter().all(|i| i.path.is_none()),
+        "no fields= means no Path: {:?}",
+        result.items
+    );
+
+    let (status, body) = get(&format!("/Items/{SEED_ID}/InstantMix?fields=Path")).await;
+    assert_eq!(status, StatusCode::OK);
+    let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).expect("mix");
+    assert_eq!(
+        result.items[0].path.as_deref(),
+        Some("/music/a.flac"),
+        "fields=Path is honoured"
+    );
+}
+
+/// The same plumbing on the two obsolete `?id=` routes and the genre-name route,
+/// which each build their own options.
+#[tokio::test]
+async fn every_instant_mix_route_honours_fields() {
+    for uri in [
+        format!("/Artists/InstantMix?id={SEED_ID}"),
+        format!("/MusicGenres/InstantMix?id={SEED_ID}"),
+        "/MusicGenres/Jazz/InstantMix".to_owned(),
+        format!("/Songs/{SEED_ID}/InstantMix"),
+        format!("/Albums/{SEED_ID}/InstantMix"),
+        format!("/Playlists/{SEED_ID}/InstantMix"),
+        format!("/Artists/{SEED_ID}/InstantMix"),
+    ] {
+        let (status, body) = get(&uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        let bare: QueryResult<BaseItemDto> = serde_json::from_slice(&body).expect("mix");
+        assert!(bare.items.iter().all(|i| i.path.is_none()), "{uri}: bare");
+
+        let sep = if uri.contains('?') { '&' } else { '?' };
+        let (status, body) = get(&format!("{uri}{sep}fields=Path")).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        let asked: QueryResult<BaseItemDto> = serde_json::from_slice(&body).expect("mix");
+        assert!(
+            asked.items.iter().all(|i| i.path.is_some()),
+            "{uri}: fields=Path"
+        );
+    }
 }
