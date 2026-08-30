@@ -300,11 +300,19 @@ pub trait ProviderManager: Send + Sync {
     /// Backs `GET /Libraries/AvailableOptions`. Defaults to an empty result so
     /// stub/test managers compile unchanged; the concrete provider manager
     /// overrides it to project the compiled-in provider registry.
+    ///
+    /// `is_new_library` is the request's `isNewLibrary` flag: the add-library
+    /// wizard passes `true`, which changes which providers report
+    /// `DefaultEnabled` (C# `IsSaverEnabledByDefault` /
+    /// `IsMetadataFetcherEnabledByDefault` / `IsImageFetcherEnabledByDefault`),
+    /// so a freshly created library does not silently start writing NFO
+    /// sidecars or querying every remote provider.
     async fn get_library_options_info(
         &self,
         item_types: &[String],
+        is_new_library: bool,
     ) -> Result<ferrofin_model::configuration::LibraryOptionsResultDto, ServiceError> {
-        let _ = item_types;
+        let _ = (item_types, is_new_library);
         Ok(ferrofin_model::configuration::LibraryOptionsResultDto::default())
     }
 

@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use ferrofin_db::entities::display_preferences::{
-    DisplayPreferencesEntity, ItemDisplayPreferencesEntity,
+    DisplayPreferencesEntity, HomeSectionEntity, ItemDisplayPreferencesEntity,
 };
 use ferrofin_model::branding::BrandingOptions;
 use ferrofin_model::configuration::{EncodingOptions, ServerConfiguration};
@@ -156,6 +156,27 @@ pub trait DisplayPreferencesManager: Send + Sync {
     async fn update_item_display_preferences(
         &self,
         item_display_preferences: &ItemDisplayPreferencesEntity,
+    ) -> Result<(), ServiceError>;
+
+    /// Lists a display-preferences row's home sections, ordered by `Order`.
+    ///
+    /// The C# manager eager-loads these through EF's
+    /// `.Include(e => e.HomeSections)`; the flat `sqlx` seam loads them
+    /// explicitly instead.
+    async fn list_home_sections(
+        &self,
+        display_preferences_id: i64,
+    ) -> Result<Vec<HomeSectionEntity>, ServiceError>;
+
+    /// Replaces a display-preferences row's home sections.
+    ///
+    /// Mirrors the C# `existingDisplayPreferences.HomeSections.Clear()` +
+    /// re-add that `UpdateDisplayPreferences` flushes: the whole set is
+    /// rewritten, never merged. Each entry is `(order, type discriminant)`.
+    async fn set_home_sections(
+        &self,
+        display_preferences_id: i64,
+        sections: &[(i32, i32)],
     ) -> Result<(), ServiceError>;
 }
 

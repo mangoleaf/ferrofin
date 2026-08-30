@@ -462,7 +462,18 @@ pub struct MediaStream {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub localized_hearing_impaired: Option<String>,
     /// The localized language name.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    ///
+    /// NEVER put on the wire. `LocalizedLanguage` is a post-10.11.8 addition
+    /// (upstream master `MediaStreamRepository.cs:175`); it is absent from
+    /// `contracts/jellyfin-openapi-10.11.8.json`'s `MediaStream`, whose
+    /// `additionalProperties` is `false`, so serializing it makes every body
+    /// carrying a language-tagged stream schema-invalid.
+    ///
+    /// The field stays because [`MediaStream::display_title`] uses it as the
+    /// pre-expanded `eng -> English` form; v10.11.8's `MediaStream.DisplayTitle`
+    /// getter (`MediaStream.cs:270-296`) does that same expansion inline via
+    /// `CultureInfo`, so the resulting `DisplayTitle` matches upstream.
+    #[serde(skip_serializing)]
     pub localized_language: Option<String>,
     /// The NAL length size.
     #[serde(skip_serializing_if = "Option::is_none")]

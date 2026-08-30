@@ -16,8 +16,8 @@
 //! code is in the binary.
 
 use ferrofin_model::configuration::{
-    ImageOption, LibraryOptionInfoDto, LibraryOptionsResultDto, LibraryTypeOptionsDto,
-    MetadataPlugin, MetadataPluginSummary, MetadataPluginType,
+    LibraryOptionInfoDto, LibraryOptionsResultDto, LibraryTypeOptionsDto, MetadataPlugin,
+    MetadataPluginSummary, MetadataPluginType,
 };
 use ferrofin_model::entities::ImageType;
 
@@ -44,8 +44,13 @@ pub mod fetcher_names {
     pub const AUDIODB: &str = "TheAudioDB";
     /// Sidecar/art-dir image discovery.
     pub const LOCAL_IMAGES: &str = "Local Images";
-    /// Cover art extracted from the media file itself.
+    /// Cover art extracted from a VIDEO file itself
+    /// (`MediaBrowser.Providers/MediaInfo/EmbeddedImageProvider.cs:69`).
     pub const EMBEDDED_IMAGES: &str = "Embedded Image Extractor";
+    /// Cover art extracted from an AUDIO file itself — a separate upstream
+    /// provider with its own name
+    /// (`MediaBrowser.Providers/MediaInfo/AudioImageProvider.cs:51`).
+    pub const AUDIO_IMAGES: &str = "Image Extractor";
 
     /// Every built-in fetcher name — the reserved set a dynamically
     /// registered (WASM) provider name must not collide with: a plugin
@@ -61,6 +66,7 @@ pub mod fetcher_names {
         AUDIODB,
         LOCAL_IMAGES,
         EMBEDDED_IMAGES,
+        AUDIO_IMAGES,
     ];
 }
 
@@ -108,17 +114,111 @@ struct Provider {
     default_enabled: bool,
     /// Whether this provider's code is compiled into the build.
     compiled: bool,
+    /// The image types this provider can supply for an item type — the port of
+    /// each provider's `GetSupportedImages(item)`. `None` for providers that
+    /// are not image fetchers.
+    images: Option<fn(&str) -> &'static [ImageType]>,
 }
+
+/// The image types a non-image provider supplies: none.
+const NO_IMAGES: Option<fn(&str) -> &'static [ImageType]> = None;
 
 impl Provider {
     fn applies_to(&self, type_name: &str) -> bool {
         self.types.is_empty() || self.types.contains(&type_name)
     }
-    fn info(&self) -> LibraryOptionInfoDto {
+    /// The provider's `LibraryOptionInfoDto`, with `DefaultEnabled` resolved
+    /// through the C# new-library rules rather than the registry's standing
+    /// default.
+    fn info_for(&self, cap: Cap, type_name: &str, is_new_library: bool) -> LibraryOptionInfoDto {
         LibraryOptionInfoDto {
             name: Some(self.name.to_owned()),
-            default_enabled: self.default_enabled,
+            default_enabled: default_enabled_for(self.name, cap, type_name, is_new_library)
+                .unwrap_or(self.default_enabled),
         }
+    }
+    /// The image types this provider supplies for `type_name`.
+    fn images_for(&self, type_name: &str) -> &'static [ImageType] {
+        self.images.map_or(&[][..], |f| f(type_name))
+    }
+}
+
+/// The `ServerConfiguration` constructor's built-in `MetadataOptions`
+/// blocklist: `MusicVideo` disables "The Open Movie Database" for both metadata
+/// and images, and `MusicAlbum`/`MusicArtist` disable "TheAudioDB" for metadata
+/// (v10.11.8 `ServerConfiguration.cs:20-63`). Everything else is unrestricted.
+///
+/// Returns `None` when nothing in the array applies, leaving the registry
+/// default in place.
+fn default_metadata_options_blocklist(name: &str, cap: Cap, type_name: &str) -> Option<bool> {
+    let eq = |a: &str| name.eq_ignore_ascii_case(a);
+    let type_is = |a: &str| type_name.eq_ignore_ascii_case(a);
+    let blocked = match cap {
+        Cap::MetadataFetcher => {
+            (type_is("MusicVideo") && eq(fetcher_names::OMDB))
+                || ((type_is("MusicAlbum") || type_is("MusicArtist")) && eq(fetcher_names::AUDIODB))
+        }
+        Cap::ImageFetcher => type_is("MusicVideo") && eq(fetcher_names::OMDB),
+        _ => false,
+    };
+    blocked.then_some(false)
+}
+
+/// The `DefaultEnabled` a fetcher/saver reports, ported from
+/// `LibraryController.IsSaverEnabledByDefault` /
+/// `IsMetadataFetcherEnabledByDefault` / `IsImageFetcherEnabledByDefault`
+/// (byte-identical between v10.11.8 and master).
+///
+/// `None` means "the C# helper does not apply to this capability", leaving the
+/// registry default in place.
+///
+/// The non-new-library branch of each helper consults
+/// `MetadataOptions.Disabled*` — a per-server admin blocklist Ferrofin has no
+/// store for — whose `metadataOptions is null || !Contains(name)` shape yields
+/// `true` for an empty store, which is what the registry default already says.
+fn default_enabled_for(
+    name: &str,
+    cap: Cap,
+    type_name: &str,
+    is_new_library: bool,
+) -> Option<bool> {
+    if !is_new_library {
+        // The non-new-library branch of each C# helper reads
+        // `ServerConfiguration.MetadataOptions`, which ships a small BUILT-IN
+        // blocklist in its constructor (v10.11.8
+        // `MediaBrowser.Model/Configuration/ServerConfiguration.cs:20-63`) —
+        // not just admin edits. Those defaults are ported here; Ferrofin has no
+        // admin-editable `Disabled*` store, and for a type the array does not
+        // name, `metadataOptions is null || !Contains(name)` is `true`, which is
+        // what the registry default already says.
+        return default_metadata_options_blocklist(name, cap, type_name);
+    }
+    let eq = |a: &str| name.eq_ignore_ascii_case(a);
+    let type_is = |types: &[&str]| types.iter().any(|t| type_name.eq_ignore_ascii_case(t));
+    match cap {
+        // `isNewLibrary` ⇒ no saver is pre-ticked, so a freshly added library
+        // does not start writing NFO sidecars into the user's media folders.
+        Cap::MetadataSaver => Some(false),
+        Cap::MetadataFetcher => Some(if eq(fetcher_names::TMDB) {
+            !type_is(&["Season", "Episode", "MusicVideo"])
+        } else {
+            eq(fetcher_names::TVDB) || eq(fetcher_names::AUDIODB) || eq(fetcher_names::MUSICBRAINZ)
+        }),
+        Cap::ImageFetcher => Some(if eq(fetcher_names::TMDB) {
+            !type_is(&["Series", "Season", "Episode", "MusicVideo"])
+        } else {
+            // The allowlist's "Image Extractor" is upstream's AudioImageProvider
+            // (`AUDIO_IMAGES`), NOT the video-side "Embedded Image Extractor",
+            // which is deliberately absent — a new library does not pre-tick
+            // frame/cover extraction for video. "Screen Grabber" is upstream's
+            // `VideoImageProvider`, which Ferrofin does not register yet; the
+            // name is kept so the arm stays a faithful transliteration.
+            eq(fetcher_names::TVDB)
+                || eq("Screen Grabber")
+                || eq(fetcher_names::AUDIODB)
+                || eq(fetcher_names::AUDIO_IMAGES)
+        }),
+        _ => None,
     }
 }
 
@@ -144,12 +244,14 @@ fn local_providers() -> Vec<Provider> {
         ],
         default_enabled: true,
         compiled: true,
+        images: NO_IMAGES,
     }]
 }
 
 /// The providers that fetch from an external service.
 fn remote_providers() -> Vec<Provider> {
     let mut provs = metadata_providers();
+    provs.extend(extractor_and_local_providers());
     provs.extend(similarity_providers());
     provs
 }
@@ -165,13 +267,28 @@ fn metadata_providers() -> Vec<Provider> {
             types: &["Movie", "Series", "Season", "Episode", "Person", "BoxSet"],
             default_enabled: true,
             compiled: true,
+            images: Some(tmdb_images),
         },
+        // OMDb's two capabilities cover DIFFERENT types upstream, so they are
+        // registered as two rows: `OmdbItemProvider`/`OmdbEpisodeProvider`
+        // supply metadata for Movie/Series/Episode, while
+        // `OmdbImageProvider.Supports` (v10.11.8 `OmdbImageProvider.cs:75-78`)
+        // is `item is Movie || item is Trailer || item is Episode` — no Series.
         Provider {
-            name: "The Open Movie Database",
-            caps: &[Cap::MetadataFetcher, Cap::ImageFetcher],
+            name: fetcher_names::OMDB,
+            caps: &[Cap::MetadataFetcher],
             types: &["Movie", "Series", "Episode"],
             default_enabled: true,
             compiled: true,
+            images: NO_IMAGES,
+        },
+        Provider {
+            name: fetcher_names::OMDB,
+            caps: &[Cap::ImageFetcher],
+            types: &["Movie", "Trailer", "Episode"],
+            default_enabled: true,
+            compiled: true,
+            images: Some(omdb_images),
         },
         Provider {
             // Optional at runtime (needs an API key/config), like OMDb —
@@ -181,6 +298,7 @@ fn metadata_providers() -> Vec<Provider> {
             types: &["Series", "Season", "Episode"],
             default_enabled: true,
             compiled: true,
+            images: Some(tvdb_images),
         },
         Provider {
             name: fetcher_names::FANART,
@@ -188,13 +306,17 @@ fn metadata_providers() -> Vec<Provider> {
             types: &["Movie", "Series"],
             default_enabled: true,
             compiled: true,
+            images: Some(fanart_images),
         },
         Provider {
             name: fetcher_names::MUSICBRAINZ,
             caps: &[Cap::MetadataFetcher],
-            types: &["MusicArtist", "MusicAlbum", "Audio"],
+            // `MusicBrainzArtistProvider` + `MusicBrainzAlbumProvider` only —
+            // upstream ships no per-track (Audio) MusicBrainz provider.
+            types: &["MusicArtist", "MusicAlbum"],
             default_enabled: true,
             compiled: true,
+            images: NO_IMAGES,
         },
         Provider {
             name: fetcher_names::AUDIODB,
@@ -202,20 +324,34 @@ fn metadata_providers() -> Vec<Provider> {
             types: &["MusicArtist", "MusicAlbum"],
             default_enabled: true,
             compiled: true,
+            images: Some(audiodb_images),
         },
+    ]
+}
+
+/// The image providers that read artwork out of the media file itself —
+/// upstream's `EmbeddedImageProvider` (video) and `AudioImageProvider`
+/// (audio) — plus the remaining non-metadata providers.
+fn extractor_and_local_providers() -> Vec<Provider> {
+    vec![
         Provider {
             name: fetcher_names::EMBEDDED_IMAGES,
             caps: &[Cap::ImageFetcher],
-            types: &[
-                "Movie",
-                "Episode",
-                "MusicVideo",
-                "Video",
-                "Audio",
-                "AudioBook",
-            ],
+            // `EmbeddedImageProvider.Supports` is `item is Video`
+            // (v10.11.8 `EmbeddedImageProvider.cs:230-242`) — audio files are
+            // the separate `Image Extractor` provider below.
+            types: &["Movie", "Episode", "MusicVideo", "Video"],
             default_enabled: true,
             compiled: true,
+            images: Some(embedded_images),
+        },
+        Provider {
+            name: fetcher_names::AUDIO_IMAGES,
+            caps: &[Cap::ImageFetcher],
+            types: &["Audio", "AudioBook"],
+            default_enabled: true,
+            compiled: true,
+            images: Some(audio_extractor_images),
         },
         Provider {
             name: "Open Subtitles",
@@ -223,6 +359,7 @@ fn metadata_providers() -> Vec<Provider> {
             types: &["Movie", "Episode"],
             default_enabled: true,
             compiled: cfg!(feature = "opensubtitles"),
+            images: NO_IMAGES,
         },
         Provider {
             name: "Local Images",
@@ -230,6 +367,7 @@ fn metadata_providers() -> Vec<Provider> {
             types: &[],
             default_enabled: true,
             compiled: true,
+            images: NO_IMAGES,
         },
         Provider {
             // Upstream registers six identically-named local providers (one per
@@ -247,6 +385,7 @@ fn metadata_providers() -> Vec<Provider> {
             ],
             default_enabled: true,
             compiled: true,
+            images: NO_IMAGES,
         },
     ]
 }
@@ -263,6 +402,7 @@ fn similarity_providers() -> Vec<Provider> {
             types: &["Movie", "Series"],
             default_enabled: false,
             compiled: true,
+            images: NO_IMAGES,
         },
         Provider {
             name: "ListenBrainz",
@@ -270,6 +410,7 @@ fn similarity_providers() -> Vec<Provider> {
             types: &["MusicArtist"],
             default_enabled: false,
             compiled: true,
+            images: NO_IMAGES,
         },
         Provider {
             name: "IntroSkipper",
@@ -277,6 +418,7 @@ fn similarity_providers() -> Vec<Provider> {
             types: &["Episode", "Movie"],
             default_enabled: true,
             compiled: true,
+            images: NO_IMAGES,
         },
     ]
 }
@@ -300,45 +442,117 @@ const CANONICAL_TYPES: &[&str] = &[
     "Photo",
 ];
 
-/// The image types a library of `type_name` can carry.
-fn supported_image_types(type_name: &str) -> Vec<ImageType> {
-    use ImageType::{
-        Art, Backdrop, Banner, Box, BoxRear, Disc, Logo, Menu, Primary, Screenshot, Thumb,
-    };
+/// `TmdbMovieImageProvider`/`TmdbSeriesImageProvider`/`TmdbSeasonImageProvider`/
+/// `TmdbEpisodeImageProvider`/`TmdbBoxSetImageProvider`/`TmdbPersonImageProvider`
+/// `GetSupportedImages`, keyed by the item type each one supports.
+fn tmdb_images(type_name: &str) -> &'static [ImageType] {
+    use ImageType::{Backdrop, Logo, Primary, Thumb};
+    const TITLE: &[ImageType] = &[Primary, Backdrop, Logo, Thumb];
+    const BOX_SET: &[ImageType] = &[Primary, Backdrop, Thumb];
+    const PRIMARY_ONLY: &[ImageType] = &[Primary];
     match type_name {
-        "Person" | "MusicArtist" => vec![Primary, Backdrop, Logo, Thumb],
-        "MusicAlbum" | "Audio" => vec![Primary, Backdrop, Logo, Disc],
-        "Photo" => vec![Primary],
-        _ => vec![
-            Primary, Art, Backdrop, Banner, Logo, Thumb, Disc, Box, Screenshot, Menu, BoxRear,
-        ],
+        "Movie" | "Series" => TITLE,
+        "BoxSet" => BOX_SET,
+        "Season" | "Episode" | "Person" => PRIMARY_ONLY,
+        _ => &[],
     }
 }
 
-/// The default per-type image download options (limits/min-widths).
-fn default_image_options(type_name: &str) -> Vec<ImageOption> {
+/// `EmbeddedImageProvider.GetSupportedImages` (v10.11.8
+/// `MediaBrowser.Providers/MediaInfo/EmbeddedImageProvider.cs:76-97`): an
+/// episode yields Primary only, any other `Video` adds Backdrop and Logo, and a
+/// non-video yields nothing.
+fn embedded_images(type_name: &str) -> &'static [ImageType] {
     use ImageType::{Backdrop, Logo, Primary};
-    let mut options = vec![
-        ImageOption {
-            type_: Primary,
-            limit: 1,
-            min_width: 0,
-        },
-        ImageOption {
-            type_: Backdrop,
-            limit: 1,
-            min_width: 1280,
-        },
-    ];
-    // Non-music, non-photo (video-ish) libraries also fetch a logo by default.
-    if !matches!(type_name, "MusicAlbum" | "MusicArtist" | "Audio" | "Photo") {
-        options.push(ImageOption {
-            type_: Logo,
-            limit: 1,
-            min_width: 0,
-        });
+    const EPISODE: &[ImageType] = &[Primary];
+    const VIDEO: &[ImageType] = &[Primary, Backdrop, Logo];
+    match type_name {
+        "Episode" => EPISODE,
+        "Movie" | "MusicVideo" | "Video" => VIDEO,
+        _ => &[],
     }
-    options
+}
+
+/// Constant-list `GetSupportedImages` helpers for the providers whose supported
+/// set does not vary with the item type. Each list is verbatim from the C#
+/// provider — the same values [`crate::provider_manager`] already keeps for the
+/// remote-image search path.
+fn omdb_images(_type_name: &str) -> &'static [ImageType] {
+    &[ImageType::Primary]
+}
+
+/// `AudioImageProvider.GetSupportedImages` (v10.11.8
+/// `MediaBrowser.Providers/MediaInfo/AudioImageProvider.cs:54-57`).
+fn audio_extractor_images(_type_name: &str) -> &'static [ImageType] {
+    &[ImageType::Primary]
+}
+
+/// `Jellyfin.Plugin.Tvdb`'s series/season/episode image providers.
+fn tvdb_images(type_name: &str) -> &'static [ImageType] {
+    use ImageType::{Backdrop, Banner, Primary};
+    const SERIES: &[ImageType] = &[Primary, Banner, Backdrop];
+    const PRIMARY_ONLY: &[ImageType] = &[Primary];
+    match type_name {
+        "Series" => SERIES,
+        "Season" | "Episode" => PRIMARY_ONLY,
+        _ => &[],
+    }
+}
+
+/// fanart.tv's movie/series/artist/album image providers.
+fn fanart_images(type_name: &str) -> &'static [ImageType] {
+    use ImageType::{Art, Backdrop, Banner, Disc, Logo, Primary, Thumb};
+    const MOVIE: &[ImageType] = &[Primary, Thumb, Art, Logo, Disc, Banner, Backdrop];
+    const SERIES: &[ImageType] = &[Primary, Thumb, Art, Logo, Backdrop, Banner];
+    const ARTIST: &[ImageType] = &[Primary, Logo, Art, Banner, Backdrop];
+    const ALBUM: &[ImageType] = &[Primary, Disc];
+    match type_name {
+        "Movie" => MOVIE,
+        "Series" => SERIES,
+        "MusicArtist" => ARTIST,
+        "MusicAlbum" => ALBUM,
+        _ => &[],
+    }
+}
+
+/// TheAudioDB's artist/album image providers.
+fn audiodb_images(type_name: &str) -> &'static [ImageType] {
+    use ImageType::{Backdrop, Banner, Disc, Logo, Primary};
+    const ARTIST: &[ImageType] = &[Primary, Logo, Banner, Backdrop];
+    const ALBUM: &[ImageType] = &[Primary, Disc];
+    match type_name {
+        "MusicArtist" => ARTIST,
+        "MusicAlbum" => ALBUM,
+        _ => &[],
+    }
+}
+
+/// The image types a library of `type_name` can carry: the union of every
+/// compiled image provider's `GetSupportedImages`, in provider-registration
+/// order, deduplicated.
+///
+/// Port of `ProviderManager.AddMetadataPlugins` (v10.11.8
+/// `MediaBrowser.Providers/Manager/ProviderManager.cs:706-714`):
+/// `imageProviders.OfType<IRemoteImageProvider>().SelectMany(GetSupportedImages)`
+/// plus the `IDynamicImageProvider`s, `.Distinct()`. Local image providers
+/// (`ILocalImageProvider`) are deliberately NOT part of that union.
+///
+/// This replaced a hardcoded per-type-name table that advertised `Menu`,
+/// `BoxRear`, `Screenshot` and `Box` for every video type — image types no
+/// provider Ferrofin ships can supply.
+fn supported_image_types(provs: &[Provider], type_name: &str) -> Vec<ImageType> {
+    let mut types: Vec<ImageType> = Vec::new();
+    for provider in provs
+        .iter()
+        .filter(|p| p.compiled && p.caps.contains(&Cap::ImageFetcher) && p.applies_to(type_name))
+    {
+        for image_type in provider.images_for(type_name) {
+            if !types.contains(image_type) {
+                types.push(*image_type);
+            }
+        }
+    }
+    types
 }
 
 /// Assembles the [`LibraryOptionsResultDto`] for a library whose representative
@@ -348,6 +562,7 @@ fn default_image_options(type_name: &str) -> Vec<ImageOption> {
 #[must_use]
 pub fn library_options_info(
     item_types: &[String],
+    is_new_library: bool,
     dynamic_fetchers: &[(String, Vec<String>)],
 ) -> LibraryOptionsResultDto {
     let dynamic_info = |name: &str| LibraryOptionInfoDto {
@@ -359,7 +574,10 @@ pub fn library_options_info(
         provs
             .iter()
             .filter(|p| p.compiled && p.caps.contains(&cap))
-            .map(Provider::info)
+            // The saver/reader lists are not per-type, so the new-library rule
+            // sees the whole request (C# `IsSaverEnabledByDefault(name,
+            // itemTypes, isNewLibrary)` ignores the types when isNewLibrary).
+            .map(|p| p.info_for(cap, "", is_new_library))
             .collect()
     };
     let type_options = item_types
@@ -369,7 +587,7 @@ pub fn library_options_info(
                 provs
                     .iter()
                     .filter(|p| p.compiled && p.caps.contains(&cap) && p.applies_to(type_name))
-                    .map(Provider::info)
+                    .map(|p| p.info_for(cap, type_name, is_new_library))
                     .collect()
             };
             let mut metadata_fetchers = per_type(Cap::MetadataFetcher);
@@ -398,8 +616,11 @@ pub fn library_options_info(
                 metadata_fetchers,
                 image_fetchers,
                 similar_item_providers,
-                supported_image_types: supported_image_types(type_name),
-                default_image_options: default_image_options(type_name),
+                supported_image_types: supported_image_types(&provs, type_name),
+                default_image_options: ferrofin_model::configuration::default_image_options(
+                    type_name,
+                )
+                .to_vec(),
             }
         })
         .collect();
@@ -440,7 +661,7 @@ pub fn all_metadata_plugins() -> Vec<MetadataPluginSummary> {
             Some(MetadataPluginSummary {
                 item_type: Some(type_name.to_owned()),
                 plugins,
-                supported_image_types: supported_image_types(type_name),
+                supported_image_types: supported_image_types(&provs, type_name),
             })
         })
         .collect()
@@ -453,7 +674,7 @@ mod tests {
 
     #[test]
     fn movie_options_expose_real_fetchers_and_savers() {
-        let info = library_options_info(&["Movie".to_owned()], &[]);
+        let info = library_options_info(&["Movie".to_owned()], false, &[]);
         // Nfo is a local reader + saver.
         assert!(
             info.metadata_readers
@@ -494,7 +715,7 @@ mod tests {
 
     #[test]
     fn tmdb_listed_for_series_and_opensubtitles_gated_by_feature() {
-        let info = library_options_info(&["Series".to_owned(), "Episode".to_owned()], &[]);
+        let info = library_options_info(&["Series".to_owned(), "Episode".to_owned()], false, &[]);
         let series = info.type_options.first().expect("series block");
         // TheMovieDb is always wired, so it is always offered for a series.
         assert!(
@@ -509,6 +730,220 @@ mod tests {
             .iter()
             .any(|o| o.name.as_deref() == Some("Open Subtitles"));
         assert_eq!(has_os, cfg!(feature = "opensubtitles"));
+    }
+
+    /// `SupportedImageTypes` is the union of the compiled image providers'
+    /// `GetSupportedImages`, so it can only name types some provider can
+    /// actually supply. It used to be a hardcoded 11-element enum dump that
+    /// claimed Menu/BoxRear/Screenshot/Box for every video type.
+    #[test]
+    fn supported_image_types_come_from_the_providers() {
+        use ferrofin_model::entities::ImageType;
+
+        let info = library_options_info(
+            &[
+                "Movie".to_owned(),
+                "Season".to_owned(),
+                "Episode".to_owned(),
+                "Person".to_owned(),
+            ],
+            false,
+            &[],
+        );
+        let block = |name: &str| {
+            info.type_options
+                .iter()
+                .find(|t| t.type_.as_deref() == Some(name))
+                .unwrap_or_else(|| panic!("{name} block"))
+        };
+
+        for absent in [
+            ImageType::Menu,
+            ImageType::BoxRear,
+            ImageType::Screenshot,
+            ImageType::Box,
+        ] {
+            assert!(
+                !block("Movie").supported_image_types.contains(&absent),
+                "no compiled provider supplies {absent:?}"
+            );
+        }
+        // TMDb leads the registration order, so its list leads the union.
+        assert_eq!(
+            &block("Movie").supported_image_types[..4],
+            &[
+                ImageType::Primary,
+                ImageType::Backdrop,
+                ImageType::Logo,
+                ImageType::Thumb
+            ]
+        );
+        // TmdbSeason/TmdbEpisodeImageProvider both yield Primary only.
+        assert_eq!(
+            block("Season").supported_image_types,
+            vec![ImageType::Primary]
+        );
+        // Episode also has the embedded extractor, which yields Primary there.
+        assert_eq!(
+            block("Episode").supported_image_types,
+            vec![ImageType::Primary]
+        );
+        // Person: TmdbPersonImageProvider only.
+        assert_eq!(
+            block("Person").supported_image_types,
+            vec![ImageType::Primary]
+        );
+    }
+
+    /// `DefaultImageOptions` is the static `TypeOptions.DefaultImageOptions`
+    /// dictionary, entry-for-entry AND in declaration order; a type the
+    /// dictionary does not name gets `[]`, not a guessed Primary/Backdrop pair.
+    #[test]
+    fn default_image_options_are_the_csharp_table() {
+        use ferrofin_model::entities::ImageType;
+
+        let info = library_options_info(
+            &[
+                "Movie".to_owned(),
+                "Season".to_owned(),
+                "Episode".to_owned(),
+                "Person".to_owned(),
+                "Photo".to_owned(),
+            ],
+            false,
+            &[],
+        );
+        let opts = |name: &str| {
+            info.type_options
+                .iter()
+                .find(|t| t.type_.as_deref() == Some(name))
+                .unwrap_or_else(|| panic!("{name} block"))
+                .default_image_options
+                .iter()
+                .map(|o| (o.type_, o.limit, o.min_width))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            opts("Movie"),
+            vec![
+                (ImageType::Backdrop, 1, 1280),
+                (ImageType::Art, 0, 0),
+                (ImageType::Disc, 0, 0),
+                (ImageType::Primary, 1, 0),
+                (ImageType::Banner, 0, 0),
+                (ImageType::Thumb, 1, 0),
+                (ImageType::Logo, 1, 0),
+            ]
+        );
+        assert_eq!(
+            opts("Season"),
+            vec![
+                (ImageType::Backdrop, 0, 1280),
+                (ImageType::Primary, 1, 0),
+                (ImageType::Banner, 0, 0),
+                (ImageType::Thumb, 0, 0),
+            ]
+        );
+        assert_eq!(
+            opts("Episode"),
+            vec![(ImageType::Backdrop, 0, 1280), (ImageType::Primary, 1, 0),]
+        );
+        // Not in the C# dictionary => `defaultImageOptions ?? Array.Empty<…>()`.
+        assert!(opts("Person").is_empty());
+        assert!(opts("Photo").is_empty());
+    }
+
+    /// `isNewLibrary=true` is the add-library wizard's pre-ticked set: no saver,
+    /// and only the allowlisted fetchers.
+    #[test]
+    fn is_new_library_changes_the_default_enabled_set() {
+        let enabled = |info: &ferrofin_model::configuration::LibraryOptionsResultDto,
+                       type_name: &str,
+                       image: bool,
+                       name: &str| {
+            let block = info
+                .type_options
+                .iter()
+                .find(|t| t.type_.as_deref() == Some(type_name))
+                .expect("block");
+            let list = if image {
+                &block.image_fetchers
+            } else {
+                &block.metadata_fetchers
+            };
+            list.iter()
+                .find(|o| o.name.as_deref() == Some(name))
+                .unwrap_or_else(|| panic!("{name} listed"))
+                .default_enabled
+        };
+
+        let existing = library_options_info(
+            &[
+                "Movie".to_owned(),
+                "Series".to_owned(),
+                "Episode".to_owned(),
+            ],
+            false,
+            &[],
+        );
+        let fresh = library_options_info(
+            &[
+                "Movie".to_owned(),
+                "Series".to_owned(),
+                "Episode".to_owned(),
+            ],
+            true,
+            &[],
+        );
+
+        // An existing library pre-ticks everything the built-in
+        // `ServerConfiguration.MetadataOptions` blocklist does not name.
+        assert!(existing.metadata_savers.iter().all(|o| o.default_enabled));
+        assert!(enabled(
+            &existing,
+            "Movie",
+            false,
+            "The Open Movie Database"
+        ));
+
+        // ...and it DOES name three entries, which come back unticked even on an
+        // existing library (v10.11.8 `ServerConfiguration.cs:20-63`).
+        let music = library_options_info(
+            &[
+                "MusicAlbum".to_owned(),
+                "MusicArtist".to_owned(),
+                "MusicVideo".to_owned(),
+            ],
+            false,
+            &[],
+        );
+        assert!(!enabled(&music, "MusicAlbum", false, "TheAudioDB"));
+        assert!(!enabled(&music, "MusicArtist", false, "TheAudioDB"));
+        // TheAudioDB's IMAGE capability is not on the blocklist.
+        assert!(enabled(&music, "MusicAlbum", true, "TheAudioDB"));
+
+        // A new library pre-ticks no saver at all.
+        assert!(fresh.metadata_savers.iter().all(|o| !o.default_enabled));
+        // TheMovieDb: metadata on for Movie/Series, off for Episode.
+        assert!(enabled(&fresh, "Movie", false, "TheMovieDb"));
+        assert!(enabled(&fresh, "Series", false, "TheMovieDb"));
+        assert!(!enabled(&fresh, "Episode", false, "TheMovieDb"));
+        // ...images on for Movie but off for Series and Episode.
+        assert!(enabled(&fresh, "Movie", true, "TheMovieDb"));
+        assert!(!enabled(&fresh, "Series", true, "TheMovieDb"));
+        assert!(!enabled(&fresh, "Episode", true, "TheMovieDb"));
+        // OMDb is not on either allowlist.
+        assert!(!enabled(&fresh, "Movie", false, "The Open Movie Database"));
+        assert!(!enabled(&fresh, "Movie", true, "The Open Movie Database"));
+        // TheTVDB is on both.
+        assert!(enabled(&fresh, "Series", false, "TheTVDB"));
+        assert!(enabled(&fresh, "Series", true, "TheTVDB"));
+        // The VIDEO-side extractor is NOT on the allowlist; the audio-side
+        // "Image Extractor" is.
+        assert!(!enabled(&fresh, "Movie", true, "Embedded Image Extractor"));
+        let fresh_music = library_options_info(&["Audio".to_owned()], true, &[]);
+        assert!(enabled(&fresh_music, "Audio", true, "Image Extractor"));
     }
 
     #[test]

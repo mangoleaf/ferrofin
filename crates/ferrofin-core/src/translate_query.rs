@@ -1311,7 +1311,7 @@ fn orders_by_sort_name_column(by: ItemSortBy, filter: &InternalItemsQuery) -> bo
 /// also what earns C#'s `ThenBy(e.Name)` tiebreaker. Ranking in SQL rather than
 /// after the fact is what makes the `LIMIT` keep the *best* matches instead of
 /// the alphabetically first ones.
-fn append_order_by(qb: &mut QueryBuilder<'_, Sqlite>, filter: &InternalItemsQuery) {
+pub(crate) fn append_order_by(qb: &mut QueryBuilder<'_, Sqlite>, filter: &InternalItemsQuery) {
     let ordered: Vec<&(ItemSortBy, SortOrder)> = filter
         .order_by
         .iter()

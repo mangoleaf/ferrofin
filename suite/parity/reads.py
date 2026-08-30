@@ -88,6 +88,108 @@ def invariant(op, fn):
     return {"op": op, "kind": "invariant", "fn": fn, "method": "property"}
 
 
+# ------------------------------------------------ display-preferences seeding
+#
+# The `usersettings?client=emby` GET only ever sees a VIRGIN auto-vivified row,
+# so it can catch a wrong creation default and nothing else. Everything the POST
+# path normalizes — the skip-length fallbacks, the home-section rebuild with its
+# per-order default substitution, the `landing-*` ViewType strip — is invisible
+# to it. This writes one deterministic DTO to a dedicated client key on BOTH
+# servers before the probe loop, so a second leg can read the result back.
+#
+# The client key is its own (`parityreads`): journeys.py writes `parity`, and
+# nothing orders the two layers.
+DISPLAY_PREFS_CLIENT = "parityreads"
+
+DISPLAY_PREFS_SEED = {
+    "Id": "usersettings",
+    "Client": DISPLAY_PREFS_CLIENT,
+    "SortBy": "SortName",
+    "SortOrder": "Ascending",
+    "RememberIndexing": False,
+    "RememberSorting": False,
+    "ScrollDirection": "Horizontal",
+    "ShowBackdrop": True,
+    "ShowSidebar": False,
+    "PrimaryImageHeight": 250,
+    "PrimaryImageWidth": 250,
+    "CustomPrefs": {
+        # persisted home sections, incl. an unparseable type that must fall back
+        # to `defaults[3]` (ResumeBook) and an order past that 8-entry table.
+        "homesection0": "smalllibrarytiles",
+        "homesection1": "resume",
+        "homesection3": "bogusvalue",
+        "homesection9": "alsobogus",
+        # a valid ViewType survives, an invalid one is stripped
+        "landing-abc": "movies",
+        "landing-bad": "notaviewtype",
+        # empty value => the C# fallback (30000), not the supplied ""
+        "skipForwardLength": "",
+        "enableNextVideoInfoOverlay": "false",
+    },
+}
+
+
+def seed_display_preferences(base, token, ctx):
+    """POSTs [`DISPLAY_PREFS_SEED`]; returns the status so a failure is visible."""
+    return http("POST",
+                f"{base}/DisplayPreferences/usersettings"
+                f"?userId={ctx['u']}&client={DISPLAY_PREFS_CLIENT}",
+                token, json.dumps(DISPLAY_PREFS_SEED))[0]
+
+
+# ------------------------------------------------- by-name ordering + options
+#
+# `parity_diff.diff` aligns arrays by `Name` (ALIGN_KEYS), which is what lets the
+# by-name rows compare at all across two independent instances — but it also
+# makes ORDER invisible. A `sortOrder=Descending` that the server silently
+# dropped diffed clean for exactly that reason. These projections keep the WHOLE
+# body and ADD the ordered name list under a synthetic key, so the ordering
+# becomes a diffable field. They strengthen the comparison; they never narrow it.
+
+def with_item_order(body):
+    out = dict(body)
+    out["_ItemNameOrder"] = [i.get("Name") for i in body.get("Items") or []]
+    return out
+
+
+# Providers Ferrofin compiles in that the lab's stock Jellyfin 10.11.8 does not
+# ship. Verified against that server's own `GET /Plugins`, which lists only
+# AudioDB and MusicBrainz — so these are structurally extra BY DESIGN (see
+# CLAUDE.md "Current scope": every remote provider is always compiled, gated
+# per library; Tier-1a extensions are compiled in too).
+#
+# They are dropped BY NAME from the fetcher lists on both sides. This is
+# deliberately not a `parity_diff.VOLATILE` entry: VOLATILE hides a field
+# everywhere, while this removes four named rows from one endpoint and leaves
+# every other provider — including their DefaultEnabled — fully compared.
+FERROFIN_ONLY_PROVIDERS = {"TheTVDB", "FanArt", "Open Subtitles", "IntroSkipper"}
+
+
+def without_ferrofin_only_providers(body):
+    def strip(lst):
+        return [o for o in lst or [] if o.get("Name") not in FERROFIN_ONLY_PROVIDERS]
+
+    out = dict(body)
+    for key in ("MetadataSavers", "MetadataReaders", "SubtitleFetchers",
+                "LyricFetchers", "MediaSegmentProviders"):
+        out[key] = strip(out.get(key))
+    type_options = []
+    for block in out.get("TypeOptions") or []:
+        b = dict(block)
+        b["MetadataFetchers"] = strip(b.get("MetadataFetchers"))
+        b["ImageFetchers"] = strip(b.get("ImageFetchers"))
+        # SupportedImageTypes is the FLATTENED union of every compiled image
+        # provider's GetSupportedImages, so the removed providers' image types
+        # cannot be un-mixed from it by name. It is compared as-is, and the
+        # residual (Ferrofin lists Art/Disc/Banner that FanArt really can
+        # fetch) is recorded as an accepted divergence in classifications.json
+        # rather than projected away here.
+        type_options.append(b)
+    out["TypeOptions"] = type_options
+    return out
+
+
 # ------------------------------------------------------- /Similar invariants
 #
 # A movie seed's /Similar body cannot diff, for TWO independent reasons, both
@@ -391,7 +493,22 @@ READS = [
     user("GET /Artists", "/Artists?userId={u}"),
     user("GET /Artists/AlbumArtists", "/Artists/AlbumArtists?userId={u}"),
     user("GET /Artists/{name}", "/Artists/{artist}?userId={u}"),
-    user("GET /MusicGenres", "/MusicGenres?userId={u}"),
+    # The by-name list plumbing (order, name range, includeItemTypes scoping) is
+    # shared by /Genres, /Studios, /Artists and /MusicGenres, so one family of
+    # aliases here covers the same bugs on all of them. `with_item_order` makes
+    # the ordering diffable — `diff` aligns arrays by Name, which is what let a
+    # dropped `sortOrder` diff clean.
+    multi("GET /MusicGenres", [
+        ("/MusicGenres?userId={u}", with_item_order),
+        ("/MusicGenres?userId={u}&limit=100", with_item_order),
+        ("/MusicGenres?userId={u}&startIndex=1&limit=5", with_item_order),
+        ("/MusicGenres?userId={u}&sortBy=SortName&sortOrder=Descending", with_item_order),
+        ("/MusicGenres?userId={u}&nameStartsWithOrGreater=J", with_item_order),
+        ("/MusicGenres?userId={u}&nameStartsWithOrGreater=j", with_item_order),
+        ("/MusicGenres?userId={u}&nameLessThan=Jb", with_item_order),
+        ("/MusicGenres?userId={u}&includeItemTypes=Audio", with_item_order),
+        ("/MusicGenres?userId={u}&includeItemTypes=Movie", with_item_order),
+    ]),
     user("GET /MusicGenres/{genreName}", "/MusicGenres/{musicgenre}?userId={u}"),
     # Instant mixes are shuffled: the diff aligns by Name, so the SET of tracks is what is
     # compared (with the whole fixture under `limit`, both sides hold every track).
@@ -403,12 +520,35 @@ READS = [
     user("GET /LiveTv/Channels/{channelId}", "/LiveTv/Channels/{channel}?userId={u}"),
     user("GET /LiveTv/Programs", "/LiveTv/Programs?channelIds={channel}&isAiring=true&userId={u}"),
     user("GET /LiveTv/Programs/Recommended", "/LiveTv/Programs/Recommended?userId={u}&isAiring=true&limit=5"),
+    user("GET /LiveTv/Timers/Defaults", "/LiveTv/Timers/Defaults"),
     user("GET /LiveTv/Info", "/LiveTv/Info"),
     user("GET /LiveTv/TunerHosts/Types", "/LiveTv/TunerHosts/Types"),
     # resolvable-path-param GETs the breadth sweep couldn't fill (needs a real id).
+    # The add-library options. `isNewLibrary` is a DIFFERENT answer, not a hint:
+    # it decides which providers come pre-ticked, so both values are probed.
+    # The projection removes the four providers Ferrofin compiles in that stock
+    # Jellyfin does not ship — by name, and only from this endpoint.
+    multi("GET /Libraries/AvailableOptions", [
+        ("/Libraries/AvailableOptions", without_ferrofin_only_providers),
+        ("/Libraries/AvailableOptions?libraryContentType=movies",
+         without_ferrofin_only_providers),
+        ("/Libraries/AvailableOptions?libraryContentType=tvshows",
+         without_ferrofin_only_providers),
+        ("/Libraries/AvailableOptions?libraryContentType=music",
+         without_ferrofin_only_providers),
+        ("/Libraries/AvailableOptions?libraryContentType=movies&isNewLibrary=true",
+         without_ferrofin_only_providers),
+        ("/Libraries/AvailableOptions?libraryContentType=tvshows&isNewLibrary=true",
+         without_ferrofin_only_providers),
+    ]),
     user("GET /ScheduledTasks/{taskId}", "/ScheduledTasks/{task}"),
-    user("GET /DisplayPreferences/{displayPreferencesId}",
-         "/DisplayPreferences/usersettings?userId={u}&client=emby"),
+    multi("GET /DisplayPreferences/{displayPreferencesId}", [
+        # leg 1: the virgin auto-vivified row (catches a wrong creation default).
+        "/DisplayPreferences/usersettings?userId={u}&client=emby",
+        # leg 2: read back after `seed_display_preferences` wrote the same DTO to
+        # both servers — this is what covers the POST normalization.
+        "/DisplayPreferences/usersettings?userId={u}&client=" + DISPLAY_PREFS_CLIENT,
+    ]),
     user("GET /Devices/Info", "/Devices/Info?id={device}"),
     # GET /Devices/Options is exercised in the write journey (needs a device that has options set).
     # Host-filesystem browsing: both containers mount the identical fixture tree at /media/synth,
@@ -494,6 +634,15 @@ def run(ferrofin_url, jellyfin_url):
     hc["server"], jc["server"] = "ferrofin", "jellyfin"
 
     pairs = correlate(path_id_map(ferrofin_url, ht, hu), path_id_map(jellyfin_url, jt, ju))
+
+    # Write-then-read-back setup for the DisplayPreferences row (see
+    # `seed_display_preferences`). Both servers get the identical body.
+    hseed = seed_display_preferences(ferrofin_url, ht, hc)
+    jseed = seed_display_preferences(jellyfin_url, jt, jc)
+    if hseed != jseed:
+        print(f"  display-preferences seed status differs: H={hseed} J={jseed}",
+              file=sys.stderr)
+
     rows = {}
 
     def record(op, clean, total, buckets, method="body-diff"):

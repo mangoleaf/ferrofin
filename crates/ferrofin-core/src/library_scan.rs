@@ -2295,6 +2295,12 @@ impl LibraryScanner {
         let source = &probed.media_source;
         entity.run_time_ticks = source.run_time_ticks.or(entity.run_time_ticks);
         entity.size = source.size.or(entity.size);
+        // Both probers persist the container bitrate onto the item row
+        // (`FFProbeVideoInfo.cs:216` / `AudioFileProber.cs:133`, both
+        // `TotalBitrate = mediaInfo.Bitrate`). `BaseItem.GetVersionInfo` seeds
+        // the media source from it, and `ItemSortBy.VideoBitRate` orders on it,
+        // so leaving it NULL silently breaks that sort.
+        entity.total_bitrate = source.bitrate.map(i64::from).or(entity.total_bitrate);
         // The item row's own Width/Height are the PRIMARY VIDEO STREAM's, written
         // by the video prober on every probe (`FFProbeVideoInfo.Fetch`,
         // FFProbeVideoInfo.cs:265-266: `video.Height = videoStream?.Height ?? 0;

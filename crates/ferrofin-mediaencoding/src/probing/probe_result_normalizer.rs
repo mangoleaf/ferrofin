@@ -275,12 +275,16 @@ impl<L: LocalizationManager> ProbeResultNormalizer<L> {
         format_info: Option<&MediaFormatInfo>,
         frames: &[MediaFrameInfo],
     ) -> Option<MediaStream> {
+        // Upstream builds this literal with `Level` and `IsAVC` set on EVERY
+        // stream type (v10.11.8 `ProbeResultNormalizer.cs:705-716`); both come
+        // from non-nullable C# fields, so audio and subtitle streams carry
+        // `0`/`false` rather than null. `Width`/`Height` are deliberately NOT
+        // set here — upstream assigns them only in the subtitle and video arms.
         let mut stream = MediaStream {
             codec: stream_info.codec_name.clone(),
             profile: stream_info.profile.clone(),
-            width: stream_info.width,
-            height: stream_info.height,
-            level: stream_info.level.map(f64::from),
+            level: Some(f64::from(stream_info.level)),
+            is_avc: Some(stream_info.is_avc),
             index: stream_info.index,
             pixel_format: stream_info.pixel_format.clone(),
             nal_length_size: stream_info.nal_length_size.clone(),
@@ -289,8 +293,7 @@ impl<L: LocalizationManager> ProbeResultNormalizer<L> {
             ..Default::default()
         };
 
-        // Filter out junk codec tags. NOTE: `codec_tag_string` binds to the
-        // typo'd JSON key upstream, so this is effectively always `None`.
+        // Filter out junk codec tags (v10.11.8 `ProbeResultNormalizer.cs:719-723`).
         if let Some(tag) = stream_info.codec_tag_string.as_deref()
             && !tag.trim().is_empty()
             && !tag.to_ascii_lowercase().contains("[0]")
@@ -358,6 +361,13 @@ impl<L: LocalizationManager> ProbeResultNormalizer<L> {
                         Some(self.localization.get_language_display_name(lang));
                 }
 
+                // Graphical subtitles may carry width/height; upstream assigns
+                // them unconditionally from non-nullable ints, so a text
+                // subtitle reports `0` rather than null
+                // (v10.11.8 `ProbeResultNormalizer.cs:775-777`).
+                stream.width = Some(stream_info.width);
+                stream.height = Some(stream_info.height);
+
                 if stream.title.as_deref().is_none_or(str::is_empty)
                     && let Some(handler) = flat_tags
                         .as_ref()
@@ -368,7 +378,6 @@ impl<L: LocalizationManager> ProbeResultNormalizer<L> {
                 }
             }
             Some(CodecType::Video) => {
-                stream.is_avc = stream_info.is_avc;
                 stream.average_frame_rate =
                     get_frame_rate(stream_info.average_frame_rate.as_deref());
                 stream.real_frame_rate = get_frame_rate(stream_info.r_frame_rate.as_deref());
@@ -399,6 +408,9 @@ impl<L: LocalizationManager> ProbeResultNormalizer<L> {
                     stream.stream_type = MediaStreamType::Video;
                 }
 
+                // v10.11.8 `ProbeResultNormalizer.cs:822-824`.
+                stream.width = Some(stream_info.width);
+                stream.height = Some(stream_info.height);
                 stream.aspect_ratio = get_aspect_ratio(stream_info);
 
                 if stream_info.bits_per_sample > 0 {
@@ -991,8 +1003,8 @@ fn get_aspect_ratio(info: &MediaStreamInfo) -> Option<String> {
         && height > 0;
 
     if !parsed {
-        width = info.width.unwrap_or(0).into();
-        height = info.height.unwrap_or(0).into();
+        width = i64::from(info.width);
+        height = i64::from(info.height);
     }
 
     if width > 0 && height > 0 {

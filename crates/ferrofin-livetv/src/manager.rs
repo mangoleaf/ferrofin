@@ -1220,6 +1220,10 @@ impl LiveTvManager for FerrofinLiveTvManager {
             options.pre_padding_seconds,
             options.post_padding_seconds,
         );
+        // `LiveTvDtoService.GetSeriesTimerInfoDto` sets `ServerId =
+        // _appHost.SystemId` on every timer DTO it builds; a strict client that
+        // expects a non-null there crashes without it.
+        defaults.base.server_id = Some(self.server_id.clone());
         let Some(program_id) = program_id else {
             return Ok(defaults);
         };
@@ -3820,13 +3824,22 @@ mod tests {
             defaults.base.start_date,
             parse_dt(&program.start_date).unwrap()
         );
-        // No id: these are defaults for a timer that does not exist yet.
-        assert_eq!(defaults.base.id, None);
+        // `LiveTvManager.GetNewTimerDefaultsInternal` nulls the SeriesTimerInfo's
+        // EXTERNAL id, but `LiveTvDtoService.GetSeriesTimerInfoDto` then derives
+        // the DTO id from it unconditionally — so the id is a fixed hash of
+        // "emby" + "" + "4", not null.
+        assert_eq!(
+            defaults.base.id.as_deref(),
+            Some("eb075d6a62e2edc6b764a304633d33c0")
+        );
+        // ...and `ServerId` is set on every timer DTO the service builds.
+        assert!(defaults.base.server_id.is_some());
 
         // Without a programme, just the standing defaults.
         let bare = mgr.get_new_timer_defaults(None).await.expect("defaults");
         assert_eq!(bare.base.name, None);
         assert_eq!(bare.base.program_id, None);
+        assert!(bare.base.server_id.is_some());
     }
 
     #[tokio::test]

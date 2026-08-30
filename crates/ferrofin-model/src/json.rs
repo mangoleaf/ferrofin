@@ -140,8 +140,26 @@ pub mod guid {
 
 /// `JsonDateTimeConverter` — `DateTime<Utc>` fields.
 pub mod datetime {
-    use chrono::{DateTime, Utc};
+    use chrono::{DateTime, NaiveDate, Utc};
     use serde::{Deserialize, Deserializer, Serializer};
+
+    /// C# `DateTime.MinValue` — `0001-01-01T00:00:00Z`, what an unassigned
+    /// .NET `DateTime` serializes to (`0001-01-01T00:00:00.0000000Z`).
+    ///
+    /// This is NOT [`chrono::DateTime::<Utc>::MIN_UTC`], which is year
+    /// -262144; that constant would produce a date no Jellyfin client has ever
+    /// seen.
+    ///
+    /// # Panics
+    ///
+    /// Never: `0001-01-01T00:00:00` is a valid date.
+    #[must_use]
+    pub fn dotnet_min() -> DateTime<Utc> {
+        NaiveDate::from_ymd_opt(1, 1, 1)
+            .and_then(|d| d.and_hms_opt(0, 0, 0))
+            .expect("0001-01-01T00:00:00 is a valid date")
+            .and_utc()
+    }
 
     /// `yyyy-MM-ddTHH:mm:ss.<ticks>Z`: all seven tick digits when the millisecond
     /// component is zero (`value.Millisecond == 0`), otherwise trailing zeros

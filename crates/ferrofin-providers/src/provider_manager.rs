@@ -2275,9 +2275,11 @@ impl ProviderManager for LocalProviderManager {
     async fn get_library_options_info(
         &self,
         item_types: &[String],
+        is_new_library: bool,
     ) -> Result<ferrofin_model::configuration::LibraryOptionsResultDto, ServiceError> {
         Ok(crate::library_options::library_options_info(
             item_types,
+            is_new_library,
             &self.dynamic_fetchers,
         ))
     }

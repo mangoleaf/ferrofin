@@ -748,7 +748,7 @@ fn parse_csv_i32(raw: Option<&str>) -> Result<Vec<i32>, ApiError> {
 /// Mirrors `RequestHelpers.GetOrderBy`: each sort column is paired with the
 /// order at the same index, falling back to the last supplied order (then
 /// ascending) when fewer orders than columns are given.
-fn parse_order_by(
+pub(crate) fn parse_order_by(
     sort_by: Option<&str>,
     sort_order: Option<&str>,
 ) -> Vec<(
