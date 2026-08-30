@@ -465,6 +465,100 @@ fn get_media_info_video_with_single_frame_mjpeg_success() {
 
     let mjpeg = &res.media_source.media_streams[2];
     assert_eq!(mjpeg.codec.as_deref(), Some("mjpeg"));
+    // Every stream in this fixture carries the junk tag `[0][0][0][0]`, which
+    // `GetMediaStream` filters out (v10.11.8 `ProbeResultNormalizer.cs:719-723`),
+    // so the mjpeg stream has no codec tag to discriminate on and stays an
+    // embedded image.
+    assert_eq!(mjpeg.codec_tag, None);
+    assert_eq!(mjpeg.stream_type, MediaStreamType::EmbeddedImage);
+
+    // `Level`/`IsAVC` come from non-nullable C# fields assigned on EVERY stream,
+    // so the audio stream reports `0`/`false` rather than null.
+    let audio = &res.media_source.media_streams[1];
+    assert_eq!(audio.stream_type, MediaStreamType::Audio);
+    assert_eq!(audio.level, Some(0.0));
+    assert_eq!(audio.is_avc, Some(false));
+    // Width/Height are assigned only in the subtitle and video arms upstream,
+    // so an audio stream leaves them null.
+    assert_eq!(audio.width, None);
+    assert_eq!(audio.height, None);
+}
+
+/// An `mjpeg` video stream carrying a REAL codec tag is a video stream, not an
+/// embedded image — `GetMediaStream`'s only discriminator between the two
+/// (v10.11.8 `ProbeResultNormalizer.cs:806-817`). This is unreachable if the
+/// `codec_tag_string` key fails to deserialize.
+#[test]
+fn get_media_stream_mjpeg_with_a_real_codec_tag_is_video() {
+    let json = r#"{"streams":[
+        {"index":0,"codec_name":"mjpeg","codec_type":"video","codec_tag_string":"MJPG",
+         "width":1920,"height":1080},
+        {"index":1,"codec_name":"mjpeg","codec_type":"video","codec_tag_string":"[0][0][0][0]",
+         "width":600,"height":400}
+    ],"format":{}}"#;
+    let parsed: InternalMediaInfoResult = serde_json::from_str(json).expect("probe json parses");
+    let res = normalizer().get_media_info(
+        parsed,
+        Some(VideoType::VideoFile),
+        false,
+        "Test Data/Probing/mjpeg.mkv",
+        MediaProtocol::File,
+    );
+
+    let tagged = &res.media_source.media_streams[0];
+    assert_eq!(tagged.codec_tag.as_deref(), Some("MJPG"));
+    assert_eq!(tagged.stream_type, MediaStreamType::Video);
+
+    let junk = &res.media_source.media_streams[1];
+    assert_eq!(junk.codec_tag, None);
+    assert_eq!(junk.stream_type, MediaStreamType::EmbeddedImage);
+}
+
+/// A text subtitle has no ffprobe `width`/`height`, but upstream assigns them
+/// from non-nullable `int`s, so the wire carries `0` and not null
+/// (v10.11.8 `ProbeResultNormalizer.cs:775-777`).
+#[test]
+fn get_media_stream_text_subtitle_reports_zero_width_and_height() {
+    let json = r#"{"streams":[
+        {"index":0,"codec_name":"subrip","codec_type":"subtitle"}
+    ],"format":{}}"#;
+    let parsed: InternalMediaInfoResult = serde_json::from_str(json).expect("probe json parses");
+    let res = normalizer().get_media_info(
+        parsed,
+        Some(VideoType::VideoFile),
+        false,
+        "Test Data/Probing/subs.mkv",
+        MediaProtocol::File,
+    );
+
+    let sub = &res.media_source.media_streams[0];
+    assert_eq!(sub.stream_type, MediaStreamType::Subtitle);
+    assert_eq!(sub.width, Some(0));
+    assert_eq!(sub.height, Some(0));
+    assert_eq!(sub.level, Some(0.0));
+    assert_eq!(sub.is_avc, Some(false));
+}
+
+/// `GetMediaAttachment` has no junk-tag filter (v10.11.8
+/// `ProbeResultNormalizer.cs:673-676`), so an attachment keeps `[0][0][0][0]`.
+#[test]
+fn get_media_attachment_keeps_the_junk_codec_tag() {
+    let json = r#"{"streams":[
+        {"index":0,"codec_name":"ttf","codec_type":"attachment",
+         "codec_tag_string":"[0][0][0][0]","tags":{"filename":"font.ttf"}}
+    ],"format":{}}"#;
+    let parsed: InternalMediaInfoResult = serde_json::from_str(json).expect("probe json parses");
+    let res = normalizer().get_media_info(
+        parsed,
+        Some(VideoType::VideoFile),
+        false,
+        "Test Data/Probing/attach.mkv",
+        MediaProtocol::File,
+    );
+
+    let att = &res.media_source.media_attachments[0];
+    assert_eq!(att.codec.as_deref(), Some("ttf"));
+    assert_eq!(att.codec_tag.as_deref(), Some("[0][0][0][0]"));
 }
 
 #[test]

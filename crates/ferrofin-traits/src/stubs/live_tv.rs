@@ -101,6 +101,28 @@ pub const TAIL_SEEK_BYTES: i64 = 20_000;
 /// timer and channel carries as `ServiceName`.
 pub const LIVE_TV_SERVICE_NAME: &str = "Emby";
 
+/// The salt every internal Live TV id derivation appends before hashing.
+///
+/// Port of `LiveTvDtoService.InternalVersionNumber` (v10.11.8
+/// `LiveTvDtoService.cs:28`).
+pub const LIVE_TV_INTERNAL_VERSION_NUMBER: &str = "4";
+
+/// The internal id `LiveTvDtoService` derives for a series timer with the given
+/// external id.
+///
+/// Port of `LiveTvDtoService.GetInternalSeriesTimerId` (v10.11.8
+/// `LiveTvDtoService.cs:417-421`):
+/// `(ServiceName + externalId + InternalVersionNumber).ToLowerInvariant().GetMD5()`.
+#[must_use]
+pub fn internal_series_timer_id(external_id: &str) -> String {
+    ferrofin_common::extensions::get_md5(
+        &format!("{LIVE_TV_SERVICE_NAME}{external_id}{LIVE_TV_INTERNAL_VERSION_NUMBER}")
+            .to_lowercase(),
+    )
+    .simple()
+    .to_string()
+}
+
 /// The defaults a new timer starts from, before any programme is applied.
 ///
 /// Port of `DefaultLiveTvService.GetNewTimerDefaultsAsync` +
@@ -116,14 +138,23 @@ pub fn new_timer_defaults(
     let record_new_only = true;
     SeriesTimerInfoDto {
         base: ferrofin_model::live_tv::BaseTimerInfoDto {
-            // `LiveTvManager.GetNewTimerDefaultsInternal` nulls the id: these
-            // are defaults for a timer that does not exist yet.
-            id: None,
+            // `LiveTvManager.GetNewTimerDefaultsInternal` nulls
+            // `SeriesTimerInfo.Id`, but `LiveTvDtoService.GetSeriesTimerInfoDto`
+            // then derives the DTO id from it unconditionally
+            // (`GetInternalSeriesTimerId(info.Id).ToString("N")`), so the empty
+            // external id hashes to one fixed value — not null, and not
+            // per-instance.
+            id: Some(internal_series_timer_id("")),
             type_: Some("SeriesTimer".to_owned()),
             service_name: Some(LIVE_TV_SERVICE_NAME.to_owned()),
             pre_padding_seconds: pre_padding_seconds.max(0),
             post_padding_seconds: post_padding_seconds.max(0),
             keep_until: KeepUntil::UntilDeleted,
+            // C# never assigns Start/End on the defaults path, so the CLR
+            // `DateTime` default is what serializes — `0001-01-01T00:00:00Z`,
+            // NOT the Unix epoch that `chrono`'s `Default` would give.
+            start_date: ferrofin_model::json::datetime::dotnet_min(),
+            end_date: ferrofin_model::json::datetime::dotnet_min(),
             ..ferrofin_model::live_tv::BaseTimerInfoDto::default()
         },
         record_any_channel: false,
@@ -531,3 +562,36 @@ pub trait LiveTvManager: Send + Sync {
 }
 
 fn _assert_object_safe_live_tv_manager(_: &dyn LiveTvManager) {}
+
+#[cfg(test)]
+mod new_timer_defaults_tests {
+    use super::{internal_series_timer_id, new_timer_defaults};
+
+    /// `GET /LiveTv/Timers/Defaults` serializes the C# defaults verbatim. The
+    /// two values that used to diverge are asserted on the WIRE, because both
+    /// are serialization artifacts: `Start/EndDate` come from an unassigned
+    /// .NET `DateTime` (`0001-01-01`, not the Unix epoch), and `Id` is derived
+    /// by `LiveTvDtoService` from the nulled external id rather than left null.
+    #[test]
+    fn serializes_the_dotnet_defaults() {
+        let v = serde_json::to_value(new_timer_defaults(0, 0)).expect("serializes");
+        assert_eq!(v["StartDate"], "0001-01-01T00:00:00.0000000Z");
+        assert_eq!(v["EndDate"], "0001-01-01T00:00:00.0000000Z");
+        assert_eq!(v["Id"], "eb075d6a62e2edc6b764a304633d33c0");
+        assert_eq!(v["Type"], "SeriesTimer");
+        assert_eq!(v["ServiceName"], "Emby");
+        assert_eq!(v["DayPattern"], "Daily");
+        assert_eq!(v["Days"].as_array().expect("Days is an array").len(), 7);
+        assert_eq!(v["KeepUntil"], "UntilDeleted");
+    }
+
+    /// `MD5("emby4")` over UTF-16LE, read as a .NET `Guid` — the value the live
+    /// Jellyfin 10.11.8 server returns for this endpoint.
+    #[test]
+    fn internal_series_timer_id_matches_the_csharp_derivation() {
+        assert_eq!(
+            internal_series_timer_id(""),
+            "eb075d6a62e2edc6b764a304633d33c0"
+        );
+    }
+}

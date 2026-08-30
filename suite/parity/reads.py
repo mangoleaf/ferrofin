@@ -16,6 +16,7 @@ Run via sweep.sh (idempotently connects to the already-up servers), or directly:
 Offline self-check:
   parity/reads.py --check
 """
+import collections
 import datetime
 import json
 import os
@@ -25,7 +26,8 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from sweep import http, get_json, bring_up          # noqa: E402
-from parity_diff import diff_counts                  # noqa: E402
+from parity_diff import diff_stats                  # noqa: E402
+import verification                                  # noqa: E402
 
 CORRELATE_LIMIT = 5   # item-scoped endpoints are exercised against this many Path-aligned items
 
@@ -92,6 +94,108 @@ def invariant(op, fn):
     property row into the body-diff count — that would redefine the number
     instead of earning it."""
     return {"op": op, "kind": "invariant", "fn": fn, "method": "property"}
+
+
+# ------------------------------------------------ display-preferences seeding
+#
+# The `usersettings?client=emby` GET only ever sees a VIRGIN auto-vivified row,
+# so it can catch a wrong creation default and nothing else. Everything the POST
+# path normalizes — the skip-length fallbacks, the home-section rebuild with its
+# per-order default substitution, the `landing-*` ViewType strip — is invisible
+# to it. This writes one deterministic DTO to a dedicated client key on BOTH
+# servers before the probe loop, so a second leg can read the result back.
+#
+# The client key is its own (`parityreads`): journeys.py writes `parity`, and
+# nothing orders the two layers.
+DISPLAY_PREFS_CLIENT = "parityreads"
+
+DISPLAY_PREFS_SEED = {
+    "Id": "usersettings",
+    "Client": DISPLAY_PREFS_CLIENT,
+    "SortBy": "SortName",
+    "SortOrder": "Ascending",
+    "RememberIndexing": False,
+    "RememberSorting": False,
+    "ScrollDirection": "Horizontal",
+    "ShowBackdrop": True,
+    "ShowSidebar": False,
+    "PrimaryImageHeight": 250,
+    "PrimaryImageWidth": 250,
+    "CustomPrefs": {
+        # persisted home sections, incl. an unparseable type that must fall back
+        # to `defaults[3]` (ResumeBook) and an order past that 8-entry table.
+        "homesection0": "smalllibrarytiles",
+        "homesection1": "resume",
+        "homesection3": "bogusvalue",
+        "homesection9": "alsobogus",
+        # a valid ViewType survives, an invalid one is stripped
+        "landing-abc": "movies",
+        "landing-bad": "notaviewtype",
+        # empty value => the C# fallback (30000), not the supplied ""
+        "skipForwardLength": "",
+        "enableNextVideoInfoOverlay": "false",
+    },
+}
+
+
+def seed_display_preferences(base, token, ctx):
+    """POSTs [`DISPLAY_PREFS_SEED`]; returns the status so a failure is visible."""
+    return http("POST",
+                f"{base}/DisplayPreferences/usersettings"
+                f"?userId={ctx['u']}&client={DISPLAY_PREFS_CLIENT}",
+                token, json.dumps(DISPLAY_PREFS_SEED))[0]
+
+
+# ------------------------------------------------- by-name ordering + options
+#
+# `parity_diff.diff` aligns arrays by `Name` (ALIGN_KEYS), which is what lets the
+# by-name rows compare at all across two independent instances — but it also
+# makes ORDER invisible. A `sortOrder=Descending` that the server silently
+# dropped diffed clean for exactly that reason. These projections keep the WHOLE
+# body and ADD the ordered name list under a synthetic key, so the ordering
+# becomes a diffable field. They strengthen the comparison; they never narrow it.
+
+def with_item_order(body):
+    out = dict(body)
+    out["_ItemNameOrder"] = [i.get("Name") for i in body.get("Items") or []]
+    return out
+
+
+# Providers Ferrofin compiles in that the lab's stock Jellyfin 10.11.8 does not
+# ship. Verified against that server's own `GET /Plugins`, which lists only
+# AudioDB and MusicBrainz — so these are structurally extra BY DESIGN (see
+# CLAUDE.md "Current scope": every remote provider is always compiled, gated
+# per library; Tier-1a extensions are compiled in too).
+#
+# They are dropped BY NAME from the fetcher lists on both sides. This is
+# deliberately not a `parity_diff.VOLATILE` entry: VOLATILE hides a field
+# everywhere, while this removes four named rows from one endpoint and leaves
+# every other provider — including their DefaultEnabled — fully compared.
+FERROFIN_ONLY_PROVIDERS = {"TheTVDB", "FanArt", "Open Subtitles", "IntroSkipper"}
+
+
+def without_ferrofin_only_providers(body):
+    def strip(lst):
+        return [o for o in lst or [] if o.get("Name") not in FERROFIN_ONLY_PROVIDERS]
+
+    out = dict(body)
+    for key in ("MetadataSavers", "MetadataReaders", "SubtitleFetchers",
+                "LyricFetchers", "MediaSegmentProviders"):
+        out[key] = strip(out.get(key))
+    type_options = []
+    for block in out.get("TypeOptions") or []:
+        b = dict(block)
+        b["MetadataFetchers"] = strip(b.get("MetadataFetchers"))
+        b["ImageFetchers"] = strip(b.get("ImageFetchers"))
+        # SupportedImageTypes is the FLATTENED union of every compiled image
+        # provider's GetSupportedImages, so the removed providers' image types
+        # cannot be un-mixed from it by name. It is compared as-is, and the
+        # residual (Ferrofin lists Art/Disc/Banner that FanArt really can
+        # fetch) is recorded as an accepted divergence in classifications.json
+        # rather than projected away here.
+        type_options.append(b)
+    out["TypeOptions"] = type_options
+    return out
 
 
 # ------------------------------------------------------- /Similar invariants
@@ -513,7 +617,22 @@ READS = [
     user("GET /Artists", "/Artists?userId={u}"),
     user("GET /Artists/AlbumArtists", "/Artists/AlbumArtists?userId={u}"),
     user("GET /Artists/{name}", "/Artists/{artist}?userId={u}"),
-    user("GET /MusicGenres", "/MusicGenres?userId={u}"),
+    # The by-name list plumbing (order, name range, includeItemTypes scoping) is
+    # shared by /Genres, /Studios, /Artists and /MusicGenres, so one family of
+    # aliases here covers the same bugs on all of them. `with_item_order` makes
+    # the ordering diffable — `diff` aligns arrays by Name, which is what let a
+    # dropped `sortOrder` diff clean.
+    multi("GET /MusicGenres", [
+        ("/MusicGenres?userId={u}", with_item_order),
+        ("/MusicGenres?userId={u}&limit=100", with_item_order),
+        ("/MusicGenres?userId={u}&startIndex=1&limit=5", with_item_order),
+        ("/MusicGenres?userId={u}&sortBy=SortName&sortOrder=Descending", with_item_order),
+        ("/MusicGenres?userId={u}&nameStartsWithOrGreater=J", with_item_order),
+        ("/MusicGenres?userId={u}&nameStartsWithOrGreater=j", with_item_order),
+        ("/MusicGenres?userId={u}&nameLessThan=Jb", with_item_order),
+        ("/MusicGenres?userId={u}&includeItemTypes=Audio", with_item_order),
+        ("/MusicGenres?userId={u}&includeItemTypes=Movie", with_item_order),
+    ]),
     user("GET /MusicGenres/{genreName}", "/MusicGenres/{musicgenre}?userId={u}"),
     # Instant mixes are shuffled: the diff aligns by Name, so the SET of tracks is what is
     # compared (with the whole fixture under `limit`, both sides hold every track).
@@ -525,6 +644,7 @@ READS = [
     user("GET /LiveTv/Channels/{channelId}", "/LiveTv/Channels/{channel}?userId={u}"),
     user("GET /LiveTv/Programs", "/LiveTv/Programs?channelIds={channel}&isAiring=true&userId={u}"),
     user("GET /LiveTv/Programs/Recommended", "/LiveTv/Programs/Recommended?userId={u}&isAiring=true&limit=5"),
+    user("GET /LiveTv/Timers/Defaults", "/LiveTv/Timers/Defaults"),
     # `EnabledUsers` is `user.Id.ToString("N")` for every user who may use Live
     # TV (`LiveTvManager.GetLiveTvInfo`). The list's LENGTH and MEMBERSHIP are
     # exactly what a regression in that filter — a dropped
@@ -551,9 +671,31 @@ READS = [
              c["users_by_id"].get(i, i) for i in (b.get("EnabledUsers") or []))}),
     user("GET /LiveTv/TunerHosts/Types", "/LiveTv/TunerHosts/Types"),
     # resolvable-path-param GETs the breadth sweep couldn't fill (needs a real id).
+    # The add-library options. `isNewLibrary` is a DIFFERENT answer, not a hint:
+    # it decides which providers come pre-ticked, so both values are probed.
+    # The projection removes the four providers Ferrofin compiles in that stock
+    # Jellyfin does not ship — by name, and only from this endpoint.
+    multi("GET /Libraries/AvailableOptions", [
+        ("/Libraries/AvailableOptions", without_ferrofin_only_providers),
+        ("/Libraries/AvailableOptions?libraryContentType=movies",
+         without_ferrofin_only_providers),
+        ("/Libraries/AvailableOptions?libraryContentType=tvshows",
+         without_ferrofin_only_providers),
+        ("/Libraries/AvailableOptions?libraryContentType=music",
+         without_ferrofin_only_providers),
+        ("/Libraries/AvailableOptions?libraryContentType=movies&isNewLibrary=true",
+         without_ferrofin_only_providers),
+        ("/Libraries/AvailableOptions?libraryContentType=tvshows&isNewLibrary=true",
+         without_ferrofin_only_providers),
+    ]),
     user("GET /ScheduledTasks/{taskId}", "/ScheduledTasks/{task}"),
-    user("GET /DisplayPreferences/{displayPreferencesId}",
-         "/DisplayPreferences/usersettings?userId={u}&client=emby"),
+    multi("GET /DisplayPreferences/{displayPreferencesId}", [
+        # leg 1: the virgin auto-vivified row (catches a wrong creation default).
+        "/DisplayPreferences/usersettings?userId={u}&client=emby",
+        # leg 2: read back after `seed_display_preferences` wrote the same DTO to
+        # both servers — this is what covers the POST normalization.
+        "/DisplayPreferences/usersettings?userId={u}&client=" + DISPLAY_PREFS_CLIENT,
+    ]),
     user("GET /Devices/Info", "/Devices/Info?id={device}"),
     # GET /Devices/Options is exercised in the write journey (needs a device that has options set).
     # Host-filesystem browsing: both containers mount the identical fixture tree at /media/synth,
@@ -657,26 +799,53 @@ def run(ferrofin_url, jellyfin_url):
     hc["server"], jc["server"] = "ferrofin", "jellyfin"
 
     pairs = correlate(path_id_map(ferrofin_url, ht, hu), path_id_map(jellyfin_url, jt, ju))
+
+    # Write-then-read-back setup for the DisplayPreferences row (see
+    # `seed_display_preferences`). Both servers get the identical body.
+    hseed = seed_display_preferences(ferrofin_url, ht, hc)
+    jseed = seed_display_preferences(jellyfin_url, jt, jc)
+    if hseed != jseed:
+        print(f"  display-preferences seed status differs: H={hseed} J={jseed}",
+              file=sys.stderr)
+
     rows = {}
 
-    def record(op, clean, total, buckets, method="body-diff"):
-        """`method` is HOW the row was verified, and it is written into the
-        results row: "body-diff" means the ledger's headline claim (the
-        responses themselves diffed clean), "property" means only the named
-        invariants agreed. gen-ledger.py counts and renders the two separately
-        so the headline keeps meaning what it says."""
-        if total == 0:
+    def agg_method(legs):
+        """The honest method for an aggregate of diffed (jbody, hbody, compared) legs.
+
+        None when no leg compared anything (untested); `empty-corpus` when every
+        leg that compared anything was two empty result envelopes agreeing on
+        their own zeros; `body-diff` as soon as one leg compared real content.
+        """
+        seen = [m for m in (verification.read_method(j, h, c) for j, h, c in legs)
+                if m is not None]
+        if not seen:
+            return None
+        return (verification.BODY_DIFF if verification.BODY_DIFF in seen
+                else verification.EMPTY_CORPUS)
+
+    def record(op, clean, total, buckets, method, note=None):
+        """`method` is HOW the row was verified, from `verification.METHODS`, and it
+        is written into the results row. There is no default: gen-ledger.py counts
+        only `body-diff` in the headline, so a row that agreed on named invariants
+        ("property"), or on two empty result envelopes ("empty-corpus"), must say so
+        rather than borrowing a claim it did not earn. `method=None` means the probe
+        compared nothing at all — recorded untested, never verified."""
+        if total == 0 or (method is None and not any(buckets.values())):
             rows[op] = {"deep_verified": None, "classification": "",
-                        "verification_method": method,
-                        "note": "no comparable response (both empty/non-200)"}
+                        "verification_method": None,
+                        "note": note or "no comparable response (nothing was compared)"}
             return
         n = sum(len(buckets[k]) for k in ("mismatch", "missing", "extra"))
         if n == 0:
+            detail = {verification.BODY_DIFF: "",
+                      verification.PROPERTY: " (named invariants agreed; bodies not diffed)",
+                      verification.EMPTY_CORPUS: " (both result sets EMPTY; only the envelope"
+                                                 " zeros compared — handler logic unexercised)",
+                      }.get(method, "")
             rows[op] = {"deep_verified": True, "classification": "ok",
                         "verification_method": method,
-                        "note": f"{clean}/{total} clean"
-                                + ("" if method == "body-diff"
-                                   else " (properties agreed; bodies not diffed)")}
+                        "note": f"{clean}/{total} clean" + detail}
         else:
             sample = "; ".join(f"{m['path']}(J={m.get('j')} H={m.get('h')})"
                                for m in buckets["mismatch"][:3])
@@ -690,7 +859,7 @@ def run(ferrofin_url, jellyfin_url):
                 return seen
             rows[op] = {"deep_verified": False,
                         "classification": "flagged: read diff vs Jellyfin (verify)",
-                        "verification_method": method,
+                        "verification_method": method or verification.BODY_DIFF,
                         "note": f"{clean}/{total} clean; mismatch:{len(buckets['mismatch'])} "
                                 f"missing:{len(buckets['missing'])} extra:{len(buckets['extra'])} | {sample}",
                         "diffs": {
@@ -715,9 +884,10 @@ def run(ferrofin_url, jellyfin_url):
                     # agreeing on a broken invariant is not parity.
                     buckets["mismatch"].append({"path": key, "j": j, "h": h})
             n = sum(len(v) for v in buckets.values())
-            record(ep["op"], 1 if n == 0 else 0, 1, buckets, method=ep["method"])
+            record(ep["op"], 1 if n == 0 else 0, 1, buckets, ep["method"])
         elif ep["kind"] == "multi":
             agg = {"mismatch": [], "missing": [], "extra": []}
+            legs = []
             clean = tested = 0
             for leg in ep["legs"]:
                 hs, hb = token_get(ferrofin_url, leg["url"](hc), ht)
@@ -739,26 +909,33 @@ def run(ferrofin_url, jellyfin_url):
                     continue
                 if leg["project"]:
                     hb, jb = leg["project"](hb), leg["project"](jb)
-                n, b = diff_counts(jb, hb)
+                n, b, compared = diff_stats(jb, hb)
+                legs.append((jb, hb, compared))
                 if n == 0:
                     clean += 1
                 for k in agg:
                     agg[k].extend(b[k])
-            record(ep["op"], clean, tested, agg)
+            record(ep["op"], clean, tested, agg, agg_method(legs))
         elif ep["kind"] in ("plain", "user"):
             path = ep["url"](hc if ep["kind"] == "user" else {})
             jpath = ep["url"](jc if ep["kind"] == "user" else {})
             hs, hb = token_get(ferrofin_url, path, ht)
             js, jb = token_get(jellyfin_url, jpath, jt)
             if hb is None or jb is None:
-                record(ep["op"], 0, 0, {})
+                # Say WHICH side failed. "both empty/non-200" was written even when
+                # only Ferrofin 500'd against a Jellyfin 200 — the loudest possible
+                # divergence, reported as an absence of evidence.
+                record(ep["op"], 0, 0, {"mismatch": [], "missing": [], "extra": []}, None,
+                       note=f"no comparable response (H={hs} J={js})")
                 continue
             if ep.get("project"):
                 hb, jb = ep["project"](hb, hc), ep["project"](jb, jc)
-            n, buckets = diff_counts(jb, hb)
-            record(ep["op"], 1 if n == 0 else 0, 1, buckets)
+            n, buckets, compared = diff_stats(jb, hb)
+            record(ep["op"], 1 if n == 0 else 0, 1, buckets,
+                   agg_method([(jb, hb, compared)]))
         else:  # item — aggregate over correlated pairs
             agg = {"mismatch": [], "missing": [], "extra": []}
+            legs = []
             clean = tested = 0
             for hid, jid in pairs:
                 hs, hb = token_get(ferrofin_url, ep["url"](hc, hid), ht)
@@ -773,13 +950,14 @@ def run(ferrofin_url, jellyfin_url):
                 if hb is None or jb is None:
                     continue
                 tested += 1
-                n, b = diff_counts(jb, hb)
+                n, b, compared = diff_stats(jb, hb)
+                legs.append((jb, hb, compared))
                 if n == 0:
                     clean += 1
                 else:
                     for k in agg:
                         agg[k].extend(b[k])
-            record(ep["op"], clean, tested, agg)
+            record(ep["op"], clean, tested, agg, agg_method(legs))
     return rows, len(pairs)
 
 
@@ -796,8 +974,13 @@ def main():
                           "suite/parity/reads-results.json"), "w") as f:
         json.dump(out, f, indent=2, sort_keys=True)
         f.write("\n")
-    ok = sum(1 for v in rows.values() if v["deep_verified"] is True)
+    ok = sum(1 for v in rows.values() if v["deep_verified"] is True
+             and v["verification_method"] == verification.BODY_DIFF)
+    other = collections.Counter(v["verification_method"] for v in rows.values()
+                                if v["deep_verified"] is True
+                                and v["verification_method"] != verification.BODY_DIFF)
     print(f"wrote parity/reads-results.json — {len(rows)} read ops, {ok} deep-verified "
+          f"(bodies diffed), {dict(other)} verified another way "
           f"(correlated {npairs} items by Path)")
 
 
@@ -894,6 +1077,17 @@ def selfcheck():
                 got = leg["project"]({"StartIndex": 7, "TotalRecordCount": 500,
                                       "Items": [{"Name": "x"}]})
                 assert got and all(v is not None for v in got.values()), got
+    # Method derivation: two EMPTY result envelopes agreeing on their own zeros is
+    # not the body-diff headline, and a pair that compared nothing at all is not a
+    # verdict. Both are the shapes that silently inflated the count before.
+    empty = {"Items": [], "TotalRecordCount": 0, "StartIndex": 0}
+    n, _, compared = diff_stats(empty, dict(empty))
+    assert n == 0 and compared == 2
+    assert verification.read_method(empty, dict(empty), compared) == verification.EMPTY_CORPUS
+    assert verification.read_method({}, {}, 0) is None
+    assert verification.read_method({"Items": [{"Name": "x"}], "TotalRecordCount": 1},
+                                    {"Items": [{"Name": "x"}], "TotalRecordCount": 1},
+                                    2) == verification.BODY_DIFF
     hf, jf = {"a": True, "b": True, "c": False}, {"a": True, "b": False, "c": False}
     bad = [k for k in sorted(set(hf) | set(jf))
            if hf.get(k) != jf.get(k) or hf.get(k) is False]

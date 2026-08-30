@@ -26,7 +26,7 @@ use ferrofin_model::search::{SearchHint, SearchQuery};
 use uuid::Uuid;
 
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::library::{SearchManager, SearchResult};
+use ferrofin_traits::library::{SearchManager, SearchResult, UserManager};
 use ferrofin_traits::options::InternalItemsQuery;
 use ferrofin_traits::persistence::ItemRepository;
 
@@ -43,6 +43,7 @@ const SCORE_SUBSTRING: f32 = 1.0;
 #[derive(Clone)]
 pub struct FerrofinSearchManager {
     items: Arc<dyn ItemRepository>,
+    users: Arc<dyn UserManager>,
 }
 
 impl std::fmt::Debug for FerrofinSearchManager {
@@ -53,10 +54,17 @@ impl std::fmt::Debug for FerrofinSearchManager {
 }
 
 impl FerrofinSearchManager {
-    /// Creates a search manager over the injected item repository.
+    /// Creates a search manager over the injected item repository and user
+    /// manager.
+    ///
+    /// The user manager is **not** optional: C# `SearchEngine` holds an
+    /// `IUserManager` and resolves `query.UserId` into the `User` it hands to
+    /// `new InternalItemsQuery(user)`. Without it the search runs unscoped —
+    /// no `TopParentIds` restriction and no visibility filtering — which leaks
+    /// rows the caller cannot browse.
     #[must_use]
-    pub fn new(items: Arc<dyn ItemRepository>) -> Self {
-        Self { items }
+    pub fn new(items: Arc<dyn ItemRepository>, users: Arc<dyn UserManager>) -> Self {
+        Self { items, users }
     }
 
     /// Translates a [`SearchQuery`] into the item query that backs it.
@@ -73,7 +81,10 @@ impl FerrofinSearchManager {
     /// window after the query, not with `OFFSET`) and `search_term` rather than
     /// `name_contains`, because only `search_term` earns the relevance
     /// `ORDER BY`.
-    fn to_item_query(query: &SearchQuery) -> InternalItemsQuery {
+    fn to_item_query(
+        query: &SearchQuery,
+        user: Option<ferrofin_db::entities::users::UserEntity>,
+    ) -> InternalItemsQuery {
         /// C# `SearchEngine.AddIfMissing`.
         fn add_if_missing(list: &mut Vec<BaseItemKind>, kind: BaseItemKind) {
             if !list.contains(&kind) {
@@ -135,6 +146,11 @@ impl FerrofinSearchManager {
         }
 
         InternalItemsQuery {
+            // C# `new InternalItemsQuery(user)`. This is what applies
+            // `TopParentIds` (the user's enabled libraries) and the visibility
+            // filters; an unscoped search returns rows — the `UserRootFolder`
+            // among them — that `/Items` correctly hides from the same user.
+            user,
             search_term: if query.search_term.is_empty() {
                 None
             } else {
@@ -162,7 +178,58 @@ impl FerrofinSearchManager {
         &self,
         query: &SearchQuery,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        self.items.get_item_list(&Self::to_item_query(query)).await
+        // C# `if (!query.UserId.IsEmpty()) user = _userManager.GetUserById(...)`.
+        let user = if query.user_id.is_nil() {
+            None
+        } else {
+            self.users.get_user_by_id(query.user_id).await?
+        };
+        self.items
+            .get_item_list(&Self::to_item_query(query, user))
+            .await
+    }
+
+    /// The `MusicAlbum` parents of the `Audio` rows in `items`, by album id.
+    ///
+    /// C# reads `song.AlbumEntity` (the song's parent `MusicAlbum`) per hint;
+    /// one batched read over the page's distinct parents does the same work
+    /// without a query per row.
+    async fn album_parents(
+        &self,
+        items: &[BaseItemEntity],
+    ) -> Result<std::collections::HashMap<Uuid, BaseItemEntity>, ServiceError> {
+        let mut parent_ids: Vec<Uuid> = Vec::new();
+        for item in items {
+            if !matches!(
+                kind_from_type_name(&item.type_),
+                Some(BaseItemKind::Audio | BaseItemKind::AudioBook)
+            ) {
+                continue;
+            }
+            if let Some(parent) = item
+                .parent_id
+                .as_deref()
+                .and_then(|raw| Uuid::parse_str(raw).ok())
+                && !parent_ids.contains(&parent)
+            {
+                parent_ids.push(parent);
+            }
+        }
+        if parent_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let rows = self
+            .items
+            .get_item_list(&InternalItemsQuery {
+                item_ids: parent_ids,
+                include_item_types: vec![BaseItemKind::MusicAlbum],
+                ..Default::default()
+            })
+            .await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| Uuid::parse_str(&row.id).ok().map(|id| (id, row)))
+            .collect())
     }
 }
 
@@ -193,13 +260,53 @@ fn score(name: &str, term: &str) -> Option<f32> {
 /// JSON; `IsFolder` is only assigned `true` (a non-folder leaves it null);
 /// and `ChannelId` is copied from the item's non-nullable `Guid`, so it is
 /// always present — the all-zero id when the item has no channel.
-fn to_hint(item: &BaseItemEntity) -> Option<SearchHint> {
+fn to_hint(
+    item: &BaseItemEntity,
+    albums: &std::collections::HashMap<Uuid, BaseItemEntity>,
+) -> Option<SearchHint> {
     // A hint is pure navigation: the client turns `Id`/`ItemId` straight into an
     // `/Items/{id}` request, so emitting the nil GUID would hand it a hit that
     // 404s. An unparseable id drops the hint — the same choice
     // `get_search_results` below already makes.
     let id = Uuid::parse_str(&item.id).ok()?;
     let kind = kind_from_type_name(&item.type_).unwrap_or(BaseItemKind::Folder);
+    // C# `switch (item)`: the music fields are set ONLY on the `MusicAlbum` and
+    // `Audio` arms, so a genre/person/movie hint carries no `Artists` at all.
+    // `AudioBook` matches the earlier `IHasSeries` arm in C# (it implements
+    // `IHasSeries`), so it never reaches the `Audio` arm.
+    let (artists, album_artist, album, album_id) = match kind {
+        BaseItemKind::MusicAlbum => (
+            split_multi(item.artists.as_deref()),
+            first_multi(item.album_artists.as_deref()),
+            None,
+            None,
+        ),
+        BaseItemKind::Audio => {
+            // `song.AlbumEntity` — the parent `MusicAlbum` names the album and
+            // supplies `AlbumId`; C# falls back to the song's own `Album` tag
+            // when the parent is not an album.
+            let parent = item
+                .parent_id
+                .as_deref()
+                .and_then(|raw| Uuid::parse_str(raw).ok())
+                .and_then(|pid| albums.get(&pid).map(|row| (pid, row)));
+            match parent {
+                Some((pid, row)) => (
+                    split_multi(item.artists.as_deref()),
+                    first_multi(item.album_artists.as_deref()),
+                    row.name.clone(),
+                    Some(pid),
+                ),
+                None => (
+                    split_multi(item.artists.as_deref()),
+                    first_multi(item.album_artists.as_deref()),
+                    item.album.clone(),
+                    None,
+                ),
+            }
+        }
+        _ => (Vec::new(), None, None, None),
+    };
     Some(SearchHint {
         item_id: id,
         id,
@@ -221,10 +328,10 @@ fn to_hint(item: &BaseItemEntity) -> Option<SearchHint> {
         end_date: item.end_date,
         series: item.series_name.clone(),
         status: None,
-        album: item.album.clone(),
-        album_id: None,
-        album_artist: None,
-        artists: split_multi(item.artists.as_deref()),
+        album,
+        album_id,
+        album_artist,
+        artists,
         song_count: None,
         episode_count: None,
         channel_id: Some(
@@ -248,6 +355,12 @@ fn parse_media_type(stored: Option<&str>) -> MediaType {
         Some("Book") => MediaType::Book,
         _ => MediaType::Unknown,
     }
+}
+
+/// The first value of a stored pipe-delimited multi-value column, if any —
+/// C# `song.AlbumArtists?.FirstOrDefault()` / `album.AlbumArtist`.
+fn first_multi(stored: Option<&str>) -> Option<String> {
+    split_multi(stored).into_iter().next()
 }
 
 /// Splits a stored pipe-delimited multi-value column (`artists`, …) into a list,
@@ -274,7 +387,11 @@ impl SearchManager for FerrofinSearchManager {
         // `TotalRecordCount` is the size of the ranked page, not of the whole
         // match set) and only then applies `StartIndex`/`Limit` to it.
         let items = self.matching_items(query).await?;
-        let mut hints: Vec<SearchHint> = items.iter().filter_map(to_hint).collect();
+        let albums = self.album_parents(&items).await?;
+        let mut hints: Vec<SearchHint> = items
+            .iter()
+            .filter_map(|item| to_hint(item, &albums))
+            .collect();
         let total = i32::try_from(hints.len()).unwrap_or(i32::MAX);
 
         if let Some(start) = query.start_index {
@@ -341,19 +458,81 @@ mod tests {
             name: Some("Stalker".to_owned()),
             ..Default::default()
         };
-        assert!(to_hint(&ok).is_some(), "a parseable id yields a hint");
+        let no_albums = std::collections::HashMap::new();
+        assert!(
+            to_hint(&ok, &no_albums).is_some(),
+            "a parseable id yields a hint"
+        );
 
         ok.id = "not-a-guid".to_owned();
         assert!(
-            to_hint(&ok).is_none(),
+            to_hint(&ok, &no_albums).is_none(),
             "an unparseable id must be dropped, never emitted as the nil GUID"
         );
+    }
+
+    /// `SearchController.GetSearchHintResult`'s `switch (item)`: the music
+    /// fields are set only on the `MusicAlbum` and `Audio` arms, and an `Audio`
+    /// row takes `Album`/`AlbumId` from its parent `MusicAlbum`.
+    #[test]
+    fn hint_music_fields_follow_the_csharp_switch() {
+        use ferrofin_db::entities::base_items::BaseItemEntity;
+
+        let album_id = Uuid::from_u128(0x301);
+        let album = BaseItemEntity {
+            id: album_id.to_string().to_uppercase(),
+            type_: "MediaBrowser.Controller.Entities.Audio.MusicAlbum".to_owned(),
+            name: Some("Album 01".to_owned()),
+            artists: Some("Artist 03".to_owned()),
+            album_artists: Some("Artist 03".to_owned()),
+            ..Default::default()
+        };
+        let mut albums = std::collections::HashMap::new();
+        albums.insert(album_id, album.clone());
+
+        let hint = to_hint(&album, &albums).expect("album hint");
+        assert_eq!(hint.artists, vec!["Artist 03".to_owned()]);
+        assert_eq!(hint.album_artist.as_deref(), Some("Artist 03"));
+        assert_eq!(hint.album, None);
+        assert_eq!(hint.album_id, None);
+
+        let song = BaseItemEntity {
+            id: Uuid::from_u128(0x302).to_string().to_uppercase(),
+            type_: "MediaBrowser.Controller.Entities.Audio.Audio".to_owned(),
+            name: Some("Track 01".to_owned()),
+            parent_id: Some(album_id.to_string().to_uppercase()),
+            artists: Some("Artist 03".to_owned()),
+            album_artists: Some("Artist 03".to_owned()),
+            ..Default::default()
+        };
+        let hint = to_hint(&song, &albums).expect("song hint");
+        assert_eq!(hint.artists, vec!["Artist 03".to_owned()]);
+        assert_eq!(hint.album_artist.as_deref(), Some("Artist 03"));
+        assert_eq!(hint.album.as_deref(), Some("Album 01"));
+        assert_eq!(hint.album_id, Some(album_id));
+
+        // A non-music row falls through the switch: no Artists, no Album.
+        let genre = BaseItemEntity {
+            id: Uuid::from_u128(0x303).to_string().to_uppercase(),
+            type_: "MediaBrowser.Controller.Entities.Genre".to_owned(),
+            name: Some("Ambient".to_owned()),
+            artists: Some("leaked".to_owned()),
+            album: Some("leaked".to_owned()),
+            ..Default::default()
+        };
+        let hint = to_hint(&genre, &albums).expect("genre hint");
+        assert!(hint.artists.is_empty());
+        assert_eq!(hint.album, None);
+        assert_eq!(hint.is_folder, None, "Genre : BaseItem, not Folder");
     }
 
     fn manager(db: &Database) -> FerrofinSearchManager {
         let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
             Arc::new(ItemTypeLookup::new());
-        FerrofinSearchManager::new(Arc::new(FerrofinItemRepository::new(db.clone(), lookup)))
+        FerrofinSearchManager::new(
+            Arc::new(FerrofinItemRepository::new(db.clone(), lookup)),
+            Arc::new(crate::user_manager::FerrofinUserManager::new(db.clone())),
+        )
     }
 
     #[test]

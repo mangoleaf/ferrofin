@@ -9,8 +9,12 @@
 //! DTO layer, not here).
 //!
 //! Port departures:
-//! - EF's `.Include(HomeSections)` eager-load is dropped: the trait returns the
-//!   flat [`DisplayPreferencesEntity`] row (home sections are a separate concern).
+//! - EF's `.Include(HomeSections)` eager-load has no `sqlx` equivalent, so the
+//!   `HomeSection` children are loaded and rewritten through the explicit
+//!   `list_home_sections`/`set_home_sections` seam methods, which delegate to
+//!   `ferrofin-db` (`Database::home_sections` / `replace_home_sections`) — the
+//!   raw SQL stays behind the persistence boundary. The flat
+//!   [`DisplayPreferencesEntity`] row itself carries no children.
 //! - The C# getters *create and persist* a default row when none exists
 //!   (`Add` + `SaveChanges`). That is reproduced: a missing row is inserted with
 //!   the Jellyfin default column values and re-read, so the returned entity
@@ -28,7 +32,7 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use ferrofin_db::Database;
 use ferrofin_db::entities::display_preferences::{
-    DisplayPreferencesEntity, ItemDisplayPreferencesEntity,
+    DisplayPreferencesEntity, HomeSectionEntity, ItemDisplayPreferencesEntity,
 };
 use ferrofin_db::store::guid_to_db;
 use ferrofin_traits::configuration::DisplayPreferencesManager;
@@ -332,6 +336,27 @@ impl DisplayPreferencesManager for FerrofinDisplayPreferencesManager {
         .map_err(db_err)?;
         Ok(())
     }
+
+    async fn list_home_sections(
+        &self,
+        display_preferences_id: i64,
+    ) -> Result<Vec<HomeSectionEntity>, ServiceError> {
+        self.db
+            .home_sections(display_preferences_id)
+            .await
+            .map_err(ServiceError::from)
+    }
+
+    async fn set_home_sections(
+        &self,
+        display_preferences_id: i64,
+        sections: &[(i32, i32)],
+    ) -> Result<(), ServiceError> {
+        self.db
+            .replace_home_sections(display_preferences_id, sections)
+            .await
+            .map_err(ServiceError::from)
+    }
 }
 
 // Default column values for a freshly created preferences row, matching the C#
@@ -339,7 +364,12 @@ impl DisplayPreferencesManager for FerrofinDisplayPreferencesManager {
 // Jellyfin's `DisplayPreferences` ctor defaults ChromecastVersion to `Stable` (0);
 // it serializes to "stable". (Was 1/"unstable" — a parity diff vs Jellyfin.)
 const DEFAULT_CHROMECAST_VERSION: i32 = 0;
-const DEFAULT_ENABLE_NEXT_VIDEO_INFO_OVERLAY: bool = true;
+// The C# `DisplayPreferences` ctor
+// (v10.11.8 `Entities/DisplayPreferences.cs:20-33`) assigns ShowSidebar,
+// ShowBackdrop, SkipForwardLength, SkipBackwardLength, ScrollDirection and
+// ChromecastVersion — and never EnableNextVideoInfoOverlay, so a freshly
+// created row carries the CLR default `false`. Only a POST turns it on.
+const DEFAULT_ENABLE_NEXT_VIDEO_INFO_OVERLAY: bool = false;
 const DEFAULT_SCROLL_DIRECTION: i32 = 0;
 const DEFAULT_SHOW_BACKDROP: bool = true;
 const DEFAULT_SHOW_SIDEBAR: bool = false;
@@ -405,7 +435,8 @@ mod tests {
             .expect("get");
         assert!(row.id > 0, "surrogate id assigned");
         assert_eq!(row.chromecast_version, 0); // Jellyfin default: Stable
-        assert!(row.enable_next_video_info_overlay);
+        // Never assigned by the C# ctor, so the CLR default `false` wins.
+        assert!(!row.enable_next_video_info_overlay);
         assert_eq!(row.skip_forward_length, 30_000);
 
         // Second call returns the same persisted row, not a new one.

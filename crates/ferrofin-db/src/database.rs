@@ -5,6 +5,7 @@ use std::str::FromStr;
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 
+use crate::entities::display_preferences::HomeSectionEntity;
 use crate::error::Result;
 
 /// The bundled initial-schema migration set (`./migrations`).
@@ -276,6 +277,66 @@ impl Database {
         .bind(value)
         .execute(&self.writer)
         .await?;
+        Ok(())
+    }
+
+    /// A display-preferences row's `HomeSection` children, ordered by `Order`.
+    ///
+    /// Stands in for EF's `.Include(e => e.HomeSections)` eager-load, which the
+    /// flat `sqlx` seam has no equivalent for.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub async fn home_sections(
+        &self,
+        display_preferences_id: i64,
+    ) -> Result<Vec<HomeSectionEntity>> {
+        let rows = sqlx::query_as::<_, HomeSectionEntity>(
+            r#"SELECT "Id", "DisplayPreferencesId", "Order", "Type"
+               FROM "HomeSection"
+               WHERE "DisplayPreferencesId" = ?1
+               ORDER BY "Order""#,
+        )
+        .bind(display_preferences_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Replaces a display-preferences row's `HomeSection` children with
+    /// `sections`, each `(order, type discriminant)`.
+    ///
+    /// A wholesale replace, mirroring the C# controller's
+    /// `HomeSections.Clear()` + re-add that `UpdateDisplayPreferences` flushes.
+    /// One transaction, so a concurrent read never sees the empty window
+    /// between the delete and the inserts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the write fails.
+    pub async fn replace_home_sections(
+        &self,
+        display_preferences_id: i64,
+        sections: &[(i32, i32)],
+    ) -> Result<()> {
+        let mut tx = self.writer.begin().await?;
+        sqlx::query(r#"DELETE FROM "HomeSection" WHERE "DisplayPreferencesId" = ?1"#)
+            .bind(display_preferences_id)
+            .execute(&mut *tx)
+            .await?;
+        for (order, type_) in sections {
+            sqlx::query(
+                r#"INSERT INTO "HomeSection" ("DisplayPreferencesId", "Order", "Type")
+                   VALUES (?1, ?2, ?3)"#,
+            )
+            .bind(display_preferences_id)
+            .bind(*order)
+            .bind(*type_)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 

@@ -29,6 +29,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from sweep import (http, get_json, authenticate, bring_up, compose, compose_service, ROOT,  # noqa: E402
                    UP_TIMEOUT_S, api_alive as alive, wait_until as wait_for)
+import verification  # noqa: E402
 
 DOWN_TIMEOUT_S = 60      # a drain must start within this
 STAY_DOWN_S = 5          # a shutdown must stay down for this long
@@ -165,8 +166,14 @@ def combine(h, j):
             cls = "flagged: Ferrofin effect not observed (verify: real gap vs probe method)"
         else:
             cls = "flagged: effect not observed on either server (likely harness/docker access)"
+        # All three ops answer 204 No Content: there is no body in existence to
+        # diff, and the two servers' responses are never compared with each other
+        # either — the verdict is two independent effect observations AND-ed. So
+        # the row says `effect`, never the ledger's body-diff headline.
         rows[op] = {"deep_verified": bool(h_ok and j_ok), "classification": cls,
-                    "note": f"H={h_ok} ({h_note}) J={j_ok} ({j_note})"}
+                    "verification_method": verification.EFFECT,
+                    "note": f"H={h_ok} ({h_note}) J={j_ok} ({j_note}) "
+                            f"(effect verdict; no body exists to diff)"}
     return rows
 
 
@@ -202,7 +209,8 @@ def main():
         json.dump(out, f, indent=2, sort_keys=True)
         f.write("\n")
     ok = sum(1 for v in rows.values() if v["deep_verified"])
-    print(f"wrote parity/terminal-results.json — {len(rows)} lifecycle ops, {ok} deep-verified")
+    print(f"wrote parity/terminal-results.json — {len(rows)} lifecycle ops, "
+          f"{ok} effect-verified (no body exists to diff)")
 
 
 def selfcheck():
@@ -216,7 +224,11 @@ def selfcheck():
     assert rows["POST /Backup/Restore"]["note"].startswith("H=False (not run)")
     rows = combine({op: (True, "") for op, _ in STEPS}, {op: (True, "") for op, _ in STEPS})
     assert all(r["deep_verified"] for r in rows.values())
-    print(f"ok: {len(STEPS)} lifecycle op-keys valid, combine logic")
+    # Every lifecycle row is an EFFECT verdict. 204 No Content has no body, so a
+    # `body-diff` stamp here would be false on its face.
+    assert all(r["verification_method"] == verification.EFFECT for r in rows.values())
+    print(f"ok: {len(STEPS)} lifecycle op-keys valid, combine logic, all rows stamped "
+          f"{verification.EFFECT!r}")
 
 
 if __name__ == "__main__":

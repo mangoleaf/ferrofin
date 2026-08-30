@@ -32,7 +32,7 @@ use ferrofin_traits::providers::{
 use uuid::Uuid;
 
 use crate::error::ProvidersError;
-use crate::library_options::fetcher_names;
+use crate::library_options::{fetcher_names, image_fetcher_enabled, metadata_fetcher_enabled};
 use crate::tmdb::{TmdbClient, TmdbDetails, TmdbImage, TmdbKind};
 use ferrofin_db::entities::base_items::BaseItemEntity;
 
@@ -749,9 +749,14 @@ pub struct LocalProviderManager {
     /// [`ItemTypeLookup`] table. Present enables the kind-filtered built-in
     /// external-id descriptors.
     kind_by_type_name: HashMap<String, BaseItemKind>,
-    /// The library configuration, for the `LibraryOptions.
-    /// PreferredMetadataLanguage` tier of `BaseItem.
-    /// GetPreferredMetadataLanguage()`. `None` skips that tier.
+    /// The virtual-folder manager: the seam that resolves an item's owning
+    /// library and its saved `LibraryOptions`. Two callers need it — the
+    /// `LibraryOptions.PreferredMetadataLanguage` tier of
+    /// `BaseItem.GetPreferredMetadataLanguage()`, and the metadata/image
+    /// fetcher checkboxes a refresh or a remote search must honour (C#
+    /// `ProviderManager.CanRefreshMetadata` / `CanRefreshImages` ->
+    /// `BaseItemManager`). Absent → no library is resolvable, that language
+    /// tier is skipped and the built-in fetcher defaults stand.
     virtual_folders: Option<Arc<dyn VirtualFolderManager>>,
     /// `ServerConfiguration.PreferredMetadataLanguage`, the last tier of the
     /// same chain. Read through a closure so a live config change is picked up
@@ -926,6 +931,88 @@ impl LocalProviderManager {
         self.image_store = Some(image_store);
         self.metadata_dir = Some(metadata_dir);
         self
+    }
+
+    /// Attaches the virtual-folder manager so an on-demand refresh can read the
+    /// owning library's `LibraryOptions` and honour its fetcher checkboxes.
+    ///
+    /// Without it a `POST /Items/{id}/Refresh` downloads remote metadata and
+    /// artwork into a library whose "Metadata downloaders" / "Image fetchers"
+    /// boxes are all cleared — the scan honours them, so the two paths would
+    /// disagree about the same library.
+    #[must_use]
+    pub fn with_virtual_folders(
+        mut self,
+        virtual_folders: Arc<dyn ferrofin_traits::library::VirtualFolderManager>,
+    ) -> Self {
+        self.virtual_folders = Some(virtual_folders);
+        self
+    }
+
+    /// The saved `LibraryOptions` of the library that owns `entity`, resolved
+    /// through its `TopParentId` (the collection-folder id every scanned row
+    /// carries). `None` when no library manager is wired, the row has no top
+    /// parent, or the library saved no options — all of which mean "no
+    /// customisation", i.e. the built-in defaults.
+    async fn library_options_for(
+        &self,
+        entity: &BaseItemEntity,
+    ) -> Option<ferrofin_model::configuration::LibraryOptions> {
+        let folders = self.virtual_folders.as_ref()?;
+        let top = entity
+            .top_parent_id
+            .as_deref()
+            .and_then(|raw| Uuid::parse_str(raw).ok())?;
+        let folders = folders.get_virtual_folders().await.ok()?;
+        folders.into_iter().find_map(|folder| {
+            let id = folder
+                .item_id
+                .as_deref()
+                .and_then(|s| Uuid::parse_str(s).ok());
+            (id == Some(top))
+                .then_some(folder.library_options)
+                .flatten()
+        })
+    }
+
+    /// `options` with the refresh modes forced to `None` wherever the C# gate
+    /// would refuse the provider.
+    ///
+    /// - metadata: `CanRefreshMetadata` — "If locked only allow local
+    ///   providers", then `IsMetadataFetcherEnabled`.
+    /// - images: `CanRefreshImages` — refused when the item is locked and the
+    ///   mode is not `FullRefresh`, then `IsImageFetcherEnabled`.
+    ///
+    /// TMDB is the only remote provider this manager's refresh path drives, so
+    /// it is the only fetcher name consulted; adding another provider here
+    /// means gating it by its own [`fetcher_names`] entry.
+    async fn gated_options(
+        &self,
+        entity: &BaseItemEntity,
+        options: &MetadataRefreshOptions,
+    ) -> MetadataRefreshOptions {
+        let library = self.library_options_for(entity).await;
+        let kind = short_kind(entity);
+        let metadata_allowed = !entity.is_locked
+            && metadata_fetcher_enabled(library.as_ref(), kind, fetcher_names::TMDB);
+        let images_allowed = (!entity.is_locked
+            || options.image_refresh_mode == MetadataRefreshMode::FullRefresh)
+            && image_fetcher_enabled(library.as_ref(), kind, fetcher_names::TMDB);
+        MetadataRefreshOptions {
+            metadata_refresh_mode: if metadata_allowed {
+                options.metadata_refresh_mode
+            } else {
+                MetadataRefreshMode::None
+            },
+            image_refresh_mode: if images_allowed {
+                options.image_refresh_mode
+            } else {
+                MetadataRefreshMode::None
+            },
+            replace_all_metadata: options.replace_all_metadata,
+            replace_all_images: options.replace_all_images,
+            search_result: options.search_result.clone(),
+        }
     }
 
     /// Resolves what a refresh should fetch for `entity`: movies/series search
@@ -1329,6 +1416,18 @@ impl LocalProviderManager {
         let Some(mut entity) = items.retrieve_item(item_id).await? else {
             return Err(ServiceError::not_found(format!("item {item_id}")));
         };
+        // ── The one gate (C# `ProviderManager.CanRefreshMetadata` /
+        // `CanRefreshImages`, v10.11.8 `MediaBrowser.Providers/Manager/
+        // ProviderManager.cs`) ───────────────────────────────────────────────
+        // Both the scan and this on-demand path must honour the owning
+        // library's fetcher checkboxes and the item's `IsLocked` flag. The scan
+        // already did; this path did not, so "Refresh metadata" in the
+        // dashboard downloaded TMDB metadata + artwork into a library whose
+        // "Metadata downloaders" and "Image fetchers" boxes were all cleared.
+        let options = &self.gated_options(&entity, options).await;
+        if !wants_fetch(options.metadata_refresh_mode) && !wants_fetch(options.image_refresh_mode) {
+            return Ok(ItemUpdateType::None);
+        }
         // The verdict (`ItemUpdateType`) is judged against this snapshot.
         let before = entity.clone();
         // "Identify → Apply": the chosen result's ids become the item's
@@ -2511,9 +2610,11 @@ impl ProviderManager for LocalProviderManager {
     async fn get_library_options_info(
         &self,
         item_types: &[String],
+        is_new_library: bool,
     ) -> Result<ferrofin_model::configuration::LibraryOptionsResultDto, ServiceError> {
         Ok(crate::library_options::library_options_info(
             item_types,
+            is_new_library,
             &self.dynamic_fetchers,
         ))
     }
@@ -2537,6 +2638,8 @@ mod tests {
         language_rank, order_by_language_descending, parse_ymd, set_text, wants_fetch,
     };
     use crate::tmdb::TmdbDetails;
+    use ferrofin_traits::providers::{MetadataRefreshMode as Mode, MetadataRefreshOptions as Opts};
+
     use async_trait::async_trait;
     use ferrofin_db::entities::base_items::BaseItemEntity;
     use ferrofin_model::data::BaseItemKind;
@@ -4952,5 +5055,41 @@ mod tests {
         // A missing TMDB value never clears an existing one.
         apply_name_overview(&mut entity, None, None, true);
         assert_eq!(entity.name.as_deref(), Some("New"));
+    }
+
+    /// C# `ProviderManager.CanRefreshMetadata` ("If locked only allow local
+    /// providers") and `CanRefreshImages` (locked refuses unless the mode is
+    /// `FullRefresh`). Without this gate the dashboard's "Refresh metadata"
+    /// re-downloaded TMDB artwork onto an item the user had locked.
+    #[tokio::test]
+    async fn a_locked_item_refuses_remote_metadata_and_non_full_images() {
+        let mgr = LocalProviderManager::new(Vec::new());
+        let locked = BaseItemEntity {
+            type_: "MediaBrowser.Controller.Entities.Movies.Movie".to_owned(),
+            is_locked: true,
+            ..Default::default()
+        };
+        let gated = mgr.gated_options(&locked, &Opts::default()).await;
+        assert_eq!(gated.metadata_refresh_mode, Mode::None);
+        assert_eq!(gated.image_refresh_mode, Mode::None);
+
+        // FullRefresh still bypasses the IsLocked half for IMAGES only.
+        let full = Opts {
+            metadata_refresh_mode: Mode::FullRefresh,
+            image_refresh_mode: Mode::FullRefresh,
+            ..Opts::default()
+        };
+        let gated = mgr.gated_options(&locked, &full).await;
+        assert_eq!(gated.metadata_refresh_mode, Mode::None);
+        assert_eq!(gated.image_refresh_mode, Mode::FullRefresh);
+
+        // An unlocked item in a library with no saved options is untouched.
+        let open = BaseItemEntity {
+            type_: "MediaBrowser.Controller.Entities.Movies.Movie".to_owned(),
+            ..Default::default()
+        };
+        let gated = mgr.gated_options(&open, &Opts::default()).await;
+        assert_eq!(gated.metadata_refresh_mode, Mode::Default);
+        assert_eq!(gated.image_refresh_mode, Mode::Default);
     }
 }

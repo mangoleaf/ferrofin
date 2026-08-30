@@ -63,12 +63,28 @@ pub(crate) async fn update_item(
         .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?;
     let before = item.clone();
     apply_update(&mut item, &request);
-    // Deliberate divergence from Jellyfin: a save that actually changes
-    // metadata locks the item, because Ferrofin's library scan rebuilds rows
-    // from disk and would otherwise revert the edit on its next pass — the
-    // scan preserves the editable columns only for locked rows. A save that
-    // changes nothing keeps the lock exactly as the checkbox sent it, so
-    // un-ticking "Lock this item" (without editing fields) still unlocks.
+    // TODO(parity, open work item — NOT an accepted divergence): v10.11.8
+    // `Jellyfin.Api/Controllers/ItemUpdateController.cs:389` is exactly
+    // `item.IsLocked = request.LockData ?? false;` — editing a field never
+    // locks the row. Ferrofin auto-locks because its library scan rebuilds
+    // rows from disk and preserves the editable columns only for locked rows
+    // ("the scan upsert writes `excluded` for unlocked rows", see
+    // `library_scan.rs`), so without this an edit is reverted by the next scan.
+    //
+    // Measured consequence, not theoretical: on the parity lab an item edited
+    // through this handler comes back `LockData=True` where Jellyfin has
+    // `False`, and because `library_scan.rs::persist_item_media` then skips the
+    // whole artwork pass for a locked row, that item's Primary freezes at
+    // whatever was stored — while Jellyfin re-discovers the sidecar
+    // `poster.jpg` on every scan (`ILocalImageProvider` short-circuits BEFORE
+    // the `IsLocked` check in `MediaBrowser.Providers/Manager/
+    // ProviderManager.cs:412`).
+    //
+    // Un-defer path (the two halves MUST land together — see the twin note in
+    // `library_scan.rs::persist_item_media`): port `MetadataService`'s per-field
+    // merge rules so an edited column survives a scan because `LockedFields` /
+    // `shouldReplace` says so, then delete this block and un-gate local image
+    // discovery. Removing either half alone regresses the other.
     if !item.is_locked && editor_fields_changed(&before, &item) {
         item.is_locked = true;
     }

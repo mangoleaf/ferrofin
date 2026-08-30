@@ -61,7 +61,10 @@ Serve it and go to **http://127.0.0.1:8125/suite/viewer/**.
 ## Why the numbers are fair (the whole point)
 
 - **Speed is shown only for deep-verified ops.** A row is `comparable` only if the parity ledger
-  deep-verified that op, both servers answered 200, and Ferrofin's body shape matches the
+  deep-verified that op — `verification_method: "body-diff"`, the response itself diffed clean;
+  a row verified some weaker way (`property`, `status-class`, `empty-corpus`) is NOT comparable,
+  because the two servers may be doing different work — both servers answered 200, and
+  Ferrofin's body shape matches the
   reviewed baseline (`suite/results/shape-baseline.json`, captured per variant by
   `suite/fingerprint.py`). An UNREVIEWED shape change — the "fast because the body went
   hollow" signature — excludes the row until a human reviews the field-level diff and
@@ -75,8 +78,10 @@ Serve it and go to **http://127.0.0.1:8125/suite/viewer/**.
   "Ferrofin started doing the work correctly."
 - **Write (non-GET) rows are fingerprint-exempt by design** — a fingerprint probe would itself
   mutate state, and write bodies mint per-run tokens/timestamps. Their honesty gate instead:
-  `deep_verified` must come from the parity **write journey**, and both servers must hit 100%
-  expected-status (204 for playstate) during the bench. See `suite/perf/README.md` "Write rows".
+  `deep_verified` must come from the parity **write journey** (`verification_method: "effect"` —
+  the write was applied and its effect confirmed on each server's own read-back), and both
+  servers must hit 100% expected-status (204 for playstate) during the bench. See
+  `suite/perf/README.md` "Write rows".
 - **A win means p50 AND p95 AND p99.** A p50 win with a tail regression is surfaced as `tail_loss`,
   never folded into "faster" (median-only boards hid 2× p99 regressions before).
 - **`suite/run.sh gate`** fails on a >1.5× latency regression *or* when a previously deep-verified

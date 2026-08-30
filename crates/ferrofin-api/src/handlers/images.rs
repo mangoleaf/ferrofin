@@ -14,9 +14,13 @@
 //! `width`/`height`/`fillWidth`/`fillHeight`/`format`/`blur` parameters resize and
 //! format-convert the bytes, and the positional-parameter URL lifts its
 //! `format`/`maxWidth`/`maxHeight` path segments into the same transform. A plain
-//! request (or an unwired processor) serves the **stored original** untouched. The
-//! overlay effects (`percentPlayed`/`unplayedCount`) select the file but are not
-//! drawn.
+//! request (or an unwired processor) serves the **stored original** untouched.
+//! When the request names no `format`, the output format is negotiated from the
+//! client's `Accept` header exactly as C# `GetClientSupportedFormats` does.
+//!
+//! TODO(overlays): the `percentPlayed`/`unplayedCount` parameters bind and are
+//! validated, but their overlays are not drawn — see the TODO on
+//! [`get_item_image_parametrized`] for the port path.
 //!
 //! A missing item (or by-name item, or user), or an item with no image of the
 //! requested type/index, or an image whose file is remote/absent, is a `404` —
@@ -145,23 +149,230 @@ impl ImageQuery {
     }
 }
 
-/// The output formats the encoder can produce, used as the default accepted set
-/// when the request names no explicit `format` (lets the processor keep a
-/// compatible original or convert as needed).
-fn default_output_formats() -> Vec<ImageFormat> {
-    vec![ImageFormat::Webp, ImageFormat::Jpg, ImageFormat::Png]
+/// The formats the *client* said it can decode, in Jellyfin's preference order.
+///
+/// Port of `ImageController.GetClientSupportedFormats` (v10.11.8
+/// `Jellyfin.Api/Controllers/ImageController.cs`): the `Accept` header is
+/// comma-split with any `;q=…` parameters stripped, the `?Accept=` query value is
+/// consulted as well, and WebP is offered **only** when it is advertised
+/// explicitly — `SupportsFormat(…, Webp, acceptAll: false)` means a bare `*/*`
+/// does *not* enable it. Gif is the opposite (`acceptAll: true`), so `*/*` does.
+///
+/// This is what stops Ferrofin handing WebP to a client that never said it could
+/// decode WebP (older Android TV / Roku / Kodi image loaders send `Accept: */*`).
+fn client_supported_formats(
+    headers: &axum::http::HeaderMap,
+    accept_param: Option<&str>,
+) -> Vec<ImageFormat> {
+    let accept = headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    // `GetCommaSeparatedValues(Accept)` then "remove charsets etc. (anything
+    // after semi-colon)".
+    let accept_types: Vec<&str> = accept
+        .split(',')
+        .map(|t| t.split(';').next().unwrap_or(t).trim())
+        .filter(|t| !t.is_empty())
+        .collect();
+
+    let mut supports_webp = supports_format(&accept_types, accept_param, ImageFormat::Webp, false);
+    if !supports_webp {
+        // The C# crosswalk/android WebView quirk: those clients decode WebP
+        // without ever advertising it.
+        let user_agent = headers
+            .get(axum::http::header::USER_AGENT)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        supports_webp = user_agent.contains("crosswalk") && user_agent.contains("android");
+    }
+
+    let mut formats = Vec::with_capacity(4);
+    if supports_webp {
+        formats.push(ImageFormat::Webp);
+    }
+    formats.push(ImageFormat::Jpg);
+    formats.push(ImageFormat::Png);
+    if supports_format(&accept_types, accept_param, ImageFormat::Gif, true) {
+        formats.push(ImageFormat::Gif);
+    }
+    formats
 }
 
-/// Parses a Jellyfin image-format string into an [`ImageFormat`].
-fn parse_image_format(format: &str) -> Option<ImageFormat> {
-    match format.trim().to_ascii_lowercase().as_str() {
-        "jpg" | "jpeg" => Some(ImageFormat::Jpg),
+/// Port of `ImageController.SupportsFormat`: the format's MIME type is listed in
+/// `Accept`, or — `accept_all` only — `*/*` is, or the `?Accept=` query value
+/// names the format.
+///
+/// The MIME comparison is ordinal (C# `IReadOnlyCollection<string>.Contains`),
+/// the `?Accept=` comparison is case-insensitive against the lowercased enum
+/// member name — note the asymmetry: `Jpg`'s MIME type is `image/jpeg` but its
+/// `?Accept=` spelling is `jpg`.
+fn supports_format(
+    accept_types: &[&str],
+    accept_param: Option<&str>,
+    format: ImageFormat,
+    accept_all: bool,
+) -> bool {
+    accept_types.contains(&format.mime_type())
+        || (accept_all && accept_types.contains(&"*/*"))
+        || accept_param.is_some_and(|p| p.eq_ignore_ascii_case(image_format_name(format)))
+}
+
+/// The lowercase enum-member spelling of an [`ImageFormat`] — C#
+/// `format.ToString().ToLowerInvariant()`, used both by `SupportsFormat` for the
+/// `?Accept=` comparison and as the canonical route-segment spelling.
+fn image_format_name(format: ImageFormat) -> &'static str {
+    match format {
+        ImageFormat::Bmp => "bmp",
+        ImageFormat::Gif => "gif",
+        ImageFormat::Jpg => "jpg",
+        ImageFormat::Png => "png",
+        ImageFormat::Webp => "webp",
+        ImageFormat::Svg => "svg",
+    }
+}
+
+/// The `?Accept=` query value, if present.
+///
+/// Port of `Request.Query[HeaderNames.Accept]`: ASP.NET's query collection is
+/// case-insensitive, so any casing of the key matches. The value is compared
+/// against bare ASCII format names, so it is taken verbatim (no unescaping).
+fn accept_query_param(uri: &axum::http::Uri) -> Option<&str> {
+    uri.query()?.split('&').find_map(|pair| {
+        let (key, value) = pair.split_once('=')?;
+        key.eq_ignore_ascii_case("accept").then_some(value)
+    })
+}
+
+/// The C# integer discriminant of an [`ImageFormat`] — the ordinal ASP.NET's
+/// enum binder accepts on the wire and the value `Enum.Parse` ORs together.
+fn image_format_ordinal(format: ImageFormat) -> i32 {
+    match format {
+        ImageFormat::Bmp => 0,
+        ImageFormat::Gif => 1,
+        ImageFormat::Jpg => 2,
+        ImageFormat::Png => 3,
+        ImageFormat::Webp => 4,
+        ImageFormat::Svg => 5,
+    }
+}
+
+/// The outcome of .NET's `Enum.Parse(typeof(ImageFormat), value, ignoreCase: true)`.
+///
+/// The three arms are distinct because the two request arms of the image routes
+/// treat them differently — see [`parse_image_format`] (route) and
+/// [`bind_query_image_format`] (query).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImageFormatBinding {
+    /// Parsed, and the result names a declared member.
+    Defined(ImageFormat),
+    /// Parsed, but the result names no declared member (`(ImageFormat)6`).
+    /// `Enum.Parse` happily produces these: any integer is accepted, and a
+    /// comma-separated list is bitwise-ORed even on a non-`[Flags]` enum.
+    Undefined,
+    /// Did not parse at all: neither a member name nor an integer.
+    Unparseable,
+}
+
+/// Port of `Enum.Parse(typeof(ImageFormat), value, ignoreCase: true)`.
+///
+/// .NET's enum parser is looser than it looks, and every rule here was measured
+/// against a live 10.11.8 (`?format=` on `/Items/{id}/Images/Primary`):
+///
+/// * leading/trailing whitespace is trimmed (`" 3 "` binds `Png`);
+/// * an integer is accepted with a sign and leading zeros (`"+3"`, `"03"`) and
+///   is **not** range-checked here (`"-1"`, `"6"` parse fine);
+/// * a comma-separated list is parsed part-by-part and bitwise-ORed, even
+///   though `ImageFormat` is not `[Flags]` — `"Jpg,Png"` is `2 | 3 == 3`
+///   (`Png`), and 10.11.8 really does answer `image/png` for it;
+/// * a value that overflows the enum's `Int32` backing store throws inside
+///   `Enum.Parse`, i.e. it is a *parse failure*, not an undefined value.
+fn bind_image_format(format: &str) -> ImageFormatBinding {
+    let mut combined: i32 = 0;
+    for part in format.split(',') {
+        let part = part.trim();
+        let Some(value) = image_format_member(part).map_or_else(
+            || part.parse::<i32>().ok(),
+            |member| Some(image_format_ordinal(member)),
+        ) else {
+            return ImageFormatBinding::Unparseable;
+        };
+        combined |= value;
+    }
+    ImageFormat::try_from(combined)
+        .map_or(ImageFormatBinding::Undefined, ImageFormatBinding::Defined)
+}
+
+/// One `ImageFormat` **member name**, matched case-insensitively as
+/// `Enum.Parse(..., ignoreCase: true)` does.
+fn image_format_member(name: &str) -> Option<ImageFormat> {
+    match name.to_ascii_lowercase().as_str() {
+        "bmp" => Some(ImageFormat::Bmp),
+        "gif" => Some(ImageFormat::Gif),
+        "jpg" => Some(ImageFormat::Jpg),
         "png" => Some(ImageFormat::Png),
         "webp" => Some(ImageFormat::Webp),
-        "gif" => Some(ImageFormat::Gif),
-        "bmp" => Some(ImageFormat::Bmp),
+        "svg" => Some(ImageFormat::Svg),
         _ => None,
     }
+}
+
+/// Binds the **route** `{format}` segment: `[FromRoute, Required] ImageFormat`,
+/// which MVC hands to `EnumTypeModelBinder` with
+/// `SuppressBindingUndefinedValueToEnumType` left at its default — so an
+/// undefined value is a model-binding error just like an unparseable one.
+/// `None` here means the caller must answer `400`.
+///
+/// Measured on 10.11.8: `jpeg`, `bogus`, `-1`, `6` and a value that overflows
+/// `Int32` are all `400` (`{"errors":{"format":["The value '-1' is invalid."]}}`),
+/// while `jpg`, `JPG`, `5` and `Jpg,Png` bind.
+fn parse_image_format(format: &str) -> Option<ImageFormat> {
+    match bind_image_format(format) {
+        ImageFormatBinding::Defined(f) => Some(f),
+        ImageFormatBinding::Undefined | ImageFormatBinding::Unparseable => None,
+    }
+}
+
+/// Binds the **query** `?format=` value: `[FromQuery] ImageFormat?`, which is a
+/// *nullable* enum and therefore does **not** get `EnumTypeModelBinder`'s
+/// undefined-value check. The two arms consequently diverge, and 10.11.8 was
+/// measured on every case below:
+///
+/// * unparseable (`bogus`, `jpeg`, `3.0`, an `Int32` overflow) — the conversion
+///   fails, the nullable parameter stays `null`, and the request proceeds with
+///   the format **negotiated** from `Accept`: `200`, not `400`;
+/// * defined (`png`, `3`, `Jpg,Png`) — that format is used;
+/// * undefined (`-1`, `6`, `99`, `Jpg,Png,Webp` = `7`) — the value binds, and
+///   then `ImageFormatExtensions.GetMimeType` throws
+///   `InvalidEnumArgumentException`. That derives from `ArgumentException`,
+///   which `ExceptionMiddleware.GetStatusCode` maps to `400`.
+///
+/// # Errors
+///
+/// [`ApiError::BadRequest`] for an undefined enum value, mirroring that throw.
+/// (Jellyfin's body there is `text/plain` "Error processing request." from its
+/// exception middleware; Ferrofin's error bodies are uniformly JSON, which is a
+/// server-wide shape difference rather than an image-contract one.)
+fn bind_query_image_format(format: Option<&str>) -> Result<Option<ImageFormat>, ApiError> {
+    let Some(raw) = format else {
+        return Ok(None);
+    };
+    match bind_image_format(raw) {
+        ImageFormatBinding::Defined(f) => Ok(Some(f)),
+        ImageFormatBinding::Unparseable => Ok(None),
+        ImageFormatBinding::Undefined => Err(ApiError::BadRequest(format!(
+            "The value of argument 'format' ({raw}) is invalid for Enum type 'ImageFormat'."
+        ))),
+    }
+}
+
+/// Binds one required numeric route segment, mapping a bind failure onto the
+/// `400` ASP.NET's model binder produces for `[FromRoute, Required] int`/`double`.
+fn bind_route_number<T: std::str::FromStr>(raw: &str, name: &str) -> Result<T, ApiError> {
+    raw.trim()
+        .parse::<T>()
+        .map_err(|_| ApiError::BadRequest(format!("The value '{raw}' is not valid for {name}.")))
 }
 
 /// Selects the image of `image_type` at `index` (default `0`) from an item's
@@ -219,11 +430,18 @@ async fn serve_image_file(
             fill_height: query.fill_height,
             blur: query.blur,
             quality: query.quality.unwrap_or(90),
-            supported_output_formats: query
-                .format
-                .as_deref()
-                .and_then(parse_image_format)
-                .map_or_else(default_output_formats, |f| vec![f]),
+            // C# `GetOutputFormats(format)`: an explicit `format` wins outright,
+            // otherwise the list is derived from what the *client* advertised.
+            supported_output_formats: bind_query_image_format(query.format.as_deref())?
+                .map_or_else(
+                    || {
+                        client_supported_formats(
+                            request.headers(),
+                            accept_query_param(request.uri()),
+                        )
+                    },
+                    |f| vec![f],
+                ),
             ..Default::default()
         };
         let processed = processor.process_image(&options).await?;
@@ -292,6 +510,20 @@ fn append_image_cache_headers(
 ) {
     use axum::http::HeaderValue;
     use axum::http::header;
+
+    // C# `GetImageInternal` builds these two into `responseHeaders` and
+    // `GetImageResult` appends them before the caching branch, so they are on
+    // every image response — cached, uncached and `304` alike. HTTP header names
+    // are case-insensitive; Jellyfin spells them `transferMode.dlna.org` /
+    // `realTimeInfo.dlna.org`.
+    headers.insert(
+        axum::http::HeaderName::from_static("transfermode.dlna.org"),
+        HeaderValue::from_static("Interactive"),
+    );
+    headers.insert(
+        axum::http::HeaderName::from_static("realtimeinfo.dlna.org"),
+        HeaderValue::from_static("DLNA.ORG_TLAG=*"),
+    );
 
     if no_cache {
         headers.insert(
@@ -474,10 +706,22 @@ async fn get_item_image_by_index(
 /// `/Items/{itemId}/Images/{imageType}/{imageIndex}/{tag}/{format}/{maxWidth}/{maxHeight}/{percentPlayed}/{unplayedCount}`.
 ///
 /// Port of Jellyfin's positional-parameter image URL (used by some clients that
-/// bake the transform into the path). The `format`/`maxWidth`/`maxHeight` path
-/// segments are lifted into an [`ImageQuery`] so the transform is applied just as
-/// the query-string form would; `tag`/`percentPlayed`/`unplayedCount` are honored
-/// for the file selection but their overlay effects are not drawn.
+/// bake the transform into the path). Every segment binds exactly as C#
+/// `GetItemImage2`/`HeadItemImage2` binds it — `[FromRoute, Required] ImageFormat
+/// format`, `int maxWidth`, `int maxHeight`, `double percentPlayed`,
+/// `int unplayedCount` — so an unbindable value is a model-binding failure
+/// (`400`), never a silent fallback to an unrequested format. The bound
+/// `format`/`maxWidth`/`maxHeight` are lifted into an [`ImageQuery`] so the
+/// transform is applied just as the query-string form would.
+///
+/// TODO(overlays): `percentPlayed`/`unplayedCount` bind and are validated, but
+/// the overlays themselves are not drawn yet — Jellyfin renders them in
+/// `Jellyfin.Drawing.Skia/PercentPlayedDrawer.cs` and `UnplayedCountIndicator.cs`.
+/// Porting them needs a compositing pass in `ferrofin-drawing` and, for the
+/// unplayed-count badge, a text rasteriser plus a bundled font (a new workspace
+/// dependency, so an owner call). Until then the two values are deliberately not
+/// forwarded into [`ImageProcessingOptions`], so the cache key and the served
+/// bytes stay honest about what was actually drawn.
 #[allow(clippy::type_complexity)]
 async fn get_item_image_parametrized(
     State(state): State<AppState>,
@@ -489,8 +733,8 @@ async fn get_item_image_parametrized(
         format,
         max_width,
         max_height,
-        _percent,
-        _unplayed,
+        percent_played,
+        unplayed_count,
     )): Path<(
         Uuid,
         String,
@@ -505,12 +749,20 @@ async fn get_item_image_parametrized(
     request: Request,
 ) -> Result<Response, ApiError> {
     let image_type = parse_image_type(&image_type)?;
-    // Lift the positional transform segments into a query (empty/`0` segments mean
-    // "unset", matching how clients bake a partial transform into the path).
+    let format = parse_image_format(&format)
+        .ok_or_else(|| ApiError::BadRequest(format!("The value '{format}' is not valid.")))?;
+    let max_width: i32 = bind_route_number(&max_width, "maxWidth")?;
+    let max_height: i32 = bind_route_number(&max_height, "maxHeight")?;
+    // Bound and validated for parity with the C# route parameters; see the
+    // overlay TODO on this handler for why they are not forwarded yet.
+    let _percent_played: f64 = bind_route_number(&percent_played, "percentPlayed")?;
+    let _unplayed_count: i32 = bind_route_number(&unplayed_count, "unplayedCount")?;
+    // Lift the positional transform segments into a query. A `0` dimension is the
+    // "unset" spelling clients bake into the path for a partial transform.
     let query = ImageQuery {
-        format: Some(format).filter(|f| !f.is_empty() && !f.eq_ignore_ascii_case("0")),
-        max_width: max_width.parse().ok().filter(|w| *w > 0),
-        max_height: max_height.parse().ok().filter(|h| *h > 0),
+        format: Some(image_format_name(format).to_owned()),
+        max_width: Some(max_width).filter(|w| *w > 0),
+        max_height: Some(max_height).filter(|h| *h > 0),
         tag: Some(tag).filter(|t| !t.is_empty() && !t.eq_ignore_ascii_case("0")),
         ..ImageQuery::default()
     };
@@ -1242,6 +1494,189 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use std::time::Duration;
+
+    /// Builds a `HeaderMap` from `(name, value)` pairs.
+    fn headers(pairs: &[(&str, &str)]) -> axum::http::HeaderMap {
+        let mut map = axum::http::HeaderMap::new();
+        for (name, value) in pairs {
+            map.insert(
+                axum::http::HeaderName::from_bytes(name.as_bytes()).expect("header name"),
+                axum::http::HeaderValue::from_str(value).expect("header value"),
+            );
+        }
+        map
+    }
+
+    /// The measured 10.11.8 `Accept` matrix: WebP is offered only when it is
+    /// advertised explicitly, so `*/*`, `image/jpeg`, `text/html` and an absent
+    /// header all come back JPEG-first. (`GetClientSupportedFormats`.)
+    #[test]
+    fn client_formats_offer_webp_only_when_advertised() {
+        let jpg_first = vec![ImageFormat::Jpg, ImageFormat::Png];
+        assert_eq!(client_supported_formats(&headers(&[]), None), jpg_first);
+        assert_eq!(
+            client_supported_formats(&headers(&[("accept", "image/jpeg")]), None),
+            jpg_first
+        );
+        assert_eq!(
+            client_supported_formats(&headers(&[("accept", "text/html")]), None),
+            jpg_first
+        );
+        // `*/*` enables Gif (acceptAll: true) but NOT WebP (acceptAll: false).
+        assert_eq!(
+            client_supported_formats(&headers(&[("accept", "*/*")]), None),
+            vec![ImageFormat::Jpg, ImageFormat::Png, ImageFormat::Gif]
+        );
+        assert_eq!(
+            client_supported_formats(
+                &headers(&[("accept", "image/webp,image/apng,image/*,*/*;q=0.8")]),
+                None
+            ),
+            vec![
+                ImageFormat::Webp,
+                ImageFormat::Jpg,
+                ImageFormat::Png,
+                ImageFormat::Gif
+            ]
+        );
+        // `;q=…` parameters are stripped before the comparison.
+        assert_eq!(
+            client_supported_formats(&headers(&[("accept", "image/webp;q=0.9")]), None),
+            vec![ImageFormat::Webp, ImageFormat::Jpg, ImageFormat::Png]
+        );
+    }
+
+    /// `?Accept=webp` and the crosswalk/android User-Agent are the two other
+    /// ways `GetClientSupportedFormats` turns WebP on.
+    #[test]
+    fn client_formats_honor_accept_param_and_crosswalk_ua() {
+        assert_eq!(
+            client_supported_formats(&headers(&[]), Some("webp")),
+            vec![ImageFormat::Webp, ImageFormat::Jpg, ImageFormat::Png]
+        );
+        assert_eq!(
+            client_supported_formats(&headers(&[]), Some("WEBP")),
+            vec![ImageFormat::Webp, ImageFormat::Jpg, ImageFormat::Png]
+        );
+        assert_eq!(
+            client_supported_formats(&headers(&[]), Some("gif")),
+            vec![ImageFormat::Jpg, ImageFormat::Png, ImageFormat::Gif]
+        );
+        let ua = "Mozilla/5.0 (Linux; Android 5.1) Crosswalk/23.53.589.4";
+        assert_eq!(
+            client_supported_formats(&headers(&[("user-agent", ua)]), None),
+            vec![ImageFormat::Webp, ImageFormat::Jpg, ImageFormat::Png]
+        );
+    }
+
+    #[test]
+    fn accept_query_param_is_case_insensitive_on_the_key() {
+        let uri: axum::http::Uri = "/Items/x/Images/Primary?maxWidth=100&Accept=webp"
+            .parse()
+            .expect("uri");
+        assert_eq!(accept_query_param(&uri), Some("webp"));
+        let lower: axum::http::Uri = "/x?accept=gif".parse().expect("uri");
+        assert_eq!(accept_query_param(&lower), Some("gif"));
+        let none: axum::http::Uri = "/x?maxWidth=100".parse().expect("uri");
+        assert_eq!(accept_query_param(&none), None);
+    }
+
+    /// `EnumTypeModelBinder` binds member names and *defined* ordinals only —
+    /// the exact set 10.11.8 answers `200` for on the positional route.
+    #[test]
+    fn image_format_binds_member_names_and_defined_ordinals() {
+        assert_eq!(parse_image_format("jpg"), Some(ImageFormat::Jpg));
+        assert_eq!(parse_image_format("JPG"), Some(ImageFormat::Jpg));
+        assert_eq!(parse_image_format("Bmp"), Some(ImageFormat::Bmp));
+        assert_eq!(parse_image_format("webp"), Some(ImageFormat::Webp));
+        assert_eq!(parse_image_format("svg"), Some(ImageFormat::Svg));
+        assert_eq!(parse_image_format("0"), Some(ImageFormat::Bmp));
+        assert_eq!(parse_image_format("2"), Some(ImageFormat::Jpg));
+        assert_eq!(parse_image_format("3"), Some(ImageFormat::Png));
+        assert_eq!(parse_image_format("4"), Some(ImageFormat::Webp));
+        assert_eq!(parse_image_format("5"), Some(ImageFormat::Svg));
+        // Not member names / not defined ordinals -> no bind -> the route 400s.
+        assert_eq!(parse_image_format("jpeg"), None);
+        assert_eq!(parse_image_format("ts"), None);
+        assert_eq!(parse_image_format("bogus"), None);
+        assert_eq!(parse_image_format("-1"), None);
+        assert_eq!(parse_image_format("6"), None);
+        assert_eq!(parse_image_format(""), None);
+        // `Enum.Parse` looseness the route arm inherits, all measured on 10.11.8:
+        // whitespace/sign/leading zeros bind, and a comma list is ORed.
+        assert_eq!(parse_image_format(" 3 "), Some(ImageFormat::Png));
+        assert_eq!(parse_image_format("+3"), Some(ImageFormat::Png));
+        assert_eq!(parse_image_format("03"), Some(ImageFormat::Png));
+        assert_eq!(parse_image_format("Jpg,Png"), Some(ImageFormat::Png)); // 2 | 3
+        assert_eq!(parse_image_format("Webp,1"), Some(ImageFormat::Svg)); // 4 | 1
+        assert_eq!(parse_image_format("Jpg,Png,Webp"), None); // 7 is undefined
+        assert_eq!(parse_image_format("Png,bogus"), None);
+        assert_eq!(parse_image_format("99999999999999999999"), None); // Int32 overflow
+    }
+
+    /// The QUERY arm is a *nullable* enum, so it skips the undefined-value check
+    /// the route arm gets: an unparseable value falls back to negotiation
+    /// (`200`), while an undefined ordinal throws through to a `400`. Every case
+    /// below was measured against 10.11.8 on
+    /// `/Items/{id}/Images/Primary?maxWidth=100&format=…`.
+    #[test]
+    fn query_format_nulls_on_unparseable_and_400s_on_undefined() {
+        // absent / unparseable -> None -> negotiate (Jellyfin answers 200 jpeg)
+        for raw in [
+            None,
+            Some(""),
+            Some("bogus"),
+            Some("jpeg"),
+            Some("ts"),
+            Some("3.0"),
+            Some("0x3"),
+            Some("Png,bogus"),
+            Some("99999999999999999999"),
+        ] {
+            assert_eq!(
+                bind_query_image_format(raw).expect("no 400"),
+                None,
+                "{raw:?} should bind to null"
+            );
+        }
+        // defined -> that format
+        for (raw, want) in [
+            ("png", ImageFormat::Png),
+            ("3", ImageFormat::Png),
+            ("webp", ImageFormat::Webp),
+            ("5", ImageFormat::Svg),
+            (" 3 ", ImageFormat::Png),
+            ("+3", ImageFormat::Png),
+            ("Jpg,Png", ImageFormat::Png),
+            ("Webp,1", ImageFormat::Svg),
+        ] {
+            assert_eq!(
+                bind_query_image_format(Some(raw)).expect("no 400"),
+                Some(want)
+            );
+        }
+        // undefined -> 400 (C# `InvalidEnumArgumentException` -> `ArgumentException`)
+        for raw in ["-1", "6", "7", "99", "Jpg,Png,Webp"] {
+            assert!(
+                matches!(
+                    bind_query_image_format(Some(raw)),
+                    Err(ApiError::BadRequest(_))
+                ),
+                "{raw} should be a 400"
+            );
+        }
+    }
+
+    #[test]
+    fn route_numbers_reject_garbage() {
+        assert_eq!(bind_route_number::<i32>("400", "maxWidth").ok(), Some(400));
+        assert_eq!(
+            bind_route_number::<f64>("50", "percentPlayed").ok(),
+            Some(50.0)
+        );
+        assert!(bind_route_number::<i32>("abc", "unplayedCount").is_err());
+        assert!(bind_route_number::<f64>("xyz", "percentPlayed").is_err());
+    }
 
     fn img(path: String) -> ItemImageInfo {
         ItemImageInfo {

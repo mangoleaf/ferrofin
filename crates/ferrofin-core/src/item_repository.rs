@@ -594,14 +594,21 @@ impl FerrofinItemRepository {
             .iter()
             .map(|t| i64::from(i32::from(*t)))
             .collect();
-        // Content-item scoping: the browse's requested kinds plus any caller-forced
-        // types (music genres come only from music items; plain genres exclude them).
+        // Content-item scoping. `GetItemValues` builds its inner query from
+        // `IncludeItemTypes` ALONE — the caller-forced list is Ferrofin's stand-in
+        // for upstream's `.Where(e => e.Type == returnType)` split between
+        // `/Genres` and `/MusicGenres`, so it is the FALLBACK when the caller
+        // named no kinds, never a union with them. Unioning made
+        // `?includeItemTypes=Movie` on `/MusicGenres` *widen* the aggregate back
+        // to music items instead of narrowing it to movies.
         let mut content_type_names: Vec<String> = filter
             .include_item_types
             .iter()
             .filter_map(|k| stored_type_name(*k).map(str::to_owned))
             .collect();
-        content_type_names.extend(include_content_types.iter().cloned());
+        if content_type_names.is_empty() {
+            content_type_names.extend(include_content_types.iter().cloned());
+        }
         let ancestors: Vec<String> = filter
             .ancestor_ids
             .iter()
@@ -634,9 +641,10 @@ impl FerrofinItemRepository {
         push_value_aggregate(&mut qb, &scope);
         push_by_name_join(&mut qb, return_type);
         append_by_name_filters(&mut qb, filter);
-        // ORDER BY Name (the key the old in-memory sort used); parity harness is the
-        // oracle for divergences from Jellyfin's SortName ordering.
-        qb.push(r#" ORDER BY bi."Name" ASC"#);
+        // C# `GetItemValues` runs the same `ApplyOrder(query, filter, context)`
+        // the main browse does, so the caller's `sortBy`/`sortOrder` apply and
+        // the no-`sortBy` default is `OrderBy(e => e.SortName)` — not `Name`.
+        crate::translate_query::append_order_by(&mut qb, filter);
         if let Some(limit) = filter.limit {
             qb.push(" LIMIT ").push_bind(i64::from(limit));
             let offset = filter.start_index.unwrap_or(0);
@@ -967,25 +975,19 @@ fn append_by_name_filters<'a>(qb: &mut QueryBuilder<'a, Sqlite>, filter: &'a Int
         qb.push(r#" AND lower(COALESCE(bi."SortName", bi."Name")) LIKE "#)
             .push_bind(format!("{}%", prefix.to_lowercase()));
     }
-    if let Some(first) = non_blank(&filter.name_starts_with_or_greater)
-        .and_then(|b| b.chars().next())
-        .map(String::from)
-    {
-        qb.push(r#" AND (substr(bi."SortName", 1, 1) > "#)
-            .push_bind(first.clone());
-        qb.push(r#" OR substr(bi."Name", 1, 1) > "#)
-            .push_bind(first);
-        qb.push(")");
+    // Both bounds are FULL-STRING comparisons against the lowercased parameter,
+    // over `SortName` only (C# `BaseItemRepository.cs:2036-2046`:
+    // `SortName!.CompareTo(param.ToLowerInvariant()) >= 0` / `< 0`). Comparing
+    // only the first character, case-sensitively, made `nameLessThan=Jb` and
+    // `nameStartsWithOrGreater=j` return the wrong page — and `>` instead of
+    // `>=` dropped the boundary row itself.
+    if let Some(boundary) = non_blank(&filter.name_starts_with_or_greater) {
+        qb.push(r#" AND bi."SortName" >= "#)
+            .push_bind(boundary.to_lowercase());
     }
-    if let Some(first) = non_blank(&filter.name_less_than)
-        .and_then(|b| b.chars().next())
-        .map(String::from)
-    {
-        qb.push(r#" AND (substr(bi."SortName", 1, 1) < "#)
-            .push_bind(first.clone());
-        qb.push(r#" OR substr(bi."Name", 1, 1) < "#)
-            .push_bind(first);
-        qb.push(")");
+    if let Some(boundary) = non_blank(&filter.name_less_than) {
+        qb.push(r#" AND bi."SortName" < "#)
+            .push_bind(boundary.to_lowercase());
     }
 }
 
@@ -2676,6 +2678,76 @@ mod tests {
         );
     }
 
+    /// The by-name browse runs the SAME `ApplyOrder` the main browse does
+    /// (C# `GetItemValues` -> `ApplyOrder(query, filter, context)`), and scopes
+    /// its inner content query by `IncludeItemTypes` ALONE.
+    ///
+    /// Neither was true before: the ORDER BY was hardcoded `bi."Name" ASC` so
+    /// `sortOrder` was a silent no-op, and `include_item_types` was UNIONed with
+    /// the caller-forced content types, so naming a kind *widened* the aggregate
+    /// instead of narrowing it. The parity diff engine aligns arrays by `Name`,
+    /// which is exactly why the ordering half went unnoticed.
+    #[tokio::test]
+    async fn by_name_order_and_include_item_types_reach_the_sql() {
+        let db = test_db().await;
+        let repository = repo(&db);
+
+        let movie = Uuid::from_u128(0xA011);
+        seed_named_item(&db, movie, BaseItemKind::Movie, "One").await;
+        for g in ["Action", "Adventure", "Comedy", "Drama", "Horror"] {
+            seed_item_genre(&db, movie, g).await;
+        }
+
+        let desc = InternalItemsQuery {
+            order_by: vec![(
+                ferrofin_model::live_tv::ItemSortBy::SortName,
+                ferrofin_model::dto::SortOrder::Descending,
+            )],
+            ..Default::default()
+        };
+        let desc_names: Vec<_> = repository
+            .get_genres(&desc)
+            .await
+            .expect("desc")
+            .items
+            .iter()
+            .filter_map(|i| i.item.name.clone())
+            .collect();
+        assert_eq!(
+            desc_names,
+            vec!["Horror", "Drama", "Comedy", "Adventure", "Action"]
+        );
+
+        // No Audio item carries these genres, so the aggregate is empty.
+        let audio_only = InternalItemsQuery {
+            include_item_types: vec![BaseItemKind::Audio],
+            ..Default::default()
+        };
+        assert!(
+            repository
+                .get_genres(&audio_only)
+                .await
+                .expect("audio only")
+                .items
+                .is_empty()
+        );
+
+        // ...and naming the kind that DOES carry them keeps all five.
+        let movie_only = InternalItemsQuery {
+            include_item_types: vec![BaseItemKind::Movie],
+            ..Default::default()
+        };
+        assert_eq!(
+            repository
+                .get_genres(&movie_only)
+                .await
+                .expect("movie only")
+                .items
+                .len(),
+            5
+        );
+    }
+
     #[tokio::test]
     async fn by_name_paging_and_filters_push_into_sql() {
         let db = test_db().await;
@@ -2720,8 +2792,9 @@ mod tests {
         assert_eq!(a_names, vec!["Action", "Adventure"]);
         assert_eq!(a.total_record_count, 0);
 
-        // nameLessThan compares only the FIRST character (C# `FirstOrDefault() <`):
-        // "Comedy" itself is excluded ('C' < 'C' is false)…
+        // nameLessThan is a FULL-STRING comparison of `SortName` against the
+        // lowercased bound (C# `SortName.CompareTo(bound.ToLowerInvariant()) < 0`).
+        // "Comedy" is excluded because "comedy" < "comedy" is false…
         let less = InternalItemsQuery {
             name_less_than: Some("Comedy".to_owned()),
             ..Default::default()
@@ -2729,8 +2802,8 @@ mod tests {
         let l = repository.get_genres(&less).await.expect("less");
         let l_names: Vec<_> = l.items.iter().filter_map(|i| i.item.name.clone()).collect();
         assert_eq!(l_names, vec!["Action", "Adventure"]);
-        // …and so is everything else starting with 'C', even when the full string
-        // sorts below the bound ("Comedy" < "Cz" as strings, but 'C' < 'C' fails).
+        // …but it IS included under "Cz", because the whole string is compared:
+        // "comedy" < "cz". A first-character-only test excluded it.
         let less_cz = InternalItemsQuery {
             name_less_than: Some("Cz".to_owned()),
             ..Default::default()
@@ -2741,7 +2814,38 @@ mod tests {
             .iter()
             .filter_map(|i| i.item.name.clone())
             .collect();
-        assert_eq!(lcz_names, vec!["Action", "Adventure"]);
+        assert_eq!(lcz_names, vec!["Action", "Adventure", "Comedy"]);
+
+        // nameStartsWithOrGreater is the INCLUSIVE mirror (`>= 0`), also
+        // lowercased and full-string: the boundary row itself is kept…
+        let ge = InternalItemsQuery {
+            name_starts_with_or_greater: Some("Comedy".to_owned()),
+            ..Default::default()
+        };
+        let ge_names: Vec<_> = repository
+            .get_genres(&ge)
+            .await
+            .expect("ge")
+            .items
+            .iter()
+            .filter_map(|i| i.item.name.clone())
+            .collect();
+        assert_eq!(ge_names, vec!["Comedy", "Drama", "Horror"]);
+        // …and the bound is case-insensitive, because C# lowercases it before
+        // comparing against the already-lowercase `SortName`.
+        let ge_lower = InternalItemsQuery {
+            name_starts_with_or_greater: Some("comedy".to_owned()),
+            ..Default::default()
+        };
+        let ge_lower_names: Vec<_> = repository
+            .get_genres(&ge_lower)
+            .await
+            .expect("ge lower")
+            .items
+            .iter()
+            .filter_map(|i| i.item.name.clone())
+            .collect();
+        assert_eq!(ge_lower_names, vec!["Comedy", "Drama", "Horror"]);
 
         // A plain searchTerm is a literal contains-match on CleanName, and the
         // count survives it.

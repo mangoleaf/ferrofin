@@ -617,8 +617,9 @@ pub async fn build_app_state(
         Arc::new(FerrofinDisplayPreferencesManager::new(db.clone()));
     let music: Arc<dyn ferrofin_traits::library::MusicManager> =
         Arc::new(FerrofinMusicManager::new(Arc::clone(&item_repository)));
-    let search: Arc<dyn ferrofin_traits::library::SearchManager> =
-        Arc::new(FerrofinSearchManager::new(Arc::clone(&item_repository)));
+    let search: Arc<dyn ferrofin_traits::library::SearchManager> = Arc::new(
+        FerrofinSearchManager::new(Arc::clone(&item_repository), Arc::clone(&users)),
+    );
     // Kept concrete so the "Migrate Trickplay Image Location" task can call the
     // inherent `move_generated_trickplay_data` helper.
     let trickplay_impl = Arc::new(FerrofinTrickplayManager::new(
@@ -695,9 +696,11 @@ pub async fn build_app_state(
             .with_database(db.clone()),
     );
 
-    // Built here rather than earlier so it can take the library configuration:
-    // the remote-image ("Choose Image") language filter resolves
-    // `LibraryOptions.PreferredMetadataLanguage` through it. Nothing consumes
+    // Built here rather than earlier so it can take the library configuration.
+    // Two things read it: the remote-image ("Choose Image") language filter
+    // resolves `LibraryOptions.PreferredMetadataLanguage` through it, and the
+    // refresh/remote-search paths resolve the owning library's metadata/image
+    // fetcher checkboxes through it (C# `BaseItemManager`). Nothing consumes
     // `providers` before this point.
     let providers: Arc<dyn ferrofin_traits::providers::ProviderManager> = Arc::new(
         LocalProviderManager::new(Vec::new())

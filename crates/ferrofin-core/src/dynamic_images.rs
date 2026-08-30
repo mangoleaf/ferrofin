@@ -712,6 +712,12 @@ mod tests {
         }
 
         async fn by_name(&self, kind: BaseItemKind, name: &str) -> BaseItemEntity {
+            self.by_name_opt(kind, name)
+                .await
+                .expect("by-name row exists")
+        }
+
+        async fn by_name_opt(&self, kind: BaseItemKind, name: &str) -> Option<BaseItemEntity> {
             self.items
                 .get_item_list(&InternalItemsQuery {
                     include_item_types: vec![kind],
@@ -722,7 +728,6 @@ mod tests {
                 .expect("query")
                 .into_iter()
                 .next()
-                .expect("by-name row exists")
         }
 
         async fn primary_of(&self, id: Uuid) -> Option<ItemImageInfo> {
@@ -873,7 +878,14 @@ mod tests {
             .await;
         fx.seed(BaseItemKind::Audio, "So What", Some("Jazz"), Some(&cover))
             .await;
-        let genre = fx.by_name(BaseItemKind::Genre, "Jazz").await;
+        // A music item's genre materializes ONLY as a `MusicGenre` row —
+        // upstream keeps `Genre` and `MusicGenre` disjoint
+        // (`LibraryManager.GetMusicGenre` vs `GetGenre`).
+        assert!(
+            fx.by_name_opt(BaseItemKind::Genre, "Jazz").await.is_none(),
+            "a music genre must not also produce a plain Genre row"
+        );
+        let genre = fx.by_name(BaseItemKind::MusicGenre, "Jazz").await;
 
         let video = fx
             .providers
@@ -890,11 +902,10 @@ mod tests {
         assert!(music.iter().all(|p| p == &cover));
 
         let report = fx.providers.refresh_all().await.expect("pass");
-        // Two by-name rows carry "Jazz" and both earn a collage: the `Genre`
-        // row seeded above, and the `MusicGenre` row the scanner materializes
-        // for a music item's genre (see `item_persistence_service`). Jellyfin
-        // keeps the same pair, and `/MusicGenres` browses the second one.
-        assert_eq!(report.generated, 2);
+        // Exactly one by-name row carries "Jazz" — the `MusicGenre` row the
+        // scanner materializes for a music item's genre — and it earns the
+        // collage. `/MusicGenres` browses it; the Genres tab does not list it.
+        assert_eq!(report.generated, 1);
         let genre_id = Uuid::parse_str(&genre.id).expect("id");
         let primary = fx.primary_of(genre_id).await.expect("music genre primary");
         let decoded = image::open(&primary.path).expect("png");

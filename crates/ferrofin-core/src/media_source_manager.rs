@@ -295,7 +295,7 @@ impl FerrofinMediaSourceManager {
         let mut source = MediaSourceInfo {
             id: Some(id),
             path: item.path.clone(),
-            name: item.name.clone(),
+            name: Some(media_source_name(item)),
             container: container_of(item),
             size: item.size,
             run_time_ticks: item.run_time_ticks,
@@ -309,6 +309,11 @@ impl FerrofinMediaSourceManager {
             video_type,
             default_audio_stream_index,
             e_tag: Some(source_etag(item)),
+            // `BaseItem.GetVersionInfo` seeds the source bitrate from the item's
+            // persisted `TotalBitrate` before inferring
+            // (v10.11.8 `BaseItem.cs:1218-1219`); `InferTotalBitrate()` is a
+            // no-op when it is already set.
+            bitrate: item.total_bitrate.and_then(|b| i32::try_from(b).ok()),
             ..Default::default()
         };
         // Sum the internal streams' bit rates into the source total
@@ -547,6 +552,40 @@ fn estimated_video_bitrate(width: i32) -> Option<i32> {
     }
 }
 
+/// The display name of an item's media source — port of
+/// `BaseItem.GetMediaSourceName` (v10.11.8 `BaseItem.cs:1224-1249`).
+///
+/// A file-protocol item names its source after the file stem, NOT after the
+/// item's own `Name`; `item.Name` is only the fallback when there is no usable
+/// path. That is what makes a movie's source read `Movie 0001 (2020)` rather
+/// than `Movie 0001`.
+///
+/// Two upstream branches cannot fire on a Ferrofin row and are therefore not
+/// reachable rather than skipped:
+///
+/// * the `HasLocalAlternateVersions` containing-folder prefix strip reads
+///   `Video.LocalAlternateVersions`, which Ferrofin does not model — alternate
+///   versions are linked through `PrimaryVersionId` (upstream's
+///   *Linked*AlternateVersions), for which `HasLocalAlternateVersions` is
+///   `false` upstream too;
+/// * the `3D`/`Bluray`/`DVD`/`ISO` terms read `Video.Video3DFormat`,
+///   `VideoType` and `IsoType`, none of which the pinned 10.11.8 `BaseItems`
+///   schema carries as a column — Ferrofin reports every video source as
+///   `VideoType::VideoFile` with no 3D format, so upstream would append no
+///   terms either.
+fn media_source_name(item: &BaseItemEntity) -> String {
+    // `item.IsFileProtocol && !string.IsNullOrEmpty(path)`.
+    let stem = item
+        .path
+        .as_deref()
+        .filter(|p| !p.is_empty())
+        .and_then(|p| std::path::Path::new(p).file_stem())
+        .map(|s| s.to_string_lossy().into_owned())
+        .filter(|s| !s.is_empty());
+
+    stem.or_else(|| item.name.clone()).unwrap_or_default()
+}
+
 /// The container of an item, derived from its stored path extension when present.
 fn container_of(item: &BaseItemEntity) -> Option<String> {
     item.path
@@ -672,9 +711,11 @@ fn localize_stream(
     stream.localized_default = Some(localization.get_localized_string("Default"));
     stream.localized_external = Some(localization.get_localized_string("External"));
     if let Some(language) = stream.language.as_deref().filter(|l| !l.is_empty()) {
+        // Feeds `display_title()` only — `MediaStream::localized_language` is
+        // `skip_serializing`, because `LocalizedLanguage` (like
+        // `LocalizedOriginal`) is post-10.11.8 and absent from the contract.
         stream.localized_language = localization.get_language_display_name(language);
     }
-    // (`LocalizedOriginal` is post-10.11.8 and absent from the contract.)
     if stream.stream_type == MediaStreamType::Subtitle {
         stream.localized_undefined = Some(localization.get_localized_string("Undefined"));
         stream.localized_forced = Some(localization.get_localized_string("Forced"));

@@ -14,11 +14,12 @@
 //! parses those keys back onto the row, persists the item preferences and the
 //! remaining custom preferences, and saves the row.
 //!
-//! Departure: Jellyfin also (de)serializes the row's `HomeSections` children as
-//! `homesection{n}` custom prefs. The `ferrofin-traits` display-preferences seam
-//! returns the *flat* row (home sections are a separate concern loaded by the
-//! DTO layer), so home-section round-tripping is deferred with that seam; the
-//! scalar and item/custom preferences are fully ported.
+//! The row's `HomeSection` children round-trip through the same `CustomPrefs`
+//! map as `homesection{n}` keys: the GET emits one per stored section, and the
+//! POST parses them back, substituting the C# per-order default when a value
+//! does not name a `HomeSectionType`. They are loaded and rewritten through the
+//! display-preferences seam's `list_home_sections`/`set_home_sections`, which
+//! stand in for EF's `.Include(HomeSections)` eager-load.
 
 use std::collections::HashMap;
 
@@ -30,6 +31,7 @@ use ferrofin_common::extensions::get_md5;
 use ferrofin_db::entities::display_preferences::{
     DisplayPreferencesEntity, ItemDisplayPreferencesEntity,
 };
+use ferrofin_db::enums::{HomeSectionType, ViewType};
 use ferrofin_model::dto::{DisplayPreferencesDto, ScrollDirection, SortOrder};
 use uuid::Uuid;
 
@@ -37,9 +39,17 @@ use crate::auth::RequireAuth;
 use crate::error::ApiError;
 use crate::state::AppState;
 
-/// The default skip length (ms) the web client uses when the custom pref is
-/// absent (C# `? … : 15000`).
-const DEFAULT_SKIP_LENGTH_MS: i32 = 15000;
+/// The rewind skip length (ms) stored when the `skipBackLength` custom pref is
+/// absent or empty (v10.11.8 `DisplayPreferencesController.cs`, `… : 10000`).
+///
+/// Upstream v12.0-rc3 unified both skip lengths to `15000`; Ferrofin pins the
+/// 10.11.8 contract, so the two values stay distinct here.
+const DEFAULT_SKIP_BACK_LENGTH_MS: i32 = 10_000;
+
+/// The fast-forward skip length (ms) stored when the `skipForwardLength` custom
+/// pref is absent or empty (v10.11.8 `DisplayPreferencesController.cs`,
+/// `… : 30000`). See [`DEFAULT_SKIP_BACK_LENGTH_MS`].
+const DEFAULT_SKIP_FORWARD_LENGTH_MS: i32 = 30_000;
 
 /// Query parameters for the display-preferences routes.
 #[derive(Debug, Default, serde::Deserialize)]
@@ -156,6 +166,20 @@ async fn get_display_preferences(
         .await?;
 
     let mut custom_prefs: HashMap<String, Option<String>> = HashMap::new();
+    // The row's home sections, as `homesection{order}` = the lowercased
+    // `HomeSectionType` name. Written before the scalar keys and before the
+    // stored custom prefs, matching the C# order (the stored-prefs merge is a
+    // `TryAdd`, so anything emitted here wins).
+    for section in state
+        .display_preferences
+        .list_home_sections(prefs.id)
+        .await?
+    {
+        custom_prefs.insert(
+            format!("homesection{}", section.order),
+            Some(home_section_name(section.type_)),
+        );
+    }
     // Scalar row fields the web client reads out of CustomPrefs.
     custom_prefs.insert(
         "chromecastVersion".to_owned(),
@@ -192,7 +216,10 @@ async fn get_display_preferences(
     }
 
     let dto = DisplayPreferencesDto {
-        id: Some(prefs.item_id.clone()),
+        // C# returns `displayPreferences.ItemId.ToString()` — the lowercase
+        // hyphenated `Guid` form. The stored column is `guid_to_db`'s uppercase
+        // form, so it has to be normalized on the way out.
+        id: Some(prefs.item_id.to_ascii_lowercase()),
         view_type: None,
         sort_by: Some(item_prefs.sort_by.clone()),
         index_by: index_by_name(prefs.index_by),
@@ -262,10 +289,10 @@ async fn update_display_preferences(
             .is_none_or(|v| v.is_empty() || !v.eq_ignore_ascii_case("false"));
     prefs.skip_backward_length = take_pref(&mut dto.custom_prefs, "skipBackLength")
         .and_then(|v| v.parse::<i32>().ok())
-        .unwrap_or(DEFAULT_SKIP_LENGTH_MS);
+        .unwrap_or(DEFAULT_SKIP_BACK_LENGTH_MS);
     prefs.skip_forward_length = take_pref(&mut dto.custom_prefs, "skipForwardLength")
         .and_then(|v| v.parse::<i32>().ok())
-        .unwrap_or(DEFAULT_SKIP_LENGTH_MS);
+        .unwrap_or(DEFAULT_SKIP_FORWARD_LENGTH_MS);
     // C# `TryGetValue(key, out var v) ? v : string.Empty` over a
     // `Dictionary<string, string?>`: an absent key stores the empty string, but a
     // key present with an explicit JSON `null` stores null — and the GET path
@@ -274,10 +301,55 @@ async fn update_display_preferences(
     prefs.dashboard_theme = take_nullable_pref(&mut dto.custom_prefs, "dashboardTheme");
     prefs.tv_home = take_nullable_pref(&mut dto.custom_prefs, "tvhome");
 
-    // Drop the home-section and landing keys: home-section persistence is
-    // deferred with the flat display-preferences seam (see the module docs).
-    dto.custom_prefs
-        .retain(|k, _| !k.to_ascii_lowercase().starts_with("homesection"));
+    // Home sections: every `homesection{order}` key is consumed off CustomPrefs
+    // and turned into a `HomeSection` row. A value that does not name a
+    // `HomeSectionType` falls back to the per-order default, and an order at or
+    // beyond that table falls back to `None` — C#
+    // `type = order < 8 ? defaults[order] : HomeSectionType.None;`.
+    let mut home_sections: Vec<(i32, i32)> = Vec::new();
+    let home_section_keys: Vec<String> = dto
+        .custom_prefs
+        .keys()
+        .filter(|k| {
+            k.len() > "homesection".len()
+                && k[.."homesection".len()].eq_ignore_ascii_case("homesection")
+        })
+        .cloned()
+        .collect();
+    for key in home_section_keys {
+        let value = dto.custom_prefs.remove(&key).flatten();
+        // C# `int.Parse` throws on a non-numeric suffix; Ferrofin drops the key
+        // instead of 500-ing, which is the same observable state for a client
+        // that never sends one.
+        let Ok(order) = key["homesection".len()..].parse::<i32>() else {
+            continue;
+        };
+        let type_ = value
+            .as_deref()
+            .and_then(home_section_from_name)
+            .unwrap_or_else(|| {
+                usize::try_from(order)
+                    .ok()
+                    .and_then(|o| HOME_SECTION_DEFAULTS.get(o).copied())
+                    .unwrap_or(0)
+            });
+        home_sections.push((order, type_));
+    }
+
+    // `landing-*` keys naming something that is not a `ViewType` are dropped
+    // rather than persisted (C# logs and removes them).
+    dto.custom_prefs.retain(|key, value| {
+        if key.len() <= "landing-".len()
+            || !key[.."landing-".len()].eq_ignore_ascii_case("landing-")
+        {
+            return true;
+        }
+        let valid = value.as_deref().is_some_and(is_view_type_name);
+        if !valid {
+            tracing::error!(landing_screen_option = ?value, "Invalid ViewType");
+        }
+        valid
+    });
 
     let mut item_prefs: ItemDisplayPreferencesEntity = state
         .display_preferences
@@ -299,6 +371,12 @@ async fn update_display_preferences(
     state
         .display_preferences
         .update_display_preferences(&prefs)
+        .await?;
+    // Flushed last, mirroring EF saving the row's cleared-and-rebuilt
+    // `HomeSections` collection as part of `UpdateDisplayPreferences`.
+    state
+        .display_preferences
+        .set_home_sections(prefs.id, &home_sections)
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -332,6 +410,90 @@ fn chromecast_from_name(name: &str) -> Option<i32> {
         _ => None,
     }
 }
+
+/// The per-`Order` fallback home-section types, verbatim from the C#
+/// `HomeSectionType[] defaults` array in
+/// `DisplayPreferencesController.UpdateDisplayPreferences`. Indexed by the
+/// section's order; an order at or beyond the array uses `None`.
+const HOME_SECTION_DEFAULTS: [i32; 8] = [
+    1, // SmallLibraryTiles
+    4, // Resume
+    5, // ResumeAudio
+    9, // ResumeBook
+    8, // LiveTv
+    7, // NextUp
+    6, // LatestMedia
+    0, // None
+];
+
+/// The `HomeSectionType` name for a stored discriminant — C#
+/// `homeSection.Type.ToString().ToLowerInvariant()`.
+fn home_section_name(value: i32) -> String {
+    HomeSectionType::try_from(value)
+        .map_or_else(|_| "none".to_owned(), |t| format!("{t:?}").to_lowercase())
+}
+
+/// Parses a `HomeSectionType` name back to its stored discriminant, case
+/// insensitively (C# `Enum.TryParse<HomeSectionType>(value, true, out _)`).
+fn home_section_from_name(name: &str) -> Option<i32> {
+    HOME_SECTION_TYPES
+        .iter()
+        .find(|t| format!("{t:?}").eq_ignore_ascii_case(name))
+        .map(|t| i32::from(*t))
+}
+
+/// Every `HomeSectionType` variant, so a name lookup can enumerate them (the
+/// `db_enum!` macro generates only the numeric conversions).
+const HOME_SECTION_TYPES: [HomeSectionType; 10] = [
+    HomeSectionType::None,
+    HomeSectionType::SmallLibraryTiles,
+    HomeSectionType::LibraryButtons,
+    HomeSectionType::ActiveRecordings,
+    HomeSectionType::Resume,
+    HomeSectionType::ResumeAudio,
+    HomeSectionType::LatestMedia,
+    HomeSectionType::NextUp,
+    HomeSectionType::LiveTv,
+    HomeSectionType::ResumeBook,
+];
+
+/// Whether `name` parses as a `ViewType`, case insensitively (C#
+/// `Enum.TryParse<ViewType>(value, true, out _)`).
+fn is_view_type_name(name: &str) -> bool {
+    VIEW_TYPES
+        .iter()
+        .any(|v| format!("{v:?}").eq_ignore_ascii_case(name))
+}
+
+/// Every `ViewType` variant, for the `landing-*` validity check.
+const VIEW_TYPES: [ViewType; 26] = [
+    ViewType::Albums,
+    ViewType::AlbumArtists,
+    ViewType::Artists,
+    ViewType::Channels,
+    ViewType::Collections,
+    ViewType::Episodes,
+    ViewType::Favorites,
+    ViewType::Genres,
+    ViewType::Guide,
+    ViewType::Movies,
+    ViewType::Networks,
+    ViewType::Playlists,
+    ViewType::Programs,
+    ViewType::Recordings,
+    ViewType::Schedule,
+    ViewType::Series,
+    ViewType::Shows,
+    ViewType::Songs,
+    ViewType::Suggestions,
+    ViewType::Trailers,
+    ViewType::Upcoming,
+    ViewType::Authors,
+    ViewType::Books,
+    ViewType::Folders,
+    ViewType::Mixed,
+    ViewType::Photos,
+];
 
 /// Registers this controller's real routes onto `router`.
 pub fn register(router: Router<AppState>) -> Router<AppState> {

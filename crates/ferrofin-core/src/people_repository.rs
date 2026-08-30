@@ -17,7 +17,6 @@
 //!   `max_list_order`, and the name range/substring predicates are applied as in
 //!   C#. The `is_favorite` user-data path is honored via a `UserData` join.
 
-use ferrofin_util::sort_name::create_sort_name;
 use std::collections::HashMap;
 
 use async_trait::async_trait;
@@ -27,6 +26,19 @@ use ferrofin_db::store::{guid_to_db, opt_datetime_to_db};
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::querying::QueryResult;
 use sqlx::QueryBuilder;
+
+/// A `Person` row's `SortName`.
+///
+/// `Person` is the only 10.11.8 entity that overrides
+/// `EnableAlphaNumericSorting => false` (`MediaBrowser.Controller/Entities/
+/// Person.cs`), which sends `BaseItem.CreateSortName` down its first branch:
+/// `return Name.TrimStart();` — the name verbatim, NOT the lowercased,
+/// article-stripped, number-padded alphanumeric key every other kind gets. A
+/// person stored as `alice parity` instead of `Alice Parity` sorts and searches
+/// in a different place than Jellyfin puts it.
+fn person_sort_name(name: &str) -> String {
+    name.trim_start().to_owned()
+}
 use sqlx::Sqlite;
 use uuid::Uuid;
 
@@ -132,7 +144,7 @@ impl FerrofinPeopleRepository {
             .bind(person_type)
             .bind(name)
             .bind(&clean)
-            .bind(create_sort_name(name))
+            .bind(person_sort_name(name))
             .bind(crate::kinds::presentation_unique_key(
                 BaseItemKind::Person,
                 Uuid::parse_str(target).unwrap_or_default(),
@@ -613,13 +625,21 @@ impl PeopleRepository for FerrofinPeopleRepository {
         let mut rows = {
             // Item-scoped credits carry the credited role (a character name)
             // from the map row, like the C# `GetPeople` projection — without it
-            // every cast entry renders roleless on the detail page. NULLIF folds
-            // the write path's empty-string "no role" back to NULL. The item id
-            // is a canonically formatted GUID (hyphenated hex), so inlining it
-            // is injection-safe.
+            // every cast entry renders roleless on the detail page.
+            //
+            // The role is read back VERBATIM: `PeopleRepository.UpdatePeople`
+            // normalizes a null role to `string.Empty` on write
+            // (v10.11.8 `PeopleRepository.cs:77-80`) and `Map` reads
+            // `Role = mapping?.Role` with no coalescing
+            // (v10.11.8 `PeopleRepository.cs:157`), so a roleless credit comes
+            // back as `""` and is serialized as `"Role": ""`. Folding `''` to
+            // NULL here would drop the field off the wire entirely.
+            //
+            // The item id is a canonically formatted GUID (hyphenated hex), so
+            // inlining it is injection-safe.
             let cols = format!(
                 r#"p."Id", p."Name", p."PersonType",
-                   (SELECT NULLIF(mr."Role", '') FROM "PeopleBaseItemMap" mr
+                   (SELECT mr."Role" FROM "PeopleBaseItemMap" mr
                     WHERE mr."PeopleId" = p."Id" AND mr."ItemId" = '{}'
                     ORDER BY mr."ListOrder" LIMIT 1) AS "Role""#,
                 guid_to_db(filter.item_id)
@@ -671,8 +691,12 @@ impl PeopleRepository for FerrofinPeopleRepository {
         }
         for chunk in item_ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
             let mut qb = QueryBuilder::<Sqlite>::new(
-                r#"SELECT m."ItemId", p."Id", p."Name", p."PersonType",
-                          NULLIF(m."Role", '') AS "Role"
+                // The role is read back VERBATIM, like the single-item
+                // projection above: `UpdatePeople` normalizes a null role to
+                // `string.Empty` on write (v10.11.8 `PeopleRepository.cs:77-80`)
+                // and `Map` reads `Role = mapping?.Role` with no coalescing
+                // (`:157`), so a roleless credit is serialized as `"Role": ""`.
+                r#"SELECT m."ItemId", p."Id", p."Name", p."PersonType", m."Role"
                    FROM "PeopleBaseItemMap" m JOIN "Peoples" p ON p."Id" = m."PeopleId"
                    WHERE m."ItemId" IN ("#,
             );
@@ -783,7 +807,7 @@ impl PeopleRepository for FerrofinPeopleRepository {
                 .bind(type_name)
                 .bind(name)
                 .bind(&clean)
-                .bind(create_sort_name(name))
+                .bind(person_sort_name(name))
                 .execute(&mut *tx)
                 .await
                 .map_err(db_err)?;
@@ -938,6 +962,21 @@ impl PeopleRepository for FerrofinPeopleRepository {
 
 #[cfg(test)]
 mod tests {
+    /// `Person` is the only 10.11.8 entity with
+    /// `EnableAlphaNumericSorting => false`, so `BaseItem.CreateSortName`
+    /// returns `Name.TrimStart()` — the name verbatim, not the lowercased
+    /// alphanumeric key every other kind gets.
+    #[test]
+    fn a_person_sorts_by_its_name_verbatim() {
+        assert_eq!(super::person_sort_name("Alice Parity"), "Alice Parity");
+        assert_eq!(super::person_sort_name("  The Rock"), "The Rock");
+        // NOT the alphanumeric pipeline (which lowercases and strips "the ").
+        assert_ne!(
+            super::person_sort_name("The Rock"),
+            ferrofin_util::sort_name::create_sort_name("The Rock")
+        );
+    }
+
     use super::FerrofinPeopleRepository;
     use crate::test_support::{seed_item, test_db};
     use ferrofin_db::entities::base_items::PeopleEntity;
@@ -954,6 +993,61 @@ mod tests {
             person_type: Some(person_type.to_owned()),
             ..Default::default()
         }
+    }
+
+    /// A credit with no role round-trips as `Some("")`, NOT `None`.
+    ///
+    /// C# `PeopleRepository.UpdatePeople` normalizes a null role to
+    /// `string.Empty` on write (v10.11.8 `:77-80`) and `Map` reads
+    /// `Role = mapping?.Role` with no coalescing (`:157`), so Jellyfin always
+    /// puts `"Role": ""` on the wire for a roleless director. Both read
+    /// projections used to wrap the column in `NULLIF(…, '')`, which folded that
+    /// back to NULL and dropped the field off the DTO entirely — an
+    /// `Option::is_none` skip on `BaseItemPerson::role`.
+    #[tokio::test]
+    async fn a_roleless_credit_reads_back_as_the_empty_string() {
+        let db = test_db().await;
+        let repo = FerrofinPeopleRepository::new(db.clone());
+        let movie = Uuid::from_u128(0x51);
+        seed_item(&db, movie, BaseItemKind::Movie).await;
+
+        let mut lead = person("Bob Parity", "Actor");
+        lead.role = Some("Lead".to_owned());
+        repo.update_people(movie, &[lead, person("Carol Ferrofin", "Director")])
+            .await
+            .expect("credits");
+
+        // The single-item projection (`get_people` with an item scope).
+        let scoped = repo
+            .get_people(&InternalPeopleQuery {
+                item_id: movie,
+                ..Default::default()
+            })
+            .await
+            .expect("scoped people");
+        let role_of = |people: &[PeopleEntity], name: &str| {
+            people
+                .iter()
+                .find(|p| p.name == name)
+                .unwrap_or_else(|| panic!("{name} credited"))
+                .role
+                .clone()
+        };
+        assert_eq!(
+            role_of(&scoped.items, "Bob Parity"),
+            Some("Lead".to_owned())
+        );
+        assert_eq!(
+            role_of(&scoped.items, "Carol Ferrofin"),
+            Some(String::new()),
+            "a roleless credit is the empty string, not null"
+        );
+
+        // ...and the batch projection the DTO service actually calls.
+        let batched = repo.get_people_batch(&[movie]).await.expect("batch");
+        let people = batched.get(&movie).expect("item present");
+        assert_eq!(role_of(people, "Bob Parity"), Some("Lead".to_owned()));
+        assert_eq!(role_of(people, "Carol Ferrofin"), Some(String::new()));
     }
 
     #[tokio::test]

@@ -40,6 +40,7 @@ import urllib.parse
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from sweep import http, get_json, bring_up, ROOT          # noqa: E402
 from assets import raw_headers, ct_family, image_info      # noqa: E402
+import verification                                        # noqa: E402
 
 DEVICE_ID = "parity-streams"
 DURATION_TOL_S = 0.5          # EXTINF / probed duration rounding (both encode the same clip)
@@ -300,6 +301,49 @@ STREAM_OPS = [
     "GET /Videos/{itemId}/Trickplay/{width}/{index}.jpg",
 ]
 
+# ---------------------------------------------------------------- how each row is verified
+#
+# Three genuinely different bars live in this layer and they must not share one word:
+#
+#   body-diff     the RESPONSE ITSELF was compared. `file_sig` is a sha256 of the whole
+#                 body (both servers serve the same hardlinked fixture) plus the range
+#                 leg; `text_sig` is the exact decoded subtitle text, BOM and line
+#                 terminators included. These earn the ledger headline.
+#   property      derived properties agreed, and the bytes provably cannot: a HEAD's
+#                 status class + media type; a NORMALISED playlist (header tags as a
+#                 set, EXTINF rounded to 0.5 s, BANDWIDTH bucketed to 250 kbps, segment
+#                 URIs reduced to ordinals, noise params stripped); an ffprobe of a live
+#                 transcode (two ffmpeg runs cannot be byte-equal); a decoded tile's
+#                 format + dimensions.
+#   status-class  a deliberately-bogus playlist/segment id, where the only contract left
+#                 is "both refuse". The SUCCESS path of those four legacy routes is never
+#                 requested, so a handler broken for every real client records the same
+#                 `(4, "")` and passes. That is not a body diff by any reading.
+#
+# `run()` additionally DOWNGRADES any row whose observed signature is a bare
+# `(status_class, "")` — the fallback every helper returns when the server served
+# nothing — so a both-404 can never be counted as a property comparison.
+STREAM_METHOD = {op: verification.BODY_DIFF for op in (
+    "GET /Videos/{itemId}/stream",
+    "GET /Videos/{itemId}/stream.{container}",
+    "GET /Audio/{itemId}/stream",
+    "GET /Audio/{itemId}/stream.{container}",
+    "GET /Audio/{itemId}/universal",
+    "GET /Videos/{routeItemId}/{routeMediaSourceId}/Subtitles/{routeIndex}/Stream.{routeFormat}",
+    "GET /Videos/{routeItemId}/{routeMediaSourceId}/Subtitles/{routeIndex}"
+    "/{routeStartPositionTicks}/Stream.{routeFormat}",
+)}
+STREAM_METHOD.update({op: verification.STATUS_CLASS for op in (
+    "GET /Videos/{itemId}/hls/{playlistId}/stream.m3u8",
+    "GET /Videos/{itemId}/hls/{playlistId}/{segmentId}.{segmentContainer}",
+    "GET /Audio/{itemId}/hls/{segmentId}/stream.aac",
+    "GET /Audio/{itemId}/hls/{segmentId}/stream.mp3",
+)})
+# Everything else (HEAD mirrors, playlists, transcoded segments, the trickplay tile)
+# compares declared properties.
+STREAM_METHOD.update({op: verification.PROPERTY for op in STREAM_OPS
+                      if op not in STREAM_METHOD})
+
 
 def trickplay_width(base, token, c):
     item = get_json(base, f"/Items/{c['episode']}?userId={c['user']}&fields=Trickplay", token) or {}
@@ -467,12 +511,23 @@ def run(ferrofin_url, jellyfin_url):
             # Neither server handed out a usable reference (e.g. a legacy playlist id): not
             # evidence of parity — recorded as untested, never as verified.
             rows[op] = {"deep_verified": None, "classification": "",
+                        "verification_method": None,
                         "note": "unresolved on both servers: no reference to probe with"}
             continue
         ok = j is not None and h == j
+        method = STREAM_METHOD[op]
+        # Honesty downgrade — see STREAM_METHOD. A signature of `(class, "")` means the
+        # server served nothing, so no body was diffed and no property compared.
+        if verification.bare_status_class(h) and verification.bare_status_class(j or ()):
+            method = verification.STATUS_CLASS
         rows[op] = {"deep_verified": bool(ok),
                     "classification": "" if ok else "flagged: stream signature diff vs Jellyfin (verify)",
-                    "note": f"H={describe(h)} J={describe(j)}"}
+                    "verification_method": method,
+                    "note": f"H={describe(h)} J={describe(j)}"
+                            + ("" if not ok or method == verification.BODY_DIFF
+                               else " (status class only; nothing was served)"
+                               if method == verification.STATUS_CLASS
+                               else " (declared properties agreed; bytes not diffed)")}
     return rows
 
 
@@ -488,8 +543,10 @@ def main():
     with open(os.path.join(ROOT, "suite/parity/stream-results.json"), "w") as f:
         json.dump(out, f, indent=2, sort_keys=True)
         f.write("\n")
-    ok = sum(1 for v in rows.values() if v["deep_verified"])
-    print(f"wrote parity/stream-results.json — {len(rows)} stream ops, {ok} deep-verified")
+    import collections
+    by = collections.Counter(v["verification_method"] for v in rows.values() if v["deep_verified"])
+    print(f"wrote parity/stream-results.json — {len(rows)} stream ops, "
+          f"{by[verification.BODY_DIFF]} deep-verified (bodies diffed), {dict(by)}")
 
 
 def selfcheck():
@@ -515,7 +572,18 @@ def selfcheck():
     assert magic(b"\x47" + b"\x00" * 187 + b"\x47") == "mpegts"
     assert magic(b"\x00\x00\x00\x18ftypisom") == "mp4"
     assert strip_noise("a/b.ts?PlaySessionId=x&foo=1") == "a/b.ts?foo=1"
-    print(f"ok: {len(declared)} stream op-keys valid, playlist normalisation, magic, noise strip")
+    # Every op declares a method from the closed set, and the four negative-path rows
+    # (bogus id, both refuse) must never claim to have diffed a body.
+    assert set(STREAM_METHOD) == set(STREAM_OPS), set(STREAM_METHOD) ^ set(STREAM_OPS)
+    assert set(STREAM_METHOD.values()) <= verification.VALID
+    assert STREAM_METHOD["GET /Audio/{itemId}/hls/{segmentId}/stream.aac"] == verification.STATUS_CLASS
+    assert STREAM_METHOD["GET /Videos/{itemId}/master.m3u8"] == verification.PROPERTY
+    assert STREAM_METHOD["GET /Videos/{itemId}/stream"] == verification.BODY_DIFF
+    assert verification.bare_status_class((4, "")) and not verification.bare_status_class((2, "file", "sha"))
+    import collections
+    by = collections.Counter(STREAM_METHOD.values())
+    print(f"ok: {len(declared)} stream op-keys valid, playlist normalisation, magic, "
+          f"noise strip, methods {dict(by)}")
 
 
 if __name__ == "__main__":

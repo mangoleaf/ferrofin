@@ -531,7 +531,8 @@ def response_schema(op):
 
 # ---------------------------------------------------------------- deep diff (Layer-2 over all GET ops)
 
-from parity_diff import diff_counts  # noqa: E402
+from parity_diff import diff_stats  # noqa: E402
+import verification  # noqa: E402
 
 
 def dedup_fields(buckets):
@@ -600,11 +601,26 @@ def sweep(ferrofin_url, jellyfin_url):
                 # multi-item reads.py wins precedence in the ledger where it also covers an op.
                 if method == "get" and hs == 200 and js == 200 and hraw and jraw:
                     try:
-                        n, buckets = diff_counts(json.loads(jraw), json.loads(hraw))
-                        row["deep_verified"] = n == 0
+                        jb, hb = json.loads(jraw), json.loads(hraw)
+                        n, buckets, compared = diff_stats(jb, hb)
+                        # HOW this row was verified, derived from what the diff
+                        # actually walked — never assumed. `compared == 0` means the
+                        # bodies were `[]`/`{}`/all-volatile and NOTHING was
+                        # compared, which is untested, not verified; two empty
+                        # result envelopes compared only their own zeros, which is
+                        # `empty-corpus`, not the body-diff headline.
+                        vm = verification.read_method(jb, hb, compared)
                         if n:
+                            row["deep_verified"] = False
+                            row["verification_method"] = vm or verification.BODY_DIFF
                             row["classification"] = "flagged: read diff vs Jellyfin (sweep single-item align)"
                             row["diffs"] = dedup_fields(buckets)
+                        elif vm is None:
+                            row["note"] += " | no comparable fields (nothing diffed)"
+                        else:
+                            row["deep_verified"] = True
+                            row["verification_method"] = vm
+                            row["note"] += f" | {compared} field(s) compared"
                     except ValueError:
                         pass
                 results[opkey] = row
@@ -617,8 +633,13 @@ def write_results(results):
     conformant = sum(1 for r in results.values() if r["status_conformant"] is True)
     schema_ok = sum(1 for r in results.values() if r["schema_valid"] is True)
     skipped = sum(1 for r in results.values() if "unresolved" in (r.get("note") or ""))
-    deep_ok = sum(1 for r in results.values() if r.get("deep_verified") is True)
+    deep_ok = sum(1 for r in results.values()
+                  if r.get("deep_verified") is True
+                  and r.get("verification_method") == verification.BODY_DIFF)
     deep_run = sum(1 for r in results.values() if "deep_verified" in r)
+    empty = sum(1 for r in results.values()
+                if r.get("verification_method") == verification.EMPTY_CORPUS
+                and r.get("deep_verified") is True)
     out = {"generated_by": "suite/parity/sweep.py", "last_verified": os.environ.get("PARITY_STAMP", ""),
            "rows": results}
     with open(os.path.join(ROOT, "suite/parity/sweep-results.json"), "w") as f:
@@ -626,7 +647,7 @@ def write_results(results):
         f.write("\n")
     print(f"wrote parity/sweep-results.json — {len(results)} ops, "
           f"{conformant} status-conformant, {schema_ok} schema-valid, {skipped} skipped (unfillable), "
-          f"{deep_ok}/{deep_run} GET deep-diffed clean")
+          f"{deep_ok}/{deep_run} GET deep-diffed clean, {empty} both-empty (empty-corpus)")
 
 # ---------------------------------------------------------------- self-check
 
@@ -681,8 +702,18 @@ def selfcheck():
     # with an id from the wrong id space and call the result parity.
     assert build_url("/LiveTv/Channels/{channelId}", {"_livetv_channel": "CH"}) == ("/LiveTv/Channels/CH", None)
     assert build_url("/Channels/{channelId}/Items", {"_livetv_channel": "CH"})[0] is None
+    # The deep-diff verdict must be derived from what was actually compared.
+    from parity_diff import diff_stats as ds
+    empty = {"Items": [], "TotalRecordCount": 0, "StartIndex": 0}
+    assert ds(empty, empty)[0] == 0 and verification.read_method(empty, empty, ds(empty, empty)[2]) \
+        == verification.EMPTY_CORPUS
+    # a body that is 100% volatile (e.g. /GetUtcTime) compares nothing → untested
+    utc = {"RequestReceptionTime": "a", "ResponseTransmissionTime": "b"}
+    assert ds(utc, {"RequestReceptionTime": "c", "ResponseTransmissionTime": "d"})[2] == 0
+    assert verification.read_method(utc, utc, 0) is None
+    assert verification.read_method({"A": 1}, {"A": 1}, 1) == verification.BODY_DIFF
     print("ok: nullable, $ref, param-fill, path-scoped params, skip, query-inject, "
-          "required-fill, status-class")
+          "required-fill, status-class, verification-method derivation")
 
 
 def main():

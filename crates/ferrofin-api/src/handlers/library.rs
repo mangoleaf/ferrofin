@@ -424,13 +424,13 @@ async fn get_available_options(
         .into_iter()
         .map(str::to_owned)
         .collect();
-    // `isNewLibrary` only nudges DefaultEnabled in C#; Ferrofin's registry defaults
-    // every provider enabled, so the flag needs no special handling.
-    let _ = query.is_new_library;
+    // `isNewLibrary` decides which providers report `DefaultEnabled` — it is the
+    // add-library wizard's pre-ticked checkbox set, not a cosmetic hint. Ignoring
+    // it pre-enabled every saver and remote fetcher on a new library.
     Ok(Json(
         state
             .providers
-            .get_library_options_info(&item_types)
+            .get_library_options_info(&item_types, query.is_new_library)
             .await?,
     ))
 }

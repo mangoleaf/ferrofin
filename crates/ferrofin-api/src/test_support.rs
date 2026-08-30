@@ -16,7 +16,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use ferrofin_db::entities::base_items::{BaseItemEntity, PeopleEntity};
 use ferrofin_db::entities::display_preferences::{
-    DisplayPreferencesEntity, ItemDisplayPreferencesEntity,
+    DisplayPreferencesEntity, HomeSectionEntity, ItemDisplayPreferencesEntity,
 };
 use ferrofin_db::entities::playback::TrickplayInfoEntity;
 use ferrofin_db::entities::security::{DeviceEntity, DeviceOptionsEntity};
@@ -2044,6 +2044,19 @@ impl DisplayPreferencesManager for FakeDisplayPreferences {
     async fn update_item_display_preferences(
         &self,
         _item_display_preferences: &ItemDisplayPreferencesEntity,
+    ) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn list_home_sections(
+        &self,
+        _display_preferences_id: i64,
+    ) -> Result<Vec<HomeSectionEntity>, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn set_home_sections(
+        &self,
+        _display_preferences_id: i64,
+        _sections: &[(i32, i32)],
     ) -> Result<(), ServiceError> {
         unimplemented!("fake")
     }

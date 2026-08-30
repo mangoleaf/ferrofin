@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 ferrofin-model.workspace = true
 ferrofin-db.workspace = true
+ferrofin-common.workspace = true
 async-trait.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
