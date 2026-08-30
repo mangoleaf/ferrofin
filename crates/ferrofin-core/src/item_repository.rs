@@ -2413,6 +2413,77 @@ mod tests {
         );
     }
 
+    /// `AddChildrenFromCollection` keeps only `e.IsVisible(user)`
+    /// (Folder.cs:1414-1417), and `Folder.IsVisible` (Folder.cs:231-253) applies
+    /// the blocked-/enabled-folders check to `ICollectionFolder && not
+    /// BasePluginFolder` — so a blocked `CollectionFolder` disappears while the
+    /// playlists folder, a `BasePluginFolder`, always stays.
+    #[tokio::test]
+    async fn the_user_root_children_branch_hides_a_blocked_library() {
+        use crate::aggregate_folder::RootFolderIds;
+        use crate::test_support::seed_folder_item;
+        let db = test_db().await;
+        let user_root = Uuid::from_u128(0xE301);
+        let aggregate = Uuid::from_u128(0xE302);
+        let blocked = Uuid::from_u128(0xE310);
+        seed_folder_item(&db, aggregate, BaseItemKind::AggregateFolder, "root", None).await;
+        seed_folder_item(&db, user_root, BaseItemKind::UserRootFolder, "MF", None).await;
+        seed_folder_item(
+            &db,
+            blocked,
+            BaseItemKind::CollectionFolder,
+            "Blocked",
+            Some(user_root),
+        )
+        .await;
+        seed_folder_item(
+            &db,
+            Uuid::from_u128(0xE311),
+            BaseItemKind::CollectionFolder,
+            "Allowed",
+            Some(user_root),
+        )
+        .await;
+        seed_folder_item(
+            &db,
+            Uuid::from_u128(0xE320),
+            BaseItemKind::PlaylistsFolder,
+            "Playlists",
+            Some(aggregate),
+        )
+        .await;
+        let user = seed_user_with_defaults(&db, Uuid::from_u128(0xE3FF)).await;
+        crate::user_entity_ext::set_preference(
+            db.pool(),
+            &user.id,
+            PreferenceKind::BlockedMediaFolders,
+            &[blocked.to_string()],
+        )
+        .await
+        .expect("block");
+
+        let rows = repo(&db)
+            .with_root_ids(RootFolderIds {
+                user_root,
+                aggregate,
+            })
+            .get_items(&InternalItemsQuery {
+                user_root_children: true,
+                user: Some(user),
+                ..InternalItemsQuery::default()
+            })
+            .await
+            .expect("browse");
+
+        let names: Vec<&str> = rows
+            .items
+            .iter()
+            .filter_map(|r| r.name.as_deref())
+            .collect();
+        assert_eq!(names, ["Allowed", "Playlists"], "got {names:?}");
+        assert_eq!(rows.total_record_count, 2);
+    }
+
     /// A recursive browse of the physical root is a browse with no PARENT, not
     /// one with no SCOPE. C# leaves `AncestorIds = [aggregate]` behind
     /// (`SetTopParentIdsOrAncestors`, LibraryManager.cs:1673-1698), so rows
