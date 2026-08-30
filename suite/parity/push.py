@@ -211,11 +211,17 @@ def msg_key(m):
     return f"{m.get('MessageType')}/{inner}" if inner else str(m.get("MessageType"))
 
 
-def diff_docs(j, h, subs_j, subs_h):
-    """`(n_diffs, compared, paths)` for one pair of documents."""
+def diff_docs(j, h, subs_j, subs_h, softened=None):
+    """`(n_diffs, compared, paths)` for one pair of documents.
+
+    `softened` collects the playback positions compared with a tolerance rather
+    than exactly (see `soften_positions`), so the caller can print them.
+    """
     out = {"mismatch": [], "missing": [], "extra": []}
     stats = {"compared": 0}
-    parity_diff.diff(normalise(j, subs_j), normalise(h, subs_h), "", out, PUSH_VOLATILE, stats)
+    nj, nh = normalise(j, subs_j), normalise(h, subs_h)
+    soften_positions(nj, nh, softened if softened is not None else [])
+    parity_diff.diff(nj, nh, "", out, PUSH_VOLATILE, stats)
     paths = [d.get("path", "?") for bucket in out.values() for d in bucket]
     return len(paths), stats["compared"], paths
 
@@ -234,6 +240,7 @@ def compare_pushes(legs):
     problems = []
     counts = []
     offsets = []
+    softened = []
     for label, jm, hm, sj, sh in legs:
         jseq, hseq = [msg_key(m) for m in jm], [msg_key(m) for m in hm]
         counts.append(f"{label} H/J {len(hm)}/{len(jm)}")
@@ -241,7 +248,7 @@ def compare_pushes(legs):
             problems.append(f"{label}: pushed message sequence differs — H={hseq} J={jseq}")
             continue
         for i, (jmsg, hmsg) in enumerate(zip(jm, hm)):
-            n, c, paths = diff_docs(jmsg, hmsg, sj, sh)
+            n, c, paths = diff_docs(jmsg, hmsg, sj, sh, softened)
             compared += c
             if n:
                 problems.append(f"{label}[{i}] {jseq[i]}: {n} diff(s) at {paths[:4]}")
@@ -262,6 +269,9 @@ def compare_pushes(legs):
     note = "; ".join(counts)
     if offsets:
         note += " | When−EmittedAt: " + "; ".join(offsets)
+    if softened:
+        note += " | position (tolerance ±%.2fs): " % (POSITION_TOLERANCE_TICKS / 10_000_000)
+        note += "; ".join(sorted(set(softened)))
     if problems:
         return False, compared, f"{note} | " + " | ".join(problems)
     return True, compared, note
@@ -341,6 +351,11 @@ def settle(sockets, residue, seconds=1.2):
     time.sleep(seconds)
     for label, ws in sockets:
         for m in ws.drain():
+            residue.append((label, msg_key(m)))
+        # The keep-alive frames the client kept out of the compared sets (see
+        # `wsclient.LIFECYCLE_MESSAGES`) are reported here exactly as before, so
+        # the per-server count difference stays visible.
+        for m in ws.drain_lifecycle():
             residue.append((label, msg_key(m)))
 
 
@@ -431,6 +446,293 @@ def subs_for(group_id):
     return {str(g): "<group-id-dashed>", g.hex: "<group-id-hex>"}
 
 
+#: Ticks (100 ns) two independent instances' PLAYBACK POSITION may differ by
+#: before it counts as a finding. See `soften_positions`.
+POSITION_TOLERANCE_TICKS = 2_500_000        # 0.25 s
+#: The payload keys that carry a playback position.
+TIME_DERIVED_TICK_KEYS = frozenset({"PositionTicks", "StartPositionTicks"})
+
+
+def soften_positions(j, h, seen):
+    """Collapse a pair of RUNNING playback positions to one placeholder.
+
+    A group that is actually playing advances `PositionTicks` with the wall
+    clock (`PositionTicks += now - LastActivity`), so a command rendered after N
+    seconds of playback carries a number two independent instances cannot match
+    exactly — the same problem `When` has, for the same reason.
+
+    It is NOT denylisted. The two values are compared AGAINST EACH OTHER with a
+    tolerance an order of magnitude above the one round trip that separates the
+    servers' calls, and anything outside it stays a diff — so the clamp defect
+    this layer measures (a server echoing the requested 999_999_999 where the
+    oracle clamps to the item's run time) is still caught, loudly. A ZERO on
+    either side is never softened either: "one server thinks playback is at the
+    start" is exactly the kind of divergence the row exists to find.
+
+    Every softened pair is recorded into `seen` so the note can print the actual
+    delta — a tolerance whose gap is invisible is indistinguishable from a
+    denylist, and this layer's whole point is that nothing disappears quietly.
+    """
+    if isinstance(j, dict) and isinstance(h, dict):
+        for k in j.keys() & h.keys():
+            if (k in TIME_DERIVED_TICK_KEYS
+                    and isinstance(j[k], int) and isinstance(h[k], int)
+                    and not isinstance(j[k], bool) and not isinstance(h[k], bool)
+                    and j[k] and h[k] and abs(j[k] - h[k]) <= POSITION_TOLERANCE_TICKS):
+                seen.append(f"{k} H={h[k]} J={j[k]} Δ={(h[k] - j[k]) / 10_000:+.0f}ms")
+                j[k] = h[k] = "<position-while-playing>"
+            else:
+                soften_positions(j[k], h[k], seen)
+    elif isinstance(j, list) and isinstance(h, list):
+        for a, b in zip(j, h):
+            soften_positions(a, b, seen)
+
+
+def playback_commands(pairs, gids, subs, allsock, residue, rows):
+    """Drive the SyncPlay playback verbs through EVERY state of the group state
+    machine and compare what each server pushed, on BOTH sockets.
+
+    Upstream does not have one handler per verb: it has one per (state, verb)
+    pair — `IdleGroupState`, `WaitingGroupState`, `PlayingGroupState`,
+    `PausedGroupState` — and the arms differ in what they send, to WHOM, and
+    whether they change state at all. A probe that only ever pauses an idle group
+    proves nothing about Pause. So each verb below is issued from every state it
+    can be issued from, and every leg compares the requesting socket AND the peer
+    socket: with one member in the group, `CurrentSession`, `AllGroup` and
+    `AllReady` are indistinguishable on the wire, which is how four wrong arms
+    survived unnoticed.
+
+    Two preconditions are asserted per leg, because a push comparison alone can
+    be fooled:
+
+    * the two groups must ALREADY be in the same state before the verb — the
+      servers are never driven separately to "the same" state, and a disagreement
+      is recorded as a finding on that verb rather than papered over;
+    * the group's `State` after the verb must agree. Several arms (Pause while
+      waiting, Seek while idle) push a message and deliberately do NOT change
+      state, so the message set alone cannot see them.
+    """
+    import datetime
+
+    h, j = pairs["h"], pairs["j"]
+    legs, notes, problems = {}, {}, {}
+
+    def now_iso():
+        return datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+
+    def group_state(p):
+        _, body = p["srv"].http("GET", f"/SyncPlay/{gids[p['srv'].tag]}", p["ctrl"])
+        return body.get("State") if isinstance(body, dict) else f"<{body!r}>"
+
+    def leg(op, label, sess, path, body=None, bodies=None):
+        """One compared leg of `op`, issued from the `sess` session of each server.
+
+        `bodies` is a per-server dict when the request has to carry an id the two
+        instances minted independently (a `PlaylistItemId`); `body` is the same
+        payload for both. Nothing here drives the two servers to "the same" state
+        separately — the state they are ALREADY in is read from both and a
+        disagreement is a finding, not something to correct for.
+        """
+        settle(allsock, residue)
+        legs.setdefault(op, [])
+        notes.setdefault(op, [])
+        problems.setdefault(op, [])
+        # A dead socket collects nothing, and "nothing" is the same shape as
+        # "the server pushed nothing" — so it would quietly turn every remaining
+        # leg into a false agreement. Say so instead.
+        dead = [lbl for lbl, ws in allsock if ws.closed]
+        if dead:
+            problems[op].append(
+                f"{label}: socket(s) {dead} are CLOSED — this leg was not measured, "
+                f"and an empty capture on a dead socket is not an agreement")
+        before = {t: group_state(pairs[t]) for t in ("h", "j")}
+        if before["h"] != before["j"]:
+            problems[op].append(
+                f"{label}: the two groups were NOT in the same state before the verb "
+                f"— H={before['h']} J={before['j']} (so this leg is not a like-for-like "
+                f"comparison; the op that put them out of step is the defect)")
+        codes = {}
+        for t in ("h", "j"):
+            codes[t], _ = pairs[t]["srv"].http(
+                "POST", path, pairs[t][sess], bodies[t] if bodies else body)
+        got = {t: (pairs[t]["ws_ctrl"].collect(), pairs[t]["ws_peer"].collect())
+               for t in ("h", "j")}
+        if codes["h"] != codes["j"] or codes["h"] != 204:
+            problems[op].append(f"{label}: HTTP H={codes['h']} J={codes['j']} (both must be 204)")
+        after = {t: group_state(pairs[t]) for t in ("h", "j")}
+        if after["h"] != after["j"]:
+            problems[op].append(
+                f"{label}: the group State AFTER the verb differs — H={after['h']} J={after['j']}")
+        notes[op].append(f"{label} {before['j']}\u2192{after['j']}")
+        legs[op].append((f"{label}/ctrl", got["j"][0], got["h"][0], subs["j"], subs["h"]))
+        legs[op].append((f"{label}/peer", got["j"][1], got["h"][1], subs["j"], subs["h"]))
+        return got
+
+    PAUSE, UNPAUSE = "POST /SyncPlay/Pause", "POST /SyncPlay/Unpause"
+    STOP, SEEK = "POST /SyncPlay/Stop", "POST /SyncPlay/Seek"
+    BUFFER, READY = "POST /SyncPlay/Buffering", "POST /SyncPlay/Ready"
+    IGNORE, QUEUE = "POST /SyncPlay/SetIgnoreWait", "POST /SyncPlay/SetNewQueue"
+
+    def ready_body(plid, position=0, playing=True):
+        return {"When": now_iso(), "PositionTicks": position,
+                "IsPlaying": playing, "PlaylistItemId": plid}
+
+    # -- the queue the rest of the run needs -------------------------------
+    # Resolved BEFORE the first leg: an idle group with an empty queue answers
+    # most verbs with an all-zero command, which compares almost nothing, and
+    # `Unpause` on it pushes a play-queue update neither server sends for an
+    # empty playlist. With a real item every leg below carries a playing item.
+    catalogue = {}
+    for t in ("h", "j"):
+        _, body = pairs[t]["srv"].http(
+            "GET", "/Items?IncludeItemTypes=Movie&Recursive=true&Limit=1000&SortBy=SortName",
+            pairs[t]["ctrl"])
+        catalogue[t] = {i.get("Name"): i.get("Id")
+                        for i in (body or {}).get("Items", []) if i.get("Id")}
+    # The INTERSECTION by name, lowest first. Neither server's ordering is
+    # trusted (they disagree — a different row), and neither server's catalogue
+    # is assumed to be the other's (this lab's Ferrofin lists 500 movies where
+    # its Jellyfin lists 515). Picking from what BOTH can see is what makes the
+    # legs below a like-for-like comparison instead of two different files.
+    shared = sorted(set(catalogue["h"]) & set(catalogue["j"]))
+    if not shared:
+        for op in (PAUSE, UNPAUSE, STOP, SEEK, BUFFER, READY, IGNORE, QUEUE):
+            problems.setdefault(op, []).append(
+                f"no movie is visible on BOTH servers (H has {len(catalogue['h'])}, "
+                f"J has {len(catalogue['j'])}) — NO leg of this verb ran")
+            legs.setdefault(op, [])
+            notes.setdefault(op, [])
+        return legs, notes, problems
+    item_name = shared[0]
+    item = {t: catalogue[t][item_name] for t in ("h", "j")}
+    if item["h"] != item["j"]:
+        # Item ids are derived from the path, so the same file is the same id on
+        # both. A mismatch means the two libraries are not the same fixture.
+        problems.setdefault(QUEUE, []).append(
+            f"{item_name!r} has different ids on the two servers "
+            f"(H={item['h']} J={item['j']})")
+
+    got = leg(QUEUE, "setnewqueue@idle", "ctrl", "/SyncPlay/SetNewQueue",
+              bodies={t: {"PlayingQueue": [item[t]], "PlayingItemPosition": 0,
+                          "StartPositionTicks": 0} for t in ("h", "j")})
+
+    def playlist_item_id(msgs):
+        """The id the server minted for the queued item, read off its own
+        `PlayQueue` push — the same place a real client reads it."""
+        for m in msgs:
+            data = (m.get("Data") or {}).get("Data")
+            if isinstance(data, dict) and data.get("Playlist"):
+                idx = data.get("PlayingItemIndex") or 0
+                return data["Playlist"][idx].get("PlaylistItemId")
+        return None
+
+    plid = {t: playlist_item_id(got[t][0]) for t in ("h", "j")}
+    if not plid["h"] or not plid["j"]:
+        for op in (PAUSE, UNPAUSE, STOP, SEEK, BUFFER, READY, IGNORE):
+            problems.setdefault(op, []).append(
+                f"no PlaylistItemId in the PlayQueue push (H={plid['h']} J={plid['j']}) — "
+                f"NO leg of this verb ran")
+            legs.setdefault(op, [])
+            notes.setdefault(op, [])
+        return legs, notes, problems
+
+    def per_server(maker):
+        """A body built from each server's OWN playlist item id."""
+        return {t: maker(plid[t]) for t in ("h", "j")}
+
+    wrong = str(uuid.uuid4())
+
+    # -- what an IDLE group answers ----------------------------------------
+    # `IdleGroupState` answers Pause/Stop/Seek/Buffering/Ready with a Stop to the
+    # CALLER alone (`prevState == Type`, IdleGroupState.cs:113-125) and changes
+    # nothing at all — no `Waiting`, no state update.
+    leg(STOP, "stop@waiting", "ctrl", "/SyncPlay/Stop")
+    leg(PAUSE, "pause@idle", "ctrl", "/SyncPlay/Pause")
+    leg(SEEK, "seek@idle", "ctrl", "/SyncPlay/Seek", {"PositionTicks": 5_000_000})
+    leg(BUFFER, "buffer@idle", "ctrl", "/SyncPlay/Buffering",
+        bodies=per_server(lambda p: ready_body(p, playing=False)))
+    leg(READY, "ready@idle", "ctrl", "/SyncPlay/Ready",
+        bodies=per_server(lambda p: ready_body(p, playing=False)))
+    # `AbstractGroupState.cs:207-211` — outside `Waiting` this records the flag
+    # and nothing else, so neither server may push anything.
+    leg(IGNORE, "ignorewait@idle", "ctrl", "/SyncPlay/SetIgnoreWait", {"IgnoreWait": False})
+    leg(STOP, "stop@idle", "ctrl", "/SyncPlay/Stop")
+    # ...except Unpause, which restarts the item and WAITS
+    # (IdleGroupState.cs:57-63 -> WaitingGroupState.cs:212-225).
+    leg(UNPAUSE, "unpause@idle", "ctrl", "/SyncPlay/Unpause")
+
+    # -- WAITING, resolved by Ready ----------------------------------------
+    # :407-418 — a Ready naming the wrong item is not a Ready: the caller alone
+    # is sent the queue and the group keeps waiting.
+    leg(READY, "ready@waiting/wrong-item", "peer", "/SyncPlay/Ready", ready_body(wrong))
+    # :471-479 — one of two members ready: it alone is told to pause when it
+    # reaches the group's position, and the group stays Waiting.
+    leg(READY, "ready@waiting/first", "ctrl", "/SyncPlay/Ready", bodies=per_server(ready_body))
+    # :484-517 — the last Ready starts playback for everyone.
+    leg(READY, "ready@waiting/last", "peer", "/SyncPlay/Ready", bodies=per_server(ready_body))
+
+    # -- the PLAYING arms --------------------------------------------------
+    # `PlayingGroupState.cs:81-86` / `:133-138`: "client got lost" — the caller
+    # alone is resynced, and the group's clock is NOT moved for everybody else.
+    leg(UNPAUSE, "unpause@playing", "ctrl", "/SyncPlay/Unpause")
+    leg(READY, "ready@playing", "ctrl", "/SyncPlay/Ready", bodies=per_server(ready_body))
+    # :346-368 — a Buffer out of Playing pauses `AllReady`, which EXCLUDES the
+    # member that just said it is buffering: the peer issues it, so only the
+    # controller is told. With one member in the group this is invisible.
+    leg(BUFFER, "buffer@playing", "peer", "/SyncPlay/Buffering",
+        bodies=per_server(lambda p: ready_body(p, playing=False)))
+    # :333-344 — the wrong item: the caller gets its queue back and nothing else.
+    leg(BUFFER, "buffer@waiting/wrong-item", "ctrl", "/SyncPlay/Buffering",
+        ready_body(wrong, playing=False))
+
+    # -- Seek, including the clamp ----------------------------------------
+    leg(SEEK, "seek@waiting", "ctrl", "/SyncPlay/Seek", {"PositionTicks": 5_000_000})
+    # `Group.SanitizePositionTicks` clamps to the item's run time (Group.cs:429-432);
+    # the fixture movies are about a second long, so this is far past the end of
+    # the file and a server without the ceiling echoes the request straight back.
+    leg(SEEK, "seek@waiting/past-the-end", "ctrl", "/SyncPlay/Seek",
+        {"PositionTicks": 999_999_999})
+
+    # -- the forced Unpause, and the group-wait it turns off ---------------
+    # :228-242 — an Unpause while waiting WITH the resume armed starts playback
+    # regardless of who is still buffering, and disarms group-wait until the next
+    # state change...
+    leg(UNPAUSE, "unpause@waiting/forced", "ctrl", "/SyncPlay/Unpause")
+    # ...so `PlayingGroupState.cs:117-123` drops the very next Buffer.
+    leg(BUFFER, "buffer@playing/ignored", "peer", "/SyncPlay/Buffering",
+        bodies=per_server(lambda p: ready_body(p, playing=False)))
+
+    # -- the PAUSED arms ---------------------------------------------------
+    leg(PAUSE, "pause@playing", "ctrl", "/SyncPlay/Pause")
+    leg(PAUSE, "pause@paused", "ctrl", "/SyncPlay/Pause")
+    leg(READY, "ready@paused", "ctrl", "/SyncPlay/Ready",
+        bodies=per_server(lambda p: ready_body(p, playing=False)))
+    leg(UNPAUSE, "unpause@paused", "ctrl", "/SyncPlay/Unpause")
+    leg(PAUSE, "pause@playing/again", "ctrl", "/SyncPlay/Pause")
+    # :369-379 — a Buffer out of Paused pauses the CALLER only and drops the
+    # group into Waiting with the resume DISARMED.
+    leg(BUFFER, "buffer@paused", "ctrl", "/SyncPlay/Buffering",
+        bodies=per_server(lambda p: ready_body(p, playing=False)))
+
+    # -- the WAITING arms that send no command -----------------------------
+    # :255-269 — stays Waiting, disarms the resume, state update only.
+    leg(PAUSE, "pause@waiting", "ctrl", "/SyncPlay/Pause")
+    # :522-535 — the group is settling into Paused, so a Ready from a client that
+    # is nowhere near the group's position is corrected instead of accepted.
+    leg(READY, "ready@waiting/correcting", "ctrl", "/SyncPlay/Ready",
+        bodies=per_server(lambda p: ready_body(p, playing=False)))
+    # :243-250 — arms the resume, still no command, still Waiting.
+    leg(UNPAUSE, "unpause@waiting/arms-resume", "ctrl", "/SyncPlay/Unpause")
+    # :655-678 — the member the group was waiting for asks not to be waited for,
+    # which is what RELEASES the group (`Group.IsBuffering` skips it).
+    leg(IGNORE, "ignorewait@waiting", "ctrl", "/SyncPlay/SetIgnoreWait", {"IgnoreWait": True})
+    leg(IGNORE, "ignorewait@playing", "ctrl", "/SyncPlay/SetIgnoreWait", {"IgnoreWait": False})
+
+    # -- back to Idle so the GET/{id} and Leave legs start where they did ---
+    leg(STOP, "stop@playing/teardown", "ctrl", "/SyncPlay/Stop")
+    return legs, notes, problems
+
+
 # ---------------------------------------------------------------- the run
 
 def run(ferrofin_url, jellyfin_url):
@@ -513,6 +815,27 @@ def run(ferrofin_url, jellyfin_url):
         rows["POST /SyncPlay/Join"] = verdict(
             ok and st["h"] == st["j"], compared,
             f"H={st['h']} J={st['j']} | {note} | {compared} field(s) compared (pushed messages)")
+
+        # -- the playback verbs, every state ----------------------------------
+        # One row per verb, whose verdict is the AND of every state's leg. See
+        # `playback_commands` for why each verb is driven from all four states
+        # and why both sockets are compared.
+        legs, pb_notes, pb_problems = playback_commands(
+            pairs, gids, {"h": sh, "j": sj}, allsock, residue, rows)
+        for op in sorted(legs):
+            ok, compared, note = compare_pushes(legs[op])
+            ok = ok and not pb_problems.get(op)
+            full = "; ".join(pb_notes.get(op, [])) + f" | {note}"
+            if pb_problems.get(op):
+                full += " | " + " | ".join(pb_problems[op])
+            rows[op] = verdict(
+                ok, compared,
+                f"{full} | {compared} field(s) compared (pushed messages)")
+        for op, probs in sorted(pb_problems.items()):
+            if op not in rows:
+                # A verb whose legs never ran (an unresolvable fixture) must not
+                # silently vanish from the results file.
+                rows[op] = verdict(False, 0, " | ".join(probs))
 
         # -- GET /SyncPlay/{id} ------------------------------------------------
         # A real JSON body, so this row is body-diff — not the push method.
@@ -804,13 +1127,35 @@ def selfcheck():
     assert stamp_age({"LastUpdatedAt": "2020-01-01T00:00:00.1234567Z"}, now) > 30
     assert stamp_age({}, now) is None
 
+    # 13. a RUNNING group's `PositionTicks` advances with the wall clock, so it is
+    #     compared with a tolerance rather than exactly — and the tolerance must
+    #     still reject a real difference, a zero on one side, and the missing
+    #     Seek clamp this batch measured.
+    def at(gid, pos):
+        m = stop(gid, "2026-01-01T00:00:00Z")
+        m["Data"]["PositionTicks"] = pos
+        m["Data"]["Command"] = "Pause"
+        return m
+
+    ok, n, note = compare_pushes([("x", [at(GJ, 71_000_000)], [at(GH, 71_800_000)], sj, sh)])
+    assert ok and "tolerance" in note and "Δ" in note, note      # 80ms apart
+    ok, _, note = compare_pushes([("x", [at(GJ, 71_000_000)], [at(GH, 170_000_000)], sj, sh)])
+    assert not ok and "PositionTicks" in note, note              # ~10s apart
+    ok, _, note = compare_pushes([("x", [at(GJ, 71_000_000)], [at(GH, 0)], sj, sh)])
+    assert not ok and "PositionTicks" in note, note              # a zero is never softened
+    #     ...and the defect the Seek row exists for: the oracle clamps to the
+    #     item's run time, a server without the ceiling echoes the request back.
+    ok, _, note = compare_pushes([("x", [at(GJ, 10_230_000)], [at(GH, 999_999_999)], sj, sh)])
+    assert not ok and "PositionTicks" in note, note
+
     print("ok: push differential rejects a missing message, an extra message, a "
           "changed payload field, a lost playing item and a When−EmittedAt offset "
           "that drifted; a sequence mismatch is RED (not 'untested'); an empty "
           "capture is untested, not verified; settle-window leftovers are reported, "
           "and a non-lifecycle one WITHDRAWS the run's greens; stamps "
           f"{verification.PUSH_DIFF!r} "
-          f"(headline stays {verification.HEADLINE!r})")
+          f"(headline stays {verification.HEADLINE!r}); a playing group's "
+          "PositionTicks is compared with a printed tolerance, never denylisted")
 
 
 if __name__ == "__main__":

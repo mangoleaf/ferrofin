@@ -71,6 +71,12 @@ def http(method, path, token=None, body=None, base=None, **ident):
         return e.code, e.read()[:500]
 
 
+#: Frames that belong to the socket's own keep-alive protocol rather than to any
+#: operation: Jellyfin's `ForceKeepAlive` prompt and either server's `KeepAlive`
+#: acknowledgement.
+LIFECYCLE_MESSAGES = frozenset({"ForceKeepAlive", "KeepAlive"})
+
+
 class WS:
     """One open WebSocket, pumping received JSON messages into a list."""
 
@@ -94,11 +100,25 @@ class WS:
             if not chunk:
                 raise RuntimeError("connection closed during handshake")
             buf += chunk
+        # The 15 s connect/handshake timeout must NOT survive into the read
+        # loop. A pushed message is an event, not a response: a socket that is
+        # simply quiet for 15 s is normal, but a timed-out `recv` raises out of
+        # the pump thread, which then exits and takes every LATER message with
+        # it. That failure is silent and it reads as agreement — both servers
+        # "pushed nothing" — which is the worst possible way for a differential
+        # to fail. Blocking reads, and `closed` says when the peer really went.
+        self.sock.settimeout(None)
         head, self.buf = buf.split(b"\r\n\r\n", 1)
         status_line = head.split(b"\r\n")[0].decode(errors="replace")
         if "101" not in status_line:
             raise RuntimeError(f"upgrade refused: {status_line} :: {head[:300]!r}")
         self.msgs = []
+        # Socket-lifecycle frames are kept apart from operation output: they are
+        # driven by an inactivity timer, not by anything a probe asked for, so
+        # letting one land inside a `collect()` window would read as "one server
+        # pushed an extra message". They are still handed to the caller — see
+        # `drain_lifecycle` — never dropped.
+        self.lifecycle = []
         self.closed = False
         self.lock = threading.Lock()
         # The pump thread answers pings while the main thread sends — two
@@ -135,8 +155,24 @@ class WS:
                         msg = json.loads(payload.decode())
                     except ValueError:
                         msg = {"MessageType": "<unparseable>", "Raw": payload.decode(errors="replace")}
+                    if msg.get("MessageType") == "ForceKeepAlive":
+                        # ANSWER IT. `SessionWebSocketListener` sends this after
+                        # `WebSocketLostTimeout * 0.75` of silence and closes the
+                        # socket at the full timeout unless the client replies
+                        # (SessionWebSocketListener.cs:160-230). A probe that
+                        # never replies simply goes deaf partway through a long
+                        # run, and every later leg reads as "neither server
+                        # pushed anything" — a false agreement, which is worse
+                        # than a failure.
+                        try:
+                            self.send_json({"MessageType": "KeepAlive"})
+                        except Exception:
+                            pass
                     with self.lock:
-                        self.msgs.append(msg)
+                        if msg.get("MessageType") in LIFECYCLE_MESSAGES:
+                            self.lifecycle.append(msg)
+                        else:
+                            self.msgs.append(msg)
                 elif opcode == 0x9:
                     self._frame(payload, 0xA)
                 elif opcode == 0x8:
@@ -206,6 +242,17 @@ class WS:
     def drain(self):
         with self.lock:
             out, self.msgs = list(self.msgs), []
+        return out
+
+    def drain_lifecycle(self):
+        """The socket-lifecycle frames received since the last call.
+
+        Kept out of `msgs` so they cannot be mistaken for an operation's output,
+        and handed back here so a caller can still REPORT them — the counts
+        differ between the two servers, and that difference is a real finding.
+        """
+        with self.lock:
+            out, self.lifecycle = list(self.lifecycle), []
         return out
 
     def close(self):
