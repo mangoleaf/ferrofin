@@ -12,8 +12,18 @@ one is reduced to the *properties a player depends on* and those are diffed:
                   bandwidth bucket. The first real check the suite has of HLS semantics.
   segments        what ffprobe says about the bytes: container magic, codecs, resolution,
                   duration rounded (both servers transcode the same 1 s clip)
-  subtitle text   the converted subtitle, whitespace-normalised (vtt / srt / json)
-  trickplay tile  decoded image format + dimensions (assets.image_info)
+  subtitle text   the converted subtitle, exactly (whitespace and terminators included)
+  trickplay tile  decoded image format + dimensions, the served-file headers
+                  (Accept-Ranges, Content-Disposition), and the two JPEG format choices a
+                  client can observe: chroma subsampling and optimized-vs-standard Huffman
+
+Each row records HOW it was verified (`verification_method`, see OP_METHOD): "body-diff"
+where the bytes/text themselves were compared, "property" where they could not be and named
+properties were compared instead. gen-ledger.py keeps property rows OUT of the headline
+deep-verified count and renders them in their own section, so "response + read-back diffed
+clean" keeps meaning exactly that. Most of this layer is necessarily "property": a HEAD has
+no body, a playlist carries per-instance ids, and a transcoded segment or a re-encoded JPEG
+is the output of two independent encoders.
 
 Transcodes run for real on both servers (the bench images carry ffmpeg); the clip is one
 second long, so a segment costs seconds. Trickplay is generated on the Shows library only
@@ -45,6 +55,11 @@ DEVICE_ID = "parity-streams"
 DURATION_TOL_S = 0.5          # EXTINF / probed duration rounding (both encode the same clip)
 BANDWIDTH_BUCKET = 250_000    # master-playlist BANDWIDTH compared in buckets of this many bps
 TRICKPLAY_WAIT_S = 600        # both servers must finish the trickplay task within this
+# Two independent JPEG writers differ by a fraction of a percent when they agree on
+# subsampling, quantization and entropy coding (measured: 73810 vs 73734 bytes = 1.001x).
+# Above this ratio the tile row keeps its green signature but carries a recorded note: a
+# real encoder-settings divergence showed up here as 3.44x, and it must not be silent.
+TILE_BYTES_RATIO_NOTE = 1.10
 # Query noise that legitimately differs per instance/session: stripped from playlist URIs
 # and tags before comparing.
 NOISE_PARAMS = {"api_key", "apikey", "deviceid", "playsessionid", "mediasourceid",
@@ -225,11 +240,85 @@ def text_sig(base, path, token):
     return (2, (h.get("content-type") or "").lower().split(";")[0], text)
 
 
+def jpeg_sampling(body):
+    """The (h, v) sampling factors of each component in a JPEG's SOF marker, i.e. its
+    chroma-subsampling regime: ((2,2),(1,1),(1,1)) is 4:2:0, ((1,1),(1,1),(1,1)) is 4:4:4.
+    None for a non-JPEG or an unparseable one.
+
+    Two independent JPEG writers are never byte-identical, so the bytes cannot be diffed —
+    but the subsampling is a discrete choice both must make the same way, and it is the one
+    that shows: a 4:4:4 tile is ~3x the bytes of the 4:2:0 one, and Jellyfin derives
+    `TrickplayInfo.Bandwidth` (a client's scrub-prefetch budget) straight from the tile's
+    file length. Skia's SkJpegEncoder defaults to Downsample::k420 for every JPEG Jellyfin
+    writes, so 4:2:0 is the oracle."""
+    if not body[:2] == b"\xff\xd8":
+        return None
+    i = 2
+    while i + 4 <= len(body):
+        if body[i] != 0xFF:
+            return None
+        marker, length = body[i + 1], (body[i + 2] << 8) | body[i + 3]
+        if 0xC0 <= marker <= 0xC2:          # SOF0 baseline / SOF1 extended / SOF2 progressive
+            count = body[i + 9]
+            # Component *ids* are deliberately excluded: jpeg-encoder numbers them 0/1/2
+            # where libjpeg (Skia) uses the JFIF-conventional 1/2/3, and decoders bind
+            # components positionally, so no client can observe that. See LEDGER note.
+            return tuple((body[i + 11 + 3 * k] >> 4, body[i + 11 + 3 * k] & 0x0F)
+                         for k in range(count))
+        i += 2 + length
+    return None
+
+
+def jpeg_huffman(body):
+    """"optimized" if the JPEG's Huffman tables were derived from the image, "standard" if
+    they are libjpeg's built-in ones, None for a non-JPEG.
+
+    libjpeg's standard AC tables always carry 162 symbols; a table built from the image's
+    own statistics carries fewer. Skia sets `optimize_coding`, so Jellyfin's tiles come out
+    with (measured) 11/93/11/56 symbols — and on the flat, mostly-DC content of a trickplay
+    tile that is a factor of two in bytes for identical pixels and identical quantization
+    tables. The exact symbol counts are two optimizers' opinions and are not compared; that
+    the encoder optimized at all is a discrete choice both must make the same way."""
+    if body[:2] != b"\xff\xd8":
+        return None
+    counts, i = [], 2
+    while i + 4 <= len(body):
+        if body[i] != 0xFF:
+            return None
+        marker, length = body[i + 1], (body[i + 2] << 8) | body[i + 3]
+        if marker == 0xDA:                 # start of scan: no tables after this
+            break
+        if marker == 0xC4:                 # DHT (may pack several tables)
+            seg, j = body[i + 4:i + 2 + length], 0
+            while j + 17 <= len(seg):
+                n = sum(seg[j + 1:j + 17])
+                counts.append(n)
+                j += 17 + n
+        i += 2 + length
+    if not counts:
+        return None
+    return "standard" if any(n == 162 for n in counts) else "optimized"
+
+
 def image_sig(base, path, token):
+    """(2, ct_family, format, w, h, accept-ranges, content-disposition, jpeg-sampling,
+    jpeg-huffman) and the body's byte length.
+
+    The byte length is RECORDED, never gated: two independent JPEG writers cannot produce
+    the same number of bytes, so it rides in the row's note instead of the signature (see
+    run()). Everything else is gated.
+
+    The decoded image, plus the served-file headers `file_sig`/`assets.file_sig` already
+    compare, plus the two JPEG format choices a client can observe: chroma subsampling and
+    whether the entropy coder optimized its tables. The bytes cannot be diffed (two
+    independent encoders), so everything about the response that *can* be compared is."""
     st, h, body = raw_headers("GET", base, path, token)
     if st != 200:
-        return (st // 100, "")
-    return (2, ct_family(h.get("content-type")), *image_info(body))
+        return (st // 100, ""), 0
+    return ((2, ct_family(h.get("content-type")), *image_info(body),
+             (h.get("accept-ranges") or "").lower(), h.get("content-disposition") or "",
+             jpeg_sampling(body), jpeg_huffman(body)),
+            len(body))
 
 # ------------------------------------------------------------- context
 
@@ -300,6 +389,57 @@ STREAM_OPS = [
     "GET /Videos/{itemId}/Trickplay/{width}/{index}.jpg",
 ]
 
+# How each op is verified — the ledger's headline count means "the response body (or a
+# write's read-back) diffed clean", so a row that compared something else must say so
+# rather than ride in on the default.
+#
+#   "body-diff"  the response body itself was compared: sha256 of the served file (both
+#                servers hardlink the SAME fixture file, so the bytes must match exactly),
+#                or the exact converted subtitle text.
+#   "property"   the body could not be compared, so named properties were: a HEAD has no
+#                body at all; a playlist carries per-instance ids/hosts/session tokens; a
+#                transcoded segment is two independent ffmpeg runs; a JPEG tile is two
+#                independent encoders. Real verification, weaker than a diff.
+OP_METHOD = {
+    # file_sig — sha256 of the body + Content-Type/Accept-Ranges (+ a Range 206).
+    "GET /Videos/{itemId}/stream": "body-diff",
+    "GET /Videos/{itemId}/stream.{container}": "body-diff",
+    "GET /Audio/{itemId}/stream": "body-diff",
+    "GET /Audio/{itemId}/stream.{container}": "body-diff",
+    "GET /Audio/{itemId}/universal": "body-diff",
+    # text_sig — the exact converted subtitle text, byte for byte.
+    "GET /Videos/{routeItemId}/{routeMediaSourceId}/Subtitles/{routeIndex}/Stream.{routeFormat}": "body-diff",
+    "GET /Videos/{routeItemId}/{routeMediaSourceId}/Subtitles/{routeIndex}/{routeStartPositionTicks}/Stream.{routeFormat}": "body-diff",
+    # head_sig — status class + Content-Type family. No body exists to diff.
+    "HEAD /Videos/{itemId}/stream": "property",
+    "HEAD /Videos/{itemId}/stream.{container}": "property",
+    "HEAD /Audio/{itemId}/stream": "property",
+    "HEAD /Audio/{itemId}/stream.{container}": "property",
+    "HEAD /Audio/{itemId}/universal": "property",
+    "HEAD /Videos/{itemId}/master.m3u8": "property",
+    "HEAD /Audio/{itemId}/master.m3u8": "property",
+    # playlist_sig — the normalised m3u8: tags, segment count, rounded EXTINF, bucketed
+    # BANDWIDTH, ordinal segment URIs. The raw text carries per-instance ids and tokens.
+    "GET /Videos/{itemId}/master.m3u8": "property",
+    "GET /Videos/{itemId}/main.m3u8": "property",
+    "GET /Videos/{itemId}/live.m3u8": "property",
+    "GET /Videos/{itemId}/hls/{playlistId}/stream.m3u8": "property",
+    "GET /Audio/{itemId}/master.m3u8": "property",
+    "GET /Audio/{itemId}/main.m3u8": "property",
+    "GET /Videos/{itemId}/{mediaSourceId}/Subtitles/{index}/subtitles.m3u8": "property",
+    "GET /Videos/{itemId}/Trickplay/{width}/tiles.m3u8": "property",
+    # segment_sig — what ffprobe says about two independent transcodes of the same clip.
+    "GET /Videos/{itemId}/hls1/{playlistId}/{segmentId}.{container}": "property",
+    "GET /Videos/{itemId}/hls/{playlistId}/{segmentId}.{segmentContainer}": "property",
+    "GET /Audio/{itemId}/hls1/{playlistId}/{segmentId}.{container}": "property",
+    "GET /Audio/{itemId}/hls/{segmentId}/stream.aac": "property",
+    "GET /Audio/{itemId}/hls/{segmentId}/stream.mp3": "property",
+    # image_sig — decoded format/dimensions, the served-file headers, and the JPEG format
+    # choices (subsampling, entropy-coder optimization). Two independent encoders, so the
+    # tile's bytes can never be diffed.
+    "GET /Videos/{itemId}/Trickplay/{width}/{index}.jpg": "property",
+}
+
 # The two ops that depend on trickplay actually having been generated on both servers.
 TRICKPLAY_OPS = (
     "GET /Videos/{itemId}/Trickplay/{width}/tiles.m3u8",
@@ -366,7 +506,10 @@ def wait_task(base, token, task_id):
 def signatures(base, token, c):
     """{op_key: signature} for one server. An op whose fixture item is missing (no movie, no
     track, no episode) is recorded UNRESOLVED — untested — rather than probed with a
-    placeholder id, which would make two 404s look like parity."""
+    placeholder id, which would make two 404s look like parity.
+
+    Keys starting with `_` are observations, not ops: run() strips them out and folds them
+    into a row's recorded note. They never become rows and never gate anything."""
     out = {}
     m, a, e, u = c["movie"], c["audio"], c["episode"], c["user"]
     ms, as_, es = c["movie_src"], c["audio_src"], c["episode_src"]
@@ -448,8 +591,8 @@ def signatures(base, token, c):
             base, tiles_url, token)
         # The tile a client fetches is whatever the playlist names (its first segment).
         tile = first_segment(tiles_body.decode("utf-8", "replace"), base + tiles_url) if tiles_body else None
-        out["GET /Videos/{itemId}/Trickplay/{width}/{index}.jpg"] = (
-            image_sig(base, tile[len(base):], token) if tile else UNRESOLVED)
+        out["GET /Videos/{itemId}/Trickplay/{width}/{index}.jpg"], out["_tile_bytes"] = (
+            image_sig(base, tile[len(base):], token) if tile else (UNRESOLVED, 0))
     else:
         out["GET /Videos/{itemId}/Trickplay/{width}/tiles.m3u8"] = UNRESOLVED
         out["GET /Videos/{itemId}/Trickplay/{width}/{index}.jpg"] = UNRESOLVED
@@ -483,17 +626,21 @@ def run(ferrofin_url, jellyfin_url):
         print(f"!! {blocked}", file=sys.stderr)
     print(f"trickplay generated: ferrofin={tp_h} jellyfin={tp_j}")
     hs, js = signatures(ferrofin_url, ht, hc), signatures(jellyfin_url, jt, jc)
+    obs_h = {k: hs.pop(k) for k in [k for k in hs if k.startswith("_")]}
+    obs_j = {k: js.pop(k) for k in [k for k in js if k.startswith("_")]}
     rows = {}
     for op in sorted(hs):
         h, j = hs[op], js.get(op)
         if h == UNRESOLVED and j == UNRESOLVED:
             # Neither server handed out a usable reference (e.g. a legacy playlist id): not
             # evidence of parity — recorded as untested, never as verified.
-            rows[op] = {"deep_verified": None, "classification": "",
+            rows[op] = {"deep_verified": None, "verification_method": OP_METHOD[op],
+                        "classification": "",
                         "note": "unresolved on both servers: no reference to probe with"}
             continue
         ok = j is not None and h == j
         rows[op] = {"deep_verified": bool(ok),
+                    "verification_method": OP_METHOD[op],
                     "classification": "" if ok else "flagged: stream signature diff vs Jellyfin (verify)",
                     "note": f"H={describe(h)} J={describe(j)}"}
     # A trickplay row that could not be probed must say *why* it could not be probed;
@@ -502,7 +649,34 @@ def run(ferrofin_url, jellyfin_url):
         for op in TRICKPLAY_OPS:
             if op in rows and not rows[op]["deep_verified"]:
                 rows[op]["note"] = f'{rows[op]["note"]} [{blocked}]'
+
+    # The one thing about the tile that cannot be gated: its byte length. Two independent
+    # JPEG writers never agree exactly, and Jellyfin derives `TrickplayInfo.Bandwidth`
+    # (the scrub-prefetch budget a client is handed) straight from it —
+    # `ceil(bytes * 8 / TileWidth / TileHeight / (Interval / 1000))`. So the difference is
+    # measured and RECORDED on the row every run rather than dropped: a green signature
+    # with a 3x byte gap is exactly what this layer used to look like, and the record is
+    # what makes a regression legible. Only the ratio is judged, and only for the note.
+    tile = "GET /Videos/{itemId}/Trickplay/{width}/{index}.jpg"
+    if tile in rows:
+        record_tile_bytes(rows[tile], obs_h.get("_tile_bytes", 0), obs_j.get("_tile_bytes", 0))
     return rows
+
+
+def record_tile_bytes(row, bh, bj):
+    """Fold the two tile byte lengths into `row`'s note, and — when they are far enough
+    apart to mean a settings divergence rather than encoder noise — into its recorded
+    classification. Mutates `row`; returns nothing."""
+    if not (bh and bj):
+        return
+    ratio = max(bh, bj) / min(bh, bj)
+    row["note"] += f" [tile bytes H={bh} J={bj} ratio={ratio:.3f}]"
+    if row["deep_verified"] and ratio > TILE_BYTES_RATIO_NOTE:
+        row["classification"] = (
+            f"accepted-with-note: format choices match (4:2:0, optimized Huffman, same "
+            f"geometry and headers) but the tile is {ratio:.2f}x Jellyfin's byte length "
+            f"({bh} vs {bj}), which scales TrickplayInfo.Bandwidth by the same factor — "
+            f"re-check the encoder settings in ferrofin-drawing::write_jpeg")
 
 
 def main():
@@ -545,7 +719,60 @@ def selfcheck():
     assert magic(b"\x47" + b"\x00" * 187 + b"\x47") == "mpegts"
     assert magic(b"\x00\x00\x00\x18ftypisom") == "mp4"
     assert strip_noise("a/b.ts?PlaySessionId=x&foo=1") == "a/b.ts?foo=1"
-    print(f"ok: {len(declared)} stream op-keys valid, playlist normalisation, magic, noise strip")
+    # Every op must declare how it is verified — a row that silently defaulted to
+    # "body-diff" would be counted in the ledger's headline as a diffed body.
+    assert set(OP_METHOD) == set(STREAM_OPS), set(OP_METHOD) ^ set(STREAM_OPS)
+    assert set(OP_METHOD.values()) <= {"body-diff", "property"}, set(OP_METHOD.values())
+    # Only the sha256/exact-text signatures may claim a body diff. Everything a HEAD, a
+    # playlist, a transcoded segment or a re-encoded image produces is a property.
+    src = inspect.getsource(signatures)
+    for op, method in OP_METHOD.items():
+        line = next(ln for ln in src.splitlines() if f'"{op}"' in ln)
+        diffed = "file_sig(" in line or "text_sig(" in line or op.endswith("Stream.{routeFormat}")
+        assert (method == "body-diff") == diffed, (op, method, line.strip())
+    # jpeg_sampling reads the SOF marker: 4:2:0 (Skia's default) vs 4:4:4.
+    def sof(luma_h, luma_v):
+        return (b"\xff\xd8"
+                + b"\xff\xe0\x00\x04\x00\x00"                    # a short APP0 to skip
+                + b"\xff\xc0\x00\x11\x08\x00\x10\x00\x10\x03"  # SOF0, 16x16, 3 components
+                + bytes([1, luma_h << 4 | luma_v, 0, 2, 0x11, 1, 3, 0x11, 1]))
+    assert jpeg_sampling(sof(2, 2)) == ((2, 2), (1, 1), (1, 1)), jpeg_sampling(sof(2, 2))
+    assert jpeg_sampling(sof(1, 1)) == ((1, 1), (1, 1), (1, 1))
+    assert jpeg_sampling(sof(2, 2)) != jpeg_sampling(sof(1, 1))
+    assert jpeg_sampling(b"\x89PNG\r\n\x1a\n") is None
+
+    # jpeg_huffman: 162 AC symbols is libjpeg's standard table; fewer means optimized.
+    def dht(symbols):
+        counts = [0] * 16
+        counts[3] = symbols                      # all symbols at code length 4
+        body = bytes([0x10]) + bytes(counts) + bytes(symbols)
+        return (b"\xff\xd8"
+                + b"\xff\xc4" + (len(body) + 2).to_bytes(2, "big") + body
+                + b"\xff\xda\x00\x02")
+    assert jpeg_huffman(dht(162)) == "standard"
+    assert jpeg_huffman(dht(93)) == "optimized"
+    assert jpeg_huffman(b"\x89PNG\r\n\x1a\n") is None
+    assert jpeg_huffman(b"\xff\xd8\xff\xda\x00\x02") is None   # no DHT at all
+    # Observations (keys starting with "_") are stripped before rows are built, so they
+    # can never become a row or be looked up in OP_METHOD.
+    assert all(not k.startswith("_") for k in STREAM_OPS)
+    assert TILE_BYTES_RATIO_NOTE > 1.0
+    # The tile byte lengths are always recorded, and a settings-level gap (the 3.44x this
+    # layer actually measured before ferrofin-drawing matched Skia's encoder) becomes a
+    # classification the ledger prints beside the green row.
+    near = {"deep_verified": True, "classification": "", "note": "sig"}
+    record_tile_bytes(near, 73810, 73734)
+    assert "ratio=1.001" in near["note"] and near["classification"] == "", near
+    far = {"deep_verified": True, "classification": "", "note": "sig"}
+    record_tile_bytes(far, 253353, 73734)
+    assert "ratio=3.436" in far["note"], far
+    assert far["classification"].startswith("accepted-with-note:"), far
+    assert "Bandwidth" in far["classification"]
+    none_yet = {"deep_verified": None, "classification": "", "note": "sig"}
+    record_tile_bytes(none_yet, 0, 73734)      # nothing measured → nothing recorded
+    assert none_yet["note"] == "sig" and none_yet["classification"] == ""
+    print(f"ok: {len(declared)} stream op-keys valid + verification methods, "
+          f"playlist normalisation, jpeg sampling, magic, noise strip")
 
 
 if __name__ == "__main__":

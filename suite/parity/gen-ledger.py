@@ -226,9 +226,12 @@ def render_md(rows):
             out.append(f"- ✅ `{r['operation']}`{note}")
     out.append("")
     out.append("## Property-verified (invariants agreed — the bodies were NOT diffed)\n")
-    out.append("_These endpoints' responses cannot be compared between two independent "
-               "instances (upstream orders them `Random`, or the two servers run different "
-               "algorithms by design). Named properties were compared on both servers "
+    out.append("_These endpoints' responses cannot be compared byte-for-byte or "
+               "field-for-field between two independent instances — upstream orders them "
+               "`Random`, the two servers run different algorithms by design, a `HEAD` has "
+               "no body at all, a playlist carries per-instance ids and session tokens, or "
+               "the payload is the output of two independent encoders (a transcoded "
+               "segment, a re-encoded JPEG). Named properties were compared on both servers "
                "instead. This is a real verification and a weaker one: it is not part of the "
                "deep-verified count._\n")
     for r in rows:

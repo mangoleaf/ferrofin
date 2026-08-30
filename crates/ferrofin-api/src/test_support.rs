@@ -1989,19 +1989,28 @@ impl FakeVirtualFolders {
     /// library's path and projects it **dashless** (`Guid.ToString("N")`, as
     /// `LibraryManager.GetVirtualFolderInfo` does). The fake only needs the same
     /// *shape* — a stable id in the same spelling — so id-keyed handlers are
-    /// exercised against the wire format clients actually echo back. (Any stable
-    /// name→bytes fold does; this one just tiles the name over the 16 id bytes.)
+    /// exercised against the wire format clients actually echo back.
+    ///
+    /// The fold is two FNV-1a-64 passes over the whole name (different offset
+    /// bases) concatenated into the 16 id bytes. Every byte of the name reaches
+    /// every id byte, so two libraries added to one fake get distinct ids — an
+    /// earlier version tiled the name across the bytes, which let distinct names
+    /// collide onto the same `ItemId` and would have silently keyed a two-library
+    /// test to one row.
     #[must_use]
     pub fn projected_item_id(name: &str) -> String {
+        /// FNV-1a over `data`, seeded with `basis`.
+        fn fnv1a64(data: &[u8], basis: u64) -> u64 {
+            const PRIME: u64 = 0x0000_0100_0000_01B3;
+            data.iter().fold(basis, |hash, byte| {
+                (hash ^ u64::from(*byte)).wrapping_mul(PRIME)
+            })
+        }
+        const OFFSET_BASIS: u64 = 0xCBF2_9CE4_8422_2325;
         let src = name.as_bytes();
         let mut bytes = [0u8; 16];
-        for (i, b) in bytes.iter_mut().enumerate() {
-            *b = src
-                .get(i % src.len().max(1))
-                .copied()
-                .unwrap_or(0)
-                .wrapping_add(u8::try_from(i).unwrap_or(0));
-        }
+        bytes[..8].copy_from_slice(&fnv1a64(src, OFFSET_BASIS).to_be_bytes());
+        bytes[8..].copy_from_slice(&fnv1a64(src, !OFFSET_BASIS).to_be_bytes());
         Uuid::from_bytes(bytes).simple().to_string()
     }
 

@@ -7,7 +7,8 @@
 //! [`DrawingError`] instead of being flattened into
 //! `ServiceError::Backend(String)`. Converting via [`From`] boxes the typed
 //! error into [`ServiceError::BackendSource`](ferrofin_traits::error::ServiceError::BackendSource),
-//! so the underlying [`std::io::Error`] / [`image::ImageError`] stays reachable
+//! so the underlying [`std::io::Error`] / [`image::ImageError`] /
+//! [`jpeg_encoder::EncodingError`] stays reachable
 //! through [`Error::source`](std::error::Error::source) for logging and tests.
 //!
 //! Pure *semantic* failures (empty path → `400`, missing file → `404`, an
@@ -46,6 +47,20 @@ pub enum DrawingError {
         #[source]
         source: image::ImageError,
     },
+
+    /// The `jpeg-encoder` crate failed to write a JPEG to its output file.
+    ///
+    /// JPEG is written by `jpeg-encoder` rather than by the `image` crate so the
+    /// chroma subsampling can be pinned to 4:2:0 (Skia's default); that encoder
+    /// has its own error type, hence a separate variant.
+    #[error("{context}: {source}")]
+    JpegEncode {
+        /// The operation and path, e.g. `"encode /cache/a.jpg"`.
+        context: String,
+        /// The underlying codec failure.
+        #[source]
+        source: jpeg_encoder::EncodingError,
+    },
 }
 
 impl DrawingError {
@@ -64,11 +79,19 @@ impl DrawingError {
             source,
         }
     }
+
+    /// Builds a [`DrawingError::JpegEncode`] tagging `source` with a `context` label.
+    pub fn jpeg_encode(context: impl Into<String>, source: jpeg_encoder::EncodingError) -> Self {
+        Self::JpegEncode {
+            context: context.into(),
+            source,
+        }
+    }
 }
 
 impl From<DrawingError> for ServiceError {
     fn from(err: DrawingError) -> Self {
-        // Both variants are infrastructure failures (HTTP 500); box them so the
+        // Every variant is an infrastructure failure (HTTP 500); box them so the
         // io/codec cause survives as a `source()` chain.
         Self::backend_source(err)
     }

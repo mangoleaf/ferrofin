@@ -548,6 +548,66 @@ async fn update_library_options_by_projected_item_id_round_trips() {
     );
 }
 
+/// Two libraries must project **distinct** `ItemId`s, and an id-keyed write must
+/// land on exactly the one it addressed.
+///
+/// The real manager derives the id from the library's path, so distinct libraries
+/// always differ; the fake's projection has to preserve that or a two-library test
+/// would silently key both rows to the same id and the "wrote the right one"
+/// assertion above would hold vacuously.
+#[tokio::test]
+async fn distinct_libraries_project_distinct_ids_and_writes_do_not_cross() {
+    let (state, vf) = working_state();
+    for name in ["Movies", "Shows"] {
+        ferrofin_traits::library::VirtualFolderManager::add_virtual_folder(
+            &*vf,
+            name,
+            None,
+            &ferrofin_model::configuration::LibraryOptions::default(),
+        )
+        .await
+        .unwrap();
+    }
+    let router = create_router(state);
+
+    let listed = folders(&router).await;
+    let ids: Vec<String> = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["ItemId"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(ids.len(), 2);
+    assert_ne!(
+        ids[0], ids[1],
+        "distinct libraries must not share an ItemId"
+    );
+
+    // The projection must separate names the *old* tiling fold mapped together:
+    // it filled the 16 id bytes with `name[i % len] + i`, so any name and its own
+    // repetition produced the identical id.
+    assert_ne!(
+        ferrofin_api::test_support::FakeVirtualFolders::projected_item_id("ab"),
+        ferrofin_api::test_support::FakeVirtualFolders::projected_item_id("abab"),
+        "a name and its repetition must not fold to the same ItemId"
+    );
+
+    assert_eq!(
+        post_options(&router, &ids[0], true).await,
+        StatusCode::NO_CONTENT
+    );
+    let after = folders(&router).await;
+    assert_eq!(
+        after[0]["LibraryOptions"]["EnableTrickplayImageExtraction"],
+        serde_json::json!(true)
+    );
+    assert_eq!(
+        after[1]["LibraryOptions"]["EnableTrickplayImageExtraction"],
+        serde_json::json!(false),
+        "the write must not leak onto the other library"
+    );
+}
+
 #[tokio::test]
 async fn physical_paths_unions_locations() {
     // `GET /Library/PhysicalPaths` is `RequiresElevation` upstream.

@@ -18,6 +18,7 @@ chrono.workspace = true
 image.workspace = true
 kamadak-exif.workspace = true
 webp.workspace = true
+jpeg-encoder.workspace = true
 blurhash.workspace = true
 thiserror.workspace = true
 uuid.workspace = true

@@ -24,7 +24,7 @@ use uuid::Uuid;
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
 use crate::handlers::hls::parse_segment_index;
-use crate::handlers::streaming::serve_static_file;
+use crate::handlers::streaming::serve_static_file_without_ranges;
 use crate::state::AppState;
 
 /// Query parameters shared by the trickplay routes.
@@ -94,6 +94,11 @@ async fn get_trickplay_hls_playlist(
 /// `Content-Disposition: attachment` header. Returns `404` when the resolution
 /// is unknown or the tile file is absent.
 ///
+/// The C# hands the file to `PhysicalFile(path, MediaTypeNames.Image.Jpeg)`,
+/// whose `EnableRangeProcessing` stays `false`, so — unlike direct play and the
+/// HLS segments — this route advertises no `Accept-Ranges` and answers a `Range`
+/// request with the complete tile.
+///
 /// The route template drops the trailing `.jpg` literal, but the captured
 /// `index` is the whole segment (`0.jpg`), so it is parsed here; a
 /// non-numeric value is `400`.
@@ -133,7 +138,10 @@ async fn get_trickplay_tile_image(
         )));
     };
 
-    let mut response = serve_static_file(&path, request).await?;
+    // C# serves the tile with `PhysicalFile(path, MediaTypeNames.Image.Jpeg)` —
+    // the overload that leaves range processing off — so the response carries no
+    // `Accept-Ranges` and a `Range` request gets the whole file with `200`.
+    let mut response = serve_static_file_without_ranges(&path, request).await?;
     if let Ok(value) = header::HeaderValue::from_str("attachment") {
         response
             .headers_mut()

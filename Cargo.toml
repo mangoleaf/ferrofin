@@ -158,6 +158,7 @@ sha1 = "0.10"            # PBKDF2-HMAC-SHA1 (legacy "PBKDF2" hash id)
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 kamadak-exif = "0.6"                                        # photo EXIF (ferrofin-drawing PhotoProvider)
 webp = { version = "0.3", default-features = false }  # LOSSY WebP encode via libwebp (BSD-3) — image-webp is lossless-only; Skia parity needs Google's encoder
+jpeg-encoder = "0.7"     # JPEG encode with 4:2:0 chroma subsampling — the `image` crate's encoder is hardcoded 4:4:4; Skia's SkJpegEncoder defaults to 4:2:0
 blurhash = "0.2"         # ImageBlurHashes — functionally-valid hashes (not byte-identical to Jellyfin's Skia)
 config = "0.15"
 clap = { version = "4.5", features = ["derive"] }

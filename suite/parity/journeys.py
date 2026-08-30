@@ -31,6 +31,56 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from sweep import http, get_json, bring_up, container_read, ROOT, USER, PASS, CLIENT, opensubtitles_credentials   # reuse HTTP + provisioning
 
 
+class Same:
+    """A journey step whose effect held on this server AND whose `evidence` must equal
+    the other server's.
+
+    A plain bool only asserts per-server self-consistency: each server is checked against
+    what *it* was posted, so two servers that each faithfully round-trip *different*
+    defaults both pass. That is a real hole — the `EnableRealtimeMonitor` default
+    (Ferrofin true / Jellyfin false on a freshly created library) had to be found by hand
+    because the LibraryOptions row asserted only the round-trip. Returning `Same(ok,
+    evidence)` instead makes the runner compare the two servers' evidence as well, so the
+    row is only green when the write took AND both servers ended up in the same state.
+
+    `evidence` must be a value that is genuinely comparable across two independent
+    instances — a settings object, a flag, a count. Never an id, a date, or anything
+    per-instance; those belong nowhere near a cross-server equality.
+    """
+
+    __slots__ = ("ok", "evidence")
+
+    def __init__(self, ok, evidence):
+        self.ok = bool(ok)
+        self.evidence = evidence
+
+    def __bool__(self):
+        return self.ok
+
+    def __repr__(self):
+        return f"{self.ok}(+evidence)"
+
+
+def cross_server_ok(h_ok, j_ok):
+    """True unless BOTH sides returned `Same` and their evidence disagrees.
+
+    This is the whole cross-server rule, in one place, so the self-check exercises the
+    code the runner actually runs rather than a restatement of it."""
+    if isinstance(h_ok, Same) and isinstance(j_ok, Same):
+        return h_ok.evidence == j_ok.evidence
+    return True
+
+
+def evidence_diff(h, j):
+    """A short human note naming where two evidence values differ. Dicts are reported as
+    the keys whose values disagree (with both values); anything else as a repr pair."""
+    if isinstance(h, dict) and isinstance(j, dict):
+        keys = sorted(set(h) | set(j))
+        bad = [f"{k}: H={h.get(k)!r} J={j.get(k)!r}" for k in keys if h.get(k) != j.get(k)]
+        return "; ".join(bad) or "(no key differs)"
+    return f"H={h!r} J={j!r}"
+
+
 def q(base, path, token, user):
     return get_json(base, f"{path}{'&' if '?' in path else '?'}userId={user}", token)
 
@@ -467,12 +517,19 @@ def j_virtualfolder_crud(base, token, user, _m, _m2):
     # LibraryOptions}` — no Name), and asserted on the WHOLE options object, not just the
     # flipped flag: C# replaces the options wholesale, so anything the server silently
     # drops or rewrites on the way through is a divergence this row should catch.
+    #
+    # The read-back is ALSO handed to the runner as cross-server evidence. The round-trip
+    # alone is per-server self-consistency — each server is compared against what it was
+    # posted, and the posted object is derived from that same server's own read — so two
+    # servers whose LibraryOptions *defaults* differ would both pass it. Comparing the
+    # resulting objects is what catches a default divergence (both libraries here are
+    # created by the same request, so their options must agree key for key).
     opts = (find() or {}).get("LibraryOptions") or {}
     opts["EnablePhotos"] = not opts.get("EnablePhotos", True)
     st, _ = http("POST", f"{base}/Library/VirtualFolders/LibraryOptions", token,
                  json.dumps({"Id": lib_id, "LibraryOptions": opts}))
     got = (find() or {}).get("LibraryOptions")
-    r["POST /Library/VirtualFolders/LibraryOptions"] = st < 300 and got == opts
+    r["POST /Library/VirtualFolders/LibraryOptions"] = Same(st < 300 and got == opts, got)
 
     st, _ = http("DELETE", f"{base}/Library/VirtualFolders/Paths?name={qn}&path={qtv}"
                           f"&refreshLibrary=false", token)
@@ -1126,16 +1183,24 @@ def journeys(ferrofin_url, jellyfin_url):
         h_ok = h.get(op)
         j_ok = j.get(op)
         if jellyfin_url:
-            deep = bool(h_ok and j_ok)
+            # A step that returned `Same` also has to end in the same state on both
+            # servers, not merely round-trip its own write on each.
+            cross = cross_server_ok(h_ok, j_ok)
+            deep = bool(h_ok and j_ok and cross)
+            note = f"H={h_ok} J={j_ok}"
             if h_ok and not j_ok:
                 cls = "flagged: Jellyfin read-back differed (verify: oracle setup or Ferrofin extra)"
             elif not h_ok and j_ok:
                 cls = "flagged: Ferrofin read-back did not reflect the write (verify: real gap vs read-back method)"
             elif not h_ok:
                 cls = "flagged: write effect not observed on either server (likely corpus/setup)"
+            elif not cross:
+                cls = ("flagged: both servers round-tripped their own write, but ended in "
+                       "different states (verify: a default divergence, not a write gap)")
+                note += f" [{evidence_diff(h_ok.evidence, j_ok.evidence)}]"
             else:
                 cls = "ok"
-            rows[op] = {"deep_verified": deep, "classification": cls, "note": f"H={h_ok} J={j_ok}"}
+            rows[op] = {"deep_verified": deep, "classification": cls, "note": note}
         else:
             rows[op] = {"deep_verified": bool(h_ok), "classification": "ok" if h_ok else "write effect not confirmed on Ferrofin",
                         "note": f"H={h_ok}"}
@@ -1160,12 +1225,21 @@ def main():
 
 
 def selfcheck():
-    # The combine logic: deep_verified only when the effect holds on BOTH servers.
+    # The combine logic: deep_verified only when the effect holds on BOTH servers, and —
+    # for a `Same` step — only when both servers ended in the same state.
     def combine(h_ok, j_ok):
-        return bool(h_ok and j_ok)
+        return bool(h_ok and j_ok and cross_server_ok(h_ok, j_ok))
     assert combine(True, True) is True
     assert combine(True, False) is False   # Jellyfin disagrees → not verified
     assert combine(False, True) is False   # real Ferrofin gap → not verified
+    # Two servers that each faithfully round-trip DIFFERENT defaults are not parity.
+    assert combine(Same(True, {"EnableRealtimeMonitor": True}),
+                   Same(True, {"EnableRealtimeMonitor": False})) is False
+    assert combine(Same(True, {"EnableRealtimeMonitor": False}),
+                   Same(True, {"EnableRealtimeMonitor": False})) is True
+    assert combine(Same(False, {"a": 1}), Same(True, {"a": 1})) is False
+    assert evidence_diff({"a": 1, "b": 2}, {"a": 1, "b": 3}) == "b: H=2 J=3"
+    assert evidence_diff({"a": 1}, {"a": 1}) == "(no key differs)"
     # Every journey advertises only op keys that exist in the vendored spec.
     import glob
     spec = json.load(open(sorted(glob.glob(os.path.join(ROOT, "contracts/jellyfin-openapi-*.json")))[-1]))
