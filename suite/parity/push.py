@@ -18,7 +18,18 @@ collects what each server pushed, and compares them:
     quietly folded into agreement;
   * every non-volatile field of each matched message's payload, through the same
     `parity_diff` the read layer uses;
+  * the two wall-clock instants a field diff CANNOT compare — a command's `When`
+    and `EmittedAt` — through their derived offset `When − EmittedAt`, which each
+    server computes from its own clock. `When` is the instant the client is told
+    to act on, so denylisting it with nothing in its place would have left the
+    most behaviourally loaded field in a `SyncPlayCommand` unasserted;
   * plus, where the op returns a body, that body — diffed the same way.
+
+Everything the probe drains but does not compare is REPORTED, never swallowed:
+the settle windows between legs record what they drop, and `residue_report()`
+turns that into an error (a late SyncPlay frame means its leg was mismeasured) or
+an observation (a socket-lifecycle frame — and one only Jellyfin sends is written
+down as a divergence, since `/socket` is not a contract op and can own no row).
 
 That is a genuine two-server differential, so it earns a method name of its own:
 `push-diff`, the SIXTH member of the closed set in `parity/verification.py`. It is
@@ -54,6 +65,17 @@ from wsclient import WS, http as ws_http   # noqa: E402
 USER = os.environ.get("BENCH_ADMIN_USER", "bench")
 PASS = os.environ.get("BENCH_ADMIN_PASSWORD", "benchpass123")
 
+#: The SECOND session logs in as its own user, created and deleted by this layer.
+#:
+#: Two sessions of the SAME user make `Participants` a one-element list on both
+#: servers, and a one-element list cannot tell `Group.GetInfo()`'s LINQ
+#: `Distinct()` (first-join order) apart from a sorted list — so the ordering
+#: would be unit-tested only and never differentiated live. The name is chosen to
+#: sort BEFORE the admin's: joining second, it must still come SECOND, which is
+#: false for any implementation that sorts.
+JOINER_USER = "aparityjoiner"
+JOINER_PASS = "Parity!123"
+
 #: Keys that cannot match between two independent instances, ON TOP of the global
 #: `parity_diff.VOLATILE`. Scoped to this layer on purpose — widening the global
 #: denylist to make a push row green would blind every other layer too.
@@ -64,6 +86,13 @@ PASS = os.environ.get("BENCH_ADMIN_PASSWORD", "benchpass123")
 #:   LastUpdate     the same, for `PlayQueueUpdate`.
 #:   When           the command's scheduled instant: wall clock + a latency cushion.
 #:   EmittedAt      the wall clock at which the command was rendered.
+#:
+#: `When` and `EmittedAt` are NOT simply dropped. `When` is the most
+#: behaviourally loaded field in a `SyncPlayCommand` — it is the instant the
+#: client is told to act on — so denylisting it with nothing in its place would
+#: leave a server that stamped `When = now` indistinguishable from a correct one.
+#: It is replaced STRUCTURALLY by `when_offset()` below, the same way
+#: `LastUpdatedAt` is replaced by the freshness assertion on GET /SyncPlay/{id}.
 #:
 #: The group's own GUID is NOT listed: it is normalised by VALUE instead (below),
 #: so `GroupLeft`'s payload — which echoes the group id as a DASHED string, an
@@ -109,6 +138,65 @@ def normalise(doc, subs, key=None):
     return doc
 
 
+#: How far the two servers' `When − EmittedAt` offsets may differ before it is a
+#: finding, in seconds. The probe issues the two servers' HTTP calls back to
+#: back, so the only legitimate gap between their offsets is one round trip —
+#: tens of milliseconds (6ms measured on this lab). 0.5s is an order of magnitude
+#: of headroom over that, and still an order of magnitude below the multi-second
+#: error it exists to catch (a group seconds old whose command was stamped `now`).
+WHEN_OFFSET_TOLERANCE = 0.5
+
+
+def parse_time(raw):
+    """One .NET/RFC3339 UTC instant as a POSIX timestamp, or None.
+
+    .NET writes up to SEVEN fractional digits, which `fromisoformat` rejects on
+    the Python we pin, so the fraction is trimmed to microseconds.
+    """
+    import datetime
+    if not isinstance(raw, str) or not raw:
+        return None
+    raw = raw.rstrip("Z")
+    if "." in raw:
+        head, frac = raw.split(".", 1)
+        raw = f"{head}.{frac[:6]}"
+    try:
+        t = datetime.datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=datetime.timezone.utc)
+    return t.timestamp()
+
+
+def when_offset(m):
+    """`When − EmittedAt` in seconds for a `SyncPlayCommand`, else None.
+
+    THE STRUCTURAL REPLACEMENT FOR THE DENYLISTED `When`. Both fields are
+    absolute wall clocks that two independent instances cannot match, but their
+    DIFFERENCE is computed by each server from its own single clock, so it IS
+    comparable — and it is exactly where the meaning of `When` lives.
+
+    Upstream builds a command as `When = context.LastActivity`, `EmittedAt =
+    DateTime.UtcNow` (`Group.NewSyncPlayCommand`,
+    v10.11.8:Emby.Server.Implementations/SyncPlay/Group.cs:317-327), so for a
+    Stop on a group that has been idle N seconds the offset is about −N on both
+    servers. A server that stamped `When = now` instead of the group's
+    `LastActivity` would report ≈0 — a difference the field-by-field diff can
+    never see, because it never looks at either field.
+
+    Returns None when the message carries neither (every `SyncPlayGroupUpdate`),
+    so a message pair with no command semantics is simply not asserted.
+    """
+    data = m.get("Data")
+    if not isinstance(data, dict):
+        return None
+    when, emitted = parse_time(data.get("When")), parse_time(data.get("EmittedAt"))
+    if when is None or emitted is None:
+        return None
+    return when - emitted
+
+
 def msg_key(m):
     """What identifies a pushed message for SEQUENCE comparison.
 
@@ -138,11 +226,14 @@ def compare_pushes(legs):
     `legs` is a list of `(label, jellyfin_msgs, hermit_msgs, subs_j, subs_h)`.
     Returns `(ok, compared, note)`. `compared` counts the leaf comparisons that
     actually ran, so "nothing was compared" can never be read as "everything
-    matched" — the same rule the read layer applies.
+    matched" — the same rule the read layer applies. `ok` is independent of it:
+    a sequence mismatch leaves NOTHING to compare field-by-field and is still a
+    definite failure, which is why `verdict()` weighs `ok` first.
     """
     compared = 0
     problems = []
     counts = []
+    offsets = []
     for label, jm, hm, sj, sh in legs:
         jseq, hseq = [msg_key(m) for m in jm], [msg_key(m) for m in hm]
         counts.append(f"{label} H/J {len(hm)}/{len(jm)}")
@@ -154,7 +245,23 @@ def compare_pushes(legs):
             compared += c
             if n:
                 problems.append(f"{label}[{i}] {jseq[i]}: {n} diff(s) at {paths[:4]}")
+            # ...and `When`, which the field diff skipped, asserted through the
+            # only form of it that CAN cross two instances (see `when_offset`).
+            oj, oh = when_offset(jmsg), when_offset(hmsg)
+            if (oj is None) != (oh is None):
+                problems.append(
+                    f"{label}[{i}] {jseq[i]}: only one server carries When+EmittedAt "
+                    f"(H={'yes' if oh is not None else 'no'} J={'yes' if oj is not None else 'no'})")
+            elif oj is not None:
+                compared += 1
+                offsets.append(f"{jseq[i]} H={oh:+.3f}s J={oj:+.3f}s")
+                if abs(oj - oh) > WHEN_OFFSET_TOLERANCE:
+                    problems.append(
+                        f"{label}[{i}] {jseq[i]}: When−EmittedAt offset differs — "
+                        f"H={oh:+.3f}s J={oj:+.3f}s (> {WHEN_OFFSET_TOLERANCE}s)")
     note = "; ".join(counts)
+    if offsets:
+        note += " | When−EmittedAt: " + "; ".join(offsets)
     if problems:
         return False, compared, f"{note} | " + " | ".join(problems)
     return True, compared, note
@@ -170,15 +277,32 @@ class Server:
         self.tag = tag
         self.sockets = []
 
-    def login(self, device_id):
+    def login(self, device_id, user=USER, password=PASS):
         ident = dict(client="parity-push", device="parity-push",
                      device_id=f"{device_id}-{self.tag}", version="1")
         st, body = ws_http("POST", "/Users/AuthenticateByName", base=self.base,
-                           body={"Username": USER, "Pw": PASS}, **ident)
+                           body={"Username": user, "Pw": password}, **ident)
         if st != 200:
-            raise RuntimeError(f"{self.base}: login failed {st}: {body!r}")
+            raise RuntimeError(f"{self.base}: login as {user!r} failed {st}: {body!r}")
         return {"token": body["AccessToken"], "ident": ident,
                 "session_id": body["SessionInfo"]["Id"], "user_id": body["User"]["Id"]}
+
+    def ensure_user(self, admin, name, password):
+        """Create `name` fresh and return its id (`POST /Users/New`).
+
+        A stale account from an aborted run is deleted first — `Users/New` refuses
+        a duplicate name, and journeys.py hit exactly that. The account is deleted
+        again in `run()`'s `finally`, symmetrically on both servers, so the layer
+        leaves the lab as it found it.
+        """
+        for u in (self.http("GET", "/Users", admin)[1] or []):
+            if isinstance(u, dict) and u.get("Name") == name:
+                self.http("DELETE", f"/Users/{u['Id']}", admin)
+        st, body = self.http("POST", "/Users/New", admin,
+                             {"Name": name, "Password": password})
+        if st >= 300 or not isinstance(body, dict) or not body.get("Id"):
+            raise RuntimeError(f"{self.base}: could not create {name!r}: {st} {body!r}")
+        return body["Id"]
 
     def http(self, method, path, sess, body=None):
         return ws_http(method, path, base=self.base, token=sess["token"],
@@ -196,15 +320,99 @@ class Server:
         self.sockets = []
 
 
-def settle(sockets, seconds=1.2):
+def settle(sockets, residue, seconds=1.2):
     """Let anything in flight land, then clear — so a leg starts from silence.
 
     Without this the previous verb's broadcast races the next `collect()` and is
     reported as a spurious extra message on whichever server happened to be slower.
+
+    NOTHING IS SILENTLY DISCARDED. Every frame drained here is recorded into
+    `residue`, tagged with the socket it arrived on, and reported by
+    `residue_report()` at the end of the run. A settle window that swallows what
+    it drains is a laundering machine: it folds anything late into agreement. It
+    is also how this layer was structurally blind to a divergence it walks past
+    twice per run — Jellyfin pushes a `ForceKeepAlive` immediately after the
+    socket handshake and Ferrofin pushes none — and it is how a genuinely delayed
+    SyncPlay message on a future leg would vanish instead of failing the row.
+
+    `sockets` is a list of `(label, ws)`; the label is what makes a leftover
+    attributable to a server and a socket rather than to "somewhere".
     """
     time.sleep(seconds)
-    for ws in sockets:
-        ws.drain()
+    for label, ws in sockets:
+        for m in ws.drain():
+            residue.append((label, msg_key(m)))
+
+
+#: Message types that belong to the SOCKET's own lifecycle rather than to any
+#: operation this layer drives. They are still reported (see `residue_report`) —
+#: this set only decides whether a leftover invalidates the run's rows.
+SOCKET_LIFECYCLE = frozenset({"ForceKeepAlive", "KeepAlive"})
+
+
+def residue_report(residue):
+    """`(errors, observations)` for everything the settle windows drained.
+
+    Two rules, both about never letting a frame disappear:
+
+    * A leftover that is NOT socket lifecycle — a SyncPlay update or command that
+      arrived late enough to miss its own leg — is an ERROR. The leg it belongs
+      to was not measured against a complete capture, so the run's rows are not
+      trustworthy and the run must say so rather than publish them quietly.
+    * Everything else is an OBSERVATION with per-server counts. An observation
+      whose counts DIFFER between the two servers is a real cross-server
+      divergence that this layer measured but owns no ledger row for: `/socket`
+      is not an operation in the vendored contract, so gen-ledger.py has nowhere
+      to put it. Reporting it here is the difference between a known divergence
+      and a forgotten one.
+    """
+    per_server = {}
+    for label, key in residue:
+        tag = label.split("/", 1)[0]
+        per_server.setdefault(key, {}).setdefault(tag, 0)
+        per_server[key][tag] += 1
+    errors, observations = [], []
+    for key, counts in sorted(per_server.items()):
+        base = key.split("/", 1)[0]
+        shown = f"{key}: " + ", ".join(f"{t}={n}" for t, n in sorted(counts.items()))
+        if base not in SOCKET_LIFECYCLE:
+            errors.append(
+                f"a non-lifecycle message was drained by a settle window, so the "
+                f"leg after it was measured against an incomplete capture — {shown}")
+        elif counts.get("h", 0) != counts.get("j", 0):
+            observations.append(
+                f"DIVERGENCE (socket lifecycle, no contract op owns it) — {shown}. "
+                f"`/socket` is not in the vendored OpenAPI, so this cannot become a "
+                f"ledger row; it is an open work item on whatever serves GET /socket.")
+        else:
+            observations.append(f"agreed (socket lifecycle) — {shown}")
+    return errors, observations
+
+
+def withdraw_on_incomplete(rows, res_errors):
+    """Take back every TRUE verdict when the run's capture was incomplete.
+
+    A non-lifecycle frame in a settle window means at least one leg was collected
+    short, and a short capture can produce a FALSE GREEN: if both servers were
+    equally late, the leg diffed a truncated message set on each and agreed. So
+    the verdicts are withdrawn to untested. Reds stand — a difference the probe
+    actually saw is still a difference — and nothing here can turn a red green.
+
+    The withdrawal, not an exit code, is the enforcement: sweep.sh runs under
+    `set -e`, so failing the process would abort the whole parity leg and write
+    no ledger at all, which is strictly LESS visible than a row that says in
+    LEDGER.md why it has no verdict.
+    """
+    if not res_errors:
+        return rows
+    for v in rows.values():
+        if v["deep_verified"] is True:
+            v.update(deep_verified=None, verification_method=None,
+                     classification="flagged: a settle window drained a "
+                                    "non-lifecycle message, so this run's "
+                                    "capture was incomplete",
+                     note="withdrawn (incomplete capture) — " + v["note"])
+    return rows
 
 
 def subs_for(group_id):
@@ -226,25 +434,30 @@ def subs_for(group_id):
 # ---------------------------------------------------------------- the run
 
 def run(ferrofin_url, jellyfin_url):
-    rows, errors = {}, []
+    rows, errors, residue = {}, [], []
     H, J = Server(ferrofin_url, "h"), Server(jellyfin_url, "j")
     stamp = uuid.uuid4().hex[:8]
+    created = []            # (server, admin-session, user-id) to reap in `finally`
     try:
         pairs = {}
         for srv in (H, J):
             ctrl = srv.login(f"push-{stamp}-a")
-            peer = srv.login(f"push-{stamp}-b")
+            # The joiner is a DIFFERENT user, so `Participants` has two names and
+            # its ORDER is a real comparison (see JOINER_USER).
+            created.append((srv, ctrl, srv.ensure_user(ctrl, JOINER_USER, JOINER_PASS)))
+            peer = srv.login(f"push-{stamp}-b", JOINER_USER, JOINER_PASS)
             pairs[srv.tag] = {"srv": srv, "ctrl": ctrl, "peer": peer,
                               "ws_ctrl": srv.socket(ctrl), "ws_peer": srv.socket(peer)}
         h, j = pairs["h"], pairs["j"]
-        allsock = [h["ws_ctrl"], h["ws_peer"], j["ws_ctrl"], j["ws_peer"]]
+        allsock = [("h/ctrl", h["ws_ctrl"]), ("h/peer", h["ws_peer"]),
+                   ("j/ctrl", j["ws_ctrl"]), ("j/peer", j["ws_peer"])]
 
         # -- POST /SyncPlay/Ping from a session that is in NO group ------------
         # The one playback verb upstream does NOT gate on `SyncPlayIsInGroup`
         # (`SyncPlayController.SyncPlayPing` carries no route policy), so it must
         # be accepted and answered with a `NotInGroup` push rather than a 403.
         # Run FIRST, while neither session has ever joined anything.
-        settle(allsock)
+        settle(allsock, residue)
         st_h, _ = h["srv"].http("POST", "/SyncPlay/Ping", h["ctrl"], {"Ping": 77})
         st_j, _ = j["srv"].http("POST", "/SyncPlay/Ping", j["ctrl"], {"Ping": 77})
         pings = (h["ws_ctrl"].collect(), j["ws_ctrl"].collect())
@@ -256,7 +469,7 @@ def run(ferrofin_url, jellyfin_url):
             extra="the not-in-group leg: accepted (no IsInGroup policy) + a NotInGroup push")
 
         # -- POST /SyncPlay/New ------------------------------------------------
-        settle(allsock)
+        settle(allsock, residue)
         new_bodies, gids = {}, {}
         for p in (h, j):
             st, body = p["srv"].http("POST", "/SyncPlay/New", p["ctrl"],
@@ -278,13 +491,15 @@ def run(ferrofin_url, jellyfin_url):
             f"H={st_h} J={st_j} | {note} | {compared} field(s) compared "
             f"({compared - c} pushed + {body_note})")
         if not gids["h"] or not gids["j"]:
-            errors.append("SyncPlay/New did not return a GroupId on both servers")
-            return rows, errors
+            # Aborts through the `except` so the finally-teardown and the
+            # settle-window residue report still run — a bare `return` here would
+            # skip both and leave a user behind on each server.
+            raise RuntimeError("SyncPlay/New did not return a GroupId on both servers")
 
         # -- POST /SyncPlay/Join ----------------------------------------------
         # Two sockets matter: the joiner (GroupJoined + the state hook) and the
         # member already in the group (UserJoined). Both are compared.
-        settle(allsock)
+        settle(allsock, residue)
         st = {}
         for p, gid in ((h, gids["h"]), (j, gids["j"])):
             st[p["srv"].tag], _ = p["srv"].http("POST", "/SyncPlay/Join", p["peer"],
@@ -310,7 +525,7 @@ def run(ferrofin_url, jellyfin_url):
         # defect Ferrofin had — it returned the last mutation's stamp) cannot pass
         # that, where an absolute age bound would, since a young group's stale
         # stamp is still young.
-        settle(allsock, 0.3)
+        settle(allsock, residue, 0.3)
         got, fresh = {}, {}
         for pas in (0, 1):
             for p, gid in ((h, gids["h"]), (j, gids["j"])):
@@ -339,7 +554,7 @@ def run(ferrofin_url, jellyfin_url):
         # The leaver gets `GroupLeft` (whose payload echoes the group id in the
         # DASHED spelling — an upstream quirk that the value normalisation keeps
         # comparable), everyone else gets `UserLeft`.
-        settle(allsock)
+        settle(allsock, residue)
         st = {}
         for p in (h, j):
             st[p["srv"].tag], _ = p["srv"].http("POST", "/SyncPlay/Leave", p["peer"])
@@ -361,23 +576,24 @@ def run(ferrofin_url, jellyfin_url):
     finally:
         H.close()
         J.close()
-    return rows, errors
+        # Symmetric teardown: the joiner account this layer created is removed on
+        # BOTH servers, so the pair is left exactly as it was found.
+        for srv, admin, uid in created:
+            try:
+                srv.http("DELETE", f"/Users/{uid}", admin)
+            except Exception as e:                           # noqa: BLE001
+                errors.append(f"could not delete {JOINER_USER} on {srv.base}: {e}")
+    res_errors, observations = residue_report(residue)
+    withdraw_on_incomplete(rows, res_errors)
+    return rows, errors + res_errors, observations
 
 
 def stamp_age(body, asked):
     """Seconds between `LastUpdatedAt` and when the read was issued, or None."""
-    if not isinstance(body, dict) or not body.get("LastUpdatedAt"):
+    if not isinstance(body, dict):
         return None
-    import datetime
-    raw = body["LastUpdatedAt"].rstrip("Z")
-    if "." in raw:                       # .NET writes up to 7 fractional digits
-        head, frac = raw.split(".", 1)
-        raw = f"{head}.{frac[:6]}"
-    try:
-        t = datetime.datetime.fromisoformat(raw).replace(tzinfo=datetime.timezone.utc)
-    except ValueError:
-        return None
-    return abs(t.timestamp() - asked)
+    t = parse_time(body.get("LastUpdatedAt"))
+    return None if t is None else abs(t - asked)
 
 
 def fmt_age(age):
@@ -385,43 +601,62 @@ def fmt_age(age):
 
 
 def verdict(ok, compared, note, method=None, extra=None):
-    """One results row.
+    """One results row. Three outcomes, weighed in THIS order:
 
-    Three outcomes, never two: nothing compared is UNTESTED (no verdict, no
-    method — a probe that measured nothing must not claim a result), a clean
-    comparison earns its method, and anything else is a flagged red.
+    1. A DEFINITE FAILURE outranks everything else. When the probe SAW a
+       difference — a pushed message sequence that does not match, differing HTTP
+       statuses, a payload field or a `When` offset that diffs — the row is RED,
+       even when the mismatch left nothing to compare field-by-field. That case
+       is not hypothetical and it is not rare: `compare_pushes` cannot diff the
+       payloads of a message one server never pushed, so the real defect
+       `H=[] J=['NotInGroup']` yields `compared == 0`. Filing it as "the probe
+       compared no fields" would make a genuine SERVER defect read as a HARNESS
+       shortfall in LEDGER.md, which renders the classification, not the note.
+    2. Nothing compared AND nothing wrong is UNTESTED — no verdict, no method. A
+       probe that measured nothing must not claim a result.
+    3. A clean comparison earns its method.
     """
+    full = note + (f" ({extra})" if extra else "")
+    if not ok:
+        return {"deep_verified": False,
+                "verification_method": method or verification.PUSH_DIFF,
+                "note": full,
+                "classification":
+                    "flagged: pushed messages or response differ (verify against the C#)"}
     if not compared:
         return {"deep_verified": None, "verification_method": None,
                 "note": f"nothing compared — {note}",
                 "classification": "flagged: the push probe compared no fields"}
-    full = note + (f" ({extra})" if extra else "")
-    if ok:
-        return {"deep_verified": True,
-                "verification_method": method or verification.PUSH_DIFF,
-                "note": full, "classification": "ok"}
-    return {"deep_verified": False, "verification_method": method or verification.PUSH_DIFF,
-            "note": full,
-            "classification": "flagged: pushed messages or response differ (verify against the C#)"}
+    return {"deep_verified": True,
+            "verification_method": method or verification.PUSH_DIFF,
+            "note": full, "classification": "ok"}
 
 
 def main():
     if "--check" in sys.argv:
         selfcheck()
         return
-    rows, errors = run(os.environ.get("FERROFIN_URL", "http://localhost:18096"),
-                       os.environ.get("JELLYFIN_URL", "http://localhost:18097"))
+    rows, errors, observations = run(
+        os.environ.get("FERROFIN_URL", "http://localhost:18096"),
+        os.environ.get("JELLYFIN_URL", "http://localhost:18097"))
     out = {"generated_by": "suite/parity/push.py",
            "last_verified": os.environ.get("PARITY_STAMP", ""),
-           "errors": errors, "rows": rows}
+           "errors": errors,
+           # What the settle windows drained. Recorded rather than swallowed, so a
+           # divergence outside any row is visible instead of laundered.
+           "observations": observations,
+           "rows": rows}
     with open(os.path.join(ROOT, "suite/parity/push-results.json"), "w") as f:
         json.dump(out, f, indent=2, sort_keys=True)
         f.write("\n")
     ok = sum(1 for v in rows.values() if v["deep_verified"])
-    print(f"wrote parity/push-results.json — {len(rows)} op(s), {ok} verified"
-          + (f", errors: {errors}" if errors else ""))
+    print(f"wrote parity/push-results.json — {len(rows)} op(s), {ok} verified")
+    for e in errors:
+        print(f"  !! {e}", file=sys.stderr)
     for k, v in sorted(rows.items()):
         print(f"  {v['deep_verified']!s:>5} {v['verification_method'] or '-':<10} {k}: {v['note']}")
+    for o in observations:
+        print(f"  settle-window residue: {o}")
 
 
 def selfcheck():
@@ -448,6 +683,17 @@ def selfcheck():
     # 2. THE BUG THIS LAYER WAS BUILT FOR: Jellyfin pushes two, Ferrofin one.
     ok, n, note = compare_pushes([("x", [gj(GJ), stop(GJ, "t")], [gj(GH)], sj, sh)])
     assert not ok and "sequence differs" in note, note
+
+    # 2b. ...and a sequence mismatch is a RED, not an "untested". A message one
+    #     server never pushed has no payload to diff, so `compared` can be 0 while
+    #     the finding is definite; `verdict` must weigh the failure first, or a
+    #     server defect renders in LEDGER.md as a harness shortfall.
+    ok0, n0, note0 = compare_pushes([("x", [gj(GJ)], [], sj, sh)])
+    assert not ok0 and n0 == 0, (ok0, n0)
+    row = verdict(ok0, n0, note0)
+    assert row["deep_verified"] is False, row
+    assert row["verification_method"] == verification.PUSH_DIFF, row
+    assert "differ" in row["classification"], row
 
     # 3. ...and the mirror image: an EXTRA message on Ferrofin is equally red.
     ok, _, note = compare_pushes([("x", [gj(GJ)], [gj(GH), stop(GH, "t")], sj, sh)])
@@ -508,7 +754,49 @@ def selfcheck():
         == verification.BODY_DIFF
     assert verdict(False, 8, "n")["deep_verified"] is False
 
-    # 10. the freshness property used for GET /SyncPlay/{id}.
+    # 10. `When` is denylisted, so it is asserted through its DERIVED offset
+    #     instead. Two servers whose commands are stamped from LastActivity agree
+    #     on `When − EmittedAt`; one that stamped `When = now` reports ~0 and is
+    #     caught — which the field-by-field diff, skipping both fields, cannot do.
+    def cmd(gid, when, emitted):
+        m = stop(gid, when)
+        m["Data"]["EmittedAt"] = emitted
+        return m
+
+    late_j = cmd(GJ, "2026-01-01T00:00:00.000000Z", "2026-01-01T00:00:03.000000Z")
+    late_h = cmd(GH, "2026-01-01T00:10:00.000000Z", "2026-01-01T00:10:03.020000Z")
+    ok, n, note = compare_pushes([("x", [late_j], [late_h], sj, sh)])
+    assert ok and "When−EmittedAt" in note, note        # -3.00s vs -2.98s
+    now_h = cmd(GH, "2026-01-01T00:10:03.000000Z", "2026-01-01T00:10:03.000000Z")
+    ok, _, note = compare_pushes([("x", [late_j], [now_h], sj, sh)])
+    assert not ok and "offset differs" in note, note
+    # ...and one server dropping the pair entirely is a difference, not a skip.
+    ok, _, note = compare_pushes([("x", [late_j], [stop(GH, "t")], sj, sh)])
+    assert not ok and "only one server carries" in note, note
+
+    # 11. the settle windows REPORT what they drain. A socket-lifecycle frame
+    #     both servers send is an agreed observation; one only Jellyfin sends is a
+    #     recorded DIVERGENCE (the live `ForceKeepAlive` gap); anything else is an
+    #     error, because a late SyncPlay frame means its leg was mismeasured.
+    errs, obs = residue_report([("h/ctrl", "ForceKeepAlive"), ("j/ctrl", "ForceKeepAlive")])
+    assert not errs and obs and obs[0].startswith("agreed"), (errs, obs)
+    errs, obs = residue_report([("j/ctrl", "ForceKeepAlive"), ("j/peer", "ForceKeepAlive")])
+    assert not errs and obs and obs[0].startswith("DIVERGENCE"), (errs, obs)
+    errs, obs = residue_report([("h/ctrl", "SyncPlayCommand/Stop")])
+    assert errs and not obs and "incomplete capture" in errs[0], (errs, obs)
+    #     ...and an incomplete capture WITHDRAWS the run's greens (a short
+    #     capture both servers shared would otherwise agree), while leaving a red
+    #     exactly as red — the withdrawal can never manufacture a pass.
+    r = {"a": verdict(True, 9, "n"), "b": verdict(False, 9, "n")}
+    withdraw_on_incomplete(r, errs)
+    assert r["a"]["deep_verified"] is None and r["a"]["verification_method"] is None
+    assert "incomplete capture" in r["a"]["note"]
+    assert r["b"]["deep_verified"] is False, r["b"]
+    clean = {"a": verdict(True, 9, "n")}
+    withdraw_on_incomplete(clean, [])
+    assert clean["a"]["deep_verified"] is True
+
+    # 12. the freshness property used for GET /SyncPlay/{id}.
     now = time.time()
     import datetime
     iso = datetime.datetime.fromtimestamp(now, datetime.timezone.utc).isoformat()
@@ -517,8 +805,11 @@ def selfcheck():
     assert stamp_age({}, now) is None
 
     print("ok: push differential rejects a missing message, an extra message, a "
-          "changed payload field and a lost playing item; an empty capture is "
-          f"untested, not verified; stamps {verification.PUSH_DIFF!r} "
+          "changed payload field, a lost playing item and a When−EmittedAt offset "
+          "that drifted; a sequence mismatch is RED (not 'untested'); an empty "
+          "capture is untested, not verified; settle-window leftovers are reported, "
+          "and a non-lifecycle one WITHDRAWS the run's greens; stamps "
+          f"{verification.PUSH_DIFF!r} "
           f"(headline stays {verification.HEADLINE!r})")
 
 

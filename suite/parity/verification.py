@@ -18,13 +18,16 @@ Reading the set, strongest first:
   push-diff     The server→client WebSocket messages the operation CAUSED were
                 captured on both servers, per receiving socket, and compared:
                 the ordered sequence of message types that arrived (so "Jellyfin
-                pushed two, Ferrofin pushed one" is a red, not a pass) and every
-                non-volatile field of each message's payload — and, where the op
-                returns a body, that body diffed clean too. It says nothing about
-                sockets the probe did not open, and nothing about delivery timing
-                beyond the probe's bounded quiet window. Counted and listed
-                separately; it is NOT the headline, because no claim about the
-                HTTP response alone is being made.
+                pushed two, Ferrofin pushed one" is a red, not a pass), every
+                non-volatile field of each message's payload, and a command's
+                scheduling instant through the derived offset
+                `When − EmittedAt` (the two wall clocks themselves cannot cross
+                instances) — and, where the op returns a body, that body diffed
+                clean too. It says nothing about sockets the probe did not open,
+                and nothing about delivery timing beyond the probe's bounded
+                quiet window. Counted and listed separately; it is NOT the
+                headline, because no claim about the HTTP response alone is
+                being made.
   property      Named properties DERIVED from the response agreed on both servers:
                 a decoded image's format and dimensions, a media type, a container
                 signature, a normalised playlist, a set of named invariants. The
@@ -77,10 +80,11 @@ METHODS = {
     PUSH_DIFF: ("⇄", "push-verified",
                 "the server→client WebSocket messages the op caused were captured "
                 "on BOTH servers and diffed — the ordered sequence of message "
-                "types per receiving socket AND every non-volatile field of each "
-                "message's payload, plus the HTTP response body where there is "
-                "one; it asserts nothing about sockets the probe never opened, "
-                "nor about timing beyond its bounded quiet window"),
+                "types per receiving socket, every non-volatile field of each "
+                "message's payload, and a command's scheduling instant via the "
+                "derived `When − EmittedAt` offset, plus the HTTP response body "
+                "where there is one; it asserts nothing about sockets the probe "
+                "never opened, nor about timing beyond its bounded quiet window"),
     PROPERTY: ("◐", "property-verified",
                "named properties derived from the response agreed on both servers "
                "(decoded format/dimensions, media type, container signature, "

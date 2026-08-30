@@ -339,6 +339,29 @@ impl Group {
         self.members.iter().any(|m| m.is_buffering)
     }
 
+    /// The `WaitingGroupState.ResumePlaying` update shared by every entry into
+    /// `Waiting` — `SessionJoined` and `HandleRequest(Seek/Buffer)`.
+    ///
+    /// Upstream writes it as THREE arms, not two
+    /// (`MediaBrowser.Controller/SyncPlay/GroupStates/WaitingGroupState.cs`,
+    /// v10.11.8 — Seek at :297-303, Buffer at :345-388): `prevState == Playing`
+    /// arms the flag, `prevState == Paused` clears it, and ANY OTHER previous
+    /// state — in practice `Waiting`, i.e. the group is already waiting on
+    /// somebody — LEAVES IT UNTOUCHED, because that state object already holds
+    /// the answer from whichever transition created it.
+    ///
+    /// Collapsing that to `resume_playing = prev == Playing` silently clears the
+    /// flag on the third arm: a group that dropped from `Playing` to `Waiting`
+    /// (a join, a seek) and then saw a second Buffer would settle into `Paused`
+    /// where Jellyfin resumes playing.
+    fn resume_playing_from(&mut self, prev_state: GroupStateType) {
+        match prev_state {
+            GroupStateType::Playing => self.resume_playing = true,
+            GroupStateType::Paused => self.resume_playing = false,
+            GroupStateType::Waiting | GroupStateType::Idle => {}
+        }
+    }
+
     fn set_all_buffering(&mut self, buffering: bool) {
         for m in &mut self.members {
             m.is_buffering = buffering;
@@ -524,9 +547,9 @@ impl Group {
             }
             PlaybackRequest::Seek { position_ticks } => {
                 self.position_ticks = (*position_ticks).max(0);
-                // `WaitingGroupState.HandleRequest(SeekGroupRequest)`: resume only
-                // if the group was playing when the seek arrived.
-                self.resume_playing = self.state == GroupStateType::Playing;
+                // `WaitingGroupState.HandleRequest(SeekGroupRequest)`, read while
+                // `self.state` is still the PREVIOUS state.
+                self.resume_playing_from(self.state);
                 self.state = GroupStateType::Waiting;
                 self.last_activity = now;
                 self.set_all_buffering(true);
@@ -536,8 +559,9 @@ impl Group {
                 ]
             }
             PlaybackRequest::Buffer { .. } => {
-                // Same rule as Seek (`WaitingGroupState.HandleRequest(BufferGroupRequest)`).
-                self.resume_playing = self.state == GroupStateType::Playing;
+                // Same rule as Seek (`WaitingGroupState.HandleRequest(BufferGroupRequest)`)
+                // — including its `Waiting` arm, which must NOT touch the flag.
+                self.resume_playing_from(self.state);
                 self.state = GroupStateType::Waiting;
                 // Tell the members that are ready to hold while this one buffers.
                 vec![
@@ -630,18 +654,14 @@ impl Group {
                 self.command_env(SendCommandType::Stop, self.last_activity, now),
             )];
         }
-        match self.state {
-            GroupStateType::Playing => {
-                // Pause the group and bank the time that has actually elapsed.
-                self.resume_playing = true;
-                self.advance_position(now);
-                self.last_activity = now;
-            }
-            // A fresh `WaitingGroupState` built from `Paused` defaults to false;
-            // an existing one (already `Waiting`) keeps the flag it holds.
-            GroupStateType::Paused => self.resume_playing = false,
-            _ => {}
+        if self.state == GroupStateType::Playing {
+            // Pause the group and bank the time that has actually elapsed.
+            self.advance_position(now);
+            self.last_activity = now;
         }
+        // Playing arms the flag, Paused clears it, an already-`Waiting` group
+        // keeps whatever it holds — the same three arms as Seek/Buffer.
+        self.resume_playing_from(self.state);
         self.state = GroupStateType::Waiting;
         // Built after the state change, as upstream does — `IsPlaying` in the
         // queue update must read `Waiting`, not the state the group just left.
@@ -907,14 +927,21 @@ impl SyncPlayManager for FerrofinSyncPlayManager {
             let group_id = Uuid::new_v4();
             let mut group = Group::new(group_id, group_name.trim().to_owned(), now);
             group.add_member(session);
-            let info = group.info(now);
             let joined = render_update(GroupUpdate::GroupJoined(GroupJoinedUpdate {
                 group_id,
-                data: info.clone(),
+                data: group.info(now),
             }));
             // `Group.CreateGroup` ends with the state hook — on a brand-new
             // (Idle) group that is a Stop command to the creating session.
             let outbound = group.session_joined(&session.session_id, now);
+            // The HTTP response is a SECOND, LATER snapshot: `SyncPlayManager.NewGroup`
+            // returns `group.GetInfo()` AFTER `CreateGroup` has run the state hook
+            // (v10.11.8:Emby.Server.Implementations/SyncPlay/SyncPlayManager.cs:134-135),
+            // where the envelope above is built before it (Group.cs:277-279). The two
+            // agree today only because the Idle hook changes no state; taking the
+            // snapshot in upstream's order means they keep agreeing when a
+            // state-changing hook lands on create.
+            let info = group.info(now);
             let targets = member_targets(&group);
             reg.groups.insert(group_id, group);
             reg.session_to_group
@@ -1500,6 +1527,59 @@ mod tests {
         assert_eq!(
             m.get_group(&a, info.group_id).await.unwrap().state,
             GroupStateType::Playing
+        );
+    }
+
+    /// `WaitingGroupState.HandleRequest(BufferGroupRequest)` has THREE arms, and
+    /// the third one is the trap: `prevState == Waiting` must LEAVE
+    /// `ResumePlaying` alone (WaitingGroupState.cs:345-388 has no `else`).
+    ///
+    /// The group is Playing; bob joins, which drops it to Waiting with
+    /// `ResumePlaying = true` and bob buffering. Bob then reports Buffering
+    /// AGAIN — arriving from Waiting this time — and leaves. Nobody is buffering
+    /// any more, so `SessionLeaving` resolves the group: with the flag intact it
+    /// resumes Playing, and a two-arm `flag = prev == Playing` would have cleared
+    /// it and settled the group into Paused instead.
+    #[tokio::test]
+    async fn buffering_from_waiting_keeps_resume_playing_armed() {
+        let (m, bus) = mgr();
+        let a = session("s1", "alice");
+        let info = m.new_group(&a, "g").await.unwrap();
+        m.handle_request(&a, play(2)).await.unwrap();
+        let b = session("s2", "bob");
+        m.join_group(&b, info.group_id).await.unwrap(); // Playing -> Waiting, resume armed
+        assert_eq!(
+            m.get_group(&a, info.group_id).await.unwrap().state,
+            GroupStateType::Waiting
+        );
+
+        // A second Buffer, this time with the group ALREADY Waiting.
+        m.handle_request(
+            &b,
+            PlaybackRequest::Buffer {
+                when: Utc::now(),
+                position_ticks: 0,
+                is_playing: false,
+                playlist_item_id: Uuid::nil(),
+            },
+        )
+        .await
+        .unwrap();
+        let before = bus.count_for("s1");
+
+        m.leave_group(&b).await.unwrap();
+
+        assert_eq!(
+            m.get_group(&a, info.group_id).await.unwrap().state,
+            GroupStateType::Playing,
+            "a Buffer arriving from Waiting must not clear ResumePlaying"
+        );
+        let alice_after = &bus.bodies_for("s1")[before..];
+        assert!(
+            alice_after
+                .iter()
+                .any(|x| x.contains("SyncPlayCommand") && x.contains("Unpause")),
+            "{alice_after:?}"
         );
     }
 
