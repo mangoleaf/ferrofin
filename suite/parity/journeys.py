@@ -184,6 +184,28 @@ JOURNEY_METHOD.update({op: verification.PROPERTY for op in (
     # served as) — the stored bytes come from two different origins and cannot be
     # diffed. See `j_remote_image_download`.
     "POST /Items/{itemId}/RemoteImages/Download",
+    # A NAMED set of invariants, compared across the two servers: did exactly one
+    # row appear, is its id derived rather than posted, did the create schedule
+    # anything, does sortBy actually reorder. Counts and orderings, not a body.
+    "POST /LiveTv/SeriesTimers",
+    "DELETE /LiveTv/SeriesTimers/{timerId}",
+    # `UpdateTimerAsync` takes four fields and discards the rest of the posted
+    # body: the projection is those four plus "did the discarded ones survive".
+    "POST /LiveTv/Timers/{timerId}",
+)})
+JOURNEY_METHOD.update({op: verification.BODY_DIFF for op in (
+    # The FIRST rows in this layer to earn the headline, and they earn it the way
+    # reads.py does: the evidence is the whole parsed `SeriesTimerInfoDto`, with
+    # exactly the four per-instance fields in SERIES_TIMER_PER_INSTANCE removed
+    # and nothing else — not a hand-listed projection that grows a field at a
+    # time. Two of those four are Id/ExternalId, and they are not waved through:
+    # `derives_its_id` re-derives the id from the C# formula on each server
+    # instead, which is a stronger check than comparing two random GUIDs could
+    # ever be. `earned_method` still downgrades either row to `effect` if the
+    # journey did not actually return `Same` on both servers.
+    "GET /LiveTv/SeriesTimers/{timerId}",
+    # Same body, read back after the update, plus the four whitelist invariants.
+    "POST /LiveTv/SeriesTimers/{timerId}",
 )})
 
 
@@ -1043,10 +1065,28 @@ LIVETV_OPS = [
     "POST /LiveTv/TunerHosts", "POST /LiveTv/ListingProviders",
     "POST /LiveStreams/Open", "GET /LiveTv/LiveStreamFiles/{streamId}/stream.{container}",
     "POST /LiveStreams/Close", "GET /LiveTv/Programs/{programId}", "POST /LiveTv/Timers",
-    "GET /LiveTv/Timers/{timerId}", "GET /LiveTv/LiveRecordings/{recordingId}/stream",
+    "GET /LiveTv/Timers/{timerId}", "POST /LiveTv/Timers/{timerId}",
+    "GET /LiveTv/LiveRecordings/{recordingId}/stream",
     "GET /LiveTv/Recordings/{recordingId}", "DELETE /LiveTv/Timers/{timerId}",
     "DELETE /LiveTv/Recordings/{recordingId}",
 ]
+SERIES_TIMER_OPS = [
+    "POST /LiveTv/SeriesTimers", "GET /LiveTv/SeriesTimers/{timerId}",
+    "POST /LiveTv/SeriesTimers/{timerId}", "DELETE /LiveTv/SeriesTimers/{timerId}",
+]
+# The fields a series-timer body diff CANNOT carry across two independent
+# instances, and nothing else. Both servers mint the timer's external id as a
+# fresh `Guid.NewGuid()` per create (DefaultLiveTvService.cs:265) and publish its
+# MD5 as `Id` (LiveTvDtoService.cs:119) — so Id/ExternalId are random by
+# construction, and `derives_its_id` below checks the DERIVATION instead of
+# waving them through. `ExternalChannelId` embeds MD5(tuner URL), which differs
+# because the two servers reach the fixture tuner on different container hosts,
+# and `ServerId` is the instance's SystemId. Everything else in the DTO — Name,
+# Overview, ChannelId, ChannelName, ProgramId, ExternalProgramId, Days,
+# DayPattern, the dates, every padding/keep/record flag, ServiceName, Type,
+# ImageTags — stays in the diff. This is scoped to this probe on purpose:
+# parity_diff.VOLATILE is global and must not be widened for it.
+SERIES_TIMER_PER_INSTANCE = ("Id", "ExternalId", "ExternalChannelId", "ServerId")
 RECORDING_START_WAIT_S = 60   # the recorder opens the tuner stream + the Recordings folder refreshes
 RECORDING_POLL_S = 5
 STREAM_PREFIX_BYTES = 16384   # ~87 TS packets: enough for is_mpegts, cheap to pull
@@ -1073,6 +1113,74 @@ def is_mpegts(body):
 
 def mpegts_response(st, ct, body):
     return st == 200 and ct.split(";")[0].strip().lower() == "video/mp2t" and is_mpegts(body)
+
+
+def timer_update_leg(base, token, user, ch):
+    """`POST /LiveTv/Timers/{timerId}` on a timer of its own, for a programme that has
+    NOT started yet.
+
+    It cannot ride on the journey's main timer: that one records the programme airing
+    right now, so its recorder fires within a second of the create and
+    `DefaultLiveTvService.UpdateTimerAsync` (v10.11.8 DefaultLiveTvService.cs:342-363)
+    then refuses to touch it — "// Only update if not currently active". Measured on the
+    lab pair: the same leg was green on one run and red on the next with Jellyfin's
+    paddings unchanged, because its capture had started and Ferrofin's had not. Racing
+    the recorder is not a parity signal, so this leg brings its own quiet timer.
+
+    What it asserts is the C# whitelist: the FOUR padding fields are taken and the rest
+    of the posted body — Name, Priority, StartDate, and a Status=Cancelled that must not
+    cancel anything — is discarded. Plus: an id nothing matches must not MINT a timer.
+    Only the "no phantom" half of that is compared across the two servers; upstream's
+    intended answer there is `ResourceNotFoundException` (:346-349) but
+    `LiveTvDtoService.GetTimerInfo` dereferences a null series timer first
+    (LiveTvDtoService.cs:453-458), so Jellyfin really answers 500 where Ferrofin answers
+    404 — a Jellyfin bug, not a status to agree on."""
+    programs = (get_json(base, f"/LiveTv/Programs?channelIds={ch}&userId={user}", token)
+                or {}).get("Items") or []
+    now = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+    tid = None
+    # A programme a leftover series timer already scheduled is a 400 ("a scheduled
+    # recording already exists for this program") on both servers, so try a few.
+    for prog in [p for p in programs if (p.get("StartDate") or "") > now][:5]:
+        defaults = get_json(base, f"/LiveTv/Timers/Defaults?programId={prog['Id']}", token) or {}
+        st, _ = http("POST", f"{base}/LiveTv/Timers", token, json.dumps(defaults))
+        if st >= 300:
+            continue
+        timers = (get_json(base, f"/LiveTv/Timers?channelId={ch}", token) or {}).get("Items") or []
+        found = next((t for t in timers if t.get("ProgramId") == prog["Id"]), None)
+        if found:
+            tid = found.get("Id")
+            break
+    if not tid:
+        return False
+    try:
+        got = get_json(base, f"/LiveTv/Timers/{tid}", token) or {}
+        upd = dict(got)
+        upd.update(PrePaddingSeconds=300, PostPaddingSeconds=600,
+                   IsPrePaddingRequired=True, IsPostPaddingRequired=True,
+                   Name="parity-update-must-be-ignored", Priority=42,
+                   Status="Cancelled", StartDate="2027-01-01T00:00:00.0000000Z")
+        st, _ = http("POST", f"{base}/LiveTv/Timers/{tid}", token, json.dumps(upd))
+        back = get_json(base, f"/LiveTv/Timers/{tid}", token) or {}
+        # ExternalId is stripped from the ghost body on purpose: leave it in and
+        # Jellyfin resolves it to the REAL timer and updates that one instead.
+        ghost = "00000000000000000000000000009999"
+        ghost_body = {k: v for k, v in upd.items() if k not in ("Id", "ExternalId")}
+        http("POST", f"{base}/LiveTv/Timers/{ghost}", token,
+             json.dumps(dict(ghost_body, Id=ghost)))
+        return Same(st < 300, {
+            "PrePaddingSeconds": back.get("PrePaddingSeconds"),
+            "PostPaddingSeconds": back.get("PostPaddingSeconds"),
+            "IsPrePaddingRequired": back.get("IsPrePaddingRequired"),
+            "IsPostPaddingRequired": back.get("IsPostPaddingRequired"),
+            "NameUnchanged": back.get("Name") == got.get("Name"),
+            "PriorityUnchanged": back.get("Priority") == got.get("Priority"),
+            "StartDateUnchanged": back.get("StartDate") == got.get("StartDate"),
+            "StatusNotTheCancelledWePosted": back.get("Status") != "Cancelled",
+            "UnknownIdNotCreated": get_json(base, f"/LiveTv/Timers/{ghost}", token) in (None, {}),
+        })
+    finally:
+        http("DELETE", f"{base}/LiveTv/Timers/{tid}", token)
 
 
 def j_livetv(base, token, user, _m, _m2):
@@ -1139,7 +1247,9 @@ def j_livetv(base, token, user, _m, _m2):
     tid = timer.get("Id")
     rec = None
     try:
-        r["GET /LiveTv/Timers/{timerId}"] = (get_json(base, f"/LiveTv/Timers/{tid}", token) or {}).get("Id") == tid
+        got = get_json(base, f"/LiveTv/Timers/{tid}", token) or {}
+        r["GET /LiveTv/Timers/{timerId}"] = got.get("Id") == tid
+        r["POST /LiveTv/Timers/{timerId}"] = timer_update_leg(base, token, user, ch)
         for _ in range(RECORDING_START_WAIT_S // RECORDING_POLL_S):
             recs = (get_json(base, f"/LiveTv/Recordings?isInProgress=true&userId={user}", token)
                     or {}).get("Items") or []
@@ -1175,6 +1285,202 @@ def j_livetv(base, token, user, _m, _m2):
             st, _ = http("DELETE", f"{base}/LiveTv/Recordings/{rec['Id']}", token)
             still = get_json(base, f"/LiveTv/Recordings/{rec['Id']}?userId={user}", token)
             r["DELETE /LiveTv/Recordings/{recordingId}"] = st < 300 and not still
+    return r
+
+
+def dotnet_md5_guid_n(text):
+    """Jellyfin's `string.GetMD5().ToString("N")`: MD5 over UTF-16LE bytes, read back
+    as a .NET `Guid` (Data1/Data2/Data3 are little-endian) and printed without dashes.
+
+    This is `LiveTvDtoService.GetInternalSeriesTimerId` (v10.11.8 LiveTvDtoService.cs:417-421)
+    when fed `"Emby" + externalId + "4"` lowercased. Having it here is what lets the
+    journey assert that a server DERIVED its series-timer id rather than minting one —
+    the alternative would be to drop Id from the comparison and call that verified."""
+    import hashlib
+    d = hashlib.md5(text.encode("utf-16-le")).digest()
+    return (bytes([d[3], d[2], d[1], d[0], d[5], d[4], d[7], d[6]]) + d[8:]).hex()
+
+
+def derives_its_id(dto):
+    """True when this series timer's Id is the MD5 upstream derives from its ExternalId."""
+    ext = dto.get("ExternalId") or ""
+    return bool(ext) and dto.get("Id") == dotnet_md5_guid_n(("Emby" + ext + "4").lower())
+
+
+def series_timer_body(dto):
+    """The read-back DTO with exactly the per-instance fields dropped — see
+    SERIES_TIMER_PER_INSTANCE for why each one, and why nothing else is dropped."""
+    return {k: v for k, v in (dto or {}).items() if k not in SERIES_TIMER_PER_INSTANCE}
+
+
+def series_timer_ids(base, token, query=""):
+    items = (get_json(base, f"/LiveTv/SeriesTimers{query}", token) or {}).get("Items") or []
+    return [t.get("Id") for t in items]
+
+
+def j_livetv_series_timers(base, token, user, _m, _m2):
+    """The series-timer lifecycle on the fixture tuner: pick two FUTURE programmes with
+    different titles from the guide, create a series timer from each programme's own
+    `Timers/Defaults` body, read one back, update it, delete it, and confirm it and the
+    timers it scheduled are gone — then clean the second one up too.
+
+    Three assertions here are the ones that were missing, and each catches a real bug:
+      * two creates from two different programmes leave TWO rows with DIFFERENT ids.
+        `Timers/Defaults` hands every programme the same constant Id and clients post
+        it straight back, so a server that honours it collapses every series timer
+        onto one row and silently destroys the previous one.
+      * the created Id is the MD5 the C# derives from a freshly minted ExternalId
+        (`derives_its_id`), not the posted one and not a random GUID in DB casing.
+      * creating a series timer SCHEDULES something: at least one timer carrying
+        SeriesTimerId. A series timer that records nothing passes every status check.
+
+    Every op starts False so an early exit (no channels, no future programmes) leaves a
+    flagged row, never a missing one."""
+    r = dict.fromkeys(SERIES_TIMER_OPS, False)
+    channels = (get_json(base, f"/LiveTv/Channels?userId={user}", token) or {}).get("Items") or []
+    if not channels:
+        return r
+    ch = channels[0]["Id"]
+    programs = (get_json(base, f"/LiveTv/Programs?channelIds={ch}&userId={user}", token)
+                or {}).get("Items") or []
+    # A programme that has already ended schedules nothing (`MinEndDate = UtcNow` in
+    # `GetTimersForSeries`), so the fan-out assertion would pass vacuously on it —
+    # and one that is airing RIGHT NOW is worse: its timer fires the moment the
+    # series timer is created, so the earliest showing races the recorder through
+    # New → InProgress → Completed while the journey is still reading. Only a
+    # programme that has not STARTED is a stable subject.
+    now = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+    future = [p for p in programs if (p.get("StartDate") or "") > now]
+    picked, seen = [], set()
+    for p in future:                      # two DIFFERENT titles: two independent series
+        if p.get("Name") not in seen:
+            seen.add(p.get("Name"))
+            picked.append(p)
+        if len(picked) == 2:
+            break
+    if len(picked) < 2:
+        return r
+    created = []
+    try:
+        # --- create, twice, from two different programmes' defaults -------------------
+        create_ok, evidence = True, {}
+        for n, prog in enumerate(picked):
+            before = set(series_timer_ids(base, token))
+            defaults = get_json(base, f"/LiveTv/Timers/Defaults?programId={prog['Id']}", token) or {}
+            defaults["Priority"] = 3 + n * 5          # non-default: the create must DISCARD it
+            st, _ = http("POST", f"{base}/LiveTv/SeriesTimers", token, json.dumps(defaults))
+            fresh = [i for i in series_timer_ids(base, token) if i not in before]
+            created += fresh
+            dto = get_json(base, f"/LiveTv/SeriesTimers/{fresh[0]}", token) if fresh else {}
+            evidence[f"created{n}"] = {
+                "status_ok": st < 300,
+                "exactly_one_new_row": len(fresh) == 1,
+                "id_is_not_the_posted_defaults_id": bool(fresh) and fresh[0] != defaults.get("Id"),
+                "id_is_derived_from_external_id": derives_its_id(dto or {}),
+                "external_channel_id_set": bool((dto or {}).get("ExternalChannelId")),
+                "program_id": (dto or {}).get("ProgramId") == prog["Id"],
+                # `LiveTvManager.CreateSeriesTimer` overwrites the posted Priority
+                # with the standing defaults' ("// Set priority from default
+                # values", LiveTvManager.cs:1145-1147). The body above posted a
+                # non-default one, so a server that honours it fails here — and
+                # would then also make the sort leg below meaningless.
+                "posted_priority_discarded": (dto or {}).get("Priority") == 0,
+            }
+            create_ok = create_ok and all(evidence[f"created{n}"].values())
+        evidence["two_distinct_ids"] = len(set(created)) == 2
+        create_ok = create_ok and evidence["two_distinct_ids"]
+        if len(created) < 2:
+            r["POST /LiveTv/SeriesTimers"] = Same(False, evidence)
+            return r
+        sid, other = created[0], created[1]
+        # …and the create SCHEDULED something: a series timer that records nothing
+        # passes every status check ever written, which is how this went unnoticed.
+        #
+        # The invariant compared is the shape upstream produces, not the raw count.
+        # Every airing of one title in this fixture hashes to the same `ShowId`
+        # (`XmlTvListingsProvider.cs:186-206` — no episode info, so it is MD5(title)),
+        # so `SearchForDuplicateShowIds` (DefaultLiveTvService.cs:681-707) records the
+        # EARLIEST showing and cancels the rest. The raw count is deliberately left out
+        # of the comparison: it is "future airings of this title at the instant the
+        # request landed", and the two servers are called seconds apart, so it moves by
+        # one across an hour boundary in the fixture's hourly guide. `>= 2` still gates
+        # that the fan-out really walked the guide rather than scheduling the one
+        # programme it was handed.
+        children = [t for t in ((get_json(base, "/LiveTv/Timers", token) or {}).get("Items") or [])
+                    if t.get("SeriesTimerId") == sid]
+        recordable = [t for t in children if t.get("Status") != "Cancelled"]
+        earliest = min(children, key=lambda t: t.get("StartDate") or "", default=None)
+        evidence["fan_out"] = {
+            "scheduled_more_than_one_showing": len(children) >= 2,
+            "exactly_one_showing_is_recordable": len(recordable) == 1,
+            "the_recordable_one_is_the_earliest":
+                bool(earliest) and earliest.get("Status") != "Cancelled",
+        }
+        create_ok = create_ok and all(evidence["fan_out"].values())
+        r["POST /LiveTv/SeriesTimers"] = Same(create_ok, evidence)
+
+        # --- read one back: the whole body, diffed against the other server ------------
+        dto = get_json(base, f"/LiveTv/SeriesTimers/{sid}", token) or {}
+        r["GET /LiveTv/SeriesTimers/{timerId}"] = Same(
+            dto.get("Id") == sid and derives_its_id(dto), series_timer_body(dto))
+
+        # --- update: the C# whitelist, and nothing else --------------------------------
+        posted = dict(dto)
+        posted.update(PrePaddingSeconds=120, PostPaddingSeconds=240,
+                      IsPrePaddingRequired=True, Priority=7, KeepUpTo=3,
+                      Days=["Saturday", "Sunday"], DayPattern="Daily",
+                      Name="RENAMED", Overview="RENAMED")
+        st, _ = http("POST", f"{base}/LiveTv/SeriesTimers/{sid}", token, json.dumps(posted))
+        # An id nothing matches must write nothing: no ghost row, no 200 afterwards.
+        ghost = "0000000000000000000000000000dead"
+        http("POST", f"{base}/LiveTv/SeriesTimers/{ghost}", token,
+             json.dumps(dict(posted, Id=ghost, ExternalId="")))
+        after = get_json(base, f"/LiveTv/SeriesTimers/{sid}", token) or {}
+        r["POST /LiveTv/SeriesTimers/{timerId}"] = Same(st < 300 and bool(after), {
+            "body": series_timer_body(after),
+            # Named here as well as inside the body so a failure says WHICH rule broke:
+            # the whitelist keeps Name/Overview, and DayPattern is recomputed from Days
+            # (`GetDayPattern`, LiveTvDtoService.cs:360-387) — [Sat,Sun] is Weekends even
+            # though the posted body said Daily.
+            "name_not_updatable": after.get("Name") == dto.get("Name"),
+            "overview_not_updatable": after.get("Overview") == dto.get("Overview"),
+            "day_pattern_recomputed": after.get("DayPattern") == "Weekends",
+            "unknown_id_made_no_row": get_json(base, f"/LiveTv/SeriesTimers/{ghost}", token) in (None, {}),
+        })
+
+        # --- sortBy is honoured, not silently dropped ---------------------------------
+        # This runs AFTER the update, which is the only way a series timer's Priority
+        # can move (create discards it): `sid` is now Priority 7 and `other` is still
+        # the default 0. Upstream's ASCENDING Priority arm is OrderByDescending(Priority)
+        # (LiveTvManager.cs:925-926) — the inversion is upstream's, ported verbatim — so
+        # the two orders are each other's reverse and both differ from the default
+        # name order. Names are compared, not ids, so this is cross-server evidence.
+        # Without distinct priorities the three lists would be identical and the leg
+        # would pass on a server that drops sortBy on the floor, which is the bug.
+        def order_of(query):
+            items = (get_json(base, f"/LiveTv/SeriesTimers{query}", token) or {}).get("Items") or []
+            return [t.get("Name") for t in items if t.get("Id") in (sid, other)]
+        r["POST /LiveTv/SeriesTimers"] = Same(create_ok, dict(
+            evidence,
+            order_default=order_of(""),
+            order_priority_asc=order_of("?sortBy=Priority"),
+            order_priority_desc=order_of("?sortBy=Priority&sortOrder=Descending")))
+
+        # --- delete: gone, its timers gone, and a second delete is not a silent 204 ----
+        st, _ = http("DELETE", f"{base}/LiveTv/SeriesTimers/{sid}", token)
+        again, _ = http("DELETE", f"{base}/LiveTv/SeriesTimers/{sid}", token)
+        left = [t for t in ((get_json(base, "/LiveTv/Timers", token) or {}).get("Items") or [])
+                if t.get("SeriesTimerId") == sid]
+        r["DELETE /LiveTv/SeriesTimers/{timerId}"] = Same(st < 300, {
+            "gone_from_the_list": sid not in series_timer_ids(base, token),
+            "single_get_is_404": get_json(base, f"/LiveTv/SeriesTimers/{sid}", token) in (None, {}),
+            "its_timers_are_gone": len(left) == 0,
+            "second_delete_is_not_2xx": again >= 400,
+        })
+        created.remove(sid)
+    finally:
+        for leftover in created:
+            http("DELETE", f"{base}/LiveTv/SeriesTimers/{leftover}", token)
     return r
 
 
@@ -1568,7 +1874,7 @@ JOURNEYS = [j_startup,   # first: see its docstring
             j_scheduled_run, j_playbackinfo_post, j_active_encodings, j_clientlog,
             j_authenticate, j_user_update, j_devices_delete, j_bulk_item_delete,
             j_subtitles_upload, j_quickconnect, j_system_and_refresh,
-            j_forgot_password, j_backup, j_livetv, j_remote_subtitles,
+            j_forgot_password, j_backup, j_livetv, j_livetv_series_timers, j_remote_subtitles,
             j_remote_image_download,
             # Destructive-ish: rewrites the metadata of two movies it owns outright
             # (Movie 0497/0496, by name), and locks one of them.
@@ -1700,8 +2006,25 @@ def selfcheck():
         assert earned_method(diffed, Same(True, 1), True) == verification.EFFECT
     finally:
         del JOURNEY_METHOD[diffed]
-    # …and every op a journey really declares stays out of the headline.
-    assert verification.BODY_DIFF not in set(JOURNEY_METHOD.values())
+    # …and the ops that claim the headline are exactly the ones whose evidence is
+    # a whole parsed body minus a named per-instance list — not a hand-listed
+    # projection. This used to be a blanket "no journey op may claim body-diff";
+    # it is an allowlist now rather than a deletion, so adding a third one is a
+    # deliberate edit here and not a quiet upgrade at the call site.
+    assert {op for op, m in JOURNEY_METHOD.items() if m == verification.BODY_DIFF} == {
+        "GET /LiveTv/SeriesTimers/{timerId}", "POST /LiveTv/SeriesTimers/{timerId}"}
+    # The derivation helper is the reason Id/ExternalId may be left out of that
+    # body diff at all, so it is checked against the C# oracle here: the constant
+    # `GET /LiveTv/Timers/Defaults` publishes is GetInternalSeriesTimerId("").
+    assert dotnet_md5_guid_n("emby4") == "eb075d6a62e2edc6b764a304633d33c0"
+    assert derives_its_id({"ExternalId": "8279078f967a44c4a96656331ebc08d2",
+                           "Id": dotnet_md5_guid_n("emby8279078f967a44c4a96656331ebc08d24")})
+    assert not derives_its_id({"ExternalId": "", "Id": "eb075d6a62e2edc6b764a304633d33c0"})
+    assert not derives_its_id({"ExternalId": "abc", "Id": "abc"})
+    # …and the body projection drops exactly the four named fields, nothing else.
+    assert series_timer_body({"Id": 1, "ExternalId": 2, "ExternalChannelId": 3,
+                              "ServerId": 4, "Name": "n", "Priority": 0}) \
+        == {"Name": "n", "Priority": 0}
     # Every journey advertises only op keys that exist in the vendored spec.
     import glob
     spec = json.load(open(sorted(glob.glob(os.path.join(ROOT, "contracts/jellyfin-openapi-*.json")))[-1]))

@@ -123,6 +123,19 @@ pub fn internal_series_timer_id(external_id: &str) -> String {
     .to_string()
 }
 
+/// The internal id `LiveTvDtoService` derives for a recording timer with the
+/// given external id.
+///
+/// Port of `LiveTvDtoService.GetInternalTimerId` (v10.11.8
+/// `LiveTvDtoService.cs:410-415`). It is the same
+/// `(ServiceName + externalId + InternalVersionNumber).ToLowerInvariant().GetMD5()`
+/// derivation [`internal_series_timer_id`] uses — upstream keeps them as two
+/// methods because they are called from two different paths, and so do we.
+#[must_use]
+pub fn internal_timer_id(external_id: &str) -> String {
+    internal_series_timer_id(external_id)
+}
+
 /// The defaults a new timer starts from, before any programme is applied.
 ///
 /// Port of `DefaultLiveTvService.GetNewTimerDefaultsAsync` +
@@ -429,16 +442,24 @@ pub trait LiveTvManager: Send + Sync {
 
     // ---- DVR: series timers ----------------------------------------------
 
-    /// Lists the recurring (series) recording timers.
-    async fn get_series_timers(&self) -> Result<Vec<SeriesTimerInfoDto>, ServiceError>;
+    /// Lists the recurring (series) recording timers, in the query's order.
+    ///
+    /// Port of `LiveTvManager.GetSeriesTimers` (v10.11.8 LiveTvManager.cs:904-930):
+    /// `SortBy == "Priority"` orders by priority then name, anything else orders
+    /// by name alone.
+    async fn get_series_timers(
+        &self,
+        query: &ferrofin_model::live_tv::SeriesTimerQuery,
+    ) -> Result<Vec<SeriesTimerInfoDto>, ServiceError>;
 
     /// Gets a single series timer by id, or `None` when unknown.
     async fn get_series_timer(&self, id: &str) -> Result<Option<SeriesTimerInfoDto>, ServiceError>;
 
-    /// Creates (or replaces) a series timer, returning its id.
+    /// Creates a series timer, returning the id the server minted for it.
     async fn create_series_timer(&self, timer: SeriesTimerInfoDto) -> Result<String, ServiceError>;
 
-    /// Updates the series timer with the given id.
+    /// Updates the series timer with the given id, or does nothing when no such
+    /// timer exists (C# `UpdateSeriesTimerAsync`'s `if (instance is not null)`).
     async fn update_series_timer(
         &self,
         id: &str,
@@ -446,6 +467,9 @@ pub trait LiveTvManager: Send + Sync {
     ) -> Result<(), ServiceError>;
 
     /// Cancels (deletes) the series timer and its pending timers.
+    ///
+    /// Returns [`ServiceError::NotFound`] when no such series timer exists
+    /// (C# `LiveTvManager.CancelSeriesTimer`).
     async fn cancel_series_timer(&self, id: &str) -> Result<(), ServiceError>;
 
     /// The defaults a client seeds a new timer form with, for a programme or in

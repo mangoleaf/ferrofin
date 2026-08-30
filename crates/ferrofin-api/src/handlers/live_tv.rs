@@ -1489,13 +1489,35 @@ async fn get_default_timer(
     }
 }
 
+/// The query `GET /LiveTv/SeriesTimers` binds.
+///
+/// Port of `LiveTvController.GetSeriesTimers`'s `[FromQuery] string? sortBy` +
+/// `[FromQuery] SortOrder? sortOrder` (v10.11.8 LiveTvController.cs:896-905),
+/// which it hands to `SeriesTimerQuery` with `SortOrder.Ascending` as the
+/// default.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct SeriesTimersQuery {
+    /// The field to sort on — only `Priority` is recognised upstream.
+    sort_by: Option<String>,
+    /// The sort direction.
+    sort_order: Option<ferrofin_model::dto::SortOrder>,
+}
+
 /// `GET /LiveTv/SeriesTimers` — recurring (series) timers.
 async fn get_series_timers(
     State(state): State<AppState>,
     RequireLiveTvAccess(_auth): RequireLiveTvAccess,
+    Query(query): Query<SeriesTimersQuery>,
 ) -> Result<Json<QueryResult<SeriesTimerInfoDto>>, ApiError> {
+    let query = ferrofin_model::live_tv::SeriesTimerQuery {
+        sort_by: query.sort_by,
+        sort_order: query.sort_order.unwrap_or_default(),
+    };
     match state.live_tv.as_ref() {
-        Some(m) => Ok(Json(QueryResult::from_items(m.get_series_timers().await?))),
+        Some(m) => Ok(Json(QueryResult::from_items(
+            m.get_series_timers(&query).await?,
+        ))),
         None => Ok(Json(QueryResult::default())),
     }
 }
@@ -1821,7 +1843,7 @@ mod tests {
             0
         );
         assert_eq!(
-            get_series_timers(State(state), auth())
+            get_series_timers(State(state), auth(), Query(SeriesTimersQuery::default()))
                 .await
                 .unwrap()
                 .0
@@ -2241,6 +2263,7 @@ mod tests {
         }
         async fn get_series_timers(
             &self,
+            _query: &ferrofin_model::live_tv::SeriesTimerQuery,
         ) -> Result<Vec<SeriesTimerInfoDto>, ferrofin_traits::error::ServiceError> {
             unimplemented!()
         }

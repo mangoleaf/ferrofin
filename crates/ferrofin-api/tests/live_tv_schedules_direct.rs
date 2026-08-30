@@ -159,7 +159,10 @@ impl LiveTvManager for CountriesLiveTv {
     async fn cancel_timer(&self, _id: &str) -> Result<(), ServiceError> {
         unreachable!()
     }
-    async fn get_series_timers(&self) -> Result<Vec<SeriesTimerInfoDto>, ServiceError> {
+    async fn get_series_timers(
+        &self,
+        _query: &ferrofin_model::live_tv::SeriesTimerQuery,
+    ) -> Result<Vec<SeriesTimerInfoDto>, ServiceError> {
         unreachable!()
     }
     async fn get_series_timer(

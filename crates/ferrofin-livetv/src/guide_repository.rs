@@ -155,6 +155,29 @@ pub async fn existing_channel_dates(
     .collect())
 }
 
+/// The tuner-facing external id of one channel, or `None` when the lineup does
+/// not hold it (or holds it empty, as a row written before migration 0023).
+///
+/// This is `SeriesTimerInfo.ChannelId`/`TimerInfo.ChannelId` upstream — the id
+/// the internal channel GUID was derived from, published on every timer DTO as
+/// `ExternalChannelId` (`LiveTvDtoService.cs:69`, `:137`).
+///
+/// # Errors
+///
+/// Fails when the read fails.
+pub async fn channel_external_id(
+    db: &Database,
+    channel_id: Uuid,
+) -> Result<Option<String>, ServiceError> {
+    let external: Option<String> =
+        sqlx::query_scalar(r#"SELECT "ExternalId" FROM "FerrofinLiveTvChannels" WHERE "Id" = ?1"#)
+            .bind(guid_to_db(channel_id))
+            .fetch_optional(db.pool())
+            .await
+            .map_err(db_err)?;
+    Ok(external.filter(|e| !e.is_empty()))
+}
+
 /// Whether any tuner host row exists.
 ///
 /// Backs the synchronous `has_tuner_hosts` flag the "Refresh Guide" task's

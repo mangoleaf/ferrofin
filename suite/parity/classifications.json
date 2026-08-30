@@ -10,10 +10,6 @@
       "category": "requires-livetv-tuner",
       "classification": "requires-livetv-tuner: the fixture tuner (M3U + XMLTV, two channels) exists, but no probe exercises this op yet — needs a journey that removes the fixture's listings provider and observes the guide emptying."
     },
-    "DELETE /LiveTv/SeriesTimers/{timerId}": {
-      "category": "requires-livetv-tuner",
-      "classification": "requires-livetv-tuner: the fixture tuner (M3U + XMLTV, two channels) exists, but no probe exercises this op yet — needs a series-timer journey (create from a programme → list → delete)."
-    },
     "DELETE /LiveTv/TunerHosts": {
       "category": "requires-livetv-tuner",
       "classification": "requires-livetv-tuner: the fixture tuner (M3U + XMLTV, two channels) exists, but no probe exercises this op yet — needs a journey that removes the fixture tuner and observes its channels going."
@@ -137,10 +133,6 @@
     "GET /LiveTv/Recordings/Groups/{groupId}": {
       "category": "requires-livetv-tuner",
       "classification": "requires-livetv-tuner: the fixture tuner (M3U + XMLTV, two channels) exists, but no probe exercises this op yet — needs a recordings-group probe once a recording exists."
-    },
-    "GET /LiveTv/SeriesTimers/{timerId}": {
-      "category": "requires-livetv-tuner",
-      "classification": "requires-livetv-tuner: the fixture tuner (M3U + XMLTV, two channels) exists, but no probe exercises this op yet — needs a series-timer journey (create from a programme → list → delete)."
     },
     "GET /LiveTv/Timers/Defaults": {
       "category": "verified",
@@ -297,18 +289,6 @@
     "POST /LiveTv/Programs": {
       "category": "requires-livetv-tuner",
       "classification": "requires-livetv-tuner: the fixture tuner (M3U + XMLTV, two channels) exists, but no probe exercises this op yet — needs a programmes-by-body probe (the POST form of /LiveTv/Programs)."
-    },
-    "POST /LiveTv/SeriesTimers": {
-      "category": "requires-livetv-tuner",
-      "classification": "requires-livetv-tuner: the fixture tuner (M3U + XMLTV, two channels) exists, but no probe exercises this op yet — needs a series-timer journey (create from a programme → list → delete)."
-    },
-    "POST /LiveTv/SeriesTimers/{timerId}": {
-      "category": "requires-livetv-tuner",
-      "classification": "requires-livetv-tuner: the fixture tuner (M3U + XMLTV, two channels) exists, but no probe exercises this op yet — needs a series-timer journey (create from a programme → list → delete)."
-    },
-    "POST /LiveTv/Timers/{timerId}": {
-      "category": "requires-livetv-tuner",
-      "classification": "requires-livetv-tuner: the fixture tuner (M3U + XMLTV, two channels) exists, but no probe exercises this op yet — needs an update step in the timer journey (change pre-padding, read back)."
     },
     "POST /LiveTv/Tuners/{tunerId}/Reset": {
       "category": "requires-livetv-tuner",

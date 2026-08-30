@@ -828,6 +828,7 @@ impl ferrofin_traits::stubs::LiveTvManager for FailingLiveTv {
     }
     async fn get_series_timers(
         &self,
+        _query: &ferrofin_model::live_tv::SeriesTimerQuery,
     ) -> Result<Vec<ferrofin_model::live_tv::SeriesTimerInfoDto>, ServiceError> {
         unreachable!()
     }

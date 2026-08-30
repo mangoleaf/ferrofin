@@ -167,7 +167,10 @@ impl LiveTvManager for CountingLiveTv {
         unimplemented!("not probed by the gate tests")
     }
     #[allow(unused_variables)]
-    async fn get_series_timers(&self) -> Result<Vec<SeriesTimerInfoDto>, ServiceError> {
+    async fn get_series_timers(
+        &self,
+        _query: &ferrofin_model::live_tv::SeriesTimerQuery,
+    ) -> Result<Vec<SeriesTimerInfoDto>, ServiceError> {
         unimplemented!("not probed by the gate tests")
     }
     #[allow(unused_variables)]

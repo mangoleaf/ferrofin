@@ -20,8 +20,8 @@ use uuid::Uuid;
 
 use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::data::{BaseItemKind, MediaType};
-use ferrofin_model::dto::SortOrder;
 use ferrofin_model::dto::{BaseItemDto, MediaSourceInfo, MediaSourceType};
+use ferrofin_model::dto::{DayOfWeek, SortOrder};
 use ferrofin_model::live_tv::LiveTvOptions;
 use ferrofin_model::live_tv::{
     ChannelType, GuideInfo, ItemSortBy, ListingsProviderInfo, LiveTvInfo, LiveTvServiceInfo,
@@ -34,7 +34,6 @@ use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::media_encoding::MediaEncoder;
 use ferrofin_traits::options::{DtoOptions, InternalItemsQuery};
 use ferrofin_traits::stubs::{LiveStreamFile, LiveTvChannelQuery, LiveTvManager};
-use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::dvr::{ActiveRecording, RecorderKind, RecordingInput, TimerRecordingInfo};
@@ -1574,8 +1573,16 @@ impl LiveTvManager for FerrofinLiveTvManager {
     }
 
     async fn get_timers(&self) -> Result<Vec<TimerInfoDto>, ServiceError> {
-        self.json_list(r#"SELECT "Data" FROM "FerrofinLiveTvTimers" ORDER BY "StartDate""#)
-            .await
+        // Port of `DefaultLiveTvService.GetTimersAsync` (v10.11.8
+        // DefaultLiveTvService.cs:392-403): a COMPLETED timer is not a scheduled
+        // recording any more and is excluded from every list read. The row stays
+        // (the recording it made points at it); only this view drops it.
+        Ok(self
+            .all_timers()
+            .await?
+            .into_iter()
+            .filter(|t| t.status != RecordingStatus::Completed)
+            .collect())
     }
 
     async fn get_timer(&self, id: &str) -> Result<Option<TimerInfoDto>, ServiceError> {
@@ -1597,7 +1604,8 @@ impl LiveTvManager for FerrofinLiveTvManager {
             ) {
                 let mut revived = existing;
                 revived.status = RecordingStatus::New;
-                self.persist_timer(&revived).await?;
+                // `existingTimer.IsManual = true` (DefaultLiveTvService.cs:226).
+                self.persist_manual_timer(&revived).await?;
                 self.arm_timer(&revived);
                 return Ok(existing_id);
             }
@@ -1607,51 +1615,57 @@ impl LiveTvManager for FerrofinLiveTvManager {
         }
 
         // The id is always the server's to mint: C# overwrites whatever the
-        // client posted with a fresh GUID.
-        timer.base.id = Some(Uuid::new_v4().simple().to_string());
+        // client posted with a fresh GUID (`info.Id = Guid.NewGuid().ToString("N")`,
+        // DefaultLiveTvService.cs:235) and publishes its MD5 as the DTO id
+        // (`Id = GetInternalTimerId(info.Id)`, LiveTvDtoService.cs:56), keeping
+        // the GUID itself on the wire as `ExternalId` (:62).
+        let external_id = Uuid::new_v4().simple().to_string();
+        timer.base.id = Some(ferrofin_traits::stubs::internal_timer_id(&external_id));
+        timer.base.external_id = Some(external_id);
         timer.base.type_ = Some("Timer".to_owned());
         timer.base.service_name = Some(ferrofin_traits::stubs::LIVE_TV_SERVICE_NAME.to_owned());
+        timer.base.server_id = Some(self.server_id.clone());
         // `CopyProgramInfoToTimerInfo`: the guide is the authority on what this
         // timer is actually recording.
-        if let Some(program) = self.timer_program_row(&timer).await? {
+        if let Some(program) = self.program_row_for_timer(&timer.base).await? {
             copy_program_into_timer(&program, &mut timer);
         }
-        let id = self.persist_timer(&timer).await?;
+        // `ExternalChannelId = info.ChannelId` (LiveTvDtoService.cs:69).
+        timer.base.external_channel_id = self.channel_external_id(timer.base.channel_id).await?;
+        // `info.IsManual = true` (DefaultLiveTvService.cs:255).
+        let id = self.persist_manual_timer(&timer).await?;
         self.arm_timer(&timer);
         Ok(id)
     }
 
-    async fn update_timer(&self, id: &str, mut timer: TimerInfoDto) -> Result<(), ServiceError> {
-        timer.base.id = Some(id.to_owned());
-        self.persist_timer(&timer).await?;
+    async fn update_timer(&self, id: &str, timer: TimerInfoDto) -> Result<(), ServiceError> {
+        // Port of `DefaultLiveTvService.UpdateTimerAsync` (v10.11.8
+        // DefaultLiveTvService.cs:342-363): an unknown id is a
+        // `ResourceNotFoundException`, a timer whose capture is already running
+        // is left alone, and the ONLY fields a client may change are the four
+        // padding ones. Everything else on the posted DTO — Name, Priority,
+        // Status, the dates, the channel — is discarded, because the guide and
+        // the server own those.
+        let Some(mut existing) = self.get_timer(id).await? else {
+            return Err(ServiceError::NotFound(format!(
+                "Timer with Id {id} not found"
+            )));
+        };
+        if self.active_recordings_lock().contains_key(id) {
+            return Ok(());
+        }
+        existing.base.pre_padding_seconds = timer.base.pre_padding_seconds;
+        existing.base.post_padding_seconds = timer.base.post_padding_seconds;
+        existing.base.is_post_padding_required = timer.base.is_post_padding_required;
+        existing.base.is_pre_padding_required = timer.base.is_pre_padding_required;
+        self.persist_timer(&existing).await?;
         // C# `TimerManager.Update` re-arms the system timer behind it.
-        self.arm_timer(&timer);
+        self.arm_timer(&existing);
         Ok(())
     }
 
     async fn cancel_timer(&self, id: &str) -> Result<(), ServiceError> {
-        // Port of `DefaultLiveTvService.CancelTimerInternal`: the timer goes to
-        // `Cancelled`; a manual one (nothing scheduled it) is deleted outright,
-        // and any capture it started stops.
-        match self.get_timer(id).await? {
-            Some(mut timer) => {
-                timer.status = RecordingStatus::Cancelled;
-                if timer
-                    .series_timer_id
-                    .as_deref()
-                    .map(str::trim)
-                    .is_none_or(str::is_empty)
-                {
-                    self.delete_by_id(DELETE_TIMER_SQL, id).await?;
-                } else {
-                    self.persist_timer(&timer).await?;
-                }
-            }
-            None => self.delete_by_id(DELETE_TIMER_SQL, id).await?,
-        }
-        self.disarm_timer(id);
-        self.cancel_recording(id);
-        Ok(())
+        self.cancel_timer_internal(id, false).await
     }
 
     async fn get_new_timer_defaults(
@@ -1699,9 +1713,15 @@ impl LiveTvManager for FerrofinLiveTvManager {
         Ok(defaults)
     }
 
-    async fn get_series_timers(&self) -> Result<Vec<SeriesTimerInfoDto>, ServiceError> {
-        self.json_list(r#"SELECT "Data" FROM "FerrofinLiveTvSeriesTimers" ORDER BY "Name""#)
-            .await
+    async fn get_series_timers(
+        &self,
+        query: &ferrofin_model::live_tv::SeriesTimerQuery,
+    ) -> Result<Vec<SeriesTimerInfoDto>, ServiceError> {
+        let mut timers: Vec<SeriesTimerInfoDto> = self
+            .json_list(r#"SELECT "Data" FROM "FerrofinLiveTvSeriesTimers""#)
+            .await?;
+        sort_series_timers(&mut timers, query);
+        Ok(timers)
     }
 
     async fn get_series_timer(&self, id: &str) -> Result<Option<SeriesTimerInfoDto>, ServiceError> {
@@ -1716,42 +1736,164 @@ impl LiveTvManager for FerrofinLiveTvManager {
         &self,
         mut timer: SeriesTimerInfoDto,
     ) -> Result<String, ServiceError> {
-        let id = ensure_id(&mut timer.base.id);
-        let data = to_json(&timer)?;
-        sqlx::query(
-            r#"INSERT INTO "FerrofinLiveTvSeriesTimers" ("Id","ChannelId","ProgramId","Name","Data")
-               VALUES (?1,?2,?3,?4,?5)
-               ON CONFLICT("Id") DO UPDATE SET
-                 "ChannelId"=excluded."ChannelId","ProgramId"=excluded."ProgramId",
-                 "Name"=excluded."Name","Data"=excluded."Data""#,
-        )
-        .bind(&id)
-        .bind(guid_to_db(timer.base.channel_id))
-        .bind(&timer.base.program_id)
-        .bind(timer.base.name.clone().unwrap_or_default())
-        .bind(&data)
-        .execute(self.db.writer())
-        .await
-        .map_err(db_err)?;
+        // Port of `DefaultLiveTvService.CreateSeriesTimer` (v10.11.8
+        // DefaultLiveTvService.cs:263-309) + the DTO projection
+        // `LiveTvDtoService.GetSeriesTimerInfoDto` (LiveTvDtoService.cs:115-158).
+        //
+        // The id is NEVER the client's: upstream overwrites whatever was posted
+        // with a fresh GUID and publishes its MD5. That matters far more here
+        // than on the single-timer path, because the body a client posts is the
+        // one `GET /LiveTv/Timers/Defaults` handed it, whose `Id` is the
+        // constant `internal_series_timer_id("")` for every programme — honour
+        // it and every "record series" overwrites the last one.
+        let external_id = Uuid::new_v4().simple().to_string();
+        let id = ferrofin_traits::stubs::internal_series_timer_id(&external_id);
+
+        // `var program = GetProgramInfoFromCache(info.ProgramId); … else throw
+        // new InvalidOperationException("SeriesId for program not found")`
+        // (DefaultLiveTvService.cs:267-275). Upstream's throw surfaces as a
+        // `500`; a body naming a programme the guide does not have is a bad
+        // request, so Ferrofin answers `400` and stores nothing — the divergence
+        // is the status code, not the rejection.
+        let Some(program) = self.program_row_for_timer(&timer.base).await? else {
+            return Err(ServiceError::InvalidInput(
+                "SeriesId for program not found".to_owned(),
+            ));
+        };
+
+        timer.base.id = Some(id.clone());
+        timer.base.external_id = Some(external_id.clone());
+        timer.base.type_ = Some("SeriesTimer".to_owned());
+        timer.base.service_name = Some(ferrofin_traits::stubs::LIVE_TV_SERVICE_NAME.to_owned());
+        timer.base.server_id = Some(self.server_id.clone());
+        timer.base.name = Some(program.title.clone());
+        timer.base.overview.clone_from(&program.overview);
+        if let Ok(channel_id) = Uuid::parse_str(&program.channel_id) {
+            timer.base.channel_id = channel_id;
+        }
+        timer.base.channel_name = Some(program.channel_name.clone());
+        if let Ok(program_id) = Uuid::parse_str(&program.id) {
+            timer.base.program_id = Some(program_id.simple().to_string());
+        }
+        timer
+            .base
+            .external_program_id
+            .clone_from(&program.external_id);
+        // `ExternalChannelId = info.ChannelId` — the tuner-facing id the internal
+        // channel GUID was derived from (LiveTvDtoService.cs:137).
+        timer.base.external_channel_id = self.channel_external_id(timer.base.channel_id).await?;
+        // `dto.DayPattern = GetDayPattern(info.Days)` — recomputed on every read,
+        // never the client's (LiveTvDtoService.cs:152).
+        timer.day_pattern = day_pattern(&timer.days);
+        // "// Set priority from default values" — `LiveTvManager.CreateSeriesTimer`
+        // (v10.11.8 LiveTvManager.cs:1145-1147) throws away whatever Priority the
+        // client posted and takes the standing defaults' instead. Priority is
+        // only settable through `UpdateSeriesTimerAsync`, whose whitelist has it.
+        timer.base.priority = self.get_new_timer_defaults(None).await?.base.priority;
+
+        let stored = StoredSeriesTimer {
+            external_id,
+            series_id: program.external_series_id.clone(),
+            dto: timer,
+        };
+        self.persist_series_timer(&stored).await?;
+        // "If any timers have already been manually created, make sure they
+        // don't get cancelled" (DefaultLiveTvService.cs:279-303).
+        self.adopt_existing_timers(&stored).await?;
+        self.update_timers_for_series_timer(&stored, true, false)
+            .await?;
         Ok(id)
     }
 
     async fn update_series_timer(
         &self,
         id: &str,
-        mut timer: SeriesTimerInfoDto,
+        timer: SeriesTimerInfoDto,
     ) -> Result<(), ServiceError> {
-        timer.base.id = Some(id.to_owned());
-        self.create_series_timer(timer).await.map(|_| ())
+        // Port of `DefaultLiveTvService.UpdateSeriesTimerAsync` (v10.11.8
+        // DefaultLiveTvService.cs:312-340). Upstream keys on the BODY's id and
+        // ignores the route's outright (`LiveTvController.UpdateSeriesTimer`
+        // suppresses CA1801 on `timerId`); Ferrofin prefers the body and falls
+        // back to the route, because both name the same row and a client that
+        // posts a bare settings object should still hit it. An id that matches
+        // no row writes NOTHING — it must not mint a ghost.
+        let stored = match timer
+            .base
+            .id
+            .as_deref()
+            .map(str::trim)
+            .filter(|body_id| !body_id.is_empty())
+        {
+            Some(body_id) => match self.stored_series_timer(body_id).await? {
+                Some(found) => Some(found),
+                None => self.stored_series_timer(id).await?,
+            },
+            None => self.stored_series_timer(id).await?,
+        };
+        let Some(mut stored) = stored else {
+            return Ok(());
+        };
+
+        // The whitelist, verbatim (DefaultLiveTvService.cs:318-332). Name,
+        // Overview, ProgramId and SeriesId are deliberately NOT in it: the
+        // programme owns them.
+        stored.dto.base.channel_id = timer.base.channel_id;
+        stored.dto.days = timer.days;
+        stored.dto.base.end_date = timer.base.end_date;
+        stored.dto.base.is_post_padding_required = timer.base.is_post_padding_required;
+        stored.dto.base.is_pre_padding_required = timer.base.is_pre_padding_required;
+        stored.dto.base.post_padding_seconds = timer.base.post_padding_seconds;
+        stored.dto.base.pre_padding_seconds = timer.base.pre_padding_seconds;
+        stored.dto.base.priority = timer.base.priority;
+        stored.dto.record_any_channel = timer.record_any_channel;
+        stored.dto.record_any_time = timer.record_any_time;
+        stored.dto.record_new_only = timer.record_new_only;
+        stored.dto.skip_episodes_in_library = timer.skip_episodes_in_library;
+        stored.dto.keep_up_to = timer.keep_up_to;
+        stored.dto.base.keep_until = timer.base.keep_until;
+        stored.dto.base.start_date = timer.base.start_date;
+
+        // `ExternalChannelId`, `ChannelName` and `DayPattern` are all re-derived
+        // on every read upstream (`GetSeriesTimerInfoDto` +
+        // `LiveTvManager.GetSeriesTimers`' channel lookup), so a changed
+        // ChannelId or day list has to carry them with it here.
+        stored.dto.base.external_channel_id =
+            self.channel_external_id(stored.dto.base.channel_id).await?;
+        if let Some(channel) =
+            crate::guide_repository::channel_row(&self.db, stored.dto.base.channel_id).await?
+        {
+            stored.dto.base.channel_name = Some(channel.name);
+        }
+        stored.dto.day_pattern = day_pattern(&stored.dto.days);
+
+        self.persist_series_timer(&stored).await?;
+        self.update_timers_for_series_timer(&stored, true, true)
+            .await
     }
 
     async fn cancel_series_timer(&self, id: &str) -> Result<(), ServiceError> {
-        // Drop the series timer and any timers it scheduled.
-        sqlx::query(r#"DELETE FROM "FerrofinLiveTvTimers" WHERE "SeriesTimerId" = ?1"#)
-            .bind(id)
-            .execute(self.db.writer())
-            .await
-            .map_err(db_err)?;
+        // Port of `LiveTvManager.CancelSeriesTimer` (v10.11.8 LiveTvManager.cs:827-841)
+        // + `DefaultLiveTvService.CancelSeriesTimerAsync` (:147-166): an unknown
+        // id is a `ResourceNotFoundException`, and every timer the series timer
+        // scheduled goes through the real per-timer cancel — which disarms it
+        // and stops any capture it had already started — not a bare `DELETE`.
+        if self.get_series_timer(id).await?.is_none() {
+            return Err(ServiceError::NotFound(format!(
+                "SeriesTimer with Id {id} not found"
+            )));
+        }
+        // `CancelSeriesTimerAsync` walks `GetTimersAsync`, so a COMPLETED child —
+        // a recording that already happened — is left alone.
+        for child in self.timer_ids_for_series(id).await? {
+            if self
+                .get_timer(&child)
+                .await?
+                .is_some_and(|t| t.status == RecordingStatus::Completed)
+            {
+                continue;
+            }
+            self.cancel_timer_internal(&child, true).await?;
+        }
         self.delete_by_id(
             r#"DELETE FROM "FerrofinLiveTvSeriesTimers" WHERE "Id" = ?1"#,
             id,
@@ -1940,8 +2082,9 @@ impl LiveTvManager for FerrofinLiveTvManager {
         }
 
         // C# `TimerManager.RestartTimers`: every persisted timer is re-armed,
-        // so a restart mid-schedule still records.
-        for timer in self.get_timers().await? {
+        // so a restart mid-schedule still records. `GetAll()`, not the
+        // Completed-excluding list view.
+        for timer in self.all_timers().await? {
             self.arm_timer(&timer);
         }
         Ok(())
@@ -2189,9 +2332,286 @@ impl FerrofinLiveTvManager {
         serde_json::from_str(&body).unwrap_or_default()
     }
 
-    /// Writes a timer through, DTO and promoted columns together.
+    /// Every stored timer, whatever its status — C# `TimerManager.GetAll()`,
+    /// which is what the restart path re-arms from. The trait's `get_timers`
+    /// is the FILTERED view on top of this.
+    async fn all_timers(&self) -> Result<Vec<TimerInfoDto>, ServiceError> {
+        self.json_list(r#"SELECT "Data" FROM "FerrofinLiveTvTimers" ORDER BY "StartDate""#)
+            .await
+    }
+
+    /// Writes a timer through, DTO and promoted columns together. A row that
+    /// already exists keeps its stored `IsManual`.
     async fn persist_timer(&self, timer: &TimerInfoDto) -> Result<String, ServiceError> {
-        crate::dvr_repository::upsert_timer(&self.db, timer).await
+        crate::dvr_repository::upsert_timer(&self.db, timer, false).await
+    }
+
+    /// Writes a hand-created timer through (`TimerInfo.IsManual = true`).
+    async fn persist_manual_timer(&self, timer: &TimerInfoDto) -> Result<String, ServiceError> {
+        crate::dvr_repository::upsert_timer(&self.db, timer, true).await
+    }
+
+    /// Port of `DefaultLiveTvService.CancelTimerInternal` (v10.11.8
+    /// DefaultLiveTvService.cs:168-197): the timer goes to `Cancelled`; one that
+    /// nothing scheduled — or whose whole series timer is being cancelled — is
+    /// deleted outright, and any capture it started stops.
+    async fn cancel_timer_internal(
+        &self,
+        id: &str,
+        is_series_cancelled: bool,
+    ) -> Result<(), ServiceError> {
+        match self.get_timer(id).await? {
+            Some(mut timer) => {
+                timer.status = RecordingStatus::Cancelled;
+                if is_series_cancelled
+                    || timer
+                        .series_timer_id
+                        .as_deref()
+                        .map(str::trim)
+                        .is_none_or(str::is_empty)
+                {
+                    self.delete_by_id(DELETE_TIMER_SQL, id).await?;
+                } else {
+                    self.persist_timer(&timer).await?;
+                }
+            }
+            None => self.delete_by_id(DELETE_TIMER_SQL, id).await?,
+        }
+        self.disarm_timer(id);
+        self.cancel_recording(id);
+        Ok(())
+    }
+
+    /// The tuner-facing external id of a channel, or `None` when the lineup does
+    /// not hold it. This is `SeriesTimerInfo.ChannelId` upstream, published as
+    /// the DTO's `ExternalChannelId` (`LiveTvDtoService.cs:137`).
+    async fn channel_external_id(&self, channel_id: Uuid) -> Result<Option<String>, ServiceError> {
+        crate::guide_repository::channel_external_id(&self.db, channel_id).await
+    }
+
+    /// The stored series timer with this id — the published DTO plus the two
+    /// server-owned identity columns the DTO has no room for.
+    async fn stored_series_timer(
+        &self,
+        id: &str,
+    ) -> Result<Option<StoredSeriesTimer>, ServiceError> {
+        Ok(crate::dvr_repository::series_timer_row(&self.db, id)
+            .await?
+            .map(|(dto, external_id, series_id)| StoredSeriesTimer {
+                dto,
+                external_id,
+                series_id,
+            }))
+    }
+
+    /// Writes a series timer through, DTO and identity columns together.
+    async fn persist_series_timer(&self, stored: &StoredSeriesTimer) -> Result<(), ServiceError> {
+        crate::dvr_repository::upsert_series_timer(
+            &self.db,
+            &stored.dto,
+            &stored.external_id,
+            stored.series_id.as_deref(),
+        )
+        .await
+    }
+
+    /// The ids of every timer this series timer scheduled.
+    async fn timer_ids_for_series(&self, series_id: &str) -> Result<Vec<String>, ServiceError> {
+        crate::dvr_repository::timer_ids_for_series(&self.db, series_id).await
+    }
+
+    /// "If any timers have already been manually created, make sure they don't
+    /// get cancelled" — port of `DefaultLiveTvService.CreateSeriesTimer`'s
+    /// adoption loop (v10.11.8 DefaultLiveTvService.cs:279-303): every existing
+    /// timer for this programme (or this series) joins the new series timer and
+    /// is flagged manual so the fan-out leaves it alone.
+    async fn adopt_existing_timers(&self, stored: &StoredSeriesTimer) -> Result<(), ServiceError> {
+        let series_id = stored.series_id.as_deref().unwrap_or_default();
+        for mut timer in self.get_timers().await? {
+            let by_program = matches_ignore_case(
+                timer.base.program_id.as_deref(),
+                stored.dto.base.program_id.as_deref(),
+            ) || matches_ignore_case(
+                timer.base.external_program_id.as_deref(),
+                stored.dto.base.external_program_id.as_deref(),
+            );
+            // Upstream compares `TimerInfo.SeriesId`, which the wire DTO has no
+            // field for, so the timer's own programme is asked for it instead —
+            // the guide is where that id came from in the first place.
+            let by_series = !by_program
+                && !series_id.is_empty()
+                && self
+                    .program_row_for_timer(&timer.base)
+                    .await?
+                    .and_then(|row| row.external_series_id)
+                    .is_some_and(|found| found.eq_ignore_ascii_case(series_id));
+            if !(by_program || by_series) {
+                continue;
+            }
+            let Some(id) = timer.base.id.clone() else {
+                continue;
+            };
+            timer.series_timer_id = stored.dto.base.id.clone();
+            timer.external_series_timer_id = Some(stored.external_id.clone());
+            self.persist_timer(&timer).await?;
+            crate::dvr_repository::set_timer_manual(&self.db, &id).await?;
+        }
+        Ok(())
+    }
+
+    /// Port of `DefaultLiveTvService.UpdateTimersForSeriesTimer` (v10.11.8
+    /// DefaultLiveTvService.cs:709-800): expand the series timer over the guide,
+    /// add a timer for every future airing it should record, refresh the ones
+    /// that already exist, and — when asked — drop the pending ones it no longer
+    /// matches.
+    async fn update_timers_for_series_timer(
+        &self,
+        stored: &StoredSeriesTimer,
+        update_timer_settings: bool,
+        delete_invalid_timers: bool,
+    ) -> Result<(), ServiceError> {
+        let candidates = self.timers_for_series(stored).await?;
+        let mut all_ids: Vec<String> = Vec::with_capacity(candidates.len());
+        // `enabledTimersForSeries` — the timers this pass left recordable, which
+        // is what the duplicate-showing sweep below runs over.
+        let mut enabled: Vec<EnabledShowing> = Vec::new();
+        for (program, mut timer) in candidates {
+            let id = timer.base.id.clone().unwrap_or_default();
+            all_ids.push(id.clone());
+            let existing = match self.get_timer(&id).await? {
+                Some(found) => Some(found),
+                None => self.timer_for_program(&timer).await?,
+            };
+            match existing {
+                None => {
+                    if should_cancel_timer_for_series_timer(&stored.dto, &program, &timer) {
+                        timer.status = RecordingStatus::Cancelled;
+                    } else {
+                        enabled.push((
+                            program_show_id(&program),
+                            timer.base.start_date,
+                            timer.clone(),
+                        ));
+                    }
+                    self.persist_timer(&timer).await?;
+                    self.arm_timer(&timer);
+                }
+                Some(mut existing) => {
+                    let existing_id = existing.base.id.clone().unwrap_or_default();
+                    // "Only update if not currently active — test both new timer
+                    // and existing in case Id's are different."
+                    if self.active_recordings_lock().contains_key(&id)
+                        || self.active_recordings_lock().contains_key(&existing_id)
+                    {
+                        continue;
+                    }
+                    update_existing_timer_with_new_metadata(&mut existing, &timer);
+                    let is_manual =
+                        crate::dvr_repository::timer_is_manual(&self.db, &existing_id).await?;
+                    if !is_manual
+                        && should_cancel_timer_for_series_timer(&stored.dto, &program, &timer)
+                    {
+                        existing.status = RecordingStatus::Cancelled;
+                    } else if !is_manual {
+                        existing.status = RecordingStatus::New;
+                    }
+                    if update_timer_settings {
+                        existing.base.keep_until = stored.dto.base.keep_until;
+                        existing.base.is_post_padding_required =
+                            stored.dto.base.is_post_padding_required;
+                        existing.base.is_pre_padding_required =
+                            stored.dto.base.is_pre_padding_required;
+                        existing.base.post_padding_seconds = stored.dto.base.post_padding_seconds;
+                        existing.base.pre_padding_seconds = stored.dto.base.pre_padding_seconds;
+                        existing.base.priority = stored.dto.base.priority;
+                    }
+                    existing.series_timer_id = stored.dto.base.id.clone();
+                    existing.external_series_timer_id = Some(stored.external_id.clone());
+                    if existing.status != RecordingStatus::Cancelled {
+                        enabled.push((
+                            program_show_id(&program),
+                            existing.base.start_date,
+                            existing.clone(),
+                        ));
+                    }
+                    self.persist_timer(&existing).await?;
+                    self.arm_timer(&existing);
+                }
+            }
+        }
+
+        // `SearchForDuplicateShowIds(enabledTimersForSeries)`: the same showing
+        // scheduled more than once records only the first of them.
+        for mut loser in duplicate_showings_to_cancel(&enabled) {
+            loser.status = RecordingStatus::Cancelled;
+            self.persist_timer(&loser).await?;
+            self.arm_timer(&loser);
+        }
+
+        if delete_invalid_timers {
+            let series_id = stored.dto.base.id.clone().unwrap_or_default();
+            let now = Utc::now();
+            for id in self.timer_ids_for_series(&series_id).await? {
+                if all_ids.iter().any(|kept| kept.eq_ignore_ascii_case(&id)) {
+                    continue;
+                }
+                let Some(timer) = self.get_timer(&id).await? else {
+                    continue;
+                };
+                if timer.status == RecordingStatus::New && timer.base.start_date > now {
+                    self.cancel_timer_internal(&id, false).await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Port of `DefaultLiveTvService.GetTimersForSeries` (v10.11.8
+    /// DefaultLiveTvService.cs:803-828) + `CreateTimer(LiveTvProgram, …)`
+    /// (:833-880): every future airing of this series — matched on the listings
+    /// series id, or on the programme title when the listings carry none, and
+    /// pinned to the series timer's channel unless it records any channel.
+    async fn timers_for_series(
+        &self,
+        stored: &StoredSeriesTimer,
+    ) -> Result<Vec<(GuideProgramRow, TimerInfoDto)>, ServiceError> {
+        let series_id = stored
+            .series_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let mut query = InternalItemsQuery {
+            min_end_date: Some(Utc::now()),
+            external_series_id: series_id.map(str::to_owned),
+            order_by: vec![(ItemSortBy::StartDate, SortOrder::Ascending)],
+            ..InternalItemsQuery::default()
+        };
+        if series_id.is_none() {
+            query.name.clone_from(&stored.dto.base.name);
+        }
+        if !stored.dto.record_any_channel {
+            query.channel_ids = vec![stored.dto.base.channel_id];
+        }
+        let rows = self.query_program_rows(&query, Utc::now()).await?;
+        // C# `tempChannelCache`: one channel lookup per distinct channel, not one
+        // per airing — a series timer over a week's guide walks the same one or
+        // two channels dozens of times.
+        let mut channel_cache: HashMap<Uuid, Option<String>> = HashMap::new();
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let mut channel_external = None;
+            if let Ok(channel_id) = Uuid::parse_str(&row.channel_id) {
+                if let Some(cached) = channel_cache.get(&channel_id) {
+                    channel_external = cached.clone();
+                } else {
+                    channel_external = self.channel_external_id(channel_id).await?;
+                    channel_cache.insert(channel_id, channel_external.clone());
+                }
+            }
+            let timer = series_child_timer(&row, stored, channel_external);
+            out.push((row, timer));
+        }
+        Ok(out)
     }
 
     /// The timer already scheduled for this timer's programme, if any.
@@ -2232,12 +2652,14 @@ impl FerrofinLiveTvManager {
 
     /// The guide programme a timer names, by its internal id or the listing
     /// provider's own — a timer created from `Timers/Defaults` carries both.
-    async fn timer_program_row(
+    ///
+    /// Takes the shared base DTO so the single-timer and series-timer paths can
+    /// both ask (`GetProgramInfoFromCache` serves both upstream).
+    async fn program_row_for_timer(
         &self,
-        timer: &TimerInfoDto,
+        timer: &ferrofin_model::live_tv::BaseTimerInfoDto,
     ) -> Result<Option<GuideProgramRow>, ServiceError> {
         if let Some(id) = timer
-            .base
             .program_id
             .as_deref()
             .and_then(|p| Uuid::parse_str(p).ok())
@@ -2246,7 +2668,6 @@ impl FerrofinLiveTvManager {
             return Ok(Some(row));
         }
         let Some(external) = timer
-            .base
             .external_program_id
             .as_deref()
             .map(str::trim)
@@ -2260,7 +2681,7 @@ impl FerrofinLiveTvManager {
         Ok(self
             .query_program_rows(
                 &InternalItemsQuery {
-                    channel_ids: vec![timer.base.channel_id],
+                    channel_ids: vec![timer.channel_id],
                     ..InternalItemsQuery::default()
                 },
                 Utc::now(),
@@ -2363,7 +2784,7 @@ impl FerrofinLiveTvManager {
             return;
         };
         let mut info = TimerRecordingInfo::from_timer(&timer);
-        if let Ok(Some(program)) = self.timer_program_row(&timer).await {
+        if let Ok(Some(program)) = self.program_row_for_timer(&timer.base).await {
             apply_program_to_recording_info(&program, &mut info);
         }
 
@@ -2969,6 +3390,21 @@ fn push_program_filters(
         }
     }
 
+    if let Some(series_id) = query
+        .external_series_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    {
+        // `InternalItemsQuery.ExternalSeriesId` — the listings series id a
+        // series timer's fan-out queries the guide with
+        // (`DefaultLiveTvService.GetTimersForSeries`, v10.11.8
+        // DefaultLiveTvService.cs:808).
+        push_separator(qb, &mut first);
+        qb.push(r#"p."ExternalSeriesId" = "#)
+            .push_bind(series_id.to_owned());
+    }
+
     if let Some(name) = query
         .name
         .as_deref()
@@ -3059,22 +3495,6 @@ fn push_program_paging(qb: &mut QueryBuilder<'_, Sqlite>, limit: Option<i32>, st
     }
 }
 
-/// Ensures a DTO id field is set, generating a fresh UUID when absent, and
-/// returns it.
-fn ensure_id(id: &mut Option<String>) -> String {
-    let value = id
-        .clone()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| guid_to_db(Uuid::new_v4()));
-    *id = Some(value.clone());
-    value
-}
-
-/// Serializes a DVR DTO to its stored JSON.
-fn to_json<T: Serialize>(value: &T) -> Result<String, ServiceError> {
-    serde_json::to_string(value).map_err(|e| LiveTvError::serialize("serialize timer", e).into())
-}
-
 /// The stored `Status` string for a [`RecordingStatus`].
 fn recording_status_name(status: RecordingStatus) -> &'static str {
     match status {
@@ -3107,6 +3527,374 @@ fn parse_dt(s: &str) -> Option<DateTime<Utc>> {
 /// consistency with the repository layer's error text.
 /// The `DELETE` that removes one timer row.
 const DELETE_TIMER_SQL: &str = r#"DELETE FROM "FerrofinLiveTvTimers" WHERE "Id" = ?1"#;
+
+/// One stored series timer: the DTO clients see, plus the two server-owned
+/// identity values the wire DTO has no field for.
+///
+/// Upstream these live on `SeriesTimerInfo` — `Id` (the external GUID, published
+/// as the DTO's `ExternalId`) and `SeriesId` (the listings series id the fan-out
+/// queries the guide with). See migration
+/// `0024_livetv_series_timer_identity.sql`.
+struct StoredSeriesTimer {
+    /// The series timer as clients see it. Its `base.id` is the published,
+    /// derived id and the row's primary key.
+    dto: SeriesTimerInfoDto,
+    /// `SeriesTimerInfo.Id`: the fresh GUID `CreateSeriesTimer` minted, which
+    /// the published id is the MD5 of.
+    external_id: String,
+    /// `SeriesTimerInfo.SeriesId`: `program.ExternalSeriesId` at create time.
+    series_id: Option<String>,
+}
+
+/// Whether two optional ids name the same thing, case-insensitively — C#'s
+/// `string.Equals(a, b, StringComparison.OrdinalIgnoreCase)` over values that
+/// are only meaningful when both are present and non-empty.
+fn matches_ignore_case(a: Option<&str>, b: Option<&str>) -> bool {
+    match (
+        a.map(str::trim).filter(|v| !v.is_empty()),
+        b.map(str::trim).filter(|v| !v.is_empty()),
+    ) {
+        (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+        _ => false,
+    }
+}
+
+/// The day pattern a day list spells out, or `None` when it spells none.
+///
+/// Port of `LiveTvDtoService.GetDayPattern` (v10.11.8 LiveTvDtoService.cs:360-387).
+/// It is recomputed on every read upstream, so the value a client posted is
+/// never trusted: post `Days=[Sat,Sun]` with `DayPattern=Daily` and the answer
+/// is `Weekends`.
+fn day_pattern(days: &[DayOfWeek]) -> Option<ferrofin_model::live_tv::DayPattern> {
+    use ferrofin_model::live_tv::DayPattern;
+    match days.len() {
+        7 => Some(DayPattern::Daily),
+        2 if days.contains(&DayOfWeek::Saturday) && days.contains(&DayOfWeek::Sunday) => {
+            Some(DayPattern::Weekends)
+        }
+        5 if [
+            DayOfWeek::Monday,
+            DayOfWeek::Tuesday,
+            DayOfWeek::Wednesday,
+            DayOfWeek::Thursday,
+            DayOfWeek::Friday,
+        ]
+        .iter()
+        .all(|d| days.contains(d)) =>
+        {
+            Some(DayPattern::Weekdays)
+        }
+        _ => None,
+    }
+}
+
+/// Compares two names the way every Jellyfin name sort does.
+///
+/// Port of `AlphanumericComparator.CompareValues` (v10.11.8
+/// Jellyfin.Extensions/AlphanumericComparator.cs): the strings are walked in
+/// alternating digit/non-digit runs, digit runs compare as numbers (leading
+/// zeros trimmed, then by length, then lexically) and everything else compares
+/// as text.
+///
+/// One knowing divergence: upstream's text comparison is
+/// `StringComparison.InvariantCulture`, a culture-aware collation. Rust has no
+/// collation in `std`, so this compares by Unicode scalar order. The two agree
+/// on ASCII; two names differing only by accent or case-collation could sort
+/// differently, which is an open work item — porting it needs a collation
+/// dependency, and adding one is not this batch's call.
+fn alphanumeric_compare(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    if a.is_empty() || b.is_empty() {
+        return a.len().cmp(&b.len());
+    }
+    let (mut pos_a, mut pos_b) = (0_usize, 0_usize);
+    loop {
+        let (start_a, start_b) = (pos_a, pos_b);
+        let is_num_a = a[pos_a].is_ascii_digit();
+        let is_num_b = b[pos_b].is_ascii_digit();
+        pos_a += 1;
+        pos_b += 1;
+        while pos_a < a.len() && a[pos_a].is_ascii_digit() == is_num_a {
+            pos_a += 1;
+        }
+        while pos_b < b.len() && b[pos_b].is_ascii_digit() == is_num_b {
+            pos_b += 1;
+        }
+        let mut span_a = &a[start_a..pos_a];
+        let mut span_b = &b[start_b..pos_b];
+        if is_num_a && is_num_b {
+            while span_a.first() == Some(&'0') {
+                span_a = &span_a[1..];
+            }
+            while span_b.first() == Some(&'0') {
+                span_b = &span_b[1..];
+            }
+            match span_a.len().cmp(&span_b.len()) {
+                Ordering::Equal => {}
+                other => return other,
+            }
+        }
+        match span_a.cmp(span_b) {
+            Ordering::Equal => {}
+            other => return other,
+        }
+        if pos_a >= a.len() || pos_b >= b.len() {
+            return a.len().cmp(&b.len());
+        }
+    }
+}
+
+/// Orders series timers the way `LiveTvManager.GetSeriesTimers` does (v10.11.8
+/// LiveTvManager.cs:919-934).
+///
+/// The `Priority` branch's ascending arm really is `OrderByDescending(Priority)`
+/// and its descending arm `OrderBy(Priority)` — upstream's inversion, ported
+/// verbatim rather than "fixed", because clients ask for
+/// `sortBy=Priority&sortOrder=Descending` and expect what Jellyfin returns.
+fn sort_series_timers(
+    timers: &mut [SeriesTimerInfoDto],
+    query: &ferrofin_model::live_tv::SeriesTimerQuery,
+) {
+    let descending = query.sort_order == SortOrder::Descending;
+    let by_priority = query
+        .sort_by
+        .as_deref()
+        .is_some_and(|s| s.eq_ignore_ascii_case("Priority"));
+    let name = |t: &SeriesTimerInfoDto| t.base.name.clone().unwrap_or_default();
+    if by_priority {
+        timers.sort_by(|a, b| {
+            let priority = if descending {
+                a.base.priority.cmp(&b.base.priority)
+            } else {
+                b.base.priority.cmp(&a.base.priority)
+            };
+            priority.then_with(|| {
+                let by_name = alphanumeric_compare(&name(a), &name(b));
+                if descending {
+                    by_name.reverse()
+                } else {
+                    by_name
+                }
+            })
+        });
+    } else {
+        timers.sort_by(|a, b| {
+            let by_name = alphanumeric_compare(&name(a), &name(b));
+            if descending {
+                by_name.reverse()
+            } else {
+                by_name
+            }
+        });
+    }
+}
+
+/// Whether a series timer's fan-out should cancel this airing rather than record
+/// it.
+///
+/// Port of `DefaultLiveTvService.ShouldCancelTimerForSeriesTimer` (v10.11.8
+/// DefaultLiveTvService.cs:644-669). The `IsManual` arm is the caller's — a
+/// hand-created timer is never cancelled, and only the caller knows whether the
+/// stored row carries that flag.
+///
+/// TODO(work item, not a deferral): upstream's last arm is
+/// `seriesTimer.SkipEpisodesInLibrary && IsProgramAlreadyInLibrary(timer)`
+/// (DefaultLiveTvService.cs:668, :961-1000), which asks the library whether the
+/// episode is already on disk. `FerrofinLiveTvManager` holds no item repository,
+/// so porting it means adding that seam (an `Arc<dyn ItemRepository>` `OnceLock`
+/// alongside `dto`, wired in `apps/ferrofin-server`) and then querying Series by
+/// name + season/episode. Until then this arm never fires. It can only differ on
+/// a guide that carries season+episode numbers or an episode title
+/// (`IsProgramAlreadyInLibrary` returns false without them), which the XMLTV
+/// parity fixture does not.
+fn should_cancel_timer_for_series_timer(
+    series: &SeriesTimerInfoDto,
+    program: &GuideProgramRow,
+    timer: &TimerInfoDto,
+) -> bool {
+    if !series.record_any_time {
+        let series_tod = series.base.start_date.time();
+        let timer_tod = timer.base.start_date.time();
+        let delta = (series_tod - timer_tod).num_minutes().abs();
+        if delta >= 10 {
+            return true;
+        }
+    }
+    if series.record_new_only && program.is_repeat {
+        return true;
+    }
+    !series.record_any_channel && timer.base.channel_id != series.base.channel_id
+}
+
+/// Refreshes a stored timer from the guide, keeping its status.
+///
+/// Port of `DefaultLiveTvService.UpdateExistingTimerWithNewMetadata` (v10.11.8
+/// DefaultLiveTvService.cs:365-391), restricted to the fields the wire
+/// `TimerInfoDto` carries — the richer programme facts upstream copies here have
+/// no DTO field and are re-read from the guide when the recorder starts.
+fn update_existing_timer_with_new_metadata(existing: &mut TimerInfoDto, updated: &TimerInfoDto) {
+    existing.base.channel_id = updated.base.channel_id;
+    existing
+        .base
+        .channel_name
+        .clone_from(&updated.base.channel_name);
+    existing
+        .base
+        .external_channel_id
+        .clone_from(&updated.base.external_channel_id);
+    existing.base.end_date = updated.base.end_date;
+    existing.base.start_date = updated.base.start_date;
+    existing.base.name.clone_from(&updated.base.name);
+    existing.base.overview.clone_from(&updated.base.overview);
+    existing
+        .base
+        .program_id
+        .clone_from(&updated.base.program_id);
+    existing
+        .base
+        .external_program_id
+        .clone_from(&updated.base.external_program_id);
+    existing.run_time_ticks = updated.run_time_ticks;
+}
+
+/// The identity a listings provider gives one SHOWING of a programme, which is
+/// what duplicate-showing suppression groups on.
+///
+/// Port of `XmlTvListingsProvider.GetProgramInfo`'s `ShowId` block (v10.11.8
+/// XmlTvListingsProvider.cs:186-213), bugs included: the season and episode
+/// branches REPLACE `uniqueString` rather than appending to it, so a programme
+/// with an episode number hashes `"-{episode}"` alone. Ported verbatim, because
+/// this value decides which showings a series timer drops.
+///
+/// Two knowing gaps, both open work items rather than choices:
+///   * upstream's `else` arm takes the listings' own `program.ProgramId` when the
+///     guide supplies one (`<episode-num system="dd_progid">`); Ferrofin's XMLTV
+///     reader does not capture that element yet, so the MD5 arm always runs. A
+///     guide carrying dd_progid would group differently — porting it means
+///     reading the element in `crate::xmltv` and carrying it to here.
+///   * this derives the value from the stored guide row instead of persisting it
+///     at ingest as `GuideManager` does. The inputs are all on the row, so the
+///     value is identical; it is a column Ferrofin does not need.
+fn program_show_id(program: &GuideProgramRow) -> String {
+    let mut unique = format!(
+        "{}{}",
+        program.title,
+        program.episode_title.as_deref().unwrap_or_default()
+    );
+    if let Some(season) = program.season_number {
+        unique = format!("-{season}");
+    }
+    if let Some(episode) = program.episode_number {
+        unique = format!("-{episode}");
+    }
+    let mut show_id = ferrofin_common::extensions::get_md5(&unique)
+        .simple()
+        .to_string();
+    // "If we don't have valid episode info, assume it's a unique program,
+    // otherwise recordings might be skipped."
+    if program.is_series && !program.is_repeat && program.episode_number.unwrap_or(0) == 0 {
+        let start = parse_dt(&program.start_date).unwrap_or_else(Utc::now);
+        show_id.push_str(&dotnet_ticks(start).to_string());
+    }
+    show_id
+}
+
+/// A UTC instant as .NET `DateTime.Ticks`: 100-nanosecond intervals since
+/// `0001-01-01T00:00:00`, which is what `ShowId`'s uniqueness suffix appends.
+fn dotnet_ticks(at: DateTime<Utc>) -> i64 {
+    /// Ticks between `0001-01-01` and the Unix epoch.
+    const UNIX_EPOCH_TICKS: i64 = 621_355_968_000_000_000;
+    UNIX_EPOCH_TICKS + at.timestamp_micros() * 10
+}
+
+/// One timer the fan-out left recordable, tagged with the showing it records:
+/// `(ShowId, StartDate, timer)` — the three things
+/// [`duplicate_showings_to_cancel`] groups and orders by.
+type EnabledShowing = (String, DateTime<Utc>, TimerInfoDto);
+
+/// Cancels every showing of a programme but the one to record, and returns the
+/// timers that lost.
+///
+/// Port of `DefaultLiveTvService.SearchForDuplicateShowIds` +
+/// `HandleDuplicateShowIds` (v10.11.8 DefaultLiveTvService.cs:671-707): timers
+/// are grouped by `ShowId`, a blank group is skipped, a group of one is skipped,
+/// a group whose key ends `"0000"` is skipped (upstream's guard for a
+/// SchedulesDirect show id with no sub-key, jellyfin/jellyfin#5856), and in what
+/// is left every showing after the first is cancelled.
+///
+/// TODO(work item, not a deferral): upstream orders the group
+/// `OrderByDescending(t => GetLiveTvChannel(t).IsHD).ThenBy(t => t.StartDate)`,
+/// so an HD showing beats an earlier SD one. Ferrofin's Live TV has no `IsHD`
+/// at all — the M3U parser does not read a channel's HD flag and no table stores
+/// one — so only the `StartDate` half is ported and the earliest showing always
+/// wins. Closing it means carrying HD through `crate::m3u` → the channel row →
+/// here. It can only differ on a lineup mixing HD and SD feeds of one channel.
+fn duplicate_showings_to_cancel(enabled: &[EnabledShowing]) -> Vec<TimerInfoDto> {
+    let mut groups: HashMap<&str, Vec<&EnabledShowing>> = HashMap::new();
+    for entry in enabled {
+        groups.entry(entry.0.as_str()).or_default().push(entry);
+    }
+    let mut losers = Vec::new();
+    for (show_id, mut group) in groups {
+        if show_id.trim().is_empty() || group.len() < 2 || show_id.ends_with("0000") {
+            continue;
+        }
+        group.sort_by_key(|entry| entry.1);
+        for entry in group.into_iter().skip(1) {
+            losers.push(entry.2.clone());
+        }
+    }
+    losers
+}
+
+/// The timer a series timer schedules for one guide airing.
+///
+/// Port of `DefaultLiveTvService.CreateTimer(LiveTvProgram, SeriesTimerInfo, …)`
+/// (v10.11.8 DefaultLiveTvService.cs:833-880). The id is derived, not random:
+/// `(seriesTimer.Id + parent.ExternalId).GetMD5()`, so re-running the fan-out
+/// finds the timer it made last time instead of scheduling the airing twice.
+fn series_child_timer(
+    program: &GuideProgramRow,
+    stored: &StoredSeriesTimer,
+    channel_external: Option<String>,
+) -> TimerInfoDto {
+    let external_id = ferrofin_common::extensions::get_md5(&format!(
+        "{}{}",
+        stored.external_id,
+        program.external_id.as_deref().unwrap_or_default()
+    ))
+    .simple()
+    .to_string();
+    let mut timer = TimerInfoDto {
+        status: RecordingStatus::New,
+        series_timer_id: stored.dto.base.id.clone(),
+        external_series_timer_id: Some(stored.external_id.clone()),
+        base: ferrofin_model::live_tv::BaseTimerInfoDto {
+            id: Some(ferrofin_traits::stubs::internal_timer_id(&external_id)),
+            external_id: Some(external_id),
+            type_: Some("Timer".to_owned()),
+            service_name: Some(ferrofin_traits::stubs::LIVE_TV_SERVICE_NAME.to_owned()),
+            server_id: stored.dto.base.server_id.clone(),
+            external_channel_id: channel_external,
+            pre_padding_seconds: stored.dto.base.pre_padding_seconds,
+            post_padding_seconds: stored.dto.base.post_padding_seconds,
+            is_pre_padding_required: stored.dto.base.is_pre_padding_required,
+            is_post_padding_required: stored.dto.base.is_post_padding_required,
+            keep_until: stored.dto.base.keep_until,
+            priority: stored.dto.base.priority,
+            ..ferrofin_model::live_tv::BaseTimerInfoDto::default()
+        },
+        ..TimerInfoDto::default()
+    };
+    if let Ok(program_id) = Uuid::parse_str(&program.id) {
+        timer.base.program_id = Some(program_id.simple().to_string());
+    }
+    // `CopyProgramInfoToTimerInfo(parent, timer, …)` — name, overview, window,
+    // channel and the listing's own programme id all come from the guide.
+    copy_program_into_timer(program, &mut timer);
+    timer
+}
 
 /// Copies what the guide knows about a programme onto the timer that records it.
 ///
@@ -3209,9 +3997,13 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
+    use chrono::Utc;
     use uuid::Uuid;
 
-    use super::{DEFAULT_LIVE_STREAM_BUFFER_MS, GuideProgramRow, LiveTvPaths, live_tv_service_key};
+    use super::{
+        DEFAULT_LIVE_STREAM_BUFFER_MS, GuideProgramRow, LiveTvPaths, alphanumeric_compare,
+        day_pattern, duplicate_showings_to_cancel, live_tv_service_key, sort_series_timers,
+    };
     use ferrofin_model::live_tv::{
         BaseTimerInfoDto, RecordingStatus, SeriesTimerInfoDto, TimerInfoDto,
     };
@@ -3221,7 +4013,7 @@ mod tests {
     use ferrofin_traits::options::{DtoOptions, InternalItemsQuery};
     use ferrofin_traits::stubs::LiveTvManager;
 
-    use ferrofin_model::dto::SortOrder;
+    use ferrofin_model::dto::{DayOfWeek, SortOrder};
     use ferrofin_model::live_tv::ItemSortBy;
 
     use super::{FerrofinLiveTvManager, SourceFetcher, parse_dt};
@@ -4898,40 +5690,477 @@ mod tests {
         assert!(mgr.get_timers().await.expect("list2").is_empty());
     }
 
+    /// A guide whose one channel airs the same title several times in the
+    /// future — what a series timer's fan-out actually needs, and what the
+    /// parity fixture's XMLTV also looks like (no `episode-num`, so the listings
+    /// carry no series id and the fan-out matches on the title).
+    fn series_guide() -> String {
+        use std::fmt::Write as _;
+        let now = chrono::Utc::now();
+        let mut xml = String::from(
+            "<tv><channel id=\"one.tv\"><display-name>Channel One</display-name></channel>\
+             <channel id=\"two.tv\"><display-name>Channel Two</display-name></channel>",
+        );
+        for (channel, from, to, title) in [
+            // Already over: `MinEndDate = UtcNow` must exclude it.
+            ("one.tv", -120, -60, "Recurring"),
+            ("one.tv", 60, 120, "Recurring"),
+            ("one.tv", 1500, 1560, "Recurring"),
+            ("one.tv", 2940, 3000, "Recurring"),
+            // Same title, other channel: only reachable with RecordAnyChannel.
+            ("two.tv", 90, 150, "Recurring"),
+            ("one.tv", 200, 260, "Something Else"),
+        ] {
+            let start = (now + chrono::Duration::minutes(from)).format("%Y%m%d%H%M%S");
+            let stop = (now + chrono::Duration::minutes(to)).format("%Y%m%d%H%M%S");
+            let _ = write!(
+                xml,
+                "<programme start=\"{start} +0000\" stop=\"{stop} +0000\" channel=\"{channel}\">\
+                 <title>{title}</title><category>Drama</category></programme>"
+            );
+        }
+        xml.push_str("</tv>");
+        xml
+    }
+
+    /// A manager whose guide holds [`series_guide`] over the two [`M3U`] channels.
+    async fn manager_with_series_guide() -> FerrofinLiveTvManager {
+        let mut sources = HashMap::new();
+        sources.insert("http://tuner/playlist.m3u".to_owned(), M3U.to_owned());
+        sources.insert("http://guide/xmltv.xml".to_owned(), series_guide());
+        let mgr = manager_with(FakeFetcher(sources)).await;
+        mgr.save_tuner_host(TunerHostInfo {
+            url: Some("http://tuner/playlist.m3u".to_owned()),
+            ..TunerHostInfo::default()
+        })
+        .await
+        .expect("tuner");
+        mgr.save_listing_provider(ListingsProviderInfo {
+            path: Some("http://guide/xmltv.xml".to_owned()),
+            ..ListingsProviderInfo::default()
+        })
+        .await
+        .expect("provider");
+        mgr.refresh_guide().await.expect("refresh");
+        mgr
+    }
+
+    /// The guide rows on the first channel whose title matches, start-date ascending.
+    async fn airings_of(mgr: &FerrofinLiveTvManager, title: &str) -> Vec<GuideProgramRow> {
+        mgr.query_program_rows(
+            &InternalItemsQuery {
+                name: Some(title.to_owned()),
+                order_by: vec![(ItemSortBy::StartDate, SortOrder::Ascending)],
+                ..InternalItemsQuery::default()
+            },
+            Utc::now(),
+        )
+        .await
+        .expect("guide")
+    }
+
+    /// The `Timers/Defaults` body a client posts back verbatim to create a
+    /// series timer — including its constant `Id`, which is the whole point.
+    async fn defaults_for(
+        mgr: &FerrofinLiveTvManager,
+        program: &GuideProgramRow,
+    ) -> SeriesTimerInfoDto {
+        mgr.get_new_timer_defaults(Some(Uuid::parse_str(&program.id).expect("guid")))
+            .await
+            .expect("defaults")
+    }
+
+    async fn all_series_timers(mgr: &FerrofinLiveTvManager) -> Vec<SeriesTimerInfoDto> {
+        mgr.get_series_timers(&ferrofin_model::live_tv::SeriesTimerQuery::default())
+            .await
+            .expect("list")
+    }
+
     #[tokio::test]
     async fn series_timer_crud_and_cascade() {
-        use ferrofin_model::live_tv::{BaseTimerInfoDto, SeriesTimerInfoDto, TimerInfoDto};
-        let mgr = manager_with(FakeFetcher(HashMap::new())).await;
-        let st = SeriesTimerInfoDto {
-            base: BaseTimerInfoDto {
-                channel_id: uuid::Uuid::new_v4(),
-                name: Some("Every episode".to_owned()),
-                ..BaseTimerInfoDto::default()
-            },
-            ..SeriesTimerInfoDto::default()
-        };
-        let st_id = mgr.create_series_timer(st).await.expect("create st");
-        assert_eq!(mgr.get_series_timers().await.expect("list").len(), 1);
+        let mgr = manager_with_series_guide().await;
+        let airings = airings_of(&mgr, "Recurring").await;
+        let future = airings
+            .iter()
+            .find(|r| parse_dt(&r.start_date).is_some_and(|s| s > Utc::now()))
+            .expect("a future airing");
+        let st_id = mgr
+            .create_series_timer(defaults_for(&mgr, future).await)
+            .await
+            .expect("create st");
+        assert_eq!(all_series_timers(&mgr).await.len(), 1);
 
-        // A timer that belongs to the series timer is removed when it's cancelled.
-        let timer = TimerInfoDto {
-            series_timer_id: Some(st_id.clone()),
-            base: BaseTimerInfoDto {
-                channel_id: uuid::Uuid::new_v4(),
-                start_date: parse_dt("2026-07-25T06:00:00Z").unwrap(),
-                end_date: parse_dt("2026-07-25T07:00:00Z").unwrap(),
-                ..BaseTimerInfoDto::default()
-            },
-            ..TimerInfoDto::default()
-        };
-        mgr.create_timer(timer).await.expect("create timer");
-        assert_eq!(mgr.get_timers().await.expect("t").len(), 1);
+        // The fan-out scheduled a timer per FUTURE airing of that title on that
+        // channel, and only those — the aired one and the other channel's are out.
+        let timers = mgr.get_timers().await.expect("timers");
+        assert_eq!(
+            timers.len(),
+            3,
+            "one timer per future airing on this channel"
+        );
+        assert!(
+            timers
+                .iter()
+                .all(|t| t.series_timer_id.as_deref() == Some(st_id.as_str())),
+            "every timer the fan-out made belongs to the series timer"
+        );
+        // …and the three showings share a ShowId, so only the EARLIEST records:
+        // `SearchForDuplicateShowIds` cancels the rest.
+        let mut by_start: Vec<_> = timers.iter().collect();
+        by_start.sort_by_key(|t| t.base.start_date);
+        assert_eq!(by_start[0].status, RecordingStatus::New);
+        assert!(
+            by_start[1..]
+                .iter()
+                .all(|t| t.status == RecordingStatus::Cancelled),
+            "a repeat showing of the same ShowId is cancelled, not recorded twice"
+        );
 
         mgr.cancel_series_timer(&st_id).await.expect("cancel st");
-        assert!(mgr.get_series_timers().await.expect("l2").is_empty());
+        assert!(all_series_timers(&mgr).await.is_empty());
         assert!(
             mgr.get_timers().await.expect("t2").is_empty(),
             "cancelling a series timer drops its timers"
+        );
+        assert!(
+            matches!(
+                mgr.cancel_series_timer(&st_id).await,
+                Err(ServiceError::NotFound(_))
+            ),
+            "cancelling an unknown series timer is a 404, not a silent 204"
+        );
+    }
+
+    /// The data-loss regression: `GET /LiveTv/Timers/Defaults` hands every
+    /// programme the SAME `Id` (`internal_series_timer_id("")`), and clients post
+    /// that body straight back. Honouring it made every "record series" overwrite
+    /// the last one. The id is the server's to mint.
+    #[tokio::test]
+    async fn two_creates_from_the_same_defaults_body_make_two_series_timers() {
+        let mgr = manager_with_series_guide().await;
+        let recurring = airings_of(&mgr, "Recurring").await;
+        let other = airings_of(&mgr, "Something Else").await;
+        let first = recurring
+            .iter()
+            .find(|r| parse_dt(&r.start_date).is_some_and(|s| s > Utc::now()))
+            .expect("future airing");
+        let mut a = defaults_for(&mgr, first).await;
+        a.base.priority = 42;
+        let b = defaults_for(&mgr, other.first().expect("other")).await;
+        let posted_id = a.base.id.clone();
+        assert_eq!(posted_id, b.base.id, "the defaults id is the same constant");
+
+        let id_a = mgr.create_series_timer(a).await.expect("a");
+        let id_b = mgr.create_series_timer(b).await.expect("b");
+        assert_ne!(id_a, id_b, "two creates, two rows");
+        assert_ne!(Some(id_a.clone()), posted_id, "the posted id is discarded");
+        assert_eq!(all_series_timers(&mgr).await.len(), 2);
+
+        // …and the published id really is the MD5 of the minted external id.
+        let stored = mgr
+            .stored_series_timer(&id_a)
+            .await
+            .expect("read")
+            .expect("row");
+        assert_eq!(
+            id_a,
+            ferrofin_traits::stubs::internal_series_timer_id(&stored.external_id)
+        );
+        assert_eq!(
+            stored.dto.base.external_id.as_deref(),
+            Some(stored.external_id.as_str())
+        );
+        assert!(
+            stored.dto.base.external_channel_id.is_some(),
+            "ExternalChannelId is the tuner-facing channel id, not null"
+        );
+        assert_eq!(
+            stored.dto.base.priority, 0,
+            "the posted Priority is discarded on create (LiveTvManager.cs:1145-1147)"
+        );
+        assert!(
+            id_a.len() == 32
+                && id_a
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase())
+        );
+    }
+
+    /// A programme the guide does not have is a rejected create, not a phantom
+    /// row (C# throws `InvalidOperationException("SeriesId for program not found")`).
+    #[tokio::test]
+    async fn create_series_timer_rejects_an_unknown_programme() {
+        let mgr = manager_with_series_guide().await;
+        let err = mgr
+            .create_series_timer(SeriesTimerInfoDto::default())
+            .await
+            .expect_err("no programme");
+        assert!(matches!(err, ServiceError::InvalidInput(_)));
+        assert!(all_series_timers(&mgr).await.is_empty());
+    }
+
+    /// `UpdateSeriesTimerAsync` copies a fixed whitelist and no-ops on an id
+    /// nothing matches — it never mints a row, and it never renames one.
+    #[tokio::test]
+    async fn update_series_timer_copies_only_the_whitelist() {
+        use ferrofin_model::live_tv::KeepUntil;
+        let mgr = manager_with_series_guide().await;
+        let airings = airings_of(&mgr, "Recurring").await;
+        let future = airings
+            .iter()
+            .find(|r| parse_dt(&r.start_date).is_some_and(|s| s > Utc::now()))
+            .expect("future airing");
+        let id = mgr
+            .create_series_timer(defaults_for(&mgr, future).await)
+            .await
+            .expect("create");
+        let before = mgr.get_series_timer(&id).await.expect("get").expect("row");
+        assert_eq!(
+            before.base.priority, 0,
+            "create takes Priority from the standing defaults, not the posted body"
+        );
+
+        let mut posted = before.clone();
+        posted.base.pre_padding_seconds = 120;
+        posted.base.is_pre_padding_required = true;
+        posted.base.priority = 7;
+        posted.keep_up_to = 3;
+        posted.base.keep_until = KeepUntil::UntilSpaceNeeded;
+        posted.days = vec![DayOfWeek::Saturday, DayOfWeek::Sunday];
+        posted.base.name = Some("RENAMED".to_owned());
+        posted.base.overview = Some("RENAMED".to_owned());
+        posted.day_pattern = Some(ferrofin_model::live_tv::DayPattern::Daily);
+        mgr.update_series_timer(&id, posted).await.expect("update");
+
+        let after = mgr
+            .get_series_timer(&id)
+            .await
+            .expect("get2")
+            .expect("row2");
+        assert_eq!(after.base.pre_padding_seconds, 120);
+        assert!(after.base.is_pre_padding_required);
+        assert_eq!(after.base.priority, 7);
+        assert_eq!(after.keep_up_to, 3);
+        assert_eq!(after.base.keep_until, KeepUntil::UntilSpaceNeeded);
+        assert_eq!(after.base.name, before.base.name, "Name is not updatable");
+        assert_eq!(after.base.overview, before.base.overview);
+        assert_eq!(
+            after.day_pattern,
+            Some(ferrofin_model::live_tv::DayPattern::Weekends),
+            "DayPattern is recomputed from Days, never the client's"
+        );
+        assert_eq!(after.base.id, before.base.id);
+        assert_eq!(after.base.external_id, before.base.external_id);
+
+        // An id nothing matches writes nothing at all.
+        let ghost = "0000000000000000000000000000dead";
+        mgr.update_series_timer(ghost, after)
+            .await
+            .expect("no-op update");
+        assert!(mgr.get_series_timer(ghost).await.expect("g").is_none());
+        assert_eq!(all_series_timers(&mgr).await.len(), 1);
+    }
+
+    /// `UpdateTimerAsync` takes the four padding fields and discards the rest of
+    /// the posted DTO; an unknown id is a `404`, not a phantom timer.
+    #[tokio::test]
+    async fn update_timer_takes_only_the_padding_fields() {
+        let mgr = manager_with_series_guide().await;
+        let airings = airings_of(&mgr, "Recurring").await;
+        let future = airings
+            .iter()
+            .find(|r| parse_dt(&r.start_date).is_some_and(|s| s > Utc::now()))
+            .expect("future airing");
+        let defaults = defaults_for(&mgr, future).await;
+        let id = mgr
+            .create_timer(TimerInfoDto {
+                base: defaults.base.clone(),
+                ..TimerInfoDto::default()
+            })
+            .await
+            .expect("create timer");
+        let before = mgr.get_timer(&id).await.expect("get").expect("row");
+
+        let mut posted = before.clone();
+        posted.base.pre_padding_seconds = 300;
+        posted.base.post_padding_seconds = 600;
+        posted.base.is_pre_padding_required = true;
+        posted.base.is_post_padding_required = true;
+        posted.base.name = Some("MUTATED".to_owned());
+        posted.base.priority = 42;
+        posted.status = RecordingStatus::Cancelled;
+        posted.base.start_date = before.base.start_date + chrono::Duration::days(365);
+        mgr.update_timer(&id, posted).await.expect("update");
+
+        let after = mgr.get_timer(&id).await.expect("get2").expect("row2");
+        assert_eq!(after.base.pre_padding_seconds, 300);
+        assert_eq!(after.base.post_padding_seconds, 600);
+        assert!(after.base.is_pre_padding_required && after.base.is_post_padding_required);
+        assert_eq!(after.base.name, before.base.name);
+        assert_eq!(after.base.priority, before.base.priority);
+        assert_eq!(after.status, before.status);
+        assert_eq!(after.base.start_date, before.base.start_date);
+
+        let ghost = "00000000000000000000000000009999";
+        assert!(matches!(
+            mgr.update_timer(ghost, after).await,
+            Err(ServiceError::NotFound(_))
+        ));
+        assert!(mgr.get_timer(ghost).await.expect("g").is_none());
+    }
+
+    /// `SearchForDuplicateShowIds`' three skips and its earliest-wins rule.
+    #[test]
+    fn duplicate_showings_keep_the_earliest_and_honour_the_skips() {
+        let showing = |show_id: &str, minutes: i64| {
+            let start =
+                parse_dt("2026-07-25T06:00:00Z").expect("dt") + chrono::Duration::minutes(minutes);
+            (
+                show_id.to_owned(),
+                start,
+                TimerInfoDto {
+                    base: ferrofin_model::live_tv::BaseTimerInfoDto {
+                        id: Some(format!("{show_id}-{minutes}")),
+                        start_date: start,
+                        ..ferrofin_model::live_tv::BaseTimerInfoDto::default()
+                    },
+                    ..TimerInfoDto::default()
+                },
+            )
+        };
+        let ids = |v: Vec<TimerInfoDto>| {
+            let mut out: Vec<String> = v
+                .into_iter()
+                .map(|t| t.base.id.unwrap_or_default())
+                .collect();
+            out.sort();
+            out
+        };
+
+        // Three showings of one programme, posted out of order: the earliest
+        // records, the two later ones are cancelled.
+        let group = [showing("aa", 120), showing("aa", 0), showing("aa", 60)];
+        assert_eq!(
+            ids(duplicate_showings_to_cancel(&group)),
+            ["aa-120", "aa-60"]
+        );
+        // A lone showing is not a duplicate…
+        assert!(duplicate_showings_to_cancel(&[showing("aa", 0)]).is_empty());
+        // …a blank ShowId groups nothing (upstream skips the empty key)…
+        assert!(duplicate_showings_to_cancel(&[showing("", 0), showing("", 60)]).is_empty());
+        // …and neither does one ending "0000" (jellyfin/jellyfin#5856).
+        assert!(
+            duplicate_showings_to_cancel(&[showing("ab0000", 0), showing("ab0000", 60)]).is_empty()
+        );
+        // Different programmes never suppress each other.
+        assert!(duplicate_showings_to_cancel(&[showing("aa", 0), showing("bb", 60)]).is_empty());
+    }
+
+    /// `GetDayPattern`, `AlphanumericComparator` and `GetSeriesTimers`' ordering,
+    /// against the C# as the oracle — including upstream's inverted priority arm.
+    #[test]
+    fn day_pattern_and_series_timer_ordering_match_upstream() {
+        use ferrofin_model::live_tv::{DayPattern, SeriesTimerQuery};
+        assert_eq!(day_pattern(&[]), None);
+        assert_eq!(
+            day_pattern(&[DayOfWeek::Saturday, DayOfWeek::Sunday]),
+            Some(DayPattern::Weekends)
+        );
+        assert_eq!(
+            day_pattern(&[DayOfWeek::Monday, DayOfWeek::Wednesday]),
+            None
+        );
+        assert_eq!(
+            day_pattern(&[
+                DayOfWeek::Monday,
+                DayOfWeek::Tuesday,
+                DayOfWeek::Wednesday,
+                DayOfWeek::Thursday,
+                DayOfWeek::Friday
+            ]),
+            Some(DayPattern::Weekdays)
+        );
+        assert_eq!(
+            day_pattern(&[
+                DayOfWeek::Sunday,
+                DayOfWeek::Monday,
+                DayOfWeek::Tuesday,
+                DayOfWeek::Wednesday,
+                DayOfWeek::Thursday,
+                DayOfWeek::Friday,
+                DayOfWeek::Saturday
+            ]),
+            Some(DayPattern::Daily)
+        );
+        // A 5-day list that is not Mon–Fri spells no pattern.
+        assert_eq!(
+            day_pattern(&[
+                DayOfWeek::Sunday,
+                DayOfWeek::Monday,
+                DayOfWeek::Tuesday,
+                DayOfWeek::Wednesday,
+                DayOfWeek::Thursday
+            ]),
+            None
+        );
+
+        // Numbers sort as numbers, not as text.
+        assert_eq!(
+            alphanumeric_compare("Show 2", "Show 10"),
+            std::cmp::Ordering::Less
+        );
+        // Leading zeros do not change the NUMBER, but upstream's final
+        // `return len1 - len2` still breaks the tie on the raw lengths.
+        assert_eq!(
+            alphanumeric_compare("Show 007", "Show 7"),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            alphanumeric_compare("Show", "Show 1"),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(alphanumeric_compare("", "a"), std::cmp::Ordering::Less);
+
+        let timer = |name: &str, priority: i32| SeriesTimerInfoDto {
+            base: ferrofin_model::live_tv::BaseTimerInfoDto {
+                name: Some(name.to_owned()),
+                priority,
+                ..ferrofin_model::live_tv::BaseTimerInfoDto::default()
+            },
+            ..SeriesTimerInfoDto::default()
+        };
+        let names = |v: &[SeriesTimerInfoDto]| {
+            v.iter()
+                .map(|t| t.base.name.clone().unwrap_or_default())
+                .collect::<Vec<_>>()
+        };
+        let mut v = vec![timer("B", 0), timer("A", 9), timer("C", 9)];
+        sort_series_timers(&mut v, &SeriesTimerQuery::default());
+        assert_eq!(names(&v), ["A", "B", "C"], "no sortBy: by name ascending");
+
+        sort_series_timers(
+            &mut v,
+            &SeriesTimerQuery {
+                sort_by: Some("priority".to_owned()),
+                sort_order: SortOrder::Ascending,
+            },
+        );
+        assert_eq!(
+            names(&v),
+            ["A", "C", "B"],
+            "upstream's ascending arm is OrderByDescending(Priority).ThenByString(Name)"
+        );
+        sort_series_timers(
+            &mut v,
+            &SeriesTimerQuery {
+                sort_by: Some("Priority".to_owned()),
+                sort_order: SortOrder::Descending,
+            },
+        );
+        assert_eq!(
+            names(&v),
+            ["B", "C", "A"],
+            "…and its descending arm is OrderBy(Priority).ThenByStringDescending(Name)"
         );
     }
 
@@ -5470,15 +6699,9 @@ mod tests {
 
         // A cancelled timer keeps its SeriesTimerId link but drops
         // TimerId/Status (upstream's `!= Cancelled && != Error` gate).
-        let mut cancelled = mgr
-            .get_timer(&timer_id)
-            .await
-            .expect("get timer")
-            .expect("timer");
-        cancelled.status = RecordingStatus::Cancelled;
-        mgr.update_timer(&timer_id, cancelled)
-            .await
-            .expect("update");
+        // Through the real cancel path: `UpdateTimerAsync` only ever takes the
+        // four padding fields, so a client cannot set `Status` this way.
+        mgr.cancel_timer(&timer_id).await.expect("cancel");
         let programs = mgr
             .get_programs(&InternalItemsQuery::default(), &DtoOptions::default())
             .await
