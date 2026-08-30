@@ -16,15 +16,18 @@ Run via sweep.sh (idempotently connects to the already-up servers), or directly:
 Offline self-check:
   parity/reads.py --check
 """
+import collections
 import json
 import os
 import re
+import time
 import urllib.parse
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from sweep import http, get_json, bring_up          # noqa: E402
-from parity_diff import diff_counts                  # noqa: E402
+from parity_diff import diff_stats                  # noqa: E402
+import verification                                  # noqa: E402
 
 CORRELATE_LIMIT = 5   # item-scoped endpoints are exercised against this many Path-aligned items
 
@@ -56,7 +59,7 @@ def item(op, tmpl):
     return {"op": op, "kind": "item", "url": lambda c, i: tmpl.format(u=c["user"], i=i)}
 
 
-def multi(op, legs):
+def multi(op, legs, seed=None, reap=None):
     """Several URLs folded into ONE ledger row (rows are keyed by op, so a second
     entry would clobber the first). Every leg is diffed; the buckets are unioned.
 
@@ -64,14 +67,21 @@ def multi(op, legs):
     `project(body)` narrows what is compared. A projection is allowed ONLY where
     the rest of the body is provably non-comparable between two independent
     instances — the Suggestions paging leg is the one case (see there) — never to
-    make a divergence disappear."""
+    make a divergence disappear.
+
+    `seed(base, token, ctx)` runs on BOTH servers immediately before this row's
+    legs and `reap(base, token, ctx)` immediately after, in a `finally`. Scoping
+    the write to the one row it exists for is deliberate: the lyric seeds change
+    the seeded track's DTO (Jellyfin gains a `MediaStreams` Lyric entry and flips
+    `HasLyrics`), and state held across the whole read set is state that can
+    contaminate an unrelated row later."""
     out = []
     for leg in legs:
         tmpl, project = leg if isinstance(leg, tuple) else (leg, None)
         out.append({"tmpl": tmpl,
                     "url": (lambda c, t=tmpl: t.format(**c)),
                     "project": project})
-    return {"op": op, "kind": "multi", "legs": out}
+    return {"op": op, "kind": "multi", "legs": out, "seed": seed, "reap": reap}
 
 
 def invariant(op, fn):
@@ -86,6 +96,251 @@ def invariant(op, fn):
     property row into the body-diff count — that would redefine the number
     instead of earning it."""
     return {"op": op, "kind": "invariant", "fn": fn, "method": "property"}
+
+
+# ------------------------------------------------ display-preferences seeding
+#
+# The `usersettings?client=emby` GET only ever sees a VIRGIN auto-vivified row,
+# so it can catch a wrong creation default and nothing else. Everything the POST
+# path normalizes — the skip-length fallbacks, the home-section rebuild with its
+# per-order default substitution, the `landing-*` ViewType strip — is invisible
+# to it. This writes one deterministic DTO to a dedicated client key on BOTH
+# servers before the probe loop, so a second leg can read the result back.
+#
+# The client key is its own (`parityreads`): journeys.py writes `parity`, and
+# nothing orders the two layers.
+DISPLAY_PREFS_CLIENT = "parityreads"
+
+DISPLAY_PREFS_SEED = {
+    "Id": "usersettings",
+    "Client": DISPLAY_PREFS_CLIENT,
+    "SortBy": "SortName",
+    "SortOrder": "Ascending",
+    "RememberIndexing": False,
+    "RememberSorting": False,
+    "ScrollDirection": "Horizontal",
+    "ShowBackdrop": True,
+    "ShowSidebar": False,
+    "PrimaryImageHeight": 250,
+    "PrimaryImageWidth": 250,
+    "CustomPrefs": {
+        # persisted home sections, incl. an unparseable type that must fall back
+        # to `defaults[3]` (ResumeBook) and an order past that 8-entry table.
+        "homesection0": "smalllibrarytiles",
+        "homesection1": "resume",
+        "homesection3": "bogusvalue",
+        "homesection9": "alsobogus",
+        # a valid ViewType survives, an invalid one is stripped
+        "landing-abc": "movies",
+        "landing-bad": "notaviewtype",
+        # empty value => the C# fallback (30000), not the supplied ""
+        "skipForwardLength": "",
+        "enableNextVideoInfoOverlay": "false",
+    },
+}
+
+
+def seed_display_preferences(base, token, ctx):
+    """POSTs [`DISPLAY_PREFS_SEED`]; returns the status so a failure is visible."""
+    return http("POST",
+                f"{base}/DisplayPreferences/usersettings"
+                f"?userId={ctx['u']}&client={DISPLAY_PREFS_CLIENT}",
+                token, json.dumps(DISPLAY_PREFS_SEED))[0]
+
+
+# ------------------------------------------------------------------- lyrics
+#
+# `GET /Audio/{itemId}/Lyrics` has no corpus of its own: the synthetic tracks
+# carry no lyrics, so the row was 404=404 — an agreement that proves nothing
+# (an unconditional-404 handler passes it). The fix is the same one
+# `seed_display_preferences` uses: write the SAME bytes to both servers, then
+# diff what each one parsed them into. A LyricDto is a deterministic function
+# of the uploaded file, so this is a real cross-server body diff — it is what
+# caught Ferrofin inventing a `Metadata` block, dropping `Cues`, and eating a
+# `.txt`'s blank lines. The upload lands in each server's own metadata folder
+# (never the read-only media mount) and is reaped after the read set runs.
+#
+# One seed per parser branch: a synced `.lrc` carrying metadata tags, an
+# enhanced `.elrc` with word-level time tags (the cue oracle, shaped like
+# upstream's `Fleetwood Mac - Rumors.elrc`), and a plain `.txt` whose blank
+# lines and trailing newline must survive.
+LYRIC_SEEDS = [
+    ("lrc", "[ar:Parity Artist]\n[ti:Parity Title]\n[al:Parity Album]\n"
+            "[00:01.00]First line\n[00:05.50]Second line\n[01:02.25]Third line\n"),
+    # The enhanced seed deliberately spans every branch of the decoder, because a
+    # corpus in which EVERY line starts with a word tag cannot fail on the one
+    # class of cue bug this row exists to catch. (It did not: Ferrofin dropped
+    # the position-0 cue that leading text owes, and neither the old seed nor
+    # upstream's own `Fleetwood Mac - Rumors.elrc` — 31 word-tag-first lines out
+    # of 31 — could see it.) The four shapes, in order:
+    #   1. word tag first, with whitespace-only segments between the words;
+    #   2. TEXT BEFORE the first word tag — `LrcTimedTextUtils.TimedTextToObject`
+    #      seeds its tag list with the LINE's start, so this owes a cue at
+    #      position 0 carrying `[00:14.69]`;
+    #   3. a word tag with nothing after it — an `IndexState.End` index, whose
+    #      cue spans the whole line and whose trailing slice emits nothing;
+    #   4. TWO line time tags, which `LrcLyricParser.Decode` refuses to attribute
+    #      word tags to, so `<00:35.00>` must survive in the text verbatim and
+    #      the line must appear twice with no cues at all.
+    ("elrc", "[00:06.84] <00:06.84> Every <00:07.20>   <00:07.56> night <00:07.87>   "
+             "<00:08.19> that <00:08.46>   <00:08.79> goes <00:09.19>   <00:09.59> between\n"
+             "[00:14.69]I feel <00:15.15>a little <00:15.96>less\n"
+             "[00:20.00]closing<00:21.00>\n"
+             "[00:25.00][00:30.00]two starts <00:35.00>here\n"),
+    ("txt", "Plain line one\n\n   indented line\nlast\n"),
+]
+LYRIC_SEED_WAIT_S = 15   # Jellyfin serves an uploaded lyric only once its queued refresh ran
+LYRIC_REAP_ROUNDS = 3    # an item can hold more than one sidecar; Jellyfin resolves one at a time
+
+
+def lyric_seed_ids(base, token, user_id):
+    """The audio items the lyric seeds are written to — the first three by PATH.
+
+    Path is the stable cross-server key (the same reason `path_id_map` uses it),
+    so both servers seed the same three tracks and the read legs line up.
+    """
+    b = get_json(base, f"/Items?userId={user_id}&recursive=true&includeItemTypes=Audio"
+                       f"&limit=500&fields=Path", token)
+    by_path = {i["Path"]: i["Id"] for i in (b or {}).get("Items") or [] if i.get("Path")}
+    ids = [by_path[p] for p in sorted(by_path)[:len(LYRIC_SEEDS)]]
+    return ids + [""] * (len(LYRIC_SEEDS) - len(ids))
+
+
+def lyric_ids(ctx):
+    """The three seeded audio ids, in LYRIC_SEEDS order."""
+    return [ctx["lyric_lrc"], ctx["lyric_elrc"], ctx["lyric_txt"]]
+
+
+def lyric_visible(base, token, aid):
+    """True once the server serves the uploaded lyric back."""
+    return http("GET", f"{base}/Audio/{aid}/Lyrics", token)[0] == 200
+
+
+def seed_lyrics(base, token, ctx):
+    """Uploads one lyric per seed id and waits until each reads back.
+
+    Records the ids that actually landed on `ctx`, so the reap only chases files
+    that exist, and returns the upload statuses so a failure is visible rather
+    than silently turning the row back into a 404=404.
+    """
+    statuses = []
+    landed = []
+    for (ext, body), aid in zip(LYRIC_SEEDS, lyric_ids(ctx)):
+        if not aid:
+            statuses.append(None)
+            continue
+        st = http("POST", f"{base}/Audio/{aid}/Lyrics?fileName=parity.{ext}", token, body)[0]
+        statuses.append(st)
+        if st == 200:
+            landed.append(aid)
+    for aid in landed:
+        for _ in range(LYRIC_SEED_WAIT_S):
+            if lyric_visible(base, token, aid):
+                break
+            time.sleep(1)
+    ctx["_lyrics_seeded"] = landed
+    return statuses
+
+
+def reap_lyrics(base, token, ctx):
+    """Removes the seeded lyrics again, so the later layers see the fixture as
+    they found it.
+
+    Jellyfin's DELETE unlinks only the files it can see as resolved
+    `MediaStreamType.Lyric` rows (`LyricManager.DeleteLyricsAsync`), and its GET
+    reads those same rows — so a GET that is NOT 200 does not mean the file is
+    gone, it equally means the queued refresh has not run yet. Treating that as
+    "already reaped" is how this batch's diagnostic phase left lyric files
+    inside the Jellyfin container for good. So: wait until the file is VISIBLE
+    (only then can DELETE find it), delete it, then wait until it is gone — and
+    say so loudly if either wait runs out, because residue on a shared pair is
+    asymmetric state that poisons somebody else's measurement.
+    """
+    def wait_until(aid, visible):
+        for _ in range(LYRIC_SEED_WAIT_S):
+            if lyric_visible(base, token, aid) == visible:
+                return True
+            time.sleep(1)
+        return False
+
+    left = []
+    for aid in ctx.get("_lyrics_seeded", []):
+        # Delete in rounds: an item that ended up with more than one sidecar
+        # (an aborted earlier run) only exposes one resolved Lyric stream at a
+        # time, so one DELETE is not necessarily the last one.
+        first = True
+        for _ in range(LYRIC_REAP_ROUNDS):
+            if not wait_until(aid, True):
+                # Nothing (more) visible. On the FIRST round that is the bad
+                # case the whole poll exists for: the upload was accepted but
+                # the server never served it back, so a file may be sitting on
+                # disk that no DELETE can reach.
+                if first:
+                    left.append(aid)
+                break
+            first = False
+            http("DELETE", f"{base}/Audio/{aid}/Lyrics", token)
+            wait_until(aid, False)
+        else:
+            left.append(aid)
+    ctx["_lyrics_seeded"] = []
+    if left:
+        print(f"  WARNING: {base} still holds seeded lyrics for {left} — they are "
+              f"asymmetric state on a shared pair; delete them before the next run",
+              file=sys.stderr)
+    return left
+
+
+# ------------------------------------------------- by-name ordering + options
+#
+# `parity_diff.diff` aligns arrays by `Name` (ALIGN_KEYS), which is what lets the
+# by-name rows compare at all across two independent instances — but it also
+# makes ORDER invisible. A `sortOrder=Descending` that the server silently
+# dropped diffed clean for exactly that reason. These projections keep the WHOLE
+# body and ADD the ordered name list under a synthetic key, so the ordering
+# becomes a diffable field. They strengthen the comparison; they never narrow it.
+
+def with_item_order(body):
+    out = dict(body)
+    out["_ItemNameOrder"] = [i.get("Name") for i in body.get("Items") or []]
+    return out
+
+
+# Providers Ferrofin compiles in that the lab's stock Jellyfin 10.11.8 does not
+# ship. Verified against that server's own `GET /Plugins`, which lists only
+# AudioDB and MusicBrainz — so these are structurally extra BY DESIGN (see
+# CLAUDE.md "Current scope": every remote provider is always compiled, gated
+# per library; Tier-1a extensions are compiled in too).
+#
+# They are dropped BY NAME from the fetcher lists on both sides. This is
+# deliberately not a `parity_diff.VOLATILE` entry: VOLATILE hides a field
+# everywhere, while this removes four named rows from one endpoint and leaves
+# every other provider — including their DefaultEnabled — fully compared.
+FERROFIN_ONLY_PROVIDERS = {"TheTVDB", "FanArt", "Open Subtitles", "IntroSkipper"}
+
+
+def without_ferrofin_only_providers(body):
+    def strip(lst):
+        return [o for o in lst or [] if o.get("Name") not in FERROFIN_ONLY_PROVIDERS]
+
+    out = dict(body)
+    for key in ("MetadataSavers", "MetadataReaders", "SubtitleFetchers",
+                "LyricFetchers", "MediaSegmentProviders"):
+        out[key] = strip(out.get(key))
+    type_options = []
+    for block in out.get("TypeOptions") or []:
+        b = dict(block)
+        b["MetadataFetchers"] = strip(b.get("MetadataFetchers"))
+        b["ImageFetchers"] = strip(b.get("ImageFetchers"))
+        # SupportedImageTypes is the FLATTENED union of every compiled image
+        # provider's GetSupportedImages, so the removed providers' image types
+        # cannot be un-mixed from it by name. It is compared as-is, and the
+        # residual (Ferrofin lists Art/Disc/Banner that FanArt really can
+        # fetch) is recorded as an accepted divergence in classifications.json
+        # rather than projected away here.
+        type_options.append(b)
+    out["TypeOptions"] = type_options
+    return out
 
 
 # ------------------------------------------------------- /Similar invariants
@@ -408,7 +663,22 @@ READS = [
     user("GET /Artists", "/Artists?userId={u}"),
     user("GET /Artists/AlbumArtists", "/Artists/AlbumArtists?userId={u}"),
     user("GET /Artists/{name}", "/Artists/{artist}?userId={u}"),
-    user("GET /MusicGenres", "/MusicGenres?userId={u}"),
+    # The by-name list plumbing (order, name range, includeItemTypes scoping) is
+    # shared by /Genres, /Studios, /Artists and /MusicGenres, so one family of
+    # aliases here covers the same bugs on all of them. `with_item_order` makes
+    # the ordering diffable — `diff` aligns arrays by Name, which is what let a
+    # dropped `sortOrder` diff clean.
+    multi("GET /MusicGenres", [
+        ("/MusicGenres?userId={u}", with_item_order),
+        ("/MusicGenres?userId={u}&limit=100", with_item_order),
+        ("/MusicGenres?userId={u}&startIndex=1&limit=5", with_item_order),
+        ("/MusicGenres?userId={u}&sortBy=SortName&sortOrder=Descending", with_item_order),
+        ("/MusicGenres?userId={u}&nameStartsWithOrGreater=J", with_item_order),
+        ("/MusicGenres?userId={u}&nameStartsWithOrGreater=j", with_item_order),
+        ("/MusicGenres?userId={u}&nameLessThan=Jb", with_item_order),
+        ("/MusicGenres?userId={u}&includeItemTypes=Audio", with_item_order),
+        ("/MusicGenres?userId={u}&includeItemTypes=Movie", with_item_order),
+    ]),
     user("GET /MusicGenres/{genreName}", "/MusicGenres/{musicgenre}?userId={u}"),
     # Instant mixes are shuffled: the diff aligns by Name, so the SET of tracks is what is
     # compared (with the whole fixture under `limit`, both sides hold every track).
@@ -438,12 +708,35 @@ READS = [
     user("GET /LiveTv/Channels/{channelId}", "/LiveTv/Channels/{channel}?userId={u}"),
     user("GET /LiveTv/Programs", "/LiveTv/Programs?channelIds={channel}&isAiring=true&userId={u}"),
     user("GET /LiveTv/Programs/Recommended", "/LiveTv/Programs/Recommended?userId={u}&isAiring=true&limit=5"),
+    user("GET /LiveTv/Timers/Defaults", "/LiveTv/Timers/Defaults"),
     user("GET /LiveTv/Info", "/LiveTv/Info"),
     user("GET /LiveTv/TunerHosts/Types", "/LiveTv/TunerHosts/Types"),
     # resolvable-path-param GETs the breadth sweep couldn't fill (needs a real id).
+    # The add-library options. `isNewLibrary` is a DIFFERENT answer, not a hint:
+    # it decides which providers come pre-ticked, so both values are probed.
+    # The projection removes the four providers Ferrofin compiles in that stock
+    # Jellyfin does not ship — by name, and only from this endpoint.
+    multi("GET /Libraries/AvailableOptions", [
+        ("/Libraries/AvailableOptions", without_ferrofin_only_providers),
+        ("/Libraries/AvailableOptions?libraryContentType=movies",
+         without_ferrofin_only_providers),
+        ("/Libraries/AvailableOptions?libraryContentType=tvshows",
+         without_ferrofin_only_providers),
+        ("/Libraries/AvailableOptions?libraryContentType=music",
+         without_ferrofin_only_providers),
+        ("/Libraries/AvailableOptions?libraryContentType=movies&isNewLibrary=true",
+         without_ferrofin_only_providers),
+        ("/Libraries/AvailableOptions?libraryContentType=tvshows&isNewLibrary=true",
+         without_ferrofin_only_providers),
+    ]),
     user("GET /ScheduledTasks/{taskId}", "/ScheduledTasks/{task}"),
-    user("GET /DisplayPreferences/{displayPreferencesId}",
-         "/DisplayPreferences/usersettings?userId={u}&client=emby"),
+    multi("GET /DisplayPreferences/{displayPreferencesId}", [
+        # leg 1: the virgin auto-vivified row (catches a wrong creation default).
+        "/DisplayPreferences/usersettings?userId={u}&client=emby",
+        # leg 2: read back after `seed_display_preferences` wrote the same DTO to
+        # both servers — this is what covers the POST normalization.
+        "/DisplayPreferences/usersettings?userId={u}&client=" + DISPLAY_PREFS_CLIENT,
+    ]),
     user("GET /Devices/Info", "/Devices/Info?id={device}"),
     # GET /Devices/Options is exercised in the write journey (needs a device that has options set).
     # Host-filesystem browsing: both containers mount the identical fixture tree at /media/synth,
@@ -451,6 +744,15 @@ READS = [
     plain("GET /Environment/DirectoryContents",
           "/Environment/DirectoryContents?path=%2Fmedia%2Fsynth%2Fmovies&includeFiles=true&includeDirectories=true"),
     plain("GET /Environment/ParentPath", "/Environment/ParentPath?path=%2Fmedia%2Fsynth%2Fmovies"),
+    # One row, three legs — one per parser branch (see LYRIC_SEEDS): the synced
+    # `.lrc`, the enhanced `.elrc` whose word cues are the real oracle, and the
+    # plain `.txt`. Seeded with identical bytes on both servers, so every field
+    # of the parsed LyricDto (line text, Start ticks, Cues, Metadata) is diffed.
+    multi("GET /Audio/{itemId}/Lyrics", [
+        "/Audio/{lyric_lrc}/Lyrics",
+        "/Audio/{lyric_elrc}/Lyrics",
+        "/Audio/{lyric_txt}/Lyrics",
+    ], seed=seed_lyrics, reap=reap_lyrics),
 ]
 
 # ---------------------------------------------------------------- correlation
@@ -544,6 +846,7 @@ def resolve_named(base, token, user_id):
     artist = first_named("/Artists")
     # By-name ids are per-server (each derives its own), like `artist_id`.
     musicgenre = first_named("/MusicGenres")
+    lyric_ids = lyric_seed_ids(base, token, user_id)
     channels = (get_json(base, f"/LiveTv/Channels?userId={user_id}&limit=1", token) or {}).get("Items") or []
     return {
         # Full by-name listings, consumed only by `reconcile_named`.
@@ -569,6 +872,10 @@ def resolve_named(base, token, user_id):
         "artist_id": artist.get("Id") or "",
         "musicgenre": urllib.parse.quote(musicgenre.get("Name") or ""),
         "musicgenre_id": musicgenre.get("Id") or "",
+        # The three tracks `seed_lyrics` writes to, in LYRIC_SEEDS order.
+        "lyric_lrc": lyric_ids[0],
+        "lyric_elrc": lyric_ids[1],
+        "lyric_txt": lyric_ids[2],
     }
 
 
@@ -581,26 +888,62 @@ def run(ferrofin_url, jellyfin_url):
     hc["server"], jc["server"] = "ferrofin", "jellyfin"
 
     pairs = correlate(path_id_map(ferrofin_url, ht, hu), path_id_map(jellyfin_url, jt, ju))
+
+    # Write-then-read-back setup for the DisplayPreferences row (see
+    # `seed_display_preferences`). Both servers get the identical body.
+    hseed = seed_display_preferences(ferrofin_url, ht, hc)
+    jseed = seed_display_preferences(jellyfin_url, jt, jc)
+    if hseed != jseed:
+        print(f"  display-preferences seed status differs: H={hseed} J={jseed}",
+              file=sys.stderr)
+
+    # The lyric row seeds and reaps itself — see `multi(..., seed=, reap=)`.
+
     rows = {}
 
-    def record(op, clean, total, buckets, method="body-diff"):
-        """`method` is HOW the row was verified, and it is written into the
-        results row: "body-diff" means the ledger's headline claim (the
-        responses themselves diffed clean), "property" means only the named
-        invariants agreed. gen-ledger.py counts and renders the two separately
-        so the headline keeps meaning what it says."""
-        if total == 0:
+    def agg_method(legs):
+        """The honest method for an aggregate of diffed (jbody, hbody, compared) legs.
+
+        None when no leg compared anything (untested); `empty-corpus` when every
+        leg that compared anything was two empty result envelopes agreeing on
+        their own zeros; `body-diff` as soon as one leg compared real content.
+        """
+        seen = [m for m in (verification.read_method(j, h, c) for j, h, c in legs)
+                if m is not None]
+        if not seen:
+            return None
+        return (verification.BODY_DIFF if verification.BODY_DIFF in seen
+                else verification.EMPTY_CORPUS)
+
+    def record(op, clean, total, buckets, method, note=None, compared=None):
+        """`method` is HOW the row was verified, from `verification.METHODS`, and it
+        is written into the results row. There is no default: gen-ledger.py counts
+        only `body-diff` in the headline, so a row that agreed on named invariants
+        ("property"), or on two empty result envelopes ("empty-corpus"), must say so
+        rather than borrowing a claim it did not earn. `method=None` means the probe
+        compared nothing at all — recorded untested, never verified.
+
+        `compared` is the number of leaf comparisons the diff actually performed,
+        carried into the note the way the sweep layer carries it. Without it the
+        page said "1/1 clean" for a row that compared 984 fields and for a row
+        that compared one, and a reader could not tell a thick body diff from a
+        thin one without opening this file."""
+        if total == 0 or (method is None and not any(buckets.values())):
             rows[op] = {"deep_verified": None, "classification": "",
-                        "verification_method": method,
-                        "note": "no comparable response (both empty/non-200)"}
+                        "verification_method": None,
+                        "note": note or "no comparable response (nothing was compared)"}
             return
         n = sum(len(buckets[k]) for k in ("mismatch", "missing", "extra"))
         if n == 0:
+            detail = {verification.BODY_DIFF: "",
+                      verification.PROPERTY: " (named invariants agreed; bodies not diffed)",
+                      verification.EMPTY_CORPUS: " (both result sets EMPTY; only the envelope"
+                                                 " zeros compared — handler logic unexercised)",
+                      }.get(method, "")
+            depth = f"; {compared} field(s) compared" if compared is not None else ""
             rows[op] = {"deep_verified": True, "classification": "ok",
                         "verification_method": method,
-                        "note": f"{clean}/{total} clean"
-                                + ("" if method == "body-diff"
-                                   else " (properties agreed; bodies not diffed)")}
+                        "note": f"{clean}/{total} clean{depth}" + detail}
         else:
             sample = "; ".join(f"{m['path']}(J={m.get('j')} H={m.get('h')})"
                                for m in buckets["mismatch"][:3])
@@ -614,7 +957,7 @@ def run(ferrofin_url, jellyfin_url):
                 return seen
             rows[op] = {"deep_verified": False,
                         "classification": "flagged: read diff vs Jellyfin (verify)",
-                        "verification_method": method,
+                        "verification_method": method or verification.BODY_DIFF,
                         "note": f"{clean}/{total} clean; mismatch:{len(buckets['mismatch'])} "
                                 f"missing:{len(buckets['missing'])} extra:{len(buckets['extra'])} | {sample}",
                         "diffs": {
@@ -639,48 +982,71 @@ def run(ferrofin_url, jellyfin_url):
                     # agreeing on a broken invariant is not parity.
                     buckets["mismatch"].append({"path": key, "j": j, "h": h})
             n = sum(len(v) for v in buckets.values())
-            record(ep["op"], 1 if n == 0 else 0, 1, buckets, method=ep["method"])
+            record(ep["op"], 1 if n == 0 else 0, 1, buckets, ep["method"],
+                   compared=len(set(jf) | set(hf)))
         elif ep["kind"] == "multi":
+            if ep.get("seed"):
+                hstat = ep["seed"](ferrofin_url, ht, hc)
+                jstat = ep["seed"](jellyfin_url, jt, jc)
+                if hstat != jstat:
+                    print(f"  {ep['op']} seed statuses differ: H={hstat} J={jstat}",
+                          file=sys.stderr)
             agg = {"mismatch": [], "missing": [], "extra": []}
+            legs = []
             clean = tested = 0
-            for leg in ep["legs"]:
-                hs, hb = token_get(ferrofin_url, leg["url"](hc), ht)
-                js, jb = token_get(jellyfin_url, leg["url"](jc), jt)
-                tested += 1
-                # A leg that does not answer 200-with-JSON on both sides is a
-                # RESULT, not a reason to skip: `continue`-ing here made a
-                # status divergence (exactly what the type=MusicArtist and
-                # type=TvChannel legs exist to catch) silently invisible.
-                if hs != js:
-                    agg["mismatch"].append(
-                        {"path": f"{leg['tmpl']} :: status", "j": js, "h": hs})
-                    continue
-                if hb is None or jb is None:
-                    agg["mismatch"].append(
-                        {"path": f"{leg['tmpl']} :: body",
-                         "j": "no JSON" if jb is None else "json",
-                         "h": "no JSON" if hb is None else "json"})
-                    continue
-                if leg["project"]:
-                    hb, jb = leg["project"](hb), leg["project"](jb)
-                n, b = diff_counts(jb, hb)
-                if n == 0:
-                    clean += 1
-                for k in agg:
-                    agg[k].extend(b[k])
-            record(ep["op"], clean, tested, agg)
+            try:
+                for leg in ep["legs"]:
+                    hs, hb = token_get(ferrofin_url, leg["url"](hc), ht)
+                    js, jb = token_get(jellyfin_url, leg["url"](jc), jt)
+                    tested += 1
+                    # A leg that does not answer 200-with-JSON on both sides is a
+                    # RESULT, not a reason to skip: `continue`-ing here made a
+                    # status divergence (exactly what the type=MusicArtist and
+                    # type=TvChannel legs exist to catch) silently invisible.
+                    if hs != js:
+                        agg["mismatch"].append(
+                            {"path": f"{leg['tmpl']} :: status", "j": js, "h": hs})
+                        continue
+                    if hb is None or jb is None:
+                        agg["mismatch"].append(
+                            {"path": f"{leg['tmpl']} :: body",
+                             "j": "no JSON" if jb is None else "json",
+                             "h": "no JSON" if hb is None else "json"})
+                        continue
+                    if leg["project"]:
+                        hb, jb = leg["project"](hb), leg["project"](jb)
+                    n, b, compared = diff_stats(jb, hb)
+                    legs.append((jb, hb, compared))
+                    if n == 0:
+                        clean += 1
+                    for k in agg:
+                        agg[k].extend(b[k])
+            finally:
+                # Whatever happened above, the seeded state comes back off both
+                # servers — an aborted run must not leave the pair asymmetric.
+                if ep.get("reap"):
+                    ep["reap"](ferrofin_url, ht, hc)
+                    ep["reap"](jellyfin_url, jt, jc)
+            record(ep["op"], clean, tested, agg, agg_method(legs),
+                   compared=sum(c for _j, _h, c in legs))
         elif ep["kind"] in ("plain", "user"):
             path = ep["url"](hc if ep["kind"] == "user" else {})
             jpath = ep["url"](jc if ep["kind"] == "user" else {})
             hs, hb = token_get(ferrofin_url, path, ht)
             js, jb = token_get(jellyfin_url, jpath, jt)
             if hb is None or jb is None:
-                record(ep["op"], 0, 0, {})
+                # Say WHICH side failed. "both empty/non-200" was written even when
+                # only Ferrofin 500'd against a Jellyfin 200 — the loudest possible
+                # divergence, reported as an absence of evidence.
+                record(ep["op"], 0, 0, {"mismatch": [], "missing": [], "extra": []}, None,
+                       note=f"no comparable response (H={hs} J={js})")
                 continue
-            n, buckets = diff_counts(jb, hb)
-            record(ep["op"], 1 if n == 0 else 0, 1, buckets)
+            n, buckets, compared = diff_stats(jb, hb)
+            record(ep["op"], 1 if n == 0 else 0, 1, buckets,
+                   agg_method([(jb, hb, compared)]), compared=compared)
         else:  # item — aggregate over correlated pairs
             agg = {"mismatch": [], "missing": [], "extra": []}
+            legs = []
             clean = tested = 0
             for hid, jid in pairs:
                 hs, hb = token_get(ferrofin_url, ep["url"](hc, hid), ht)
@@ -695,13 +1061,16 @@ def run(ferrofin_url, jellyfin_url):
                 if hb is None or jb is None:
                     continue
                 tested += 1
-                n, b = diff_counts(jb, hb)
+                n, b, compared = diff_stats(jb, hb)
+                legs.append((jb, hb, compared))
                 if n == 0:
                     clean += 1
                 else:
                     for k in agg:
                         agg[k].extend(b[k])
-            record(ep["op"], clean, tested, agg)
+            record(ep["op"], clean, tested, agg, agg_method(legs),
+                   compared=sum(c for _j, _h, c in legs))
+
     return rows, len(pairs)
 
 
@@ -718,8 +1087,13 @@ def main():
                           "suite/parity/reads-results.json"), "w") as f:
         json.dump(out, f, indent=2, sort_keys=True)
         f.write("\n")
-    ok = sum(1 for v in rows.values() if v["deep_verified"] is True)
+    ok = sum(1 for v in rows.values() if v["deep_verified"] is True
+             and v["verification_method"] == verification.BODY_DIFF)
+    other = collections.Counter(v["verification_method"] for v in rows.values()
+                                if v["deep_verified"] is True
+                                and v["verification_method"] != verification.BODY_DIFF)
     print(f"wrote parity/reads-results.json — {len(rows)} read ops, {ok} deep-verified "
+          f"(bodies diffed), {dict(other)} verified another way "
           f"(correlated {npairs} items by Path)")
 
 
@@ -764,7 +1138,8 @@ def selfcheck():
     ctx = {"user": "U", "u": "U", "genre": "G", "studio": "S", "person": "P", "series": "SE",
            "task": "T", "device": "D", "artist": "A", "artist_id": "AID", "musicgenre": "MG",
            "channel": "CH", "album_id": "ALB", "movie": "MOV", "episode": "EP",
-           "musicgenre_id": "MGID", "year": "Y", "named_listings": {}}
+           "musicgenre_id": "MGID", "year": "Y", "named_listings": {},
+           "lyric_lrc": "L1", "lyric_elrc": "L2", "lyric_txt": "L3"}
     # The context keys the self-check invents must be the ones resolve_named
     # actually produces, or this guard passes while the live run KeyErrors.
     import inspect
@@ -824,6 +1199,17 @@ def selfcheck():
     assert any("/MusicGenres/{genre}/InstantMix" in t
                for t in legs["GET /MusicGenres/{name}/InstantMix"]), \
         legs["GET /MusicGenres/{name}/InstantMix"]
+    # Method derivation: two EMPTY result envelopes agreeing on their own zeros is
+    # not the body-diff headline, and a pair that compared nothing at all is not a
+    # verdict. Both are the shapes that silently inflated the count before.
+    empty = {"Items": [], "TotalRecordCount": 0, "StartIndex": 0}
+    n, _, compared = diff_stats(empty, dict(empty))
+    assert n == 0 and compared == 2
+    assert verification.read_method(empty, dict(empty), compared) == verification.EMPTY_CORPUS
+    assert verification.read_method({}, {}, 0) is None
+    assert verification.read_method({"Items": [{"Name": "x"}], "TotalRecordCount": 1},
+                                    {"Items": [{"Name": "x"}], "TotalRecordCount": 1},
+                                    2) == verification.BODY_DIFF
     hf, jf = {"a": True, "b": True, "c": False}, {"a": True, "b": False, "c": False}
     bad = [k for k in sorted(set(hf) | set(jf))
            if hf.get(k) != jf.get(k) or hf.get(k) is False]

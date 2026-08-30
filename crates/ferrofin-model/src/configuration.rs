@@ -165,6 +165,83 @@ impl Default for ImageOption {
     }
 }
 
+/// The default image-download options for an item type — a verbatim
+/// transliteration of the static `TypeOptions.DefaultImageOptions` dictionary
+/// (v10.11.8 `MediaBrowser.Model/Configuration/TypeOptions.cs`), including the
+/// declaration ORDER of each array, which the wire preserves.
+///
+/// A type the dictionary does not name gets an empty slice — C#
+/// `LibraryController`'s `defaultImageOptions ?? Array.Empty<ImageOption>()`.
+/// That is why Person/Book/Video/Photo/Audio/Playlist report `[]` rather than
+/// a guessed Primary/Backdrop pair.
+#[must_use]
+pub fn default_image_options(item_type: &str) -> &'static [ImageOption] {
+    const fn opt(type_: ImageType, limit: i32, min_width: i32) -> ImageOption {
+        ImageOption {
+            type_,
+            limit,
+            min_width,
+        }
+    }
+    use ImageType::{Art, Backdrop, Banner, Disc, Logo, Primary, Thumb};
+
+    // Movie and MusicVideo share one array upstream; the entries (and their
+    // order) are identical, so they share one constant here.
+    const MOVIE: &[ImageOption] = &[
+        opt(Backdrop, 1, 1280),
+        // Upstream: "Don't download this by default as it's rarely used."
+        opt(Art, 0, 0),
+        opt(Disc, 0, 0),
+        opt(Primary, 1, 0),
+        opt(Banner, 0, 0),
+        opt(Thumb, 1, 0),
+        opt(Logo, 1, 0),
+    ];
+
+    const SERIES: &[ImageOption] = &[
+        opt(Backdrop, 1, 1280),
+        opt(Art, 0, 0),
+        opt(Primary, 1, 0),
+        opt(Banner, 1, 0),
+        opt(Thumb, 1, 0),
+        opt(Logo, 1, 0),
+    ];
+    const MUSIC_ALBUM: &[ImageOption] = &[opt(Backdrop, 0, 1280), opt(Disc, 0, 0)];
+    const MUSIC_ARTIST: &[ImageOption] = &[
+        opt(Backdrop, 1, 1280),
+        opt(Banner, 0, 0),
+        opt(Art, 0, 0),
+        opt(Logo, 1, 0),
+    ];
+    const BOX_SET: &[ImageOption] = &[
+        opt(Backdrop, 1, 1280),
+        opt(Primary, 1, 0),
+        opt(Thumb, 1, 0),
+        opt(Logo, 1, 0),
+        opt(Art, 0, 0),
+        opt(Disc, 0, 0),
+        opt(Banner, 0, 0),
+    ];
+    const SEASON: &[ImageOption] = &[
+        opt(Backdrop, 0, 1280),
+        opt(Primary, 1, 0),
+        opt(Banner, 0, 0),
+        opt(Thumb, 0, 0),
+    ];
+    const EPISODE: &[ImageOption] = &[opt(Backdrop, 0, 1280), opt(Primary, 1, 0)];
+
+    match item_type {
+        "Movie" | "MusicVideo" => MOVIE,
+        "Series" => SERIES,
+        "MusicAlbum" => MUSIC_ALBUM,
+        "MusicArtist" => MUSIC_ARTIST,
+        "BoxSet" => BOX_SET,
+        "Season" => SEASON,
+        "Episode" => EPISODE,
+        _ => &[],
+    }
+}
+
 /// Info about a media path in a library.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
@@ -209,7 +286,16 @@ pub struct LibraryTypeOptionsDto {
 
     /// Gets or sets the available similarity providers. Local ones are
     /// default-enabled; remote ones must be ticked.
-    #[serde(default)]
+    ///
+    /// NEVER put on the wire. `SimilarItemProviders` is a post-10.11.8 addition
+    /// (it appears on upstream master's `TypeOptions`/`LibraryTypeOptionsDto`
+    /// but not on `v10.11.8`), and `LibraryTypeOptionsDto` in
+    /// `contracts/jellyfin-openapi-10.11.8.json` sets `additionalProperties:
+    /// false` — so emitting it made every `GET /Libraries/AvailableOptions`
+    /// body schema-invalid. It stays computed because Ferrofin's similarity
+    /// registry is real; only the wire projection is withheld until the
+    /// vendored contract is bumped.
+    #[serde(default, skip_serializing)]
     pub similar_item_providers: Vec<LibraryOptionInfoDto>,
 
     /// Gets or sets the supported image types.

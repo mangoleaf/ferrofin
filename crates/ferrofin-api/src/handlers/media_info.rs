@@ -174,7 +174,9 @@ async fn playback_info(
     // The client threads this id through every playback-progress report; C#
     // mints a fresh GUID per PlaybackInfo call, so a null here breaks reporting.
     // Minted before the decision loop so the metrics row can be keyed by it.
-    let play_session_id = Uuid::new_v4().to_string();
+    // `MediaInfoHelper.cs:142` formats it `ToString("N")` — 32 hex digits, no
+    // hyphens — which is the shape clients echo back.
+    let play_session_id = Uuid::new_v4().simple().to_string();
 
     // When the client posts its device profile, decide per source whether it can
     // direct-play or must transcode (e.g. h264 video but AC3 audio a browser can't

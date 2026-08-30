@@ -288,12 +288,12 @@ impl<'a> FetcherPolicy<'a> {
     }
 
     /// Whether the library enabled metadata fetcher `name` for `kind`.
+    ///
+    /// Delegates to the shared gate so the scan and the on-demand refresh in
+    /// `ferrofin-providers` answer this question with one implementation —
+    /// C# has exactly one (`BaseItemManager.IsMetadataFetcherEnabled`).
     fn metadata_enabled(self, kind: &str, name: &str) -> bool {
-        self.type_entry(kind).is_none_or(|t| {
-            t.metadata_fetchers
-                .iter()
-                .any(|f| f.eq_ignore_ascii_case(name))
-        })
+        ferrofin_providers::library_options::metadata_fetcher_enabled(self.options, kind, name)
     }
 
     /// The fetcher's admin-order position for `kind` (lower = higher
@@ -309,12 +309,10 @@ impl<'a> FetcherPolicy<'a> {
     }
 
     /// Whether the library enabled image fetcher `name` for `kind`.
+    ///
+    /// Delegates to the shared gate — see [`Self::metadata_enabled`].
     fn image_enabled(self, kind: &str, name: &str) -> bool {
-        self.type_entry(kind).is_none_or(|t| {
-            t.image_fetchers
-                .iter()
-                .any(|f| f.eq_ignore_ascii_case(name))
-        })
+        ferrofin_providers::library_options::image_fetcher_enabled(self.options, kind, name)
     }
 
     /// The library's preferred metadata language, lowercased. Jellyfin's own
@@ -1493,8 +1491,22 @@ impl LibraryScanner {
                 .await?;
         }
         self.save_chapters(item_id, &probe.chapters).await?;
-        // Artwork — locked items skip the rewrite entirely: their image rows
-        // are user-owned.
+        // Artwork. TODO(parity, open work item — NOT an accepted divergence):
+        // upstream does NOT skip the whole pass for a locked row. v10.11.8
+        // `MediaBrowser.Providers/Manager/ProviderManager.cs:412` returns true
+        // for `provider is ILocalImageProvider` BEFORE the `item.IsLocked`
+        // check, so only the REMOTE image providers are gated — Jellyfin keeps
+        // re-discovering a sidecar `poster.jpg` on a locked item. Ferrofin
+        // skips everything, so a locked row's Primary freezes at whatever was
+        // stored (measured on the parity lab: a metadata-dir download stayed
+        // Primary where Jellyfin held the sidecar).
+        //
+        // It cannot be fixed here alone: `save_item_images` REPLACES the rows,
+        // so un-gating this while `item_update.rs` still auto-locks on any edit
+        // would let a scan overwrite a user-chosen image. The pair is
+        // (a) port `MetadataService`'s per-field merge rules and drop the
+        // auto-lock in `item_update.rs`, (b) narrow this gate to the remote arm
+        // (`if images.is_empty() && !locked` around `fetch_remote_images`).
         if !media.locked {
             let art = ArtworkPass {
                 entity,
@@ -2085,10 +2097,14 @@ impl LibraryScanner {
             return Ok(());
         };
         {
+            // C# `AlbumMetadataService.GetChildrenForMetadataUpdates` is
+            // `item.GetRecursiveChildren(i => i is Audio)` — recursive, so a
+            // multi-disc album (`Album/Disc 1/*.flac`) still aggregates.
             let tracks = items
                 .get_item_list(&InternalItemsQuery {
                     parent_id: album_uuid,
                     include_item_types: vec![BaseItemKind::Audio],
+                    recursive: true,
                     ..Default::default()
                 })
                 .await?;
@@ -2390,6 +2406,12 @@ impl LibraryScanner {
         let source = &probed.media_source;
         entity.run_time_ticks = source.run_time_ticks.or(entity.run_time_ticks);
         entity.size = source.size.or(entity.size);
+        // Both probers persist the container bitrate onto the item row
+        // (`FFProbeVideoInfo.cs:216` / `AudioFileProber.cs:133`, both
+        // `TotalBitrate = mediaInfo.Bitrate`). `BaseItem.GetVersionInfo` seeds
+        // the media source from it, and `ItemSortBy.VideoBitRate` orders on it,
+        // so leaving it NULL silently breaks that sort.
+        entity.total_bitrate = source.bitrate.map(i64::from).or(entity.total_bitrate);
         // The item row's own Width/Height are the PRIMARY VIDEO STREAM's, written
         // by the video prober on every probe (`FFProbeVideoInfo.Fetch`,
         // FFProbeVideoInfo.cs:265-266: `video.Height = videoStream?.Height ?? 0;
@@ -6320,7 +6342,6 @@ fn apply_audio_metadata(entity: &mut BaseItemEntity, info: &MediaInfo) -> Vec<(S
         .filter(|s| !s.is_empty())
     {
         entity.name = Some(title.to_owned());
-        entity.sort_name = Some(create_sort_name(title));
     }
     // The ALBUM tag replaces the plan's folder-stem placeholder (upstream's
     // `audio.Album ??= trackAlbum` works on a null the resolver left; here the
@@ -6369,6 +6390,19 @@ fn apply_audio_metadata(entity: &mut BaseItemEntity, info: &MediaInfo) -> Vec<(S
     }
     if entity.premiere_date.is_none() {
         entity.premiere_date = info.premiere_date;
+    }
+    // The sort key is recomputed LAST, because `Audio.CreateSortName` reads the
+    // disc/track numbers this pass just filled in
+    // (`{ParentIndexNumber:0000 - }{IndexNumber:0000 - }Name`). Deriving it
+    // earlier — as the resolver's `base_item` does for every row — leaves a
+    // track sorting by the alphanumeric name key, which puts it in a different
+    // place than Jellyfin puts it in every album and every search-hint page.
+    // A `ForcedSortName` (an NFO `<sortname>`) still wins, as `BaseItem.SortName`
+    // does.
+    if entity.forced_sort_name.is_none()
+        && let Some(name) = entity.name.clone()
+    {
+        entity.sort_name = Some(derived_sort_name(entity, &name));
     }
     info.provider_ids
         .iter()
@@ -6524,19 +6558,23 @@ fn apply_album_child_metadata(
     album: &BaseItemEntity,
     tracks: &[BaseItemEntity],
 ) -> (BaseItemEntity, bool) {
-    // Aggregate album-artist + year from the tracks onto the album row.
+    // Aggregate the tracks' metadata onto the album row.
     let mut updated = album.clone();
     let mut changed = false;
-    if updated
-        .album_artists
-        .as_deref()
-        .unwrap_or_default()
-        .is_empty()
-        && let Some(aa) = tracks
-            .iter()
-            .find_map(|t| t.album_artists.clone().filter(|s| !s.is_empty()))
-    {
-        updated.album_artists = Some(aa);
+    // `MetadataService.UpdateCumulativeRunTimeTicks` (v10.11.8
+    // `MediaBrowser.Providers/Manager/MetadataService.cs`), which the base
+    // `UpdateMetadataFromChildren` runs for any `Folder` with
+    // `SupportsCumulativeRunTimeTicks` — `MusicAlbum.cs` sets it. It runs BEFORE
+    // the `IsLocked` early-return in `AlbumMetadataService`, so a locked album
+    // still gets its runtime. The sum is assigned even when it is 0, which is
+    // why Jellyfin emits `RunTimeTicks: 0` and never omits the field.
+    let ticks: i64 = tracks
+        .iter()
+        .filter(|t| !t.is_folder)
+        .map(|t| t.run_time_ticks.unwrap_or(0))
+        .sum();
+    if updated.run_time_ticks != Some(ticks) {
+        updated.run_time_ticks = Some(ticks);
         changed = true;
     }
     // The item-level lock stands in for C#'s per-field
@@ -6556,6 +6594,21 @@ fn apply_album_child_metadata(
         changed |= assign_from_children(
             &mut updated.studios,
             &distinct_ignoring_case(tracks.iter().map(|t| t.studios.as_deref())),
+        );
+        // `AlbumMetadataService.SetArtistsFromSongs` — the tracks' performer
+        // credits, most-frequent first. Without this the album row's `Artists`
+        // column stays NULL and the DTO omits both `Artists` and `ArtistItems`.
+        changed |= assign_ordered(
+            &mut updated.artists,
+            &frequency_ordered_distinct(tracks.iter().map(|t| t.artists.as_deref())),
+        );
+        // `AlbumMetadataService.SetAlbumArtistFromSongs` — the same shape over
+        // the tracks' album-artist tags. C# assigns unconditionally; the old
+        // "fill only when the column is empty, from the first non-empty track"
+        // rule appears nowhere upstream.
+        changed |= assign_ordered(
+            &mut updated.album_artists,
+            &frequency_ordered_distinct(tracks.iter().map(|t| t.album_artists.as_deref())),
         );
     }
     // `MetadataService.UpdatePremiereDate`: the earliest child premiere
@@ -6617,6 +6670,82 @@ fn distinct_ignoring_case<'a>(columns: impl Iterator<Item = Option<&'a str>>) ->
         }
     }
     out
+}
+
+/// The grouping key of .NET's `StringComparer.OrdinalIgnoreCase`.
+///
+/// Ordinal-ignore-case is *invariant simple* case folding: .NET upper-cases one
+/// char to exactly one char and leaves a char whose mapping is not 1:1 alone.
+/// Rust's `str::to_lowercase` is the *full* Unicode mapping, which is a
+/// different comparer — under it `\u{3c2}` (final sigma) and `\u{3c3}` are
+/// distinct, where .NET folds both to `\u{3a3}` and calls them equal. Folding
+/// per char and keeping only the 1:1 results reproduces .NET exactly, including
+/// its non-folds (`\u{df}` stays, because `ToUpperInvariant` cannot expand it
+/// to `SS`).
+fn ordinal_ignore_case_key(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| {
+            let mut upper = c.to_uppercase();
+            match (upper.next(), upper.next()) {
+                (Some(one), None) => one,
+                _ => c,
+            }
+        })
+        .collect()
+}
+
+/// The distinct values of a `|`-joined column across a set of children, ordered
+/// by descending frequency with ties keeping first-appearance order.
+///
+/// Port of the LINQ `children.SelectMany(...).GroupBy(i, OrdinalIgnoreCase)
+/// .OrderByDescending(g => g.Count()).Select(g => g.Key)` that
+/// `AlbumMetadataService.SetArtistsFromSongs` / `SetAlbumArtistFromSongs` run.
+/// `GroupBy` yields groups in first-appearance order and `g.Key` is the
+/// first-seen casing; `OrderByDescending` is a stable sort, so `sort_by` on an
+/// insertion-ordered vector reproduces it exactly.
+fn frequency_ordered_distinct<'a>(columns: impl Iterator<Item = Option<&'a str>>) -> Vec<String> {
+    let mut order: Vec<(String, usize)> = Vec::new();
+    let mut index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for value in columns
+        .flatten()
+        .flat_map(|column| column.split('|'))
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        let key = ordinal_ignore_case_key(value);
+        if let Some(&at) = index.get(&key) {
+            order[at].1 += 1;
+        } else {
+            index.insert(key, order.len());
+            order.push((value.to_owned(), 1));
+        }
+    }
+    // Stable, so ties keep first-appearance order — C# `OrderByDescending`.
+    order.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+    order.into_iter().map(|(name, _)| name).collect()
+}
+
+/// Writes an aggregated child value list onto a parent's `|`-joined column when
+/// the ORDERED, case-sensitive sequence differs, reporting whether it changed.
+///
+/// This is the comparison `Set*FromSongs` uses — a plain
+/// `SequenceEqual(..., StringComparer.Ordinal)` — as opposed to the sorted,
+/// case-insensitive set comparison of `UpdateGenres`/`UpdateStudios`. A pure
+/// re-ordering therefore counts as a change and rewrites the column.
+fn assign_ordered(column: &mut Option<String>, values: &[String]) -> bool {
+    let current: Vec<&str> = column
+        .as_deref()
+        .unwrap_or_default()
+        .split('|')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if current.len() == values.len() && current.iter().zip(values).all(|(c, v)| *c == v.as_str()) {
+        return false;
+    }
+    *column = (!values.is_empty()).then(|| values.join("|"));
+    true
 }
 
 /// Writes an aggregated child value list onto a parent's `|`-joined column,
@@ -6731,8 +6860,27 @@ fn derived_sort_name(entity: &BaseItemEntity, title: &str) -> String {
     match entity.type_.rsplit('.').next().unwrap_or(&entity.type_) {
         "Episode" => episode_sort_name(entity.parent_index_number, entity.index_number, title),
         "Season" => season_sort_name(entity.index_number, title),
+        "Audio" | "AudioBook" => {
+            audio_sort_name(entity.parent_index_number, entity.index_number, title)
+        }
         _ => create_sort_name(title),
     }
+}
+
+/// Port of C# `Audio.CreateSortName` (v10.11.8
+/// `MediaBrowser.Controller/Entities/Audio/Audio.cs`):
+/// `ParentIndexNumber.ToString("0000 - ") + IndexNumber.ToString("0000 - ") + Name`,
+/// each prefix omitted when its number is absent, and the **raw** name appended
+/// — `Audio` overrides `CreateSortName` outright, so the alphanumeric
+/// lowercase/pad pipeline never runs on a track.
+///
+/// A track stored with the alphanumeric key instead sorts in a different place
+/// than Jellyfin puts it, which reorders every album and every search-hint page
+/// that contains one.
+fn audio_sort_name(parent_index: Option<i64>, index: Option<i64>, name: &str) -> String {
+    let disc = parent_index.map_or_else(String::new, |n| format!("{n:04} - "));
+    let track = index.map_or_else(String::new, |n| format!("{n:04} - "));
+    format!("{disc}{track}{name}")
 }
 
 /// Port of C# `BaseItem.CreateSortName` + `ModifySortChunks`; the shared
@@ -6896,6 +7044,29 @@ mod tests {
     use ferrofin_db::entities::base_items::BaseItemEntity;
     use ferrofin_model::data::BaseItemKind;
     use ferrofin_traits::persistence::ItemPersistenceService as _;
+
+    /// `AlbumMetadataService` groups the songs' artists with
+    /// `StringComparer.OrdinalIgnoreCase`, which folds one char to one char and
+    /// leaves the non-1:1 mappings alone. `str::to_lowercase` (the full Unicode
+    /// mapping) is a different comparer, and these are the pairs where they part.
+    #[test]
+    fn ordinal_ignore_case_matches_dotnet_not_full_case_mapping() {
+        let key = super::ordinal_ignore_case_key;
+        assert_eq!(key("Artist 01"), key("ARTIST 01"));
+        // Greek final sigma: .NET folds \u{3c2}/\u{3c3} together, `to_lowercase` does not.
+        assert_eq!(key("\u{3c2}"), key("\u{3c3}"));
+        assert_ne!("\u{3c2}".to_lowercase(), "\u{3c3}".to_lowercase());
+        // Turkish dotted capital I stays distinct from ASCII `i`, as in .NET.
+        assert_ne!(key("\u{130}"), key("i"));
+        // Sharp s does not expand: `ToUpperInvariant` cannot map it 1:1 to `SS`.
+        assert_ne!(key("\u{df}"), key("ss"));
+        // Frequency ordering itself is unaffected by the change.
+        let rows = [Some("B|a"), Some("A"), Some("b")];
+        assert_eq!(
+            super::frequency_ordered_distinct(rows.iter().copied()),
+            vec!["B".to_owned(), "a".to_owned()]
+        );
+    }
 
     // date_modified must be the file's mtime (stable across rescans), never the
     // scan time: it feeds ImageTags and the resize-cache key, so a churning value
@@ -8075,9 +8246,14 @@ mod tests {
             Arc::new(FerrofinItemRepository::new(db.clone(), lookup));
 
         let album_id = uuid::Uuid::new_v4();
+        let track_ids = [
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+        ];
         let stored = |k| stored_type_name(k).unwrap().to_owned();
-        let track = |name: &str, genres: &str, month: u32| BaseItemEntity {
-            id: ferrofin_db::store::guid_to_db(uuid::Uuid::new_v4()),
+        let track = |id: uuid::Uuid, name: &str, genres: &str, month: u32| BaseItemEntity {
+            id: ferrofin_db::store::guid_to_db(id),
             type_: stored(BaseItemKind::Audio),
             name: Some(name.to_owned()),
             parent_id: Some(ferrofin_db::store::guid_to_db(album_id)),
@@ -8101,12 +8277,21 @@ mod tests {
                 },
                 // Two tracks share a genre with different casing (C# dedupes
                 // `OrdinalIgnoreCase`), a third adds a second genre.
-                track("So What", "Jazz", 6),
-                track("Blue in Green", "jazz", 3),
-                track("Flamenco Sketches", "Jazz|Modal", 9),
+                track(track_ids[0], "So What", "Jazz", 6),
+                track(track_ids[1], "Blue in Green", "jazz", 3),
+                track(track_ids[2], "Flamenco Sketches", "Jazz|Modal", 9),
             ])
             .await
             .expect("seed");
+        // The scan records the album as each track's ancestor; the aggregation
+        // reads the tracks through the recursive (`GetRecursiveChildren`) query,
+        // so a multi-disc album still aggregates.
+        for id in track_ids {
+            persistence
+                .set_ancestors(id, &[album_id])
+                .await
+                .expect("ancestors");
+        }
 
         let tmp = tempfile::tempdir().unwrap();
         let vf: Arc<dyn VirtualFolderManager> = Arc::new(
@@ -8160,6 +8345,146 @@ mod tests {
         );
     }
 
+    /// `Audio.CreateSortName` (v10.11.8
+    /// `MediaBrowser.Controller/Entities/Audio/Audio.cs`):
+    /// `{ParentIndexNumber:0000 - }{IndexNumber:0000 - }Name`, with the RAW
+    /// name — `Audio` overrides `CreateSortName`, so the alphanumeric pipeline
+    /// never runs on a track.
+    #[rstest::rstest]
+    #[case(
+        None,
+        Some(1),
+        "Artist 01 Album 01 Track 01",
+        "0001 - Artist 01 Album 01 Track 01"
+    )]
+    #[case(Some(2), Some(13), "Blue in Green", "0002 - 0013 - Blue in Green")]
+    #[case(None, None, "So What", "So What")]
+    #[case(Some(1), None, "So What", "0001 - So What")]
+    fn audio_sort_name_matches_the_csharp_format(
+        #[case] disc: Option<i64>,
+        #[case] track: Option<i64>,
+        #[case] name: &str,
+        #[case] expected: &str,
+    ) {
+        assert_eq!(super::audio_sort_name(disc, track, name), expected);
+    }
+
+    /// `derived_sort_name` routes `Audio`/`AudioBook` to that override and
+    /// leaves every other kind on the alphanumeric pipeline.
+    #[test]
+    fn only_the_audio_kinds_take_the_audio_sort_override() {
+        use ferrofin_db::entities::base_items::BaseItemEntity;
+        let row = |type_: &str| BaseItemEntity {
+            type_: type_.to_owned(),
+            index_number: Some(1),
+            ..Default::default()
+        };
+        assert_eq!(
+            super::derived_sort_name(
+                &row("MediaBrowser.Controller.Entities.Audio.Audio"),
+                "Track 01"
+            ),
+            "0001 - Track 01"
+        );
+        assert_eq!(
+            super::derived_sort_name(
+                &row("MediaBrowser.Controller.Entities.Movies.Movie"),
+                "The A"
+            ),
+            ferrofin_util::sort_name::create_sort_name("The A")
+        );
+    }
+
+    /// `AlbumMetadataService.SetArtistsFromSongs` / `SetAlbumArtistFromSongs`
+    /// and the base `UpdateCumulativeRunTimeTicks`, on the shape the parity
+    /// fixture has: three tracks by one artist, 2 s each.
+    #[test]
+    fn album_aggregates_artists_and_cumulative_runtime_from_tracks() {
+        use super::apply_album_child_metadata;
+        use ferrofin_db::entities::base_items::BaseItemEntity;
+
+        let track = |artists: &str, ticks: i64| BaseItemEntity {
+            type_: "MediaBrowser.Controller.Entities.Audio.Audio".to_owned(),
+            artists: Some(artists.to_owned()),
+            album_artists: Some("Artist 03".to_owned()),
+            run_time_ticks: Some(ticks),
+            ..Default::default()
+        };
+        let album = BaseItemEntity {
+            type_: "MediaBrowser.Controller.Entities.Audio.MusicAlbum".to_owned(),
+            name: Some("Album 01".to_owned()),
+            is_folder: true,
+            ..Default::default()
+        };
+
+        let tracks = [
+            track("Artist 03", 20_000_000),
+            track("Artist 03", 20_000_000),
+            track("Artist 03", 20_000_000),
+        ];
+        let (updated, changed) = apply_album_child_metadata(&album, &tracks);
+        assert!(changed);
+        assert_eq!(updated.artists.as_deref(), Some("Artist 03"));
+        assert_eq!(updated.album_artists.as_deref(), Some("Artist 03"));
+        assert_eq!(updated.run_time_ticks, Some(60_000_000));
+
+        // Zero-length tracks still assign 0 — Jellyfin emits `RunTimeTicks: 0`,
+        // it never omits the field.
+        let silent = [track("Artist 03", 0)];
+        let (updated, _) = apply_album_child_metadata(&album, &silent);
+        assert_eq!(updated.run_time_ticks, Some(0));
+    }
+
+    /// `GroupBy(...).OrderByDescending(g => g.Count())`: the most-credited
+    /// artist leads, ties keep first-appearance order, and the casing is the
+    /// first-seen one.
+    #[test]
+    fn album_artists_are_frequency_ordered() {
+        use super::apply_album_child_metadata;
+        use ferrofin_db::entities::base_items::BaseItemEntity;
+
+        let track = |artists: &str| BaseItemEntity {
+            type_: "MediaBrowser.Controller.Entities.Audio.Audio".to_owned(),
+            artists: Some(artists.to_owned()),
+            ..Default::default()
+        };
+        let album = BaseItemEntity {
+            type_: "MediaBrowser.Controller.Entities.Audio.MusicAlbum".to_owned(),
+            is_folder: true,
+            ..Default::default()
+        };
+        let tracks = [track("A|B"), track("b"), track("B")];
+        let (updated, _) = apply_album_child_metadata(&album, &tracks);
+        assert_eq!(updated.artists.as_deref(), Some("B|A"));
+    }
+
+    /// The C# order is: base `UpdateMetadataFromChildren` (cumulative runtime)
+    /// FIRST, then `if (item.IsLocked) return;`. So a locked album keeps its
+    /// user-owned artist columns but still gets its runtime updated.
+    #[test]
+    fn locked_album_keeps_artists_but_still_gets_runtime() {
+        use super::apply_album_child_metadata;
+        use ferrofin_db::entities::base_items::BaseItemEntity;
+
+        let album = BaseItemEntity {
+            type_: "MediaBrowser.Controller.Entities.Audio.MusicAlbum".to_owned(),
+            is_folder: true,
+            is_locked: true,
+            artists: Some("Hand Edited".to_owned()),
+            ..Default::default()
+        };
+        let tracks = [BaseItemEntity {
+            type_: "MediaBrowser.Controller.Entities.Audio.Audio".to_owned(),
+            artists: Some("Artist 03".to_owned()),
+            run_time_ticks: Some(20_000_000),
+            ..Default::default()
+        }];
+        let (updated, changed) = apply_album_child_metadata(&album, &tracks);
+        assert!(changed);
+        assert_eq!(updated.artists.as_deref(), Some("Hand Edited"));
+        assert_eq!(updated.run_time_ticks, Some(20_000_000));
+    }
+
     #[tokio::test]
     async fn enrich_music_resolves_ids_from_embedded_track_tags() {
         use crate::item_persistence_service::FerrofinItemPersistenceService;
@@ -8200,6 +8525,10 @@ mod tests {
             ])
             .await
             .expect("seed");
+        persistence
+            .set_ancestors(track_id, &[album_id])
+            .await
+            .expect("ancestors");
         // Embedded MusicBrainz ids on the track, and the MusicArtist item.
         for (k, v) in [
             ("MusicBrainzAlbum", "rel-x"),
@@ -8300,6 +8629,10 @@ mod tests {
             ])
             .await
             .expect("seed");
+        persistence
+            .set_ancestors(track_id, &[album_id])
+            .await
+            .expect("ancestors");
         persistence
             .save_provider_id(track_id, "MusicBrainzAlbum", "rel-x")
             .await
@@ -9605,6 +9938,7 @@ mod tests {
     // A track's embedded cover becomes its Primary image, stored in the
     // metadata dir (never next to the user's media), and the album inherits it.
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn embedded_cover_art_lands_on_the_track_and_its_album() {
         use crate::item_persistence_service::FerrofinItemPersistenceService;
         use crate::item_repository::FerrofinItemRepository;
@@ -9648,6 +9982,10 @@ mod tests {
             ])
             .await
             .expect("seed");
+        persistence
+            .set_ancestors(track_id, &[album_id])
+            .await
+            .expect("ancestors");
         let track = items.retrieve_item(track_id).await.unwrap().unwrap();
 
         let vf: Arc<dyn VirtualFolderManager> = Arc::new(

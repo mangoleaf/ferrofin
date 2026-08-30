@@ -21,6 +21,7 @@ use ferrofin_traits::options::DtoOptions;
 use ferrofin_traits::persistence::ItemWithCounts;
 
 use crate::error::ApiError;
+use crate::handlers::items::parse_order_by;
 use crate::state::AppState;
 
 /// The paging + name-range query parameters shared by every by-name **list**
@@ -60,6 +61,18 @@ pub(crate) struct ByNameListQuery {
     /// When non-empty, the aggregated counts are folded onto each DTO.
     #[serde(default)]
     pub include_item_types: Option<String>,
+    /// Comma-delimited `BaseItemKind`s the inner content query excludes.
+    #[serde(default)]
+    pub exclude_item_types: Option<String>,
+    /// Comma-delimited media types the inner content query is restricted to.
+    #[serde(default)]
+    pub media_types: Option<String>,
+    /// Comma-delimited sort keys (C# `sortBy`), paired with [`Self::sort_order`].
+    #[serde(default)]
+    pub sort_by: Option<String>,
+    /// Comma-delimited sort directions (C# `sortOrder`).
+    #[serde(default)]
+    pub sort_order: Option<String>,
     /// Whether a total record count is requested (defaults to `true` in C#).
     #[serde(default)]
     pub enable_total_record_count: Option<bool>,
@@ -172,10 +185,24 @@ impl ByNameListQuery {
         let include_item_types = crate::handlers::query_parse::parse_csv_enums_lenient::<
             ferrofin_model::data::BaseItemKind,
         >(self.include_item_types.as_deref());
+        let exclude_item_types = crate::handlers::query_parse::parse_csv_enums_lenient::<
+            ferrofin_model::data::BaseItemKind,
+        >(self.exclude_item_types.as_deref());
+        // `GetItemValues` copies `MediaTypes` onto the inner content query too.
+        let media_types = crate::handlers::query_parse::parse_csv_enums_lenient::<
+            ferrofin_model::data::MediaType,
+        >(self.media_types.as_deref());
         ferrofin_traits::options::InternalItemsQuery {
             user,
             is_favorite,
             include_item_types,
+            exclude_item_types,
+            media_types,
+            // C# `MusicGenresController` (and every by-name sibling) passes
+            // `OrderBy = RequestHelpers.GetOrderBy(sortBy, sortOrder)`, which
+            // `ApplyOrder` then applies to the OUTER by-name query. Dropping it
+            // made `sortOrder=Descending` a silent no-op.
+            order_by: parse_order_by(self.sort_by.as_deref(), self.sort_order.as_deref()),
             start_index: self.start_index,
             limit: self.limit,
             search_term: self.search_term.clone(),
@@ -291,7 +318,13 @@ pub(crate) async fn project_query_result(
         .await?;
     if include_item_types {
         for (dto, counts) in dtos.iter_mut().zip(counts.iter()) {
-            dto.child_count = Some(counts.item_count);
+            // NOT `counts.item_count`: C# `GetItemValues` never assigns
+            // `ItemCounts.ItemCount` (nor `ProgramCount`), so
+            // `RequestHelpers.SetItemCounts`'s `dto.ChildCount =
+            // counts.ItemCount` always writes the `0` default. Putting the
+            // per-value aggregate there instead reported a number upstream
+            // never sends, in a field jellyfin-web does not read.
+            dto.child_count = Some(0);
             dto.program_count = Some(counts.program_count);
             dto.series_count = Some(counts.series_count);
             dto.episode_count = Some(counts.episode_count);

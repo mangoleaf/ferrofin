@@ -24,6 +24,67 @@ setup() { cd "$BATS_TEST_DIRNAME"; }
   [[ "$output" == *"benchmark coverage OK"* ]]
 }
 
+# The parity ledger's headline ("N/412 deep-verified") means ONE thing: the response
+# was diffed clean. Every row carrying a verdict must declare which method earned it,
+# from the closed set in parity/verification.py. That rule was enforced only when a
+# human typed `--check`: sweep.sh ran bare `gen-ledger.py`, no workflow and no test
+# ran the check, and an unstamped verdict was written into ledger.json AND LEDGER.md
+# — rendering the body-diff tick — before the process happened to die on an unrelated
+# sort. These three tests make the rule hold by CI instead of by habit.
+@test "every parity ledger verdict declares how it was verified" {
+  run python3 parity/gen-ledger.py --check
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"deep-verified (the headline)"* ]]
+}
+
+@test "verification method set self-test passes (nested empty envelopes, bare signatures)" {
+  run python3 parity/verification.py
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"5 verification methods"* ]]
+}
+
+# The guard must REFUSE, and refuse before writing: the failure mode being tested is
+# a complete ledger.json + LEDGER.md on disk with an unstamped row rendered ✅.
+@test "gen-ledger refuses to write a ledger when a verdict has no verification_method" {
+  scratch="$BATS_TEST_TMPDIR/repo"
+  mkdir -p "$scratch/suite"
+  ln -s "$BATS_TEST_DIRNAME/../contracts" "$scratch/contracts"
+  ln -s "$BATS_TEST_DIRNAME/../crates" "$scratch/crates"
+  cp -r parity "$scratch/suite/parity"
+  python3 - "$scratch/suite/parity" <<'STRIP'
+import glob, json, os, sys
+d = sys.argv[1]
+for f in glob.glob(os.path.join(d, "*-results.json")):
+    doc = json.load(open(f))
+    for row in doc["rows"].values():
+        row.pop("verification_method", None)
+    json.dump(doc, open(f, "w"))
+STRIP
+  before=$(md5sum "$scratch/suite/parity/ledger.json" | cut -d' ' -f1)
+  before_md=$(md5sum "$scratch/suite/parity/LEDGER.md" | cut -d' ' -f1)
+  run python3 "$scratch/suite/parity/gen-ledger.py"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"verification_method"* ]]
+  # nothing was written: the old code emitted both files complete, then crashed
+  [ "$before" = "$(md5sum "$scratch/suite/parity/ledger.json" | cut -d' ' -f1)" ]
+  [ "$before_md" = "$(md5sum "$scratch/suite/parity/LEDGER.md" | cut -d' ' -f1)" ]
+}
+
+# ledger.json and LEDGER.md are GENERATED — "do not hand-edit" is printed at the top
+# of the file and was enforced by nothing. Regeneration is offline (it re-folds the
+# committed parity/*-results.json against the contract and REAL_ROUTES), so the fix
+# for a failure here is one command: `python3 suite/parity/gen-ledger.py`.
+@test "regenerating the parity ledger is a no-op (it is generated, not hand-edited)" {
+  cp parity/ledger.json "$BATS_TEST_TMPDIR/ledger.committed.json"
+  cp parity/LEDGER.md "$BATS_TEST_TMPDIR/LEDGER.committed.md"
+  run python3 parity/gen-ledger.py
+  [ "$status" -eq 0 ]
+  run diff -q parity/ledger.json "$BATS_TEST_TMPDIR/ledger.committed.json"
+  [ "$status" -eq 0 ]
+  run diff -q parity/LEDGER.md "$BATS_TEST_TMPDIR/LEDGER.committed.md"
+  [ "$status" -eq 0 ]
+}
+
 @test "fingerprint shape hashing self-test passes" {
   run python3 fingerprint.py --selftest
   [ "$status" -eq 0 ]

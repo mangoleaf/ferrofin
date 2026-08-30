@@ -263,11 +263,20 @@ the substance of what a handler actually does — don't rely on a green checkmar
 ## Current scope
 
 **All 412 operations in the vendored contract are wired to real handlers — 0 stubs, 0 `501`s.**
-The parity ledger (`suite/parity/LEDGER.md`) classifies every op `REAL`, with 241 of them
-deep-verified (response + read-back diffed clean against Jellyfin 10.11.8), 146 classified as
-divergences (accepted, or named open work), and 25 awaiting a parity leg on the current tree.
-Those counts come from the ledger — re-read it rather than quoting this paragraph, and
-regenerate it (`python3 suite/parity/gen-ledger.py`) after any parity run. Working end-to-end: authentication/users/QuickConnect,
+The parity ledger (`suite/parity/LEDGER.md`) classifies every op `REAL`. Every ledger row
+declares HOW it was verified, from the closed set in `suite/parity/verification.py`, and
+**only `body-diff` — the response or a write's read-back itself diffed clean against Jellyfin
+10.11.8 — is counted in the deep-verified headline**. A row verified some weaker way (named
+`property`s agreed, a write's `effect` was confirmed, only the `status-class` matched, or both
+servers returned an `empty-corpus`) is real verification and is counted and rendered
+separately; it never joins the headline. A row with no method, or one outside the set, fails
+`gen-ledger.py --check` — there is no default, because a default is how a weak probe borrows a
+strong claim. That rule is enforced by machine, not by habit: `gen-ledger.py` VALIDATES BEFORE
+IT WRITES on every run (so the parity leg aborts rather than shipping an unstamped verdict),
+CI runs `--check` plus a negative test that the guard refuses, and `suite/viewer/` — the
+dashboard — counts `body-diff` only, exactly as `LEDGER.md` does. Read the counts off the
+ledger rather than quoting this paragraph, and regenerate it
+(`python3 suite/parity/gen-ledger.py`) after any parity run. Working end-to-end: authentication/users/QuickConnect,
 library scan + live filesystem watch, browse/query/DTO, images, sessions/playstate/remote
 control, WebSocket push, playlists/collections, direct play + live HLS transcode (subtitle
 burn-in, fMP4 HEVC/AV1), Live TV (M3U/XMLTV + DVR timers), SyncPlay, all 20 scheduled tasks,

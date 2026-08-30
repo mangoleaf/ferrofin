@@ -2,8 +2,10 @@
 //!
 //! These map the raw `ffprobe -print_format json` output onto strongly typed
 //! structs. Field names / `serde(rename)` keys match the upstream
-//! `[JsonPropertyName]` attributes byte-for-byte, including the notable
-//! `codec_tag_string?` typo (see [`MediaStreamInfo::codec_tag_string`]).
+//! `[JsonPropertyName]` attributes byte-for-byte, and the value types match
+//! upstream's nullability: a C# non-nullable `int`/`bool` becomes a plain
+//! `i32`/`bool` here (absent key deserializes to `0`/`false`, exactly as the
+//! .NET deserializer leaves the CLR default), not an `Option`.
 
 use std::collections::HashMap;
 
@@ -76,14 +78,20 @@ pub struct MediaStreamInfo {
     #[serde(default, rename = "bit_rate")]
     pub bit_rate: Option<String>,
     /// The width.
+    ///
+    /// Upstream declares `public int Width` (non-nullable, v10.11.8
+    /// `MediaStreamInfo.cs:95`), so an absent ffprobe key means `0`, not null.
     #[serde(default)]
-    pub width: Option<i32>,
+    pub width: i32,
     /// The reference frame count.
     #[serde(default)]
     pub refs: i32,
     /// The height.
+    ///
+    /// Upstream declares `public int Height` (non-nullable, v10.11.8
+    /// `MediaStreamInfo.cs:109`), so an absent ffprobe key means `0`, not null.
     #[serde(default)]
-    pub height: Option<i32>,
+    pub height: i32,
     /// The display aspect ratio.
     #[serde(default, rename = "display_aspect_ratio")]
     pub display_aspect_ratio: Option<String>,
@@ -110,8 +118,11 @@ pub struct MediaStreamInfo {
     #[serde(default, rename = "pix_fmt")]
     pub pixel_format: Option<String>,
     /// The level.
+    ///
+    /// Upstream declares `public int Level` (non-nullable, v10.11.8
+    /// `MediaStreamInfo.cs:172`), so an absent ffprobe key means `0`, not null.
     #[serde(default)]
-    pub level: Option<i32>,
+    pub level: i32,
     /// The time base.
     #[serde(default, rename = "time_base")]
     pub time_base: Option<String>,
@@ -120,16 +131,18 @@ pub struct MediaStreamInfo {
     pub codec_time_base: Option<String>,
     /// The codec tag string.
     ///
-    /// NOTE: upstream binds this to the JSON key `"codec_tag_string?"` (with a
-    /// trailing `?`), which never matches real ffprobe output. The typo is
-    /// preserved verbatim so the derived behaviour (e.g. `mjpeg` streams always
-    /// classified as embedded images because `codec_tag` is never populated)
-    /// matches the oracle exactly.
-    #[serde(default, rename = "codec_tag_string?")]
+    /// The pinned oracle (v10.11.8 `MediaStreamInfo.cs:206`) binds the plain
+    /// key `codec_tag_string`. A trailing-`?` typo exists on upstream *master*
+    /// only; binding that would make the key never deserialize, which in turn
+    /// misclassifies every `mjpeg` video stream as an embedded image.
+    #[serde(default, rename = "codec_tag_string")]
     pub codec_tag_string: Option<String>,
     /// Whether the stream is AVC (`is_avc`, may be a JSON string).
+    ///
+    /// Upstream declares `public bool IsAvc` (non-nullable, v10.11.8
+    /// `MediaStreamInfo.cs:235`), so an absent key means `false`, not null.
     #[serde(default, rename = "is_avc", deserialize_with = "de_bool_flexible")]
-    pub is_avc: Option<bool>,
+    pub is_avc: bool,
     /// The NAL length size.
     #[serde(default, rename = "nal_length_size")]
     pub nal_length_size: Option<String>,
@@ -246,7 +259,7 @@ pub struct MediaStreamInfoSideData {
 
 /// Deserializes a bool that ffprobe may encode as a JSON string
 /// (`"true"`/`"false"`), matching Jellyfin's `JsonBoolStringConverter`.
-fn de_bool_flexible<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+fn de_bool_flexible<'de, D>(deserializer: D) -> Result<bool, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -257,15 +270,15 @@ where
         Str(String),
     }
 
+    // The C# target is a non-nullable `bool`, so anything unparseable or absent
+    // lands on the CLR default rather than on null.
     let opt = Option::<BoolOrString>::deserialize(deserializer)?;
     Ok(match opt {
-        None => None,
-        Some(BoolOrString::Bool(b)) => Some(b),
-        Some(BoolOrString::Str(s)) => match s.trim().to_ascii_lowercase().as_str() {
-            "true" | "1" => Some(true),
-            "false" | "0" => Some(false),
-            _ => None,
-        },
+        None => false,
+        Some(BoolOrString::Bool(b)) => b,
+        Some(BoolOrString::Str(s)) => {
+            matches!(s.trim().to_ascii_lowercase().as_str(), "true" | "1")
+        }
     })
 }
 

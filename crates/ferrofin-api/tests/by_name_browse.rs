@@ -553,11 +553,16 @@ async fn genres_list_returns_query_result() {
 
 #[tokio::test]
 async fn genres_list_folds_counts_when_include_item_types_set() {
-    // `includeItemTypes` non-empty → aggregated counts fold onto ChildCount.
+    // `includeItemTypes` non-empty → the typed-count block is emitted. C#
+    // `GetItemValues` never assigns `ItemCounts.ItemCount`, and
+    // `RequestHelpers.SetItemCounts` copies that straight onto `ChildCount`, so
+    // upstream always reports `0` there — the per-value aggregate belongs in the
+    // typed counters, not in `ChildCount`.
     let response = get("/Genres?includeItemTypes=Movie").await;
     assert_eq!(response.status(), StatusCode::OK);
     let body = json_body(response).await;
-    assert_eq!(body["Items"][0]["ChildCount"], 7);
+    assert_eq!(body["Items"][0]["ChildCount"], 0);
+    assert_eq!(body["Items"][0]["ProgramCount"], 0);
 }
 
 #[tokio::test]

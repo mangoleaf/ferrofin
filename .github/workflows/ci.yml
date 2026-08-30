@@ -37,6 +37,28 @@ jobs:
       - name: benchmark coverage (contract accounted for)
         run: python3 suite/coverage.py
 
+      # The parity ledger's headline counts ONE method (body-diff: the response
+      # was itself diffed clean). --check rejects a row that carries a verdict
+      # without declaring which method earned it, a method outside the closed
+      # set, a method on a row with no verdict, and an open-work or unreviewed
+      # detector flag rendered as an accepted divergence. It ran nowhere until
+      # now, so the rule held only when a human remembered to type it — which is
+      # the same shape of defect the stamping exists to close.
+      #
+      # Pure Python, ~200 ms, no Rust, no Docker: sits with the coverage gate
+      # ahead of the toolchain rather than behind minutes of compilation.
+      - name: parity ledger (every verdict declares how it was verified)
+        run: python3 suite/parity/gen-ledger.py --check
+
+      # ...and the guard's own negative test: strip a method in a scratch copy and
+      # assert gen-ledger REFUSES and writes nothing. Scoped with --filter to the
+      # ledger tests: the rest of run.bats depends on host benchmark artifacts and
+      # is not what this step is signing up for.
+      - name: parity ledger guards fire (negative test)
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq bats
+          bats --filter 'ledger|verification method' suite/run.bats
+
       - uses: dtolnay/rust-toolchain@1.97.0
         with:
           components: rustfmt, clippy

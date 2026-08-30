@@ -29,6 +29,206 @@ import urllib.error
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from sweep import http, get_json, bring_up, container_read, ROOT, USER, PASS, CLIENT, opensubtitles_credentials   # reuse HTTP + provisioning
+import verification   # the closed set of verification methods
+
+# ---------------------------------------------------------------- how each row is verified
+#
+# Almost nothing in this layer diffs a body. The write's own response is normally
+# discarded (`st, _ = http(...)`), the read-back pulls out one to three NAMED
+# fields, and the two servers are combined by AND-ing two independent booleans —
+# no value from Ferrofin is ever compared to the same value from Jellyfin. Those
+# rows may NOT claim the ledger's `body-diff` headline. Each op declares which
+# weaker thing it actually established:
+#
+#   effect        a write was applied and its effect confirmed on that server's
+#                 own read-back (the favourite is set, the id is gone, the count
+#                 moved, the created object identifies itself).
+#   status-class  the request was accepted (`st < 300`) and NOTHING was read
+#                 back. A handler that 204s and ignores the request passes.
+#   property      a named property of a response body agreed (an MPEG-TS sync
+#                 signature, a non-empty search result) — no effect, no diff.
+#
+# The ONE exception is enumerated in `JOURNEY_BODY_DIFF` below and nowhere else:
+# a `Same(ok, evidence)` step whose evidence IS the whole raw response, so
+# `cross_server_ok` compares the two servers' bodies to each other. That is the
+# headline by the closed set's own definition, and it is an explicit allowlist
+# rather than a default precisely so a new journey cannot drift into it.
+#
+# `selfcheck()` asserts this table covers every op key the journeys declare, so a
+# new journey op cannot land in the ledger without saying how it was verified.
+JOURNEY_METHOD = {op: verification.STATUS_CLASS for op in (
+    # Bare `st < 300`: accepted, never read back.
+    "POST /Playlists/{playlistId}",                     # rename never read back
+    "POST /System/Ping",
+    "POST /Items/{itemId}/ContentType",
+    "POST /Items/{itemId}/Refresh",
+    "POST /Library/Refresh",
+    "POST /ScheduledTasks/Running/{taskId}",
+    "DELETE /ScheduledTasks/Running/{taskId}",
+    "DELETE /Items",                                    # the removal effect is the singular DELETE's
+    "POST /QuickConnect/Authorize",
+    # A status PAIR (real path 2xx, bogus path 4xx) — still only statuses.
+    "POST /Environment/ValidatePath",
+    # Remote-control commands fired at a session with no live receiver: the server
+    # accepting them is all that is observable here.
+    "POST /Sessions/Viewing",
+    "POST /Sessions/Playing/Ping",
+    "POST /Sessions/{sessionId}/Command/{command}",
+    "POST /Sessions/{sessionId}/Command",
+    "POST /Sessions/{sessionId}/Message",
+    "POST /Sessions/{sessionId}/Playing",
+    "POST /Sessions/{sessionId}/Playing/{command}",
+    "POST /Sessions/{sessionId}/System/{command}",
+    "POST /Sessions/{sessionId}/Viewing",
+)}
+JOURNEY_METHOD.update({op: verification.PROPERTY for op in (
+    # A container signature, not an effect: 200 + video/mp2t + a 0x47 sync byte at
+    # 0 and 188. Wrong PIDs, wrong channel or a black feed all match.
+    "GET /LiveTv/LiveStreamFiles/{streamId}/stream.{container}",
+    "GET /LiveTv/LiveRecordings/{recordingId}/stream",
+    # A read whose bar is "non-empty on both", not a write effect.
+    "GET /Items/{itemId}/RemoteSearch/Subtitles/{language}",
+    "GET /Providers/Subtitles/Subtitles/{subtitleId}",
+)})
+
+
+# The effect rows: a write was issued against BOTH servers and its effect confirmed
+# on each server's OWN read-back. Enumerated, not defaulted. `effect` used to be
+# whatever `journey_method` returned for an op nobody had classified, which is the
+# same shape of defect the whole stamping exercise exists to remove — a new journey
+# op would inherit the strongest verdict this layer can issue without anyone
+# deciding that it had earned it. `--check` now fails on an op that appears in no
+# list below.
+JOURNEY_METHOD.update({op: verification.EFFECT for op in (
+    "DELETE /Audio/{itemId}/Lyrics",
+    "DELETE /Auth/Keys/{key}",
+    "DELETE /Collections/{collectionId}/Items",
+    "DELETE /Devices",
+    "DELETE /Items/{itemId}",
+    "DELETE /Library/VirtualFolders",
+    "DELETE /Library/VirtualFolders/Paths",
+    "DELETE /LiveTv/Recordings/{recordingId}",
+    "DELETE /LiveTv/Timers/{timerId}",
+    "DELETE /PlayingItems/{itemId}",
+    "DELETE /Playlists/{playlistId}/Items",
+    "DELETE /Playlists/{playlistId}/Users/{userId}",
+    "DELETE /Sessions/{sessionId}/User/{userId}",
+    "DELETE /UserFavoriteItems/{itemId}",
+    "DELETE /UserItems/{itemId}/Rating",
+    "DELETE /UserPlayedItems/{itemId}",
+    "DELETE /Users/{userId}",
+    "DELETE /Videos/ActiveEncodings",
+    "DELETE /Videos/{itemId}/AlternateSources",
+    "DELETE /Videos/{itemId}/Subtitles/{index}",
+    "GET /Backup",
+    "GET /Backup/Manifest",
+    "GET /Devices/Options",
+    "GET /LiveTv/Programs/{programId}",
+    "GET /LiveTv/Recordings/{recordingId}",
+    "GET /LiveTv/Timers/{timerId}",
+    "GET /Playlists/{playlistId}",
+    "GET /Playlists/{playlistId}/Items",
+    "GET /Playlists/{playlistId}/Users",
+    "GET /Playlists/{playlistId}/Users/{userId}",
+    "GET /QuickConnect/Connect",
+    "GET /System/Configuration/{key}",
+    "GET /Users/{userId}",
+    "POST /Audio/{itemId}/Lyrics",
+    "POST /Auth/Keys",
+    "POST /Backup/Create",
+    "POST /ClientLog/Document",
+    "POST /Collections",
+    "POST /Collections/{collectionId}/Items",
+    "POST /Devices/Options",
+    "POST /DisplayPreferences/{displayPreferencesId}",
+    "POST /Items/{itemId}",
+    "POST /Items/{itemId}/PlaybackInfo",
+    "POST /Items/{itemId}/RemoteSearch/Subtitles/{subtitleId}",
+    "POST /Library/VirtualFolders",
+    "POST /Library/VirtualFolders/LibraryOptions",
+    "POST /Library/VirtualFolders/Name",
+    "POST /Library/VirtualFolders/Paths",
+    "POST /Library/VirtualFolders/Paths/Update",
+    "POST /LiveStreams/Close",
+    "POST /LiveStreams/Open",
+    "POST /LiveTv/ListingProviders",
+    "POST /LiveTv/Timers",
+    "POST /LiveTv/TunerHosts",
+    "POST /MergeVersions/MergeEpisodes",
+    "POST /MergeVersions/MergeMovies",
+    "POST /MergeVersions/SplitEpisodes",
+    "POST /MergeVersions/SplitMovies",
+    "POST /PlayingItems/{itemId}",
+    "POST /PlayingItems/{itemId}/Progress",
+    "POST /Playlists",
+    "POST /Playlists/{playlistId}/Items",
+    "POST /Playlists/{playlistId}/Items/{itemId}/Move/{newIndex}",
+    "POST /Playlists/{playlistId}/Users/{userId}",
+    "POST /QuickConnect/Initiate",
+    "POST /ScheduledTasks/{taskId}/Triggers",
+    "POST /Sessions/Capabilities",
+    "POST /Sessions/Capabilities/Full",
+    "POST /Sessions/Logout",
+    "POST /Sessions/Playing",
+    "POST /Sessions/Playing/Progress",
+    "POST /Sessions/Playing/Stopped",
+    "POST /Sessions/{sessionId}/User/{userId}",
+    "POST /Startup/Complete",
+    "POST /Startup/Configuration",
+    "POST /Startup/RemoteAccess",
+    "POST /Startup/User",
+    "POST /System/Configuration",
+    "POST /System/Configuration/Branding",
+    "POST /System/Configuration/{key}",
+    "POST /UserFavoriteItems/{itemId}",
+    "POST /UserItems/{itemId}/Rating",
+    "POST /UserItems/{itemId}/UserData",
+    "POST /UserPlayedItems/{itemId}",
+    "POST /Users",
+    "POST /Users/AuthenticateByName",
+    "POST /Users/AuthenticateWithQuickConnect",
+    "POST /Users/Configuration",
+    "POST /Users/ForgotPassword",
+    "POST /Users/ForgotPassword/Pin",
+    "POST /Users/New",
+    "POST /Users/Password",
+    "POST /Users/{userId}/Policy",
+    "POST /Videos/MergeVersions",
+    "POST /Videos/{itemId}/Subtitles",
+)})
+
+# The enumerated body-diff exception. `j_remote_search_identify` is the only journey
+# whose `Same.evidence` is the RAW response — `identify()` returns the candidate list
+# untouched, every key, order included — so `cross_server_ok` compares Ferrofin's body
+# to Jellyfin's directly, and does it with a bare `==` that has no VOLATILE denylist at
+# all (stricter than parity_diff, not looser). `RemoteSearchResult` has 12 contract
+# properties and not one is per-instance, which is why a whole-object comparison is
+# available here and nowhere else in this layer.
+#
+# This is a LIST, never a rule: an op earns the headline by being named here after
+# someone read its journey, which is the opposite of the silent default the stamping
+# work removed.
+JOURNEY_BODY_DIFF = frozenset((
+    "POST /Items/RemoteSearch/BoxSet",
+    "POST /Items/RemoteSearch/Movie",
+    "POST /Items/RemoteSearch/Person",
+    "POST /Items/RemoteSearch/Series",
+    "POST /Items/RemoteSearch/Trailer",
+))
+JOURNEY_METHOD.update({op: verification.BODY_DIFF for op in JOURNEY_BODY_DIFF})
+
+
+def journey_method(op):
+    """The declared method for a journey op. There is NO default: an op that no list
+    in `JOURNEY_METHOD` names raises, and `--check` turns that into a hard failure
+    before any results file is written."""
+    try:
+        return JOURNEY_METHOD[op]
+    except KeyError:
+        raise KeyError(
+            f"{op!r} declares no verification_method — add it to JOURNEY_METHOD "
+            f"(effect / status-class / property; journeys never body-diff)") from None
+
 
 
 class Same:
@@ -812,6 +1012,137 @@ def j_subtitles_upload(base, token, user, mid, _m2):
     return r
 
 
+LYRIC_REFRESH_WAIT_S = 10   # Jellyfin serves an uploaded lyric only once its refresh ran
+
+#: A synced .lrc: metadata tags (which must NOT surface as LyricDto.Metadata),
+#: three timestamped lines, one of them carrying enhanced-LRC word time tags.
+PARITY_LRC = ("[ar:Parity Artist]\n[ti:Parity Title]\n[al:Parity Album]\n"
+              "[00:01.00]First line\n"
+              "[00:05.50]<00:05.50>Second <00:06.00>line\n"
+              # Text BEFORE the first word tag. `LrcTimedTextUtils` seeds its tag
+              # list with the LINE's start, so this line owes a cue at position 0
+              # carrying [00:08.00] — a shape a word-tag-first corpus can never
+              # demand, and one Ferrofin used to drop.
+              "[00:08.00]Third <00:09.00>line\n"
+              "[00:12.25]Fourth line\n")
+#: What both servers must parse PARITY_LRC into, per line: Text, Start-in-ticks,
+#: and the word cues as (Position, EndPosition, Start, End). Asserting the CUES
+#: and not just the text is what makes this read-back a real check on the
+#: enhanced-LRC parser rather than a "it came back 200".
+PARITY_LRC_LINES = [
+    ("First line", 10000000, []),
+    # The tag index lands AFTER the space the parser inserts at a boundary, so
+    # the first cue of a `<tag>word <tag>word` line ends at 7, not 6.
+    ("Second line", 55000000, [(0, 7, 55000000, 60000000),
+                               (7, 11, 60000000, 80000000)]),
+    ("Third line", 80000000, [(0, 6, 80000000, 90000000),
+                              (6, 10, 90000000, 122500000)]),
+    ("Fourth line", 122500000, []),
+]
+
+
+def last_audio(base, token, user):
+    """The LAST audio item by Path — deterministic and identical on both servers,
+    and deliberately disjoint from the first three tracks reads.py seeds."""
+    b = get_json(base, f"/Items?userId={user}&recursive=true&includeItemTypes=Audio"
+                       f"&limit=500&fields=Path", token)
+    by_path = {i["Path"]: i["Id"] for i in (b or {}).get("Items") or [] if i.get("Path")}
+    return by_path[sorted(by_path)[-1]] if by_path else ""
+
+
+def lyric_lines(doc):
+    """(Text, Start, cues) per line of a LyricDto, shaped like PARITY_LRC_LINES."""
+    return [(ln.get("Text"), ln.get("Start"),
+             [(c.get("Position"), c.get("EndPosition"), c.get("Start"), c.get("End"))
+              for c in ln.get("Cues") or []])
+            for ln in (doc or {}).get("Lyrics") or []]
+
+
+def stored_lyric_lines(base, token, aid):
+    """The item's stored lyric lines (see `lyric_lines`), or None when it has none."""
+    st, raw = http("GET", f"{base}/Audio/{aid}/Lyrics", token)
+    if st != 200:
+        return None
+    try:
+        doc = json.loads(raw)
+    except ValueError:
+        return None
+    return lyric_lines(doc)
+
+
+def await_lyric(base, token, aid, present):
+    """Poll the read-back until the lyric is there (present=True) or gone."""
+    for _ in range(LYRIC_REFRESH_WAIT_S):
+        got = stored_lyric_lines(base, token, aid)
+        if (got is not None) == present:
+            return got
+        time.sleep(1)
+    return stored_lyric_lines(base, token, aid)
+
+
+def j_lyrics(base, token, user, mid, _m2):
+    """Upload a .lrc to an audio item -> it reads back as the parsed, timestamped
+    lyric -> delete it -> the item has no lyrics again. Also pins the two status
+    contracts the controller owes and that Ferrofin used to break: a file whose
+    extension no lyric parser claims is refused (400, nothing stored), and a
+    NON-audio id is a 404 on this route (`mid` is a movie) rather than an accepted
+    write. The lyric is reaped whatever happened, so a leftover from an aborted run
+    cannot mask the next.
+
+    The read-back is asserted line by line AND cue by cue against
+    `PARITY_LRC_LINES`, whose document deliberately includes a line with text
+    before its first word tag - the shape whose position-0 cue Ferrofin used to
+    drop.
+
+    This layer only ever compares a server against its OWN read-back, so both ops
+    are `effect` rows. The cross-server body diff of the parsed LyricDto - the
+    thing that actually pins Metadata/Cues/blank-line handling - is reads.py's
+    `GET /Audio/{itemId}/Lyrics` row, off the identical seeds it uploads."""
+    r = {}
+    aid = last_audio(base, token, user)
+    if not aid:
+        return r
+    pending = False        # True while an uploaded lyric is still on this server
+    try:
+        http("DELETE", f"{base}/Audio/{aid}/Lyrics", token)      # start from clean
+        st, raw = http("POST", f"{base}/Audio/{aid}/Lyrics?fileName=parity.lrc",
+                       token, PARITY_LRC)
+        pending = st == 200
+        try:
+            posted = json.loads(raw)
+        except ValueError:
+            posted = {}
+        echoed = lyric_lines(posted)
+        stored = await_lyric(base, token, aid, True)
+        # An extension no parser claims must be refused outright, not coerced.
+        bad = http("POST", f"{base}/Audio/{aid}/Lyrics?fileName=parity.foo", token, "hello")[0]
+        r["POST /Audio/{itemId}/Lyrics"] = (st == 200 and echoed == PARITY_LRC_LINES
+                                            and stored == PARITY_LRC_LINES and bad == 400)
+
+        st = http("DELETE", f"{base}/Audio/{aid}/Lyrics", token)[0]
+        gone = await_lyric(base, token, aid, False) is None
+        # A movie id is not an audio item: every lyric route 404s on it.
+        movie = http("DELETE", f"{base}/Audio/{mid}/Lyrics", token)[0]
+        pending = not gone
+        r["DELETE /Audio/{itemId}/Lyrics"] = st < 300 and gone and movie == 404
+    finally:
+        # Reap anything the run did not manage to remove. A GET that is not 200
+        # does NOT prove the file is gone: Jellyfin's DELETE only unlinks
+        # resolved MediaStreamType.Lyric rows and its GET reads those same rows,
+        # so before the queued refresh lands the read 404s while the file is
+        # still on disk. Breaking out on that 404 is how a lyric gets stranded
+        # inside the container for good. Wait for it to become VISIBLE, then
+        # delete, then confirm — and say so if it will not go.
+        if pending:
+            if await_lyric(base, token, aid, True) is not None:
+                http("DELETE", f"{base}/Audio/{aid}/Lyrics", token)
+            if await_lyric(base, token, aid, False) is not None:
+                print(f"  WARNING: {base} still holds a lyric on {aid} — asymmetric "
+                      f"state on a shared pair; remove it before the next run",
+                      file=sys.stderr)
+    return r
+
+
 def j_merge_versions_controller(base, token, user, mid, m2):
     """The /MergeVersions/* controller (no documented params/body). Probe each with the
     ids query the sibling /Videos/MergeVersions uses; records acceptance so the differential
@@ -985,12 +1316,18 @@ def j_livetv(base, token, user, _m, _m2):
     # Provisioning (sweep.provision_livetv) added the tuner host and the listings provider;
     # their effect is what this journey runs on: channels from the tuner, programmes from
     # the guide.
+    # EFFECT, at one remove: the POST is issued by sweep.provision_livetv (the tuner
+    # host must exist before this layer runs at all), and what is confirmed here is
+    # its effect on each server's own read-back — no tuner host, no channels. The
+    # row is not a read of the POST's response and never was; the note says so.
     r["POST /LiveTv/TunerHosts"] = bool(channels)
     if not channels:
         return r
     ch = channels[0]["Id"]
     programs = (get_json(base, f"/LiveTv/Programs?channelIds={ch}&isAiring=true&userId={user}", token)
                 or {}).get("Items") or []
+    # Same shape: the listings provider is provisioned upstream and its effect is
+    # the guide having programmes on this server.
     r["POST /LiveTv/ListingProviders"] = bool(programs)
     # --- live stream -------------------------------------------------------------------
     _, raw = http("POST", f"{base}/Items/{ch}/PlaybackInfo?userId={user}", token, json.dumps({}))
@@ -1385,7 +1722,7 @@ JOURNEYS = [j_startup,   # first: see its docstring
             j_users_password, j_virtualfolder_crud, j_sessions, j_config_writes,
             j_scheduled_run, j_playbackinfo_post, j_active_encodings, j_clientlog,
             j_authenticate, j_user_update, j_devices_delete, j_bulk_item_delete,
-            j_subtitles_upload, j_quickconnect, j_system_and_refresh,
+            j_subtitles_upload, j_lyrics, j_quickconnect, j_system_and_refresh,
             j_forgot_password, j_backup, j_livetv, j_remote_subtitles,
             j_remote_search_identify,
             # Destructive: merges/splits the shared movies, so it must run LAST so its
@@ -1448,10 +1785,23 @@ def journeys(ferrofin_url, jellyfin_url):
                 note += f" [{evidence_diff(h_ok.evidence, j_ok.evidence)}]"
             else:
                 cls = "ok"
-            rows[op] = {"deep_verified": deep, "classification": cls, "note": note}
+            method = journey_method(op)
+            rows[op] = {"deep_verified": deep, "classification": cls,
+                        "verification_method": method,
+                        "note": f"{note} ({method}"
+                                + ("; the two servers' raw bodies were compared"
+                                   if method == verification.BODY_DIFF
+                                   else "; bodies not diffed") + ")"}
         else:
-            rows[op] = {"deep_verified": bool(h_ok), "classification": "ok" if h_ok else "write effect not confirmed on Ferrofin",
-                        "note": f"H={h_ok}"}
+            # No oracle: the row rests on Ferrofin alone, which is not a parity
+            # verdict at all — there is nothing to have agreed with. Recorded
+            # UNTESTED with the Ferrofin-only observation kept in the note; the
+            # old code called this `deep_verified`, which then defaulted into the
+            # ledger's body-diff headline with Jellyfin never contacted.
+            rows[op] = {"deep_verified": None, "classification": "",
+                        "verification_method": None,
+                        "note": f"H={h_ok} — no Jellyfin oracle, so no parity verdict "
+                                f"(Ferrofin-only run)"}
     return rows, {k: v for k, v in h.items() if k.startswith("_")}
 
 
@@ -1468,7 +1818,10 @@ def main():
         json.dump(out, f, indent=2, sort_keys=True)
         f.write("\n")
     ok = sum(1 for v in rows.values() if v["deep_verified"])
-    print(f"wrote parity/journey-results.json — {len(rows)} write ops, {ok} deep-verified"
+    import collections
+    by = collections.Counter(v["verification_method"] for v in rows.values()
+                             if v["deep_verified"] is True)
+    print(f"wrote parity/journey-results.json — {len(rows)} write ops, {ok} verified {dict(by)}"
           + (f", errors: {list(errors)}" if errors else ""))
 
 
@@ -1543,13 +1896,35 @@ def selfcheck():
         # Introspect by running against a no-op recorder base is overkill; instead assert the
         # op-key literals in each function source are spec paths.
         import inspect
-        for line in inspect.getsource(jn).splitlines():
+        import re
+        src = inspect.getsource(jn)
+        for line in src.splitlines():
             if 'r["' in line:
                 key = line.split('r["', 1)[1].split('"]', 1)[0]
                 declared.add(key)
+        # …plus op keys carried in a data table rather than an `r["…"]` literal —
+        # the nine remote-control rows are assigned in a loop, so scraping only
+        # `r["` left them unvalidated against the spec AND unstamped.
+        declared.update(re.findall(r'"((?:GET|POST|PUT|DELETE|PATCH) /[^"\s]*)"', src))
     missing = sorted(k for k in declared if k not in valid)
     assert not missing, f"journey op-keys not in spec: {missing}"
-    print(f"ok: combine logic, {len(declared)} journey op-keys all valid spec paths")
+    # Every declared op must resolve to a method inside the closed set, and NO
+    # journey op may claim the body-diff headline — this layer never diffs a body.
+    for k in declared:
+        m = journey_method(k)
+        assert m in verification.VALID, f"{k}: unknown verification method {m!r}"
+        assert (m != verification.BODY_DIFF) or k in JOURNEY_BODY_DIFF, \
+            f"{k}: only the enumerated JOURNEY_BODY_DIFF ops may claim the headline"
+    assert JOURNEY_BODY_DIFF <= declared, JOURNEY_BODY_DIFF - declared
+    stale = sorted(k for k in JOURNEY_METHOD if k not in declared)
+    assert not stale, f"JOURNEY_METHOD names ops no journey declares: {stale}"
+    undeclared = sorted(k for k in declared if k not in JOURNEY_METHOD)
+    assert not undeclared, (f"{len(undeclared)} journey op(s) declare no "
+                            f"verification_method: {undeclared}")
+    import collections
+    by = collections.Counter(journey_method(k) for k in declared)
+    print(f"ok: combine logic, {len(declared)} journey op-keys all valid spec paths, "
+          f"methods {dict(by)}")
 
 
 if __name__ == "__main__":

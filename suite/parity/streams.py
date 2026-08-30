@@ -17,7 +17,7 @@ one is reduced to the *properties a player depends on* and those are diffed:
                   (Accept-Ranges, Content-Disposition), and the two JPEG format choices a
                   client can observe: chroma subsampling and optimized-vs-standard Huffman
 
-Each row records HOW it was verified (`verification_method`, see OP_METHOD): "body-diff"
+Each row records HOW it was verified (`verification_method`, see STREAM_METHOD): "body-diff"
 where the bytes/text themselves were compared, "property" where they could not be and named
 properties were compared instead. gen-ledger.py keeps property rows OUT of the headline
 deep-verified count and renders them in their own section, so "response + read-back diffed
@@ -50,6 +50,7 @@ import urllib.parse
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from sweep import http, get_json, bring_up, ROOT          # noqa: E402
 from assets import raw_headers, ct_family, image_info      # noqa: E402
+import verification                                        # noqa: E402
 
 DEVICE_ID = "parity-streams"
 DURATION_TOL_S = 0.5          # EXTINF / probed duration rounding (both encode the same clip)
@@ -389,56 +390,55 @@ STREAM_OPS = [
     "GET /Videos/{itemId}/Trickplay/{width}/{index}.jpg",
 ]
 
-# How each op is verified — the ledger's headline count means "the response body (or a
-# write's read-back) diffed clean", so a row that compared something else must say so
-# rather than ride in on the default.
+# ---------------------------------------------------------------- how each row is verified
 #
-#   "body-diff"  the response body itself was compared: sha256 of the served file (both
-#                servers hardlink the SAME fixture file, so the bytes must match exactly),
-#                or the exact converted subtitle text.
-#   "property"   the body could not be compared, so named properties were: a HEAD has no
-#                body at all; a playlist carries per-instance ids/hosts/session tokens; a
-#                transcoded segment is two independent ffmpeg runs; a JPEG tile is two
-#                independent encoders. Real verification, weaker than a diff.
-OP_METHOD = {
-    # file_sig — sha256 of the body + Content-Type/Accept-Ranges (+ a Range 206).
-    "GET /Videos/{itemId}/stream": "body-diff",
-    "GET /Videos/{itemId}/stream.{container}": "body-diff",
-    "GET /Audio/{itemId}/stream": "body-diff",
-    "GET /Audio/{itemId}/stream.{container}": "body-diff",
-    "GET /Audio/{itemId}/universal": "body-diff",
-    # text_sig — the exact converted subtitle text, byte for byte.
-    "GET /Videos/{routeItemId}/{routeMediaSourceId}/Subtitles/{routeIndex}/Stream.{routeFormat}": "body-diff",
-    "GET /Videos/{routeItemId}/{routeMediaSourceId}/Subtitles/{routeIndex}/{routeStartPositionTicks}/Stream.{routeFormat}": "body-diff",
-    # head_sig — status class + Content-Type family. No body exists to diff.
-    "HEAD /Videos/{itemId}/stream": "property",
-    "HEAD /Videos/{itemId}/stream.{container}": "property",
-    "HEAD /Audio/{itemId}/stream": "property",
-    "HEAD /Audio/{itemId}/stream.{container}": "property",
-    "HEAD /Audio/{itemId}/universal": "property",
-    "HEAD /Videos/{itemId}/master.m3u8": "property",
-    "HEAD /Audio/{itemId}/master.m3u8": "property",
-    # playlist_sig — the normalised m3u8: tags, segment count, rounded EXTINF, bucketed
-    # BANDWIDTH, ordinal segment URIs. The raw text carries per-instance ids and tokens.
-    "GET /Videos/{itemId}/master.m3u8": "property",
-    "GET /Videos/{itemId}/main.m3u8": "property",
-    "GET /Videos/{itemId}/live.m3u8": "property",
-    "GET /Videos/{itemId}/hls/{playlistId}/stream.m3u8": "property",
-    "GET /Audio/{itemId}/master.m3u8": "property",
-    "GET /Audio/{itemId}/main.m3u8": "property",
-    "GET /Videos/{itemId}/{mediaSourceId}/Subtitles/{index}/subtitles.m3u8": "property",
-    "GET /Videos/{itemId}/Trickplay/{width}/tiles.m3u8": "property",
-    # segment_sig — what ffprobe says about two independent transcodes of the same clip.
-    "GET /Videos/{itemId}/hls1/{playlistId}/{segmentId}.{container}": "property",
-    "GET /Videos/{itemId}/hls/{playlistId}/{segmentId}.{segmentContainer}": "property",
-    "GET /Audio/{itemId}/hls1/{playlistId}/{segmentId}.{container}": "property",
-    "GET /Audio/{itemId}/hls/{segmentId}/stream.aac": "property",
-    "GET /Audio/{itemId}/hls/{segmentId}/stream.mp3": "property",
-    # image_sig — decoded format/dimensions, the served-file headers, and the JPEG format
-    # choices (subsampling, entropy-coder optimization). Two independent encoders, so the
-    # tile's bytes can never be diffed.
-    "GET /Videos/{itemId}/Trickplay/{width}/{index}.jpg": "property",
-}
+# Three genuinely different bars live in this layer and they must not share one word:
+#
+#   body-diff     the RESPONSE ITSELF was compared. `file_sig` is a sha256 of the whole
+#                 body (both servers serve the same hardlinked fixture) plus the range
+#                 leg; `text_sig` is the exact decoded subtitle text, BOM and line
+#                 terminators included. These earn the ledger headline.
+#   property      derived properties agreed, and the bytes provably cannot: a HEAD's
+#                 status class + media type; a NORMALISED playlist (header tags as a
+#                 set, EXTINF rounded to 0.5 s, BANDWIDTH bucketed to 250 kbps, segment
+#                 URIs reduced to ordinals, noise params stripped); an ffprobe of a live
+#                 transcode (two ffmpeg runs cannot be byte-equal); a decoded tile's
+#                 format + dimensions.
+#   status-class  a deliberately-bogus playlist/segment id, where the only contract left
+#                 is "both refuse". The SUCCESS path of those four legacy routes is never
+#                 requested, so a handler broken for every real client records the same
+#                 `(4, "")` and passes. That is not a body diff by any reading.
+#
+# `run()` additionally DOWNGRADES any row whose observed signature is a bare
+# `(status_class, "")` — the fallback every helper returns when the server served
+# nothing — so a both-404 can never be counted as a property comparison.
+STREAM_METHOD = {op: verification.BODY_DIFF for op in (
+    "GET /Videos/{itemId}/stream",
+    "GET /Videos/{itemId}/stream.{container}",
+    "GET /Audio/{itemId}/stream",
+    "GET /Audio/{itemId}/stream.{container}",
+    "GET /Audio/{itemId}/universal",
+    "GET /Videos/{routeItemId}/{routeMediaSourceId}/Subtitles/{routeIndex}/Stream.{routeFormat}",
+    "GET /Videos/{routeItemId}/{routeMediaSourceId}/Subtitles/{routeIndex}"
+    "/{routeStartPositionTicks}/Stream.{routeFormat}",
+)}
+STREAM_METHOD.update({op: verification.STATUS_CLASS for op in (
+    "GET /Videos/{itemId}/hls/{playlistId}/stream.m3u8",
+    "GET /Videos/{itemId}/hls/{playlistId}/{segmentId}.{segmentContainer}",
+    "GET /Audio/{itemId}/hls/{segmentId}/stream.aac",
+    "GET /Audio/{itemId}/hls/{segmentId}/stream.mp3",
+)})
+# Every HEAD mirror. `head_sig` returns `(status_class, content-type family)` and
+# nothing else — a HEAD has no body, so no playlist was parsed, no container
+# probed, no property of any stream examined. That is the closed set's definition
+# of `status-class` ("at most also a content-type family"), so these seven rows
+# say so instead of reading as "declared properties agreed".
+STREAM_METHOD.update({op: verification.STATUS_CLASS for op in STREAM_OPS
+                      if op.startswith("HEAD ")})
+# Everything else (playlists, transcoded segments, the trickplay tile) compares
+# declared properties derived from a real body.
+STREAM_METHOD.update({op: verification.PROPERTY for op in STREAM_OPS
+                      if op not in STREAM_METHOD})
 
 # The two ops that depend on trickplay actually having been generated on both servers.
 TRICKPLAY_OPS = (
@@ -634,15 +634,24 @@ def run(ferrofin_url, jellyfin_url):
         if h == UNRESOLVED and j == UNRESOLVED:
             # Neither server handed out a usable reference (e.g. a legacy playlist id): not
             # evidence of parity — recorded as untested, never as verified.
-            rows[op] = {"deep_verified": None, "verification_method": OP_METHOD[op],
-                        "classification": "",
+            rows[op] = {"deep_verified": None, "classification": "",
+                        "verification_method": None,
                         "note": "unresolved on both servers: no reference to probe with"}
             continue
         ok = j is not None and h == j
+        method = STREAM_METHOD[op]
+        # Honesty downgrade — see STREAM_METHOD. A signature of `(class, "")` means the
+        # server served nothing, so no body was diffed and no property compared.
+        if verification.bare_status_class(h) and verification.bare_status_class(j or ()):
+            method = verification.STATUS_CLASS
         rows[op] = {"deep_verified": bool(ok),
-                    "verification_method": OP_METHOD[op],
                     "classification": "" if ok else "flagged: stream signature diff vs Jellyfin (verify)",
-                    "note": f"H={describe(h)} J={describe(j)}"}
+                    "verification_method": method,
+                    "note": f"H={describe(h)} J={describe(j)}"
+                            + ("" if not ok or method == verification.BODY_DIFF
+                               else " (status class only; nothing was served)"
+                               if method == verification.STATUS_CLASS
+                               else " (declared properties agreed; bytes not diffed)")}
     # A trickplay row that could not be probed must say *why* it could not be probed;
     # otherwise a broken enabling write reads as an inconclusive fixture problem.
     if blocked:
@@ -691,8 +700,10 @@ def main():
     with open(os.path.join(ROOT, "suite/parity/stream-results.json"), "w") as f:
         json.dump(out, f, indent=2, sort_keys=True)
         f.write("\n")
-    ok = sum(1 for v in rows.values() if v["deep_verified"])
-    print(f"wrote parity/stream-results.json — {len(rows)} stream ops, {ok} deep-verified")
+    import collections
+    by = collections.Counter(v["verification_method"] for v in rows.values() if v["deep_verified"])
+    print(f"wrote parity/stream-results.json — {len(rows)} stream ops, "
+          f"{by[verification.BODY_DIFF]} deep-verified (bodies diffed), {dict(by)}")
 
 
 def selfcheck():
@@ -719,17 +730,14 @@ def selfcheck():
     assert magic(b"\x47" + b"\x00" * 187 + b"\x47") == "mpegts"
     assert magic(b"\x00\x00\x00\x18ftypisom") == "mp4"
     assert strip_noise("a/b.ts?PlaySessionId=x&foo=1") == "a/b.ts?foo=1"
-    # Every op must declare how it is verified — a row that silently defaulted to
-    # "body-diff" would be counted in the ledger's headline as a diffed body.
-    assert set(OP_METHOD) == set(STREAM_OPS), set(OP_METHOD) ^ set(STREAM_OPS)
-    assert set(OP_METHOD.values()) <= {"body-diff", "property"}, set(OP_METHOD.values())
-    # Only the sha256/exact-text signatures may claim a body diff. Everything a HEAD, a
-    # playlist, a transcoded segment or a re-encoded image produces is a property.
-    src = inspect.getsource(signatures)
-    for op, method in OP_METHOD.items():
-        line = next(ln for ln in src.splitlines() if f'"{op}"' in ln)
-        diffed = "file_sig(" in line or "text_sig(" in line or op.endswith("Stream.{routeFormat}")
-        assert (method == "body-diff") == diffed, (op, method, line.strip())
+    # Every op declares a method from the closed set, and the four negative-path rows
+    # (bogus id, both refuse) must never claim to have diffed a body.
+    assert set(STREAM_METHOD) == set(STREAM_OPS), set(STREAM_METHOD) ^ set(STREAM_OPS)
+    assert set(STREAM_METHOD.values()) <= verification.VALID
+    assert STREAM_METHOD["GET /Audio/{itemId}/hls/{segmentId}/stream.aac"] == verification.STATUS_CLASS
+    assert STREAM_METHOD["GET /Videos/{itemId}/master.m3u8"] == verification.PROPERTY
+    assert STREAM_METHOD["GET /Videos/{itemId}/stream"] == verification.BODY_DIFF
+    assert verification.bare_status_class((4, "")) and not verification.bare_status_class((2, "file", "sha"))
     # jpeg_sampling reads the SOF marker: 4:2:0 (Skia's default) vs 4:4:4.
     def sof(luma_h, luma_v):
         return (b"\xff\xd8"
@@ -754,7 +762,7 @@ def selfcheck():
     assert jpeg_huffman(b"\x89PNG\r\n\x1a\n") is None
     assert jpeg_huffman(b"\xff\xd8\xff\xda\x00\x02") is None   # no DHT at all
     # Observations (keys starting with "_") are stripped before rows are built, so they
-    # can never become a row or be looked up in OP_METHOD.
+    # can never become a row or be looked up in STREAM_METHOD.
     assert all(not k.startswith("_") for k in STREAM_OPS)
     assert TILE_BYTES_RATIO_NOTE > 1.0
     # The tile byte lengths are always recorded, and a settings-level gap (the 3.44x this
@@ -771,8 +779,10 @@ def selfcheck():
     none_yet = {"deep_verified": None, "classification": "", "note": "sig"}
     record_tile_bytes(none_yet, 0, 73734)      # nothing measured → nothing recorded
     assert none_yet["note"] == "sig" and none_yet["classification"] == ""
-    print(f"ok: {len(declared)} stream op-keys valid + verification methods, "
-          f"playlist normalisation, jpeg sampling, magic, noise strip")
+    import collections
+    by = collections.Counter(STREAM_METHOD.values())
+    print(f"ok: {len(declared)} stream op-keys valid, playlist normalisation, magic, "
+          f"noise strip, methods {dict(by)}")
 
 
 if __name__ == "__main__":

@@ -1486,6 +1486,7 @@ version = "0.4.1"
 dependencies = [
  "async-trait",
  "chrono",
+ "ferrofin-common",
  "ferrofin-db",
  "ferrofin-model",
  "serde",

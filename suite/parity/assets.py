@@ -29,6 +29,7 @@ import urllib.parse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from sweep import http, get_json, bring_up, ROOT   # noqa: E402
+import verification  # noqa: E402  — the closed set of verification methods
 
 # A 1x1 PNG — the smallest valid upload payload; decodes to (png, 1, 1).
 ONE_PX_PNG = base64.b64decode(
@@ -169,9 +170,30 @@ def resolve(base, token, user_id):
 
 
 # ------------------------------------------------------------- read (property) probes
+#
+# HOW these rows are verified, and why it is not a body diff.
+#
+# Ferrofin resizes/encodes with the Rust `image` crate and Jellyfin with Skia, so a
+# transformed image's BYTES cannot match and byte-equality is not the contract. What
+# IS the contract is the DECLARED properties: the status, the media type, the decoded
+# container, and the pixel dimensions. Those are what these rows compare, so they are
+# stamped `verification_method: "property"` — a real verification, but a weaker claim
+# than the ledger's headline ("the response itself diffed clean"), and gen-ledger.py
+# counts and renders it separately so the headline keeps meaning what it says.
+#
+# The exception is the file family (`/Download`, `/File`, `/Attachments/{index}`):
+# both servers serve the SAME hardlinked fixture bytes, so those rows really are a
+# byte-for-byte diff (sha256) and stay "body-diff".
+SIG_PROPERTY = verification.PROPERTY
+SIG_BODY_DIFF = verification.BODY_DIFF
+SIG_EFFECT = verification.EFFECT
+SIG_STATUS_CLASS = verification.STATUS_CLASS
+
+
 def read_signatures(base, token, c):
-    """{op_key: signature} where signature is a comparable tuple derived from the response.
-    For a 200 image: (status_class, ct_family, format, w, h). Otherwise: (status_class, '', ...)."""
+    """`({op_key: signature}, {op_key: verification_method})`, where signature is a
+    comparable tuple derived from the response. For a 200 image:
+    (status_class, ct_family, format, w, h). Otherwise: (status_class, '', ...)."""
     it, tag, u = c["item"], c["tag"], c["user"]
     reqs = [
         ("GET /Items/{itemId}/Images/{imageType}", "GET", f"/Items/{it}/Images/Primary"),
@@ -209,7 +231,7 @@ def read_signatures(base, token, c):
         ("HEAD /MusicGenres/{name}/Images/{imageType}/{imageIndex}", f"/MusicGenres/{c['musicgenre']}/Images/Primary/0"),
         ("HEAD /UserImage", f"/UserImage?userId={u}"),
     ]
-    out = {}
+    out, methods = {}, {}
     for op, method, path in reqs:
         st, ct, body = raw(method, base, path, token)
         if st == 200 and ct_family(ct) == "image":
@@ -218,33 +240,145 @@ def read_signatures(base, token, c):
             out[op] = (2, ct_family(ct), bool(body))   # css/font: family + non-empty
         else:
             out[op] = (st // 100, "")                   # non-200: status class parity
+        methods[op] = SIG_PROPERTY
+    # A HEAD has NO BODY, so nothing is ever served, decoded or measured here: the
+    # signature is the status class plus a content-type family, which is verbatim
+    # what the closed set defines as `status-class` ("at most also a content-type
+    # family"). These 13 rows were stamped `property` and rendered "declared
+    # properties agreed" while agreeing on nothing but a header.
     for op, path in heads:
         st, ct, _ = raw("HEAD", base, path, token)
         out[op] = (st // 100, ct_family(ct) if st == 200 else "")
+        methods[op] = SIG_STATUS_CLASS
     # File-family ops. Both servers serve the SAME hardlinked fixture file, so the bar is the
     # file's sha256 plus the headers a download client depends on (type, ranges, disposition).
     fi, fs = c.get("file_item"), c.get("file_src")
     if fi:
         out["GET /Items/{itemId}/Download"] = file_sig(base, f"/Items/{fi}/Download", token)
         out["GET /Items/{itemId}/File"] = file_sig(base, f"/Items/{fi}/File", token, ranged=True)
+        methods["GET /Items/{itemId}/Download"] = SIG_BODY_DIFF
+        methods["GET /Items/{itemId}/File"] = SIG_BODY_DIFF
     # BitrateTest is opaque bytes whose contract is "at least `size` of them": Jellyfin's
     # ArrayPool.Rent(1000) hands back a 1024-byte buffer and it ships the whole thing, so an
     # exact-length bar would flag the oracle's own over-delivery, not a Ferrofin gap.
     st, h, body = raw_headers("GET", base, "/Playback/BitrateTest?size=1000", token)
     out["GET /Playback/BitrateTest"] = ((2, ct_family(h.get("content-type")), len(body) >= 1000)
                                         if st == 200 else (st // 100, ""))
+    methods["GET /Playback/BitrateTest"] = SIG_PROPERTY
     # The fixture clip carries an attached font (stream index 3: video, audio, subtitle,
     # attachment), so both servers return the same bytes: sha256 + content type.
     if fi:
         out["GET /Videos/{videoId}/{mediaSourceId}/Attachments/{index}"] = file_sig(
             base, f"/Videos/{fi}/{fs}/Attachments/3", token)
+        methods["GET /Videos/{videoId}/{mediaSourceId}/Attachments/{index}"] = SIG_BODY_DIFF
     # A log file's contents differ per instance by nature: type + non-empty is the contract.
     logs = get_json(base, "/System/Logs", token) or []
     name = logs[0]["Name"] if logs and logs[0].get("Name") else "missing.log"
     st, h, body = raw_headers("GET", base, "/System/Logs/Log?name=" + urllib.parse.quote(name), token)
     out["GET /System/Logs/Log"] = ((2, (h.get("content-type") or "").split(";")[0].strip(), bool(body))
                                    if st == 200 else (st // 100, ""))
-    return out
+    methods["GET /System/Logs/Log"] = SIG_PROPERTY
+    return out, methods
+
+
+# --------------------------------------------- content negotiation / route binding
+#
+# `read_signatures` only ever asks for a transform WITH an explicit `/jpg/` segment,
+# so two whole classes of divergence were structurally invisible to this layer:
+#
+#   1. output-format negotiation — C# `ImageController.GetClientSupportedFormats`
+#      derives the format list from the request's `Accept` header (and the `?Accept=`
+#      query value); WebP is offered ONLY when advertised, so `Accept: */*` must come
+#      back JPEG. Ferrofin used to hardcode `[Webp, Jpg, Png]` and hand WebP to every
+#      client, forever.
+#   2. `{format}` route binding — C# binds `[FromRoute, Required] ImageFormat`, so an
+#      unbindable segment is a model-binding failure (400). Ferrofin used to fall back
+#      to the default format list and answer 200 with an unrequested container.
+#
+# Both are compared as DECLARED properties (status class, Content-Type, decoded
+# format) — never as bytes, which the two encoders cannot match.
+NEGOTIATION_OPS = {
+    "GET /Items/{itemId}/Images/{imageType}": "negotiation",
+    "GET /Items/{itemId}/Images/{imageType}/{imageIndex}": "negotiation",
+    "GET /Items/{itemId}/Images/{imageType}/{imageIndex}/{tag}/{format}"
+    "/{maxWidth}/{maxHeight}/{percentPlayed}/{unplayedCount}": "binding",
+}
+
+
+def _decoded_sig(base, path, token, extra=None):
+    """(status, content-type, decoded format) — the declared properties only.
+
+    The status is EXACT, not the `// 100` class the byte-signature probes use: this
+    matrix exists to police status codes, so a 400 that regressed to a 404 must fail.
+
+    The Content-Type is compared for 200s only. Jellyfin's own error bodies are not
+    self-consistent — a model-binding 400 is `application/json` ProblemDetails while an
+    `ArgumentException` 400 out of `ExceptionMiddleware` is `text/plain` — and Ferrofin
+    answers JSON for both. That is a server-wide error-envelope difference, not an
+    image-contract one, so it is excluded here and recorded as a divergence instead."""
+    st, h, body = raw_headers("GET", base, path, token, extra)
+    if st != 200:
+        return (st, "", "")
+    return (200, (h.get("content-type") or "").split(";")[0].strip().lower(), image_info(body)[0])
+
+
+def negotiation_signatures(base, token, c):
+    """{op_key: tuple of sub-signatures} for the format-negotiation and route-binding
+    behaviour of the item-image ops. Empty when the context has no item."""
+    it, tag = c.get("item"), c.get("tag")
+    if not it:
+        return {}
+    # Accept matrix on a transform that names NO format. `*/*` must NOT enable WebP
+    # (`SupportsFormat(..., Webp, acceptAll: false)`); an explicit `image/webp` must.
+    negotiate = tuple(
+        _decoded_sig(base, f"/Items/{it}/Images/Primary?maxWidth=100", token, extra)
+        for extra in (
+            None,
+            {"Accept": "*/*"},
+            {"Accept": "image/jpeg"},
+            {"Accept": "image/webp,image/apng,image/*,*/*;q=0.8"},
+        )
+    ) + (
+        # the `?Accept=` query form of the same switch
+        _decoded_sig(base, f"/Items/{it}/Images/Primary?maxWidth=100&Accept=webp", token),
+    )
+    # `?format=` is a SEPARATE binding arm from the `{format}` segment and diverges
+    # from it, so it needs its own sub-probes: C# binds `[FromQuery] ImageFormat?`
+    # (nullable => no `EnumTypeModelBinder` undefined-value check), so an unparseable
+    # value falls back to negotiation (200) while an UNDEFINED ordinal binds and then
+    # throws `InvalidEnumArgumentException` out of `GetMimeType` (400). Without these
+    # the query arm was as invisible to this layer as the route arm used to be.
+    negotiate += tuple(
+        _decoded_sig(base, f"/Items/{it}/Images/Primary?maxWidth=100&format={v}", token)
+        for v in ("bogus", "jpeg", "3.0", "-1", "6", "99",
+                  "3", "png", "webp", "Jpg%2CPng", "Jpg%2CPng%2CWebp")
+    )
+    # Route-segment binding on the positional URL: a non-member `{format}` and a
+    # non-numeric `{percentPlayed}` are 400s; a numeric enum ordinal binds (3 = Png).
+    binding = tuple(
+        _decoded_sig(base, f"/Items/{it}/Images/Primary/0/{tag}/{seg}", token)
+        for seg in ("ts/100/100/0/0", "jpeg/100/100/0/0", "3/100/100/0/0",
+                    "jpg/100/100/abc/0", "webp/100/100/0/0",
+                    # the same undefined/loose-parse values as the query arm above —
+                    # here they are 400s, which is exactly the divergence between arms.
+                    "-1/100/100/0/0", "6/100/100/0/0",
+                    "Jpg%2CPng/100/100/0/0", "Jpg%2CPng%2CWebp/100/100/0/0")
+    )
+    return {op: (negotiate if which == "negotiation" else binding)
+            for op, which in NEGOTIATION_OPS.items()}
+
+
+def primary_image_path(base, token, item):
+    """The stored `Path` of an item's Primary image, as `/Items/{id}/Images` reports it.
+
+    The property diff compares DERIVED properties of the served bytes, which is only
+    meaningful when both servers are serving the same SOURCE file. When they are not,
+    a dimension mismatch says nothing about the image endpoint — so the row must fail
+    naming that, instead of implying a resize bug."""
+    for info in (get_json(base, f"/Items/{item}/Images", token) or []):
+        if info.get("ImageType") == "Primary":
+            return info.get("Path") or ""
+    return ""
 
 
 def file_sig(base, path, token, ranged=False):
@@ -296,10 +430,17 @@ def write_effects(base, token, c):
         r["DELETE /Items/{itemId}/Images/{imageType}"] = d < 300 and gone >= 400
 
         # Indexed variants: two backdrops (indices 0,1), reorder 1->0, delete by index.
+        # The indexed upload must actually USE the indexed route. It used to be
+        # recorded from a POST to the UNindexed URL, so the row reported the status
+        # of a different endpoint — `SetItemImageByIndex` (a distinct C# action,
+        # ImageController.cs:389) was never requested at all.
         post_bytes(base, f"/Items/{it}/Images/Backdrop", token, base64.b64encode(ONE_PX_PNG), "image/png")
-        st = post_bytes(base, f"/Items/{it}/Images/Backdrop", token,
+        st = post_bytes(base, f"/Items/{it}/Images/Backdrop/0", token,
                         base64.b64encode(ONE_PX_PNG), "image/png")
-        r["POST /Items/{itemId}/Images/{imageType}/{imageIndex}"] = st < 300
+        idx0 = raw("GET", base, f"/Items/{it}/Images/Backdrop/0", token)
+        r["POST /Items/{itemId}/Images/{imageType}/{imageIndex}"] = (
+            st < 300 and image_info(idx0[2])[0] == "png")
+        post_bytes(base, f"/Items/{it}/Images/Backdrop", token, base64.b64encode(ONE_PX_PNG), "image/png")
         st = post_bytes(base, f"/Items/{it}/Images/Backdrop/1/Index?newIndex=0", token, b"", "application/json")
         r["POST /Items/{itemId}/Images/{imageType}/{imageIndex}/Index"] = st < 300
         d = raw("DELETE", base, f"/Items/{it}/Images/Backdrop/0", token)[0]
@@ -336,21 +477,74 @@ def run(ferrofin_url, jellyfin_url):
     hc, jc = resolve(ferrofin_url, ht, hu), resolve(jellyfin_url, jt, ju)
 
     rows = {}
-    hsig, jsig = read_signatures(ferrofin_url, ht, hc), read_signatures(jellyfin_url, jt, jc)
+    hsig, hmethod = read_signatures(ferrofin_url, ht, hc)
+    jsig, _ = read_signatures(jellyfin_url, jt, jc)
     for op in sorted(hsig):
         h, j = hsig[op], jsig.get(op)
         ok = j is not None and sig_match(h, j)
+        method = hmethod.get(op, SIG_PROPERTY)
+        # HONESTY DOWNGRADE. A signature is `(status_class, kind_label, *evidence)`,
+        # and a row where `evidence` is absent or entirely falsy established nothing
+        # but the status class: the `(status // 100, "")` every helper falls back to
+        # when the server served nothing, a headers-only HEAD, or a 200 whose body
+        # was EMPTY (`/Branding/Css` at `(2, "css", False)`, the deliberately
+        # nonexistent `/FallbackFont/Fonts/nonexistent.woff2` at `(2, "none", False)`).
+        # None of those decoded an image or compared a property, so none may read as
+        # "properties agreed" — a Ferrofin that 404'd every by-name image request
+        # would otherwise pass 16 rows.
+        if verification.bare_status_class(h) and verification.bare_status_class(j or ()):
+            method = SIG_STATUS_CLASS
         rows[op] = {"deep_verified": bool(ok),
                     "classification": "" if ok else "flagged: asset property diff vs Jellyfin (verify)",
-                    "note": f"H={h} J={j}"}
+                    # HOW, not just whether — see the SIG_PROPERTY note above. Only the
+                    # file family is a real byte diff; the image rows compare declared
+                    # properties, which two different encoders CAN match and bytes cannot.
+                    "verification_method": method,
+                    "note": f"H={h} J={j}"
+                            + ("" if method == SIG_BODY_DIFF or not ok
+                               else " (status class only; nothing was served on either server)"
+                               if method == SIG_STATUS_CLASS
+                               else " (declared properties agreed; bytes not diffed)")}
+
+    # Format negotiation + route binding, folded into the same rows.
+    hneg = negotiation_signatures(ferrofin_url, ht, hc)
+    jneg = negotiation_signatures(jellyfin_url, jt, jc)
+    for op, h in hneg.items():
+        j = jneg.get(op)
+        row = rows.get(op)
+        if row is None:
+            continue
+        if h != j:
+            row["deep_verified"] = False
+            row["classification"] = "flagged: asset property diff vs Jellyfin (verify)"
+            row["note"] += f" | negotiation/binding H={h} J={j}"
+
+    # Source-image guard: a dimension diff on the item-image ops only means the image
+    # endpoint when both servers hold the SAME Primary file. Name it when they do not.
+    hpath = primary_image_path(ferrofin_url, ht, hc["item"]) if hc.get("item") else ""
+    jpath = primary_image_path(jellyfin_url, jt, jc["item"]) if jc.get("item") else ""
+    if hpath != jpath:
+        for op in NEGOTIATION_OPS:
+            row = rows.get(op)
+            if row is None:
+                continue
+            row["deep_verified"] = False
+            row["classification"] = "flagged: asset property diff vs Jellyfin (verify)"
+            row["note"] += f" | SOURCE IMAGE MISMATCH H={hpath!r} J={jpath!r}"
 
     hw, jw = write_effects(ferrofin_url, ht, hc), write_effects(jellyfin_url, jt, jc)
     for op in sorted(hw):
         h_ok, j_ok = hw[op], jw.get(op)
         ok = bool(h_ok and j_ok)
+        # These are EFFECT verdicts (the write succeeded on both, and where a read-back
+        # exists it decodes as the uploaded format). No body was diffed and the two
+        # servers' responses were never compared with each other, so they carry
+        # `effect` — distinct from `property`, where a property of a RESPONSE agreed.
         rows[op] = {"deep_verified": ok,
                     "classification": "" if ok else "flagged: asset write effect diff vs Jellyfin (verify)",
-                    "note": f"H={h_ok} J={j_ok}"}
+                    "verification_method": SIG_EFFECT,
+                    "note": f"H={h_ok} J={j_ok}"
+                            + (" (effect verdict; bodies not diffed)" if ok else "")}
     return rows
 
 
@@ -389,10 +583,6 @@ def selfcheck():
     spec = json.load(open(sorted(glob.glob(os.path.join(ROOT, "contracts/jellyfin-openapi-*.json")))[-1]))
     valid = {f"{m.upper()} {p}" for p, it in spec["paths"].items() for m in it
              if m in ("get", "post", "put", "delete", "head")}
-    # Build the op-key list without a live server (empty context).
-    c = {"user": "U", "item": "I", "tag": "T", "genre": "G", "studio": "S",
-         "person": "P", "artist": "A", "musicgenre": "M"}
-    keys = set(read_signatures.__wrapped__(c) if hasattr(read_signatures, "__wrapped__") else [])
     # read_signatures needs a server; instead scan its literal op keys + the write op keys
     # (both the `("GET …", …)` request tuples and the direct `out["GET …"] =` probes).
     import inspect
@@ -400,9 +590,40 @@ def selfcheck():
     declared = set()
     for fn in (read_signatures, write_effects):
         declared.update(re.findall(r'"((?:GET|HEAD|POST|DELETE) /[^"]+)"', inspect.getsource(fn)))
+    # `negotiation_signatures` holds no op-key literals of its own — its keys are
+    # NEGOTIATION_OPS, folded in here.
+    declared.update(NEGOTIATION_OPS)
     bad = sorted(k for k in declared if k not in valid)
     assert not bad, f"asset op-keys not in spec: {bad}"
-    print(f"ok: image parser, sig_match, {len(declared)} asset op-keys valid")
+    # The negotiation/binding fold only ever tightens a row: it can turn a green row
+    # red, never the other way round.
+    assert set(NEGOTIATION_OPS).issubset(valid)
+    # Honesty invariant: "body-diff" is the ledger's headline claim, so this layer may
+    # only stamp it where the response BYTES were actually compared — the file family,
+    # where both servers serve the same hardlinked fixture and the signature is a
+    # sha256. Every other asset row compares declared properties and must say so.
+    byte_exact = set(re.findall(r'methods\["((?:GET|HEAD|POST|DELETE) /[^"]+)"\] = SIG_BODY_DIFF',
+                                inspect.getsource(read_signatures)))
+    assert byte_exact == {
+        "GET /Items/{itemId}/Download",
+        "GET /Items/{itemId}/File",
+        "GET /Videos/{videoId}/{mediaSourceId}/Attachments/{index}",
+    }, byte_exact
+    assert (SIG_PROPERTY, SIG_BODY_DIFF) == ("property", "body-diff")
+    assert {SIG_PROPERTY, SIG_BODY_DIFF, SIG_EFFECT, SIG_STATUS_CLASS} <= verification.VALID
+    # The status-class downgrade: two bare `(class, "")` signatures matching is not a
+    # property comparison, and must never be rendered as one.
+    assert verification.bare_status_class((4, "")) and verification.bare_status_class((2, ""))
+    assert not verification.bare_status_class((2, "image", "png", 600, 600))
+    # An empty 200 body and a headers-only HEAD are status-class, not property.
+    assert verification.bare_status_class((2, "css", False))
+    assert verification.bare_status_class((2, "image"))
+    # Every write row names the route it actually requested: the indexed upload must
+    # POST to an INDEXED url, or the row reports a different endpoint's status.
+    assert 'f"/Items/{it}/Images/Backdrop/0", token,' in inspect.getsource(write_effects)
+    print(f"ok: image parser, sig_match, {len(declared)} asset op-keys valid, "
+          f"{len(byte_exact)} byte-exact rows, status-class downgrade, "
+          f"write rows stamped {SIG_EFFECT!r}")
 
 
 if __name__ == "__main__":

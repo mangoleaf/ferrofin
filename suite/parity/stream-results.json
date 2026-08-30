@@ -1,146 +1,174 @@
 {
   "generated_by": "suite/parity/streams.py",
-  "last_verified": "446f0ae 2026-08-24",
+  "last_verified": "16a48e1 2026-08-29",
   "rows": {
     "GET /Audio/{itemId}/hls/{segmentId}/stream.aac": {
       "classification": "",
       "deep_verified": true,
-      "note": "H=[4, \"\"] J=[4, \"\"]"
+      "note": "H=[4, \"\"] J=[4, \"\"] (status class only; nothing was served)",
+      "verification_method": "status-class"
     },
     "GET /Audio/{itemId}/hls/{segmentId}/stream.mp3": {
       "classification": "",
       "deep_verified": true,
-      "note": "H=[4, \"\"] J=[4, \"\"]"
+      "note": "H=[4, \"\"] J=[4, \"\"] (status class only; nothing was served)",
+      "verification_method": "status-class"
     },
     "GET /Audio/{itemId}/hls1/{playlistId}/{segmentId}.{container}": {
       "classification": "",
       "deep_verified": true,
-      "note": "H=[2, \"segment\", \"video/mp2t\", \"mpegts\", [[\"audio:aac\"], 2.0]] J=[2, \"segment\", \"video/mp2t\", \"mpegts\", [[\"audio:aac\"], 2.0]]"
+      "note": "H=[2, \"segment\", \"video/mp2t\", \"mpegts\", [[\"audio:aac\"], 2.0]] J=[2, \"segment\", \"video/mp2t\", \"mpegts\", [[\"audio:aac\"], 2.0]] (declared properties agreed; bytes not diffed)",
+      "verification_method": "property"
     },
     "GET /Audio/{itemId}/main.m3u8": {
       "classification": "",
       "deep_verified": true,
-      "note": "H=[2, \"m3u8\", \"application/vnd.apple.mpegurl\", [\"#EXT-X-MEDIA-SEQUENCE:0\", \"#EXT-X-PLAYLIST-TYPE:VOD\", \"#EXT-X-TARGETDURATION:2\", \"#EXT-X-VERSION:3\", \"#EXTM3U\", \"#EXTINF:2\", \"segment#1\", \"#EXT-X-ENDLIST\"]] J=[2, \"m3u8\", \"application/vnd.apple.mpegurl\", [\"#EXT-X-MEDIA-SEQUENCE:0\", \"#EXT-X-PLAYLIST-TYPE:VOD\", \"#EXT-X-TARGETDURATION:2\", \"#EXT-X-VERSION:3\", \"#EXTM3U\", \"#EXTINF:2\", \"segment#1\", \"#EXT-X-ENDLIST\"]]"
+      "note": "H=[2, \"m3u8\", \"application/vnd.apple.mpegurl\", [\"#EXT-X-MEDIA-SEQUENCE:0\", \"#EXT-X-PLAYLIST-TYPE:VOD\", \"#EXT-X-TARGETDURATION:2\", \"#EXT-X-VERSION:3\", \"#EXTM3U\", \"#EXTINF:2\", \"segment#1\", \"#EXT-X-ENDLIST\"]] J=[2, \"m3u8\", \"application/vnd.apple.mpegurl\", [\"#EXT-X-MEDIA-SEQUENCE:0\", \"#EXT-X-PLAYLIST-TYPE:VOD\", \"#EXT-X-TARGETDURATION:2\", \"#EXT-X-VERSION:3\", \"#EXTM3U\", \"#EXTINF:2\", \"segment#1\", \"#EXT-X-ENDLIST\"]] (declared properties agreed; bytes not diffed)",
+      "verification_method": "property"
     },
     "GET /Audio/{itemId}/master.m3u8": {
       "classification": "",
       "deep_verified": true,
-      "note": "H=[2, \"m3u8\", \"application/vnd.apple.mpegurl\", [\"#EXTM3U\", \"#EXT-X-STREAM-INF:AVERAGE-BANDWIDTH=0,BANDWIDTH=0,CODECS=\\\"mp4a.40.2\\\" \\u2192 main.m3u8?audioBitRate=128000&audioCodec=aac&segmentContainer=ts\"]] J=[2, \"m3u8\", \"application/vnd.apple.mpegurl\", [\"#EXTM3U\", \"#EXT-X-STREAM-INF:AVERAGE-BANDWIDTH=0,BANDWIDTH=0,CODECS=\\\"mp4a.40.2\\\" \\u2192 main.m3u8?audioBitRate=128000&audioCodec=aac&segmentContainer=ts\"]]"
+      "note": "H=[2, \"m3u8\", \"application/vnd.apple.mpegurl\", [\"#EXTM3U\", \"#EXT-X-STREAM-INF:AVERAGE-BANDWIDTH=0,BANDWIDTH=0,CODECS=\\\"mp4a.40.2\\\" \\u2192 main.m3u8?audioBitRate=128000&audioCodec=aac&segmentContainer=ts\"]] J=[2, \"m3u8\", \"application/vnd.apple.mpegurl\", [\"#EXTM3U\", \"#EXT-X-STREAM-INF:AVERAGE-BANDWIDTH=0,BANDWIDTH=0,CODECS=\\\"mp4a.40.2\\\" \\u2192 main.m3u8?audioBitRate=128000&audioCodec=aac&segmentContainer=ts\"]] (declared properties agreed; bytes not diffed)",
+      "verification_method": "property"
     },
     "GET /Audio/{itemId}/stream": {
       "classification": "",
       "deep_verified": true,
-      "note": "H=[2, \"file\", \"d9c29dff9433dd0b01cb49cdee80f6efebbedba1d7f553b08df87a2a3fd06e6e\", \"audio/flac\", \"bytes\", 206, \"bytes 0-99/39310\", \"64f327979c2c5257c4aa5a74e0209cfffd8a04ae0f2599ca030b1acf9ad09270\"] J=[2, \"file\", \"d9c29dff9433dd0b01cb49cdee80f6efebbedba1d7f553b08df87a2a3fd06e6e\", \"audio/flac\", \"bytes\", 206, \"bytes 0-99/39310\", \"64f327979c2c5257c4aa5a74e0209cfffd8a04ae0f2599ca030b1acf9ad09270\"]"
+      "note": "H=[2, \"file\", \"d9c29dff9433dd0b01cb49cdee80f6efebbedba1d7f553b08df87a2a3fd06e6e\", \"audio/flac\", \"bytes\", 206, \"bytes 0-99/39310\", \"64f327979c2c5257c4aa5a74e0209cfffd8a04ae0f2599ca030b1acf9ad09270\"] J=[2, \"file\", \"d9c29dff9433dd0b01cb49cdee80f6efebbedba1d7f553b08df87a2a3fd06e6e\", \"audio/flac\", \"bytes\", 206, \"bytes 0-99/39310\", \"64f327979c2c5257c4aa5a74e0209cfffd8a04ae0f2599ca030b1acf9ad09270\"]",
+      "verification_method": "body-diff"
     },
     "GET /Audio/{itemId}/stream.{container}": {
       "classification": "",
       "deep_verified": true,
-      "note": "H=[2, \"file\", \"d9c29dff9433dd0b01cb49cdee80f6efebbedba1d7f553b08df87a2a3fd06e6e\", \"audio/flac\", \"bytes\"] J=[2, \"file\", \"d9c29dff9433dd0b01cb49cdee80f6efebbedba1d7f553b08df87a2a3fd06e6e\", \"audio/flac\", \"bytes\"]"
+      "note": "H=[2, \"file\", \"d9c29dff9433dd0b01cb49cdee80f6efebbedba1d7f553b08df87a2a3fd06e6e\", \"audio/flac\", \"bytes\"] J=[2, \"file\", \"d9c29dff9433dd0b01cb49cdee80f6efebbedba1d7f553b08df87a2a3fd06e6e\", \"audio/flac\", \"bytes\"]",
+      "verification_method": "body-diff"
     },
     "GET /Audio/{itemId}/universal": {
       "classification": "",
       "deep_verified": true,
-      "note": "H=[2, \"file\", \"d9c29dff9433dd0b01cb49cdee80f6efebbedba1d7f553b08df87a2a3fd06e6e\", \"audio/flac\", \"bytes\"] J=[2, \"file\", \"d9c29dff9433dd0b01cb49cdee80f6efebbedba1d7f553b08df87a2a3fd06e6e\", \"audio/flac\", \"bytes\"]"
+      "note": "H=[2, \"file\", \"d9c29dff9433dd0b01cb49cdee80f6efebbedba1d7f553b08df87a2a3fd06e6e\", \"audio/flac\", \"bytes\"] J=[2, \"file\", \"d9c29dff9433dd0b01cb49cdee80f6efebbedba1d7f553b08df87a2a3fd06e6e\", \"audio/flac\", \"bytes\"]",
+      "verification_method": "body-diff"
     },
     "GET /Videos/{itemId}/Trickplay/{width}/tiles.m3u8": {
       "classification": "flagged: stream signature diff vs Jellyfin (verify)",
       "deep_verified": false,
-      "note": "H=[null, \"unresolved\"] J=[2, \"m3u8\", \"application/vnd.apple.mpegurl\", [\"#EXT-X-IMAGES-ONLY\", \"#EXT-X-MEDIA-SEQUENCE:1\", \"#EXT-X-PLAYLIST-TYPE:VOD\", \"#EXT-X-TARGETDURATION:1\", \"#EXT-X-VERSION:7\", \"#EXTM3U\", \"#EXTINF:30\", \"#EXT-X-TILES:RESOLUTION=320x240,LAYOUT=10x10,DURATION=10\", \"segment#1\", \"#EXT-X-ENDLIST\"]]"
+      "note": "H=[null, \"unresolved\"] J=[2, \"m3u8\", \"application/vnd.apple.mpegurl\", [\"#EXT-X-IMAGES-ONLY\", \"#EXT-X-MEDIA-SEQUENCE:1\", \"#EXT-X-PLAYLIST-TYPE:VOD\", \"#EXT-X-TARGETDURATION:1\", \"#EXT-X-VERSION:7\", \"#EXTM3U\", \"#EXTINF:30\", \"#EXT-X-TILES:RESOLUTION=320x240,LAYOUT=10x10,DURATION=10\", \"segment#1\", \"#EXT-X-ENDLIST\"]]",
+      "verification_method": "property"
     },
     "GET /Videos/{itemId}/Trickplay/{width}/{index}.jpg": {
       "classification": "flagged: stream signature diff vs Jellyfin (verify)",
       "deep_verified": false,
-      "note": "H=[null, \"unresolved\"] J=[2, \"image\", \"jpeg\", 3200, 2400]"
+      "note": "H=[null, \"unresolved\"] J=[2, \"image\", \"jpeg\", 3200, 2400]",
+      "verification_method": "property"
     },
     "GET /Videos/{itemId}/hls/{playlistId}/stream.m3u8": {
       "classification": "",
       "deep_verified": true,
-      "note": "H=[4, \"\"] J=[4, \"\"]"
+      "note": "H=[4, \"\"] J=[4, \"\"] (status class only; nothing was served)",
+      "verification_method": "status-class"
     },
     "GET /Videos/{itemId}/hls/{playlistId}/{segmentId}.{segmentContainer}": {
       "classification": "",
       "deep_verified": true,
-      "note": "H=[4, \"\"] J=[4, \"\"]"
+      "note": "H=[4, \"\"] J=[4, \"\"] (status class only; nothing was served)",
+      "verification_method": "status-class"
     },
     "GET /Videos/{itemId}/hls1/{playlistId}/{segmentId}.{container}": {
       "classification": "",
       "deep_verified": true,
-      "note": "H=[2, \"segment\", \"video/mp2t\", \"mpegts\", [[\"audio:aac\", \"video:h264:320x240\"], 1.0]] J=[2, \"segment\", \"video/mp2t\", \"mpegts\", [[\"audio:aac\", \"video:h264:320x240\"], 1.0]]"
+      "note": "H=[2, \"segment\", \"video/mp2t\", \"mpegts\", [[\"audio:aac\", \"video:h264:320x240\"], 1.0]] J=[2, \"segment\", \"video/mp2t\", \"mpegts\", [[\"audio:aac\", \"video:h264:320x240\"], 1.0]] (declared properties agreed; bytes not diffed)",
+      "verification_method": "property"
     },
     "GET /Videos/{itemId}/live.m3u8": {
       "classification": "",
       "deep_verified": true,
-      "note": "H=[2, \"m3u8\", \"application/vnd.apple.mpegurl\", [\"#EXT-X-MEDIA-SEQUENCE:0\", \"#EXT-X-PLAYLIST-TYPE:VOD\", \"#EXT-X-TARGETDURATION:1\", \"#EXT-X-VERSION:3\", \"#EXTM3U\", \"#EXTINF:1\", \"segment#1\", \"#EXT-X-ENDLIST\"]] J=[2, \"m3u8\", \"application/vnd.apple.mpegurl\", [\"#EXT-X-MEDIA-SEQUENCE:0\", \"#EXT-X-PLAYLIST-TYPE:VOD\", \"#EXT-X-TARGETDURATION:1\", \"#EXT-X-VERSION:3\", \"#EXTM3U\", \"#EXTINF:1\", \"segment#1\", \"#EXT-X-ENDLIST\"]]"
+      "note": "H=[2, \"m3u8\", \"application/vnd.apple.mpegurl\", [\"#EXT-X-MEDIA-SEQUENCE:0\", \"#EXT-X-PLAYLIST-TYPE:VOD\", \"#EXT-X-TARGETDURATION:1\", \"#EXT-X-VERSION:3\", \"#EXTM3U\", \"#EXTINF:1\", \"segment#1\", \"#EXT-X-ENDLIST\"]] J=[2, \"m3u8\", \"application/vnd.apple.mpegurl\", [\"#EXT-X-MEDIA-SEQUENCE:0\", \"#EXT-X-PLAYLIST-TYPE:VOD\", \"#EXT-X-TARGETDURATION:1\", \"#EXT-X-VERSION:3\", \"#EXTM3U\", \"#EXTINF:1\", \"segment#1\", \"#EXT-X-ENDLIST\"]] (declared properties agreed; bytes not diffed)",
+      "verification_method": "property"
     },
     "GET /Videos/{itemId}/main.m3u8": {
       "classification": "",
       "deep_verified": true,
-      "note": "H=[2, \"m3u8\", \"application/vnd.apple.mpegurl\", [\"#EXT-X-MEDIA-SEQUENCE:0\", \"#EXT-X-PLAYLIST-TYPE:VOD\", \"#EXT-X-TARGETDURATION:2\", \"#EXT-X-VERSION:3\", \"#EXTM3U\", \"#EXTINF:1\", \"segment#1\", \"#EXT-X-ENDLIST\"]] J=[2, \"m3u8\", \"application/vnd.apple.mpegurl\", [\"#EXT-X-MEDIA-SEQUENCE:0\", \"#EXT-X-PLAYLIST-TYPE:VOD\", \"#EXT-X-TARGETDURATION:2\", \"#EXT-X-VERSION:3\", \"#EXTM3U\", \"#EXTINF:1\", \"segment#1\", \"#EXT-X-ENDLIST\"]]"
+      "note": "H=[2, \"m3u8\", \"application/vnd.apple.mpegurl\", [\"#EXT-X-MEDIA-SEQUENCE:0\", \"#EXT-X-PLAYLIST-TYPE:VOD\", \"#EXT-X-TARGETDURATION:2\", \"#EXT-X-VERSION:3\", \"#EXTM3U\", \"#EXTINF:1\", \"segment#1\", \"#EXT-X-ENDLIST\"]] J=[2, \"m3u8\", \"application/vnd.apple.mpegurl\", [\"#EXT-X-MEDIA-SEQUENCE:0\", \"#EXT-X-PLAYLIST-TYPE:VOD\", \"#EXT-X-TARGETDURATION:2\", \"#EXT-X-VERSION:3\", \"#EXTM3U\", \"#EXTINF:1\", \"segment#1\", \"#EXT-X-ENDLIST\"]] (declared properties agreed; bytes not diffed)",
+      "verification_method": "property"
     },
     "GET /Videos/{itemId}/master.m3u8": {
       "classification": "",
       "deep_verified": true,
-      "note": "H=[2, \"m3u8\", \"application/vnd.apple.mpegurl\", [\"#EXTM3U\", \"#EXT-X-STREAM-INF:AVERAGE-BANDWIDTH=4,BANDWIDTH=4,CODECS=\\\"avc1.424029,mp4a.40.2\\\",FRAME-RATE=10,RESOLUTION=320x240,VIDEO-RANGE=SDR \\u2192 main.m3u8?audioBitRate=128000&audioCodec=aac&maxWidth=320&segmentContainer=ts&transcodingMaxAudioChannels=2&videoBitRate=1000000&videoCodec=h264\"]] J=[2, \"m3u8\", \"application/vnd.apple.mpegurl\", [\"#EXTM3U\", \"#EXT-X-STREAM-INF:AVERAGE-BANDWIDTH=4,BANDWIDTH=4,CODECS=\\\"avc1.424029,mp4a.40.2\\\",FRAME-RATE=10,RESOLUTION=320x240,VIDEO-RANGE=SDR \\u2192 main.m3u8?audioBitRate=128000&audioCodec=aac&maxWidth=320&segmentContainer=ts&transcodingMaxAudioChannels=2&videoBitRate=1000000&videoCodec=h264\"]]"
+      "note": "H=[2, \"m3u8\", \"application/vnd.apple.mpegurl\", [\"#EXTM3U\", \"#EXT-X-STREAM-INF:AVERAGE-BANDWIDTH=4,BANDWIDTH=4,CODECS=\\\"avc1.424029,mp4a.40.2\\\",FRAME-RATE=10,RESOLUTION=320x240,VIDEO-RANGE=SDR \\u2192 main.m3u8?audioBitRate=128000&audioCodec=aac&maxWidth=320&segmentContainer=ts&transcodingMaxAudioChannels=2&videoBitRate=1000000&videoCodec=h264\"]] J=[2, \"m3u8\", \"application/vnd.apple.mpegurl\", [\"#EXTM3U\", \"#EXT-X-STREAM-INF:AVERAGE-BANDWIDTH=4,BANDWIDTH=4,CODECS=\\\"avc1.424029,mp4a.40.2\\\",FRAME-RATE=10,RESOLUTION=320x240,VIDEO-RANGE=SDR \\u2192 main.m3u8?audioBitRate=128000&audioCodec=aac&maxWidth=320&segmentContainer=ts&transcodingMaxAudioChannels=2&videoBitRate=1000000&videoCodec=h264\"]] (declared properties agreed; bytes not diffed)",
+      "verification_method": "property"
     },
     "GET /Videos/{itemId}/stream": {
       "classification": "",
       "deep_verified": true,
-      "note": "H=[2, \"file\", \"2801fdb3955d4f5acf8822b4a3414a72eeecd9b68f4a0083d30e46f15ff58f7c\", \"video/x-matroska\", \"bytes\", 206, \"bytes 0-99/775053\", \"fd69399658b25b328773da41ebdbb9df83f303b7332d2fadb010235d40e71982\"] J=[2, \"file\", \"2801fdb3955d4f5acf8822b4a3414a72eeecd9b68f4a0083d30e46f15ff58f7c\", \"video/x-matroska\", \"bytes\", 206, \"bytes 0-99/775053\", \"fd69399658b25b328773da41ebdbb9df83f303b7332d2fadb010235d40e71982\"]"
+      "note": "H=[2, \"file\", \"2801fdb3955d4f5acf8822b4a3414a72eeecd9b68f4a0083d30e46f15ff58f7c\", \"video/x-matroska\", \"bytes\", 206, \"bytes 0-99/775053\", \"fd69399658b25b328773da41ebdbb9df83f303b7332d2fadb010235d40e71982\"] J=[2, \"file\", \"2801fdb3955d4f5acf8822b4a3414a72eeecd9b68f4a0083d30e46f15ff58f7c\", \"video/x-matroska\", \"bytes\", 206, \"bytes 0-99/775053\", \"fd69399658b25b328773da41ebdbb9df83f303b7332d2fadb010235d40e71982\"]",
+      "verification_method": "body-diff"
     },
     "GET /Videos/{itemId}/stream.{container}": {
       "classification": "",
       "deep_verified": true,
-      "note": "H=[2, \"file\", \"2801fdb3955d4f5acf8822b4a3414a72eeecd9b68f4a0083d30e46f15ff58f7c\", \"video/x-matroska\", \"bytes\"] J=[2, \"file\", \"2801fdb3955d4f5acf8822b4a3414a72eeecd9b68f4a0083d30e46f15ff58f7c\", \"video/x-matroska\", \"bytes\"]"
+      "note": "H=[2, \"file\", \"2801fdb3955d4f5acf8822b4a3414a72eeecd9b68f4a0083d30e46f15ff58f7c\", \"video/x-matroska\", \"bytes\"] J=[2, \"file\", \"2801fdb3955d4f5acf8822b4a3414a72eeecd9b68f4a0083d30e46f15ff58f7c\", \"video/x-matroska\", \"bytes\"]",
+      "verification_method": "body-diff"
     },
     "GET /Videos/{itemId}/{mediaSourceId}/Subtitles/{index}/subtitles.m3u8": {
       "classification": "",
       "deep_verified": true,
-      "note": "H=[2, \"m3u8\", \"application/vnd.apple.mpegurl\", [\"#EXT-X-MEDIA-SEQUENCE:0\", \"#EXT-X-PLAYLIST-TYPE:VOD\", \"#EXT-X-TARGETDURATION:10\", \"#EXT-X-VERSION:3\", \"#EXTM3U\", \"#EXTINF:1\", \"segment#1\", \"#EXT-X-ENDLIST\"]] J=[2, \"m3u8\", \"application/vnd.apple.mpegurl\", [\"#EXT-X-MEDIA-SEQUENCE:0\", \"#EXT-X-PLAYLIST-TYPE:VOD\", \"#EXT-X-TARGETDURATION:10\", \"#EXT-X-VERSION:3\", \"#EXTM3U\", \"#EXTINF:1\", \"segment#1\", \"#EXT-X-ENDLIST\"]]"
+      "note": "H=[2, \"m3u8\", \"application/vnd.apple.mpegurl\", [\"#EXT-X-MEDIA-SEQUENCE:0\", \"#EXT-X-PLAYLIST-TYPE:VOD\", \"#EXT-X-TARGETDURATION:10\", \"#EXT-X-VERSION:3\", \"#EXTM3U\", \"#EXTINF:1\", \"segment#1\", \"#EXT-X-ENDLIST\"]] J=[2, \"m3u8\", \"application/vnd.apple.mpegurl\", [\"#EXT-X-MEDIA-SEQUENCE:0\", \"#EXT-X-PLAYLIST-TYPE:VOD\", \"#EXT-X-TARGETDURATION:10\", \"#EXT-X-VERSION:3\", \"#EXTM3U\", \"#EXTINF:1\", \"segment#1\", \"#EXT-X-ENDLIST\"]] (declared properties agreed; bytes not diffed)",
+      "verification_method": "property"
     },
     "GET /Videos/{routeItemId}/{routeMediaSourceId}/Subtitles/{routeIndex}/Stream.{routeFormat}": {
       "classification": "",
       "deep_verified": true,
-      "note": "H=[[2, \"text/vtt\", \"\\ufeffWEBVTT\\n\\nRegion: id:subtitle width:80% lines:3 regionanchor:50%,100% viewportanchor:50%,90%\\n\\n00:00:00.023 --> 00:00:01.023 region:subtitle line:90%\\nParity subtitle\\nsecond line\\n\\n\"], [2, \"application/x-subrip\", \"1\\n00:00:00,023 --> 00:00:01,023\\nParity subtitle\\nsecond line\\n\\n\"], [2, \"application/json\", \"{\\\"TrackEvents\\\":[{\\\"Id\\\":\\\"1\\\",\\\"Text\\\":\\\"Parity subtitle\\\\nsec\u2026 J=[[2, \"text/vtt\", \"\\ufeffWEBVTT\\n\\nRegion: id:subtitle width:80% lines:3 regionanchor:50%,100% viewportanchor:50%,90%\\n\\n00:00:00.023 --> 00:00:01.023 region:subtitle line:90%\\nParity subtitle\\nsecond line\\n\\n\"], [2, \"application/x-subrip\", \"1\\n00:00:00,023 --> 00:00:01,023\\nParity subtitle\\nsecond line\\n\\n\"], [2, \"application/json\", \"{\\\"TrackEvents\\\":[{\\\"Id\\\":\\\"1\\\",\\\"Text\\\":\\\"Parity subtitle\\\\nsec\u2026"
+      "note": "H=[[2, \"text/vtt\", \"\\ufeffWEBVTT\\n\\nRegion: id:subtitle width:80% lines:3 regionanchor:50%,100% viewportanchor:50%,90%\\n\\n00:00:00.023 --> 00:00:01.023 region:subtitle line:90%\\nParity subtitle\\nsecond line\\n\\n\"], [2, \"application/x-subrip\", \"1\\n00:00:00,023 --> 00:00:01,023\\nParity subtitle\\nsecond line\\n\\n\"], [2, \"application/json\", \"{\\\"TrackEvents\\\":[{\\\"Id\\\":\\\"1\\\",\\\"Text\\\":\\\"Parity subtitle\\\\nsec\u2026 J=[[2, \"text/vtt\", \"\\ufeffWEBVTT\\n\\nRegion: id:subtitle width:80% lines:3 regionanchor:50%,100% viewportanchor:50%,90%\\n\\n00:00:00.023 --> 00:00:01.023 region:subtitle line:90%\\nParity subtitle\\nsecond line\\n\\n\"], [2, \"application/x-subrip\", \"1\\n00:00:00,023 --> 00:00:01,023\\nParity subtitle\\nsecond line\\n\\n\"], [2, \"application/json\", \"{\\\"TrackEvents\\\":[{\\\"Id\\\":\\\"1\\\",\\\"Text\\\":\\\"Parity subtitle\\\\nsec\u2026",
+      "verification_method": "body-diff"
     },
     "GET /Videos/{routeItemId}/{routeMediaSourceId}/Subtitles/{routeIndex}/{routeStartPositionTicks}/Stream.{routeFormat}": {
       "classification": "",
       "deep_verified": true,
-      "note": "H=[2, \"text/vtt\", \"WEBVTT\\nX-TIMESTAMP-MAP=MPEGTS:900000,LOCAL:00:00:00.000\\n\\nRegion: id:subtitle width:80% lines:3 regionanchor:50%,100% viewportanchor:50%,90%\\n\\n00:00:00.023 --> 00:00:01.023 region:subtitle line:90%\\nParity subtitle\\nsecond line\\n\\n\"] J=[2, \"text/vtt\", \"WEBVTT\\nX-TIMESTAMP-MAP=MPEGTS:900000,LOCAL:00:00:00.000\\n\\nRegion: id:subtitle width:80% lines:3 regionanchor:50%,100% viewportanchor:50%,90%\\n\\n00:00:00.023 --> 00:00:01.023 region:subtitle line:90%\\nParity subtitle\\nsecond line\\n\\n\"]"
+      "note": "H=[2, \"text/vtt\", \"WEBVTT\\nX-TIMESTAMP-MAP=MPEGTS:900000,LOCAL:00:00:00.000\\n\\nRegion: id:subtitle width:80% lines:3 regionanchor:50%,100% viewportanchor:50%,90%\\n\\n00:00:00.023 --> 00:00:01.023 region:subtitle line:90%\\nParity subtitle\\nsecond line\\n\\n\"] J=[2, \"text/vtt\", \"WEBVTT\\nX-TIMESTAMP-MAP=MPEGTS:900000,LOCAL:00:00:00.000\\n\\nRegion: id:subtitle width:80% lines:3 regionanchor:50%,100% viewportanchor:50%,90%\\n\\n00:00:00.023 --> 00:00:01.023 region:subtitle line:90%\\nParity subtitle\\nsecond line\\n\\n\"]",
+      "verification_method": "body-diff"
     },
     "HEAD /Audio/{itemId}/master.m3u8": {
       "classification": "",
       "deep_verified": true,
-      "note": "H=[2, \"application/vnd.apple.mpegurl\"] J=[2, \"application/vnd.apple.mpegurl\"]"
+      "note": "H=[2, \"application/vnd.apple.mpegurl\"] J=[2, \"application/vnd.apple.mpegurl\"] (status class only; nothing was served)",
+      "verification_method": "status-class"
     },
     "HEAD /Audio/{itemId}/stream": {
       "classification": "",
       "deep_verified": true,
-      "note": "H=[2, \"audio/flac\"] J=[2, \"audio/flac\"]"
+      "note": "H=[2, \"audio/flac\"] J=[2, \"audio/flac\"] (status class only; nothing was served)",
+      "verification_method": "status-class"
     },
     "HEAD /Audio/{itemId}/stream.{container}": {
       "classification": "",
       "deep_verified": true,
-      "note": "H=[2, \"audio/flac\"] J=[2, \"audio/flac\"]"
+      "note": "H=[2, \"audio/flac\"] J=[2, \"audio/flac\"] (status class only; nothing was served)",
+      "verification_method": "status-class"
     },
     "HEAD /Audio/{itemId}/universal": {
       "classification": "",
       "deep_verified": true,
-      "note": "H=[2, \"audio/flac\"] J=[2, \"audio/flac\"]"
+      "note": "H=[2, \"audio/flac\"] J=[2, \"audio/flac\"] (status class only; nothing was served)",
+      "verification_method": "status-class"
     },
     "HEAD /Videos/{itemId}/master.m3u8": {
       "classification": "",
       "deep_verified": true,
-      "note": "H=[2, \"application/vnd.apple.mpegurl\"] J=[2, \"application/vnd.apple.mpegurl\"]"
+      "note": "H=[2, \"application/vnd.apple.mpegurl\"] J=[2, \"application/vnd.apple.mpegurl\"] (status class only; nothing was served)",
+      "verification_method": "status-class"
     },
     "HEAD /Videos/{itemId}/stream": {
       "classification": "",
       "deep_verified": true,
-      "note": "H=[2, \"video/x-matroska\"] J=[2, \"video/x-matroska\"]"
+      "note": "H=[2, \"video/x-matroska\"] J=[2, \"video/x-matroska\"] (status class only; nothing was served)",
+      "verification_method": "status-class"
     },
     "HEAD /Videos/{itemId}/stream.{container}": {
       "classification": "",
       "deep_verified": true,
-      "note": "H=[2, \"video/x-matroska\"] J=[2, \"video/x-matroska\"]"
+      "note": "H=[2, \"video/x-matroska\"] J=[2, \"video/x-matroska\"] (status class only; nothing was served)",
+      "verification_method": "status-class"
     }
   }
 }

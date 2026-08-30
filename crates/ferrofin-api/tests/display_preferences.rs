@@ -20,7 +20,7 @@ use ferrofin_api::test_support::{
     FakeSubtitles, FakeTasks, FakeTrickplay, FakeTvSeries, FakeUserData, FakeUserViews, FakeUsers,
 };
 use ferrofin_db::entities::display_preferences::{
-    DisplayPreferencesEntity, ItemDisplayPreferencesEntity,
+    DisplayPreferencesEntity, HomeSectionEntity, ItemDisplayPreferencesEntity,
 };
 use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::branding::BrandingOptions;
@@ -238,6 +238,7 @@ struct StubDisplayPreferences {
     row: Mutex<Option<DisplayPreferencesEntity>>,
     item: Mutex<Option<ItemDisplayPreferencesEntity>>,
     custom: Mutex<Option<std::collections::HashMap<String, Option<String>>>>,
+    sections: Mutex<Option<Vec<(i32, i32)>>>,
 }
 
 fn canned_prefs() -> DisplayPreferencesEntity {
@@ -248,7 +249,8 @@ fn canned_prefs() -> DisplayPreferencesEntity {
         dashboard_theme: Some("dark".to_owned()),
         enable_next_video_info_overlay: true,
         index_by: Some(1),
-        item_id: "11111111-1111-1111-1111-111111111111".to_owned(),
+        // Stored the way `guid_to_db` writes it — uppercase hyphenated.
+        item_id: "AAAAAAAA-1111-1111-1111-111111111111".to_owned(),
         scroll_direction: 1,
         show_backdrop: true,
         show_sidebar: false,
@@ -331,6 +333,20 @@ impl ferrofin_traits::configuration::DisplayPreferencesManager for StubDisplayPr
         item_display_preferences: &ItemDisplayPreferencesEntity,
     ) -> Result<(), ServiceError> {
         *self.item.lock().unwrap() = Some(item_display_preferences.clone());
+        Ok(())
+    }
+    async fn list_home_sections(
+        &self,
+        _display_preferences_id: i64,
+    ) -> Result<Vec<HomeSectionEntity>, ServiceError> {
+        Ok(Vec::new())
+    }
+    async fn set_home_sections(
+        &self,
+        _display_preferences_id: i64,
+        sections: &[(i32, i32)],
+    ) -> Result<(), ServiceError> {
+        *self.sections.lock().unwrap() = Some(sections.to_vec());
         Ok(())
     }
 }
@@ -423,6 +439,9 @@ async fn display_preferences_get_folds_scalars_into_custom_prefs() {
     assert_eq!(v["CustomPrefs"]["dashboardTheme"], "dark");
     // Stored custom prefs are carried through.
     assert_eq!(v["CustomPrefs"]["customKey"], "customVal");
+    // C# returns `ItemId.ToString()` — the lowercase hyphenated Guid — while the
+    // column stores `guid_to_db`'s uppercase form.
+    assert_eq!(v["Id"], "aaaaaaaa-1111-1111-1111-111111111111");
     // IndexBy discriminant (1) → ProductionYear; scroll direction (1) → Vertical.
     assert_eq!(v["IndexBy"], "ProductionYear");
     assert_eq!(v["ScrollDirection"], "Vertical");
@@ -482,6 +501,118 @@ async fn display_preferences_post_parses_scalars_back() {
     assert!(custom.contains_key("keepMe"));
     assert!(!custom.contains_key("chromecastVersion"));
     assert!(!custom.contains_key("homesection0"));
+    // ...and the homesection key became a real HomeSection row (Resume = 4).
+    let sections = prefs.sections.lock().unwrap().clone().unwrap();
+    assert_eq!(sections, vec![(0, 4)]);
+}
+
+/// With no `skipBackLength`/`skipForwardLength` in `CustomPrefs`, the C#
+/// controller stores 10000/30000 — NOT one shared constant. (Upstream v12.0-rc3
+/// unified both to 15000; the pinned oracle is 10.11.8.)
+#[tokio::test]
+async fn display_preferences_post_skip_length_fallbacks_are_10000_and_30000() {
+    let prefs = Arc::new(StubDisplayPreferences::default());
+    let app = state_with_display_prefs(prefs.clone());
+    let body = r#"{
+        "CustomPrefs": { "foo": "bar" },
+        "ScrollDirection": "Horizontal",
+        "SortOrder": "Ascending",
+        "ShowBackdrop": false,
+        "ShowSidebar": true,
+        "RememberIndexing": false,
+        "RememberSorting": true,
+        "PrimaryImageHeight": 250,
+        "PrimaryImageWidth": 250
+    }"#;
+    let (status, _) = send(
+        app,
+        "POST",
+        "/DisplayPreferences/home?client=web",
+        Body::from(body),
+        Some("application/json"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let saved = prefs.row.lock().unwrap().clone().unwrap();
+    assert_eq!(saved.skip_backward_length, 10_000);
+    assert_eq!(saved.skip_forward_length, 30_000);
+}
+
+/// A `landing-*` key whose value does not name a `ViewType` is dropped rather
+/// than persisted; a valid one survives.
+#[tokio::test]
+async fn display_preferences_post_strips_invalid_landing_keys() {
+    let prefs = Arc::new(StubDisplayPreferences::default());
+    let app = state_with_display_prefs(prefs.clone());
+    let body = r#"{
+        "CustomPrefs": {
+            "landing-abc": "movies",
+            "landing-bad": "notaviewtype",
+            "keepMe": "yes"
+        },
+        "ScrollDirection": "Horizontal",
+        "SortOrder": "Ascending",
+        "ShowBackdrop": false,
+        "ShowSidebar": true,
+        "RememberIndexing": false,
+        "RememberSorting": true,
+        "PrimaryImageHeight": 250,
+        "PrimaryImageWidth": 250
+    }"#;
+    let (status, _) = send(
+        app,
+        "POST",
+        "/DisplayPreferences/home?client=web",
+        Body::from(body),
+        Some("application/json"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let custom = prefs.custom.lock().unwrap().clone().unwrap();
+    assert!(
+        custom.contains_key("landing-abc"),
+        "valid ViewType survives"
+    );
+    assert!(
+        !custom.contains_key("landing-bad"),
+        "invalid ViewType stripped"
+    );
+    assert!(custom.contains_key("keepMe"), "unrelated keys untouched");
+}
+
+/// Home sections round-trip through `CustomPrefs`, and an unparseable type
+/// falls back to `defaults[order]` (order 3 -> ResumeBook), while an order at or
+/// beyond that 8-entry table falls back to `None`.
+#[tokio::test]
+async fn display_preferences_home_sections_round_trip_with_default_substitution() {
+    let (v, _saved) = round_trip(
+        r#"{
+            "CustomPrefs": {
+                "homesection0": "smalllibrarytiles",
+                "homesection1": "resume",
+                "homesection3": "bogusvalue",
+                "homesection9": "alsobogus"
+            },
+            "ScrollDirection": "Horizontal",
+            "SortOrder": "Ascending",
+            "ShowBackdrop": false,
+            "ShowSidebar": true,
+            "RememberIndexing": false,
+            "RememberSorting": true,
+            "PrimaryImageHeight": 250,
+            "PrimaryImageWidth": 250
+        }"#,
+    )
+    .await;
+
+    assert_eq!(v["CustomPrefs"]["homesection0"], "smalllibrarytiles");
+    assert_eq!(v["CustomPrefs"]["homesection1"], "resume");
+    // defaults[3] == HomeSectionType.ResumeBook
+    assert_eq!(v["CustomPrefs"]["homesection3"], "resumebook");
+    // order >= 8 has no default entry -> None
+    assert_eq!(v["CustomPrefs"]["homesection9"], "none");
 }
 
 /// A display-preferences manager that actually round-trips: `get` returns the
@@ -490,6 +621,7 @@ async fn display_preferences_post_parses_scalars_back() {
 #[derive(Default)]
 struct RoundTripDisplayPreferences {
     row: Mutex<Option<DisplayPreferencesEntity>>,
+    sections: Mutex<Vec<(i32, i32)>>,
 }
 
 #[async_trait]
@@ -550,6 +682,34 @@ impl ferrofin_traits::configuration::DisplayPreferencesManager for RoundTripDisp
         &self,
         _item_display_preferences: &ItemDisplayPreferencesEntity,
     ) -> Result<(), ServiceError> {
+        Ok(())
+    }
+    async fn list_home_sections(
+        &self,
+        _display_preferences_id: i64,
+    ) -> Result<Vec<HomeSectionEntity>, ServiceError> {
+        Ok(self
+            .sections
+            .lock()
+            .unwrap()
+            .iter()
+            .enumerate()
+            .map(|(i, (order, type_))| HomeSectionEntity {
+                id: i64::try_from(i).unwrap_or(0) + 1,
+                display_preferences_id: 1,
+                order: *order,
+                type_: *type_,
+            })
+            .collect())
+    }
+    async fn set_home_sections(
+        &self,
+        _display_preferences_id: i64,
+        sections: &[(i32, i32)],
+    ) -> Result<(), ServiceError> {
+        let mut stored = sections.to_vec();
+        stored.sort_unstable();
+        *self.sections.lock().unwrap() = stored;
         Ok(())
     }
 }

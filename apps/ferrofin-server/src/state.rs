@@ -505,39 +505,6 @@ pub async fn build_app_state(
         }
     };
 
-    let providers: Arc<dyn ferrofin_traits::providers::ProviderManager> = Arc::new(
-        LocalProviderManager::new(Vec::new())
-            .with_image_store(
-                Arc::clone(&item_persistence_service),
-                metadata_library.clone(),
-            )
-            .with_remote_images(Arc::clone(&tmdb_client), Arc::clone(&item_repository))
-            .with_remote_search_providers(search_providers)
-            .with_dynamic_fetchers(wasm_host.provider_names())
-            .with_studios(Arc::clone(&studios_client))
-            // The other "Choose Image" providers: fanart.tv (movies/series/
-            // artists/albums), TheAudioDb (artists/albums) and OMDb's poster
-            // (movies/trailers/episodes; inert without an API key).
-            .with_fanart(Arc::clone(&fanart_client))
-            .with_audiodb(Arc::clone(&audiodb_client))
-            .with_omdb(Arc::clone(&omdb_client))
-            // The Identify search fills a blank SearchInfo.MetadataLanguage /
-            // MetadataCountryCode from the server configuration, read live so a
-            // `POST /System/Configuration` applies without a restart.
-            .with_metadata_defaults({
-                let config_mgr = Arc::clone(&config_mgr);
-                move || {
-                    let config = config_mgr.snapshot_shared();
-                    (
-                        config.preferred_metadata_language.clone(),
-                        config.metadata_country_code.clone(),
-                    )
-                }
-            })
-            // Enables the kind-filtered built-in external-id descriptors the
-            // Identify dialog renders as id input fields.
-            .with_item_types(item_type_lookup.as_ref()),
-    );
     let file_system: Arc<dyn ferrofin_traits::filesystem::FileSystem> =
         Arc::new(FerrofinFileSystem::new());
     // Kept concrete alongside the trait handle: consumers subscribe on the
@@ -550,13 +517,6 @@ pub async fn build_app_state(
             let config_mgr = Arc::clone(&config_mgr);
             move || config_mgr.snapshot_shared().ui_culture.clone()
         }),
-    );
-    let lyric_providers: Vec<Arc<dyn ferrofin_traits::stubs::LyricProvider>> =
-        vec![Arc::new(ferrofin_providers::LrcLibProvider::new())];
-    let lyrics: Arc<dyn ferrofin_traits::stubs::LyricManager> = Arc::new(
-        FerrofinLyricManager::new()
-            .with_items(Arc::clone(&item_repository))
-            .with_providers(lyric_providers),
     );
     let path_manager: Arc<dyn ferrofin_traits::system::PathManager> =
         Arc::new(FerrofinPathManager::new(Arc::clone(&paths)));
@@ -648,8 +608,9 @@ pub async fn build_app_state(
         Arc::new(FerrofinApiKeyManager::new(db.clone()));
     let display_preferences: Arc<dyn ferrofin_traits::configuration::DisplayPreferencesManager> =
         Arc::new(FerrofinDisplayPreferencesManager::new(db.clone()));
-    let search: Arc<dyn ferrofin_traits::library::SearchManager> =
-        Arc::new(FerrofinSearchManager::new(Arc::clone(&item_repository)));
+    let search: Arc<dyn ferrofin_traits::library::SearchManager> = Arc::new(
+        FerrofinSearchManager::new(Arc::clone(&item_repository), Arc::clone(&users)),
+    );
     // Kept concrete so the "Migrate Trickplay Image Location" task can call the
     // inherent `move_generated_trickplay_data` helper.
     let trickplay_impl = Arc::new(FerrofinTrickplayManager::new(
@@ -697,6 +658,62 @@ pub async fn build_app_state(
     );
     let virtual_folders: Arc<dyn ferrofin_traits::library::VirtualFolderManager> =
         virtual_folders_impl.clone();
+
+    // Lyrics: sidecars for an audio item plus the remote providers. The
+    // internal-metadata root is where an uploaded/downloaded lyric always
+    // lands (Jellyfin's `TrySaveLyric`), and the virtual folders answer the
+    // library's `SaveLyricsWithMedia` flag that decides whether the media
+    // folder is a save target at all — so an upload works over a read-only
+    // media mount.
+    let lyric_providers: Vec<Arc<dyn ferrofin_traits::stubs::LyricProvider>> =
+        vec![Arc::new(ferrofin_providers::LrcLibProvider::new())];
+    let lyrics: Arc<dyn ferrofin_traits::stubs::LyricManager> = Arc::new(
+        FerrofinLyricManager::new()
+            .with_items(Arc::clone(&item_repository))
+            .with_providers(lyric_providers)
+            .with_metadata_path(paths.internal_metadata_path())
+            .with_virtual_folders(Arc::clone(&virtual_folders)),
+    );
+    // Built after the virtual-folder manager: the refresh path reads the
+    // owning library's saved options through it (C# `BaseItemManager`).
+    let providers: Arc<dyn ferrofin_traits::providers::ProviderManager> = Arc::new(
+        LocalProviderManager::new(Vec::new())
+            .with_image_store(
+                Arc::clone(&item_persistence_service),
+                metadata_library.clone(),
+            )
+            .with_remote_images(Arc::clone(&tmdb_client), Arc::clone(&item_repository))
+            .with_remote_search_providers(search_providers)
+            .with_dynamic_fetchers(wasm_host.provider_names())
+            .with_studios(Arc::clone(&studios_client))
+            // The other "Choose Image" providers: fanart.tv (movies/series/
+            // artists/albums), TheAudioDb (artists/albums) and OMDb's poster
+            // (movies/trailers/episodes; inert without an API key).
+            .with_fanart(Arc::clone(&fanart_client))
+            .with_audiodb(Arc::clone(&audiodb_client))
+            .with_omdb(Arc::clone(&omdb_client))
+            // The Identify search fills a blank SearchInfo.MetadataLanguage /
+            // MetadataCountryCode from the server configuration, read live so a
+            // `POST /System/Configuration` applies without a restart.
+            .with_metadata_defaults({
+                let config_mgr = Arc::clone(&config_mgr);
+                move || {
+                    let config = config_mgr.snapshot_shared();
+                    (
+                        config.preferred_metadata_language.clone(),
+                        config.metadata_country_code.clone(),
+                    )
+                }
+            })
+            // Enables the kind-filtered built-in external-id descriptors the
+            // Identify dialog renders as id input fields.
+            .with_item_types(item_type_lookup.as_ref())
+            // The library-options gate for an on-demand refresh: without it a
+            // `POST /Items/{id}/Refresh` ignores the library's metadata/image
+            // fetcher checkboxes that the scan honours.
+            .with_virtual_folders(Arc::clone(&virtual_folders)),
+    );
+
     // The virtual-folder manager gives `/Items/Latest` each library's collection
     // type (C# `CollectionFolder.CollectionType`), which is why the user-view
     // manager is built after it.
