@@ -205,9 +205,10 @@ pub async fn tuner_hosts_exist(db: &Database) -> Result<bool, ServiceError> {
 pub async fn channel_stream_source(
     db: &Database,
     id: Uuid,
-) -> Result<Option<(String, String)>, ServiceError> {
+) -> Result<Option<(crate::tuner_host::StoredChannel, String)>, ServiceError> {
     let row = sqlx::query(
-        r#"SELECT "StreamUrl","TunerHostId" FROM "FerrofinLiveTvChannels" WHERE "Id" = ?1"#,
+        r#"SELECT "StreamUrl","TunerHostId","ExternalId","IsHd","VideoCodec","AudioCodec"
+           FROM "FerrofinLiveTvChannels" WHERE "Id" = ?1"#,
     )
     .bind(guid_to_db(id))
     .fetch_optional(db.pool())
@@ -215,7 +216,15 @@ pub async fn channel_stream_source(
     .map_err(db_err)?;
     Ok(row.map(|r| {
         (
-            r.get::<String, _>("StreamUrl"),
+            crate::tuner_host::StoredChannel {
+                external_id: r.get::<String, _>("ExternalId"),
+                path: r.get::<String, _>("StreamUrl"),
+                // `ChannelInfo.IsHD` is `bool?`: NULL is "the tuner did not
+                // say", which `HdHomerunHost.GetMediaSource` reads as `?? true`.
+                is_hd: r.get::<Option<i64>, _>("IsHd").map(|v| v != 0),
+                video_codec: r.get::<Option<String>, _>("VideoCodec"),
+                audio_codec: r.get::<Option<String>, _>("AudioCodec"),
+            },
             r.get::<String, _>("TunerHostId"),
         )
     }))

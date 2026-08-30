@@ -90,6 +90,15 @@ impl LiveTvManager for CountriesLiveTv {
     async fn save_tuner_host(&self, _info: TunerHostInfo) -> Result<TunerHostInfo, ServiceError> {
         unreachable!()
     }
+    fn tuner_host_types(&self) -> Vec<ferrofin_model::dto::NameIdPair> {
+        unreachable!()
+    }
+    async fn discover_tuners(
+        &self,
+        _discovery_duration_ms: u64,
+    ) -> Result<Vec<TunerHostInfo>, ServiceError> {
+        unreachable!()
+    }
     async fn delete_tuner_host(&self, _id: &str) -> Result<(), ServiceError> {
         unreachable!()
     }

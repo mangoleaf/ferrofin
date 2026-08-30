@@ -491,6 +491,70 @@ def guide_info_invariants(base, token, ctx):
 guide_info_invariants.alias = "LiveTvGuideInfo"
 
 
+#: A groupId that resolves in no id space on either server. The value is
+#: arbitrary BY DESIGN — see `recording_group_invariants`.
+PROBE_GROUP_GUID = "f0f0f0f0-1111-2222-3333-444444444444"
+
+
+def recording_group_invariants(base, token, ctx):
+    """`GET /LiveTv/Recordings/Groups/{groupId}` — an OBSOLETE endpoint whose
+    whole C# body is `return NotFound();`.
+
+    v10.11.8 `Jellyfin.Api/Controllers/LiveTvController.cs:955-966`:
+
+        [HttpGet("Recordings/Groups/{groupId}")]
+        [Authorize(Policy = Policies.LiveTvAccess)]
+        [Obsolete("This endpoint is obsolete.")]
+        public ActionResult<BaseItemDto> GetRecordingGroup([FromRoute, Required] Guid groupId)
+            => NotFound();
+
+    `git grep RecordingGroup v10.11.8 -- '*.cs'` returns only the two controller
+    signatures: there is no `LiveTvManager.GetRecordingGroups`, no group-id
+    derivation and no DTO anywhere in the 10.11.8 tree. The answer is therefore
+    groupId-INDEPENDENT, and no recording can ever make it 200 — which is why
+    this is a property row and not a body diff: there is no 200 body to diff,
+    ever, on either server.
+
+    What the facts actually claim, then, is the thing a lookup-that-happens-to-
+    miss would fail: that ids which DO resolve in other id spaces (a real Live
+    TV channel, a real recording — recordings exist on both servers now) are
+    still 404, that the policy gate is in front of the `NotFound`, and that a
+    malformed groupId is a route-binding 400 rather than the handler's 404.
+
+    Only statuses and a boolean go into the facts. The ids themselves are
+    per-server (each instance minted its own recording), so putting one in a
+    fact would be a guaranteed false red.
+    """
+    facts = {}
+
+    def status(group_id, tok=token):
+        return token_get(base, f"/LiveTv/Recordings/Groups/{group_id}", tok)[0]
+
+    facts["nil_guid"] = status("00000000-0000-0000-0000-000000000000")
+    facts["random_guid"] = status(PROBE_GROUP_GUID)
+    if ctx.get("channel"):
+        # A real id from a NEIGHBOURING id space: proof the handler never looks
+        # anything up, rather than looking in an empty table.
+        facts["live_channel_id_does_not_resolve"] = status(ctx["channel"])
+    recordings = (get_json(base, "/LiveTv/Recordings?limit=1", token) or {}).get("Items") or []
+    recording_id = recordings[0].get("Id") if recordings else ""
+    # Recorded as a fact so the leg above cannot silently degrade to "there was
+    # nothing to try": the old classification claimed this row needed a
+    # recording to exist, and this is where that claim is settled.
+    facts["recording_seed_present"] = bool(recording_id)
+    if recording_id:
+        facts["recording_id_does_not_resolve"] = status(recording_id)
+    # `Guid` route binding rejects before the handler runs: 400, not 404.
+    facts["malformed_groupid"] = status("notaguid")
+    # `Policies.LiveTvAccess` sits in front of the `NotFound`, so an anonymous
+    # caller must not be able to tell this route from any other.
+    facts["unauthenticated"] = status(PROBE_GROUP_GUID, None)
+    return facts
+
+
+recording_group_invariants.alias = "LiveTvRecordingGroup"
+
+
 def similar_invariants_for(alias):
     """The invariant probe bound to ONE alias.
 
@@ -580,6 +644,18 @@ def similar_invariants(base, token, ctx, alias="Movies"):
     facts["aliases_agree"] = len(set(sets)) == 1
     facts["aliases_non_empty"] = bool(sets and sets[0])
     return facts
+
+
+def guide_window_body(ctx, body):
+    """`body` plus the `MinStartDate`/`MaxStartDate` window BOTH servers hold.
+
+    A no-op when `shared_guide_window` found no overlap to name — the leg then
+    runs unpinned and its diff says so, rather than the harness inventing a
+    window neither server covers.
+    """
+    if ctx.get("guide_from") and ctx.get("guide_to"):
+        return {**body, "MinStartDate": ctx["guide_from"], "MaxStartDate": ctx["guide_to"]}
+    return dict(body)
 
 
 READS = [
@@ -771,6 +847,83 @@ READS = [
     user("GET /LiveTv/Channels", "/LiveTv/Channels?userId={u}"),
     user("GET /LiveTv/Channels/{channelId}", "/LiveTv/Channels/{channel}?userId={u}"),
     user("GET /LiveTv/Programs", "/LiveTv/Programs?channelIds={channel}&isAiring=true&userId={u}"),
+    # The BODY form of the row above. `LiveTvController.GetPrograms([FromBody]
+    # GetProgramsDto)` (v10.11.8 LiveTvController.cs:654-695) builds the
+    # identical `InternalItemsQuery` as the query-string overload and calls the
+    # same `_liveTvManager.GetPrograms`, so an equivalent body must return the
+    # equivalent guide — on each server AND across the pair. It lives here and
+    # not in journeys.py for the `RemoteSearch` reason: nothing is mutated,
+    # there is no read-back, and `posted` settles both STATUSES before any body
+    # compare, which is what keeps a Ferrofin 422 against a Jellyfin 200 from
+    # being silently dropped instead of failing.
+    posted("POST /LiveTv/Programs", [
+        # 1. The body twin of the GET leg above — same filters, same answer.
+        post_leg("/LiveTv/Programs", lambda c: {
+            "ChannelIds": [c["channel"]], "IsAiring": True, "UserId": c["u"]}),
+        # 2. The whole guide inside the WINDOW BOTH SERVERS HOLD — every field of
+        #    every programme in it, unpaged. The window pin is not a narrowing of
+        #    what is compared: each server anchors its rolling ~7-day guide to
+        #    its OWN last refresh (`GuideManager.RefreshChannelsInternal` keeps
+        #    `[now - 1h, now - 1h + GuideDays)`), so an unpinned leg compares
+        #    Ferrofin's window against Jellyfin's and calls the offset a body
+        #    divergence. See `shared_guide_window`, which MEASURES the overlap
+        #    from the two servers' own answers rather than hard-coding one.
+        post_leg("/LiveTv/Programs", lambda c: guide_window_body(c, {"UserId": c["u"]})),
+        # 3. Paging, with the tie-break PINNED. `LiveTvManager.GetPrograms`
+        #    (LiveTvManager.cs:199-206) falls back to `OrderBy = [(StartDate,
+        #    Ascending)]` with NO secondary key, and the fixture holds two
+        #    programmes per StartDate. A page edge that cuts such a tie orders
+        #    differently even between Jellyfin's OWN paged and unpaged answers,
+        #    so a bare startIndex/limit leg would be permanently and
+        #    meaninglessly red. Naming the second key makes the page boundary a
+        #    real assertion again rather than a coin toss.
+        post_leg("/LiveTv/Programs", lambda c: guide_window_body(c, {
+            "UserId": c["u"], "StartIndex": 10, "Limit": 5,
+            "SortBy": ["StartDate", "SortName"],
+            "SortOrder": ["Ascending", "Ascending"]})),
+        # 4. The DTO options — `Fields`, image types and user data all reach
+        #    `GetProgramsDto.into_parts`'s `DtoOptions`. `Limit` cuts a
+        #    StartDate tie, so the second sort key is named here too.
+        post_leg("/LiveTv/Programs", lambda c: guide_window_body(c, {
+            "UserId": c["u"], "Limit": 5,
+            "SortBy": ["StartDate", "SortName"],
+            "SortOrder": ["Ascending", "Ascending"],
+            "Fields": ["ChannelInfo", "Overview", "Genres"],
+            "EnableImages": True, "ImageTypeLimit": 1,
+            "EnableImageTypes": ["Primary"], "EnableUserData": True})),
+        # 5-7. THE DELIMITED-STRING FORM. Seven `GetProgramsDto` properties carry
+        #    `JsonCommaDelimitedCollectionConverterFactory` upstream (`Genres`
+        #    carries the PIPE factory), so `"SortBy":"StartDate"` is as valid as
+        #    `["StartDate"]`, and an entry the `TypeConverter` refuses is
+        #    silently dropped rather than rejected
+        #    (JsonDelimitedCollectionConverter.Read). Ferrofin bound all seven as
+        #    plain arrays and answered 422 to every string form; these legs are
+        #    the regression pin for that fix, and leg 7 pins the DROP semantics
+        #    specifically — a strict parser would 400 where Jellyfin returns the
+        #    real channel's programmes.
+        #
+        #    These three are window-pinned as well: a leg that 422s on one side
+        #    fails on the STATUS before any body compare, so the pin cannot mask
+        #    the regression it exists to catch — it only stops the guide offset
+        #    from reporting a second, false divergence on top of it.
+        post_leg("/LiveTv/Programs", lambda c: guide_window_body(c, {
+            "ChannelIds": c["channel"], "SortBy": "StartDate,SortName",
+            "SortOrder": "Ascending,Ascending", "Fields": "Overview",
+            "EnableImageTypes": "Primary", "UserId": c["u"], "Limit": 5})),
+        post_leg("/LiveTv/Programs", lambda c: guide_window_body(c, {
+            "Genres": "News", "UserId": c["u"], "Limit": 5,
+            "SortBy": "StartDate,SortName", "SortOrder": "Ascending,Ascending"})),
+        post_leg("/LiveTv/Programs", lambda c: guide_window_body(c, {
+            "ChannelIds": "not-a-guid," + c["channel"],
+            "SortBy": "NotASort,StartDate,SortName",
+            "SortOrder": "Ascending,Ascending", "UserId": c["u"], "Limit": 5})),
+        # 8. `UserId` is NOT defaulted from the caller on the body form —
+        #    `body.UserId.IsNullOrEmpty() ? null : GetUserById(...)`, unlike the
+        #    query-string overload. An anonymous-user guide is a different DTO.
+        post_leg("/LiveTv/Programs", lambda c: guide_window_body(c, {
+            "Limit": 3, "SortBy": ["StartDate", "SortName"],
+            "SortOrder": ["Ascending", "Ascending"]})),
+    ]),
     user("GET /LiveTv/Programs/Recommended", "/LiveTv/Programs/Recommended?userId={u}&isAiring=true&limit=5"),
     user("GET /LiveTv/Timers/Defaults", "/LiveTv/Timers/Defaults"),
     # `EnabledUsers` is `user.Id.ToString("N")` for every user who may use Live
@@ -794,6 +947,7 @@ READS = [
     # `sorted()` the day the harness provisions users in a pinned order on both
     # servers, and the row gets its ordering check back for free.
     invariant("GET /LiveTv/GuideInfo", guide_info_invariants),
+    invariant("GET /LiveTv/Recordings/Groups/{groupId}", recording_group_invariants),
     user("GET /LiveTv/Info", "/LiveTv/Info",
          project=lambda b, c: {**b, "EnabledUsers": sorted(
              c["users_by_id"].get(i, i) for i in (b.get("EnabledUsers") or []))}),
@@ -1024,12 +1178,65 @@ def resolve_named(base, token, user_id):
     }
 
 
+def shared_guide_window(bases_tokens):
+    """The `[MinStartDate, MaxStartDate)` BOTH servers' guides cover, as ISO-8601 Z.
+
+    Each server holds a ROLLING guide window anchored to its own last refresh:
+    `GuideManager.RefreshChannelsInternal` keeps `[now - 1h, now - 1h + GuideDays)`
+    and drops the rest (v10.11.8 GuideManager.cs:215-231). Two independent
+    instances therefore never hold the same window — a container restart moves
+    one of them by hours — so an UNPINNED programme leg compares Ferrofin's
+    window against Jellyfin's and reports the offset as a body divergence,
+    which it is not.
+
+    Pinning the window is the honest instrument here, and it is narrow: it is
+    the intersection of what the two servers actually hold, measured from their
+    own answers rather than hard-coded, so it shrinks when the servers disagree
+    instead of hiding the disagreement. What stays compared inside it is every
+    field of every programme. Guide-window ANCHORING itself is per-instance
+    refresh state owned by the guide-refresh and scheduled-task rows, not by
+    this op.
+
+    Returns `None` when either server holds no guide, so the caller can leave
+    the legs unpinned rather than invent a window.
+    """
+    edges = []
+    for base, token in bases_tokens:
+        lo = hi = None
+        for order, pick in (("Ascending", "lo"), ("Descending", "hi")):
+            body = get_json(base, "/LiveTv/Programs?limit=1&sortBy=StartDate"
+                                  f"&sortOrder={order}", token) or {}
+            items = body.get("Items") or []
+            if not items:
+                return None
+            if pick == "lo":
+                lo = items[0].get("StartDate")
+            else:
+                hi = items[0].get("StartDate")
+        if not lo or not hi:
+            return None
+        edges.append((lo, hi))
+    # ISO-8601 Z strings of one fixed shape sort lexicographically, which is
+    # exactly the comparison the intersection needs.
+    start, end = max(e[0] for e in edges), min(e[1] for e in edges)
+    return (start, end) if start < end else None
+
+
 def run(ferrofin_url, jellyfin_url):
     ht, hu = bring_up(ferrofin_url, "ferrofin")
     jt, ju = bring_up(jellyfin_url, "jellyfin")
     hc, jc = resolve_named(ferrofin_url, ht, hu), resolve_named(jellyfin_url, jt, ju)
     # `similar_invariants` holds each server to ITS OWN documented algorithm.
     hc["server"], jc["server"] = "ferrofin", "jellyfin"
+
+    # The guide window both servers hold, so the programme legs ask for the same
+    # airings on both rather than for each server's own rolling window.
+    window = shared_guide_window([(ferrofin_url, ht), (jellyfin_url, jt)])
+    if window is None:
+        print("  live tv guide window: one server holds no programmes; the POST "
+              "/LiveTv/Programs legs run UNPINNED", file=sys.stderr)
+    for ctx in (hc, jc):
+        ctx["guide_from"], ctx["guide_to"] = window or (None, None)
 
     pairs = correlate(path_id_map(ferrofin_url, ht, hu), path_id_map(jellyfin_url, jt, ju))
 
@@ -1341,6 +1548,9 @@ def selfcheck():
     ctx = {"user": "U", "u": "U", "genre": "G", "studio": "S", "person": "P", "series": "SE",
            "task": "T", "device": "D", "artist": "A", "artist_id": "AID", "musicgenre": "MG",
            "channel": "CH", "album_id": "ALB", "movie": "MOV", "episode": "EP",
+           # The shared guide window `run` measures; `None` is the "no overlap
+           # to name" case, and the self-check must exercise it too.
+           "guide_from": None, "guide_to": None,
            "season": "SEA", "audio_id": "AUD", "person_id": "PID",
            # user GUID -> username, for the projections that translate a
            # per-instance user id into a comparable identity.
@@ -1357,17 +1567,32 @@ def selfcheck():
             for leg in ep["legs"]:
                 leg["url"](ctx)
         elif ep["kind"] == "posted":
+            # The three assertions below are about the `RemoteSearch` family's body shape
+            # and its rate-limiter machinery, NOT about `posted` in general. Scoped to that
+            # family on purpose: applying them to every posted row made a Live TV row —
+            # which mutates nothing, is never rate-limited and has no `SearchInfo` — abort
+            # the whole self-test, so the layer could not run at all.
+            remote_search = ep["op"].startswith("POST /Items/RemoteSearch")
             for leg in ep["legs"]:
                 body = leg["body"](ctx)
-                assert isinstance(body, dict) and "SearchInfo" in body, \
-                    f"{ep['op']}: a RemoteSearch body without SearchInfo makes Jellyfin 500"
-                assert not (leg["retry_empty"] and not body["IncludeDisabledProviders"]), \
-                    (f"{ep['op']}: a GATED leg asserts `[]`; retrying it away would turn the "
-                     "assertion into an absence of evidence")
-                assert body["IncludeDisabledProviders"] or leg["requires"], \
-                    (f"{ep['op']}: a GATED leg must name a positive control in `requires` — "
-                     "otherwise a rate-limited provider satisfies its `[]` exactly as well "
-                     "as a working gate does")
+                assert isinstance(body, dict), f"{ep['op']}: a leg body must be a dict"
+                if remote_search:
+                    assert "SearchInfo" in body, \
+                        f"{ep['op']}: a RemoteSearch body without SearchInfo makes Jellyfin 500"
+                    assert not (leg["retry_empty"] and not body["IncludeDisabledProviders"]), \
+                        (f"{ep['op']}: a GATED leg asserts `[]`; retrying it away would turn the "
+                         "assertion into an absence of evidence")
+                    assert body["IncludeDisabledProviders"] or leg["requires"], \
+                        (f"{ep['op']}: a GATED leg must name a positive control in `requires` — "
+                         "otherwise a rate-limited provider satisfies its `[]` exactly as well "
+                         "as a working gate does")
+                else:
+                    # `retry_empty` only ever means "a SHARED external rate limiter can make
+                    # both sides empty". Nothing outside RemoteSearch has one, so setting it
+                    # elsewhere would drop a real `[] vs []` divergence.
+                    assert not leg["retry_empty"], \
+                        (f"{ep['op']}: retry_empty models the MusicBrainz rate limiter; a row "
+                         "with no shared external provider must not set it")
                 json.dumps(body)
         if ep["kind"] == "posted":
             tags = {leg["tag"] for leg in ep["legs"] if leg["tag"]}
@@ -1407,7 +1632,10 @@ def selfcheck():
     # are one measurement of the same route.
     aliases = [ep["fn"].alias for ep in READS if ep["kind"] == "invariant"]
     assert len(aliases) == len(set(aliases)), f"invariant rows share an alias: {aliases}"
-    assert set(aliases) <= set(SIMILAR_ALIASES) | {"LiveTvGuideInfo"}, aliases
+    # The allow-list is the `Similar` family plus each hand-written property row.
+    # Naming them keeps a typo'd alias from silently colliding with a real one.
+    assert set(aliases) <= set(SIMILAR_ALIASES) | {
+        "LiveTvGuideInfo", "LiveTvRecordingGroup"}, aliases
     # Every invariant row is stamped `property`, never the body-diff method the
     # ledger headline counts.
     assert all(ep["method"] == "property" for ep in READS if ep["kind"] == "invariant")

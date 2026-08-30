@@ -77,6 +77,16 @@ impl LiveTvManager for CountingLiveTv {
     async fn save_tuner_host(&self, info: TunerHostInfo) -> Result<TunerHostInfo, ServiceError> {
         unimplemented!("not probed by the gate tests")
     }
+    fn tuner_host_types(&self) -> Vec<ferrofin_model::dto::NameIdPair> {
+        unimplemented!("not probed by the gate tests")
+    }
+    #[allow(unused_variables)]
+    async fn discover_tuners(
+        &self,
+        discovery_duration_ms: u64,
+    ) -> Result<Vec<TunerHostInfo>, ServiceError> {
+        unimplemented!("not probed by the gate tests")
+    }
     #[allow(unused_variables)]
     async fn delete_tuner_host(&self, id: &str) -> Result<(), ServiceError> {
         unimplemented!("not probed by the gate tests")

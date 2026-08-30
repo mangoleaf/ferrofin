@@ -162,6 +162,11 @@ blurhash = "0.2"         # ImageBlurHashes — functionally-valid hashes (not by
 config = "0.15"
 clap = { version = "4.5", features = ["derive"] }
 bitflags = "2"
+# CRC-32 (reflected zlib polynomial) for the HDHomeRun control protocol's packet
+# checksum — a port of `MediaBrowser.Common/Crc32.cs`, whose own tests pin
+# 0x414fa339 for "The quick brown fox...". Already in the lock file as a
+# transitive dependency of flate2/zip, so it adds no new compilation.
+crc32fast = "1.5"
 regex = "1"
 fancy-regex = "0.14"    # for C# regexes that use lookaround
 quick-xml = { version = "0.37", features = ["serialize"] }   # NFO/XBMC metadata parsing (ferrofin-providers)

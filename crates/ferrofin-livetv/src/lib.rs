@@ -10,6 +10,13 @@
 //! from `/LiveTv/LiveStreamFiles/{uniqueId}/stream.ts` — so one tuner connection
 //! feeds several viewers plus the transcoder.
 //!
+//! A tuner *kind* is a [`TunerHost`] implementation ([`tuner_host`]) — the port
+//! of `ITunerHost`/`BaseTunerHost`. Ferrofin ships two, the same two Jellyfin
+//! registers: [`M3uTunerHost`] and [`hdhomerun::HdHomerunHost`]. The manager
+//! holds them as `Vec<Arc<dyn TunerHost>>`, so the advertised type list, the
+//! guide refresh's per-tuner dispatch and the media-source/stream paths all
+//! read from one collection.
+//!
 //! [`SchedulesDirect`] serves the account-less Schedules Direct country list
 //! behind Jellyfin's memory + on-disk cache.
 
@@ -18,11 +25,13 @@ pub mod dvr_repository;
 pub mod error;
 pub mod fetch;
 pub mod guide_repository;
+pub mod hdhomerun;
 pub mod m3u;
 pub mod manager;
 pub mod projection;
 pub mod schedules_direct;
 pub mod stream;
+pub mod tuner_host;
 pub mod xmltv;
 
 pub use dvr::{ActiveRecording, RecorderKind, RecordingInput, TimerRecordingInfo};
@@ -31,3 +40,4 @@ pub use fetch::{ReqwestFetcher, SourceFetcher};
 pub use manager::{FerrofinLiveTvManager, LiveTvPaths};
 pub use schedules_direct::SchedulesDirect;
 pub use stream::{ReqwestTunerSource, TunerStreamBody, TunerStreamSource};
+pub use tuner_host::{M3uTunerHost, TunerChannel, TunerHost};

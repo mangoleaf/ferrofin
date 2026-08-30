@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::dto::DayOfWeek;
-use ferrofin_model::dto::{BaseItemDto, MediaSourceInfo, SortOrder};
+use ferrofin_model::dto::{BaseItemDto, MediaSourceInfo, NameIdPair, SortOrder};
 use ferrofin_model::live_tv::{
     ChannelType, DayPattern, GuideInfo, ItemSortBy, KeepUntil, ListingsProviderInfo, LiveTvInfo,
     RecordingQuery, RecordingStatus, SeriesTimerInfoDto, TimerInfoDto, TimerQuery, TunerHostInfo,
@@ -247,7 +247,30 @@ pub trait LiveTvManager: Send + Sync {
 
     /// Saves (adds or updates) a tuner host, returning the stored value with its
     /// assigned id.
+    ///
+    /// Fails with [`ServiceError::NotFound`] when no registered tuner backend
+    /// claims `info.Type` — `TunerHostManager.SaveTunerHost` (v10.11.8
+    /// TunerHostManager.cs:60-69) throws `ResourceNotFoundException` there.
     async fn save_tuner_host(&self, info: TunerHostInfo) -> Result<TunerHostInfo, ServiceError>;
+
+    /// The tuner-host kinds this server supports, ordered by display name.
+    ///
+    /// Port of `ITunerHostManager.GetTunerHostTypes` (v10.11.8
+    /// TunerHostManager.cs:52-58) — the projection of every registered,
+    /// supported `ITunerHost`. Synchronous because it reads a fixed collection,
+    /// not configuration.
+    fn tuner_host_types(&self) -> Vec<NameIdPair>;
+
+    /// Scans the network for tuner devices, giving each backend
+    /// `discovery_duration_ms` to answer.
+    ///
+    /// Port of `ITunerHostManager.DiscoverTuners(newDevicesOnly: false)`
+    /// (v10.11.8 TunerHostManager.cs:102-121). An empty list is a legitimate
+    /// answer — it is what a network with no tuner on it looks like.
+    async fn discover_tuners(
+        &self,
+        discovery_duration_ms: u64,
+    ) -> Result<Vec<TunerHostInfo>, ServiceError>;
 
     /// Deletes the tuner host with the given id (and its cached channels).
     async fn delete_tuner_host(&self, id: &str) -> Result<(), ServiceError>;

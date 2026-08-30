@@ -46,7 +46,10 @@ use ferrofin_traits::stubs::LiveTvChannelQuery;
 use crate::auth::{RequireAdmin, RequireLiveTvAccess, RequireLiveTvManagement};
 use crate::error::ApiError;
 use crate::handlers::items::resolve_user_opt;
-use crate::handlers::query_parse::{parse_csv_enums_lenient, parse_csv_uuids, parse_pipe_strings};
+use crate::handlers::query_parse::{
+    de_comma_delimited, de_pipe_delimited, parse_csv_enums_lenient, parse_csv_uuids,
+    parse_pipe_strings,
+};
 use crate::state::AppState;
 
 /// `GET /LiveTv/Info` — top-level Live TV status.
@@ -342,11 +345,19 @@ impl ProgramsQuery {
 /// Every array member is nullable in the vendored schema and upstream coalesces
 /// each to empty (`body.ChannelIds ?? []`), so they bind as `Option<Vec<_>>`
 /// and collapse the same way.
+///
+/// Seven of those members carry a delimited-collection converter upstream
+/// (`JsonCommaDelimitedCollectionConverterFactory`, or the *pipe* factory on
+/// `Genres`), so each also accepts the delimited-**string** spelling —
+/// `{"SortBy":"StartDate"}` as well as `{"SortBy":["StartDate"]}` — with
+/// unconvertible entries dropped rather than rejected. See
+/// [`de_comma_delimited`].
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(rename_all = "PascalCase", default)]
 #[allow(clippy::struct_excessive_bools)] // one field per contract property
 struct GetProgramsDto {
     /// The channels to return guide information for.
+    #[serde(deserialize_with = "de_comma_delimited")]
     channel_ids: Option<Vec<Uuid>>,
     /// The target user. Unlike the query-string form this does *not* fall back
     /// to the authenticated caller (upstream reads the body id only).
@@ -382,18 +393,24 @@ struct GetProgramsDto {
     /// The maximum number of records to return.
     limit: Option<i32>,
     /// The sort columns.
+    #[serde(deserialize_with = "de_comma_delimited")]
     sort_by: Option<Vec<ItemSortBy>>,
     /// The sort orders, paired positionally with `SortBy`.
+    #[serde(deserialize_with = "de_comma_delimited")]
     sort_order: Option<Vec<SortOrder>>,
-    /// The genre names to return guide information for.
+    /// The genre names to return guide information for. Upstream decorates
+    /// this one — and only this one — with the *pipe* converter factory.
+    #[serde(deserialize_with = "de_pipe_delimited")]
     genres: Option<Vec<String>>,
     /// The genre ids to return guide information for.
+    #[serde(deserialize_with = "de_comma_delimited")]
     genre_ids: Option<Vec<Uuid>>,
     /// Whether image information is included.
     enable_images: Option<bool>,
     /// The maximum number of images returned per image type.
     image_type_limit: Option<i32>,
     /// The image types to include.
+    #[serde(deserialize_with = "de_comma_delimited")]
     enable_image_types: Option<Vec<ImageType>>,
     /// Whether user data is included.
     enable_user_data: Option<bool>,
@@ -402,6 +419,7 @@ struct GetProgramsDto {
     /// Filter to the programmes of one library series.
     library_series_id: Option<Uuid>,
     /// Additional DTO fields.
+    #[serde(deserialize_with = "de_comma_delimited")]
     fields: Option<Vec<ItemFields>>,
     /// Whether the total record count is computed (schema default `true`).
     enable_total_record_count: Option<bool>,
@@ -1602,21 +1620,45 @@ async fn get_lineups(RequireLiveTvAccess(_auth): RequireLiveTvAccess) -> Json<Ve
     Json(Vec::new())
 }
 
+/// How long each tuner backend is given to answer a discovery scan.
+///
+/// `TunerHostManager.TunerDiscoveryDurationMs` (v10.11.8
+/// TunerHostManager.cs:23) — the budget upstream gives `DiscoverDevices`, which
+/// for HDHomeRun is how long the UDP broadcast's replies are collected. Long
+/// enough for a device on the same segment to answer, short enough that a
+/// dashboard "Detect my devices" click is not a hang.
+const TUNER_DISCOVERY_DURATION_MS: u64 = 3000;
+
 /// `GET /LiveTv/TunerHosts/Types` — supported tuner-host types.
 ///
-/// Port of `LiveTvController.GetTunerHostTypes`. Ferrofin ships the M3U backend.
+/// Port of `LiveTvController.GetTunerHostTypes` over
+/// `ITunerHostManager.GetTunerHostTypes`: the projection of every registered,
+/// supported tuner backend, ordered by name. It is a fixed list, not a
+/// reachability probe — upstream advertises HDHomeRun whether or not a device
+/// is on the network, because `HdHomerunHost` never overrides
+/// `BaseTunerHost.IsSupported => true`.
 async fn get_tuner_host_types(
     RequireLiveTvAccess(_auth): RequireLiveTvAccess,
-) -> Json<Vec<NameIdPair>> {
-    Json(vec![NameIdPair {
-        name: Some("M3U Tuner".to_owned()),
-        id: Some("m3u".to_owned()),
-    }])
+    State(state): State<AppState>,
+) -> Result<Json<Vec<NameIdPair>>, ApiError> {
+    Ok(Json(live_tv(&state)?.tuner_host_types()))
 }
 
-/// `GET /LiveTv/Tuners/Discover` — auto-discovered tuner devices (none → empty).
-async fn discover_tuners(RequireAdmin(_auth): RequireAdmin) -> Json<Vec<TunerHostInfo>> {
-    Json(Vec::new())
+/// `GET /LiveTv/Tuners/Discover` — auto-discovered tuner devices.
+///
+/// Port of `LiveTvController.DiscoverTuners` over
+/// `ITunerHostManager.DiscoverTuners`: every backend scans for
+/// [`TUNER_DISCOVERY_DURATION_MS`]. An empty list is the honest answer on a
+/// network with no tuner on it.
+async fn discover_tuners(
+    RequireAdmin(_auth): RequireAdmin,
+    State(state): State<AppState>,
+) -> Result<Json<Vec<TunerHostInfo>>, ApiError> {
+    Ok(Json(
+        live_tv(&state)?
+            .discover_tuners(TUNER_DISCOVERY_DURATION_MS)
+            .await?,
+    ))
 }
 
 /// Registers the Live TV surface onto `router`.
@@ -1804,6 +1846,53 @@ mod tests {
         assert_eq!(err.status(), axum::http::StatusCode::NOT_FOUND);
     }
 
+    /// The type list is the MANAGER's, projected — not a literal in the
+    /// handler. Ferrofin advertised only `m3u` while Jellyfin advertised
+    /// `hdhomerun` too, and the reason was exactly a literal here.
+    #[tokio::test]
+    async fn tuner_host_types_projects_the_managers_list() {
+        let state = fake_state().with_live_tv(std::sync::Arc::new(FakeLiveTv {
+            tuner_host_types: vec![
+                NameIdPair {
+                    name: Some("HD Homerun".to_owned()),
+                    id: Some("hdhomerun".to_owned()),
+                },
+                NameIdPair {
+                    name: Some("M3U Tuner".to_owned()),
+                    id: Some("m3u".to_owned()),
+                },
+            ],
+            ..FakeLiveTv::default()
+        }));
+        let types = get_tuner_host_types(auth(), State(state)).await.unwrap().0;
+        assert_eq!(
+            types
+                .iter()
+                .map(|p| p.id.clone().unwrap_or_default())
+                .collect::<Vec<_>>(),
+            ["hdhomerun", "m3u"]
+        );
+    }
+
+    /// Discovery reaches the manager, carrying upstream's 3000 ms budget, and
+    /// an empty answer stays a 200 rather than becoming an error.
+    #[tokio::test]
+    async fn discover_tuners_hands_the_manager_the_upstream_budget() {
+        let fake = std::sync::Arc::new(FakeLiveTv::default());
+        let state = fake_state().with_live_tv(fake.clone());
+        assert!(
+            discover_tuners(admin_auth(), State(state))
+                .await
+                .unwrap()
+                .0
+                .is_empty()
+        );
+        assert_eq!(
+            *fake.discovery_duration_ms.lock().expect("lock"),
+            Some(TUNER_DISCOVERY_DURATION_MS)
+        );
+    }
+
     #[tokio::test]
     async fn defaults_and_lists() {
         let _ = get_guide_info(State(fake_state()), auth()).await;
@@ -1816,8 +1905,6 @@ mod tests {
         let _ = get_channel_mapping_options(admin_auth()).await;
         let _ = get_default_listing_provider(auth()).await;
         assert!(get_lineups(auth()).await.0.is_empty());
-        assert_eq!(get_tuner_host_types(auth()).await.0.len(), 1);
-        assert!(discover_tuners(admin_auth()).await.0.is_empty());
         let state = fake_state();
         assert!(
             get_recordings(
@@ -2091,6 +2178,11 @@ mod tests {
         /// The Schedules Direct country document; `None` models an upstream
         /// fetch failure.
         countries: Option<Vec<u8>>,
+        /// The tuner-host types the manager reports, so a test can prove the
+        /// handler *projects the manager's list* rather than a literal.
+        tuner_host_types: Vec<NameIdPair>,
+        /// The discovery budget the handler passed down, if it was called.
+        discovery_duration_ms: std::sync::Mutex<Option<u64>>,
     }
 
     #[async_trait::async_trait]
@@ -2172,6 +2264,16 @@ mod tests {
             _info: TunerHostInfo,
         ) -> Result<TunerHostInfo, ferrofin_traits::error::ServiceError> {
             unimplemented!()
+        }
+        fn tuner_host_types(&self) -> Vec<NameIdPair> {
+            self.tuner_host_types.clone()
+        }
+        async fn discover_tuners(
+            &self,
+            discovery_duration_ms: u64,
+        ) -> Result<Vec<TunerHostInfo>, ferrofin_traits::error::ServiceError> {
+            *self.discovery_duration_ms.lock().expect("lock") = Some(discovery_duration_ms);
+            Ok(Vec::new())
         }
         async fn delete_tuner_host(
             &self,
@@ -2667,6 +2769,103 @@ mod tests {
         assert_eq!(options.image_type_limit, 1);
         assert!(!options.enable_user_data);
         assert!(options.enable_images);
+    }
+
+    /// Parses a `POST /LiveTv/Programs` body the way the handler's extractor
+    /// does, so the delimited-collection tests below exercise the real binding.
+    fn programs_body(json: &str) -> GetProgramsDto {
+        serde_json::from_str(json).expect("body binds")
+    }
+
+    #[test]
+    fn programs_body_accepts_comma_delimited_strings_and_arrays() {
+        // `GetProgramsDto.ChannelIds` carries
+        // `JsonCommaDelimitedCollectionConverterFactory` upstream, so the
+        // string form is as valid as the array form and must bind identically.
+        let one = Uuid::from_u128(1);
+        let two = Uuid::from_u128(2);
+        let from_string = programs_body(&format!(r#"{{"ChannelIds":"{one},{two}"}}"#));
+        assert_eq!(from_string.channel_ids, Some(vec![one, two]));
+        let from_array = programs_body(&format!(r#"{{"ChannelIds":["{one}","{two}"]}}"#));
+        assert_eq!(from_array.channel_ids, from_string.channel_ids);
+        // Whitespace around an entry is `Trim()`ed away upstream.
+        let spaced = programs_body(&format!(r#"{{"ChannelIds":" {one} , {two} "}}"#));
+        assert_eq!(spaced.channel_ids, Some(vec![one, two]));
+    }
+
+    #[test]
+    fn programs_body_drops_unconvertible_delimited_entries() {
+        // `catch (FormatException) { /* Ignore unconvertible inputs */ }` —
+        // a bad GUID or an unknown sort column is dropped, not a 400. Verified
+        // live against Jellyfin 10.11.8: `"ChannelIds":"not-a-guid,<real>"`
+        // returns 200 with only the real channel's programmes.
+        let real = Uuid::from_u128(3);
+        let body = programs_body(&format!(
+            r#"{{"ChannelIds":"not-a-guid,{real}","SortBy":"NotASort,StartDate"}}"#
+        ));
+        assert_eq!(body.channel_ids, Some(vec![real]));
+        assert_eq!(body.sort_by, Some(vec![ItemSortBy::StartDate]));
+    }
+
+    #[test]
+    fn programs_body_delimited_string_of_only_separators_is_empty() {
+        // `StringSplitOptions.RemoveEmptyEntries` leaves nothing, and an empty
+        // channel filter is *unfiltered* — Jellyfin answers the whole guide.
+        let body = programs_body(r#"{"ChannelIds":",,"}"#);
+        assert_eq!(body.channel_ids, Some(Vec::new()));
+        assert!(body.into_parts().0.channel_ids.is_empty());
+    }
+
+    #[test]
+    fn programs_body_genres_split_on_the_pipe_only() {
+        // `Genres` is the one property upstream gives the *pipe* factory. A
+        // comma is therefore an ordinary character inside a single genre name.
+        let piped = programs_body(r#"{"Genres":"News|Sport"}"#);
+        assert_eq!(
+            piped.genres,
+            Some(vec!["News".to_owned(), "Sport".to_owned()])
+        );
+        let commas = programs_body(r#"{"Genres":"News,Sport"}"#);
+        assert_eq!(commas.genres, Some(vec!["News,Sport".to_owned()]));
+    }
+
+    #[test]
+    fn programs_body_binds_every_delimited_property() {
+        let genre = Uuid::from_u128(4);
+        let body = programs_body(&format!(
+            r#"{{"SortOrder":"Descending","GenreIds":"{genre}",
+                 "EnableImageTypes":"Primary,Thumb","Fields":"ChannelInfo,Overview"}}"#
+        ));
+        assert_eq!(body.sort_order, Some(vec![SortOrder::Descending]));
+        assert_eq!(body.genre_ids, Some(vec![genre]));
+        assert_eq!(
+            body.enable_image_types,
+            Some(vec![ImageType::Primary, ImageType::Thumb])
+        );
+        assert_eq!(
+            body.fields,
+            Some(vec![ItemFields::ChannelInfo, ItemFields::Overview])
+        );
+    }
+
+    #[test]
+    fn programs_body_array_arm_stays_strict() {
+        // The non-string token falls through to `JsonSerializer.Deserialize<T[]>`,
+        // which is strict: Jellyfin answers 400 for `{"SortBy":["NotASort"]}`.
+        // Only the delimited-string form swallows a bad entry.
+        assert!(serde_json::from_str::<GetProgramsDto>(r#"{"SortBy":["NotASort"]}"#).is_err());
+        assert!(serde_json::from_str::<GetProgramsDto>(r#"{"ChannelIds":["nope"]}"#).is_err());
+    }
+
+    #[test]
+    fn programs_body_absent_and_null_collections_stay_none() {
+        let empty = programs_body("{}");
+        assert_eq!(empty.channel_ids, None);
+        assert_eq!(empty.genres, None);
+        let nulled = programs_body(r#"{"ChannelIds":null,"Genres":null,"Fields":null}"#);
+        assert_eq!(nulled.channel_ids, None);
+        assert_eq!(nulled.genres, None);
+        assert_eq!(nulled.fields, None);
     }
 
     #[tokio::test]

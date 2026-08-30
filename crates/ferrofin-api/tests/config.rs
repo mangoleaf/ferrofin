@@ -750,6 +750,15 @@ impl ferrofin_traits::stubs::LiveTvManager for FailingLiveTv {
     ) -> Result<ferrofin_model::live_tv::TunerHostInfo, ServiceError> {
         unreachable!()
     }
+    fn tuner_host_types(&self) -> Vec<ferrofin_model::dto::NameIdPair> {
+        unreachable!()
+    }
+    async fn discover_tuners(
+        &self,
+        _discovery_duration_ms: u64,
+    ) -> Result<Vec<ferrofin_model::live_tv::TunerHostInfo>, ServiceError> {
+        unreachable!()
+    }
     async fn delete_tuner_host(&self, _id: &str) -> Result<(), ServiceError> {
         unreachable!()
     }

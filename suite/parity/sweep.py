@@ -260,10 +260,20 @@ def provision_opensubtitles(base, target, token):
         raise SystemExit(f"{target}: opensubtitles configuration failed (status {st})")
 
 
+#: The fake HDHomeRun device the `hdhomerun-source` compose service runs. Both servers get
+#: a `hdhomerun` tuner host pointed here, so the SECOND tuner backend is exercised — and
+#: diffed — against one real device interface rather than against nothing.
+#:
+#: Overridable so a run against a PHYSICAL HDHomeRun can point at it instead; unset it to
+#: provision the M3U tuner alone.
+LIVETV_HDHR = os.environ.get("LIVETV_HDHR", "http://hdhomerun-source:8100")
+
+
 def provision_livetv(base, token):
-    """The Live TV fixture: one M3U tuner host + one XMLTV listings provider (both read
-    from the shared mount), then the guide refresh task, waited on until channels and
-    programmes are listed. No-op when the fixture is off (LIVETV_M3U unset)."""
+    """The Live TV fixture: an M3U tuner host, an HDHomeRun tuner host (the fake device on
+    the compose network) and one XMLTV listings provider, then the guide refresh task,
+    waited on until channels and programmes are listed. No-op when the fixture is off
+    (LIVETV_M3U unset)."""
     m3u, xmltv = os.environ.get("LIVETV_M3U"), os.environ.get("LIVETV_XMLTV")
     if not m3u or not xmltv:
         return
@@ -272,6 +282,15 @@ def provision_livetv(base, token):
                                "ImportFavoritesOnly": False, "AllowHWTranscoding": False}))
     if st >= 300:
         raise SystemExit(f"{base}: add tuner host failed {st}: {raw[:200]!r}")
+    if LIVETV_HDHR:
+        # `TunerHostManager.SaveTunerHost` runs the host's `Validate` before storing, so a
+        # non-2xx here means the device did not answer discover.json on ONE of the servers
+        # — which is a finding, not something to skip past.
+        st, raw = http("POST", base + "/LiveTv/TunerHosts", token,
+                       json.dumps({"Type": "hdhomerun", "Url": LIVETV_HDHR,
+                                   "ImportFavoritesOnly": False, "AllowHWTranscoding": False}))
+        if st >= 300:
+            raise SystemExit(f"{base}: add hdhomerun tuner host failed {st}: {raw[:200]!r}")
     st, raw = http("POST", base + "/LiveTv/ListingProviders?validateListings=false", token,
                    json.dumps({"Type": "xmltv", "Path": xmltv, "EnableAllTuners": True}))
     if st >= 300:
@@ -390,6 +409,16 @@ def resolve_fixtures(base, token, user):
         # scoped by path (see PATH_SCOPED) rather than put in `fx`, so filling
         # one cannot silently probe the other with a wrong id.
         "_livetv_channel": channel,
+        # `{groupId}` occurs in exactly ONE contract path, and
+        # `LiveTvController.GetRecordingGroup` (v10.11.8) is `[Obsolete]` with
+        # the body `return NotFound();` — no `RecordingGroup` lookup exists
+        # anywhere in the 10.11.8 tree, so the response cannot depend on the
+        # value. A literal GUID is therefore the only possible seed AND the
+        # right one: the breadth row then measures the 404/404 status parity
+        # instead of skipping the op. It stays a NON-deep row here (sweep
+        # body-diffs only 200/200); reads.py's `recording_group_invariants`
+        # is what earns the verification.
+        "groupId": "00000000-0000-0000-0000-000000000000",
         "year": "2020", "container": "mp4", "segmentContainer": "ts", "format": "ts",
         "routeFormat": "ts", "width": "400", "maxWidth": "400", "maxHeight": "400",
         "percentPlayed": "0", "unplayedCount": "0", "tag": "x", "language": "eng",

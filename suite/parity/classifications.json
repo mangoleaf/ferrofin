@@ -131,16 +131,12 @@
       "classification": "requires-livetv-tuner: the fixture tuner (M3U + XMLTV, two channels) exists, but no probe exercises this op yet — needs a lineup probe (needs a Schedules Direct-style provider; xmltv has none)."
     },
     "GET /LiveTv/Recordings/Groups/{groupId}": {
-      "category": "requires-livetv-tuner",
-      "classification": "requires-livetv-tuner: the fixture tuner (M3U + XMLTV, two channels) exists, but no probe exercises this op yet — needs a recordings-group probe once a recording exists."
+      "category": "verified",
+      "classification": "verified 2026-08-30: OBSOLETE endpoint. LiveTvController.GetRecordingGroup (v10.11.8 Jellyfin.Api/Controllers/LiveTvController.cs) is [Obsolete] and its whole body is `return NotFound();`; `git grep RecordingGroup v10.11.8 -- '*.cs'` returns only the two controller signatures, so there is no LiveTvManager.GetRecordingGroups, no group-id derivation and no DTO anywhere in the tree. The response is groupId-INDEPENDENT, which makes the old note ('needs a recordings-group probe once a recording exists') work that cannot exist: recordings DO exist on both servers now and the answer is still 404 for those very recording ids. Property-verified live by reads.py (recording_group_invariants), measured twice: the nil GUID, a random GUID, a real Live TV channel id and a real recording id all 404 on both servers; a malformed groupId is a route-binding 400 on both (exact status, not class); an anonymous caller gets 401 on both. It is a property row and not a body diff because there is no 200 body to diff, ever. The 404 BODY differs only by the server-wide error envelope (Jellyfin ProblemDetails vs Ferrofin {\"error\":…}), an existing project-wide divergence, not an op-level one."
     },
     "GET /LiveTv/Timers/Defaults": {
       "category": "verified",
       "classification": "verified 2026-08-11: SeriesTimerInfoDto defaults (ChannelId/Days/padding flags/…), 200 + schema conformant."
-    },
-    "GET /LiveTv/TunerHosts/Types": {
-      "category": "open-work",
-      "classification": "open-work (NOT accepted): Ferrofin advertises only the M3U tuner host; Jellyfin also lists HDHomeRun. Port of HdHomerunHost (~1.2K C# LOC: UDP discovery, lineup, legacy control protocol, HTTP/UDP streams) is an open work item — see brain/DEFERRED.md 2026-08-22 sweep."
     },
     "GET /MediaSegmentsApi": {
       "category": "expected-extension",
@@ -287,8 +283,8 @@
       "classification": "requires-livetv-tuner: the fixture tuner (M3U + XMLTV, two channels) exists, but no probe exercises this op yet — needs a channel-mapping probe against the fixture's listings provider."
     },
     "POST /LiveTv/Programs": {
-      "category": "requires-livetv-tuner",
-      "classification": "requires-livetv-tuner: the fixture tuner (M3U + XMLTV, two channels) exists, but no probe exercises this op yet — needs a programmes-by-body probe (the POST form of /LiveTv/Programs)."
+      "category": "lab-state",
+      "classification": "lab-state (NOT a Ferrofin divergence, and NOT an accepted one): the op's own bug is FIXED and pinned. Ferrofin bound all seven of GetProgramsDto's collection properties as plain arrays and answered 422 to the delimited-STRING spelling upstream accepts — v10.11.8 Jellyfin.Api/Models/LiveTvDtos/GetProgramsDto.cs decorates ChannelIds/SortBy/SortOrder/GenreIds/EnableImageTypes/Fields with JsonCommaDelimitedCollectionConverterFactory and Genres with the PIPE factory, and JsonDelimitedCollectionConverter.Read splits with RemoveEmptyEntries + Trim() and DROPS an entry the TypeConverter refuses ('catch (FormatException) { /* Ignore unconvertible inputs */ }') while the array arm stays a strict JsonSerializer.Deserialize<T[]>. reads.py legs 5-7 pin exactly that, drop semantics included, and all three are clean. RESIDUAL, measured twice on the D3 pair 2026-08-30: leg 2 (the whole guide inside the window BOTH servers hold, 4058 leaves) reports 34 MISSING keys with 0 mismatch and 0 extra, and every one of them is Status/TimerId/SeriesTimerId on one of the 28 programmes Jellyfin holds a timer for. That is DVR STATE, not code: live counts were Ferrofin timers=0 seriesTimers=1 recordings=6 against Jellyfin 28/8/15 — drift from sibling batches' journeys on a lab that has been up for days. Ferrofin implements the enrichment (LiveTvManager.AddRecordingInfo is ported as add_recording_info in crates/ferrofin-livetv/src/manager.rs, and manager::tests::program_dtos_link_their_recording_timer asserts all three fields on a programme whose timer exists); it simply has no timers to attach. sweep.sh runs reads.py BEFORE journeys.py, so on the authoritative freshly-wiped pair neither server holds a timer when this leg runs. The three fields are deliberately NOT dropped from the compare: dropping them would hide a real enrichment regression, which is the one thing this leg is uniquely placed to catch. Delete this entry when the row comes back clean on a fresh sweep."
     },
     "POST /LiveTv/SeriesTimers": {
       "category": "jellyfin-bug",

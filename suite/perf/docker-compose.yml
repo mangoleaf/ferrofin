@@ -78,6 +78,18 @@ services:
       - ./livetv-source.py:/srv/livetv-source.py:ro
       - ./fixtures/media:/media/synth:ro
 
+  # A fake HDHomeRun device (http://hdhomerun-source:8100), so BOTH servers'
+  # `hdhomerun` tuner hosts see one real device interface and can be diffed
+  # against it. Its lineup's channel URLs point at the livetv-source broadcast
+  # above, so tuning an HDHR channel really plays a real MPEG-TS. Started by the
+  # PARITY leg only, like livetv-source (see hdhomerun-source.py for why a wire
+  # protocol is faithfully fakeable where a GPU filter chain is not).
+  hdhomerun-source:
+    image: python:3-alpine
+    command: ["python", "/srv/hdhomerun-source.py", "8100", "hdhomerun-source"]
+    volumes:
+      - ./hdhomerun-source.py:/srv/hdhomerun-source.py:ro
+
 # Named volumes so `docker compose down -v` gives each run a clean DB.
 volumes:
   ferrofin-data:

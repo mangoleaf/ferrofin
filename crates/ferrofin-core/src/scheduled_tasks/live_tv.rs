@@ -144,6 +144,15 @@ mod tests {
         ) -> Result<ferrofin_model::live_tv::TunerHostInfo, ServiceError> {
             unimplemented!()
         }
+        fn tuner_host_types(&self) -> Vec<ferrofin_model::dto::NameIdPair> {
+            unimplemented!()
+        }
+        async fn discover_tuners(
+            &self,
+            _discovery_duration_ms: u64,
+        ) -> Result<Vec<ferrofin_model::live_tv::TunerHostInfo>, ServiceError> {
+            unimplemented!()
+        }
         async fn delete_tuner_host(&self, _id: &str) -> Result<(), ServiceError> {
             unimplemented!()
         }

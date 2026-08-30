@@ -39,7 +39,6 @@ use serde::de::DeserializeOwned;
 use crate::dvr::{ActiveRecording, RecorderKind, RecordingInput, TimerRecordingInfo};
 use crate::error::LiveTvError;
 use crate::fetch::SourceFetcher;
-use crate::m3u::parse_m3u;
 use crate::projection::{
     ChannelRow, ProgramRow as GuideProgramRow, channel_entity, program_entity, remove_fields,
 };
@@ -150,28 +149,17 @@ const LIVE_TV_SERVICE_NAME: &str = "Emby";
 /// TV id at once; it is part of the hash input, so it must match byte for byte.
 const LIVE_TV_INTERNAL_VERSION: &str = "4";
 
-/// The `m3u` tuner's channel-id prefix, before the tuner-URL hash.
+/// A fresh lock key for one HDHomeRun control session.
 ///
-/// Port of `BaseTunerHost.ChannelIdPrefix` => `Type + "_"` with
-/// `M3UTunerHost.Type == "m3u"` (v10.11.8 BaseTunerHost.cs:46,
-/// M3UTunerHost.cs:60).
-const M3U_CHANNEL_ID_PREFIX: &str = "m3u_";
-
-/// The tuner-facing external id of one M3U channel.
-///
-/// Port of `M3UTunerHost.GetFullChannelIdPrefix` (v10.11.8 M3UTunerHost.cs:64-67)
-/// followed by `M3uParser.GetChannelsAsync` (M3uParser.cs:104), which
-/// *overwrites* the `tvg-id`-derived id set in `GetChannelInfo` with
-/// `prefix + MD5(streamUrlLine)`. The identity of a channel upstream is
-/// therefore `(tuner URL, stream URL)` — never the `tvg-id`, which survives only
-/// as the guide join key (`TunerChannelId`). Two playlist entries sharing a
-/// `tvg-id` stay distinct here, exactly as they do upstream.
-fn m3u_external_channel_id(tuner_url: &str, stream_url: &str) -> String {
-    format!(
-        "{M3U_CHANNEL_ID_PREFIX}{}{}",
-        ferrofin_common::extensions::get_md5(tuner_url).simple(),
-        ferrofin_common::extensions::get_md5(stream_url).simple()
-    )
+/// `HdHomerunManager.StartStreaming`'s `_lockkey = (uint)Random.Shared.Next()`
+/// (v10.11.8 HdHomerunManager.cs:84). It is a mutual-exclusion token between
+/// viewers of the same device, not a secret, so any value the next session is
+/// unlikely to repeat will do — `Uuid::new_v4`'s first four bytes come from the
+/// same OS entropy `Random.Shared` seeds from, without adding a dependency for
+/// one `u32`.
+fn rand_lockkey() -> u32 {
+    let bytes = Uuid::new_v4().into_bytes();
+    u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
 }
 
 /// `LibraryManager.GetNewItemId(key, type)` for a key that is already relative
@@ -371,6 +359,15 @@ pub struct FerrofinLiveTvManager {
     /// The account-less Schedules Direct surface (country list), sharing the
     /// fetcher and caching under the application cache directory.
     schedules_direct: SchedulesDirect,
+    /// The registered tuner backends, one per tuner *kind*.
+    ///
+    /// Port of `TunerHostManager._tunerHosts` (v10.11.8 TunerHostManager.cs:44),
+    /// which is the DI-registered `IEnumerable<ITunerHost>` filtered to
+    /// `IsSupported`. It is the single source for the advertised type list, the
+    /// save-time type lookup, the guide refresh's per-tuner dispatch and the
+    /// media-source/stream paths — so a tuner kind is added by registering an
+    /// implementation, never by adding a `match`.
+    hosts: Vec<Arc<dyn crate::tuner_host::TunerHost>>,
 }
 
 impl std::fmt::Debug for FerrofinLiveTvManager {
@@ -518,9 +515,20 @@ impl FerrofinLiveTvManager {
         cache_dir: impl Into<PathBuf>,
     ) -> Self {
         let schedules_direct = SchedulesDirect::new(Arc::clone(&fetcher), cache_dir);
+        // The same two hosts, in the same order, that
+        // `LiveTvServiceCollectionExtensions.AddLiveTvServices` registers
+        // (v10.11.8 LiveTvServiceCollectionExtensions.cs:41-42): HDHomeRun
+        // then M3U. The ORDER of registration is not the advertised order —
+        // `GetTunerHostTypes` sorts by name — but keeping it identical means a
+        // future first-match rule cannot silently diverge.
+        let hosts: Vec<Arc<dyn crate::tuner_host::TunerHost>> = vec![
+            Arc::new(crate::hdhomerun::HdHomerunHost::new(Arc::clone(&fetcher))),
+            Arc::new(crate::tuner_host::M3uTunerHost::new(Arc::clone(&fetcher))),
+        ];
         Self {
             db,
             fetcher,
+            hosts,
             users: None,
             server_id,
             tuner_flag: Arc::new(AtomicBool::new(false)),
@@ -602,15 +610,18 @@ impl FerrofinLiveTvManager {
             .ok_or_else(|| ServiceError::Backend("live tv dto service not wired".to_owned()))
     }
 
-    /// Rewrites the channel lineup for one tuner host from its M3U body, in a
-    /// transaction (deleting the old channels cascades away their programmes).
+    /// Rewrites the channel lineup for one tuner host from the lineup its
+    /// [`TunerHost`] produced, in a transaction (deleting the old channels
+    /// cascades away their programmes).
+    ///
+    /// The lineup arrives already built, so the identity of a channel is the
+    /// HOST's business — `m3u_{md5}{md5}` for a playlist, `hdhr_{GuideNumber}`
+    /// for an HDHomeRun — exactly as `ChannelInfo.Id` is upstream.
     async fn replace_channels(
         &self,
         tuner_id: &str,
-        tuner_url: &str,
-        m3u_body: &str,
+        channels: &[crate::tuner_host::TunerChannel],
     ) -> Result<(), ServiceError> {
-        let channels = parse_m3u(m3u_body);
         let mut tx = self.db.writer().begin().await.map_err(db_err)?;
 
         // A channel already in the lineup keeps its first-seen instant across
@@ -625,24 +636,23 @@ impl FerrofinLiveTvManager {
             .await
             .map_err(db_err)?;
 
-        // 11 columns per row; chunked multi-row insert instead of one round-trip
+        // 14 columns per row; chunked multi-row insert instead of one round-trip
         // per channel.
-        for (chunk_index, chunk) in channels.chunks(SQLITE_BIND_LIMIT / 11).enumerate() {
+        for (chunk_index, chunk) in channels.chunks(SQLITE_BIND_LIMIT / 14).enumerate() {
             let mut qb: QueryBuilder<'_, Sqlite> = QueryBuilder::new(
                 r#"INSERT INTO "FerrofinLiveTvChannels"
-                   ("Id","TunerHostId","TvgId","Name","Number","ImageUrl","ChannelType","StreamUrl","SortIndex","DateCreated","ExternalId") "#,
+                   ("Id","TunerHostId","TvgId","Name","Number","ImageUrl","ChannelType","StreamUrl","SortIndex","DateCreated","ExternalId","IsHd","VideoCodec","AudioCodec") "#,
             );
-            let base = chunk_index * (SQLITE_BIND_LIMIT / 11);
+            let base = chunk_index * (SQLITE_BIND_LIMIT / 14);
             qb.push_values(chunk.iter().enumerate(), |mut b, (offset, ch)| {
                 // `GuideManager.GetChannel` stores the item under
                 // `GetInternalChannelId(serviceName, channelInfo.Id)`, where
                 // `channelInfo.Id` is the tuner's external id — a pure function
-                // of the tuner URL and this entry's stream URL. Nothing
-                // per-instance goes in, so two servers reading the same playlist
-                // agree, and re-adding the same tuner keeps every channel's
-                // user data, timers and favourites attached.
-                let external_id = m3u_external_channel_id(tuner_url, &ch.url);
-                let id = guid_to_db(internal_channel_id(&external_id));
+                // of the tuner and this entry. Nothing per-instance goes in, so
+                // two servers reading the same lineup agree, and re-adding the
+                // same tuner keeps every channel's user data, timers and
+                // favourites attached.
+                let id = guid_to_db(internal_channel_id(&ch.external_id));
                 let channel_type = if ch.is_radio { "Radio" } else { "Tv" };
                 let date_created = existing
                     .get(&id)
@@ -650,15 +660,18 @@ impl FerrofinLiveTvManager {
                     .unwrap_or_else(|| now.clone());
                 b.push_bind(id)
                     .push_bind(tuner_id)
-                    .push_bind(&ch.id)
+                    .push_bind(&ch.guide_key)
                     .push_bind(&ch.name)
                     .push_bind(&ch.number)
-                    .push_bind(&ch.logo)
+                    .push_bind(&ch.image_url)
                     .push_bind(channel_type)
                     .push_bind(&ch.url)
                     .push_bind(i64::try_from(base + offset).unwrap_or(i64::MAX))
                     .push_bind(date_created)
-                    .push_bind(external_id);
+                    .push_bind(&ch.external_id)
+                    .push_bind(ch.is_hd.map(i64::from))
+                    .push_bind(&ch.video_codec)
+                    .push_bind(&ch.audio_codec);
             });
             qb.build().execute(&mut *tx).await.map_err(db_err)?;
         }
@@ -975,6 +988,25 @@ impl LiveTvManager for FerrofinLiveTvManager {
         &self,
         mut info: TunerHostInfo,
     ) -> Result<TunerHostInfo, ServiceError> {
+        // `TunerHostManager.SaveTunerHost` (v10.11.8 TunerHostManager.cs:60-69)
+        // resolves the provider FIRST and throws `ResourceNotFoundException`
+        // when nothing matches `info.Type` — a 404. Defaulting an unknown type
+        // to "m3u" instead stored a row no host would ever read, so a typo in a
+        // client's Type silently produced a tuner that fetched nothing.
+        //
+        // An ABSENT type still means M3U: `TunerHostInfo.Type` is a plain
+        // string with no default upstream, and Ferrofin's own configuration and
+        // the parity fixtures have always written M3U rows without one.
+        if info.type_.as_deref().is_none_or(str::is_empty) {
+            info.type_ = Some("m3u".to_owned());
+        }
+        let type_id = info.type_.clone().unwrap_or_default();
+        let Some(host) = crate::tuner_host::find_host(&self.hosts, &type_id) else {
+            return Err(ServiceError::not_found(format!(
+                "tuner host type {type_id}"
+            )));
+        };
+
         let id = info
             .id
             .clone()
@@ -986,23 +1018,60 @@ impl LiveTvManager for FerrofinLiveTvManager {
             // `GET /System/Configuration/livetv`.
             .unwrap_or_else(|| Uuid::new_v4().simple().to_string());
         info.id = Some(id.clone());
-        if info.type_.is_none() {
-            info.type_ = Some("m3u".to_owned());
-        }
         let url = info.url.clone().unwrap_or_default();
         if url.is_empty() {
             return Err(ServiceError::InvalidInput(
                 "tuner host Url is required".into(),
             ));
         }
+
+        // `if (provider is IConfigurableTunerHost configurable) await
+        // configurable.Validate(info)` — before the row is written, so a device
+        // that does not answer is not saved, and one that does contributes its
+        // `DeviceId`.
+        host.validate(&mut info).await?;
+
         let data = serde_json::to_string(&info)
             .map_err(|e| LiveTvError::serialize("serialize tuner host", e))?;
         self.db
-            .upsert_live_tv_tuner_host(&id, &url, info.type_.as_deref().unwrap_or("m3u"), &data)
+            .upsert_live_tv_tuner_host(&id, &url, &type_id, &data)
             .await
             .map_err(ServiceError::from)?;
         self.tuner_flag.store(true, Ordering::Relaxed);
         Ok(info)
+    }
+
+    fn tuner_host_types(&self) -> Vec<ferrofin_model::dto::NameIdPair> {
+        crate::tuner_host::tuner_host_types(&self.hosts)
+    }
+
+    async fn discover_tuners(
+        &self,
+        discovery_duration_ms: u64,
+    ) -> Result<Vec<TunerHostInfo>, ServiceError> {
+        // `TunerHostManager.DiscoverTuners(newDevicesOnly: false)` (v10.11.8
+        // TunerHostManager.cs:102-121): every registered host is asked, and
+        // `DiscoverDevices`' own `catch` turns a host that blew up into an
+        // empty list rather than failing the request.
+        let mut found = Vec::new();
+        for host in &self.hosts {
+            match host.discover_devices(discovery_duration_ms).await {
+                Ok(devices) => {
+                    for device in devices {
+                        tracing::info!(
+                            host = host.name(),
+                            url = device.url.as_deref().unwrap_or_default(),
+                            "live tv: discovered a tuner device"
+                        );
+                        found.push(device);
+                    }
+                }
+                Err(error) => {
+                    tracing::error!(host = host.name(), %error, "live tv: tuner discovery failed");
+                }
+            }
+        }
+        Ok(found)
     }
 
     async fn delete_tuner_host(&self, id: &str) -> Result<(), ServiceError> {
@@ -1317,12 +1386,36 @@ impl LiveTvManager for FerrofinLiveTvManager {
 
     async fn refresh_guide(&self) -> Result<(), ServiceError> {
         for tuner in self.get_tuner_hosts().await? {
-            let (Some(id), Some(url)) = (tuner.id.as_deref(), tuner.url.as_deref()) else {
+            let Some(id) = tuner.id.clone() else {
                 continue;
             };
-            match self.fetcher.fetch(url).await {
-                Ok(body) => self.replace_channels(id, url, &body).await?,
-                Err(e) => tracing::warn!(%url, error = %e, "live tv: tuner fetch failed"),
+            // `GuideManager.RefreshChannelsInternal` asks the tuner-host
+            // manager for the channels, which fans out over the registered
+            // hosts (`TunerHostManager`/`BaseTunerHost.GetChannels`). Dispatch
+            // on the row's own `Type`: feeding an HDHomeRun's URL to the M3U
+            // parser produced an empty lineup and no error at all.
+            let type_id = tuner.type_.as_deref().unwrap_or_default();
+            let Some(host) = crate::tuner_host::find_host(&self.hosts, type_id) else {
+                tracing::warn!(
+                    tuner = %id,
+                    type_id,
+                    "live tv: no tuner host is registered for this type; its channels are skipped"
+                );
+                continue;
+            };
+            match host.get_channels(&tuner).await {
+                Ok(channels) => self.replace_channels(&id, &channels).await?,
+                Err(e) => {
+                    // `BaseTunerHost.GetChannels` logs and falls back to its
+                    // channel cache rather than failing the whole refresh, so
+                    // one unreachable tuner must not lose the others' guide.
+                    tracing::warn!(
+                        tuner = %id,
+                        url = tuner.url.as_deref().unwrap_or_default(),
+                        error = %e,
+                        "live tv: tuner lineup fetch failed"
+                    );
+                }
             }
         }
         // `GuideManager.RefreshChannelsInternal` asks each listings provider for
@@ -1374,24 +1467,31 @@ impl LiveTvManager for FerrofinLiveTvManager {
         &self,
         id: Uuid,
     ) -> Result<Vec<MediaSourceInfo>, ServiceError> {
-        let Some((path, tuner_host_id)) =
+        let Some((channel, tuner_host_id)) =
             crate::guide_repository::channel_stream_source(&self.db, id).await?
         else {
             return Ok(Vec::new());
         };
         let tuner = self.tuner_host(&tuner_host_id).await?;
-        let mut source = crate::stream::create_media_source_info(&path, &tuner);
-        crate::stream::normalize(&mut source);
-        Self::stamp_source(&mut source);
-        // `LiveTvMediaSourceProvider.GetMediaSourcesInternal`: the open token is
-        // `{item type}_{item id "N"}_{source id}`. The media-source manager
-        // prefixes the provider key before it reaches a client.
-        source.open_token = Some(format!(
-            "{OPEN_TOKEN_ITEM_TYPE}{STREAM_ID_DELIMITER}{}{STREAM_ID_DELIMITER}{}",
-            id.simple(),
-            source.id.clone().unwrap_or_default()
-        ));
-        Ok(vec![source])
+        // Each host builds its own sources: the M3U host has exactly one, and
+        // an HDHomeRun offers a source per transcode profile the device
+        // supports (`BaseTunerHost.GetChannelStreamMediaSources`).
+        let host = self.host_for(&tuner)?;
+        let mut sources = host.channel_media_sources(&tuner, &channel).await?;
+        for source in &mut sources {
+            crate::stream::normalize(source);
+            Self::stamp_source(source);
+            // `LiveTvMediaSourceProvider.GetMediaSourcesInternal`: the open
+            // token is `{item type}_{item id "N"}_{source id}`. The
+            // media-source manager prefixes the provider key before it reaches
+            // a client.
+            source.open_token = Some(format!(
+                "{OPEN_TOKEN_ITEM_TYPE}{STREAM_ID_DELIMITER}{}{STREAM_ID_DELIMITER}{}",
+                id.simple(),
+                source.id.clone().unwrap_or_default()
+            ));
+        }
+        Ok(sources)
     }
 
     async fn open_channel_stream(
@@ -1423,7 +1523,7 @@ impl LiveTvManager for FerrofinLiveTvManager {
         // Upstream resolves the channel item before anything else
         // (`LiveTvMediaSourceProvider.GetChannelStream`), so an unknown id is a
         // 404 whether or not some other stream happens to be open.
-        let Some((path, tuner_host_id)) =
+        let Some((channel, tuner_host_id)) =
             crate::guide_repository::channel_stream_source(&self.db, channel_id).await?
         else {
             return Err(ServiceError::not_found(format!(
@@ -1442,52 +1542,21 @@ impl LiveTvManager for FerrofinLiveTvManager {
         let tuner = self.tuner_host(&tuner_host_id).await?;
         self.enforce_tuner_count(&tuner_host_id, tuner.tuner_count)?;
 
-        let mut source = crate::stream::create_media_source_info(&path, &tuner);
+        // The host decides both the source and HOW it is opened: a plain HTTP
+        // tuner URL, or — on a legacy HDHomeRun — the device's UDP control
+        // protocol (`BaseTunerHost.GetChannelStream`).
+        let host = self.host_for(&tuner)?;
+        let chosen = host
+            .channel_stream(&tuner, &channel, stream_id.as_deref())
+            .await?;
+        let mut source = chosen.source;
+        let path = source.path.clone().unwrap_or_default();
         crate::stream::normalize(&mut source);
         Self::stamp_source(&mut source);
 
-        let share = tuner.allow_stream_sharing
-            && source.protocol == MediaProtocol::Http
-            && !source.requires_looping
-            && self.can_share_stream(&path, &source).await;
-
-        let (unique_id, opened_at, alive, kind) = if share {
-            let transcode_dir = self.transcode_dir()?;
-            let base_url = self.local_api_url()?;
-            let opened = crate::stream::open_shared_http_stream(
-                self.tuner_source.as_ref(),
-                &path,
-                &source.required_http_headers,
-                &transcode_dir,
-            )
+        let (unique_id, opened_at, alive, kind) = self
+            .start_live_stream(&chosen.kind, &tuner, &path, &mut source)
             .await?;
-            // Every consumer now reads the one buffered copy, not the tuner
-            // (C# `SharedHttpStream.Open`).
-            source.path = Some(format!(
-                "{base_url}/LiveTv/LiveStreamFiles/{}/stream.{LIVE_STREAM_BUFFER_CONTAINER}",
-                opened.unique_id
-            ));
-            source.protocol = MediaProtocol::Http;
-            source.container = Some(LIVE_STREAM_BUFFER_CONTAINER.to_owned());
-            (
-                opened.unique_id,
-                opened.opened_at,
-                opened.alive,
-                LiveStreamKind::Shared {
-                    temp_path: opened.temp_path,
-                    task: opened.task,
-                },
-            )
-        } else {
-            // The pass-through stream: nothing is buffered and the media source
-            // keeps the tuner URL (C# bare `LiveStream`).
-            (
-                Uuid::new_v4().simple().to_string(),
-                Utc::now(),
-                Arc::new(std::sync::atomic::AtomicBool::new(true)),
-                LiveStreamKind::Direct,
-            )
-        };
 
         source.requires_closing = true;
         let live_stream_id = format!(
@@ -3199,6 +3268,109 @@ impl FerrofinLiveTvManager {
             .unwrap_or_default())
     }
 
+    /// The registered host that owns this tuner row.
+    ///
+    /// `TunerHostManager` only ever holds rows whose `Type` a registered host
+    /// claims — [`LiveTvManager::save_tuner_host`] rejects the rest — so a miss
+    /// here means the row predates the check or names a host that has been
+    /// removed. Reporting it as not-found beats silently streaming it as M3U.
+    fn host_for(
+        &self,
+        tuner: &TunerHostInfo,
+    ) -> Result<&Arc<dyn crate::tuner_host::TunerHost>, ServiceError> {
+        let type_id = tuner.type_.as_deref().unwrap_or("m3u");
+        crate::tuner_host::find_host(&self.hosts, type_id)
+            .ok_or_else(|| ServiceError::not_found(format!("tuner host type {type_id}")))
+    }
+
+    /// Starts the live stream the host chose, buffering it when it can be
+    /// shared, and rewrites `source` to point at whatever a client should read.
+    ///
+    /// The three arms are upstream's three: `HdHomerunUdpStream` (which always
+    /// buffers — there is no URL a client could read instead, only datagrams
+    /// this server is receiving), `SharedHttpStream` (one tuner connection
+    /// feeding every consumer through the temp file), and the bare `LiveStream`
+    /// pass-through for a tuner whose stream cannot be shared.
+    async fn start_live_stream(
+        &self,
+        kind: &crate::tuner_host::ChannelStreamKind,
+        tuner: &TunerHostInfo,
+        path: &str,
+        source: &mut MediaSourceInfo,
+    ) -> Result<
+        (
+            String,
+            chrono::DateTime<Utc>,
+            Arc<std::sync::atomic::AtomicBool>,
+            LiveStreamKind,
+        ),
+        ServiceError,
+    > {
+        let opened = match kind {
+            crate::tuner_host::ChannelStreamKind::LegacyUdp(plan) => {
+                let transcode_dir = self.transcode_dir()?;
+                Some(
+                    crate::hdhomerun::udp_stream::open_legacy_udp_stream(
+                        plan,
+                        &transcode_dir,
+                        rand_lockkey(),
+                    )
+                    .await?,
+                )
+            }
+            crate::tuner_host::ChannelStreamKind::Http => {
+                let share = tuner.allow_stream_sharing
+                    && source.protocol == MediaProtocol::Http
+                    && !source.requires_looping
+                    && self.can_share_stream(path, source).await;
+                if share {
+                    let transcode_dir = self.transcode_dir()?;
+                    Some(
+                        crate::stream::open_shared_http_stream(
+                            self.tuner_source.as_ref(),
+                            path,
+                            &source.required_http_headers,
+                            &transcode_dir,
+                        )
+                        .await?,
+                    )
+                } else {
+                    None
+                }
+            }
+        };
+
+        let Some(opened) = opened else {
+            // The pass-through stream: nothing is buffered and the media source
+            // keeps the tuner URL (C# bare `LiveStream`).
+            return Ok((
+                Uuid::new_v4().simple().to_string(),
+                Utc::now(),
+                Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                LiveStreamKind::Direct,
+            ));
+        };
+
+        // Every consumer now reads the one buffered copy, not the tuner
+        // (C# `SharedHttpStream.Open`).
+        let base_url = self.local_api_url()?;
+        source.path = Some(format!(
+            "{base_url}/LiveTv/LiveStreamFiles/{}/stream.{LIVE_STREAM_BUFFER_CONTAINER}",
+            opened.unique_id
+        ));
+        source.protocol = MediaProtocol::Http;
+        source.container = Some(LIVE_STREAM_BUFFER_CONTAINER.to_owned());
+        Ok((
+            opened.unique_id,
+            opened.opened_at,
+            opened.alive,
+            LiveStreamKind::Shared {
+                temp_path: opened.temp_path,
+                task: opened.task,
+            },
+        ))
+    }
+
     /// The per-source stamp `LiveTvMediaSourceProvider.GetMediaSourcesInternal`
     /// applies to every Live TV source.
     fn stamp_source(source: &mut MediaSourceInfo) {
@@ -4330,6 +4502,149 @@ mod tests {
             err,
             ferrofin_traits::error::ServiceError::InvalidInput(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn an_unregistered_tuner_type_is_not_found() {
+        // `TunerHostManager.SaveTunerHost` (v10.11.8 TunerHostManager.cs:60-69)
+        // resolves the provider first and throws `ResourceNotFoundException`
+        // when nothing claims `info.Type` — Jellyfin answers 404 here.
+        // Ferrofin used to default the unknown type to "m3u" and answer 200,
+        // storing a tuner no host would ever read.
+        let mgr = manager_with(FakeFetcher(HashMap::new())).await;
+        let err = mgr
+            .save_tuner_host(TunerHostInfo {
+                type_: Some("nosuchtype".to_owned()),
+                url: Some("http://tuner/playlist.m3u".to_owned()),
+                ..TunerHostInfo::default()
+            })
+            .await
+            .expect_err("an unregistered type must not be stored");
+        assert!(
+            matches!(err, ferrofin_traits::error::ServiceError::NotFound(_)),
+            "{err}"
+        );
+        assert!(
+            mgr.get_tuner_hosts().await.expect("list").is_empty(),
+            "the rejected host must not have been persisted"
+        );
+        assert!(!mgr.has_tuner_hosts());
+    }
+
+    #[tokio::test]
+    async fn the_advertised_tuner_types_are_the_registered_hosts() {
+        // The exact bytes Jellyfin 10.11.8 answers on
+        // `GET /LiveTv/TunerHosts/Types`, in its order (`OrderBy(i => i.Name)`).
+        let mgr = manager_with(FakeFetcher(HashMap::new())).await;
+        assert_eq!(
+            mgr.tuner_host_types()
+                .into_iter()
+                .map(|p| (p.name.unwrap_or_default(), p.id.unwrap_or_default()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("HD Homerun".to_owned(), "hdhomerun".to_owned()),
+                ("M3U Tuner".to_owned(), "m3u".to_owned()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_hdhomerun_tuner_refreshes_through_the_hdhomerun_host() {
+        // The dispatch bug this replaces: `refresh_guide` fed EVERY tuner's URL
+        // to the M3U parser, so an HDHomeRun's `discover.json` parsed as a
+        // playlist with no channels and no error at all.
+        let device = HashMap::from([
+            (
+                "http://192.168.1.182/discover.json".to_owned(),
+                r#"{"FriendlyName":"HDHomeRun PRIME","ModelNumber":"HDHR3-CC","DeviceID":"FFFFFFFF",
+                    "TunerCount":3,"BaseURL":"http://192.168.1.182:80",
+                    "LineupURL":"http://192.168.1.182:80/lineup.json"}"#
+                    .to_owned(),
+            ),
+            (
+                "http://192.168.1.182:80/lineup.json".to_owned(),
+                r#"[{"GuideNumber":"4.1","GuideName":"WCMH-DT","HD":1,
+                     "VideoCodec":"MPEG2","AudioCodec":"AC3",
+                     "URL":"http://192.168.1.111:5004/auto/v4.1"},
+                    {"GuideNumber":"4.2","GuideName":"MeTV",
+                     "VideoCodec":"MPEG2","AudioCodec":"AC3",
+                     "URL":"http://192.168.1.111:5004/auto/v4.2"},
+                    {"GuideNumber":"9.9","GuideName":"Scrambled","DRM":1,
+                     "URL":"http://192.168.1.111:5004/auto/v9.9"}]"#
+                    .to_owned(),
+            ),
+        ]);
+        let mgr = manager_with(FakeFetcher(device)).await;
+        let saved = mgr
+            .save_tuner_host(TunerHostInfo {
+                type_: Some("hdhomerun".to_owned()),
+                url: Some("http://192.168.1.182".to_owned()),
+                ..TunerHostInfo::default()
+            })
+            .await
+            .expect("save");
+        // `IConfigurableTunerHost.Validate` ran and adopted the device id.
+        assert_eq!(saved.device_id.as_deref(), Some("FFFFFFFF"));
+
+        mgr.refresh_guide().await.expect("refresh");
+        // Read back through the repository, not inline SQL (the SQL-boundary
+        // ratchet): `channel_rows` is the lineup in stored order, and
+        // `channel_stream_source` is the per-channel tuner facts.
+        let rows = crate::guide_repository::channel_rows(&mgr.db)
+            .await
+            .expect("channels");
+        // The DRM row is dropped, and the identity is `hdhr_{GuideNumber}` —
+        // NOT the M3U `m3u_{md5}{md5}` shape.
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].name, "WCMH-DT");
+        assert_eq!(rows[0].number.as_deref(), Some("4.1"));
+        assert_eq!(rows[1].name, "MeTV");
+        for (guide_number, is_hd) in [("4.1", Some(true)), ("4.2", Some(false))] {
+            let external = format!("hdhr_{guide_number}");
+            let (stored, tuner_id) = crate::guide_repository::channel_stream_source(
+                &mgr.db,
+                super::internal_channel_id(&external),
+            )
+            .await
+            .expect("stream source")
+            .expect("the channel exists under the id derived from its external id");
+            assert_eq!(stored.external_id, external);
+            // `HD` is absent on 4.2, so the flag is false — not "unknown".
+            assert_eq!(stored.is_hd, is_hd);
+            assert_eq!(stored.video_codec.as_deref(), Some("MPEG2"));
+            assert_eq!(stored.audio_codec.as_deref(), Some("AC3"));
+            assert_eq!(
+                stored.path,
+                format!("http://192.168.1.111:5004/auto/v{guide_number}")
+            );
+            assert_eq!(tuner_id, saved.id.clone().expect("id"));
+        }
+
+        // …and the media source is the HDHomeRun one, not the M3U one: an
+        // HDHR3-CC does not transcode, so exactly the native profile exists.
+        let channel_id = super::internal_channel_id("hdhr_4.1");
+        let sources = mgr
+            .get_channel_media_sources(channel_id)
+            .await
+            .expect("sources");
+        assert_eq!(sources.len(), 1);
+        let source = &sources[0];
+        assert!(
+            source
+                .id
+                .as_deref()
+                .is_some_and(|id| id.starts_with("native_")),
+            "{:?}",
+            source.id
+        );
+        assert_eq!(source.container.as_deref(), Some("ts"));
+        assert!(!source.supports_direct_play);
+        assert!(source.use_most_compatible_transcoding_profile);
+        // `isHd` ⇒ the android-tv 1200 condition's dummy resolution.
+        assert_eq!(source.media_streams[0].width, Some(1920));
+        assert_eq!(source.media_streams[0].height, Some(1080));
+        assert_eq!(source.media_streams[0].bit_rate, Some(15_000_000));
+        assert_eq!(source.media_streams[1].bit_rate, Some(448_000));
     }
 
     #[tokio::test]
@@ -6966,8 +7281,11 @@ mod tests {
 mod id_derivation_tests {
     use super::{
         LIVE_TV_INTERNAL_VERSION, LIVE_TV_SERVICE_NAME, internal_channel_id, internal_program_id,
-        m3u_external_channel_id, new_item_id, to_lower_invariant,
+        new_item_id, to_lower_invariant,
     };
+    // The channel identity itself moved to the M3U tuner host with the rest of
+    // that backend; these vectors pin it wherever it lives.
+    use crate::tuner_host::m3u_external_channel_id;
 
     const TUNER: &str = "/media/synth/livetv/channels.m3u";
 
