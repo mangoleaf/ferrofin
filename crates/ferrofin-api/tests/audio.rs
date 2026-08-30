@@ -109,8 +109,16 @@ impl AuthorizationContext for OkAuth {
     }
 }
 
-/// A [`UserManager`] resolving the fixed authenticated user.
-struct OkUsers;
+/// A [`UserManager`] resolving the fixed authenticated user. The flags are the
+/// user's `IsAdministrator` and `EnableLyricManagement` policy bits — together
+/// they decide `RequireLyricManagement`, which gates five of the six lyric
+/// routes.
+struct OkUsers {
+    /// `Policy.IsAdministrator`.
+    admin: bool,
+    /// `Policy.EnableLyricManagement`.
+    lyric: bool,
+}
 
 #[async_trait]
 impl UserManager for OkUsers {
@@ -183,7 +191,15 @@ impl UserManager for OkUsers {
         _user: &UserEntity,
         _server_id: Option<String>,
     ) -> Result<ferrofin_model::dto::UserDto, ServiceError> {
-        unimplemented!()
+        Ok(ferrofin_model::dto::UserDto {
+            id: USER_ID,
+            policy: Some(ferrofin_model::users::UserPolicy {
+                is_administrator: self.admin,
+                enable_lyric_management: self.lyric,
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
     }
     async fn update_configuration(
         &self,
@@ -441,9 +457,15 @@ impl LyricManager for CannedLyrics {
 /// Builds an [`AppState`] serving `path` for streams and using `lyrics` for the
 /// Lyrics routes; every other manager is a shared panic fake.
 fn state(path: &str, lyrics: Arc<dyn LyricManager>) -> AppState {
+    state_as(path, lyrics, false, true)
+}
+
+/// [`state`] with the caller's `IsAdministrator` and `EnableLyricManagement`
+/// policy bits set explicitly.
+fn state_as(path: &str, lyrics: Arc<dyn LyricManager>, admin: bool, lyric: bool) -> AppState {
     AppState::new(
         Arc::new(StreamLibrary),
-        Arc::new(OkUsers),
+        Arc::new(OkUsers { admin, lyric }),
         Arc::new(FakeUserViews),
         Arc::new(FakeUserData),
         Arc::new(StreamSources {
@@ -628,6 +650,66 @@ async fn lyrics_routes_404_on_a_non_audio_item() {
     }
     // …and nothing was deleted along the way.
     assert!(!*deleted.lock().unwrap());
+}
+
+#[tokio::test]
+async fn lyric_writes_need_the_lyric_management_permission() {
+    // Port of `[Authorize(Policy = Policies.LyricManagement)]` — the
+    // `UserPermissionRequirement(PermissionKind.EnableLyricManagement)` five of
+    // the six `LyricsController` actions carry. The permission defaults to
+    // FALSE for a new user and is not implied by IsAdministrator, so without
+    // this gate any authenticated account could overwrite or delete another
+    // user's lyrics. A parity run cannot see it: the bench user holds it.
+    let deleted = Arc::new(Mutex::new(false));
+    let canned = || CannedLyrics {
+        stored: Some(LyricDto::default()),
+        remote: Some(("abc_1".to_owned(), LyricDto::default())),
+        deleted: deleted.clone(),
+    };
+    let gated = [
+        ("POST", format!("/Audio/{ITEM_ID}/Lyrics?fileName=x.lrc")),
+        ("DELETE", format!("/Audio/{ITEM_ID}/Lyrics")),
+        ("GET", format!("/Audio/{ITEM_ID}/RemoteSearch/Lyrics")),
+        (
+            "POST",
+            format!("/Audio/{ITEM_ID}/RemoteSearch/Lyrics/abc_1"),
+        ),
+        ("GET", "/Providers/Lyrics/abc_1".to_owned()),
+    ];
+    for (method, path) in &gated {
+        let (_dir, media) = temp_media();
+        let app = state_as(&media, Arc::new(canned()), false, false);
+        let (status, _) = call(app, method, path).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {path}");
+    }
+    // Nothing ran behind the refusal.
+    assert!(!*deleted.lock().unwrap());
+
+    // …and with the permission the same routes are reachable again.
+    for (method, path) in &gated {
+        let (_dir, media) = temp_media();
+        let app = state_as(&media, Arc::new(canned()), false, true);
+        let (status, _) = call(app, method, path).await;
+        assert_ne!(status, StatusCode::FORBIDDEN, "{method} {path}");
+    }
+
+    // An ADMINISTRATOR passes with the permission still false:
+    // `UserPermissionRequirement` derives from `DefaultAuthorizationRequirement`,
+    // so `DefaultAuthorizationHandler`'s "Admins can do everything" branch
+    // succeeds it first. Measured against Jellyfin 10.11.8, whose bench
+    // administrator uploads a lyric with `EnableLyricManagement: false`.
+    for (method, path) in &gated {
+        let (_dir, media) = temp_media();
+        let app = state_as(&media, Arc::new(canned()), true, false);
+        let (status, _) = call(app, method, path).await;
+        assert_ne!(status, StatusCode::FORBIDDEN, "admin {method} {path}");
+    }
+
+    // `GetLyrics` is a plain `[Authorize]` upstream — it must NOT be gated.
+    let (_dir, media) = temp_media();
+    let app = state_as(&media, Arc::new(canned()), false, false);
+    let (status, _) = call(app, "GET", &format!("/Audio/{ITEM_ID}/Lyrics")).await;
+    assert_eq!(status, StatusCode::OK);
 }
 
 #[tokio::test]

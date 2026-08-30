@@ -59,7 +59,7 @@ def item(op, tmpl):
     return {"op": op, "kind": "item", "url": lambda c, i: tmpl.format(u=c["user"], i=i)}
 
 
-def multi(op, legs):
+def multi(op, legs, seed=None, reap=None):
     """Several URLs folded into ONE ledger row (rows are keyed by op, so a second
     entry would clobber the first). Every leg is diffed; the buckets are unioned.
 
@@ -67,14 +67,21 @@ def multi(op, legs):
     `project(body)` narrows what is compared. A projection is allowed ONLY where
     the rest of the body is provably non-comparable between two independent
     instances — the Suggestions paging leg is the one case (see there) — never to
-    make a divergence disappear."""
+    make a divergence disappear.
+
+    `seed(base, token, ctx)` runs on BOTH servers immediately before this row's
+    legs and `reap(base, token, ctx)` immediately after, in a `finally`. Scoping
+    the write to the one row it exists for is deliberate: the lyric seeds change
+    the seeded track's DTO (Jellyfin gains a `MediaStreams` Lyric entry and flips
+    `HasLyrics`), and state held across the whole read set is state that can
+    contaminate an unrelated row later."""
     out = []
     for leg in legs:
         tmpl, project = leg if isinstance(leg, tuple) else (leg, None)
         out.append({"tmpl": tmpl,
                     "url": (lambda c, t=tmpl: t.format(**c)),
                     "project": project})
-    return {"op": op, "kind": "multi", "legs": out}
+    return {"op": op, "kind": "multi", "legs": out, "seed": seed, "reap": reap}
 
 
 def invariant(op, fn):
@@ -160,13 +167,30 @@ def seed_display_preferences(base, token, ctx):
 LYRIC_SEEDS = [
     ("lrc", "[ar:Parity Artist]\n[ti:Parity Title]\n[al:Parity Album]\n"
             "[00:01.00]First line\n[00:05.50]Second line\n[01:02.25]Third line\n"),
+    # The enhanced seed deliberately spans every branch of the decoder, because a
+    # corpus in which EVERY line starts with a word tag cannot fail on the one
+    # class of cue bug this row exists to catch. (It did not: Ferrofin dropped
+    # the position-0 cue that leading text owes, and neither the old seed nor
+    # upstream's own `Fleetwood Mac - Rumors.elrc` — 31 word-tag-first lines out
+    # of 31 — could see it.) The four shapes, in order:
+    #   1. word tag first, with whitespace-only segments between the words;
+    #   2. TEXT BEFORE the first word tag — `LrcTimedTextUtils.TimedTextToObject`
+    #      seeds its tag list with the LINE's start, so this owes a cue at
+    #      position 0 carrying `[00:14.69]`;
+    #   3. a word tag with nothing after it — an `IndexState.End` index, whose
+    #      cue spans the whole line and whose trailing slice emits nothing;
+    #   4. TWO line time tags, which `LrcLyricParser.Decode` refuses to attribute
+    #      word tags to, so `<00:35.00>` must survive in the text verbatim and
+    #      the line must appear twice with no cues at all.
     ("elrc", "[00:06.84] <00:06.84> Every <00:07.20>   <00:07.56> night <00:07.87>   "
              "<00:08.19> that <00:08.46>   <00:08.79> goes <00:09.19>   <00:09.59> between\n"
-             "[00:14.69] <00:14.69> I <00:14.78>   <00:14.87> feel <00:15.15>   "
-             "<00:15.44> a <00:15.54>   <00:15.65> little <00:15.96>   <00:16.28> less\n"),
+             "[00:14.69]I feel <00:15.15>a little <00:15.96>less\n"
+             "[00:20.00]closing<00:21.00>\n"
+             "[00:25.00][00:30.00]two starts <00:35.00>here\n"),
     ("txt", "Plain line one\n\n   indented line\nlast\n"),
 ]
 LYRIC_SEED_WAIT_S = 15   # Jellyfin serves an uploaded lyric only once its queued refresh ran
+LYRIC_REAP_ROUNDS = 3    # an item can hold more than one sidecar; Jellyfin resolves one at a time
 
 
 def lyric_seed_ids(base, token, user_id):
@@ -182,36 +206,89 @@ def lyric_seed_ids(base, token, user_id):
     return ids + [""] * (len(LYRIC_SEEDS) - len(ids))
 
 
-def seed_lyrics(base, token, ids):
+def lyric_ids(ctx):
+    """The three seeded audio ids, in LYRIC_SEEDS order."""
+    return [ctx["lyric_lrc"], ctx["lyric_elrc"], ctx["lyric_txt"]]
+
+
+def lyric_visible(base, token, aid):
+    """True once the server serves the uploaded lyric back."""
+    return http("GET", f"{base}/Audio/{aid}/Lyrics", token)[0] == 200
+
+
+def seed_lyrics(base, token, ctx):
     """Uploads one lyric per seed id and waits until each reads back.
 
-    Returns the upload statuses so a failure is visible rather than silently
-    turning the row back into a 404=404.
+    Records the ids that actually landed on `ctx`, so the reap only chases files
+    that exist, and returns the upload statuses so a failure is visible rather
+    than silently turning the row back into a 404=404.
     """
     statuses = []
-    for (ext, body), aid in zip(LYRIC_SEEDS, ids):
+    landed = []
+    for (ext, body), aid in zip(LYRIC_SEEDS, lyric_ids(ctx)):
         if not aid:
             statuses.append(None)
             continue
-        statuses.append(http("POST", f"{base}/Audio/{aid}/Lyrics?fileName=parity.{ext}",
-                             token, body)[0])
-    for aid in ids:
+        st = http("POST", f"{base}/Audio/{aid}/Lyrics?fileName=parity.{ext}", token, body)[0]
+        statuses.append(st)
+        if st == 200:
+            landed.append(aid)
+    for aid in landed:
         for _ in range(LYRIC_SEED_WAIT_S):
-            if aid and http("GET", f"{base}/Audio/{aid}/Lyrics", token)[0] == 200:
+            if lyric_visible(base, token, aid):
                 break
             time.sleep(1)
+    ctx["_lyrics_seeded"] = landed
     return statuses
 
 
-def reap_lyrics(base, token, ids):
+def reap_lyrics(base, token, ctx):
     """Removes the seeded lyrics again, so the later layers see the fixture as
-    they found it."""
-    for aid in ids:
-        for _ in range(3):
-            if not aid or http("GET", f"{base}/Audio/{aid}/Lyrics", token)[0] != 200:
-                break
-            http("DELETE", f"{base}/Audio/{aid}/Lyrics", token)
+    they found it.
+
+    Jellyfin's DELETE unlinks only the files it can see as resolved
+    `MediaStreamType.Lyric` rows (`LyricManager.DeleteLyricsAsync`), and its GET
+    reads those same rows — so a GET that is NOT 200 does not mean the file is
+    gone, it equally means the queued refresh has not run yet. Treating that as
+    "already reaped" is how this batch's diagnostic phase left lyric files
+    inside the Jellyfin container for good. So: wait until the file is VISIBLE
+    (only then can DELETE find it), delete it, then wait until it is gone — and
+    say so loudly if either wait runs out, because residue on a shared pair is
+    asymmetric state that poisons somebody else's measurement.
+    """
+    def wait_until(aid, visible):
+        for _ in range(LYRIC_SEED_WAIT_S):
+            if lyric_visible(base, token, aid) == visible:
+                return True
             time.sleep(1)
+        return False
+
+    left = []
+    for aid in ctx.get("_lyrics_seeded", []):
+        # Delete in rounds: an item that ended up with more than one sidecar
+        # (an aborted earlier run) only exposes one resolved Lyric stream at a
+        # time, so one DELETE is not necessarily the last one.
+        first = True
+        for _ in range(LYRIC_REAP_ROUNDS):
+            if not wait_until(aid, True):
+                # Nothing (more) visible. On the FIRST round that is the bad
+                # case the whole poll exists for: the upload was accepted but
+                # the server never served it back, so a file may be sitting on
+                # disk that no DELETE can reach.
+                if first:
+                    left.append(aid)
+                break
+            first = False
+            http("DELETE", f"{base}/Audio/{aid}/Lyrics", token)
+            wait_until(aid, False)
+        else:
+            left.append(aid)
+    ctx["_lyrics_seeded"] = []
+    if left:
+        print(f"  WARNING: {base} still holds seeded lyrics for {left} — they are "
+              f"asymmetric state on a shared pair; delete them before the next run",
+              file=sys.stderr)
+    return left
 
 
 # ------------------------------------------------- by-name ordering + options
@@ -640,7 +717,7 @@ READS = [
         "/Audio/{lyric_lrc}/Lyrics",
         "/Audio/{lyric_elrc}/Lyrics",
         "/Audio/{lyric_txt}/Lyrics",
-    ]),
+    ], seed=seed_lyrics, reap=reap_lyrics),
 ]
 
 # ---------------------------------------------------------------- correlation
@@ -733,12 +810,7 @@ def run(ferrofin_url, jellyfin_url):
         print(f"  display-preferences seed status differs: H={hseed} J={jseed}",
               file=sys.stderr)
 
-    # Same idea for the lyric row: identical bytes on both servers, then diff
-    # what each parsed them into (see LYRIC_SEEDS).
-    hlyr = seed_lyrics(ferrofin_url, ht, [hc["lyric_lrc"], hc["lyric_elrc"], hc["lyric_txt"]])
-    jlyr = seed_lyrics(jellyfin_url, jt, [jc["lyric_lrc"], jc["lyric_elrc"], jc["lyric_txt"]])
-    if hlyr != jlyr:
-        print(f"  lyric seed statuses differ: H={hlyr} J={jlyr}", file=sys.stderr)
+    # The lyric row seeds and reaps itself — see `multi(..., seed=, reap=)`.
 
     rows = {}
 
@@ -826,35 +898,48 @@ def run(ferrofin_url, jellyfin_url):
             record(ep["op"], 1 if n == 0 else 0, 1, buckets, ep["method"],
                    compared=len(set(jf) | set(hf)))
         elif ep["kind"] == "multi":
+            if ep.get("seed"):
+                hstat = ep["seed"](ferrofin_url, ht, hc)
+                jstat = ep["seed"](jellyfin_url, jt, jc)
+                if hstat != jstat:
+                    print(f"  {ep['op']} seed statuses differ: H={hstat} J={jstat}",
+                          file=sys.stderr)
             agg = {"mismatch": [], "missing": [], "extra": []}
             legs = []
             clean = tested = 0
-            for leg in ep["legs"]:
-                hs, hb = token_get(ferrofin_url, leg["url"](hc), ht)
-                js, jb = token_get(jellyfin_url, leg["url"](jc), jt)
-                tested += 1
-                # A leg that does not answer 200-with-JSON on both sides is a
-                # RESULT, not a reason to skip: `continue`-ing here made a
-                # status divergence (exactly what the type=MusicArtist and
-                # type=TvChannel legs exist to catch) silently invisible.
-                if hs != js:
-                    agg["mismatch"].append(
-                        {"path": f"{leg['tmpl']} :: status", "j": js, "h": hs})
-                    continue
-                if hb is None or jb is None:
-                    agg["mismatch"].append(
-                        {"path": f"{leg['tmpl']} :: body",
-                         "j": "no JSON" if jb is None else "json",
-                         "h": "no JSON" if hb is None else "json"})
-                    continue
-                if leg["project"]:
-                    hb, jb = leg["project"](hb), leg["project"](jb)
-                n, b, compared = diff_stats(jb, hb)
-                legs.append((jb, hb, compared))
-                if n == 0:
-                    clean += 1
-                for k in agg:
-                    agg[k].extend(b[k])
+            try:
+                for leg in ep["legs"]:
+                    hs, hb = token_get(ferrofin_url, leg["url"](hc), ht)
+                    js, jb = token_get(jellyfin_url, leg["url"](jc), jt)
+                    tested += 1
+                    # A leg that does not answer 200-with-JSON on both sides is a
+                    # RESULT, not a reason to skip: `continue`-ing here made a
+                    # status divergence (exactly what the type=MusicArtist and
+                    # type=TvChannel legs exist to catch) silently invisible.
+                    if hs != js:
+                        agg["mismatch"].append(
+                            {"path": f"{leg['tmpl']} :: status", "j": js, "h": hs})
+                        continue
+                    if hb is None or jb is None:
+                        agg["mismatch"].append(
+                            {"path": f"{leg['tmpl']} :: body",
+                             "j": "no JSON" if jb is None else "json",
+                             "h": "no JSON" if hb is None else "json"})
+                        continue
+                    if leg["project"]:
+                        hb, jb = leg["project"](hb), leg["project"](jb)
+                    n, b, compared = diff_stats(jb, hb)
+                    legs.append((jb, hb, compared))
+                    if n == 0:
+                        clean += 1
+                    for k in agg:
+                        agg[k].extend(b[k])
+            finally:
+                # Whatever happened above, the seeded state comes back off both
+                # servers — an aborted run must not leave the pair asymmetric.
+                if ep.get("reap"):
+                    ep["reap"](ferrofin_url, ht, hc)
+                    ep["reap"](jellyfin_url, jt, jc)
             record(ep["op"], clean, tested, agg, agg_method(legs),
                    compared=sum(c for _j, _h, c in legs))
         elif ep["kind"] in ("plain", "user"):
@@ -899,8 +984,6 @@ def run(ferrofin_url, jellyfin_url):
             record(ep["op"], clean, tested, agg, agg_method(legs),
                    compared=sum(c for _j, _h, c in legs))
 
-    reap_lyrics(ferrofin_url, ht, [hc["lyric_lrc"], hc["lyric_elrc"], hc["lyric_txt"]])
-    reap_lyrics(jellyfin_url, jt, [jc["lyric_lrc"], jc["lyric_elrc"], jc["lyric_txt"]])
     return rows, len(pairs)
 
 

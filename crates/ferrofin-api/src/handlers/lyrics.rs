@@ -8,6 +8,13 @@
 //! - `POST /Audio/{itemId}/RemoteSearch/Lyrics/{lyricId}` — download a remote lyric.
 //! - `GET /Providers/Lyrics/{lyricId}` — fetch a remote lyric by id.
 //!
+//! Five of the six carry `[Authorize(Policy = Policies.LyricManagement)]`
+//! upstream — only `GET /Audio/{itemId}/Lyrics` is a plain `[Authorize]` — so
+//! they take [`RequireLyricManagement`] rather than [`RequireAuth`]. The
+//! permission behind it (`EnableLyricManagement`) defaults to false and is not
+//! implied by administrator, so this is what stops any authenticated account
+//! overwriting or deleting another user's lyrics.
+//!
 //! Every route is backed by the [`LyricManager`] (sidecar `.lrc`/`.txt` files
 //! plus the registered remote providers such as LrcLib). On a successful item
 //! resolve, upload / download also queue a metadata refresh, matching the C#
@@ -20,7 +27,7 @@ use axum::{Json, Router};
 use ferrofin_model::lyrics::{LyricDto, RemoteLyricInfoDto};
 use uuid::Uuid;
 
-use crate::auth::RequireAuth;
+use crate::auth::{RequireAuth, RequireLyricManagement};
 use crate::error::ApiError;
 use crate::handlers::queue_high_priority_refresh;
 use crate::state::AppState;
@@ -102,7 +109,7 @@ struct UploadLyricsQuery {
 )]
 async fn upload_lyrics(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireLyricManagement(_auth): RequireLyricManagement,
     Path(item_id): Path<Uuid>,
     Query(query): Query<UploadLyricsQuery>,
     body: String,
@@ -147,7 +154,7 @@ async fn upload_lyrics(
 )]
 async fn delete_lyrics(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireLyricManagement(_auth): RequireLyricManagement,
     Path(item_id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
     require_item(&state, item_id).await?;
@@ -171,7 +178,7 @@ async fn delete_lyrics(
 )]
 async fn search_remote_lyrics(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireLyricManagement(_auth): RequireLyricManagement,
     Path(item_id): Path<Uuid>,
 ) -> Result<Json<Vec<RemoteLyricInfoDto>>, ApiError> {
     require_item(&state, item_id).await?;
@@ -199,7 +206,7 @@ async fn search_remote_lyrics(
 )]
 async fn download_remote_lyrics(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireLyricManagement(_auth): RequireLyricManagement,
     Path((item_id, lyric_id)): Path<(Uuid, String)>,
 ) -> Result<Json<LyricDto>, ApiError> {
     require_item(&state, item_id).await?;
@@ -228,7 +235,7 @@ async fn download_remote_lyrics(
 )]
 async fn get_remote_lyrics(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireLyricManagement(_auth): RequireLyricManagement,
     Path(lyric_id): Path<String>,
 ) -> Result<Json<LyricDto>, ApiError> {
     // `LyricManager.GetRemoteLyricsAsync`: route the namespaced id to its

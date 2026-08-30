@@ -23,6 +23,17 @@
 //! (`LyricManager.InternalSearchProviderAsync`), so a locally parsed lyric
 //! always serialises `"Metadata":{}`.
 //!
+//! `LrcLyricParser` does not parse LRC itself — it delegates to the `LrcParser`
+//! NuGet package, which Jellyfin 10.11.8 ships as `LrcParser.dll`
+//! `2025.0623.0+ae8e5a182e7841a8150e852bb8cd6a9e01be3548`. `parse_lrc` here is a
+//! port of that library's `Lrc` decoder at that exact commit —
+//! `LrcStartTimeUtils.SplitLyricAndTimeTag`, `LrcLyricParser.Decode` and
+//! `LrcTimedTextUtils.TimedTextToObject` — because the two behaviours a
+//! from-first-principles reading misses are both in there: the word-tag list is
+//! seeded with the LINE's own start time (so text before the first `<mm:ss.xx>`
+//! owes a cue at position 0), and a line with zero or more than one `[mm:ss.xx]`
+//! start time is returned verbatim with its word tags NOT parsed at all.
+//!
 //! Remote lyrics mirror the C# manager over its `ILyricProvider[]` registry:
 //! [`search_lyrics`](LyricManager::search_lyrics) builds a
 //! [`LyricSearchRequest`] from the resolved item and queries the providers one
@@ -595,146 +606,227 @@ fn parse_time_tag(inner: &str) -> Option<i64> {
         .checked_add(millis)
 }
 
-/// Splits `line` on every valid time tag delimited by `open`/`close`, returning
-/// the tag times (ms) and the `tags + 1` text segments around them. A bracketed
-/// run that is not a valid time tag is left in the surrounding segment verbatim
-/// — Jellyfin keeps `[ti:T]` and `<00:08>` inside the lyric text (measured).
-fn split_time_tags(line: &str, open: char, close: char) -> (Vec<i64>, Vec<String>) {
-    let (mut times, mut segments) = (Vec::new(), Vec::new());
-    let mut current = String::new();
-    let mut rest = line;
-    while let Some(start) = rest.find(open) {
-        let after = &rest[start + open.len_utf8()..];
-        let Some(end) = after.find(close) else {
+/// One time tag matched inside a source line: its byte range and its value in
+/// milliseconds.
+struct TimeTag {
+    /// Byte offset of the opening delimiter.
+    start: usize,
+    /// Byte offset one past the closing delimiter.
+    end: usize,
+    /// The tag's value in milliseconds.
+    ms: i64,
+}
+
+/// Finds every valid time tag delimited by `open`/`close`, in source order.
+///
+/// Equivalent to the `LrcParser` library's `TimeTagUtils` regexes
+/// (`\[(\d{1,}):(\d{2})\.(\d{2,3})\]` and its `<>` twin): a delimited run that
+/// is not a valid time tag is left in the surrounding text verbatim, which is
+/// why Jellyfin keeps `[ti:T]` and `<00:08>` inside the lyric (measured), and
+/// why the scan restarts just past a rejected `[` so `[abc[00:05.00]` still
+/// yields the inner timestamp — exactly what the regex engine does.
+fn find_time_tags(line: &str, open: char, close: char) -> Vec<TimeTag> {
+    let mut out = Vec::new();
+    let mut base = 0usize;
+    while let Some(rel) = line[base..].find(open) {
+        let start = base + rel;
+        let inner_from = start + open.len_utf8();
+        let Some(rel_end) = line[inner_from..].find(close) else {
             break;
         };
-        if let Some(ms) = parse_time_tag(&after[..end]) {
-            current.push_str(&rest[..start]);
-            segments.push(std::mem::take(&mut current));
-            times.push(ms);
-            rest = &after[end + close.len_utf8()..];
+        let inner_to = inner_from + rel_end;
+        if let Some(ms) = parse_time_tag(&line[inner_from..inner_to]) {
+            let end = inner_to + close.len_utf8();
+            out.push(TimeTag { start, end, ms });
+            base = end;
         } else {
-            // Not a time tag: keep the delimiter and rescan from just after it,
-            // so `[abc[00:05.00]` still yields the inner timestamp.
-            current.push_str(&rest[..start + open.len_utf8()]);
-            rest = after;
+            base = inner_from;
         }
     }
-    current.push_str(rest);
-    segments.push(current);
-    (times, segments)
+    out
 }
 
-/// A karaoke line's rendered text plus its word-level cues.
-struct KaraokeLine {
+/// Splits an LRC line into its `[mm:ss.xx]` line time tags and the remaining
+/// text. Port of `LrcStartTimeUtils.SplitLyricAndTimeTag`: **every** line time
+/// tag is collected wherever it occurs, all of them are removed from the text,
+/// and what is left is `.Trim()`ed.
+fn split_lyric_and_time_tag(line: &str) -> (Vec<i64>, String) {
+    if line.trim().is_empty() {
+        return (Vec::new(), String::new());
+    }
+    let tags = find_time_tags(line, '[', ']');
+    let mut text = String::new();
+    let mut prev = 0usize;
+    for tag in &tags {
+        text.push_str(&line[prev..tag.start]);
+        prev = tag.end;
+    }
+    text.push_str(&line[prev..]);
+    (tags.iter().map(|t| t.ms).collect(), text.trim().to_owned())
+}
+
+/// `LrcParser.Model.TextIndex`: a UTF-16 index into the rendered line plus the
+/// `IndexState` saying whether the tag sits *before* that character (`Start`)
+/// or *after* it (`End`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct TextIndex {
+    /// The UTF-16 index. `-1` is reachable — `lyricText.Length - 1` on an empty
+    /// builder — and resolves to position 0.
+    index: i32,
+    /// True for `IndexState.End`.
+    end_state: bool,
+}
+
+impl TextIndex {
+    /// The character position `LrcLyricParser` slices at:
+    /// `State == IndexState.End ? Index + 1 : Index`.
+    fn position(self) -> i32 {
+        if self.end_state {
+            self.index.saturating_add(1)
+        } else {
+            self.index
+        }
+    }
+}
+
+/// The rendered text of one LRC line plus its ordered word time tags.
+struct TimedText {
     /// The lyric text with every word time tag removed.
     text: String,
-    /// The cues, in tag order. The final one's `end` is filled in from the NEXT
-    /// line's start once the document is sorted (see [`parse_lrc`]).
-    cues: Vec<LyricLineCue>,
-    /// Whether the final cue is that open-ended last-tag cue.
-    open_last: bool,
+    /// `(index, milliseconds)` in `SortedDictionary` order — which is also
+    /// insertion order here, because both the `Start` indices and the trailing
+    /// `End` index only ever move forward.
+    tags: Vec<(TextIndex, i64)>,
 }
 
-/// Renders one timestamp-stripped LRC line: strips the enhanced-LRC
-/// `<mm:ss.xx>` word tags and derives the `LyricLineCue` list from them.
+/// `SortedDictionary.TryAdd`: the FIRST value written at a key wins.
 ///
-/// The text model is the `LrcParser` library's, established by measuring
-/// Jellyfin 10.11.8 directly: each inter-tag segment is trimmed, whitespace that
-/// touched a tag boundary collapses to a single space, and whitespace *inside* a
-/// segment is preserved verbatim (`[00:10.00]a    b` stays `a    b`). A tag sits
-/// at the start of the next segment's first non-blank character when there is
-/// one, else just past the last non-blank character before it — the
-/// `IndexState.Start` / `IndexState.End` distinction `LrcLyricParser` reads back
-/// out of `TimeTags`.
+/// It matters — a line ending in a whitespace-only segment inserts the same
+/// `(len - 1, End)` key twice (once from the blank-segment branch, once from
+/// the no-remaining-text branch) and Jellyfin keeps the earlier time.
+fn try_add_tag(tags: &mut Vec<(TextIndex, i64)>, index: TextIndex, ms: i64) {
+    if !tags.iter().any(|(k, _)| *k == index) {
+        tags.push((index, ms));
+    }
+}
+
+/// Parses one LRC line's text for enhanced-LRC `<mm:ss.xx>` word time tags.
+/// Faithful port of `LrcParser`'s `LrcTimedTextUtils.TimedTextToObject`
+/// (v2025.0623.0, the build Jellyfin 10.11.8 ships as `LrcParser.dll`).
 ///
-/// Positions are UTF-16 code-unit indices, because the C# slices a .NET string.
-fn parse_karaoke_line(remainder: &str) -> KaraokeLine {
-    let (times, segments) = split_time_tags(remainder, '<', '>');
+/// The detail that is easy to miss, and that a corpus of lines all starting
+/// with a word tag cannot expose: `lastTimeTag` is seeded with the **line's own
+/// start time**, so a line carrying text before its first word tag records a
+/// tag at index 0 holding that line start — `[00:01.00]hello <00:02.00>there`
+/// has cues for *both* "hello" and "there", not just "there".
+///
+/// Whitespace: each segment is `Trim()`ed, a single space is inserted when the
+/// previous segment ended with whitespace or the next one starts with it, and
+/// whitespace *inside* a segment survives verbatim.
+fn timed_text_to_object(timed_text: &str, line_start_ms: i64) -> TimedText {
+    if timed_text.trim().is_empty() {
+        return TimedText {
+            text: String::new(),
+            tags: Vec::new(),
+        };
+    }
+    let matches = find_time_tags(timed_text, '<', '>');
+    if matches.is_empty() {
+        // No word time tags: the line is returned exactly as it came in.
+        return TimedText {
+            text: timed_text.to_owned(),
+            tags: Vec::new(),
+        };
+    }
 
     let mut text = String::new();
-    let mut len16 = 0usize;
-    let mut core_start: Vec<Option<usize>> = Vec::with_capacity(segments.len());
-    let mut core_end: Vec<Option<usize>> = Vec::with_capacity(segments.len());
-    let mut pending_space = false;
-    for seg in &segments {
-        let core = seg.trim();
-        if seg.starts_with(char::is_whitespace) {
-            pending_space = true;
-        }
-        if core.is_empty() {
-            core_start.push(None);
-            core_end.push(None);
-        } else {
-            if pending_space && len16 > 0 {
-                text.push(' ');
-                len16 += 1;
+    // The C# tracks `lyricText.Length`, i.e. UTF-16 code units.
+    let mut len16: i32 = 0;
+    let mut tags: Vec<(TextIndex, i64)> = Vec::new();
+    let mut last_ms = line_start_ms;
+    let mut segment_start = 0usize;
+    let mut insert_space = false;
+    let mut last_tag_was_start = false;
+
+    for m in &matches {
+        let segment = &timed_text[segment_start..m.start];
+        segment_start = m.end;
+
+        if segment.trim().is_empty() {
+            if last_tag_was_start {
+                // The previous tag opened a run that this tag closes.
+                try_add_tag(
+                    &mut tags,
+                    TextIndex {
+                        index: len16 - 1,
+                        end_state: true,
+                    },
+                    last_ms,
+                );
+                last_tag_was_start = false;
             }
-            pending_space = false;
-            core_start.push(Some(len16));
-            text.push_str(core);
-            len16 += core.encode_utf16().count();
-            core_end.push(Some(len16));
-        }
-        if seg.ends_with(char::is_whitespace) {
-            pending_space = true;
-        }
-    }
-
-    // Each tag's index in the rendered text.
-    let mut positions: Vec<usize> = Vec::with_capacity(times.len());
-    let mut last_end = 0usize;
-    for i in 0..segments.len() {
-        if let Some(end) = core_end[i] {
-            last_end = end;
-        }
-        if i < times.len() {
-            positions.push(core_start[i + 1].unwrap_or(last_end));
-        }
-    }
-
-    let units: Vec<u16> = text.encode_utf16().collect();
-    let mut cues = Vec::new();
-    let mut open_last = false;
-    if let Some(last) = times.len().checked_sub(1) {
-        // The pairwise cues: `[tag_k, tag_{k+1})`, skipping a blank slice.
-        for k in 0..last {
-            let (a, b) = (positions[k], positions[k + 1].max(positions[k]));
-            if slice_is_blank(&units, a, b) {
-                continue;
+            last_ms = m.ms;
+            if !segment.is_empty() {
+                insert_space = true;
             }
-            cues.push(LyricLineCue {
-                position: to_i32(a),
-                end_position: to_i32(b),
-                start: times[k] * TICKS_PER_MS,
-                end: Some(times[k + 1] * TICKS_PER_MS),
-            });
+            continue;
         }
-        // The last tag runs to the end of the line; its `end` is the next
-        // line's start (patched after sorting), or absent on the final line.
-        let a = positions[last];
-        if !slice_is_blank(&units, a, units.len()) {
-            cues.push(LyricLineCue {
-                position: to_i32(a),
-                end_position: to_i32(units.len()),
-                start: times[last] * TICKS_PER_MS,
-                end: None,
-            });
-            open_last = true;
+
+        if (segment.starts_with(char::is_whitespace) || insert_space) && len16 > 0 {
+            text.push(' ');
+            len16 += 1;
         }
+        try_add_tag(
+            &mut tags,
+            TextIndex {
+                index: len16,
+                end_state: false,
+            },
+            last_ms,
+        );
+        last_tag_was_start = true;
+        let core = segment.trim();
+        text.push_str(core);
+        len16 = len16.saturating_add(to_i32(core.encode_utf16().count()));
+        last_ms = m.ms;
+        insert_space = segment.ends_with(char::is_whitespace);
     }
 
-    KaraokeLine {
-        text,
-        cues,
-        open_last,
+    let remaining = &timed_text[segment_start..];
+    if remaining.trim().is_empty() {
+        try_add_tag(
+            &mut tags,
+            TextIndex {
+                index: len16 - 1,
+                end_state: true,
+            },
+            last_ms,
+        );
+    } else {
+        if (remaining.starts_with(char::is_whitespace) || insert_space) && len16 > 0 {
+            text.push(' ');
+            len16 += 1;
+        }
+        try_add_tag(
+            &mut tags,
+            TextIndex {
+                index: len16,
+                end_state: false,
+            },
+            last_ms,
+        );
+        text.push_str(remaining.trim());
     }
+
+    TimedText { text, tags }
 }
 
 /// True when the UTF-16 slice `[a, b)` trims to nothing (C#
-/// `currentSlice.Trim().Length == 0`).
-fn slice_is_blank(units: &[u16], a: usize, b: usize) -> bool {
-    let (a, b) = (a.min(units.len()), b.min(units.len()));
+/// `currentSlice.Trim().Length == 0`). Positions are clamped, because a tag at
+/// `TextIndex(-1, End)` resolves to 0 and the final slice runs to the end.
+fn slice_is_blank(units: &[u16], a: i32, b: i32) -> bool {
+    let clamp = |v: i32| usize::try_from(v).unwrap_or(0).min(units.len());
+    let (a, b) = (clamp(a), clamp(b));
     a >= b || String::from_utf16_lossy(&units[a..b]).trim().is_empty()
 }
 
@@ -744,36 +836,53 @@ fn to_i32(value: usize) -> i32 {
     i32::try_from(value).unwrap_or(i32::MAX)
 }
 
+/// One decoded LRC line — `LrcParser.Model.Lyric` after
+/// `LrcParser.PostProcess` has expanded a multi-start line into one entry per
+/// start time.
+struct LrcLine {
+    /// The rendered lyric text.
+    text: String,
+    /// This entry's start time, in milliseconds.
+    start_ms: i64,
+    /// The line's word time tags (empty unless it had exactly one start time).
+    tags: Vec<(TextIndex, i64)>,
+}
+
 /// Parses an LRC/ELRC document into a [`LyricDto`]. Port of
-/// `LrcLyricParser.ParseLyrics`.
+/// `LrcLyricParser.ParseLyrics` over the `LrcParser` library's decoder.
 ///
 /// `Metadata` is **never** populated — upstream returns
 /// `new LyricDto { Lyrics = lyricList }` and leaves `Metadata` at its empty
-/// default even for a file carrying `[ar:]`/`[ti:]`/`[al:]` tags (measured:
-/// Jellyfin answers `"Metadata":{}`). Returns `None` when no timestamped line
-/// was produced (`sortedLyricData.Count == 0`), which is what makes an untimed
-/// `.lrc` fall through to [`parse_txt`].
+/// default even for a file carrying `[ar:]`/`[ti:]`/`[al:]` tags (those lines
+/// carry no line time tag, so `StartTimes` is empty and they produce no lyric
+/// at all). Returns `None` when no timestamped line was produced
+/// (`sortedLyricData.Count == 0`), which is what makes an untimed `.lrc` fall
+/// through to [`parse_txt`].
 fn parse_lrc(content: &str) -> Option<LyricDto> {
-    struct Pending {
-        text: String,
-        cues: Vec<LyricLineCue>,
-        open_last: bool,
-        start: i64,
-    }
-
-    let mut lines: Vec<Pending> = Vec::new();
+    let mut lines: Vec<LrcLine> = Vec::new();
     for raw in split_lines(content) {
-        let (times, chunks) = split_time_tags(raw, '[', ']');
-        if times.is_empty() {
+        // `LyricParser.Decode` drops whitespace-only lines before parsing.
+        if raw.trim().is_empty() {
             continue;
         }
-        let karaoke = parse_karaoke_line(&chunks.concat());
-        for ms in times {
-            lines.push(Pending {
-                text: karaoke.text.clone(),
-                cues: karaoke.cues.clone(),
-                open_last: karaoke.open_last,
-                start: ms * TICKS_PER_MS,
+        let (start_times, raw_lyric) = split_lyric_and_time_tag(raw);
+        // `LrcLyricParser.Decode`: with no start time, or with more than one,
+        // the word time tags cannot be attributed to a start time, so the
+        // library deliberately returns the line as-is and parses none of them
+        // — `[00:01.00][00:05.00]a <00:10.00>b` keeps `<00:10.00>` in the text.
+        let decoded = if start_times.len() == 1 {
+            timed_text_to_object(&raw_lyric, start_times[0])
+        } else {
+            TimedText {
+                text: raw_lyric,
+                tags: Vec::new(),
+            }
+        };
+        for start_ms in start_times {
+            lines.push(LrcLine {
+                text: decoded.text.clone(),
+                start_ms,
+                tags: decoded.tags.clone(),
             });
         }
     }
@@ -782,29 +891,48 @@ fn parse_lrc(content: &str) -> Option<LyricDto> {
     }
 
     // `OrderBy(x => x.StartTime)` — .NET's stable sort, as is `sort_by_key`.
-    lines.sort_by_key(|l| l.start);
-    for i in 0..lines.len() {
-        if !lines[i].open_last {
-            continue;
+    lines.sort_by_key(|l| l.start_ms);
+
+    let mut out = Vec::with_capacity(lines.len());
+    for (i, line) in lines.iter().enumerate() {
+        let units: Vec<u16> = line.text.encode_utf16().collect();
+        let mut cues = Vec::new();
+        if let Some((last, pairs)) = line.tags.split_last() {
+            for (cur, next) in pairs.iter().zip(line.tags.iter().skip(1)) {
+                let (a, b) = (cur.0.position(), next.0.position());
+                if slice_is_blank(&units, a, b) {
+                    continue;
+                }
+                cues.push(LyricLineCue {
+                    position: a,
+                    end_position: b,
+                    start: cur.1 * TICKS_PER_MS,
+                    end: Some(next.1 * TICKS_PER_MS),
+                });
+            }
+            // The last tag runs to the end of the line; its `end` is the next
+            // SORTED line's start, or absent on the final line.
+            let a = last.0.position();
+            let end_of_text = to_i32(units.len());
+            if !slice_is_blank(&units, a, end_of_text) {
+                cues.push(LyricLineCue {
+                    position: a,
+                    end_position: end_of_text,
+                    start: last.1 * TICKS_PER_MS,
+                    end: lines.get(i + 1).map(|n| n.start_ms * TICKS_PER_MS),
+                });
+            }
         }
-        let next_start = lines.get(i + 1).map(|l| l.start);
-        if let Some(next_start) = next_start
-            && let Some(cue) = lines[i].cues.last_mut()
-        {
-            cue.end = Some(next_start);
-        }
+        out.push(LyricLine {
+            text: line.text.clone(),
+            start: Some(line.start_ms * TICKS_PER_MS),
+            cues: Some(cues),
+        });
     }
 
     Some(LyricDto {
         metadata: LyricMetadata::default(),
-        lyrics: lines
-            .into_iter()
-            .map(|l| LyricLine {
-                text: l.text,
-                start: Some(l.start),
-                cues: Some(l.cues),
-            })
-            .collect(),
+        lyrics: out,
     })
 }
 
@@ -837,7 +965,7 @@ mod tests {
     use ferrofin_model::data::BaseItemKind;
     use ferrofin_model::entities::CollectionTypeOptions;
     use ferrofin_model::entities_media::VirtualFolderInfo;
-    use ferrofin_model::lyrics::{LyricMetadata, LyricSearchRequest};
+    use ferrofin_model::lyrics::{LyricLineCue, LyricMetadata, LyricSearchRequest};
     use ferrofin_traits::error::ServiceError;
     use ferrofin_traits::library::VirtualFolderManager;
     use ferrofin_traits::stubs::{LyricManager, LyricProvider, LyricResponse, RemoteLyricInfo};
@@ -1549,6 +1677,204 @@ mod tests {
         assert_eq!(
             kept.lyrics[0].cues.as_ref().expect("cues")[0].end_position,
             11
+        );
+    }
+
+    /// A measured oracle line: its text, its start in ticks, and one
+    /// `(position, end_position, start, end)` per cue.
+    type Line = (&'static str, i64, &'static [(i32, i32, i64, Option<i64>)]);
+
+    /// Parses each document and asserts the whole line/cue shape against the
+    /// captured Jellyfin response.
+    fn assert_lrc(cases: &[(&str, &[Line])]) {
+        for (input, expected) in cases {
+            let dto = parse_lrc(input).expect("timed");
+            let got: Vec<_> = dto
+                .lyrics
+                .iter()
+                .map(|l| {
+                    (
+                        l.text.clone(),
+                        l.start.expect("start"),
+                        l.cues
+                            .as_ref()
+                            .expect("cues")
+                            .iter()
+                            .map(|c| (c.position, c.end_position, c.start, c.end))
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect();
+            let want: Vec<_> = expected
+                .iter()
+                .map(|(t, s, c)| ((*t).to_owned(), *s, c.to_vec()))
+                .collect();
+            assert_eq!(got, want, "for {input:?}");
+        }
+    }
+
+    /// The class of enhanced-LRC line that a corpus of "every line starts with
+    /// a word tag" cannot expose: `LrcTimedTextUtils.TimedTextToObject` seeds
+    /// `lastTimeTag` with the LINE's start time, so text sitting before the
+    /// first `<mm:ss.xx>` tag gets a cue of its own at position 0. Ferrofin
+    /// used to drop it. Every expectation here is Jellyfin 10.11.8's own
+    /// response to that exact input, captured from the lab pair.
+    #[test]
+    fn leading_text_before_the_first_word_tag_keeps_its_cue() {
+        let cases: [(&str, &[Line]); 4] = [
+            // text, then a word tag: TWO cues, the first carrying the line start.
+            (
+                "[00:01.00]hello <00:02.00>there\n[00:03.00]end\n",
+                &[
+                    (
+                        "hello there",
+                        10_000_000,
+                        &[
+                            (0, 6, 10_000_000, Some(20_000_000)),
+                            (6, 11, 20_000_000, Some(30_000_000)),
+                        ],
+                    ),
+                    ("end", 30_000_000, &[]),
+                ],
+            ),
+            // the split can fall mid-word.
+            (
+                "[00:01.00]he<00:01.50>llo\n[00:03.00]end\n",
+                &[
+                    (
+                        "hello",
+                        10_000_000,
+                        &[
+                            (0, 2, 10_000_000, Some(15_000_000)),
+                            (2, 5, 15_000_000, Some(30_000_000)),
+                        ],
+                    ),
+                    ("end", 30_000_000, &[]),
+                ],
+            ),
+            // a word tag AT index 0 wins over the line start (`TryAdd` keeps the
+            // first value written at a key, and the blank leading segment never
+            // writes one).
+            (
+                "[00:01.00]<00:05.00>hello <00:06.00>there\n[00:09.00]end\n",
+                &[
+                    (
+                        "hello there",
+                        10_000_000,
+                        &[
+                            (0, 6, 50_000_000, Some(60_000_000)),
+                            (6, 11, 60_000_000, Some(90_000_000)),
+                        ],
+                    ),
+                    ("end", 90_000_000, &[]),
+                ],
+            ),
+            // leading WHITESPACE is not leading text: still one cue.
+            (
+                "[00:01.00]   <00:02.00>there\n[00:09.00]end\n",
+                &[
+                    ("there", 10_000_000, &[(0, 5, 20_000_000, Some(90_000_000))]),
+                    ("end", 90_000_000, &[]),
+                ],
+            ),
+        ];
+        assert_lrc(&cases);
+    }
+
+    /// The rest of the measured `TimedTextToObject` oracle: what the LINE start
+    /// tag does when the line's last segment is empty or blank (it becomes an
+    /// `IndexState.End` index, whose own trailing slice emits nothing), that
+    /// tags sort by index and not by time, and that a line with no word tags
+    /// gets no cue at all despite having a start. Jellyfin 10.11.8's own
+    /// responses, captured from the lab pair.
+    #[test]
+    fn line_start_tags_close_and_sort_the_way_upstream_does() {
+        let cases: [(&str, &[Line]); 4] = [
+            // a tag with nothing after it closes the leading run as an End
+            // index, so the ONE cue spans the whole line.
+            (
+                "[00:01.00]hello<00:02.00>\n[00:09.00]end\n",
+                &[
+                    ("hello", 10_000_000, &[(0, 5, 10_000_000, Some(20_000_000))]),
+                    ("end", 90_000_000, &[]),
+                ],
+            ),
+            // …and the same when the trailing segment is whitespace only.
+            (
+                "[00:01.00]hello <00:02.00>   <00:03.00>   \n[00:09.00]end\n",
+                &[
+                    ("hello", 10_000_000, &[(0, 5, 10_000_000, Some(20_000_000))]),
+                    ("end", 90_000_000, &[]),
+                ],
+            ),
+            // keys sort by INDEX, not by time: a word tag earlier than the line
+            // start produces a cue whose end precedes its start. Jellyfin does
+            // this; so do we.
+            (
+                "[00:05.00]hello <00:02.00>there\n[00:09.00]end\n",
+                &[
+                    (
+                        "hello there",
+                        50_000_000,
+                        &[
+                            (0, 6, 50_000_000, Some(20_000_000)),
+                            (6, 11, 20_000_000, Some(90_000_000)),
+                        ],
+                    ),
+                    ("end", 90_000_000, &[]),
+                ],
+            ),
+            // no word tags at all ⇒ no cues, even though the line has a start.
+            (
+                "[00:01.00]just text\n[00:09.00]end\n",
+                &[("just text", 10_000_000, &[]), ("end", 90_000_000, &[])],
+            ),
+        ];
+        assert_lrc(&cases);
+    }
+
+    /// `LrcLyricParser.Decode` refuses to attribute word time tags when the
+    /// line does not have exactly ONE start time — the library returns the line
+    /// as-is, word tags and all, because `<00:10.00>` cannot belong to both
+    /// `[00:01.00]` and `[00:05.00]`. Measured against Jellyfin 10.11.8, which
+    /// answers `Text = "hello <00:10.00>there"` with no cues.
+    #[test]
+    fn a_line_with_two_start_times_keeps_its_word_tags_verbatim() {
+        let dto =
+            parse_lrc("[00:01.00][00:05.00]hello <00:10.00>there\n[00:20.00]end\n").expect("timed");
+        let lines: Vec<_> = dto
+            .lyrics
+            .iter()
+            .map(|l| (l.text.as_str(), l.start, l.cues.as_deref().map(<[_]>::len)))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                ("hello <00:10.00>there", Some(10_000_000), Some(0)),
+                ("hello <00:10.00>there", Some(50_000_000), Some(0)),
+                ("end", Some(200_000_000), Some(0)),
+            ]
+        );
+
+        // Line time tags are collected wherever they occur, not just at the
+        // start — `SplitLyricAndTimeTag` runs the regex over the whole line —
+        // so a second, mid-line `[..]` disables word parsing the same way.
+        let mid = parse_lrc("[00:01.00]hello [00:05.00]world <00:10.00>x\n").expect("timed");
+        assert_eq!(mid.lyrics[0].text, "hello world <00:10.00>x");
+        assert_eq!(mid.lyrics.len(), 2);
+
+        // With exactly one such tag the word tags ARE parsed, and the text is
+        // the tag-stripped remainder.
+        let single = parse_lrc("hello [00:01.00]world <00:10.00>x\n").expect("timed");
+        assert_eq!(single.lyrics[0].text, "hello world x");
+        assert_eq!(
+            single.lyrics[0].cues.as_ref().expect("cues")[0],
+            LyricLineCue {
+                position: 0,
+                end_position: 12,
+                start: 10_000_000,
+                end: Some(100_000_000),
+            }
         );
     }
 

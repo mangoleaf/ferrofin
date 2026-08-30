@@ -322,6 +322,65 @@ impl FromRequestParts<AppState> for FirstTimeSetupOrElevated {
     }
 }
 
+/// Extractor for handlers behind Jellyfin's `LyricManagement` policy.
+///
+/// Port of `new UserPermissionRequirement(PermissionKind.EnableLyricManagement)`
+/// (`ApiServiceCollectionExtensions.cs:88`, v10.11.8), which TWO handlers see:
+///
+/// 1. `UserPermissionHandler` — an API key has global permissions and succeeds
+///    outright; otherwise the user must hold `EnableLyricManagement`, which
+///    `UserEntityExtensions.AddDefaultPermissions` initialises to **false**.
+/// 2. `DefaultAuthorizationHandler` — because `UserPermissionRequirement`
+///    derives from `DefaultAuthorizationRequirement`, the default handler runs
+///    for this requirement too, and its "Admins can do everything" branch
+///    calls `context.Succeed(requirement)` before the permission is ever
+///    consulted. So an administrator passes with the permission set to false.
+///
+/// That second leg is not a guess: measured on the lab pair, Jellyfin 10.11.8
+/// accepts a lyric upload from the bench administrator whose
+/// `Policy.EnableLyricManagement` reads `false`.
+///
+/// `LyricsController` puts the policy on five of its six actions; only
+/// `GetLyrics` is a plain `[Authorize]`. Without it every authenticated
+/// account could overwrite and delete any other user's lyrics — the same
+/// "gated in a comment, not in code" hole [`RequireAdmin`] exists to close, and
+/// invisible to a parity run whose bench user is an administrator.
+///
+/// The default handler's other two legs — refusing a remote caller without
+/// `EnableRemoteAccess`, and the parental schedule — belong to the base
+/// `[Authorize]` policy that [`RequireAuth`] stands for and are not ported
+/// here (or in [`RequireAdmin`]); they are open work on the default policy,
+/// not something specific to lyrics.
+#[derive(Debug, Clone)]
+pub struct RequireLyricManagement(pub AuthorizationInfo);
+
+impl FromRequestParts<AppState> for RequireLyricManagement {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let RequireAuth(info) = RequireAuth::from_request_parts(parts, state).await?;
+        if info.is_api_key {
+            return Ok(Self(info));
+        }
+        if let Some(user) = &info.user
+            && state
+                .users
+                .get_user_dto(user, None)
+                .await?
+                .policy
+                .is_some_and(|p| p.is_administrator || p.enable_lyric_management)
+        {
+            return Ok(Self(info));
+        }
+        Err(ApiError::Forbidden(
+            "lyric management access required".to_owned(),
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::request_context;

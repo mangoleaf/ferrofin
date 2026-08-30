@@ -933,10 +933,26 @@ LYRIC_REFRESH_WAIT_S = 10   # Jellyfin serves an uploaded lyric only once its re
 PARITY_LRC = ("[ar:Parity Artist]\n[ti:Parity Title]\n[al:Parity Album]\n"
               "[00:01.00]First line\n"
               "[00:05.50]<00:05.50>Second <00:06.00>line\n"
-              "[00:12.25]Third line\n")
-#: What both servers must parse PARITY_LRC into: (Text, Start-in-ticks) per line.
-PARITY_LRC_LINES = [("First line", 10000000), ("Second line", 55000000),
-                    ("Third line", 122500000)]
+              # Text BEFORE the first word tag. `LrcTimedTextUtils` seeds its tag
+              # list with the LINE's start, so this line owes a cue at position 0
+              # carrying [00:08.00] — a shape a word-tag-first corpus can never
+              # demand, and one Ferrofin used to drop.
+              "[00:08.00]Third <00:09.00>line\n"
+              "[00:12.25]Fourth line\n")
+#: What both servers must parse PARITY_LRC into, per line: Text, Start-in-ticks,
+#: and the word cues as (Position, EndPosition, Start, End). Asserting the CUES
+#: and not just the text is what makes this read-back a real check on the
+#: enhanced-LRC parser rather than a "it came back 200".
+PARITY_LRC_LINES = [
+    ("First line", 10000000, []),
+    # The tag index lands AFTER the space the parser inserts at a boundary, so
+    # the first cue of a `<tag>word <tag>word` line ends at 7, not 6.
+    ("Second line", 55000000, [(0, 7, 55000000, 60000000),
+                               (7, 11, 60000000, 80000000)]),
+    ("Third line", 80000000, [(0, 6, 80000000, 90000000),
+                              (6, 10, 90000000, 122500000)]),
+    ("Fourth line", 122500000, []),
+]
 
 
 def last_audio(base, token, user):
@@ -948,8 +964,16 @@ def last_audio(base, token, user):
     return by_path[sorted(by_path)[-1]] if by_path else ""
 
 
+def lyric_lines(doc):
+    """(Text, Start, cues) per line of a LyricDto, shaped like PARITY_LRC_LINES."""
+    return [(ln.get("Text"), ln.get("Start"),
+             [(c.get("Position"), c.get("EndPosition"), c.get("Start"), c.get("End"))
+              for c in ln.get("Cues") or []])
+            for ln in (doc or {}).get("Lyrics") or []]
+
+
 def stored_lyric_lines(base, token, aid):
-    """(Text, Start) of the item's stored lyric lines, or None when it has none."""
+    """The item's stored lyric lines (see `lyric_lines`), or None when it has none."""
     st, raw = http("GET", f"{base}/Audio/{aid}/Lyrics", token)
     if st != 200:
         return None
@@ -957,7 +981,7 @@ def stored_lyric_lines(base, token, aid):
         doc = json.loads(raw)
     except ValueError:
         return None
-    return [(ln.get("Text"), ln.get("Start")) for ln in doc.get("Lyrics") or []]
+    return lyric_lines(doc)
 
 
 def await_lyric(base, token, aid, present):
@@ -979,6 +1003,11 @@ def j_lyrics(base, token, user, mid, _m2):
     write. The lyric is reaped whatever happened, so a leftover from an aborted run
     cannot mask the next.
 
+    The read-back is asserted line by line AND cue by cue against
+    `PARITY_LRC_LINES`, whose document deliberately includes a line with text
+    before its first word tag - the shape whose position-0 cue Ferrofin used to
+    drop.
+
     This layer only ever compares a server against its OWN read-back, so both ops
     are `effect` rows. The cross-server body diff of the parsed LyricDto - the
     thing that actually pins Metadata/Cues/blank-line handling - is reads.py's
@@ -987,15 +1016,17 @@ def j_lyrics(base, token, user, mid, _m2):
     aid = last_audio(base, token, user)
     if not aid:
         return r
+    pending = False        # True while an uploaded lyric is still on this server
     try:
         http("DELETE", f"{base}/Audio/{aid}/Lyrics", token)      # start from clean
         st, raw = http("POST", f"{base}/Audio/{aid}/Lyrics?fileName=parity.lrc",
                        token, PARITY_LRC)
+        pending = st == 200
         try:
             posted = json.loads(raw)
         except ValueError:
             posted = {}
-        echoed = [(ln.get("Text"), ln.get("Start")) for ln in posted.get("Lyrics") or []]
+        echoed = lyric_lines(posted)
         stored = await_lyric(base, token, aid, True)
         # An extension no parser claims must be refused outright, not coerced.
         bad = http("POST", f"{base}/Audio/{aid}/Lyrics?fileName=parity.foo", token, "hello")[0]
@@ -1006,13 +1037,23 @@ def j_lyrics(base, token, user, mid, _m2):
         gone = await_lyric(base, token, aid, False) is None
         # A movie id is not an audio item: every lyric route 404s on it.
         movie = http("DELETE", f"{base}/Audio/{mid}/Lyrics", token)[0]
+        pending = not gone
         r["DELETE /Audio/{itemId}/Lyrics"] = st < 300 and gone and movie == 404
     finally:
-        for _ in range(3):                                       # reap, whichever path ran
-            if stored_lyric_lines(base, token, aid) is None:
-                break
-            http("DELETE", f"{base}/Audio/{aid}/Lyrics", token)
-            time.sleep(1)
+        # Reap anything the run did not manage to remove. A GET that is not 200
+        # does NOT prove the file is gone: Jellyfin's DELETE only unlinks
+        # resolved MediaStreamType.Lyric rows and its GET reads those same rows,
+        # so before the queued refresh lands the read 404s while the file is
+        # still on disk. Breaking out on that 404 is how a lyric gets stranded
+        # inside the container for good. Wait for it to become VISIBLE, then
+        # delete, then confirm — and say so if it will not go.
+        if pending:
+            if await_lyric(base, token, aid, True) is not None:
+                http("DELETE", f"{base}/Audio/{aid}/Lyrics", token)
+            if await_lyric(base, token, aid, False) is not None:
+                print(f"  WARNING: {base} still holds a lyric on {aid} — asymmetric "
+                      f"state on a shared pair; remove it before the next run",
+                      file=sys.stderr)
     return r
 
 
