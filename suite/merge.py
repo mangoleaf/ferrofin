@@ -405,20 +405,17 @@ def main():
             continue  # a benched name not in the registry — self-test would have caught new ones
         pr = par.get(op, {})
         # The honesty gate is BODY-diffed parity, not merely a green ledger cell.
-        # A "property" row (gen-ledger.py `verification_method`) had its
-        # invariants compared, not its response — so the two servers may be
-        # returning genuinely different work, and a latency comparison of
-        # different work is not a comparison. Those rows stay non-comparable
-        # here, exactly as they were before they had any verdict at all.
-        deep = (bool(pr.get("deep_verified"))
-                and pr.get("verification_method", "body-diff") == "body-diff")
-        benched_ops.add(op)
-        if deep:
-            deep_ops.add(op)
-
+        # Any row whose `verification_method` (parity/verification.py) is not
+        # "body-diff" had something WEAKER compared than its response — named
+        # properties, a write's effect, a status class, or two empty result sets
+        # — so the two servers may be returning genuinely different work, and a
+        # latency comparison of different work is not a comparison. An
+        # `empty-corpus` row is the sharpest case: both servers returned nothing,
+        # and timing two empty pages measures the harness. Those rows stay
+        # non-comparable here, exactly as they were before they had any verdict.
         # Write (non-GET) rows are fingerprint-exempt: fingerprint.py never captures
-        # them (a probe would mutate state), so their honesty gate is deep_verified —
-        # the parity WRITE JOURNEY — plus the 100% expected-status check below.
+        # them (a probe would mutate state), so their honesty gate is the parity
+        # WRITE JOURNEY's effect verdict plus the 100% expected-status check below.
         is_write = not op.startswith("GET ")
         f_e = None if is_write else fp_entry(fp_h, variant, op)
         j_e = None if is_write else fp_entry(fp_j, variant, op)

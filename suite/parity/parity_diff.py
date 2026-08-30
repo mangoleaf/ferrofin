@@ -73,10 +73,19 @@ def _keyed(arr):
     return m
 
 
-def diff(j, h, path, out, volatile=VOLATILE):
-    """Walk both trees; append differences to out['mismatch'|'missing'|'extra']."""
+def diff(j, h, path, out, volatile=VOLATILE, stats=None):
+    """Walk both trees; append differences to out['mismatch'|'missing'|'extra'].
+
+    `stats` (a dict) counts, in `stats["compared"]`, how many non-volatile LEAF
+    comparisons actually executed. That count is not a nicety: a clean diff of an
+    empty list, a bare `{}`, or a document whose every key is VOLATILE returns
+    zero differences having compared nothing, and "nothing was compared" must
+    never be recorded as "everything matched".
+    """
     tj, th = _kind(j), _kind(h)
     if tj != th:
+        if stats is not None:
+            stats["compared"] += 1
         out["mismatch"].append({"path": path, "j": _brief(j), "h": _brief(h)})
         return
     if tj == "object":
@@ -89,7 +98,7 @@ def diff(j, h, path, out, volatile=VOLATILE):
             elif k not in j:
                 out["extra"].append({"path": p, "h": _brief(h[k])})
             else:
-                diff(j[k], h[k], p, out, volatile)
+                diff(j[k], h[k], p, out, volatile, stats)
     elif tj == "array":
         jk, hk = _keyed(j), _keyed(h)
         if jk is not None and hk is not None:
@@ -100,14 +109,17 @@ def diff(j, h, path, out, volatile=VOLATILE):
                 elif key not in jk:
                     out["extra"].append({"path": f"{p} (whole item)"})
                 else:
-                    diff(jk[key], hk[key], p, out, volatile)
+                    diff(jk[key], hk[key], p, out, volatile, stats)
         else:
             if len(j) != len(h):
                 out["mismatch"].append({"path": f"{path}[]", "j": f"len {len(j)}", "h": f"len {len(h)}"})
             for i in range(min(len(j), len(h))):
-                diff(j[i], h[i], f"{path}[{i}]", out, volatile)
-    elif j != h:
-        out["mismatch"].append({"path": path, "j": _brief(j), "h": _brief(h)})
+                diff(j[i], h[i], f"{path}[{i}]", out, volatile, stats)
+    else:
+        if stats is not None:
+            stats["compared"] += 1
+        if j != h:
+            out["mismatch"].append({"path": path, "j": _brief(j), "h": _brief(h)})
 
 
 # `DtoService.GetChildCount` (Emby.Server.Implementations/Dto/DtoService.cs:649-656):
@@ -154,7 +166,19 @@ def diff_counts(j, h):
     Both sides go through [`scrub_random_child_count`] first — see its comment
     for why that one field is not diffable and why it is not in `VOLATILE`.
     """
-    out = {"mismatch": [], "missing": [], "extra": []}
-    diff(scrub_random_child_count(j), scrub_random_child_count(h), "", out)
-    n = len(out["mismatch"]) + len(out["missing"]) + len(out["extra"])
+    n, out, _ = diff_stats(j, h)
     return n, out
+
+
+def diff_stats(j, h):
+    """`diff_counts` plus the number of non-volatile leaf comparisons performed.
+
+    A caller deciding HOW a row was verified needs the third value: `n == 0` with
+    `compared == 0` is "the probe compared nothing", which is untested, while
+    `n == 0` with `compared > 0` is a real agreement.
+    """
+    out = {"mismatch": [], "missing": [], "extra": []}
+    stats = {"compared": 0}
+    diff(scrub_random_child_count(j), scrub_random_child_count(h), "", out, VOLATILE, stats)
+    n = len(out["mismatch"]) + len(out["missing"]) + len(out["extra"])
+    return n, out, stats["compared"]

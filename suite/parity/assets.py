@@ -29,6 +29,7 @@ import urllib.parse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from sweep import http, get_json, bring_up, ROOT   # noqa: E402
+import verification  # noqa: E402  — the closed set of verification methods
 
 # A 1x1 PNG — the smallest valid upload payload; decodes to (png, 1, 1).
 ONE_PX_PNG = base64.b64decode(
@@ -183,8 +184,10 @@ def resolve(base, token, user_id):
 # The exception is the file family (`/Download`, `/File`, `/Attachments/{index}`):
 # both servers serve the SAME hardlinked fixture bytes, so those rows really are a
 # byte-for-byte diff (sha256) and stay "body-diff".
-SIG_PROPERTY = "property"
-SIG_BODY_DIFF = "body-diff"
+SIG_PROPERTY = verification.PROPERTY
+SIG_BODY_DIFF = verification.BODY_DIFF
+SIG_EFFECT = verification.EFFECT
+SIG_STATUS_CLASS = verification.STATUS_CLASS
 
 
 def read_signatures(base, token, c):
@@ -422,10 +425,17 @@ def write_effects(base, token, c):
         r["DELETE /Items/{itemId}/Images/{imageType}"] = d < 300 and gone >= 400
 
         # Indexed variants: two backdrops (indices 0,1), reorder 1->0, delete by index.
+        # The indexed upload must actually USE the indexed route. It used to be
+        # recorded from a POST to the UNindexed URL, so the row reported the status
+        # of a different endpoint — `SetItemImageByIndex` (a distinct C# action,
+        # ImageController.cs:389) was never requested at all.
         post_bytes(base, f"/Items/{it}/Images/Backdrop", token, base64.b64encode(ONE_PX_PNG), "image/png")
-        st = post_bytes(base, f"/Items/{it}/Images/Backdrop", token,
+        st = post_bytes(base, f"/Items/{it}/Images/Backdrop/0", token,
                         base64.b64encode(ONE_PX_PNG), "image/png")
-        r["POST /Items/{itemId}/Images/{imageType}/{imageIndex}"] = st < 300
+        idx0 = raw("GET", base, f"/Items/{it}/Images/Backdrop/0", token)
+        r["POST /Items/{itemId}/Images/{imageType}/{imageIndex}"] = (
+            st < 300 and image_info(idx0[2])[0] == "png")
+        post_bytes(base, f"/Items/{it}/Images/Backdrop", token, base64.b64encode(ONE_PX_PNG), "image/png")
         st = post_bytes(base, f"/Items/{it}/Images/Backdrop/1/Index?newIndex=0", token, b"", "application/json")
         r["POST /Items/{itemId}/Images/{imageType}/{imageIndex}/Index"] = st < 300
         d = raw("DELETE", base, f"/Items/{it}/Images/Backdrop/0", token)[0]
@@ -468,6 +478,13 @@ def run(ferrofin_url, jellyfin_url):
         h, j = hsig[op], jsig.get(op)
         ok = j is not None and sig_match(h, j)
         method = hmethod.get(op, SIG_PROPERTY)
+        # HONESTY DOWNGRADE. Every signature helper falls back to `(status // 100, "")`
+        # when the server did not serve the thing. Two of those matching proves only
+        # that BOTH refused — no image was decoded, no media type compared, no property
+        # of any asset examined — so the row must not read as "properties agreed". A
+        # Ferrofin that 404'd every by-name image request would otherwise pass 16 rows.
+        if verification.bare_status_class(h) and verification.bare_status_class(j or ()):
+            method = SIG_STATUS_CLASS
         rows[op] = {"deep_verified": bool(ok),
                     "classification": "" if ok else "flagged: asset property diff vs Jellyfin (verify)",
                     # HOW, not just whether — see the SIG_PROPERTY note above. Only the
@@ -475,9 +492,10 @@ def run(ferrofin_url, jellyfin_url):
                     # properties, which two different encoders CAN match and bytes cannot.
                     "verification_method": method,
                     "note": f"H={h} J={j}"
-                            + ("" if method == SIG_BODY_DIFF
-                               else " (declared properties agreed; bytes not diffed)"
-                               if ok else "")}
+                            + ("" if method == SIG_BODY_DIFF or not ok
+                               else " (status class only; nothing was served on either server)"
+                               if method == SIG_STATUS_CLASS
+                               else " (declared properties agreed; bytes not diffed)")}
 
     # Format negotiation + route binding, folded into the same rows.
     hneg = negotiation_signatures(ferrofin_url, ht, hc)
@@ -510,11 +528,12 @@ def run(ferrofin_url, jellyfin_url):
         h_ok, j_ok = hw[op], jw.get(op)
         ok = bool(h_ok and j_ok)
         # These are EFFECT verdicts (the write succeeded on both, and where a read-back
-        # exists it decodes as the uploaded format) — not a read-back body diff, so they
-        # are "property" too.
+        # exists it decodes as the uploaded format). No body was diffed and the two
+        # servers' responses were never compared with each other, so they carry
+        # `effect` — distinct from `property`, where a property of a RESPONSE agreed.
         rows[op] = {"deep_verified": ok,
                     "classification": "" if ok else "flagged: asset write effect diff vs Jellyfin (verify)",
-                    "verification_method": SIG_PROPERTY,
+                    "verification_method": SIG_EFFECT,
                     "note": f"H={h_ok} J={j_ok}"
                             + (" (effect verdict; bodies not diffed)" if ok else "")}
     return rows
@@ -582,8 +601,18 @@ def selfcheck():
         "GET /Videos/{videoId}/{mediaSourceId}/Attachments/{index}",
     }, byte_exact
     assert (SIG_PROPERTY, SIG_BODY_DIFF) == ("property", "body-diff")
+    assert {SIG_PROPERTY, SIG_BODY_DIFF, SIG_EFFECT, SIG_STATUS_CLASS} <= verification.VALID
+    # The status-class downgrade: two bare `(class, "")` signatures matching is not a
+    # property comparison, and must never be rendered as one.
+    assert verification.bare_status_class((4, "")) and verification.bare_status_class((2, ""))
+    assert not verification.bare_status_class((2, "image", "png", 600, 600))
+    assert not verification.bare_status_class((2, "css", False))
+    # Every write row names the route it actually requested: the indexed upload must
+    # POST to an INDEXED url, or the row reports a different endpoint's status.
+    assert 'f"/Items/{it}/Images/Backdrop/0", token,' in inspect.getsource(write_effects)
     print(f"ok: image parser, sig_match, {len(declared)} asset op-keys valid, "
-          f"{len(byte_exact)} byte-exact rows, the rest property-verified")
+          f"{len(byte_exact)} byte-exact rows, status-class downgrade, "
+          f"write rows stamped {SIG_EFFECT!r}")
 
 
 if __name__ == "__main__":

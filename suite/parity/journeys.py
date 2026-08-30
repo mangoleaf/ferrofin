@@ -29,6 +29,67 @@ import urllib.error
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from sweep import http, get_json, bring_up, container_read, ROOT, USER, PASS, CLIENT, opensubtitles_credentials   # reuse HTTP + provisioning
+import verification   # the closed set of verification methods
+
+# ---------------------------------------------------------------- how each row is verified
+#
+# This layer NEVER diffs a body. The write's own response is discarded (`st, _ =
+# http(...)`), the read-back pulls out one to three NAMED fields, and the two
+# servers are combined by AND-ing two independent booleans — no value from
+# Ferrofin is ever compared to the same value from Jellyfin. So no journey row
+# may claim the ledger's `body-diff` headline. Each op declares which weaker
+# thing it actually established:
+#
+#   effect        a write was applied and its effect confirmed on that server's
+#                 own read-back (the favourite is set, the id is gone, the count
+#                 moved, the created object identifies itself).
+#   status-class  the request was accepted (`st < 300`) and NOTHING was read
+#                 back. A handler that 204s and ignores the request passes.
+#   property      a named property of a response body agreed (an MPEG-TS sync
+#                 signature, a non-empty search result) — no effect, no diff.
+#
+# `selfcheck()` asserts this table covers every op key the journeys declare, so a
+# new journey op cannot land in the ledger without saying how it was verified.
+JOURNEY_METHOD = {op: verification.STATUS_CLASS for op in (
+    # Bare `st < 300`: accepted, never read back.
+    "POST /Playlists/{playlistId}",                     # rename never read back
+    "POST /System/Ping",
+    "POST /Items/{itemId}/ContentType",
+    "POST /Items/{itemId}/Refresh",
+    "POST /Library/Refresh",
+    "POST /ScheduledTasks/Running/{taskId}",
+    "DELETE /ScheduledTasks/Running/{taskId}",
+    "DELETE /Items",                                    # the removal effect is the singular DELETE's
+    "POST /QuickConnect/Authorize",
+    # A status PAIR (real path 2xx, bogus path 4xx) — still only statuses.
+    "POST /Environment/ValidatePath",
+    # Remote-control commands fired at a session with no live receiver: the server
+    # accepting them is all that is observable here.
+    "POST /Sessions/Viewing",
+    "POST /Sessions/Playing/Ping",
+    "POST /Sessions/{sessionId}/Command/{command}",
+    "POST /Sessions/{sessionId}/Command",
+    "POST /Sessions/{sessionId}/Message",
+    "POST /Sessions/{sessionId}/Playing",
+    "POST /Sessions/{sessionId}/Playing/{command}",
+    "POST /Sessions/{sessionId}/System/{command}",
+    "POST /Sessions/{sessionId}/Viewing",
+)}
+JOURNEY_METHOD.update({op: verification.PROPERTY for op in (
+    # A container signature, not an effect: 200 + video/mp2t + a 0x47 sync byte at
+    # 0 and 188. Wrong PIDs, wrong channel or a black feed all match.
+    "GET /LiveTv/LiveStreamFiles/{streamId}/stream.{container}",
+    "GET /LiveTv/LiveRecordings/{recordingId}/stream",
+    # A read whose bar is "non-empty on both", not a write effect.
+    "GET /Items/{itemId}/RemoteSearch/Subtitles/{language}",
+    "GET /Providers/Subtitles/Subtitles/{subtitleId}",
+)})
+
+
+def journey_method(op):
+    """Declared method for a journey op; effect is the layer's default shape."""
+    return JOURNEY_METHOD.get(op, verification.EFFECT)
+
 
 
 def q(base, path, token, user):
@@ -1132,10 +1193,19 @@ def journeys(ferrofin_url, jellyfin_url):
                 cls = "flagged: write effect not observed on either server (likely corpus/setup)"
             else:
                 cls = "ok"
-            rows[op] = {"deep_verified": deep, "classification": cls, "note": f"H={h_ok} J={j_ok}"}
+            rows[op] = {"deep_verified": deep, "classification": cls,
+                        "verification_method": journey_method(op),
+                        "note": f"H={h_ok} J={j_ok} ({journey_method(op)}; bodies not diffed)"}
         else:
-            rows[op] = {"deep_verified": bool(h_ok), "classification": "ok" if h_ok else "write effect not confirmed on Ferrofin",
-                        "note": f"H={h_ok}"}
+            # No oracle: the row rests on Ferrofin alone, which is not a parity
+            # verdict at all — there is nothing to have agreed with. Recorded
+            # UNTESTED with the Ferrofin-only observation kept in the note; the
+            # old code called this `deep_verified`, which then defaulted into the
+            # ledger's body-diff headline with Jellyfin never contacted.
+            rows[op] = {"deep_verified": None, "classification": "",
+                        "verification_method": None,
+                        "note": f"H={h_ok} — no Jellyfin oracle, so no parity verdict "
+                                f"(Ferrofin-only run)"}
     return rows, {k: v for k, v in h.items() if k.startswith("_")}
 
 
@@ -1152,7 +1222,10 @@ def main():
         json.dump(out, f, indent=2, sort_keys=True)
         f.write("\n")
     ok = sum(1 for v in rows.values() if v["deep_verified"])
-    print(f"wrote parity/journey-results.json — {len(rows)} write ops, {ok} deep-verified"
+    import collections
+    by = collections.Counter(v["verification_method"] for v in rows.values()
+                             if v["deep_verified"] is True)
+    print(f"wrote parity/journey-results.json — {len(rows)} write ops, {ok} verified {dict(by)}"
           + (f", errors: {list(errors)}" if errors else ""))
 
 
@@ -1176,13 +1249,30 @@ def selfcheck():
         # Introspect by running against a no-op recorder base is overkill; instead assert the
         # op-key literals in each function source are spec paths.
         import inspect
-        for line in inspect.getsource(jn).splitlines():
+        import re
+        src = inspect.getsource(jn)
+        for line in src.splitlines():
             if 'r["' in line:
                 key = line.split('r["', 1)[1].split('"]', 1)[0]
                 declared.add(key)
+        # …plus op keys carried in a data table rather than an `r["…"]` literal —
+        # the nine remote-control rows are assigned in a loop, so scraping only
+        # `r["` left them unvalidated against the spec AND unstamped.
+        declared.update(re.findall(r'"((?:GET|POST|PUT|DELETE|PATCH) /[^"\s]*)"', src))
     missing = sorted(k for k in declared if k not in valid)
     assert not missing, f"journey op-keys not in spec: {missing}"
-    print(f"ok: combine logic, {len(declared)} journey op-keys all valid spec paths")
+    # Every declared op must resolve to a method inside the closed set, and NO
+    # journey op may claim the body-diff headline — this layer never diffs a body.
+    for k in declared:
+        m = journey_method(k)
+        assert m in verification.VALID, f"{k}: unknown verification method {m!r}"
+        assert m != verification.BODY_DIFF, f"{k}: journeys never diff a body"
+    stale = sorted(k for k in JOURNEY_METHOD if k not in declared)
+    assert not stale, f"JOURNEY_METHOD names ops no journey declares: {stale}"
+    import collections
+    by = collections.Counter(journey_method(k) for k in declared)
+    print(f"ok: combine logic, {len(declared)} journey op-keys all valid spec paths, "
+          f"methods {dict(by)}")
 
 
 if __name__ == "__main__":

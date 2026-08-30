@@ -9,14 +9,20 @@ Signals wired now (Phase 0):
   route    registered / 501-stub   <- ferrofin-api handlers::REAL_ROUTES
   depth    REAL / PARTIAL / HOLLOW / STUB   <- REAL_ROUTES + optional classify.tsv overlay
   deep_verified / classification / last_verified   <- parity/seed.json (fix-loop results)
-  verification_method  body-diff / property   <- the layer that produced the row
+  verification_method   <- the layer that produced the row (see parity/verification.py)
 
 `deep_verified` alone is not the headline: a row is counted as DEEP-VERIFIED only
 when its `verification_method` is "body-diff", i.e. the response (or a write's
-read-back) was itself diffed clean. Rows verified by named invariants instead —
-because the body is provably non-comparable between two independent instances —
-carry "property" and are counted and rendered in their own section. A reader must
-be able to tell the two apart without reading the probe source.
+read-back) was itself diffed clean. Every other row says which WEAKER thing it
+established — named properties agreed, a write's effect was confirmed, only the
+status class matched, or both servers were empty — and is counted and rendered in
+its own section. A reader must be able to tell them apart without opening a probe.
+
+There is NO DEFAULT method. A row that carries a verdict without declaring how it
+was earned fails `--check`, and so does a method outside the closed set in
+`parity/verification.py`. A default is exactly how a weak probe borrows a strong
+headline: batch A2 found a 15-boolean probe recording `deep_verified` for rows
+whose bodies were known not to diff clean.
 
 Columns left null are untested and are filled by later layers (contract sweep =
 status_conformant/schema_valid; differential replay = deep_verified at scale).
@@ -30,7 +36,10 @@ import json
 import os
 import re
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import verification  # noqa: E402  — the closed set of verification methods
 
 METHODS = ("get", "post", "put", "delete", "patch", "head")
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -137,12 +146,11 @@ def build_rows(spec, real, overlay, curated, sweep, owners):
                 "schema_valid": sw.get("schema_valid"),
                 "note": sw.get("note", ""),
                 "deep_verified": s.get("deep_verified"),
-                # HOW the row was verified. "body-diff" is the ledger's headline
-                # claim (the responses/read-backs themselves diffed clean);
-                # "property" means only named invariants were compared, which is
-                # a weaker claim and is counted and rendered separately below.
-                # A layer that does not say defaults to "body-diff".
-                "verification_method": s.get("verification_method") or "body-diff",
+                # HOW the row was verified, verbatim from the layer that produced
+                # it — never defaulted. `check()` rejects a verdict with no method,
+                # a method outside the closed set, or a method on a row that has no
+                # verdict. See parity/verification.py for what each name claims.
+                "verification_method": s.get("verification_method"),
                 "classification": s.get("classification", ""),
                 "last_verified": s.get("last_verified") if s else None,
             })
@@ -150,21 +158,52 @@ def build_rows(spec, real, overlay, curated, sweep, owners):
     return rows
 
 
-def is_property(r):
-    """Verified by invariants rather than by diffing the response itself."""
-    return r["deep_verified"] is True and r.get("verification_method") == "property"
+def is_headline(r):
+    """Counted in the ledger's deep-verified number: the response itself diffed clean."""
+    return r["deep_verified"] is True and r.get("verification_method") == verification.HEADLINE
+
+
+def verified_by(r, method):
+    return r["deep_verified"] is True and r.get("verification_method") == method
+
+
+def is_open_work(r):
+    """A named, NOT-accepted divergence — an open work item, not a settled decision.
+
+    These must never render under the "accepted — not a bug" heading: a reader
+    scanning that section would take a real gap for a closed question.
+    """
+    return r["classification"].startswith("open-work")
+
+
+def is_flagged(r):
+    """Auto-generated detector text ("flagged: … (verify)") that NOBODY has reviewed.
+
+    Rendering these under "accepted — not a bug" is the same defect as an unstamped
+    row in the deep count, pointed the other way: a detector's guess read as a
+    settled decision. They get their own section until a human classifies them.
+    """
+    return r["classification"].startswith("flagged")
+
+
+def is_accepted(r):
+    return (r["classification"] and r["deep_verified"] is not True
+            and not is_open_work(r) and not is_flagged(r))
 
 
 def render_md(rows):
     total = len(rows)
     # The headline number means exactly what its heading says: the response (or
-    # the write's read-back) was diffed clean, field for field. Rows verified
-    # some OTHER way are real verification but a weaker claim, so they are
-    # counted and listed on their own — folding them in would redefine the
-    # number instead of earning it.
-    deep = sum(1 for r in rows if r["deep_verified"] is True and not is_property(r))
-    prop = sum(1 for r in rows if is_property(r))
-    classified = sum(1 for r in rows if r["classification"] and r["deep_verified"] is not True)
+    # the write's read-back) was diffed clean, field for field. Rows verified some
+    # OTHER way are real verification and a weaker claim, so each method is counted
+    # and listed on its own — folding any of them in would redefine the number
+    # instead of earning it.
+    deep = sum(1 for r in rows if is_headline(r))
+    by_method = Counter(r["verification_method"] for r in rows if r["deep_verified"] is True)
+    other = sum(n for m, n in by_method.items() if m != verification.HEADLINE)
+    accepted = sum(1 for r in rows if is_accepted(r))
+    openwork = sum(1 for r in rows if is_open_work(r) and r["deep_verified"] is not True)
+    flagged = sum(1 for r in rows if is_flagged(r) and r["deep_verified"] is not True)
     untested = sum(1 for r in rows if r["deep_verified"] is None and not r["classification"])
     depth_counts = defaultdict(int)
     route_counts = defaultdict(int)
@@ -183,14 +222,29 @@ def render_md(rows):
     sv_run = sum(1 for r in rows if r["schema_valid"] is not None)
     layer1 = (f"Layer 1: {sc_yes}/{sc_run} status-conformant · {sv_yes}/{sv_run} schema-valid"
               if sc_run or sv_run else "status-conformance + schema-validation not yet run — Layer 1")
-    out.append(f"**{deep}/{total} deep-verified · {prop} property-verified · "
-               f"{classified} classified-divergence · "
-               f"{untested} untested**  \n_{layer1}_\n")
-    out.append("_deep-verified = the response (or a write's read-back) was diffed field-for-field "
-               "against Jellyfin 10.11.8 and came back clean. property-verified = the body is "
-               "provably non-comparable between two independent instances, so named invariants "
-               "were compared instead; a weaker claim, listed separately and never counted in "
-               "the deep-verified number._\n")
+    out.append(f"**{deep}/{total} deep-verified · {other} verified another way · "
+               f"{accepted} classified-divergence · {openwork} open work · "
+               f"{flagged} flagged (unreviewed) · {untested} untested**  \n_{layer1}_\n")
+    out.append("_deep-verified means exactly one thing: "
+               f"{verification.METHODS[verification.HEADLINE][2]}. "
+               "It is the ONLY method counted in that number. Every other verified row "
+               "declares which weaker thing it established — see the table below — and no "
+               "row may reach this ledger without declaring a method "
+               "(`gen-ledger.py --check` rejects it)._\n")
+
+    out.append("## How each row was verified\n")
+    out.append("_One closed set, defined in `parity/verification.py`. A row's method is the "
+               "claim it earns; nothing is inferred and nothing defaults._\n")
+    out.append("| | method | ops | what was actually compared |")
+    out.append("|---|---|---:|---|")
+    for m, (glyph, label, meaning) in verification.METHODS.items():
+        head = " **(the headline)**" if m == verification.HEADLINE else ""
+        out.append(f"| {glyph} | `{m}` — {label}{head} | {by_method.get(m, 0)} | {meaning} |")
+    out.append(f"| · | _untested_ | {untested} | no probe produced a verdict — including "
+               "probes that ran and compared nothing, which is an absence of evidence, "
+               "not a pass |")
+    out.append("")
+
     out.append("## Depth (what the wired handler actually does)\n")
     out.append("| depth | ops | % |")
     out.append("|---|---:|---:|")
@@ -202,54 +256,80 @@ def render_md(rows):
     out.append("## Ownership (core vs compiled-in extensions)\n")
     out.append("_Extensions must not dilute or flatter core's coverage number — "
                "each owner's deep-verified share stands alone._\n")
-    out.append("| owner | ops | deep-verified | property-verified | classified | untested |")
-    out.append("|---|---:|---:|---:|---:|---:|")
+    out.append("| owner | ops | deep-verified | verified another way | classified | open work "
+               "| flagged | untested |")
+    out.append("|---|---:|---:|---:|---:|---:|---:|---:|")
     by_owner = defaultdict(list)
     for r in rows:
         by_owner[r["owner"]].append(r)
     for owner in sorted(by_owner, key=lambda o: (o != "core", o)):
         rs = by_owner[owner]
-        d = sum(1 for r in rs if r["deep_verified"] is True and not is_property(r))
-        p = sum(1 for r in rs if is_property(r))
-        c = sum(1 for r in rs if r["classification"] and r["deep_verified"] is not True)
+        d = sum(1 for r in rs if is_headline(r))
+        o = sum(1 for r in rs if r["deep_verified"] is True and not is_headline(r))
+        c = sum(1 for r in rs if is_accepted(r))
+        w = sum(1 for r in rs if is_open_work(r) and r["deep_verified"] is not True)
+        fl = sum(1 for r in rs if is_flagged(r) and r["deep_verified"] is not True)
         u = sum(1 for r in rs if r["deep_verified"] is None and not r["classification"])
-        out.append(f"| {owner} | {len(rs)} | {d} ({100 * d // len(rs)}%) | {p} | {c} | {u} |")
+        out.append(f"| {owner} | {len(rs)} | {d} ({100 * d // len(rs)}%) | {o} | {c} | {w} "
+                   f"| {fl} | {u} |")
     out.append("")
+
+    def listing(method):
+        glyph = verification.METHODS[method][0]
+        for r in rows:
+            if verified_by(r, method):
+                # A green row can still carry a recorded divergence (e.g. a probe
+                # that is only meaningful at a pinned limit, or a candidate universe
+                # that is empty on both servers). Show it here — dropping the note
+                # is how a real difference becomes invisible.
+                note = f" — {r['classification']}" if r["classification"] not in ("", "ok") else ""
+                out.append(f"- {glyph} `{r['operation']}`{note}")
+        out.append("")
+
     out.append("## Deep-verified (response + read-back diffed clean vs Jellyfin 10.11.8)\n")
-    for r in rows:
-        if r["deep_verified"] is True and not is_property(r):
-            # A green row can still carry a recorded divergence (e.g. a probe
-            # that is only meaningful at a pinned limit, or a candidate universe
-            # that is empty on both servers). Show it here — dropping the note
-            # is how a real difference becomes invisible.
-            note = f" — {r['classification']}" if r["classification"] not in ("", "ok") else ""
-            out.append(f"- ✅ `{r['operation']}`{note}")
-    out.append("")
-    out.append("## Property-verified (invariants agreed — the bodies were NOT diffed)\n")
-    out.append("_These endpoints' responses cannot be compared between two independent "
-               "instances (upstream orders them `Random`, or the two servers run different "
-               "algorithms by design). Named properties were compared on both servers "
-               "instead. This is a real verification and a weaker one: it is not part of the "
-               "deep-verified count._\n")
-    for r in rows:
-        if is_property(r):
-            note = f" — {r['classification']}" if r["classification"] not in ("", "ok") else ""
-            out.append(f"- ◐ `{r['operation']}`{note}")
-    out.append("")
+    out.append("_The headline. Nothing else on this page is counted in it._\n")
+    listing(verification.HEADLINE)
+    for m, (glyph, label, meaning) in verification.METHODS.items():
+        if m == verification.HEADLINE:
+            continue
+        out.append(f"## {label.capitalize()} — {glyph} `{m}` (NOT deep-verified)\n")
+        out.append(f"_{meaning[0].upper()}{meaning[1:]}. A real verification and a weaker "
+                   "one: never counted in the deep-verified number._\n")
+        listing(m)
+
     out.append("## Classified divergence (accepted — not a bug)\n")
+    out.append("_Settled decisions. An item here is a question that has been closed._\n")
     for r in rows:
-        if r["classification"] and r["deep_verified"] is not True:
+        if is_accepted(r):
             out.append(f"- ⚠️ `{r['operation']}` — {r['classification']}")
     out.append("")
+    out.append("## Open work (NOT accepted — a named divergence still to port)\n")
+    out.append("_These are real gaps with an owner and a path, kept OUT of the accepted "
+               "section: rendering an unfinished port under \"accepted\" is how a gap "
+               "quietly becomes a decision._\n")
+    for r in rows:
+        if is_open_work(r) and r["deep_verified"] is not True:
+            out.append(f"- ⛏ `{r['operation']}` — {r['classification']}")
+    out.append("")
+    out.append("## Flagged by a detector — UNREVIEWED (not accepted, not verified)\n")
+    out.append("_A probe recorded a divergence and wrote its own text. Nobody has looked at "
+               "these yet: they are neither an accepted divergence nor a named work item. "
+               "They sat under \"accepted — not a bug\" until this section existed._\n")
+    for r in rows:
+        if is_flagged(r) and r["deep_verified"] is not True:
+            out.append(f"- 🔍 `{r['operation']}` — {r['classification']}")
+    out.append("")
     out.append("## Full ledger\n")
-    out.append("_status/schema: ✅ pass · ⚠️ fail · · untested_  \n"
-               "_deep: ✅ bodies diffed clean · ◐ property-verified (invariants only, "
-               "not counted as deep) · ⚠️ fail · · untested_\n")
-    out.append("| operation | route | depth | status | schema | deep | classification |")
+    out.append("_status/schema: ✅ pass · ⚠️ fail · · untested_  \n")
+    legend = " · ".join(f"{g} {m}" for m, (g, _l, _d) in verification.METHODS.items())
+    out.append(f"_verified: {legend} · ⚠️ fail · · untested. Only ✅ is deep-verified._\n")
+    out.append("| operation | route | depth | status | schema | verified | classification |")
     out.append("|---|---|---|---|---|---|---|")
     mark = {True: "✅", False: "⚠️", None: "·"}
     for r in rows:
-        deep_mark = "◐" if is_property(r) else mark[r["deep_verified"]]
+        vm = r["verification_method"]
+        deep_mark = (verification.METHODS[vm][0] if r["deep_verified"] is True and vm
+                     else mark[r["deep_verified"]])
         out.append(f"| `{r['operation']}` | {r['route']} | {r['depth']} | "
                    f"{mark[r['status_conformant']]} | {mark[r['schema_valid']]} | "
                    f"{deep_mark} | {r['classification']} |")
@@ -275,9 +355,11 @@ def build_curated():
     curated = {k: {**v, "last_verified": seed_stamp} for k, v in seed.items()}
     for k, v in sweep.items():
         if "deep_verified" in v:   # only GET 200/200 ops the sweep deep-diffed
-            curated[k] = {"deep_verified": v["deep_verified"],
-                          "classification": v.get("classification", ""),
-                          "last_verified": sweep_stamp}
+            # Spread the row, exactly like every other layer below: rebuilding a
+            # fresh literal here DROPPED the sweep's `verification_method`, so this
+            # layer's 55 headline rows were the one set whose stamp could never
+            # reach the ledger — they defaulted into the body-diff count instead.
+            curated[k] = {**v, "last_verified": sweep_stamp}
     for k, v in reads.items():
         if v.get("deep_verified") is not None or v.get("classification"):
             curated[k] = {**v, "last_verified": r_stamp}
@@ -315,21 +397,63 @@ def build_curated():
     return curated
 
 
+def _guards_fire():
+    """Prove the --check guards actually reject, on synthetic rows.
+
+    A guard that has never been seen to fail is a guard nobody has tested. These
+    three shapes are exactly what used to slip into the headline silently.
+    """
+    base = {"operation": "GET /x", "deep_verified": True, "classification": "",
+            "verification_method": None}
+    def rejected(row):
+        try:
+            check([{**base, **row}], {})
+        except AssertionError:
+            return True
+        except Exception:
+            return True
+        return False
+    assert rejected({}), "a verdict with no method must be rejected"
+    assert rejected({"verification_method": "hand-wave"}), "an unknown method must be rejected"
+    assert rejected({"deep_verified": None, "verification_method": "body-diff"}), \
+        "a method with no verdict must be rejected"
+
+
 def check(rows, curated):
     """Self-check: the ledger must cover 412 ops and every curated row must match one
     (a typo'd path silently drops its classification otherwise)."""
-    assert len(rows) == 412, f"expected 412 ops, got {len(rows)}"
+    if len(rows) != 412:
+        # _guards_fire() calls back in with a synthetic single row; skip the
+        # coverage assertion for it and let the method guards below do the work.
+        assert len(rows) == 1, f"expected 412 ops, got {len(rows)}"
     keys = {norm(*r["operation"].split(" ", 1)) for r in rows}
     unmatched = [k for k in curated if k not in keys]
     assert not unmatched, f"curated rows match no spec op: {unmatched}"
-    # Every row must declare HOW it was verified, from a closed set — an
-    # unrecognised method would silently fall into the headline deep count.
-    bad = [r["operation"] for r in rows
-           if r["verification_method"] not in ("body-diff", "property")]
-    assert not bad, f"unknown verification_method on: {bad}"
-    prop = sum(1 for r in rows if is_property(r))
+    # Every row that carries a VERDICT must declare HOW it was earned, from the
+    # closed set in parity/verification.py. There is no default: a missing method
+    # used to fall straight into the headline deep-verified count, which is a
+    # stated assurance nobody earned. And a row with NO verdict must carry no
+    # method either — a method there asserts a comparison that never ran.
+    unstamped = [r["operation"] for r in rows
+                 if r["deep_verified"] is not None and not r["verification_method"]]
+    assert not unstamped, (f"{len(unstamped)} row(s) carry a verdict with no "
+                           f"verification_method: {unstamped[:10]}")
+    unknown = [(r["operation"], r["verification_method"]) for r in rows
+               if r["verification_method"] and r["verification_method"] not in verification.VALID]
+    assert not unknown, f"verification_method outside {sorted(verification.VALID)}: {unknown[:10]}"
+    phantom = [r["operation"] for r in rows
+               if r["deep_verified"] is None and r["verification_method"]]
+    assert not phantom, (f"{len(phantom)} row(s) declare a verification_method with no "
+                         f"verdict — nothing was compared: {phantom[:10]}")
+    # An open work item, and an unreviewed detector flag, must never render under
+    # "accepted — not a bug" — that heading is a claim about a HUMAN decision.
+    assert not [r for r in rows if is_open_work(r) and is_accepted(r)]
+    assert not [r for r in rows if is_flagged(r) and is_accepted(r)]
+    by = Counter(r["verification_method"] for r in rows if r["deep_verified"] is True)
+    other = ", ".join(f"{n} {m}" for m, n in sorted(by.items()) if m != verification.HEADLINE)
     print(f"ok: {len(rows)} ops, all {len(curated)} curated rows matched, "
-          f"{prop} property-verified (excluded from the deep-verified count)")
+          f"{by[verification.HEADLINE]} deep-verified (the headline), "
+          f"verified another way: {other or 'none'}")
 
 
 def main():
@@ -340,6 +464,7 @@ def main():
     owners = load_extension_routes()
 
     if "--check" in sys.argv:
+        _guards_fire()
         check(build_rows(spec, real, {}, curated, sweep, owners), curated)
         return
 
@@ -353,10 +478,11 @@ def main():
     with open(os.path.join(ROOT, "suite/parity/LEDGER.md"), "w") as f:
         f.write(render_md(rows))
 
-    deep = sum(1 for r in rows if r["deep_verified"] is True and not is_property(r))
-    prop = sum(1 for r in rows if is_property(r))
+    deep = sum(1 for r in rows if is_headline(r))
+    by = Counter(r["verification_method"] for r in rows if r["deep_verified"] is True)
+    other = ", ".join(f"{n} {m}" for m, n in sorted(by.items()) if m != verification.HEADLINE)
     print(f"wrote parity/ledger.json + parity/LEDGER.md — {len(rows)} ops, "
-          f"{deep} deep-verified (bodies diffed), {prop} property-verified")
+          f"{deep} deep-verified (bodies diffed); verified another way: {other or 'none'}")
 
 
 if __name__ == "__main__":
