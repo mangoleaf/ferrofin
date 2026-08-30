@@ -361,6 +361,12 @@ def resolve_fixtures(base, token, user):
     session = sessions[0]["Id"] if sessions else None
     logs = get_json(base, "/System/Logs", token) or []
     log_name = logs[0]["Name"] if logs and logs[0].get("Name") else None
+    # `GET /LiveTv/Channels/{channelId}` and `/LiveTv/Channels/{channelId}/...`
+    # were reported "unresolved path param" — the sweep never had a channel id to
+    # substitute, so a route with a real implementation behind it went unprobed.
+    # The Live TV fixture provisions the tuner, so the lineup is right there.
+    channels = get_json(base, f"/LiveTv/Channels?userId={user}&limit=1", token) or {}
+    channel = ((channels.get("Items") or [{}])[0]).get("Id")
 
     def source_id(item_id):
         """The item's media source id from PlaybackInfo — what a client sends as
@@ -379,6 +385,11 @@ def resolve_fixtures(base, token, user):
         "SeasonId": season or any_item, "userId": user, "sessionId": session,
         "name": genre, "genreName": genre, "imageType": "Primary",
         "imageIndex": "0", "index": "0", "newIndex": "0", "routeIndex": "0",
+        # `channelId` is TWO different id spaces in this contract: a Live TV
+        # channel under /LiveTv/, and a plugin-channel under /Channels/. It is
+        # scoped by path (see PATH_SCOPED) rather than put in `fx`, so filling
+        # one cannot silently probe the other with a wrong id.
+        "_livetv_channel": channel,
         "year": "2020", "container": "mp4", "segmentContainer": "ts", "format": "ts",
         "routeFormat": "ts", "width": "400", "maxWidth": "400", "maxHeight": "400",
         "percentPlayed": "0", "unplayedCount": "0", "tag": "x", "language": "eng",
@@ -439,8 +450,23 @@ QUERY_FILL = {
 }
 
 
+# Path params whose meaning depends on where they appear. `(path prefix, param)
+# -> fixture key`: only a path under the prefix gets the value, so a name shared
+# by two unrelated id spaces cannot cross-contaminate.
+PATH_SCOPED = {("/LiveTv/", "channelId"): "_livetv_channel"}
+
+
+def scoped_fixtures(path, fixtures):
+    """`fixtures` plus the path-scoped entries that apply to `path`."""
+    extra = {param: fixtures[key]
+             for (prefix, param), key in PATH_SCOPED.items()
+             if path.startswith(prefix) and fixtures.get(key)}
+    return {**fixtures, **extra} if extra else fixtures
+
+
 def build_url(path, fixtures):
     """Fill path params from one server's fixtures. Return (url, skip_reason_or_None)."""
+    fixtures = scoped_fixtures(path, fixtures)
     params = set(re.findall(r"{(\w+)}", path))
     missing = [p for p in params if p not in fixtures]
     if missing:
@@ -649,7 +675,14 @@ def selfcheck():
                             {"itemId": "m", "_album": "al"})["itemId"] == "m"
     # status-class comparison is by hundreds bucket.
     assert (200 // 100) == (204 // 100) and (404 // 100) != (500 // 100)
-    print("ok: nullable, $ref, param-fill, skip, query-inject, required-fill, status-class")
+    # A path-scoped param fills only inside its own path family. `channelId`
+    # names a Live TV channel under /LiveTv/ and a plugin channel under
+    # /Channels/; leaking the former into the latter would probe a real route
+    # with an id from the wrong id space and call the result parity.
+    assert build_url("/LiveTv/Channels/{channelId}", {"_livetv_channel": "CH"}) == ("/LiveTv/Channels/CH", None)
+    assert build_url("/Channels/{channelId}/Items", {"_livetv_channel": "CH"})[0] is None
+    print("ok: nullable, $ref, param-fill, path-scoped params, skip, query-inject, "
+          "required-fill, status-class")
 
 
 def main():

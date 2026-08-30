@@ -24,7 +24,7 @@ use ferrofin_model::dto::SortOrder;
 use ferrofin_model::dto::{BaseItemDto, MediaSourceInfo, MediaSourceType};
 use ferrofin_model::live_tv::LiveTvOptions;
 use ferrofin_model::live_tv::{
-    ChannelType, ItemSortBy, ListingsProviderInfo, LiveTvInfo, LiveTvServiceInfo,
+    ChannelType, GuideInfo, ItemSortBy, ListingsProviderInfo, LiveTvInfo, LiveTvServiceInfo,
     LiveTvServiceStatus, RecordingStatus, SeriesTimerInfoDto, TimerInfoDto, TunerHostInfo,
 };
 use ferrofin_model::media_info::MediaProtocol;
@@ -80,10 +80,134 @@ const DEFAULT_LIVE_STREAM_BUFFER_MS: i32 = 1500;
 /// direct-vs-encoded choice reads when no probe is possible.
 const LIVE_STREAM_BUFFER_CONTAINER: &str = "ts";
 
-/// Namespace for deriving stable channel UUIDs (v5) from `tuner-host|tvg-id`.
-const CHANNEL_NS: Uuid = Uuid::from_u128(0x6c74_7663_6861_6e6e_656c_735f_6e73_3031);
-/// Namespace for deriving stable programme UUIDs (v5) from `channel|start`.
-const PROGRAM_NS: Uuid = Uuid::from_u128(0x6c74_7670_726f_6772_616d_735f_6e73_3031);
+/// Days of guide data ingested and advertised when `LiveTvOptions.GuideDays`
+/// is unset.
+///
+/// Port of the `: 7` fallback in `GuideManager.GetGuideDays` (v10.11.8
+/// GuideManager.cs:161-168).
+const DEFAULT_GUIDE_DAYS: i64 = 7;
+
+/// The ceiling `LiveTvOptions.GuideDays` is clamped to.
+///
+/// Port of `GuideManager.MaxGuideDays` (v10.11.8 GuideManager.cs:26).
+const MAX_GUIDE_DAYS: i64 = 14;
+
+/// How far before "now" the guide window opens, so an airing already in
+/// progress when the refresh runs is still ingested.
+///
+/// Port of `GuideManager.RefreshChannelsInternal`'s
+/// `DateTime.UtcNow.AddHours(-1)` (v10.11.8 GuideManager.cs:226).
+const GUIDE_WINDOW_LEAD_IN_HOURS: i64 = 1;
+
+/// One airing's recommendation score.
+///
+/// Port of `LiveTvManager.GetRecommendationScore(program, user, factorChannelWatchCount: true)`
+/// (v10.11.8 LiveTvManager.cs:333-372). `channel` is the caller's user-data for
+/// the owning channel as `(Likes, IsFavorite, PlayCount)`; upstream returns the
+/// programme-only score when the channel item cannot be resolved, which is what
+/// `None` stands for here.
+fn recommendation_score(
+    program: &GuideProgramRow,
+    channel: Option<&(Option<bool>, bool, i32)>,
+) -> i32 {
+    let mut score = 0;
+    if program.is_live {
+        score += 1;
+    }
+    if program.is_series && !program.is_repeat {
+        score += 1;
+    }
+    let Some((likes, is_favorite, play_count)) = channel else {
+        return score;
+    };
+    if let Some(likes) = likes {
+        score += if *likes { 2 } else { -2 };
+    }
+    if *is_favorite {
+        score += 3;
+    }
+    score + play_count
+}
+
+/// The calendar date part of a stored start instant, for
+/// `OrderBy(i => i.StartDate.Date)`.
+///
+/// The column holds .NET's `yyyy-MM-ddTHH:mm:ss.fffffffZ`, so the date is the
+/// leading `yyyy-MM-dd`. Comparing the prefix as text is the same ordering as
+/// comparing the dates, and costs no parse.
+fn start_day(start_date: &str) -> &str {
+    start_date.get(..10).unwrap_or(start_date)
+}
+
+/// The `ILiveTvService` name every internal Live TV id is salted with.
+///
+/// Port of `LiveTvDtoService.ServiceName` (v10.11.8 LiveTvDtoService.cs:30).
+const LIVE_TV_SERVICE_NAME: &str = "Emby";
+
+/// The id-scheme version `LiveTvDtoService` appends before hashing.
+///
+/// Port of `LiveTvDtoService.InternalVersionNumber` (v10.11.8
+/// LiveTvDtoService.cs:28). Upstream bumps it to invalidate every derived Live
+/// TV id at once; it is part of the hash input, so it must match byte for byte.
+const LIVE_TV_INTERNAL_VERSION: &str = "4";
+
+/// The `m3u` tuner's channel-id prefix, before the tuner-URL hash.
+///
+/// Port of `BaseTunerHost.ChannelIdPrefix` => `Type + "_"` with
+/// `M3UTunerHost.Type == "m3u"` (v10.11.8 BaseTunerHost.cs:46,
+/// M3UTunerHost.cs:60).
+const M3U_CHANNEL_ID_PREFIX: &str = "m3u_";
+
+/// The tuner-facing external id of one M3U channel.
+///
+/// Port of `M3UTunerHost.GetFullChannelIdPrefix` (v10.11.8 M3UTunerHost.cs:64-67)
+/// followed by `M3uParser.GetChannelsAsync` (M3uParser.cs:104), which
+/// *overwrites* the `tvg-id`-derived id set in `GetChannelInfo` with
+/// `prefix + MD5(streamUrlLine)`. The identity of a channel upstream is
+/// therefore `(tuner URL, stream URL)` — never the `tvg-id`, which survives only
+/// as the guide join key (`TunerChannelId`). Two playlist entries sharing a
+/// `tvg-id` stay distinct here, exactly as they do upstream.
+fn m3u_external_channel_id(tuner_url: &str, stream_url: &str) -> String {
+    format!(
+        "{M3U_CHANNEL_ID_PREFIX}{}{}",
+        ferrofin_common::extensions::get_md5(tuner_url).simple(),
+        ferrofin_common::extensions::get_md5(stream_url).simple()
+    )
+}
+
+/// `LibraryManager.GetNewItemId(key, type)` for a key that is already relative
+/// to the program-data path.
+///
+/// Port of `LibraryManager.GetNewItemIdInternal` (v10.11.8 LibraryManager.cs:636-658):
+/// the program-data prefix strip does not apply to these synthetic keys, the
+/// case fold has already been applied by the caller (upstream applies it *before*
+/// prepending `type.FullName`, so the type name keeps its original casing), and
+/// the hash is `BaseExtensions.GetMD5` — MD5 over UTF-16LE in .NET `Guid` byte
+/// order, which [`ferrofin_common::extensions::get_md5`] implements.
+fn new_item_id(type_full_name: &str, lowercased_key: &str) -> Uuid {
+    ferrofin_common::extensions::get_md5(&format!("{type_full_name}{lowercased_key}"))
+}
+
+/// The internal item GUID of a Live TV channel, from its tuner-facing external id.
+///
+/// Port of `LiveTvDtoService.GetInternalChannelId` (v10.11.8 LiveTvDtoService.cs:403-408).
+fn internal_channel_id(external_id: &str) -> Uuid {
+    new_item_id(
+        crate::projection::CHANNEL_TYPE_NAME,
+        &format!("{LIVE_TV_SERVICE_NAME}{external_id}{LIVE_TV_INTERNAL_VERSION}").to_lowercase(),
+    )
+}
+
+/// The internal item GUID of a Live TV programme, from its listings-facing
+/// external id.
+///
+/// Port of `LiveTvDtoService.GetInternalProgramId` (v10.11.8 LiveTvDtoService.cs:424-429).
+fn internal_program_id(external_id: &str) -> Uuid {
+    new_item_id(
+        crate::projection::PROGRAM_TYPE_NAME,
+        &format!("{LIVE_TV_SERVICE_NAME}{external_id}{LIVE_TV_INTERNAL_VERSION}").to_lowercase(),
+    )
+}
 
 /// The columns a guide list read returns, joined to the owning channel for
 /// `ChannelName`. Held apart from the filters so the `WHERE`/`ORDER`/`LIMIT`
@@ -217,6 +341,9 @@ impl std::fmt::Debug for FerrofinLiveTvManager {
 struct ProgramRow<'a> {
     id: String,
     channel_id: &'a String,
+    /// `{xmltvChannelId}_{start:O}_{channelExternalId}` — the listings-facing id
+    /// the item GUID is derived from.
+    external_id: Option<String>,
     start: String,
     end: Option<String>,
     genres: Option<String>,
@@ -313,16 +440,21 @@ impl CategoryClasses {
             episode_title,
             season_number,
             episode_number: if is_movie { None } else { episode_number },
-            // `{channelId}_{start:O}`. Upstream formats the file's own
-            // DateTimeOffset (a `+0100` guide yields `…+01:00`); the parser here
-            // normalizes to UTC, so the offset is always +00:00 — an accepted
-            // divergence for an id no DTO field surfaces.
+            // `XmlTvListingsProvider.GetProgramInfo`: `$"{channelId}_{start:O}"`
+            // (v10.11.8 XmlTvListingsProvider.cs:216). `{0:O}` on a
+            // `DateTimeOffset` is `yyyy-MM-ddTHH:mm:ss.fffffff` plus the source
+            // offset as `+HH:mm` — never `Z`, and never normalised to UTC, so a
+            // `+0100` guide really does render `+01:00`. `ListingsManager`
+            // appends `"_" + channel.Id` afterwards (ListingsManager.cs:151-155);
+            // that half needs the owning channel, so it is added at the
+            // insert site.
             external_id: prog.start.map(|start| {
                 format!(
-                    "{}_{}.{:07}+00:00",
+                    "{}_{}.{:07}{}",
                     prog.channel_id,
                     start.format("%Y-%m-%dT%H:%M:%S"),
-                    start.timestamp_subsec_nanos() / 100
+                    start.timestamp_subsec_nanos() / 100,
+                    start.offset()
                 )
             }),
             external_series_id,
@@ -428,7 +560,12 @@ impl FerrofinLiveTvManager {
 
     /// Rewrites the channel lineup for one tuner host from its M3U body, in a
     /// transaction (deleting the old channels cascades away their programmes).
-    async fn replace_channels(&self, tuner_id: &str, m3u_body: &str) -> Result<(), ServiceError> {
+    async fn replace_channels(
+        &self,
+        tuner_id: &str,
+        tuner_url: &str,
+        m3u_body: &str,
+    ) -> Result<(), ServiceError> {
         let channels = parse_m3u(m3u_body);
         let mut tx = self.db.writer().begin().await.map_err(db_err)?;
 
@@ -444,20 +581,24 @@ impl FerrofinLiveTvManager {
             .await
             .map_err(db_err)?;
 
-        // 10 columns per row; chunked multi-row insert instead of one round-trip
+        // 11 columns per row; chunked multi-row insert instead of one round-trip
         // per channel.
-        for (chunk_index, chunk) in channels.chunks(SQLITE_BIND_LIMIT / 10).enumerate() {
+        for (chunk_index, chunk) in channels.chunks(SQLITE_BIND_LIMIT / 11).enumerate() {
             let mut qb: QueryBuilder<'_, Sqlite> = QueryBuilder::new(
                 r#"INSERT INTO "FerrofinLiveTvChannels"
-                   ("Id","TunerHostId","TvgId","Name","Number","ImageUrl","ChannelType","StreamUrl","SortIndex","DateCreated") "#,
+                   ("Id","TunerHostId","TvgId","Name","Number","ImageUrl","ChannelType","StreamUrl","SortIndex","DateCreated","ExternalId") "#,
             );
-            let base = chunk_index * (SQLITE_BIND_LIMIT / 10);
+            let base = chunk_index * (SQLITE_BIND_LIMIT / 11);
             qb.push_values(chunk.iter().enumerate(), |mut b, (offset, ch)| {
-                let key = if ch.id.is_empty() { &ch.name } else { &ch.id };
-                let id = guid_to_db(Uuid::new_v5(
-                    &CHANNEL_NS,
-                    format!("{tuner_id}|{key}").as_bytes(),
-                ));
+                // `GuideManager.GetChannel` stores the item under
+                // `GetInternalChannelId(serviceName, channelInfo.Id)`, where
+                // `channelInfo.Id` is the tuner's external id — a pure function
+                // of the tuner URL and this entry's stream URL. Nothing
+                // per-instance goes in, so two servers reading the same playlist
+                // agree, and re-adding the same tuner keeps every channel's
+                // user data, timers and favourites attached.
+                let external_id = m3u_external_channel_id(tuner_url, &ch.url);
+                let id = guid_to_db(internal_channel_id(&external_id));
                 let channel_type = if ch.is_radio { "Radio" } else { "Tv" };
                 let date_created = existing
                     .get(&id)
@@ -472,12 +613,143 @@ impl FerrofinLiveTvManager {
                     .push_bind(channel_type)
                     .push_bind(&ch.url)
                     .push_bind(i64::try_from(base + offset).unwrap_or(i64::MAX))
-                    .push_bind(date_created);
+                    .push_bind(date_created)
+                    .push_bind(external_id);
             });
             qb.build().execute(&mut *tx).await.map_err(db_err)?;
         }
 
         tx.commit().await.map_err(db_err)
+    }
+
+    /// Every channel keyed by its `tvg-id`, as `(channel GUID, external id)`.
+    ///
+    /// The external id rides along because upstream builds a programme's id
+    /// from the *channel's* external id (`ListingsManager.GetProgramsAsync`,
+    /// v10.11.8 ListingsManager.cs:151-155), not from its item GUID, and a
+    /// `tvg-id` can legitimately be shared by more than one channel.
+    async fn channels_by_tvg_id(
+        &self,
+    ) -> Result<HashMap<String, Vec<(String, String)>>, ServiceError> {
+        let rows = sqlx::query(r#"SELECT "Id","TvgId","ExternalId" FROM "FerrofinLiveTvChannels""#)
+            .fetch_all(self.db.pool())
+            .await
+            .map_err(db_err)?;
+        let mut by_tvg: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        for row in rows {
+            let id: String = row.get("Id");
+            let tvg: String = row.get("TvgId");
+            let ext: String = row.get("ExternalId");
+            by_tvg.entry(tvg).or_default().push((id, ext));
+        }
+        Ok(by_tvg)
+    }
+
+    /// The channels one XMLTV document speaks for — every channel bound to a
+    /// `<channel>` or `<programme>` `tvg-id` it carries.
+    ///
+    /// These are the channels the refresh is authoritative for, and so the ones
+    /// [`Self::clean_programs`] may replace. Scoping matters: with two listings
+    /// providers configured, the second document must not delete the first's
+    /// airings.
+    fn channels_covered_by(
+        guide: &crate::xmltv::Xmltv,
+        by_tvg: &HashMap<String, Vec<(String, String)>>,
+    ) -> Vec<String> {
+        guide
+            .channels
+            .iter()
+            .map(|c| c.id.clone())
+            .chain(guide.programmes.iter().map(|p| p.channel_id.clone()))
+            .filter_map(|tvg| by_tvg.get(&tvg))
+            .flatten()
+            .map(|(id, _)| id.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    /// Drops every stored airing on the given channels, returning the
+    /// `Id → DateCreated` map they had.
+    ///
+    /// This is `GuideManager.CleanDatabase` (v10.11.8 GuideManager.cs:147-148)
+    /// expressed as a replace: a refresh is authoritative for the channels it
+    /// covers, so anything it does not re-emit must go, and re-inserting only
+    /// what it did emit is the same end state. The old creation instants come
+    /// back with the caller because upstream *updates* a surviving programme
+    /// item rather than recreating it, and `DateCreated` is a field the
+    /// programme DTO surfaces.
+    async fn clean_programs(
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        channel_ids: &[String],
+    ) -> Result<HashMap<String, Option<String>>, ServiceError> {
+        let mut existing: HashMap<String, Option<String>> = HashMap::new();
+        for chunk in channel_ids.chunks(SQLITE_BIND_LIMIT) {
+            let mut qb: QueryBuilder<'_, Sqlite> = QueryBuilder::new(
+                r#"SELECT "Id","DateCreated" FROM "FerrofinLiveTvPrograms" WHERE "ChannelId" IN ("#,
+            );
+            let mut sep = qb.separated(",");
+            for id in chunk {
+                sep.push_bind(id);
+            }
+            qb.push(")");
+            for row in qb.build().fetch_all(&mut **tx).await.map_err(db_err)? {
+                existing.insert(row.get("Id"), row.get("DateCreated"));
+            }
+
+            let mut qb: QueryBuilder<'_, Sqlite> =
+                QueryBuilder::new(r#"DELETE FROM "FerrofinLiveTvPrograms" WHERE "ChannelId" IN ("#);
+            let mut sep = qb.separated(",");
+            for id in chunk {
+                sep.push_bind(id);
+            }
+            qb.push(")");
+            qb.build().execute(&mut **tx).await.map_err(db_err)?;
+        }
+        Ok(existing)
+    }
+
+    /// Whether an airing falls inside the guide window the refresh asked for.
+    ///
+    /// `XmlTvListingsProvider.GetProgramsAsync` hands the window straight to
+    /// `XmlTvReader.GetProgrammes(channelId, start, end)`, which keeps a
+    /// programme that *overlaps* it — an airing already in progress when the
+    /// refresh runs is part of the guide. An airing with no `stop` is treated as
+    /// instantaneous at its start.
+    ///
+    /// The boundary form (`end >= start`, `start < end`) is the one that
+    /// reproduces the oracle: on the lab fixture Jellyfin retains exactly the
+    /// airings from the hour containing `now - 1h` through `+7d` inclusive of
+    /// the far endpoint (338 rows = 2 channels x 169 hourly airings), which no
+    /// start-only or fully-exclusive filter yields.
+    fn in_guide_window(
+        prog: &crate::xmltv::XmltvProgramme,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> bool {
+        let Some(prog_start) = prog.start.map(|d| d.with_timezone(&Utc)) else {
+            // No start attribute: upstream's reader cannot place it either, and
+            // the row is already unaddressable. Keep it rather than silently
+            // shrinking the lineup.
+            return true;
+        };
+        let prog_end = prog.stop.map_or(prog_start, |d| d.with_timezone(&Utc));
+        prog_end >= start && prog_start < end
+    }
+
+    /// The number of days of guide data a refresh ingests and
+    /// `GET /LiveTv/GuideInfo` advertises.
+    ///
+    /// Port of `GuideManager.GetGuideDays` (v10.11.8 GuideManager.cs:161-168):
+    /// the dashboard's `LiveTvOptions.GuideDays` clamped to
+    /// `1..=`[`MAX_GUIDE_DAYS`], or [`DEFAULT_GUIDE_DAYS`] when unset.
+    async fn guide_days(&self) -> i64 {
+        self.live_tv_options()
+            .await
+            .guide_days
+            .map_or(DEFAULT_GUIDE_DAYS, |d| {
+                i64::from(d).clamp(1, MAX_GUIDE_DAYS)
+            })
     }
 
     /// Inserts programmes from an XMLTV body, binding each to every channel whose
@@ -488,21 +760,15 @@ impl FerrofinLiveTvManager {
         &self,
         xmltv_body: &str,
         provider: &ListingsProviderInfo,
+        window: (DateTime<Utc>, DateTime<Utc>),
     ) -> Result<(), ServiceError> {
         let guide = parse_xmltv(xmltv_body);
         let classes = CategoryClasses::from_provider(provider);
+        let (window_start, window_end) = window;
 
-        // Map each tvg-id to the channel UUIDs that carry it.
-        let rows = sqlx::query(r#"SELECT "Id","TvgId" FROM "FerrofinLiveTvChannels""#)
-            .fetch_all(self.db.pool())
-            .await
-            .map_err(db_err)?;
-        let mut by_tvg: HashMap<String, Vec<String>> = HashMap::new();
-        for row in rows {
-            let id: String = row.get("Id");
-            let tvg: String = row.get("TvgId");
-            by_tvg.entry(tvg).or_default().push(id);
-        }
+        let by_tvg = self.channels_by_tvg_id().await?;
+
+        let touched = Self::channels_covered_by(&guide, &by_tvg);
 
         // Flatten to one (channel, programme) row per binding, then insert in
         // chunked multi-row statements (25 columns per row) instead of one
@@ -510,21 +776,38 @@ impl FerrofinLiveTvManager {
         let rows: Vec<_> = guide
             .programmes
             .iter()
+            .filter(|prog| Self::in_guide_window(prog, window_start, window_end))
             .flat_map(|prog| {
-                let channel_ids = by_tvg.get(&prog.channel_id).map_or(&[][..], Vec::as_slice);
-                let start = opt_datetime_to_db(prog.start).unwrap_or_default();
-                let end = opt_datetime_to_db(prog.stop);
+                let channels = by_tvg.get(&prog.channel_id).map_or(&[][..], Vec::as_slice);
+                let start = opt_datetime_to_db(prog.start.map(|d| d.with_timezone(&Utc)))
+                    .unwrap_or_default();
+                let end = opt_datetime_to_db(prog.stop.map(|d| d.with_timezone(&Utc)));
                 let genres = if prog.categories.is_empty() {
                     None
                 } else {
                     serde_json::to_string(&prog.categories).ok()
                 };
                 let class = classes.classify(prog);
-                channel_ids.iter().map(move |channel_id| {
-                    let id = Uuid::new_v5(&PROGRAM_NS, format!("{channel_id}|{start}").as_bytes());
+                channels.iter().map(move |(channel_id, channel_external)| {
+                    // `ListingsManager.GetProgramsAsync` (v10.11.8
+                    // ListingsManager.cs:151-155) suffixes the provider's id with
+                    // `"_" + channel.Id` — the tuner's external channel id — and
+                    // `LiveTvDtoService.GetInternalProgramId` hashes the result.
+                    let external_id = class
+                        .external_id
+                        .as_ref()
+                        .map(|base| format!("{base}_{channel_external}"));
+                    let id = external_id.as_deref().map_or_else(
+                        // No start attribute means upstream has no id to build
+                        // either; keep the row addressable rather than dropping
+                        // it, keyed on what it does have.
+                        || internal_program_id(&format!("{channel_external}_{}", prog.title)),
+                        internal_program_id,
+                    );
                     ProgramRow {
                         id: guid_to_db(id),
                         channel_id,
+                        external_id: external_id.clone(),
                         start: start.clone(),
                         end: end.clone(),
                         genres: genres.clone(),
@@ -537,6 +820,9 @@ impl FerrofinLiveTvManager {
 
         let now = datetime_to_db(Utc::now());
         let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+
+        let existing_dates = Self::clean_programs(&mut tx, &touched).await?;
+
         for chunk in rows.chunks(SQLITE_BIND_LIMIT / 26) {
             let mut qb: QueryBuilder<'_, Sqlite> = QueryBuilder::new(
                 r#"INSERT INTO "FerrofinLiveTvPrograms"
@@ -570,11 +856,16 @@ impl FerrofinLiveTvManager {
                     .push_bind(i32::from(class.is_kids))
                     .push_bind(i32::from(class.is_sports))
                     .push_bind(0_i32)
-                    .push_bind(&class.external_id)
+                    .push_bind(&row.external_id)
                     .push_bind(&class.external_series_id)
                     .push_bind(class.season_number)
                     .push_bind(class.episode_number)
-                    .push_bind(&now);
+                    .push_bind(
+                        existing_dates
+                            .get(&row.id)
+                            .and_then(Clone::clone)
+                            .unwrap_or_else(|| now.clone()),
+                    );
             });
             qb.push(PROGRAM_UPSERT_CONFLICT);
             qb.build().execute(&mut *tx).await.map_err(db_err)?;
@@ -644,7 +935,12 @@ impl LiveTvManager for FerrofinLiveTvManager {
             .id
             .clone()
             .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| guid_to_db(Uuid::new_v4()));
+            // `TunerHostManager.SaveTunerHost` / `ListingsManager.SaveListingProvider`
+            // mint the id as `Guid.NewGuid().ToString("N")` — 32 lowercase hex
+            // digits, no dashes. `guid_to_db`'s uppercase-dashed DB form is a
+            // storage detail; these ids go out over the wire on
+            // `GET /System/Configuration/livetv`.
+            .unwrap_or_else(|| Uuid::new_v4().simple().to_string());
         info.id = Some(id.clone());
         if info.type_.is_none() {
             info.type_ = Some("m3u".to_owned());
@@ -705,7 +1001,12 @@ impl LiveTvManager for FerrofinLiveTvManager {
             .id
             .clone()
             .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| guid_to_db(Uuid::new_v4()));
+            // `TunerHostManager.SaveTunerHost` / `ListingsManager.SaveListingProvider`
+            // mint the id as `Guid.NewGuid().ToString("N")` — 32 lowercase hex
+            // digits, no dashes. `guid_to_db`'s uppercase-dashed DB form is a
+            // storage detail; these ids go out over the wire on
+            // `GET /System/Configuration/livetv`.
+            .unwrap_or_else(|| Uuid::new_v4().simple().to_string());
         info.id = Some(id.clone());
         if info.type_.is_none() {
             info.type_ = Some("xmltv".to_owned());
@@ -869,6 +1170,81 @@ impl LiveTvManager for FerrofinLiveTvManager {
         Ok(QueryResult::new(Some(start_index), Some(total), items))
     }
 
+    async fn get_recommended_programs(
+        &self,
+        query: &InternalItemsQuery,
+        options: &DtoOptions,
+    ) -> Result<QueryResult<BaseItemDto>, ServiceError> {
+        // Port of `LiveTvManager.GetRecommendedProgramsAsync` +
+        // `GetRecommendedProgramsInternal` (v10.11.8 LiveTvManager.cs:266-334).
+        //
+        // When `isAiring` is anything but `true` this endpoint *is*
+        // `GetPrograms` — same query, same paging.
+        if query.is_airing != Some(true) {
+            return self.get_programs(query, options).await;
+        }
+
+        // The airing branch is a different query, not a filtered one:
+        //  - the sort is forced to StartDate ascending — the caller's `orderBy`
+        //    is discarded, because the score is applied on top of it;
+        //  - `StartIndex` is dropped (upstream builds `internalQuery` without
+        //    it), so this endpoint does not page;
+        //  - the limit is over-fetched to `max(limit * 4, 200)` so the ranking
+        //    has a pool to rank *within*, and the caller's limit is applied
+        //    after scoring;
+        //  - `TotalRecordCount` is the size of that fetched pool, not the true
+        //    guide total. That reads like a bug and is not one: it is what the
+        //    "On Now" row is built against, and reporting the real total would
+        //    make a client page into rows this endpoint never ranks.
+        let mut internal = query.clone();
+        internal.order_by = vec![(ItemSortBy::StartDate, SortOrder::Ascending)];
+        internal.start_index = None;
+        internal.limit = query.limit.map(|l| l.saturating_mul(4).max(200));
+
+        let now = Utc::now();
+        let rows = self.query_program_rows(&internal, now).await?;
+        let total = i32::try_from(rows.len()).unwrap_or(i32::MAX);
+
+        let scores = match query
+            .user
+            .as_ref()
+            .and_then(|u| Uuid::parse_str(&u.id).ok())
+        {
+            Some(uid) => {
+                crate::guide_repository::channel_recommendation_data(&self.db, uid).await?
+            }
+            None => HashMap::new(),
+        };
+
+        // `OrderBy(i => i.StartDate.Date).ThenByDescending(score)`: the primary
+        // key is the start *date*, not the instant, so everything airing on the
+        // same day competes on score. LINQ's OrderBy is stable, so airings that
+        // tie on both keep the StartDate order the query returned them in.
+        let mut ranked: Vec<_> = rows
+            .into_iter()
+            .map(|row| {
+                let score = recommendation_score(&row, scores.get(&row.channel_id));
+                (row, score)
+            })
+            .collect();
+        ranked.sort_by(|(a, sa), (b, sb)| {
+            start_day(&a.start_date)
+                .cmp(start_day(&b.start_date))
+                .then(sb.cmp(sa))
+        });
+        if let Some(limit) = query.limit {
+            ranked.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+        }
+        let rows: Vec<_> = ranked.into_iter().map(|(row, _)| row).collect();
+
+        let mut list_options = options.clone();
+        remove_fields(&mut list_options);
+        let items = self
+            .program_dtos(&rows, &list_options, query.user.as_ref())
+            .await?;
+        Ok(QueryResult::new(query.start_index, Some(total), items))
+    }
+
     async fn get_program(
         &self,
         id: Uuid,
@@ -901,20 +1277,42 @@ impl LiveTvManager for FerrofinLiveTvManager {
                 continue;
             };
             match self.fetcher.fetch(url).await {
-                Ok(body) => self.replace_channels(id, &body).await?,
+                Ok(body) => self.replace_channels(id, url, &body).await?,
                 Err(e) => tracing::warn!(%url, error = %e, "live tv: tuner fetch failed"),
             }
         }
+        // `GuideManager.RefreshChannelsInternal` asks each listings provider for
+        // exactly `[now - 1h, now - 1h + GuideDays)` and keeps nothing else
+        // (v10.11.8 GuideManager.cs:215-231). Ingesting the whole document
+        // instead is not a harmless superset: it inflates every guide query's
+        // `TotalRecordCount`, and it hands clients airings from months the
+        // guide window never claimed to cover.
+        let days = self.guide_days().await;
+        let start = Utc::now() - chrono::Duration::hours(GUIDE_WINDOW_LEAD_IN_HOURS);
+        let window = (start, start + chrono::Duration::days(days));
+        tracing::info!(days, "live tv: refreshing guide");
         for provider in self.get_listing_providers().await? {
             let Some(path) = provider.path.as_deref() else {
                 continue;
             };
             match self.fetcher.fetch(path).await {
-                Ok(body) => self.insert_programs(&body, &provider).await?,
+                Ok(body) => self.insert_programs(&body, &provider, window).await?,
                 Err(e) => tracing::warn!(%path, error = %e, "live tv: guide fetch failed"),
             }
         }
         Ok(())
+    }
+
+    async fn get_guide_info(&self) -> Result<GuideInfo, ServiceError> {
+        // Port of `GuideManager.GetGuideInfo` (v10.11.8 GuideManager.cs:82-92):
+        // `now .. now + GetGuideDays()`, the same day count the ingest window
+        // above uses, so the advertised window and the data behind it cannot
+        // drift apart.
+        let start = Utc::now();
+        Ok(GuideInfo {
+            start_date: start,
+            end_date: start + chrono::Duration::days(self.guide_days().await),
+        })
     }
 
     async fn get_channel_stream_url(&self, id: Uuid) -> Result<Option<String>, ServiceError> {
@@ -2913,6 +3311,24 @@ mod tests {
     const M3U: &str = "#EXTM3U\n\
         #EXTINF:-1 tvg-id=\"one.tv\" tvg-chno=\"1\",Channel One\nhttp://tuner/one\n\
         #EXTINF:-1 tvg-id=\"two.tv\" tvg-chno=\"2\",Channel Two\nhttp://tuner/two\n";
+    /// The `YYYYMMDD` an XMLTV test fixture should be dated `offset` days out.
+    ///
+    /// The guide refresh only ingests `[now - 1h, now - 1h + GuideDays)`, the way
+    /// `GuideManager.RefreshChannelsInternal` does, so a fixture pinned to a
+    /// literal calendar date silently empties itself once that date rolls past.
+    /// Day 0 is *tomorrow*: that is inside the window whatever time of day the
+    /// suite runs at, where today at 06:00 is not.
+    fn guide_day(offset: i64) -> String {
+        (chrono::Utc::now().date_naive() + chrono::Duration::days(1 + offset))
+            .format("%Y%m%d")
+            .to_string()
+    }
+
+    /// A fixture dated with [`guide_day`] instead of a literal date.
+    fn dated(template: &str) -> String {
+        template.replace("20260725", &guide_day(0))
+    }
+
     const XMLTV: &str = "<tv>\
         <channel id=\"one.tv\"><display-name>Channel One</display-name></channel>\
         <programme start=\"20260725060000 +0000\" stop=\"20260725070000 +0000\" channel=\"one.tv\">\
@@ -3086,10 +3502,7 @@ mod tests {
     async fn guide_refresh_classifies_programmes_like_the_xmltv_provider() {
         let mut sources = HashMap::new();
         sources.insert("http://tuner/playlist.m3u".to_owned(), M3U.to_owned());
-        sources.insert(
-            "http://guide/xmltv.xml".to_owned(),
-            CLASSIFIED_XMLTV.to_owned(),
-        );
+        sources.insert("http://guide/xmltv.xml".to_owned(), dated(CLASSIFIED_XMLTV));
         let mgr = manager_with(FakeFetcher(sources)).await;
         mgr.save_tuner_host(TunerHostInfo {
             url: Some("http://tuner/playlist.m3u".to_owned()),
@@ -3228,7 +3641,7 @@ mod tests {
     async fn refresh_populates_channels_and_guide() {
         let mut sources = HashMap::new();
         sources.insert("http://tuner/playlist.m3u".to_owned(), M3U.to_owned());
-        sources.insert("http://guide/xmltv.xml".to_owned(), XMLTV.to_owned());
+        sources.insert("http://guide/xmltv.xml".to_owned(), dated(XMLTV));
         let mgr = manager_with(FakeFetcher(sources)).await;
 
         mgr.save_tuner_host(TunerHostInfo {
@@ -3327,7 +3740,7 @@ mod tests {
 
         let mut sources = HashMap::new();
         sources.insert("http://tuner/ae.m3u".to_owned(), M3U_AMP.to_owned());
-        sources.insert("http://guide/ae.xml".to_owned(), XMLTV_AMP.to_owned());
+        sources.insert("http://guide/ae.xml".to_owned(), dated(XMLTV_AMP));
         let mgr = manager_with(FakeFetcher(sources)).await;
 
         mgr.save_tuner_host(TunerHostInfo {
@@ -3378,13 +3791,13 @@ mod tests {
         let mut xmltv = String::from("<tv>");
         for p in 0..5000u32 {
             let ch = p % 150;
-            let day = 20 + p / 24 / 60 % 8;
+            let day = guide_day(i64::from(p / 24 / 60 % 8));
             let hh = p / 60 % 24;
             let mm = p % 60;
             let _ = write!(
                 xmltv,
-                "<programme start=\"202607{day:02}{hh:02}{mm:02}00 +0000\" \
-                 stop=\"202607{day:02}{hh:02}{mm:02}30 +0000\" channel=\"ch{ch}.tv\">\
+                "<programme start=\"{day}{hh:02}{mm:02}00 +0000\" \
+                 stop=\"{day}{hh:02}{mm:02}30 +0000\" channel=\"ch{ch}.tv\">\
                  <title>Show {p}</title></programme>"
             );
         }
@@ -3437,7 +3850,11 @@ mod tests {
              <channel id=\"two.tv\"><display-name>Channel Two</display-name></channel>",
         );
         for (channel, from, to, title, genre) in [
-            ("one.tv", -180, -120, "Aired", "News"),
+            // Already over, but inside the refresh's one-hour lead-in — an
+            // airing that ended more than an hour ago is not in the guide
+            // window at all, so upstream would not have it either and neither
+            // does Ferrofin.
+            ("one.tv", -55, -45, "Aired", "News"),
             ("one.tv", -30, 30, "Now Playing", "Drama"),
             ("one.tv", 120, 180, "Later", "Comedy"),
             ("two.tv", -10, 50, "Two Now", "News"),
@@ -3769,6 +4186,85 @@ mod tests {
             });
         mgr.set_local_api_url("http://127.0.0.1:8096");
         mgr
+    }
+
+    /// A manager whose `LiveTvOptions` file holds `guide_days`, or none at all.
+    async fn manager_with_guide_days(days: Option<i32>) -> FerrofinLiveTvManager {
+        let root =
+            std::env::temp_dir().join(format!("ferrofin-guide-days-{}", Uuid::new_v4().simple()));
+        let named = root.join("named");
+        std::fs::create_dir_all(&named).expect("mkdir");
+        if days.is_some() {
+            // Serialize a whole `LiveTvOptions`, which is what
+            // `POST /System/Configuration/livetv` writes — a hand-trimmed
+            // fragment does not deserialize, and `live_tv_options` would
+            // silently hand back the defaults.
+            let options = ferrofin_model::live_tv::LiveTvOptions {
+                guide_days: days,
+                ..ferrofin_model::live_tv::LiveTvOptions::default()
+            };
+            std::fs::write(
+                named.join("livetv.json"),
+                serde_json::to_string(&options).expect("serialize options"),
+            )
+            .expect("write options");
+        }
+        manager_with(FakeFetcher(HashMap::new()))
+            .await
+            .with_paths(LiveTvPaths {
+                transcode_dir: root.join("transcodes"),
+                data_dir: root.join("data"),
+                options_file: named.join("livetv.json"),
+            })
+    }
+
+    /// `GuideManager.GetGuideInfo` is `now .. now + GetGuideDays()`, and
+    /// `GetGuideDays` is `GuideDays.HasValue ? Clamp(value, 1, 14) : 7`
+    /// (v10.11.8 GuideManager.cs:82-92, 161-168). The handler used to answer a
+    /// hardcoded 7 days and could not read the setting at all — it took no
+    /// state — so the dashboard's "Guide days" control changed nothing.
+    #[rstest::rstest]
+    #[case(None, 7)]
+    #[case(Some(7), 7)]
+    #[case(Some(14), 14)]
+    #[case(Some(1), 1)]
+    // Clamped, not rejected: upstream uses Math.Clamp, so an out-of-range value
+    // still yields a usable window.
+    #[case(Some(100), 14)]
+    #[case(Some(0), 1)]
+    #[case(Some(-5), 1)]
+    #[tokio::test]
+    async fn guide_info_window_follows_the_configured_guide_days(
+        #[case] configured: Option<i32>,
+        #[case] expected_days: i64,
+    ) {
+        let mgr = manager_with_guide_days(configured).await;
+        let before = chrono::Utc::now();
+        let info = mgr.get_guide_info().await.expect("guide info");
+        let after = chrono::Utc::now();
+        assert!(info.start_date >= before && info.start_date <= after);
+        assert_eq!(
+            info.end_date - info.start_date,
+            chrono::Duration::days(expected_days),
+            "GuideDays={configured:?}"
+        );
+    }
+
+    /// The advertised window and the window the refresh actually ingests read
+    /// the same setting — an advertised fortnight over a stored week is how a
+    /// client ends up scrolling into an empty guide.
+    #[tokio::test]
+    async fn the_ingest_window_and_the_advertised_window_agree() {
+        for days in [None, Some(1), Some(14), Some(100)] {
+            let mgr = manager_with_guide_days(days).await;
+            let advertised = mgr.get_guide_info().await.expect("guide info");
+            let ingested = mgr.guide_days().await;
+            assert_eq!(
+                advertised.end_date - advertised.start_date,
+                chrono::Duration::days(ingested),
+                "GuideDays={days:?}"
+            );
+        }
     }
 
     /// The guide programme airing right now on the first channel.
@@ -4638,10 +5134,7 @@ mod tests {
     async fn channel_kind_filters_follow_the_guide_aggregation() {
         let mut sources = HashMap::new();
         sources.insert("http://tuner/playlist.m3u".to_owned(), M3U.to_owned());
-        sources.insert(
-            "http://guide/xmltv.xml".to_owned(),
-            CLASSIFIED_XMLTV.to_owned(),
-        );
+        sources.insert("http://guide/xmltv.xml".to_owned(), dated(CLASSIFIED_XMLTV));
         let mgr = manager_with(FakeFetcher(sources)).await;
         mgr.save_tuner_host(TunerHostInfo {
             url: Some("http://tuner/playlist.m3u".to_owned()),
@@ -4972,5 +5465,218 @@ mod tests {
         );
         // Debug stays free of the fetcher and cache internals.
         assert!(format!("{mgr:?}").contains("srv"));
+    }
+}
+
+/// Tests pinning the Live TV id derivation to the values a real Jellyfin
+/// 10.11.8 produces.
+///
+/// The oracle is the lab pair's synthetic tuner: `channels.m3u` at
+/// `/media/synth/livetv/channels.m3u` with two entries streaming from
+/// `http://livetv-source:8000/live.ts?ch={1,2}`, and an XMLTV guide whose
+/// `parity1` programmes start on the hour. The expected GUIDs below are the
+/// bytes Jellyfin returned on `GET /LiveTv/Channels` and stored in its own
+/// `BaseItems` table for that fixture — not values recomputed from this code.
+#[cfg(test)]
+mod id_derivation_tests {
+    use super::{internal_channel_id, internal_program_id, m3u_external_channel_id};
+
+    const TUNER: &str = "/media/synth/livetv/channels.m3u";
+
+    #[rstest::rstest]
+    #[case(
+        "http://livetv-source:8000/live.ts?ch=1",
+        "m3u_5581ab8b17869acbac4cc454abc401683f2ed88fba54056b16c110c12038d26b",
+        "d53240a11ffc0b1a0c165896a3bdf7f4"
+    )]
+    #[case(
+        "http://livetv-source:8000/live.ts?ch=2",
+        "m3u_5581ab8b17869acbac4cc454abc40168446c98aa7b6e4352b95b322018c4eebf",
+        "dcd04dcd7fa074c3b728a1fa49acd10e"
+    )]
+    fn channel_ids_match_jellyfin(
+        #[case] stream_url: &str,
+        #[case] expected_external: &str,
+        #[case] expected_guid: &str,
+    ) {
+        let external = m3u_external_channel_id(TUNER, stream_url);
+        assert_eq!(external, expected_external);
+        assert_eq!(
+            internal_channel_id(&external).simple().to_string(),
+            expected_guid
+        );
+    }
+
+    /// `M3uParser` keys a channel on its stream URL, so two playlist entries
+    /// that share a `tvg-id` stay distinct. Ferrofin used to key on the
+    /// `tvg-id`, which collapsed them onto one primary key and aborted the
+    /// whole lineup insert.
+    #[test]
+    fn same_tvg_id_different_stream_urls_stay_distinct() {
+        let a = internal_channel_id(&m3u_external_channel_id(TUNER, "http://t/a.ts"));
+        let b = internal_channel_id(&m3u_external_channel_id(TUNER, "http://t/b.ts"));
+        assert_ne!(a, b);
+    }
+
+    /// The same stream URL served by two different tuners is two channels: the
+    /// tuner URL is hashed into the prefix.
+    #[test]
+    fn same_stream_url_different_tuners_stay_distinct() {
+        let a = m3u_external_channel_id("http://one/list.m3u", "http://t/a.ts");
+        let b = m3u_external_channel_id("http://two/list.m3u", "http://t/a.ts");
+        assert_ne!(a, b);
+    }
+
+    /// `{xmltvChannelId}_{StartDate:O}_{channelExternalId}`, hashed as a
+    /// `LiveTvProgram`. The two expected GUIDs are the ones Jellyfin served as
+    /// `CurrentProgram.Id` (03:00 airing) and stored in `BaseItems` (00:00
+    /// airing) for the same fixture.
+    #[rstest::rstest]
+    #[case(
+        "2026-08-30T03:00:00.0000000+00:00",
+        "30126bace3d86b5ee0f00c270d105f86"
+    )]
+    #[case(
+        "2026-08-30T00:00:00.0000000+00:00",
+        "b68c76f67dc24315d7a00eb076ada809"
+    )]
+    fn program_ids_match_jellyfin(#[case] start: &str, #[case] expected_guid: &str) {
+        let channel_external =
+            m3u_external_channel_id(TUNER, "http://livetv-source:8000/live.ts?ch=1");
+        let external = format!("parity1_{start}_{channel_external}");
+        assert_eq!(
+            internal_program_id(&external).simple().to_string(),
+            expected_guid
+        );
+    }
+
+    /// The hash input is case-folded only on the `"Emby"+id+"4"` half —
+    /// `LibraryManager.GetNewItemIdInternal` prepends `type.FullName` *after*
+    /// the `ToLowerInvariant()`. Folding the whole key instead is the mistake
+    /// that silently produces plausible-but-wrong GUIDs.
+    #[test]
+    fn type_name_casing_is_load_bearing() {
+        let external = "m3u_5581ab8b17869acbac4cc454abc401683f2ed88fba54056b16c110c12038d26b";
+        let wrong = ferrofin_common::extensions::get_md5(
+            &format!("MediaBrowser.Controller.LiveTv.LiveTvChannelEmby{external}4").to_lowercase(),
+        );
+        assert_ne!(wrong, internal_channel_id(external));
+    }
+}
+
+/// Tests for the guide window and the recommendation ranking.
+#[cfg(test)]
+mod guide_window_tests {
+    use chrono::{Duration, TimeZone, Utc};
+
+    use super::{FerrofinLiveTvManager, GuideProgramRow, recommendation_score, start_day};
+
+    fn programme(start_hour: i64, dur_hours: i64) -> crate::xmltv::XmltvProgramme {
+        let base = Utc.with_ymd_and_hms(2026, 8, 30, 0, 0, 0).unwrap();
+        crate::xmltv::XmltvProgramme {
+            start: Some((base + Duration::hours(start_hour)).fixed_offset()),
+            stop: Some((base + Duration::hours(start_hour + dur_hours)).fixed_offset()),
+            ..crate::xmltv::XmltvProgramme::default()
+        }
+    }
+
+    /// The window is `[now - 1h, now - 1h + GuideDays)` and keeps anything
+    /// *overlapping* it, so the airing already in progress survives and the one
+    /// that ended exactly at the boundary does not.
+    #[test]
+    fn window_keeps_overlapping_airings_only() {
+        let base = Utc.with_ymd_and_hms(2026, 8, 30, 0, 0, 0).unwrap();
+        let start = base + Duration::minutes(30);
+        let end = start + Duration::days(7);
+
+        // 23:00-00:00 the previous day ended before the window opened.
+        assert!(!FerrofinLiveTvManager::in_guide_window(
+            &programme(-1, 1),
+            start,
+            end
+        ));
+        // 00:00-01:00 is in progress at 00:30.
+        assert!(FerrofinLiveTvManager::in_guide_window(
+            &programme(0, 1),
+            start,
+            end
+        ));
+        // The airing starting exactly `GuideDays` on is inside; the next is not.
+        assert!(FerrofinLiveTvManager::in_guide_window(
+            &programme(7 * 24, 1),
+            start,
+            end
+        ));
+        assert!(!FerrofinLiveTvManager::in_guide_window(
+            &programme(7 * 24 + 1, 1),
+            start,
+            end
+        ));
+    }
+
+    /// On the lab fixture that filter must retain exactly what Jellyfin
+    /// retained: 169 hourly airings per channel for a 7-day window.
+    #[test]
+    fn seven_day_window_retains_the_jellyfin_row_count() {
+        let base = Utc.with_ymd_and_hms(2026, 8, 30, 0, 0, 0).unwrap();
+        let start = base + Duration::minutes(30);
+        let end = start + Duration::days(7);
+        let kept = (-24..24 * 400)
+            .filter(|h| FerrofinLiveTvManager::in_guide_window(&programme(*h, 1), start, end))
+            .count();
+        assert_eq!(kept, 169);
+    }
+
+    /// A programme with no `start` cannot be placed, so it is not silently
+    /// dropped by the window.
+    #[test]
+    fn undated_airings_survive_the_window() {
+        let base = Utc.with_ymd_and_hms(2026, 8, 30, 0, 0, 0).unwrap();
+        assert!(FerrofinLiveTvManager::in_guide_window(
+            &crate::xmltv::XmltvProgramme::default(),
+            base,
+            base + Duration::days(7)
+        ));
+    }
+
+    fn row(is_live: bool, is_series: bool, is_repeat: bool) -> GuideProgramRow {
+        GuideProgramRow {
+            is_live,
+            is_series,
+            is_repeat,
+            start_date: "2026-08-30T03:00:00.0000000Z".to_owned(),
+            ..GuideProgramRow::default()
+        }
+    }
+
+    /// Port check against `LiveTvManager.GetRecommendationScore`: +1 live,
+    /// +1 non-repeat series, ±2 like/dislike, +3 favourite, +PlayCount.
+    #[test]
+    fn recommendation_score_matches_the_c_sharp_arithmetic() {
+        assert_eq!(recommendation_score(&row(false, false, false), None), 0);
+        assert_eq!(recommendation_score(&row(true, false, false), None), 1);
+        assert_eq!(recommendation_score(&row(true, true, false), None), 2);
+        // A repeat gets no series bonus.
+        assert_eq!(recommendation_score(&row(true, true, true), None), 1);
+        // Channel user-data: liked, favourite, three plays.
+        assert_eq!(
+            recommendation_score(&row(false, false, false), Some(&(Some(true), true, 3))),
+            8
+        );
+        // Disliked and not favourited subtracts.
+        assert_eq!(
+            recommendation_score(&row(false, false, false), Some(&(Some(false), false, 0))),
+            -2
+        );
+    }
+
+    /// `OrderBy(i => i.StartDate.Date)` groups by calendar day, not instant.
+    #[test]
+    fn start_day_is_the_calendar_date() {
+        assert_eq!(start_day("2026-08-30T23:00:00.0000000Z"), "2026-08-30");
+        assert_eq!(
+            start_day("2026-08-30T01:00:00.0000000Z"),
+            start_day("2026-08-30T23:00:00.0000000Z")
+        );
     }
 }

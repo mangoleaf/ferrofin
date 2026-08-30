@@ -105,6 +105,19 @@ mod tests {
 
     #[async_trait]
     impl LiveTvManager for FakeLiveTv {
+        async fn get_guide_info(&self) -> Result<ferrofin_model::live_tv::GuideInfo, ServiceError> {
+            unimplemented!("this fake is never asked for the guide window")
+        }
+        async fn get_recommended_programs(
+            &self,
+            _query: &ferrofin_traits::options::InternalItemsQuery,
+            _options: &ferrofin_traits::options::DtoOptions,
+        ) -> Result<
+            ferrofin_model::querying::QueryResult<ferrofin_model::dto::BaseItemDto>,
+            ServiceError,
+        > {
+            unimplemented!("this fake is never asked for recommended programs")
+        }
         fn has_tuner_hosts(&self) -> bool {
             self.tuners.load(Ordering::Relaxed)
         }

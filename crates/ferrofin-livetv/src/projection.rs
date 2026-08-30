@@ -68,7 +68,7 @@ pub struct ChannelRow {
 
 /// One `FerrofinLiveTvPrograms` row joined to its channel, as the query paths
 /// read it.
-#[derive(Debug, Clone, sqlx::FromRow)]
+#[derive(Debug, Clone, Default, sqlx::FromRow)]
 #[sqlx(rename_all = "PascalCase")]
 #[allow(clippy::struct_excessive_bools)] // the upstream ProgramInfo flags
 pub struct ProgramRow {

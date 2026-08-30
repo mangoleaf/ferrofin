@@ -92,6 +92,47 @@ pub async fn channel_user_data(
         .collect())
 }
 
+/// The user's channel user-data rows keyed by the stored channel id, in the
+/// shape `LiveTvManager.GetRecommendationScore` reads:
+/// `(Likes, IsFavorite, PlayCount)`.
+///
+/// Kept apart from [`channel_user_data`] because the recommendation score wants
+/// `Likes`/`PlayCount` and the filters want `Rating`; one query returning both
+/// shapes would make every favourite-filtered guide read pay for columns it
+/// throws away.
+///
+/// # Errors
+///
+/// Fails when the database read fails.
+pub async fn channel_recommendation_data(
+    db: &Database,
+    user_id: Uuid,
+) -> Result<std::collections::HashMap<String, (Option<bool>, bool, i32)>, ServiceError> {
+    let rows = sqlx::query(
+        r#"SELECT ud."ItemId", ud."Likes", ud."IsFavorite", ud."PlayCount"
+           FROM "UserData" ud
+           JOIN "FerrofinLiveTvChannels" c ON c."Id" = ud."ItemId"
+           WHERE ud."UserId" = ?1 AND ud."CustomDataKey" = lower(ud."ItemId")"#,
+    )
+    .bind(guid_to_db(user_id))
+    .fetch_all(db.pool())
+    .await
+    .map_err(db_err)?;
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            (
+                r.get::<String, _>("ItemId"),
+                (
+                    r.get::<Option<bool>, _>("Likes"),
+                    r.get::<bool, _>("IsFavorite"),
+                    r.get::<i32, _>("PlayCount"),
+                ),
+            )
+        })
+        .collect())
+}
+
 /// The `Id → DateCreated` map for one tuner's current lineup, read inside the
 /// refresh transaction so a re-inserted channel keeps its first-seen instant.
 ///

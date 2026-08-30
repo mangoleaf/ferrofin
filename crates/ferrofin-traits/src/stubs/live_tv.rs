@@ -18,7 +18,7 @@ use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::dto::DayOfWeek;
 use ferrofin_model::dto::{BaseItemDto, MediaSourceInfo, SortOrder};
 use ferrofin_model::live_tv::{
-    ChannelType, DayPattern, ItemSortBy, KeepUntil, ListingsProviderInfo, LiveTvInfo,
+    ChannelType, DayPattern, GuideInfo, ItemSortBy, KeepUntil, ListingsProviderInfo, LiveTvInfo,
     RecordingQuery, RecordingStatus, SeriesTimerInfoDto, TimerInfoDto, TimerQuery, TunerHostInfo,
 };
 use ferrofin_model::querying::QueryResult;
@@ -252,6 +252,21 @@ pub trait LiveTvManager: Send + Sync {
         options: &DtoOptions,
     ) -> Result<QueryResult<BaseItemDto>, ServiceError>;
 
+    /// Queries the "recommended"/"On Now" program list.
+    ///
+    /// Port of `LiveTvManager.GetRecommendedProgramsAsync`. The contract:
+    /// implementations delegate to [`Self::get_programs`] unless
+    /// `is_airing == Some(true)`, and otherwise force a StartDate-ascending
+    /// fetch of `max(limit * 4, 200)` rows, rank each start-date's airings by
+    /// the recommendation score (live, non-repeat series, and the caller's
+    /// channel likes/favourite/play count), take `limit`, and report the
+    /// fetched pool size as the total.
+    async fn get_recommended_programs(
+        &self,
+        query: &InternalItemsQuery,
+        options: &DtoOptions,
+    ) -> Result<QueryResult<BaseItemDto>, ServiceError>;
+
     /// Gets a single program by id, or `None` when it is unknown.
     ///
     /// Port of `LiveTvManager.GetProgram(id, ct, user)`. The contract:
@@ -279,6 +294,16 @@ pub trait LiveTvManager: Send + Sync {
     /// Refreshes the channel lineup and guide by fetching every configured
     /// tuner host (M3U) and listing provider (XMLTV) and rewriting the cache.
     async fn refresh_guide(&self) -> Result<(), ServiceError>;
+
+    /// The guide's advertised date range.
+    ///
+    /// Port of `IGuideManager.GetGuideInfo`: `now .. now + GuideDays`, where
+    /// `GuideDays` is the dashboard's Live TV setting clamped to `1..=14`. It
+    /// lives on the manager rather than in the handler because it must be the
+    /// same day count the guide *ingest* window uses — advertising a range the
+    /// stored guide does not cover is how a client ends up scrolling into an
+    /// empty week.
+    async fn get_guide_info(&self) -> Result<GuideInfo, ServiceError>;
 
     /// Resolves a channel id to the tuner stream URL that plays it, or `None`
     /// when the channel is unknown.

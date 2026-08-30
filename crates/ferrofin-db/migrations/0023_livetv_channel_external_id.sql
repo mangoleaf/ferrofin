@@ -1,0 +1,16 @@
+-- A Live TV channel carries the tuner-facing external id its internal GUID was
+-- derived from.
+--
+-- Upstream, `M3UTunerHost.GetFullChannelIdPrefix` + `M3uParser.GetChannelsAsync`
+-- (v10.11.8 M3UTunerHost.cs:64-67, M3uParser.cs:104) give a channel the external
+-- id `m3u_{MD5(tunerUrl)}{MD5(streamUrl)}`, and
+-- `LiveTvDtoService.GetInternalChannelId` hashes that into the item GUID. The
+-- guide's programme ids are built from the same external id
+-- (`ListingsManager.GetProgramsAsync`, ListingsManager.cs:151-155), so it has to
+-- be readable back out at guide-ingest time rather than recomputed from a
+-- playlist that may have moved on.
+--
+-- Ferrofin-owned table (`FerrofinLiveTvChannels`), so this is additive and the
+-- Jellyfin-pinned schema shape is untouched. Existing rows get `''`; the next
+-- guide refresh rewrites the lineup and fills it in.
+ALTER TABLE "FerrofinLiveTvChannels" ADD COLUMN "ExternalId" TEXT NOT NULL DEFAULT '';

@@ -16,6 +16,7 @@ Run via sweep.sh (idempotently connects to the already-up servers), or directly:
 Offline self-check:
   parity/reads.py --check
 """
+import datetime
 import json
 import os
 import re
@@ -44,11 +45,16 @@ def plain(op, url):
     return {"op": op, "kind": "plain", "url": lambda c: url}
 
 
-def user(op, url):
+def user(op, url, project=None):
     # url may reference {u} (user id) plus resolved per-server context keys (genre/studio/person/
     # year/series/season). By-name values are URL-encoded and identical across servers (same NFO);
     # series/season ids are per-server (same title on both → clean diff).
-    return {"op": op, "kind": "user", "url": lambda c: url.format(**c)}
+    #
+    # `project(body, ctx)` narrows what is compared, and is allowed ONLY to
+    # translate a value that is genuinely per-instance into one that is not —
+    # never to drop a field. The one user is /LiveTv/Info's EnabledUsers, which
+    # is a list of raw user GUIDs; see there.
+    return {"op": op, "kind": "user", "url": lambda c: url.format(**c), "project": project}
 
 
 def item(op, tmpl):
@@ -192,6 +198,65 @@ def _obeys_own_candidate_rule(base, token, ctx, seed_dto, items, limit):
 
 
 SIMILAR_ALIASES = ("Items", "Movies", "Trailers", "Albums", "Artists")
+
+
+def guide_info_invariants(base, token, ctx):
+    """The properties `GET /LiveTv/GuideInfo` must have on BOTH servers.
+
+    `GuideManager.GetGuideInfo` is `now .. now + GetGuideDays()`, so the two
+    endpoints of the window are a per-request instant and cannot be byte-equal
+    between two servers answering microseconds apart. Everything *else* about
+    the window can be, and is compared here: its LENGTH (the bug this row was
+    hiding — Ferrofin ignored `LiveTvOptions.GuideDays` and always answered 7
+    days where Jellyfin answers the configured value clamped to 1..14), its
+    now-relativity (an epoch/default window is the regression this route already
+    had once), and the .NET 7-fractional-digit wire format.
+
+    This is deliberately NOT a `parity_diff.VOLATILE` entry: denylisting
+    StartDate/EndDate would have swallowed the GuideDays divergence whole.
+    """
+    del ctx
+    facts = {}
+    before = datetime.datetime.now(datetime.timezone.utc)
+    st, b = token_get(base, "/LiveTv/GuideInfo", token)
+    after = datetime.datetime.now(datetime.timezone.utc)
+    facts["status_200"] = st == 200
+    if not isinstance(b, dict):
+        return facts
+    start_raw, end_raw = b.get("StartDate"), b.get("EndDate")
+    facts["has_both_bounds"] = bool(start_raw and end_raw)
+    if not facts["has_both_bounds"]:
+        return facts
+
+    def parse(v):
+        return datetime.datetime.fromisoformat(v.replace("Z", "+00:00"))
+
+    # `Utf8JsonWriter`'s `FFFFFFF` trims a fraction's trailing zeros, so the
+    # DIGIT COUNT is a property of the instant, not of the server — sampled 60
+    # times, Jellyfin emits 5, 6 and 7 digits and Ferrofin emits 6 and 7. Only
+    # the shape is comparable: UTC `Z`, no offset, never more than .NET tick
+    # precision.
+    wire = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,7})?Z$")
+
+    start, end = parse(start_raw), parse(end_raw)
+    # The exact instant is per-request; that it IS this request's instant is not.
+    facts["start_is_request_instant"] = (before - datetime.timedelta(seconds=120)
+                                         <= start
+                                         <= after + datetime.timedelta(seconds=120))
+    # The window length in whole seconds — identical on both servers or the row
+    # fails, which is what makes a 7-vs-14 day divergence visible.
+    facts["window_seconds"] = int((end - start).total_seconds())
+    facts["window_is_whole_days"] = facts["window_seconds"] % 86400 == 0
+    facts["start_wire_format"] = bool(wire.match(start_raw))
+    facts["end_wire_format"] = bool(wire.match(end_raw))
+    # Both bounds are stamped from ONE `UtcNow`, so their sub-second parts agree.
+    # `AddDays` cannot change them, and a window built from two separate reads
+    # would not survive this.
+    facts["bounds_share_subsecond"] = start.microsecond == end.microsecond
+    return facts
+
+
+guide_info_invariants.alias = "LiveTvGuideInfo"
 
 
 def similar_invariants_for(alias):
@@ -460,7 +525,19 @@ READS = [
     user("GET /LiveTv/Channels/{channelId}", "/LiveTv/Channels/{channel}?userId={u}"),
     user("GET /LiveTv/Programs", "/LiveTv/Programs?channelIds={channel}&isAiring=true&userId={u}"),
     user("GET /LiveTv/Programs/Recommended", "/LiveTv/Programs/Recommended?userId={u}&isAiring=true&limit=5"),
-    user("GET /LiveTv/Info", "/LiveTv/Info"),
+    # `EnabledUsers` is `user.Id.ToString("N")` for every user who may use Live
+    # TV (`LiveTvManager.GetLiveTvInfo`). The list's LENGTH and MEMBERSHIP are
+    # exactly what a regression in that filter — a dropped
+    # `EnableLiveTvAccess` check, a missing tuner-host guard — would change, so
+    # they must stay compared; only the GUID itself cannot match, because each
+    # server minted the `bench` account independently. Substituting each
+    # server's own id for that server's username keeps a wrong count, a missing
+    # user and a user who should have been filtered out all failing the diff.
+    # An `EnabledUsers` entry in parity_diff.VOLATILE would hide all three.
+    invariant("GET /LiveTv/GuideInfo", guide_info_invariants),
+    user("GET /LiveTv/Info", "/LiveTv/Info",
+         project=lambda b, c: {**b, "EnabledUsers": sorted(
+             c["users_by_id"].get(i, i) for i in (b.get("EnabledUsers") or []))}),
     user("GET /LiveTv/TunerHosts/Types", "/LiveTv/TunerHosts/Types"),
     # resolvable-path-param GETs the breadth sweep couldn't fill (needs a real id).
     user("GET /ScheduledTasks/{taskId}", "/ScheduledTasks/{task}"),
@@ -521,9 +598,19 @@ def resolve_named(base, token, user_id):
         items = (get_json(base, "/Devices", token) or {}).get("Items") or []
         return items[0]["Id"] if items and items[0].get("Id") else ""
 
+    def users_by_id():
+        """`user GUID -> username` for this server.
+
+        The two servers create their accounts independently, so the same person
+        has a different GUID on each. Any body that carries a raw user id is
+        therefore undiffable as bytes but perfectly diffable as identity.
+        """
+        return {u["Id"]: u.get("Name") for u in (get_json(base, "/Users", token) or [])}
+
     artist = first_named("/Artists")
     channels = (get_json(base, f"/LiveTv/Channels?userId={user_id}&limit=1", token) or {}).get("Items") or []
     return {
+        "users_by_id": users_by_id(),
         "channel": channels[0]["Id"] if channels else "",
         "user": user_id,   # item() reads c["user"]
         "u": user_id,       # user() URL templates use {u}
@@ -655,6 +742,8 @@ def run(ferrofin_url, jellyfin_url):
             if hb is None or jb is None:
                 record(ep["op"], 0, 0, {})
                 continue
+            if ep.get("project"):
+                hb, jb = ep["project"](hb, hc), ep["project"](jb, jc)
             n, buckets = diff_counts(jb, hb)
             record(ep["op"], 1 if n == 0 else 0, 1, buckets)
         else:  # item — aggregate over correlated pairs
@@ -742,7 +831,10 @@ def selfcheck():
     ctx = {"user": "U", "u": "U", "genre": "G", "studio": "S", "person": "P", "series": "SE",
            "task": "T", "device": "D", "artist": "A", "artist_id": "AID", "musicgenre": "MG",
            "channel": "CH", "album_id": "ALB", "movie": "MOV", "episode": "EP",
-           "season": "SEA", "audio_id": "AUD", "person_id": "PID"}
+           "season": "SEA", "audio_id": "AUD", "person_id": "PID",
+           # user GUID -> username, for the projections that translate a
+           # per-instance user id into a comparable identity.
+           "users_by_id": {"U": "bench"}}
     # The context keys the self-check invents must be the ones resolve_named
     # actually produces, or this guard passes while the live run KeyErrors.
     import inspect
@@ -761,10 +853,26 @@ def selfcheck():
     # are one measurement of the same route.
     aliases = [ep["fn"].alias for ep in READS if ep["kind"] == "invariant"]
     assert len(aliases) == len(set(aliases)), f"invariant rows share an alias: {aliases}"
-    assert set(aliases) <= set(SIMILAR_ALIASES), aliases
+    assert set(aliases) <= set(SIMILAR_ALIASES) | {"LiveTvGuideInfo"}, aliases
     # Every invariant row is stamped `property`, never the body-diff method the
     # ledger headline counts.
     assert all(ep["method"] == "property" for ep in READS if ep["kind"] == "invariant")
+    # A projected user() row must be a real narrowing, not a body-eraser: the
+    # projection has to keep every key it was given (so it cannot make a
+    # divergence vanish by dropping a field) and has to actually change the
+    # per-instance value it exists to translate.
+    for ep in READS:
+        if ep["kind"] != "user" or not ep.get("project"):
+            continue
+        probe = {"Services": [{"Name": "Emby"}], "IsEnabled": True, "EnabledUsers": ["U"]}
+        out = ep["project"](probe, ctx)
+        assert set(out) == set(probe), f'{ep["op"]}: projection changed the key set'
+        assert out["EnabledUsers"] == ["bench"], f'{ep["op"]}: projection did not translate the id'
+        # A user the map does not know must survive as its raw id, so an
+        # unexpected extra account still shows up as a diff.
+        stray = ep["project"]({**probe, "EnabledUsers": ["U", "X"]}, ctx)
+        assert stray["EnabledUsers"] == ["X", "bench"], stray
+
     # A projected multi leg must project BOTH sides to the same key set, and
     # must not be able to project a body away to nothing.
     for ep in READS:

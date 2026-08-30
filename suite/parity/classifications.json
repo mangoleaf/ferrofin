@@ -128,7 +128,7 @@
     },
     "GET /LiveTv/GuideInfo": {
       "category": "instance",
-      "classification": "instance: now-relative guide window (now .. now+7d) matches Jellyfin's behavior, but the exact StartDate/EndDate timestamps can't match across two independently-clocked servers."
+      "classification": "instance: property-verified by reads.py (guide_info_invariants), not asserted. The old note claimed the 'now .. now+7d' window matched Jellyfin; it did not \u2014 GuideManager.GetGuideInfo is now .. now + GetGuideDays() (LiveTvOptions.GuideDays clamped 1..14, default 7) and Ferrofin's handler took no state, so it answered a hardcoded 7 days whatever the dashboard was set to (measured: GuideDays=14 gave J +14d, F +7d). Ported. What is compared now: window length in seconds, whole-day-ness, now-relativity, UTC tick wire format, and that both bounds come from ONE UtcNow. Excluded: the instant itself, and the fraction's DIGIT COUNT \u2014 Utf8JsonWriter's FFFFFFF trims trailing zeros, so both servers emit 5, 6 or 7 digits depending on the instant (sampled 60x each)."
     },
     "GET /LiveTv/ListingProviders/Lineups": {
       "category": "requires-livetv-tuner",

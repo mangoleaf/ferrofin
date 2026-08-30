@@ -179,6 +179,46 @@ pub fn authed_fake_state() -> AppState {
     )
 }
 
+/// Like [`authed_fake_state`] but with a caller-chosen [`UserPolicy`] behind
+/// the authenticated user, for asserting a permission gate's allow *and* deny.
+#[must_use]
+pub fn authed_fake_state_with_policy(policy: UserPolicy) -> AppState {
+    AppState::new(
+        Arc::new(FakeLibrary),
+        Arc::new(PolicyUsers(policy)),
+        Arc::new(FakeUserViews),
+        Arc::new(FakeUserData),
+        Arc::new(FakeMediaSources),
+        Arc::new(FakeSessions),
+        Arc::new(FakeSystem),
+        Arc::new(FakeAppHost),
+        Arc::new(FakeConfig),
+        Arc::new(FakeProviders),
+        Arc::new(FakeMusic),
+        Arc::new(FakeSimilarItems),
+        Arc::new(FakeSearch),
+        Arc::new(FakeDto),
+        Arc::new(FakeAuthContext),
+        Arc::new(AuthedUserService),
+        Arc::new(FakeQuickConnect),
+        Arc::new(FakePlaylists),
+        Arc::new(FakeCollections),
+        Arc::new(FakeTvSeries),
+        Arc::new(FakeSubtitles),
+        Arc::new(FakeLyrics),
+        Arc::new(FakeMediaSegments),
+        Arc::new(FakeTrickplay),
+        Arc::new(FakeDevices),
+        Arc::new(FakeClientEventLogger),
+        Arc::new(FakeApiKeys),
+        Arc::new(FakeLocalization),
+        Arc::new(FakeDisplayPreferences),
+        Arc::new(FakeActivity),
+        Arc::new(FakeFileSystem),
+        Arc::new(FakeTasks),
+    )
+}
+
 /// Like [`authed_fake_state`] but authenticated as an **API key**, which
 /// satisfies Jellyfin's `RequiresElevation` policy without a user/policy
 /// lookup — so [`RequireAdmin`](crate::auth::RequireAdmin)-guarded routes
@@ -500,6 +540,176 @@ impl LibraryManager for FakeLibrary {
     }
     async fn queue_library_scan(&self) -> Result<(), ServiceError> {
         unimplemented!("fake")
+    }
+}
+
+/// A plain, non-administrator [`UserEntity`] for tests that need the
+/// authenticated caller to *be* somebody — every permission extractor resolves
+/// the policy from `AuthorizationInfo::user`, so a `None` there is
+/// indistinguishable from a denial.
+#[must_use]
+pub fn sample_user() -> UserEntity {
+    UserEntity {
+        id: "11111111-1111-1111-1111-111111111111".to_owned(),
+        audio_language_preference: None,
+        authentication_provider_id: String::new(),
+        cast_receiver_id: None,
+        display_collections_view: false,
+        display_missing_episodes: false,
+        enable_auto_login: false,
+        enable_local_password: false,
+        enable_next_episode_auto_play: false,
+        enable_user_preference_access: false,
+        hide_played_in_latest: false,
+        internal_id: 0,
+        invalid_login_attempt_count: 0,
+        last_activity_date: None,
+        last_login_date: None,
+        login_attempts_before_lockout: None,
+        max_active_sessions: 0,
+        max_parental_rating_score: None,
+        max_parental_rating_sub_score: None,
+        must_update_password: false,
+        password: None,
+        password_reset_provider_id: String::new(),
+        play_default_audio_track: false,
+        remember_audio_selections: false,
+        remember_subtitle_selections: false,
+        remote_client_bitrate_limit: None,
+        row_version: 0,
+        subtitle_language_preference: None,
+        subtitle_mode: 0,
+        sync_play_access: 0,
+        username: "bench".to_owned(),
+    }
+}
+
+/// An [`AuthService`] that authenticates as [`sample_user`], so a
+/// permission extractor has a user whose policy it can read.
+pub struct AuthedUserService;
+
+#[async_trait]
+impl AuthService for AuthedUserService {
+    async fn authenticate(
+        &self,
+        _request: &RequestContext,
+    ) -> Result<AuthorizationInfo, ServiceError> {
+        Ok(AuthorizationInfo {
+            is_authenticated: true,
+            user: Some(sample_user()),
+            ..AuthorizationInfo::default()
+        })
+    }
+}
+
+/// A fake [`UserManager`] whose `get_user_dto` reports a caller-chosen
+/// [`UserPolicy`], for tests of a permission gate.
+///
+/// Everything else is [`FakeUsers`]'s behaviour; only the policy projection —
+/// the one thing every permission extractor reads — is parameterised.
+pub struct PolicyUsers(pub UserPolicy);
+
+#[async_trait]
+impl UserManager for PolicyUsers {
+    async fn get_user_dto(
+        &self,
+        user: &UserEntity,
+        _server_id: Option<String>,
+    ) -> Result<UserDto, ServiceError> {
+        Ok(UserDto {
+            id: Uuid::parse_str(&user.id).unwrap_or_default(),
+            name: Some(user.username.clone()),
+            policy: Some(self.0.clone()),
+            ..UserDto::default()
+        })
+    }
+    async fn get_users(&self) -> Result<Vec<UserEntity>, ServiceError> {
+        FakeUsers.get_users().await
+    }
+    async fn get_user_ids(&self) -> Result<Vec<Uuid>, ServiceError> {
+        FakeUsers.get_user_ids().await
+    }
+    async fn initialize(&self) -> Result<(), ServiceError> {
+        FakeUsers.initialize().await
+    }
+    async fn get_user_by_id(&self, id: Uuid) -> Result<Option<UserEntity>, ServiceError> {
+        FakeUsers.get_user_by_id(id).await
+    }
+    async fn get_first_user(&self) -> Result<Option<UserEntity>, ServiceError> {
+        FakeUsers.get_first_user().await
+    }
+    async fn get_user_by_name(&self, name: &str) -> Result<Option<UserEntity>, ServiceError> {
+        FakeUsers.get_user_by_name(name).await
+    }
+    async fn rename_user(
+        &self,
+        user_id: Uuid,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<(), ServiceError> {
+        FakeUsers.rename_user(user_id, old_name, new_name).await
+    }
+    async fn update_user(&self, user: &UserEntity) -> Result<(), ServiceError> {
+        FakeUsers.update_user(user).await
+    }
+    async fn create_user(&self, name: &str) -> Result<UserEntity, ServiceError> {
+        FakeUsers.create_user(name).await
+    }
+    async fn delete_user(&self, user_id: Uuid) -> Result<(), ServiceError> {
+        FakeUsers.delete_user(user_id).await
+    }
+    async fn reset_password(&self, user_id: Uuid) -> Result<(), ServiceError> {
+        FakeUsers.reset_password(user_id).await
+    }
+    async fn change_password(&self, user_id: Uuid, new_password: &str) -> Result<(), ServiceError> {
+        FakeUsers.change_password(user_id, new_password).await
+    }
+    async fn authenticate_user(
+        &self,
+        username: &str,
+        password: &str,
+        remote_endpoint: &str,
+        is_user_session: bool,
+    ) -> Result<Option<UserEntity>, ServiceError> {
+        FakeUsers
+            .authenticate_user(username, password, remote_endpoint, is_user_session)
+            .await
+    }
+    async fn get_authentication_providers(&self) -> Result<Vec<NameIdPair>, ServiceError> {
+        FakeUsers.get_authentication_providers().await
+    }
+    async fn get_password_reset_providers(&self) -> Result<Vec<NameIdPair>, ServiceError> {
+        FakeUsers.get_password_reset_providers().await
+    }
+    async fn update_configuration(
+        &self,
+        user_id: Uuid,
+        config: &UserConfiguration,
+    ) -> Result<(), ServiceError> {
+        FakeUsers.update_configuration(user_id, config).await
+    }
+    async fn update_policy(&self, user_id: Uuid, policy: &UserPolicy) -> Result<(), ServiceError> {
+        FakeUsers.update_policy(user_id, policy).await
+    }
+    async fn clear_profile_image(&self, user: &UserEntity) -> Result<(), ServiceError> {
+        FakeUsers.clear_profile_image(user).await
+    }
+    async fn save_profile_image(
+        &self,
+        user: &UserEntity,
+        content: &[u8],
+        mime_type: &str,
+        extension: &str,
+    ) -> Result<(), ServiceError> {
+        FakeUsers
+            .save_profile_image(user, content, mime_type, extension)
+            .await
+    }
+    async fn get_profile_image(
+        &self,
+        user_id: Uuid,
+    ) -> Result<Option<ferrofin_traits::options::ItemImageInfo>, ServiceError> {
+        FakeUsers.get_profile_image(user_id).await
     }
 }
 

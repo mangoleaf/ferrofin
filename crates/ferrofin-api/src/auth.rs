@@ -162,6 +162,110 @@ impl FromRequestParts<AppState> for RequireAdmin {
     }
 }
 
+/// Extractor for handlers behind Jellyfin's `LiveTvAccess` policy.
+///
+/// Port of `options.AddPolicy(Policies.LiveTvAccess, new
+/// UserPermissionRequirement(PermissionKind.EnableLiveTvAccess))`
+/// (v10.11.8 ApiServiceCollectionExtensions.cs:80), evaluated by
+/// `UserPermissionHandler`: an API key carries global permissions and succeeds
+/// outright; any other caller must hold the permission, and anything else is
+/// `403`.
+///
+/// v10.11.8's `LiveTvController` declares this on 22 read actions. Ferrofin
+/// served them under plain `RequireAuth`, so "Allow Live TV access" was a
+/// checkbox the dashboard rendered and the server ignored — an account with it
+/// cleared could still browse the whole guide. `EnableLiveTvAccess` defaults to
+/// `true` (UserEntityExtensions.cs:187), which is why a single-admin fixture
+/// never noticed, and why this gate changes nothing for a stock account.
+///
+/// Unlike [`RequireLiveTvManagement`], this one is a bare permission check: the
+/// disagreement measured there is between "administrator" and "permission
+/// denied", and it cannot arise here, because no shipped account has
+/// `EnableLiveTvAccess` cleared unless an administrator cleared it on purpose.
+#[derive(Debug, Clone)]
+pub struct RequireLiveTvAccess(pub AuthorizationInfo);
+
+impl FromRequestParts<AppState> for RequireLiveTvAccess {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let info = require_live_tv_permission(parts, state, |p| p.enable_live_tv_access).await?;
+        Ok(Self(info))
+    }
+}
+
+/// Extractor for handlers behind Jellyfin's `LiveTvManagement` policy —
+/// administrator **or** the `EnableLiveTvManagement` permission.
+///
+/// v10.11.8's `LiveTvController` declares
+/// `[Authorize(Policy = Policies.LiveTvManagement)]` on its seven
+/// timer/recording mutations, registered as
+/// `UserPermissionRequirement(PermissionKind.EnableLiveTvManagement)`. Reading
+/// only that, this would be a bare permission check.
+///
+/// It is not, because the permission check alone does not reproduce what a real
+/// Jellyfin 10.11.8 does. Measured against the lab oracle: for a caller who is
+/// an administrator and whose stored `EnableLiveTvManagement` permission is
+/// `0` (the shipped default — `UserEntityExtensions.cs:188`), Jellyfin served
+/// `DELETE /LiveTv/Timers/{id}` (404 from the handler) and
+/// `POST /LiveTv/SeriesTimers` rather than `403`; the same held for an
+/// unrelated `UserPermissionRequirement` policy, `CollectionManagement` with
+/// `EnableCollectionManagement = 0`, on `POST /Collections` (200). So an
+/// administrator is not refused by these policies in practice, whatever
+/// `UserPermissionHandler` reads like in isolation.
+///
+/// Admitting *either* is therefore the only gate that matches the oracle on
+/// both sides of the disagreement: it never refuses the administrator Jellyfin
+/// admitted, and it admits the non-administrator the dashboard explicitly
+/// granted recording rights — whom Ferrofin's previous `RequireAdmin` refused,
+/// and who is the entire point of the permission existing. It is also strictly
+/// tighter than what Ferrofin shipped on most of these routes, which was plain
+/// `RequireAuth`: any authenticated account could create and cancel timers.
+#[derive(Debug, Clone)]
+pub struct RequireLiveTvManagement(pub AuthorizationInfo);
+
+impl FromRequestParts<AppState> for RequireLiveTvManagement {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let info = require_live_tv_permission(parts, state, |p| {
+            p.is_administrator || p.enable_live_tv_management
+        })
+        .await?;
+        Ok(Self(info))
+    }
+}
+
+/// The shared body of the two Live TV permission extractors.
+///
+/// Port of `UserPermissionHandler.HandleRequirement`: "Api keys have global
+/// permissions, so just succeed the requirement"; otherwise the user must hold
+/// the permission the policy names.
+async fn require_live_tv_permission(
+    parts: &mut Parts,
+    state: &AppState,
+    granted: fn(&ferrofin_model::users::UserPolicy) -> bool,
+) -> Result<AuthorizationInfo, ApiError> {
+    let RequireAuth(info) = RequireAuth::from_request_parts(parts, state).await?;
+    if info.is_api_key {
+        return Ok(info);
+    }
+    if let Some(user) = &info.user
+        && crate::handlers::users::user_policy(state, user)
+            .await?
+            .is_some_and(|p| granted(&p))
+    {
+        return Ok(info);
+    }
+    Err(ApiError::Forbidden("live tv access required".to_owned()))
+}
+
 /// Extractor for handlers behind Jellyfin's `LocalAccessOrRequiresElevation`
 /// policy — in the vendored contract, `POST /System/Restart` alone.
 ///

@@ -43,7 +43,7 @@ use ferrofin_traits::options::{DtoOptions, InternalItemsQuery};
 
 use ferrofin_traits::stubs::LiveTvChannelQuery;
 
-use crate::auth::{RequireAdmin, RequireAuth};
+use crate::auth::{RequireAdmin, RequireLiveTvAccess, RequireLiveTvManagement};
 use crate::error::ApiError;
 use crate::handlers::items::resolve_user_opt;
 use crate::handlers::query_parse::{parse_csv_enums_lenient, parse_csv_uuids, parse_pipe_strings};
@@ -55,7 +55,7 @@ use crate::state::AppState;
 /// single M3U/XMLTV service once a tuner host exists), or disabled when none.
 async fn get_live_tv_info(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireLiveTvAccess(_auth): RequireLiveTvAccess,
 ) -> Result<Json<LiveTvInfo>, ApiError> {
     match state.live_tv.as_ref() {
         Some(m) => Ok(Json(m.get_live_tv_info().await?)),
@@ -63,24 +63,33 @@ async fn get_live_tv_info(
     }
 }
 
-/// Number of days of guide data the window spans, forward from now.
+/// Number of days of guide data the window spans when no Live TV manager is
+/// wired to read the configured value from.
 ///
-/// Mirrors Jellyfin's `LiveTvOptions.GuideDays` fallback (7). This is a
-/// candidate configuration value (valid range 1..=14); it is hardcoded here
-/// until Live TV options are surfaced in Ferrofin's config.
+/// Port of the `: 7` fallback in `GuideManager.GetGuideDays` (v10.11.8
+/// GuideManager.cs:161-168).
 const GUIDE_DAYS_DEFAULT: i64 = 7;
 
 /// `GET /LiveTv/GuideInfo` — the guide's date range.
 ///
-/// Port of `LiveTvController.GetGuideInfo`. Returns a now-relative window
-/// spanning [`GUIDE_DAYS_DEFAULT`] days forward from the current instant.
-async fn get_guide_info(RequireAuth(_auth): RequireAuth) -> Json<GuideInfo> {
+/// Port of `LiveTvController.GetGuideInfo` => `IGuideManager.GetGuideInfo`:
+/// `now .. now + GuideDays`, where `GuideDays` is the dashboard's Live TV
+/// setting clamped to `1..=14`. The day count comes from the manager, not from
+/// this handler, because the guide *ingest* window is computed from the same
+/// setting — a handler with its own constant would happily advertise a week of
+/// guide over a fortnight of stored airings, or the reverse.
+async fn get_guide_info(
+    State(state): State<AppState>,
+    RequireLiveTvAccess(_auth): RequireLiveTvAccess,
+) -> Result<Json<GuideInfo>, ApiError> {
+    if let Some(manager) = state.live_tv.as_ref() {
+        return Ok(Json(manager.get_guide_info().await?));
+    }
     let start = Utc::now();
-    let end = start + chrono::Duration::days(GUIDE_DAYS_DEFAULT);
-    Json(GuideInfo {
+    Ok(Json(GuideInfo {
         start_date: start,
-        end_date: end,
-    })
+        end_date: start + chrono::Duration::days(GUIDE_DAYS_DEFAULT),
+    }))
 }
 
 /// The query parameters honoured by `GET /LiveTv/Channels`.
@@ -146,7 +155,7 @@ struct ChannelsQuery {
 /// `addCurrentProgram=false`).
 async fn get_channels(
     State(state): State<AppState>,
-    RequireAuth(auth): RequireAuth,
+    RequireLiveTvAccess(auth): RequireLiveTvAccess,
     Query(query): Query<ChannelsQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     let Some(m) = state.live_tv.as_ref() else {
@@ -195,7 +204,7 @@ async fn get_channels(
 /// no known client requests a channel by the empty guid.
 async fn get_channel(
     State(state): State<AppState>,
-    RequireAuth(auth): RequireAuth,
+    RequireLiveTvAccess(auth): RequireLiveTvAccess,
     Path(channel_id): Path<Uuid>,
     Query(query): Query<UserIdQuery>,
 ) -> Result<Json<BaseItemDto>, ApiError> {
@@ -656,7 +665,7 @@ fn parse_date_time(raw: &str) -> Option<DateTime<Utc>> {
 /// caller (C# `RequestHelpers.GetUserId`).
 async fn get_programs(
     State(state): State<AppState>,
-    RequireAuth(auth): RequireAuth,
+    RequireLiveTvAccess(auth): RequireLiveTvAccess,
     Query(query): Query<ProgramsQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     let user = resolve_user_opt(&state, &auth, query.user_id).await?;
@@ -672,7 +681,7 @@ async fn get_programs(
 /// back to the authenticated caller here.
 async fn post_programs(
     State(state): State<AppState>,
-    RequireAuth(auth): RequireAuth,
+    RequireLiveTvAccess(auth): RequireLiveTvAccess,
     Json(body): Json<GetProgramsDto>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     let user = match body.user_id.filter(|id| !id.is_nil()) {
@@ -685,33 +694,21 @@ async fn post_programs(
 
 /// `GET /LiveTv/Programs/Recommended` — "On Now" / recommended programs.
 ///
-/// Port of `LiveTvController.GetRecommendedPrograms`. Upstream's
-/// `LiveTvManager.GetRecommendedProgramsAsync` is **not** merely a filtered
-/// program list:
-///
-/// - when `isAiring` is anything but `true` it *is* `GetPrograms` — the same
-///   query, so this handler takes the same path;
-/// - when `isAiring` is `true` it additionally re-orders the airing programmes
-///   by a per-user recommendation score (channel liked / favourited / play
-///   count, plus live and non-repeat bonuses), over-fetching
-///   `max(limit * 4, 200)` rows to rank within.
-///
-/// That score needs per-user *channel* user-data, which Ferrofin's
-/// [`LiveTvManager`] seam does not expose (no user-data method, and its M3U
-/// channels carry none), so the ranking step is an accepted divergence: airing
-/// programmes come back in start-date order — Jellyfin's own primary sort key —
-/// and the over-fetch is deliberately not done, since pulling four times the
-/// requested rows only to return them unranked would break `limit`. The filters
-/// themselves (`isAiring`, `hasAired`, the kind flags, `genreIds`, paging) are
-/// honoured.
+/// Port of `LiveTvController.GetRecommendedPrograms`. The filters are assembled
+/// exactly as for `GET /LiveTv/Programs`; the difference is entirely in the
+/// manager, whose `get_recommended_programs` ranks the airing branch by
+/// Jellyfin's per-user recommendation score (see
+/// [`LiveTvManager::get_recommended_programs`](ferrofin_traits::live_tv::LiveTvManager::get_recommended_programs)).
 async fn get_recommended_programs(
     State(state): State<AppState>,
-    RequireAuth(auth): RequireAuth,
+    RequireLiveTvAccess(auth): RequireLiveTvAccess,
     Query(query): Query<RecommendedProgramsQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     let user = resolve_user_opt(&state, &auth, query.user_id).await?;
     let (filters, options) = query.into_parts()?;
-    Ok(Json(query_programs(&state, user, filters, &options).await?))
+    Ok(Json(
+        query_programs_inner(&state, user, filters, &options, true).await?,
+    ))
 }
 
 /// `GET /LiveTv/Programs/{programId}` — a single programme.
@@ -721,7 +718,7 @@ async fn get_recommended_programs(
 /// unknown.
 async fn get_program(
     State(state): State<AppState>,
-    RequireAuth(auth): RequireAuth,
+    RequireLiveTvAccess(auth): RequireLiveTvAccess,
     Path(program_id): Path<Uuid>,
     Query(query): Query<UserIdQuery>,
 ) -> Result<Json<BaseItemDto>, ApiError> {
@@ -746,6 +743,22 @@ async fn query_programs(
     user: Option<UserEntity>,
     filters: ProgramFilters,
     options: &DtoOptions,
+) -> Result<QueryResult<BaseItemDto>, ApiError> {
+    query_programs_inner(state, user, filters, options, false).await
+}
+
+/// The shared body of `GET/POST /LiveTv/Programs` and
+/// `GET /LiveTv/Programs/Recommended`.
+///
+/// `recommended` picks which manager entry point the assembled query goes to:
+/// upstream's two controller actions build the identical `InternalItemsQuery`
+/// and differ only in calling `GetProgramsAsync` vs `GetRecommendedProgramsAsync`.
+async fn query_programs_inner(
+    state: &AppState,
+    user: Option<UserEntity>,
+    filters: ProgramFilters,
+    options: &DtoOptions,
+    recommended: bool,
 ) -> Result<QueryResult<BaseItemDto>, ApiError> {
     let Some(manager) = state.live_tv.as_ref() else {
         return Ok(QueryResult::default());
@@ -789,7 +802,11 @@ async fn query_programs(
             query.name = series.name;
         }
     }
-    Ok(manager.get_programs(&query, options).await?)
+    Ok(if recommended {
+        manager.get_recommended_programs(&query, options).await?
+    } else {
+        manager.get_programs(&query, options).await?
+    })
 }
 
 /// `POST /LiveTv/TunerHosts` — add (or update) an M3U tuner host.
@@ -931,7 +948,7 @@ struct RecordingsQuery {
 /// how far through it is.
 async fn get_recordings(
     State(state): State<AppState>,
-    RequireAuth(auth): RequireAuth,
+    RequireLiveTvAccess(auth): RequireLiveTvAccess,
     Query(query): Query<RecordingsQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     let Some(manager) = state.live_tv.as_ref() else {
@@ -974,7 +991,7 @@ async fn get_recordings(
 /// `GET /LiveTv/Recordings/{recordingId}` — a single recording (`404` if absent).
 async fn get_recording(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireLiveTvAccess(_auth): RequireLiveTvAccess,
     Path(recording_id): Path<Uuid>,
 ) -> Result<Json<BaseItemDto>, ApiError> {
     live_tv(&state)?
@@ -987,7 +1004,7 @@ async fn get_recording(
 /// `DELETE /LiveTv/Recordings/{recordingId}` — delete a recording + its file.
 async fn delete_recording(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireLiveTvManagement(_auth): RequireLiveTvManagement,
     Path(recording_id): Path<Uuid>,
 ) -> Result<axum::http::StatusCode, ApiError> {
     live_tv(&state)?.delete_recording(recording_id).await?;
@@ -995,12 +1012,16 @@ async fn delete_recording(
 }
 
 /// `GET /LiveTv/Recordings/Folders` — recording folders (not modelled → empty).
-async fn get_recording_folders(RequireAuth(_auth): RequireAuth) -> Json<QueryResult<BaseItemDto>> {
+async fn get_recording_folders(
+    RequireLiveTvAccess(_auth): RequireLiveTvAccess,
+) -> Json<QueryResult<BaseItemDto>> {
     Json(QueryResult::default())
 }
 
 /// `GET /LiveTv/Recordings/Groups` — recording groups (deprecated; empty).
-async fn get_recording_groups(RequireAuth(_auth): RequireAuth) -> Json<QueryResult<BaseItemDto>> {
+async fn get_recording_groups(
+    RequireLiveTvAccess(_auth): RequireLiveTvAccess,
+) -> Json<QueryResult<BaseItemDto>> {
     Json(QueryResult::default())
 }
 
@@ -1010,7 +1031,7 @@ async fn get_recording_groups(RequireAuth(_auth): RequireAuth) -> Json<QueryResu
 /// concept (the list endpoint returns empty), so no group is ever resolvable and
 /// this always reports `404` — the faithful outcome.
 async fn get_recording_group(
-    RequireAuth(_auth): RequireAuth,
+    RequireLiveTvAccess(_auth): RequireLiveTvAccess,
     Path(_group_id): Path<Uuid>,
 ) -> Result<Json<BaseItemDto>, ApiError> {
     Err(ApiError::NotFound("recording group".into()))
@@ -1301,7 +1322,9 @@ async fn set_channel_mapping(
 }
 
 /// `GET /LiveTv/Recordings/Series` — series recordings (deprecated; empty).
-async fn get_recordings_series(RequireAuth(_auth): RequireAuth) -> Json<QueryResult<BaseItemDto>> {
+async fn get_recordings_series(
+    RequireLiveTvAccess(_auth): RequireLiveTvAccess,
+) -> Json<QueryResult<BaseItemDto>> {
     Json(QueryResult::default())
 }
 
@@ -1327,7 +1350,7 @@ struct TimersQuery {
 /// scheduled filters, ordered by start date.
 async fn get_timers(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireLiveTvAccess(_auth): RequireLiveTvAccess,
     Query(query): Query<TimersQuery>,
 ) -> Result<Json<QueryResult<TimerInfoDto>>, ApiError> {
     let Some(manager) = state.live_tv.as_ref() else {
@@ -1348,7 +1371,7 @@ async fn get_timers(
 /// `GET /LiveTv/Timers/{timerId}` — a single timer (`404` if absent).
 async fn get_timer(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireLiveTvAccess(_auth): RequireLiveTvAccess,
     Path(timer_id): Path<String>,
 ) -> Result<Json<TimerInfoDto>, ApiError> {
     live_tv(&state)?
@@ -1361,7 +1384,7 @@ async fn get_timer(
 /// `POST /LiveTv/Timers` — create a recording timer.
 async fn create_timer(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireLiveTvManagement(_auth): RequireLiveTvManagement,
     Json(timer): Json<TimerInfoDto>,
 ) -> Result<axum::http::StatusCode, ApiError> {
     let program_id = timer.base.program_id.clone();
@@ -1400,7 +1423,7 @@ async fn notify_timer_event(
 /// `POST /LiveTv/Timers/{timerId}` — update a recording timer.
 async fn update_timer(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireLiveTvManagement(_auth): RequireLiveTvManagement,
     Path(timer_id): Path<String>,
     Json(timer): Json<TimerInfoDto>,
 ) -> Result<axum::http::StatusCode, ApiError> {
@@ -1411,7 +1434,7 @@ async fn update_timer(
 /// `DELETE /LiveTv/Timers/{timerId}` — cancel a recording timer.
 async fn cancel_timer(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireLiveTvManagement(_auth): RequireLiveTvManagement,
     Path(timer_id): Path<String>,
 ) -> Result<axum::http::StatusCode, ApiError> {
     live_tv(&state)?.cancel_timer(&timer_id).await?;
@@ -1445,7 +1468,7 @@ struct TimerDefaultsQuery {
 /// client posts straight back to create the timer.
 async fn get_default_timer(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireLiveTvAccess(_auth): RequireLiveTvAccess,
     Query(query): Query<TimerDefaultsQuery>,
 ) -> Result<Json<SeriesTimerInfoDto>, ApiError> {
     match state.live_tv.as_ref() {
@@ -1469,7 +1492,7 @@ async fn get_default_timer(
 /// `GET /LiveTv/SeriesTimers` — recurring (series) timers.
 async fn get_series_timers(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireLiveTvAccess(_auth): RequireLiveTvAccess,
 ) -> Result<Json<QueryResult<SeriesTimerInfoDto>>, ApiError> {
     match state.live_tv.as_ref() {
         Some(m) => Ok(Json(QueryResult::from_items(m.get_series_timers().await?))),
@@ -1480,7 +1503,7 @@ async fn get_series_timers(
 /// `GET /LiveTv/SeriesTimers/{timerId}` — a single series timer (`404` if absent).
 async fn get_series_timer(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireLiveTvAccess(_auth): RequireLiveTvAccess,
     Path(timer_id): Path<String>,
 ) -> Result<Json<SeriesTimerInfoDto>, ApiError> {
     live_tv(&state)?
@@ -1493,7 +1516,7 @@ async fn get_series_timer(
 /// `POST /LiveTv/SeriesTimers` — create a series timer.
 async fn create_series_timer(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireLiveTvManagement(_auth): RequireLiveTvManagement,
     Json(timer): Json<SeriesTimerInfoDto>,
 ) -> Result<axum::http::StatusCode, ApiError> {
     let program_id = timer.base.program_id.clone();
@@ -1511,7 +1534,7 @@ async fn create_series_timer(
 /// `POST /LiveTv/SeriesTimers/{timerId}` — update a series timer.
 async fn update_series_timer(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireLiveTvManagement(_auth): RequireLiveTvManagement,
     Path(timer_id): Path<String>,
     Json(timer): Json<SeriesTimerInfoDto>,
 ) -> Result<axum::http::StatusCode, ApiError> {
@@ -1524,7 +1547,7 @@ async fn update_series_timer(
 /// `DELETE /LiveTv/SeriesTimers/{timerId}` — cancel a series timer.
 async fn cancel_series_timer(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireLiveTvManagement(_auth): RequireLiveTvManagement,
     Path(timer_id): Path<String>,
 ) -> Result<axum::http::StatusCode, ApiError> {
     live_tv(&state)?.cancel_series_timer(&timer_id).await?;
@@ -1547,20 +1570,22 @@ async fn get_channel_mapping_options(
 
 /// `GET /LiveTv/ListingProviders/Default` — default listing-provider config.
 async fn get_default_listing_provider(
-    RequireAuth(_auth): RequireAuth,
+    RequireLiveTvAccess(_auth): RequireLiveTvAccess,
 ) -> Json<ListingsProviderInfo> {
     Json(ListingsProviderInfo::default())
 }
 
 /// `GET /LiveTv/ListingProviders/Lineups` — available lineups (none → empty).
-async fn get_lineups(RequireAuth(_auth): RequireAuth) -> Json<Vec<NameIdPair>> {
+async fn get_lineups(RequireLiveTvAccess(_auth): RequireLiveTvAccess) -> Json<Vec<NameIdPair>> {
     Json(Vec::new())
 }
 
 /// `GET /LiveTv/TunerHosts/Types` — supported tuner-host types.
 ///
 /// Port of `LiveTvController.GetTunerHostTypes`. Ferrofin ships the M3U backend.
-async fn get_tuner_host_types(RequireAuth(_auth): RequireAuth) -> Json<Vec<NameIdPair>> {
+async fn get_tuner_host_types(
+    RequireLiveTvAccess(_auth): RequireLiveTvAccess,
+) -> Json<Vec<NameIdPair>> {
     Json(vec![NameIdPair {
         name: Some("M3U Tuner".to_owned()),
         id: Some("m3u".to_owned()),
@@ -1659,8 +1684,8 @@ mod tests {
     use crate::test_support::fake_state;
 
     /// A `RequireAuth` for an authenticated (default) caller.
-    fn auth() -> RequireAuth {
-        RequireAuth(AuthorizationInfo::default())
+    fn auth() -> RequireLiveTvAccess {
+        RequireLiveTvAccess(AuthorizationInfo::default())
     }
 
     /// The elevated caller for the tuner/listing-provider routes, which are
@@ -1759,7 +1784,7 @@ mod tests {
 
     #[tokio::test]
     async fn defaults_and_lists() {
-        let _ = get_guide_info(auth()).await;
+        let _ = get_guide_info(State(fake_state()), auth()).await;
         let _ = get_default_timer(
             State(fake_state()),
             auth(),
@@ -1810,7 +1835,7 @@ mod tests {
     #[tokio::test]
     async fn guide_info_is_now_relative_seven_day_window() {
         let before = chrono::Utc::now();
-        let info = get_guide_info(auth()).await.0;
+        let info = get_guide_info(State(fake_state()), auth()).await.unwrap().0;
         let after = chrono::Utc::now();
         // Start is "now" (bracketed by the call), not the epoch/default.
         assert!(info.start_date >= before && info.start_date <= after);
@@ -2036,6 +2061,8 @@ mod tests {
         /// The one open live stream, keyed by its unique id.
         live_stream: Option<(String, ferrofin_traits::stubs::LiveStreamFile)>,
         programs_query: std::sync::Mutex<Option<InternalItemsQuery>>,
+        /// How many times the *recommended* entry point was reached.
+        recommended_calls: std::sync::atomic::AtomicUsize,
         programs_options: std::sync::Mutex<Option<DtoOptions>>,
         channels_query: std::sync::Mutex<Option<LiveTvChannelQuery>>,
         channels_options: std::sync::Mutex<Option<DtoOptions>>,
@@ -2046,6 +2073,29 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ferrofin_traits::stubs::LiveTvManager for FakeLiveTv {
+        async fn get_guide_info(
+            &self,
+        ) -> Result<ferrofin_model::live_tv::GuideInfo, ferrofin_traits::error::ServiceError>
+        {
+            unimplemented!("this fake is never asked for the guide window")
+        }
+        /// Records into the same slot `get_programs` does, and counts the
+        /// call, so a test can assert both *what* the handler asked for and
+        /// *which* manager entry point it reached.
+        async fn get_recommended_programs(
+            &self,
+            query: &ferrofin_traits::options::InternalItemsQuery,
+            options: &ferrofin_traits::options::DtoOptions,
+        ) -> Result<
+            ferrofin_model::querying::QueryResult<ferrofin_model::dto::BaseItemDto>,
+            ferrofin_traits::error::ServiceError,
+        > {
+            self.recommended_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            *self.programs_query.lock().unwrap() = Some(query.clone());
+            *self.programs_options.lock().unwrap() = Some(options.clone());
+            Ok(QueryResult::from_items(vec![BaseItemDto::default()]))
+        }
         async fn get_listing_providers(
             &self,
         ) -> Result<Vec<ListingsProviderInfo>, ferrofin_traits::error::ServiceError> {
@@ -2313,6 +2363,12 @@ mod tests {
         let _ = get_recommended_programs(State(state), auth(), query)
             .await
             .expect("ok");
+        assert_eq!(
+            fake.recommended_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "Recommended must reach the manager's ranked entry point, not GetPrograms"
+        );
         let recorded = fake.programs_query.lock().unwrap().clone();
         recorded.expect("the manager was called")
     }

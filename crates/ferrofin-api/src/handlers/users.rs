@@ -290,12 +290,20 @@ pub(crate) async fn is_administrator(
     state: &AppState,
     user: &UserEntity,
 ) -> Result<bool, ApiError> {
-    Ok(state
-        .users
-        .get_user_dto(user, None)
+    Ok(user_policy(state, user)
         .await?
-        .policy
         .is_some_and(|p| p.is_administrator))
+}
+
+/// The given user's effective policy, as the `Permissions` table projects it.
+///
+/// The one read path every permission-gated extractor goes through, so a policy
+/// check can never disagree with what `GET /Users/{id}` reports.
+pub(crate) async fn user_policy(
+    state: &AppState,
+    user: &UserEntity,
+) -> Result<Option<ferrofin_model::users::UserPolicy>, ApiError> {
+    Ok(state.users.get_user_dto(user, None).await?.policy)
 }
 
 /// Ports C# `RequestHelpers.AssertCanUpdateUser`: the caller may update `target`

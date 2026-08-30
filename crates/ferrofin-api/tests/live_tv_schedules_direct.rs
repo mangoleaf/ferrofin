@@ -63,6 +63,17 @@ impl CountriesLiveTv {
 
 #[async_trait]
 impl LiveTvManager for CountriesLiveTv {
+    async fn get_guide_info(&self) -> Result<ferrofin_model::live_tv::GuideInfo, ServiceError> {
+        unimplemented!("this fake is never asked for the guide window")
+    }
+    async fn get_recommended_programs(
+        &self,
+        _query: &ferrofin_traits::options::InternalItemsQuery,
+        _options: &ferrofin_traits::options::DtoOptions,
+    ) -> Result<ferrofin_model::querying::QueryResult<ferrofin_model::dto::BaseItemDto>, ServiceError>
+    {
+        unimplemented!("this fake is never asked for recommended programs")
+    }
     async fn get_schedules_direct_countries(&self) -> Result<Vec<u8>, ServiceError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.document
