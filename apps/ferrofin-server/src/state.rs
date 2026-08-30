@@ -505,26 +505,6 @@ pub async fn build_app_state(
         }
     };
 
-    let providers: Arc<dyn ferrofin_traits::providers::ProviderManager> = Arc::new(
-        LocalProviderManager::new(Vec::new())
-            .with_image_store(
-                Arc::clone(&item_persistence_service),
-                metadata_library.clone(),
-            )
-            .with_remote_images(Arc::clone(&tmdb_client), Arc::clone(&item_repository))
-            .with_remote_search_providers(search_providers)
-            .with_dynamic_fetchers(wasm_host.provider_names())
-            .with_studios(Arc::clone(&studios_client))
-            // The other "Choose Image" providers: fanart.tv (movies/series/
-            // artists/albums), TheAudioDb (artists/albums) and OMDb's poster
-            // (movies/trailers/episodes; inert without an API key).
-            .with_fanart(Arc::clone(&fanart_client))
-            .with_audiodb(Arc::clone(&audiodb_client))
-            .with_omdb(Arc::clone(&omdb_client))
-            // Enables the kind-filtered built-in external-id descriptors the
-            // Identify dialog renders as id input fields.
-            .with_item_types(item_type_lookup.as_ref()),
-    );
     let file_system: Arc<dyn ferrofin_traits::filesystem::FileSystem> =
         Arc::new(FerrofinFileSystem::new());
     // Kept concrete alongside the trait handle: consumers subscribe on the
@@ -686,16 +666,67 @@ pub async fn build_app_state(
     );
     let virtual_folders: Arc<dyn ferrofin_traits::library::VirtualFolderManager> =
         virtual_folders_impl.clone();
+    // The `UserRootFolder` provisioner (`GetUserRootFolder()` /
+    // `CreateRootFolder()`): the row `Items/Root` resolves to, the parent of
+    // every library's `CollectionFolder`, and the parent of the playlists
+    // plugin folder — which is what makes the root's `ChildCount` match
+    // upstream's. Built once and shared: the store memoizes its pass, so the
+    // two holders settle it together instead of each paying for it.
+    let user_root_store = ferrofin_core::UserRootFolderStore::new(
+        Arc::clone(&item_persistence_service),
+        id_derivation.clone(),
+        paths.default_user_views_path(),
+    )
+    .with_playlists(db.clone(), playlists_path);
     // The virtual-folder manager gives `/Items/Latest` each library's collection
     // type (C# `CollectionFolder.CollectionType`), which is why the user-view
     // manager is built after it.
     let user_views: Arc<dyn ferrofin_traits::library::UserViewManager> = Arc::new(
         FerrofinUserViewManager::new(Arc::clone(&item_repository))
-            .with_playlists_store(Arc::clone(&item_persistence_service), playlists_path)
+            .with_item_store(Arc::clone(&item_persistence_service))
+            .with_user_root(user_root_store.clone())
             .with_metadata_path(paths.internal_metadata_path())
             .with_id_derivation(id_derivation.clone())
             .with_virtual_folders(Arc::clone(&virtual_folders))
             .with_database(db.clone()),
+    );
+
+    // Built here rather than earlier so it can take the library configuration:
+    // the remote-image ("Choose Image") language filter resolves
+    // `LibraryOptions.PreferredMetadataLanguage` through it. Nothing consumes
+    // `providers` before this point.
+    let providers: Arc<dyn ferrofin_traits::providers::ProviderManager> = Arc::new(
+        LocalProviderManager::new(Vec::new())
+            .with_image_store(
+                Arc::clone(&item_persistence_service),
+                metadata_library.clone(),
+            )
+            .with_remote_images(Arc::clone(&tmdb_client), Arc::clone(&item_repository))
+            .with_remote_search_providers(search_providers)
+            .with_dynamic_fetchers(wasm_host.provider_names())
+            .with_studios(Arc::clone(&studios_client))
+            // The other "Choose Image" providers: fanart.tv (movies/series/
+            // artists/albums), TheAudioDb (artists/albums) and OMDb's poster
+            // (movies/trailers/episodes; inert without an API key).
+            .with_fanart(Arc::clone(&fanart_client))
+            .with_audiodb(Arc::clone(&audiodb_client))
+            .with_omdb(Arc::clone(&omdb_client))
+            // Enables the kind-filtered built-in external-id descriptors the
+            // Identify dialog renders as id input fields.
+            .with_item_types(item_type_lookup.as_ref())
+            // `BaseItem.GetPreferredMetadataLanguage()`'s two off-row tiers,
+            // which the remote-image language filter runs on. Read live rather
+            // than snapshotted so changing the setting takes effect without a
+            // restart.
+            .with_metadata_language(Arc::clone(&virtual_folders), {
+                let config_mgr = Arc::clone(&config_mgr);
+                Arc::new(move || {
+                    config_mgr
+                        .snapshot_shared()
+                        .preferred_metadata_language
+                        .clone()
+                })
+            }),
     );
     // Similar items: the local weighted-overlap scorer always runs; the remote
     // providers below run only for a library that ticked them in its
@@ -733,15 +764,6 @@ pub async fn build_app_state(
         Arc::clone(&item_persistence_service),
         id_derivation.clone(),
         paths.year_path(),
-    );
-    // The `UserRootFolder` provisioner (`GetUserRootFolder()`): the row
-    // `Items/Root` resolves to and the parent of every library's
-    // `CollectionFolder` (the virtual-folder manager builds its own over the
-    // same root + store, so both land on the one derived id).
-    let user_root_store = ferrofin_core::UserRootFolderStore::new(
-        Arc::clone(&item_persistence_service),
-        id_derivation.clone(),
-        paths.default_user_views_path(),
     );
     let mut scanner = ferrofin_core::LibraryScanner::new(
         Arc::clone(&virtual_folders),

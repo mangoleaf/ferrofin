@@ -539,7 +539,7 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
         if let Some(path) = &self.playlists_path {
             rows.push((
                 ferrofin_util::sort_name::create_sort_name(
-                    crate::user_view_manager::PLAYLISTS_FOLDER_NAME,
+                    crate::user_root_folder::PLAYLISTS_FOLDER_NAME,
                 ),
                 vec![path.to_string_lossy().into_owned()],
             ));

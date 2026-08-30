@@ -426,12 +426,20 @@ fn is_live_tv_program(kind: BaseItemKind) -> bool {
 }
 
 /// The kind a client sees as the DTO's `Type` — C# `GetClientTypeName`, which
-/// `LiveTvChannel`/`LiveTvProgram` override to `"TvChannel"`/`"Program"`. Every
-/// other kind passes through.
+/// `LiveTvChannel`/`LiveTvProgram` override to `"TvChannel"`/`"Program"` and
+/// `PlaylistsFolder` overrides to `"ManualPlaylistsFolder"`. Every other kind
+/// passes through.
+///
+/// The playlists arm is why 10.11.8 ships no `ManualPlaylistsFolder` *class*
+/// while every client sees that `Type`: the row is stored as
+/// `Emby.Server.Implementations.Playlists.PlaylistsFolder` and only renamed on
+/// the way out (`PlaylistsFolder.GetClientTypeName()`, v10.11.8
+/// `Emby.Server.Implementations/Playlists/PlaylistsFolder.cs:50`).
 fn client_kind(kind: BaseItemKind) -> BaseItemKind {
     match kind {
         BaseItemKind::LiveTvChannel => BaseItemKind::TvChannel,
         BaseItemKind::LiveTvProgram => BaseItemKind::Program,
+        BaseItemKind::PlaylistsFolder => BaseItemKind::ManualPlaylistsFolder,
         other => other,
     }
 }
@@ -4398,6 +4406,74 @@ mod tests {
             .unwrap();
         let count = dto.child_count.expect("placeholder set");
         assert!((1..=9).contains(&count));
+    }
+
+    /// `UserRootFolder` is neither `ICollectionFolder` nor `UserView`, so C#
+    /// falls through to `folder.GetChildCount(user)` — a REAL count
+    /// (DtoService.cs:648-665). Its children are the libraries plus the
+    /// playlists plugin folder `CreateRootFolder()` parents to it, and getting
+    /// this wrong is what made `GET /Items/Root` report 3 where 10.11.8
+    /// reports 4.
+    #[tokio::test]
+    async fn child_count_is_real_for_the_user_root_folder() {
+        let db = test_db().await;
+        // A fixed id whose id-derived placeholder is NOT the count service's
+        // canned value, so the assertion below can only pass on the real branch.
+        let root = Uuid::from_u128(0x1234_5678_9abc_def0_1122_3344_5566_7700);
+        let placeholder = i32::from(root.as_bytes()[15] % 9) + 1;
+        assert_ne!(placeholder, 4, "the fixture must separate the two branches");
+        seed_folder_item(
+            &db,
+            root,
+            BaseItemKind::UserRootFolder,
+            "Media Folders",
+            None,
+        )
+        .await;
+        // The children upstream's root has: the libraries plus the playlists
+        // plugin folder. (`FakeCounts` reports a fixed 4 per parent, so what is
+        // under test is which branch `attach_child_count` takes, not the sum.)
+        for (kind, name) in [
+            (BaseItemKind::CollectionFolder, "Movies"),
+            (BaseItemKind::CollectionFolder, "Shows"),
+            (BaseItemKind::PlaylistsFolder, "Playlists"),
+        ] {
+            seed_folder_item(&db, Uuid::new_v4(), kind, name, Some(root)).await;
+        }
+        let user = seed_user(&db, Uuid::new_v4()).await;
+        let item = fetch_item(&db, root).await;
+        let svc = service(db);
+        let options = DtoOptions {
+            fields: vec![ItemFields::ChildCount],
+            ..DtoOptions::default()
+        };
+
+        let dto = svc
+            .get_base_item_dto(&item, &options, Some(&user), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            dto.child_count,
+            Some(4),
+            "the root takes the real-count branch, not the id-derived placeholder"
+        );
+    }
+
+    /// `PlaylistsFolder.GetClientTypeName()` returns `"ManualPlaylistsFolder"`
+    /// (v10.11.8 `Emby.Server.Implementations/Playlists/PlaylistsFolder.cs:50`),
+    /// which is why 10.11.8 ships no class of that name yet every client sees
+    /// that `Type`.
+    #[test]
+    fn playlists_folder_renders_as_manual_playlists_folder() {
+        assert_eq!(
+            client_kind(BaseItemKind::PlaylistsFolder),
+            BaseItemKind::ManualPlaylistsFolder
+        );
+        assert_eq!(
+            client_kind(BaseItemKind::LiveTvChannel),
+            BaseItemKind::TvChannel
+        );
+        assert_eq!(client_kind(BaseItemKind::Movie), BaseItemKind::Movie);
     }
 
     #[tokio::test]

@@ -109,6 +109,11 @@ struct ImagesResponse {
     backdrops: Vec<ImageEntry>,
     #[serde(default)]
     logos: Vec<ImageEntry>,
+    /// Episode stills (`/tv/{id}/season/{n}/episode/{m}/images`). C#
+    /// `ConvertStillsToRemoteImageInfo` maps them to `Primary`, which is what
+    /// an episode's poster slot actually holds.
+    #[serde(default)]
+    stills: Vec<ImageEntry>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1012,6 +1017,77 @@ impl TmdbClient {
         map(parsed.posters, ImageType::Primary)
             .chain(map(parsed.backdrops, ImageType::Backdrop))
             .chain(map(parsed.logos, ImageType::Logo))
+            .collect()
+    }
+
+    /// Every poster TMDB has for one season — `GET
+    /// /tv/{series}/season/{n}/images`, the list behind
+    /// `TmdbSeasonImageProvider.GetImages`.
+    ///
+    /// Keyed off the **series** id plus the season number: TMDB has no
+    /// standalone season id, which is also why Ferrofin advertises no
+    /// per-season `Tmdb` external-id field. Empty on any transport or decode
+    /// failure — a "Choose Image" dialog with no candidates, never an error.
+    pub async fn season_images(&self, series_tmdb_id: i64, season_number: i32) -> Vec<TmdbImage> {
+        self.tv_images(format!(
+            "{}/tv/{series_tmdb_id}/season/{season_number}/images",
+            self.base_url
+        ))
+        .await
+    }
+
+    /// Every still TMDB has for one episode — `GET
+    /// /tv/{series}/season/{n}/episode/{m}/images`, the list behind
+    /// `TmdbEpisodeImageProvider.GetImages`.
+    pub async fn episode_images(
+        &self,
+        series_tmdb_id: i64,
+        season_number: i32,
+        episode_number: i32,
+    ) -> Vec<TmdbImage> {
+        self.tv_images(format!(
+            "{}/tv/{series_tmdb_id}/season/{season_number}/episode/{episode_number}/images",
+            self.base_url
+        ))
+        .await
+    }
+
+    /// The shared body of [`season_images`](Self::season_images) and
+    /// [`episode_images`](Self::episode_images): fetch one TMDB `images`
+    /// document and take its posters and stills, both as `Primary`
+    /// (C# `ConvertPostersToRemoteImageInfo` / `ConvertStillsToRemoteImageInfo`).
+    async fn tv_images(&self, url: String) -> Vec<TmdbImage> {
+        let Ok(resp) = self
+            .http
+            .get(url)
+            .query(&[("api_key", self.api_key.expose_secret())])
+            .send()
+            .await
+        else {
+            return Vec::new();
+        };
+        if !resp.status().is_success() {
+            return Vec::new();
+        }
+        let Ok(parsed) = resp.json::<ImagesResponse>().await else {
+            return Vec::new();
+        };
+        parsed
+            .posters
+            .into_iter()
+            .chain(parsed.stills)
+            .filter_map(|e| {
+                let path = e.file_path.filter(|p| !p.is_empty())?;
+                Some(TmdbImage {
+                    image_type: ImageType::Primary,
+                    url: format!("{IMAGE_BASE}{path}"),
+                    width: e.width,
+                    height: e.height,
+                    community_rating: e.vote_average,
+                    vote_count: e.vote_count,
+                    language: e.iso_639_1.filter(|l| !l.is_empty()),
+                })
+            })
             .collect()
     }
 

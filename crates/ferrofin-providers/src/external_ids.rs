@@ -13,12 +13,31 @@
 //! is a match rather than a trait — see the `ferrofin-traits` port note on
 //! strategy interfaces becoming match-on-kind logic.
 //!
-//! Ported providers (Jellyfin 12.0):
-//! `Movies/Imdb{,Person}External{Id,UrlProvider}`, `TV/Zap2It*`,
-//! `Plugins/Tmdb/Tmdb*External{Id,UrlProvider}`, `Plugins/MusicBrainz/*`,
-//! `Plugins/AudioDb/*`, `Books/{ComicVine,GoogleBooks,Isbn}/*`,
-//! `Music/ImvdbId`, plus `jellyfin-plugin-tvdb`'s `Providers/ExternalId/*`
-//! (TVDB ships built into Ferrofin, so its id fields ship too).
+//! **The oracle is Jellyfin 10.11.8** — the version the vendored contract is
+//! pinned to — not whatever the upstream checkout happens to be at. That
+//! distinction is load-bearing here: `TmdbSeasonExternalId` and
+//! `TmdbEpisodeExternalId` do not exist in 10.11.8 (they post-date it), and a
+//! port aimed at `master` grows id fields upstream does not serve.
+//!
+//! Ported providers, the complete 10.11.8 `IExternalId` set (19 classes,
+//! `git grep -l ": IExternalId" v10.11.8`):
+//! `Movies/Imdb{,Person}ExternalId`, `TV/Zap2ItExternalId`,
+//! `Plugins/Tmdb/{BoxSets,Movies,People,TV}/Tmdb*ExternalId`,
+//! `Plugins/MusicBrainz/*` (7), `Plugins/AudioDb/*` (4), `Music/ImvdbId`.
+//!
+//! Two deliberate Ferrofin additions, both backed by code that reads the id:
+//! `jellyfin-plugin-tvdb`'s `TvdbSeriesExternalId` (TVDB ships compiled into
+//! Ferrofin) and `Books/{ComicVine,GoogleBooks,Isbn}` (Ferrofin has a books
+//! provider, and [`external_urls`] renders all three as "Links"). Both are
+//! recorded as accepted divergences in `suite/parity/classifications.json`.
+//!
+//! ORDER IS PART OF THE CONTRACT. `ProviderManager.AddParts` stores
+//! `externalIds.OrderBy(i => i.ProviderName)`, and LINQ `OrderBy` is a STABLE
+//! sort, so entries sharing a provider name come back in the order the
+//! assembly exported them (`GetExports<IExternalId>()` — reflection order, not
+//! anything derivable from the source). This table therefore encodes that
+//! sequence, with the live 10.11.8 response as the oracle, and
+//! [`external_id_infos`] re-sorts with an equally stable `sort_by`.
 
 use std::collections::HashMap;
 
@@ -351,18 +370,6 @@ const EXTERNAL_IDS: &[ExternalIdDescriptor] = {
         ExternalIdDescriptor {
             name: "TheMovieDb",
             key: "Tmdb",
-            media_type: Some(ExternalIdMediaType::Season),
-            kinds: &[K::Season],
-        },
-        ExternalIdDescriptor {
-            name: "TheMovieDb",
-            key: "Tmdb",
-            media_type: Some(ExternalIdMediaType::Episode),
-            kinds: &[K::Episode],
-        },
-        ExternalIdDescriptor {
-            name: "TheMovieDb",
-            key: "Tmdb",
             media_type: Some(ExternalIdMediaType::Person),
             kinds: &[K::Person],
         },
@@ -373,49 +380,42 @@ const EXTERNAL_IDS: &[ExternalIdDescriptor] = {
             media_type: Some(ExternalIdMediaType::BoxSet),
             kinds: &[K::Movie, K::MusicVideo, K::Trailer],
         },
-        // jellyfin-plugin-tvdb Providers/ExternalId/*
+        // jellyfin-plugin-tvdb Providers/ExternalId/TvdbSeriesExternalId — the
+        // ONE id field Ferrofin adds beyond 10.11.8's lineup, and the only TVDB
+        // id anything here can actually consume: `resolve_tmdb_id` resolves a
+        // series through TMDB's `/find?external_source=tvdb_id`
+        // (provider_manager.rs, gated on `TmdbKind::Series`) and fanart.tv looks
+        // its series artwork up by TVDB id. A `Season`/`Episode`/`Movie`/`Person`
+        // field was offered here too and NOTHING read it — the TVDB client has
+        // no movie lookup, the scan derives an episode from the series' TVDB id
+        // plus the season/episode numbers, and `person_details` has no caller —
+        // so a user typing into those fields wrote a `ProviderIds` row that
+        // never came back. They are gone rather than hollow.
         ExternalIdDescriptor {
             name: "TheTVDB Numerical",
             key: "Tvdb",
             media_type: Some(ExternalIdMediaType::Series),
             kinds: &[K::Series],
         },
-        ExternalIdDescriptor {
-            name: "TheTVDB",
-            key: "Tvdb",
-            media_type: Some(ExternalIdMediaType::Season),
-            kinds: &[K::Season],
-        },
-        ExternalIdDescriptor {
-            name: "TheTVDB",
-            key: "Tvdb",
-            media_type: Some(ExternalIdMediaType::Episode),
-            kinds: &[K::Episode],
-        },
-        ExternalIdDescriptor {
-            name: "TheTVDB Numerical",
-            key: "Tvdb",
-            media_type: Some(ExternalIdMediaType::Movie),
-            kinds: &[K::Movie],
-        },
-        ExternalIdDescriptor {
-            name: "TheTVDB",
-            key: "Tvdb",
-            media_type: Some(ExternalIdMediaType::Person),
-            kinds: &[K::Person],
-        },
-        // Plugins/MusicBrainz/*
-        ExternalIdDescriptor {
-            name: "MusicBrainz",
-            key: "MusicBrainzAlbum",
-            media_type: Some(ExternalIdMediaType::Album),
-            kinds: &[K::Audio, K::MusicAlbum],
-        },
+        // Plugins/MusicBrainz/* — in the order the assembly exports them,
+        // which for this one directory is by C# type name:
+        // AlbumArtist, Album, Artist, OtherArtist, Recording, ReleaseGroup,
+        // Track. `ProviderManager` stores `externalIds.OrderBy(i =>
+        // i.ProviderName)` and LINQ `OrderBy` is STABLE, so every entry here
+        // shares the name "MusicBrainz" and this sequence survives into the
+        // response verbatim. Transcribing it wrong is invisible to a set
+        // comparison and still reorders the Identify dialog's fields.
         ExternalIdDescriptor {
             name: "MusicBrainz",
             key: "MusicBrainzAlbumArtist",
             media_type: Some(ExternalIdMediaType::AlbumArtist),
             kinds: &[K::Audio],
+        },
+        ExternalIdDescriptor {
+            name: "MusicBrainz",
+            key: "MusicBrainzAlbum",
+            media_type: Some(ExternalIdMediaType::Album),
+            kinds: &[K::Audio, K::MusicAlbum],
         },
         ExternalIdDescriptor {
             name: "MusicBrainz",
@@ -431,6 +431,12 @@ const EXTERNAL_IDS: &[ExternalIdDescriptor] = {
         },
         ExternalIdDescriptor {
             name: "MusicBrainz",
+            key: "MusicBrainzRecording",
+            media_type: Some(ExternalIdMediaType::Recording),
+            kinds: &[K::Audio],
+        },
+        ExternalIdDescriptor {
+            name: "MusicBrainz",
             key: "MusicBrainzReleaseGroup",
             media_type: Some(ExternalIdMediaType::ReleaseGroup),
             kinds: &[K::Audio, K::MusicAlbum],
@@ -439,12 +445,6 @@ const EXTERNAL_IDS: &[ExternalIdDescriptor] = {
             name: "MusicBrainz",
             key: "MusicBrainzTrack",
             media_type: Some(ExternalIdMediaType::Track),
-            kinds: &[K::Audio],
-        },
-        ExternalIdDescriptor {
-            name: "MusicBrainz",
-            key: "MusicBrainzRecording",
-            media_type: Some(ExternalIdMediaType::Recording),
             kinds: &[K::Audio],
         },
         // Plugins/AudioDb/*
@@ -774,12 +774,74 @@ mod tests {
         assert!(keys.contains(&"Imdb".to_owned()));
         assert!(keys.contains(&"Tmdb".to_owned()));
         assert!(keys.contains(&"TmdbCollection".to_owned()));
-        assert!(keys.contains(&"Tvdb".to_owned()));
         assert!(!keys.contains(&"ISBN".to_owned()));
+        // A movie offers NO TVDB field: nothing in Ferrofin can consume a
+        // per-movie TVDB id (the client has no movie lookup, and
+        // `resolve_tmdb_id`'s tvdb branch is gated on `TmdbKind::Series`), and
+        // 10.11.8 has no `Tvdb` IExternalId at all.
+        assert!(!keys.contains(&"Tvdb".to_owned()));
 
         let book = external_id_infos(BaseItemKind::Book);
         let book_keys: Vec<_> = book.iter().map(|i| i.key.clone().unwrap()).collect();
         assert_eq!(book_keys, vec!["ComicVine", "GoogleBooks", "ISBN"]);
+    }
+
+    /// The exact ordered field list live Jellyfin 10.11.8 serves for each kind
+    /// the parity fixture can correlate by path. These are measured bytes, not
+    /// a restatement of the table: `ProviderManager`'s `OrderBy(ProviderName)`
+    /// is stable, so intra-provider order is part of the response and a set
+    /// comparison would not have caught the MusicBrainz block being
+    /// transcribed out of order.
+    #[test]
+    fn identify_fields_match_the_live_10_11_8_bytes() {
+        let keys = |kind| -> Vec<String> {
+            external_id_infos(kind)
+                .into_iter()
+                .map(|i| i.key.unwrap_or_default())
+                .collect()
+        };
+        assert_eq!(
+            keys(BaseItemKind::Audio),
+            [
+                "MusicBrainzAlbumArtist",
+                "MusicBrainzAlbum",
+                "MusicBrainzArtist",
+                "MusicBrainzRecording",
+                "MusicBrainzReleaseGroup",
+                "MusicBrainzTrack",
+                "AudioDbAlbum",
+                "AudioDbArtist",
+            ]
+        );
+        assert_eq!(
+            keys(BaseItemKind::MusicAlbum),
+            [
+                "MusicBrainzAlbum",
+                "MusicBrainzArtist",
+                "MusicBrainzReleaseGroup",
+                "AudioDbAlbum",
+                "AudioDbArtist",
+            ]
+        );
+        assert_eq!(
+            keys(BaseItemKind::MusicArtist),
+            ["MusicBrainzArtist", "AudioDbArtist"]
+        );
+        assert_eq!(
+            keys(BaseItemKind::Movie),
+            ["Imdb", "Tmdb", "TmdbCollection"]
+        );
+        // A season offers nothing: TMDB keys its season lookups off the SERIES
+        // id plus the season number, so there is no per-season id to hold.
+        assert_eq!(keys(BaseItemKind::Season), Vec::<String>::new());
+        assert_eq!(keys(BaseItemKind::Episode), ["Imdb"]);
+        // Series and Person carry Ferrofin's two accepted additions
+        // (`Tvdb`, `ComicVine`); everything else is the 10.11.8 sequence.
+        assert_eq!(
+            keys(BaseItemKind::Series),
+            ["Imdb", "Tmdb", "Tvdb", "Zap2It"]
+        );
+        assert_eq!(keys(BaseItemKind::Person), ["ComicVine", "Imdb", "Tmdb"]);
     }
 
     #[test]

@@ -293,6 +293,11 @@ READS = [
     plain("GET /Sessions", "/Sessions"),
     user("GET /UserViews", "/UserViews?userId={u}"),
     user("GET /Library/MediaFolders", "/Library/MediaFolders"),
+    # `GET /Items/Root` takes NO item id — both servers resolve the same
+    # deterministic UserRootFolder — so sweep's single-item pass was already
+    # comparing like for like and its diff was honest. It lives here now so the
+    # ledger sources it from a full body diff rather than a Layer-1 spot check.
+    user("GET /Items/Root", "/Items/Root?userId={u}"),
     user("GET /Library/VirtualFolders", "/Library/VirtualFolders"),
     user("GET /Items", "/Items?userId={u}&recursive=true&includeItemTypes=Movie&limit=50&sortBy=SortName&fields=Path"),
     user("GET /Items/Latest", "/Items/Latest?userId={u}&limit=20&fields=Path"),
@@ -349,6 +354,58 @@ READS = [
     item("GET /Items/{itemId}/Ancestors", "/Items/{i}/Ancestors?userId={u}"),
     item("GET /Items/{itemId}/PlaybackInfo", "/Items/{i}/PlaybackInfo?userId={u}"),
     item("GET /Items/{itemId}/Images", "/Items/{i}/Images"),
+    # The Identify-dialog id fields, and the metadata editor that re-serves them.
+    # FANNED ACROSS KINDS ON PURPOSE: the descriptor list is chosen by
+    # `Supports(item)`, so a Movie-only probe (what sweep did) cannot see the
+    # Season/Episode/Audio arms — and the MusicBrainz block was ordered wrongly
+    # in exactly the Audio arm. Intra-provider ORDER is part of the response
+    # (`ProviderManager` sorts `OrderBy(ProviderName)`, which is STABLE), so the
+    # deep diff must stay order-sensitive here; do not relax it to a set compare.
+    multi("GET /Items/{itemId}/ExternalIdInfos", [
+        "/Items/{movie}/ExternalIdInfos",
+        "/Items/{series}/ExternalIdInfos",
+        "/Items/{season}/ExternalIdInfos",
+        "/Items/{episode}/ExternalIdInfos",
+        "/Items/{album_id}/ExternalIdInfos",
+        "/Items/{audio_id}/ExternalIdInfos",
+        "/Items/{person_id}/ExternalIdInfos",
+    ]),
+    multi("GET /Items/{itemId}/MetadataEditor", [
+        "/Items/{movie}/MetadataEditor",
+        "/Items/{series}/MetadataEditor",
+        "/Items/{season}/MetadataEditor",
+        "/Items/{episode}/MetadataEditor",
+        "/Items/{album_id}/MetadataEditor",
+        "/Items/{audio_id}/MetadataEditor",
+        "/Items/{person_id}/MetadataEditor",
+    ]),
+    # "Choose Image". Same reason for fanning: Ferrofin listed NO provider for a
+    # Season and only OMDb for an Episode, which a movie-only probe cannot show.
+    multi("GET /Items/{itemId}/RemoteImages/Providers", [
+        "/Items/{movie}/RemoteImages/Providers",
+        "/Items/{series}/RemoteImages/Providers",
+        "/Items/{season}/RemoteImages/Providers",
+        "/Items/{episode}/RemoteImages/Providers",
+        "/Items/{album_id}/RemoteImages/Providers",
+        "/Items/{audio_id}/RemoteImages/Providers",
+        "/Items/{person_id}/RemoteImages/Providers",
+    ]),
+    # The image candidates themselves. The unscoped leg is kept even though it
+    # cannot come back clean — Ferrofin ships fanart.tv and Jellyfin bakes an
+    # OMDb key, both recorded in classifications.json — because dropping it would
+    # leave the endpoint's real shape (TotalRecordCount, Providers) unchecked.
+    # The `providerName=TheMovieDb` legs are the strict ones: both servers run the
+    # same provider there, so those bodies must match field for field AND in
+    # order, which is what pins the preferred-language filter and
+    # `OrderByLanguageDescending`. Live TMDB, so a candidate list that changes
+    # upstream between the two calls shows here as noise, not a server bug.
+    multi("GET /Items/{itemId}/RemoteImages", [
+        "/Items/{movie}/RemoteImages",
+        "/Items/{movie}/RemoteImages?providerName=TheMovieDb",
+        "/Items/{movie}/RemoteImages?providerName=TheMovieDb&includeAllLanguages=true",
+        "/Items/{movie}/RemoteImages?providerName=TheMovieDb&type=Logo",
+        "/Items/{series}/RemoteImages?providerName=TheMovieDb",
+    ]),
     invariant("GET /Movies/{itemId}/Similar", similar_invariants_for("Movies")),
     invariant("GET /Trailers/{itemId}/Similar", similar_invariants_for("Trailers")),
     # The NON-movie seeds ARE diffable: upstream master serves Series/MusicAlbum/
@@ -478,6 +535,14 @@ def resolve_named(base, token, user_id):
         "album_id": first_id("MusicAlbum"),
         "movie": first_id("Movie"),
         "episode": first_id("Episode"),
+        # Path-derived, so these resolve to the SAME id on both servers (checked
+        # live: Movie/Series/Season/Episode/MusicAlbum/Audio and the Person all
+        # match byte-for-byte). That is what lets the kind-fanned rows below
+        # compare like for like instead of each server's own arbitrary first item
+        # — the "sweep single-item align" failure these probes exist to replace.
+        "season": first_id("Season"),
+        "audio_id": first_id("Audio"),
+        "person_id": first_named("/Persons").get("Id") or "",
         "task": first_task(),
         "device": first_device(),
         "artist": urllib.parse.quote(artist.get("Name") or ""),
@@ -676,7 +741,8 @@ def selfcheck():
     # {u} vs "user" KeyError). Format each with a fully-populated context; a KeyError fails here.
     ctx = {"user": "U", "u": "U", "genre": "G", "studio": "S", "person": "P", "series": "SE",
            "task": "T", "device": "D", "artist": "A", "artist_id": "AID", "musicgenre": "MG",
-           "channel": "CH", "album_id": "ALB", "movie": "MOV", "episode": "EP"}
+           "channel": "CH", "album_id": "ALB", "movie": "MOV", "episode": "EP",
+           "season": "SEA", "audio_id": "AUD", "person_id": "PID"}
     # The context keys the self-check invents must be the ones resolve_named
     # actually produces, or this guard passes while the live run KeyErrors.
     import inspect

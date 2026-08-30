@@ -22,6 +22,7 @@ use ferrofin_model::providers::{
     ExternalIdInfo, ImageProviderInfo, RemoteImageInfo, RemoteImageQuery, RemoteSearchResult,
 };
 use ferrofin_traits::error::ServiceError;
+use ferrofin_traits::library::VirtualFolderManager;
 use ferrofin_traits::options::ItemImageInfo;
 use ferrofin_traits::persistence::{ItemPersistenceService, ItemRepository, ItemTypeLookup};
 use ferrofin_traits::providers::{
@@ -748,12 +749,25 @@ pub struct LocalProviderManager {
     /// [`ItemTypeLookup`] table. Present enables the kind-filtered built-in
     /// external-id descriptors.
     kind_by_type_name: HashMap<String, BaseItemKind>,
+    /// The library configuration, for the `LibraryOptions.
+    /// PreferredMetadataLanguage` tier of `BaseItem.
+    /// GetPreferredMetadataLanguage()`. `None` skips that tier.
+    virtual_folders: Option<Arc<dyn VirtualFolderManager>>,
+    /// `ServerConfiguration.PreferredMetadataLanguage`, the last tier of the
+    /// same chain. Read through a closure so a live config change is picked up
+    /// rather than frozen at startup. `None` → the C# default, `"en"`.
+    server_metadata_language: Option<Arc<dyn Fn() -> String + Send + Sync>>,
 }
 
 impl std::fmt::Debug for LocalProviderManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LocalProviderManager")
             .field("external_id_infos", &self.external_id_infos)
+            .field("has_virtual_folders", &self.virtual_folders.is_some())
+            .field(
+                "has_server_metadata_language",
+                &self.server_metadata_language.is_some(),
+            )
             .field(
                 "remote_search_providers",
                 &self.remote_search_providers.len(),
@@ -794,7 +808,25 @@ impl LocalProviderManager {
             audiodb: None,
             omdb: None,
             kind_by_type_name: HashMap::new(),
+            virtual_folders: None,
+            server_metadata_language: None,
         }
+    }
+
+    /// Attaches the library configuration and the server's
+    /// `PreferredMetadataLanguage`, the two tiers of
+    /// `BaseItem.GetPreferredMetadataLanguage()` that do not live on the item's
+    /// own row. Without them the remote-image language filter falls back to the
+    /// C# default of `"en"`.
+    #[must_use]
+    pub fn with_metadata_language(
+        mut self,
+        virtual_folders: Arc<dyn VirtualFolderManager>,
+        server_language: Arc<dyn Fn() -> String + Send + Sync>,
+    ) -> Self {
+        self.virtual_folders = Some(virtual_folders);
+        self.server_metadata_language = Some(server_language);
+        self
     }
 
     /// Attaches the fanart.tv client as a remote image provider for movies,
@@ -923,6 +955,18 @@ impl LocalProviderManager {
         Ok(refresh_target_of(entity, series.as_ref()))
     }
 
+    /// The `Series` row a `Season`/`Episode` hangs off — C# `season.Series` /
+    /// `episode.Series`. `None` without an item repository, or when the row
+    /// carries no resolvable `SeriesId`.
+    async fn parent_series_of(&self, entity: &BaseItemEntity) -> Option<BaseItemEntity> {
+        let items = self.items.as_ref()?;
+        let series_uuid = entity
+            .series_id
+            .as_deref()
+            .and_then(|s| Uuid::parse_str(s).ok())?;
+        items.retrieve_item(series_uuid).await.ok().flatten()
+    }
+
     /// Resolves the parent series' TMDB id (its stored provider ids first,
     /// then a title search) and fetches one season's details — the shared
     /// first half of the season/episode refresh arms. `None` when the series
@@ -939,17 +983,31 @@ impl LocalProviderManager {
             Some(id) => self.stored_provider_ids(id).await,
             None => Vec::new(),
         };
-        let tmdb_id = match resolve_tmdb_id(tmdb, TmdbKind::Series, &stored).await {
-            Some(id) => id,
-            None => {
-                tmdb.search(TmdbKind::Series, series_name, series_year)
-                    .await
-                    .into_iter()
-                    .next()?
-                    .tmdb_id
-            }
-        };
+        let tmdb_id = Self::series_tmdb_id(tmdb, &stored, series_name, series_year).await?;
         tmdb.season_details(tmdb_id, season_number).await
+    }
+
+    /// The parent series' TMDB id: its stored ids first (`Tmdb`, else `Imdb`
+    /// or `Tvdb` through `/find`), else the first hit of a name/year search.
+    ///
+    /// This is the key every TMDB TV lookup hangs off — season and episode
+    /// artwork included, since TMDB has no standalone season or episode id.
+    async fn series_tmdb_id(
+        tmdb: &Arc<TmdbClient>,
+        stored: &[(String, String)],
+        series_name: &str,
+        series_year: Option<i32>,
+    ) -> Option<i64> {
+        if let Some(id) = resolve_tmdb_id(tmdb, TmdbKind::Series, stored).await {
+            return Some(id);
+        }
+        Some(
+            tmdb.search(TmdbKind::Series, series_name, series_year)
+                .await
+                .into_iter()
+                .next()?
+                .tmdb_id,
+        )
     }
 
     /// The item's stored external ids (`BaseItemProviders`) as
@@ -1466,6 +1524,12 @@ enum RemoteImageSource {
     TmdbBoxSet,
     /// `TmdbPersonImageProvider`: a person's profile image.
     TmdbPerson,
+    /// `TmdbSeasonImageProvider`: a season's posters, keyed off the parent
+    /// series' TMDB id plus the season number.
+    TmdbSeason,
+    /// `TmdbEpisodeImageProvider`: an episode's stills, keyed off the parent
+    /// series' TMDB id plus the season and episode numbers.
+    TmdbEpisode,
     /// The fanart.tv plugin's `MovieProvider`.
     FanartMovie,
     /// The fanart.tv plugin's `SeriesProvider`.
@@ -1488,7 +1552,11 @@ impl RemoteImageSource {
     /// The provider's display name (`IRemoteImageProvider.Name`).
     fn name(self) -> &'static str {
         match self {
-            Self::TmdbTitle(_) | Self::TmdbBoxSet | Self::TmdbPerson => TMDB_PROVIDER_NAME,
+            Self::TmdbTitle(_)
+            | Self::TmdbBoxSet
+            | Self::TmdbPerson
+            | Self::TmdbSeason
+            | Self::TmdbEpisode => TMDB_PROVIDER_NAME,
             Self::FanartMovie | Self::FanartSeries | Self::FanartArtist | Self::FanartAlbum => {
                 FANART_PROVIDER_NAME
             }
@@ -1505,7 +1573,7 @@ impl RemoteImageSource {
         match self {
             Self::TmdbTitle(_) => &[Primary, Backdrop, Logo, Thumb],
             Self::TmdbBoxSet => &[Primary, Backdrop, Thumb],
-            Self::TmdbPerson | Self::Omdb => &[Primary],
+            Self::TmdbPerson | Self::TmdbSeason | Self::TmdbEpisode | Self::Omdb => &[Primary],
             Self::FanartMovie => &[Primary, Thumb, Art, Logo, Disc, Banner, Backdrop],
             Self::FanartSeries => &[Primary, Thumb, Art, Logo, Backdrop, Banner],
             Self::FanartArtist => &[Primary, Logo, Art, Banner, Backdrop],
@@ -1517,6 +1585,53 @@ impl RemoteImageSource {
 }
 
 impl LocalProviderManager {
+    /// Ports `BaseItem.GetPreferredMetadataLanguage()`: the item's own
+    /// `PreferredMetadataLanguage`, else the first non-empty one on an
+    /// ancestor (C# walks `GetParents()` then `GetCollectionFolders()` — both
+    /// read the same column off rows this chain already covers), else the
+    /// containing library's `LibraryOptions.PreferredMetadataLanguage`, else
+    /// `ServerConfiguration.PreferredMetadataLanguage`, whose own default is
+    /// `"en"`.
+    async fn preferred_metadata_language(&self, entity: &BaseItemEntity) -> String {
+        let usable = |v: Option<&str>| {
+            v.map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(str::to_owned)
+        };
+        if let Some(lang) = usable(entity.preferred_metadata_language.as_deref()) {
+            return lang;
+        }
+        if let Some(items) = &self.items
+            && let Ok(id) = Uuid::parse_str(&entity.id)
+            && let Ok(Some(chain)) = items.get_ancestor_chain(id).await
+            && let Some(lang) = chain
+                .iter()
+                .find_map(|a| usable(a.preferred_metadata_language.as_deref()))
+        {
+            return lang;
+        }
+        if let Some(folders) = &self.virtual_folders
+            && let Some(path) = entity.path.as_deref()
+            && let Ok(list) = folders.get_virtual_folders().await
+            && let Some(lang) = list
+                .iter()
+                .find(|f| {
+                    f.locations
+                        .iter()
+                        .any(|loc| !loc.is_empty() && path.starts_with(loc.as_str()))
+                })
+                .and_then(|f| f.library_options.as_ref())
+                .and_then(|o| usable(o.preferred_metadata_language.as_deref()))
+        {
+            return lang;
+        }
+        self.server_metadata_language
+            .as_ref()
+            .map(|f| f())
+            .and_then(|l| usable(Some(&l)))
+            .unwrap_or_else(|| "en".to_owned())
+    }
+
     /// The remote image providers that `Supports(item)` for `entity`'s kind,
     /// in registration order, restricted to the clients actually wired.
     fn image_sources_for(&self, entity: &BaseItemEntity) -> Vec<RemoteImageSource> {
@@ -1538,7 +1653,15 @@ impl LocalProviderManager {
                 ));
                 sources.extend(has(self.fanart.is_some(), RemoteImageSource::FanartSeries));
             }
-            "Episode" => sources.extend(has(self.omdb.is_some(), RemoteImageSource::Omdb)),
+            // `TmdbSeasonImageProvider` has no arm here at all before this —
+            // the "Choose Image" dialog on a season offered NOTHING.
+            "Season" => sources.extend(has(self.tmdb.is_some(), RemoteImageSource::TmdbSeason)),
+            "Episode" => {
+                // TMDB first: C# orders by `IHasOrder.Order`, and
+                // `TmdbEpisodeImageProvider` is 1 against `OmdbImageProvider`'s 90.
+                sources.extend(has(self.tmdb.is_some(), RemoteImageSource::TmdbEpisode));
+                sources.extend(has(self.omdb.is_some(), RemoteImageSource::Omdb));
+            }
             "BoxSet" => sources.extend(has(self.tmdb.is_some(), RemoteImageSource::TmdbBoxSet)),
             "Person" => sources.extend(has(self.tmdb.is_some(), RemoteImageSource::TmdbPerson)),
             "MusicArtist" => {
@@ -1570,7 +1693,9 @@ impl LocalProviderManager {
         match source {
             RemoteImageSource::TmdbTitle(_)
             | RemoteImageSource::TmdbBoxSet
-            | RemoteImageSource::TmdbPerson => self.tmdb_images(source, entity, ids).await,
+            | RemoteImageSource::TmdbPerson
+            | RemoteImageSource::TmdbSeason
+            | RemoteImageSource::TmdbEpisode => self.tmdb_images(source, entity, ids).await,
             RemoteImageSource::FanartMovie
             | RemoteImageSource::FanartSeries
             | RemoteImageSource::FanartArtist
@@ -1643,6 +1768,45 @@ impl LocalProviderManager {
                             .collect()
                     })
                     .unwrap_or_default()
+            }
+            RemoteImageSource::TmdbSeason | RemoteImageSource::TmdbEpisode => {
+                // `TmdbSeason/EpisodeImageProvider`: both hop to the PARENT
+                // SERIES for the TMDB id (`season.Series`/`episode.Series` in
+                // C#) and select within it by number — `season.IndexNumber`,
+                // and for an episode `ParentIndexNumber` ?? 1 plus
+                // `IndexNumber`. C# returns empty when the episode has no
+                // number, and so does this.
+                let Some(series) = self.parent_series_of(entity).await else {
+                    return Vec::new();
+                };
+                let series_name = series.name.clone().filter(|n| !n.is_empty());
+                let Some(series_name) = series_name else {
+                    return Vec::new();
+                };
+                let series_year = series.production_year.and_then(|y| i32::try_from(y).ok());
+                let stored = match Uuid::parse_str(&series.id) {
+                    Ok(id) => self.stored_provider_ids(id).await,
+                    Err(_) => Vec::new(),
+                };
+                let Some(series_tmdb_id) =
+                    Self::series_tmdb_id(tmdb, &stored, &series_name, series_year).await
+                else {
+                    return Vec::new();
+                };
+                let number = |v: Option<i64>| v.and_then(|n| i32::try_from(n).ok());
+                if source == RemoteImageSource::TmdbSeason {
+                    let Some(season_number) = number(entity.index_number) else {
+                        return Vec::new();
+                    };
+                    tmdb.season_images(series_tmdb_id, season_number).await
+                } else {
+                    let season_number = number(entity.parent_index_number).unwrap_or(1);
+                    let Some(episode_number) = number(entity.index_number) else {
+                        return Vec::new();
+                    };
+                    tmdb.episode_images(series_tmdb_id, season_number, episode_number)
+                        .await
+                }
             }
             _ => {
                 // `TmdbPersonImageProvider`: the person's profile by Tmdb id,
@@ -1770,6 +1934,56 @@ fn provider_id_of_pairs<'a>(ids: &'a [(String, String)], key: &str) -> Option<&'
         .find(|(k, _)| k.eq_ignore_ascii_case(key))
         .map(|(_, v)| v.trim())
         .filter(|v| !v.is_empty())
+}
+
+/// The C# `OrderByLanguageDescending` rank for one image's language tag
+/// (`MediaBrowser.Model/Extensions/EnumerableExtensions.cs`, v10.11.8).
+///
+/// The ladder is **preferred (4) > no language (3) > English (2) > anything
+/// else (0)** — an untagged image outranks an English one, which is easy to get
+/// backwards. `requested` has already been defaulted to `"en"` by the caller,
+/// per the same file's opening guard.
+///
+/// The no-language test is C# `IsNullOrEmpty`, NOT `IsNullOrWhiteSpace`: a tag
+/// of `" "` is not "no language" here and falls to 0.
+fn language_rank(language: Option<&str>, requested: &str) -> u8 {
+    match language {
+        Some(l) if l.eq_ignore_ascii_case(requested) => 4,
+        // C# `IsNullOrEmpty` — an absent tag and an empty one are both
+        // "no language"; note a WHITESPACE tag is not, and falls to 0.
+        None | Some("") => 3,
+        Some(l) if l.eq_ignore_ascii_case("en") => 2,
+        _ => 0,
+    }
+}
+
+/// C# `Math.Round(value ?? 0, 1)` — banker's rounding, which is .NET's default
+/// midpoint mode and what `round_ties_even` gives.
+fn rounded_rating(rating: Option<f64>) -> f64 {
+    (rating.unwrap_or(0.0) * 10.0).round_ties_even() / 10.0
+}
+
+/// Ports `IEnumerable<RemoteImageInfo>.OrderByLanguageDescending(requested)`:
+/// language rank, then rounded community rating, then vote count — all
+/// descending.
+///
+/// `sort_by` is STABLE, matching LINQ's `OrderByDescending`/`ThenByDescending`,
+/// so images that tie on all three keep the provider's own order.
+fn order_by_language_descending(images: &mut [RemoteImageInfo], requested: &str) {
+    // "Default to English if no requested language is specified."
+    let requested = if requested.trim().is_empty() {
+        "en"
+    } else {
+        requested
+    };
+    images.sort_by(|a, b| {
+        language_rank(b.language.as_deref(), requested)
+            .cmp(&language_rank(a.language.as_deref(), requested))
+            .then_with(|| {
+                rounded_rating(b.community_rating).total_cmp(&rounded_rating(a.community_rating))
+            })
+            .then_with(|| b.vote_count.unwrap_or(0).cmp(&a.vote_count.unwrap_or(0)))
+    });
 }
 
 /// The TMDB id an item's external ids pin it to: its own `Tmdb` id, else an
@@ -2145,25 +2359,47 @@ impl ProviderManager for LocalProviderManager {
             return Ok(Vec::new());
         }
         let ids = self.stored_provider_ids(item_id).await;
+        let preferred = self.preferred_metadata_language(&entity).await;
         let mut results = Vec::new();
         for source in sources {
             let images = self.images_from(source, &entity, &ids).await;
-            results.extend(
-                images
-                    .into_iter()
-                    .filter(|img| query.image_type.is_none_or(|t| t == img.image_type))
-                    .map(|img| RemoteImageInfo {
-                        provider_name: Some(source.name().to_owned()),
-                        url: Some(img.url),
-                        width: img.width,
-                        height: img.height,
-                        community_rating: img.community_rating,
-                        vote_count: img.vote_count,
-                        language: img.language,
-                        type_: img.image_type,
-                        ..RemoteImageInfo::default()
-                    }),
-            );
+            // `GetImages` runs PER PROVIDER, and so must the language filter and
+            // the sort: C# concatenates each provider's already-ordered block
+            // (`results.SelectMany`), it does not sort the union. Sorting the
+            // union instead would interleave providers and reorder the whole
+            // response.
+            let mut block: Vec<RemoteImageInfo> = images
+                .into_iter()
+                .filter(|img| query.image_type.is_none_or(|t| t == img.image_type))
+                .map(|img| RemoteImageInfo {
+                    provider_name: Some(source.name().to_owned()),
+                    url: Some(img.url),
+                    width: img.width,
+                    height: img.height,
+                    community_rating: img.community_rating,
+                    vote_count: img.vote_count,
+                    language: img.language,
+                    type_: img.image_type,
+                    ..RemoteImageInfo::default()
+                })
+                .collect();
+            // `if (!includeAllLanguages && hasPreferredLanguage)`: keep images
+            // with no language, the preferred language, or English. Note the
+            // asymmetry with the sort below — the FILTER tests
+            // `IsNullOrWhiteSpace`, the sort's no-language rank tests
+            // `IsNullOrEmpty`, so a whitespace-only tag survives the filter and
+            // then sorts as "other". That is upstream's behaviour, quirk and all.
+            if !query.include_all_languages && !preferred.trim().is_empty() {
+                block.retain(|img| {
+                    img.language.as_deref().is_none_or(|l| {
+                        l.trim().is_empty()
+                            || l.eq_ignore_ascii_case(&preferred)
+                            || l.eq_ignore_ascii_case("en")
+                    })
+                });
+            }
+            order_by_language_descending(&mut block, &preferred);
+            results.extend(block);
         }
         Ok(results)
     }
@@ -2297,8 +2533,8 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        LocalProviderManager, RemoteSearchProvider, apply_tmdb_details, parse_ymd, set_text,
-        wants_fetch,
+        LocalProviderManager, RemoteImageInfo, RemoteSearchProvider, apply_tmdb_details,
+        language_rank, order_by_language_descending, parse_ymd, set_text, wants_fetch,
     };
     use crate::tmdb::TmdbDetails;
     use async_trait::async_trait;
@@ -3264,7 +3500,10 @@ mod tests {
             &self,
             _item_id: Uuid,
         ) -> Result<Option<Vec<BaseItemEntity>>, ServiceError> {
-            unimplemented!()
+            // These fixtures are flat: no ancestor carries a
+            // `PreferredMetadataLanguage`, so the language chain falls through
+            // to the library/server tiers.
+            Ok(None)
         }
         async fn get_items(
             &self,
@@ -3771,6 +4010,252 @@ mod tests {
         (item_id, wire(mgr))
     }
 
+    /// `OrderByLanguageDescending`'s ladder, straight from
+    /// `MediaBrowser.Model/Extensions/EnumerableExtensions.cs` (v10.11.8).
+    /// The trap: an UNTAGGED image (3) outranks an English one (2), and a
+    /// whitespace-only tag is not "no language" — `IsNullOrEmpty`, not
+    /// `IsNullOrWhiteSpace` — so it falls to 0.
+    #[test]
+    fn language_rank_matches_the_csharp_ladder() {
+        assert_eq!(language_rank(Some("fr"), "fr"), 4);
+        assert_eq!(language_rank(Some("FR"), "fr"), 4, "OrdinalIgnoreCase");
+        assert_eq!(language_rank(None, "fr"), 3);
+        assert_eq!(language_rank(Some(""), "fr"), 3);
+        assert_eq!(language_rank(Some("en"), "fr"), 2);
+        assert_eq!(language_rank(Some("de"), "fr"), 0);
+        assert_eq!(
+            language_rank(Some(" "), "fr"),
+            0,
+            "IsNullOrEmpty, not WhiteSpace"
+        );
+        // With "en" requested, English takes the top rank and untagged drops to 3.
+        assert_eq!(language_rank(Some("en"), "en"), 4);
+        assert_eq!(language_rank(None, "en"), 3);
+    }
+
+    /// The full `OrderByDescending(rank).ThenByDescending(Math.Round(rating,
+    /// 1)).ThenByDescending(voteCount)` chain, plus the "default to English
+    /// when nothing is requested" guard.
+    #[test]
+    fn images_order_by_language_then_rating_then_votes() {
+        let img = |lang: Option<&str>, rating: Option<f64>, votes: Option<i32>, url: &str| {
+            RemoteImageInfo {
+                url: Some(url.to_owned()),
+                language: lang.map(str::to_owned),
+                community_rating: rating,
+                vote_count: votes,
+                ..RemoteImageInfo::default()
+            }
+        };
+        let mut images = vec![
+            img(Some("de"), Some(9.0), Some(999), "other"),
+            img(Some("en"), Some(1.0), Some(1), "english"),
+            img(None, Some(1.0), Some(1), "untagged"),
+            img(Some("fr"), Some(5.0), Some(2), "fr-low-votes"),
+            img(Some("fr"), Some(5.04), Some(50), "fr-rounds-equal"),
+            img(Some("fr"), Some(5.2), Some(1), "fr-top"),
+        ];
+        order_by_language_descending(&mut images, "fr");
+        let urls: Vec<&str> = images.iter().filter_map(|i| i.url.as_deref()).collect();
+        assert_eq!(
+            urls,
+            [
+                // rank 4, by rating: 5.2 > 5.0
+                "fr-top",
+                // 5.04 rounds to 5.0, tying "fr-low-votes" — votes break it
+                "fr-rounds-equal",
+                "fr-low-votes",
+                // rank 3 (untagged) before rank 2 (English) before rank 0
+                "untagged",
+                "english",
+                "other",
+            ]
+        );
+
+        // "Default to English if no requested language is specified."
+        let mut blank = vec![
+            img(Some("de"), None, None, "de"),
+            img(Some("en"), None, None, "en"),
+        ];
+        order_by_language_descending(&mut blank, "   ");
+        assert_eq!(blank[0].url.as_deref(), Some("en"));
+    }
+
+    const TMDB_MIXED_LANGUAGE_IMAGES: &str = r#"{"posters":[
+        {"file_path":"/de.jpg","iso_639_1":"de","vote_average":9.9,"vote_count":900},
+        {"file_path":"/en.jpg","iso_639_1":"en","vote_average":2.0,"vote_count":2},
+        {"file_path":"/none.jpg","vote_average":1.0,"vote_count":1},
+        {"file_path":"/sv.jpg","iso_639_1":"sv","vote_average":8.0,"vote_count":80}
+    ]}"#;
+
+    /// `ProviderManager.GetImages`: unless `IncludeAllLanguages`, drop every
+    /// image whose language is neither blank, nor the preferred one, nor
+    /// English — then order by the language ladder. Ferrofin returned the
+    /// provider's raw list unfiltered and unsorted, which is why
+    /// `GET /Items/{id}/RemoteImages` served 497 images where 10.11.8 served
+    /// 139, in a different order.
+    #[tokio::test]
+    async fn remote_images_filter_and_order_by_preferred_language() {
+        let tmdb_server = crate::mock_http::MockServer::always(TMDB_MIXED_LANGUAGE_IMAGES).await;
+        let (item_id, mgr) = image_manager(
+            "Movies.Movie",
+            "Parity",
+            &[("Tmdb", "550")],
+            Arc::new(crate::tmdb::TmdbClient::new().with_base_url(&tmdb_server.base_url)),
+            |mgr| mgr,
+        );
+
+        // Default query: no `PreferredMetadataLanguage` anywhere, so the chain
+        // ends at the C# server default, "en".
+        let filtered = mgr
+            .get_available_remote_images(item_id, &RemoteImageQuery::default())
+            .await
+            .expect("images");
+        let urls: Vec<&str> = filtered.iter().filter_map(|i| i.url.as_deref()).collect();
+        assert_eq!(
+            urls,
+            [
+                "https://image.tmdb.org/t/p/original/en.jpg",
+                "https://image.tmdb.org/t/p/original/none.jpg",
+            ],
+            "de and sv are filtered out; en (rank 4) precedes untagged (rank 3)"
+        );
+
+        // `IncludeAllLanguages` keeps everything — still ordered.
+        let all = mgr
+            .get_available_remote_images(
+                item_id,
+                &RemoteImageQuery {
+                    include_all_languages: true,
+                    ..RemoteImageQuery::default()
+                },
+            )
+            .await
+            .expect("images");
+        let all_urls: Vec<&str> = all.iter().filter_map(|i| i.url.as_deref()).collect();
+        assert_eq!(
+            all_urls,
+            [
+                "https://image.tmdb.org/t/p/original/en.jpg",
+                "https://image.tmdb.org/t/p/original/none.jpg",
+                // rank 0, so the 9.9-rated German poster sorts LAST despite
+                // having the best rating and vote count.
+                "https://image.tmdb.org/t/p/original/de.jpg",
+                "https://image.tmdb.org/t/p/original/sv.jpg",
+            ]
+        );
+    }
+
+    /// A season and an episode both hop to the parent series for TMDB
+    /// artwork (`TmdbSeasonImageProvider` / `TmdbEpisodeImageProvider`, both
+    /// `Order = 1`, both `[Primary]`). Ferrofin listed NO provider for a season
+    /// and only OMDb (`Order = 90`) for an episode.
+    #[tokio::test]
+    async fn season_and_episode_offer_tmdb_images_from_the_parent_series() {
+        let tmdb_server = crate::mock_http::MockServer::start(vec![
+            (
+                "/season/1/episode/2/images",
+                r#"{"stills":[{"file_path":"/still.jpg"}]}"#.to_owned(),
+            ),
+            (
+                "/season/1/images",
+                r#"{"posters":[{"file_path":"/season.jpg"}]}"#.to_owned(),
+            ),
+        ])
+        .await;
+        let tmdb = Arc::new(crate::tmdb::TmdbClient::new().with_base_url(&tmdb_server.base_url));
+
+        let series_id = Uuid::new_v4();
+        let mut series = row("TV.Series", "Parity Show");
+        series.id = series_id.to_string();
+        let season_id = Uuid::new_v4();
+        let mut season = row("TV.Season", "Season 1");
+        season.id = season_id.to_string();
+        season.series_id = Some(series_id.to_string());
+        season.index_number = Some(1);
+        let episode_id = Uuid::new_v4();
+        let mut episode = row("TV.Episode", "Ep 2");
+        episode.id = episode_id.to_string();
+        episode.series_id = Some(series_id.to_string());
+        episode.parent_index_number = Some(1);
+        episode.index_number = Some(2);
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let items = Arc::new(FakeItems {
+            rows: HashMap::from([
+                (series_id, series),
+                (season_id, season),
+                (episode_id, episode),
+            ]),
+            seen: tx,
+        });
+        let store = Arc::new(RecordingStore::default());
+        store
+            .stored_ids
+            .lock()
+            .expect("lock")
+            .insert(series_id, vec![("Tmdb".to_owned(), "1399".to_owned())]);
+        let mgr = LocalProviderManager::default()
+            .with_remote_images(tmdb, items)
+            .with_image_store(store, std::env::temp_dir())
+            .with_omdb(Arc::new(crate::omdb::OmdbClient::new("key")));
+
+        // Provider info — `Supports()` is type-only in C#, so both are listed
+        // regardless of whether the series carries a TMDB id.
+        let season_info = mgr.get_remote_image_provider_info(season_id).await.unwrap();
+        let names: Vec<&str> = season_info
+            .iter()
+            .filter_map(|i| i.name.as_deref())
+            .collect();
+        assert_eq!(names, ["TheMovieDb"]);
+        assert_eq!(season_info[0].supported_images, [ImageType::Primary]);
+
+        let episode_info = mgr
+            .get_remote_image_provider_info(episode_id)
+            .await
+            .unwrap();
+        let ep_names: Vec<&str> = episode_info
+            .iter()
+            .filter_map(|i| i.name.as_deref())
+            .collect();
+        assert_eq!(
+            ep_names,
+            ["TheMovieDb", "The Open Movie Database"],
+            "TMDB Order=1 precedes OMDb Order=90"
+        );
+
+        // …and the artwork itself comes back, keyed off the SERIES tmdb id.
+        let season_images = mgr
+            .get_available_remote_images(season_id, &RemoteImageQuery::default())
+            .await
+            .expect("season images");
+        assert_eq!(
+            season_images
+                .iter()
+                .map(|i| (i.url.as_deref(), i.type_))
+                .collect::<Vec<_>>(),
+            [(
+                Some("https://image.tmdb.org/t/p/original/season.jpg"),
+                ImageType::Primary
+            )]
+        );
+        let episode_images = mgr
+            .get_available_remote_images(episode_id, &RemoteImageQuery::default())
+            .await
+            .expect("episode images");
+        assert_eq!(
+            episode_images
+                .iter()
+                .map(|i| (i.url.as_deref(), i.type_))
+                .collect::<Vec<_>>(),
+            [(
+                Some("https://image.tmdb.org/t/p/original/still.jpg"),
+                ImageType::Primary
+            )],
+            "stills map to Primary, like ConvertStillsToRemoteImageInfo"
+        );
+    }
+
     const FANART_MUSIC: &str = r#"{"artistthumb":[{"url":"https://f/thumb.jpg","likes":"5"}],"musicbanner":[{"url":"https://f/banner.jpg"}],"albums":[{"release_group_id":"rg-1","albumcover":[{"url":"https://f/cover.jpg"}],"cdart":[{"url":"https://f/cd.png"}]}]}"#;
     const AUDIODB_ARTIST: &str = r#"{"artists":[{"strArtistThumb":"https://a/thumb.jpg","strArtistLogo":"https://a/logo.png","strArtistFanart":"https://a/fan.jpg"}]}"#;
     const AUDIODB_ALBUM: &str =
@@ -4008,21 +4493,27 @@ mod tests {
         assert_eq!(
             shape,
             [
+                // Within each provider the block is `OrderByLanguageDescending`,
+                // so the two `en`-tagged images (rank 4) come before the two
+                // untagged ones (rank 3) — NOT the raw poster/backdrop/logo
+                // order TMDB returned. All four tie on rating and votes, and
+                // the sort is stable, so each rank keeps TMDB's own sequence.
                 (
                     "TheMovieDb",
                     ImageType::Primary,
                     "https://image.tmdb.org/t/p/original/p.jpg"
                 ),
-                (
-                    "TheMovieDb",
-                    ImageType::Backdrop,
-                    "https://image.tmdb.org/t/p/original/b.jpg"
-                ),
-                // A languaged backdrop is a Thumb (it carries text).
+                // A languaged backdrop is a Thumb (it carries text) — and that
+                // language is what floats it above the untagged backdrop.
                 (
                     "TheMovieDb",
                     ImageType::Thumb,
                     "https://image.tmdb.org/t/p/original/t.jpg"
+                ),
+                (
+                    "TheMovieDb",
+                    ImageType::Backdrop,
+                    "https://image.tmdb.org/t/p/original/b.jpg"
                 ),
                 (
                     "TheMovieDb",
