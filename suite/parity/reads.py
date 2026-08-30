@@ -844,6 +844,31 @@ READS = [
     user("GET /MusicGenres/InstantMix", "/MusicGenres/InstantMix?name={musicgenre}&userId={u}&limit=100"),
     # Live TV (needs the tuner fixture): channels are keyed by Name across servers; the
     # airing programmes by Name too (the guide is identical on both).
+    # Tuner DISCOVERY. `LiveTvController.DiscoverTuners([FromQuery] bool
+    # newDevicesOnly = false)` (v10.11.8 LiveTvController.cs:1146-1150) →
+    # `TunerHostManager.DiscoverTuners`, which UDP-broadcasts the 20-byte
+    # HDHomeRun discovery datagram, waits 3 s, and then — when the flag is set —
+    # drops every device whose `DeviceId` is already on a configured tuner host
+    # (TunerHostManager.cs:102-121).
+    #
+    # Both legs are needed and neither is redundant. The fake device
+    # (`suite/perf/hdhomerun-source.py`) answers the broadcast, so the `false`
+    # leg diffs a real discovered `TunerHostInfo` field for field; the fixture
+    # then CONFIGURES that same device, so the `true` leg must be empty on both
+    # — and it is only empty because the filter runs. Ferrofin's handler took no
+    # query parameter at all until this was measured: it answered the device to
+    # both spellings, where Jellyfin answers it to one. With a single leg that
+    # divergence is invisible.
+    #
+    # Two legs, ~3 s each per server, because the wait IS the protocol. The
+    # `/LiveTv/Tuners/Discvover` alias route is deliberately NOT a second row:
+    # it is the same handler behind a second path (the contract carries
+    # upstream's typo), so a Layer-2 row there would measure the router, which
+    # Layer 1 already does.
+    multi("GET /LiveTv/Tuners/Discover", [
+        "/LiveTv/Tuners/Discover?newDevicesOnly=false",
+        "/LiveTv/Tuners/Discover?newDevicesOnly=true",
+    ]),
     user("GET /LiveTv/Channels", "/LiveTv/Channels?userId={u}"),
     user("GET /LiveTv/Channels/{channelId}", "/LiveTv/Channels/{channel}?userId={u}"),
     user("GET /LiveTv/Programs", "/LiveTv/Programs?channelIds={channel}&isAiring=true&userId={u}"),

@@ -653,6 +653,50 @@ pub trait LibraryManager: Send + Sync {
 
 fn _assert_object_safe_library_manager(_: &dyn LibraryManager) {}
 
+/// The three playback permissions a user's policy imposes on a media source.
+///
+/// The inputs to `MediaSourceManager`'s per-user overwrite (v10.11.8
+/// Emby.Server.Implementations/Library/MediaSourceManager.cs:204-217): an
+/// AUDIO item's `SupportsTranscoding` becomes
+/// `EnableAudioPlaybackTranscoding`; a VIDEO item's becomes
+/// `EnableVideoPlaybackTranscoding`, and its `SupportsDirectStream` becomes
+/// `EnablePlaybackRemuxing`. Everything else (photos, books, unknown media)
+/// is left as the source built it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlaybackPermissions {
+    /// `PermissionKind.EnableVideoPlaybackTranscoding`.
+    pub video_transcoding: bool,
+    /// `PermissionKind.EnableAudioPlaybackTranscoding`.
+    pub audio_transcoding: bool,
+    /// `PermissionKind.EnablePlaybackRemuxing`.
+    pub remuxing: bool,
+}
+
+impl PlaybackPermissions {
+    /// Applies the overwrite to one media source, for an item of `media_type`.
+    ///
+    /// Port of the `if (user is not null)` block shared by
+    /// `GetStaticMediaSources` (:355-372) and `GetPlaybackMediaSources`
+    /// (:204-217) — the same three lines, on the static and the dynamic
+    /// sources respectively. `media_type` is `BaseItem.MediaType` ("Audio" /
+    /// "Video"); any other value is upstream's implicit `else`, which touches
+    /// nothing.
+    pub fn apply(
+        self,
+        media_type: Option<&str>,
+        source: &mut ferrofin_model::dto::MediaSourceInfo,
+    ) {
+        match media_type {
+            Some("Audio") => source.supports_transcoding = self.audio_transcoding,
+            Some("Video") => {
+                source.supports_transcoding = self.video_transcoding;
+                source.supports_direct_stream = self.remuxing;
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Manages user accounts, authentication, and per-user policy/configuration.
 ///
 /// Port of `IUserManager`. User rows are [`UserEntity`]; [`Self::get_user_dto`]
@@ -937,6 +981,33 @@ pub trait UserDataManager: Send + Sync {
         &self,
         user_id: Uuid,
     ) -> Result<Option<(bool, bool)>, ServiceError> {
+        let _ = user_id;
+        Ok(None)
+    }
+
+    /// The user's three PLAYBACK permissions.
+    ///
+    /// Backs `MediaSourceManager.GetStaticMediaSources` /
+    /// `GetPlaybackMediaSources`' per-user overwrite (v10.11.8
+    /// Emby.Server.Implementations/Library/MediaSourceManager.cs:355-372 and
+    /// :204-217), which re-sets `SupportsTranscoding` — and, for video,
+    /// `SupportsDirectStream` — from the user's policy AFTER the source has
+    /// been built.
+    ///
+    /// It sits beside [`Self::get_content_permissions`] for the same reason
+    /// that one does: both are a small bundle of `Permissions` rows read on one
+    /// request for one caller, and both belong with the per-user data rather
+    /// than in the manager that consumes them.
+    ///
+    /// `None` means "no policy known", and the caller must then leave the
+    /// source untouched — upstream's `if (user is not null)` path. It is
+    /// deliberately not three `false`s, which would tell a client the item can
+    /// be neither remuxed nor transcoded. The default returns it; the concrete
+    /// manager reads the `Permissions` rows.
+    async fn get_playback_permissions(
+        &self,
+        user_id: Uuid,
+    ) -> Result<Option<PlaybackPermissions>, ServiceError> {
         let _ = user_id;
         Ok(None)
     }
@@ -1495,6 +1566,56 @@ mod tests {
         };
         assert_eq!(r.item_id, id);
         assert!((r.score - 0.5).abs() < f32::EPSILON);
+    }
+
+    /// The `if (user is not null)` block in
+    /// `MediaSourceManager.GetPlaybackMediaSources` (v10.11.8
+    /// Emby.Server.Implementations/Library/MediaSourceManager.cs:204-217):
+    /// audio takes only `EnableAudioPlaybackTranscoding`; video takes
+    /// `EnableVideoPlaybackTranscoding` AND `EnablePlaybackRemuxing`; anything
+    /// else is untouched. The overwrite is unconditional — it RAISES a flag the
+    /// source left false, which is exactly why an HDHomeRun source (Protocol
+    /// Udp, so the direct-stream validation cleared the flag) is still reported
+    /// direct-streamable by Jellyfin.
+    #[test]
+    fn playback_permissions_overwrite_follows_the_media_type() {
+        use crate::library::PlaybackPermissions;
+        use ferrofin_model::dto::MediaSourceInfo;
+        let perms = PlaybackPermissions {
+            video_transcoding: false,
+            audio_transcoding: true,
+            remuxing: true,
+        };
+        let cleared = || MediaSourceInfo {
+            supports_transcoding: false,
+            supports_direct_stream: false,
+            ..MediaSourceInfo::default()
+        };
+
+        let mut video = cleared();
+        perms.apply(Some("Video"), &mut video);
+        assert!(
+            !video.supports_transcoding,
+            "EnableVideoPlaybackTranscoding"
+        );
+        assert!(
+            video.supports_direct_stream,
+            "EnablePlaybackRemuxing RAISES a flag the protocol gate cleared"
+        );
+
+        let mut audio = cleared();
+        perms.apply(Some("Audio"), &mut audio);
+        assert!(audio.supports_transcoding, "EnableAudioPlaybackTranscoding");
+        assert!(
+            !audio.supports_direct_stream,
+            "the audio arm never touches SupportsDirectStream"
+        );
+
+        for media_type in [None, Some("Photo"), Some("Book"), Some("Unknown")] {
+            let mut other = cleared();
+            perms.apply(media_type, &mut other);
+            assert!(!other.supports_transcoding && !other.supports_direct_stream);
+        }
     }
 
     #[test]

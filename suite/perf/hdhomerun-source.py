@@ -5,6 +5,7 @@ An HDHomeRun's server-facing interface is three plain HTTP documents plus a UDP
 discovery datagram — there is no proprietary transport a server has to speak to
 enumerate and play a channel:
 
+  UDP  :65001            answers the broadcast discovery datagram
   GET /discover.json     the device's identity and where its lineup lives
   GET /lineup_status.json  whether a channel scan is in progress (dashboard only)
   GET /lineup.json       the channels, each with the URL that plays it
@@ -21,11 +22,30 @@ The channel URLs point at the EXISTING `livetv-source` broadcast
 (`http://livetv-source:8000/live.ts`), so a channel that is tuned really plays a
 real, endless MPEG-TS — the same source the M3U tuner uses.
 
-`ModelNumber` is `HDHR3-US` deliberately: `DiscoverResponse.SupportsTranscoding`
-is `ModelNumber.Contains("hdtc")`, and only the EXTEND (`HDTC-2US`) transcodes.
-An HDHR3 therefore offers the native profile alone, which is the shape both
-servers must agree on without either of them inventing profile URLs this fake
-does not serve.
+`ModelNumber` is `HDTC-2US` — a real SiliconDust EXTEND — deliberately:
+`DiscoverResponse.SupportsTranscoding` is `ModelNumber.Contains("hdtc")`, and it
+is the ONLY input that opens `GetChannelStreamMediaSources`' transcoding fan-out
+(HdHomerunHost.cs:339-379). With an `HDHR3-US` here (the first draft) the two
+servers agreed on a single `native` media source and five of `GetMediaSource`'s
+six profile arms — heavy / internet540 / internet480 / internet360 /
+internet240 / mobile, each with its own width, height, bitrate, codec and NAL
+length — were never compared against Jellyfin at all. An EXTEND plus
+`AllowHWTranscoding` on the tuner host makes both servers emit all seven
+sources, so every arm is diffed; `native` is still among them, so nothing is
+lost. The device serves the same MPEG-TS whatever `?transcode=` asks for, which
+is what a real EXTEND does when a profile is unavailable.
+
+DISCOVERY. `GET /LiveTv/Tuners/Discover` is a UDP broadcast, not an HTTP call:
+`HdHomerunHost.DiscoverDevices` (HdHomerunHost.cs:481-518) sends the 20-byte
+`HDHOMERUN_TYPE_DISCOVER_REQ` to 255.255.255.255:65001 and accepts any datagram
+longer than 13 bytes whose second byte is 3 (the REPLY type), then fetches
+`http://{sender ip}/discover.json`. So this fake also listens on UDP 65001 and
+answers a real reply frame — the framing is confirmed against upstream's own
+verbatim request datagram, whose trailing CRC-32 this module's `frame()`
+reproduces byte for byte — and serves its HTTP documents on port 80 as well as
+`PORT`, because the address the servers derive from a reply carries no port.
+Without that, `Discover` is a both-empty agreement and the `newDevicesOnly`
+filter has nothing to filter.
 
   python3 hdhomerun-source.py [port] [advertised-host]
 
@@ -33,8 +53,12 @@ Runs inside the `hdhomerun-source` compose service (python:3-alpine, stdlib only
 """
 import http.server
 import json
+import socket
 import socketserver
+import struct
 import sys
+import threading
+import zlib
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8100
 # The name the SERVERS reach this device by, which is what must go into the
@@ -47,8 +71,8 @@ BASE = f"http://{HOST}:{PORT}"
 # interface address.
 DISCOVER = {
     "FriendlyName": "Parity HDHomeRun",
-    "ModelNumber": "HDHR3-US",
-    "FirmwareName": "hdhomerun3_atsc",
+    "ModelNumber": "HDTC-2US",
+    "FirmwareName": "hdhomerun_dvcr_atsc",
     "FirmwareVersion": "20200225",
     "DeviceID": "1040A0A1",
     "DeviceAuth": "parityfixture",
@@ -126,6 +150,76 @@ class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
     allow_reuse_address = True
 
 
+# ---------------------------------------------------------------------------
+# The UDP discovery half.
+
+#: `HDHOMERUN_TYPE_DISCOVER_REQ` / `_RPY`. A server only checks that a datagram
+#: is longer than 13 bytes and that its second byte is 3, but answering a REAL
+#: frame is what makes this a fake device rather than a shaped blob.
+DISCOVER_REQ = 0x0002
+DISCOVER_RPY = 0x0003
+HD_HOMERUN_PORT = 65001
+
+#: The reply's TLVs: device type (tuner), device id, tuner count. Tag/length/
+#: value, the same encoding the request's two wildcard TLVs use.
+TAG_DEVICE_TYPE = 0x01
+TAG_DEVICE_ID = 0x02
+TAG_TUNER_COUNT = 0x2A
+DEVICE_TYPE_TUNER = 0x00000001
+
+
+def frame(packet_type, payload):
+    """One HDHomeRun control packet: type, payload length, payload, CRC-32.
+
+    The CRC is the standard IEEE CRC-32 over the header and payload, appended
+    LITTLE-endian. Verified against upstream's own hard-coded discovery
+    datagram (HdHomerunHost.cs:494): the CRC of its first 16 bytes is
+    0x8f7dcc73, which is exactly the `73 cc 7d 8f` those bytes end with.
+    """
+    header = struct.pack(">HH", packet_type, len(payload)) + payload
+    return header + struct.pack("<I", zlib.crc32(header) & 0xFFFFFFFF)
+
+
+def tlv(tag, value):
+    return bytes([tag, len(value)]) + value
+
+
+DISCOVER_REPLY = frame(DISCOVER_RPY, (
+    tlv(TAG_DEVICE_TYPE, struct.pack(">I", DEVICE_TYPE_TUNER))
+    + tlv(TAG_DEVICE_ID, bytes.fromhex(DISCOVER["DeviceID"]))
+    + tlv(TAG_TUNER_COUNT, bytes([DISCOVER["TunerCount"]]))
+))
+
+
+def serve_discovery():
+    """Answer the broadcast discovery datagram, forever.
+
+    A real device replies from its own address, which is the ONLY thing the
+    servers take from the reply — they then fetch `http://{that address}/
+    discover.json`. Replying to any DISCOVER_REQ (the request's device-type and
+    device-id TLVs are the `FFFFFFFF` wildcards) is what a device on the
+    segment does.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    sock.bind(("", HD_HOMERUN_PORT))
+    while True:
+        try:
+            data, sender = sock.recvfrom(8192)
+        except OSError:
+            continue
+        if len(data) >= 4 and struct.unpack(">H", data[:2])[0] == DISCOVER_REQ:
+            sock.sendto(DISCOVER_REPLY, sender)
+
+
 if __name__ == "__main__":
+    threading.Thread(target=serve_discovery, daemon=True).start()
+    # Port 80 as well as PORT: a discovered device is reached at
+    # `"http://" + deviceIP` with no port (HdHomerunHost.cs:511), so the
+    # documents must be there too or discovery finds an address it cannot read.
+    if PORT != 80:
+        bare = Server(("", 80), Device)
+        threading.Thread(target=bare.serve_forever, daemon=True).start()
     with Server(("", PORT), Device) as httpd:
         httpd.serve_forever()

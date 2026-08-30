@@ -1644,19 +1644,33 @@ async fn get_tuner_host_types(
     Ok(Json(live_tv(&state)?.tuner_host_types()))
 }
 
+/// The `?newDevicesOnly=` query both discovery routes bind.
+///
+/// `LiveTvController.DiscoverTuners([FromQuery] bool newDevicesOnly = false)`
+/// (v10.11.8 Jellyfin.Api/Controllers/LiveTvController.cs:1146-1150) — absent
+/// means `false`, i.e. report every reachable device.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct DiscoverTunersQuery {
+    /// Only report devices that are not already a configured tuner host.
+    new_devices_only: bool,
+}
+
 /// `GET /LiveTv/Tuners/Discover` — auto-discovered tuner devices.
 ///
 /// Port of `LiveTvController.DiscoverTuners` over
 /// `ITunerHostManager.DiscoverTuners`: every backend scans for
-/// [`TUNER_DISCOVERY_DURATION_MS`]. An empty list is the honest answer on a
-/// network with no tuner on it.
+/// [`TUNER_DISCOVERY_DURATION_MS`], and `newDevicesOnly` drops the devices
+/// already configured (matched on `DeviceId`). An empty list is the honest
+/// answer on a network with no tuner on it.
 async fn discover_tuners(
     RequireAdmin(_auth): RequireAdmin,
     State(state): State<AppState>,
+    Query(query): Query<DiscoverTunersQuery>,
 ) -> Result<Json<Vec<TunerHostInfo>>, ApiError> {
     Ok(Json(
         live_tv(&state)?
-            .discover_tuners(TUNER_DISCOVERY_DURATION_MS)
+            .discover_tuners(TUNER_DISCOVERY_DURATION_MS, query.new_devices_only)
             .await?,
     ))
 }
@@ -1881,16 +1895,39 @@ mod tests {
         let fake = std::sync::Arc::new(FakeLiveTv::default());
         let state = fake_state().with_live_tv(fake.clone());
         assert!(
-            discover_tuners(admin_auth(), State(state))
-                .await
-                .unwrap()
-                .0
-                .is_empty()
+            discover_tuners(
+                admin_auth(),
+                State(state),
+                Query(DiscoverTunersQuery::default())
+            )
+            .await
+            .unwrap()
+            .0
+            .is_empty()
         );
         assert_eq!(
             *fake.discovery_duration_ms.lock().expect("lock"),
             Some(TUNER_DISCOVERY_DURATION_MS)
         );
+        // `[FromQuery] bool newDevicesOnly = false` — an absent flag is false.
+        assert_eq!(*fake.discovery_new_only.lock().expect("lock"), Some(false));
+    }
+
+    /// `?newDevicesOnly=true` reaches the manager. Dropping it here is invisible
+    /// on an empty network and a live divergence on one with a tuner: upstream
+    /// filters the answer against the configured `DeviceId`s
+    /// (TunerHostManager.cs:102-121).
+    #[tokio::test]
+    async fn discover_tuners_forwards_new_devices_only() {
+        let fake = std::sync::Arc::new(FakeLiveTv::default());
+        let state = fake_state().with_live_tv(fake.clone());
+        let query: DiscoverTunersQuery =
+            serde_urlencoded::from_str("newDevicesOnly=true").expect("query");
+        let found = discover_tuners(admin_auth(), State(state), Query(query))
+            .await
+            .expect("discover");
+        assert!(found.0.is_empty());
+        assert_eq!(*fake.discovery_new_only.lock().expect("lock"), Some(true));
     }
 
     #[tokio::test]
@@ -2183,6 +2220,8 @@ mod tests {
         tuner_host_types: Vec<NameIdPair>,
         /// The discovery budget the handler passed down, if it was called.
         discovery_duration_ms: std::sync::Mutex<Option<u64>>,
+        /// The `newDevicesOnly` flag the handler forwarded.
+        discovery_new_only: std::sync::Mutex<Option<bool>>,
     }
 
     #[async_trait::async_trait]
@@ -2271,8 +2310,10 @@ mod tests {
         async fn discover_tuners(
             &self,
             discovery_duration_ms: u64,
+            new_devices_only: bool,
         ) -> Result<Vec<TunerHostInfo>, ferrofin_traits::error::ServiceError> {
             *self.discovery_duration_ms.lock().expect("lock") = Some(discovery_duration_ms);
+            *self.discovery_new_only.lock().expect("lock") = Some(new_devices_only);
             Ok(Vec::new())
         }
         async fn delete_tuner_host(

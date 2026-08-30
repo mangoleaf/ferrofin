@@ -84,6 +84,7 @@ impl LiveTvManager for CountingLiveTv {
     async fn discover_tuners(
         &self,
         discovery_duration_ms: u64,
+        new_devices_only: bool,
     ) -> Result<Vec<TunerHostInfo>, ServiceError> {
         unimplemented!("not probed by the gate tests")
     }

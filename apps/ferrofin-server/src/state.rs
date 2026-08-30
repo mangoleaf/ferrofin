@@ -971,6 +971,10 @@ pub async fn build_app_state(
             Arc::clone(&providers),
         )
         .with_live_tv(Arc::clone(&live_tv))
+        // `GetPlaybackMediaSources`' per-user overwrite of
+        // `SupportsTranscoding`/`SupportsDirectStream` reads the requesting
+        // user's policy; without it the overwrite cannot run at all.
+        .with_user_data(Arc::clone(&user_data))
         .with_localization(Arc::clone(&localization)),
     );
 

@@ -264,12 +264,18 @@ pub trait LiveTvManager: Send + Sync {
     /// Scans the network for tuner devices, giving each backend
     /// `discovery_duration_ms` to answer.
     ///
-    /// Port of `ITunerHostManager.DiscoverTuners(newDevicesOnly: false)`
-    /// (v10.11.8 TunerHostManager.cs:102-121). An empty list is a legitimate
-    /// answer — it is what a network with no tuner on it looks like.
+    /// Port of `ITunerHostManager.DiscoverTuners(newDevicesOnly)` (v10.11.8
+    /// TunerHostManager.cs:102-121). An empty list is a legitimate answer — it
+    /// is what a network with no tuner on it looks like.
+    ///
+    /// `new_devices_only` is the controller's `?newDevicesOnly=` flag: when
+    /// set, a discovered device whose `DeviceId` is already on a configured
+    /// tuner host is dropped, so the dashboard's "Detect my devices" offers
+    /// only tuners that are not already added.
     async fn discover_tuners(
         &self,
         discovery_duration_ms: u64,
+        new_devices_only: bool,
     ) -> Result<Vec<TunerHostInfo>, ServiceError>;
 
     /// Deletes the tuner host with the given id (and its cached channels).
@@ -556,6 +562,27 @@ pub trait LiveTvManager: Send + Sync {
         timer_id: &str,
     ) -> Result<Option<String>, ServiceError> {
         let _ = timer_id;
+        Ok(None)
+    }
+
+    /// `BaseItem.MediaType` of a Live TV channel or DVR recording — `"Video"`,
+    /// `"Audio"`, or `None` when `id` is neither.
+    ///
+    /// The media-source manager needs it for the per-user
+    /// `SupportsTranscoding`/`SupportsDirectStream` overwrite
+    /// (`MediaSourceManager.GetPlaybackMediaSources`, v10.11.8
+    /// Emby.Server.Implementations/Library/MediaSourceManager.cs:204-217),
+    /// which branches on `item.MediaType`. Upstream reads it off the
+    /// `LiveTvChannel`/recording `BaseItem` it already has in hand; Ferrofin's
+    /// channels and recordings are not `BaseItems` rows, so the Live TV
+    /// manager answers for them. `LiveTvChannel.MediaType` is
+    /// `ChannelType == Radio ? Audio : Video`, and a recording inherits the
+    /// media type of the channel it was captured from.
+    ///
+    /// The default reports `None`, which leaves the source exactly as the
+    /// tuner built it — upstream's `user is null` behaviour.
+    async fn live_tv_media_type(&self, id: Uuid) -> Result<Option<String>, ServiceError> {
+        let _ = id;
         Ok(None)
     }
 

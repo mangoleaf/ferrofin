@@ -287,8 +287,16 @@ def provision_livetv(base, token):
         # non-2xx here means the device did not answer discover.json on ONE of the servers
         # — which is a finding, not something to skip past.
         st, raw = http("POST", base + "/LiveTv/TunerHosts", token,
+                       # `AllowHWTranscoding` is what opens
+                       # `GetChannelStreamMediaSources`' six-profile fan-out
+                       # (HdHomerunHost.cs:339-379) on a device whose
+                       # ModelNumber contains "hdtc" — the fake is an EXTEND, so
+                       # with it on BOTH servers emit heavy / internet540 /
+                       # internet480 / internet360 / internet240 / mobile /
+                       # native and every `GetMediaSource` arm is diffed. Off,
+                       # only `native` is, which is one arm of six.
                        json.dumps({"Type": "hdhomerun", "Url": LIVETV_HDHR,
-                                   "ImportFavoritesOnly": False, "AllowHWTranscoding": False}))
+                                   "ImportFavoritesOnly": False, "AllowHWTranscoding": True}))
         if st >= 300:
             raise SystemExit(f"{base}: add hdhomerun tuner host failed {st}: {raw[:200]!r}")
     st, raw = http("POST", base + "/LiveTv/ListingProviders?validateListings=false", token,

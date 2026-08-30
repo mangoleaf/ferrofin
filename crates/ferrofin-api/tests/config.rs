@@ -756,6 +756,7 @@ impl ferrofin_traits::stubs::LiveTvManager for FailingLiveTv {
     async fn discover_tuners(
         &self,
         _discovery_duration_ms: u64,
+        _new_devices_only: bool,
     ) -> Result<Vec<ferrofin_model::live_tv::TunerHostInfo>, ServiceError> {
         unreachable!()
     }

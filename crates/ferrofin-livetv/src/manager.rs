@@ -504,6 +504,22 @@ impl CategoryClasses {
 }
 
 impl FerrofinLiveTvManager {
+    /// Replaces the registered tuner hosts.
+    ///
+    /// Test-only seam. The real set is upstream's fixed DI registration
+    /// (`LiveTvServiceCollectionExtensions.AddLiveTvServices`), so there is no
+    /// production reason to swap it; a test needs one to drive
+    /// `discover_tuners` without broadcasting on the host's network.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_tuner_hosts(
+        mut self,
+        hosts: Vec<Arc<dyn crate::tuner_host::TunerHost>>,
+    ) -> Self {
+        self.hosts = hosts;
+        self
+    }
+
     /// Creates the manager over the given database and source fetcher, caching
     /// Schedules Direct documents under `cache_dir` (the application cache
     /// path — `IApplicationPaths.CachePath` upstream).
@@ -994,12 +1010,13 @@ impl LiveTvManager for FerrofinLiveTvManager {
         // to "m3u" instead stored a row no host would ever read, so a typo in a
         // client's Type silently produced a tuner that fetched nothing.
         //
-        // An ABSENT type still means M3U: `TunerHostInfo.Type` is a plain
-        // string with no default upstream, and Ferrofin's own configuration and
-        // the parity fixtures have always written M3U rows without one.
-        if info.type_.as_deref().is_none_or(str::is_empty) {
-            info.type_ = Some("m3u".to_owned());
-        }
+        // An ABSENT or EMPTY type is exactly that case, not an M3U shorthand:
+        // upstream's lookup is `string.Equals(info.Type, i.Type,
+        // OrdinalIgnoreCase)` over hosts whose `Type` is "hdhomerun"/"m3u", so
+        // null and "" match nothing and 404 too. An earlier draft carved them
+        // out to "m3u" — measured on the parity pair, that carve-out was the
+        // one arm still answering 200 (and storing a row) where Jellyfin
+        // answered 404.
         let type_id = info.type_.clone().unwrap_or_default();
         let Some(host) = crate::tuner_host::find_host(&self.hosts, &type_id) else {
             return Err(ServiceError::not_found(format!(
@@ -1048,16 +1065,42 @@ impl LiveTvManager for FerrofinLiveTvManager {
     async fn discover_tuners(
         &self,
         discovery_duration_ms: u64,
+        new_devices_only: bool,
     ) -> Result<Vec<TunerHostInfo>, ServiceError> {
-        // `TunerHostManager.DiscoverTuners(newDevicesOnly: false)` (v10.11.8
+        // `TunerHostManager.DiscoverTuners(newDevicesOnly)` (v10.11.8
         // TunerHostManager.cs:102-121): every registered host is asked, and
         // `DiscoverDevices`' own `catch` turns a host that blew up into an
         // empty list rather than failing the request.
+        //
+        // `newDevicesOnly` filters the answer against the DEVICE IDS already in
+        // the Live TV configuration — `config.TunerHosts.Where(i =>
+        // !string.IsNullOrWhiteSpace(i.DeviceId)).Select(i => i.DeviceId)`, then
+        // `!configuredDeviceIds.Contains(tuner.DeviceId, OrdinalIgnoreCase)`.
+        // A configured row with no DeviceId contributes nothing to the filter,
+        // and a discovered device with no DeviceId matches nothing, so both are
+        // reported — that is upstream's `Contains` semantics, not a shortcut.
+        let configured: Vec<String> = if new_devices_only {
+            self.get_tuner_hosts()
+                .await?
+                .into_iter()
+                .filter_map(|h| h.device_id)
+                .filter(|d| !d.trim().is_empty())
+                .collect()
+        } else {
+            Vec::new()
+        };
         let mut found = Vec::new();
         for host in &self.hosts {
             match host.discover_devices(discovery_duration_ms).await {
                 Ok(devices) => {
                     for device in devices {
+                        if new_devices_only
+                            && device.device_id.as_deref().is_some_and(|id| {
+                                configured.iter().any(|c| c.eq_ignore_ascii_case(id))
+                            })
+                        {
+                            continue;
+                        }
                         tracing::info!(
                             host = host.name(),
                             url = device.url.as_deref().unwrap_or_default(),
@@ -2047,6 +2090,28 @@ impl LiveTvManager for FerrofinLiveTvManager {
             .map(|recording| recording.path.display().to_string()))
     }
 
+    async fn live_tv_media_type(&self, id: Uuid) -> Result<Option<String>, ServiceError> {
+        // `LiveTvChannel.MediaType => ChannelType == ChannelType.Radio ?
+        // MediaType.Audio : MediaType.Video` — the same mapping
+        // `add_channel_info`/`add_recording_info` already apply to the DTO.
+        if let Some(row) = crate::guide_repository::channel_row(&self.db, id).await? {
+            return Ok(Some(radio_or_tv_media_type(&row.channel_type).to_owned()));
+        }
+        // A recording is the capture of one channel's airing, so it carries
+        // that channel's media type (upstream's `RecordingHelper` builds an
+        // `Audio` item for a radio programme and a `Movie`/`Episode`/`Video`
+        // for a television one — all `MediaType.Video`).
+        let Some(recording) = crate::dvr_repository::recording_row(&self.db, id).await? else {
+            return Ok(None);
+        };
+        let Ok(channel_id) = Uuid::parse_str(&recording.channel_id) else {
+            return Ok(None);
+        };
+        Ok(crate::guide_repository::channel_row(&self.db, channel_id)
+            .await?
+            .map(|row| radio_or_tv_media_type(&row.channel_type).to_owned()))
+    }
+
     async fn get_recording_media_sources(
         &self,
         recording_id: Uuid,
@@ -2167,6 +2232,17 @@ impl LiveTvManager for FerrofinLiveTvManager {
 
     async fn get_schedules_direct_countries(&self) -> Result<Vec<u8>, ServiceError> {
         self.schedules_direct.get_available_countries().await
+    }
+}
+
+/// `LiveTvChannel.MediaType` for a stored channel's `ChannelType` column.
+///
+/// `ChannelType == ChannelType.Radio ? MediaType.Audio : MediaType.Video`.
+fn radio_or_tv_media_type(channel_type: &str) -> &'static str {
+    if channel_type == "Radio" {
+        "Audio"
+    } else {
+        "Video"
     }
 }
 
@@ -3278,7 +3354,11 @@ impl FerrofinLiveTvManager {
         &self,
         tuner: &TunerHostInfo,
     ) -> Result<&Arc<dyn crate::tuner_host::TunerHost>, ServiceError> {
-        let type_id = tuner.type_.as_deref().unwrap_or("m3u");
+        // No "m3u" default here either: `save_tuner_host` rejects a row whose
+        // `Type` names no registered host, so a stored row always has one, and
+        // guessing on the playback path would send an HDHomeRun row down the
+        // M3U arm. `refresh_guide` reads the same field the same way.
+        let type_id = tuner.type_.as_deref().unwrap_or_default();
         crate::tuner_host::find_host(&self.hosts, type_id)
             .ok_or_else(|| ServiceError::not_found(format!("tuner host type {type_id}")))
     }
@@ -4389,6 +4469,7 @@ mod tests {
         // A tuner host is not a service: the list stays exactly [Emby] (Jellyfin
         // lists ILiveTvServices, of which a stock server has one).
         mgr.save_tuner_host(TunerHostInfo {
+            type_: Some("m3u".to_owned()),
             url: Some("http://tuner/playlist.m3u".to_owned()),
             ..TunerHostInfo::default()
         })
@@ -4449,6 +4530,7 @@ mod tests {
                 .is_empty()
         );
         mgr.save_tuner_host(TunerHostInfo {
+            type_: Some("m3u".to_owned()),
             url: Some("http://tuner/playlist.m3u".to_owned()),
             ..TunerHostInfo::default()
         })
@@ -4469,6 +4551,7 @@ mod tests {
         assert!(!mgr.has_tuner_hosts(), "no host configured yet");
         let saved = mgr
             .save_tuner_host(TunerHostInfo {
+                type_: Some("m3u".to_owned()),
                 url: Some("http://tuner/playlist.m3u".to_owned()),
                 ..TunerHostInfo::default()
             })
@@ -4495,13 +4578,50 @@ mod tests {
     async fn tuner_host_without_url_is_rejected() {
         let mgr = manager_with(FakeFetcher(HashMap::new())).await;
         let err = mgr
-            .save_tuner_host(TunerHostInfo::default())
+            .save_tuner_host(TunerHostInfo {
+                type_: Some("m3u".to_owned()),
+                ..TunerHostInfo::default()
+            })
             .await
             .expect_err("no url");
         assert!(matches!(
             err,
             ferrofin_traits::error::ServiceError::InvalidInput(_)
         ));
+    }
+
+    #[rstest::rstest]
+    #[case::absent(None)]
+    #[case::empty(Some(""))]
+    #[case::blank(Some("   "))]
+    #[case::unregistered(Some("nosuchtype"))]
+    #[tokio::test]
+    async fn a_tuner_type_no_host_claims_is_not_found(#[case] type_: Option<&str>) {
+        // `TunerHostManager.SaveTunerHost`'s lookup is
+        // `_tunerHosts.FirstOrDefault(i => string.Equals(info.Type, i.Type,
+        // OrdinalIgnoreCase))` (v10.11.8 TunerHostManager.cs:63) with NO
+        // carve-out: null, "" and "   " match neither "hdhomerun" nor "m3u",
+        // so all four of these are `ResourceNotFoundException` — a 404.
+        // Ferrofin briefly defaulted the first three to "m3u", which answered
+        // 200 and stored a row where Jellyfin answered 404 (measured on the
+        // parity pair 2026-08-30).
+        let mgr = manager_with(FakeFetcher(HashMap::new())).await;
+        let err = mgr
+            .save_tuner_host(TunerHostInfo {
+                type_: type_.map(str::to_owned),
+                url: Some("http://tuner/playlist.m3u".to_owned()),
+                ..TunerHostInfo::default()
+            })
+            .await
+            .expect_err("a type no host claims must not be stored");
+        assert!(
+            matches!(err, ferrofin_traits::error::ServiceError::NotFound(_)),
+            "{err}"
+        );
+        assert!(
+            mgr.get_tuner_hosts().await.expect("list").is_empty(),
+            "the rejected host must not have been persisted"
+        );
     }
 
     #[tokio::test]
@@ -4529,6 +4649,102 @@ mod tests {
             "the rejected host must not have been persisted"
         );
         assert!(!mgr.has_tuner_hosts());
+    }
+
+    /// A tuner host that reports a fixed set of devices from `DiscoverDevices`.
+    struct DiscoveringHost(Vec<TunerHostInfo>);
+
+    #[async_trait::async_trait]
+    impl crate::tuner_host::TunerHost for DiscoveringHost {
+        fn name(&self) -> &'static str {
+            "Discovering"
+        }
+        fn type_id(&self) -> &'static str {
+            "discovering"
+        }
+        async fn get_channels(
+            &self,
+            _tuner: &TunerHostInfo,
+        ) -> Result<Vec<crate::tuner_host::TunerChannel>, ferrofin_traits::error::ServiceError>
+        {
+            Ok(Vec::new())
+        }
+        async fn discover_devices(
+            &self,
+            _duration_ms: u64,
+        ) -> Result<Vec<TunerHostInfo>, ferrofin_traits::error::ServiceError> {
+            Ok(self.0.clone())
+        }
+        async fn channel_media_sources(
+            &self,
+            _tuner: &TunerHostInfo,
+            _channel: &crate::tuner_host::StoredChannel,
+        ) -> Result<Vec<ferrofin_model::dto::MediaSourceInfo>, ferrofin_traits::error::ServiceError>
+        {
+            Ok(Vec::new())
+        }
+        async fn channel_stream(
+            &self,
+            _tuner: &TunerHostInfo,
+            _channel: &crate::tuner_host::StoredChannel,
+            _stream_id: Option<&str>,
+        ) -> Result<crate::tuner_host::ChannelStream, ferrofin_traits::error::ServiceError>
+        {
+            Err(ferrofin_traits::error::ServiceError::backend("no"))
+        }
+    }
+
+    /// `TunerHostManager.DiscoverTuners(newDevicesOnly)` (v10.11.8
+    /// TunerHostManager.cs:102-121) filters the discovered devices against the
+    /// `DeviceId`s already on a configured tuner host. Dropping the flag —
+    /// which the handler did until the type list gained a second backend —
+    /// reports an already-added device as a new one.
+    #[tokio::test]
+    async fn discovery_can_drop_the_devices_already_configured() {
+        let device = |id: &str, url: &str| TunerHostInfo {
+            type_: Some("discovering".to_owned()),
+            device_id: Some(id.to_owned()),
+            url: Some(url.to_owned()),
+            ..TunerHostInfo::default()
+        };
+        let mgr = manager_with(FakeFetcher(HashMap::new()))
+            .await
+            .with_tuner_hosts(vec![Arc::new(DiscoveringHost(vec![
+                device("AAAA1111", "http://one/"),
+                device("BBBB2222", "http://two/"),
+                // `Contains(tuner.DeviceId, OrdinalIgnoreCase)` never matches a
+                // null, so a device that did not name itself is always new.
+                TunerHostInfo {
+                    type_: Some("discovering".to_owned()),
+                    url: Some("http://three/".to_owned()),
+                    ..TunerHostInfo::default()
+                },
+            ]))]);
+
+        // Nothing configured: both flags report all three.
+        assert_eq!(mgr.discover_tuners(0, false).await.expect("all").len(), 3);
+        assert_eq!(mgr.discover_tuners(0, true).await.expect("new").len(), 3);
+
+        // Configure the first device, in the OTHER case — the C# comparison is
+        // `StringComparer.OrdinalIgnoreCase`.
+        mgr.save_tuner_host(device("aaaa1111", "http://one/"))
+            .await
+            .expect("save");
+        let all = mgr.discover_tuners(0, false).await.expect("all");
+        assert_eq!(
+            all.len(),
+            3,
+            "newDevicesOnly=false still reports every device"
+        );
+        let new_only = mgr.discover_tuners(0, true).await.expect("new");
+        assert_eq!(
+            new_only
+                .iter()
+                .map(|d| d.device_id.clone().unwrap_or_default())
+                .collect::<Vec<_>>(),
+            vec!["BBBB2222".to_owned(), String::new()],
+            "the configured device is dropped; the unnamed one is not"
+        );
     }
 
     #[tokio::test]
@@ -4689,6 +4905,7 @@ mod tests {
         sources.insert("http://guide/xmltv.xml".to_owned(), dated(CLASSIFIED_XMLTV));
         let mgr = manager_with(FakeFetcher(sources)).await;
         mgr.save_tuner_host(TunerHostInfo {
+            type_: Some("m3u".to_owned()),
             url: Some("http://tuner/playlist.m3u".to_owned()),
             ..TunerHostInfo::default()
         })
@@ -4829,6 +5046,7 @@ mod tests {
         let mgr = manager_with(FakeFetcher(sources)).await;
 
         mgr.save_tuner_host(TunerHostInfo {
+            type_: Some("m3u".to_owned()),
             url: Some("http://tuner/playlist.m3u".to_owned()),
             ..TunerHostInfo::default()
         })
@@ -4928,6 +5146,7 @@ mod tests {
         let mgr = manager_with(FakeFetcher(sources)).await;
 
         mgr.save_tuner_host(TunerHostInfo {
+            type_: Some("m3u".to_owned()),
             url: Some("http://tuner/ae.m3u".to_owned()),
             ..TunerHostInfo::default()
         })
@@ -4992,6 +5211,7 @@ mod tests {
         sources.insert("http://guide/xmltv.xml".to_owned(), xmltv);
         let mgr = manager_with(FakeFetcher(sources)).await;
         mgr.save_tuner_host(TunerHostInfo {
+            type_: Some("m3u".to_owned()),
             url: Some("http://tuner/playlist.m3u".to_owned()),
             ..TunerHostInfo::default()
         })
@@ -5063,6 +5283,7 @@ mod tests {
         sources.insert("http://guide/xmltv.xml".to_owned(), relative_guide());
         let mgr = manager_with(FakeFetcher(sources)).await;
         mgr.save_tuner_host(TunerHostInfo {
+            type_: Some("m3u".to_owned()),
             url: Some("http://tuner/playlist.m3u".to_owned()),
             ..TunerHostInfo::default()
         })
@@ -5127,6 +5348,55 @@ mod tests {
             });
         mgr.set_local_api_url("http://127.0.0.1:8096");
         mgr
+    }
+
+    /// `LiveTvChannel.MediaType` — what the media-source manager's per-user
+    /// `SupportsTranscoding`/`SupportsDirectStream` overwrite branches on
+    /// (`MediaSourceManager.GetPlaybackMediaSources`, v10.11.8
+    /// MediaSourceManager.cs:204-217). A channel is not a `BaseItems` row here,
+    /// so the Live TV manager is the only thing that can answer.
+    #[tokio::test]
+    async fn a_channel_reports_the_media_type_of_its_kind() {
+        let mgr = manager_with_relative_guide().await;
+        let channel = first_channel_id(&mgr).await;
+        assert_eq!(
+            mgr.live_tv_media_type(channel).await.expect("type"),
+            Some("Video".to_owned()),
+            "a television channel is MediaType.Video"
+        );
+        // The radio arm: a `radio="true"` playlist entry, through the same M3U
+        // host and the same refresh, so `ChannelType == Radio ? Audio : Video`
+        // is exercised end to end rather than by hand-editing the stored row.
+        let mut sources = HashMap::new();
+        sources.insert(
+            "http://tuner/radio.m3u".to_owned(),
+            "#EXTM3U\n#EXTINF:-1 tvg-id=\"jazz.fm\" radio=\"true\",Jazz FM\nhttp://tuner/jazz\n"
+                .to_owned(),
+        );
+        let radio_mgr = manager_with(FakeFetcher(sources)).await;
+        radio_mgr
+            .save_tuner_host(TunerHostInfo {
+                type_: Some("m3u".to_owned()),
+                url: Some("http://tuner/radio.m3u".to_owned()),
+                ..TunerHostInfo::default()
+            })
+            .await
+            .expect("tuner");
+        radio_mgr.refresh_guide().await.expect("refresh");
+        let radio = first_channel_id(&radio_mgr).await;
+        assert_eq!(
+            radio_mgr.live_tv_media_type(radio).await.expect("type"),
+            Some("Audio".to_owned()),
+            "a radio channel is MediaType.Audio"
+        );
+        // An id that is neither a channel nor a recording has no media type,
+        // and the caller must then leave the source as it was built.
+        assert_eq!(
+            mgr.live_tv_media_type(Uuid::from_u128(0xfeed))
+                .await
+                .expect("type"),
+            None
+        );
     }
 
     #[tokio::test]
@@ -6073,6 +6343,7 @@ mod tests {
         sources.insert("http://guide/xmltv.xml".to_owned(), series_guide());
         let mgr = manager_with(FakeFetcher(sources)).await;
         mgr.save_tuner_host(TunerHostInfo {
+            type_: Some("m3u".to_owned()),
             url: Some("http://tuner/playlist.m3u".to_owned()),
             ..TunerHostInfo::default()
         })
@@ -6810,6 +7081,7 @@ mod tests {
         )
         .with_dto(Arc::new(FakeDto));
         mgr.save_tuner_host(TunerHostInfo {
+            type_: Some("m3u".to_owned()),
             url: Some("http://tuner/playlist.m3u".to_owned()),
             ..TunerHostInfo::default()
         })
@@ -6943,6 +7215,7 @@ mod tests {
         sources.insert("http://guide/xmltv.xml".to_owned(), dated(CLASSIFIED_XMLTV));
         let mgr = manager_with(FakeFetcher(sources)).await;
         mgr.save_tuner_host(TunerHostInfo {
+            type_: Some("m3u".to_owned()),
             url: Some("http://tuner/playlist.m3u".to_owned()),
             ..TunerHostInfo::default()
         })

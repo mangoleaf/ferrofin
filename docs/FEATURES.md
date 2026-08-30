@@ -62,9 +62,10 @@ Deep-verified against a real Jellyfin server:
   `discover.json`/`lineup.json`, UDP device discovery, the per-channel HTTP stream with
   its transcode profiles, and the legacy binary control protocol. **No physical HDHomeRun
   has been run against it** — it is verified against Jellyfin's own JSON fixtures, against
-  a fake device on the parity lab's compose network that both servers consume, and (for
-  the legacy control path) at the byte/CRC level plus a fake device that speaks the
-  protocol back. Live TV as a whole is deep-verified at the API level only — **not yet
+  a fake device on the parity lab's compose network that both servers consume (it answers
+  the UDP discovery broadcast as well as the three HTTP documents, so `Detect my devices`
+  is differentially diffed too), and (for the legacy control path) at the byte/CRC level
+  plus a fake device that speaks the protocol back. Live TV as a whole is deep-verified at the API level only — **not yet
   exercised end-to-end with a real tuner/guide by a human**; treat as less battle-tested
   than the rest of this list.
 - **SyncPlay** — groups, playback-command relay, time sync.

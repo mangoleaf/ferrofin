@@ -96,6 +96,7 @@ impl LiveTvManager for CountriesLiveTv {
     async fn discover_tuners(
         &self,
         _discovery_duration_ms: u64,
+        _new_devices_only: bool,
     ) -> Result<Vec<TunerHostInfo>, ServiceError> {
         unreachable!()
     }

@@ -57,6 +57,12 @@ pub struct FerrofinMediaSourceManager {
     /// Live TV manager, when configured — lets playback resolve a Live TV channel
     /// id (which is not a `BaseItems` row) to its tuner stream.
     live_tv: Option<Arc<dyn ferrofin_traits::stubs::LiveTvManager>>,
+    /// User-data manager, when configured — the source of the per-user playback
+    /// permissions `GetStaticMediaSources`/`GetPlaybackMediaSources` overwrite
+    /// `SupportsTranscoding`/`SupportsDirectStream` from. `None` (unit tests)
+    /// leaves every source exactly as it was built, which is upstream's
+    /// `user is null` path.
+    user_data: Option<Arc<dyn ferrofin_traits::library::UserDataManager>>,
     /// Localization for the `MediaStream.Localized*` labels re-stamped on
     /// every read (the C# `MediaStreamRepository.Map` does the same — they are
     /// not persisted). `None` (unit tests) leaves them unset.
@@ -101,6 +107,7 @@ impl FerrofinMediaSourceManager {
             encoder,
             provider,
             live_tv: None,
+            user_data: None,
             localization: None,
             open_streams: Arc::new(Mutex::new(HashMap::new())),
             probe_cache: Arc::new(Mutex::new(HashMap::new())),
@@ -112,6 +119,23 @@ impl FerrofinMediaSourceManager {
     #[must_use]
     pub fn with_live_tv(mut self, live_tv: Arc<dyn ferrofin_traits::stubs::LiveTvManager>) -> Self {
         self.live_tv = Some(live_tv);
+        self
+    }
+
+    /// Wires the user-data manager, so a media source's `SupportsTranscoding`
+    /// and `SupportsDirectStream` reflect the requesting user's policy.
+    ///
+    /// Without it the per-user overwrite in
+    /// `MediaSourceManager.GetStaticMediaSources` / `GetPlaybackMediaSources`
+    /// (v10.11.8 MediaSourceManager.cs:355-372 and :204-217) cannot run, and
+    /// every source is reported as the builder left it — which is what
+    /// upstream does when it has no user.
+    #[must_use]
+    pub fn with_user_data(
+        mut self,
+        user_data: Arc<dyn ferrofin_traits::library::UserDataManager>,
+    ) -> Self {
+        self.user_data = Some(user_data);
         self
     }
 
@@ -162,6 +186,56 @@ impl FerrofinMediaSourceManager {
             set_live_tv_key_properties(source);
         }
         Ok(sources)
+    }
+
+    /// Overwrites `SupportsTranscoding`/`SupportsDirectStream` on `sources`
+    /// from the requesting user's policy.
+    ///
+    /// Port of the `if (user is not null)` block upstream runs twice — over the
+    /// STATIC sources in `GetStaticMediaSources` (v10.11.8
+    /// Emby.Server.Implementations/Library/MediaSourceManager.cs:355-372) and
+    /// over the DYNAMIC ones in `GetPlaybackMediaSources` (:204-217). Both
+    /// branch on `item.MediaType`: audio sets `SupportsTranscoding` from
+    /// `EnableAudioPlaybackTranscoding`, video sets it from
+    /// `EnableVideoPlaybackTranscoding` and `SupportsDirectStream` from
+    /// `EnablePlaybackRemuxing`, and anything else is untouched.
+    ///
+    /// `media_type` is the item's, when the caller has an item row. `None`
+    /// means "a Live TV id", and the Live TV manager is asked for it — a
+    /// channel and a recording are not `BaseItems` rows here, so there is no
+    /// entity to read it off.
+    ///
+    /// No user, no user-data manager, or no policy for that user all leave every
+    /// source exactly as built: upstream's null-user path, not a default of
+    /// "everything permitted" (which would over-promise) nor "nothing
+    /// permitted" (which would break playback for an id we simply failed to
+    /// resolve).
+    async fn apply_playback_permissions(
+        &self,
+        sources: &mut [MediaSourceInfo],
+        item_id: Uuid,
+        media_type: Option<&str>,
+        user_id: Option<Uuid>,
+    ) -> Result<(), ServiceError> {
+        let (Some(user_id), Some(user_data)) = (user_id, self.user_data.as_ref()) else {
+            return Ok(());
+        };
+        let Some(permissions) = user_data.get_playback_permissions(user_id).await? else {
+            return Ok(());
+        };
+        let resolved;
+        let media_type = match (media_type, self.live_tv.as_ref()) {
+            (Some(t), _) => Some(t),
+            (None, Some(live_tv)) => {
+                resolved = live_tv.live_tv_media_type(item_id).await?;
+                resolved.as_deref()
+            }
+            (None, None) => None,
+        };
+        for source in sources.iter_mut() {
+            permissions.apply(media_type, source);
+        }
+        Ok(())
     }
 
     /// The media sources for a DVR recording, or empty when the id is not one.
@@ -374,6 +448,37 @@ fn set_live_tv_key_properties(source: &mut MediaSourceInfo) {
             *value = Some(format!("{prefix}{current}"));
         }
     }
+}
+
+/// Orders (and filters) the sources `GetPlaybackMediaSources` hands back.
+///
+/// Port of `MediaSourceManager.SortMediaSources` (v10.11.8
+/// Emby.Server.Implementations/Library/MediaSourceManager.cs:479-497), which is
+/// the very last thing `GetPlaybackMediaSources` does (`return
+/// SortMediaSources(list).ToArray()`, :223) and the ONLY place it is applied —
+/// `GetStaticMediaSources` returns the builders' order untouched, and so does
+/// Ferrofin.
+///
+/// `OrderBy(VideoType == VideoFile ? 0 : 1)`, then `ThenBy(Video3DFormat is
+/// null ? 0 : 1)`, then `ThenByDescending(VideoStream?.Width ?? 0)`, dropping
+/// `MediaSourceType.Placeholder`. LINQ's `OrderBy` is a STABLE sort and so is
+/// [`slice::sort_by_key`], which is load-bearing here: an HDHomeRun EXTEND
+/// offers `heavy` and `native` at the same 1920 width, and only stability keeps
+/// them in the order `GetChannelStreamMediaSources` appended them.
+///
+/// Skipping this left an HDHomeRun channel's seven profiles in append order
+/// (heavy, internet540/480/360/240, mobile, native) where Jellyfin answers them
+/// widest-first (heavy, native, mobile, internet540/480/360/240) — a client
+/// picking `MediaSources[0]` got a different stream from each server.
+fn sort_media_sources(sources: &mut Vec<MediaSourceInfo>) {
+    sources.retain(|s| s.type_ != MediaSourceType::Placeholder);
+    sources.sort_by_key(|s| {
+        (
+            u8::from(s.video_type != Some(ferrofin_model::entities::VideoType::VideoFile)),
+            u8::from(s.video3d_format.is_some()),
+            std::cmp::Reverse(s.video_stream().and_then(|v| v.width).unwrap_or(0)),
+        )
+    });
 }
 
 /// Parses a Live TV `OpenToken` into the channel id and media-source id it
@@ -882,15 +987,18 @@ impl MediaSourceManager for FerrofinMediaSourceManager {
     async fn get_playback_media_sources(
         &self,
         item_id: Uuid,
-        _user_id: Uuid,
+        user_id: Uuid,
         _allow_media_probe: bool,
         enable_path_substitution: bool,
     ) -> Result<Vec<MediaSourceInfo>, ServiceError> {
         // Playback sources build on the static sources; the per-user bitrate/profile
         // negotiation (MediaStreamSelector) is deferred, so the static set is the
         // playback set for v1.
-        self.get_static_media_sources(item_id, enable_path_substitution, Some(_user_id))
-            .await
+        let mut sources = self
+            .get_static_media_sources(item_id, enable_path_substitution, Some(user_id))
+            .await?;
+        sort_media_sources(&mut sources);
+        Ok(sources)
     }
 
     async fn get_alternate_versions_batch(
@@ -907,17 +1015,29 @@ impl MediaSourceManager for FerrofinMediaSourceManager {
         &self,
         item_id: Uuid,
         _enable_path_substitution: bool,
-        _user_id: Option<Uuid>,
+        user_id: Option<Uuid>,
     ) -> Result<Vec<MediaSourceInfo>, ServiceError> {
         let Some(mut item) = self.items.retrieve_item(item_id).await? else {
             // Not a library item — it may be a Live TV channel, or a DVR
             // recording (which upstream resolves through the same Live TV
             // media-source provider).
-            let channel = self.channel_media_source(item_id).await?;
-            if !channel.is_empty() {
-                return Ok(channel);
+            let mut sources = self.channel_media_source(item_id).await?;
+            if sources.is_empty() {
+                sources = self.recording_media_source(item_id).await?;
             }
-            return self.recording_media_source(item_id).await;
+            if sources.is_empty() {
+                return Ok(sources);
+            }
+            // `GetPlaybackMediaSources`' per-user overwrite over the DYNAMIC
+            // sources (v10.11.8 MediaSourceManager.cs:204-217), applied AFTER
+            // the `SupportsDirectStream(Path, Protocol)` validation the
+            // channel path already ran — that order is upstream's, and it is
+            // why an HDHomeRun channel (Protocol Udp, so the validation says
+            // false) is still reported direct-streamable to a user who has
+            // `EnablePlaybackRemuxing`.
+            self.apply_playback_permissions(&mut sources, item_id, None, user_id)
+                .await?;
+            return Ok(sources);
         };
         // An ALTERNATE version (PrimaryVersionId set) resolves through its
         // primary, so playing any version yields the full merged source list
@@ -945,6 +1065,13 @@ impl MediaSourceManager for FerrofinMediaSourceManager {
                 sources.push(Self::static_source(&alt, alt_streams, alt_attachments));
             }
         }
+        // `GetStaticMediaSources(item, enablePathSubstitution, user)`'s tail
+        // (v10.11.8 MediaSourceManager.cs:355-372): when a user was supplied,
+        // the policy decides `SupportsTranscoding` and (for video)
+        // `SupportsDirectStream`. `user` is null on the anonymous paths
+        // (`GET /Videos/{id}/stream`), and there the sources stay as built.
+        self.apply_playback_permissions(&mut sources, item_id, item.media_type.as_deref(), user_id)
+            .await?;
         Ok(sources)
     }
 
@@ -1408,6 +1535,51 @@ mod tests {
         }
     }
 
+    /// A config manager whose configuration is the factory default — the
+    /// user-data manager needs one, and nothing on the playback-permission path
+    /// reads it.
+    struct FixedConfig;
+
+    #[async_trait]
+    impl ferrofin_traits::configuration::ServerConfigurationManager for FixedConfig {
+        fn application_paths(&self) -> Arc<dyn ferrofin_traits::system::ServerApplicationPaths> {
+            unreachable!("not used in these tests")
+        }
+        async fn configuration(
+            &self,
+        ) -> Result<Arc<ferrofin_model::configuration::ServerConfiguration>, ServiceError> {
+            Ok(Arc::new(
+                crate::configuration_manager::default_server_configuration(),
+            ))
+        }
+        async fn update_configuration(
+            &self,
+            _configuration: &ferrofin_model::configuration::ServerConfiguration,
+        ) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        async fn get_branding(
+            &self,
+        ) -> Result<ferrofin_model::branding::BrandingOptions, ServiceError> {
+            Ok(ferrofin_model::branding::BrandingOptions::default())
+        }
+        async fn update_branding(
+            &self,
+            _branding: &ferrofin_model::branding::BrandingOptions,
+        ) -> Result<(), ServiceError> {
+            Ok(())
+        }
+    }
+
+    /// The real user-data manager over the test db — the source of the
+    /// `Permissions` rows the playback overwrite reads.
+    fn user_data_manager(db: &Database) -> Arc<dyn ferrofin_traits::library::UserDataManager> {
+        Arc::new(crate::user_data_manager::FerrofinUserDataManager::new(
+            db.clone(),
+            Arc::new(FixedConfig),
+        ))
+    }
+
     fn manager(db: &Database) -> FerrofinMediaSourceManager {
         let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
             Arc::new(ItemTypeLookup::new());
@@ -1474,6 +1646,7 @@ mod tests {
         async fn discover_tuners(
             &self,
             _discovery_duration_ms: u64,
+            _new_devices_only: bool,
         ) -> Result<Vec<ferrofin_model::live_tv::TunerHostInfo>, ServiceError> {
             Ok(Vec::new())
         }
@@ -1538,6 +1711,10 @@ mod tests {
         }
         async fn get_channel_stream_url(&self, _id: Uuid) -> Result<Option<String>, ServiceError> {
             Ok(Some(FAKE_TUNER_URL.to_owned()))
+        }
+        async fn live_tv_media_type(&self, _id: Uuid) -> Result<Option<String>, ServiceError> {
+            // `LiveTvChannel.MediaType` for a television channel.
+            Ok(Some("Video".to_owned()))
         }
         async fn get_channel_media_sources(
             &self,
@@ -1676,6 +1853,191 @@ mod tests {
         async fn delete_recording(&self, _id: Uuid) -> Result<(), ServiceError> {
             Ok(())
         }
+    }
+
+    /// `SortMediaSources` (v10.11.8 MediaSourceManager.cs:479-497), the last
+    /// thing `GetPlaybackMediaSources` does. Measured on the parity pair: an
+    /// HDHomeRun EXTEND offers seven profiles, and without this Ferrofin
+    /// answered them in append order where Jellyfin answers them widest-first,
+    /// so `MediaSources[0]` named a different stream on each server.
+    #[test]
+    fn playback_sources_are_ordered_widest_first_and_lose_placeholders() {
+        use ferrofin_model::entities::{MediaStreamType, Video3DFormat, VideoType};
+        let src = |name: &str, width: Option<i32>| MediaSourceInfo {
+            id: Some(name.to_owned()),
+            media_streams: width
+                .map(|w| {
+                    vec![ferrofin_model::entities_media::MediaStream {
+                        stream_type: MediaStreamType::Video,
+                        width: Some(w),
+                        ..Default::default()
+                    }]
+                })
+                .unwrap_or_default(),
+            ..MediaSourceInfo::default()
+        };
+        // The real HDHomeRun append order, and the widths GetMediaSource gives
+        // each profile.
+        let mut sources = vec![
+            src("heavy", Some(1920)),
+            src("internet540", Some(960)),
+            src("internet480", Some(848)),
+            src("internet360", Some(640)),
+            src("internet240", Some(432)),
+            src("mobile", Some(1280)),
+            src("native", Some(1920)),
+            MediaSourceInfo {
+                id: Some("placeholder".to_owned()),
+                type_: MediaSourceType::Placeholder,
+                ..MediaSourceInfo::default()
+            },
+        ];
+        sort_media_sources(&mut sources);
+        assert_eq!(
+            sources
+                .iter()
+                .map(|s| s.id.clone().unwrap_or_default())
+                .collect::<Vec<_>>(),
+            // Jellyfin's exact answer, measured on the pair. `heavy` before
+            // `native` is the STABLE tie-break at 1920, not an accident.
+            [
+                "heavy",
+                "native",
+                "mobile",
+                "internet540",
+                "internet480",
+                "internet360",
+                "internet240"
+            ],
+        );
+
+        // The two earlier keys: a `VideoFile` source outranks everything, and a
+        // 3D one sinks below a flat one of the same rank — both regardless of
+        // width, because they sort BEFORE it.
+        let mut ranked = vec![
+            src("wide-3d", Some(4096)),
+            src("wide-flat", Some(3840)),
+            MediaSourceInfo {
+                video_type: Some(VideoType::VideoFile),
+                ..src("narrow-file", Some(320))
+            },
+        ];
+        ranked[0].video3d_format = Some(Video3DFormat::HalfSideBySide);
+        sort_media_sources(&mut ranked);
+        assert_eq!(
+            ranked
+                .iter()
+                .map(|s| s.id.clone().unwrap_or_default())
+                .collect::<Vec<_>>(),
+            ["narrow-file", "wide-flat", "wide-3d"],
+        );
+    }
+
+    /// `GetPlaybackMediaSources` re-sets `SupportsDirectStream` /
+    /// `SupportsTranscoding` on a DYNAMIC source from the requesting user's
+    /// policy, AFTER the `SupportsDirectStream(Path, Protocol)` validation
+    /// (v10.11.8 Emby.Server.Implementations/Library/MediaSourceManager.cs:204-217).
+    ///
+    /// This is the arm an HDHomeRun channel lands on: its protocol is `Udp`, so
+    /// the validation says false, and Jellyfin still reports it
+    /// direct-streamable because `EnablePlaybackRemuxing` is on. Ferrofin never
+    /// applied the overwrite at all, which was invisible while every channel
+    /// was an HTTP M3U one.
+    #[tokio::test]
+    async fn a_dynamic_source_takes_its_direct_stream_flag_from_the_user_policy() {
+        use ferrofin_db::enums::PermissionKind;
+        use ferrofin_traits::library::UserManager as _;
+
+        let db = test_db().await;
+        let users = crate::user_manager::FerrofinUserManager::new(db.clone());
+        let user = users.create_user("erin").await.expect("create user");
+        let user_id = Uuid::parse_str(&user.id).expect("uuid");
+        let mgr = manager(&db)
+            .with_live_tv(Arc::new(FakeLiveTv::default()))
+            .with_user_data(user_data_manager(&db));
+        let channel = Uuid::from_u128(0x777);
+
+        // With no user the source stays exactly as the tuner built it — the
+        // anonymous path (`GET /Videos/{id}/stream`) reaches this too, and
+        // upstream's `if (user is not null)` skips the whole block there.
+        let unowned = mgr
+            .get_static_media_sources(channel, false, None)
+            .await
+            .expect("no user");
+        assert!(unowned[0].supports_direct_stream && unowned[0].supports_transcoding);
+
+        // A default policy grants both, so both come back true.
+        let granted = mgr
+            .get_playback_media_sources(channel, user_id, false, false)
+            .await
+            .expect("granted");
+        assert!(granted[0].supports_direct_stream, "EnablePlaybackRemuxing");
+        assert!(
+            granted[0].supports_transcoding,
+            "EnableVideoPlaybackTranscoding"
+        );
+
+        // Revoke them and the same source reports false — the overwrite is the
+        // policy, not a constant.
+        for kind in [
+            PermissionKind::EnablePlaybackRemuxing,
+            PermissionKind::EnableVideoPlaybackTranscoding,
+        ] {
+            crate::user_entity_ext::set_permission(db.pool(), &user.id, kind, false)
+                .await
+                .expect("revoke");
+        }
+        let revoked = mgr
+            .get_playback_media_sources(channel, user_id, false, false)
+            .await
+            .expect("revoked");
+        assert!(!revoked[0].supports_direct_stream);
+        assert!(!revoked[0].supports_transcoding);
+    }
+
+    /// The same overwrite on a STATIC source — `GetStaticMediaSources`' own
+    /// `if (user is not null)` tail (MediaSourceManager.cs:355-372).
+    #[tokio::test]
+    async fn a_static_video_source_takes_its_flags_from_the_user_policy() {
+        use ferrofin_db::enums::PermissionKind;
+        use ferrofin_traits::library::UserManager as _;
+
+        let db = test_db().await;
+        let users = crate::user_manager::FerrofinUserManager::new(db.clone());
+        let user = users.create_user("erin").await.expect("create user");
+        let user_id = Uuid::parse_str(&user.id).expect("uuid");
+        let id = Uuid::from_u128(0x202);
+        // `MediaType` is the only field this arm branches on.
+        crate::test_support::seed_video_item(&db, id, BaseItemKind::Movie).await;
+        let mgr = manager(&db).with_user_data(user_data_manager(&db));
+
+        let granted = mgr
+            .get_playback_media_sources(id, user_id, false, false)
+            .await
+            .expect("granted");
+        assert!(granted[0].supports_direct_stream);
+        assert!(granted[0].supports_transcoding);
+
+        crate::user_entity_ext::set_permission(
+            db.pool(),
+            &user.id,
+            PermissionKind::EnablePlaybackRemuxing,
+            false,
+        )
+        .await
+        .expect("revoke");
+        let revoked = mgr
+            .get_playback_media_sources(id, user_id, false, false)
+            .await
+            .expect("revoked");
+        assert!(
+            !revoked[0].supports_direct_stream,
+            "remuxing revoked must reach a library item too"
+        );
+        assert!(
+            revoked[0].supports_transcoding,
+            "video transcoding is a separate permission"
+        );
     }
 
     #[tokio::test]

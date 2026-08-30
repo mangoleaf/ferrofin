@@ -104,6 +104,9 @@ struct ItemRow<'a> {
     episode: Option<i64>,
     /// `Data` — Jellyfin's serialized-item JSON blob.
     data: Option<&'a str>,
+    /// `MediaType` — `"Video"` / `"Audio"`. `None` leaves the column NULL,
+    /// which is what every fixture that does not care about it gets.
+    media_type: Option<&'a str>,
 }
 
 /// The one `BaseItems` insert every item fixture goes through.
@@ -145,8 +148,8 @@ async fn insert_base_item_raw_id(
            ("Id", "Type", "IsFolder", "IsInMixedFolder", "IsLocked", "IsMovie",
             "IsRepeat", "IsSeries", "IsVirtualItem", "Name", "ParentId",
             "TopParentId", "SeriesPresentationUniqueKey", "ParentIndexNumber",
-            "IndexNumber", "Data")
-           VALUES (?1, ?2, ?3, 0, 0, 0, 0, 0, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"#,
+            "IndexNumber", "Data", "MediaType")
+           VALUES (?1, ?2, ?3, 0, 0, 0, 0, 0, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"#,
     )
     .bind(raw_id)
     .bind(type_name(kind))
@@ -163,6 +166,7 @@ async fn insert_base_item_raw_id(
     .bind(row.season)
     .bind(row.episode)
     .bind(row.data)
+    .bind(row.media_type)
     .execute(db.writer())
     .await
     .expect("insert item");
@@ -291,6 +295,25 @@ pub async fn items_at_path(db: &Database, path: &str) -> usize {
 /// Inserts a minimal `BaseItems` row of the given kind.
 pub async fn seed_item(db: &Database, id: Uuid, kind: BaseItemKind) {
     seed_named_item(db, id, kind, "").await;
+}
+
+/// Inserts an item whose `MediaType` is `"Video"`.
+///
+/// The column a real scan fills in and `seed_item` leaves NULL. Anything that
+/// branches on `BaseItem.MediaType` — the per-user
+/// `SupportsTranscoding`/`SupportsDirectStream` overwrite, for one — sees
+/// nothing without it.
+pub async fn seed_video_item(db: &Database, id: Uuid, kind: BaseItemKind) {
+    insert_base_item(
+        db,
+        id,
+        kind,
+        &ItemRow {
+            media_type: Some("Video"),
+            ..ItemRow::default()
+        },
+    )
+    .await;
 }
 
 /// Inserts a `BaseItems` row of the given kind with a name.
