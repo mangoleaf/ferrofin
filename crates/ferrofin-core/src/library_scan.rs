@@ -299,13 +299,13 @@ impl<'a> FetcherPolicy<'a> {
     /// The fetcher's admin-order position for `kind` (lower = higher
     /// authority); a fetcher absent from the order list sorts last, which
     /// preserves the default chain among unordered fetchers.
+    ///
+    /// Delegates to the shared order for the same reason
+    /// [`metadata_enabled`](Self::metadata_enabled) does: C# has one
+    /// `GetConfiguredOrder`, and the remote-search path in `ferrofin-providers`
+    /// ranks its fetchers with it too.
     fn metadata_rank(self, kind: &str, name: &str) -> usize {
-        self.type_entry(kind).map_or(usize::MAX, |t| {
-            t.metadata_fetcher_order
-                .iter()
-                .position(|f| f.eq_ignore_ascii_case(name))
-                .unwrap_or(usize::MAX)
-        })
+        ferrofin_providers::library_options::metadata_fetcher_rank(self.options, kind, name)
     }
 
     /// Whether the library enabled image fetcher `name` for `kind`.

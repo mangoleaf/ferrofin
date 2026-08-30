@@ -566,9 +566,17 @@ def sweep(ferrofin_url, jellyfin_url):
             if method not in METHODS:
                 continue
             opkey = f"{method.upper()} {path}"
-            if method not in ("get", "head"):   # writes are destructive/ordered → Layer-2 journeys
+            # Non-GET ops are ordered and often destructive, so the breadth sweep
+            # does not fire them; a Layer-2 probe owns each one. Which probe is
+            # the OP's business, not this stamp's: the RemoteSearch/<Kind> family
+            # is a POST-shaped SEARCH and lives in reads.py, everything that
+            # mutates lives in journeys.py. (The note used to say "deferred to
+            # Layer-2 journey", which named the wrong layer for those rows and
+            # asserted a state this project does not have — see CLAUDE.md.)
+            if method not in ("get", "head"):
                 results[opkey] = {"status_conformant": None, "schema_valid": None,
-                                  "note": "write: deferred to Layer-2 journey"}
+                                  "note": "write: not fired by the breadth sweep — "
+                                          "owned by a Layer-2 probe"}
                 continue
             fx_h = audio_fixtures(fixtures) if path.startswith("/Audio/") else fixtures
             fx_j = audio_fixtures(fixtures_j) if path.startswith("/Audio/") else fixtures_j

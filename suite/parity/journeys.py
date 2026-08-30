@@ -24,6 +24,7 @@ import os
 import sys
 import time
 import urllib.parse
+import uuid
 import urllib.request
 import urllib.error
 
@@ -31,14 +32,78 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from sweep import http, get_json, bring_up, container_read, ROOT, USER, PASS, CLIENT, opensubtitles_credentials   # reuse HTTP + provisioning
 import verification   # the closed set of verification methods
 
+class Same:
+    """A journey step whose effect held on this server AND whose `evidence` must equal
+    the other server's.
+
+    A plain bool only asserts per-server self-consistency: each server is checked
+    against what *it* was posted, so two servers that each faithfully round-trip
+    *different* values both pass. Returning `Same(ok, evidence)` instead makes the
+    runner compare the two servers' evidence as well, so the row is green only
+    when the write took AND both servers ended up in the same state.
+
+    `evidence` must be a value that is genuinely comparable across two independent
+    instances — a settings object, a flag, a count, a projected read-back, a
+    sha256 of served bytes. NEVER an id, a date, or anything per-instance.
+    """
+
+    __slots__ = ("ok", "evidence")
+
+    def __init__(self, ok, evidence):
+        self.ok = bool(ok)
+        self.evidence = evidence
+
+    def __bool__(self):
+        return self.ok
+
+    def __repr__(self):
+        return f"{self.ok}(+evidence)"
+
+
+def cross_server_ok(h_ok, j_ok):
+    """True unless BOTH sides returned `Same` and their evidence disagrees.
+
+    The whole cross-server rule, in one place, so the self-check exercises the code
+    the runner actually runs rather than a restatement of it."""
+    if isinstance(h_ok, Same) and isinstance(j_ok, Same):
+        return h_ok.evidence == j_ok.evidence
+    return True
+
+
+def evidence_diff(h, j):
+    """A short note naming where two evidence values differ: for dicts, the keys whose
+    values disagree (with both values); otherwise a repr pair."""
+    if isinstance(h, dict) and isinstance(j, dict):
+        keys = sorted(set(h) | set(j))
+        bad = [f"{k}: H={h.get(k)!r} J={j.get(k)!r}" for k in keys if h.get(k) != j.get(k)]
+        return "; ".join(bad) or "(no key differs)"
+    return f"H={h!r} J={j!r}"
+
+
+def earned_method(op, h_ok, j_ok):
+    """The method a row actually earned, which is never stronger than what ran.
+
+    A row may DECLARE `body-diff` only if it returned `Same` on BOTH servers —
+    i.e. something comparable really was compared across them. If it did not, the
+    claim is downgraded to `effect` here rather than being taken on trust: the
+    declaration is a promise, this is the check. (The blanket "journeys never
+    body-diff" rule this replaces was right about plain booleans and wrong about a
+    read-back that IS diffed against the other server's.)"""
+    declared = journey_method(op)
+    if declared == verification.BODY_DIFF and not (
+            isinstance(h_ok, Same) and isinstance(j_ok, Same)):
+        return verification.EFFECT
+    return declared
+
+
 # ---------------------------------------------------------------- how each row is verified
 #
-# This layer NEVER diffs a body. The write's own response is discarded (`st, _ =
-# http(...)`), the read-back pulls out one to three NAMED fields, and the two
-# servers are combined by AND-ing two independent booleans — no value from
-# Ferrofin is ever compared to the same value from Jellyfin. So no journey row
-# may claim the ledger's `body-diff` headline. Each op declares which weaker
-# thing it actually established:
+# Most of this layer never diffs a body. The write's own response is discarded
+# (`st, _ = http(...)`), the read-back pulls out one to three NAMED fields, and
+# the two servers are combined by AND-ing two independent booleans — no value
+# from Ferrofin is compared to the same value from Jellyfin. Such a row may not
+# claim the ledger's `body-diff` headline. Each op declares which thing it
+# actually established:
 #
 #   effect        a write was applied and its effect confirmed on that server's
 #                 own read-back (the favourite is set, the id is gone, the count
@@ -47,6 +112,12 @@ import verification   # the closed set of verification methods
 #                 back. A handler that 204s and ignores the request passes.
 #   property      a named property of a response body agreed (an MPEG-TS sync
 #                 signature, a non-empty search result) — no effect, no diff.
+#   body-diff     the ONLY rows allowed this are the ones that return `Same` with
+#                 the read-back itself (or the sha256 of the bytes the write
+#                 stored) as evidence, so Ferrofin's post-write state is compared
+#                 field-for-field against Jellyfin's. `earned_method` enforces it
+#                 at runtime: declare it and return a bool and the row is
+#                 recorded `effect`.
 #
 # `selfcheck()` asserts this table covers every op key the journeys declare, so a
 # new journey op cannot land in the ledger without saying how it was verified.
@@ -75,6 +146,9 @@ JOURNEY_METHOD = {op: verification.STATUS_CLASS for op in (
     "POST /Sessions/{sessionId}/System/{command}",
     "POST /Sessions/{sessionId}/Viewing",
 )}
+#: The one row whose read-back really is compared against the other server's, so it
+#: may claim the headline — and `earned_method` re-checks that claim at run time.
+JOURNEY_METHOD.update({"POST /Items/RemoteSearch/Apply/{itemId}": verification.BODY_DIFF})
 JOURNEY_METHOD.update({op: verification.PROPERTY for op in (
     # A container signature, not an effect: 200 + video/mp2t + a 0x47 sync byte at
     # 0 and 188. Wrong PIDs, wrong channel or a black feed all match.
@@ -83,6 +157,11 @@ JOURNEY_METHOD.update({op: verification.PROPERTY for op in (
     # A read whose bar is "non-empty on both", not a write effect.
     "GET /Items/{itemId}/RemoteSearch/Subtitles/{language}",
     "GET /Providers/Subtitles/Subtitles/{subtitleId}",
+    # The write's effect IS compared across the two servers, but on derived
+    # properties (which ImageTags keys appeared, what media type the stored file is
+    # served as) — the stored bytes come from two different origins and cannot be
+    # diffed. See `j_remote_image_download`.
+    "POST /Items/{itemId}/RemoteImages/Download",
 )})
 
 
@@ -1118,6 +1197,223 @@ def j_remote_subtitles(base, token, user, mid, _m2):
     return r
 
 
+# ---------------------------------------------------------------- Identify → Apply
+
+def http_headers(method, url, token=None, body=None):
+    """`sweep.http()` plus the response headers, keys lowercased.
+
+    Only the artwork journey needs them: what a stored image is SERVED as is the
+    observable half of "the download was typed from the response, not the URL",
+    and header casing differs between the two stacks (axum lowercases, Kestrel
+    does not), so the lookup must be case-insensitive."""
+    headers = {"Content-Type": "application/json"}
+    if token is not None:
+        headers["Authorization"] = f'MediaBrowser Token="{token}", {CLIENT}'
+    req = urllib.request.Request(url, data=(body.encode() if isinstance(body, str) else body),
+                                 method=method.upper(), headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return resp.status, resp.read(), {k.lower(): v for k, v in resp.headers.items()}
+    except urllib.error.HTTPError as e:
+        return e.code, e.read(), {k.lower(): v for k, v in e.headers.items()}
+    except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+        return 0, str(e).encode(), {}
+
+
+def movie_named(base, token, user, name):
+    """The movie whose Name is exactly `name`, or None.
+
+    Selection is BY NAME, never by sort position: the two servers do not hold the
+    same movie list (Jellyfin's DVR journey leaves recordings behind that sort into
+    the same range), so `limit=1&sortOrder=Descending` picks a DIFFERENT item on each
+    side and the cross-server comparison silently stops comparing the same thing."""
+    b = get_json(base, f"/Items?userId={user}&recursive=true&includeItemTypes=Movie"
+                       f"&searchTerm={urllib.parse.quote(name)}&limit=10", token)
+    return next((i["Id"] for i in (b or {}).get("Items", []) if i.get("Name") == name), None)
+
+
+#: The read-back fields `POST /Items/RemoteSearch/Apply/{itemId}` can change.
+#: Every one is compared between the two servers; nothing here is dropped.
+IDENTIFY_READBACK = ("Name", "OriginalTitle", "ProductionYear", "PremiereDate", "ProviderIds",
+                     "Overview", "Genres", "Taglines", "CommunityRating", "OfficialRating",
+                     "RunTimeTicks", "LockData", "LockedFields")
+
+
+def identified(dto):
+    """The item's post-Apply state, projected into a CROSS-SERVER comparable shape.
+
+    Three narrowings, each because the value is per-instance and for no other reason:
+      * `Studios` — the DTO entries carry each server's own GUID for the studio, so the
+        NAMES are compared, which is the whole of what a provider supplies.
+      * `ImageTags` — the tag is an md5 of path+mtime, so it differs between two servers
+        holding byte-identical artwork (measured). The KEY SET is compared, so an image
+        that appeared, vanished, or landed under the wrong `ImageType` still fails.
+      * `BackdropImageTags` — same tag problem; the COUNT is compared.
+    Everything else, values included, is compared as-is."""
+    out = {k: dto.get(k) for k in IDENTIFY_READBACK}
+    out["Studios"] = sorted(s.get("Name") for s in (dto.get("Studios") or []))
+    out["ImageTags"] = sorted((dto.get("ImageTags") or {}).keys())
+    out["BackdropImageTags"] = len(dto.get("BackdropImageTags") or [])
+    return out
+
+
+def j_remote_search_apply(base, token, user, _m, _m2):
+    """`POST /Items/RemoteSearch/Apply/{itemId}` — the Identify dialog's "Apply".
+
+    A real mutation, so the row is earned on the READ-BACK — and the read-back is
+    diffed against the OTHER server's read-back, field for field (`Same`), not merely
+    against this server's own before-state. That is the difference between "the write
+    did something here" (`effect`) and "both servers ended up holding the same item"
+    (`body-diff`); `earned_method` enforces which one this row may claim.
+
+    Two legs, on movies no other journey touches (`Movie 0497`/`Movie 0496`, chosen by
+    name — see `movie_named`):
+
+      1. UNLOCKED. The fixture's Movies library has every "Metadata downloaders" and
+         "Image fetchers" box cleared (`LibraryOptions.TypeOptions[Movie]`), so no
+         remote fetcher may run: v10.11.8 `ProviderManager.CanRefreshMetadata` →
+         `BaseItemManager.IsMetadataFetcherEnabled` is an ALLOW-list, and an empty
+         `MetadataFetchers` disables everything. Two things must happen anyway. The
+         controller's own assignment — `item.ProviderIds = searchResult.ProviderIds`,
+         commented "Since the refresh process won't erase provider Ids, we need to set
+         this explicitly now" (`ItemLookupController.ApplySearchCriteria`) — and the
+         `RemoveOldMetadata` wipe: `MetadataService.RefreshWithProviders` skips
+         re-adding the item's own values, so merging the empty provider result under
+         `ReplaceAllMetadata` CLEARS every provider-supplied field. Ferrofin failed
+         this leg three ways in turn: it ignored the checkboxes and fetched TMDB; then,
+         once gated, it dropped the chosen ids too; and it never cleared the old
+         record's genres/studios/year.
+
+      2. LOCKED. `item.IsLocked` makes `RefreshWithProviders` return before the merge,
+         so the ids land and nothing else moves. Refusing the FETCH (right) and
+         refusing the ID ASSIGNMENT (wrong) are separable only on this leg.
+
+    Deliberately NOT probed: a leg with the downloaders TICKED. It would rewrite both
+    items from live TMDB, whose answer is not pinned in time, so the row would go red
+    on an upstream synopsis edit. The gate is what this row is for.
+    """
+    r = {}
+    unlocked = movie_named(base, token, user, "Movie 0497")
+    locked = movie_named(base, token, user, "Movie 0496")
+    if not (unlocked and locked):
+        return r
+
+    st, _ = http("POST", f"{base}/Items/RemoteSearch/Apply/{unlocked}?replaceAllImages=true",
+                 token, json.dumps({"Name": "The Matrix", "ProviderIds": {"Tmdb": "603"},
+                                    "ProductionYear": 1999,
+                                    "SearchProviderName": "TheMovieDb"}))
+    after_open = identified(q(base, f"/Items/{unlocked}", token, user) or {})
+
+    dto = q(base, f"/Items/{locked}", token, user) or {}
+    dto["LockData"] = True
+    lock_st, _ = http("POST", f"{base}/Items/{locked}", token, json.dumps(dto))
+    st2, _ = http("POST", f"{base}/Items/RemoteSearch/Apply/{locked}?replaceAllImages=true",
+                  token, json.dumps({"Name": "Inception", "ProviderIds": {"Tmdb": "27205"},
+                                     "ProductionYear": 2010,
+                                     "SearchProviderName": "TheMovieDb"}))
+    after_locked = identified(q(base, f"/Items/{locked}", token, user) or {})
+
+    ev = {"status": st, "locked_status": st2, "lock_accepted": lock_st < 300,
+          "unlocked": after_open, "locked": after_locked}
+    r["POST /Items/RemoteSearch/Apply/{itemId}"] = Same(
+        st == 204 and st2 == 204
+        and (after_open.get("ProviderIds") or {}).get("Tmdb") == "603"
+        and (after_locked.get("ProviderIds") or {}).get("Tmdb") == "27205"
+        and after_locked.get("LockData") is True, ev)
+    return r
+
+
+def j_remote_image_download(base, token, user, _m, _m2):
+    """`POST /Items/{itemId}/RemoteImages/Download` — "Choose Image"'s download-by-URL.
+
+    Gated by admin elevation ONLY: v10.11.8 `RemoteImageController.DownloadRemoteImage`
+    carries `[Authorize(Policy = Policies.RequiresElevation)]` and consults no library
+    option, because `ProviderManager.SaveImage` is a raw GET of a caller-supplied URL,
+    not a provider call. Unlike Refresh and Identify, the absence of a "Metadata
+    downloaders"/"Image fetchers" check here is CORRECT; adding one would be the
+    divergence.
+
+    Each server downloads from ITSELF (`http://127.0.0.1:8096/...`, the in-container
+    listener) — the one source URL that is identical text on both sides and depends on
+    no other container. That is also why the row is `property` and not `body-diff`: the
+    two servers' stored bytes come from two different origins (each server's own
+    re-encode of its own poster), so they cannot be diffed against each other. What IS
+    compared across the two servers is the derived set below — statuses, which
+    `ImageTags` keys appeared, and the media type each stored file is SERVED as, which
+    is exactly what the two bugs this row exists for corrupted:
+
+      * the stored file used to be typed from the URL's SUFFIX ("ends with .png ? png :
+        jpeg"), so a PNG fetched from a URL carrying no `.png` was written as `.jpg`
+        and served as `image/jpeg`. C# reads `response.Content.Headers.ContentType` and
+        falls back to the URL PATH only when that is absent or
+        `application/octet-stream` (`ProviderManager.SaveImage`);
+      * and there was no `image/*` check at all, so a URL answering JSON was stored as
+        the item's artwork and served back as an image. C# throws
+        `Request returned '{contentType}' instead of an image type`.
+
+    Reaped at the end so a re-run, and every layer after it, sees the item unchanged.
+    """
+    r = {}
+    mid = movie_named(base, token, user, "Movie 0495")
+    if not mid:
+        return r
+    # The server fetches this itself, from inside its own container.
+    src = f"http://127.0.0.1:8096/Items/{mid}/Images/Primary"
+    before = sorted(((q(base, f"/Items/{mid}", token, user) or {}).get("ImageTags") or {}).keys())
+
+    def download(image_type, url):
+        st, _ = http("POST", f"{base}/Items/{mid}/RemoteImages/Download?type={image_type}"
+                             f"&imageUrl={urllib.parse.quote(url, safe='')}", token, "")
+        return st
+
+    # 1. happy path: a JPEG, from a URL with no extension at all.
+    logo_st = download("Logo", src)
+    # 2. the same picture re-encoded as PNG, again extensionless — the leg that used to
+    #    land as `.jpg` and be served `image/jpeg`.
+    thumb_st = download("Thumb", src + "?format=Png")
+    # 3. a URL that answers JSON: must be refused, and must leave no artwork behind.
+    art_st = download("Art", "http://127.0.0.1:8096/System/Info/Public")
+    # 4. the argument checks (`type` and `imageUrl` are both required).
+    no_type = http("POST", f"{base}/Items/{mid}/RemoteImages/Download"
+                           f"?imageUrl={urllib.parse.quote(src, safe='')}", token, "")[0]
+    no_url = http("POST", f"{base}/Items/{mid}/RemoteImages/Download?type=Logo", token, "")[0]
+    # 5. an unknown item is 404 — a RANDOM guid, never the degenerate
+    #    00000000-0000-0000-0000-000000000001, which makes Jellyfin 500 out of its own
+    #    repository (an artefact of that id, not of this endpoint).
+    unknown = http("POST", f"{base}/Items/{uuid.uuid4().hex}/RemoteImages/Download?type=Logo"
+                           f"&imageUrl={urllib.parse.quote(src, safe='')}", token, "")[0]
+
+    keys = sorted(((q(base, f"/Items/{mid}", token, user) or {}).get("ImageTags") or {}).keys())
+
+    def served(image_type):
+        st, _, headers = http_headers("GET", f"{base}/Items/{mid}/Images/{image_type}", token)
+        return st, (headers.get("content-type") or "").split(";")[0].strip().lower()
+
+    logo_served, logo_ct = served("Logo")
+    thumb_served, thumb_ct = served("Thumb")
+    art_served, _ = served("Art")
+
+    ev = {"logo_status": logo_st, "thumb_status": thumb_st, "art_status_class": art_st // 100,
+          "no_type_status": no_type, "no_url_status": no_url, "unknown_item_status": unknown,
+          "added_keys": sorted(set(keys) - set(before)),
+          "logo_served": logo_served, "logo_content_type": logo_ct,
+          "thumb_served": thumb_served, "thumb_content_type": thumb_ct,
+          "art_served": art_served}
+    r["POST /Items/{itemId}/RemoteImages/Download"] = Same(
+        logo_st == 204 and thumb_st == 204
+        and "Logo" in keys and "Thumb" in keys
+        # the refusal, and its consequence: no Art image exists afterwards
+        and art_st >= 400 and "Art" not in keys and art_served == 404
+        # …and the PNG kept its own type all the way through the store
+        and logo_ct == "image/jpeg" and thumb_ct == "image/png"
+        and no_type == 400 and no_url == 400 and unknown == 404, ev)
+
+    for image_type in ("Logo", "Thumb", "Art"):
+        if image_type in keys:
+            http("DELETE", f"{base}/Items/{mid}/Images/{image_type}", token)
+    return r
+
+
 def j_backup(base, token, user, _m, _m2):
     """Backup create → manifest → list on the server's own data dir. The manifest must echo
     the posted options, the Manifest route must read the same manifest back by the returned
@@ -1152,6 +1448,10 @@ JOURNEYS = [j_startup,   # first: see its docstring
             j_authenticate, j_user_update, j_devices_delete, j_bulk_item_delete,
             j_subtitles_upload, j_quickconnect, j_system_and_refresh,
             j_forgot_password, j_backup, j_livetv, j_remote_subtitles,
+            j_remote_image_download,
+            # Destructive-ish: rewrites the metadata of two movies it owns outright
+            # (Movie 0497/0496, by name), and locks one of them.
+            j_remote_search_apply,
             # Destructive: merges/splits the shared movies, so it must run LAST so its
             # mutations can't corrupt the items other journeys read/refresh.
             j_merge_versions_controller]
@@ -1184,7 +1484,16 @@ def journeys(ferrofin_url, jellyfin_url):
         h_ok = h.get(op)
         j_ok = j.get(op)
         if jellyfin_url:
-            deep = bool(h_ok and j_ok)
+            agreed = cross_server_ok(h_ok, j_ok)
+            deep = bool(h_ok and j_ok) and agreed
+            method = earned_method(op, h_ok, j_ok)
+            if h_ok and j_ok and not agreed:
+                rows[op] = {"deep_verified": False,
+                            "classification": "flagged: the write took on both servers but "
+                                              "they ended in DIFFERENT states (verify)",
+                            "verification_method": method,
+                            "note": evidence_diff(h_ok.evidence, j_ok.evidence)}
+                continue
             if h_ok and not j_ok:
                 cls = "flagged: Jellyfin read-back differed (verify: oracle setup or Ferrofin extra)"
             elif not h_ok and j_ok:
@@ -1193,9 +1502,11 @@ def journeys(ferrofin_url, jellyfin_url):
                 cls = "flagged: write effect not observed on either server (likely corpus/setup)"
             else:
                 cls = "ok"
+            detail = ("read-backs diffed against each other"
+                      if method == verification.BODY_DIFF else "bodies not diffed")
             rows[op] = {"deep_verified": deep, "classification": cls,
-                        "verification_method": journey_method(op),
-                        "note": f"H={h_ok} J={j_ok} ({journey_method(op)}; bodies not diffed)"}
+                        "verification_method": method,
+                        "note": f"H={h_ok} J={j_ok} ({method}; {detail})"}
         else:
             # No oracle: the row rests on Ferrofin alone, which is not a parity
             # verdict at all — there is nothing to have agreed with. Recorded
@@ -1232,10 +1543,19 @@ def main():
 def selfcheck():
     # The combine logic: deep_verified only when the effect holds on BOTH servers.
     def combine(h_ok, j_ok):
-        return bool(h_ok and j_ok)
+        return bool(h_ok and j_ok) and cross_server_ok(h_ok, j_ok)
     assert combine(True, True) is True
     assert combine(True, False) is False   # Jellyfin disagrees → not verified
     assert combine(False, True) is False   # real Ferrofin gap → not verified
+    # …and for a `Same` step, only when both servers ended in the same state.
+    assert combine(Same(True, {"ProductionYear": 2020}), Same(True, {"ProductionYear": None})) is False
+    assert combine(Same(True, {"ProductionYear": None}), Same(True, {"ProductionYear": None})) is True
+    assert combine(Same(False, {"a": 1}), Same(True, {"a": 1})) is False
+    # A row may only KEEP a declared body-diff when both sides really compared.
+    diffed = next(k for k, v in JOURNEY_METHOD.items() if v == verification.BODY_DIFF)
+    assert earned_method(diffed, Same(True, 1), Same(True, 1)) == verification.BODY_DIFF
+    assert earned_method(diffed, True, True) == verification.EFFECT
+    assert earned_method(diffed, Same(True, 1), True) == verification.EFFECT
     # Every journey advertises only op keys that exist in the vendored spec.
     import glob
     spec = json.load(open(sorted(glob.glob(os.path.join(ROOT, "contracts/jellyfin-openapi-*.json")))[-1]))
@@ -1266,7 +1586,6 @@ def selfcheck():
     for k in declared:
         m = journey_method(k)
         assert m in verification.VALID, f"{k}: unknown verification method {m!r}"
-        assert m != verification.BODY_DIFF, f"{k}: journeys never diff a body"
     stale = sorted(k for k in JOURNEY_METHOD if k not in declared)
     assert not stale, f"JOURNEY_METHOD names ops no journey declares: {stale}"
     import collections

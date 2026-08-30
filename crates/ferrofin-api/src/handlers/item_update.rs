@@ -521,6 +521,9 @@ async fn refresh_item(
         replace_all_metadata: query.replace_all_metadata.unwrap_or(false),
         replace_all_images: query.replace_all_images.unwrap_or(false),
         search_result: None,
+        // `ItemRefreshController` builds a plain `MetadataRefreshOptions`; only
+        // the Identify "Apply" endpoint sets `RemoveOldMetadata`.
+        remove_old_metadata: false,
     };
     state
         .providers

@@ -59,6 +59,30 @@ pub fn metadata_fetcher_enabled(
     })
 }
 
+/// The admin-chosen order position of metadata fetcher `name` for item type
+/// `kind` — lower sorts first, and a fetcher absent from the list sorts last.
+///
+/// Port of `ProviderManager.GetConfiguredOrder` (v10.11.8
+/// `MediaBrowser.Providers/Manager/ProviderManager.cs`), whose
+/// `Array.IndexOf(order, providerName)` returns `-1` → `int.MaxValue` for a
+/// fetcher the admin never ranked. Order is load-bearing wherever results from
+/// several fetchers are merged first-writer-wins: `GetRemoteSearchResults`
+/// dedups candidates by shared provider id, so the highest-ranked fetcher
+/// decides which record a client sees.
+#[must_use]
+pub fn metadata_fetcher_rank(
+    options: Option<&ferrofin_model::configuration::LibraryOptions>,
+    kind: &str,
+    name: &str,
+) -> usize {
+    type_entry(options, kind).map_or(usize::MAX, |t| {
+        t.metadata_fetcher_order
+            .iter()
+            .position(|f| f.eq_ignore_ascii_case(name))
+            .unwrap_or(usize::MAX)
+    })
+}
+
 /// Whether the library enables image fetcher `name` for item type `kind`.
 ///
 /// Port of `BaseItemManager.IsImageFetcherEnabled`, the image half of the same

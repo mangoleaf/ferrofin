@@ -173,8 +173,9 @@ pub struct ReleaseHit {
     pub id: String,
     /// The release title.
     pub title: Option<String>,
-    /// The release date (`Date?.Year` / `NearestDate`).
-    pub date: Option<PartialDate>,
+    /// The release date, as MusicBrainz answered it (`Date?.Year` /
+    /// `Date?.NearestDate` in the C#).
+    pub date: MbDate,
     /// The `MusicBrainzReleaseGroup` id, when supplied.
     pub release_group_id: Option<String>,
     /// The artist credits in order; the first is the album artist.
@@ -189,8 +190,9 @@ pub struct ArtistHit {
     pub id: String,
     /// The artist name as MusicBrainz spells it.
     pub name: Option<String>,
-    /// The life-span begin date (`LifeSpan?.Begin`).
-    pub begin: Option<PartialDate>,
+    /// The life-span begin date (`LifeSpan?.Begin`), as MusicBrainz answered
+    /// it — see [`MbDate`].
+    pub begin: MbDate,
 }
 
 impl From<Release> for ReleaseHit {
@@ -198,7 +200,7 @@ impl From<Release> for ReleaseHit {
         Self {
             id: r.id,
             title: non_empty(r.title),
-            date: r.date.as_deref().and_then(parse_partial_date),
+            date: MbDate::parse(r.date.as_deref()),
             release_group_id: r.group.map(|g| g.id),
             artist_credits: r
                 .artist_credit
@@ -229,6 +231,63 @@ pub struct ArtistDetails {
     /// The life-span end date (a band's break-up), which the artist NFO saver
     /// writes as `<disbanded>`.
     pub end_date: Option<PartialDate>,
+}
+
+/// The `DateTime.MinValue` a component-less MetaBrainz `PartialDate` reports
+/// as its `NearestDate` — `0001-01-01T00:00:00Z`, which Jellyfin serialises as
+/// `"0001-01-01T00:00:00.0000000Z"`.
+pub const MIN_DATE: PartialDate = PartialDate {
+    year: 1,
+    month: 1,
+    day: 1,
+};
+
+/// How MusicBrainz answered a date field, preserving the distinction C#
+/// inherits from MetaBrainz: a MISSING key leaves `IRelease.Date` null (both
+/// `Year` and `NearestDate` null), while a key carrying no usable components —
+/// MusicBrainz writes `"date": ""` for a release whose date is unknown — still
+/// constructs a `PartialDate`, whose `Year` is null but whose `NearestDate` is
+/// `DateTime.MinValue`. Collapsing the two drops `PremiereDate` from the
+/// Identify dialog for every dateless release.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MbDate {
+    /// MusicBrainz supplied no date at all.
+    #[default]
+    Absent,
+    /// MusicBrainz supplied a date with no parseable components.
+    Componentless,
+    /// MusicBrainz supplied a usable date.
+    Known(PartialDate),
+}
+
+impl MbDate {
+    /// `Date?.Year` — `None` unless MusicBrainz gave a real year.
+    #[must_use]
+    pub fn year(self) -> Option<i32> {
+        match self {
+            Self::Known(date) => Some(date.year),
+            _ => None,
+        }
+    }
+
+    /// `Date?.NearestDate` — the parsed instant, or `DateTime.MinValue` for a
+    /// component-less date, or `None` when there was no date at all.
+    #[must_use]
+    pub fn nearest(self) -> Option<PartialDate> {
+        match self {
+            Self::Absent => None,
+            Self::Componentless => Some(MIN_DATE),
+            Self::Known(date) => Some(date),
+        }
+    }
+
+    /// Classifies the raw JSON value MusicBrainz returned for a date field.
+    fn parse(value: Option<&str>) -> Self {
+        match value {
+            None => Self::Absent,
+            Some(raw) => parse_partial_date(raw).map_or(Self::Componentless, Self::Known),
+        }
+    }
 }
 
 /// Parses a MusicBrainz partial date (`YYYY`, `YYYY-MM`, `YYYY-MM-DD`).
@@ -299,6 +358,14 @@ impl MusicBrainzClient {
 
     /// GETs `path?{query}&fmt=json` as an authenticated (User-Agent) MB call,
     /// returning the parsed body or `None` on any failure. Throttled.
+    ///
+    /// Every failure is LOGGED before it is swallowed. musicbrainz.org
+    /// rate-limits at roughly one request per second per IP and answers `503`
+    /// when it is exceeded; returning a silent `None` makes that
+    /// indistinguishable from "no such release" in the Identify dialog. C#
+    /// surfaces the same failures — `ProviderManager` catches the MetaBrainz
+    /// `HttpError` and logs `Provider {ProviderName} failed to retrieve search
+    /// results` (v10.11.8 `MediaBrowser.Providers/Manager/ProviderManager.cs`).
     async fn get<T: for<'de> Deserialize<'de>>(
         &self,
         path: &str,
@@ -307,18 +374,32 @@ impl MusicBrainzClient {
         self.throttle().await;
         let mut q: Vec<(&str, String)> = vec![("fmt", "json".to_owned())];
         q.extend(query.iter().cloned());
-        let resp = self
+        let resp = match self
             .http
             .get(format!("{}{path}", self.base_url))
             .header(reqwest::header::USER_AGENT, &self.user_agent)
             .query(&q)
             .send()
             .await
-            .ok()?;
-        if !resp.status().is_success() {
+        {
+            Ok(resp) => resp,
+            Err(error) => {
+                tracing::warn!(%path, %error, "MusicBrainz request failed");
+                return None;
+            }
+        };
+        let status = resp.status();
+        if !status.is_success() {
+            tracing::warn!(%path, %status, "MusicBrainz request rejected");
             return None;
         }
-        resp.json().await.ok()
+        match resp.json().await {
+            Ok(body) => Some(body),
+            Err(error) => {
+                tracing::warn!(%path, %error, "MusicBrainz response could not be parsed");
+                None
+            }
+        }
     }
 
     /// Resolves an artist's `MusicBrainzArtist` id by name, or `None`. Port of
@@ -422,11 +503,7 @@ impl MusicBrainzClient {
                 Some(ArtistHit {
                     id: non_empty(a.id)?,
                     name: non_empty(a.name),
-                    begin: a
-                        .span
-                        .and_then(|s| s.begin)
-                        .as_deref()
-                        .and_then(parse_partial_date),
+                    begin: MbDate::parse(a.span.and_then(|s| s.begin).as_deref()),
                 })
             })
             .collect()
@@ -439,11 +516,7 @@ impl MusicBrainzClient {
         Some(ArtistHit {
             id: non_empty(artist.id).unwrap_or_else(|| artist_id.to_owned()),
             name: non_empty(artist.name),
-            begin: artist
-                .span
-                .and_then(|s| s.begin)
-                .as_deref()
-                .and_then(parse_partial_date),
+            begin: MbDate::parse(artist.span.and_then(|s| s.begin).as_deref()),
         })
     }
 
@@ -761,6 +834,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_dateless_release_keeps_the_min_date_sentinel() {
+        // MusicBrainz writes `"date": ""` for a release whose date is unknown.
+        // MetaBrainz still builds a `PartialDate` from it, so C# emits
+        // `PremiereDate = DateTime.MinValue` with NO `ProductionYear`
+        // (`MusicBrainzAlbumProvider.GetReleaseResult`: `Date?.NearestDate` /
+        // `Date?.Year`). Dropping the distinction loses `PremiereDate` from
+        // every dateless Identify candidate.
+        use crate::mock_http::MockServer;
+        let server = MockServer::start(vec![
+            (
+                "/ws/2/release?",
+                r#"{"releases":[{"id":"empty","title":"No Date","date":""},{"id":"absent","title":"No Key"}]}"#.to_owned(),
+            ),
+            (
+                "/ws/2/artist?",
+                r#"{"artists":[{"id":"a","name":"A","life-span":{"begin":""}}]}"#.to_owned(),
+            ),
+        ])
+        .await;
+        let c = MusicBrainzClient::new(&server.base_url, "test");
+
+        let hits = c.find_releases("x").await;
+        assert_eq!(hits[0].date, MbDate::Componentless);
+        assert_eq!(hits[0].date.year(), None, "no ProductionYear");
+        assert_eq!(
+            hits[0].date.nearest(),
+            Some(MIN_DATE),
+            "PremiereDate = MinValue"
+        );
+        assert_eq!(
+            MIN_DATE.to_utc().expect("min date").to_rfc3339(),
+            "0001-01-01T00:00:00+00:00"
+        );
+        // No `date` key at all leaves BOTH null.
+        assert_eq!(hits[1].date, MbDate::Absent);
+        assert_eq!(hits[1].date.year(), None);
+        assert_eq!(hits[1].date.nearest(), None);
+
+        // The artist life-span takes the same split.
+        let artists = c.find_artists("x").await;
+        assert_eq!(artists[0].begin, MbDate::Componentless);
+        assert_eq!(artists[0].begin.nearest(), Some(MIN_DATE));
+    }
+
+    #[tokio::test]
     async fn identify_hits_carry_title_date_group_and_artist_credits() {
         use crate::mock_http::MockServer;
         let server = MockServer::start(vec![
@@ -785,7 +903,7 @@ mod tests {
         let hit = &hits[0];
         assert_eq!(hit.id, "rel-1");
         assert_eq!(hit.title.as_deref(), Some("Kind of Blue"));
-        assert_eq!(hit.date.map(|d| d.year), Some(1959));
+        assert_eq!(hit.date.year(), Some(1959));
         assert_eq!(hit.release_group_id.as_deref(), Some("rg-1"));
         assert_eq!(hit.artist_credits.len(), 2);
         assert_eq!(hit.artist_credits[0].name.as_deref(), Some("Miles Davis"));
@@ -801,13 +919,13 @@ mod tests {
         assert_eq!(artists.len(), 1);
         assert_eq!(artists[0].id, "artist-mbid");
         assert_eq!(
-            artists[0].begin.map(|d| (d.year, d.month, d.day)),
+            artists[0].begin.nearest().map(|d| (d.year, d.month, d.day)),
             Some((1926, 5, 26))
         );
 
         let artist = c.lookup_artist("artist-mbid").await.expect("lookup");
         assert_eq!(artist.name.as_deref(), Some("Miles Davis"));
-        assert_eq!(artist.begin.map(|d| d.year), Some(1926));
+        assert_eq!(artist.begin.year(), Some(1926));
     }
 
     #[tokio::test]

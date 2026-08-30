@@ -308,13 +308,16 @@ async fn apply_search_criteria(
 
     // Full metadata + image refresh, replacing everything (the C# builds
     // `FullRefresh` for both modes with `ReplaceAllMetadata = true`), bound to
-    // the chosen result (`SearchResult = searchResult`).
+    // the chosen result (`SearchResult = searchResult`), and — the flag only
+    // this endpoint sets — `RemoveOldMetadata = true`, so the previously
+    // identified record's fields do not survive under the new one.
     let options = MetadataRefreshOptions {
         metadata_refresh_mode: MetadataRefreshMode::FullRefresh,
         image_refresh_mode: MetadataRefreshMode::FullRefresh,
         replace_all_metadata: true,
         replace_all_images: query.replace_all_images,
         search_result: Some(search_result),
+        remove_old_metadata: true,
     };
     state.providers.refresh_full_item(item_id, &options).await?;
 

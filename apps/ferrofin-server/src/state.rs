@@ -733,6 +733,12 @@ pub async fn build_app_state(
                         .preferred_metadata_language
                         .clone()
                 })
+            })
+            // `SearchInfo.MetadataCountryCode`'s server-config fallback on the
+            // remote-search ("Identify") path.
+            .with_metadata_country({
+                let config_mgr = Arc::clone(&config_mgr);
+                Arc::new(move || config_mgr.snapshot_shared().metadata_country_code.clone())
             }),
     );
     // Similar items: the local weighted-overlap scorer always runs; the remote

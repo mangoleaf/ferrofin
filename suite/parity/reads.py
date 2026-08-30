@@ -23,6 +23,7 @@ import os
 import re
 import urllib.parse
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from sweep import http, get_json, bring_up          # noqa: E402
@@ -31,9 +32,26 @@ import verification                                  # noqa: E402
 
 CORRELATE_LIMIT = 5   # item-scoped endpoints are exercised against this many Path-aligned items
 
+#: musicbrainz.org rate-limits at ~1 request/second per IP, and both containers
+#: plus this harness share the lab's egress address. A 503 comes back as an
+#: empty result list, so the MusicBrainz-backed `posted` legs are paced and
+#: retried rather than reported as a divergence (or, worse, as agreement).
+MB_PACE = 2.5
+MB_RETRIES = 4
+
 
 def token_get(base, path, token):
     st, raw = http("GET", base + path, token)
+    if st != 200 or not raw:
+        return st, None
+    try:
+        return st, json.loads(raw)
+    except ValueError:
+        return st, None
+
+def token_post(base, path, token, body):
+    """POST `body` as JSON; returns `(status, parsed body or None)`."""
+    st, raw = http("POST", base + path, token, json.dumps(body))
     if st != 200 or not raw:
         return st, None
     try:
@@ -80,6 +98,38 @@ def multi(op, legs):
                     "url": (lambda c, t=tmpl: t.format(**c)),
                     "project": project})
     return {"op": op, "kind": "multi", "legs": out}
+
+
+def post_leg(url, body, retry_empty=False):
+    """One leg of a [`posted`] row. `body(ctx)` builds the JSON for THAT server,
+    so a leg can carry the server's own item id.
+
+    `retry_empty` marks a leg whose emptiness would be a HARNESS artefact rather
+    than an answer — the MusicBrainz-backed searches, where musicbrainz.org
+    rate-limits at roughly one request per second per IP and answers 503, which
+    both servers turn into `[]`. Such a leg is retried, and if either side is
+    still empty it is DROPPED from the row with a note, because `[] vs []`
+    compares nothing and must never be reported as agreement. A leg whose
+    correct answer IS `[]` (the fetcher-gate legs) must leave this false.
+    """
+    return {"url": url, "body": body, "retry_empty": retry_empty}
+
+
+def posted(op, legs):
+    """A POST-shaped READ folded into one ledger row.
+
+    The `RemoteSearch/<Kind>` family is POST by contract but a SEARCH by
+    behaviour — v10.11.8 `ItemLookupController` only calls
+    `IProviderManager.GetRemoteSearchResults` and returns `Ok`, so nothing is
+    mutated and there is no read-back. These rows live here, not in
+    `journeys.py`, precisely because there IS no write effect: both servers get
+    the byte-identical body and their two RESPONSES are deep-diffed, which is
+    the same claim every GET row makes. The method is derived by
+    `verification.read_method` from what the diff actually compared, so a family
+    with no provider on either side lands `empty-corpus` rather than borrowing
+    the headline.
+    """
+    return {"op": op, "kind": "posted", "legs": legs}
 
 
 def invariant(op, fn):
@@ -670,6 +720,96 @@ READS = [
          project=lambda b, c: {**b, "EnabledUsers": sorted(
              c["users_by_id"].get(i, i) for i in (b.get("EnabledUsers") or []))}),
     user("GET /LiveTv/TunerHosts/Types", "/LiveTv/TunerHosts/Types"),
+
+    # ------------------------------------------------------------------ Identify
+    #
+    # `POST /Items/RemoteSearch/<Kind>` — POST by contract, a SEARCH by
+    # behaviour (see `posted`). Everything below is pinned by a PROVIDER ID, not
+    # by a name: musicbrainz.org returns 96 equal-score hits for "Abbey Road"
+    # and its page order is not stable request-to-request (measured), while the
+    # dedup in `ProviderManager.GetRemoteSearchResults` collapses them to
+    # whichever release came back first — so a name search's single result is
+    # nondeterministic on ONE server, let alone two. A lookup by id takes the
+    # `LookupRelease`/`LookupArtist` path and returns one stable document. That
+    # is why there is no `ProviderIds`/`PremiereDate` entry in
+    # parity_diff.VOLATILE for these rows: nothing here needs one.
+    #
+    # Needs outbound musicbrainz.org reachability from BOTH containers; with
+    # none, the `retry_empty` legs drop out and the row records "no comparable
+    # response" rather than passing vacuously.
+    posted("POST /Items/RemoteSearch/MusicAlbum", [
+        # 1. The deterministic lookup. `MusicBrainzAlbumProvider.GetSearchResults`
+        #    short-circuits on a known release id, so both servers fetch the same
+        #    single MB document and every field must agree.
+        post_leg("/Items/RemoteSearch/MusicAlbum", lambda c: {
+            "SearchInfo": {"Name": "Abbey Road", "ProviderIds": {
+                "MusicBrainzAlbum": "6bb3793b-f991-378e-9bff-0bd3117f2298"}},
+            "IncludeDisabledProviders": True}, retry_empty=True),
+        # 2. The dateless-release sentinel. MusicBrainz dates this release `""`;
+        #    MetaBrainz still builds a `PartialDate`, so C# emits
+        #    `PremiereDate: 0001-01-01T00:00:00.0000000Z` with NO `ProductionYear`
+        #    (`Date?.NearestDate` / `Date?.Year`). Ferrofin used to drop the field.
+        post_leg("/Items/RemoteSearch/MusicAlbum", lambda c: {
+            "SearchInfo": {"Name": "Abbey Road", "ProviderIds": {
+                "MusicBrainzAlbum": "372f7e64-08dd-3ffb-913a-f29e5fe2b9d5"}},
+            "IncludeDisabledProviders": True}, retry_empty=True),
+        # 3. The fetcher gate. The fixture's Music library has every "Metadata
+        #    downloaders" box cleared, so with an `ItemId` naming an album in it
+        #    and no `IncludeDisabledProviders` override, `CanRefreshMetadata` ->
+        #    `IsMetadataFetcherEnabled` lets NO fetcher run: `[]` on both. This
+        #    leg is the one that used to be red — Ferrofin ignored `ItemId`,
+        #    `IncludeDisabledProviders` and the library entirely. Its empty
+        #    answer is the ASSERTION, so it is never retried away.
+        post_leg("/Items/RemoteSearch/MusicAlbum", lambda c: {
+            "ItemId": c["album_id"],
+            "SearchInfo": {"Name": "Abbey Road", "ProviderIds": {
+                "MusicBrainzAlbum": "6bb3793b-f991-378e-9bff-0bd3117f2298"}},
+            "IncludeDisabledProviders": False}),
+    ]),
+    posted("POST /Items/RemoteSearch/MusicArtist", [
+        # The artist lookup by `MusicBrainzArtist` id — `LookupArtist`, one
+        # stable document, carrying the life-span begin as PremiereDate.
+        post_leg("/Items/RemoteSearch/MusicArtist", lambda c: {
+            "SearchInfo": {"Name": "Radiohead", "ProviderIds": {
+                "MusicBrainzArtist": "a74b1b7f-71a5-4011-9441-d0b5e4122711"}},
+            "IncludeDisabledProviders": True}, retry_empty=True),
+        # …and the same fetcher gate, on this server's own `Artist 01`.
+        post_leg("/Items/RemoteSearch/MusicArtist", lambda c: {
+            "ItemId": c["artist_id"],
+            "SearchInfo": {"Name": "Radiohead", "ProviderIds": {
+                "MusicBrainzArtist": "a74b1b7f-71a5-4011-9441-d0b5e4122711"}},
+            "IncludeDisabledProviders": False}),
+    ]),
+    # MusicVideo and Book have NO remote search provider on either side, so both
+    # answer `[]` unconditionally and the row can only earn `empty-corpus` —
+    # `verification.read_method` derives that from the diff having compared zero
+    # leaves, so the row cannot borrow the body-diff headline. This is CORRECT,
+    # not a gap: `git grep -n "IRemoteMetadataProvider<" v10.11.8` lists AudioDb
+    # album/artist, MusicBrainz album/artist, Omdb episode/series/movie/trailer
+    # and Tmdb boxset/movie/person/episode/season/series, and no MusicVideo or
+    # Book arm anywhere — upstream's `MusicVideoMetadataService` and
+    # `BookMetadataService` are LOCAL services. Ferrofin registers nothing for
+    # either kind either, so the two empty sets have the same cause.
+    #
+    # The bodies are well-formed on purpose: v10.11.8 dereferences
+    # `searchInfo.SearchInfo.MetadataLanguage` with no null check
+    # (ProviderManager.cs, `GetRemoteSearchResults`) and answers 500 to a body
+    # with no `SearchInfo`, where Ferrofin defaults it and answers `200 []`.
+    # Probing that would flag the row for a Jellyfin defect no client provokes.
+    posted("POST /Items/RemoteSearch/MusicVideo", [
+        post_leg("/Items/RemoteSearch/MusicVideo", lambda c: {
+            "SearchInfo": {"Name": "Thriller", "Artists": ["Michael Jackson"],
+                           "Year": 1983, "MetadataLanguage": "en",
+                           "MetadataCountryCode": "US"},
+            "IncludeDisabledProviders": True}),
+    ]),
+    posted("POST /Items/RemoteSearch/Book", [
+        post_leg("/Items/RemoteSearch/Book", lambda c: {
+            "SearchInfo": {"Name": "Dune", "Year": 1965, "MetadataLanguage": "en",
+                           "MetadataCountryCode": "US", "ProviderIds": {}},
+            "IncludeDisabledProviders": True}),
+    ]),
+
     # resolvable-path-param GETs the breadth sweep couldn't fill (needs a real id).
     # The add-library options. `isNewLibrary` is a DIFFERENT answer, not a hint:
     # it decides which providers come pre-ticked, so both values are probed.
@@ -916,6 +1056,43 @@ def run(ferrofin_url, jellyfin_url):
                 for k in agg:
                     agg[k].extend(b[k])
             record(ep["op"], clean, tested, agg, agg_method(legs))
+        elif ep["kind"] == "posted":
+            agg = {"mismatch": [], "missing": [], "extra": []}
+            legs = []
+            clean = tested = 0
+            dropped = []
+            for leg in ep["legs"]:
+                # Both servers get the identical body, in the same run, back to
+                # back, so an upstream provider sees one state.
+                for attempt in range(MB_RETRIES if leg["retry_empty"] else 1):
+                    hs, hb = token_post(ferrofin_url, leg["url"], ht, leg["body"](hc))
+                    time.sleep(MB_PACE)
+                    js, jb = token_post(jellyfin_url, leg["url"], jt, leg["body"](jc))
+                    if not leg["retry_empty"] or (hb and jb):
+                        break
+                    time.sleep(MB_PACE)
+                if leg["retry_empty"] and not (hb and jb):
+                    # See `post_leg`: an empty answer here is the upstream rate
+                    # limiter, not a result. Dropping the leg loses evidence;
+                    # keeping it would MANUFACTURE evidence out of `[] vs []`.
+                    dropped.append(f"{leg['url']} (H={len(hb or [])} J={len(jb or [])})")
+                    continue
+                tested += 1
+                if hs != js:
+                    agg["mismatch"].append(
+                        {"path": f"{leg['url']} :: status", "j": js, "h": hs})
+                    continue
+                n, b, compared = diff_stats(jb, hb)
+                legs.append((jb, hb, compared))
+                if n == 0:
+                    clean += 1
+                for k in agg:
+                    agg[k].extend(b[k])
+            note = None
+            if dropped:
+                note = ("no comparable response — the remote provider answered empty on "
+                        "at least one side after retries: " + "; ".join(dropped))
+            record(ep["op"], clean, tested, agg, agg_method(legs), note=note)
         elif ep["kind"] in ("plain", "user"):
             path = ep["url"](hc if ep["kind"] == "user" else {})
             jpath = ep["url"](jc if ep["kind"] == "user" else {})
@@ -1017,9 +1194,18 @@ def selfcheck():
     spec = json.load(open(sorted(glob.glob(os.path.join(
         os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
         "contracts/jellyfin-openapi-*.json")))[-1]))
-    valid = {f"GET {p}" for p in spec["paths"]}
+    # This layer is GET-shaped, but the `posted` rows are POSTs by contract, so
+    # accept both verbs — and only for a path the spec actually declares with
+    # that verb, so a typo still fails here.
+    valid = {f"{m.upper()} {p}" for p, item in spec["paths"].items()
+             for m in item if m in ("get", "post")}
     bad = [ep["op"] for ep in READS if ep["op"] not in valid]
     assert not bad, f"read op-keys not in spec: {bad}"
+    # Every `posted` row's legs must be well-formed and buildable from a
+    # populated context, and only a leg whose empty answer would be an upstream
+    # artefact may set `retry_empty` — never a leg whose assertion IS `[]`.
+    posted_rows = [ep for ep in READS if ep["kind"] == "posted"]
+    assert posted_rows, "the posted mechanism has no rows"
     # every {placeholder} in a user() URL must be a key resolve_named() produces (guards the
     # {u} vs "user" KeyError). Format each with a fully-populated context; a KeyError fails here.
     ctx = {"user": "U", "u": "U", "genre": "G", "studio": "S", "person": "P", "series": "SE",
@@ -1040,6 +1226,15 @@ def selfcheck():
         elif ep["kind"] == "multi":
             for leg in ep["legs"]:
                 leg["url"](ctx)
+        elif ep["kind"] == "posted":
+            for leg in ep["legs"]:
+                body = leg["body"](ctx)
+                assert isinstance(body, dict) and "SearchInfo" in body, \
+                    f"{ep['op']}: a RemoteSearch body without SearchInfo makes Jellyfin 500"
+                assert not (leg["retry_empty"] and not body["IncludeDisabledProviders"]), \
+                    (f"{ep['op']}: a GATED leg asserts `[]`; retrying it away would turn the "
+                     "assertion into an absence of evidence")
+                json.dumps(body)
     # The invariant rows must carry a callable, and the diff-shaped folding of
     # its facts must flag both a disagreement AND a fact both servers fail.
     assert all(callable(ep["fn"]) for ep in READS if ep["kind"] == "invariant")

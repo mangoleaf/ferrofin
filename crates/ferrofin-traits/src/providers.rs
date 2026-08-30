@@ -94,6 +94,17 @@ pub struct MetadataRefreshOptions {
     /// record, its name/year drive any fallback search (the C#
     /// `MetadataService.ApplySearchResult`).
     pub search_result: Option<RemoteSearchResult>,
+    /// `MetadataRefreshOptions.RemoveOldMetadata`: do NOT re-add the item's
+    /// existing metadata to the providers' result before merging it back.
+    ///
+    /// With `replace_all_metadata`, that turns the merge into a REPLACEMENT:
+    /// every provider-supplied field no enabled fetcher re-supplied is cleared
+    /// (C# `MetadataService.RefreshWithProviders` skips its "add existing
+    /// metadata to provider result" `MergeData` when this is set), and with
+    /// `replace_all_images` the existing images are removed first. Only the
+    /// Identify flow (`POST /Items/RemoteSearch/Apply/{itemId}`) sets it —
+    /// picking a new record must not leave the old record's genres behind.
+    pub remove_old_metadata: bool,
 }
 
 impl Default for MetadataRefreshOptions {
@@ -105,6 +116,7 @@ impl Default for MetadataRefreshOptions {
             replace_all_metadata: false,
             replace_all_images: false,
             search_result: None,
+            remove_old_metadata: false,
         }
     }
 }

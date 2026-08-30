@@ -76,11 +76,19 @@ VALID = frozenset(METHODS)
 
 
 def is_empty_envelope(doc):
-    """True for a QueryResult that carried nothing: `Items: []` with `TotalRecordCount: 0`.
+    """True for a response that carried no content.
 
-    Diffing two of these compares the envelope scalars and no content at all, so the
+    Two wire shapes qualify: a QueryResult with `Items: []` and
+    `TotalRecordCount: 0`, and a bare empty LIST — the shape the array-returning
+    endpoints use (`POST /Items/RemoteSearch/{kind}` answers `[]` when no
+    fetcher matched). The bare list is the more extreme case: a QueryResult at
+    least compares its own zeros, a `[]` compares literally nothing.
+
+    Diffing two of these proves only that both handlers answered empty, so the
     row is `empty-corpus`, never the headline.
     """
+    if isinstance(doc, list):
+        return not doc
     return (isinstance(doc, dict) and doc.get("Items") == []
             and doc.get("TotalRecordCount") in (0, None))
 
@@ -91,11 +99,17 @@ def read_method(jbody, hbody, compared):
     `compared` is the number of non-volatile leaf comparisons the diff actually
     performed (`parity_diff.diff_stats`). Returns None when the probe produced no
     evidence at all — the caller must then record the row untested, not verified.
+
+    The empty test comes FIRST because a bare `[] vs []` compares zero leaves:
+    reporting it untested would hide that both servers were asked and both
+    answered the same nothing, and reporting it `body-diff` would claim a
+    comparison that never happened. `empty-corpus` says exactly what occurred,
+    and gen-ledger keeps it out of the headline count.
     """
-    if not compared:
-        return None
     if is_empty_envelope(jbody) and is_empty_envelope(hbody):
         return EMPTY_CORPUS
+    if not compared:
+        return None
     return BODY_DIFF
 
 
@@ -115,7 +129,13 @@ def selfcheck():
     assert HEADLINE in VALID and len(VALID) == 5
     assert is_empty_envelope({"Items": [], "TotalRecordCount": 0, "StartIndex": 0})
     assert not is_empty_envelope({"Items": [{"Name": "x"}], "TotalRecordCount": 1})
-    assert not is_empty_envelope([])          # a bare list compares nothing at all
+    # A bare empty list is the array endpoints' empty answer — `empty-corpus`,
+    # not the headline and not untested. (This assertion used to read
+    # `not is_empty_envelope([])`, which routed those rows to `None`/untested;
+    # the claim is unchanged in strength, only in which member names it.)
+    assert is_empty_envelope([])
+    assert not is_empty_envelope([{"Name": "x"}])
+    assert read_method([], [], 0) == EMPTY_CORPUS
     # no evidence is untested, not verified
     assert read_method({}, {}, 0) is None
     assert read_method({"Items": [], "TotalRecordCount": 0}, {"Items": [], "TotalRecordCount": 0}, 2) \
