@@ -632,6 +632,23 @@ pub trait LibraryManager: Send + Sync {
     async fn queue_library_scan_scoped(&self, _library_id: Uuid) -> Result<(), ServiceError> {
         self.queue_library_scan().await
     }
+
+    /// Runs a full library scan and returns only when it has FINISHED.
+    ///
+    /// The scheduled-task entry point, and the one place the difference from
+    /// `queue_library_scan` matters. Upstream's "Scan Media Library" task is
+    /// `await ValidateMediaLibraryInternal(progress, ct)`
+    /// (v10.11.8 `RefreshMediaLibraryTask.ExecuteAsync`), so the task stays
+    /// `Running` for the whole scan and its `LastExecutionResult` records the
+    /// real duration. A task that queued the scan and returned would report
+    /// itself finished in 0 ms with the scan still writing — which is what the
+    /// dashboard, and anything that waits on the task, would then believe.
+    ///
+    /// Defaults to the queueing form so implementations with no scanner need no
+    /// change; the real manager overrides it.
+    async fn run_library_scan(&self) -> Result<(), ServiceError> {
+        self.queue_library_scan().await
+    }
 }
 
 fn _assert_object_safe_library_manager(_: &dyn LibraryManager) {}

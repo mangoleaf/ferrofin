@@ -1278,6 +1278,34 @@ impl LibraryScanner {
             // genres/studios/tags/overview/ratings/year from `movie.nfo` /
             // `tvshow.nfo` / `<episode>.nfo`, and yields the credited cast/crew
             // plus the external ids the file pins.
+            //
+            // OPEN WORK ITEM — the metadata CHANGE MONITOR is not ported, so this
+            // read is unconditional where upstream's is gated. C# runs the local
+            // readers only when one reports a change:
+            // `BaseNfoProvider.HasChanged` is
+            // `nfoLastWriteTimeUtc - item.DateLastSaved > TimeSpan.FromMinutes(1)`
+            // (v10.11.8 MediaBrowser.XbmcMetadata/Providers/BaseNfoProvider.cs),
+            // and `MetadataService.GetProviders` returns an EMPTY provider list
+            // when nothing changed, so a scan over an item saved more recently
+            // than its sidecar merges nothing. Ferrofin re-derives every unlocked
+            // row from disk on every pass, which is why a library scan reverts
+            // what the Identify dialog's Apply just wrote — measured on the lab
+            // pair and recorded as the `unlocked_after_scan` red on
+            // `POST /Items/RemoteSearch/Apply/{itemId}`.
+            //
+            // UN-DEFER PATH (all three together, or the fix loses data — the
+            // full argument is on that row in suite/parity/classifications.json):
+            //   1. write `BaseItems.DateLastSaved` on every save
+            //      (`FerrofinItemPersistenceService::save_items` binds the column
+            //      but only ever from an entity carrying `None`). This alone
+            //      changes `Etag` (dto_service.rs hashes DateLastSaved) and the
+            //      `minDateLastSaved` query filter on every DTO, so it needs its
+            //      own batch and its own perf run;
+            //   2. gate this call and `fetch_remote_metadata` on the
+            //      sidecar-mtime-vs-DateLastSaved comparison;
+            //   3. a scan-upsert variant that PRESERVES the provider-supplied
+            //      columns when no provider ran — without it, skipping the read
+            //      wipes the very fields the gate exists to protect.
             let (mut people, nfo_ids) = if locked {
                 (Vec::new(), Vec::new())
             } else {

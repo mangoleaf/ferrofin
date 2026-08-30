@@ -100,19 +100,97 @@ def multi(op, legs):
     return {"op": op, "kind": "multi", "legs": out}
 
 
-def post_leg(url, body, retry_empty=False):
+def post_leg(url, body, retry_empty=False, tag=None, requires=None):
     """One leg of a [`posted`] row. `body(ctx)` builds the JSON for THAT server,
     so a leg can carry the server's own item id.
 
     `retry_empty` marks a leg whose emptiness would be a HARNESS artefact rather
     than an answer — the MusicBrainz-backed searches, where musicbrainz.org
     rate-limits at roughly one request per second per IP and answers 503, which
-    both servers turn into `[]`. Such a leg is retried, and if either side is
-    still empty it is DROPPED from the row with a note, because `[] vs []`
-    compares nothing and must never be reported as agreement. A leg whose
-    correct answer IS `[]` (the fetcher-gate legs) must leave this false.
+    both servers turn into `[]`. Such a leg is retried until BOTH sides answer
+    non-empty, and if BOTH are still empty it is DROPPED from the row with a
+    note, because `[] vs []` compares nothing and must never be reported as
+    agreement. A leg whose correct answer IS `[]` (the fetcher-gate legs) must
+    leave this false.
+
+    Two deliberate non-behaviours of `retry_empty`, both of which used to
+    launder a Ferrofin failure into a green row:
+      * it never fires on a NON-200. `token_post` returns `(status, None)` for
+        anything but 200-with-JSON, and a falsy body is indistinguishable from
+        `[]`; the runner therefore settles the statuses FIRST, so a Ferrofin
+        500 against a Jellyfin 200 is a status mismatch, not a drop;
+      * it needs BOTH sides empty. One side empty and the other carrying hits,
+        after every retry, is a divergence — the rate limiter is shared, but it
+        does not answer for the server that did return data, and "one of them
+        found nothing" is exactly the shape a broken search has.
+
+    `tag`/`requires` pin a POSITIVE CONTROL to an assertion whose expected
+    answer is `[]`. A gate leg asserting "no fetcher may run" is satisfied
+    equally by a working gate and by a rate-limited provider; naming the
+    control's `tag` in the gated leg's `requires` makes the runner drop the
+    gate leg unless the control really did return content on both servers in
+    the same pass.
     """
-    return {"url": url, "body": body, "retry_empty": retry_empty}
+    return {"url": url, "body": body, "retry_empty": retry_empty,
+            "tag": tag, "requires": requires}
+
+
+def post_leg_outcome(leg, hs, hb, js, jb, proven):
+    """What a `posted` leg's two responses mean, as ONE word, so the rule is
+    testable instead of being an `if`-ladder buried in the runner.
+
+    Order matters, and each step exists because the one below it used to swallow
+    a real result:
+
+      `uncontrolled`  the leg asserts `[]` (a fetcher gate) and its positive
+                      control did not return content in this pass, so the
+                      assertion is unattributable — drop it.
+      `status`        the two servers disagreed on the HTTP status. The loudest
+                      possible result. Settled BEFORE any emptiness test,
+                      because `token_post` reports a Ferrofin 500 as a falsy
+                      body and it would otherwise look like "the provider
+                      answered empty".
+      `unavailable`   both refused identically, or neither returned JSON. Not a
+                      divergence and not evidence: the leg compared nothing.
+      `rate-limited`  both answered 200 and BOTH came back empty on a leg whose
+                      emptiness is a harness artefact. Dropped with a note —
+                      `[] vs []` compares nothing and must never read as
+                      agreement. One side empty is NOT this: it falls through
+                      and diffs, which is a divergence.
+      `compare`       diff the two bodies.
+    """
+    if leg["requires"] and leg["requires"] not in proven:
+        return "uncontrolled"
+    if hs != js:
+        return "status"
+    if hs != 200 or hb is None or jb is None:
+        return "unavailable"
+    if leg["retry_empty"] and not hb and not jb:
+        return "rate-limited"
+    return "compare"
+
+
+def leaf_note(per_leg):
+    """The " (leaves A+B+C)" fragment a multi-leg row's note carries, or "" when
+    the caller kept no per-leg counts.
+
+    Spelled out leg by leg on purpose. A row whose legs are `[14, 5, 0]` has
+    three CLEAN legs and two legs of evidence; summing them to 19 and printing
+    "3/3 clean" invites the reader to divide, and the leg that compared nothing
+    is exactly the one — a fetcher gate asserting `[]` — whose silence must stay
+    visible. A row whose every leg compared something reads the same way, so
+    there is no special case to remember.
+    """
+    if not per_leg:
+        return ""
+    # The clause is only worth carrying when a zero sits NEXT TO real evidence —
+    # that is the case where a reader would otherwise credit the empty leg with
+    # a share of the total. A row whose every leg compared nothing already says
+    # so in `record`'s `empty-corpus` detail, and repeating it there just makes
+    # the note longer than the finding.
+    hidden_zero = 0 in per_leg and any(per_leg)
+    return (f" ({'+'.join(str(c) for c in per_leg)} leaves compared"
+            + ("; the 0 is a leg whose ASSERTION is emptiness)" if hidden_zero else ")"))
 
 
 def posted(op, legs):
@@ -738,13 +816,22 @@ READS = [
     # none, the `retry_empty` legs drop out and the row records "no comparable
     # response" rather than passing vacuously.
     posted("POST /Items/RemoteSearch/MusicAlbum", [
-        # 1. The deterministic lookup. `MusicBrainzAlbumProvider.GetSearchResults`
-        #    short-circuits on a known release id, so both servers fetch the same
-        #    single MB document and every field must agree.
+        # 1. The deterministic lookup, AND the positive control for leg 3.
+        #    `MusicBrainzAlbumProvider.GetSearchResults` short-circuits on a
+        #    known release id, so both servers fetch the same single MB document
+        #    and every field must agree. It carries the SAME `ItemId` as the
+        #    gate leg with `IncludeDisabledProviders: True`, which is the
+        #    override C# checks first (`ProviderManager.GetRemoteSearchResults`
+        #    :801-830), so the only difference between this leg and leg 3 is the
+        #    gate itself — content here and `[]` there is attributable to the
+        #    checkbox and to nothing else. Without this pairing a musicbrainz.org
+        #    503 satisfies leg 3 exactly as well as a working gate does.
         post_leg("/Items/RemoteSearch/MusicAlbum", lambda c: {
+            "ItemId": c["album_id"],
             "SearchInfo": {"Name": "Abbey Road", "ProviderIds": {
                 "MusicBrainzAlbum": "6bb3793b-f991-378e-9bff-0bd3117f2298"}},
-            "IncludeDisabledProviders": True}, retry_empty=True),
+            "IncludeDisabledProviders": True},
+            retry_empty=True, tag="mb-album-reachable"),
         # 2. The dateless-release sentinel. MusicBrainz dates this release `""`;
         #    MetaBrainz still builds a `PartialDate`, so C# emits
         #    `PremiereDate: 0001-01-01T00:00:00.0000000Z` with NO `ProductionYear`
@@ -759,26 +846,32 @@ READS = [
         #    `IsMetadataFetcherEnabled` lets NO fetcher run: `[]` on both. This
         #    leg is the one that used to be red — Ferrofin ignored `ItemId`,
         #    `IncludeDisabledProviders` and the library entirely. Its empty
-        #    answer is the ASSERTION, so it is never retried away.
+        #    answer is the ASSERTION, so it is never retried away — and for the
+        #    same reason it is only credited when leg 1 proved, in the same
+        #    pass, that the provider WOULD have answered.
         post_leg("/Items/RemoteSearch/MusicAlbum", lambda c: {
             "ItemId": c["album_id"],
             "SearchInfo": {"Name": "Abbey Road", "ProviderIds": {
                 "MusicBrainzAlbum": "6bb3793b-f991-378e-9bff-0bd3117f2298"}},
-            "IncludeDisabledProviders": False}),
+            "IncludeDisabledProviders": False}, requires="mb-album-reachable"),
     ]),
     posted("POST /Items/RemoteSearch/MusicArtist", [
         # The artist lookup by `MusicBrainzArtist` id — `LookupArtist`, one
-        # stable document, carrying the life-span begin as PremiereDate.
+        # stable document, carrying the life-span begin as PremiereDate. Same
+        # `ItemId` + `IncludeDisabledProviders: True` shape as the album row, so
+        # it is also the gate leg's positive control.
         post_leg("/Items/RemoteSearch/MusicArtist", lambda c: {
+            "ItemId": c["artist_id"],
             "SearchInfo": {"Name": "Radiohead", "ProviderIds": {
                 "MusicBrainzArtist": "a74b1b7f-71a5-4011-9441-d0b5e4122711"}},
-            "IncludeDisabledProviders": True}, retry_empty=True),
+            "IncludeDisabledProviders": True},
+            retry_empty=True, tag="mb-artist-reachable"),
         # …and the same fetcher gate, on this server's own `Artist 01`.
         post_leg("/Items/RemoteSearch/MusicArtist", lambda c: {
             "ItemId": c["artist_id"],
             "SearchInfo": {"Name": "Radiohead", "ProviderIds": {
                 "MusicBrainzArtist": "a74b1b7f-71a5-4011-9441-d0b5e4122711"}},
-            "IncludeDisabledProviders": False}),
+            "IncludeDisabledProviders": False}, requires="mb-artist-reachable"),
     ]),
     # MusicVideo and Book have NO remote search provider on either side, so both
     # answer `[]` unconditionally and the row can only earn `empty-corpus` —
@@ -954,8 +1047,10 @@ def run(ferrofin_url, jellyfin_url):
         """The honest method for an aggregate of diffed (jbody, hbody, compared) legs.
 
         None when no leg compared anything (untested); `empty-corpus` when every
-        leg that compared anything was two empty result envelopes agreeing on
-        their own zeros; `body-diff` as soon as one leg compared real content.
+        leg was two EMPTY results (an `Items: []` envelope agreeing on its own
+        zeros, or a bare `[]` agreeing on nothing at all — see
+        `verification.is_empty_result`); `body-diff` as soon as one leg compared
+        real content.
         """
         seen = [m for m in (verification.read_method(j, h, c) for j, h, c in legs)
                 if m is not None]
@@ -964,13 +1059,20 @@ def run(ferrofin_url, jellyfin_url):
         return (verification.BODY_DIFF if verification.BODY_DIFF in seen
                 else verification.EMPTY_CORPUS)
 
-    def record(op, clean, total, buckets, method, note=None):
+    def record(op, clean, total, buckets, method, note=None, compared=None):
         """`method` is HOW the row was verified, from `verification.METHODS`, and it
         is written into the results row. There is no default: gen-ledger.py counts
         only `body-diff` in the headline, so a row that agreed on named invariants
         ("property"), or on two empty result envelopes ("empty-corpus"), must say so
         rather than borrowing a claim it did not earn. `method=None` means the probe
-        compared nothing at all — recorded untested, never verified."""
+        compared nothing at all — recorded untested, never verified.
+
+        `compared`, when given, is the PER-LEG count of non-volatile LEAF
+        comparisons the row actually performed, rendered leg by leg next to the
+        leg count. Per-leg and not a total, because the total is what hides the
+        problem: "3/3 clean" reads as three times the evidence when one of the
+        three legs asserted `[]` and compared nothing at all, and "3/3 clean, 19
+        leaves" still does. "3/3 legs clean (leaves 14+5+0)" cannot."""
         if total == 0 or (method is None and not any(buckets.values())):
             rows[op] = {"deep_verified": None, "classification": "",
                         "verification_method": None,
@@ -983,9 +1085,11 @@ def run(ferrofin_url, jellyfin_url):
                       verification.EMPTY_CORPUS: " (both result sets EMPTY; only the envelope"
                                                  " zeros compared — handler logic unexercised)",
                       }.get(method, "")
+            leaves = leaf_note(compared)
             rows[op] = {"deep_verified": True, "classification": "ok",
                         "verification_method": method,
-                        "note": f"{clean}/{total} clean" + detail}
+                        "note": f"{clean}/{total} legs clean{leaves}" + detail
+                                + (f"; {note}" if note else "")}
         else:
             sample = "; ".join(f"{m['path']}(J={m.get('j')} H={m.get('h')})"
                                for m in buckets["mismatch"][:3])
@@ -1000,8 +1104,10 @@ def run(ferrofin_url, jellyfin_url):
             rows[op] = {"deep_verified": False,
                         "classification": "flagged: read diff vs Jellyfin (verify)",
                         "verification_method": method or verification.BODY_DIFF,
-                        "note": f"{clean}/{total} clean; mismatch:{len(buckets['mismatch'])} "
-                                f"missing:{len(buckets['missing'])} extra:{len(buckets['extra'])} | {sample}",
+                        "note": f"{clean}/{total} legs clean{leaf_note(compared)}; "
+                                f"mismatch:{len(buckets['mismatch'])} "
+                                f"missing:{len(buckets['missing'])} extra:{len(buckets['extra'])} | {sample}"
+                                + (f" | {note}" if note else ""),
                         "diffs": {
                             "missing": sorted(field_paths(buckets["missing"])),
                             "extra": sorted(field_paths(buckets["extra"])),
@@ -1061,38 +1167,62 @@ def run(ferrofin_url, jellyfin_url):
             legs = []
             clean = tested = 0
             dropped = []
+            unavailable = []
+            proven = set()          # tags whose control returned content on BOTH servers
             for leg in ep["legs"]:
-                # Both servers get the identical body, in the same run, back to
-                # back, so an upstream provider sees one state.
-                for attempt in range(MB_RETRIES if leg["retry_empty"] else 1):
-                    hs, hb = token_post(ferrofin_url, leg["url"], ht, leg["body"](hc))
-                    time.sleep(MB_PACE)
-                    js, jb = token_post(jellyfin_url, leg["url"], jt, leg["body"](jc))
-                    if not leg["retry_empty"] or (hb and jb):
-                        break
-                    time.sleep(MB_PACE)
-                if leg["retry_empty"] and not (hb and jb):
-                    # See `post_leg`: an empty answer here is the upstream rate
-                    # limiter, not a result. Dropping the leg loses evidence;
-                    # keeping it would MANUFACTURE evidence out of `[] vs []`.
-                    dropped.append(f"{leg['url']} (H={len(hb or [])} J={len(jb or [])})")
+                hs = js = 0
+                hb = jb = None
+                if not (leg["requires"] and leg["requires"] not in proven):
+                    # Both servers get the identical body, in the same run, back
+                    # to back, so an upstream provider sees one state.
+                    for _attempt in range(MB_RETRIES if leg["retry_empty"] else 1):
+                        hs, hb = token_post(ferrofin_url, leg["url"], ht, leg["body"](hc))
+                        time.sleep(MB_PACE)
+                        js, jb = token_post(jellyfin_url, leg["url"], jt, leg["body"](jc))
+                        # Retry while EITHER side is empty on a 200 — the
+                        # rate-limiter signature, which lands on ONE server as
+                        # often as on both (musicbrainz.org answers per request,
+                        # not per pass). Settle on both-non-empty; a non-200 is
+                        # a RESULT and is never retried. What leaves this loop is
+                        # then unambiguous: both empty is the limiter, one empty
+                        # after every retry is a persistent divergence and gets
+                        # diffed like anything else.
+                        if not leg["retry_empty"] or hs != 200 or js != 200 or (hb and jb):
+                            break
+                        time.sleep(MB_PACE)
+                outcome = post_leg_outcome(leg, hs, hb, js, jb, proven)
+                if outcome == "uncontrolled":
+                    dropped.append(f"{leg['url']} (gate assertion not credited: its positive "
+                                   f"control {leg['requires']!r} did not return content)")
                     continue
-                tested += 1
-                if hs != js:
+                if outcome == "status":
+                    tested += 1
                     agg["mismatch"].append(
                         {"path": f"{leg['url']} :: status", "j": js, "h": hs})
                     continue
+                if outcome == "unavailable":
+                    unavailable.append(f"{leg['url']} (both HTTP {hs}, no JSON body)")
+                    continue
+                if outcome == "rate-limited":
+                    dropped.append(f"{leg['url']} (H={len(hb)} J={len(jb)}, both empty)")
+                    continue
+                tested += 1
                 n, b, compared = diff_stats(jb, hb)
                 legs.append((jb, hb, compared))
                 if n == 0:
                     clean += 1
+                    if leg["tag"] and hb and jb:
+                        proven.add(leg["tag"])
                 for k in agg:
                     agg[k].extend(b[k])
-            note = None
+            notes = []
             if dropped:
-                note = ("no comparable response — the remote provider answered empty on "
-                        "at least one side after retries: " + "; ".join(dropped))
-            record(ep["op"], clean, tested, agg, agg_method(legs), note=note)
+                notes.append("no comparable response on: " + "; ".join(dropped))
+            if unavailable:
+                notes.append("no body to compare on: " + "; ".join(unavailable))
+            record(ep["op"], clean, tested, agg, agg_method(legs),
+                   note="; ".join(notes) or None,
+                   compared=[c for _, _, c in legs])
         elif ep["kind"] in ("plain", "user"):
             path = ep["url"](hc if ep["kind"] == "user" else {})
             jpath = ep["url"](jc if ep["kind"] == "user" else {})
@@ -1234,7 +1364,42 @@ def selfcheck():
                 assert not (leg["retry_empty"] and not body["IncludeDisabledProviders"]), \
                     (f"{ep['op']}: a GATED leg asserts `[]`; retrying it away would turn the "
                      "assertion into an absence of evidence")
+                assert body["IncludeDisabledProviders"] or leg["requires"], \
+                    (f"{ep['op']}: a GATED leg must name a positive control in `requires` — "
+                     "otherwise a rate-limited provider satisfies its `[]` exactly as well "
+                     "as a working gate does")
                 json.dumps(body)
+        if ep["kind"] == "posted":
+            tags = {leg["tag"] for leg in ep["legs"] if leg["tag"]}
+            needed = {leg["requires"] for leg in ep["legs"] if leg["requires"]}
+            assert needed <= tags, \
+                f"{ep['op']}: `requires` names a control this row does not run: {needed - tags}"
+    # The `posted` leg-outcome rule, exercised on the exact shapes that used to
+    # be laundered into a green row.
+    control = {"retry_empty": True, "tag": "ctl", "requires": None}
+    gate = {"retry_empty": False, "tag": None, "requires": "ctl"}
+    plain_leg = {"retry_empty": True, "tag": None, "requires": None}
+    # A Ferrofin 5xx against a Jellyfin 200 is a STATUS divergence, never a drop.
+    assert post_leg_outcome(plain_leg, 500, None, 200, [{"Name": "x"}], set()) == "status"
+    assert post_leg_outcome(control, 503, None, 200, [{"Name": "x"}], set()) == "status"
+    # Both refused identically: no divergence, and no evidence either.
+    assert post_leg_outcome(plain_leg, 500, None, 500, None, set()) == "unavailable"
+    # Both 200-and-empty on a retry_empty leg is the shared rate limiter.
+    assert post_leg_outcome(plain_leg, 200, [], 200, [], set()) == "rate-limited"
+    # …but ONE side empty is a divergence, so it must reach the diff.
+    assert post_leg_outcome(plain_leg, 200, [], 200, [{"Name": "x"}], set()) == "compare"
+    assert post_leg_outcome(plain_leg, 200, [{"Name": "x"}], 200, [], set()) == "compare"
+    # A gate leg is only credited when its control returned content this pass.
+    assert post_leg_outcome(gate, 200, [], 200, [], set()) == "uncontrolled"
+    assert post_leg_outcome(gate, 200, [], 200, [], {"ctl"}) == "compare"
+    # …and a clean multi-leg row must SHOW the leg that compared nothing, rather
+    # than folding it into a total that reads as evidence.
+    assert leaf_note(None) == "" and leaf_note([]) == ""
+    assert leaf_note([14, 5, 0]) == (" (14+5+0 leaves compared; the 0 is a leg "
+                                     "whose ASSERTION is emptiness)")
+    assert leaf_note([14, 5]) == " (14+5 leaves compared)"
+    # An all-empty row does not repeat itself: `empty-corpus` already says it.
+    assert leaf_note([0]) == " (0 leaves compared)"
     # The invariant rows must carry a callable, and the diff-shaped folding of
     # its facts must flag both a disagreement AND a fact both servers fail.
     assert all(callable(ep["fn"]) for ep in READS if ep["kind"] == "invariant")

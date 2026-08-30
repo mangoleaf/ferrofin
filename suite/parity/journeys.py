@@ -72,10 +72,23 @@ def cross_server_ok(h_ok, j_ok):
 
 def evidence_diff(h, j):
     """A short note naming where two evidence values differ: for dicts, the keys whose
-    values disagree (with both values); otherwise a repr pair."""
+    values disagree (with both values); otherwise a repr pair.
+
+    RECURSES into a differing pair of dicts and names the inner keys instead of
+    printing both whole objects. Evidence that carries a projected read-back is
+    a dict of dicts, and the flat form rendered ~1.5 KB of identical fields to
+    say that three of them differed — a note nobody reads is a divergence
+    nobody sees."""
     if isinstance(h, dict) and isinstance(j, dict):
-        keys = sorted(set(h) | set(j))
-        bad = [f"{k}: H={h.get(k)!r} J={j.get(k)!r}" for k in keys if h.get(k) != j.get(k)]
+        bad = []
+        for k in sorted(set(h) | set(j)):
+            a, b = h.get(k), j.get(k)
+            if a == b:
+                continue
+            if isinstance(a, dict) and isinstance(b, dict):
+                bad.append(f"{k}{{{evidence_diff(a, b)}}}")
+            else:
+                bad.append(f"{k}: H={a!r} J={b!r}")
         return "; ".join(bad) or "(no key differs)"
     return f"H={h!r} J={j!r}"
 
@@ -112,12 +125,14 @@ def earned_method(op, h_ok, j_ok):
 #                 back. A handler that 204s and ignores the request passes.
 #   property      a named property of a response body agreed (an MPEG-TS sync
 #                 signature, a non-empty search result) — no effect, no diff.
-#   body-diff     the ONLY rows allowed this are the ones that return `Same` with
-#                 the read-back itself (or the sha256 of the bytes the write
-#                 stored) as evidence, so Ferrofin's post-write state is compared
-#                 field-for-field against Jellyfin's. `earned_method` enforces it
-#                 at runtime: declare it and return a bool and the row is
-#                 recorded `effect`.
+#   body-diff     reserved, and currently claimed by NO row in this layer. It
+#                 would need the read-back BODY itself — every non-volatile
+#                 field — diffed against the other server's, which is what
+#                 reads.py does and what a named projection, however wide, does
+#                 not. `earned_method` still enforces the weaker half of the
+#                 claim at runtime (a row declaring it must at least have
+#                 returned `Same` on both servers), so the guard survives the
+#                 day a row earns it.
 #
 # `selfcheck()` asserts this table covers every op key the journeys declare, so a
 # new journey op cannot land in the ledger without saying how it was verified.
@@ -146,10 +161,17 @@ JOURNEY_METHOD = {op: verification.STATUS_CLASS for op in (
     "POST /Sessions/{sessionId}/System/{command}",
     "POST /Sessions/{sessionId}/Viewing",
 )}
-#: The one row whose read-back really is compared against the other server's, so it
-#: may claim the headline — and `earned_method` re-checks that claim at run time.
-JOURNEY_METHOD.update({"POST /Items/RemoteSearch/Apply/{itemId}": verification.BODY_DIFF})
 JOURNEY_METHOD.update({op: verification.PROPERTY for op in (
+    # The write's effect IS compared across the two servers, field for field —
+    # but on a NAMED PROJECTION of the read-back DTO, not on the body. The
+    # projection is `identified()`; read its docstring for exactly which fields
+    # are in it and which are not. It is `property` and not `body-diff` for one
+    # reason, stated plainly: `body-diff` means "every non-volatile field of the
+    # parsed body", and a hand-listed tuple is not that, however long the tuple
+    # gets. (It was recorded `body-diff` once. The projection had 16 entries,
+    # `MergeBaseItemData` under `replaceData` touches more, and the row's own
+    # docstring claimed "nothing here is dropped" — which was false.)
+    "POST /Items/RemoteSearch/Apply/{itemId}",
     # A container signature, not an effect: 200 + video/mp2t + a 0x47 sync byte at
     # 0 and 188. Wrong PIDs, wrong channel or a black feed all match.
     "GET /LiveTv/LiveStreamFiles/{streamId}/stream.{container}",
@@ -1232,39 +1254,114 @@ def movie_named(base, token, user, name):
     return next((i["Id"] for i in (b or {}).get("Items", []) if i.get("Name") == name), None)
 
 
-#: The read-back fields `POST /Items/RemoteSearch/Apply/{itemId}` can change.
-#: Every one is compared between the two servers; nothing here is dropped.
+#: The read-back fields `POST /Items/RemoteSearch/Apply/{itemId}` can change,
+#: derived from v10.11.8 `MetadataService.MergeBaseItemData` — every scalar it
+#: assigns under `replaceData: true`, plus the four the endpoint's own contract
+#: covers (`LockData`/`LockedFields`, and the ids the controller writes).
+#:
+#: This list is NOT the body. See `identified()` for what is left out and why the
+#: row is recorded `property`.
 IDENTIFY_READBACK = ("Name", "OriginalTitle", "ProductionYear", "PremiereDate", "ProviderIds",
                      "Overview", "Genres", "Taglines", "CommunityRating", "OfficialRating",
-                     "RunTimeTicks", "LockData", "LockedFields")
+                     "RunTimeTicks", "LockData", "LockedFields",
+                     # …the rest of MergeBaseItemData's replaceData assignments,
+                     # which the first cut of this projection omitted — exactly
+                     # the fields a port could silently skip and no probe see.
+                     "EndDate", "IndexNumber", "ParentIndexNumber", "CustomRating",
+                     "CriticRating", "Tags", "ProductionLocations", "ForcedSortName",
+                     "PreferredMetadataLanguage", "PreferredMetadataCountryCode",
+                     "AlbumArtist", "AlbumArtists")
 
 
 def identified(dto):
     """The item's post-Apply state, projected into a CROSS-SERVER comparable shape.
 
-    Three narrowings, each because the value is per-instance and for no other reason:
-      * `Studios` — the DTO entries carry each server's own GUID for the studio, so the
-        NAMES are compared, which is the whole of what a provider supplies.
-      * `ImageTags` — the tag is an md5 of path+mtime, so it differs between two servers
-        holding byte-identical artwork (measured). The KEY SET is compared, so an image
-        that appeared, vanished, or landed under the wrong `ImageType` still fails.
-      * `BackdropImageTags` — same tag problem; the COUNT is compared.
-    Everything else, values included, is compared as-is."""
+    A PROJECTION, not a body — which is why the row is recorded `property` and not
+    the `body-diff` headline. Being explicit about both halves, because the
+    previous version of this docstring asserted "nothing here is dropped" and that
+    was not true:
+
+    COMPARED. Every field in `IDENTIFY_READBACK` (the whole of
+    `MergeBaseItemData`'s `replaceData` assignment list, MetadataService.cs
+    :1009-1176, plus `LockData`/`LockedFields`/`ProviderIds`), and four derived
+    values whose raw form is per-instance and for no other reason:
+      * `Studios` — the DTO entries carry each server's own GUID for the studio, so
+        the NAMES are compared, which is the whole of what a provider supplies.
+      * `People` — same GUID problem; the (Name, Type, Role) triples are compared,
+        so a cleared or re-ordered cast still fails. Upstream deliberately KEEPS
+        the cast here (`temp.People` is null, and `SaveItemAsync` skips a null
+        people list), so this is a guard against Ferrofin clearing it, not a
+        prediction that it will change.
+      * `RemoteTrailers` — the URLs are compared; the C# replaces the whole list
+        under `replaceData`.
+      * `ImageTags` — the tag is an md5 of path+mtime, so it differs between two
+        servers holding byte-identical artwork (measured). The KEY SET is
+        compared, so an image that appeared, vanished, or landed under the wrong
+        `ImageType` still fails. `BackdropImageTags` has the same tag problem, so
+        the COUNT is compared.
+
+    NOT COMPARED, and therefore not claimed: everything else the DTO carries —
+    `MediaSources`/`MediaStreams`/`Chapters`/`Trickplay`/`UserData`/`ExternalUrls`
+    and the rest. Those are the file's facts, not the merge's, they are owned by
+    the `GET /Items/{itemId}` row, and two of them (`MediaStreams[].BitRate`,
+    `MediaSources[].Bitrate`) carry a known open divergence that would pin this
+    row red for someone else's bug. A whole-body diff belongs in reads.py, which
+    has one.
+    """
     out = {k: dto.get(k) for k in IDENTIFY_READBACK}
     out["Studios"] = sorted(s.get("Name") for s in (dto.get("Studios") or []))
+    out["People"] = sorted((p.get("Name"), p.get("Type"), p.get("Role"))
+                           for p in (dto.get("People") or []))
+    out["RemoteTrailers"] = sorted(t.get("Url") for t in (dto.get("RemoteTrailers") or []))
     out["ImageTags"] = sorted((dto.get("ImageTags") or {}).keys())
     out["BackdropImageTags"] = len(dto.get("BackdropImageTags") or [])
     return out
+
+
+#: How long to wait for a forced library scan to report itself finished. The
+#: fixture's 552 items take ~3 s on both stacks; the ceiling is generous so a
+#: loaded host produces a `scan_completed: False` row rather than a timeout.
+SCAN_WAIT_S = 300
+
+
+def scan_library_and_wait(base, token):
+    """Run the library scan to completion on `base`; True only if it really ran.
+
+    Driven through the `RefreshLibrary` SCHEDULED TASK, not `POST
+    /Library/Refresh`, because the task is the only library-scan trigger that
+    reports a completion signal on both stacks: `State` returns to `Idle` and
+    `LastExecutionResult.EndTimeUtc` advances past the value captured before the
+    start. `POST /Library/Refresh` is fire-and-forget on both, which is exactly
+    how a read-back taken "after" a scan can be taken before it.
+
+    Returns False on a timeout, on a missing task, or on a refused start — the
+    caller puts that in its evidence, so a scan that did not happen can never be
+    mistaken for a scan that changed nothing.
+    """
+    task = next((t for t in (get_json(base, "/ScheduledTasks", token) or [])
+                 if t.get("Key") == "RefreshLibrary"), None)
+    if not task:
+        return False
+    task_id, before = task["Id"], (task.get("LastExecutionResult") or {}).get("EndTimeUtc")
+    if http("POST", f"{base}/ScheduledTasks/Running/{task_id}", token, "")[0] >= 300:
+        return False
+    deadline = time.time() + SCAN_WAIT_S
+    while time.time() < deadline:
+        time.sleep(2)
+        now = get_json(base, f"/ScheduledTasks/{task_id}", token) or {}
+        end = (now.get("LastExecutionResult") or {}).get("EndTimeUtc")
+        if now.get("State") == "Idle" and end != before:
+            return True
+    return False
 
 
 def j_remote_search_apply(base, token, user, _m, _m2):
     """`POST /Items/RemoteSearch/Apply/{itemId}` — the Identify dialog's "Apply".
 
     A real mutation, so the row is earned on the READ-BACK — and the read-back is
-    diffed against the OTHER server's read-back, field for field (`Same`), not merely
-    against this server's own before-state. That is the difference between "the write
-    did something here" (`effect`) and "both servers ended up holding the same item"
-    (`body-diff`); `earned_method` enforces which one this row may claim.
+    compared against the OTHER server's, field for field, through `identified()`.
+    That is a NAMED PROJECTION of the DTO and not the DTO, so the row is recorded
+    `property`; `identified()`'s docstring lists what is in it and what is not.
 
     Two legs, on movies no other journey touches (`Movie 0497`/`Movie 0496`, chosen by
     name — see `movie_named`):
@@ -1287,6 +1384,22 @@ def j_remote_search_apply(base, token, user, _m, _m2):
       2. LOCKED. `item.IsLocked` makes `RefreshWithProviders` return before the merge,
          so the ids land and nothing else moves. Refusing the FETCH (right) and
          refusing the ID ASSIGNMENT (wrong) are separable only on this leg.
+
+    …and then, for BOTH legs, the same read-back again after a library scan that
+    this journey forces and WAITS FOR (`scan_library_and_wait`). That third
+    observation is not decoration; it is the difference between a fact and a
+    coincidence. An earlier version of this row took its read-back immediately and
+    recorded it green, while the journeys suite's own `POST /Library/Refresh` was
+    mid-flight; seconds later Ferrofin's scan re-applied `movie.nfo` over the item
+    Apply had just cleared, and the row had certified a state that no longer
+    existed. Upstream cannot do that: `BaseNfoProvider.HasChanged` is
+    `nfoWriteTime - item.DateLastSaved > 1 minute`, so a sidecar older than the last
+    save reports no change, `MetadataService.GetProviders` returns an empty provider
+    list for the item, and the scan leaves it alone. Ferrofin's scan re-reads the
+    sidecar unconditionally, so `unlocked_after_scan` diverges — see the
+    `open-work (NOT accepted)` entry in classifications.json. Forcing the scan makes
+    that divergence a deterministic red instead of a race whose outcome depends on
+    when the suite happened to run.
 
     Deliberately NOT probed: a leg with the downloaders TICKED. It would rewrite both
     items from live TMDB, whose answer is not pinned in time, so the row would go red
@@ -1313,10 +1426,18 @@ def j_remote_search_apply(base, token, user, _m, _m2):
                                      "SearchProviderName": "TheMovieDb"}))
     after_locked = identified(q(base, f"/Items/{locked}", token, user) or {})
 
+    # Durability. `scan_completed` is IN the evidence and in `ok`, so a scan that
+    # timed out or never started cannot pass as "the scan changed nothing".
+    scanned = scan_library_and_wait(base, token)
+    durable_open = identified(q(base, f"/Items/{unlocked}", token, user) or {})
+    durable_locked = identified(q(base, f"/Items/{locked}", token, user) or {})
+
     ev = {"status": st, "locked_status": st2, "lock_accepted": lock_st < 300,
-          "unlocked": after_open, "locked": after_locked}
+          "unlocked": after_open, "locked": after_locked,
+          "scan_completed": scanned,
+          "unlocked_after_scan": durable_open, "locked_after_scan": durable_locked}
     r["POST /Items/RemoteSearch/Apply/{itemId}"] = Same(
-        st == 204 and st2 == 204
+        st == 204 and st2 == 204 and scanned
         and (after_open.get("ProviderIds") or {}).get("Tmdb") == "603"
         and (after_locked.get("ProviderIds") or {}).get("Tmdb") == "27205"
         and after_locked.get("LockData") is True, ev)
@@ -1502,8 +1623,18 @@ def journeys(ferrofin_url, jellyfin_url):
                 cls = "flagged: write effect not observed on either server (likely corpus/setup)"
             else:
                 cls = "ok"
-            detail = ("read-backs diffed against each other"
-                      if method == verification.BODY_DIFF else "bodies not diffed")
+            detail = {
+                verification.BODY_DIFF: "read-back bodies diffed against each other",
+                # `Same` rows compare a NAMED PROJECTION of each server's
+                # read-back against the other's; plain-bool rows compare nothing
+                # across servers at all. Saying "bodies not diffed" for both hid
+                # which of the two a row was.
+                verification.PROPERTY: ("named properties compared across the two servers; "
+                                        "bodies NOT diffed"),
+                verification.EFFECT: ("each server checked against its OWN read-back only; "
+                                      "nothing compared across the two"),
+                verification.STATUS_CLASS: "status only; nothing read back",
+            }.get(method, "bodies not diffed")
             rows[op] = {"deep_verified": deep, "classification": cls,
                         "verification_method": method,
                         "note": f"H={h_ok} J={j_ok} ({method}; {detail})"}
@@ -1551,11 +1682,26 @@ def selfcheck():
     assert combine(Same(True, {"ProductionYear": 2020}), Same(True, {"ProductionYear": None})) is False
     assert combine(Same(True, {"ProductionYear": None}), Same(True, {"ProductionYear": None})) is True
     assert combine(Same(False, {"a": 1}), Same(True, {"a": 1})) is False
+    # …and the note names the INNER key, not the whole projection.
+    assert evidence_diff({"after": {"Year": 2020, "Name": "M"}},
+                         {"after": {"Year": None, "Name": "M"}}) \
+        == "after{Year: H=2020 J=None}"
+    assert evidence_diff({"a": 1}, {"a": 1}) == "(no key differs)"
     # A row may only KEEP a declared body-diff when both sides really compared.
-    diffed = next(k for k, v in JOURNEY_METHOD.items() if v == verification.BODY_DIFF)
-    assert earned_method(diffed, Same(True, 1), Same(True, 1)) == verification.BODY_DIFF
-    assert earned_method(diffed, True, True) == verification.EFFECT
-    assert earned_method(diffed, Same(True, 1), True) == verification.EFFECT
+    # No row in this layer declares it today (see the JOURNEY_METHOD comment), so
+    # the guard is exercised against a synthetic declaration rather than being
+    # deleted — the day a journey earns a real body diff, this is what checks it.
+    diffed = "GET /System/Info"
+    assert diffed not in JOURNEY_METHOD
+    JOURNEY_METHOD[diffed] = verification.BODY_DIFF
+    try:
+        assert earned_method(diffed, Same(True, 1), Same(True, 1)) == verification.BODY_DIFF
+        assert earned_method(diffed, True, True) == verification.EFFECT
+        assert earned_method(diffed, Same(True, 1), True) == verification.EFFECT
+    finally:
+        del JOURNEY_METHOD[diffed]
+    # …and every op a journey really declares stays out of the headline.
+    assert verification.BODY_DIFF not in set(JOURNEY_METHOD.values())
     # Every journey advertises only op keys that exist in the vendored spec.
     import glob
     spec = json.load(open(sorted(glob.glob(os.path.join(ROOT, "contracts/jellyfin-openapi-*.json")))[-1]))

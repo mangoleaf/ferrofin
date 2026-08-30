@@ -2383,15 +2383,31 @@ fn apply_tmdb_details(entity: &mut BaseItemEntity, details: &TmdbDetails, replac
 /// Apply into a library with every "Metadata downloaders" box cleared leaves
 /// Jellyfin's movie with no `ProductionYear`, no `Genres` and no `Studios`.
 ///
-/// Deliberately NOT cleared, matching the C#:
-/// - `Name`, guarded by `if (!string.IsNullOrWhiteSpace(source.Name))` — an
-///   empty provider name never blanks the title;
-/// - `ForcedSortName`, guarded the same way;
-/// - `ProviderIds`, which the merge only ever adds to;
+/// Deliberately NOT cleared, matching the C#. Each entry names the line that
+/// preserves it, because "the port skips it" and "upstream keeps it" look
+/// identical from a read-back and only the citation separates them:
+/// - `Name`, guarded by `if (!string.IsNullOrWhiteSpace(source.Name))`
+///   (MetadataService.cs:1010-1017) — an empty provider name never blanks the
+///   title;
+/// - `ForcedSortName`, guarded the same way (:1182-1189);
+/// - `ProviderIds`, which the merge only ever adds to (:1149-1162);
 /// - `RunTimeTicks` on a video/audio row, where
-///   `if (target is not Audio && target is not Video)` protects the value the
-///   media probe measured;
-/// - `IsLocked`/`DateCreated`, which the metadata-settings half preserves.
+///   `if (target is not Audio && target is not Video)` (:1103-1110) protects
+///   the value the media probe measured;
+/// - `IsLocked`/`DateCreated`, which the metadata-settings half preserves
+///   (:1191-1224);
+/// - `ParentIndexNumber`, `PreferredMetadataCountryCode` and
+///   `PreferredMetadataLanguage` — the merge DOES assign these under
+///   `replaceData`, but `RefreshWithProviders` copies each one from the item
+///   onto the empty `temp` before the merge ever runs
+///   (MetadataService.cs:752-757), so the value that comes back is the item's
+///   own. Clearing them here would be the divergence;
+/// - the item's CAST. `MergeBaseItemData` sets
+///   `targetResult.People = sourceResult.People` (:1078-1087), and the empty
+///   `temp` result carries `People = null`, not an empty list;
+///   `SaveItemAsync` only writes people `if (result.People is not null)`, so
+///   upstream leaves the stored cast in place. Measured on the lab pair: after
+///   an Apply, Jellyfin's movie kept its People array.
 ///
 /// NOT honoured, because Ferrofin has no storage for it: the C# skips
 /// `Name`/`Genres`/`Overview`/`OfficialRating`/`Studios`/`Tags`/
@@ -2416,9 +2432,43 @@ fn clear_provider_supplied_metadata(entity: &mut BaseItemEntity) {
     entity.studios = None;
     entity.tags = None;
     entity.production_locations = None;
+    // `MergeAlbumArtist` (MetadataService.cs:1288-1300): under `replaceData`
+    // the target's `AlbumArtists` becomes the source's, so an empty source
+    // clears them. Only `IHasAlbumArtist` rows have the field at all.
+    entity.album_artists = None;
+    // `target.RemoteTrailers = source.RemoteTrailers` under `replaceData`
+    // (MetadataService.cs:1169-1176). Ferrofin keeps them in the `Data` blob
+    // (the 10.11.8 schema's only home for them), so the clear is a keyed edit
+    // of that JSON, leaving every other key alone.
+    if let Some(data) = clear_remote_trailers(entity.data.as_deref()) {
+        entity.data = Some(data);
+    }
     if !probes_its_own_runtime(short_kind(entity)) {
         entity.run_time_ticks = None;
     }
+}
+
+/// Drops the `RemoteTrailers` array from a `Data` column value, returning the
+/// new column text — or `None` when the blob had none, so the caller skips a
+/// pointless rewrite.
+///
+/// Mirrors `ferrofin_core::item_data::merge_remote_trailers` in shape (parse,
+/// edit one key, re-serialise) but cannot call it: `ferrofin-core` depends on
+/// this crate, not the other way round.
+fn clear_remote_trailers(data: Option<&str>) -> Option<String> {
+    let mut object: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(data?).ok()?;
+    match object.get("RemoteTrailers") {
+        // Already absent, or already empty: nothing to write.
+        None => return None,
+        Some(serde_json::Value::Array(entries)) if entries.is_empty() => return None,
+        Some(_) => {}
+    }
+    object.insert(
+        "RemoteTrailers".to_owned(),
+        serde_json::Value::Array(Vec::new()),
+    );
+    serde_json::to_string(&serde_json::Value::Object(object)).ok()
 }
 
 /// Whether a row's `RunTimeTicks` comes from the media file rather than a
@@ -5794,8 +5844,63 @@ mod tests {
         super::clear_provider_supplied_metadata(&mut book);
         assert_eq!(book.run_time_ticks, None);
 
-        // End to end: the Apply options run the clear even though the fetch is
-        // gated off, and the cleared row is persisted.
+        end_to_end_apply_persists_the_cleared_row(movie).await;
+    }
+
+    #[tokio::test]
+    async fn remove_old_metadata_keeps_the_fields_the_merge_copies_back() {
+        // The fields an adversarial read of the C# says the clear is missing.
+        // Two of them upstream PRESERVES (it copies them onto the empty `temp`
+        // before the merge, MetadataService.cs:752-757), two it really does
+        // clear — so the assertions have to go both ways or they prove nothing.
+        let mut merged = row("Movies.Movie", "Movie 0410");
+        merged.parent_index_number = Some(3);
+        merged.preferred_metadata_language = Some("en".to_owned());
+        merged.preferred_metadata_country_code = Some("US".to_owned());
+        merged.album_artists = Some("Some Artist".to_owned());
+        merged.data = Some(
+            r#"{"RemoteTrailers":[{"Url":"https://example.invalid/t","Name":"Trailer"}],"Keep":1}"#
+                .to_owned(),
+        );
+        super::clear_provider_supplied_metadata(&mut merged);
+        assert_eq!(
+            merged.parent_index_number,
+            Some(3),
+            "temp.Item.ParentIndexNumber = item.ParentIndexNumber, so the merge gives it back"
+        );
+        assert_eq!(merged.preferred_metadata_language.as_deref(), Some("en"));
+        assert_eq!(
+            merged.preferred_metadata_country_code.as_deref(),
+            Some("US")
+        );
+        assert_eq!(
+            merged.album_artists, None,
+            "MergeAlbumArtist replaces AlbumArtists with the empty source's"
+        );
+        let data: serde_json::Value =
+            serde_json::from_str(merged.data.as_deref().expect("data")).expect("json");
+        assert_eq!(
+            data.get("RemoteTrailers"),
+            Some(&serde_json::Value::Array(Vec::new())),
+            "target.RemoteTrailers = source.RemoteTrailers under replaceData"
+        );
+        assert_eq!(
+            data.get("Keep").and_then(serde_json::Value::as_i64),
+            Some(1),
+            "every other key in the blob survives"
+        );
+        // A row with no trailers is left byte-identical rather than rewritten.
+        let mut untouched = row("Movies.Movie", "Movie 0411");
+        untouched.data = Some(r#"{"Keep":1}"#.to_owned());
+        super::clear_provider_supplied_metadata(&mut untouched);
+        assert_eq!(untouched.data.as_deref(), Some(r#"{"Keep":1}"#));
+    }
+
+    /// End to end: the Apply options run the clear even though the fetch is
+    /// gated off, and the cleared row is persisted. Shared by the two
+    /// `remove_old_metadata_*` tests' subject row so neither has to rebuild the
+    /// whole manager to make the same point twice.
+    async fn end_to_end_apply_persists_the_cleared_row(mut movie: BaseItemEntity) {
         let item_id = Uuid::new_v4();
         let library_id = Uuid::new_v4();
         movie.id = item_id.to_string();
