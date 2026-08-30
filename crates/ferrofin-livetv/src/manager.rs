@@ -188,13 +188,56 @@ fn new_item_id(type_full_name: &str, lowercased_key: &str) -> Uuid {
     ferrofin_common::extensions::get_md5(&format!("{type_full_name}{lowercased_key}"))
 }
 
+/// .NET `string.ToLowerInvariant`, which is **not** Rust's
+/// [`str::to_lowercase`].
+///
+/// `ToLowerInvariant` is documented to perform *simple* case mapping — it maps
+/// each code point independently and never changes the string's length — while
+/// `str::to_lowercase` performs *full*, context-sensitive Unicode lowercasing.
+/// They differ on two things that can reach these hash inputs, because the
+/// programme half of the key embeds the XMLTV `channel` attribute verbatim and
+/// that is arbitrary text:
+///
+/// - **Final sigma.** `str::to_lowercase` implements the `Final_Sigma`
+///   condition, so a trailing `Σ` becomes `ς` (U+03C2); the simple mapping
+///   always yields `σ` (U+03C3). A Greek channel id ending in a capital sigma
+///   would otherwise derive a programme GUID Jellyfin never mints.
+/// - **U+0130** (`İ`). Its *full* lowercase mapping expands to two code points
+///   (`i` + U+0307 combining dot above); the simple mapping is the single
+///   `i`. `SpecialCasing.txt` lists U+0130 as the only **unconditional**
+///   multi-code-point lowercase mapping — every other multi-char entry is
+///   conditional (final sigma above, plus the `lt`/`tr`/`az` locale rules,
+///   which the invariant culture does not apply) — so special-casing it here
+///   makes the rest of the fold exact rather than merely closer.
+///
+/// This lives next to its callers rather than beside
+/// [`ferrofin_common::extensions::get_md5`] (the other .NET string primitive it
+/// is always paired with) only because those are the sole callers; move it
+/// there the moment a second subsystem needs the same fold.
+fn to_lower_invariant(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c == '\u{0130}' {
+            out.push('i');
+            continue;
+        }
+        // `char::to_lowercase` is already context-free, so with U+0130 handled
+        // above it yields exactly one char for every input; the fallback keeps
+        // this total rather than relying on that. The iterator is never empty.
+        out.push(c.to_lowercase().next().unwrap_or(c));
+    }
+    out
+}
+
 /// The internal item GUID of a Live TV channel, from its tuner-facing external id.
 ///
 /// Port of `LiveTvDtoService.GetInternalChannelId` (v10.11.8 LiveTvDtoService.cs:403-408).
 fn internal_channel_id(external_id: &str) -> Uuid {
     new_item_id(
         crate::projection::CHANNEL_TYPE_NAME,
-        &format!("{LIVE_TV_SERVICE_NAME}{external_id}{LIVE_TV_INTERNAL_VERSION}").to_lowercase(),
+        &to_lower_invariant(&format!(
+            "{LIVE_TV_SERVICE_NAME}{external_id}{LIVE_TV_INTERNAL_VERSION}"
+        )),
     )
 }
 
@@ -205,7 +248,9 @@ fn internal_channel_id(external_id: &str) -> Uuid {
 fn internal_program_id(external_id: &str) -> Uuid {
     new_item_id(
         crate::projection::PROGRAM_TYPE_NAME,
-        &format!("{LIVE_TV_SERVICE_NAME}{external_id}{LIVE_TV_INTERNAL_VERSION}").to_lowercase(),
+        &to_lower_invariant(&format!(
+            "{LIVE_TV_SERVICE_NAME}{external_id}{LIVE_TV_INTERNAL_VERSION}"
+        )),
     )
 }
 
@@ -5479,7 +5524,10 @@ mod tests {
 /// `BaseItems` table for that fixture — not values recomputed from this code.
 #[cfg(test)]
 mod id_derivation_tests {
-    use super::{internal_channel_id, internal_program_id, m3u_external_channel_id};
+    use super::{
+        LIVE_TV_INTERNAL_VERSION, LIVE_TV_SERVICE_NAME, internal_channel_id, internal_program_id,
+        m3u_external_channel_id, new_item_id, to_lower_invariant,
+    };
 
     const TUNER: &str = "/media/synth/livetv/channels.m3u";
 
@@ -5547,6 +5595,45 @@ mod id_derivation_tests {
         assert_eq!(
             internal_program_id(&external).simple().to_string(),
             expected_guid
+        );
+    }
+
+    /// `ToLowerInvariant` is a simple, per-code-point fold. Rust's
+    /// `str::to_lowercase` is a full, context-sensitive one, and the two
+    /// disagree on exactly the inputs an XMLTV `channel` attribute can carry.
+    /// ASCII — every id this fixture produces — is identical either way, which
+    /// is why the pinned GUIDs above are unaffected and why nothing caught this.
+    #[rstest::rstest]
+    // Final sigma: `str::to_lowercase` yields U+03C2, the simple mapping U+03C3.
+    #[case("\u{03A3}", "\u{03C3}")]
+    #[case("\u{039F}\u{0394}\u{039F}\u{03A3}", "\u{03BF}\u{03B4}\u{03BF}\u{03C3}")]
+    // A non-final sigma is unambiguous and both agree.
+    #[case("\u{03A3}A", "\u{03C3}a")]
+    // U+0130: the full mapping expands to two code points, the simple one does not.
+    #[case("\u{0130}", "i")]
+    // Turkish dotless i has no lowercase of its own; the invariant fold is identity.
+    #[case("\u{0131}", "\u{0131}")]
+    #[case("M3U_ABC", "m3u_abc")]
+    fn to_lower_invariant_is_the_simple_fold(#[case] input: &str, #[case] expected: &str) {
+        assert_eq!(to_lower_invariant(input), expected);
+        // The documented .NET guarantee: the fold never changes the code-point count.
+        assert_eq!(
+            to_lower_invariant(input).chars().count(),
+            input.chars().count()
+        );
+    }
+
+    /// The negative control for the above: `str::to_lowercase` really does
+    /// derive a different programme GUID for a Greek channel id, so the helper
+    /// is load-bearing and not decoration.
+    #[test]
+    fn a_final_sigma_channel_id_would_have_derived_a_different_guid() {
+        let external = "\u{039F}\u{0394}\u{039F}\u{03A3}_2026-08-30T03:00:00.0000000+00:00_m3u_abc";
+        let key = format!("{LIVE_TV_SERVICE_NAME}{external}{LIVE_TV_INTERNAL_VERSION}");
+        assert_ne!(to_lower_invariant(&key), key.to_lowercase());
+        assert_ne!(
+            internal_program_id(external),
+            new_item_id(crate::projection::PROGRAM_TYPE_NAME, &key.to_lowercase()),
         );
     }
 

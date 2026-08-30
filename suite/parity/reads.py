@@ -534,6 +534,17 @@ READS = [
     # server's own id for that server's username keeps a wrong count, a missing
     # user and a user who should have been filtered out all failing the diff.
     # An `EnabledUsers` entry in parity_diff.VOLATILE would hide all three.
+    #
+    # The projection also SORTS, which is a second, separate narrowing and is
+    # called out here because the rest of this batch documents every one.
+    # `LiveTvManager.GetLiveTvInfo` (LiveTvManager.cs:1207-1210) emits
+    # `_userManager.Users.Where(IsLiveTvEnabled)` in store order, so ordering IS
+    # a signal upstream — but it is not a comparable one across two servers whose
+    # `bench` accounts were provisioned independently, in separate transactions,
+    # with independently minted GUIDs. Sorting discards only that incomparable
+    # signal: count, membership and duplicates all still fail the diff. Drop the
+    # `sorted()` the day the harness provisions users in a pinned order on both
+    # servers, and the row gets its ordering check back for free.
     invariant("GET /LiveTv/GuideInfo", guide_info_invariants),
     user("GET /LiveTv/Info", "/LiveTv/Info",
          project=lambda b, c: {**b, "EnabledUsers": sorted(

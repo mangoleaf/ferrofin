@@ -9,10 +9,21 @@
 //! "Allow Live TV access" was a checkbox the dashboard rendered and the server
 //! ignored.
 //!
+//! A `UserPermissionRequirement` is **not** a bare permission check, and these
+//! tests pin all four of its arms in the order `DefaultAuthorizationHandler`
+//! evaluates them — API key, remote-without-`EnableRemoteAccess`,
+//! administrator, access schedule, then the named permission. The order is
+//! itself under test: `context.Fail()` is unconditional in ASP.NET Core, so the
+//! remote arm refuses an administrator (it precedes the admin arm) while the
+//! schedule arm does not (it follows). See `require_live_tv_permission`'s doc
+//! comment for the citation chain.
+//!
 //! These tests pin the gate itself: the deny is what regresses silently, so
 //! every case asserts the *denied* status as well as the allowed one, and the
 //! Live TV manager is a fake that records whether it was reached — a `403` that
-//! still ran the handler would be no gate at all.
+//! still ran the handler would be no gate at all. Each `Fail` arm also carries a
+//! positive twin (the same account, LAN-side; the same account, open window) so
+//! a case cannot pass by refusing everything.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -203,25 +214,40 @@ impl LiveTvManager for CountingLiveTv {
 
 /// The policy a stock Jellyfin account is seeded with for the two Live TV
 /// permissions: access granted, management withheld
-/// (`UserEntityExtensions.cs:187-188`).
+/// (`UserEntityExtensions.cs:187-188`). `EnableRemoteAccess` also defaults to
+/// `true` there, and `UserPolicy::default()` agrees, so the remote arm is out
+/// of the way unless a case turns it off.
 fn policy(access: bool, management: bool, admin: bool) -> UserPolicy {
     UserPolicy {
         enable_live_tv_access: access,
         enable_live_tv_management: management,
         is_administrator: admin,
+        enable_remote_access: true,
         ..UserPolicy::default()
     }
 }
 
 async fn probe(state: AppState, method: &str, uri: &str) -> StatusCode {
+    probe_from(state, method, uri, None).await
+}
+
+/// [`probe`] with an explicit transport peer, so a case can put the caller
+/// outside the local network. `None` leaves `ConnectInfo` absent, which
+/// `client_address` resolves to loopback exactly as C#
+/// `GetNormalizedRemoteIP` does.
+async fn probe_from(state: AppState, method: &str, uri: &str, peer: Option<&str>) -> StatusCode {
+    let mut request = Request::builder()
+        .method(method)
+        .uri(uri)
+        .body(Body::empty())
+        .unwrap();
+    if let Some(peer) = peer {
+        request.extensions_mut().insert(axum::extract::ConnectInfo(
+            peer.parse::<std::net::SocketAddr>().unwrap(),
+        ));
+    }
     create_router(state)
-        .oneshot(
-            Request::builder()
-                .method(method)
-                .uri(uri)
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(request)
         .await
         .unwrap()
         .status()
@@ -250,23 +276,131 @@ async fn live_tv_reads_require_the_access_permission() {
     }
 }
 
-/// Being an administrator does not stand in for `EnableLiveTvAccess` — the
-/// policy names the permission, and only the permission.
+/// "Admins can do everything" — `DefaultAuthorizationHandler.cs:73-77`. It runs
+/// for `UserPermissionRequirement` because that requirement subclasses
+/// `DefaultAuthorizationRequirement` (`UserPermissionRequirement.cs:9`) and the
+/// handler is an `AuthorizationHandler<DefaultAuthorizationRequirement>`,
+/// registered first (`ApiServiceCollectionExtensions.cs:59`).
+///
+/// This test previously asserted the opposite — `403`, on the reading that "the
+/// policy names the permission, and only the permission". That reading came
+/// from `UserPermissionHandler` alone and is contradicted by the same pinned
+/// tag: a real 10.11.8 served an administrator whose `EnableLiveTvManagement`
+/// was `0`, and the arm responsible is per-*requirement*, not per-policy, so it
+/// governs `EnableLiveTvAccess` identically.
+///
+/// Both policies are asserted here so the sibling can never drift from it again.
 #[tokio::test]
-async fn administrator_without_the_access_permission_is_still_refused() {
-    let manager = Arc::new(CountingLiveTv::default());
-    let state =
-        authed_fake_state_with_policy(policy(false, false, true)).with_live_tv(manager.clone());
-    assert_eq!(
-        probe(state, "GET", "/LiveTv/Info").await,
-        StatusCode::FORBIDDEN
-    );
-    assert_eq!(manager.reached.load(Ordering::SeqCst), 0);
+async fn an_administrator_is_admitted_without_either_live_tv_permission() {
+    for (method, uri) in [("GET", "/LiveTv/Info"), ("DELETE", "/LiveTv/Timers/t1")] {
+        let manager = Arc::new(CountingLiveTv::default());
+        let state =
+            authed_fake_state_with_policy(policy(false, false, true)).with_live_tv(manager.clone());
+        assert_ne!(
+            probe(state, method, uri).await,
+            StatusCode::FORBIDDEN,
+            "{uri}: an administrator must not be refused by a UserPermissionRequirement"
+        );
+        assert_eq!(manager.reached.load(Ordering::SeqCst), 1, "{uri}");
+    }
 }
 
-/// A management route admits the administrator *or* the holder of
-/// `EnableLiveTvManagement`, and refuses a plain account that is neither — where
-/// Ferrofin previously let any authenticated caller cancel a timer.
+/// `DefaultAuthorizationHandler.cs:66-70` fails a caller who is outside the
+/// local network and lacks `EnableRemoteAccess`. It sits *before* the admin arm,
+/// and `context.Fail()` is unconditional in ASP.NET Core, so it refuses an
+/// administrator too — the one ordering detail that distinguishes a real port of
+/// this policy from a permission check with an admin bypass bolted on.
+#[tokio::test]
+async fn a_remote_caller_without_remote_access_is_refused_even_as_administrator() {
+    for admin in [false, true] {
+        let denied = UserPolicy {
+            enable_remote_access: false,
+            ..policy(true, true, admin)
+        };
+        let manager = Arc::new(CountingLiveTv::default());
+        let state = authed_fake_state_with_policy(denied).with_live_tv(manager.clone());
+        assert_eq!(
+            probe_from(state, "GET", "/LiveTv/Info", Some("203.0.113.7:9000")).await,
+            StatusCode::FORBIDDEN,
+            "admin={admin}"
+        );
+        assert_eq!(manager.reached.load(Ordering::SeqCst), 0, "admin={admin}");
+
+        // Same account, same permission, on the LAN: the arm is about *where*
+        // the caller is, so this must still be served.
+        let manager = Arc::new(CountingLiveTv::default());
+        let local = UserPolicy {
+            enable_remote_access: false,
+            ..policy(true, true, admin)
+        };
+        let state = authed_fake_state_with_policy(local).with_live_tv(manager.clone());
+        assert_eq!(
+            probe_from(state, "GET", "/LiveTv/Info", Some("127.0.0.1:9000")).await,
+            StatusCode::OK,
+            "admin={admin}"
+        );
+        assert_eq!(manager.reached.load(Ordering::SeqCst), 1, "admin={admin}");
+    }
+}
+
+/// `DefaultAuthorizationHandler.cs:81-84` fails a caller outside their access
+/// schedule, because `UserPermissionRequirement` leaves
+/// `validateParentalSchedule` at `true` (`UserPermissionRequirement.cs:17`).
+/// It sits *after* the admin arm, so an administrator is not schedule-bound —
+/// the mirror image of the remote arm above, and the reason both orderings are
+/// pinned rather than assumed.
+#[tokio::test]
+async fn an_access_schedule_gates_the_non_administrator_only() {
+    // A window that cannot contain "now": `StartHour`/`EndHour` are fractional
+    // hours of the local day, and this one is empty on every day of the week.
+    let closed = ferrofin_model::users::AccessSchedule {
+        id: 1,
+        user_id: Uuid::nil(),
+        day_of_week: ferrofin_model::users::DynamicDayOfWeek::Everyday,
+        start_hour: 25.0,
+        end_hour: 26.0,
+    };
+    for (admin, expected) in [(false, StatusCode::FORBIDDEN), (true, StatusCode::OK)] {
+        let scheduled = UserPolicy {
+            access_schedules: vec![closed],
+            ..policy(true, true, admin)
+        };
+        let manager = Arc::new(CountingLiveTv::default());
+        let state = authed_fake_state_with_policy(scheduled).with_live_tv(manager.clone());
+        assert_eq!(
+            probe(state, "GET", "/LiveTv/Info").await,
+            expected,
+            "admin={admin}"
+        );
+        assert_eq!(
+            manager.reached.load(Ordering::SeqCst),
+            usize::from(expected == StatusCode::OK),
+            "admin={admin}"
+        );
+    }
+
+    // The same account with a window that spans the whole day is served, so the
+    // case above is testing the window and not merely "a schedule exists".
+    let open = ferrofin_model::users::AccessSchedule {
+        start_hour: 0.0,
+        end_hour: 24.0,
+        ..closed
+    };
+    let manager = Arc::new(CountingLiveTv::default());
+    let state = authed_fake_state_with_policy(UserPolicy {
+        access_schedules: vec![open],
+        ..policy(true, true, false)
+    })
+    .with_live_tv(manager.clone());
+    assert_eq!(probe(state, "GET", "/LiveTv/Info").await, StatusCode::OK);
+    assert_eq!(manager.reached.load(Ordering::SeqCst), 1);
+}
+
+/// A management route admits the administrator (the arm at
+/// `DefaultAuthorizationHandler.cs:73-77`) *or* the holder of
+/// `EnableLiveTvManagement` (the arm in `UserPermissionHandler`), and refuses a
+/// plain account that is neither — where Ferrofin previously let any
+/// authenticated caller cancel a timer.
 #[tokio::test]
 async fn timer_mutations_require_management_or_administrator() {
     for (management, admin, expected) in [

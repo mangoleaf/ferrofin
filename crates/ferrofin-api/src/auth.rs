@@ -98,6 +98,42 @@ pub async fn auth_context_layer(
 /// does it fall through to [`AuthService::authenticate`], which is the old
 /// per-handler path and serves as a safety net for tests that wire
 /// `FakeAuthContext` (unauthenticated) alongside `AuthedAuthService`.
+///
+/// # Open work item: this is not yet the whole default policy
+///
+/// Upstream's default policy is `new DefaultAuthorizationRequirement()`
+/// (`ApiServiceCollectionExtensions.cs:68-72`), so `DefaultAuthorizationHandler`
+/// evaluates every `[Authorize]` route, and it carries two `context.Fail()`
+/// arms this extractor does not yet port:
+///
+/// - a caller outside the local network who lacks the `EnableRemoteAccess`
+///   **user permission** is refused (`DefaultAuthorizationHandler.cs:66-70`).
+///   Ferrofin enforces the unrelated *network*-level
+///   `NetworkConfiguration.enable_remote_access`
+///   (`ferrofin_networking::NetworkManager::should_allow_server_access`), but
+///   the per-user permission is read only into the policy DTO;
+/// - a non-administrator outside their access schedule is refused
+///   (`:81-84`). `ferrofin-core` ports the rule
+///   (`user_entity_ext::is_parental_schedule_allowed`) but applies it only at
+///   **login**, so a token minted inside the window keeps working outside it.
+///
+/// [`require_live_tv_permission`] ports both arms for the 29 routes behind the
+/// two Live TV `UserPermissionRequirement` policies, which is where the
+/// divergence was measured. It is named here rather than left implicit because
+/// the gap is the *default* policy's, not Live TV's.
+///
+/// The un-defer path is to hoist the two arms out of
+/// [`require_live_tv_permission`] into this extractor (which then makes them
+/// unconditional for every gated route, as C# does), resolve the caller's
+/// policy once in [`auth_context_layer`] and carry it on [`AuthorizationInfo`]
+/// so the arms cost no extra per-request read, and re-run the parity sweep —
+/// every route's status is in its blast radius, and it adds a policy read to
+/// the hottest paths in the server, so it needs the perf gate this lane cannot
+/// run. It is deliberately not bundled into a Live TV parity batch.
+/// [`RequireAdmin`] needs neither arm: `Policies.RequiresElevation` is
+/// registered as a bare `RequireClaim` policy (`:79-83`), not a
+/// `DefaultAuthorizationRequirement`, so `DefaultAuthorizationHandler` never
+/// runs for it.
 #[derive(Debug, Clone)]
 pub struct RequireAuth(pub AuthorizationInfo);
 
@@ -166,22 +202,16 @@ impl FromRequestParts<AppState> for RequireAdmin {
 ///
 /// Port of `options.AddPolicy(Policies.LiveTvAccess, new
 /// UserPermissionRequirement(PermissionKind.EnableLiveTvAccess))`
-/// (v10.11.8 ApiServiceCollectionExtensions.cs:80), evaluated by
-/// `UserPermissionHandler`: an API key carries global permissions and succeeds
-/// outright; any other caller must hold the permission, and anything else is
-/// `403`.
+/// (v10.11.8 `ApiServiceCollectionExtensions.cs:80`). v10.11.8's
+/// `LiveTvController` declares it on 22 read actions. Ferrofin served them under
+/// plain [`RequireAuth`], so "Allow Live TV access" was a checkbox the dashboard
+/// rendered and the server ignored — an account with it cleared could still
+/// browse the whole guide.
 ///
-/// v10.11.8's `LiveTvController` declares this on 22 read actions. Ferrofin
-/// served them under plain `RequireAuth`, so "Allow Live TV access" was a
-/// checkbox the dashboard rendered and the server ignored — an account with it
-/// cleared could still browse the whole guide. `EnableLiveTvAccess` defaults to
-/// `true` (UserEntityExtensions.cs:187), which is why a single-admin fixture
-/// never noticed, and why this gate changes nothing for a stock account.
-///
-/// Unlike [`RequireLiveTvManagement`], this one is a bare permission check: the
-/// disagreement measured there is between "administrator" and "permission
-/// denied", and it cannot arise here, because no shipped account has
-/// `EnableLiveTvAccess` cleared unless an administrator cleared it on purpose.
+/// The policy itself is [`require_live_tv_permission`], which both Live TV
+/// extractors share; this one names `EnableLiveTvAccess` as the permission the
+/// non-administrator arm demands. `EnableLiveTvAccess` defaults to `true`
+/// (`UserEntityExtensions.cs:187`), which is why a stock account sees no change.
 #[derive(Debug, Clone)]
 pub struct RequireLiveTvAccess(pub AuthorizationInfo);
 
@@ -197,33 +227,19 @@ impl FromRequestParts<AppState> for RequireLiveTvAccess {
     }
 }
 
-/// Extractor for handlers behind Jellyfin's `LiveTvManagement` policy —
-/// administrator **or** the `EnableLiveTvManagement` permission.
+/// Extractor for handlers behind Jellyfin's `LiveTvManagement` policy.
 ///
-/// v10.11.8's `LiveTvController` declares
-/// `[Authorize(Policy = Policies.LiveTvManagement)]` on its seven
-/// timer/recording mutations, registered as
-/// `UserPermissionRequirement(PermissionKind.EnableLiveTvManagement)`. Reading
-/// only that, this would be a bare permission check.
+/// Port of `options.AddPolicy(Policies.LiveTvManagement, new
+/// UserPermissionRequirement(PermissionKind.EnableLiveTvManagement))`
+/// (v10.11.8 `ApiServiceCollectionExtensions.cs:81`), declared on the
+/// controller's seven timer/recording mutations. Ferrofin shipped most of them
+/// under plain [`RequireAuth`] — any authenticated account could cancel a
+/// timer — and the rest under [`RequireAdmin`], which refused the
+/// non-administrator the dashboard had explicitly granted recording rights.
 ///
-/// It is not, because the permission check alone does not reproduce what a real
-/// Jellyfin 10.11.8 does. Measured against the lab oracle: for a caller who is
-/// an administrator and whose stored `EnableLiveTvManagement` permission is
-/// `0` (the shipped default — `UserEntityExtensions.cs:188`), Jellyfin served
-/// `DELETE /LiveTv/Timers/{id}` (404 from the handler) and
-/// `POST /LiveTv/SeriesTimers` rather than `403`; the same held for an
-/// unrelated `UserPermissionRequirement` policy, `CollectionManagement` with
-/// `EnableCollectionManagement = 0`, on `POST /Collections` (200). So an
-/// administrator is not refused by these policies in practice, whatever
-/// `UserPermissionHandler` reads like in isolation.
-///
-/// Admitting *either* is therefore the only gate that matches the oracle on
-/// both sides of the disagreement: it never refuses the administrator Jellyfin
-/// admitted, and it admits the non-administrator the dashboard explicitly
-/// granted recording rights — whom Ferrofin's previous `RequireAdmin` refused,
-/// and who is the entire point of the permission existing. It is also strictly
-/// tighter than what Ferrofin shipped on most of these routes, which was plain
-/// `RequireAuth`: any authenticated account could create and cancel timers.
+/// The policy itself is [`require_live_tv_permission`]; this one names
+/// `EnableLiveTvManagement`, which defaults to `false`
+/// (`UserEntityExtensions.cs:188`).
 #[derive(Debug, Clone)]
 pub struct RequireLiveTvManagement(pub AuthorizationInfo);
 
@@ -234,36 +250,169 @@ impl FromRequestParts<AppState> for RequireLiveTvManagement {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        let info = require_live_tv_permission(parts, state, |p| {
-            p.is_administrator || p.enable_live_tv_management
-        })
-        .await?;
+        let info =
+            require_live_tv_permission(parts, state, |p| p.enable_live_tv_management).await?;
         Ok(Self(info))
     }
 }
 
-/// The shared body of the two Live TV permission extractors.
+/// The shared body of the two Live TV permission extractors — a port of the
+/// **whole** `UserPermissionRequirement` policy, which is two handlers deep.
 ///
-/// Port of `UserPermissionHandler.HandleRequirement`: "Api keys have global
-/// permissions, so just succeed the requirement"; otherwise the user must hold
-/// the permission the policy names.
+/// Read alone, `UserPermissionHandler` (v10.11.8
+/// `Jellyfin.Api/Auth/UserPermissionPolicy/UserPermissionHandler.cs`) is a bare
+/// permission check: API key succeeds, otherwise `user.HasPermission(kind)`.
+/// That is not the policy. `UserPermissionRequirement` **subclasses**
+/// `DefaultAuthorizationRequirement` (`UserPermissionRequirement.cs:9`), and
+/// `DefaultAuthorizationHandler` — registered as an `IAuthorizationHandler`
+/// first, "so that it is evaluated first"
+/// (`ApiServiceCollectionExtensions.cs:59`) — is an
+/// `AuthorizationHandler<DefaultAuthorizationRequirement>`, whose base
+/// `HandleAsync` dispatches over `context.Requirements.OfType<TRequirement>()`
+/// and therefore matches every subclass. So `DefaultAuthorizationHandler` runs
+/// against these two policies as well, and its own closing comment says so:
+/// "Only succeed if the requirement isn't a subclass as any subclassed
+/// requirement will handle success in its own handler"
+/// (`DefaultAuthorizationHandler.cs:86-90`).
+///
+/// The composed decision, in `DefaultAuthorizationHandler`'s order — the order
+/// matters, because ASP.NET Core's `context.Fail()` is unconditional and beats
+/// any `Succeed`, so an arm's *position* relative to the admin arm decides
+/// whether an administrator escapes it:
+///
+/// 1. **API key → allow** (`:53-57`, and `UserPermissionHandler` agrees):
+///    "Api keys are unrestricted."
+/// 2. **Remote caller without `EnableRemoteAccess` → deny** (`:66-70`). Before
+///    the admin arm, so it refuses a remote administrator too.
+/// 3. **Administrator → allow** (`:73-77`): "Admins can do everything." This is
+///    the arm the batch that added these extractors missed for `LiveTvAccess`.
+///    It is not a lab artefact: it is why a real 10.11.8 served
+///    `DELETE /LiveTv/Timers/{id}` and `POST /LiveTv/SeriesTimers` to an
+///    administrator whose stored `EnableLiveTvManagement` was `0` (the shipped
+///    default), and `POST /Collections` to the same caller under the unrelated
+///    `CollectionManagement` policy with `EnableCollectionManagement = 0`.
+///    Both measurements are of this one arm, and it is not per-policy: it
+///    governs `LiveTvAccess` exactly as it governs `LiveTvManagement`.
+/// 4. **Outside the parental/access schedule → deny** (`:81-84`).
+///    `UserPermissionRequirement` leaves `validateParentalSchedule` at its
+///    default `true` (`UserPermissionRequirement.cs:17`). After the admin arm,
+///    so an administrator is not schedule-bound.
+/// 5. **The named permission** — `DefaultAuthorizationHandler` deliberately does
+///    *not* succeed a subclassed requirement (`:87-90`), leaving
+///    `UserPermissionHandler` to allow only a holder of the permission.
+///
+/// Anything that reaches neither an allow arm nor a `Fail` is `403`: the
+/// requirement is simply never satisfied.
 async fn require_live_tv_permission(
     parts: &mut Parts,
     state: &AppState,
-    granted: fn(&ferrofin_model::users::UserPolicy) -> bool,
+    permission: fn(&ferrofin_model::users::UserPolicy) -> bool,
 ) -> Result<AuthorizationInfo, ApiError> {
+    // Read the peer before `RequireAuth` borrows `parts` mutably.
+    //
+    // C# asks `_networkManager.IsInLocalNetwork(HttpContext.GetNormalizedRemoteIP())`,
+    // and `GetNormalizedRemoteIP` resolves a missing peer to loopback — i.e.
+    // local. `client_address` already defaults the same way, so this is a
+    // faithful port with no guard. That differs from
+    // [`RequireLocalAccessOrAdmin`], which deliberately reads a missing peer as
+    // *remote*; the divergence there is documented and is not copied here,
+    // because a parity extractor should not invent a second divergence. Neither
+    // choice is reachable in served traffic — the composition root installs
+    // `with_connect_info`, so the peer is missing only under synthetic test
+    // routing.
+    let is_in_local_network = state.is_in_local_network(state.client_address(parts));
+
     let RequireAuth(info) = RequireAuth::from_request_parts(parts, state).await?;
+
+    // 1. "Api keys are unrestricted."
     if info.is_api_key {
         return Ok(info);
     }
-    if let Some(user) = &info.user
-        && crate::handlers::users::user_policy(state, user)
-            .await?
-            .is_some_and(|p| granted(&p))
-    {
+
+    // C# throws `ResourceNotFoundException` when the token's user has vanished;
+    // here an absent policy means the same thing and is refused rather than
+    // silently granted.
+    let Some(user) = &info.user else {
+        return Err(ApiError::Forbidden("live tv access required".to_owned()));
+    };
+    let Some(policy) = crate::handlers::users::user_policy(state, user).await? else {
+        return Err(ApiError::Forbidden("live tv access required".to_owned()));
+    };
+
+    // 2. "User cannot access remotely and user is remote" — before the admin arm.
+    if !is_in_local_network && !policy.enable_remote_access {
+        return Err(ApiError::Forbidden(
+            "remote access is not permitted for this user".to_owned(),
+        ));
+    }
+
+    // 3. "Admins can do everything."
+    if policy.is_administrator {
+        return Ok(info);
+    }
+
+    // 4. The parental/access schedule, which `UserPermissionRequirement` validates.
+    if !parental_schedule_allows(&policy.access_schedules, chrono::Local::now()) {
+        return Err(ApiError::Forbidden(
+            "outside this user's access schedule".to_owned(),
+        ));
+    }
+
+    // 5. The permission the policy names.
+    if permission(&policy) {
         return Ok(info);
     }
     Err(ApiError::Forbidden("live tv access required".to_owned()))
+}
+
+/// Whether `now` falls inside any of `schedules`, or there are none — C#
+/// `UserEntityExtensions.IsParentalScheduleAllowed` (`:148-152`, `:210-220`).
+///
+/// C# evaluates `DateTime.UtcNow.ToLocalTime()`, i.e. server-local wall clock,
+/// and compares `TimeOfDay.TotalHours` against the schedule's fractional
+/// `StartHour`/`EndHour` inclusively at both ends. `ferrofin-core` already ports
+/// this over the `AccessSchedules` table for the login path
+/// (`user_entity_ext::is_parental_schedule_allowed`); this is the same rule over
+/// the [`UserPolicy`](ferrofin_model::users::UserPolicy) projection of those
+/// rows, because `ferrofin-api` may not depend on `ferrofin-core` and the policy
+/// DTO already carries them.
+fn parental_schedule_allows(
+    schedules: &[ferrofin_model::users::AccessSchedule],
+    now: chrono::DateTime<chrono::Local>,
+) -> bool {
+    use chrono::{Datelike as _, Timelike as _};
+
+    if schedules.is_empty() {
+        return true;
+    }
+    let hour =
+        f64::from(now.hour()) + f64::from(now.minute()) / 60.0 + f64::from(now.second()) / 3600.0;
+    let weekday = now.date_naive().weekday();
+    schedules.iter().any(|s| {
+        day_of_week_contains(s.day_of_week, weekday) && hour >= s.start_hour && hour <= s.end_hour
+    })
+}
+
+/// Whether a [`DynamicDayOfWeek`](ferrofin_model::users::DynamicDayOfWeek)
+/// covers `weekday` — C# `DayOfWeekHelper.Contains` (`Jellyfin.Data/DayOfWeekHelper.cs:21-31`).
+fn day_of_week_contains(
+    day: ferrofin_model::users::DynamicDayOfWeek,
+    weekday: chrono::Weekday,
+) -> bool {
+    use chrono::Weekday;
+    use ferrofin_model::users::DynamicDayOfWeek as D;
+    match day {
+        D::Everyday => true,
+        D::Weekday => !matches!(weekday, Weekday::Sat | Weekday::Sun),
+        D::Weekend => matches!(weekday, Weekday::Sat | Weekday::Sun),
+        D::Sunday => weekday == Weekday::Sun,
+        D::Monday => weekday == Weekday::Mon,
+        D::Tuesday => weekday == Weekday::Tue,
+        D::Wednesday => weekday == Weekday::Wed,
+        D::Thursday => weekday == Weekday::Thu,
+        D::Friday => weekday == Weekday::Fri,
+        D::Saturday => weekday == Weekday::Sat,
+    }
 }
 
 /// Extractor for handlers behind Jellyfin's `LocalAccessOrRequiresElevation`
