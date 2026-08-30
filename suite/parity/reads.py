@@ -20,6 +20,7 @@ import collections
 import json
 import os
 import re
+import time
 import urllib.parse
 import sys
 
@@ -138,6 +139,79 @@ def seed_display_preferences(base, token, ctx):
                 f"{base}/DisplayPreferences/usersettings"
                 f"?userId={ctx['u']}&client={DISPLAY_PREFS_CLIENT}",
                 token, json.dumps(DISPLAY_PREFS_SEED))[0]
+
+
+# ------------------------------------------------------------------- lyrics
+#
+# `GET /Audio/{itemId}/Lyrics` has no corpus of its own: the synthetic tracks
+# carry no lyrics, so the row was 404=404 — an agreement that proves nothing
+# (an unconditional-404 handler passes it). The fix is the same one
+# `seed_display_preferences` uses: write the SAME bytes to both servers, then
+# diff what each one parsed them into. A LyricDto is a deterministic function
+# of the uploaded file, so this is a real cross-server body diff — it is what
+# caught Ferrofin inventing a `Metadata` block, dropping `Cues`, and eating a
+# `.txt`'s blank lines. The upload lands in each server's own metadata folder
+# (never the read-only media mount) and is reaped after the read set runs.
+#
+# One seed per parser branch: a synced `.lrc` carrying metadata tags, an
+# enhanced `.elrc` with word-level time tags (the cue oracle, shaped like
+# upstream's `Fleetwood Mac - Rumors.elrc`), and a plain `.txt` whose blank
+# lines and trailing newline must survive.
+LYRIC_SEEDS = [
+    ("lrc", "[ar:Parity Artist]\n[ti:Parity Title]\n[al:Parity Album]\n"
+            "[00:01.00]First line\n[00:05.50]Second line\n[01:02.25]Third line\n"),
+    ("elrc", "[00:06.84] <00:06.84> Every <00:07.20>   <00:07.56> night <00:07.87>   "
+             "<00:08.19> that <00:08.46>   <00:08.79> goes <00:09.19>   <00:09.59> between\n"
+             "[00:14.69] <00:14.69> I <00:14.78>   <00:14.87> feel <00:15.15>   "
+             "<00:15.44> a <00:15.54>   <00:15.65> little <00:15.96>   <00:16.28> less\n"),
+    ("txt", "Plain line one\n\n   indented line\nlast\n"),
+]
+LYRIC_SEED_WAIT_S = 15   # Jellyfin serves an uploaded lyric only once its queued refresh ran
+
+
+def lyric_seed_ids(base, token, user_id):
+    """The audio items the lyric seeds are written to — the first three by PATH.
+
+    Path is the stable cross-server key (the same reason `path_id_map` uses it),
+    so both servers seed the same three tracks and the read legs line up.
+    """
+    b = get_json(base, f"/Items?userId={user_id}&recursive=true&includeItemTypes=Audio"
+                       f"&limit=500&fields=Path", token)
+    by_path = {i["Path"]: i["Id"] for i in (b or {}).get("Items") or [] if i.get("Path")}
+    ids = [by_path[p] for p in sorted(by_path)[:len(LYRIC_SEEDS)]]
+    return ids + [""] * (len(LYRIC_SEEDS) - len(ids))
+
+
+def seed_lyrics(base, token, ids):
+    """Uploads one lyric per seed id and waits until each reads back.
+
+    Returns the upload statuses so a failure is visible rather than silently
+    turning the row back into a 404=404.
+    """
+    statuses = []
+    for (ext, body), aid in zip(LYRIC_SEEDS, ids):
+        if not aid:
+            statuses.append(None)
+            continue
+        statuses.append(http("POST", f"{base}/Audio/{aid}/Lyrics?fileName=parity.{ext}",
+                             token, body)[0])
+    for aid in ids:
+        for _ in range(LYRIC_SEED_WAIT_S):
+            if aid and http("GET", f"{base}/Audio/{aid}/Lyrics", token)[0] == 200:
+                break
+            time.sleep(1)
+    return statuses
+
+
+def reap_lyrics(base, token, ids):
+    """Removes the seeded lyrics again, so the later layers see the fixture as
+    they found it."""
+    for aid in ids:
+        for _ in range(3):
+            if not aid or http("GET", f"{base}/Audio/{aid}/Lyrics", token)[0] != 200:
+                break
+            http("DELETE", f"{base}/Audio/{aid}/Lyrics", token)
+            time.sleep(1)
 
 
 # ------------------------------------------------- by-name ordering + options
@@ -558,6 +632,15 @@ READS = [
     plain("GET /Environment/DirectoryContents",
           "/Environment/DirectoryContents?path=%2Fmedia%2Fsynth%2Fmovies&includeFiles=true&includeDirectories=true"),
     plain("GET /Environment/ParentPath", "/Environment/ParentPath?path=%2Fmedia%2Fsynth%2Fmovies"),
+    # One row, three legs — one per parser branch (see LYRIC_SEEDS): the synced
+    # `.lrc`, the enhanced `.elrc` whose word cues are the real oracle, and the
+    # plain `.txt`. Seeded with identical bytes on both servers, so every field
+    # of the parsed LyricDto (line text, Start ticks, Cues, Metadata) is diffed.
+    multi("GET /Audio/{itemId}/Lyrics", [
+        "/Audio/{lyric_lrc}/Lyrics",
+        "/Audio/{lyric_elrc}/Lyrics",
+        "/Audio/{lyric_txt}/Lyrics",
+    ]),
 ]
 
 # ---------------------------------------------------------------- correlation
@@ -607,6 +690,7 @@ def resolve_named(base, token, user_id):
         return items[0]["Id"] if items and items[0].get("Id") else ""
 
     artist = first_named("/Artists")
+    lyric_ids = lyric_seed_ids(base, token, user_id)
     channels = (get_json(base, f"/LiveTv/Channels?userId={user_id}&limit=1", token) or {}).get("Items") or []
     return {
         "channel": channels[0]["Id"] if channels else "",
@@ -625,6 +709,10 @@ def resolve_named(base, token, user_id):
         "artist": urllib.parse.quote(artist.get("Name") or ""),
         "artist_id": artist.get("Id") or "",
         "musicgenre": first_name("/MusicGenres"),
+        # The three tracks `seed_lyrics` writes to, in LYRIC_SEEDS order.
+        "lyric_lrc": lyric_ids[0],
+        "lyric_elrc": lyric_ids[1],
+        "lyric_txt": lyric_ids[2],
     }
 
 
@@ -644,6 +732,13 @@ def run(ferrofin_url, jellyfin_url):
     if hseed != jseed:
         print(f"  display-preferences seed status differs: H={hseed} J={jseed}",
               file=sys.stderr)
+
+    # Same idea for the lyric row: identical bytes on both servers, then diff
+    # what each parsed them into (see LYRIC_SEEDS).
+    hlyr = seed_lyrics(ferrofin_url, ht, [hc["lyric_lrc"], hc["lyric_elrc"], hc["lyric_txt"]])
+    jlyr = seed_lyrics(jellyfin_url, jt, [jc["lyric_lrc"], jc["lyric_elrc"], jc["lyric_txt"]])
+    if hlyr != jlyr:
+        print(f"  lyric seed statuses differ: H={hlyr} J={jlyr}", file=sys.stderr)
 
     rows = {}
 
@@ -803,6 +898,9 @@ def run(ferrofin_url, jellyfin_url):
                         agg[k].extend(b[k])
             record(ep["op"], clean, tested, agg, agg_method(legs),
                    compared=sum(c for _j, _h, c in legs))
+
+    reap_lyrics(ferrofin_url, ht, [hc["lyric_lrc"], hc["lyric_elrc"], hc["lyric_txt"]])
+    reap_lyrics(jellyfin_url, jt, [jc["lyric_lrc"], jc["lyric_elrc"], jc["lyric_txt"]])
     return rows, len(pairs)
 
 
@@ -869,7 +967,8 @@ def selfcheck():
     # {u} vs "user" KeyError). Format each with a fully-populated context; a KeyError fails here.
     ctx = {"user": "U", "u": "U", "genre": "G", "studio": "S", "person": "P", "series": "SE",
            "task": "T", "device": "D", "artist": "A", "artist_id": "AID", "musicgenre": "MG",
-           "channel": "CH", "album_id": "ALB", "movie": "MOV", "episode": "EP"}
+           "channel": "CH", "album_id": "ALB", "movie": "MOV", "episode": "EP",
+           "lyric_lrc": "L1", "lyric_elrc": "L2", "lyric_txt": "L3"}
     # The context keys the self-check invents must be the ones resolve_named
     # actually produces, or this guard passes while the live run KeyErrors.
     import inspect

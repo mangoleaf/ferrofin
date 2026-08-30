@@ -38,6 +38,8 @@ use uuid::Uuid;
 
 const USER_ID: Uuid = Uuid::from_u128(0x00A1_0000);
 const ITEM_ID: Uuid = Uuid::from_u128(0x00A1_0001);
+/// A non-audio item id: it EXISTS, but the lyric routes must still refuse it.
+const MOVIE_ID: Uuid = Uuid::from_u128(0x00A1_0002);
 
 /// A minimal authenticated user for the stubs.
 fn user() -> UserEntity {
@@ -271,6 +273,11 @@ struct StreamLibrary;
 #[async_trait]
 impl LibraryManager for StreamLibrary {
     async fn get_item_by_id(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
+        if id == MOVIE_ID {
+            // A real item that is NOT an `Audio`: every lyric route must 404 on
+            // it, the way C# `GetItemById<Audio>` does.
+            return Ok(Some(minimal_base_item(MOVIE_ID, "A Movie", "Movie")));
+        }
         Ok((id == ITEM_ID).then(|| minimal_base_item(ITEM_ID, "A Song", "Audio")))
     }
     async fn query_items(
@@ -591,6 +598,36 @@ async fn lyrics_get_returns_stored_or_404() {
     );
     let (missing, _) = call(app, "GET", &format!("/Audio/{ITEM_ID}/Lyrics")).await;
     assert_eq!(missing, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn lyrics_routes_404_on_a_non_audio_item() {
+    // Port of `GetItemById<Audio>`: the movie exists, but it is not an `Audio`,
+    // so every item-scoped lyric route refuses it. Ferrofin used to accept it —
+    // `DELETE /Audio/{movieId}/Lyrics` answered 204 against Jellyfin's 404.
+    let deleted = Arc::new(Mutex::new(false));
+    let canned = || CannedLyrics {
+        stored: Some(LyricDto::default()),
+        remote: Some(("abc_1".to_owned(), LyricDto::default())),
+        deleted: deleted.clone(),
+    };
+    for (method, path) in [
+        ("GET", format!("/Audio/{MOVIE_ID}/Lyrics")),
+        ("POST", format!("/Audio/{MOVIE_ID}/Lyrics?fileName=x.lrc")),
+        ("DELETE", format!("/Audio/{MOVIE_ID}/Lyrics")),
+        ("GET", format!("/Audio/{MOVIE_ID}/RemoteSearch/Lyrics")),
+        (
+            "POST",
+            format!("/Audio/{MOVIE_ID}/RemoteSearch/Lyrics/abc_1"),
+        ),
+    ] {
+        let (_dir, path_media) = temp_media();
+        let app = state(&path_media, Arc::new(canned()));
+        let (status, _) = call(app, method, &path).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{method} {path}");
+    }
+    // …and nothing was deleted along the way.
+    assert!(!*deleted.lock().unwrap());
 }
 
 #[tokio::test]

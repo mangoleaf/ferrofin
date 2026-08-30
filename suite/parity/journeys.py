@@ -94,6 +94,7 @@ JOURNEY_METHOD.update({op: verification.PROPERTY for op in (
 # deciding that it had earned it. `--check` now fails on an op that appears in no
 # list below.
 JOURNEY_METHOD.update({op: verification.EFFECT for op in (
+    "DELETE /Audio/{itemId}/Lyrics",
     "DELETE /Auth/Keys/{key}",
     "DELETE /Collections/{collectionId}/Items",
     "DELETE /Devices",
@@ -126,6 +127,7 @@ JOURNEY_METHOD.update({op: verification.EFFECT for op in (
     "GET /QuickConnect/Connect",
     "GET /System/Configuration/{key}",
     "GET /Users/{userId}",
+    "POST /Audio/{itemId}/Lyrics",
     "POST /Auth/Keys",
     "POST /Backup/Create",
     "POST /ClientLog/Document",
@@ -924,6 +926,96 @@ def j_subtitles_upload(base, token, user, mid, _m2):
     return r
 
 
+LYRIC_REFRESH_WAIT_S = 10   # Jellyfin serves an uploaded lyric only once its refresh ran
+
+#: A synced .lrc: metadata tags (which must NOT surface as LyricDto.Metadata),
+#: three timestamped lines, one of them carrying enhanced-LRC word time tags.
+PARITY_LRC = ("[ar:Parity Artist]\n[ti:Parity Title]\n[al:Parity Album]\n"
+              "[00:01.00]First line\n"
+              "[00:05.50]<00:05.50>Second <00:06.00>line\n"
+              "[00:12.25]Third line\n")
+#: What both servers must parse PARITY_LRC into: (Text, Start-in-ticks) per line.
+PARITY_LRC_LINES = [("First line", 10000000), ("Second line", 55000000),
+                    ("Third line", 122500000)]
+
+
+def last_audio(base, token, user):
+    """The LAST audio item by Path — deterministic and identical on both servers,
+    and deliberately disjoint from the first three tracks reads.py seeds."""
+    b = get_json(base, f"/Items?userId={user}&recursive=true&includeItemTypes=Audio"
+                       f"&limit=500&fields=Path", token)
+    by_path = {i["Path"]: i["Id"] for i in (b or {}).get("Items") or [] if i.get("Path")}
+    return by_path[sorted(by_path)[-1]] if by_path else ""
+
+
+def stored_lyric_lines(base, token, aid):
+    """(Text, Start) of the item's stored lyric lines, or None when it has none."""
+    st, raw = http("GET", f"{base}/Audio/{aid}/Lyrics", token)
+    if st != 200:
+        return None
+    try:
+        doc = json.loads(raw)
+    except ValueError:
+        return None
+    return [(ln.get("Text"), ln.get("Start")) for ln in doc.get("Lyrics") or []]
+
+
+def await_lyric(base, token, aid, present):
+    """Poll the read-back until the lyric is there (present=True) or gone."""
+    for _ in range(LYRIC_REFRESH_WAIT_S):
+        got = stored_lyric_lines(base, token, aid)
+        if (got is not None) == present:
+            return got
+        time.sleep(1)
+    return stored_lyric_lines(base, token, aid)
+
+
+def j_lyrics(base, token, user, mid, _m2):
+    """Upload a .lrc to an audio item -> it reads back as the parsed, timestamped
+    lyric -> delete it -> the item has no lyrics again. Also pins the two status
+    contracts the controller owes and that Ferrofin used to break: a file whose
+    extension no lyric parser claims is refused (400, nothing stored), and a
+    NON-audio id is a 404 on this route (`mid` is a movie) rather than an accepted
+    write. The lyric is reaped whatever happened, so a leftover from an aborted run
+    cannot mask the next.
+
+    This layer only ever compares a server against its OWN read-back, so both ops
+    are `effect` rows. The cross-server body diff of the parsed LyricDto - the
+    thing that actually pins Metadata/Cues/blank-line handling - is reads.py's
+    `GET /Audio/{itemId}/Lyrics` row, off the identical seeds it uploads."""
+    r = {}
+    aid = last_audio(base, token, user)
+    if not aid:
+        return r
+    try:
+        http("DELETE", f"{base}/Audio/{aid}/Lyrics", token)      # start from clean
+        st, raw = http("POST", f"{base}/Audio/{aid}/Lyrics?fileName=parity.lrc",
+                       token, PARITY_LRC)
+        try:
+            posted = json.loads(raw)
+        except ValueError:
+            posted = {}
+        echoed = [(ln.get("Text"), ln.get("Start")) for ln in posted.get("Lyrics") or []]
+        stored = await_lyric(base, token, aid, True)
+        # An extension no parser claims must be refused outright, not coerced.
+        bad = http("POST", f"{base}/Audio/{aid}/Lyrics?fileName=parity.foo", token, "hello")[0]
+        r["POST /Audio/{itemId}/Lyrics"] = (st == 200 and echoed == PARITY_LRC_LINES
+                                            and stored == PARITY_LRC_LINES and bad == 400)
+
+        st = http("DELETE", f"{base}/Audio/{aid}/Lyrics", token)[0]
+        gone = await_lyric(base, token, aid, False) is None
+        # A movie id is not an audio item: every lyric route 404s on it.
+        movie = http("DELETE", f"{base}/Audio/{mid}/Lyrics", token)[0]
+        r["DELETE /Audio/{itemId}/Lyrics"] = st < 300 and gone and movie == 404
+    finally:
+        for _ in range(3):                                       # reap, whichever path ran
+            if stored_lyric_lines(base, token, aid) is None:
+                break
+            http("DELETE", f"{base}/Audio/{aid}/Lyrics", token)
+            time.sleep(1)
+    return r
+
+
 def j_merge_versions_controller(base, token, user, mid, m2):
     """The /MergeVersions/* controller (no documented params/body). Probe each with the
     ids query the sibling /Videos/MergeVersions uses; records acceptance so the differential
@@ -1267,7 +1359,7 @@ JOURNEYS = [j_startup,   # first: see its docstring
             j_users_password, j_virtualfolder_crud, j_sessions, j_config_writes,
             j_scheduled_run, j_playbackinfo_post, j_active_encodings, j_clientlog,
             j_authenticate, j_user_update, j_devices_delete, j_bulk_item_delete,
-            j_subtitles_upload, j_quickconnect, j_system_and_refresh,
+            j_subtitles_upload, j_lyrics, j_quickconnect, j_system_and_refresh,
             j_forgot_password, j_backup, j_livetv, j_remote_subtitles,
             # Destructive: merges/splits the shared movies, so it must run LAST so its
             # mutations can't corrupt the items other journeys read/refresh.

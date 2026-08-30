@@ -326,10 +326,12 @@ impl LyricProvider for LrcLibProvider {
         provider_local_id: &str,
     ) -> Result<Option<LyricResponse>, ServiceError> {
         // The provider-local id is `"{lrclib_id}_{synced|plain}"`.
+        // An id this provider did not mint is a plain miss, not an error:
+        // upstream `GetLyricsAsync` returning null is the controller's 404, and
+        // the vendored contract declares no 400 on these routes.
         let Some((record_id, variant)) = provider_local_id.split_once('_') else {
-            return Err(ServiceError::invalid_input(format!(
-                "malformed lrclib lyric id: {provider_local_id}"
-            )));
+            tracing::debug!(provider_local_id, "malformed lrclib lyric id");
+            return Ok(None);
         };
         let Some(item) = self
             .get_json::<LrcLibItem>(&format!("/api/get/{record_id}"), &[])
@@ -602,7 +604,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_lyrics_missing_variant_is_none_and_bad_id_rejects() {
+    async fn get_lyrics_missing_variant_and_malformed_id_are_a_miss() {
         // The canned record has no synced lyrics → the synced variant is gone.
         let (base_url, _seen) = spawn_stub_server(
             "HTTP/1.1 200 OK",
@@ -617,9 +619,10 @@ mod tests {
                 .is_none()
         );
 
-        // An id without the variant suffix is malformed.
+        // An id without the variant suffix was never minted here: a miss
+        // (the controller's 404), not an off-contract 400.
         let provider = LrcLibProvider::new().with_base_url("http://127.0.0.1:1");
-        assert!(provider.get_lyrics("42").await.is_err());
+        assert!(provider.get_lyrics("42").await.expect("runs").is_none());
 
         // An unreachable remote surfaces as not-found.
         assert!(provider.get_lyrics("42_synced").await.is_err());

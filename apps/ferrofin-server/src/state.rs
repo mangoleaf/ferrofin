@@ -518,13 +518,6 @@ pub async fn build_app_state(
             move || config_mgr.snapshot_shared().ui_culture.clone()
         }),
     );
-    let lyric_providers: Vec<Arc<dyn ferrofin_traits::stubs::LyricProvider>> =
-        vec![Arc::new(ferrofin_providers::LrcLibProvider::new())];
-    let lyrics: Arc<dyn ferrofin_traits::stubs::LyricManager> = Arc::new(
-        FerrofinLyricManager::new()
-            .with_items(Arc::clone(&item_repository))
-            .with_providers(lyric_providers),
-    );
     let path_manager: Arc<dyn ferrofin_traits::system::PathManager> =
         Arc::new(FerrofinPathManager::new(Arc::clone(&paths)));
     let client_event_logger: Arc<dyn ferrofin_traits::events::ClientEventLogger> =
@@ -667,6 +660,22 @@ pub async fn build_app_state(
     );
     let virtual_folders: Arc<dyn ferrofin_traits::library::VirtualFolderManager> =
         virtual_folders_impl.clone();
+
+    // Lyrics: sidecars for an audio item plus the remote providers. The
+    // internal-metadata root is where an uploaded/downloaded lyric always
+    // lands (Jellyfin's `TrySaveLyric`), and the virtual folders answer the
+    // library's `SaveLyricsWithMedia` flag that decides whether the media
+    // folder is a save target at all — so an upload works over a read-only
+    // media mount.
+    let lyric_providers: Vec<Arc<dyn ferrofin_traits::stubs::LyricProvider>> =
+        vec![Arc::new(ferrofin_providers::LrcLibProvider::new())];
+    let lyrics: Arc<dyn ferrofin_traits::stubs::LyricManager> = Arc::new(
+        FerrofinLyricManager::new()
+            .with_items(Arc::clone(&item_repository))
+            .with_providers(lyric_providers)
+            .with_metadata_path(paths.internal_metadata_path())
+            .with_virtual_folders(Arc::clone(&virtual_folders)),
+    );
     // Built after the virtual-folder manager: the refresh path reads the
     // owning library's saved options through it (C# `BaseItemManager`).
     let providers: Arc<dyn ferrofin_traits::providers::ProviderManager> = Arc::new(

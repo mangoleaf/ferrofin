@@ -25,10 +25,22 @@ use crate::error::ApiError;
 use crate::handlers::queue_high_priority_refresh;
 use crate::state::AppState;
 
-/// Ensures the audio item exists, returning `404` otherwise (mirrors the C#
-/// `GetItemById<Audio>` null check that every route performs first).
+/// Ensures the item exists **and is an audio item**, returning `404` otherwise.
+///
+/// Mirrors the C# `GetItemById<Audio>(itemId, User.GetUserId())` null check that
+/// every route in `LyricsController` performs first: a non-audio id is a `404`
+/// on all six routes, not an accepted target for a lyric write. `Audio` covers
+/// its `AudioBook` subclass, so both kinds pass.
 async fn require_item(state: &AppState, item_id: Uuid) -> Result<(), ApiError> {
-    if state.library.get_item_by_id(item_id).await?.is_none() {
+    let is_audio = state
+        .library
+        .get_item_by_id(item_id)
+        .await?
+        .is_some_and(|item| {
+            let short = item.type_.rsplit('.').next().unwrap_or(&item.type_);
+            matches!(short, "Audio" | "AudioBook")
+        });
+    if !is_audio {
         return Err(ApiError::NotFound(format!("item {item_id}")));
     }
     Ok(())
