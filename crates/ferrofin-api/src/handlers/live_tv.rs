@@ -32,7 +32,7 @@ use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use uuid::Uuid;
 
 use ferrofin_db::entities::users::UserEntity;
-use ferrofin_model::dto::{BaseItemDto, NameIdPair, NameValuePair, SortOrder};
+use ferrofin_model::dto::{BaseItemDto, NameIdPair, SortOrder};
 use ferrofin_model::entities::ImageType;
 use ferrofin_model::live_tv::{
     ChannelMappingOptionsDto, GuideInfo, ItemSortBy, ListingsProviderInfo, LiveTvInfo,
@@ -843,7 +843,14 @@ async fn delete_listing_provider(
     RequireAdmin(_auth): RequireAdmin,
     Query(q): Query<IdQuery>,
 ) -> Result<axum::http::StatusCode, ApiError> {
-    live_tv(&state)?.delete_listing_provider(&q.id).await?;
+    let m = live_tv(&state)?;
+    m.delete_listing_provider(&q.id).await?;
+    // `ListingsManager.DeleteListingsProvider` queues
+    // `RefreshGuideScheduledTask`, whose `CleanDatabase` pass is what actually
+    // drains the listings the removed provider supplied. (`DeleteTunerHost`
+    // deliberately does NOT — upstream leaves its channels until the next
+    // refresh; here they cascade away with the host row.)
+    m.refresh_guide().await?;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
@@ -1259,45 +1266,25 @@ struct SetChannelMappingDto {
 
 /// `POST /LiveTv/ChannelMappings` — map a tuner channel to a provider channel.
 ///
-/// Port of `LiveTvController.SetChannelMapping` → `SetChannelMapping`: upserts the
-/// `tunerChannelId -> providerChannelId` pair into the listings provider's
-/// `ChannelMappings` and persists it (the guide match honors the mapping on the
-/// next refresh). Returns the resulting [`TunerChannelMapping`]. `404` when the
-/// provider id is unknown.
+/// Port of `LiveTvController.SetChannelMapping` → `ListingsManager.SetChannelMapping`:
+/// stores the `tunerChannelId -> providerChannelId` pair on the listings
+/// provider, refreshes the guide through it, and returns that tuner channel's
+/// recomputed [`TunerChannelMapping`]. `404` when the provider id or the tuner
+/// channel id names nothing.
 async fn set_channel_mapping(
     State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
     Json(dto): Json<SetChannelMappingDto>,
 ) -> Result<Json<TunerChannelMapping>, ApiError> {
-    let manager = live_tv(&state)?;
-    let mut provider = manager
-        .get_listing_providers()
-        .await?
-        .into_iter()
-        .find(|p| p.id.as_deref() == Some(dto.provider_id.as_str()))
-        .ok_or_else(|| ApiError::NotFound("listing provider".into()))?;
-
-    // Upsert the mapping (keyed on the tuner channel id).
-    if let Some(existing) = provider
-        .channel_mappings
-        .iter_mut()
-        .find(|m| m.name.as_deref() == Some(dto.tuner_channel_id.as_str()))
-    {
-        existing.value = Some(dto.provider_channel_id.clone());
-    } else {
-        provider.channel_mappings.push(NameValuePair {
-            name: Some(dto.tuner_channel_id.clone()),
-            value: Some(dto.provider_channel_id.clone()),
-        });
-    }
-    manager.save_listing_provider(provider).await?;
-
-    Ok(Json(TunerChannelMapping {
-        name: Some(dto.tuner_channel_id.clone()),
-        id: Some(dto.tuner_channel_id),
-        provider_channel_id: Some(dto.provider_channel_id),
-        provider_channel_name: None,
-    }))
+    Ok(Json(
+        live_tv(&state)?
+            .set_channel_mapping(
+                &dto.provider_id,
+                &dto.tuner_channel_id,
+                &dto.provider_channel_id,
+            )
+            .await?,
+    ))
 }
 
 /// `GET /LiveTv/Recordings/Series` — series recordings (deprecated; empty).
@@ -1538,11 +1525,32 @@ async fn cancel_series_timer(
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
-/// `GET /LiveTv/ChannelMappingOptions` — channel-mapping options.
+/// The query `GET /LiveTv/ChannelMappingOptions` binds.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ChannelMappingOptionsQuery {
+    /// The listings provider whose mapping state is being rendered.
+    #[serde(default)]
+    provider_id: Option<String>,
+}
+
+/// `GET /LiveTv/ChannelMappingOptions` — a listings provider's tuner/provider
+/// channel lineups and the mappings between them.
+///
+/// Port of `LiveTvController.GetChannelMappingOptions` →
+/// `ListingsManager.GetChannelMappingOptions`. `404` when `providerId` is
+/// absent or names no configured provider (upstream's unguarded `.First(...)`
+/// throws there, which the middleware turns into a 500).
 async fn get_channel_mapping_options(
+    State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
-) -> Json<ChannelMappingOptionsDto> {
-    Json(ChannelMappingOptionsDto::default())
+    Query(q): Query<ChannelMappingOptionsQuery>,
+) -> Result<Json<ChannelMappingOptionsDto>, ApiError> {
+    Ok(Json(
+        live_tv(&state)?
+            .get_channel_mapping_options(q.provider_id.as_deref().unwrap_or_default())
+            .await?,
+    ))
 }
 
 /// `GET /LiveTv/ListingProviders/Default` — default listing-provider config.
@@ -1552,9 +1560,45 @@ async fn get_default_listing_provider(
     Json(ListingsProviderInfo::default())
 }
 
-/// `GET /LiveTv/ListingProviders/Lineups` — available lineups (none → empty).
-async fn get_lineups(RequireAuth(_auth): RequireAuth) -> Json<Vec<NameIdPair>> {
-    Json(Vec::new())
+/// The query `GET /LiveTv/ListingProviders/Lineups` binds.
+///
+/// Port of `LiveTvController.GetLineups`' `[FromQuery]` parameter list.
+#[derive(Debug, Default, serde::Deserialize)]
+struct LineupsQuery {
+    /// The configured listings provider to read the lineups of.
+    #[serde(default)]
+    id: Option<String>,
+    /// The listings-provider backend type.
+    #[serde(default, rename = "type")]
+    type_: Option<String>,
+    /// The location, for backends that scope lineups by it.
+    #[serde(default)]
+    location: Option<String>,
+    /// The country, for backends that scope lineups by it.
+    #[serde(default)]
+    country: Option<String>,
+}
+
+/// `GET /LiveTv/ListingProviders/Lineups` — a listings provider's lineups.
+///
+/// Port of `LiveTvController.GetLineups` → `ListingsManager.GetLineups`. `404`
+/// when the provider cannot be resolved, which is what the C#
+/// `ResourceNotFoundException` maps to.
+async fn get_lineups(
+    State(state): State<AppState>,
+    RequireAuth(_auth): RequireAuth,
+    Query(q): Query<LineupsQuery>,
+) -> Result<Json<Vec<NameIdPair>>, ApiError> {
+    Ok(Json(
+        live_tv(&state)?
+            .get_lineups(
+                q.id.as_deref(),
+                q.type_.as_deref(),
+                q.country.as_deref(),
+                q.location.as_deref(),
+            )
+            .await?,
+    ))
 }
 
 /// `GET /LiveTv/TunerHosts/Types` — supported tuner-host types.
@@ -1766,9 +1810,7 @@ mod tests {
             Query(TimerDefaultsQuery::default()),
         )
         .await;
-        let _ = get_channel_mapping_options(admin_auth()).await;
         let _ = get_default_listing_provider(auth()).await;
-        assert!(get_lineups(auth()).await.0.is_empty());
         assert_eq!(get_tuner_host_types(auth()).await.0.len(), 1);
         assert!(discover_tuners(admin_auth()).await.0.is_empty());
         let state = fake_state();
@@ -2042,6 +2084,11 @@ mod tests {
         /// The Schedules Direct country document; `None` models an upstream
         /// fetch failure.
         countries: Option<Vec<u8>>,
+        /// What the last `set_channel_mapping` call handed the seam
+        /// (provider id, tuner channel id, provider channel id) — the
+        /// assertion target for the pass-through, so the handler is proven to
+        /// forward the DTO rather than reinterpret it.
+        mapping_args: std::sync::Mutex<Option<(String, String, String)>>,
     }
 
     #[async_trait::async_trait]
@@ -2077,6 +2124,60 @@ mod tests {
                 .as_ref()
                 .filter(|(id, _)| id == unique_id)
                 .map(|(_, file)| file.clone()))
+        }
+        async fn get_lineups(
+            &self,
+            provider_id: Option<&str>,
+            _provider_type: Option<&str>,
+            _country: Option<&str>,
+            _location: Option<&str>,
+        ) -> Result<Vec<NameIdPair>, ferrofin_traits::error::ServiceError> {
+            match provider_id {
+                Some("prov1") => Ok(vec![NameIdPair {
+                    name: Some("parity1".into()),
+                    id: Some("parity1".into()),
+                }]),
+                _ => Err(ferrofin_traits::error::ServiceError::not_found("provider")),
+            }
+        }
+        async fn get_channel_mapping_options(
+            &self,
+            provider_id: &str,
+        ) -> Result<ChannelMappingOptionsDto, ferrofin_traits::error::ServiceError> {
+            if provider_id != "prov1" {
+                return Err(ferrofin_traits::error::ServiceError::not_found("provider"));
+            }
+            Ok(ChannelMappingOptionsDto {
+                provider_name: Some("XmlTV".into()),
+                ..ChannelMappingOptionsDto::default()
+            })
+        }
+        async fn set_channel_mapping(
+            &self,
+            provider_id: &str,
+            tuner_channel_id: &str,
+            provider_channel_id: &str,
+        ) -> Result<TunerChannelMapping, ferrofin_traits::error::ServiceError> {
+            if self
+                .providers
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|p| p.id.as_deref() != Some(provider_id))
+            {
+                return Err(ferrofin_traits::error::ServiceError::not_found("provider"));
+            }
+            *self.mapping_args.lock().unwrap() = Some((
+                provider_id.to_owned(),
+                tuner_channel_id.to_owned(),
+                provider_channel_id.to_owned(),
+            ));
+            Ok(TunerChannelMapping {
+                name: Some(format!("10 {tuner_channel_id}")),
+                provider_channel_name: Some("HBO East".into()),
+                provider_channel_id: Some(provider_channel_id.to_owned()),
+                id: Some(tuner_channel_id.to_owned()),
+            })
         }
         async fn get_schedules_direct_countries(
             &self,
@@ -2238,17 +2339,20 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn set_channel_mapping_upserts_and_returns() {
-        let provider = ListingsProviderInfo {
-            id: Some("prov1".into()),
-            ..ListingsProviderInfo::default()
-        };
-        let fake = std::sync::Arc::new(FakeLiveTv {
-            providers: std::sync::Mutex::new(vec![provider]),
-            recording_path: None,
+    /// A fake holding one listings provider, `prov1`.
+    fn fake_with_provider() -> std::sync::Arc<FakeLiveTv> {
+        std::sync::Arc::new(FakeLiveTv {
+            providers: std::sync::Mutex::new(vec![ListingsProviderInfo {
+                id: Some("prov1".into()),
+                ..ListingsProviderInfo::default()
+            }]),
             ..FakeLiveTv::default()
-        });
+        })
+    }
+
+    #[tokio::test]
+    async fn set_channel_mapping_forwards_the_dto_and_returns_the_resolved_row() {
+        let fake = fake_with_provider();
         let state = fake_state().with_live_tv(fake.clone());
         let mapping = set_channel_mapping(
             State(state),
@@ -2262,13 +2366,68 @@ mod tests {
         .await
         .unwrap()
         .0;
+        // The three ids reach the manager as sent — the upsert semantics
+        // themselves are `ListingsManager.SetChannelMapping`'s, tested in
+        // `ferrofin-livetv`.
+        assert_eq!(
+            fake.mapping_args.lock().unwrap().clone(),
+            Some(("prov1".into(), "10".into(), "HBO".into()))
+        );
+        // And the RESOLVED row comes back, not an echo of the request: the
+        // provider channel NAME is present, which the old hand-built response
+        // never carried.
         assert_eq!(mapping.id.as_deref(), Some("10"));
+        assert_eq!(mapping.name.as_deref(), Some("10 10"));
         assert_eq!(mapping.provider_channel_id.as_deref(), Some("HBO"));
-        // The mapping was persisted onto the provider.
-        let saved = fake.providers.lock().unwrap()[0].channel_mappings.clone();
-        assert_eq!(saved.len(), 1);
-        assert_eq!(saved[0].name.as_deref(), Some("10"));
-        assert_eq!(saved[0].value.as_deref(), Some("HBO"));
+        assert_eq!(mapping.provider_channel_name.as_deref(), Some("HBO East"));
+    }
+
+    #[tokio::test]
+    async fn channel_mapping_options_binds_the_provider_id() {
+        let state = fake_state().with_live_tv(fake_with_provider());
+        let ok = get_channel_mapping_options(
+            State(state.clone()),
+            admin_auth(),
+            Query(ChannelMappingOptionsQuery {
+                provider_id: Some("prov1".into()),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(ok.provider_name.as_deref(), Some("XmlTV"));
+        // An absent `providerId` is not a silent empty answer: it resolves no
+        // provider, which is a 404.
+        let err = get_channel_mapping_options(
+            State(state),
+            admin_auth(),
+            Query(ChannelMappingOptionsQuery::default()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status(), axum::http::StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn lineups_binds_the_provider_id() {
+        let state = fake_state().with_live_tv(fake_with_provider());
+        let ok = get_lineups(
+            State(state.clone()),
+            auth(),
+            Query(LineupsQuery {
+                id: Some("prov1".into()),
+                ..LineupsQuery::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(ok.len(), 1);
+        assert_eq!(ok[0].id.as_deref(), Some("parity1"));
+        let err = get_lineups(State(state), auth(), Query(LineupsQuery::default()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.status(), axum::http::StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

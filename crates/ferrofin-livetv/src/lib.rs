@@ -20,6 +20,7 @@ pub mod fetch;
 pub mod guide_repository;
 pub mod m3u;
 pub mod manager;
+pub mod mapping;
 pub mod projection;
 pub mod schedules_direct;
 pub mod stream;

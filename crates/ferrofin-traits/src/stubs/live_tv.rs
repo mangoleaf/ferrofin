@@ -16,10 +16,11 @@ use uuid::Uuid;
 
 use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::dto::DayOfWeek;
-use ferrofin_model::dto::{BaseItemDto, MediaSourceInfo, SortOrder};
+use ferrofin_model::dto::{BaseItemDto, MediaSourceInfo, NameIdPair, SortOrder};
 use ferrofin_model::live_tv::{
-    ChannelType, DayPattern, ItemSortBy, KeepUntil, ListingsProviderInfo, LiveTvInfo,
-    RecordingQuery, RecordingStatus, SeriesTimerInfoDto, TimerInfoDto, TimerQuery, TunerHostInfo,
+    ChannelMappingOptionsDto, ChannelType, DayPattern, ItemSortBy, KeepUntil, ListingsProviderInfo,
+    LiveTvInfo, RecordingQuery, RecordingStatus, SeriesTimerInfoDto, TimerInfoDto, TimerQuery,
+    TunerChannelMapping, TunerHostInfo,
 };
 use ferrofin_model::querying::QueryResult;
 
@@ -251,6 +252,45 @@ pub trait LiveTvManager: Send + Sync {
 
     /// Deletes the listing provider with the given id.
     async fn delete_listing_provider(&self, id: &str) -> Result<(), ServiceError>;
+
+    /// The lineups a listings provider offers.
+    ///
+    /// Port of `ListingsManager.GetLineups`. `provider_id` names a configured
+    /// provider; when it is absent or names none, the C# `GetProvider` /
+    /// `FirstOrDefault(...) ?? throw` pair raises `ResourceNotFoundException`,
+    /// so the answer here is [`ServiceError::NotFound`] (HTTP `404`).
+    async fn get_lineups(
+        &self,
+        provider_id: Option<&str>,
+        provider_type: Option<&str>,
+        country: Option<&str>,
+        location: Option<&str>,
+    ) -> Result<Vec<NameIdPair>, ServiceError>;
+
+    /// The tuner-channel ↔ provider-channel matching state for one listings
+    /// provider — what the dashboard's channel-mapping dialog renders.
+    ///
+    /// Port of `ListingsManager.GetChannelMappingOptions`. An unresolvable
+    /// `provider_id` is [`ServiceError::NotFound`]; upstream's unguarded
+    /// `.First(...)` throws `InvalidOperationException` (HTTP `500`) there,
+    /// which is a bug, not a contract.
+    async fn get_channel_mapping_options(
+        &self,
+        provider_id: &str,
+    ) -> Result<ChannelMappingOptionsDto, ServiceError>;
+
+    /// Maps one tuner channel onto one provider channel, returning that
+    /// channel's recomputed mapping row.
+    ///
+    /// Port of `ListingsManager.SetChannelMapping`: a pair whose two ids are
+    /// equal is the "unmap" gesture (the existing pair is removed and no new
+    /// one stored), and the guide is refreshed so the mapping takes effect.
+    async fn set_channel_mapping(
+        &self,
+        provider_id: &str,
+        tuner_channel_id: &str,
+        provider_channel_id: &str,
+    ) -> Result<TunerChannelMapping, ServiceError>;
 
     /// Queries Live TV channels as `BaseItemDto`s (`Type = "TvChannel"`).
     ///

@@ -91,6 +91,29 @@ impl LiveTvManager for CountriesLiveTv {
     ) -> Result<ListingsProviderInfo, ServiceError> {
         unreachable!()
     }
+    async fn get_lineups(
+        &self,
+        _provider_id: Option<&str>,
+        _provider_type: Option<&str>,
+        _country: Option<&str>,
+        _location: Option<&str>,
+    ) -> Result<Vec<ferrofin_model::dto::NameIdPair>, ServiceError> {
+        unreachable!()
+    }
+    async fn get_channel_mapping_options(
+        &self,
+        _provider_id: &str,
+    ) -> Result<ferrofin_model::live_tv::ChannelMappingOptionsDto, ServiceError> {
+        unreachable!()
+    }
+    async fn set_channel_mapping(
+        &self,
+        _provider_id: &str,
+        _tuner_channel_id: &str,
+        _provider_channel_id: &str,
+    ) -> Result<ferrofin_model::live_tv::TunerChannelMapping, ServiceError> {
+        unreachable!()
+    }
     async fn delete_listing_provider(&self, _id: &str) -> Result<(), ServiceError> {
         unreachable!()
     }

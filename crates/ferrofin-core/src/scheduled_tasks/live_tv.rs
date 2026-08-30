@@ -145,6 +145,29 @@ mod tests {
         ) -> Result<ferrofin_model::live_tv::ListingsProviderInfo, ServiceError> {
             unimplemented!()
         }
+        async fn get_lineups(
+            &self,
+            _provider_id: Option<&str>,
+            _provider_type: Option<&str>,
+            _country: Option<&str>,
+            _location: Option<&str>,
+        ) -> Result<Vec<ferrofin_model::dto::NameIdPair>, ServiceError> {
+            unimplemented!()
+        }
+        async fn get_channel_mapping_options(
+            &self,
+            _provider_id: &str,
+        ) -> Result<ferrofin_model::live_tv::ChannelMappingOptionsDto, ServiceError> {
+            unimplemented!()
+        }
+        async fn set_channel_mapping(
+            &self,
+            _provider_id: &str,
+            _tuner_channel_id: &str,
+            _provider_channel_id: &str,
+        ) -> Result<ferrofin_model::live_tv::TunerChannelMapping, ServiceError> {
+            unimplemented!()
+        }
         async fn delete_listing_provider(&self, _id: &str) -> Result<(), ServiceError> {
             unimplemented!()
         }

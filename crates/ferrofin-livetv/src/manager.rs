@@ -6,7 +6,7 @@
 //! binds programmes to channels by the tuner `tvg-id` / XMLTV `channel id`.
 //! Channels and programmes are surfaced to clients as `BaseItemDto`s.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -21,11 +21,14 @@ use uuid::Uuid;
 use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::data::{BaseItemKind, MediaType};
 use ferrofin_model::dto::SortOrder;
-use ferrofin_model::dto::{BaseItemDto, MediaSourceInfo, MediaSourceType};
+use ferrofin_model::dto::{
+    BaseItemDto, MediaSourceInfo, MediaSourceType, NameIdPair, NameValuePair,
+};
 use ferrofin_model::live_tv::LiveTvOptions;
 use ferrofin_model::live_tv::{
-    ChannelType, ItemSortBy, ListingsProviderInfo, LiveTvInfo, LiveTvServiceInfo,
-    LiveTvServiceStatus, RecordingStatus, SeriesTimerInfoDto, TimerInfoDto, TunerHostInfo,
+    ChannelMappingOptionsDto, ChannelType, ItemSortBy, ListingsProviderInfo, LiveTvInfo,
+    LiveTvServiceInfo, LiveTvServiceStatus, RecordingStatus, SeriesTimerInfoDto, TimerInfoDto,
+    TunerChannelMapping, TunerHostInfo,
 };
 use ferrofin_model::media_info::MediaProtocol;
 use ferrofin_model::querying::{ItemFields, QueryResult};
@@ -41,6 +44,10 @@ use crate::dvr::{ActiveRecording, RecorderKind, RecordingInput, TimerRecordingIn
 use crate::error::LiveTvError;
 use crate::fetch::SourceFetcher;
 use crate::m3u::parse_m3u;
+use crate::mapping::{
+    EpgChannel, EpgChannelData, TunerChannel, epg_channel_for_tuner_channel,
+    is_listing_provider_enabled_for_tuner, m3u_channel_id, tuner_channel_mapping,
+};
 use crate::projection::{
     ChannelRow, ProgramRow as GuideProgramRow, channel_entity, program_entity, remove_fields,
 };
@@ -103,6 +110,17 @@ const PROGRAM_SELECT: &str = r#"SELECT p."Id",p."ChannelId",p."StartDate",p."End
 const PROGRAM_COUNT: &str = r#"SELECT COUNT(*)
                FROM "FerrofinLiveTvPrograms" p
                JOIN "FerrofinLiveTvChannels" c ON c."Id" = p."ChannelId""#;
+
+/// The `ON CONFLICT` tail of the channel upsert: a channel already in the
+/// lineup keeps its first-seen `DateCreated` (upstream stamps it only on a NEW
+/// `LiveTvChannel`; a pre-migration NULL heals to the refresh instant via the
+/// COALESCE) and takes the playlist's current word for everything else.
+const CHANNEL_UPSERT_CONFLICT: &str = r#" ON CONFLICT("Id") DO UPDATE SET
+                    "DateCreated"=COALESCE("FerrofinLiveTvChannels"."DateCreated", excluded."DateCreated"),
+                    "TunerHostId"=excluded."TunerHostId","TvgId"=excluded."TvgId",
+                    "Name"=excluded."Name","Number"=excluded."Number",
+                    "ImageUrl"=excluded."ImageUrl","ChannelType"=excluded."ChannelType",
+                    "StreamUrl"=excluded."StreamUrl","SortIndex"=excluded."SortIndex""#;
 
 /// The `ON CONFLICT` tail of the programme upsert: a refreshed airing keeps
 /// its first-seen `DateCreated` (upstream stamps it only on a NEW
@@ -200,6 +218,15 @@ pub struct FerrofinLiveTvManager {
     /// `AsyncNonKeyedLocker(1)` around the whole of `OpenLiveStreamInternal`);
     /// a `tokio::sync::Mutex` because this one *is* held across awaits.
     open_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes guide refreshes, so two of them can never interleave.
+    ///
+    /// Port of `_taskManager.CancelIfRunningAndQueue<RefreshGuideScheduledTask>()`:
+    /// upstream there is exactly ONE guide-refresh task, and queuing it cancels
+    /// the running one. Ferrofin reaches `refresh_guide` from the scheduled task
+    /// AND inline from the tuner-host/listings-provider writes, so without this
+    /// two passes could overlap and one's `CleanDatabase` prune would delete the
+    /// listings the other had just written.
+    guide_lock: Arc<tokio::sync::Mutex<()>>,
     /// The account-less Schedules Direct surface (country list), sharing the
     /// fetcher and caching under the application cache directory.
     schedules_direct: SchedulesDirect,
@@ -358,6 +385,7 @@ impl FerrofinLiveTvManager {
             retry_counts: Arc::new(Mutex::new(HashMap::new())),
             encoder: None,
             open_lock: Arc::new(tokio::sync::Mutex::new(())),
+            guide_lock: Arc::new(tokio::sync::Mutex::new(())),
             schedules_direct,
         }
     }
@@ -426,23 +454,29 @@ impl FerrofinLiveTvManager {
             .ok_or_else(|| ServiceError::Backend("live tv dto service not wired".to_owned()))
     }
 
-    /// Rewrites the channel lineup for one tuner host from its M3U body, in a
-    /// transaction (deleting the old channels cascades away their programmes).
-    async fn replace_channels(&self, tuner_id: &str, m3u_body: &str) -> Result<(), ServiceError> {
+    /// Refreshes the channel lineup for one tuner host from its M3U body,
+    /// returning the ids it wrote for the caller's `CleanDatabase` pass.
+    ///
+    /// An UPSERT, not a delete-and-reinsert: `GuideManager.RefreshChannelsInternal`
+    /// saves each channel it found and only removes the ones the pass did not
+    /// re-emit, at the very end. Deleting first would cascade every programme of
+    /// the tuner away (`FK_LiveTvChannels_TunerHosts_TunerHostId ON DELETE
+    /// CASCADE` reaches them through the channel rows), so a client reading the
+    /// guide mid-refresh would see it empty and briefly wrong.
+    async fn replace_channels(
+        &self,
+        tuner_id: &str,
+        m3u_body: &str,
+    ) -> Result<Vec<String>, ServiceError> {
         let channels = parse_m3u(m3u_body);
         let mut tx = self.db.writer().begin().await.map_err(db_err)?;
 
-        // A channel already in the lineup keeps its first-seen instant across
-        // refreshes, the way `GuideManager.GetChannel` only stamps
+        // `DateCreated` is bound for every row, but only a NEW channel keeps
+        // it: the upsert's COALESCE holds an existing channel's first-seen
+        // instant, the way `GuideManager.GetChannel` only stamps
         // `DateCreated = DateTime.UtcNow` on a NEW item.
-        let existing = crate::guide_repository::existing_channel_dates(&mut tx, tuner_id).await?;
         let now = datetime_to_db(Utc::now());
-
-        sqlx::query(r#"DELETE FROM "FerrofinLiveTvChannels" WHERE "TunerHostId" = ?1"#)
-            .bind(tuner_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(db_err)?;
+        let mut written = Vec::with_capacity(channels.len());
 
         // 10 columns per row; chunked multi-row insert instead of one round-trip
         // per channel.
@@ -459,10 +493,8 @@ impl FerrofinLiveTvManager {
                     format!("{tuner_id}|{key}").as_bytes(),
                 ));
                 let channel_type = if ch.is_radio { "Radio" } else { "Tv" };
-                let date_created = existing
-                    .get(&id)
-                    .and_then(Clone::clone)
-                    .unwrap_or_else(|| now.clone());
+                let date_created = now.clone();
+                written.push(id.clone());
                 b.push_bind(id)
                     .push_bind(tuner_id)
                     .push_bind(&ch.id)
@@ -474,34 +506,149 @@ impl FerrofinLiveTvManager {
                     .push_bind(i64::try_from(base + offset).unwrap_or(i64::MAX))
                     .push_bind(date_created);
             });
+            qb.push(CHANNEL_UPSERT_CONFLICT);
             qb.build().execute(&mut *tx).await.map_err(db_err)?;
         }
 
-        tx.commit().await.map_err(db_err)
+        tx.commit().await.map_err(db_err)?;
+        Ok(written)
     }
 
-    /// Inserts programmes from an XMLTV body, binding each to every channel whose
-    /// `TvgId` matches the programme's `channel` attribute, classified against the
-    /// listings provider's category lists as `XmlTvListingsProvider.GetProgramInfo`
-    /// does.
+    /// The configured listings provider with this id.
+    ///
+    /// Port of the `ListingProviders.FirstOrDefault(... OrdinalIgnoreCase)`
+    /// lookup every `ListingsManager` entry point opens with. Upstream spells
+    /// two of them `.First(...)`, which throws `InvalidOperationException`
+    /// (HTTP `500`) on no match; the honest answer for an unknown id is the
+    /// `ResourceNotFoundException` → `404` the third one already gives.
+    async fn listing_provider_by_id(&self, id: &str) -> Result<ListingsProviderInfo, ServiceError> {
+        self.get_listing_providers()
+            .await?
+            .into_iter()
+            .find(|p| {
+                p.id.as_deref()
+                    .is_some_and(|pid| pid.eq_ignore_ascii_case(id))
+            })
+            .ok_or_else(|| ServiceError::not_found(format!("listings provider {id}")))
+    }
+
+    /// The display name of a listings-provider backend, by its `Type`.
+    ///
+    /// Port of `ListingsManager.GetProvider`, which resolves the registered
+    /// `IListingsProvider` for a type and throws `ResourceNotFoundException`
+    /// when there is none. Ferrofin registers the XMLTV backend
+    /// (`XmlTvListingsProvider.Name`/`.Type`); a Schedules Direct listings
+    /// provider is an open work item, and until it is ported its type is
+    /// genuinely unregistered here, which is the same 404 the C# gives for any
+    /// type it has no provider for.
+    fn listings_provider_name(provider_type: Option<&str>) -> Result<&'static str, ServiceError> {
+        match provider_type {
+            Some(t) if t.eq_ignore_ascii_case("xmltv") => Ok("XmlTV"),
+            other => Err(ServiceError::not_found(format!(
+                "Couldn't find provider of type {}",
+                other.unwrap_or_default()
+            ))),
+        }
+    }
+
+    /// A listings provider's own channel list.
+    ///
+    /// Port of `XmlTvListingsProvider.GetChannels`: the guide document's
+    /// `<channel>` elements, with the number falling back to the id when the
+    /// document carries none (Ferrofin's XMLTV reader parses no channel number,
+    /// so that fallback always applies) — the fallback matters because it is
+    /// what feeds the by-number arm of the match ladder.
+    async fn provider_channels(
+        &self,
+        info: &ListingsProviderInfo,
+    ) -> Result<Vec<EpgChannel>, ServiceError> {
+        Self::listings_provider_name(info.type_.as_deref())?;
+        let path = info.path.clone().unwrap_or_default();
+        let body = self.fetcher.fetch(&path).await?;
+        Ok(parse_xmltv(&body)
+            .channels
+            .into_iter()
+            .map(|c| EpgChannel {
+                number: c.id.clone(),
+                id: c.id,
+                name: c.display_name,
+            })
+            .collect())
+    }
+
+    /// Every tuner channel this listings provider supplies listings for, with
+    /// its stored key alongside the external `ChannelInfo.Id` clients see.
+    ///
+    /// Port of `ListingsManager.GetChannelsForListingsProvider`: each tuner
+    /// host's lineup, filtered by `IsListingProviderEnabledForTuner`.
+    async fn channels_for_listings_provider(
+        &self,
+        info: &ListingsProviderInfo,
+    ) -> Result<Vec<(String, TunerChannel)>, ServiceError> {
+        let mut out = Vec::new();
+        for tuner in self.get_tuner_hosts().await? {
+            let (Some(host_id), Some(url)) = (tuner.id.as_deref(), tuner.url.as_deref()) else {
+                continue;
+            };
+            if !is_listing_provider_enabled_for_tuner(info, host_id) {
+                continue;
+            }
+            for row in crate::guide_repository::tuner_lineup(&self.db, host_id).await? {
+                out.push((
+                    row.id,
+                    TunerChannel {
+                        id: m3u_channel_id(url, &row.stream_url),
+                        tuner_channel_id: row.tvg_id,
+                        number: row.number,
+                        name: row.name,
+                        tuner_host_id: host_id.to_owned(),
+                    },
+                ));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Inserts programmes from an XMLTV body, binding each to every channel that
+    /// takes its listings from the programme's guide channel, classified against
+    /// the listings provider's category lists as
+    /// `XmlTvListingsProvider.GetProgramInfo` does. Returns the ids it wrote, for
+    /// the caller's `CleanDatabase` pass.
+    ///
+    /// The tuner-channel → guide-channel binding is
+    /// `ListingsManager.GetEpgChannelFromTunerChannel`, so the provider's manual
+    /// `ChannelMappings` actually move listings — the join is not the raw
+    /// `tvg-id`.
     async fn insert_programs(
         &self,
         xmltv_body: &str,
         provider: &ListingsProviderInfo,
-    ) -> Result<(), ServiceError> {
+    ) -> Result<Vec<String>, ServiceError> {
         let guide = parse_xmltv(xmltv_body);
         let classes = CategoryClasses::from_provider(provider);
 
-        // Map each tvg-id to the channel UUIDs that carry it.
-        let rows = sqlx::query(r#"SELECT "Id","TvgId" FROM "FerrofinLiveTvChannels""#)
-            .fetch_all(self.db.pool())
-            .await
-            .map_err(db_err)?;
-        let mut by_tvg: HashMap<String, Vec<String>> = HashMap::new();
-        for row in rows {
-            let id: String = row.get("Id");
-            let tvg: String = row.get("TvgId");
-            by_tvg.entry(tvg).or_default().push(id);
+        // Which stored channel takes its listings from which guide channel —
+        // the same match ladder the channel-mapping dialog renders.
+        let epg_channels: Vec<EpgChannel> = guide
+            .channels
+            .iter()
+            .map(|c| EpgChannel {
+                number: c.id.clone(),
+                id: c.id.clone(),
+                name: c.display_name.clone(),
+            })
+            .collect();
+        let epg = EpgChannelData::new(&epg_channels);
+        let mut by_epg_channel: HashMap<String, Vec<String>> = HashMap::new();
+        for (stored_id, tuner_channel) in self.channels_for_listings_provider(provider).await? {
+            if let Some(matched) =
+                epg_channel_for_tuner_channel(&provider.channel_mappings, &tuner_channel, &epg)
+            {
+                by_epg_channel
+                    .entry(matched.id.clone())
+                    .or_default()
+                    .push(stored_id);
+            }
         }
 
         // Flatten to one (channel, programme) row per binding, then insert in
@@ -511,7 +658,9 @@ impl FerrofinLiveTvManager {
             .programmes
             .iter()
             .flat_map(|prog| {
-                let channel_ids = by_tvg.get(&prog.channel_id).map_or(&[][..], Vec::as_slice);
+                let channel_ids = by_epg_channel
+                    .get(&prog.channel_id)
+                    .map_or(&[][..], Vec::as_slice);
                 let start = opt_datetime_to_db(prog.start).unwrap_or_default();
                 let end = opt_datetime_to_db(prog.stop);
                 let genres = if prog.categories.is_empty() {
@@ -579,7 +728,8 @@ impl FerrofinLiveTvManager {
             qb.push(PROGRAM_UPSERT_CONFLICT);
             qb.build().execute(&mut *tx).await.map_err(db_err)?;
         }
-        tx.commit().await.map_err(db_err)
+        tx.commit().await.map_err(db_err)?;
+        Ok(rows.into_iter().map(|row| row.id).collect())
     }
 }
 
@@ -640,11 +790,22 @@ impl LiveTvManager for FerrofinLiveTvManager {
         &self,
         mut info: TunerHostInfo,
     ) -> Result<TunerHostInfo, ServiceError> {
-        let id = info
-            .id
-            .clone()
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| guid_to_db(Uuid::new_v4()));
+        // `TunerHostManager.SaveTunerHost`: the supplied id is honoured only
+        // when it names a host that already exists (`Array.FindIndex(...,
+        // OrdinalIgnoreCase)`); `index == -1 || IsNullOrWhiteSpace(info.Id)`
+        // mints a fresh `Guid.NewGuid().ToString("N")` — 32 lowercase hex, no
+        // dashes. The existing row's stored spelling wins on a case-differing
+        // match, because Ferrofin's channel rows reference it by that string.
+        let id = match info.id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(wanted) => crate::guide_repository::existing_config_id(
+                &self.db,
+                crate::guide_repository::TUNER_HOSTS_TABLE,
+                wanted,
+            )
+            .await?
+            .unwrap_or_else(|| Uuid::new_v4().simple().to_string()),
+            None => Uuid::new_v4().simple().to_string(),
+        };
         info.id = Some(id.clone());
         if info.type_.is_none() {
             info.type_ = Some("m3u".to_owned());
@@ -666,7 +827,11 @@ impl LiveTvManager for FerrofinLiveTvManager {
     }
 
     async fn delete_tuner_host(&self, id: &str) -> Result<(), ServiceError> {
-        sqlx::query(r#"DELETE FROM "FerrofinLiveTvTunerHosts" WHERE "Id" = ?1"#)
+        // `LiveTvController.DeleteTunerHost` filters with
+        // `StringComparison.OrdinalIgnoreCase`; the stored key is a
+        // BINARY-collated TEXT primary key, so the match must say NOCASE or a
+        // case-differing id silently deletes nothing.
+        sqlx::query(r#"DELETE FROM "FerrofinLiveTvTunerHosts" WHERE "Id" = ?1 COLLATE NOCASE"#)
             .bind(id)
             .execute(self.db.writer())
             .await
@@ -701,11 +866,19 @@ impl LiveTvManager for FerrofinLiveTvManager {
         &self,
         mut info: ListingsProviderInfo,
     ) -> Result<ListingsProviderInfo, ServiceError> {
-        let id = info
-            .id
-            .clone()
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| guid_to_db(Uuid::new_v4()));
+        // `ListingsManager.SaveListingProvider`, same rule as the tuner hosts:
+        // an id that names no configured provider is replaced by a fresh
+        // `Guid.NewGuid().ToString("N")`.
+        let id = match info.id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(wanted) => crate::guide_repository::existing_config_id(
+                &self.db,
+                crate::guide_repository::LISTING_PROVIDERS_TABLE,
+                wanted,
+            )
+            .await?
+            .unwrap_or_else(|| Uuid::new_v4().simple().to_string()),
+            None => Uuid::new_v4().simple().to_string(),
+        };
         info.id = Some(id.clone());
         if info.type_.is_none() {
             info.type_ = Some("xmltv".to_owned());
@@ -733,12 +906,130 @@ impl LiveTvManager for FerrofinLiveTvManager {
     }
 
     async fn delete_listing_provider(&self, id: &str) -> Result<(), ServiceError> {
-        sqlx::query(r#"DELETE FROM "FerrofinLiveTvListingProviders" WHERE "Id" = ?1"#)
-            .bind(id)
-            .execute(self.db.writer())
-            .await
-            .map_err(db_err)?;
+        // `ListingsManager.DeleteListingsProvider` filters OrdinalIgnoreCase.
+        sqlx::query(
+            r#"DELETE FROM "FerrofinLiveTvListingProviders" WHERE "Id" = ?1 COLLATE NOCASE"#,
+        )
+        .bind(id)
+        .execute(self.db.writer())
+        .await
+        .map_err(db_err)?;
         Ok(())
+    }
+
+    async fn get_lineups(
+        &self,
+        provider_id: Option<&str>,
+        provider_type: Option<&str>,
+        _country: Option<&str>,
+        _location: Option<&str>,
+    ) -> Result<Vec<NameIdPair>, ServiceError> {
+        // Port of `ListingsManager.GetLineups`. With a blank id the C# calls
+        // `GetProvider(providerType).GetLineups(null, …)`: an unregistered type
+        // is `ResourceNotFoundException` (404), and the xmltv backend
+        // dereferences the null `info` inside `GetXml` and 500s. Ferrofin
+        // answers 404 to both — there is no provider to read a document from,
+        // and a NullReferenceException is not a contract.
+        let Some(id) = provider_id.map(str::trim).filter(|s| !s.is_empty()) else {
+            return Err(ServiceError::not_found(format!(
+                "Couldn't find provider of type {}",
+                provider_type.unwrap_or_default()
+            )));
+        };
+        let info = self.listing_provider_by_id(id).await?;
+        Ok(self
+            .provider_channels(&info)
+            .await?
+            .into_iter()
+            .map(|c| NameIdPair {
+                name: Some(c.name),
+                id: Some(c.id),
+            })
+            .collect())
+    }
+
+    async fn get_channel_mapping_options(
+        &self,
+        provider_id: &str,
+    ) -> Result<ChannelMappingOptionsDto, ServiceError> {
+        // Port of `ListingsManager.GetChannelMappingOptions`.
+        let info = self.listing_provider_by_id(provider_id).await?;
+        let provider_name = Self::listings_provider_name(info.type_.as_deref())?;
+        let tuner_channels = self.channels_for_listings_provider(&info).await?;
+        let provider_channels = self.provider_channels(&info).await?;
+        let epg = EpgChannelData::new(&provider_channels);
+        Ok(ChannelMappingOptionsDto {
+            tuner_channels: tuner_channels
+                .iter()
+                .map(|(_, c)| tuner_channel_mapping(c, &info.channel_mappings, &epg))
+                .collect(),
+            provider_channels: provider_channels
+                .into_iter()
+                .map(|c| NameIdPair {
+                    name: Some(c.name),
+                    id: Some(c.id),
+                })
+                .collect(),
+            mappings: info.channel_mappings,
+            provider_name: Some(provider_name.to_owned()),
+        })
+    }
+
+    async fn set_channel_mapping(
+        &self,
+        provider_id: &str,
+        tuner_channel_id: &str,
+        provider_channel_id: &str,
+    ) -> Result<TunerChannelMapping, ServiceError> {
+        // Port of `ListingsManager.SetChannelMapping`. The pair list is
+        // rebuilt, not upserted: every pair keyed on this tuner channel is
+        // removed first, and a replacement is stored only when the two ids
+        // differ and the pair is new — so re-posting a channel onto itself is
+        // the documented "unmap" gesture.
+        let mut info = self.listing_provider_by_id(provider_id).await?;
+        let already = info.channel_mappings.iter().any(|pair| {
+            pair.name
+                .as_deref()
+                .is_some_and(|n| n.eq_ignore_ascii_case(tuner_channel_id))
+                && pair
+                    .value
+                    .as_deref()
+                    .is_some_and(|v| v.eq_ignore_ascii_case(provider_channel_id))
+        });
+        info.channel_mappings.retain(|pair| {
+            !pair
+                .name
+                .as_deref()
+                .is_some_and(|n| n.eq_ignore_ascii_case(tuner_channel_id))
+        });
+        if !tuner_channel_id.eq_ignore_ascii_case(provider_channel_id) && !already {
+            info.channel_mappings.push(NameValuePair {
+                name: Some(tuner_channel_id.to_owned()),
+                value: Some(provider_channel_id.to_owned()),
+            });
+        }
+        let info = self.save_listing_provider(info).await?;
+
+        let tuner_channels = self.channels_for_listings_provider(&info).await?;
+        let provider_channels = self.provider_channels(&info).await?;
+        let epg = EpgChannelData::new(&provider_channels);
+
+        // `CancelIfRunningAndQueue<RefreshGuideScheduledTask>()`: the mapping
+        // only moves listings once the guide has been rebuilt through it.
+        self.refresh_guide().await?;
+
+        tuner_channels
+            .iter()
+            .map(|(_, c)| tuner_channel_mapping(c, &info.channel_mappings, &epg))
+            .find(|row| {
+                row.id
+                    .as_deref()
+                    .is_some_and(|id| id.eq_ignore_ascii_case(tuner_channel_id))
+            })
+            // C# `.First(...)` throws `InvalidOperationException` (500) for a
+            // tuner channel that is not in the lineup; 404 is the honest answer
+            // for an id that names nothing.
+            .ok_or_else(|| ServiceError::not_found(format!("tuner channel {tuner_channel_id}")))
     }
 
     async fn get_channels(
@@ -890,28 +1181,86 @@ impl LiveTvManager for FerrofinLiveTvManager {
         Ok(self.program_dtos(&rows, options, user).await?.pop())
     }
 
-    async fn reset_tuner(&self, _id: &str) -> Result<(), ServiceError> {
-        // M3U tuners are stateless HTTP streams — there is nothing to reset.
+    async fn reset_tuner(&self, id: &str) -> Result<(), ServiceError> {
+        // Port of `LiveTvManager.ResetTuner`: the id is `{service key}_{tuner
+        // id}`, and a first segment naming no registered `ILiveTvService` is
+        // `ArgumentException("Service not found.")` — HTTP 400.
+        let service = id.split_once(STREAM_ID_DELIMITER).map_or(id, |(s, _)| s);
+        if !service.eq_ignore_ascii_case(live_tv_service_key()) {
+            return Err(ServiceError::invalid_input("Service not found."));
+        }
+        // The prefix names the one built-in service, whose
+        // `DefaultLiveTvService.ResetTuner` is `Task.CompletedTask` — M3U
+        // tuners are stateless HTTP streams, so there is nothing to reset.
+        //
+        // Deliberate divergence: with a matching prefix and no `_`, the C#
+        // indexes `parts[1]` of a one-element split and throws
+        // `IndexOutOfRangeException` (HTTP 500). Ferrofin no-ops; an unhandled
+        // crash is not a contract.
         Ok(())
     }
 
     async fn refresh_guide(&self) -> Result<(), ServiceError> {
+        // One guide refresh at a time — see `guide_lock`. Two overlapping
+        // passes would each prune against their own kept set, and the loser
+        // would delete what the winner had just written.
+        let _guard = self.guide_lock.lock().await;
+
+        // `GuideManager.RefreshChannels` collects the ids this pass (re)wrote
+        // and then drops everything else through `CleanDatabase` — but only
+        // when nothing threw: its catch sets `cleanDatabase = false`, so a
+        // tuner or guide that could not be read never empties the cache.
+        let mut clean_database = true;
+        let mut kept_channels: HashSet<String> = HashSet::new();
         for tuner in self.get_tuner_hosts().await? {
             let (Some(id), Some(url)) = (tuner.id.as_deref(), tuner.url.as_deref()) else {
+                clean_database = false;
                 continue;
             };
             match self.fetcher.fetch(url).await {
-                Ok(body) => self.replace_channels(id, &body).await?,
-                Err(e) => tracing::warn!(%url, error = %e, "live tv: tuner fetch failed"),
+                Ok(body) => kept_channels.extend(self.replace_channels(id, &body).await?),
+                Err(e) => {
+                    clean_database = false;
+                    tracing::warn!(%url, error = %e, "live tv: tuner fetch failed");
+                }
             }
         }
+        let mut kept_programs: HashSet<String> = HashSet::new();
         for provider in self.get_listing_providers().await? {
             let Some(path) = provider.path.as_deref() else {
+                clean_database = false;
                 continue;
             };
             match self.fetcher.fetch(path).await {
-                Ok(body) => self.insert_programs(&body, &provider).await?,
-                Err(e) => tracing::warn!(%path, error = %e, "live tv: guide fetch failed"),
+                Ok(body) => kept_programs.extend(self.insert_programs(&body, &provider).await?),
+                Err(e) => {
+                    clean_database = false;
+                    tracing::warn!(%path, error = %e, "live tv: guide fetch failed");
+                }
+            }
+        }
+        if clean_database {
+            // `CleanDatabase(newChannelIdList, [LiveTvChannel], …)` then
+            // `CleanDatabase(newProgramIdList, [LiveTvProgram], …)`: everything
+            // this pass did not re-emit goes. With no listings provider left the
+            // kept programme set is empty and the whole guide drains, which is
+            // what removing a provider is supposed to do. Channels go first so a
+            // dropped channel takes its airings with it via the FK cascade.
+            let stale: Vec<String> = crate::guide_repository::all_channel_ids(&self.db)
+                .await?
+                .into_iter()
+                .filter(|id| !kept_channels.contains(id))
+                .collect();
+            if !stale.is_empty() {
+                crate::guide_repository::delete_channels(&self.db, &stale).await?;
+            }
+            let stale: Vec<String> = crate::guide_repository::all_program_ids(&self.db)
+                .await?
+                .into_iter()
+                .filter(|id| !kept_programs.contains(id))
+                .collect();
+            if !stale.is_empty() {
+                crate::guide_repository::delete_programs(&self.db, &stale).await?;
             }
         }
         Ok(())
@@ -2902,6 +3251,22 @@ mod tests {
         }
     }
 
+    /// A [`SourceFetcher`] whose bodies can be swapped between refreshes, for
+    /// the tests that need a second pass to see different upstream content.
+    struct SwappableFetcher(std::sync::Mutex<HashMap<String, String>>);
+
+    #[async_trait::async_trait]
+    impl SourceFetcher for SwappableFetcher {
+        async fn fetch(&self, url: &str) -> Result<String, ferrofin_traits::error::ServiceError> {
+            self.0
+                .lock()
+                .unwrap()
+                .get(url)
+                .cloned()
+                .ok_or_else(|| ferrofin_traits::error::ServiceError::Backend(format!("no {url}")))
+        }
+    }
+
     async fn manager_with(fetcher: FakeFetcher) -> FerrofinLiveTvManager {
         let db = Database::connect_in_memory().await.expect("db");
         db.run_migrations().await.expect("migrate");
@@ -3380,6 +3745,16 @@ mod tests {
             );
         }
         let mut xmltv = String::from("<tv>");
+        // The guide must DECLARE its channels: `ListingsManager.GetProgramsAsync`
+        // resolves a tuner channel to an EPG channel through
+        // `GetEpgChannelFromTunerChannel` and gives up when none matches, so a
+        // document carrying only <programme> elements yields no listings at all.
+        for c in 0..150 {
+            let _ = write!(
+                xmltv,
+                "<channel id=\"ch{c}.tv\"><display-name>Channel {c}</display-name></channel>"
+            );
+        }
         for p in 0..5000u32 {
             let ch = p % 150;
             let day = 20 + p / 24 / 60 % 8;
@@ -4985,5 +5360,445 @@ mod tests {
         );
         // Debug stays free of the fetcher and cache internals.
         assert!(format!("{mgr:?}").contains("srv"));
+    }
+
+    // ---- tuner-host / listings-provider administration -------------------
+
+    /// A manager over the two-channel M3U and the one-channel XMLTV guide,
+    /// with the tuner host and listings provider already saved.
+    async fn mapping_manager() -> (FerrofinLiveTvManager, String, String) {
+        let mut sources = HashMap::new();
+        sources.insert("http://tuner/playlist.m3u".to_owned(), M3U.to_owned());
+        sources.insert("http://guide/xmltv.xml".to_owned(), XMLTV.to_owned());
+        let mgr = manager_with(FakeFetcher(sources)).await;
+        let tuner = mgr
+            .save_tuner_host(TunerHostInfo {
+                url: Some("http://tuner/playlist.m3u".to_owned()),
+                ..TunerHostInfo::default()
+            })
+            .await
+            .expect("tuner");
+        let provider = mgr
+            .save_listing_provider(ListingsProviderInfo {
+                path: Some("http://guide/xmltv.xml".to_owned()),
+                ..ListingsProviderInfo::default()
+            })
+            .await
+            .expect("provider");
+        mgr.refresh_guide().await.expect("refresh");
+        (
+            mgr,
+            tuner.id.expect("tuner id"),
+            provider.id.expect("provider id"),
+        )
+    }
+
+    #[tokio::test]
+    async fn config_ids_are_minted_the_way_guid_tostring_n_does() {
+        let (_mgr, tuner_id, provider_id) = mapping_manager().await;
+        // `Guid.NewGuid().ToString("N", InvariantCulture)` — 32 lowercase hex,
+        // no dashes (TunerHostManager.cs:85, ListingsManager.cs:69). The old
+        // uppercase-hyphenated form is what a client round-trips into
+        // `?providerId=` and `?id=`, so it is visible, not cosmetic.
+        for id in [&tuner_id, &provider_id] {
+            assert_eq!(id.len(), 32, "{id}");
+            assert!(
+                id.chars()
+                    .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+                "{id}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_supplied_id_is_honored_only_when_it_names_an_existing_row() {
+        let (mgr, tuner_id, _) = mapping_manager().await;
+        // `index == -1` → a fresh guid, whatever the client asked for.
+        let invented = mgr
+            .save_tuner_host(TunerHostInfo {
+                id: Some("not-a-configured-host".to_owned()),
+                url: Some("http://tuner/other.m3u".to_owned()),
+                ..TunerHostInfo::default()
+            })
+            .await
+            .expect("save");
+        assert_ne!(invented.id.as_deref(), Some("not-a-configured-host"));
+        assert_eq!(mgr.get_tuner_hosts().await.expect("hosts").len(), 2);
+
+        // An existing id — in a different case — updates that row in place
+        // (`Array.FindIndex(..., OrdinalIgnoreCase)`), it does not add a third.
+        mgr.save_tuner_host(TunerHostInfo {
+            id: Some(tuner_id.to_ascii_uppercase()),
+            url: Some("http://tuner/playlist.m3u".to_owned()),
+            friendly_name: Some("renamed".to_owned()),
+            ..TunerHostInfo::default()
+        })
+        .await
+        .expect("update");
+        let hosts = mgr.get_tuner_hosts().await.expect("hosts");
+        assert_eq!(hosts.len(), 2);
+        assert!(
+            hosts
+                .iter()
+                .any(|h| h.friendly_name.as_deref() == Some("renamed"))
+        );
+    }
+
+    #[tokio::test]
+    async fn deletes_match_the_id_case_insensitively() {
+        let (mgr, tuner_id, provider_id) = mapping_manager().await;
+        // C# filters both lists with `StringComparison.OrdinalIgnoreCase`; the
+        // stored key is a BINARY-collated TEXT primary key, so a case-differing
+        // id used to 204 and delete nothing.
+        mgr.delete_listing_provider(&provider_id.to_ascii_uppercase())
+            .await
+            .expect("delete provider");
+        assert!(
+            mgr.get_listing_providers()
+                .await
+                .expect("providers")
+                .is_empty()
+        );
+        mgr.delete_tuner_host(&tuner_id.to_ascii_uppercase())
+            .await
+            .expect("delete tuner");
+        assert!(mgr.get_tuner_hosts().await.expect("hosts").is_empty());
+    }
+
+    #[tokio::test]
+    async fn reset_tuner_validates_the_service_prefix() {
+        let mgr = manager_with(FakeFetcher(HashMap::new())).await;
+        // `LiveTvManager.ResetTuner` splits `{service key}_{tuner id}` and
+        // throws `ArgumentException("Service not found.")` — 400 — when the
+        // first segment names no registered service.
+        assert_eq!(live_tv_service_key(), "af999c25a00715699361240d4c6c7a53");
+        mgr.reset_tuner(&format!("{}_1", live_tv_service_key()))
+            .await
+            .expect("known service");
+        // OrdinalIgnoreCase.
+        mgr.reset_tuner(&format!(
+            "{}_tuner0",
+            live_tv_service_key().to_ascii_uppercase()
+        ))
+        .await
+        .expect("known service, upper");
+        // A bare prefix with no `_` is where the C# indexes `parts[1]` of a
+        // one-element split and crashes; Ferrofin no-ops rather than 500.
+        mgr.reset_tuner(live_tv_service_key())
+            .await
+            .expect("bare prefix");
+        assert!(matches!(
+            mgr.reset_tuner("abc").await,
+            Err(ServiceError::InvalidInput(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn channel_mapping_options_matches_the_lineup_against_the_guide() {
+        let (mgr, _tuner_id, provider_id) = mapping_manager().await;
+        let opts = mgr
+            .get_channel_mapping_options(&provider_id)
+            .await
+            .expect("options");
+
+        assert_eq!(opts.provider_name.as_deref(), Some("XmlTV"));
+        assert_eq!(opts.mappings, Vec::new());
+        // `XmlTvListingsProvider.GetChannels` → the guide's `<channel>` list.
+        assert_eq!(opts.provider_channels.len(), 1);
+        assert_eq!(opts.provider_channels[0].id.as_deref(), Some("one.tv"));
+        assert_eq!(
+            opts.provider_channels[0].name.as_deref(),
+            Some("Channel One")
+        );
+
+        // `GetTunerChannelMapping`: "{Number} {Name}", the external
+        // `ChannelInfo.Id`, and the provider columns only where a guide channel
+        // matched (channel two has no counterpart in this guide).
+        assert_eq!(opts.tuner_channels.len(), 2);
+        assert_eq!(
+            opts.tuner_channels[0].name.as_deref(),
+            Some("1 Channel One")
+        );
+        assert_eq!(
+            opts.tuner_channels[0].id.as_deref(),
+            Some(
+                crate::mapping::m3u_channel_id("http://tuner/playlist.m3u", "http://tuner/one")
+                    .as_str()
+            )
+        );
+        assert_eq!(
+            opts.tuner_channels[0].provider_channel_id.as_deref(),
+            Some("one.tv")
+        );
+        assert_eq!(
+            opts.tuner_channels[0].provider_channel_name.as_deref(),
+            Some("Channel One")
+        );
+        assert_eq!(
+            opts.tuner_channels[1].name.as_deref(),
+            Some("2 Channel Two")
+        );
+        assert!(opts.tuner_channels[1].provider_channel_id.is_none());
+
+        // An unresolvable provider id is 404, not a 200 with an empty DTO.
+        assert!(matches!(
+            mgr.get_channel_mapping_options("nope").await,
+            Err(ServiceError::NotFound(_))
+        ));
+        assert!(matches!(
+            mgr.get_channel_mapping_options("").await,
+            Err(ServiceError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn set_channel_mapping_moves_the_listings_and_a_self_map_unmaps() {
+        let (mgr, _tuner_id, provider_id) = mapping_manager().await;
+        let two = crate::mapping::m3u_channel_id("http://tuner/playlist.m3u", "http://tuner/two");
+
+        // Before: the guide's one airing binds to channel one only.
+        assert_eq!(
+            crate::guide_repository::all_program_ids(&mgr.db)
+                .await
+                .expect("ids")
+                .len(),
+            1
+        );
+
+        let row = mgr
+            .set_channel_mapping(&provider_id, &two, "one.tv")
+            .await
+            .expect("map");
+        // The response is the RESOLVED row, not an echo of the request.
+        assert_eq!(row.id.as_deref(), Some(two.as_str()));
+        assert_eq!(row.name.as_deref(), Some("2 Channel Two"));
+        assert_eq!(row.provider_channel_id.as_deref(), Some("one.tv"));
+        assert_eq!(row.provider_channel_name.as_deref(), Some("Channel One"));
+
+        // And it has an EFFECT: the airing now binds to both channels, because
+        // the guide join runs through `GetEpgChannelFromTunerChannel`.
+        assert_eq!(
+            crate::guide_repository::all_program_ids(&mgr.db)
+                .await
+                .expect("ids")
+                .len(),
+            2
+        );
+        let stored = mgr.get_listing_providers().await.expect("p")[0]
+            .channel_mappings
+            .clone();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].name.as_deref(), Some(two.as_str()));
+        assert_eq!(stored[0].value.as_deref(), Some("one.tv"));
+
+        // Re-posting the SAME pair TOGGLES it off — `channelMappingExists`
+        // suppresses the re-add after the unconditional removal
+        // (ListingsManager.cs:233-249). Verified against the live Jellyfin
+        // 10.11.8 lab, which goes [] on the second identical POST.
+        mgr.set_channel_mapping(&provider_id, &two, "one.tv")
+            .await
+            .expect("re-post");
+        assert!(
+            mgr.get_listing_providers().await.expect("p")[0]
+                .channel_mappings
+                .is_empty()
+        );
+        assert_eq!(
+            crate::guide_repository::all_program_ids(&mgr.db)
+                .await
+                .expect("ids")
+                .len(),
+            1
+        );
+        // Map it back so the unmap gesture below has something to remove.
+        mgr.set_channel_mapping(&provider_id, &two, "one.tv")
+            .await
+            .expect("remap");
+        assert_eq!(
+            mgr.get_listing_providers().await.expect("p")[0]
+                .channel_mappings
+                .len(),
+            1
+        );
+
+        // Mapping a channel onto ITSELF is the C# unmap gesture: the pair is
+        // removed and none stored, and the listings go back with it.
+        mgr.set_channel_mapping(&provider_id, &two, &two)
+            .await
+            .expect("unmap");
+        assert!(
+            mgr.get_listing_providers().await.expect("p")[0]
+                .channel_mappings
+                .is_empty()
+        );
+        assert_eq!(
+            crate::guide_repository::all_program_ids(&mgr.db)
+                .await
+                .expect("ids")
+                .len(),
+            1
+        );
+
+        // A tuner channel that is not in the lineup cannot be mapped.
+        assert!(matches!(
+            mgr.set_channel_mapping(&provider_id, "m3u_bogus", "one.tv")
+                .await,
+            Err(ServiceError::NotFound(_))
+        ));
+        assert!(matches!(
+            mgr.set_channel_mapping("nope", &two, "one.tv").await,
+            Err(ServiceError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn lineups_are_the_guide_channels_and_need_a_resolvable_provider() {
+        let (mgr, _tuner_id, provider_id) = mapping_manager().await;
+        let lineups = mgr
+            .get_lineups(Some(&provider_id), Some("xmltv"), None, None)
+            .await
+            .expect("lineups");
+        assert_eq!(lineups.len(), 1);
+        assert_eq!(lineups[0].id.as_deref(), Some("one.tv"));
+        assert_eq!(lineups[0].name.as_deref(), Some("Channel One"));
+
+        // `GetProvider(null)`/`FirstOrDefault(...) ?? throw` — 404, not 200 [].
+        for args in [
+            (None, None),
+            (None, Some("xmltv")),
+            (None, Some("bogus")),
+            (Some("nope"), Some("xmltv")),
+        ] {
+            assert!(
+                matches!(
+                    mgr.get_lineups(args.0, args.1, None, None).await,
+                    Err(ServiceError::NotFound(_))
+                ),
+                "{args:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_guide_drops_listings_the_pass_did_not_re_emit() {
+        let (mgr, _tuner_id, provider_id) = mapping_manager().await;
+        assert_eq!(
+            crate::guide_repository::all_program_ids(&mgr.db)
+                .await
+                .expect("ids")
+                .len(),
+            1
+        );
+
+        // `GuideManager.CleanDatabase`: with the listings provider gone, the
+        // refresh re-emits nothing and the guide drains — while the tuner's
+        // channels, which belong to the tuner host, survive.
+        mgr.delete_listing_provider(&provider_id)
+            .await
+            .expect("delete");
+        mgr.refresh_guide().await.expect("refresh");
+        assert!(
+            crate::guide_repository::all_program_ids(&mgr.db)
+                .await
+                .expect("ids")
+                .is_empty()
+        );
+        assert_eq!(
+            crate::guide_repository::channel_rows(&mgr.db)
+                .await
+                .expect("channels")
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn a_channel_dropped_from_the_playlist_is_pruned_with_its_airings() {
+        // `CleanDatabase(newChannelIdList, [LiveTvChannel], …)`. The refresh
+        // UPSERTS the lineup rather than deleting it first — deleting would
+        // cascade every airing away for the duration of the pass, so a client
+        // reading the guide mid-refresh would see it empty — and the channels
+        // the pass did not re-emit are removed here instead.
+        let mut sources = HashMap::new();
+        sources.insert("http://tuner/playlist.m3u".to_owned(), M3U.to_owned());
+        sources.insert("http://guide/xmltv.xml".to_owned(), XMLTV.to_owned());
+        let fetcher = Arc::new(SwappableFetcher(std::sync::Mutex::new(sources)));
+        let db = Database::connect_in_memory().await.expect("db");
+        db.run_migrations().await.expect("migrate");
+        let mgr = FerrofinLiveTvManager::new(
+            db,
+            Arc::clone(&fetcher) as Arc<dyn SourceFetcher>,
+            "srv".to_owned(),
+            std::env::temp_dir().join("ferrofin-livetv-manager-tests"),
+        )
+        .with_dto(Arc::new(FakeDto));
+        mgr.save_tuner_host(TunerHostInfo {
+            url: Some("http://tuner/playlist.m3u".to_owned()),
+            ..TunerHostInfo::default()
+        })
+        .await
+        .expect("tuner");
+        mgr.save_listing_provider(ListingsProviderInfo {
+            path: Some("http://guide/xmltv.xml".to_owned()),
+            ..ListingsProviderInfo::default()
+        })
+        .await
+        .expect("provider");
+        mgr.refresh_guide().await.expect("refresh");
+        let before = crate::guide_repository::channel_rows(&mgr.db)
+            .await
+            .expect("channels");
+        assert_eq!(before.len(), 2);
+        let kept_id = before[0].id.clone();
+        assert!(
+            !crate::guide_repository::all_program_ids(&mgr.db)
+                .await
+                .expect("ids")
+                .is_empty()
+        );
+
+        // The playlist now carries only the first channel; the second must go.
+        fetcher.0.lock().unwrap().insert(
+            "http://tuner/playlist.m3u".to_owned(),
+            "#EXTM3U\n#EXTINF:-1 tvg-id=\"one.tv\" tvg-chno=\"1\",Channel One\nhttp://tuner/one\n"
+                .to_owned(),
+        );
+        mgr.refresh_guide().await.expect("refresh2");
+
+        let after = crate::guide_repository::channel_rows(&mgr.db)
+            .await
+            .expect("channels2");
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].id, kept_id, "the surviving channel keeps its id");
+    }
+
+    #[tokio::test]
+    async fn a_failed_fetch_never_empties_the_guide() {
+        let (mgr, _tuner_id, _provider_id) = mapping_manager().await;
+        assert_eq!(
+            crate::guide_repository::all_program_ids(&mgr.db)
+                .await
+                .expect("ids")
+                .len(),
+            1
+        );
+
+        // A provider whose document cannot be read is the C# catch that sets
+        // `cleanDatabase = false`: the pass re-emits nothing for it, and the
+        // cache must NOT be taken as authoritative.
+        mgr.save_listing_provider(ListingsProviderInfo {
+            path: Some("http://guide/offline.xml".to_owned()),
+            ..ListingsProviderInfo::default()
+        })
+        .await
+        .expect("second provider");
+        mgr.refresh_guide().await.expect("refresh");
+        assert_eq!(
+            crate::guide_repository::all_program_ids(&mgr.db)
+                .await
+                .expect("ids")
+                .len(),
+            1
+        );
     }
 }

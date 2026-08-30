@@ -92,26 +92,162 @@ pub async fn channel_user_data(
         .collect())
 }
 
-/// The `Id → DateCreated` map for one tuner's current lineup, read inside the
-/// refresh transaction so a re-inserted channel keeps its first-seen instant.
+/// One channel of a tuner host's stored lineup, as the channel-mapping and
+/// guide-binding paths need it.
+///
+/// The stored [`id`](Self::id) is Ferrofin's internal channel key; the external
+/// `ChannelInfo.Id` Jellyfin exposes is derived from the tuner URL and
+/// [`stream_url`](Self::stream_url) by [`crate::mapping::m3u_channel_id`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TunerLineupRow {
+    /// The stored channel id (Ferrofin's internal key).
+    pub id: String,
+    /// The playlist's `tvg-id` — `ChannelInfo.TunerChannelId`.
+    pub tvg_id: String,
+    /// The display name.
+    pub name: String,
+    /// The channel number, or empty when the playlist carried none.
+    pub number: String,
+    /// The stream URL the channel plays from.
+    pub stream_url: String,
+}
+
+/// One tuner host's stored lineup, in playlist order.
+///
+/// Backs the port of `ListingsManager.GetChannelsForListingsProvider`, which
+/// upstream re-parses the tuner's M3U on every call; Ferrofin already caches
+/// the parse in this table, so the same `ChannelInfo` fields are read back
+/// from it.
 ///
 /// # Errors
 ///
 /// Fails when the database read fails.
-pub async fn existing_channel_dates(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    tuner_id: &str,
-) -> Result<std::collections::HashMap<String, Option<String>>, ServiceError> {
-    Ok(sqlx::query(
-        r#"SELECT "Id","DateCreated" FROM "FerrofinLiveTvChannels" WHERE "TunerHostId" = ?1"#,
+pub async fn tuner_lineup(
+    db: &Database,
+    tuner_host_id: &str,
+) -> Result<Vec<TunerLineupRow>, ServiceError> {
+    let rows = sqlx::query(
+        r#"SELECT "Id","TvgId","Name","Number","StreamUrl" FROM "FerrofinLiveTvChannels"
+           WHERE "TunerHostId" = ?1 COLLATE NOCASE ORDER BY "SortIndex", "Name""#,
     )
-    .bind(tuner_id)
-    .fetch_all(&mut **tx)
+    .bind(tuner_host_id)
+    .fetch_all(db.pool())
     .await
-    .map_err(db_err)?
-    .into_iter()
-    .map(|r| (r.get("Id"), r.get("DateCreated")))
-    .collect())
+    .map_err(db_err)?;
+    Ok(rows
+        .into_iter()
+        .map(|r| TunerLineupRow {
+            id: r.get("Id"),
+            tvg_id: r.get("TvgId"),
+            name: r.get("Name"),
+            number: r.get::<Option<String>, _>("Number").unwrap_or_default(),
+            stream_url: r.get("StreamUrl"),
+        })
+        .collect())
+}
+
+/// Every channel id currently cached.
+///
+/// Backs the `CleanDatabase(newChannelIdList, [LiveTvChannel], …)` half of the
+/// guide refresh.
+///
+/// # Errors
+///
+/// Fails when the database read fails.
+pub async fn all_channel_ids(db: &Database) -> Result<Vec<String>, ServiceError> {
+    sqlx::query_scalar(r#"SELECT "Id" FROM "FerrofinLiveTvChannels""#)
+        .fetch_all(db.pool())
+        .await
+        .map_err(db_err)
+}
+
+/// Deletes the channels whose ids are listed (their airings go with them,
+/// through the programme table's foreign key).
+///
+/// # Errors
+///
+/// Fails when the database write fails.
+pub async fn delete_channels(db: &Database, ids: &[String]) -> Result<(), ServiceError> {
+    delete_by_id(db, "FerrofinLiveTvChannels", ids).await
+}
+
+/// Every programme id currently cached.
+///
+/// Backs the port of `GuideManager.CleanDatabase`, which lists every stored
+/// `LiveTvProgram` and deletes the ones the refresh pass did not re-emit.
+///
+/// # Errors
+///
+/// Fails when the database read fails.
+pub async fn all_program_ids(db: &Database) -> Result<Vec<String>, ServiceError> {
+    sqlx::query_scalar(r#"SELECT "Id" FROM "FerrofinLiveTvPrograms""#)
+        .fetch_all(db.pool())
+        .await
+        .map_err(db_err)
+}
+
+/// Deletes the programmes whose ids are listed.
+///
+/// The second half of the [`all_program_ids`] pair: `CleanDatabase` deletes the
+/// stale rows one item at a time upstream; here they go in bind-limit chunks.
+///
+/// # Errors
+///
+/// Fails when the database write fails.
+pub async fn delete_programs(db: &Database, ids: &[String]) -> Result<(), ServiceError> {
+    delete_by_id(db, "FerrofinLiveTvPrograms", ids).await
+}
+
+/// Deletes rows of `table` by id, in bind-limit chunks.
+///
+/// `table` is one of two crate-private literals, never caller input.
+async fn delete_by_id(
+    db: &Database,
+    table: &'static str,
+    ids: &[String],
+) -> Result<(), ServiceError> {
+    for chunk in ids.chunks(500) {
+        let mut qb: sqlx::QueryBuilder<'_, sqlx::Sqlite> =
+            sqlx::QueryBuilder::new(format!(r#"DELETE FROM "{table}" WHERE "Id" IN ("#));
+        let mut separated = qb.separated(", ");
+        for id in chunk {
+            separated.push_bind(id);
+        }
+        qb.push(")");
+        qb.build().execute(db.writer()).await.map_err(db_err)?;
+    }
+    Ok(())
+}
+
+/// The tuner-host configuration table.
+pub const TUNER_HOSTS_TABLE: &str = "FerrofinLiveTvTunerHosts";
+/// The listings-provider configuration table.
+pub const LISTING_PROVIDERS_TABLE: &str = "FerrofinLiveTvListingProviders";
+
+/// The stored spelling of a configuration row's id, when one matches `wanted`
+/// case-insensitively.
+///
+/// Backs the `Array.FindIndex(..., OrdinalIgnoreCase)` half of
+/// `TunerHostManager.SaveTunerHost` / `ListingsManager.SaveListingProvider`: a
+/// client id that names no existing row is discarded and a fresh one minted.
+/// The stored spelling is what comes back, because the channel rows reference
+/// their tuner host by that exact string.
+///
+/// # Errors
+///
+/// Fails when the database read fails.
+pub async fn existing_config_id(
+    db: &Database,
+    table: &'static str,
+    wanted: &str,
+) -> Result<Option<String>, ServiceError> {
+    // `table` is one of the two crate constants above, never caller input.
+    let sql = format!(r#"SELECT "Id" FROM "{table}" WHERE "Id" = ?1 COLLATE NOCASE"#);
+    sqlx::query_scalar(&sql)
+        .bind(wanted)
+        .fetch_optional(db.pool())
+        .await
+        .map_err(db_err)
 }
 
 /// Whether any tuner host row exists.

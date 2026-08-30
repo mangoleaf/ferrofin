@@ -676,6 +676,15 @@ READS = [
     user("GET /LiveTv/Timers/Defaults", "/LiveTv/Timers/Defaults"),
     user("GET /LiveTv/Info", "/LiveTv/Info"),
     user("GET /LiveTv/TunerHosts/Types", "/LiveTv/TunerHosts/Types"),
+    # The tuner/listings administration reads. Both bodies are derived entirely
+    # from the shared fixture (the M3U's names/numbers/stream URLs and the
+    # guide's <channel> list), so they are byte-comparable across servers even
+    # though each server's listings-provider id differs — the id is resolved per
+    # server into {listings_provider}, never diffed.
+    user("GET /LiveTv/ChannelMappingOptions",
+         "/LiveTv/ChannelMappingOptions?providerId={listings_provider}"),
+    user("GET /LiveTv/ListingProviders/Lineups",
+         "/LiveTv/ListingProviders/Lineups?id={listings_provider}"),
     # resolvable-path-param GETs the breadth sweep couldn't fill (needs a real id).
     # The add-library options. `isNewLibrary` is a DIFFERENT answer, not a hint:
     # it decides which providers come pre-ticked, so both values are probed.
@@ -769,8 +778,13 @@ def resolve_named(base, token, user_id):
     artist = first_named("/Artists")
     lyric_ids = lyric_seed_ids(base, token, user_id)
     channels = (get_json(base, f"/LiveTv/Channels?userId={user_id}&limit=1", token) or {}).get("Items") or []
+    listings_providers = (get_json(base, "/System/Configuration/livetv", token) or {}).get("ListingProviders") or []
     return {
         "channel": channels[0]["Id"] if channels else "",
+        # The fixture's XMLTV listings provider, per server: Jellyfin and
+        # Ferrofin each mint their own id, and both the mapping-options and
+        # lineups reads take it as a query parameter.
+        "listings_provider": listings_providers[0].get("Id") or "" if listings_providers else "",
         "user": user_id,   # item() reads c["user"]
         "u": user_id,       # user() URL templates use {u}
         "genre": first_name("/Genres"),
@@ -1051,6 +1065,7 @@ def selfcheck():
     ctx = {"user": "U", "u": "U", "genre": "G", "studio": "S", "person": "P", "series": "SE",
            "task": "T", "device": "D", "artist": "A", "artist_id": "AID", "musicgenre": "MG",
            "channel": "CH", "album_id": "ALB", "movie": "MOV", "episode": "EP",
+           "listings_provider": "LP",
            "lyric_lrc": "L1", "lyric_elrc": "L2", "lyric_txt": "L3"}
     # The context keys the self-check invents must be the ones resolve_named
     # actually produces, or this guard passes while the live run KeyErrors.

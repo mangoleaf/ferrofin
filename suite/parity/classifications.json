@@ -1,22 +1,14 @@
 {
   "_comment": "Curated ACCEPTED divergences (not bugs). Highest-precedence classification in gen-ledger: overrides the auto 'flagged: verify' from the Layer-2 read diff. deep_verified stays as the live layers report it (these do not diff clean vs Jellyfin by design). Sourced from the parity-triage workflow verdicts (parity/triage-findings.json) + the roadmap synthesis, minus the ops since fixed (Filters2 WI-2, Collections add/remove WI-6, Images Size WI-1).",
-  "last_verified": "2026-08-30 batch C3 (untested writes: lyrics): the three REMOTE lyric ops are recorded undiffable-by-construction — Jellyfin 10.11.8 ships no ILyricProvider at all, so its success leg does not exist. The four LOCAL lyric ops are NOT classified: they are now earned live (GET /Audio/{itemId}/Lyrics body-diffs 54 fields across an .lrc/.elrc/.txt seed in reads.py; POST/DELETE are effect rows in journeys.py's j_lyrics). 2026-08-29 batch A3 (stale seed rows + the MediaStream probe-value residual): the 'instance/probe-noise' framing on GET /Items/{itemId} and /PlaybackInfo was disproven by cross-probing both containers' ffprobe binaries (byte-identical output) and replaced with a bitrate-only jellyfin-bug entry; the three 2026-08-11 'verified' seeds for DisplayPreferences, LiveTv/Timers/Defaults and MusicGenres were deleted after the underlying server bugs were fixed, so those rows now earn deep_verified from a live probe instead of a sentence.",
+  "last_verified": "2026-08-30 batch D2 (live tv: tuner and listing-provider administration): the six `requires-livetv-tuner: no probe exercises this op yet` seeds for ChannelMappingOptions, ChannelMappings, Lineups, the two DELETEs and Tuners/Reset were deleted — reads.py now body-diffs the two GETs against the fixture's per-server listings provider and j_livetv_admin exercises the three writes, so those rows earn their verdicts live. What replaces four of them is narrower: an error-path-only jellyfin-bug entry each, where Ferrofin deliberately answers 404/204 instead of porting an unguarded `.First()`, a NullReferenceException or an IndexOutOfRangeException. The Lineups seed's claim that “xmltv has none” was simply false: XmlTvListingsProvider.GetLineups is real and Jellyfin returns the fixture guide's two channels from it. 2026-08-30 batch C3 (untested writes: lyrics): the three REMOTE lyric ops are recorded undiffable-by-construction — Jellyfin 10.11.8 ships no ILyricProvider at all, so its success leg does not exist. The four LOCAL lyric ops are NOT classified: they are now earned live (GET /Audio/{itemId}/Lyrics body-diffs 54 fields across an .lrc/.elrc/.txt seed in reads.py; POST/DELETE are effect rows in journeys.py's j_lyrics). 2026-08-29 batch A3 (stale seed rows + the MediaStream probe-value residual): the 'instance/probe-noise' framing on GET /Items/{itemId} and /PlaybackInfo was disproven by cross-probing both containers' ffprobe binaries (byte-identical output) and replaced with a bitrate-only jellyfin-bug entry; the three 2026-08-11 'verified' seeds for DisplayPreferences, LiveTv/Timers/Defaults and MusicGenres were deleted after the underlying server bugs were fixed, so those rows now earn deep_verified from a live probe instead of a sentence.",
   "rows": {
     "DELETE /Intros/Show/{SeriesId}/{SeasonId}": {
       "category": "expected-extension",
       "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises."
     },
-    "DELETE /LiveTv/ListingProviders": {
-      "category": "requires-livetv-tuner",
-      "classification": "requires-livetv-tuner: the fixture tuner (M3U + XMLTV, two channels) exists, but no probe exercises this op yet — needs a journey that removes the fixture's listings provider and observes the guide emptying."
-    },
     "DELETE /LiveTv/SeriesTimers/{timerId}": {
       "category": "requires-livetv-tuner",
       "classification": "requires-livetv-tuner: the fixture tuner (M3U + XMLTV, two channels) exists, but no probe exercises this op yet — needs a series-timer journey (create from a programme → list → delete)."
-    },
-    "DELETE /LiveTv/TunerHosts": {
-      "category": "requires-livetv-tuner",
-      "classification": "requires-livetv-tuner: the fixture tuner (M3U + XMLTV, two channels) exists, but no probe exercises this op yet — needs a journey that removes the fixture tuner and observes its channels going."
     },
     "DELETE /MediaSegmentsApi/{segmentId}": {
       "category": "expected-extension",
@@ -123,16 +115,16 @@
       "classification": "expected-extension (SupportedImageTypes + the fetcher lists): Ferrofin compiles in TheTVDB, FanArt, Open Subtitles and IntroSkipper, which the lab's stock Jellyfin 10.11.8 does not ship (GET /Plugins there lists only AudioDB and MusicBrainz). They therefore appear as extra ImageFetchers/MetadataFetchers rows, and — because SupportedImageTypes is the flattened union of every compiled image provider's GetSupportedImages (ProviderManager.cs:706-714) — their image types (Art/Disc/Banner) widen that list beyond Jellyfin's. The 2026-08-11 'verified' text this replaces was false: sweep already recorded 15 extra / 39 mismatch / 2 missing paths and schema_valid:false on this row. Fixed in batch A3: DefaultImageOptions is now the verbatim TypeOptions.DefaultImageOptions table (order included, [] for unnamed types); SupportedImageTypes is derived from the providers instead of a hardcoded 11-element enum dump; isNewLibrary now drives DefaultEnabled; and SimilarItemProviders (post-10.11.8, additionalProperties:false) is no longer serialized. OPEN WORK, not accepted: upstream's 'Screen Grabber' (VideoImageProvider, Order 100, [Primary]) is still unported — Ferrofin owns the capability (MediaEncoder::extract_video_image) but does not register the provider, so it is deliberately absent from the list rather than advertised hollow."
     },
     "GET /LiveTv/ChannelMappingOptions": {
-      "category": "requires-livetv-tuner",
-      "classification": "requires-livetv-tuner: the fixture tuner (M3U + XMLTV, two channels) exists, but no probe exercises this op yet — needs a channel-mapping probe against the fixture's listings provider."
+      "category": "jellyfin-bug",
+      "classification": "jellyfin-bug, error path only: with NO `providerId` (which is what the breadth sweep sends) Jellyfin runs `ListingProviders.First(info => providerId == info.Id)` unguarded and throws InvalidOperationException → 500 (`Sequence contains no matching element` in the container log; src/Jellyfin.LiveTv/Listings/ListingsManager.cs:207-210 @ v10.11.8). Ferrofin answers 404 — the same `ResourceNotFoundException` Jellyfin's own `GetProvider` (ListingsManager.cs:461-463) raises for an unresolvable provider — so the sweep's bare-URL row reads H=404 J=500 by design. The CONTRACT path (`?providerId=<configured provider>`) agrees and is body-diffed in reads.py."
     },
     "GET /LiveTv/GuideInfo": {
       "category": "instance",
       "classification": "instance: now-relative guide window (now .. now+7d) matches Jellyfin's behavior, but the exact StartDate/EndDate timestamps can't match across two independently-clocked servers."
     },
     "GET /LiveTv/ListingProviders/Lineups": {
-      "category": "requires-livetv-tuner",
-      "classification": "requires-livetv-tuner: the fixture tuner (M3U + XMLTV, two channels) exists, but no probe exercises this op yet — needs a lineup probe (needs a Schedules Direct-style provider; xmltv has none)."
+      "category": "jellyfin-bug",
+      "classification": "jellyfin-bug, error path only: `?type=xmltv` with no `id` makes Jellyfin call `GetProvider(type).GetLineups(null, …)` (ListingsManager.cs:104-107), and `XmlTvListingsProvider.GetLineups` dereferences the null `info` inside `GetXml` → NullReferenceException → 500 (XmlTvListingsProvider.cs:239-249 @ v10.11.8). Ferrofin returns 404 there, which is what Jellyfin itself returns for every other unresolvable provider. The two contract paths agree: `?id=<configured provider>` is 200 and body-diffed in reads.py, and no id/unknown id is 404 on both."
     },
     "GET /LiveTv/Recordings/Groups/{groupId}": {
       "category": "requires-livetv-tuner",
@@ -287,8 +279,8 @@
       "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises."
     },
     "POST /LiveTv/ChannelMappings": {
-      "category": "requires-livetv-tuner",
-      "classification": "requires-livetv-tuner: the fixture tuner (M3U + XMLTV, two channels) exists, but no probe exercises this op yet — needs a channel-mapping probe against the fixture's listings provider."
+      "category": "jellyfin-bug",
+      "classification": "jellyfin-bug, error path only: an unknown `ProviderId`, or a `TunerChannelId` that is not in the lineup, makes Jellyfin throw from an unguarded `.First(…)` → 500 (ListingsManager.cs:231 and :264 @ v10.11.8). Ferrofin answers 404 to both. The persistence order is ported as-is, not \"fixed\": upstream saves the configuration at :251 BEFORE the :264 throw, so a mapping keyed on a channel that does not exist is stored on both servers and then reported as not found — a dangling pair the match ladder simply never hits. The success path agrees and is the `effect` row j_livetv_admin measures."
     },
     "POST /LiveTv/Programs": {
       "category": "requires-livetv-tuner",
@@ -307,8 +299,8 @@
       "classification": "requires-livetv-tuner: the fixture tuner (M3U + XMLTV, two channels) exists, but no probe exercises this op yet — needs an update step in the timer journey (change pre-padding, read back)."
     },
     "POST /LiveTv/Tuners/{tunerId}/Reset": {
-      "category": "requires-livetv-tuner",
-      "classification": "requires-livetv-tuner: the fixture tuner (M3U + XMLTV, two channels) exists, but no probe exercises this op yet — needs a tuner-reset probe with the fixture tuner's id."
+      "category": "jellyfin-bug",
+      "classification": "jellyfin-bug, error path only: a `tunerId` whose prefix DOES name the registered service but carries no `_` makes Jellyfin index `parts[1]` of a one-element `Split('_', 2)` → IndexOutOfRangeException → 500 (src/Jellyfin.LiveTv/LiveTvManager.cs:1233-1245 @ v10.11.8; measured J=500 on `af999c25a00715699361240d4c6c7a53`). Ferrofin no-ops with 204. The two contract-relevant statuses agree and are the status-pair j_livetv_admin measures: a registered service prefix → 204, an unknown prefix → 400 (`ArgumentException(\"Service not found.\")`, mapped by Jellyfin.Api/Middleware/ExceptionMiddleware.cs:127)."
     },
     "POST /MediaSegmentsApi/{itemId}": {
       "category": "expected-extension",

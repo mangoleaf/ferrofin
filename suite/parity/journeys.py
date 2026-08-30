@@ -63,6 +63,11 @@ JOURNEY_METHOD = {op: verification.STATUS_CLASS for op in (
     "POST /QuickConnect/Authorize",
     # A status PAIR (real path 2xx, bogus path 4xx) — still only statuses.
     "POST /Environment/ValidatePath",
+    # A registered service prefix resets (204), an unknown one is rejected (400).
+    # `DefaultLiveTvService.ResetTuner` is `Task.CompletedTask` upstream, so the
+    # success path genuinely has nothing to read back — the id VALIDATION is the
+    # whole observable behaviour.
+    "POST /LiveTv/Tuners/{tunerId}/Reset",
     # Remote-control commands fired at a session with no live receiver: the server
     # accepting them is all that is observable here.
     "POST /Sessions/Viewing",
@@ -101,8 +106,10 @@ JOURNEY_METHOD.update({op: verification.EFFECT for op in (
     "DELETE /Items/{itemId}",
     "DELETE /Library/VirtualFolders",
     "DELETE /Library/VirtualFolders/Paths",
+    "DELETE /LiveTv/ListingProviders",
     "DELETE /LiveTv/Recordings/{recordingId}",
     "DELETE /LiveTv/Timers/{timerId}",
+    "DELETE /LiveTv/TunerHosts",
     "DELETE /PlayingItems/{itemId}",
     "DELETE /Playlists/{playlistId}/Items",
     "DELETE /Playlists/{playlistId}/Users/{userId}",
@@ -145,6 +152,7 @@ JOURNEY_METHOD.update({op: verification.EFFECT for op in (
     "POST /Library/VirtualFolders/Paths/Update",
     "POST /LiveStreams/Close",
     "POST /LiveStreams/Open",
+    "POST /LiveTv/ChannelMappings",
     "POST /LiveTv/ListingProviders",
     "POST /LiveTv/Timers",
     "POST /LiveTv/TunerHosts",
@@ -1327,6 +1335,167 @@ def j_livetv(base, token, user, _m, _m2):
     return r
 
 
+LIVETV_ADMIN_OPS = [
+    "POST /LiveTv/Tuners/{tunerId}/Reset", "POST /LiveTv/ChannelMappings",
+    "DELETE /LiveTv/ListingProviders", "DELETE /LiveTv/TunerHosts",
+]
+# MD5 of the UTF-16LE bytes of "Jellyfin.LiveTv.DefaultLiveTvService" rendered as
+# a .NET Guid "N" — the service key `LiveTvManager.ResetTuner` splits `tunerId`
+# on (LiveTvManager.cs:1233-1245). A prefix that names no registered service is
+# `ArgumentException("Service not found.")` → 400.
+LIVETV_SERVICE_KEY = "af999c25a00715699361240d4c6c7a53"
+LIVETV_ADMIN_POLL_S = 5
+LIVETV_ADMIN_WAIT_S = 120   # Jellyfin drains/rebuilds the guide via a QUEUED task
+
+
+def _livetv_config(base, token):
+    cfg = get_json(base, "/System/Configuration/livetv", token) or {}
+    return (cfg.get("TunerHosts") or []), (cfg.get("ListingProviders") or [])
+
+
+def _livetv_counts(base, token, user):
+    """(channels, programmes) as this server reports them right now, or -1 for a
+    count this server would not answer.
+
+    -1 means "the read failed", NEVER "zero": a request that 500s or times out
+    while a guide refresh holds the writer must not be scored as "the guide is
+    empty" or "the channels are gone". `_wait_until` discards such a sample.
+    """
+    ch = get_json(base, "/LiveTv/Channels?limit=0&enableTotalRecordCount=true"
+                        f"&userId={user}", token) or {}
+    pr = get_json(base, "/LiveTv/Programs?limit=0&enableTotalRecordCount=true"
+                        f"&userId={user}", token) or {}
+    return ch.get("TotalRecordCount", -1), pr.get("TotalRecordCount", -1)
+
+
+def _wait_until(base, token, user, predicate):
+    """Polls (channels, programmes) until `predicate` holds on a sample both reads
+    answered. Jellyfin does this work on a queued scheduled task and Ferrofin
+    inline, so the wait is what makes the two comparable rather than a race.
+
+    A sample carrying a -1 is discarded rather than tested: judging a verdict on
+    a read that failed is how a probe reports a server bug that never happened."""
+    counts = (-1, -1)
+    for _ in range(LIVETV_ADMIN_WAIT_S // LIVETV_ADMIN_POLL_S):
+        counts = _livetv_counts(base, token, user)
+        if min(counts) >= 0 and predicate(*counts):
+            return True, counts
+        time.sleep(LIVETV_ADMIN_POLL_S)
+    return False, counts
+
+
+def _settle_guide(base, token, user, channels, programs):
+    """Waits for the guide to finish rebuilding — hygiene, not an assertion.
+
+    Jellyfin rebuilds on a QUEUED scheduled task, so "programmes are listed again"
+    can be true while the task is still half way through. Handing the lab back in
+    that state would make whatever runs next read a partial guide, so the journey
+    waits for the pre-journey counts to come back before it returns. The verdict is
+    already decided; this only refuses to leave a mess."""
+    _wait_until(base, token, user, lambda ch, pr: ch >= channels and pr >= programs)
+
+
+def _refresh_guide(base, token):
+    tasks = get_json(base, "/ScheduledTasks", token) or []
+    guide = next((t for t in tasks if t.get("Key") == "RefreshGuide"), None)
+    if guide:
+        http("POST", f"{base}/ScheduledTasks/Running/{guide['Id']}", token, "")
+
+
+def j_livetv_admin(base, token, user, _m, _m2):
+    """Tuner-host and listings-provider administration, on the fixture's own tuner.
+
+    Runs AFTER j_livetv (and after every Live TV read probe in reads.py) because it
+    mutates the configuration those depend on, and it puts back everything it takes
+    away: the listings provider and the tuner host are re-added from the bodies read
+    at the top, and the journey does not return until channels AND programmes are
+    listed again on this server.
+
+    Every op starts False, so an early exit (no tuner fixture, no channels) leaves a
+    flagged row rather than a missing one."""
+    r = dict.fromkeys(LIVETV_ADMIN_OPS, False)
+    tuners, providers = _livetv_config(base, token)
+    if not tuners or not providers:
+        return r
+    tuner, provider = tuners[0], providers[0]
+    tuner_id, provider_id = tuner.get("Id") or "", provider.get("Id") or ""
+    base_channels, base_programs = _livetv_counts(base, token, user)
+    if base_channels <= 0 or base_programs <= 0:
+        return r
+
+    # --- reset a tuner (no mutation: the C# success path is Task.CompletedTask) ----
+    good, _ = http("POST", f"{base}/LiveTv/Tuners/{LIVETV_SERVICE_KEY}_1/Reset", token, "")
+    bad, _ = http("POST", f"{base}/LiveTv/Tuners/nosuchservice/Reset", token, "")
+    r["POST /LiveTv/Tuners/{tunerId}/Reset"] = good == 204 and bad == 400
+
+    # --- map a tuner channel onto the OTHER channel's listings --------------------
+    opts = get_json(base, f"/LiveTv/ChannelMappingOptions?providerId={provider_id}", token) or {}
+    tuner_channels = opts.get("TunerChannels") or []
+    if len(tuner_channels) >= 2:
+        target = tuner_channels[1]["Id"]                       # the channel being re-pointed
+        onto = tuner_channels[0].get("ProviderChannelId") or ""  # the other channel's guide id
+        st, raw = http("POST", f"{base}/LiveTv/ChannelMappings", token, json.dumps({
+            "ProviderId": provider_id, "TunerChannelId": target, "ProviderChannelId": onto}))
+        try:
+            mapped = json.loads(raw)
+        except ValueError:
+            mapped = {}
+        # The response is the RESOLVED row: the id asked for, the provider channel
+        # asked for, and the provider channel's NAME — which a handler that merely
+        # echoes the request body cannot produce.
+        posted_ok = (st == 200 and mapped.get("Id") == target
+                     and mapped.get("ProviderChannelId") == onto
+                     and bool(mapped.get("ProviderChannelName")))
+        # EFFECT, on this server's own read-back: the pair is stored, and the tuner
+        # channel now reports the guide channel it was pointed at.
+        after = get_json(base, f"/LiveTv/ChannelMappingOptions?providerId={provider_id}", token) or {}
+        stored = after.get("Mappings") or []
+        moved = next((c for c in (after.get("TunerChannels") or []) if c.get("Id") == target), {})
+        applied = (any(p.get("Name") == target and p.get("Value") == onto for p in stored)
+                   and moved.get("ProviderChannelId") == onto)
+        # RESTORE: re-posting the identical pair is the C# toggle — `channelMappingExists`
+        # suppresses the re-add after the unconditional removal (ListingsManager.cs:233-249),
+        # so the mapping list goes back to empty. Verified live against Jellyfin 10.11.8.
+        http("POST", f"{base}/LiveTv/ChannelMappings", token, json.dumps({
+            "ProviderId": provider_id, "TunerChannelId": target, "ProviderChannelId": onto}))
+        restored = get_json(base, f"/LiveTv/ChannelMappingOptions?providerId={provider_id}", token) or {}
+        r["POST /LiveTv/ChannelMappings"] = (posted_ok and applied
+                                             and not (restored.get("Mappings") or []))
+
+    # --- remove the listings provider: the guide drains, the channels stay --------
+    # The id is CASE-FLIPPED on purpose: both C# deletes filter with
+    # StringComparison.OrdinalIgnoreCase, and a server matching the stored key
+    # byte-for-byte would 204 and delete nothing.
+    st, _ = http("DELETE", f"{base}/LiveTv/ListingProviders?id={provider_id.upper()}", token)
+    gone = not _livetv_config(base, token)[1]
+    drained, counts = _wait_until(base, token, user, lambda ch, pr: pr == 0)
+    channels_survived = counts[0] == base_channels
+    # RESTORE the provider (Jellyfin mints a NEW id here — `index == -1` — so nothing
+    # may cache the old one) and wait for the guide to come back.
+    http("POST", f"{base}/LiveTv/ListingProviders?validateListings=false", token, json.dumps(provider))
+    _refresh_guide(base, token)
+    back, _ = _wait_until(base, token, user, lambda ch, pr: pr > 0)
+    r["DELETE /LiveTv/ListingProviders"] = (st == 204 and gone and drained
+                                            and channels_survived and back)
+
+    # --- remove the tuner host ---------------------------------------------------
+    # Asserted on the CONFIG read-back, not on the channel count: C# DeleteTunerHost
+    # only rewrites the configuration and (unlike DeleteListingsProvider) queues no
+    # guide refresh, so Jellyfin's channel items linger until the next one, while
+    # Ferrofin's cascade away with the host row. The configuration is what both
+    # servers agree the delete means.
+    st, _ = http("DELETE", f"{base}/LiveTv/TunerHosts?id={tuner_id.upper()}", token)
+    tuner_gone = not _livetv_config(base, token)[0]
+    # RESTORE the tuner host and rebuild the guide behind it.
+    http("POST", f"{base}/LiveTv/TunerHosts", token, json.dumps(tuner))
+    _refresh_guide(base, token)
+    whole, _ = _wait_until(base, token, user,
+                           lambda ch, pr: ch >= base_channels and pr > 0)
+    r["DELETE /LiveTv/TunerHosts"] = st == 204 and tuner_gone and whole
+    _settle_guide(base, token, user, base_channels, base_programs)
+    return r
+
+
 def j_remote_subtitles(base, token, user, mid, _m2):
     """Remote subtitles through OpenSubtitles — only when credentials are configured (see
     sweep.opensubtitles_credentials). The fixture's first movie carries a real IMDb id in
@@ -1401,7 +1570,7 @@ JOURNEYS = [j_startup,   # first: see its docstring
             j_scheduled_run, j_playbackinfo_post, j_active_encodings, j_clientlog,
             j_authenticate, j_user_update, j_devices_delete, j_bulk_item_delete,
             j_subtitles_upload, j_lyrics, j_quickconnect, j_system_and_refresh,
-            j_forgot_password, j_backup, j_livetv, j_remote_subtitles,
+            j_forgot_password, j_backup, j_livetv, j_livetv_admin, j_remote_subtitles,
             # Destructive: merges/splits the shared movies, so it must run LAST so its
             # mutations can't corrupt the items other journeys read/refresh.
             j_merge_versions_controller]
