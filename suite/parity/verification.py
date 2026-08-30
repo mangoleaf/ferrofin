@@ -118,21 +118,27 @@ def read_method(jbody, hbody, compared):
     performed (`parity_diff.diff_stats`). Returns None when the probe produced no
     evidence at all — the caller must then record the row untested, not verified.
 
-    The empty test comes FIRST because a bare `[] vs []` compares zero leaves:
-    reporting it untested would hide that both servers were asked and both
-    answered the same nothing, and reporting it `body-diff` would claim a
-    comparison that never happened. `empty-corpus` says exactly what occurred,
-    and gen-ledger keeps it out of the headline count.
+    The COMPARED test comes first, and the order is load-bearing. A bare
+    `[] vs []` walks zero leaves, and zero leaves compared is an absence of
+    evidence, not an agreement — there is no envelope there to restate its own
+    emptiness, so there is nothing a probe can be said to have checked. Such a
+    row is untested. Only a document that genuinely carried an empty envelope
+    (and so had its zeros compared) earns `empty-corpus`, which gen-ledger then
+    keeps out of the headline count.
+
+    Inverting these two lines silently promotes every both-empty bare list from
+    untested to verified — it did exactly that to POST /Items/RemoteSearch/Book
+    and /MusicVideo before this was restored.
 
     Note what this does NOT do: an empty answer on one side and content on the
     other is not an empty result, so it falls through to the leaf count and
     the caller's diff buckets — a one-sided empty is a divergence, never an
     agreement.
     """
-    if is_empty_result(jbody) and is_empty_result(hbody):
-        return EMPTY_CORPUS
     if not compared:
         return None
+    if is_empty_result(jbody) and is_empty_result(hbody):
+        return EMPTY_CORPUS
     return BODY_DIFF
 
 
@@ -160,7 +166,9 @@ def selfcheck():
     assert is_bare_empty_list([]) and not is_bare_empty_list([{"Name": "x"}])
     assert is_empty_result([]) and is_empty_result({"Items": [], "TotalRecordCount": 0})
     assert not is_empty_result([{"Name": "x"}])
-    assert read_method([], [], 0) == EMPTY_CORPUS
+    # A bare `[]` carries nothing AND compares nothing: read_method calls that
+    # untested (no method) before the empty-corpus question is ever asked.
+    assert read_method([], [], 0) is None
     # …but only when BOTH sides are empty. One side empty is a DIVERGENCE, so it
     # must not short-circuit to `empty-corpus`; it falls through to the leaf
     # count, which for a one-sided empty is zero — untested, not verified. Both
