@@ -284,6 +284,35 @@ pub trait LibraryManager: Send + Sync {
         parent_id: Option<Uuid>,
     ) -> Result<(), ServiceError>;
 
+    /// Replaces an item's whole external-id set (`BaseItemProviders`) with
+    /// `provider_ids`.
+    ///
+    /// The write behind C# `ItemUpdateController.UpdateItem`'s
+    /// `item.ProviderIds = request.ProviderIds` (v10.11.8
+    /// `Jellyfin.Api/Controllers/ItemUpdateController.cs:402-410`): an
+    /// **assignment**, so a key the request omits is removed, not merged. The
+    /// caller strips empty values first, exactly as the C# does.
+    ///
+    /// External ids live in their own table, not on [`BaseItemEntity`], so they
+    /// cannot ride along with [`update_items`](Self::update_items) — hence a
+    /// method of its own.
+    ///
+    /// The default is a no-op so the API-layer test doubles that implement this
+    /// trait keep compiling; the real manager persists through the item
+    /// repository. A double that asserts on this write overrides it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ServiceError`] if the ids cannot be persisted.
+    async fn update_item_provider_ids(
+        &self,
+        item_id: Uuid,
+        provider_ids: &[(String, String)],
+    ) -> Result<(), ServiceError> {
+        let _ = (item_id, provider_ids);
+        Ok(())
+    }
+
     /// Deletes an item, honoring the given [`DeleteOptions`].
     async fn delete_item(&self, id: Uuid, options: &DeleteOptions) -> Result<(), ServiceError>;
 

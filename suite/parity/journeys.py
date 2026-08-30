@@ -21,6 +21,7 @@ Offline self-check:
 """
 import json
 import os
+import shutil
 import sys
 import time
 import urllib.parse
@@ -100,6 +101,14 @@ JOURNEY_METHOD.update({op: verification.PROPERTY for op in (
 # deciding that it had earned it. `--check` now fails on an op that appears in no
 # list below.
 JOURNEY_METHOD.update({op: verification.EFFECT for op in (
+    # The external-change webhooks (j_library_webhooks): each server is checked against
+    # its OWN read-back — the item the reported path created/removed, the Overview the
+    # matched external id refreshed — and the two servers' bodies are never compared.
+    "POST /Library/Media/Updated",
+    "POST /Library/Movies/Added",
+    "POST /Library/Movies/Updated",
+    "POST /Library/Series/Added",
+    "POST /Library/Series/Updated",
     "DELETE /Audio/{itemId}/Lyrics",
     "DELETE /Auth/Keys/{key}",
     "DELETE /Collections/{collectionId}/Items",
@@ -428,13 +437,32 @@ def j_users(base, token, user, _m, _m2):
 
 
 def j_item_edit(base, token, user, mid, _m2):
+    """The metadata editor's save. Two things are read back, because they are two
+    different writes: a Tags edit (a column on the item row) and the external ids
+    (their own `BaseItemProviders` table, which C# assigns wholesale —
+    `item.ProviderIds = request.ProviderIds`). The id half is asserted since Ferrofin
+    was measured silently DROPPING it: same DTO to both servers, both 204, read-back
+    `{"Tvdb": "..."}` on Jellyfin and `{}` on Ferrofin. The original ids are posted
+    back at the end so the corpus other rows diff is left as it was found."""
     r = {}
     dto = q(base, f"/Items/{mid}", token, user)
     if dto:
+        before_ids = dto.get("ProviderIds") or {}
         dto["Tags"] = list(dict.fromkeys((dto.get("Tags") or []) + ["parity-test"]))
+        # A key that no fixture item carries and no remote provider can resolve, plus
+        # an EMPTY value that both servers must strip rather than store.
+        dto["ProviderIds"] = {**before_ids, "TvMaze": "990101", "Zap2It": ""}
         st, _ = http("POST", f"{base}/Items/{mid}", token, json.dumps(dto))
-        back = q(base, f"/Items/{mid}?fields=Tags", token, user) or {}
-        r["POST /Items/{itemId}"] = st < 300 and "parity-test" in (back.get("Tags") or [])
+        back = q(base, f"/Items/{mid}?fields=Tags,ProviderIds", token, user) or {}
+        ids = back.get("ProviderIds") or {}
+        r["POST /Items/{itemId}"] = Same(
+            st < 300 and "parity-test" in (back.get("Tags") or [])
+            and ids.get("TvMaze") == "990101" and "Zap2It" not in ids,
+            {"tag edit read back": "parity-test" in (back.get("Tags") or []),
+             "external id read back": ids.get("TvMaze") == "990101",
+             "empty id value stripped": "Zap2It" not in ids})
+        dto["ProviderIds"] = before_ids
+        http("POST", f"{base}/Items/{mid}", token, json.dumps(dto))   # restore
     return r
 
 
@@ -818,6 +846,205 @@ def j_sessions(base, token, user, mid, _m2):
     r["POST /Sessions/Logout"] = st < 300 and dead == 401
 
     http("DELETE", f"{base}/Users/{ctl_uid}", token)   # cleanup
+    return r
+
+
+# ---------------------------------------------------------------- external-change webhooks
+#
+# The synthetic media tree both containers bind-mount read-only at /media/synth
+# (suite/perf/docker-compose.yml mounts ./fixtures/media into BOTH servers). The
+# webhook journey writes its probe folders here, host-side, because "a file appeared
+# on disk" is the only precondition these routes exist to answer.
+WEBHOOK_MEDIA = os.path.join(ROOT, "suite/perf/fixtures/media")
+# The debounce both servers apply before acting on a reported path
+# (ServerConfiguration.LibraryMonitorDelay). The journey lowers it to this and restores
+# the server's own value afterwards; at the stock 60 s every wait below would have to be
+# a minute longer.
+WEBHOOK_DELAY = 1
+# How long a reported change may take to become visible. Measured on the parity lab at
+# LibraryMonitorDelay=1: a create lands in 2–20 s (Ferrofin ~2 s, Jellyfin ~15 s) and an
+# id-matched refresh in ~2 s, so 45 s is ~2x the slowest observed. The negative control
+# instead waits WEBHOOK_SETTLE and asserts NOTHING happened: that one is a floor (too
+# short and it would pass by not having looked yet), which is why it is not the same
+# number.
+WEBHOOK_EFFECT_TIMEOUT = 45
+WEBHOOK_SETTLE = 12
+
+
+def _webhook_leg(base):
+    """A per-server suffix for the probe folders, so the Ferrofin leg and the Jellyfin leg
+    never share a path: each leg creates, reports and removes only its own."""
+    return str(urllib.parse.urlparse(base).port or "x")
+
+
+def _webhook_nfo(path, tag, title, id_type, id_value, plot):
+    """Write the Kodi/XBMC sidecar both servers read: the external id the webhook selects
+    on, and a `<plot>` that is the marker a refresh is proven by."""
+    with open(path, "w", encoding="utf-8") as f:
+        f.write('<?xml version="1.0" encoding="utf-8"?>\n'
+                f"<{tag}><title>{title}</title><year>1999</year>"
+                f'<uniqueid type="{id_type}" default="true">{id_value}</uniqueid>'
+                f"<plot>{plot}</plot></{tag}>\n")
+
+
+def _webhook_report(base, token, path, update_type):
+    st, _ = http("POST", f"{base}/Library/Media/Updated", token,
+                 json.dumps({"Updates": [{"Path": path, "UpdateType": update_type}]}))
+    return st
+
+
+def _webhook_item(base, token, user, name, kind):
+    b = get_json(base, f"/Items?userId={user}&Recursive=true&IncludeItemTypes={kind}"
+                       f"&Fields=Overview,ProviderIds&searchTerm={name}", token) or {}
+    return next((i for i in b.get("Items", []) if i.get("Name") == name), None)
+
+
+def _webhook_wait(base, token, user, name, kind, pred, timeout=WEBHOOK_EFFECT_TIMEOUT):
+    """Poll until `pred(item)` holds (item is None while it does not exist). Returns the
+    last item seen and whether the predicate ever held."""
+    end = time.time() + timeout
+    while True:
+        it = _webhook_item(base, token, user, name, kind)
+        if pred(it):
+            return it, True
+        if time.time() >= end:
+            return it, False
+        time.sleep(3)
+
+
+def _webhook_probe(base, token, user, kind, route, folder, mkv_src, nfo_name, tag,
+                   id_type, id_value, id_param):
+    """One provider-id webhook pair (Movies or Series), start to finish, on ONE server.
+
+    Creates a probe folder on disk, makes it an item with `POST /Library/Media/Updated`,
+    then proves that `/Library/<route>/Updated` and `/Library/<route>/Added` refresh THAT
+    item when the external id matches and leave it alone when it does not. The probe's
+    external id is deliberately unresolvable (no such title exists at TMDB/TVDB), so a
+    library whose "Metadata downloaders" are enabled cannot overwrite the marker and the
+    `<plot>` in the sidecar stays the only thing that can change the Overview.
+
+    Returns `(created_ok, deleted_ok, {"Updated": Same, "Added": Same})` — the caller
+    binds those to their op keys, which stay spelled out there so `--check` can scrape
+    them.
+    """
+    ops = {}
+    name = os.path.basename(folder).split(" (")[0]
+    media_path = "/media/synth/" + os.path.relpath(folder, WEBHOOK_MEDIA).replace(os.sep, "/")
+    if kind == "Movie":
+        media_path += f"/{os.path.basename(folder)}.mkv"
+    shutil.rmtree(folder, ignore_errors=True)
+    # Self-heal: a run that was killed mid-probe leaves its item in the library, and a
+    # stale row would fail the create assertion below for the wrong reason (the item is
+    # there, but carrying the previous run's marker). Report the removal of whatever is
+    # left and wait for it to go before building the probe again. Costs one query when
+    # there is nothing to clean, which is the normal case.
+    if _webhook_item(base, token, user, name, kind) is not None:
+        _webhook_report(base, token, media_path, "Deleted")
+        _webhook_wait(base, token, user, name, kind, lambda it: it is None,
+                      WEBHOOK_EFFECT_TIMEOUT)
+    leaf = os.path.join(folder, "Season 01") if kind == "Series" else folder
+    os.makedirs(leaf)
+    shutil.copyfile(mkv_src, os.path.join(
+        leaf, f"{name} S01E01.mkv" if kind == "Series" else f"{os.path.basename(folder)}.mkv"))
+    nfo = os.path.join(folder, nfo_name)
+    try:
+        _webhook_nfo(nfo, tag, name, id_type, id_value, "PARITY-BASE")
+        st_c = _webhook_report(base, token, media_path, "Created")
+        made, ok = _webhook_wait(base, token, user, name, kind, lambda it: it is not None,
+                                 WEBHOOK_EFFECT_TIMEOUT + 30)
+        created_ok = (st_c < 300 and ok
+                      and (made.get("ProviderIds") or {}).get(id_type.capitalize()) == id_value
+                      and made.get("Overview") == "PARITY-BASE")
+        if created_ok:
+            for op, marker in (("Updated", "PARITY-UPDATED"), ("Added", "PARITY-ADDED")):
+                # Let the previous step's scan go quiet, then read the Overview the
+                # negative control is measured against. Taking the CURRENT value rather
+                # than a literal is what makes the control survive the second pass (whose
+                # baseline is the first pass's marker) and any ingest still finishing.
+                time.sleep(WEBHOOK_SETTLE)
+                baseline = (_webhook_item(base, token, user, name, kind) or {}).get("Overview")
+                _webhook_nfo(nfo, tag, name, id_type, id_value, marker)
+                # NEGATIVE control: an id that matches nothing must refresh nothing. This
+                # is the leg that fails a handler which ignores the selector and rescans.
+                st_n, _ = http("POST", f"{base}/Library/{route}/{op}?{id_param}=0", token, "")
+                time.sleep(WEBHOOK_SETTLE)
+                held = (_webhook_item(base, token, user, name, kind) or {}).get("Overview") == baseline
+                st_p, _ = http("POST", f"{base}/Library/{route}/{op}?{id_param}={id_value}", token, "")
+                _, hit = _webhook_wait(base, token, user, name, kind,
+                                       lambda it: bool(it) and it.get("Overview") == marker)
+                ops[op] = Same(
+                    st_n < 300 and st_p < 300 and held and hit,
+                    {"unmatched id changed nothing": held, "matched id refreshed the item": hit})
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+        st_d = _webhook_report(base, token, media_path, "Deleted")
+        _, gone = _webhook_wait(base, token, user, name, kind, lambda it: it is None,
+                                WEBHOOK_EFFECT_TIMEOUT + 30)
+    return created_ok, (st_d < 300 and gone), ops
+
+
+def j_library_webhooks(base, token, user, _m, _m2):
+    """The Sonarr/Radarr external-change webhooks: `/Library/Media/Updated` (by path) and
+    `/Library/{Movies,Series}/{Added,Updated}` (by external id).
+
+    The effect that can FAIL is a real one: a folder that exists on disk becomes a library
+    item ONLY because the POST reported it, stops being one when the removal is reported,
+    and an edited NFO reaches the item ONLY when the reported external id matches. Every
+    fixture library has `EnableRealtimeMonitor` false on both servers, so no OS watcher can
+    manufacture the same green, and each id-selecting op is paired with a NEGATIVE control
+    (an id that matches nothing) that must leave the item untouched.
+
+    Settings this depends on, named because they change the timing and the corpus, not the
+    verdict: `ServerConfiguration.LibraryMonitorDelay` (the debounce, lowered to 1 s here
+    and restored), and the library's "Metadata downloaders" checkboxes (the probe's
+    external id is unresolvable, so no remote fetcher can overwrite the marker).
+
+    Each server is only ever checked against its OWN read-back: `effect`, never a body diff.
+    """
+    r = {}
+    movies_root = os.path.join(WEBHOOK_MEDIA, "movies")
+    tv_root = os.path.join(WEBHOOK_MEDIA, "tv")
+    src = next((os.path.join(d.path, f) for d in os.scandir(movies_root) if d.is_dir()
+                for f in sorted(os.listdir(d.path)) if f.endswith(".mkv")), None) \
+        if os.path.isdir(movies_root) else None
+    if src is None or not os.path.isdir(tv_root):
+        return r   # not the synthetic lab: claim nothing rather than fail for the wrong reason
+    leg = _webhook_leg(base)
+    cfg = get_json(base, "/System/Configuration", token) or {}
+    prev_delay = cfg.get("LibraryMonitorDelay")
+    if prev_delay is not None:
+        cfg["LibraryMonitorDelay"] = WEBHOOK_DELAY
+        http("POST", f"{base}/System/Configuration", token, json.dumps(cfg))
+    try:
+        m_made, m_gone, m_ops = _webhook_probe(
+            base, token, user, "Movie", "Movies",
+            os.path.join(movies_root, f"Parityhookm{leg} (1999)"),
+            src, "movie.nfo", "movie", "imdb", f"tt99{leg}", "imdbId")
+        r["POST /Library/Movies/Updated"] = m_ops.get("Updated", False)
+        r["POST /Library/Movies/Added"] = m_ops.get("Added", False)
+        s_made, s_gone, s_ops = _webhook_probe(
+            base, token, user, "Series", "Series",
+            os.path.join(tv_root, f"Parityhooks{leg}"),
+            src, "tvshow.nfo", "tvshow", "tvdb", f"99{leg}", "tvdbId")
+        r["POST /Library/Series/Updated"] = s_ops.get("Updated", False)
+        r["POST /Library/Series/Added"] = s_ops.get("Added", False)
+        # The path-addressed webhook's own row: it is what created and removed both probes,
+        # plus the two rejections C# raises from inside the loop (a null and an empty path,
+        # `ArgumentException` → 400). The 400 BODIES are not compared: Jellyfin answers
+        # text/plain "Error processing request.", Ferrofin a JSON error envelope.
+        st_null, _ = http("POST", f"{base}/Library/Media/Updated", token,
+                          json.dumps({"Updates": [{"UpdateType": "Modified"}]}))
+        st_empty, _ = http("POST", f"{base}/Library/Media/Updated", token,
+                           json.dumps({"Updates": [{"Path": "", "UpdateType": "Modified"}]}))
+        r["POST /Library/Media/Updated"] = Same(
+            m_made and m_gone and s_made and s_gone and st_null == 400 and st_empty == 400,
+            {"reported file became an item": m_made and s_made,
+             "reported removal pruned it": m_gone and s_gone,
+             "path-less update rejected": st_null == 400 and st_empty == 400})
+    finally:
+        if prev_delay is not None:
+            cfg["LibraryMonitorDelay"] = prev_delay
+            http("POST", f"{base}/System/Configuration", token, json.dumps(cfg))
     return r
 
 
@@ -1722,7 +1949,10 @@ JOURNEYS = [j_startup,   # first: see its docstring
             j_users_password, j_virtualfolder_crud, j_sessions, j_config_writes,
             j_scheduled_run, j_playbackinfo_post, j_active_encodings, j_clientlog,
             j_authenticate, j_user_update, j_devices_delete, j_bulk_item_delete,
-            j_subtitles_upload, j_lyrics, j_quickconnect, j_system_and_refresh,
+            j_subtitles_upload, j_lyrics, j_quickconnect,
+            # Writes probe folders into the shared media mount, so it runs late (after the
+            # journeys that read the corpus) but before the destructive merge journey.
+            j_library_webhooks, j_system_and_refresh,
             j_forgot_password, j_backup, j_livetv, j_remote_subtitles,
             j_remote_search_identify,
             # Destructive: merges/splits the shared movies, so it must run LAST so its

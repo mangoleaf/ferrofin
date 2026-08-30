@@ -559,6 +559,19 @@ impl LibraryManager for FerrofinLibraryManager {
         Ok(())
     }
 
+    async fn update_item_provider_ids(
+        &self,
+        item_id: Uuid,
+        provider_ids: &[(String, String)],
+    ) -> Result<(), ServiceError> {
+        // An assignment, not a merge (C# `item.ProviderIds = request.ProviderIds`):
+        // `replace_provider_ids` deletes the rows the new set lacks and upserts
+        // the rest in one transaction.
+        self.persistence
+            .replace_provider_ids(item_id, provider_ids)
+            .await
+    }
+
     async fn delete_item(&self, id: Uuid, _options: &DeleteOptions) -> Result<(), ServiceError> {
         if id.is_nil() {
             return Err(ServiceError::invalid_input("item id can't be empty"));
@@ -1244,6 +1257,46 @@ mod tests {
             .expect("facets");
         assert_eq!(facets.genres, vec!["Sci-Fi".to_owned()]);
         assert_eq!(facets.tags, vec!["4K".to_owned(), "Christmas".to_owned()]);
+    }
+
+    /// The metadata editor's external ids reach the `BaseItemProviders` table and
+    /// REPLACE what was there — the write behind C# `item.ProviderIds = request.ProviderIds`.
+    #[tokio::test]
+    async fn update_item_provider_ids_replaces_the_stored_set() {
+        let db = test_db().await;
+        let id = Uuid::from_u128(0x7A);
+        seed_named_item(&db, id, BaseItemKind::Movie, "Solaris").await;
+        let mgr = manager(&db);
+
+        mgr.update_item_provider_ids(id, &[("Tvdb".to_owned(), "1".to_owned())])
+            .await
+            .expect("seed");
+        mgr.update_item_provider_ids(
+            id,
+            &[
+                ("Imdb".to_owned(), "tt0069293".to_owned()),
+                ("Tmdb".to_owned(), "593".to_owned()),
+            ],
+        )
+        .await
+        .expect("replace");
+
+        let ids = mgr
+            .get_item_list(&InternalItemsQuery {
+                any_provider_id_equals: vec![("Imdb".to_owned(), "tt0069293".to_owned())],
+                ..Default::default()
+            })
+            .await
+            .expect("lookup by the new id");
+        assert_eq!(ids.len(), 1, "the new id resolves the item");
+        let stale = mgr
+            .get_item_list(&InternalItemsQuery {
+                any_provider_id_equals: vec![("Tvdb".to_owned(), "1".to_owned())],
+                ..Default::default()
+            })
+            .await
+            .expect("lookup by the replaced id");
+        assert!(stale.is_empty(), "the replaced key is gone, not merged");
     }
 
     #[tokio::test]

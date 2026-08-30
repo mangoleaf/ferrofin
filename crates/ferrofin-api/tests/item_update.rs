@@ -289,6 +289,10 @@ impl UserManager for OkUsers {
     }
 }
 
+/// The external-id writes a test captures: `(item id, the whole new set)` per call
+/// to `update_item_provider_ids`.
+type RecordedProviderIds = Arc<Mutex<Vec<(Uuid, Vec<(String, String)>)>>>;
+
 /// A [`LibraryManager`] resolving a single known item id (any other is `None`);
 /// `update_items` succeeds so the edit handler runs end-to-end. The folder
 /// fields shape the resolved entity for the folder-refresh (scoped scan) tests,
@@ -300,6 +304,9 @@ struct OkLibrary {
     scoped_scans: Arc<Mutex<Vec<Uuid>>>,
     /// Entities passed to `update_items`, for asserting what the edit wrote.
     updated: Arc<Mutex<Vec<BaseItemEntity>>>,
+    /// External-id sets passed to `update_item_provider_ids` — a second write,
+    /// because `BaseItemProviders` is its own table.
+    provider_ids: RecordedProviderIds,
 }
 
 #[async_trait]
@@ -322,6 +329,17 @@ impl LibraryManager for OkLibrary {
         _parent_id: Option<Uuid>,
     ) -> Result<(), ServiceError> {
         self.updated.lock().unwrap().extend(items.iter().cloned());
+        Ok(())
+    }
+    async fn update_item_provider_ids(
+        &self,
+        item_id: Uuid,
+        provider_ids: &[(String, String)],
+    ) -> Result<(), ServiceError> {
+        self.provider_ids
+            .lock()
+            .unwrap()
+            .push((item_id, provider_ids.to_vec()));
         Ok(())
     }
     async fn query_items(
@@ -634,6 +652,7 @@ fn state(item_id: Uuid, queued: Arc<Mutex<Vec<Uuid>>>) -> AppState {
             is_folder: false,
             top_parent_id: None,
             scoped_scans: Arc::default(),
+            provider_ids: Arc::default(),
             updated: Arc::default(),
         }),
         queued,
@@ -736,6 +755,7 @@ async fn update_and_capture(item_id: Uuid, body: String) -> BaseItemEntity {
             is_folder: false,
             top_parent_id: None,
             scoped_scans: Arc::default(),
+            provider_ids: Arc::default(),
             updated: updated.clone(),
         }),
         Arc::new(Mutex::new(Vec::new())),
@@ -794,6 +814,95 @@ async fn unchanged_save_respects_unlock() {
     assert!(
         !written.is_locked,
         "an unchanged save with LockData=false must not re-lock"
+    );
+}
+
+/// The editor's external ids are persisted, empty values are dropped, and the
+/// write REPLACES the stored set — C# `ItemUpdateController.UpdateItem` strips
+/// empty pairs and then assigns (`item.ProviderIds = request.ProviderIds`,
+/// v10.11.8 lines 402-410), so a key the client omitted is gone afterwards.
+/// Before this, the handler parsed the DTO and silently dropped `ProviderIds`,
+/// which lost the id every "Identify" and every hand-typed IMDb/TVDB id.
+#[tokio::test]
+async fn update_item_replaces_the_external_ids() {
+    let item_id = Uuid::from_u128(0x59);
+    let recorded: RecordedProviderIds = Arc::default();
+    let router = create_router(state_with_library(
+        Arc::new(OkLibrary {
+            item_id,
+            is_folder: false,
+            top_parent_id: None,
+            scoped_scans: Arc::default(),
+            provider_ids: recorded.clone(),
+            updated: Arc::default(),
+        }),
+        Arc::new(Mutex::new(Vec::new())),
+    ));
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/Items/{item_id}"))
+                .header("X-Emby-Token", "valid")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(format!(
+                    r#"{{"Id":"{item_id}","Type":"Movie","MediaType":"Video","Name":"Test Item",
+                        "ProviderIds":{{"Imdb":"tt0111161","Tmdb":"278","Tvdb":""}}}}"#
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let written = recorded.lock().unwrap();
+    let (id, ids) = written.first().expect("provider ids written").clone();
+    assert_eq!(id, item_id);
+    assert_eq!(
+        ids,
+        vec![
+            ("Imdb".to_owned(), "tt0111161".to_owned()),
+            ("Tmdb".to_owned(), "278".to_owned()),
+        ],
+        "empty values are stripped; the rest are written as the whole new set"
+    );
+}
+
+/// A body with no `ProviderIds` key leaves the stored ids alone rather than
+/// clearing them: the vendored contract types the field `nullable: true`, so an
+/// absent key is a legal request that says nothing about the ids.
+#[tokio::test]
+async fn update_item_without_provider_ids_leaves_them_alone() {
+    let item_id = Uuid::from_u128(0x59);
+    let recorded: RecordedProviderIds = Arc::default();
+    let router = create_router(state_with_library(
+        Arc::new(OkLibrary {
+            item_id,
+            is_folder: false,
+            top_parent_id: None,
+            scoped_scans: Arc::default(),
+            provider_ids: recorded.clone(),
+            updated: Arc::default(),
+        }),
+        Arc::new(Mutex::new(Vec::new())),
+    ));
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/Items/{item_id}"))
+                .header("X-Emby-Token", "valid")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(format!(
+                    r#"{{"Id":"{item_id}","Type":"Movie","MediaType":"Video","Name":"Renamed"}}"#
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert!(
+        recorded.lock().unwrap().is_empty(),
+        "an absent ProviderIds key must not write (and so must not clear) the id set"
     );
 }
 
@@ -860,6 +969,7 @@ async fn refresh_library_folder_queues_scoped_scan() {
             is_folder: true,
             top_parent_id: None, // a CollectionFolder is its own library root
             scoped_scans: scans.clone(),
+            provider_ids: Arc::default(),
             updated: Arc::default(),
         }),
         queued.clone(),
@@ -896,6 +1006,7 @@ async fn refresh_nested_folder_scopes_to_owning_library() {
             is_folder: true,
             top_parent_id: Some(library_id),
             scoped_scans: scans.clone(),
+            provider_ids: Arc::default(),
             updated: Arc::default(),
         }),
         Arc::new(Mutex::new(Vec::new())),
