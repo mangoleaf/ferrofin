@@ -141,6 +141,31 @@ pub trait ScheduledTask: Send + Sync {
         false
     }
 
+    /// Whether this task implements C# `IConfigurableScheduledTask`.
+    ///
+    /// Load-bearing for `GET /ScheduledTasks`: `ScheduledTasksController.GetTasks`
+    /// applies the `isHidden`/`isEnabled` filters **only** inside
+    /// `if (task.ScheduledTask is IConfigurableScheduledTask scheduledTask)`, so
+    /// a task that does not implement the interface is yielded whatever the
+    /// caller asked for. Exactly nine of Jellyfin 10.11.8's twenty tasks do
+    /// (`CleanActivityLog`, `DeleteCacheFiles`, `CleanLogFiles`,
+    /// `DeleteTranscodeFiles`, `OptimizeDatabaseTask`, `RefreshPeople`,
+    /// `PluginUpdates`, `RefreshGuide`, `RefreshInternetChannels`), so this
+    /// defaults to `false`.
+    fn is_configurable(&self) -> bool {
+        false
+    }
+
+    /// C# `IConfigurableScheduledTask.IsEnabled`.
+    ///
+    /// Only consulted when [`is_configurable`](ScheduledTask::is_configurable)
+    /// is `true`, and only by the `isEnabled` query filter — `TaskInfo` has no
+    /// `IsEnabled` field, so this never reaches the wire. Every configurable
+    /// task in 10.11.8 returns `true`.
+    fn is_enabled(&self) -> bool {
+        true
+    }
+
     /// The task's default triggers, fired by the scheduler unless overridden
     /// via [`FerrofinTaskManager::set_triggers`].
     fn default_triggers(&self) -> Vec<TaskTriggerInfo> {
@@ -499,13 +524,44 @@ impl FerrofinTaskManager {
         });
     }
 
-    /// Lists every registered task as a wire [`TaskInfo`] (hidden tasks included),
-    /// ordered by key for a stable listing.
+    /// Lists every registered task as a wire [`TaskInfo`] (hidden tasks
+    /// included), ordered by display name.
+    ///
+    /// The order is C#'s: `ScheduledTasksController.GetTasks` and
+    /// `ScheduledTasksWebSocketListener.GetDataToSend` both enumerate
+    /// `_taskManager.ScheduledTasks.OrderBy(o => o.Name)`. It is the wire order
+    /// every client sees, so sorting by key instead is observable.
     #[must_use]
     pub fn list(&self) -> Vec<TaskInfo> {
+        self.list_filtered(None, None)
+    }
+
+    /// Lists the registered tasks the `isHidden`/`isEnabled` filters keep.
+    ///
+    /// Port of the loop in `ScheduledTasksController.GetTasks`: the filters are
+    /// applied **only** to tasks implementing `IConfigurableScheduledTask`; a
+    /// non-configurable task is yielded unconditionally. Ordered by name, as C#
+    /// orders before filtering.
+    #[must_use]
+    pub fn list_filtered(
+        &self,
+        is_hidden: Option<bool>,
+        is_enabled: Option<bool>,
+    ) -> Vec<TaskInfo> {
         let guard = lock(&self.tasks);
-        let mut infos: Vec<TaskInfo> = guard.values().map(Registration::to_info).collect();
-        infos.sort_by(|a, b| a.key.cmp(&b.key));
+        let mut infos: Vec<TaskInfo> = guard
+            .values()
+            .filter(|reg| {
+                if !reg.task.is_configurable() {
+                    return true;
+                }
+                is_hidden.is_none_or(|want| want == reg.task.is_hidden())
+                    && is_enabled.is_none_or(|want| want == reg.task.is_enabled())
+            })
+            .map(Registration::to_info)
+            .collect();
+        drop(guard);
+        infos.sort_by(|a, b| a.name.cmp(&b.name));
         infos
     }
 
@@ -1085,6 +1141,14 @@ impl ferrofin_traits::tasks::TaskManager for FerrofinTaskManager {
         Ok(self.list())
     }
 
+    async fn get_tasks_filtered(
+        &self,
+        is_hidden: Option<bool>,
+        is_enabled: Option<bool>,
+    ) -> Result<Vec<TaskInfo>, ServiceError> {
+        Ok(self.list_filtered(is_hidden, is_enabled))
+    }
+
     async fn get_task(&self, task_id: &str) -> Result<Option<TaskInfo>, ServiceError> {
         Ok(self.get(task_id))
     }
@@ -1161,6 +1225,130 @@ mod tests {
         }
     }
 
+    /// A minimal task whose key, name, hidden and configurable flags are set by
+    /// the test — the four axes `GET /ScheduledTasks` orders and filters on.
+    struct MetaTask {
+        key: &'static str,
+        name: &'static str,
+        hidden: bool,
+        configurable: bool,
+        enabled: bool,
+    }
+
+    #[allow(clippy::unnecessary_literal_bound)]
+    #[async_trait]
+    impl ScheduledTask for MetaTask {
+        fn key(&self) -> &str {
+            self.key
+        }
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn description(&self) -> &str {
+            "meta"
+        }
+        fn category(&self) -> &str {
+            "Test"
+        }
+        fn is_hidden(&self) -> bool {
+            self.hidden
+        }
+        fn is_configurable(&self) -> bool {
+            self.configurable
+        }
+        fn is_enabled(&self) -> bool {
+            self.enabled
+        }
+        async fn execute(&self, _progress: &TaskProgress) -> Result<(), ServiceError> {
+            Ok(())
+        }
+    }
+
+    fn meta_registry() -> FerrofinTaskManager {
+        let mgr = FerrofinTaskManager::new();
+        // Registered so that key order and name order disagree: by key it is
+        // Alpha, Bravo, Charlie; by name it is "A name", "B name", "C name"
+        // attached to Charlie, Alpha, Bravo respectively.
+        mgr.register(Arc::new(MetaTask {
+            key: "Charlie",
+            name: "A name",
+            hidden: false,
+            configurable: false,
+            enabled: true,
+        }));
+        mgr.register(Arc::new(MetaTask {
+            key: "Alpha",
+            name: "B name",
+            hidden: true,
+            configurable: true,
+            enabled: true,
+        }));
+        mgr.register(Arc::new(MetaTask {
+            key: "Bravo",
+            name: "C name",
+            hidden: false,
+            configurable: true,
+            enabled: false,
+        }));
+        mgr
+    }
+
+    /// C# `ScheduledTasksController.GetTasks` / `ScheduledTasksWebSocketListener`
+    /// both enumerate `_taskManager.ScheduledTasks.OrderBy(o => o.Name)`. The
+    /// registry used to sort by key, which is a different — and observable —
+    /// wire order.
+    #[test]
+    fn list_is_ordered_by_display_name_not_key() {
+        let list = meta_registry().list();
+        let names: Vec<&str> = list.iter().filter_map(|t| t.name.as_deref()).collect();
+        assert_eq!(names, vec!["A name", "B name", "C name"]);
+        let keys: Vec<&str> = list.iter().filter_map(|t| t.key.as_deref()).collect();
+        assert_eq!(keys, vec!["Charlie", "Alpha", "Bravo"]);
+        assert_ne!(keys, {
+            let mut sorted = keys.clone();
+            sorted.sort_unstable();
+            sorted
+        });
+    }
+
+    /// The C# applies `isHidden`/`isEnabled` only inside
+    /// `if (task.ScheduledTask is IConfigurableScheduledTask)`, so a
+    /// non-configurable task is yielded whatever the caller asked for.
+    #[test]
+    fn filters_apply_only_to_configurable_tasks() {
+        let mgr = meta_registry();
+
+        let keys = |infos: Vec<ferrofin_model::tasks::TaskInfo>| -> Vec<String> {
+            infos.into_iter().filter_map(|t| t.key).collect()
+        };
+
+        // Charlie is non-configurable, so it survives every filter.
+        assert_eq!(
+            keys(mgr.list_filtered(Some(true), None)),
+            vec!["Charlie", "Alpha"]
+        );
+        assert_eq!(
+            keys(mgr.list_filtered(Some(false), None)),
+            vec!["Charlie", "Bravo"]
+        );
+        assert_eq!(
+            keys(mgr.list_filtered(None, Some(true))),
+            vec!["Charlie", "Alpha"]
+        );
+        assert_eq!(
+            keys(mgr.list_filtered(None, Some(false))),
+            vec!["Charlie", "Bravo"]
+        );
+        assert_eq!(
+            keys(mgr.list_filtered(Some(true), Some(false))),
+            vec!["Charlie"]
+        );
+        assert_eq!(
+            keys(mgr.list_filtered(None, None)),
+            vec!["Charlie", "Alpha", "Bravo"]
+        );
+    }
+
     #[tokio::test]
     async fn register_list_and_run() {
         let mgr = FerrofinTaskManager::new();
@@ -1199,7 +1387,7 @@ mod tests {
             "TaskCompleted",
             Arc::new(move |payload: &str| {
                 let _ = tx.send(payload.to_owned());
-                Ok(())
+                crate::event_manager::consumer_done()
             }),
         );
         mgr.set_event_manager(Arc::new(events));

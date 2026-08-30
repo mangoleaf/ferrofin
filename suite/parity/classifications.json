@@ -1,6 +1,6 @@
 {
   "_comment": "Curated ACCEPTED divergences (not bugs). Highest-precedence classification in gen-ledger: overrides the auto 'flagged: verify' from the Layer-2 read diff. deep_verified stays as the live layers report it (these do not diff clean vs Jellyfin by design). Sourced from the parity-triage workflow verdicts (parity/triage-findings.json) + the roadmap synthesis, minus the ops since fixed (Filters2 WI-2, Collections add/remove WI-6, Images Size WI-1).",
-  "last_verified": "2026-08-30 batch C3 (untested writes: lyrics): the three REMOTE lyric ops are recorded undiffable-by-construction — Jellyfin 10.11.8 ships no ILyricProvider at all, so its success leg does not exist. The four LOCAL lyric ops are NOT classified: they are now earned live (GET /Audio/{itemId}/Lyrics body-diffs 54 fields across an .lrc/.elrc/.txt seed in reads.py; POST/DELETE are effect rows in journeys.py's j_lyrics). 2026-08-29 batch A3 (stale seed rows + the MediaStream probe-value residual): the 'instance/probe-noise' framing on GET /Items/{itemId} and /PlaybackInfo was disproven by cross-probing both containers' ffprobe binaries (byte-identical output) and replaced with a bitrate-only jellyfin-bug entry; the three 2026-08-11 'verified' seeds for DisplayPreferences, LiveTv/Timers/Defaults and MusicGenres were deleted after the underlying server bugs were fixed, so those rows now earn deep_verified from a live probe instead of a sentence.",
+  "last_verified": "2026-08-30 batch F5 (genuinely host-specific state): four of the seven 'instance' labels in this family were false and were hiding real bugs. GET /Environment/Drives (Ferrofin returned a hardcoded single '/'), GET /System/Ping (returned FriendlyName where C# returns _appHost.Name, the ProductName build constant) and GET /System/ActivityLog/Entries (null ShortOverview everywhere from an unplumbed RemoteEndPoint, plus an inverted login pair) had their entries DELETED — those rows must now earn a live verdict. GET /System/Info/Storage and GET /ScheduledTasks keep an entry, but one that names exactly what is instance and what is now property/body verified. GET /Trailers was re-categorised from 'instance' to 'jellyfin-bug' with the NullReferenceException's actual cause. 2026-08-30 batch C3 (untested writes: lyrics): the three REMOTE lyric ops are recorded undiffable-by-construction — Jellyfin 10.11.8 ships no ILyricProvider at all, so its success leg does not exist. The four LOCAL lyric ops are NOT classified: they are now earned live (GET /Audio/{itemId}/Lyrics body-diffs 54 fields across an .lrc/.elrc/.txt seed in reads.py; POST/DELETE are effect rows in journeys.py's j_lyrics). 2026-08-29 batch A3 (stale seed rows + the MediaStream probe-value residual): the 'instance/probe-noise' framing on GET /Items/{itemId} and /PlaybackInfo was disproven by cross-probing both containers' ffprobe binaries (byte-identical output) and replaced with a bitrate-only jellyfin-bug entry; the three 2026-08-11 'verified' seeds for DisplayPreferences, LiveTv/Timers/Defaults and MusicGenres were deleted after the underlying server bugs were fixed, so those rows now earn deep_verified from a live probe instead of a sentence.",
   "rows": {
     "DELETE /Intros/Show/{SeriesId}/{SeasonId}": {
       "category": "expected-extension",
@@ -57,10 +57,6 @@
     "GET /Channels/{channelId}/Items": {
       "category": "requires-channel-plugin",
       "classification": "requires-channel-plugin: the ChannelsController serves IChannel plugin channels, not Live TV — no tuner journey can reach these; they need a channel plugin on both servers."
-    },
-    "GET /Environment/Drives": {
-      "category": "instance",
-      "classification": "instance: per-host filesystem drives."
     },
     "GET /Episode/{Id}/Timestamps": {
       "category": "expected-extension",
@@ -196,7 +192,7 @@
     },
     "GET /ScheduledTasks": {
       "category": "instance",
-      "classification": "instance: LastExecutionResult depends on whether/when a task last ran."
+      "classification": "instance: LastExecutionResult — which tasks have run on this instance and when — is the ONE per-run field, and reads.py's `tasks_projection` drops it; everything else (the task set, the wire ORDER, and each task's Name/Description/Category/IsHidden/State/CurrentProgressPercentage/Triggers) is diffed across five legs, one per isHidden/isEnabled filter combination. Id is a separate, pre-existing accepted divergence already covered by the global VOLATILE denylist: Jellyfin's is md5(ScheduledTask.GetType().FullName) (ScheduledTaskWorker.cs), Ferrofin's is the task Key."
     },
     "GET /Shows/{itemId}/Similar": {
       "category": "instance",
@@ -210,25 +206,17 @@
       "category": "verified-by-push-probe",
       "classification": "verified-by-push-probe: the response body carries no signal here — the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py)."
     },
-    "GET /System/ActivityLog/Entries": {
-      "category": "instance",
-      "classification": "instance: activity-log entries differ per instance/run."
-    },
     "GET /System/Info/Storage": {
       "category": "instance",
-      "classification": "instance: per-host disk paths and free/used space."
+      "classification": "instance: exactly three things here are not comparable, and they are named. (1) The Path strings are the container layout, not code: Ferrofin's /config/cache vs Jellyfin's JELLYFIN_CACHE_DIR=/cache, /config/web vs /jellyfin/jellyfin-web. (2) FreeSpace/UsedSpace are sampled at two different instants. (3) The Libraries array ORDER is inherited verbatim from GET /Library/VirtualFolders and belongs to that row. Everything else IS comparable because both containers stat the same host filesystem, and reads.py's `storage_invariants` now asserts it as `property`: the exact FolderStorageDto key set, DeviceId == Path (on Unix DriveInfo.Name is the ctor argument verbatim), FreeSpace+UsedSpace == the filesystem's TotalSize byte-for-byte, the StorageType DriveType word, and the libraries compared as a SET. The missing-folder branch (FreeSpace/UsedSpace -1 with StorageType/DeviceId null, StorageHelper.GetFreeSpaceOf's catch arm) cannot be forced symmetrically from a probe and is covered by a unit test in crates/ferrofin-core/src/system_manager.rs instead."
     },
     "GET /System/Logs": {
       "category": "instance",
-      "classification": "instance: log-file set differs per instance/run."
-    },
-    "GET /System/Ping": {
-      "category": "instance",
-      "classification": "instance: returns the server name string (ferrofin vs the Jellyfin instance name)."
+      "classification": "instance: `LogFile` has four fields and two (DateCreated/DateModified) are already VOLATILE, so the only fields a diff could compare are Name and Size — and both are the host's own. Jellyfin's Serilog sink writes `log_YYYYMMDD.log` (Jellyfin.Server/Resources/Configuration/logging.json: `%JELLYFIN_LOG_DIR%//log_.log`, rollingInterval Day) while Ferrofin's tracing-appender writes `log.YYYY-MM-DD.log` (apps/ferrofin-server/src/bootstrap.rs); Size is each server's own log volume. Name is also parity_diff's array-align key, so the sweep can only ever report '(whole item)'. Body-diff is structurally impossible; the row is earned as `property` by assets.py, which asserts the exact 4-key LogFile contract, the .txt/.log extension filter (ManagedFileSystem.GetFiles — the Jellyfin container's extension-less `.jellyfin-log` must be absent), bare filenames, and the C# ordering rule OrderByDescending(DateModified).ThenByDescending(DateCreated).ThenBy(Name). Handler and ordering are a faithful port of SystemController.GetServerLogs; the ordering chain is unit-tested in crates/ferrofin-api/tests/system.rs."
     },
     "GET /Trailers": {
-      "category": "instance",
-      "classification": "instance: Jellyfin 10.11.8 returns 500 here (its own error with no Trailers provider), while Ferrofin correctly returns 200 with an empty result. Kept correct per policy (do not port Jellyfin bugs); not a Ferrofin gap."
+      "category": "jellyfin-bug",
+      "classification": "jellyfin-bug: Jellyfin 10.11.8 returns 500 on its own route, unconditionally. TrailersController takes ItemsController as a constructor dependency and calls _itemsController.GetItems(...) on it (TrailersController.cs:20/26/28/209); that DI-constructed instance has no ControllerContext, so ControllerBase.User is null and the first statement of GetItems — `var isApiKey = User.GetIsApiKey();` (ItemsController.cs:250) — dereferences it in ClaimsPrincipalExtensions.GetClaimValue (ClaimsPrincipalExtensions.cs:71-79, no null guard) and throws a NullReferenceException. Confirmed from the live container's stack trace; still unfixed on master (ItemsController.cs:263). The vendored contract declares only 200/401/403/503 for this path and the C# action is [ProducesResponseType(Status200OK)], so 200 is the required behaviour: Ferrofin is correct and is kept correct (do not port Jellyfin bugs). Because the two responses therefore cannot be diffed against each other, reads.py's `trailers_invariants` earns the row as `property` through the cross-route oracle the C# controller is literally defined as (GetTrailers == GetItems with includeItemTypes=[Trailer]): the Trailer corpus is compared via /Items?includeItemTypes=Trailer, which works on both servers, and Ferrofin's /Trailers is held to equal its own /Items answer. Jellyfin's 500 is pinned as a fact, so an upstream fix flips the row loudly instead of passing in silence."
     },
     "GET /Trailers/{itemId}/Similar": {
       "category": "instance",

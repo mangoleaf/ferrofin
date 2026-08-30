@@ -628,12 +628,29 @@ async fn sessions_message(state: &AppState, user_id: uuid::Uuid) -> Option<Strin
 }
 
 /// The `ScheduledTasksInfo` stream payload: the current task list.
+///
+/// Port of `ScheduledTasksWebSocketListener.GetDataToSend`:
+/// `_taskManager.ScheduledTasks.OrderBy(i => i.Name).Select(GetTaskInfo)
+/// .Where(i => !i.IsHidden)` — name-ordered (which `get_tasks` already is) and
+/// with hidden tasks dropped, unlike the `GET /ScheduledTasks` listing.
 async fn tasks_message(state: &AppState) -> Option<String> {
-    let tasks = state.tasks.get_tasks().await.ok()?;
+    let tasks = visible_tasks(state.tasks.get_tasks().await.ok()?);
     Some(envelope(
         "ScheduledTasksInfo",
         &serde_json::to_value(tasks).ok()?,
     ))
+}
+
+/// The listener's `.Where(i => !i.IsHidden)` clause.
+///
+/// The push stream drops hidden tasks; `GET /ScheduledTasks` does not (it
+/// filters on `isHidden` only for configurable tasks). The incoming order is
+/// already the C# `OrderBy(i => i.Name)` one and is preserved.
+fn visible_tasks(
+    mut tasks: Vec<ferrofin_model::tasks::TaskInfo>,
+) -> Vec<ferrofin_model::tasks::TaskInfo> {
+    tasks.retain(|task| !task.is_hidden);
+    tasks
 }
 
 /// The `ActivityLogEntry` stream payload: entries created since the last send,
@@ -687,7 +704,7 @@ mod tests {
     use super::{
         Action, DEFAULT_STREAM_MILLIS, Inbound, KEEPALIVE_SECS, PUSH_QUEUE_DEPTH, action_for,
         force_keep_alive_message, header_token, keep_alive_ack, parse_inbound, push_sink,
-        query_param,
+        query_param, visible_tasks,
     };
     use axum::extract::ws::Message;
     use axum::http::HeaderMap;
@@ -952,6 +969,30 @@ mod tests {
         assert!(
             ended.lock().expect("ended mutex").is_empty(),
             "the live session must not be ended"
+        );
+    }
+    /// `ScheduledTasksWebSocketListener.GetDataToSend` ends in
+    /// `.Where(i => !i.IsHidden)`, so the push stream — unlike
+    /// `GET /ScheduledTasks` — never carries a hidden task, and it keeps the
+    /// name order it was given.
+    #[test]
+    fn the_task_push_drops_hidden_tasks_and_keeps_the_order() {
+        let task = |name: &str, hidden: bool| ferrofin_model::tasks::TaskInfo {
+            name: Some(name.to_owned()),
+            is_hidden: hidden,
+            ..ferrofin_model::tasks::TaskInfo::default()
+        };
+        let visible = visible_tasks(vec![
+            task("Clean Activity Log", false),
+            task("TasksRefreshChannels", true),
+            task("Scan Media Library", false),
+        ]);
+        assert_eq!(
+            visible
+                .iter()
+                .filter_map(|t| t.name.as_deref())
+                .collect::<Vec<_>>(),
+            vec!["Clean Activity Log", "Scan Media Library"]
         );
     }
 }

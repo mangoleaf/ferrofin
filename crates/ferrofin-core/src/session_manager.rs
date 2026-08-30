@@ -1954,11 +1954,17 @@ impl FerrofinSessionManager {
         // echo it back to the client.
         let access_token = Secret::from(created.access_token);
 
+        // C# `AuthenticateNewSessionInternal` publishes
+        // `AuthenticationResultEventArgs` — which carries the SessionInfo —
+        // *after* the awaited `LogSessionActivity` that raised `SessionStarted`.
+        // The payload is the same SessionInfoDto JSON `SessionStarted` uses, so
+        // the `AuthenticationSucceededLogger` port can read the user name and
+        // the remote endpoint out of it.
         let _ = self
             .event_manager
             .publish(
                 "AuthenticationSucceeded",
-                dto.id.as_deref().unwrap_or_default(),
+                &serde_json::to_string(&dto).unwrap_or_else(|_| "{}".to_owned()),
             )
             .await;
         Ok(AuthenticationResultData {

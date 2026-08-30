@@ -276,14 +276,50 @@ impl FileSystem for StubFileSystem {
     fn validate_writable(&self, _path: &str) -> Result<(), ServiceError> {
         Ok(())
     }
+    /// Four log files in a deliberately SCRAMBLED order, so the handler's sort —
+    /// C# `OrderByDescending(DateModified).ThenByDescending(DateCreated)
+    /// .ThenBy(Name)` — is actually exercised. Two share a mtime (forcing the
+    /// DateCreated tiebreak) and two share both timestamps (forcing the
+    /// ascending Name tiebreak).
     fn get_files(&self, _path: &str, _extensions: &[&str]) -> Vec<FileMetadata> {
-        vec![FileMetadata {
-            name: "ferrofin.log".to_owned(),
-            full_name: "/logs/ferrofin.log".to_owned(),
-            length: 42,
-            date_created: chrono::Utc::now(),
-            date_modified: chrono::Utc::now(),
-        }]
+        fn at(secs: i64) -> chrono::DateTime<chrono::Utc> {
+            chrono::DateTime::from_timestamp(1_800_000_000 + secs, 0).expect("timestamp")
+        }
+        vec![
+            // Same mtime and ctime as "b.log": Name ascending decides, so
+            // "a.log" must come first.
+            FileMetadata {
+                name: "b.log".to_owned(),
+                full_name: "/logs/b.log".to_owned(),
+                length: 2,
+                date_created: at(50),
+                date_modified: at(50),
+            },
+            FileMetadata {
+                name: "a.log".to_owned(),
+                full_name: "/logs/a.log".to_owned(),
+                length: 1,
+                date_created: at(50),
+                date_modified: at(50),
+            },
+            // Newest mtime: first overall.
+            FileMetadata {
+                name: "ferrofin.log".to_owned(),
+                full_name: "/logs/ferrofin.log".to_owned(),
+                length: 42,
+                date_created: at(10),
+                date_modified: at(90),
+            },
+            // Same mtime as "a"/"b" but a NEWER ctime, so the DateCreated
+            // tiebreak puts it ahead of both.
+            FileMetadata {
+                name: "z.log".to_owned(),
+                full_name: "/logs/z.log".to_owned(),
+                length: 3,
+                date_created: at(80),
+                date_modified: at(50),
+            },
+        ]
     }
     fn read_file(&self, path: &str) -> Result<Vec<u8>, ServiceError> {
         if path == "/logs/ferrofin.log" {
@@ -306,7 +342,15 @@ impl SystemManager for StubSystem {
         &self,
         _request: &RequestContext,
     ) -> Result<PublicSystemInfo, ServiceError> {
-        Ok(PublicSystemInfo::default())
+        Ok(PublicSystemInfo {
+            // C# `SystemManager.GetPublicSystemInfo` sets
+            // `ProductName = _applicationHost.Name`, the same value
+            // `/System/Ping` returns — so the stub reports the product name
+            // here, not the friendly name (which is `ServerName`).
+            product_name: Some("Jellyfin Server".to_owned()),
+            server_name: Some("ferrofin-test".to_owned()),
+            ..PublicSystemInfo::default()
+        })
     }
     async fn restart(&self) -> Result<(), ServiceError> {
         Ok(())
@@ -490,11 +534,28 @@ async fn public_system_info_returns_body() {
 }
 
 #[tokio::test]
-async fn system_ping_returns_name() {
+async fn system_ping_returns_the_product_name_not_the_friendly_name() {
     let (status, body) = get(full_state(), "/System/Ping").await;
     assert_eq!(status, StatusCode::OK);
-    // FakeAppHost's friendly name.
-    assert_eq!(json(&body), "ferrofin-test");
+    // C# `SystemController.PingSystem` returns `_appHost.Name`, i.e.
+    // `ApplicationProductName` — a build constant — NOT `_appHost.FriendlyName`.
+    assert_eq!(json(&body), "Jellyfin Server");
+    assert_ne!(
+        json(&body),
+        "ferrofin-test",
+        "must not echo the friendly name"
+    );
+}
+
+#[tokio::test]
+async fn system_ping_matches_public_info_product_name() {
+    // Both are `_appHost.Name` in C# (`SystemManager.GetPublicSystemInfo` sets
+    // `ProductName = _applicationHost.Name`), so they can never disagree.
+    let (ping_status, ping) = get(full_state(), "/System/Ping").await;
+    let (info_status, info) = get(full_state(), "/System/Info/Public").await;
+    assert_eq!(ping_status, StatusCode::OK);
+    assert_eq!(info_status, StatusCode::OK);
+    assert_eq!(json(&ping), json(&info)["ProductName"]);
 }
 
 #[tokio::test]
@@ -513,6 +574,32 @@ async fn system_logs_list_and_fetch() {
     let v = json(&body);
     assert_eq!(v[0]["Name"], "ferrofin.log");
     assert_eq!(v[0]["Size"], 42);
+
+    // The C# sort chain, end to end:
+    //   DateModified desc  → ferrofin.log (newest mtime) first
+    //   DateCreated  desc  → z.log ahead of a/b (same mtime, newer ctime)
+    //   Name         asc   → a.log before b.log (same mtime AND ctime)
+    let names: Vec<&str> = v
+        .as_array()
+        .expect("array")
+        .iter()
+        .map(|f| f["Name"].as_str().expect("name"))
+        .collect();
+    assert_eq!(names, vec!["ferrofin.log", "z.log", "a.log", "b.log"]);
+
+    // `LogFile` is exactly four fields (the contract is additionalProperties:false).
+    let keys: std::collections::BTreeSet<&str> = v[0]
+        .as_object()
+        .expect("object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        keys,
+        ["DateCreated", "DateModified", "Name", "Size"]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+    );
 
     let (fetch_status, fetch_body) =
         get(elevated_full_state(), "/System/Logs/Log?name=ferrofin.log").await;

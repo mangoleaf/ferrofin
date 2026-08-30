@@ -4336,8 +4336,20 @@ impl LibraryScanner {
             let Some(owner) = owner_for_extra(&path, &movies_by_dir) else {
                 continue; // an extra with no resolvable movie is skipped
             };
+            // The extra's item KIND comes from its extra type, per
+            // `ExtraResolver.GetResolversForExtraType`: `ExtraType.Trailer` is
+            // resolved by `GenericVideoResolver<Trailer>`, so a `-trailer.*` or
+            // `trailers/` file is a `Trailer` item — which is what makes it
+            // visible to `GET /Trailers` and to
+            // `/Items?includeItemTypes=Trailer`. Everything else stays `Video`
+            // (`_videoResolvers`).
+            let kind = if extra_type == ferrofin_model::entities::ExtraType::Trailer {
+                BaseItemKind::Trailer
+            } else {
+                BaseItemKind::Video
+            };
             let Some((id, mut entity)) =
-                self.base_item(BaseItemKind::Video, cf, cf, file_stem(&path), &path, false)
+                self.base_item(kind, cf, cf, file_stem(&path), &path, false)
             else {
                 continue;
             };
@@ -11375,7 +11387,7 @@ mod tests {
                 name,
                 Arc::new(move |payload: &str| {
                     sink.lock().unwrap().push(payload.to_owned());
-                    Ok(())
+                    crate::event_manager::consumer_done()
                 }),
             );
         }
@@ -12046,6 +12058,42 @@ mod tests {
             trailers.len(),
             2,
             "both trailer spellings attach to the movie"
+        );
+
+        // C# resolves an `ExtraType.Trailer` extra with
+        // `GenericVideoResolver<Trailer>`, so the row's item TYPE is Trailer —
+        // which is what `GET /Trailers` (and `/Items?includeItemTypes=Trailer`)
+        // filters on. Stored as `Video`, both routes returned nothing.
+        let by_kind = repo
+            .get_item_list(&InternalItemsQuery {
+                include_item_types: vec![BaseItemKind::Trailer],
+                ..Default::default()
+            })
+            .await
+            .expect("trailers by kind");
+        assert_eq!(
+            by_kind.len(),
+            2,
+            "both trailer spellings are Trailer-kind items"
+        );
+        let mut names: Vec<&str> = by_kind
+            .iter()
+            .map(|i| i.name.as_deref().unwrap_or(""))
+            .collect();
+        names.sort_unstable();
+        assert_eq!(names, vec!["Heat (1995)-trailer", "alt"]);
+
+        // A non-trailer extra keeps the `Video` kind (`_videoResolvers`).
+        let videos = repo
+            .get_item_list(&InternalItemsQuery {
+                include_item_types: vec![BaseItemKind::Video],
+                ..Default::default()
+            })
+            .await
+            .expect("videos");
+        assert!(
+            videos.is_empty(),
+            "this fixture has only trailer extras, so no Video-kind rows remain"
         );
     }
 

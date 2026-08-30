@@ -34,6 +34,14 @@ use ferrofin_traits::system::{ServerApplicationHost, ServerApplicationPaths};
 
 use crate::app_paths::FerrofinServerApplicationPaths;
 
+/// The application product name (`ApplicationHost.ApplicationProductName`).
+///
+/// In C# this is `FileVersionInfo.GetVersionInfo(entryAssembly).ProductName`,
+/// which for the Jellyfin server assembly is the literal below. Ferrofin speaks
+/// Jellyfin's API, so the constant is the same string clients already expect
+/// from `GET /System/Ping` and `PublicSystemInfo.ProductName`.
+pub const PRODUCT_NAME: &str = "Jellyfin Server";
+
 /// The network-facing facts the host reports and uses to build URLs.
 ///
 /// Filled by the composition root from the live network configuration (which
@@ -246,6 +254,12 @@ impl ServerApplicationHost for FerrofinServerApplicationHost {
 
     fn listen_with_https(&self) -> bool {
         self.network.listen_with_https
+    }
+
+    fn name(&self) -> String {
+        // C# `ApplicationHost.Name => ApplicationProductName` — a build
+        // constant, deliberately NOT the friendly name.
+        PRODUCT_NAME.to_owned()
     }
 
     fn friendly_name(&self) -> String {

@@ -278,7 +278,9 @@ impl FerrofinAuthorizationContext {
             info.device_id = Some(self.system_id.clone());
         }
         if info.device.as_deref().unwrap_or("").trim().is_empty() {
-            info.device = Some(self.application_host.friendly_name());
+            // C# `AuthorizationContext`: `authInfo.Device = _serverApplicationHost.Name`
+            // (the product name), not the friendly name.
+            info.device = Some(self.application_host.name());
         }
         if info.version.as_deref().unwrap_or("").trim().is_empty() {
             info.version = Some(self.server_version.clone());
@@ -356,6 +358,10 @@ impl AuthorizationContext for FerrofinAuthorizationContext {
             is_api_key: false,
             user: None,
             is_authenticated: false,
+            // C# reads `HttpContext.GetNormalizedRemoteIP()` ambiently; the
+            // portable seam carries it on the request context, so it rides
+            // along on the resolved info for `RequestHelpers.GetSession`.
+            remote_endpoint: request.remote_endpoint.clone(),
         };
 
         info.token = Self::resolve_token(request, parts.token.take(), legacy).map(Into::into);
@@ -672,6 +678,9 @@ mod tests {
         }
         fn listen_with_https(&self) -> bool {
             false
+        }
+        fn name(&self) -> String {
+            "Jellyfin Server".to_owned()
         }
         fn friendly_name(&self) -> String {
             self.name.clone()
@@ -1156,7 +1165,10 @@ mod tests {
         assert_eq!(info.client.as_deref(), Some("Automation"));
         assert_eq!(info.device_id.as_deref(), Some("sys-1"));
         assert_eq!(info.version.as_deref(), Some("10.9.0"));
-        assert_eq!(info.device.as_deref(), Some("test-machine"));
+        // C# `AuthorizationContext` fills a blank Device from
+        // `_serverApplicationHost.Name` (the product name), not FriendlyName
+        // (which is "test-machine" on this fake).
+        assert_eq!(info.device.as_deref(), Some("Jellyfin Server"));
     }
 
     #[tokio::test]

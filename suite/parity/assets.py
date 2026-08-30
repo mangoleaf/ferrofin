@@ -271,8 +271,57 @@ def read_signatures(base, token, c):
         out["GET /Videos/{videoId}/{mediaSourceId}/Attachments/{index}"] = file_sig(
             base, f"/Videos/{fi}/{fs}/Attachments/3", token)
         methods["GET /Videos/{videoId}/{mediaSourceId}/Attachments/{index}"] = SIG_BODY_DIFF
+    # `GET /System/Logs` lists the host's OWN log files, and `LogFile` has only
+    # four fields — two of which (DateCreated/DateModified) are already VOLATILE.
+    # That leaves Name and Size, and both are irreducibly per-instance: Jellyfin's
+    # Serilog sink writes `log_YYYYMMDD.log` (`%JELLYFIN_LOG_DIR%//log_.log`,
+    # rollingInterval Day) while Ferrofin's tracing-appender writes
+    # `log.YYYY-MM-DD.log`, and Size is each server's own log volume. Because Name
+    # is parity_diff's array-align key, the sweep's diff can only ever report
+    # "(whole item)" on both sides. So the body CANNOT be diffed — but the
+    # declared SHAPE can, and no layer asserted it:
+    #   * the exact 4-key `LogFile` contract (the schema is additionalProperties:false);
+    #   * the `.txt`/`.log` extension filter (`ManagedFileSystem.GetFiles`) — the
+    #     Jellyfin container also holds a `.jellyfin-log` file, which must be absent;
+    #   * a bare filename, never a path;
+    #   * the C# ordering rule, `OrderByDescending(DateModified)
+    #     .ThenByDescending(DateCreated).ThenBy(Name)`.
+    # NOTE: the ordering clause is vacuous while a container holds a single log
+    # file; it becomes real after a day rollover. It is kept because it is the
+    # only cross-server statement of that rule the harness makes.
+    st, h, log_bytes = raw_headers("GET", base, "/System/Logs", token)
+    logs = []
+    if st == 200:
+        try:
+            logs = json.loads(log_bytes)
+        except ValueError:
+            logs = None
+    keys = {"DateCreated", "DateModified", "Size", "Name"}
+
+    def _utc(v):
+        return isinstance(v, str) and v.endswith("Z") and len(v) >= 20
+
+    def _sort_key(f):
+        # ThenBy(Name) is ASCENDING while the two dates are descending, so the
+        # name is inverted to make one monotonic tuple comparison.
+        return (f["DateModified"], f["DateCreated"], [-ord(ch) for ch in f["Name"]])
+
+    shape_ok = isinstance(logs, list) and len(logs) > 0 and all(
+        set(f) == keys
+        and isinstance(f.get("Name"), str) and "/" not in f["Name"]
+        and f["Name"].lower().endswith((".txt", ".log"))
+        and isinstance(f.get("Size"), int) and not isinstance(f.get("Size"), bool)
+        and f["Size"] >= 0
+        and _utc(f.get("DateCreated")) and _utc(f.get("DateModified"))
+        for f in logs)
+    order_ok = bool(shape_ok) and all(
+        _sort_key(logs[i]) >= _sort_key(logs[i + 1]) for i in range(len(logs) - 1))
+    out["GET /System/Logs"] = ((2, ct_family(h.get("content-type")), shape_ok, order_ok)
+                               if st == 200 else (st // 100, ""))
+    methods["GET /System/Logs"] = SIG_PROPERTY
+
     # A log file's contents differ per instance by nature: type + non-empty is the contract.
-    logs = get_json(base, "/System/Logs", token) or []
+    logs = logs if isinstance(logs, list) else []
     name = logs[0]["Name"] if logs and logs[0].get("Name") else "missing.log"
     st, h, body = raw_headers("GET", base, "/System/Logs/Log?name=" + urllib.parse.quote(name), token)
     out["GET /System/Logs/Log"] = ((2, (h.get("content-type") or "").split(";")[0].strip(), bool(body))

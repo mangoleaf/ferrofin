@@ -98,19 +98,35 @@ fn task_info(key: &str, name: &str, hidden: bool) -> TaskInfo {
     }
 }
 
+/// The `(isHidden, isEnabled)` pair the handler forwarded to the task manager.
+type TaskFilters = (Option<bool>, Option<bool>);
+
 /// A [`TaskManager`] stub with a fixed task set that records `start_task`,
 /// `cancel_task`, and `update_triggers` calls.
 struct StubTasks {
     tasks: Vec<TaskInfo>,
+    /// Keys of the tasks that implement C# `IConfigurableScheduledTask` — the
+    /// only ones `GET /ScheduledTasks`' filters may reject. Empty by default.
+    configurable: Vec<String>,
+    /// The `(isHidden, isEnabled)` pair the handler forwarded, if any.
+    filters: Arc<Mutex<Vec<TaskFilters>>>,
     started: Arc<Mutex<Vec<String>>>,
     cancelled: Arc<Mutex<Vec<String>>>,
     triggered: Arc<Mutex<Vec<(String, usize)>>>,
 }
 
 impl StubTasks {
+    /// Marks these task keys configurable, so the query filters apply to them.
+    fn configurable(mut self, keys: &[&str]) -> Self {
+        self.configurable = keys.iter().map(|k| (*k).to_owned()).collect();
+        self
+    }
+
     fn new(tasks: Vec<TaskInfo>) -> Self {
         Self {
             tasks,
+            configurable: Vec::new(),
+            filters: Arc::new(Mutex::new(Vec::new())),
             started: Arc::new(Mutex::new(Vec::new())),
             cancelled: Arc::new(Mutex::new(Vec::new())),
             triggered: Arc::new(Mutex::new(Vec::new())),
@@ -122,6 +138,36 @@ impl StubTasks {
 impl TaskManager for StubTasks {
     async fn get_tasks(&self) -> Result<Vec<TaskInfo>, ServiceError> {
         Ok(self.tasks.clone())
+    }
+    /// The C# rule: the filters are applied only inside
+    /// `if (task.ScheduledTask is IConfigurableScheduledTask)`. Every stub task
+    /// is enabled, as every 10.11.8 configurable task is.
+    async fn get_tasks_filtered(
+        &self,
+        is_hidden: Option<bool>,
+        is_enabled: Option<bool>,
+    ) -> Result<Vec<TaskInfo>, ServiceError> {
+        self.filters
+            .lock()
+            .expect("lock")
+            .push((is_hidden, is_enabled));
+        Ok(self
+            .tasks
+            .iter()
+            .filter(|t| {
+                let configurable = t
+                    .key
+                    .as_deref()
+                    .is_some_and(|k| self.configurable.iter().any(|c| c == k));
+                if !configurable {
+                    return true;
+                }
+                // Every stub task is enabled (as every 10.11.8 configurable
+                // task is), so `isEnabled=false` rejects them all.
+                is_hidden.is_none_or(|want| want == t.is_hidden) && is_enabled != Some(false)
+            })
+            .cloned()
+            .collect())
     }
     async fn get_task(&self, task_id: &str) -> Result<Option<TaskInfo>, ServiceError> {
         Ok(self
@@ -257,10 +303,13 @@ async fn get_tasks_returns_every_task() {
 
 #[tokio::test]
 async fn get_tasks_is_hidden_filter_keeps_only_hidden() {
-    let tasks = Arc::new(StubTasks::new(vec![
-        task_info("scan", "Scan", false),
-        task_info("cleanup", "Cleanup", true),
-    ]));
+    let tasks = Arc::new(
+        StubTasks::new(vec![
+            task_info("scan", "Scan", false),
+            task_info("cleanup", "Cleanup", true),
+        ])
+        .configurable(&["scan", "cleanup"]),
+    );
     let (status, body) = send(tasks, true, "GET", "/ScheduledTasks?isHidden=true").await;
     assert_eq!(status, StatusCode::OK);
     let result: Vec<TaskInfo> = serde_json::from_slice(&body).expect("task list");
@@ -268,9 +317,48 @@ async fn get_tasks_is_hidden_filter_keeps_only_hidden() {
     assert_eq!(result[0].id.as_deref(), Some("cleanup"));
 }
 
+/// C# `ScheduledTasksController.GetTasks` applies `isHidden`/`isEnabled` only
+/// inside `if (task.ScheduledTask is IConfigurableScheduledTask)`, so a task
+/// that does not implement the interface is listed whatever the caller asked
+/// for. Eleven of 10.11.8's twenty tasks are in that group.
+#[tokio::test]
+async fn get_tasks_filters_never_reject_a_non_configurable_task() {
+    let tasks = Arc::new(
+        StubTasks::new(vec![
+            task_info("scan", "Scan", false),
+            task_info("cleanup", "Cleanup", true),
+        ])
+        .configurable(&["cleanup"]),
+    );
+    let (status, body) = send(
+        Arc::clone(&tasks),
+        true,
+        "GET",
+        "/ScheduledTasks?isHidden=true&isEnabled=false",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let result: Vec<TaskInfo> = serde_json::from_slice(&body).expect("task list");
+    // "scan" is not hidden and would fail both filters, but it is not
+    // configurable, so it survives; "cleanup" is configurable and is rejected.
+    assert_eq!(
+        result
+            .iter()
+            .filter_map(|t| t.id.as_deref())
+            .collect::<Vec<_>>(),
+        vec!["scan"]
+    );
+    // The handler forwarded both query parameters verbatim.
+    assert_eq!(
+        *tasks.filters.lock().expect("lock"),
+        vec![(Some(true), Some(false))]
+    );
+}
+
 #[tokio::test]
 async fn get_tasks_is_enabled_false_returns_none() {
-    let tasks = Arc::new(StubTasks::new(vec![task_info("scan", "Scan", false)]));
+    let tasks =
+        Arc::new(StubTasks::new(vec![task_info("scan", "Scan", false)]).configurable(&["scan"]));
     let (status, body) = send(tasks, true, "GET", "/ScheduledTasks?isEnabled=false").await;
     assert_eq!(status, StatusCode::OK);
     let result: Vec<TaskInfo> = serde_json::from_slice(&body).expect("task list");

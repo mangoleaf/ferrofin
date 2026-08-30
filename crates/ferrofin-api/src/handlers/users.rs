@@ -349,6 +349,12 @@ async fn authenticate_by_name(
     Json(body): Json<AuthenticateByNameRequest>,
 ) -> Result<Json<AuthenticationResult>, ApiError> {
     let auth = auth_info(&parts);
+    // C# `UserController.AuthenticateUserByName` sets
+    // `RemoteEndPoint = HttpContext.GetNormalizedRemoteIP().ToString()`. It ends
+    // up on `SessionInfo.RemoteEndPoint`, which is what `GET /Sessions` reports
+    // and what every activity-log `ShortOverview` ("IP address: …") is built
+    // from — so a `None` here silently blanks both.
+    let remote_ip = state.client_address(&parts).to_string();
     let request = AuthenticationRequest {
         username: body.username,
         user_id: None,
@@ -357,9 +363,7 @@ async fn authenticate_by_name(
         app_version: auth.version,
         device_id: auth.device_id,
         device_name: auth.device,
-        // The remote address layer is wired at the composition root; not
-        // available as a request extension here.
-        remote_endpoint: None,
+        remote_endpoint: Some(remote_ip.clone()),
     };
     let username = request.username.clone().unwrap_or_default();
     let result = match state.sessions.authenticate_new_session(&request).await {
@@ -373,6 +377,9 @@ async fn authenticate_by_name(
                     name: format!("Failed login attempt from {username}"),
                     type_: "AuthenticationFailed".to_owned(),
                     severity: ferrofin_model::activity::LogLevel::Error,
+                    // `LabelIpAddressValue` = "IP address: {0}", filled from
+                    // `AuthenticationRequestEventArgs.RemoteEndPoint`.
+                    short_overview: Some(format!("IP address: {remote_ip}")),
                     ..Default::default()
                 },
             )
@@ -380,17 +387,12 @@ async fn authenticate_by_name(
             return Err(e.into());
         }
     };
-    // Port of `AuthenticationSucceededLogger`.
-    log_activity(
-        &state,
-        ferrofin_traits::activity::ActivityLogCreate {
-            name: format!("{username} successfully authenticated"),
-            type_: "AuthenticationSucceeded".to_owned(),
-            user_id: Some(result.session.user_id),
-            ..Default::default()
-        },
-    )
-    .await;
+    // The `AuthenticationSucceeded` entry is NOT written here: C# raises it from
+    // `SessionManager.AuthenticateNewSessionInternal`, *after* the awaited
+    // `LogSessionActivity` that raises `SessionStarted`. Writing it in the
+    // handler instead put it before the (spawned) SessionStarted row and showed
+    // the dashboard's login pair backwards. The consumer lives beside the
+    // SessionStarted one in the composition root.
     Ok(Json(authentication_result(&state, result).await))
 }
 
@@ -425,7 +427,9 @@ async fn authenticate_with_quick_connect(
         app_version: auth.version,
         device_id: auth.device_id,
         device_name: auth.device,
-        remote_endpoint: None,
+        // As on the password path: C# fills this from
+        // `HttpContext.GetNormalizedRemoteIP()`.
+        remote_endpoint: Some(state.client_address(&parts).to_string()),
     };
     let result = state.sessions.authenticate_direct(&request).await?;
     Ok(Json(authentication_result(&state, result).await))

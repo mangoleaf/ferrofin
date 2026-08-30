@@ -34,10 +34,12 @@ pub(crate) async fn current_session(
             auth.version.as_deref().unwrap_or_default(),
             auth.device_id.as_deref().unwrap_or_default(),
             auth.device.as_deref().unwrap_or_default(),
-            // The normalized remote IP is wired at the composition root's remote-
-            // address layer, which is not part of the `AuthorizationInfo` seam;
-            // the session manager only records it, so an empty value is safe here.
-            "",
+            // C# passes `httpContext.GetNormalizedRemoteIP().ToString()` here, so
+            // a session's `RemoteEndPoint` tracks a roaming client. The address
+            // is resolved by the auth layer and rides on `AuthorizationInfo`;
+            // passing "" would blank the value the login recorded, because
+            // `upsert_session` writes this field unconditionally.
+            auth.remote_endpoint.as_deref().unwrap_or_default(),
             &user,
         )
         .await?;

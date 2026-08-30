@@ -200,7 +200,7 @@ async fn report_playback_start(
     info.session_id = Some(current_session_id(&state, &auth).await?);
     state.sessions.on_playback_start(&info).await?;
     record_metrics_started(&state, info.play_session_id.as_deref()).await;
-    log_playback_activity(&state, &auth, info.item_id, "is playing", "VideoPlayback").await;
+    log_playback_activity(&state, &auth, info.item_id, PlaybackPhase::Start).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -224,16 +224,78 @@ async fn record_metrics_stopped(
     }
 }
 
+/// Which of the two playback loggers is writing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlaybackPhase {
+    /// C# `PlaybackStartLogger`.
+    Start,
+    /// C# `PlaybackStopLogger`.
+    Stop,
+}
+
+/// The activity-log `Type` for a playback event, from the item's media type.
+///
+/// Port of `PlaybackStartLogger.GetPlaybackNotificationType` /
+/// `PlaybackStopLogger.GetPlaybackStoppedNotificationType`. `None` means "write
+/// no entry": the stop logger returns `null` for anything that is neither audio
+/// nor video and bails out, while the start logger falls back to `"Playback"`.
+fn playback_notification_type(
+    phase: PlaybackPhase,
+    media_type: Option<&str>,
+) -> Option<&'static str> {
+    let audio = media_type.is_some_and(|m| m.eq_ignore_ascii_case("Audio"));
+    let video = media_type.is_some_and(|m| m.eq_ignore_ascii_case("Video"));
+    match (phase, audio, video) {
+        (PlaybackPhase::Start, true, _) => Some("AudioPlayback"),
+        (PlaybackPhase::Start, _, true) => Some("VideoPlayback"),
+        (PlaybackPhase::Start, _, _) => Some("Playback"),
+        (PlaybackPhase::Stop, true, _) => Some("AudioPlaybackStopped"),
+        (PlaybackPhase::Stop, _, true) => Some("VideoPlaybackStopped"),
+        (PlaybackPhase::Stop, _, _) => None,
+    }
+}
+
+/// The display name both playback loggers build (C# `GetItemName`): the item
+/// name, prefixed with its series and then its first artist.
+fn playback_item_name(
+    name: Option<&str>,
+    series_name: Option<&str>,
+    artists: Option<&str>,
+) -> String {
+    let mut out = name.unwrap_or_default().to_owned();
+    if let Some(series) = series_name.filter(|s| !s.is_empty()) {
+        out = format!("{series} - {out}");
+    }
+    // The stored column is the `|`-delimited multi-value form; C# takes
+    // `item.Artists[0]`.
+    if let Some(first) = artists
+        .into_iter()
+        .flat_map(|a| a.split('|'))
+        .find(|a| !a.is_empty())
+    {
+        out = format!("{first} - {out}");
+    }
+    out
+}
+
+/// Whether the item is theme media, which both loggers skip
+/// ("Don't report theme song or local trailer playback").
+///
+/// `ExtraType` 8/9 are `ThemeSong`/`ThemeVideo` in the stored encoding (see
+/// `ferrofin_core::dto_service`).
+fn is_theme_media(extra_type: Option<i32>) -> bool {
+    matches!(extra_type, Some(8 | 9))
+}
+
 /// Records a playback activity-log entry (best-effort — a logging failure must
-/// not fail the playback report). Port of `ActivityLogEntryPoint.OnPlayback*`,
-/// which writes "{user} is playing {item} on {device}" so the dashboard's
-/// Activity feed reflects what's being watched.
+/// not fail the playback report). Port of `PlaybackStartLogger` /
+/// `PlaybackStopLogger`, which write "{user} is playing {item} on {device}" so
+/// the dashboard's Activity feed reflects what's being watched.
 async fn log_playback_activity(
     state: &AppState,
     auth: &ferrofin_traits::options::AuthorizationInfo,
     item_id: Uuid,
-    action: &str,
-    type_: &str,
+    phase: PlaybackPhase,
 ) {
     // No user → no entry, matching Jellyfin (it skips user-less playback events).
     let Some(user) = auth.user.as_ref() else {
@@ -245,14 +307,26 @@ async fn log_playback_activity(
         .clone()
         .or_else(|| auth.client.clone())
         .unwrap_or_default();
-    let item_name = state
-        .library
-        .get_item_by_id(item_id)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|i| i.name)
-        .unwrap_or_default();
+    let item = state.library.get_item_by_id(item_id).await.ok().flatten();
+    // "Don't report theme song or local trailer playback."
+    if item.as_ref().is_some_and(|i| is_theme_media(i.extra_type)) {
+        return;
+    }
+    let Some(type_) =
+        playback_notification_type(phase, item.as_ref().and_then(|i| i.media_type.as_deref()))
+    else {
+        // `GetPlaybackStoppedNotificationType` returned null: no entry at all.
+        return;
+    };
+    let item_name = playback_item_name(
+        item.as_ref().and_then(|i| i.name.as_deref()),
+        item.as_ref().and_then(|i| i.series_name.as_deref()),
+        item.as_ref().and_then(|i| i.artists.as_deref()),
+    );
+    let action = match phase {
+        PlaybackPhase::Start => "is playing",
+        PlaybackPhase::Stop => "has finished playing",
+    };
     let name = format!("{} {action} {item_name} on {device}", user.username);
     // The same line goes to the server log so playback/cast session events are
     // greppable without the dashboard (the cast receiver reports through these
@@ -367,14 +441,7 @@ async fn report_playback_stopped(
     let item_id = info.item_id;
     state.sessions.on_playback_stopped(&info).await?;
     record_metrics_stopped(&state, info.play_session_id.as_deref(), info.position_ticks).await;
-    log_playback_activity(
-        &state,
-        &auth,
-        item_id,
-        "has finished playing",
-        "VideoPlaybackStopped",
-    )
-    .await;
+    log_playback_activity(&state, &auth, item_id, PlaybackPhase::Stop).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -690,4 +757,75 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
             "/Users/{userId}/PlayingItems/{itemId}/Progress",
             post(on_playback_progress_for_user),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PlaybackPhase, is_theme_media, playback_item_name, playback_notification_type};
+
+    /// C# `PlaybackStartLogger.GetPlaybackNotificationType` /
+    /// `PlaybackStopLogger.GetPlaybackStoppedNotificationType`. The type was
+    /// hardcoded to the Video pair, so an audio track's play landed in the
+    /// dashboard feed as "VideoPlayback".
+    #[test]
+    fn playback_type_follows_the_items_media_type() {
+        use PlaybackPhase::{Start, Stop};
+        assert_eq!(
+            playback_notification_type(Start, Some("Audio")),
+            Some("AudioPlayback")
+        );
+        assert_eq!(
+            playback_notification_type(Start, Some("Video")),
+            Some("VideoPlayback")
+        );
+        assert_eq!(
+            playback_notification_type(Stop, Some("Audio")),
+            Some("AudioPlaybackStopped")
+        );
+        assert_eq!(
+            playback_notification_type(Stop, Some("Video")),
+            Some("VideoPlaybackStopped")
+        );
+        // Neither audio nor video: the start logger falls back to "Playback"…
+        assert_eq!(
+            playback_notification_type(Start, Some("Book")),
+            Some("Playback")
+        );
+        assert_eq!(playback_notification_type(Start, None), Some("Playback"));
+        // …and the stop logger returns null, i.e. writes NO entry at all.
+        assert_eq!(playback_notification_type(Stop, Some("Book")), None);
+        assert_eq!(playback_notification_type(Stop, None), None);
+    }
+
+    /// C# `GetItemName`: series first, then the first artist, then the name.
+    #[test]
+    fn playback_item_name_prefixes_series_then_artist() {
+        assert_eq!(playback_item_name(Some("Track 01"), None, None), "Track 01");
+        assert_eq!(
+            playback_item_name(Some("Pilot"), Some("Series 01"), None),
+            "Series 01 - Pilot"
+        );
+        // The stored column is the `|`-delimited multi-value form; C# takes [0].
+        assert_eq!(
+            playback_item_name(Some("Track 01"), None, Some("Artist A|Artist B")),
+            "Artist A - Track 01"
+        );
+        assert_eq!(
+            playback_item_name(Some("Ep"), Some("Show"), Some("A")),
+            "A - Show - Ep"
+        );
+        // Empty strings must not produce a bare separator.
+        assert_eq!(playback_item_name(Some("X"), Some(""), Some("")), "X");
+        assert_eq!(playback_item_name(None, None, None), "");
+    }
+
+    /// Both loggers bail on theme media ("Don't report theme song or local
+    /// trailer playback"). 8/9 are ThemeSong/ThemeVideo in the stored encoding.
+    #[test]
+    fn theme_media_is_recognised_by_extra_type() {
+        assert!(is_theme_media(Some(8)));
+        assert!(is_theme_media(Some(9)));
+        assert!(!is_theme_media(Some(1)));
+        assert!(!is_theme_media(None));
+    }
 }

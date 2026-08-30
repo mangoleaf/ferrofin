@@ -186,6 +186,12 @@ impl ScheduledTask for CleanActivityLogTask {
     fn key(&self) -> &str {
         "CleanActivityLog"
     }
+    /// C# `CleanActivityLogTask` implements `IConfigurableScheduledTask`, so the
+    /// `GET /ScheduledTasks` `isHidden`/`isEnabled` filters apply to it.
+    fn is_configurable(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "Clean Activity Log"
     }
@@ -240,6 +246,12 @@ impl ScheduledTask for DeleteCacheFileTask {
     fn key(&self) -> &str {
         "DeleteCacheFiles"
     }
+    /// C# `DeleteCacheFileTask` implements `IConfigurableScheduledTask`, so the
+    /// `GET /ScheduledTasks` `isHidden`/`isEnabled` filters apply to it.
+    fn is_configurable(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "Clean Cache Directory"
     }
@@ -306,6 +318,12 @@ impl ScheduledTask for DeleteLogFileTask {
     fn key(&self) -> &str {
         "CleanLogFiles"
     }
+    /// C# `DeleteLogFileTask` implements `IConfigurableScheduledTask`, so the
+    /// `GET /ScheduledTasks` `isHidden`/`isEnabled` filters apply to it.
+    fn is_configurable(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "Clean Log Directory"
     }
@@ -367,6 +385,12 @@ impl ScheduledTask for DeleteTranscodeFileTask {
     fn key(&self) -> &str {
         "DeleteTranscodeFiles"
     }
+    /// C# `DeleteTranscodeFileTask` implements `IConfigurableScheduledTask`, so the
+    /// `GET /ScheduledTasks` `isHidden`/`isEnabled` filters apply to it.
+    fn is_configurable(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "Clean Transcode Directory"
     }
@@ -558,6 +582,12 @@ impl ScheduledTask for OptimizeDatabaseTask {
     fn key(&self) -> &str {
         "OptimizeDatabaseTask"
     }
+    /// C# `OptimizeDatabaseTask` implements `IConfigurableScheduledTask`, so the
+    /// `GET /ScheduledTasks` `isHidden`/`isEnabled` filters apply to it.
+    fn is_configurable(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "Optimize database"
     }

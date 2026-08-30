@@ -94,66 +94,125 @@ pub trait LifecycleController: Send + Sync {
 pub trait StorageProbe: Send + Sync {
     /// Returns the storage info for `path` (resolved path, free/used bytes).
     fn probe(&self, path: &str) -> FolderStorageInfo;
+
+    /// Probes several paths in one pass.
+    ///
+    /// `GET /System/Info/Storage` reports seven fixed folders plus every library
+    /// location, so the real probe reads the mount table once here rather than
+    /// once per folder. The default implementation fans out to
+    /// [`probe`](StorageProbe::probe).
+    fn probe_all(&self, paths: &[String]) -> Vec<FolderStorageInfo> {
+        paths.iter().map(|p| self.probe(p)).collect()
+    }
 }
 
-/// The default storage probe: reports the path with the free/used bytes of the
-/// filesystem it lives on.
+/// The default storage probe: reports the path with the free/used bytes and the
+/// drive type of the filesystem it lives on.
+///
+/// Port of `StorageHelper.GetFreeSpaceOf`
+/// (`Jellyfin.Server.Implementations/StorageHelpers/StorageHelper.cs`):
+///
+/// ```text
+/// try {
+///     var driveInfo = new DriveInfo(path);
+///     FreeSpace   = driveInfo.AvailableFreeSpace;
+///     UsedSpace   = driveInfo.TotalSize - driveInfo.AvailableFreeSpace;
+///     StorageType = driveInfo.DriveType.ToString();
+///     DeviceId    = driveInfo.Name;
+/// } catch {
+///     FreeSpace = -1; UsedSpace = -1; StorageType = null; DeviceId = null;
+/// }
+/// ```
+///
+/// There is deliberately **no** walk up to the nearest existing ancestor: in C#
+/// a path that does not exist makes `AvailableFreeSpace` throw and the catch arm
+/// reports `-1`. `DriveInfo.Name` on Unix is the constructor argument verbatim
+/// (`NormalizeDriveName` only rejects empty/NUL names), so `DeviceId` is the
+/// path exactly as passed in — not the canonicalized one.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FsStorageProbe;
 
-impl StorageProbe for FsStorageProbe {
-    fn probe(&self, path: &str) -> FolderStorageInfo {
+impl FsStorageProbe {
+    /// Probes one path against an already-parsed mount table.
+    fn probe_with(mounts: &[crate::mount_table::MountEntry], path: &str) -> FolderStorageInfo {
         let resolved_path = std::fs::canonicalize(path)
             .map_or_else(|_| path.to_owned(), |p| p.to_string_lossy().into_owned());
-        let (free_space, used_space) = disk_usage(&resolved_path);
+        let Some((free_space, used_space)) = disk_usage(path) else {
+            // The C# catch arm.
+            return FolderStorageInfo {
+                path: path.to_owned(),
+                resolved_path,
+                free_space: -1,
+                used_space: -1,
+                storage_type: None,
+                device_id: None,
+            };
+        };
+        // `driveInfo.DriveType.ToString()`. An unresolvable filesystem is
+        // `DriveType.Unknown`, the C# table's default arm — never a missing key.
+        let storage_type = crate::mount_table::fs_type_for_path(mounts, &resolved_path)
+            .map_or(crate::mount_table::DriveType::Unknown, |t| {
+                crate::mount_table::drive_type(t)
+            })
+            .to_string();
         FolderStorageInfo {
             path: path.to_owned(),
             resolved_path,
             free_space,
             used_space,
-            ..Default::default()
+            storage_type: Some(storage_type),
+            device_id: Some(path.to_owned()),
         }
     }
 }
 
-/// Returns `(free_space, used_space)` in bytes for the filesystem containing
-/// `path`, mirroring C# `DriveInfo` (free = space available to unprivileged
-/// callers; used = total − total-free). Both are `0` if the query fails.
+impl StorageProbe for FsStorageProbe {
+    fn probe(&self, path: &str) -> FolderStorageInfo {
+        Self::probe_with(&crate::mount_table::read_mount_table(), path)
+    }
+
+    fn probe_all(&self, paths: &[String]) -> Vec<FolderStorageInfo> {
+        let mounts = crate::mount_table::read_mount_table();
+        paths.iter().map(|p| Self::probe_with(&mounts, p)).collect()
+    }
+}
+
+/// Returns `(free_space, used_space)` in bytes for the filesystem at `path`, or
+/// `None` when `statvfs` fails — the condition under which the C# `DriveInfo`
+/// property access throws and `StorageHelper` reports `-1`.
+///
+/// The formulas are C#'s exactly: `AvailableFreeSpace` is `f_bavail` (the space
+/// an unprivileged caller may use) and `TotalSize` is `f_blocks`, so
+/// `UsedSpace = TotalSize - AvailableFreeSpace` **includes** the root-reserved
+/// blocks. Subtracting `f_bfree` there instead under-reports used space by the
+/// reservation (15.2 GiB on the parity lab's filesystem).
 #[cfg(unix)]
-fn disk_usage(path: &str) -> (i64, i64) {
+fn disk_usage(path: &str) -> Option<(i64, i64)> {
     use std::os::unix::ffi::OsStrExt;
-    // A configured folder may not exist on disk yet (e.g. the log dir before the
-    // first write); walk up to the nearest existing ancestor so we still report
-    // the containing filesystem, as C# `DriveInfo` does.
-    let mut current = Some(std::path::Path::new(path));
-    while let Some(dir) = current {
-        let Ok(c_path) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
-            return (0, 0);
-        };
-        // SAFETY: `stat` is written by `statvfs` before we read it; `c_path` is a
-        // valid NUL-terminated C string that outlives the call.
-        let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
-        if unsafe { libc::statvfs(c_path.as_ptr(), std::ptr::from_mut(&mut stat)) } == 0 {
-            let block = i128::from(stat.f_frsize);
-            let bytes = |blocks: u64| -> i64 {
-                i64::try_from(i128::from(blocks) * block).unwrap_or(i64::MAX)
-            };
-            let free = bytes(stat.f_bavail);
-            let used = bytes(stat.f_blocks.saturating_sub(stat.f_bfree));
-            return (free, used);
-        }
-        current = dir.parent();
+
+    let c_path = std::ffi::CString::new(std::path::Path::new(path).as_os_str().as_bytes()).ok()?;
+    // SAFETY: `stat` is fully written by `statvfs` before it is read, and
+    // `c_path` is a valid NUL-terminated C string that outlives the call.
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c_path.as_ptr(), std::ptr::from_mut(&mut stat)) } != 0 {
+        return None;
     }
-    (0, 0)
+    let block = i128::from(stat.f_frsize);
+    let bytes =
+        |blocks: u64| -> i64 { i64::try_from(i128::from(blocks) * block).unwrap_or(i64::MAX) };
+    let free = bytes(stat.f_bavail);
+    let total = bytes(stat.f_blocks);
+    Some((free, total.saturating_sub(free)))
 }
 
-/// Non-unix fallback: no portable `statvfs`, so usage is unknown.
+/// Non-unix fallback: no portable `statvfs`, so the query cannot be answered and
+/// the C# catch shape (`-1`/`-1`, no `StorageType`, no `DeviceId`) is reported.
 ///
 // ponytail: Windows would use `GetDiskFreeSpaceExW`; add it if a Windows build
 // ships. The user's server is unix, where this is real.
 #[cfg(not(unix))]
-fn disk_usage(_path: &str) -> (i64, i64) {
-    (0, 0)
+fn disk_usage(_path: &str) -> Option<(i64, i64)> {
+    None
 }
 
 /// Supplies the per-library storage folders.
@@ -352,27 +411,49 @@ impl ferrofin_traits::system::SystemManager for FerrofinSystemManager {
     }
 
     async fn get_system_storage_info(&self) -> Result<SystemStorageInfo, ServiceError> {
-        let probe = |p: String| self.storage_probe.probe(&p);
-        let libraries = self
-            .library_storage
-            .libraries()
-            .await
+        // Every folder goes through one `probe_all` pass so the real probe reads
+        // the mount table once per request rather than once per folder.
+        let library_folders = self.library_storage.libraries().await;
+        let mut paths = vec![
+            self.paths.program_data_path(),
+            self.paths.web_path(),
+            self.paths.image_cache_path(),
+            self.paths.cache_path(),
+            self.paths.log_directory_path(),
+            self.paths.internal_metadata_path(),
+            self.transcode_path(),
+        ];
+        for (_, _, folders) in &library_folders {
+            paths.extend(folders.iter().cloned());
+        }
+
+        let mut probed = self.storage_probe.probe_all(&paths).into_iter();
+        let mut next = || probed.next().unwrap_or_default();
+        let program_data_folder = next();
+        let web_folder = next();
+        let image_cache_folder = next();
+        let cache_folder = next();
+        let log_folder = next();
+        let internal_metadata_folder = next();
+        let transcoding_temp_folder = next();
+
+        let libraries = library_folders
             .into_iter()
             .map(|(id, name, folders)| LibraryStorageInfo {
                 id,
                 name,
-                folders: folders.into_iter().map(&probe).collect(),
+                folders: folders.iter().map(|_| next()).collect(),
             })
             .collect();
 
         Ok(SystemStorageInfo {
-            program_data_folder: probe(self.paths.program_data_path()),
-            web_folder: probe(self.paths.web_path()),
-            image_cache_folder: probe(self.paths.image_cache_path()),
-            cache_folder: probe(self.paths.cache_path()),
-            log_folder: probe(self.paths.log_directory_path()),
-            internal_metadata_folder: probe(self.paths.internal_metadata_path()),
-            transcoding_temp_folder: probe(self.transcode_path()),
+            program_data_folder,
+            web_folder,
+            image_cache_folder,
+            cache_folder,
+            log_folder,
+            internal_metadata_folder,
+            transcoding_temp_folder,
             libraries,
         })
     }
@@ -513,5 +594,93 @@ mod tests {
         let info = FsStorageProbe.probe(&dir.to_string_lossy());
         assert!(info.free_space > 0, "free space should be non-zero");
         assert!(info.used_space > 0, "used space should be non-zero");
+    }
+
+    /// C#: `UsedSpace = driveInfo.TotalSize - driveInfo.AvailableFreeSpace`.
+    /// `FreeSpace + UsedSpace` must therefore be the filesystem's *total* size —
+    /// which is what makes the field comparable byte-for-byte between two
+    /// servers on the same host. Subtracting `f_bfree` instead of `f_bavail`
+    /// (the bug this replaced) makes the sum short by the root reservation.
+    #[cfg(unix)]
+    #[test]
+    fn fs_probe_used_plus_free_is_the_filesystem_total() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = std::env::temp_dir();
+        let info = FsStorageProbe.probe(&dir.to_string_lossy());
+
+        let c_path = std::ffi::CString::new(dir.as_os_str().as_bytes()).expect("cstring");
+        // SAFETY: `stat` is fully written by `statvfs` before it is read.
+        let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::statvfs(c_path.as_ptr(), std::ptr::from_mut(&mut stat)) },
+            0
+        );
+        let total = i64::try_from(i128::from(stat.f_blocks) * i128::from(stat.f_frsize))
+            .expect("total fits");
+        assert_eq!(info.free_space + info.used_space, total);
+        assert_eq!(
+            info.free_space,
+            i64::try_from(i128::from(stat.f_bavail) * i128::from(stat.f_frsize)).expect("free")
+        );
+    }
+
+    /// C# reports `DeviceId = driveInfo.Name`, and on Unix `DriveInfo.Name` is
+    /// the constructor argument verbatim — so it echoes the path as passed, not
+    /// the canonicalized one. `StorageType` is `DriveType.ToString()`, always a
+    /// value (`Unknown` is the table's default arm), never a missing key.
+    #[cfg(unix)]
+    #[test]
+    fn fs_probe_reports_device_id_and_storage_type() {
+        let dir = std::env::temp_dir();
+        let path = format!("{}/.", dir.to_string_lossy());
+        let info = FsStorageProbe.probe(&path);
+        assert_eq!(info.device_id.as_deref(), Some(path.as_str()));
+        let storage_type = info.storage_type.expect("storage type");
+        assert!(
+            [
+                "Fixed",
+                "Network",
+                "Removable",
+                "Ram",
+                "CDRom",
+                "Unknown",
+                "NoRootDirectory"
+            ]
+            .contains(&storage_type.as_str()),
+            "unexpected DriveType string {storage_type}"
+        );
+    }
+
+    /// The C# catch arm: a path that does not exist makes `AvailableFreeSpace`
+    /// throw, and `StorageHelper` reports `-1`/`-1` with both optional keys
+    /// null. Ferrofin used to walk up to the nearest existing ancestor and
+    /// report that filesystem's real byte counts, which C# never does.
+    #[cfg(unix)]
+    #[test]
+    fn fs_probe_reports_minus_one_for_a_missing_folder() {
+        let missing = "/nonexistent-ferrofin-parity-probe/deeper/still";
+        assert!(!std::path::Path::new(missing).exists());
+        let info = FsStorageProbe.probe(missing);
+        assert_eq!(info.path, missing);
+        assert_eq!(info.free_space, -1);
+        assert_eq!(info.used_space, -1);
+        assert_eq!(info.storage_type, None);
+        assert_eq!(info.device_id, None);
+    }
+
+    /// `probe_all` must answer in the same order it was asked, so the caller can
+    /// destructure the seven fixed folders and then the library locations.
+    #[cfg(unix)]
+    #[test]
+    fn fs_probe_all_preserves_order() {
+        let dir = std::env::temp_dir().to_string_lossy().into_owned();
+        let paths = vec![dir.clone(), "/nonexistent-ferrofin-probe".to_owned(), dir];
+        let out = FsStorageProbe.probe_all(&paths);
+        assert_eq!(out.len(), 3);
+        assert!(out[0].free_space > 0);
+        assert_eq!(out[1].free_space, -1);
+        assert!(out[2].free_space > 0);
+        assert_eq!(out[0], out[2]);
     }
 }

@@ -81,6 +81,11 @@ movie_nfo() { # $1=dir $2=title $3=index
 XML
 }
 
+# How many movies get a trailer extra (see the loop below). Three is enough to
+# give the trailer routes a real, order-checkable corpus without moving the perf
+# fixture's item count meaningfully.
+TRAILER_MOVIES=${TRAILER_MOVIES:-3}
+
 echo "generating $MOVIES movies..."
 for i in $(seq 1 "$MOVIES"); do
   n=$(printf '%04d' "$i"); d="$ROOT/movies/Movie $n (2020)"
@@ -88,6 +93,20 @@ for i in $(seq 1 "$MOVIES"); do
   link "$MASTER" "$d/Movie $n (2020).mkv"
   link "$POSTER" "$d/poster.jpg"
   movie_nfo "$d" "Movie $n" "$i"
+  # The first few movies carry trailer EXTRAS, in both spellings Jellyfin's
+  # NamingOptions classify as ExtraType.Trailer (`<name>-trailer.<ext>` and a
+  # `trailers/` subfolder). Without them GET /Trailers,
+  # /Items?includeItemTypes=Trailer and /Items/{id}/LocalTrailers all have an
+  # empty corpus and can only ever be verified as `empty-corpus`. Kept to a
+  # handful: this tree is shared with the perf leg, where the item count is the
+  # measured variable.
+  if [ "$i" -le "$TRAILER_MOVIES" ]; then
+    link "$MASTER" "$d/Movie $n (2020)-trailer.mkv"
+    if [ "$i" -eq 1 ]; then
+      mkdir -p "$d/trailers"
+      link "$MASTER" "$d/trailers/alt.mkv"
+    fi
+  fi
 done
 
 echo "generating $SERIES series x $EPS episodes..."

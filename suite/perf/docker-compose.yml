@@ -53,6 +53,17 @@ services:
       - ${REAL_TV_DIR:-./fixtures/empty}:/media/tv-real:ro
       - ./fixtures/media:/media/synth:ro
       - ferrofin-data:/config
+      # A counterpart to the jellyfin service's `jellyfin-cache:/cache` below.
+      # The official jellyfin image pins that path, so without this mount the
+      # two containers' MOUNT TABLES differ by one row — and
+      # `GET /Environment/Drives` enumerates the mount table
+      # (ManagedFileSystem.GetDrives → DriveInfo.GetDrives), so the endpoint
+      # would differ for a deployment reason rather than a code one. Same
+      # argument as the FERROFIN_DATA_DIR=/config comment above. Ferrofin does
+      # not need to USE /cache; the endpoint reads mounts, not config.
+      # Container-internal only, so the shared perf leg is unaffected — but it
+      # needs the pair re-provisioned, not just restarted, to take effect.
+      - ferrofin-cache:/cache
 
   jellyfin:
     image: ${JELLYFIN_IMAGE}
@@ -81,5 +92,6 @@ services:
 # Named volumes so `docker compose down -v` gives each run a clean DB.
 volumes:
   ferrofin-data:
+  ferrofin-cache:
   jellyfin-config:
   jellyfin-cache:

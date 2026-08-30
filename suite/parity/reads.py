@@ -540,6 +540,188 @@ def similar_invariants(base, token, ctx, alias="Movies"):
     return facts
 
 
+# ------------------------------------------------------------ scheduled tasks
+
+def tasks_projection(body):
+    """What `GET /ScheduledTasks` legitimately CAN be diffed on.
+
+    `LastExecutionResult` is the one genuinely per-run field — which tasks have
+    run at all on this instance, and when — so it is dropped. Everything else is
+    fully determined by the server's own task registry and must match.
+
+    `Order` is listed EXPLICITLY because parity_diff aligns arrays by Name: the
+    wire order would otherwise never be compared, and it is C# behaviour
+    (`_taskManager.ScheduledTasks.OrderBy(o => o.Name)`), not an accident. `Id`
+    and `Key` are already dropped by the global VOLATILE denylist (Jellyfin's Id
+    is md5(type FullName), Ferrofin's is the task key — a pre-existing accepted
+    divergence)."""
+    if not isinstance(body, list):
+        return body
+    return {
+        "Order": [t.get("Name") for t in body],
+        "Tasks": {t.get("Key"): {k: v for k, v in t.items()
+                                 if k != "LastExecutionResult"}
+                  for t in body},
+    }
+
+
+# ------------------------------------------------------------------- storage
+
+STORAGE_FOLDERS = ("ProgramDataFolder", "LogFolder", "InternalMetadataFolder")
+
+#: Two independent captures cannot be simultaneous, so free space may move
+#: between the two requests. 64 MiB is far below any real divergence (the bug
+#: this guards against was a 15.2 GiB constant offset) and far above ordinary
+#: write noise on an idle lab.
+FREE_SPACE_TOLERANCE = 64 * 1024 * 1024
+
+
+def storage_invariants(base, token, ctx):
+    """`GET /System/Info/Storage` properties that hold on BOTH servers.
+
+    NOT a body diff, and it must never be recorded as one: the `Path` strings are
+    the container layout (Ferrofin's `/config/cache` vs Jellyfin's `/cache`,
+    `/config/web` vs `/jellyfin/jellyfin-web`) and the byte counts are sampled at
+    two different instants. What IS comparable, because both containers stat the
+    SAME host filesystem:
+
+      * the exact key set of every folder object (C# `FolderStorageDto`);
+      * `DeviceId == Path` — on Unix `DriveInfo.Name` is the constructor argument
+        verbatim, so `StorageHelper.GetFreeSpaceOf(path)` echoes the path;
+      * `FreeSpace + UsedSpace`, which is `DriveInfo.TotalSize` and is therefore
+        byte-equal across the two servers. This is the fact that catches a wrong
+        `UsedSpace` formula (subtracting `f_bfree` instead of `f_bavail`
+        under-reported it by the root reservation on every folder);
+      * `StorageType`, the `DriveType.ToString()` of the same filesystem;
+      * the libraries, compared as a SET of (Name, sorted folder paths) — never
+        positionally: the array ORDER is inherited from
+        `GET /Library/VirtualFolders` and belongs to that row.
+
+    ORDER-DEPENDENT, deliberately: the `libraries` fact holds in the canonical
+    layer order (sweep → reads → journeys → …), where both servers hold only the
+    fixture libraries. Run reads AFTER journeys and it goes red, because
+    creating a BoxSet makes Jellyfin auto-create a `Collections` virtual folder
+    (`{data}/collections`) and a DVR path makes it create `Recordings`, and
+    Ferrofin creates NEITHER — measured directly: `POST /Collections` on
+    Ferrofin makes the BoxSet but leaves `GET /Library/VirtualFolders`
+    unchanged. That is a real gap on `GET /Library/VirtualFolders`, which this
+    row merely projects, and the fact is left un-weakened so it says so.
+
+    The missing-folder branch (`-1`/`-1`/null/null) is NOT reachable here — no
+    probe can point both servers at a directory that does not exist — so it is
+    covered by a unit test in `ferrofin-core`'s `system_manager` instead."""
+    facts = {}
+    st, body = token_get(base, "/System/Info/Storage", token)
+    facts["status_200"] = st == 200
+    if not isinstance(body, dict):
+        return facts
+
+    folders = {k: v for k, v in body.items()
+               if isinstance(v, dict) and "Path" in v}
+    facts["folder_count"] = len(folders)
+    facts["folder_keys"] = sorted(folders)
+    facts["folder_object_keys"] = sorted({k for f in folders.values() for k in f})
+    # `DeviceId = driveInfo.Name`, and on Unix `DriveInfo.Name` is the ctor
+    # argument verbatim — so it echoes the path. It is absent exactly on the
+    # folders that hit `StorageHelper.GetFreeSpaceOf`'s catch arm, which also
+    # reports -1/-1 and no StorageType; that pairing is asserted too.
+    facts["device_id_equals_path"] = all(
+        f.get("DeviceId") == f.get("Path")
+        for f in folders.values() if f.get("DeviceId") is not None)
+    facts["absent_keys_pair_with_minus_one"] = all(
+        (f.get("DeviceId") is None) == (f.get("FreeSpace") == -1)
+        and (f.get("StorageType") is None) == (f.get("FreeSpace") == -1)
+        and (f.get("FreeSpace") == -1) == (f.get("UsedSpace") == -1)
+        for f in folders.values())
+    facts["free_space_is_int"] = all(isinstance(f.get("FreeSpace"), int)
+                                     for f in folders.values())
+
+    # TotalSize of the shared host filesystem — identical on both servers.
+    for name in STORAGE_FOLDERS:
+        f = folders.get(name) or {}
+        free, used = f.get("FreeSpace"), f.get("UsedSpace")
+        facts[f"{name}.total"] = (free + used
+                                  if isinstance(free, int) and isinstance(used, int)
+                                  else None)
+        facts[f"{name}.storage_type"] = f.get("StorageType")
+
+    # Free space is sampled at two different instants; bucket it so a genuine
+    # divergence still shows while ordinary write noise does not.
+    free = (folders.get("ProgramDataFolder") or {}).get("FreeSpace")
+    facts["program_data_free_bucket"] = (free // FREE_SPACE_TOLERANCE
+                                         if isinstance(free, int) else None)
+
+    libs = body.get("Libraries")
+    if isinstance(libs, list):
+        facts["libraries"] = sorted(
+            (lib.get("Name"), tuple(sorted(f.get("Path") for f in (lib.get("Folders") or []))))
+            for lib in libs)
+        facts["library_folders_have_storage_type"] = all(
+            f.get("StorageType") is not None
+            for lib in libs for f in (lib.get("Folders") or []))
+        facts["library_folder_device_id_equals_path"] = all(
+            f.get("DeviceId") == f.get("Path")
+            for lib in libs for f in (lib.get("Folders") or []))
+    return facts
+
+
+# ------------------------------------------------------------------ trailers
+
+def trailers_invariants(base, token, ctx):
+    """`GET /Trailers` — Jellyfin 10.11.8 500s on its own route, so the two
+    responses cannot be diffed against each other.
+
+    `TrailersController` holds a DI-constructed `ItemsController` whose
+    `ControllerContext` is never set, so `HttpContext`/`User` are null and the
+    first statement of `ItemsController.GetItems` (`User.GetIsApiKey()`) throws
+    a NullReferenceException. The vendored contract declares only 200/401/403/503
+    for this path and the C# action is `[ProducesResponseType(Status200OK)]`, so
+    200 is the required behaviour and Ferrofin's is the correct one.
+
+    That leaves a cross-route oracle, which is exactly how the C# DEFINES the
+    endpoint: `GetTrailers` is `GetItems(..., includeItemTypes: [Trailer],
+    indexNumber: null)`. `/Items?includeItemTypes=Trailer` works on BOTH servers,
+    so the CONTENT is comparable there, and Ferrofin's own `/Trailers` is held to
+    equal its own `/Items` answer.
+
+    Jellyfin's 500 is PINNED: if upstream ever fixes it, this fact flips and the
+    row goes red loudly instead of passing in silence."""
+    u = ctx["user"]
+    q = "userId=%s&recursive=true&sortBy=SortName&sortOrder=Ascending&limit=1000" % u
+    facts = {}
+
+    st_t, tb = token_get(base, f"/Trailers?{q}", token)
+    st_i, ib = token_get(base, f"/Items?{q}&includeItemTypes=Trailer&fields=Path", token)
+    facts["items_trailer_status_200"] = st_i == 200
+
+    jellyfin = ctx.get("server") == "jellyfin"
+    # Each server against ITS OWN documented behaviour, folded into one fact that
+    # must be True on both. Ferrofin must serve the contract's 200; Jellyfin's
+    # 500 is PINNED here, so an upstream fix turns this False on the Jellyfin
+    # side and the row goes red loudly instead of passing in silence.
+    facts["route_matches_documented_behaviour"] = (st_t == 500) if jellyfin else (st_t == 200)
+    # Ferrofin's hand-rolled /Trailers must answer what its own /Items does for
+    # the same query — the C# route IS literally that delegation. VACUOUS on the
+    # Jellyfin side, which never returns a body to compare; stated rather than
+    # hidden, and it is a Ferrofin self-consistency check, not a parity claim.
+    tbi = (tb or {}).get("Items") or []
+    ibi = (ib or {}).get("Items") or []
+    facts["trailers_equals_own_items_where_the_route_works"] = jellyfin or (
+        [i.get("Id") for i in tbi] == [i.get("Id") for i in ibi]
+        and (tb or {}).get("TotalRecordCount") == (ib or {}).get("TotalRecordCount"))
+
+    items = (ib or {}).get("Items") or []
+    facts["count"] = len(items)
+    facts["names"] = sorted(i.get("Name") or "" for i in items)
+    facts["all_types_are_Trailer"] = all(i.get("Type") == "Trailer" for i in items)
+    facts["total_equals_len"] = (ib or {}).get("TotalRecordCount") == len(items)
+    facts["start_index_zero"] = (ib or {}).get("StartIndex") == 0
+    # A non-empty corpus is what makes `names`/`count` mean anything; the fixture
+    # ships trailer extras (suite/perf/gen-fixtures.sh) so this must hold.
+    facts["corpus_not_empty"] = len(items) > 0
+    return facts
+
+
 READS = [
     plain("GET /System/Info", "/System/Info"),
     plain("GET /System/Endpoint", "/System/Endpoint"),
@@ -695,6 +877,22 @@ READS = [
          without_ferrofin_only_providers),
     ]),
     user("GET /ScheduledTasks/{taskId}", "/ScheduledTasks/{task}"),
+    # One row, five legs — the unfiltered listing plus each isHidden/isEnabled
+    # leg. The filters are the part no layer ever exercised, and they are where
+    # the `IConfigurableScheduledTask` carve-out lives.
+    multi("GET /ScheduledTasks", [
+        ("/ScheduledTasks", tasks_projection),
+        ("/ScheduledTasks?isHidden=true", tasks_projection),
+        ("/ScheduledTasks?isHidden=false", tasks_projection),
+        ("/ScheduledTasks?isEnabled=true", tasks_projection),
+        ("/ScheduledTasks?isEnabled=false", tasks_projection),
+    ]),
+    # Paths and instantaneous byte counts are the container's own; the filesystem
+    # totals, the DriveType word and the key set are not — see the docstring.
+    invariant("GET /System/Info/Storage", storage_invariants),
+    # Jellyfin 500s on its own /Trailers route, so the row is earned through the
+    # cross-route oracle the C# controller is literally defined as.
+    invariant("GET /Trailers", trailers_invariants),
     multi("GET /DisplayPreferences/{displayPreferencesId}", [
         # leg 1: the virgin auto-vivified row (catches a wrong creation default).
         "/DisplayPreferences/usersettings?userId={u}&client=emby",
@@ -719,6 +917,7 @@ READS = [
         "/Audio/{lyric_txt}/Lyrics",
     ], seed=seed_lyrics, reap=reap_lyrics),
 ]
+
 
 # ---------------------------------------------------------------- correlation
 
@@ -1066,11 +1265,16 @@ def selfcheck():
     # The invariant rows must carry a callable, and the diff-shaped folding of
     # its facts must flag both a disagreement AND a fact both servers fail.
     assert all(callable(ep["fn"]) for ep in READS if ep["kind"] == "invariant")
-    # ...and each invariant row must own a DISTINCT alias, or three ledger rows
-    # are one measurement of the same route.
-    aliases = [ep["fn"].alias for ep in READS if ep["kind"] == "invariant"]
+    # ...and each /Similar invariant row must own a DISTINCT alias, or three
+    # ledger rows are one measurement of the same route. (Rows that are not part
+    # of that family — storage, trailers — carry no alias; they are one row per
+    # op, which `rows` already keys uniquely.)
+    aliases = [ep["fn"].alias for ep in READS
+               if ep["kind"] == "invariant" and hasattr(ep["fn"], "alias")]
     assert len(aliases) == len(set(aliases)), f"invariant rows share an alias: {aliases}"
     assert set(aliases) <= set(SIMILAR_ALIASES), aliases
+    inv_ops = [ep["op"] for ep in READS if ep["kind"] == "invariant"]
+    assert len(inv_ops) == len(set(inv_ops)), inv_ops
     # Every invariant row is stamped `property`, never the body-diff method the
     # ledger headline counts.
     assert all(ep["method"] == "property" for ep in READS if ep["kind"] == "invariant")
@@ -1084,6 +1288,17 @@ def selfcheck():
                 got = leg["project"]({"StartIndex": 7, "TotalRecordCount": 500,
                                       "Items": [{"Name": "x"}]})
                 assert got and all(v is not None for v in got.values()), got
+    # The scheduled-tasks projection must keep the wire ORDER as an explicit
+    # comparable (parity_diff aligns arrays by Name and would never see it) and
+    # must drop ONLY LastExecutionResult.
+    proj = tasks_projection([
+        {"Key": "B", "Name": "Bee", "IsHidden": False, "LastExecutionResult": {"Status": "x"}},
+        {"Key": "A", "Name": "Ay", "IsHidden": True},
+    ])
+    assert proj["Order"] == ["Bee", "Ay"], proj
+    assert set(proj["Tasks"]) == {"A", "B"}, proj
+    assert "LastExecutionResult" not in proj["Tasks"]["B"], proj
+    assert proj["Tasks"]["B"]["IsHidden"] is False and proj["Tasks"]["A"]["Name"] == "Ay"
     # Method derivation: two EMPTY result envelopes agreeing on their own zeros is
     # not the body-diff headline, and a pair that compared nothing at all is not a
     # verdict. Both are the shapes that silently inflated the count before.

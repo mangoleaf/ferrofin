@@ -49,6 +49,11 @@ impl ScheduledTask for RefreshGuideTask {
     fn key(&self) -> &str {
         "RefreshGuide"
     }
+    /// C# `RefreshGuideScheduledTask` implements `IConfigurableScheduledTask`, so the
+    /// `GET /ScheduledTasks` `isHidden`/`isEnabled` filters apply to it.
+    fn is_configurable(&self) -> bool {
+        true
+    }
 
     fn name(&self) -> &str {
         "Refresh Guide"

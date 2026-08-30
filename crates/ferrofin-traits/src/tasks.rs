@@ -30,10 +30,33 @@ use crate::error::ServiceError;
 pub trait TaskManager: Send + Sync {
     /// Lists every registered task as a wire [`TaskInfo`].
     ///
-    /// Ports `ScheduledTasksController.GetTasks`: the caller applies the
-    /// `isHidden`/`isEnabled` query filters over the returned list (every task
-    /// here is enabled, so the `isEnabled` filter only matches on `true`).
+    /// The unfiltered listing, in the C# wire order
+    /// (`_taskManager.ScheduledTasks.OrderBy(o => o.Name)`). The query filters
+    /// live on [`get_tasks_filtered`](TaskManager::get_tasks_filtered).
     async fn get_tasks(&self) -> Result<Vec<TaskInfo>, ServiceError>;
+
+    /// Lists the tasks the `isHidden`/`isEnabled` query filters keep.
+    ///
+    /// Ports the loop in `ScheduledTasksController.GetTasks`, where the two
+    /// filters are applied **only** inside
+    /// `if (task.ScheduledTask is IConfigurableScheduledTask scheduledTask)` — a
+    /// task that does not implement the interface is yielded whatever the caller
+    /// asked for. Configurability is a property of the concrete task, so it is
+    /// resolved here rather than by the handler.
+    ///
+    /// The default implementation is the answer for a registry whose tasks are
+    /// all non-configurable: both filters are skipped and every task is listed.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`get_tasks`](TaskManager::get_tasks) returns.
+    async fn get_tasks_filtered(
+        &self,
+        _is_hidden: Option<bool>,
+        _is_enabled: Option<bool>,
+    ) -> Result<Vec<TaskInfo>, ServiceError> {
+        self.get_tasks().await
+    }
 
     /// Fetches a single task by its id (the C# `IScheduledTaskWorker.Id`), or
     /// `None` when no task has that id.

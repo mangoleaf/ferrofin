@@ -988,6 +988,11 @@ impl ServerApplicationHost for FakeAppHost {
     fn listen_with_https(&self) -> bool {
         false
     }
+    fn name(&self) -> String {
+        // Deliberately different from the friendly name so a regression that
+        // swaps the two (as `/System/Ping` once did) fails the test.
+        "Jellyfin Server".to_owned()
+    }
     fn friendly_name(&self) -> String {
         "ferrofin-test".to_owned()
     }
