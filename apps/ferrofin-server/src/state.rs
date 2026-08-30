@@ -705,6 +705,16 @@ pub async fn build_app_state(
                     )
                 }
             })
+            // The SERVER-WIDE per-item-type MetadataOptions. Identify's
+            // provider ordering falls back to this array's
+            // `MetadataFetcherOrder` for a kind whose library saved no
+            // `TypeOptions` entry (C# `ProviderManager.cs:445`); without it an
+            // admin's server-wide fetcher order is silently ignored. Read live
+            // for the same reason the language defaults are.
+            .with_metadata_options({
+                let config_mgr = Arc::clone(&config_mgr);
+                move || config_mgr.snapshot_shared().metadata_options.clone()
+            })
             // Enables the kind-filtered built-in external-id descriptors the
             // Identify dialog renders as id input fields.
             .with_item_types(item_type_lookup.as_ref())

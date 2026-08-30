@@ -59,19 +59,41 @@ pub fn metadata_fetcher_enabled(
     })
 }
 
-/// The library's configured `MetadataFetcherOrder` for item type `kind` — the
-/// order `GetMetadataProvidersInternal` sorts remote providers by
-/// (`ProviderManager.cs:445`). Empty when the library pins no order, in which
-/// case the providers keep their registration order (upstream's
-/// `GetDefaultOrder` tie-break).
+/// The library's configured `MetadataFetcherOrder` for item type `kind`, or
+/// `None` when the library saved no `TypeOptions` entry for the kind.
+///
+/// The `None` is load-bearing and is why this is not a bare `Vec`:
+/// `GetMetadataProvidersInternal` reads
+/// `typeOptions?.MetadataFetcherOrder ?? globalMetadataOptions.MetadataFetcherOrder`
+/// (`ProviderManager.cs:445`), and `??` fires on a MISSING entry only. A saved
+/// entry whose order list is empty is an answer — "this library ranks nothing"
+/// — and must NOT fall through to the server-wide order, or clearing the list
+/// in the UI would silently re-inherit the global one.
 #[must_use]
 pub fn metadata_fetcher_order(
     options: Option<&ferrofin_model::configuration::LibraryOptions>,
     kind: &str,
-) -> Vec<String> {
-    type_entry(options, kind)
-        .map(|t| t.metadata_fetcher_order.clone())
-        .unwrap_or_default()
+) -> Option<Vec<String>> {
+    type_entry(options, kind).map(|t| t.metadata_fetcher_order.clone())
+}
+
+/// The server-wide [`MetadataOptions`] entry for item type `kind`.
+///
+/// Port of `MetadataConfigurationExtensions.GetMetadataOptionsForType`
+/// (v10.11.8 `MediaBrowser.Controller/Library/MetadataConfigurationExtensions.cs:21`):
+/// `Array.Find(config.MetadataOptions, i => i.ItemType == type)`, ordinal
+/// case-insensitive, `null` when the server configuration names no entry for
+/// the type.
+#[must_use]
+pub fn global_metadata_options<'a>(
+    all: &'a [ferrofin_model::configuration::MetadataOptions],
+    kind: &str,
+) -> Option<&'a ferrofin_model::configuration::MetadataOptions> {
+    all.iter().find(|o| {
+        o.item_type
+            .as_deref()
+            .is_some_and(|t| t.eq_ignore_ascii_case(kind))
+    })
 }
 
 /// Whether the library enables image fetcher `name` for item type `kind`.

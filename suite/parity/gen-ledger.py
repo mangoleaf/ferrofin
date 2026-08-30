@@ -190,9 +190,29 @@ def is_flagged(r):
     return r["classification"].startswith("flagged")
 
 
+#: The marker a classification carries while the OWNER has not yet ruled on it.
+#: Written into the classification text by whoever recorded the divergence.
+PENDING_MARKER = "OWNER CALL PENDING"
+
+
+def is_pending_ratification(r):
+    """A divergence Ferrofin believes is Jellyfin's bug, NOT yet ratified.
+
+    Third state, and it needs to exist. "Accepted — not a bug" is a claim that
+    a human closed the question; "open work" is a claim that Ferrofin still
+    owes a port. A "don't port Jellyfin's bug" call is neither until the owner
+    rules on it: the code is deliberate and correct, and the decision is still
+    somebody's to make. Rendering it as accepted is how a pending call quietly
+    becomes a settled one, which is the same defect as an unreviewed detector
+    flag reading as a decision, pointed a third way.
+    """
+    return PENDING_MARKER in r["classification"]
+
+
 def is_accepted(r):
     return (r["classification"] and r["deep_verified"] is not True
-            and not is_open_work(r) and not is_flagged(r))
+            and not is_open_work(r) and not is_flagged(r)
+            and not is_pending_ratification(r))
 
 
 #: "N field(s) compared" / "N fields compared", however a layer phrases it.
@@ -231,6 +251,8 @@ def render_md(rows):
     other = sum(n for m, n in by_method.items() if m != verification.HEADLINE)
     accepted = sum(1 for r in rows if is_accepted(r))
     openwork = sum(1 for r in rows if is_open_work(r) and r["deep_verified"] is not True)
+    pending = sum(1 for r in rows
+                  if is_pending_ratification(r) and r["deep_verified"] is not True)
     flagged = sum(1 for r in rows if is_flagged(r) and r["deep_verified"] is not True)
     untested = sum(1 for r in rows if r["deep_verified"] is None and not r["classification"])
     depth_counts = defaultdict(int)
@@ -251,7 +273,8 @@ def render_md(rows):
     layer1 = (f"Layer 1: {sc_yes}/{sc_run} status-conformant · {sv_yes}/{sv_run} schema-valid"
               if sc_run or sv_run else "status-conformance + schema-validation not yet run — Layer 1")
     out.append(f"**{deep}/{total} deep-verified · {other} verified another way · "
-               f"{accepted} classified-divergence · {openwork} open work · "
+               f"{accepted} classified-divergence · {pending} awaiting owner ratification · "
+               f"{openwork} open work · "
                f"{flagged} flagged (unreviewed) · {untested} untested**  \n_{layer1}_\n")
     out.append("_deep-verified means exactly one thing: "
                f"{verification.METHODS[verification.HEADLINE][2]}. "
@@ -284,9 +307,9 @@ def render_md(rows):
     out.append("## Ownership (core vs compiled-in extensions)\n")
     out.append("_Extensions must not dilute or flatter core's coverage number — "
                "each owner's deep-verified share stands alone._\n")
-    out.append("| owner | ops | deep-verified | verified another way | classified | open work "
-               "| flagged | untested |")
-    out.append("|---|---:|---:|---:|---:|---:|---:|---:|")
+    out.append("| owner | ops | deep-verified | verified another way | classified "
+               "| awaiting ratification | open work | flagged | untested |")
+    out.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|")
     by_owner = defaultdict(list)
     for r in rows:
         by_owner[r["owner"]].append(r)
@@ -295,11 +318,13 @@ def render_md(rows):
         d = sum(1 for r in rs if is_headline(r))
         o = sum(1 for r in rs if r["deep_verified"] is True and not is_headline(r))
         c = sum(1 for r in rs if is_accepted(r))
+        pr = sum(1 for r in rs
+                 if is_pending_ratification(r) and r["deep_verified"] is not True)
         w = sum(1 for r in rs if is_open_work(r) and r["deep_verified"] is not True)
         fl = sum(1 for r in rs if is_flagged(r) and r["deep_verified"] is not True)
         u = sum(1 for r in rs if r["deep_verified"] is None and not r["classification"])
-        out.append(f"| {owner} | {len(rs)} | {d} ({100 * d // len(rs)}%) | {o} | {c} | {w} "
-                   f"| {fl} | {u} |")
+        out.append(f"| {owner} | {len(rs)} | {d} ({100 * d // len(rs)}%) | {o} | {c} | {pr} "
+                   f"| {w} | {fl} | {u} |")
     out.append("")
 
     def listing(method, show_evidence=False):
@@ -335,6 +360,16 @@ def render_md(rows):
     for r in rows:
         if is_accepted(r):
             out.append(f"- ⚠️ `{r['operation']}` — {r['classification']}")
+    out.append("")
+    out.append("## Awaiting owner ratification (NOT yet accepted)\n")
+    out.append("_Ferrofin is deliberately doing the thing the C# is understood to have gotten "
+               "wrong, with the upstream evidence recorded on the row. That is a decision the "
+               "OWNER makes, not an agent — so these are kept out of \"accepted\" until it is "
+               "made. Each one stays `deep_verified=false` against the 10.11.8 oracle while it "
+               "waits: the divergence is real and visible, not filtered out of the diff._\n")
+    for r in rows:
+        if is_pending_ratification(r) and r["deep_verified"] is not True:
+            out.append(f"- ⚖️ `{r['operation']}` — {r['classification']}")
     out.append("")
     out.append("## Open work (NOT accepted — a named divergence still to port)\n")
     out.append("_These are real gaps with an owner and a path, kept OUT of the accepted "
@@ -499,12 +534,24 @@ def check(rows, curated):
     # "accepted — not a bug" — that heading is a claim about a HUMAN decision.
     assert not [r for r in rows if is_open_work(r) and is_accepted(r)]
     assert not [r for r in rows if is_flagged(r) and is_accepted(r)]
+    # …and neither may a divergence whose text says the owner has not ruled yet.
+    assert not [r for r in rows if is_pending_ratification(r) and is_accepted(r)]
+    # A pending-ratification row that has ALSO been marked open work is
+    # incoherent: one says Ferrofin is right, the other says Ferrofin owes a
+    # port. Whoever wrote it must pick.
+    contradictory = [r["operation"] for r in rows
+                     if is_pending_ratification(r) and is_open_work(r)]
+    assert not contradictory, (f"row(s) claim both 'owner call pending' and 'open work': "
+                               f"{contradictory}")
     by = Counter(r["verification_method"] for r in rows if r["deep_verified"] is True)
     other = ", ".join(f"{n} {m}" for m, n in sorted(by.items(), key=lambda kv: kv[0] or "")
                       if m != verification.HEADLINE)
+    pending = sum(1 for r in rows
+                  if is_pending_ratification(r) and r["deep_verified"] is not True)
     print(f"ok: {len(rows)} ops, all {len(curated)} curated rows matched, "
           f"{by[verification.HEADLINE]} deep-verified (the headline), "
-          f"verified another way: {other or 'none'}")
+          f"verified another way: {other or 'none'}, "
+          f"{pending} awaiting owner ratification")
 
 
 def main():

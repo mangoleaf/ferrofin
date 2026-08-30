@@ -71,6 +71,13 @@ impl RemoteSearchProvider for TmdbSearchProvider {
         item_kind == self.supported
     }
 
+    /// `TmdbMovieProvider.Order => 1` (`Movies/TmdbMovieProvider.cs:48`) and
+    /// `TmdbSeriesProvider.Order => 1` (`TV/TmdbSeriesProvider.cs:52`) — the
+    /// two kinds this instance can be built for both declare 1.
+    fn default_order(&self) -> i32 {
+        1
+    }
+
     async fn get_search_results(
         &self,
         request: &RemoteSearchRequest,
@@ -242,6 +249,15 @@ impl RemoteSearchProvider for TvdbSearchProvider {
         item_kind == BaseItemKind::Series
     }
 
+    /// No oracle value exists: 10.11.8 ships **no** TVDB provider (TheTVDB is
+    /// an out-of-tree .NET plugin upstream, and compiled in here), so there is
+    /// no `IHasOrder` to port. It therefore takes `GetDefaultOrder`'s value for
+    /// a provider that declares none — the inherited 50, spelled out rather
+    /// than inherited silently so the absence of an oracle is on the record.
+    fn default_order(&self) -> i32 {
+        50
+    }
+
     async fn get_search_results(
         &self,
         request: &RemoteSearchRequest,
@@ -294,6 +310,14 @@ impl RemoteSearchProvider for TmdbBoxSetSearchProvider {
 
     fn supports(&self, item_kind: BaseItemKind) -> bool {
         item_kind == BaseItemKind::BoxSet
+    }
+
+    /// `TmdbBoxSetProvider` implements `IRemoteMetadataProvider<BoxSet,…>` and
+    /// **not** `IHasOrder` (`BoxSets/TmdbBoxSetProvider.cs:20`), so upstream
+    /// gives it `GetDefaultOrder`'s 50 — deliberately NOT the 1 its sibling
+    /// movie/series providers declare.
+    fn default_order(&self) -> i32 {
+        50
     }
 
     async fn get_search_results(
@@ -418,6 +442,18 @@ impl RemoteSearchProvider for OmdbSearchProvider {
 
     fn supports(&self, item_kind: BaseItemKind) -> bool {
         item_kind == self.supported
+    }
+
+    /// Two different C# classes, two different orders:
+    /// `OmdbItemProvider.Order => 2` (`Omdb/OmdbItemProvider.cs:56`) serves
+    /// movie/series/trailer, while `OmdbEpisodeProvider.Order => 1`
+    /// (`Omdb/OmdbEpisodeProvider.cs:33`) serves episodes.
+    fn default_order(&self) -> i32 {
+        if self.supported == BaseItemKind::Episode {
+            1
+        } else {
+            2
+        }
     }
 
     async fn get_search_results(
@@ -671,6 +707,12 @@ impl RemoteSearchProvider for MusicBrainzAlbumSearchProvider {
         item_kind == BaseItemKind::MusicAlbum
     }
 
+    /// `MusicBrainzAlbumProvider.Order => 0`
+    /// (`MusicBrainz/MusicBrainzAlbumProvider.cs:46`) — it wants to be first.
+    fn default_order(&self) -> i32 {
+        0
+    }
+
     async fn get_search_results(
         &self,
         request: &RemoteSearchRequest,
@@ -744,6 +786,14 @@ impl RemoteSearchProvider for MusicBrainzArtistSearchProvider {
         item_kind == BaseItemKind::MusicArtist
     }
 
+    /// `MusicBrainzArtistProvider` implements `IRemoteMetadataProvider` and
+    /// `IDisposable` but **not** `IHasOrder`
+    /// (`MusicBrainz/MusicBrainzArtistProvider.cs:25`) — unlike its album
+    /// sibling, which declares 0. Upstream's default 50.
+    fn default_order(&self) -> i32 {
+        50
+    }
+
     async fn get_search_results(
         &self,
         request: &RemoteSearchRequest,
@@ -803,6 +853,15 @@ impl RemoteSearchProvider for AudioDbSearchProvider {
         item_kind == self.supported
     }
 
+    /// `AudioDbArtistProvider.Order => 1` (`AudioDb/AudioDbArtistProvider.cs:52`)
+    /// and `AudioDbAlbumProvider.Order => 1` (`AudioDb/AudioDbAlbumProvider.cs:53`)
+    /// — both kinds this instance can be built for declare 1, which puts
+    /// TheAudioDb after MusicBrainz's album provider (0) and before an
+    /// unranked one (50).
+    fn default_order(&self) -> i32 {
+        1
+    }
+
     async fn get_search_results(
         &self,
         _request: &RemoteSearchRequest,
@@ -837,6 +896,12 @@ impl RemoteSearchProvider for TmdbPersonSearchProvider {
 
     fn supports(&self, item_kind: BaseItemKind) -> bool {
         item_kind == BaseItemKind::Person
+    }
+
+    /// `TmdbPersonProvider` implements `IRemoteMetadataProvider<Person,…>` and
+    /// **not** `IHasOrder` (`People/TmdbPersonProvider.cs:18`) — upstream's 50.
+    fn default_order(&self) -> i32 {
+        50
     }
 
     async fn get_search_results(
@@ -908,6 +973,21 @@ pub trait RemoteSearchProvider: Send + Sync {
     /// Whether this provider can search for `item_kind`.
     fn supports(&self, item_kind: BaseItemKind) -> bool;
 
+    /// The provider's own precedence — `IHasOrder.Order` in the C#.
+    ///
+    /// `GetMetadataProvidersInternal` sorts remote providers by the library's
+    /// configured `MetadataFetcherOrder` and then `.ThenBy(GetDefaultOrder)`
+    /// (`ProviderManager.cs:459` / `:506`), where `GetDefaultOrder` is the
+    /// provider's `IHasOrder.Order` if it declares one and **50** if it does
+    /// not — "after items that want to be first (~0) but before items that
+    /// want to be last (~100)", in upstream's own words. The default here is
+    /// that same 50, so a provider that declares nothing sorts exactly where a
+    /// non-`IHasOrder` C# provider sorts. Ties keep registration order, since
+    /// `slice::sort_by_key` is stable and so is LINQ's `OrderBy`/`ThenBy`.
+    fn default_order(&self) -> i32 {
+        50
+    }
+
     /// Runs the search, returning raw candidate results (name/provider-ids set).
     /// `request` carries the shared
     /// [`ItemLookupInfo`](ferrofin_model::providers::ItemLookupInfo)
@@ -977,6 +1057,17 @@ pub struct LocalProviderManager {
     /// `POST /System/Configuration` takes effect without a restart. Absent →
     /// the request's own values (possibly none) are used unchanged.
     metadata_defaults: Option<Arc<dyn Fn() -> (String, String) + Send + Sync>>,
+    /// Reads the server configuration's `MetadataOptions` array — the
+    /// SERVER-WIDE per-item-type provider options, which are a different thing
+    /// from a library's `TypeOptions`. `GetMetadataProvidersInternal` falls
+    /// back to `globalMetadataOptions.MetadataFetcherOrder` whenever the
+    /// library saved no `TypeOptions` entry for the kind
+    /// (`ProviderManager.cs:445`), so without this an admin's server-wide
+    /// fetcher order is silently ignored. Read live, like
+    /// [`metadata_defaults`](Self::metadata_defaults), so a
+    /// `POST /System/Configuration` applies without a restart. Absent → an
+    /// empty global array, i.e. no server-wide ranking.
+    metadata_options: Option<Arc<dyn Fn() -> Vec<MetadataOptions> + Send + Sync>>,
 }
 
 impl std::fmt::Debug for LocalProviderManager {
@@ -999,6 +1090,7 @@ impl std::fmt::Debug for LocalProviderManager {
             .field("dynamic_fetchers", &self.dynamic_fetchers.len())
             .field("kind_by_type_name", &self.kind_by_type_name.len())
             .field("has_metadata_defaults", &self.metadata_defaults.is_some())
+            .field("has_metadata_options", &self.metadata_options.is_some())
             .finish()
     }
 }
@@ -1027,6 +1119,7 @@ impl LocalProviderManager {
             omdb: None,
             kind_by_type_name: HashMap::new(),
             metadata_defaults: None,
+            metadata_options: None,
         }
     }
 
@@ -1046,6 +1139,32 @@ impl LocalProviderManager {
     ) -> Self {
         self.metadata_defaults = Some(Arc::new(defaults));
         self
+    }
+
+    /// Attaches a reader for the server configuration's `MetadataOptions`
+    /// array, so the remote-search provider ordering can fall back to the
+    /// SERVER-WIDE `MetadataFetcherOrder` for a kind the library did not
+    /// customise (`ProviderManager.cs:445`).
+    ///
+    /// The closure is called once per search and read live, so a
+    /// `POST /System/Configuration` applies without a restart. Without it the
+    /// global array reads as empty and only a library's own order ranks
+    /// anything.
+    #[must_use]
+    pub fn with_metadata_options(
+        mut self,
+        options: impl Fn() -> Vec<MetadataOptions> + Send + Sync + 'static,
+    ) -> Self {
+        self.metadata_options = Some(Arc::new(options));
+        self
+    }
+
+    /// The server-wide [`MetadataOptions`] for item type `kind`, or `None`
+    /// when the configuration names no entry for it (or no reader is wired) —
+    /// `_configurationManager.GetMetadataOptionsForType(item.GetType().Name)`.
+    fn global_metadata_options_for(&self, kind: &str) -> Option<MetadataOptions> {
+        let all = self.metadata_options.as_ref()?();
+        crate::library_options::global_metadata_options(&all, kind).cloned()
     }
 
     /// A copy of `request` whose blank `MetadataLanguage`/`MetadataCountryCode`
@@ -2653,19 +2772,34 @@ impl ProviderManager for LocalProviderManager {
                     && can_refresh(p.name())
             })
             .collect();
-        // `.OrderBy(GetConfiguredOrder(metadataFetcherOrder, i.Name))` with
-        // `.ThenBy(GetDefaultOrder)` — a provider the library did not rank sorts
-        // after every ranked one, and ties keep registration order (the sort is
-        // stable, as `OrderBy` is).
-        let order = crate::library_options::metadata_fetcher_order(library.as_ref(), &kind);
-        if !order.is_empty() {
-            providers.sort_by_key(|p| {
-                order
-                    .iter()
-                    .position(|n| n.eq_ignore_ascii_case(p.name()))
-                    .unwrap_or(usize::MAX)
+        // `.OrderBy(GetConfiguredOrder(metadataFetcherOrder, i.Name))` then
+        // `.ThenBy(GetDefaultOrder)` (`ProviderManager.cs:455-459`), where
+        //   metadataFetcherOrder = typeOptions?.MetadataFetcherOrder
+        //                          ?? globalMetadataOptions.MetadataFetcherOrder  (:445)
+        // Both halves matter and both used to be missing here. The `??` fires
+        // on a MISSING library `TypeOptions` entry only, which is why
+        // `metadata_fetcher_order` returns an Option: a saved-but-empty order
+        // list means "this library ranks nothing" and must not re-inherit the
+        // server-wide one. `GetConfiguredOrder` gives an unranked provider
+        // `int.MaxValue` (:502), so it sorts after every ranked one, and the
+        // `GetDefaultOrder` tie-break is the provider's own `IHasOrder.Order`
+        // (50 when it declares none, :506) — NOT registration order, which is
+        // what the bare stable sort used to substitute for it. Ties on both
+        // keys still keep registration order: `sort_by_key` is stable, as
+        // LINQ's `OrderBy`/`ThenBy` are.
+        let order = crate::library_options::metadata_fetcher_order(library.as_ref(), &kind)
+            .unwrap_or_else(|| {
+                self.global_metadata_options_for(&kind)
+                    .map(|o| o.metadata_fetcher_order)
+                    .unwrap_or_default()
             });
-        }
+        providers.sort_by_key(|p| {
+            let ranked = order
+                .iter()
+                .position(|n| n.eq_ignore_ascii_case(p.name()))
+                .unwrap_or(usize::MAX);
+            (ranked, p.default_order())
+        });
 
         // A blank `MetadataLanguage`/`MetadataCountryCode` is filled from the
         // server configuration BEFORE the providers run, exactly as the C#
@@ -2708,8 +2842,22 @@ impl ProviderManager for LocalProviderManager {
         ))
     }
 
-    async fn get_metadata_options(&self, _item_id: Uuid) -> Result<MetadataOptions, ServiceError> {
-        Ok(MetadataOptions::default())
+    async fn get_metadata_options(&self, item_id: Uuid) -> Result<MetadataOptions, ServiceError> {
+        // `ProviderManager.GetMetadataOptions(BaseItem item)` (`:652`):
+        // `GetMetadataOptionsForType(item.GetType().Name) ?? new MetadataOptions()`
+        // — the server-wide entry for the item's own type, and a default
+        // (all-empty) one when the configuration names none. An unresolvable
+        // id has no type, so it takes the same default.
+        let kind = match (&self.items, item_id) {
+            (Some(items), id) if !id.is_nil() => items
+                .retrieve_item(id)
+                .await?
+                .map(|e| short_kind(&e).to_owned()),
+            _ => None,
+        };
+        Ok(kind
+            .and_then(|k| self.global_metadata_options_for(&k))
+            .unwrap_or_default())
     }
 
     async fn get_refresh_queue(&self) -> Result<Vec<Uuid>, ServiceError> {
@@ -2731,6 +2879,7 @@ mod tests {
 
     use async_trait::async_trait;
     use ferrofin_db::entities::base_items::BaseItemEntity;
+    use ferrofin_model::configuration::MetadataOptions;
     use ferrofin_model::data::BaseItemKind;
     use ferrofin_model::entities::ImageType;
     use ferrofin_model::providers::{
@@ -2769,6 +2918,40 @@ mod tests {
                 return Err(ServiceError::backend("boom"));
             }
             Ok(self.results.clone())
+        }
+    }
+
+    /// A provider whose only job is to be sortable: it declares an
+    /// `IHasOrder`-style order and returns one uniquely-identified result, so
+    /// the merged list's order IS the provider order.
+    struct OrderedProvider {
+        name: String,
+        order: i32,
+    }
+
+    #[async_trait]
+    impl RemoteSearchProvider for OrderedProvider {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn supports(&self, item_kind: BaseItemKind) -> bool {
+            item_kind == BaseItemKind::MusicArtist
+        }
+
+        fn default_order(&self) -> i32 {
+            self.order
+        }
+
+        async fn get_search_results(
+            &self,
+            _request: &RemoteSearchRequest,
+        ) -> Result<Vec<RemoteSearchResult>, ServiceError> {
+            Ok(vec![result_with(
+                &self.name,
+                &[("MusicBrainzArtist", &self.name)],
+                None,
+            )])
         }
     }
 
@@ -3658,6 +3841,183 @@ mod tests {
     /// leaves unticked. An UNSCOPED search builds a dummy with default
     /// `LibraryOptions`, where nothing is unticked, so it keeps the provider —
     /// which is why the two only diverge once `ItemId` is sent.
+    /// `GetMetadataProvidersInternal`'s ordering, both halves
+    /// (`ProviderManager.cs:442-459`):
+    ///   metadataFetcherOrder = typeOptions?.MetadataFetcherOrder
+    ///                          ?? globalMetadataOptions.MetadataFetcherOrder
+    ///   .OrderBy(GetConfiguredOrder(...)).ThenBy(GetDefaultOrder)
+    ///
+    /// Registration order is DELIBERATELY the reverse of every expected answer
+    /// here, so a test that merely echoed the registration list would fail
+    /// case (a) immediately.
+    #[tokio::test]
+    async fn remote_search_orders_by_configured_then_default_order() {
+        let names = |out: &[RemoteSearchResult]| -> Vec<String> {
+            out.iter().filter_map(|r| r.name.clone()).collect()
+        };
+        let providers = || {
+            vec![
+                Arc::new(OrderedProvider {
+                    name: "Unranked".to_owned(),
+                    order: 50,
+                }) as Arc<dyn RemoteSearchProvider>,
+                Arc::new(OrderedProvider {
+                    name: "Second".to_owned(),
+                    order: 2,
+                }),
+                Arc::new(OrderedProvider {
+                    name: "First".to_owned(),
+                    order: 0,
+                }),
+            ]
+        };
+        let req = request(BaseItemKind::MusicArtist);
+
+        // (a) Nothing configured anywhere: `GetDefaultOrder` alone decides, and
+        //     it is the provider's own order — NOT the registration order.
+        let bare = LocalProviderManager::default().with_remote_search_providers(providers());
+        assert_eq!(
+            names(&bare.remote_search(&req).await.unwrap()),
+            ["First", "Second", "Unranked"],
+        );
+
+        // (b) The SERVER-WIDE MetadataOptions rank a provider the library did
+        //     not: `typeOptions?.… ?? globalMetadataOptions.…` fires because no
+        //     library resolves here. An unranked provider keeps `int.MaxValue`
+        //     and sorts after, still tie-broken by GetDefaultOrder.
+        let global = LocalProviderManager::default()
+            .with_remote_search_providers(providers())
+            .with_metadata_options(|| {
+                vec![MetadataOptions {
+                    item_type: Some("MusicArtist".to_owned()),
+                    metadata_fetcher_order: vec!["Unranked".to_owned()],
+                    ..MetadataOptions::default()
+                }]
+            });
+        assert_eq!(
+            names(&global.remote_search(&req).await.unwrap()),
+            ["Unranked", "First", "Second"],
+        );
+
+        // (c) The global entry is keyed on the item TYPE: an entry for another
+        //     type must not rank anything here.
+        let other_type = LocalProviderManager::default()
+            .with_remote_search_providers(providers())
+            .with_metadata_options(|| {
+                vec![MetadataOptions {
+                    item_type: Some("Movie".to_owned()),
+                    metadata_fetcher_order: vec!["Unranked".to_owned()],
+                    ..MetadataOptions::default()
+                }]
+            });
+        assert_eq!(
+            names(&other_type.remote_search(&req).await.unwrap()),
+            ["First", "Second", "Unranked"],
+        );
+    }
+
+    /// The library half of the same citation: a library that SAVED a
+    /// `TypeOptions` entry answers for itself, even when its order list is
+    /// EMPTY. `typeOptions?.MetadataFetcherOrder ?? global` fires on a MISSING
+    /// entry only, so an emptied order list must not re-inherit the
+    /// server-wide one — the leg the old `if !order.is_empty()` could not
+    /// express, since it could not tell "absent" from "empty".
+    #[tokio::test]
+    async fn a_saved_but_empty_library_order_does_not_inherit_the_global_one() {
+        let names = |out: &[RemoteSearchResult]| -> Vec<String> {
+            out.iter().filter_map(|r| r.name.clone()).collect()
+        };
+        let providers = || {
+            vec![
+                Arc::new(OrderedProvider {
+                    name: "Unranked".to_owned(),
+                    order: 50,
+                }) as Arc<dyn RemoteSearchProvider>,
+                Arc::new(OrderedProvider {
+                    name: "Second".to_owned(),
+                    order: 2,
+                }),
+                Arc::new(OrderedProvider {
+                    name: "First".to_owned(),
+                    order: 0,
+                }),
+            ]
+        };
+        let library_id = Uuid::from_u128(0x6001);
+        let artist_id = Uuid::from_u128(0x6002);
+        let entity = BaseItemEntity {
+            id: ferrofin_db::store::guid_to_db(artist_id),
+            type_: "MediaBrowser.Controller.Entities.Audio.MusicArtist".to_owned(),
+            name: Some("Radiohead".to_owned()),
+            top_parent_id: Some(ferrofin_db::store::guid_to_db(library_id)),
+            ..BaseItemEntity::default()
+        };
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut rows = HashMap::new();
+        rows.insert(artist_id, entity);
+        let with_library = |order: Vec<String>| {
+            LocalProviderManager::default()
+                .with_remote_search_providers(providers())
+                .with_metadata_options(|| {
+                    vec![MetadataOptions {
+                        item_type: Some("MusicArtist".to_owned()),
+                        metadata_fetcher_order: vec!["Unranked".to_owned()],
+                        ..MetadataOptions::default()
+                    }]
+                })
+                .with_virtual_folders(Arc::new(OneLibrary(
+                    ferrofin_model::entities_media::VirtualFolderInfo {
+                        name: Some("Music".to_owned()),
+                        item_id: Some(library_id.to_string()),
+                        library_options: Some(ferrofin_model::configuration::LibraryOptions {
+                            type_options: vec![ferrofin_model::configuration::TypeOptions {
+                                type_: Some("MusicArtist".to_owned()),
+                                metadata_fetchers: vec![
+                                    "Unranked".to_owned(),
+                                    "Second".to_owned(),
+                                    "First".to_owned(),
+                                ],
+                                metadata_fetcher_order: order,
+                                ..ferrofin_model::configuration::TypeOptions::default()
+                            }],
+                            ..ferrofin_model::configuration::LibraryOptions::default()
+                        }),
+                        ..ferrofin_model::entities_media::VirtualFolderInfo::default()
+                    },
+                ))
+                    as Arc<dyn ferrofin_traits::library::VirtualFolderManager>)
+                .with_remote_images(
+                    Arc::new(crate::tmdb::TmdbClient::new()),
+                    Arc::new(FakeItems {
+                        rows: rows.clone(),
+                        seen: tx.clone(),
+                    }),
+                )
+        };
+        let mut scoped = request(BaseItemKind::MusicArtist);
+        scoped.item_id = artist_id;
+        assert_eq!(
+            names(
+                &with_library(Vec::new())
+                    .remote_search(&scoped)
+                    .await
+                    .unwrap()
+            ),
+            ["First", "Second", "Unranked"],
+            "an emptied library order does not fall back to the global one"
+        );
+        // …and a library that DOES rank wins over the global ranking.
+        assert_eq!(
+            names(
+                &with_library(vec!["Second".to_owned()])
+                    .remote_search(&scoped)
+                    .await
+                    .unwrap()
+            ),
+            ["Second", "First", "Unranked"],
+        );
+    }
+
     #[tokio::test]
     async fn remote_search_honours_the_librarys_metadata_fetcher_checkboxes() {
         let library_id = Uuid::from_u128(0x5001);
@@ -4221,12 +4581,59 @@ mod tests {
         assert!(!mgr.get_all_metadata_plugins().await.unwrap().is_empty());
         assert!(mgr.get_refresh_queue().await.unwrap().is_empty());
 
-        // Metadata options fall back to the type default.
+        // With no config reader and no item store, `GetMetadataOptions` has
+        // nothing to look up and takes the `?? new MetadataOptions()` arm.
         let opts = mgr.get_metadata_options(id).await.unwrap();
-        assert_eq!(
-            opts,
-            ferrofin_model::configuration::MetadataOptions::default()
+        assert_eq!(opts, MetadataOptions::default());
+    }
+
+    /// `ProviderManager.GetMetadataOptions(item)` (`:652`) is
+    /// `GetMetadataOptionsForType(item.GetType().Name) ?? new MetadataOptions()`
+    /// — the SERVER-WIDE entry for the item's OWN type. It used to return the
+    /// default unconditionally, which made the server-wide options invisible.
+    #[tokio::test]
+    async fn get_metadata_options_resolves_the_items_own_type() {
+        let artist_id = Uuid::from_u128(0x7001);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut rows = HashMap::new();
+        rows.insert(
+            artist_id,
+            BaseItemEntity {
+                id: ferrofin_db::store::guid_to_db(artist_id),
+                type_: "MediaBrowser.Controller.Entities.Audio.MusicArtist".to_owned(),
+                ..BaseItemEntity::default()
+            },
         );
+        let mgr = LocalProviderManager::default()
+            .with_remote_images(
+                Arc::new(crate::tmdb::TmdbClient::new()),
+                Arc::new(FakeItems { rows, seen: tx }),
+            )
+            .with_metadata_options(|| {
+                vec![
+                    MetadataOptions {
+                        item_type: Some("Movie".to_owned()),
+                        metadata_fetcher_order: vec!["TheMovieDb".to_owned()],
+                        ..MetadataOptions::default()
+                    },
+                    MetadataOptions {
+                        item_type: Some("MusicArtist".to_owned()),
+                        metadata_fetcher_order: vec!["MusicBrainz".to_owned()],
+                        ..MetadataOptions::default()
+                    },
+                ]
+            });
+
+        let opts = mgr.get_metadata_options(artist_id).await.unwrap();
+        assert_eq!(opts.metadata_fetcher_order, ["MusicBrainz"], "its OWN type");
+
+        // An id no row answers for has no type, so it takes the default arm —
+        // NOT the first entry in the array.
+        let unknown = mgr
+            .get_metadata_options(Uuid::from_u128(0x7002))
+            .await
+            .unwrap();
+        assert_eq!(unknown, MetadataOptions::default());
     }
 
     /// An [`ItemRepository`] over a fixed map, reporting each `retrieve_item`

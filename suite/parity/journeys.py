@@ -2002,13 +2002,15 @@ def j_remote_search_identify(base, token, user, _m, _m2):
 
     artist_id, artist_path = artist_by_path(base, token)
     scoped = forced = None
+    scoped_status = forced_status = None
     if artist_id:
-        _, scoped = remote_search(base, token, "MusicArtist", {"Name": "Radiohead"},
-                                  MUSICBRAINZ, item_id=artist_id)
+        scoped_status, scoped = remote_search(base, token, "MusicArtist", {"Name": "Radiohead"},
+                                              MUSICBRAINZ, item_id=artist_id)
         for attempt in range(MB_RETRIES):
             time.sleep(MB_SPACING_S)
-            _, forced = remote_search(base, token, "MusicArtist", {"Name": "Radiohead"},
-                                      MUSICBRAINZ, item_id=artist_id, include_disabled=True)
+            forced_status, forced = remote_search(base, token, "MusicArtist",
+                                                  {"Name": "Radiohead"}, MUSICBRAINZ,
+                                                  item_id=artist_id, include_disabled=True)
             if forced:
                 break
             time.sleep(MB_SPACING_S * (attempt + 1))
@@ -2019,11 +2021,19 @@ def j_remote_search_identify(base, token, user, _m, _m2):
           "forced_count": len(forced or []),
           "artist_resolved": bool(artist_id),
           "artist_path": artist_path,
+          # Both statuses are evidence, not just gate inputs: the runner compares the whole
+          # dict across servers, so a status that diverges between the two fails the row
+          # even when both bodies happen to be empty.
+          "scoped_status": scoped_status,
+          "forced_status": forced_status,
           # The gate: the library ticks no MusicArtist metadata fetcher, so a scoped
-          # search must answer [] even though the unscoped one answers.
-          "gate_drops_the_fetcher": scoped == [],
+          # search must answer [] even though the unscoped one answers. `[]` alone is NOT
+          # enough — `remote_search` yields [] for an unparseable body too, so a 401/404/
+          # 500 would satisfy a bare `scoped == []`. Pinning 200 is what makes this a
+          # statement about the fetcher gate rather than about the server being reachable.
+          "gate_drops_the_fetcher": scoped_status == 200 and scoped == [],
           # …and lifting the gate must put the SAME provider back.
-          "include_disabled_restores": bool(forced)
+          "include_disabled_restores": forced_status == 200 and bool(forced)
           and {x.get("SearchProviderName") for x in forced} == {MUSICBRAINZ}}
     r["POST /Items/RemoteSearch/MusicArtist"] = Same(
         bool(artist_id) and bool(rows["ma_named"])

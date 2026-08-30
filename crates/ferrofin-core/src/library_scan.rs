@@ -5185,9 +5185,17 @@ impl LibraryScanner {
                     self.plan_music_node(&entry.path, cf, artist_id, true, naming, out);
                 }
             }
-            // Loose audio sitting directly in the artist folder still becomes
-            // an album of that artist.
-            self.plan_music_album(dir, cf, artist_id, naming, out);
+            // Loose audio sitting DIRECTLY in a resolved artist folder is not
+            // an album, and used to be wrapped in one here. Upstream never
+            // wraps it: once the directory resolves as a `MusicArtist`, its
+            // child FILES go through the ordinary resolver chain, and
+            // `MusicAlbumResolver` cannot claim them — it resolves a
+            // DIRECTORY (`MusicAlbumResolver.Resolve` returns null unless
+            // `args.IsDirectory`), so an audio file becomes an `Audio` whose
+            // parent is the artist. Wrapping them invented a `MusicAlbum` row
+            // Jellyfin has no row for and stamped the artist's folder name
+            // into every such track's `Album`.
+            self.plan_loose_artist_audio(dir, cf, artist_id, naming, out);
             return;
         }
         if self.is_music_album(dir, naming, true) {
@@ -5317,6 +5325,49 @@ impl LibraryScanner {
                 id,
                 entity,
                 ancestors: ancestors.clone(),
+            });
+        }
+    }
+
+    /// The audio files sitting directly in a resolved artist directory, as
+    /// `Audio` rows parented straight to the `MusicArtist` — no album.
+    ///
+    /// Subdirectories are deliberately NOT walked: `plan_music_node` has
+    /// already recursed into every child directory of the artist, so reusing
+    /// [`collect_album_tracks`](Self::collect_album_tracks) here (which also
+    /// pulls a multi-disc subfolder's tracks in) would plan those tracks
+    /// twice — once under their own album and once under the artist.
+    fn plan_loose_artist_audio(
+        &self,
+        dir: &str,
+        cf: Uuid,
+        artist_id: Uuid,
+        naming: &NamingOptions,
+        out: &mut Vec<Planned>,
+    ) {
+        for entry in self.file_system.get_file_system_entries(dir) {
+            if entry.type_ == FileSystemEntryType::Directory || !is_audio_file(&entry.path, naming)
+            {
+                continue;
+            }
+            let Some((id, mut entity)) = self.base_item(
+                BaseItemKind::Audio,
+                cf,
+                artist_id,
+                file_stem(&entry.path),
+                &entry.path,
+                false,
+            ) else {
+                continue;
+            };
+            entity.media_type = Some("Audio".to_owned());
+            // No `album` placeholder: there is no album. A file that carries an
+            // ALBUM tag still gets it from `apply_audio_metadata`; one that does
+            // not is albumless on both servers.
+            out.push(Planned {
+                id,
+                entity,
+                ancestors: vec![cf, artist_id],
             });
         }
     }
@@ -12844,6 +12895,77 @@ mod tests {
             Some(boc.id.as_str()),
             "album skips the `albums` container"
         );
+    }
+
+    /// Loose audio directly inside a resolved artist folder is `Audio`
+    /// PARENTED TO THE ARTIST — not a synthetic album named after the artist.
+    ///
+    /// Upstream resolves the artist DIRECTORY as `MusicArtist` and then hands
+    /// its child files to the ordinary resolver chain; `MusicAlbumResolver`
+    /// only ever resolves a directory, so a stray track never acquires an
+    /// album. Wrapping it invented a `MusicAlbum` row Jellyfin has no row for.
+    /// The negative control is the second assertion: exactly ONE album exists
+    /// (the real one in the subfolder), and the multi-disc subfolder's tracks
+    /// are planned once, not twice.
+    #[tokio::test]
+    async fn loose_audio_in_an_artist_folder_parents_to_the_artist_not_a_fake_album() {
+        use ferrofin_traits::persistence::ItemRepository as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let media = tmp.path().join("music");
+
+        // An artist folder: one real album subfolder (which is what makes the
+        // directory resolve as an artist at all) plus a stray track beside it.
+        let artist = media.join("Burial");
+        let album = artist.join("Untrue");
+        std::fs::create_dir_all(&album).unwrap();
+        std::fs::write(album.join("01 Archangel.flac"), b"").unwrap();
+        std::fs::write(artist.join("Rival Dealer.flac"), b"").unwrap();
+
+        let (db, _cf) = scan_one(CollectionTypeOptions::music, "Music", &media).await;
+        let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
+            Arc::new(crate::item_type_lookup::ItemTypeLookup::new());
+        let repo = crate::FerrofinItemRepository::new(db.clone(), lookup);
+        let list = |kind| {
+            let repo = repo.clone();
+            async move {
+                repo.get_item_list(&ferrofin_traits::options::InternalItemsQuery {
+                    include_item_types: vec![kind],
+                    ..Default::default()
+                })
+                .await
+                .expect("query")
+            }
+        };
+
+        let artists = list(ferrofin_model::data::BaseItemKind::MusicArtist).await;
+        assert_eq!(artists.len(), 1);
+        let artist_id = artists[0].id.clone();
+
+        // Exactly one album — "Untrue". No album named after the artist folder.
+        let albums = list(ferrofin_model::data::BaseItemKind::MusicAlbum).await;
+        let album_names: Vec<_> = albums.iter().map(|a| a.name.clone()).collect();
+        assert_eq!(album_names, vec![Some("Untrue".to_owned())]);
+
+        let mut audio = list(ferrofin_model::data::BaseItemKind::Audio).await;
+        audio.sort_by(|a, b| a.name.cmp(&b.name));
+        assert_eq!(audio.len(), 2, "each track planned exactly once");
+        let stray = audio
+            .iter()
+            .find(|a| a.name.as_deref() == Some("Rival Dealer"))
+            .expect("the stray track");
+        assert_eq!(
+            stray.parent_id.as_deref(),
+            Some(artist_id.as_str()),
+            "the stray track parents to the ARTIST"
+        );
+        assert_eq!(stray.album, None, "and it is given no invented album name");
+        // The album's own track still parents to the album, unchanged.
+        let inside = audio
+            .iter()
+            .find(|a| a.name.as_deref() == Some("01 Archangel"))
+            .expect("the album track");
+        assert_eq!(inside.parent_id.as_deref(), Some(albums[0].id.as_str()));
     }
 
     // The art-dir helpers behind uploaded-image survival: stem parsing is the
