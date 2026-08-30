@@ -1665,7 +1665,9 @@ impl LiveTvManager for FerrofinLiveTvManager {
     }
 
     async fn cancel_timer(&self, id: &str) -> Result<(), ServiceError> {
-        self.cancel_timer_internal(id, false).await
+        // `CancelTimerAsync` -> `CancelTimerInternal(timerId, false, true)`
+        // (v10.11.8 DefaultLiveTvService.cs:199-203): a hand cancel is manual.
+        self.cancel_timer_internal(id, false, true).await
     }
 
     async fn get_new_timer_defaults(
@@ -1811,24 +1813,31 @@ impl LiveTvManager for FerrofinLiveTvManager {
         timer: SeriesTimerInfoDto,
     ) -> Result<(), ServiceError> {
         // Port of `DefaultLiveTvService.UpdateSeriesTimerAsync` (v10.11.8
-        // DefaultLiveTvService.cs:312-340). Upstream keys on the BODY's id and
-        // ignores the route's outright (`LiveTvController.UpdateSeriesTimer`
-        // suppresses CA1801 on `timerId`); Ferrofin prefers the body and falls
-        // back to the route, because both name the same row and a client that
-        // posts a bare settings object should still hit it. An id that matches
-        // no row writes NOTHING — it must not mint a ghost.
-        let stored = match timer
+        // DefaultLiveTvService.cs:312-340). The row is keyed on the BODY's id
+        // and ONLY on it: `LiveTvController.UpdateSeriesTimer` (:933-937) hands
+        // `LiveTvManager.UpdateSeriesTimer` the body alone and never looks at
+        // the route's `timerId`, and `UpdateSeriesTimerAsync` matches on
+        // `info.Id` (:314). Keying on the route as a fallback was tried here and
+        // reverted: it is strictly more lenient than upstream, so a client
+        // posting a stale or foreign body id to a valid route would update on
+        // Ferrofin and no-op on Jellyfin — a silent divergence on a write path.
+        // An id that matches no row writes NOTHING; it must not mint a ghost.
+        let body_id = timer
             .base
             .id
             .as_deref()
             .map(str::trim)
-            .filter(|body_id| !body_id.is_empty())
-        {
-            Some(body_id) => match self.stored_series_timer(body_id).await? {
-                Some(found) => Some(found),
-                None => self.stored_series_timer(id).await?,
-            },
-            None => self.stored_series_timer(id).await?,
+            .filter(|body_id| !body_id.is_empty());
+        if body_id.is_some_and(|body_id| !body_id.eq_ignore_ascii_case(id)) {
+            tracing::debug!(
+                route_id = %id,
+                "live tv: series-timer update body names a different id than the route; \
+                 upstream keys on the body, so the body wins"
+            );
+        }
+        let stored = match body_id {
+            Some(body_id) => self.stored_series_timer(body_id).await?,
+            None => None,
         };
         let Some(mut stored) = stored else {
             return Ok(());
@@ -1882,17 +1891,14 @@ impl LiveTvManager for FerrofinLiveTvManager {
                 "SeriesTimer with Id {id} not found"
             )));
         }
-        // `CancelSeriesTimerAsync` walks `GetTimersAsync`, so a COMPLETED child —
-        // a recording that already happened — is left alone.
+        // `CancelSeriesTimerAsync` walks `_timerManager.GetAll()` (:149-152),
+        // NOT the `Completed`-excluding `GetTimersAsync` — so a child that has
+        // already recorded goes too, and the series timer leaves no orphan row
+        // behind pointing at an id nothing answers. `timer_ids_for_series` is
+        // the `GetAll()` shape on purpose: it reads the table, not the filtered
+        // view `get_timers` publishes.
         for child in self.timer_ids_for_series(id).await? {
-            if self
-                .get_timer(&child)
-                .await?
-                .is_some_and(|t| t.status == RecordingStatus::Completed)
-            {
-                continue;
-            }
-            self.cancel_timer_internal(&child, true).await?;
+            self.cancel_timer_internal(&child, true, true).await?;
         }
         self.delete_by_id(
             r#"DELETE FROM "FerrofinLiveTvSeriesTimers" WHERE "Id" = ?1"#,
@@ -2340,13 +2346,17 @@ impl FerrofinLiveTvManager {
             .await
     }
 
-    /// Writes a timer through, DTO and promoted columns together. A row that
-    /// already exists keeps its stored `IsManual`.
+    /// Writes a timer through, DTO and promoted columns together, WITHOUT
+    /// claiming the row is manual. A row that already exists keeps its stored
+    /// `IsManual` — the flag is sticky-true, see `dvr_repository::upsert_timer`.
     async fn persist_timer(&self, timer: &TimerInfoDto) -> Result<String, ServiceError> {
         crate::dvr_repository::upsert_timer(&self.db, timer, false).await
     }
 
-    /// Writes a hand-created timer through (`TimerInfo.IsManual = true`).
+    /// Writes a timer through and raises `TimerInfo.IsManual`, on a fresh row
+    /// and on one that already exists alike — the four upstream sites that set
+    /// the flag (`DefaultLiveTvService.cs:178`, `:227`, `:255`, `:302`) are
+    /// three updates and one insert.
     async fn persist_manual_timer(&self, timer: &TimerInfoDto) -> Result<String, ServiceError> {
         crate::dvr_repository::upsert_timer(&self.db, timer, true).await
     }
@@ -2355,10 +2365,22 @@ impl FerrofinLiveTvManager {
     /// DefaultLiveTvService.cs:168-197): the timer goes to `Cancelled`; one that
     /// nothing scheduled — or whose whole series timer is being cancelled — is
     /// deleted outright, and any capture it started stops.
+    ///
+    /// `is_manual_cancellation` is upstream's third parameter (`:176-180`), and
+    /// it is load-bearing rather than decorative: a person cancelling ONE
+    /// showing of a series (`CancelTimerAsync` passes `true`, `:199-203`) leaves
+    /// a `Cancelled` row flagged `IsManual`, and the next fan-out over that
+    /// series timer sees the flag and leaves the showing alone
+    /// (`ShouldCancelTimerForSeriesTimer`'s first arm, `:646`, plus the
+    /// `else if (!existingTimer.IsManual)` that would otherwise reset it to
+    /// `New`, `:751`). The fan-out's own tidy-up pass passes `false` (`:797`),
+    /// because a timer the guide no longer justifies was never a person's
+    /// choice.
     async fn cancel_timer_internal(
         &self,
         id: &str,
         is_series_cancelled: bool,
+        is_manual_cancellation: bool,
     ) -> Result<(), ServiceError> {
         match self.get_timer(id).await? {
             Some(mut timer) => {
@@ -2371,6 +2393,8 @@ impl FerrofinLiveTvManager {
                         .is_none_or(str::is_empty)
                 {
                     self.delete_by_id(DELETE_TIMER_SQL, id).await?;
+                } else if is_manual_cancellation {
+                    self.persist_manual_timer(&timer).await?;
                 } else {
                     self.persist_timer(&timer).await?;
                 }
@@ -2448,13 +2472,14 @@ impl FerrofinLiveTvManager {
             if !(by_program || by_series) {
                 continue;
             }
-            let Some(id) = timer.base.id.clone() else {
+            if timer.base.id.is_none() {
                 continue;
-            };
+            }
             timer.series_timer_id = stored.dto.base.id.clone();
             timer.external_series_timer_id = Some(stored.external_id.clone());
-            self.persist_timer(&timer).await?;
-            crate::dvr_repository::set_timer_manual(&self.db, &id).await?;
+            // `timer.IsManual = true` (:302) goes through the same write as the
+            // rest of the row, because `upsert_timer` raises the flag.
+            self.persist_manual_timer(&timer).await?;
         }
         Ok(())
     }
@@ -2559,7 +2584,10 @@ impl FerrofinLiveTvManager {
                     continue;
                 };
                 if timer.status == RecordingStatus::New && timer.base.start_date > now {
-                    self.cancel_timer_internal(&id, false).await?;
+                    // `CancelTimerInternal(timer.Id, false, false)` (:797): the
+                    // guide moved, nobody asked for this — so it must NOT be
+                    // flagged manual, or the row would become un-reschedulable.
+                    self.cancel_timer_internal(&id, false, false).await?;
                 }
             }
         }
@@ -5828,6 +5856,182 @@ mod tests {
                 Err(ServiceError::NotFound(_))
             ),
             "cancelling an unknown series timer is a 404, not a silent 204"
+        );
+    }
+
+    /// The `IsManual` contract, end to end: a person cancels ONE showing of a
+    /// series by hand, then edits the series timer — and the showing they
+    /// cancelled must STAY cancelled, with the next one promoted in its place.
+    ///
+    /// `CancelTimerAsync` passes `isManualCancellation: true`
+    /// (v10.11.8 DefaultLiveTvService.cs:199-203), which sets `timer.IsManual`
+    /// on the surviving `Cancelled` row (`:176-180`); the next
+    /// `UpdateTimersForSeriesTimer` copies that flag onto the candidate
+    /// (`:745`) and both of the arms that could revive it are guarded on it
+    /// (`ShouldCancelTimerForSeriesTimer`'s first arm `:646`, and the
+    /// `else if (!existingTimer.IsManual)` at `:751`).
+    ///
+    /// The regression this pins: the flag was only ever written on INSERT, so
+    /// cancelling a child — always an UPDATE, because a child keeps its
+    /// `SeriesTimerId` and is not deleted — never raised it, and the next edit
+    /// of the series timer put the showing back to `New` and recorded it.
+    #[tokio::test]
+    async fn a_hand_cancelled_showing_stays_cancelled_across_the_next_fan_out() {
+        let mgr = manager_with_series_guide().await;
+        let airings = airings_of(&mgr, "Recurring").await;
+        let future = airings
+            .iter()
+            .find(|r| parse_dt(&r.start_date).is_some_and(|s| s > Utc::now()))
+            .expect("a future airing");
+        let st_id = mgr
+            .create_series_timer(defaults_for(&mgr, future).await)
+            .await
+            .expect("create st");
+
+        let mut timers = mgr.get_timers().await.expect("timers");
+        timers.sort_by_key(|t| t.base.start_date);
+        assert_eq!(timers.len(), 3);
+        assert_eq!(timers[0].status, RecordingStatus::New);
+        let hand_cancelled = timers[0].base.id.clone().expect("id");
+        let next_up = timers[1].base.id.clone().expect("id");
+
+        // The person cancels the earliest showing.
+        mgr.cancel_timer(&hand_cancelled).await.expect("cancel");
+        assert!(
+            crate::dvr_repository::timer_is_manual(&mgr.db, &hand_cancelled)
+                .await
+                .expect("flag"),
+            "a hand cancel flags the surviving row IsManual"
+        );
+
+        // …then edits the series timer, which re-runs the whole fan-out.
+        let mut edit = mgr
+            .get_series_timer(&st_id)
+            .await
+            .expect("get st")
+            .expect("row");
+        edit.base.pre_padding_seconds = 90;
+        mgr.update_series_timer(&st_id, edit).await.expect("update");
+
+        let after: HashMap<String, RecordingStatus> = mgr
+            .all_timers()
+            .await
+            .expect("after")
+            .into_iter()
+            .filter_map(|t| t.base.id.clone().map(|id| (id, t.status)))
+            .collect();
+        assert_eq!(
+            after.get(&hand_cancelled),
+            Some(&RecordingStatus::Cancelled),
+            "the fan-out must not resurrect a showing the user cancelled by hand"
+        );
+        assert_eq!(
+            after.get(&next_up),
+            Some(&RecordingStatus::New),
+            "with the earliest showing off the table the next one records instead"
+        );
+    }
+
+    /// The fan-out's own tidy-up pass is NOT a manual cancellation
+    /// (`CancelTimerInternal(timer.Id, false, false)`, v10.11.8
+    /// DefaultLiveTvService.cs:797): a timer the guide no longer justifies is
+    /// cancelled but must NOT be flagged `IsManual`, or the next fan-out would
+    /// treat a machine decision as the user's and could never revive it.
+    #[tokio::test]
+    async fn the_fan_out_tidy_up_is_not_a_manual_cancellation() {
+        let mgr = manager_with_series_guide().await;
+        let airings = airings_of(&mgr, "Recurring").await;
+        let future = airings
+            .iter()
+            .find(|r| parse_dt(&r.start_date).is_some_and(|s| s > Utc::now()))
+            .expect("a future airing");
+        let st_id = mgr
+            .create_series_timer(defaults_for(&mgr, future).await)
+            .await
+            .expect("create st");
+        // A pending timer claiming this series timer that the guide never
+        // produced: exactly what `deleteInvalidTimers` sweeps.
+        let orphan = TimerInfoDto {
+            base: BaseTimerInfoDto {
+                id: Some("orphan-timer".to_owned()),
+                name: Some("Not in the guide".to_owned()),
+                start_date: Utc::now() + chrono::Duration::minutes(600),
+                end_date: Utc::now() + chrono::Duration::minutes(660),
+                ..BaseTimerInfoDto::default()
+            },
+            status: RecordingStatus::New,
+            series_timer_id: Some(st_id.clone()),
+            ..TimerInfoDto::default()
+        };
+        mgr.persist_timer(&orphan).await.expect("plant");
+
+        let mut edit = mgr
+            .get_series_timer(&st_id)
+            .await
+            .expect("get st")
+            .expect("row");
+        edit.base.post_padding_seconds = 30;
+        mgr.update_series_timer(&st_id, edit).await.expect("update");
+
+        // It keeps its `SeriesTimerId`, so `CancelTimerInternal` updates rather
+        // than deletes it — the row survives as `Cancelled`.
+        let swept = mgr
+            .get_timer("orphan-timer")
+            .await
+            .expect("get")
+            .expect("still there");
+        assert_eq!(
+            swept.status,
+            RecordingStatus::Cancelled,
+            "the tidy-up pass cancels a pending timer the guide no longer justifies"
+        );
+        assert!(
+            !crate::dvr_repository::timer_is_manual(&mgr.db, "orphan-timer")
+                .await
+                .expect("flag"),
+            "…and does NOT flag it manual — only a person's own cancel does that"
+        );
+    }
+
+    /// `CancelSeriesTimerAsync` walks `_timerManager.GetAll()` (v10.11.8
+    /// DefaultLiveTvService.cs:149-152) — not the `Completed`-excluding
+    /// `GetTimersAsync` — so a child that has ALREADY recorded is deleted with
+    /// the rest. Skipping it left an orphan row pointing at a series timer that
+    /// no longer exists, invisible to `GET /LiveTv/Timers` (which does filter
+    /// `Completed`) and therefore invisible to the parity probe as well.
+    #[tokio::test]
+    async fn cancelling_a_series_timer_removes_its_completed_children_too() {
+        let mgr = manager_with_series_guide().await;
+        let airings = airings_of(&mgr, "Recurring").await;
+        let future = airings
+            .iter()
+            .find(|r| parse_dt(&r.start_date).is_some_and(|s| s > Utc::now()))
+            .expect("a future airing");
+        let st_id = mgr
+            .create_series_timer(defaults_for(&mgr, future).await)
+            .await
+            .expect("create st");
+
+        let mut timers = mgr.get_timers().await.expect("timers");
+        timers.sort_by_key(|t| t.base.start_date);
+        let recorded = timers.first().cloned().expect("a child");
+        let recorded_id = recorded.base.id.clone().expect("id");
+        let mut done = recorded;
+        done.status = RecordingStatus::Completed;
+        mgr.persist_timer(&done).await.expect("complete it");
+        assert!(
+            mgr.get_timers()
+                .await
+                .expect("filtered")
+                .iter()
+                .all(|t| t.base.id.as_deref() != Some(recorded_id.as_str())),
+            "the filtered view already hides it — which is why this needed a test"
+        );
+
+        mgr.cancel_series_timer(&st_id).await.expect("cancel st");
+        assert!(
+            mgr.all_timers().await.expect("all").is_empty(),
+            "no orphan child survives its series timer, Completed or not"
         );
     }
 

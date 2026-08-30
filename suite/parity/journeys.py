@@ -125,14 +125,18 @@ def earned_method(op, h_ok, j_ok):
 #                 back. A handler that 204s and ignores the request passes.
 #   property      a named property of a response body agreed (an MPEG-TS sync
 #                 signature, a non-empty search result) — no effect, no diff.
-#   body-diff     reserved, and currently claimed by NO row in this layer. It
-#                 would need the read-back BODY itself — every non-volatile
-#                 field — diffed against the other server's, which is what
-#                 reads.py does and what a named projection, however wide, does
-#                 not. `earned_method` still enforces the weaker half of the
-#                 claim at runtime (a row declaring it must at least have
-#                 returned `Same` on both servers), so the guard survives the
-#                 day a row earns it.
+#   body-diff     the read-back BODY itself — every field of the parsed DTO bar
+#                 a named, justified per-instance handful — diffed against the
+#                 other server's, which is what reads.py does. A named
+#                 PROJECTION, however wide, does not earn this: the test is
+#                 "start from the whole body and subtract", never "start from
+#                 nothing and add". Claimed today by exactly the two ops in the
+#                 BODY_DIFF block below (see SERIES_TIMER_PER_INSTANCE for the
+#                 subtraction and why each entry is in it); `selfcheck()` holds
+#                 that list to an explicit allowlist so a third claim takes a
+#                 deliberate edit, and `earned_method` independently downgrades
+#                 any declaring row that did not actually return `Same` on both
+#                 servers.
 #
 # `selfcheck()` asserts this table covers every op key the journeys declare, so a
 # new journey op cannot land in the ledger without saying how it was verified.
@@ -1079,14 +1083,34 @@ SERIES_TIMER_OPS = [
 # fresh `Guid.NewGuid()` per create (DefaultLiveTvService.cs:265) and publish its
 # MD5 as `Id` (LiveTvDtoService.cs:119) — so Id/ExternalId are random by
 # construction, and `derives_its_id` below checks the DERIVATION instead of
-# waving them through. `ExternalChannelId` embeds MD5(tuner URL), which differs
-# because the two servers reach the fixture tuner on different container hosts,
-# and `ServerId` is the instance's SystemId. Everything else in the DTO — Name,
-# Overview, ChannelId, ChannelName, ProgramId, ExternalProgramId, Days,
-# DayPattern, the dates, every padding/keep/record flag, ServiceName, Type,
-# ImageTags — stays in the diff. This is scoped to this probe on purpose:
-# parity_diff.VOLATILE is global and must not be widened for it.
-SERIES_TIMER_PER_INSTANCE = ("Id", "ExternalId", "ExternalChannelId", "ServerId")
+# waving them through. `ServerId` is the instance's own SystemId.
+#
+# `ExternalChannelId` was in this tuple and has been PUT BACK IN THE DIFF. The
+# reason given for dropping it — "it embeds MD5(tuner URL), which differs
+# because the two servers reach the fixture tuner on different container hosts"
+# — was simply false, and measuring it said so: both servers' /System/Configuration/livetv
+# configure the m3u tuner with the identical `Url` "/media/synth/livetv/channels.m3u"
+# (a container-local PATH, not a host URL), both publish the same LiveTvChannel
+# guids, and a series timer created on each carries the same
+# `ExternalChannelId` = m3u_5581ab8b…26b. A field that agrees is a field the
+# diff must carry; excluding it hid nothing today and would have hidden a real
+# channel-identity divergence tomorrow.
+#
+# Everything else in the DTO — Name, Overview, ChannelId, ChannelName,
+# ExternalChannelId, ProgramId, ExternalProgramId, Days, DayPattern, the dates,
+# every padding/keep/record flag, ServiceName, Type, ImageTags — stays in the
+# diff. This is scoped to this probe on purpose: parity_diff.VOLATILE is global
+# and must not be widened for it.
+SERIES_TIMER_PER_INSTANCE = ("Id", "ExternalId", "ServerId")
+# How far ahead a programme must start before this journey will build a series
+# timer on it. "Has not started yet" is not enough: the journey runs the two
+# servers one after the other and takes tens of seconds per side, so a programme
+# three minutes out is New on the first server and already recording on the
+# second — measured, 2026-08-30 16:57Z, on the 17:00 airing: Ferrofin still had
+# a `New` child and Jellyfin had none, and the hand-cancel leg could not run
+# there. The fixture guide is HOURLY, so ten minutes costs at most one candidate
+# programme and buys a subject that cannot start mid-journey.
+SERIES_TIMER_MIN_LEAD_S = 600
 RECORDING_START_WAIT_S = 60   # the recorder opens the tuner stream + the Recordings folder refreshes
 RECORDING_POLL_S = 5
 STREAM_PREFIX_BYTES = 16384   # ~87 TS packets: enough for is_mpegts, cheap to pull
@@ -1177,7 +1201,11 @@ def timer_update_leg(base, token, user, ch):
             "PriorityUnchanged": back.get("Priority") == got.get("Priority"),
             "StartDateUnchanged": back.get("StartDate") == got.get("StartDate"),
             "StatusNotTheCancelledWePosted": back.get("Status") != "Cancelled",
-            "UnknownIdNotCreated": get_json(base, f"/LiveTv/Timers/{ghost}", token) in (None, {}),
+            # NOT "is 404": `get_json` answers None for any non-200 AND for a 200
+            # whose body is `null`, which is literally what Jellyfin returns here.
+            # All this establishes is that no timer exists to read — see the
+            # docstring for why the status itself is not a parity signal.
+            "UnknownIdHasNoTimerToRead": get_json(base, f"/LiveTv/Timers/{ghost}", token) in (None, {}),
         })
     finally:
         http("DELETE", f"{base}/LiveTv/Timers/{tid}", token)
@@ -1318,6 +1346,18 @@ def series_timer_ids(base, token, query=""):
     return [t.get("Id") for t in items]
 
 
+def children_of(base, token, series_timer_id):
+    """The timers a series timer has scheduled, as `GET /LiveTv/Timers` publishes them.
+
+    That view excludes `Completed` on both servers (`GetTimersAsync`, v10.11.8
+    DefaultLiveTvService.cs:392-403), so it is the right lens for "what is still
+    going to record" and the wrong one for "what rows exist" — which is exactly why
+    the Completed-child leak in `CancelSeriesTimerAsync` needed a unit test rather
+    than a journey leg."""
+    return [t for t in ((get_json(base, "/LiveTv/Timers", token) or {}).get("Items") or [])
+            if t.get("SeriesTimerId") == series_timer_id]
+
+
 def j_livetv_series_timers(base, token, user, _m, _m2):
     """The series-timer lifecycle on the fixture tuner: pick two FUTURE programmes with
     different titles from the guide, create a series timer from each programme's own
@@ -1333,6 +1373,11 @@ def j_livetv_series_timers(base, token, user, _m, _m2):
         (`derives_its_id`), not the posted one and not a random GUID in DB casing.
       * creating a series timer SCHEDULES something: at least one timer carrying
         SeriesTimerId. A series timer that records nothing passes every status check.
+      * editing the series timer does not RESURRECT a showing the user cancelled by
+        hand — the `IsManual` contract. Ferrofin wrote that flag on INSERT only, so
+        cancelling a child (always an UPDATE) never raised it and the next edit put
+        the showing back to New.
+      * the update keys on the BODY's id, not the route's, exactly as upstream does.
 
     Every op starts False so an early exit (no channels, no future programmes) leaves a
     flagged row, never a missing one."""
@@ -1348,8 +1393,10 @@ def j_livetv_series_timers(base, token, user, _m, _m2):
     # and one that is airing RIGHT NOW is worse: its timer fires the moment the
     # series timer is created, so the earliest showing races the recorder through
     # New → InProgress → Completed while the journey is still reading. Only a
-    # programme that has not STARTED is a stable subject.
-    now = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+    # programme SERIES_TIMER_MIN_LEAD_S out is a stable subject; see that constant
+    # for why "has not started yet" was not a wide enough margin.
+    now = time.strftime("%Y-%m-%dT%H:%M:%S",
+                        time.gmtime(time.time() + SERIES_TIMER_MIN_LEAD_S))
     future = [p for p in programs if (p.get("StartDate") or "") > now]
     picked, seen = [], set()
     for p in future:                      # two DIFFERENT titles: two independent series
@@ -1406,8 +1453,7 @@ def j_livetv_series_timers(base, token, user, _m, _m2):
         # one across an hour boundary in the fixture's hourly guide. `>= 2` still gates
         # that the fan-out really walked the guide rather than scheduling the one
         # programme it was handed.
-        children = [t for t in ((get_json(base, "/LiveTv/Timers", token) or {}).get("Items") or [])
-                    if t.get("SeriesTimerId") == sid]
+        children = children_of(base, token, sid)
         recordable = [t for t in children if t.get("Status") != "Cancelled"]
         earliest = min(children, key=lambda t: t.get("StartDate") or "", default=None)
         evidence["fan_out"] = {
@@ -1425,16 +1471,63 @@ def j_livetv_series_timers(base, token, user, _m, _m2):
             dto.get("Id") == sid and derives_its_id(dto), series_timer_body(dto))
 
         # --- update: the C# whitelist, and nothing else --------------------------------
+        ghost = "0000000000000000000000000000dead"
         posted = dict(dto)
         posted.update(PrePaddingSeconds=120, PostPaddingSeconds=240,
                       IsPrePaddingRequired=True, Priority=7, KeepUpTo=3,
                       Days=["Saturday", "Sunday"], DayPattern="Daily",
                       Name="RENAMED", Overview="RENAMED")
+
+        # Before the edit: a person cancels the ONE showing this series timer was
+        # going to record. The edit below must not put it back. `CancelTimerAsync`
+        # cancels manually (v10.11.8 DefaultLiveTvService.cs:199-203), which flags the
+        # surviving row `IsManual` (:176-180); the next fan-out copies that flag onto
+        # the candidate (:745) and both arms that could revive it are guarded on it
+        # (`ShouldCancelTimerForSeriesTimer`'s first arm :646, and the
+        # `else if (!existingTimer.IsManual)` at :751). Ferrofin wrote `IsManual` on
+        # INSERT only, so cancelling a child — always an UPDATE, because a child keeps
+        # its SeriesTimerId and so is updated rather than deleted — never raised it.
+        # Measured on the pair before the fix: Jellyfin left the cancelled showing
+        # `Cancelled` and promoted the next one, Ferrofin set it back to `New` and
+        # would have recorded it. The create leg above has already established that
+        # `recordable` holds exactly one timer on both servers.
+        victim = recordable[0].get("Id") if len(recordable) == 1 else None
+        if victim:
+            http("DELETE", f"{base}/LiveTv/Timers/{victim}", token)
+
         st, _ = http("POST", f"{base}/LiveTv/SeriesTimers/{sid}", token, json.dumps(posted))
-        # An id nothing matches must write nothing: no ghost row, no 200 afterwards.
-        ghost = "0000000000000000000000000000dead"
+        updated = get_json(base, f"/LiveTv/SeriesTimers/{sid}", token) or {}
+
+        hand_cancel = {"ran": False, "recordable_children": len(recordable)}
+        if victim:
+            kids_after = children_of(base, token, sid)
+            same_showing = next((t for t in kids_after if t.get("Id") == victim), None)
+            hand_cancel = {
+                "ran": True,
+                "the_cancelled_showing_is_not_new_again":
+                    same_showing is not None and same_showing.get("Status") != "New",
+                "another_showing_took_its_place":
+                    any(t.get("Status") == "New" and t.get("Id") != victim
+                        for t in kids_after),
+            }
+
+        # The row is keyed on the BODY's id, not the route's: `LiveTvController`
+        # (v10.11.8 LiveTvController.cs:933-937) hands the manager the body alone and
+        # never reads `timerId`, and `UpdateSeriesTimerAsync` matches on `info.Id`
+        # (DefaultLiveTvService.cs:314). So a body carrying a FOREIGN id, posted to a
+        # perfectly valid route, must change nothing. This leg exists because Ferrofin
+        # used to fall back to the route id when the body id matched no row — strictly
+        # more lenient than upstream, and invisible to the ghost leg below (which
+        # misses on both ids at once and so cannot tell the two rules apart).
+        http("POST", f"{base}/LiveTv/SeriesTimers/{sid}", token,
+             json.dumps(dict(posted, Id=ghost, ExternalId="",
+                             PrePaddingSeconds=999, PostPaddingSeconds=888)))
+        after_foreign = get_json(base, f"/LiveTv/SeriesTimers/{sid}", token) or {}
+
+        # An id nothing matches must write nothing: no ghost row, no readable row after.
         http("POST", f"{base}/LiveTv/SeriesTimers/{ghost}", token,
              json.dumps(dict(posted, Id=ghost, ExternalId="")))
+
         after = get_json(base, f"/LiveTv/SeriesTimers/{sid}", token) or {}
         r["POST /LiveTv/SeriesTimers/{timerId}"] = Same(st < 300 and bool(after), {
             "body": series_timer_body(after),
@@ -1445,7 +1538,15 @@ def j_livetv_series_timers(base, token, user, _m, _m2):
             "name_not_updatable": after.get("Name") == dto.get("Name"),
             "overview_not_updatable": after.get("Overview") == dto.get("Overview"),
             "day_pattern_recomputed": after.get("DayPattern") == "Weekends",
-            "unknown_id_made_no_row": get_json(base, f"/LiveTv/SeriesTimers/{ghost}", token) in (None, {}),
+            "foreign_body_id_changed_nothing":
+                series_timer_body(after_foreign) == series_timer_body(updated),
+            # Deliberately NOT named "is 404": `get_json` returns None for any
+            # non-200, and what this leg establishes is only "no row exists to
+            # read". The status itself is not compared here because upstream's is
+            # a Jellyfin bug — see `timer_update_leg`'s docstring.
+            "unknown_id_has_no_row_to_read":
+                get_json(base, f"/LiveTv/SeriesTimers/{ghost}", token) in (None, {}),
+            "hand_cancelled_showing_survives_the_edit": hand_cancel,
         })
 
         # --- sortBy is honoured, not silently dropped ---------------------------------
@@ -1469,11 +1570,16 @@ def j_livetv_series_timers(base, token, user, _m, _m2):
         # --- delete: gone, its timers gone, and a second delete is not a silent 204 ----
         st, _ = http("DELETE", f"{base}/LiveTv/SeriesTimers/{sid}", token)
         again, _ = http("DELETE", f"{base}/LiveTv/SeriesTimers/{sid}", token)
-        left = [t for t in ((get_json(base, "/LiveTv/Timers", token) or {}).get("Items") or [])
-                if t.get("SeriesTimerId") == sid]
+        left = children_of(base, token, sid)
         r["DELETE /LiveTv/SeriesTimers/{timerId}"] = Same(st < 300, {
             "gone_from_the_list": sid not in series_timer_ids(base, token),
-            "single_get_is_404": get_json(base, f"/LiveTv/SeriesTimers/{sid}", token) in (None, {}),
+            # The literal status, not "get_json came back empty": `get_json`
+            # answers None for ANY non-200, so the old form let a 500 pass as a
+            # 404 and a regression from one to the other stayed green. Both
+            # servers really do answer 404 here (`LiveTvController.GetSeriesTimer`
+            # returns `NotFound()` on a null timer, v10.11.8 LiveTvController.cs:875-884),
+            # so the code is comparable and is compared.
+            "single_get_status": http("GET", f"{base}/LiveTv/SeriesTimers/{sid}", token)[0],
             "its_timers_are_gone": len(left) == 0,
             "second_delete_is_not_2xx": again >= 400,
         })
@@ -1994,9 +2100,9 @@ def selfcheck():
         == "after{Year: H=2020 J=None}"
     assert evidence_diff({"a": 1}, {"a": 1}) == "(no key differs)"
     # A row may only KEEP a declared body-diff when both sides really compared.
-    # No row in this layer declares it today (see the JOURNEY_METHOD comment), so
-    # the guard is exercised against a synthetic declaration rather than being
-    # deleted — the day a journey earns a real body diff, this is what checks it.
+    # Two rows declare it (the allowlist below pins which), but the guard itself is
+    # exercised on a SYNTHETIC declaration so it is tested even when the real
+    # claimants change: it must upgrade nothing and downgrade a plain-bool row.
     diffed = "GET /System/Info"
     assert diffed not in JOURNEY_METHOD
     JOURNEY_METHOD[diffed] = verification.BODY_DIFF
@@ -2021,10 +2127,14 @@ def selfcheck():
                            "Id": dotnet_md5_guid_n("emby8279078f967a44c4a96656331ebc08d24")})
     assert not derives_its_id({"ExternalId": "", "Id": "eb075d6a62e2edc6b764a304633d33c0"})
     assert not derives_its_id({"ExternalId": "abc", "Id": "abc"})
-    # …and the body projection drops exactly the four named fields, nothing else.
-    assert series_timer_body({"Id": 1, "ExternalId": 2, "ExternalChannelId": 3,
-                              "ServerId": 4, "Name": "n", "Priority": 0}) \
-        == {"Name": "n", "Priority": 0}
+    # …and the body projection drops exactly the three named per-instance fields,
+    # nothing else. `ExternalChannelId` is deliberately NOT among them: it was,
+    # on a rationale that measured false, and it is back in the diff.
+    assert series_timer_body({"Id": 1, "ExternalId": 2, "ServerId": 4,
+                              "ExternalChannelId": "m3u_abc",
+                              "Name": "n", "Priority": 0}) \
+        == {"ExternalChannelId": "m3u_abc", "Name": "n", "Priority": 0}
+    assert "ExternalChannelId" not in SERIES_TIMER_PER_INSTANCE
     # Every journey advertises only op keys that exist in the vendored spec.
     import glob
     spec = json.load(open(sorted(glob.glob(os.path.join(ROOT, "contracts/jellyfin-openapi-*.json")))[-1]))

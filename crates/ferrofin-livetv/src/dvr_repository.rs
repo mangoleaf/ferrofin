@@ -32,11 +32,17 @@ const RECORDING_SELECT: &str = r#"SELECT r."Id",r."ChannelId",r."TimerId",r."Ser
 /// round-trips exactly what was posted.
 ///
 /// `is_manual` is `TimerInfo.IsManual` — whether a person asked for this exact
-/// recording rather than a series timer scheduling it. It is written on INSERT
-/// only: an update PRESERVES the stored flag, because upstream carries it on the
-/// long-lived `TimerInfo` and only ever sets it deliberately
-/// (`DefaultLiveTvService.cs:630` on a manual create, `:284-296` when a series
-/// timer adopts an existing timer, `:178` on a manual cancel).
+/// recording rather than a series timer scheduling it. It is STICKY-TRUE: an
+/// update raises the stored flag but never clears it (`MAX` in the `ON CONFLICT`
+/// clause below). That is exactly what upstream does with the field, because
+/// every assignment in `DefaultLiveTvService` writes `true` and none writes
+/// `false` — `:178` on a manual cancel, `:227` on reviving a cancelled timer by
+/// hand, `:255` on a manual create, `:302` when a series timer adopts an
+/// existing timer — and the one read-back (`:745`,
+/// `timer.IsManual = existingTimer.IsManual`) copies the stored value forward
+/// rather than resetting it. Writing it on INSERT only would silently drop
+/// every one of those four, which is what `persist_manual_timer` on an
+/// already-stored row means.
 ///
 /// # Errors
 ///
@@ -59,7 +65,8 @@ pub async fn upsert_timer(
              "ChannelId"=excluded."ChannelId","ProgramId"=excluded."ProgramId",
              "SeriesTimerId"=excluded."SeriesTimerId","Name"=excluded."Name",
              "StartDate"=excluded."StartDate","EndDate"=excluded."EndDate",
-             "Status"=excluded."Status","Data"=excluded."Data""#,
+             "Status"=excluded."Status","Data"=excluded."Data",
+             "IsManual"=MAX("FerrofinLiveTvTimers"."IsManual",excluded."IsManual")"#,
     )
     .bind(&id)
     .bind(guid_to_db(timer.base.channel_id))
@@ -96,25 +103,6 @@ pub async fn timer_is_manual(db: &Database, id: &str) -> Result<bool, ServiceErr
             .await
             .map_err(db_err)?;
     Ok(flag.is_some_and(|f| f != 0))
-}
-
-/// Marks a stored timer as manually created, so a series timer's fan-out will
-/// neither cancel it nor reset its status.
-///
-/// Port of the `timer.IsManual = true` half of
-/// `DefaultLiveTvService.CreateSeriesTimer`'s adoption loop (v10.11.8
-/// DefaultLiveTvService.cs:294-301).
-///
-/// # Errors
-///
-/// Fails when the write fails.
-pub async fn set_timer_manual(db: &Database, id: &str) -> Result<(), ServiceError> {
-    sqlx::query(r#"UPDATE "FerrofinLiveTvTimers" SET "IsManual" = 1 WHERE "Id" = ?1"#)
-        .bind(id)
-        .execute(db.writer())
-        .await
-        .map_err(db_err)?;
-    Ok(())
 }
 
 /// One stored series timer's row: the published DTO JSON, the external id it was
