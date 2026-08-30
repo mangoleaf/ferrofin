@@ -35,6 +35,7 @@ use uuid::Uuid;
 
 use crate::auth::{RequireAdmin, RequireAuth};
 use crate::error::ApiError;
+use crate::handlers::items::effective_user_id;
 use crate::handlers::query_parse::{parse_csv_enums_lenient, parse_csv_uuids};
 use crate::handlers::session_ctx::{current_session, current_session_id};
 use crate::state::AppState;
@@ -68,13 +69,20 @@ async fn get_sessions(
     RequireAuth(auth): RequireAuth,
     Query(query): Query<GetSessionsQuery>,
 ) -> Result<Json<Vec<SessionInfoDto>>, ApiError> {
+    // C# `controllableByUserId is null ? null : RequestHelpers.GetUserId(User,
+    // controllableByUserId)`: the filter is only resolved when the caller
+    // actually sent one, and naming another user needs the administrator role.
+    let controllable_by_user_id = match query.controllable_by_user_id {
+        Some(id) => Some(effective_user_id(&state, &auth, Some(id)).await?),
+        None => None,
+    };
     let sessions = state
         .sessions
         .get_sessions(
             auth.user_id(),
             query.device_id.as_deref(),
             query.active_within_seconds,
-            query.controllable_by_user_id,
+            controllable_by_user_id,
             auth.is_api_key,
         )
         .await?;

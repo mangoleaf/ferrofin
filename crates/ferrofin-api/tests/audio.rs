@@ -788,3 +788,47 @@ async fn providers_lyrics_by_id_returns_remote_lyric_without_item() {
     let (missing, _) = call(app, "GET", "/Providers/Lyrics/deadbeef_1").await;
     assert_eq!(missing, StatusCode::NOT_FOUND);
 }
+
+/// `GET /Audio/{itemId}/universal` runs C# `RequestHelpers.GetUserId` on
+/// `userId` (v10.11.8 `UniversalAudioController.cs:120`) before it builds the
+/// playback info, so a non-administrator naming another user is refused there.
+/// Ferrofin dropped the parameter and served the stream.
+#[tokio::test]
+async fn universal_audio_cross_user_as_non_admin_is_forbidden() {
+    let (_dir, path) = temp_media();
+    let other = Uuid::from_u128(0x00A1_00FF);
+    let (status, _) = call(
+        state(&path, no_lyrics()),
+        "GET",
+        &format!("/Audio/{ITEM_ID}/universal?userId={other}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+/// The administrator half of the rule still serves the stream.
+#[tokio::test]
+async fn universal_audio_cross_user_as_admin_is_allowed() {
+    let (_dir, path) = temp_media();
+    let other = Uuid::from_u128(0x00A1_00FF);
+    let (status, _) = call(
+        state_as(&path, no_lyrics(), true, true),
+        "GET",
+        &format!("/Audio/{ITEM_ID}/universal?userId={other}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+/// A non-administrator naming their own id is served, as before the gate.
+#[tokio::test]
+async fn universal_audio_self_as_non_admin_is_allowed() {
+    let (_dir, path) = temp_media();
+    let (status, _) = call(
+        state(&path, no_lyrics()),
+        "GET",
+        &format!("/Audio/{ITEM_ID}/universal?userId={USER_ID}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}

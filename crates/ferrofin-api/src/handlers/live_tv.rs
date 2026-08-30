@@ -45,7 +45,7 @@ use ferrofin_traits::stubs::LiveTvChannelQuery;
 
 use crate::auth::{RequireAdmin, RequireAuth};
 use crate::error::ApiError;
-use crate::handlers::items::resolve_user_opt;
+use crate::handlers::items::{effective_user_id, resolve_user_opt};
 use crate::handlers::query_parse::{parse_csv_enums_lenient, parse_csv_uuids, parse_pipe_strings};
 use crate::state::AppState;
 
@@ -971,12 +971,29 @@ async fn get_recordings(
     ))
 }
 
+/// The lone `userId` query parameter shared by the recording routes that take
+/// one only to resolve the caller (C# `RequestHelpers.GetUserId`).
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LiveTvUserQuery {
+    /// Optional target user; defaults to the authenticated caller.
+    #[serde(default)]
+    user_id: Option<Uuid>,
+}
+
 /// `GET /LiveTv/Recordings/{recordingId}` — a single recording (`404` if absent).
+///
+/// `userId` only attaches user data upstream, but it still runs through
+/// `RequestHelpers.GetUserId` (v10.11.8 `LiveTvController.cs:435`) BEFORE the
+/// lookup, so naming another user as a non-administrator is a `403` there and
+/// must be one here.
 async fn get_recording(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAuth(auth): RequireAuth,
     Path(recording_id): Path<Uuid>,
+    Query(query): Query<LiveTvUserQuery>,
 ) -> Result<Json<BaseItemDto>, ApiError> {
+    effective_user_id(&state, &auth, query.user_id).await?;
     live_tv(&state)?
         .get_recording(recording_id)
         .await?
@@ -995,8 +1012,17 @@ async fn delete_recording(
 }
 
 /// `GET /LiveTv/Recordings/Folders` — recording folders (not modelled → empty).
-async fn get_recording_folders(RequireAuth(_auth): RequireAuth) -> Json<QueryResult<BaseItemDto>> {
-    Json(QueryResult::default())
+///
+/// Empty either way, but the `userId` gate still runs: upstream applies
+/// `RequestHelpers.GetUserId` before it asks the manager for folders, so an
+/// unentitled caller gets a `403` rather than an empty `200`.
+async fn get_recording_folders(
+    State(state): State<AppState>,
+    RequireAuth(auth): RequireAuth,
+    Query(query): Query<LiveTvUserQuery>,
+) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
+    effective_user_id(&state, &auth, query.user_id).await?;
+    Ok(Json(QueryResult::default()))
 }
 
 /// `GET /LiveTv/Recordings/Groups` — recording groups (deprecated; empty).
@@ -1784,7 +1810,18 @@ mod tests {
             .items
             .is_empty()
         );
-        assert!(get_recording_folders(auth()).await.0.items.is_empty());
+        assert!(
+            get_recording_folders(
+                State(state.clone()),
+                auth(),
+                Query(LiveTvUserQuery::default())
+            )
+            .await
+            .unwrap()
+            .0
+            .items
+            .is_empty()
+        );
         assert!(get_recording_groups(auth()).await.0.items.is_empty());
         assert!(get_recordings_series(auth()).await.0.items.is_empty());
         assert_eq!(

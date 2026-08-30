@@ -249,12 +249,23 @@ impl UserManager for OkUsers {
     ) -> Result<Vec<ferrofin_model::dto::NameIdPair>, ServiceError> {
         unimplemented!()
     }
+    /// An ordinary, non-administrator account.
+    ///
+    /// Implemented rather than `unimplemented!()` because the cross-user gate
+    /// (C# `RequestHelpers.GetUserId`) resolves the caller's role through it: a
+    /// panic here would make the *refused* side of `?userId=` untestable.
     async fn get_user_dto(
         &self,
-        _user: &UserEntity,
-        _server_id: Option<String>,
+        user: &UserEntity,
+        server_id: Option<String>,
     ) -> Result<ferrofin_model::dto::UserDto, ServiceError> {
-        unimplemented!()
+        Ok(ferrofin_model::dto::UserDto {
+            id: Uuid::parse_str(&user.id).unwrap_or_default(),
+            name: Some(user.username.clone()),
+            server_id,
+            policy: Some(ferrofin_model::users::UserPolicy::default()),
+            ..ferrofin_model::dto::UserDto::default()
+        })
     }
     async fn update_configuration(
         &self,
@@ -532,9 +543,20 @@ fn state_with_dto(
     collections: Arc<RecordingCollections>,
     dto: Arc<OkDto>,
 ) -> AppState {
+    state_full(playlists, collections, dto, Arc::new(OkUsers))
+}
+
+/// [`state_with_dto`] with the caller's role chosen by the test: [`OkUsers`]
+/// reports an ordinary account, `FakeAdminUsers` an administrator.
+fn state_full(
+    playlists: Arc<RecordingPlaylists>,
+    collections: Arc<RecordingCollections>,
+    dto: Arc<OkDto>,
+    users: Arc<dyn ferrofin_traits::library::UserManager>,
+) -> AppState {
     AppState::new(
         Arc::new(ferrofin_api::test_support::FakeLibrary),
-        Arc::new(OkUsers),
+        users,
         Arc::new(FakeUserViews),
         Arc::new(FakeUserData),
         Arc::new(FakeMediaSources),
@@ -932,4 +954,156 @@ async fn get_playlist_reports_open_access() {
     assert_eq!(status, StatusCode::OK);
     let dto: PlaylistDto = serde_json::from_slice(&bytes).unwrap();
     assert!(dto.open_access, "the DTO carries the real OpenAccess flag");
+}
+
+/// `POST /Playlists` runs C# `RequestHelpers.GetUserId` on the `userId` it takes
+/// from the query (or the body): the resolved id becomes the new playlist's
+/// **owner**, so a non-administrator naming another user is refused.
+#[tokio::test]
+async fn create_playlist_cross_user_as_non_admin_is_forbidden() {
+    let other = Uuid::from_u128(0x0999);
+    let pl = Arc::new(RecordingPlaylists::default());
+    let app = state(pl.clone(), Arc::new(RecordingCollections::default()));
+    let body = serde_json::json!({ "Name": "Roadtrip", "Ids": [ITEM_A.to_string()] });
+    let (status, _) = send(
+        app,
+        "POST",
+        &format!("/Playlists?userId={other}"),
+        Body::from(serde_json::to_vec(&body).unwrap()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(pl.created.lock().unwrap().is_none());
+}
+
+/// The body's `UserId` is the same parameter by another route and gets the same
+/// gate — C# folds it into `userId` *before* calling `GetUserId`.
+#[tokio::test]
+async fn create_playlist_cross_user_in_body_as_non_admin_is_forbidden() {
+    let other = Uuid::from_u128(0x0999);
+    let pl = Arc::new(RecordingPlaylists::default());
+    let app = state(pl.clone(), Arc::new(RecordingCollections::default()));
+    let body = serde_json::json!({ "Name": "Roadtrip", "UserId": other.to_string() });
+    let (status, _) = send(
+        app,
+        "POST",
+        "/Playlists",
+        Body::from(serde_json::to_vec(&body).unwrap()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(pl.created.lock().unwrap().is_none());
+}
+
+/// An administrator may still create a playlist owned by another user.
+#[tokio::test]
+async fn create_playlist_cross_user_as_admin_is_allowed() {
+    let other = Uuid::from_u128(0x0999);
+    let pl = Arc::new(RecordingPlaylists::default());
+    let app = state_full(
+        pl.clone(),
+        Arc::new(RecordingCollections::default()),
+        Arc::new(OkDto::default()),
+        Arc::new(ferrofin_api::test_support::FakeAdminUsers),
+    );
+    let body = serde_json::json!({ "Name": "Roadtrip", "Ids": [ITEM_A.to_string()] });
+    let (status, _) = send(
+        app,
+        "POST",
+        &format!("/Playlists?userId={other}"),
+        Body::from(serde_json::to_vec(&body).unwrap()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        pl.created
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("recorded")
+            .user_id,
+        other
+    );
+}
+
+/// ...and a non-administrator naming their own id still creates their playlist.
+#[tokio::test]
+async fn create_playlist_self_as_non_admin_is_allowed() {
+    let pl = Arc::new(RecordingPlaylists::default());
+    let app = state(pl.clone(), Arc::new(RecordingCollections::default()));
+    let body = serde_json::json!({ "Name": "Roadtrip", "Ids": [ITEM_A.to_string()] });
+    let (status, _) = send(
+        app,
+        "POST",
+        &format!("/Playlists?userId={USER_ID}"),
+        Body::from(serde_json::to_vec(&body).unwrap()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        pl.created
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("recorded")
+            .user_id,
+        USER_ID
+    );
+}
+
+/// `POST /Playlists/{id}/Items` makes its edit-permission check against the
+/// resolved `userId`, so an ungated one let a caller borrow another user's
+/// share. Refused for a non-administrator.
+#[tokio::test]
+async fn add_items_cross_user_as_non_admin_is_forbidden() {
+    let other = Uuid::from_u128(0x0999);
+    let pl = Arc::new(RecordingPlaylists::default());
+    let app = state(pl.clone(), Arc::new(RecordingCollections::default()));
+    let (status, _) = send(
+        app,
+        "POST",
+        &format!("/Playlists/{PLAYLIST_ID}/Items?ids={ITEM_A}&userId={other}"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(pl.added.lock().unwrap().is_none());
+}
+
+/// An administrator may still act on another user's behalf.
+#[tokio::test]
+async fn add_items_cross_user_as_admin_is_allowed() {
+    let other = Uuid::from_u128(0x0999);
+    let pl = Arc::new(RecordingPlaylists::default());
+    let app = state_full(
+        pl.clone(),
+        Arc::new(RecordingCollections::default()),
+        Arc::new(OkDto::default()),
+        Arc::new(ferrofin_api::test_support::FakeAdminUsers),
+    );
+    let (status, _) = send(
+        app,
+        "POST",
+        &format!("/Playlists/{PLAYLIST_ID}/Items?ids={ITEM_A}&userId={other}"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(pl.added.lock().unwrap().is_some());
+}
+
+/// ...and a non-administrator naming their own id is unaffected.
+#[tokio::test]
+async fn add_items_self_as_non_admin_is_allowed() {
+    let pl = Arc::new(RecordingPlaylists::default());
+    let app = state(pl.clone(), Arc::new(RecordingCollections::default()));
+    let (status, _) = send(
+        app,
+        "POST",
+        &format!("/Playlists/{PLAYLIST_ID}/Items?ids={ITEM_A}&userId={USER_ID}"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(pl.added.lock().unwrap().is_some());
 }

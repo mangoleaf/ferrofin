@@ -94,6 +94,24 @@ impl AuthService for AdminAuth {
     }
 }
 
+/// An [`AuthService`] authenticating as `bob`, an ordinary (non-administrator)
+/// account — the caller that must be refused another user's id.
+struct BobAuth;
+
+#[async_trait]
+impl AuthService for BobAuth {
+    async fn authenticate(
+        &self,
+        _request: &RequestContext,
+    ) -> Result<AuthorizationInfo, ServiceError> {
+        Ok(AuthorizationInfo {
+            user: Some(user_entity(BOB_ID, "bob", None)),
+            is_authenticated: true,
+            ..AuthorizationInfo::default()
+        })
+    }
+}
+
 /// A [`UserManager`] backed by an in-memory table, recording password/policy
 /// writes so the tests can assert them.
 #[derive(Default)]
@@ -259,7 +277,11 @@ impl ServerConfigurationManager for MemConfig {
 }
 
 /// A [`QuickConnect`] returning canned pairing data.
-struct OkQuickConnect;
+#[derive(Default)]
+struct OkQuickConnect {
+    /// The user id the last `authorize_request` was made for.
+    authorized_for: Mutex<Option<Uuid>>,
+}
 
 #[async_trait]
 impl QuickConnect for OkQuickConnect {
@@ -283,7 +305,8 @@ impl QuickConnect for OkQuickConnect {
             ..QuickConnectResult::default()
         })
     }
-    async fn authorize_request(&self, _user_id: Uuid, _code: &str) -> Result<bool, ServiceError> {
+    async fn authorize_request(&self, user_id: Uuid, _code: &str) -> Result<bool, ServiceError> {
+        *self.authorized_for.lock().unwrap() = Some(user_id);
         Ok(true)
     }
     async fn get_authorized_request(&self, _secret: &str) -> Result<SessionInfoDto, ServiceError> {
@@ -485,6 +508,23 @@ impl SessionManager for NoopSessions {
 
 /// Assembles an [`AppState`] from the batch-6 fakes plus panic fakes elsewhere.
 fn state(users: Arc<MemUsers>, config: Arc<MemConfig>) -> AppState {
+    state_full(
+        users,
+        config,
+        Arc::new(AdminAuth),
+        Arc::new(OkQuickConnect::default()),
+    )
+}
+
+/// [`state`], but with the caller's identity and the Quick Connect fake chosen
+/// by the test — the cross-user authorization cases need a non-administrator
+/// caller and need to read back which user the request was authorized for.
+fn state_full(
+    users: Arc<MemUsers>,
+    config: Arc<MemConfig>,
+    auth: Arc<dyn AuthService>,
+    quick_connect: Arc<OkQuickConnect>,
+) -> AppState {
     AppState::new(
         Arc::new(FakeLibrary),
         users,
@@ -501,8 +541,8 @@ fn state(users: Arc<MemUsers>, config: Arc<MemConfig>) -> AppState {
         Arc::new(FakeSearch),
         Arc::new(FakeDto),
         Arc::new(FakeAuthContext),
-        Arc::new(AdminAuth),
-        Arc::new(OkQuickConnect),
+        auth,
+        quick_connect,
         Arc::new(ferrofin_api::test_support::FakePlaylists),
         Arc::new(ferrofin_api::test_support::FakeCollections),
         Arc::new(ferrofin_api::test_support::FakeTvSeries),
@@ -595,4 +635,96 @@ async fn quick_connect_authorize_requires_auth() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(body_json(response).await, serde_json::json!(true));
+}
+
+/// C# `QuickConnectController.AuthorizeQuickConnect` runs
+/// `RequestHelpers.GetUserId(User, userId)`: a non-administrator naming another
+/// user's id is refused.
+///
+/// This one is a privilege escalation, not just a parity divergence —
+/// authorizing a pending request mints a session for the **named** user on the
+/// pairing device, so an ungated `userId` let `bob` hand a device an admin
+/// session.
+#[tokio::test]
+async fn quick_connect_authorize_cross_user_as_non_admin_is_forbidden() {
+    let qc = Arc::new(OkQuickConnect::default());
+    let router = create_router(state_full(
+        Arc::new(MemUsers::default()),
+        Arc::new(MemConfig::new(true)),
+        Arc::new(BobAuth),
+        qc.clone(),
+    ));
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/QuickConnect/Authorize?code=123456&userId={ADMIN_ID}"
+                ))
+                .header("X-Emby-Token", "t")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    // The refusal is before the manager: no session was minted for anyone.
+    assert!(qc.authorized_for.lock().unwrap().is_none());
+}
+
+/// The administrator half of the same rule still works — an admin authorizing on
+/// behalf of another user is served, and the request is authorized for *that*
+/// user.
+#[tokio::test]
+async fn quick_connect_authorize_cross_user_as_admin_is_allowed() {
+    let qc = Arc::new(OkQuickConnect::default());
+    let router = create_router(state_full(
+        Arc::new(MemUsers::default()),
+        Arc::new(MemConfig::new(true)),
+        Arc::new(AdminAuth),
+        qc.clone(),
+    ));
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/QuickConnect/Authorize?code=123456&userId={BOB_ID}"
+                ))
+                .header("X-Emby-Token", "t")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(*qc.authorized_for.lock().unwrap(), Some(BOB_ID));
+}
+
+/// A non-administrator naming their **own** id is served, as is omitting the
+/// parameter entirely.
+#[tokio::test]
+async fn quick_connect_authorize_self_as_non_admin_is_allowed() {
+    let qc = Arc::new(OkQuickConnect::default());
+    let router = create_router(state_full(
+        Arc::new(MemUsers::default()),
+        Arc::new(MemConfig::new(true)),
+        Arc::new(BobAuth),
+        qc.clone(),
+    ));
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/QuickConnect/Authorize?code=123456&userId={BOB_ID}"
+                ))
+                .header("X-Emby-Token", "t")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(*qc.authorized_for.lock().unwrap(), Some(BOB_ID));
 }

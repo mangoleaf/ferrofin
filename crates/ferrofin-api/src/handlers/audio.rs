@@ -26,6 +26,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
+use crate::handlers::items::effective_user_id;
 use crate::handlers::streaming::{serve_static_file, stream_path};
 use crate::state::AppState;
 
@@ -66,6 +67,21 @@ async fn get_audio_stream_by_container(
     }
 }
 
+/// The `userId` query parameter `GET /Audio/{itemId}/universal` accepts.
+///
+/// Upstream resolves it through `RequestHelpers.GetUserId`
+/// (v10.11.8 `UniversalAudioController.cs:120`) before it builds the playback
+/// info, so naming another user as a non-administrator is a `403` there. The
+/// stream itself is item-scoped here, but dropping the parameter turned that
+/// refusal into a served stream.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UniversalAudioUserQuery {
+    /// Optional target user; defaults to the authenticated caller.
+    #[serde(default)]
+    user_id: Option<Uuid>,
+}
+
 /// `GET`/`HEAD /Audio/{itemId}/universal` — serve the item's audio file.
 ///
 /// Port of `UniversalAudioController.GetUniversalAudioStream`, direct-play branch:
@@ -73,11 +89,13 @@ async fn get_audio_stream_by_container(
 /// progressively (Range/`HEAD`). Requires authentication (`[Authorize]`).
 async fn get_universal_audio_stream(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAuth(auth): RequireAuth,
     Path(item_id): Path<Uuid>,
     Query(hls_query): Query<crate::handlers::hls::HlsQueryPub>,
+    Query(user_query): Query<UniversalAudioUserQuery>,
     request: Request,
 ) -> Result<Response, ApiError> {
+    effective_user_id(&state, &auth, user_query.user_id).await?;
     // Direct-play when a static source exists; otherwise transcode (the
     // UniversalAudioController fallback), now wired to the real runtime.
     match stream_path(&state, item_id).await {

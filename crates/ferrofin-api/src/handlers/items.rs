@@ -52,7 +52,13 @@ use crate::state::AppState;
 /// The role lookup only runs when the caller actually named a different user
 /// (jellyfin-web always sends its own id), so the common path adds no work. An
 /// API-key caller is elevated upstream and is elevated here.
-async fn effective_user_id(
+///
+/// This is the **single** implementation of the rule for the whole crate: any
+/// handler that accepts a `userId` from the request must route it through here
+/// (directly, or via [`resolve_user`] / [`resolve_user_opt`]) rather than
+/// hand-rolling a `user_id.unwrap_or(caller)` fallback, which silently drops
+/// half 2 and lets any authenticated account act as any other.
+pub(crate) async fn effective_user_id(
     state: &AppState,
     auth: &AuthorizationInfo,
     user_id: Option<Uuid>,

@@ -37,6 +37,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
+use crate::handlers::items::effective_user_id;
 use crate::state::AppState;
 
 /// The rewind skip length (ms) stored when the `skipBackLength` custom pref is
@@ -145,7 +146,9 @@ async fn get_display_preferences(
     Path(display_preferences_id): Path<String>,
     Query(params): Query<DisplayPreferencesParams>,
 ) -> Result<Json<DisplayPreferencesDto>, ApiError> {
-    let user_id = params.user_id.unwrap_or_else(|| auth.user_id());
+    // C# `userId = RequestHelpers.GetUserId(User, userId)` — a named user other
+    // than the caller requires the administrator role, else `403`.
+    let user_id = effective_user_id(&state, &auth, params.user_id).await?;
     let client = params
         .client
         .filter(|c| !c.is_empty())
@@ -259,7 +262,9 @@ async fn update_display_preferences(
     Query(params): Query<DisplayPreferencesParams>,
     Json(mut dto): Json<DisplayPreferencesDto>,
 ) -> Result<StatusCode, ApiError> {
-    let user_id = params.user_id.unwrap_or_else(|| auth.user_id());
+    // C# `userId = RequestHelpers.GetUserId(User, userId)` — a named user other
+    // than the caller requires the administrator role, else `403`.
+    let user_id = effective_user_id(&state, &auth, params.user_id).await?;
     let client = params
         .client
         .filter(|c| !c.is_empty())

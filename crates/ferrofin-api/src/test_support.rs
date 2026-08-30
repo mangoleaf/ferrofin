@@ -614,6 +614,154 @@ impl UserManager for FakeUsers {
     }
 }
 
+/// Builds a bare [`UserEntity`] with the given id and username.
+///
+/// `UserEntity` mirrors the pinned Jellyfin `Users` row and deliberately has no
+/// `Default`, so every test that needs one otherwise spells out thirty fields.
+#[must_use]
+pub fn fake_user_entity(id: Uuid, username: &str) -> UserEntity {
+    UserEntity {
+        id: id.to_string(),
+        audio_language_preference: None,
+        authentication_provider_id: String::new(),
+        cast_receiver_id: None,
+        display_collections_view: false,
+        display_missing_episodes: false,
+        enable_auto_login: false,
+        enable_local_password: false,
+        enable_next_episode_auto_play: false,
+        enable_user_preference_access: false,
+        hide_played_in_latest: false,
+        internal_id: 0,
+        invalid_login_attempt_count: 0,
+        last_activity_date: None,
+        last_login_date: None,
+        login_attempts_before_lockout: None,
+        max_active_sessions: 0,
+        max_parental_rating_score: None,
+        max_parental_rating_sub_score: None,
+        must_update_password: false,
+        password: None,
+        password_reset_provider_id: String::new(),
+        play_default_audio_track: false,
+        remember_audio_selections: false,
+        remember_subtitle_selections: false,
+        remote_client_bitrate_limit: None,
+        row_version: 0,
+        subtitle_language_preference: None,
+        subtitle_mode: 0,
+        sync_play_access: 0,
+        username: username.to_owned(),
+    }
+}
+
+/// A [`UserManager`] whose caller reports `IsAdministrator` — the counterpart to
+/// [`FakeUsers`], which reports an ordinary account.
+///
+/// The cross-user authorization rule (C# `RequestHelpers.GetUserId`) has two
+/// sides, and a fake that can only express "not an admin" can only test one of
+/// them: a gate that refuses *everyone* would look identical. Any handler that
+/// accepts a `userId` needs both this and [`FakeUsers`] to be covered honestly.
+pub struct FakeAdminUsers;
+
+#[async_trait]
+impl UserManager for FakeAdminUsers {
+    async fn get_users(&self) -> Result<Vec<UserEntity>, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn get_user_ids(&self) -> Result<Vec<Uuid>, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn initialize(&self) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn get_user_by_id(&self, id: Uuid) -> Result<Option<UserEntity>, ServiceError> {
+        // Every id resolves, so a cross-user request that clears the admin gate
+        // reaches the handler instead of dying as a 404 lookup miss.
+        Ok(Some(fake_user_entity(id, "someone")))
+    }
+    async fn get_first_user(&self) -> Result<Option<UserEntity>, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn get_user_by_name(&self, _name: &str) -> Result<Option<UserEntity>, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn rename_user(
+        &self,
+        _user_id: Uuid,
+        _old_name: &str,
+        _new_name: &str,
+    ) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn update_user(&self, _user: &UserEntity) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn create_user(&self, _name: &str) -> Result<UserEntity, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn delete_user(&self, _user_id: Uuid) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn reset_password(&self, _user_id: Uuid) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn change_password(
+        &self,
+        _user_id: Uuid,
+        _new_password: &str,
+    ) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn authenticate_user(
+        &self,
+        _username: &str,
+        _password: &str,
+        _remote_endpoint: &str,
+        _is_user_session: bool,
+    ) -> Result<Option<UserEntity>, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn get_authentication_providers(&self) -> Result<Vec<NameIdPair>, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn get_password_reset_providers(&self) -> Result<Vec<NameIdPair>, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn get_user_dto(
+        &self,
+        user: &UserEntity,
+        _server_id: Option<String>,
+    ) -> Result<UserDto, ServiceError> {
+        Ok(UserDto {
+            id: Uuid::parse_str(&user.id).unwrap_or_default(),
+            name: Some(user.username.clone()),
+            policy: Some(ferrofin_model::users::UserPolicy {
+                is_administrator: true,
+                ..ferrofin_model::users::UserPolicy::default()
+            }),
+            ..UserDto::default()
+        })
+    }
+    async fn update_configuration(
+        &self,
+        _user_id: Uuid,
+        _config: &UserConfiguration,
+    ) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn update_policy(
+        &self,
+        _user_id: Uuid,
+        _policy: &UserPolicy,
+    ) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn clear_profile_image(&self, _user: &UserEntity) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+}
+
 /// A fake [`UserViewManager`]; every method is unused by INFRA-level tests.
 pub struct FakeUserViews;
 

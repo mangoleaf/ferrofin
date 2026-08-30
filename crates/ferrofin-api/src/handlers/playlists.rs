@@ -45,6 +45,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
+use crate::handlers::items::effective_user_id;
 use crate::handlers::query_parse::parse_csv_uuids;
 use crate::state::AppState;
 
@@ -102,12 +103,12 @@ async fn create_playlist(
         query_ids
     };
 
-    // `userId` (query) ?? body.UserId ?? caller — then default to the caller when
-    // still nil (mirrors `RequestHelpers.GetUserId`).
-    let mut user_id = query.user_id.or(body.user_id).unwrap_or_else(Uuid::nil);
-    if user_id.is_nil() {
-        user_id = auth.user_id();
-    }
+    // C# `userId ??= createPlaylistRequest?.UserId ?? default; userId =
+    // RequestHelpers.GetUserId(User, userId)`: the query id wins over the body
+    // id, an absent/all-zero id falls back to the caller, and naming another
+    // user (which would make *them* the playlist owner) requires the
+    // administrator role.
+    let user_id = effective_user_id(&state, &auth, query.user_id.or(body.user_id)).await?;
 
     let request = PlaylistCreationRequest {
         name: query.name.or(body.name),
@@ -351,7 +352,10 @@ async fn add_item_to_playlist(
     Path(playlist_id): Path<Uuid>,
     Query(query): Query<AddItemsQuery>,
 ) -> Result<StatusCode, ApiError> {
-    let user_id = query.user_id.unwrap_or_else(|| auth.user_id());
+    // C# `userId = RequestHelpers.GetUserId(User, userId)` — the share check
+    // below is made against this id, so an ungated one let a caller borrow
+    // another user's edit rights on the playlist.
+    let user_id = effective_user_id(&state, &auth, query.user_id).await?;
     require_edit(
         state
             .playlists
