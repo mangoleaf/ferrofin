@@ -635,9 +635,6 @@ pub async fn build_app_state(
         Arc::new(FerrofinApiKeyManager::new(db.clone()));
     let display_preferences: Arc<dyn ferrofin_traits::configuration::DisplayPreferencesManager> =
         Arc::new(FerrofinDisplayPreferencesManager::new(db.clone()));
-    let music: Arc<dyn ferrofin_traits::library::MusicManager> = Arc::new(
-        FerrofinMusicManager::new(Arc::clone(&item_repository)).with_users(Arc::clone(&users)),
-    );
     let search: Arc<dyn ferrofin_traits::library::SearchManager> =
         Arc::new(FerrofinSearchManager::new(Arc::clone(&item_repository)));
     // Kept concrete so the "Migrate Trickplay Image Location" task can call the
@@ -746,6 +743,16 @@ pub async fn build_app_state(
         paths.music_genre_path(),
         paths.studio_path(),
         paths.artists_path(),
+    );
+    // The instant mix resolves its seed genre NAMES through the same
+    // provisioner: C# `GetInstantMixFromGenres` calls
+    // `_libraryManager.GetMusicGenre(i).Id`, which creates the row. Without it
+    // an unresolved name empties `GenreIds`, and an empty `GenreIds` is no
+    // filter — the mix would answer with the whole audio library.
+    let music: Arc<dyn ferrofin_traits::library::MusicManager> = Arc::new(
+        FerrofinMusicManager::new(Arc::clone(&item_repository))
+            .with_users(Arc::clone(&users))
+            .with_by_name_store(by_name_store.clone()),
     );
     // The `UserRootFolder` provisioner (`GetUserRootFolder()`): the row
     // `Items/Root` resolves to and the parent of every library's

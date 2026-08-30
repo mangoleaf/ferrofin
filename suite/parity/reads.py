@@ -382,8 +382,25 @@ READS = [
     # by-name + shows (need the NFO metadata + shows fixture); {genre}/{studio}/{person} are
     # URL-encoded names shared across servers, {series} is the per-server first-series id.
     user("GET /Genres/{genreName}", "/Genres/{genre}?userId={u}"),
-    user("GET /Studios/{name}", "/Studios/{studio}?userId={u}"),
+    # TWO legs, and the second one is the point: a by-name Studio whose name is
+    # also a GENRE name. `ItemCountService` restricts the `ItemValues` match to
+    # the value type the kind owns (`ItemValueType.Studios` for a Studio,
+    # `ItemCountService.cs:150-168`); without that restriction the studio
+    # inherits every item carrying the same-named genre. The `{studio}` leg
+    # cannot see it — a real studio name does not collide — so the collision is
+    # probed explicitly. This is also the body of a route the by-name lazy
+    # create turned from a 404 into a 200, which is exactly when a status-only
+    # check stops being enough.
+    multi("GET /Studios/{name}", [
+        "/Studios/{studio}?userId={u}",
+        "/Studios/{genre}?userId={u}",
+    ]),
     user("GET /Persons/{name}", "/Persons/{person}?userId={u}"),
+    # A `Year` counts by `ProductionYear`, not through `ItemValues`
+    # (`ItemCountService.cs:170-181`) — a distinct branch of the same by-name
+    # count path, and unprobed until now: Ferrofin answered ChildCount 0 for
+    # every year against Jellyfin's real totals.
+    user("GET /Years/{year}", "/Years/{year}?userId={u}"),
     user("GET /Shows/{seriesId}/Seasons", "/Shows/{series}/Seasons?userId={u}"),
     user("GET /Shows/{seriesId}/Episodes", "/Shows/{series}/Episodes?userId={u}"),
     # by-name music (needs the music fixture: tagged tracks → identical artists/genres on
@@ -402,6 +419,19 @@ READS = [
     # as agreement, and the route was never actually compared.
     user("GET /MusicGenres/InstantMix",
          "/MusicGenres/InstantMix?id={musicgenre_id}&userId={u}&limit=100"),
+    # The by-NAME instant mix, which had no row at all. Two legs, and the second
+    # is the one that matters: a genre name with no `MusicGenre` row. C#
+    # `GetInstantMixFromGenres` resolves every name through
+    # `GetMusicGenre(i).Id` = `CreateItemByName`, so its id list is never short;
+    # dropping an unresolved name instead leaves `GenreIds` empty, and an empty
+    # `GenreIds` emits NO predicate — the mix then answers with the whole audio
+    # library. Measured H=9 J=0 before the fix. Probing a movie genre here is a
+    # WRITE on both servers by design (it materializes the row), which is why it
+    # is a deliberate, named leg rather than a lucky seed.
+    multi("GET /MusicGenres/{name}/InstantMix", [
+        "/MusicGenres/{musicgenre}/InstantMix?userId={u}&limit=100",
+        "/MusicGenres/{genre}/InstantMix?userId={u}&limit=100",
+    ]),
     # Live TV (needs the tuner fixture): channels are keyed by Name across servers; the
     # airing programmes by Name too (the guide is identical on both).
     user("GET /LiveTv/Channels", "/LiveTv/Channels?userId={u}"),
@@ -443,13 +473,55 @@ def correlate(hmap, jmap):
 
 # ---------------------------------------------------------------- run
 
+# The by-name context keys whose value is a NAME both servers must be asked
+# about, mapped to the companion per-server id key (or None).
+#
+# "first by SortName on each server" is NOT enough to guarantee that, and the
+# failure is specific to this family: /Genres/{name}, /Studios/{name},
+# /Artists/{name}, /MusicGenres/{name} and /Years/{year} are `CreateItemByName`
+# upstream, so PROBING one of them against Jellyfin materializes a row. A lab
+# that has been swept therefore accumulates by-name rows on one side, the two
+# listings drift, and the row reports `Name(J="Action" H="Ambient")` — a
+# question asked wrong, not a divergence. Seeding from the first name present on
+# BOTH listings fixes the question and narrows nothing: the same full body is
+# diffed, and a name one server is genuinely missing still fails the listing row
+# (`GET /Genres`, `GET /MusicGenres`, … are full-body diffs of the whole list).
+NAMED_SEEDS = {"genre": None, "studio": None, "person": None, "year": None,
+               "artist": "artist_id", "musicgenre": "musicgenre_id"}
+
+
+def reconcile_named(hc, jc):
+    """Re-seeds every [`NAMED_SEEDS`] key to a name BOTH servers list, in the
+    Ferrofin listing's SortName order. Returns the keys that had no shared name
+    (a real fixture divergence, left for the listing row to report)."""
+    unshared = []
+    for key, id_key in NAMED_SEEDS.items():
+        h_items = hc["named_listings"].get(key) or []
+        j_items = jc["named_listings"].get(key) or []
+        j_by_name = {(i.get("Name") or ""): (i.get("Id") or "") for i in j_items}
+        shared = next((i for i in h_items if (i.get("Name") or "") in j_by_name), None)
+        if shared is None:
+            unshared.append(key)
+            continue
+        name = shared.get("Name") or ""
+        hc[key] = jc[key] = urllib.parse.quote(name)
+        if id_key:
+            hc[id_key], jc[id_key] = shared.get("Id") or "", j_by_name[name]
+    return unshared
+
+
 def resolve_named(base, token, user_id):
     """Per-server context for the by-name/shows endpoints. Names are URL-encoded (shared across
     servers via the same NFO); the series id is per-server (same title on both)."""
+    def named_list(path):
+        """A by-name listing in SortName order — the whole list, so
+        `reconcile_named` can intersect it with the other server's."""
+        return (get_json(base, f"{path}?userId={user_id}&sortBy=SortName", token)
+                or {}).get("Items") or []
+
     def first_named(path):
         """The first item of a by-name listing, by SortName so both servers pick the same one."""
-        items = (get_json(base, f"{path}?userId={user_id}&limit=1&sortBy=SortName", token)
-                 or {}).get("Items") or []
+        items = named_list(path)
         return items[0] if items else {}
 
     def first_name(path):
@@ -474,6 +546,12 @@ def resolve_named(base, token, user_id):
     musicgenre = first_named("/MusicGenres")
     channels = (get_json(base, f"/LiveTv/Channels?userId={user_id}&limit=1", token) or {}).get("Items") or []
     return {
+        # Full by-name listings, consumed only by `reconcile_named`.
+        "named_listings": {"genre": named_list("/Genres"), "studio": named_list("/Studios"),
+                           "person": named_list("/Persons"), "year": named_list("/Years"),
+                           "artist": named_list("/Artists"),
+                           "musicgenre": named_list("/MusicGenres")},
+        "year": first_named("/Years").get("Name") or "",
         "channel": channels[0]["Id"] if channels else "",
         "user": user_id,   # item() reads c["user"]
         "u": user_id,       # user() URL templates use {u}
@@ -498,6 +576,7 @@ def run(ferrofin_url, jellyfin_url):
     ht, hu = bring_up(ferrofin_url, "ferrofin")
     jt, ju = bring_up(jellyfin_url, "jellyfin")
     hc, jc = resolve_named(ferrofin_url, ht, hu), resolve_named(jellyfin_url, jt, ju)
+    reconcile_named(hc, jc)
     # `similar_invariants` holds each server to ITS OWN documented algorithm.
     hc["server"], jc["server"] = "ferrofin", "jellyfin"
 
@@ -685,7 +764,7 @@ def selfcheck():
     ctx = {"user": "U", "u": "U", "genre": "G", "studio": "S", "person": "P", "series": "SE",
            "task": "T", "device": "D", "artist": "A", "artist_id": "AID", "musicgenre": "MG",
            "channel": "CH", "album_id": "ALB", "movie": "MOV", "episode": "EP",
-           "musicgenre_id": "MGID"}
+           "musicgenre_id": "MGID", "year": "Y", "named_listings": {}}
     # The context keys the self-check invents must be the ones resolve_named
     # actually produces, or this guard passes while the live run KeyErrors.
     import inspect
@@ -718,13 +797,41 @@ def selfcheck():
                 got = leg["project"]({"StartIndex": 7, "TotalRecordCount": 500,
                                       "Items": [{"Name": "x"}]})
                 assert got and all(v is not None for v in got.values()), got
+    # The by-name seeds must be reconciled ACROSS servers, or a lab that has
+    # accumulated a by-name row on one side asks the two servers about different
+    # names and calls the answer a divergence.
+    hc = {"named_listings": {k: [] for k in NAMED_SEEDS}}
+    jc = {"named_listings": {k: [] for k in NAMED_SEEDS}}
+    hc["named_listings"]["musicgenre"] = [{"Name": "Ambient", "Id": "H-AMB"},
+                                          {"Name": "Jazz", "Id": "H-JAZ"}]
+    jc["named_listings"]["musicgenre"] = [{"Name": "Action", "Id": "J-ACT"},
+                                          {"Name": "Jazz", "Id": "J-JAZ"}]
+    unshared = reconcile_named(hc, jc)
+    assert hc["musicgenre"] == jc["musicgenre"] == "Jazz", (hc["musicgenre"], jc["musicgenre"])
+    assert (hc["musicgenre_id"], jc["musicgenre_id"]) == ("H-JAZ", "J-JAZ")
+    # ...and a key with NO shared name is REPORTED, never silently seeded with
+    # two different names.
+    assert set(unshared) == set(NAMED_SEEDS) - {"musicgenre"}, unshared
+    assert "musicgenre" not in unshared
+    # Every reconciled key (and its id companion) must be one resolve_named produces.
+    seed_keys = set(NAMED_SEEDS) | {v for v in NAMED_SEEDS.values() if v}
+    assert seed_keys <= produced, f"NAMED_SEEDS keys resolve_named does not produce: {seed_keys - produced}"
+    # The two name-collision legs are the whole reason those rows are `multi`.
+    # A future edit that drops one silently restores the blind spot.
+    legs = {ep["op"]: [leg["tmpl"] for leg in ep["legs"]]
+            for ep in READS if ep["kind"] == "multi"}
+    assert any("/Studios/{genre}" in t for t in legs["GET /Studios/{name}"]), legs["GET /Studios/{name}"]
+    assert any("/MusicGenres/{genre}/InstantMix" in t
+               for t in legs["GET /MusicGenres/{name}/InstantMix"]), \
+        legs["GET /MusicGenres/{name}/InstantMix"]
     hf, jf = {"a": True, "b": True, "c": False}, {"a": True, "b": False, "c": False}
     bad = [k for k in sorted(set(hf) | set(jf))
            if hf.get(k) != jf.get(k) or hf.get(k) is False]
     assert bad == ["b", "c"], f"invariant folding wrong: {bad}"
     print(f"ok: diff, Path-align, correlation, {len(READS)} read op-keys valid, "
           f"user/multi templates fillable, invariant folding, "
-          f"{len(aliases)} distinct invariant aliases, projections total")
+          f"{len(aliases)} distinct invariant aliases, projections total, "
+          f"{len(NAMED_SEEDS)} by-name seeds reconciled cross-server, collision legs present")
 
 
 if __name__ == "__main__":

@@ -12,6 +12,7 @@ use std::collections::{HashMap, HashSet};
 use async_trait::async_trait;
 use ferrofin_db::Database;
 use ferrofin_db::entities::users::UserEntity;
+use ferrofin_db::enums::ItemValueType;
 use ferrofin_db::store::guid_to_db;
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::dto::ItemCounts;
@@ -108,6 +109,63 @@ impl FerrofinItemCountService {
     /// keyed on the person row's `Name` (C# `ItemCountService` Person branch —
     /// `m.People.Name == item.Name`). People are not in `ItemValues`, so the generic
     /// CleanName/ItemValues count path returns zero for them.
+    /// The per-year counts for a page of `Year` by-name rows — the C#
+    /// `BaseItemKind.Year` arm, which parses the row's `Name` and counts items
+    /// whose `ProductionYear` equals it. A `Name` that does not parse counts
+    /// zero (the C# `else { return new ItemCounts(); }`).
+    async fn production_year_counts(
+        &self,
+        rows: &[NameItemRow<'_>],
+        related_item_kinds: &[BaseItemKind],
+        mut out: HashMap<Uuid, ItemCounts>,
+    ) -> Result<HashMap<Uuid, ItemCounts>, ServiceError> {
+        let year_by_id: Vec<(Uuid, i32)> = rows
+            .iter()
+            .filter_map(|row| {
+                row.name
+                    .and_then(|n| n.parse::<i32>().ok())
+                    .map(|y| (row.id, y))
+            })
+            .collect();
+        if year_by_id.is_empty() {
+            return Ok(out);
+        }
+        let type_names: Vec<&'static str> = related_item_kinds
+            .iter()
+            .filter_map(|k| stored_type_name(*k))
+            .collect();
+        let distinct_years: Vec<i32> = year_by_id
+            .iter()
+            .map(|(_, y)| *y)
+            .collect::<HashSet<i32>>()
+            .into_iter()
+            .collect();
+
+        let mut by_year: HashMap<i32, HashMap<String, i32>> = HashMap::new();
+        for chunk in distinct_years.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+            let sql = production_year_counts_sql(chunk.len(), type_names.len());
+            let mut query = sqlx::query_as::<_, (i32, String, i64)>(&sql);
+            for year in chunk {
+                query = query.bind(*year);
+            }
+            for t in &type_names {
+                query = query.bind(*t);
+            }
+            for (year, type_, count) in query.fetch_all(self.db.pool()).await.map_err(db_err)? {
+                by_year
+                    .entry(year)
+                    .or_default()
+                    .insert(type_, i32::try_from(count).unwrap_or(i32::MAX));
+            }
+        }
+        for (id, year) in year_by_id {
+            if let Some(by_type) = by_year.get(&year) {
+                out.insert(id, counts_from_type_map(by_type));
+            }
+        }
+        Ok(out)
+    }
+
     async fn people_name_counts(
         &self,
         rows: &[NameItemRow<'_>],
@@ -275,6 +333,20 @@ impl ItemCountService for FerrofinItemCountService {
         if kind == BaseItemKind::Person {
             return self.people_name_counts(rows, related_item_kinds, out).await;
         }
+        // A `Year` counts by `ProductionYear`, not by a value name
+        // (`ItemCountService.cs:170-181`); routing it through the clean-value
+        // aggregate below answered 0 for every year that has content.
+        if kind == BaseItemKind::Year {
+            return self
+                .production_year_counts(rows, related_item_kinds, out)
+                .await;
+        }
+        // The C# `switch`'s `default:` arm returns an empty `ItemCounts`. Any
+        // other kind reaching here would otherwise be counted by a name match
+        // against every value type at once.
+        let Some(value_types) = by_name_count_value_types(kind) else {
+            return Ok(out);
+        };
 
         // Each row's CleanName rides along on the row the caller is already
         // projecting, so this path reads `ItemValues` and nothing else.
@@ -310,7 +382,7 @@ impl ItemCountService for FerrofinItemCountService {
             .collect();
         let mut by_clean: HashMap<String, HashMap<String, i32>> = HashMap::new();
         for chunk in distinct_cleans.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
-            let sql = item_value_counts_sql(chunk.len(), type_names.len());
+            let sql = item_value_counts_sql(chunk.len(), type_names.len(), value_types);
 
             let mut query = sqlx::query_as::<_, (String, String, i64)>(&sql);
             for clean in chunk {
@@ -644,16 +716,27 @@ fn folder_leaf_count_sql(parents: usize, extra_join: &str, extra_where: &str) ->
     sql
 }
 
-/// The per-clean-value count aggregate for the generic by-name kinds
-/// (genre/studio/year/artist): `cleans` bound clean values and, when `types` is
-/// non-zero, that many stored `Type` names to restrict to.
+/// The per-clean-value count aggregate for the `ItemValues`-backed by-name kinds
+/// (genre / music genre / studio / artist): `cleans` bound clean values,
+/// `value_types` the `ItemValue.Type` discriminants that kind owns, and, when
+/// `types` is non-zero, that many stored item `Type` names to restrict to.
+///
+/// The `iv."Type"` restriction is not optional and is not a perf hint. C#
+/// `ItemCountService.GetItemCountsForNameItem` (`ItemCountService.cs:140-168`)
+/// switches on the by-name kind and pins the value type per arm —
+/// `ItemValueType.Studios` for a `Studio`, `.Genre` for `Genre`/`MusicGenre`,
+/// `.Artist | .AlbumArtist` for a `MusicArtist`. Matching on `CleanValue` alone
+/// makes a name collision a count collision: the by-name `Studio` "Action"
+/// inherited every movie carrying the *genre* "Action" (measured 201 against
+/// Jellyfin's 0). Ferrofin's own query translator already gets this right
+/// (`translate_query.rs:1033-1052`); this aggregate was the one place that did not.
 ///
 /// Same join-order pin as [`people_name_counts_sql`], for the same reason:
 /// driven from `BaseItems` the planner walks every item of every counted type
 /// before the clean-value filter can reject anything, where seeding from
-/// `ItemValues` — one row per genre/studio/year name — seeks straight to the
+/// `ItemValues` — one row per genre/studio/artist name — seeks straight to the
 /// values asked for.
-fn item_value_counts_sql(cleans: usize, types: usize) -> String {
+fn item_value_counts_sql(cleans: usize, types: usize, value_types: &[ItemValueType]) -> String {
     let mut sql = format!(
         r#"SELECT iv."CleanValue", bi."Type", COUNT(DISTINCT bi."Id")
            FROM "ItemValues" iv
@@ -662,12 +745,61 @@ fn item_value_counts_sql(cleans: usize, types: usize) -> String {
            WHERE iv."CleanValue" IN ({})"#,
         placeholders(cleans)
     );
+    if !value_types.is_empty() {
+        sql.push_str(r#" AND iv."Type" IN ("#);
+        for (i, t) in value_types.iter().enumerate() {
+            if i > 0 {
+                sql.push_str(", ");
+            }
+            // Bound discriminants, not user input — inlined so the binds stay
+            // positional for the caller's two loops.
+            sql.push_str(&i32::from(*t).to_string());
+        }
+        sql.push(')');
+    }
     if types > 0 {
         sql.push_str(r#" AND bi."Type" IN ("#);
         sql.push_str(&placeholders(types));
         sql.push(')');
     }
     sql.push_str(r#" GROUP BY iv."CleanValue", bi."Type""#);
+    sql
+}
+
+/// The `ItemValue.Type`s a by-name `kind` counts through, or [`None`] for a kind
+/// the C# `switch` does not handle through `ItemValues`.
+///
+/// [`None`] is meaningful twice over: `Person` and `Year` have their own
+/// branches, and every other kind hits the C# `default:` arm, which returns an
+/// empty [`ItemCounts`] rather than counting something.
+fn by_name_count_value_types(kind: BaseItemKind) -> Option<&'static [ItemValueType]> {
+    match kind {
+        BaseItemKind::Genre | BaseItemKind::MusicGenre => Some(&[ItemValueType::Genre]),
+        BaseItemKind::Studio => Some(&[ItemValueType::Studios]),
+        BaseItemKind::MusicArtist => Some(&[ItemValueType::Artist, ItemValueType::AlbumArtist]),
+        _ => None,
+    }
+}
+
+/// The per-year count aggregate: `years` bound production years and, when
+/// `types` is non-zero, that many stored item `Type` names to restrict to.
+///
+/// C# `ItemCountService.cs:170-181` counts a `Year` by `e.ProductionYear == year`
+/// — it never touches `ItemValues`, which is why routing a `Year` through the
+/// clean-value aggregate answered 0 for every year that has content.
+fn production_year_counts_sql(years: usize, types: usize) -> String {
+    let mut sql = format!(
+        r#"SELECT bi."ProductionYear", bi."Type", COUNT(DISTINCT bi."Id")
+           FROM "BaseItems" bi
+           WHERE bi."ProductionYear" IN ({})"#,
+        placeholders(years)
+    );
+    if types > 0 {
+        sql.push_str(r#" AND bi."Type" IN ("#);
+        sql.push_str(&placeholders(types));
+        sql.push(')');
+    }
+    sql.push_str(r#" GROUP BY bi."ProductionYear", bi."Type""#);
     sql
 }
 
@@ -690,8 +822,8 @@ fn placeholders(n: usize) -> String {
 mod tests {
     use super::*;
     use crate::test_support::{
-        fetch_item, seed_child_item, seed_item, seed_item_genre, seed_item_with_data,
-        seed_named_item, seed_user, seed_user_data, set_clean_name, test_db,
+        fetch_item, seed_child_item, seed_item, seed_item_genre, seed_item_value,
+        seed_item_with_data, seed_named_item, seed_user, seed_user_data, set_clean_name, test_db,
     };
     use ferrofin_db::Database;
     use ferrofin_db::entities::base_items::BaseItemEntity;
@@ -986,6 +1118,185 @@ mod tests {
             .await
             .expect("no linked");
         assert_eq!(none.total, 0);
+    }
+
+    /// The `ItemValue.Type` restriction, name-collision edition — the C#
+    /// `switch` in `ItemCountService.cs:140-168` pins the value type per
+    /// by-name kind, and dropping it makes a Studio inherit a Genre's items.
+    /// Measured live before the fix: `/Studios/Action` reported ChildCount 201
+    /// against Jellyfin's 0, because 200 movies carried the *genre* "Action".
+    #[tokio::test]
+    async fn a_by_name_studio_does_not_inherit_a_genre_of_the_same_name() {
+        let db = test_db().await;
+        let service = svc(&db);
+
+        // One name, two different ItemValue types on two different items.
+        let studio = Uuid::from_u128(0xCC01);
+        seed_named_item(&db, studio, BaseItemKind::Studio, "Action").await;
+        set_clean_name(&db, studio, "Action").await;
+        let genre = Uuid::from_u128(0xCC02);
+        seed_named_item(&db, genre, BaseItemKind::Genre, "Action").await;
+        set_clean_name(&db, genre, "Action").await;
+
+        let genre_movie = Uuid::from_u128(0xCC03);
+        seed_named_item(&db, genre_movie, BaseItemKind::Movie, "GM").await;
+        seed_item_genre(&db, genre_movie, "Action").await;
+        let studio_movie = Uuid::from_u128(0xCC04);
+        seed_named_item(&db, studio_movie, BaseItemKind::Movie, "SM").await;
+        seed_item_value(
+            &db,
+            studio_movie,
+            ferrofin_db::enums::ItemValueType::Studios,
+            "Action",
+        )
+        .await;
+
+        let studio_counts = service
+            .get_item_counts_for_name_item(
+                BaseItemKind::Studio,
+                studio,
+                &[BaseItemKind::Movie],
+                &InternalItemsQuery::default(),
+            )
+            .await
+            .expect("studio counts");
+        assert_eq!(
+            studio_counts.movie_count, 1,
+            "a Studio counts only ItemValueType::Studios rows"
+        );
+
+        let genre_counts = service
+            .get_item_counts_for_name_item(
+                BaseItemKind::Genre,
+                genre,
+                &[BaseItemKind::Movie],
+                &InternalItemsQuery::default(),
+            )
+            .await
+            .expect("genre counts");
+        assert_eq!(
+            genre_counts.movie_count, 1,
+            "a Genre counts only ItemValueType::Genre rows"
+        );
+    }
+
+    /// A `MusicArtist` counts through `Artist | AlbumArtist` and nothing else —
+    /// the C# `MusicArtist` arm. A same-named Genre value must not leak in.
+    #[tokio::test]
+    async fn a_by_name_artist_counts_only_artist_values() {
+        let db = test_db().await;
+        let service = svc(&db);
+
+        let artist = Uuid::from_u128(0xCD01);
+        seed_named_item(&db, artist, BaseItemKind::MusicArtist, "Rock").await;
+        set_clean_name(&db, artist, "Rock").await;
+
+        let track = Uuid::from_u128(0xCD02);
+        seed_named_item(&db, track, BaseItemKind::Audio, "T").await;
+        seed_item_value(
+            &db,
+            track,
+            ferrofin_db::enums::ItemValueType::AlbumArtist,
+            "Rock",
+        )
+        .await;
+        // A DIFFERENT track carries "Rock" only as a genre.
+        let other = Uuid::from_u128(0xCD03);
+        seed_named_item(&db, other, BaseItemKind::Audio, "O").await;
+        seed_item_genre(&db, other, "Rock").await;
+
+        let counts = service
+            .get_item_counts_for_name_item(
+                BaseItemKind::MusicArtist,
+                artist,
+                &[BaseItemKind::Audio],
+                &InternalItemsQuery::default(),
+            )
+            .await
+            .expect("artist counts");
+        assert_eq!(counts.song_count, 1, "the genre-only track must not count");
+    }
+
+    /// A `Year` counts by `ProductionYear`, not through `ItemValues`
+    /// (`ItemCountService.cs:170-181`). Routing it through the clean-value
+    /// aggregate answered 0 for every year that has content — measured live,
+    /// `/Years/2020` reported ChildCount 0 against Jellyfin's 500.
+    #[tokio::test]
+    async fn a_by_name_year_counts_by_production_year() {
+        let db = test_db().await;
+        let service = svc(&db);
+
+        let year = Uuid::from_u128(0xCE01);
+        seed_named_item(&db, year, BaseItemKind::Year, "2020").await;
+        set_clean_name(&db, year, "2020").await;
+
+        for (raw, name, produced) in [
+            (0xCE02_u128, "A", 2020),
+            (0xCE03, "B", 2020),
+            (0xCE04, "C", 2021),
+        ] {
+            let item = Uuid::from_u128(raw);
+            seed_named_item(&db, item, BaseItemKind::Movie, name).await;
+            sqlx::query(r#"UPDATE "BaseItems" SET "ProductionYear" = ?2 WHERE "Id" = ?1"#)
+                .bind(guid_to_db(item))
+                .bind(produced)
+                .execute(db.writer())
+                .await
+                .expect("set production year");
+        }
+
+        let counts = service
+            .get_item_counts_for_name_item(
+                BaseItemKind::Year,
+                year,
+                &[BaseItemKind::Movie],
+                &InternalItemsQuery::default(),
+            )
+            .await
+            .expect("year counts");
+        assert_eq!(counts.movie_count, 2, "only the 2020 movies count");
+
+        // A Name that does not parse as a year counts zero (the C# `else` arm).
+        let junk = Uuid::from_u128(0xCE09);
+        seed_named_item(&db, junk, BaseItemKind::Year, "not-a-year").await;
+        set_clean_name(&db, junk, "not-a-year").await;
+        let zero = service
+            .get_item_counts_for_name_item(
+                BaseItemKind::Year,
+                junk,
+                &[BaseItemKind::Movie],
+                &InternalItemsQuery::default(),
+            )
+            .await
+            .expect("junk year counts");
+        assert_eq!(zero.movie_count, 0);
+    }
+
+    /// The C# `switch`'s `default:` arm returns an empty `ItemCounts` — a kind
+    /// it does not handle is never counted by an unrestricted name match.
+    #[tokio::test]
+    async fn an_unhandled_by_name_kind_counts_nothing() {
+        let db = test_db().await;
+        let service = svc(&db);
+
+        let tag = Uuid::from_u128(0xCF01);
+        seed_named_item(&db, tag, BaseItemKind::Folder, "Action").await;
+        set_clean_name(&db, tag, "Action").await;
+        let movie = Uuid::from_u128(0xCF02);
+        seed_named_item(&db, movie, BaseItemKind::Movie, "M").await;
+        seed_item_genre(&db, movie, "Action").await;
+
+        let counts = service
+            .get_item_counts_for_name_item(
+                BaseItemKind::Folder,
+                tag,
+                &[BaseItemKind::Movie],
+                &InternalItemsQuery::default(),
+            )
+            .await
+            .expect("unhandled kind counts");
+        assert_eq!(counts.movie_count, 0);
+        assert_eq!(counts.item_count, 0);
     }
 
     #[tokio::test]
@@ -1551,7 +1862,7 @@ mod tests {
             "person counts must reach BaseItems by id, got: {plan:?}"
         );
 
-        let values = item_value_counts_sql(3, 2);
+        let values = item_value_counts_sql(3, 2, &[ItemValueType::Genre]);
         let plan = query_plan(&db, &values, 5).await;
         let outer = plan.first().expect("a plan step");
         assert!(

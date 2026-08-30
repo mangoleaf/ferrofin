@@ -40,6 +40,7 @@ const INSTANT_MIX_LIMIT: i32 = 200;
 pub struct FerrofinMusicManager {
     items: Arc<dyn ItemRepository>,
     users: Option<Arc<dyn UserManager>>,
+    by_name: Option<crate::by_name_store::ByNameStore>,
 }
 
 impl std::fmt::Debug for FerrofinMusicManager {
@@ -76,7 +77,11 @@ impl FerrofinMusicManager {
     /// Creates a music manager over the injected item repository.
     #[must_use]
     pub fn new(items: Arc<dyn ItemRepository>) -> Self {
-        Self { items, users: None }
+        Self {
+            items,
+            users: None,
+            by_name: None,
+        }
     }
 
     /// Attaches the user seam so a mix is scoped to the caller's libraries —
@@ -85,6 +90,22 @@ impl FerrofinMusicManager {
     #[must_use]
     pub fn with_users(mut self, users: Arc<dyn UserManager>) -> Self {
         self.users = Some(users);
+        self
+    }
+
+    /// Attaches the `CreateItemByName<T>` provisioner the C# reaches through
+    /// `_libraryManager.GetMusicGenre(name)`.
+    ///
+    /// This is load-bearing, not a convenience: `GetInstantMixFromGenres`
+    /// resolves every seed name with `GetMusicGenre(i).Id`, which **creates**
+    /// the row when none exists (`LibraryManager.cs:1289`), so the C# id list is
+    /// never short. Without the store a name that has no `MusicGenre` row drops
+    /// out, and an empty `genre_ids` list means *no genre predicate at all* —
+    /// the mix then answers with the whole audio library where Jellyfin answers
+    /// with the zero songs that genre actually has.
+    #[must_use]
+    pub fn with_by_name_store(mut self, store: crate::by_name_store::ByNameStore) -> Self {
+        self.by_name = Some(store);
         self
     }
 
@@ -118,9 +139,22 @@ impl FerrofinMusicManager {
     }
 
     /// The `MusicGenre` item ids for `genres` — C#
-    /// `genres.DistinctNames().Select(i => _libraryManager.GetMusicGenre(i).Id)`,
-    /// resolved here by the same cleaned-name match the by-name lookup uses. A
-    /// name with no materialized row drops out (the C# `catch` arm).
+    /// `genres.DistinctNames().Select(i => _libraryManager.GetMusicGenre(i).Id)`.
+    ///
+    /// `GetMusicGenre` is `CreateItemByName<MusicGenre>`, **not** a lookup: it
+    /// materializes the row when none exists, so upstream every distinct name
+    /// contributes an id and the mix filters on a genre that may simply have no
+    /// songs. That distinction decides the answer, because
+    /// [`Self::mix_from_genre_ids`] with an EMPTY list emits no genre predicate
+    /// at all: a name that fails to resolve does not narrow the mix, it widens
+    /// it to the entire audio library.
+    ///
+    /// So the resolution is two-step, and the order is a deliberate perf
+    /// choice, not a semantic one: one batched read resolves every name that
+    /// already has a row (the steady state — zero writes), and only the
+    /// leftovers go through [`ByNameStore::ensure`](crate::by_name_store::ByNameStore::ensure).
+    /// A name still unresolved after that (no store wired, or a create that
+    /// failed) drops out — the C# `catch { return Guid.Empty; }` arm.
     async fn music_genre_ids(&self, genres: &[String]) -> Result<Vec<Uuid>, ServiceError> {
         let names = distinct_names(genres.to_vec());
         if names.is_empty() {
@@ -129,15 +163,29 @@ impl FerrofinMusicManager {
         let rows = self
             .items
             .get_item_list(&InternalItemsQuery {
-                names,
+                names: names.clone(),
                 include_item_types: vec![BaseItemKind::MusicGenre],
                 ..InternalItemsQuery::default()
             })
             .await?;
-        Ok(rows
+        let mut ids: Vec<Uuid> = rows
             .iter()
             .filter_map(|r| Uuid::parse_str(&r.id).ok())
-            .collect())
+            .collect();
+        let matched: std::collections::HashSet<String> =
+            rows.iter().filter_map(|r| r.clean_name.clone()).collect();
+        let Some(store) = &self.by_name else {
+            return Ok(ids);
+        };
+        for name in &names {
+            if matched.contains(&crate::text_util::get_clean_value(name)) {
+                continue;
+            }
+            if let Some(id) = store.ensure(BaseItemKind::MusicGenre, name).await? {
+                ids.push(id);
+            }
+        }
+        Ok(ids)
     }
 
     /// A mix seeded by a row's own display genres — the shared body of C#
@@ -251,6 +299,24 @@ mod tests {
         FerrofinMusicManager::new(Arc::new(FerrofinItemRepository::new(db.clone(), lookup)))
     }
 
+    /// The composed manager the server actually runs: the same repository plus
+    /// the `CreateItemByName` provisioner the C# reaches through
+    /// `_libraryManager.GetMusicGenre(name)`. Every test that asks how an
+    /// UNRESOLVED genre name behaves must use this one — without the store the
+    /// name simply drops, which is the bug, not the behaviour.
+    fn provisioned_manager(db: &Database, dir: &std::path::Path) -> FerrofinMusicManager {
+        let persistence: Arc<dyn ferrofin_traits::persistence::ItemPersistenceService> = Arc::new(
+            crate::item_persistence_service::FerrofinItemPersistenceService::new(db.clone()),
+        );
+        manager(db).with_by_name_store(crate::by_name_store::ByNameStore::new(
+            persistence,
+            dir.join("Genre"),
+            dir.join("MusicGenre"),
+            dir.join("Studio"),
+            dir.join("artists"),
+        ))
+    }
+
     /// Writes the row's display `Genres` column — the seed the C# reads through
     /// `item.Genres` before resolving it to genre ids.
     async fn set_genres(db: &Database, id: Uuid, genres: &str) {
@@ -340,6 +406,106 @@ mod tests {
         let mut names: Vec<&str> = mix.iter().filter_map(|r| r.name.as_deref()).collect();
         names.sort_unstable();
         assert_eq!(names, vec!["Rock A", "Rock B"]);
+    }
+
+    /// The regression the reviewer caught: a seed genre NAME with no
+    /// materialized `MusicGenre` row must narrow the mix to that genre's songs
+    /// (none), never widen it to the whole library.
+    ///
+    /// C# cannot reach the widened state, because
+    /// `GetInstantMixFromGenres` resolves each name with
+    /// `_libraryManager.GetMusicGenre(i).Id` — `CreateItemByName`
+    /// (`LibraryManager.cs:1247, 1289`), which always yields a real id. Dropping
+    /// the name instead leaves `GenreIds` empty, and an empty `GenreIds` emits
+    /// NO predicate (`translate_query.rs:1035`). Measured live before the fix:
+    /// `/MusicGenres/Comedy/InstantMix` H=9 (the entire audio library) J=0.
+    #[tokio::test]
+    async fn a_seed_genre_with_no_row_yields_no_songs_not_every_song() {
+        let db = test_db().await;
+        seed_song(&db, Uuid::from_u128(0x101), "Rock A", "Rock").await;
+        seed_song(&db, Uuid::from_u128(0x102), "Jazz A", "Jazz").await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mgr = provisioned_manager(&db, dir.path());
+
+        let mix = mgr
+            .get_instant_mix_from_genres(&["Comedy".to_owned()], None, &DtoOptions::default())
+            .await
+            .expect("mix");
+        assert!(
+            mix.is_empty(),
+            "an unmatched genre must filter to nothing, got {:?}",
+            mix.iter()
+                .filter_map(|r| r.name.as_deref())
+                .collect::<Vec<_>>()
+        );
+
+        // ...and the resolution MATERIALIZED the row, exactly as the GET route
+        // does upstream, so a second call resolves it by lookup.
+        let created = mgr
+            .items
+            .get_item_list(&InternalItemsQuery {
+                names: vec!["Comedy".to_owned()],
+                include_item_types: vec![BaseItemKind::MusicGenre],
+                ..InternalItemsQuery::default()
+            })
+            .await
+            .expect("genre rows");
+        assert_eq!(created.len(), 1, "GetMusicGenre creates the row");
+    }
+
+    /// A resolvable name still resolves through the batched read, and the
+    /// unresolved leftovers do not disturb it: a mix over both a real and an
+    /// absent genre returns exactly the real genre's songs.
+    #[tokio::test]
+    async fn a_mixed_seed_resolves_the_real_genre_and_creates_the_absent_one() {
+        let db = test_db().await;
+        seed_song(&db, Uuid::from_u128(0x101), "Rock A", "Rock").await;
+        seed_song(&db, Uuid::from_u128(0x102), "Jazz A", "Jazz").await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mgr = provisioned_manager(&db, dir.path());
+
+        let mix = mgr
+            .get_instant_mix_from_genres(
+                &["Rock".to_owned(), "Comedy".to_owned()],
+                None,
+                &DtoOptions::default(),
+            )
+            .await
+            .expect("mix");
+        let names: Vec<&str> = mix.iter().filter_map(|r| r.name.as_deref()).collect();
+        assert_eq!(names, vec!["Rock A"]);
+        // The absent name still contributed an id (a genre with no songs), and
+        // the row it created is the one a later lookup finds.
+        let created = mgr
+            .items
+            .get_item_list(&InternalItemsQuery {
+                names: vec!["Comedy".to_owned()],
+                include_item_types: vec![BaseItemKind::MusicGenre],
+                ..InternalItemsQuery::default()
+            })
+            .await
+            .expect("genre rows");
+        assert_eq!(created.len(), 1);
+    }
+
+    /// A row-genre seed goes through the same resolution, so an album/artist
+    /// whose `Genres` column names a genre with no row must not widen either.
+    #[tokio::test]
+    async fn a_row_genre_seed_with_no_genre_row_yields_no_songs() {
+        let db = test_db().await;
+        seed_song(&db, Uuid::from_u128(0x101), "Rock A", "Rock").await;
+        let album = Uuid::from_u128(0x201);
+        seed_named_item(&db, album, BaseItemKind::MusicAlbum, "Album X").await;
+        // The column names a genre no `ItemValues` row backs.
+        set_genres(&db, album, "Comedy").await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mgr = provisioned_manager(&db, dir.path());
+
+        let mix = mgr
+            .get_instant_mix_from_item(album, None, &DtoOptions::default())
+            .await
+            .expect("mix");
+        assert!(mix.is_empty(), "got {}", mix.len());
     }
 
     #[tokio::test]
