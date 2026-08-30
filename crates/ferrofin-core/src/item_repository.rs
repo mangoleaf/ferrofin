@@ -110,6 +110,96 @@ impl FerrofinItemRepository {
         self
     }
 
+    /// The C# `ItemsController.GetItems` **non-query** branch, or `None` when
+    /// this request is not it.
+    ///
+    /// Upstream (ItemsController.cs:307, 525-529):
+    ///
+    /// ```text
+    /// if ((recursive ?? false) || ids.Length != 0 || item is not UserRootFolder) { …query… }
+    /// else { result = new QueryResult<BaseItem>(folder.GetChildren(user, true)); }
+    /// ```
+    ///
+    /// `GetChildren` builds its OWN `InternalItemsQuery`, so the request's sort,
+    /// paging, item types and filters are all discarded — measured against
+    /// 10.11.8 on the batch pair, `sortBy=SortName&sortOrder=Descending`,
+    /// `sortBy=DateCreated`, `limit=2&startIndex=1`, `includeItemTypes=Movie` and
+    /// a bare `/Items` (no `parentId` at all —
+    /// `LibraryManager.GetParentItem(null, userId)` returns the user root) each
+    /// answered with the identical seven root rows in the identical order.
+    ///
+    /// Ferrofin used to answer that bare `/Items` with the WHOLE server (554
+    /// rows against Jellyfin's 7) and to sort the concatenated playlists folder
+    /// inline instead of appending it.
+    ///
+    /// Needs [`RootFolderIds`] to recognise the user root, so it is inert on a
+    /// repository built without them (unit tests, and any composition that has
+    /// no aggregate root to concatenate from in the first place).
+    async fn user_root_children(
+        &self,
+        filter: &InternalItemsQuery,
+    ) -> Result<Option<Vec<BaseItemEntity>>, ServiceError> {
+        if !filter.user_root_children {
+            return Ok(None);
+        }
+        let Some(roots) = self.roots else {
+            return Ok(None);
+        };
+        if filter.parent_id != Uuid::nil() && filter.parent_id != roots.user_root {
+            return Ok(None);
+        }
+        let children = InternalItemsQuery {
+            user: filter.user.clone(),
+            parent_id: roots.user_root,
+            ..InternalItemsQuery::default()
+        };
+        let mut rows = self.fetch_rows(&children, QueryShape::FullRows).await?;
+        // `AddChildrenFromCollection` keeps only `e.IsVisible(user)`
+        // (Folder.cs:1414-1417). `Folder.IsVisible` (Folder.cs:231-253) is the
+        // blocked-/enabled-folders check, and it applies to `ICollectionFolder
+        // && not BasePluginFolder` — so a `CollectionFolder` is filtered, while
+        // a `UserView` (not an `ICollectionFolder`) and the playlists folder (a
+        // `BasePluginFolder`) always pass.
+        if let Some(user) = filter.user.as_ref() {
+            let hidden = self.hidden_media_folders(user).await?;
+            if !hidden.is_empty() {
+                rows.retain(|row| Uuid::parse_str(&row.id).is_ok_and(|id| !hidden.contains(&id)));
+            }
+        }
+        Ok(Some(rows))
+    }
+
+    /// The media-folder ids `user` may NOT see — `Folder.IsVisible`'s
+    /// blocked-/enabled-folders arm, resolved once per call.
+    ///
+    /// Empty (and so a no-op) for the ordinary all-folders-enabled user, which
+    /// is why the set is computed rather than probed per row.
+    async fn hidden_media_folders(&self, user: &UserEntity) -> Result<Vec<Uuid>, ServiceError> {
+        let blocked =
+            folder_preference(&self.db, user, PreferenceKind::BlockedMediaFolders).await?;
+        if !blocked.is_empty() {
+            return Ok(blocked);
+        }
+        if has_permission(self.db.pool(), &user.id, PermissionKind::EnableAllFolders).await? {
+            return Ok(Vec::new());
+        }
+        let Some(collection_folder) = stored_type_name(BaseItemKind::CollectionFolder) else {
+            return Ok(Vec::new());
+        };
+        let allowed = folder_preference(&self.db, user, PreferenceKind::EnabledFolders).await?;
+        let rows: Vec<String> =
+            sqlx::query_scalar(r#"SELECT "Id" FROM "BaseItems" WHERE "Type" = ?1"#)
+                .bind(collection_folder)
+                .fetch_all(self.db.pool())
+                .await
+                .map_err(db_err)?;
+        Ok(rows
+            .iter()
+            .filter_map(|id| Uuid::parse_str(id).ok())
+            .filter(|id| !allowed.contains(id))
+            .collect())
+    }
+
     /// Resolves the virtual library views a browse names into the physical
     /// folders its items actually hang off, returning `None` when there is
     /// nothing to resolve.
@@ -140,6 +230,19 @@ impl FerrofinItemRepository {
         // query scoped to it is a query with no scope at all. Jellyfin reaches
         // the same answer through its ancestor closure, which carries the
         // aggregate on every scanned row.
+        //
+        // …but "no scope" is not the same as "no user scope". C#
+        // `SetTopParentIdsOrAncestors` puts the aggregate (neither an
+        // `ICollectionFolder` nor a `UserView`) into `query.AncestorIds` and
+        // only then clears `query.Parent` (LibraryManager.cs:1673-1698), so the
+        // result stays inside the physical root's ancestor closure. Ferrofin
+        // keeps a one-level `AncestorIds` table, not a transitive closure, so
+        // binding the aggregate there would match nothing; the equivalent is to
+        // answer exactly as the SAME query with no parent at all does — which
+        // is what `scope_to_user_libraries` scopes. Without it the branch leaked
+        // rows outside the closure: measured on the batch pair,
+        // `/Items?parentId={aggregate}&recursive=true&includeItemTypes=Person`
+        // was Ferrofin 3 / Jellyfin 0.
         if filter.recursive
             && !filter.physical_children_only
             && self
@@ -148,7 +251,11 @@ impl FerrofinItemRepository {
         {
             let mut resolved = filter.clone();
             resolved.parent_id = Uuid::nil();
-            return Ok(Some(resolved));
+            return Ok(Some(
+                scope_to_user_libraries(&self.db, &resolved)
+                    .await?
+                    .unwrap_or(resolved),
+            ));
         }
         // A *recursive* browse of a library is scoped by top parent, not by the
         // ancestor closure — C# `SetTopParentIdsOrAncestors`, which swaps a
@@ -1410,6 +1517,20 @@ impl ItemRepository for FerrofinItemRepository {
         &self,
         filter: &InternalItemsQuery,
     ) -> Result<QueryResult<BaseItemEntity>, ServiceError> {
+        // C# `ItemsController.GetItems` does NOT query when the parent is the
+        // user root and the request is neither recursive nor id-scoped — see
+        // [`Self::user_root_children`].
+        if let Some(children) = self.user_root_children(filter).await? {
+            let total = i32::try_from(children.len()).unwrap_or(i32::MAX);
+            // `new QueryResult<BaseItem>(itemsArray)`: the total is the array's
+            // own length, and the controller echoes the REQUESTED `startIndex`
+            // back unchanged (it paged nothing).
+            return Ok(QueryResult::new(
+                Some(filter.start_index.unwrap_or(0)),
+                Some(total),
+                children,
+            ));
+        }
         // Resolve once for both statements below: the page and its count share
         // one scope, and asking the database twice for the same library's
         // folders is a round trip on every paged browse.
@@ -2142,6 +2263,211 @@ mod tests {
         let mut names: Vec<&str> = rows.iter().filter_map(|r| r.name.as_deref()).collect();
         names.sort_unstable();
         assert_eq!(names, ["Movies", "Playlists"]);
+    }
+
+    /// The virtual children come LAST, not in `SortName` order among the rest:
+    /// `UserRootFolder.GetEligibleChildrenForRecursiveChildren` APPENDS them
+    /// (`list.AddRange`, UserRootFolder.cs:96-102). Measured on 10.11.8,
+    /// `/Items?parentId={userRoot}` answers `[…, Shows (synth), Playlists]`
+    /// although "playlists" sorts before "shows (synth)".
+    #[tokio::test]
+    async fn the_aggregates_virtual_children_are_appended_not_sorted_inline() {
+        use crate::aggregate_folder::RootFolderIds;
+        use crate::test_support::seed_folder_item;
+        let db = test_db().await;
+        let user_root = Uuid::from_u128(0xE001);
+        let aggregate = Uuid::from_u128(0xE002);
+        seed_folder_item(&db, aggregate, BaseItemKind::AggregateFolder, "root", None).await;
+        seed_folder_item(&db, user_root, BaseItemKind::UserRootFolder, "MF", None).await;
+        for (n, name) in [(0xE010_u128, "Collections"), (0xE011, "Shows")] {
+            seed_folder_item(
+                &db,
+                Uuid::from_u128(n),
+                BaseItemKind::CollectionFolder,
+                name,
+                Some(user_root),
+            )
+            .await;
+        }
+        // "Playlists" sorts between "Collections" and "Shows".
+        seed_folder_item(
+            &db,
+            Uuid::from_u128(0xE020),
+            BaseItemKind::PlaylistsFolder,
+            "Playlists",
+            Some(aggregate),
+        )
+        .await;
+
+        let rows = repo(&db)
+            .with_root_ids(RootFolderIds {
+                user_root,
+                aggregate,
+            })
+            .get_item_list(&InternalItemsQuery {
+                parent_id: user_root,
+                ..InternalItemsQuery::default()
+            })
+            .await
+            .expect("browse");
+
+        let names: Vec<&str> = rows.iter().filter_map(|r| r.name.as_deref()).collect();
+        assert_eq!(
+            names,
+            ["Collections", "Shows", "Playlists"],
+            "got {names:?}"
+        );
+    }
+
+    /// `ItemsController.GetItems`' non-query branch (ItemsController.cs:307,
+    /// 525-529): a non-recursive, id-less request whose parent resolves to the
+    /// user root — INCLUDING an absent `parentId`, which
+    /// `LibraryManager.GetParentItem(null, userId)` maps to the user root — is
+    /// answered by `folder.GetChildren(user, true)`, so the request's sort,
+    /// paging and item types are all discarded.
+    #[tokio::test]
+    async fn the_user_root_children_branch_ignores_sort_paging_and_filters() {
+        use crate::aggregate_folder::RootFolderIds;
+        use crate::test_support::seed_folder_item;
+        let db = test_db().await;
+        let user_root = Uuid::from_u128(0xE101);
+        let aggregate = Uuid::from_u128(0xE102);
+        seed_folder_item(&db, aggregate, BaseItemKind::AggregateFolder, "root", None).await;
+        seed_folder_item(&db, user_root, BaseItemKind::UserRootFolder, "MF", None).await;
+        for (n, name) in [(0xE110_u128, "Collections"), (0xE111, "Shows")] {
+            seed_folder_item(
+                &db,
+                Uuid::from_u128(n),
+                BaseItemKind::CollectionFolder,
+                name,
+                Some(user_root),
+            )
+            .await;
+        }
+        seed_folder_item(
+            &db,
+            Uuid::from_u128(0xE120),
+            BaseItemKind::PlaylistsFolder,
+            "Playlists",
+            Some(aggregate),
+        )
+        .await;
+        // A movie deep in the tree: it must never appear on this branch, and it
+        // is what the unparented query used to answer with.
+        seed_named_item(&db, Uuid::from_u128(0xE130), BaseItemKind::Movie, "Movie").await;
+
+        let repository = repo(&db).with_root_ids(RootFolderIds {
+            user_root,
+            aggregate,
+        });
+        let noisy = InternalItemsQuery {
+            user_root_children: true,
+            limit: Some(1),
+            start_index: Some(2),
+            include_item_types: vec![BaseItemKind::Movie],
+            order_by: vec![(
+                ferrofin_model::live_tv::ItemSortBy::SortName,
+                ferrofin_model::dto::SortOrder::Descending,
+            )],
+            ..InternalItemsQuery::default()
+        };
+
+        for parent in [Uuid::nil(), user_root] {
+            let result = repository
+                .get_items(&InternalItemsQuery {
+                    parent_id: parent,
+                    ..noisy.clone()
+                })
+                .await
+                .expect("browse");
+            let names: Vec<&str> = result
+                .items
+                .iter()
+                .filter_map(|r| r.name.as_deref())
+                .collect();
+            assert_eq!(
+                names,
+                ["Collections", "Shows", "Playlists"],
+                "parent {parent}: got {names:?}"
+            );
+            assert_eq!(result.total_record_count, 3);
+            // The controller echoes the REQUESTED start index; it paged nothing.
+            assert_eq!(result.start_index, 2);
+        }
+
+        // …and the branch is inert for a parent that is not the user root, and
+        // for a recursive/id-scoped request (the handler does not set the flag
+        // there, but the repository must not depend on that).
+        let elsewhere = repository
+            .get_items(&InternalItemsQuery {
+                parent_id: Uuid::from_u128(0xE110),
+                user_root_children: true,
+                ..InternalItemsQuery::default()
+            })
+            .await
+            .expect("elsewhere");
+        assert!(
+            elsewhere.items.is_empty(),
+            "got {:?}",
+            elsewhere.items.len()
+        );
+    }
+
+    /// A recursive browse of the physical root is a browse with no PARENT, not
+    /// one with no SCOPE. C# leaves `AncestorIds = [aggregate]` behind
+    /// (`SetTopParentIdsOrAncestors`, LibraryManager.cs:1673-1698), so rows
+    /// outside the closure stay out; the equivalent here is the same scope an
+    /// unparented query gets.
+    #[tokio::test]
+    async fn a_recursive_aggregate_browse_keeps_the_unparented_scope() {
+        use crate::aggregate_folder::RootFolderIds;
+        use crate::test_support::seed_folder_item;
+        let db = test_db().await;
+        let user_root = Uuid::from_u128(0xE201);
+        let aggregate = Uuid::from_u128(0xE202);
+        let library = Uuid::from_u128(0xE210);
+        seed_folder_item(&db, aggregate, BaseItemKind::AggregateFolder, "root", None).await;
+        seed_folder_item(&db, user_root, BaseItemKind::UserRootFolder, "MF", None).await;
+        seed_folder_item(
+            &db,
+            library,
+            BaseItemKind::CollectionFolder,
+            "Movies",
+            Some(user_root),
+        )
+        .await;
+        let user = seed_user_with_defaults(&db, Uuid::from_u128(0xE2FF)).await;
+        seed_top_parented_item(
+            &db,
+            Uuid::from_u128(0xE220),
+            BaseItemKind::Movie,
+            "In library",
+            library,
+        )
+        .await;
+        // A by-name row: inside no library, so outside the aggregate's closure.
+        seed_named_item(&db, Uuid::from_u128(0xE221), BaseItemKind::Person, "Actor").await;
+
+        let rows = repo(&db)
+            .with_root_ids(RootFolderIds {
+                user_root,
+                aggregate,
+            })
+            .get_item_list(&InternalItemsQuery {
+                parent_id: aggregate,
+                recursive: true,
+                user: Some(user),
+                ..InternalItemsQuery::default()
+            })
+            .await
+            .expect("browse");
+
+        let names: Vec<&str> = rows.iter().filter_map(|r| r.name.as_deref()).collect();
+        assert!(names.contains(&"In library"), "got {names:?}");
+        assert!(
+            !names.contains(&"Actor"),
+            "a row outside the aggregate's closure leaked: {names:?}"
+        );
     }
 
     #[test]

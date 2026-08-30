@@ -331,6 +331,13 @@ async fn get_items(
     if let Some(parent) = query.parent_id {
         internal.parent_id = parent;
     }
+    // C# `ItemsController.GetItems` (ItemsController.cs:307, 525-529) answers a
+    // non-recursive, id-less request whose parent resolves to the
+    // `UserRootFolder` with `folder.GetChildren(user, true)` — not with a query.
+    // The controller owns that decision; the repository applies it only if the
+    // parent really is the user root (an ABSENT `parentId` is, per
+    // `LibraryManager.GetParentItem(null, userId)`).
+    internal.user_root_children = !internal.recursive && internal.item_ids.is_empty();
     // C# `ApplyFilters` translates the `filters` flag set onto the tri-state
     // fields, rejecting contradictory pairs with a `400`. Token parsing is
     // lenient + case-insensitive like ASP.NET's binder: jellyfin-web sends
@@ -542,37 +549,67 @@ fn short_type(item: &BaseItemEntity) -> &str {
     item.type_.rsplit('.').next().unwrap_or(&item.type_)
 }
 
-/// Port of `LibraryController.TranslateParentItem`: for a user, a physical
-/// library root (a folder whose parent is the `AggregateFolder`, as in a
-/// database scanned by Jellyfin) is shown as the user's view containing it —
-/// the `CollectionFolder` whose `PhysicalLocations` include the folder's path.
-/// `None` when no view contains it (the C# `FirstOrDefault` miss, which ends
-/// the walk). Items Ferrofin scanned already parent straight to their
-/// `CollectionFolder`, so the hop only fires on adopted data.
+/// The children of the `UserRootFolder` that are the aggregate's VIRTUAL
+/// children rather than its own rows — the plug-in folders
+/// `LibraryManager.CreateRootFolder` registers with `AddVirtualChild`
+/// (LibraryManager.cs:883, the only call site in 10.11.8: the playlists folder).
 ///
-/// A **plug-in folder** under the aggregate is exempt: `CreateRootFolder`
-/// parents the playlists folder to the `AggregateFolder` and registers it with
-/// `AddVirtualChild` (LibraryManager.cs:855-885), so it is a *virtual* child,
-/// not a resolved physical library root, and no `CollectionFolder` will ever
-/// carry its path. Translating it would find nothing and end the walk, which is
-/// how a playlist came back with an EMPTY ancestor chain where Jellyfin answers
-/// `[Playlists, root]`.
+/// Named as a set because that is what it is in the C#: they are members of the
+/// candidate list `TranslateParentItem` searches, and their
+/// `BaseItem.PhysicalLocations` is `[Path]` (BaseItem.cs:450-461), so the search
+/// matches such a folder against ITSELF.
+const AGGREGATE_VIRTUAL_CHILD_TYPES: [&str; 3] = [
+    "PlaylistsFolder",
+    "ManualPlaylistsFolder",
+    "BasePluginFolder",
+];
+
+/// Port of `LibraryController.TranslateParentItem` (LibraryController.cs:959-966):
+///
+/// ```text
+/// item.GetParent() is AggregateFolder
+///     ? _libraryManager.GetUserRootFolder().GetChildren(user, true)
+///         .FirstOrDefault(i => i.PhysicalLocations.Contains(item.Path))
+///     : item
+/// ```
+///
+/// A hop whose parent is NOT the aggregate passes through untouched. A hop under
+/// the aggregate is looked up in the user root's children — and `GetChildren`
+/// there is the concatenated set (`UserRootFolder.cs:96-102`), so the candidates
+/// are BOTH groups:
+///
+/// 1. the user root's own children, the `CollectionFolder` views, whose
+///    `PhysicalLocations` are the library's configured locations — a physical
+///    library root under the aggregate (as in a database scanned by Jellyfin) is
+///    therefore shown as the view containing it;
+/// 2. the aggregate's virtual children, whose `PhysicalLocations` is `[Path]` —
+///    such a folder matches itself, so the walk continues THROUGH it. Ferrofin
+///    used to leave that group out of the candidate set entirely, and a
+///    playlist's ancestor chain came back EMPTY where Jellyfin answers
+///    `[Playlists, root]`.
+///
+/// The two groups are disjoint by construction (a library location is never the
+/// plug-in folder's own `{data}/playlists` path), so group 2 is tested first —
+/// it needs no query.
+///
+/// `None` is the C# `FirstOrDefault` miss, which ends the walk.
 async fn translate_parent_item(
     state: &AppState,
     item: &BaseItemEntity,
     grandparent: Option<&BaseItemEntity>,
 ) -> Result<Option<BaseItemEntity>, ApiError> {
-    if grandparent.is_none_or(|g| short_type(g) != "AggregateFolder")
-        || matches!(
-            short_type(item),
-            "PlaylistsFolder" | "ManualPlaylistsFolder" | "BasePluginFolder"
-        )
-    {
+    if grandparent.is_none_or(|g| short_type(g) != "AggregateFolder") {
         return Ok(Some(item.clone()));
     }
     let Some(path) = item.path.as_deref() else {
         return Ok(None);
     };
+    // Candidate group 2: `PhysicalLocations == [Path]`, so `Contains(item.Path)`
+    // is true of the item itself.
+    if AGGREGATE_VIRTUAL_CHILD_TYPES.contains(&short_type(item)) {
+        return Ok(Some(item.clone()));
+    }
+    // Candidate group 1: the `CollectionFolder` views.
     let folders = state.virtual_folders.get_virtual_folders().await?;
     let Some(view_id) = folders
         .iter()

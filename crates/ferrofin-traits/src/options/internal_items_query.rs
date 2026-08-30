@@ -287,6 +287,28 @@ pub struct InternalItemsQuery {
     /// **aggregate** and registers it as a virtual child, so the user root
     /// lists a row that does not carry its id as `ParentId`.
     pub virtual_child_parent_id: Option<Uuid>,
+    /// The caller is `GET /Items` in the shape that C# answers with
+    /// `Folder.GetChildren`, not with a query.
+    ///
+    /// Port of `ItemsController.GetItems`' branch condition
+    /// (ItemsController.cs:307-528): when the request is **not** recursive, names
+    /// **no** `ids`, and its resolved parent **is** the `UserRootFolder` — which
+    /// `LibraryManager.GetParentItem(parentId, userId)` also returns for an
+    /// ABSENT `parentId` — upstream skips the whole `InternalItemsQuery` it
+    /// otherwise builds and returns
+    /// `new QueryResult<BaseItem>(folder.GetChildren(user, true))`.
+    ///
+    /// That branch applies no sort, no paging and none of the request's filters,
+    /// and its children are the user root's own rows with the `AggregateFolder`'s
+    /// virtual children APPENDED (`list.AddRange`, UserRootFolder.cs:96-102) —
+    /// measured on 10.11.8: `sortBy=SortName&sortOrder=Descending`,
+    /// `sortBy=DateCreated`, `limit=2&startIndex=1` and `includeItemTypes=Movie`
+    /// all return the identical seven rows in the identical order, Playlists last.
+    ///
+    /// Set only by the `GET /Items` handler (the controller owns this branch);
+    /// the repository ignores it unless the parent really does resolve to the
+    /// user root.
+    pub user_root_children: bool,
     /// The parent item kind, if known.
     pub parent_type: Option<BaseItemKind>,
     /// Restrict to descendants of these ancestors.
@@ -518,6 +540,7 @@ impl Default for InternalItemsQuery {
             physical_children_only: false,
             parent_physical_folder_ids: Vec::new(),
             virtual_child_parent_id: None,
+            user_root_children: false,
             parent_type: None,
             ancestor_ids: Vec::new(),
             linked_child_ancestor_ids: Vec::new(),

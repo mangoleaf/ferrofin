@@ -1402,6 +1402,28 @@ pub(crate) fn append_order_by(qb: &mut QueryBuilder<'_, Sqlite>, filter: &Intern
 
     qb.push(" ORDER BY ");
 
+    // `UserRootFolder.GetEligibleChildrenForRecursiveChildren` (UserRootFolder.cs:96-102)
+    // does `list.AddRange(LibraryManager.RootFolder.VirtualChildren)` — it
+    // APPENDS the aggregate's plug-in folders after its own children rather
+    // than merging them into a sort. Measured on 10.11.8, `/Items?parentId=
+    // {userRoot}` answers `[Collections, Movies, Music, ParityCRUD, Recordings,
+    // Shows, Playlists]` — Playlists LAST although its `SortName` ("playlists")
+    // sorts before "shows (synth)". Expressed as a leading ordering term
+    // because the concat is a SQL `OR` disjunct here, so without it the row
+    // sorts inline.
+    //
+    // (`GET /Library/MediaFolders` is the opposite and already agrees:
+    // LibraryController.cs:547-551 concatenates the same two sets and then
+    // `.OrderBy(i => i.SortName)`, so there the playlists folder IS inline.)
+    //
+    // `virtual_child_parent_id` is set only for a browse of the user root or of
+    // the aggregate itself, so no other statement gains this term.
+    if let Some(aggregate) = filter.virtual_child_parent_id {
+        qb.push(r#"(CASE WHEN bi."ParentId" = "#)
+            .push_bind(guid_to_db(aggregate))
+            .push(" THEN 1 ELSE 0 END), ");
+    }
+
     if let Some(term) = search_term {
         push_search_relevance(qb, term);
         qb.push(r#", bi."SortName" ASC, bi."Name" ASC"#);

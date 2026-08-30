@@ -741,6 +741,15 @@ fn people_name_counts_sql(names: usize, types: usize) -> String {
 /// Merged alternate versions (`PrimaryVersionId` set) are hidden duplicates of
 /// their primary — counting them inflated every series/season episode total
 /// after a merge-versions pass.
+///
+/// `IsVirtualItem = 0` is upstream's, not an optimisation: BOTH
+/// `Folder.GetRecursiveChildCount` (Folder.cs:701-714) and the
+/// `UnplayedItemCount` query in `Folder.FillUserDataDtoValues`
+/// (Folder.cs:1812-1824) set `IsVirtualItem = false`, so a missing episode is
+/// counted by neither. It was absent here while the whole-server variant
+/// (`whole_server_leaf_counts`, the `AggregateFolder`'s counts) carried it,
+/// which meant a page holding both an ordinary folder and the aggregate counted
+/// them by two different rules.
 fn folder_leaf_count_sql(parents: usize, extra_join: &str, extra_where: &str) -> String {
     let mut sql = format!(
         r#"SELECT a."ParentItemId", COUNT(DISTINCT a."ItemId")
@@ -748,6 +757,7 @@ fn folder_leaf_count_sql(parents: usize, extra_join: &str, extra_where: &str) ->
            WHERE EXISTS (SELECT 1 FROM "BaseItems" bi
                          WHERE bi."Id" = a."ItemId"
                            AND bi."IsFolder" = 0
+                           AND bi."IsVirtualItem" = 0
                            AND bi."PrimaryVersionId" IS NULL){extra_where}
              AND a."ParentItemId" IN ("#
     );

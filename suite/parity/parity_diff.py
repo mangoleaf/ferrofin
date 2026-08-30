@@ -66,6 +66,12 @@ def _align_key(e):
 def _keyed(arr):
     m = {}
     for e in arr:
+        # Only an array of OBJECTS can be key-aligned. An array of scalars has no
+        # key to align on and must stay positional — `_align_key` would also
+        # raise on one (`"Id" in "some string"` is a substring test, and the
+        # index that follows it is a TypeError).
+        if not isinstance(e, dict):
+            return None
         k = _align_key(e)
         if k is None or k in m:
             return None

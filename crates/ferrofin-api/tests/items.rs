@@ -370,12 +370,19 @@ impl LibraryManager for OkLibrary {
         item_id: Uuid,
     ) -> Result<Option<Vec<BaseItemEntity>>, ServiceError> {
         if item_id == PLAYLIST_ID {
+            // The playlists folder carries a real `Path` because the row
+            // `CreateRootFolder` writes does: `TranslateParentItem` matches a
+            // candidate on `PhysicalLocations.Contains(item.Path)`, and
+            // `BaseItem.PhysicalLocations` is EMPTY for a pathless row
+            // (BaseItem.cs:450-461), which would legitimately end the walk.
+            let mut playlists = item_entity(
+                PLAYLISTS_FOLDER_ID,
+                "Playlists",
+                BaseItemKind::PlaylistsFolder,
+            );
+            playlists.path = Some("/data/playlists".to_owned());
             return Ok(Some(vec![
-                item_entity(
-                    PLAYLISTS_FOLDER_ID,
-                    "Playlists",
-                    BaseItemKind::PlaylistsFolder,
-                ),
+                playlists,
                 item_entity(AGGREGATE_ID, "root", BaseItemKind::AggregateFolder),
             ]));
         }
@@ -1243,11 +1250,12 @@ async fn ancestors_translate_physical_root_to_the_users_view() {
     }
 }
 
-/// A plug-in folder under the `AggregateFolder` is NOT translated: it is a
-/// virtual child (`AddVirtualChild`), not a resolved physical library root, so
-/// no `CollectionFolder` carries its path. Translating it found nothing and
-/// ended the walk, which answered a playlist's ancestors with an EMPTY array
-/// where Jellyfin answers `[Playlists, root]`.
+/// A plug-in folder under the `AggregateFolder` survives the translation: it is
+/// a virtual child (`AddVirtualChild`), so it is IN the candidate set
+/// `TranslateParentItem` searches, and its `PhysicalLocations` is `[Path]` — the
+/// search therefore matches the folder against itself and the walk continues
+/// through it. Leaving that group out of the candidate set answered a playlist's
+/// ancestors with an EMPTY array where Jellyfin answers `[Playlists, root]`.
 #[tokio::test]
 async fn ancestors_keep_a_plugin_folder_and_the_physical_root() {
     let state = ok_state_with(OkLibrary {

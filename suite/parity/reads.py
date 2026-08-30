@@ -72,10 +72,12 @@ def multi(op, legs, seed=None, reap=None):
     entry would clobber the first). Every leg is diffed; the buckets are unioned.
 
     A leg is a URL template, or a `(template, project)` pair whose
-    `project(body)` narrows what is compared. A projection is allowed ONLY where
-    the rest of the body is provably non-comparable between two independent
-    instances — the Suggestions paging leg is the one case (see there) — never to
-    make a divergence disappear.
+    `project(body)` reshapes what is compared. A REDUCTIVE projection — one that
+    narrows the comparison — is allowed ONLY where the rest of the body is
+    provably non-comparable between two independent instances (the Suggestions
+    paging leg is the one case, see there), never to make a divergence
+    disappear. An ADDITIVE one (`with_item_order`) needs no such licence: it
+    only ever adds comparisons.
 
     `seed(base, token, ctx)` runs on BOTH servers immediately before this row's
     legs and `reap(base, token, ctx)` immediately after, in a `finally`. Scoping
@@ -557,7 +559,22 @@ READS = [
     user("GET /UserViews", "/UserViews?userId={u}"),
     user("GET /Library/MediaFolders", "/Library/MediaFolders"),
     user("GET /Library/VirtualFolders", "/Library/VirtualFolders"),
-    user("GET /Items", "/Items?userId={u}&recursive=true&includeItemTypes=Movie&limit=50&sortBy=SortName&fields=Path"),
+    # Two legs, both order-checked (see `with_item_order`).
+    #
+    # Leg 2 is the `UserRootFolder` browse, and it is not a duplicate of
+    # `GET /Items/Root`: C# `ItemsController.GetItems` answers it from
+    # `folder.GetChildren(user, true)` instead of a query (ItemsController.cs:307,
+    # 525-529), which is a code path nothing else in this layer reaches — no
+    # sort, no paging, no item-type filter, and the aggregate's virtual children
+    # APPENDED rather than sorted in. Measured on 10.11.8, `sortBy=…`,
+    # `limit=…&startIndex=…` and `includeItemTypes=…` all leave the answer
+    # unchanged, so the leg pins the branch as well as the order.
+    multi("GET /Items", [
+        ("/Items?userId={u}&recursive=true&includeItemTypes=Movie&limit=50&sortBy=SortName&fields=Path",
+         with_item_order),
+        ("/Items?userId={u}&parentId={root}&sortBy=SortName&sortOrder=Descending&limit=2&startIndex=1",
+         with_item_order),
+    ]),
     user("GET /Items/Latest", "/Items/Latest?userId={u}&limit=20&fields=Path"),
     user("GET /UserItems/Resume", "/UserItems/Resume?userId={u}&limit=12&fields=Path"),
     user("GET /Shows/NextUp", "/Shows/NextUp?userId={u}&limit=24"),
@@ -798,6 +815,14 @@ def resolve_named(base, token, user_id):
                 return it.get("Id") or ""
         return ""
 
+    def user_root_id():
+        """The `UserRootFolder`, per server (`GET /Items/Root`, which is
+        `LibraryManager.GetUserRootFolder()`). Both servers derive the same GUID
+        from the same application paths, but it is resolved per server rather
+        than pinned so a divergence in the derivation shows up as a status/body
+        difference on the leg instead of being papered over by a constant."""
+        return (get_json(base, "/Items/Root", token) or {}).get("Id") or ""
+
     artist = first_named("/Artists")
     lyric_ids = lyric_seed_ids(base, token, user_id)
     channels = (get_json(base, f"/LiveTv/Channels?userId={user_id}&limit=1", token) or {}).get("Items") or []
@@ -807,6 +832,9 @@ def resolve_named(base, token, user_id):
         # The `PlaylistsFolder` — the one seed whose ancestor chain reaches the
         # `AggregateFolder`.
         "playlists_folder": playlists_folder_id(),
+        # The `UserRootFolder` — the parent whose browse takes C#'s
+        # `folder.GetChildren` branch instead of a query.
+        "root": user_root_id(),
         # The fixture's XMLTV listings provider, per server: Jellyfin and
         # Ferrofin each mint their own id, and both the mapping-options and
         # lineups reads take it as a query parameter.
@@ -1001,8 +1029,23 @@ def run(ferrofin_url, jellyfin_url):
             agg = {"mismatch": [], "missing": [], "extra": []}
             legs = []
             clean = tested = 0
-            extra = [(hc.get(k) or "", jc.get(k) or "") for k in ep.get("extra_seeds", ())]
-            for hid, jid in list(pairs) + [p for p in extra if p[0] and p[1]]:
+            # A declared `extra_seeds` key that either server cannot resolve is a
+            # LOST LEG, not a clean run with fewer legs. Dropping it silently is
+            # how the one probe that reaches the `AggregateFolder` could vanish
+            # and leave the row reading BETTER than before (fewer legs, fewer
+            # diffs). Every other failure mode in this loop records something;
+            # so does this one.
+            extra = []
+            for key in ep.get("extra_seeds", ()):
+                hid, jid = hc.get(key) or "", jc.get(key) or ""
+                if hid and jid:
+                    extra.append((hid, jid))
+                    continue
+                tested += 1
+                agg["mismatch"].append({
+                    "path": f"[extra_seeds:{key}] :: unresolved",
+                    "j": jid or "(absent)", "h": hid or "(absent)"})
+            for hid, jid in list(pairs) + extra:
                 hs, hb = token_get(ferrofin_url, ep["url"](hc, hid), ht)
                 js, jb = token_get(jellyfin_url, ep["url"](jc, jid), jt)
                 if hs != js:
@@ -1092,7 +1135,7 @@ def selfcheck():
     ctx = {"user": "U", "u": "U", "genre": "G", "studio": "S", "person": "P", "series": "SE",
            "task": "T", "device": "D", "artist": "A", "artist_id": "AID", "musicgenre": "MG",
            "channel": "CH", "album_id": "ALB", "movie": "MOV", "episode": "EP",
-           "listings_provider": "LP", "playlists_folder": "PLF",
+           "listings_provider": "LP", "playlists_folder": "PLF", "root": "ROOT",
            "lyric_lrc": "L1", "lyric_elrc": "L2", "lyric_txt": "L3"}
     # The context keys the self-check invents must be the ones resolve_named
     # actually produces, or this guard passes while the live run KeyErrors.
@@ -1123,9 +1166,30 @@ def selfcheck():
             continue
         for leg in ep["legs"]:
             if leg["project"]:
-                got = leg["project"]({"StartIndex": 7, "TotalRecordCount": 500,
-                                      "Items": [{"Name": "x"}]})
+                body = {"StartIndex": 7, "TotalRecordCount": 500,
+                        "Items": [{"Name": "x"}, {"Name": "y"}]}
+                got = leg["project"](dict(body))
                 assert got and all(v is not None for v in got.values()), got
+                if leg["project"] is with_item_order:
+                    # ADDITIVE: keeps every original key and adds the order.
+                    assert set(body) <= set(got), got
+                    assert got["_ItemNameOrder"] == ["x", "y"], got
+    # …and the order it adds must actually be able to fail: a list of plain
+    # strings is the one array shape `parity_diff` compares POSITIONALLY, which
+    # is the whole point of adding it.
+    assert diff_stats(with_item_order({"Items": [{"Name": "x"}, {"Name": "y"}]}),
+                      with_item_order({"Items": [{"Name": "y"}, {"Name": "x"}]}))[0] > 0, \
+        "reordered Items must diff once ItemOrder is attached"
+    assert diff_stats({"Items": [{"Name": "x"}, {"Name": "y"}]},
+                      {"Items": [{"Name": "y"}, {"Name": "x"}]})[0] == 0, \
+        "…and without it the key-aligned array is order-blind (the blind spot)"
+    # An `extra_seeds` key must be declared on an `item` row and must be a key
+    # `resolve_named` produces, or the live run can only ever record it as
+    # unresolved.
+    for ep in READS:
+        for key in ep.get("extra_seeds", ()):
+            assert ep["kind"] == "item", ep["op"]
+            assert key in produced, f"{ep['op']}: extra seed {key!r} is not resolved"
     # Method derivation: two EMPTY result envelopes agreeing on their own zeros is
     # not the body-diff headline, and a pair that compared nothing at all is not a
     # verdict. Both are the shapes that silently inflated the count before.

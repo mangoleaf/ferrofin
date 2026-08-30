@@ -131,6 +131,26 @@ impl DynamicImageKind {
             // top parents, which `DynamicImageProviders::folder_supported`
             // filters (it needs the parent row, which this pure lookup has
             // not got).
+            //
+            // These three kinds are the WHOLE of upstream's set, not a
+            // narrowing of it. `FolderImageProvider.Supports` reads as though it
+            // accepted `Season`/`Series`/`BoxSet`/`Playlist` too, but it is an
+            // `ICustomMetadataProvider<Folder>`, and `ProviderManager`
+            // dispatches by `_metadataProviders.OfType<IMetadataProvider<T>>()`
+            // with `T` bound to the item's `MetadataService` type
+            // (ProviderManager.cs:440-459) — an invariant generic. 10.11.8 ships
+            // an exact `MetadataService<…>` for Season, Series, BoxSet,
+            // Playlist, CollectionFolder, MusicAlbum, MusicArtist, PhotoAlbum
+            // and UserView, so `FolderMetadataService` (`T = Folder`) only ever
+            // takes the Folder subclasses that have NO service of their own:
+            // `Folder`, `AggregateFolder`, `UserRootFolder` and
+            // `BasePluginFolder` — and the last is excluded anyway by
+            // `IsTopParent` (BaseItem.cs:733-757).
+            //
+            // Confirmed on the batch pair: 10.11.8 serves NO `ImageTags.Primary`
+            // for any Series, Season, MusicAlbum, BoxSet or plain Folder on the
+            // fixture, only for the two roots (and for Playlists, which is
+            // `PlaylistImageProvider`, handled above).
             BaseItemKind::Folder | BaseItemKind::UserRootFolder | BaseItemKind::AggregateFolder => {
                 Some(Self::Folder)
             }
