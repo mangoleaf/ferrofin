@@ -1175,16 +1175,62 @@ fn append_provider_predicates(qb: &mut QueryBuilder<'_, Sqlite>, filter: &Intern
 /// Appends the ancestor / top-parent predicates.
 ///
 /// `AncestorIds` is an `EXISTS` over the `AncestorIds` closure table; top-parent
-/// is a direct `TopParentId` in-list. `LinkedChildAncestorIds` and the
-/// item-by-name top-parent widening are deferred (library-manager concerns).
+/// is a direct `TopParentId` in-list, widened for the by-name types when the
+/// caller asked for them.
+/// The stored type names of the by-name kinds this query can return.
+///
+/// Port of `BaseItemRepository.GetItemByNameTypesInQuery` + `IsTypeInQuery`: a
+/// kind counts when it is not excluded and either no include set was given or
+/// it is in that set. The order is upstream's (Person, Genre, MusicGenre,
+/// MusicArtist, Studio).
+fn item_by_name_types_in_query(filter: &InternalItemsQuery) -> Vec<String> {
+    let in_query = |kind: BaseItemKind| {
+        !filter.exclude_item_types.contains(&kind)
+            && (filter.include_item_types.is_empty() || filter.include_item_types.contains(&kind))
+    };
+    [
+        BaseItemKind::Person,
+        BaseItemKind::Genre,
+        BaseItemKind::MusicGenre,
+        BaseItemKind::MusicArtist,
+        BaseItemKind::Studio,
+    ]
+    .into_iter()
+    .filter(|kind| in_query(*kind))
+    .filter_map(|kind| stored_type_name(kind).map(str::to_owned))
+    .collect()
+}
+
 fn append_ancestor_predicates(qb: &mut QueryBuilder<'_, Sqlite>, filter: &InternalItemsQuery) {
     if !filter.top_parent_ids.is_empty() {
-        qb.push(r#" AND bi."TopParentId" IS NOT NULL AND "#);
-        push_in_list(
-            qb,
-            r#"bi."TopParentId""#,
-            &to_guid_strings(&filter.top_parent_ids),
-        );
+        // C# `BaseItemRepository.TranslateQuery`
+        // (v10.11.8 `Jellyfin.Server.Implementations/Item/BaseItemRepository.cs`):
+        //   if (enableItemsByName && includedItemByNameTypes.Count > 0)
+        //       e => includedItemByNameTypes.Contains(e.Type)
+        //            || queryTopParentIds.Any(w => w == e.TopParentId)
+        // A by-name row (Genre/MusicGenre/Studio/Person/MusicArtist) has NO
+        // `TopParentId` — it belongs to no library — so without this exemption
+        // any user-scoped query silently drops every genre, studio and person.
+        // `/Search/Hints` is exactly such a query.
+        let by_name = item_by_name_types_in_query(filter);
+        if filter.include_items_by_name.unwrap_or(false) && !by_name.is_empty() {
+            qb.push(" AND (");
+            push_in_list(qb, r#"bi."Type""#, &by_name);
+            qb.push(r#" OR (bi."TopParentId" IS NOT NULL AND "#);
+            push_in_list(
+                qb,
+                r#"bi."TopParentId""#,
+                &to_guid_strings(&filter.top_parent_ids),
+            );
+            qb.push("))");
+        } else {
+            qb.push(r#" AND bi."TopParentId" IS NOT NULL AND "#);
+            push_in_list(
+                qb,
+                r#"bi."TopParentId""#,
+                &to_guid_strings(&filter.top_parent_ids),
+            );
+        }
     }
     if !filter.ancestor_ids.is_empty() {
         qb.push(r#" AND EXISTS (SELECT 1 FROM "AncestorIds" a WHERE a."ItemId" = bi."Id" AND "#);

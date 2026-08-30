@@ -505,26 +505,6 @@ pub async fn build_app_state(
         }
     };
 
-    let providers: Arc<dyn ferrofin_traits::providers::ProviderManager> = Arc::new(
-        LocalProviderManager::new(Vec::new())
-            .with_image_store(
-                Arc::clone(&item_persistence_service),
-                metadata_library.clone(),
-            )
-            .with_remote_images(Arc::clone(&tmdb_client), Arc::clone(&item_repository))
-            .with_remote_search_providers(search_providers)
-            .with_dynamic_fetchers(wasm_host.provider_names())
-            .with_studios(Arc::clone(&studios_client))
-            // The other "Choose Image" providers: fanart.tv (movies/series/
-            // artists/albums), TheAudioDb (artists/albums) and OMDb's poster
-            // (movies/trailers/episodes; inert without an API key).
-            .with_fanart(Arc::clone(&fanart_client))
-            .with_audiodb(Arc::clone(&audiodb_client))
-            .with_omdb(Arc::clone(&omdb_client))
-            // Enables the kind-filtered built-in external-id descriptors the
-            // Identify dialog renders as id input fields.
-            .with_item_types(item_type_lookup.as_ref()),
-    );
     let file_system: Arc<dyn ferrofin_traits::filesystem::FileSystem> =
         Arc::new(FerrofinFileSystem::new());
     // Kept concrete alongside the trait handle: consumers subscribe on the
@@ -637,8 +617,9 @@ pub async fn build_app_state(
         Arc::new(FerrofinDisplayPreferencesManager::new(db.clone()));
     let music: Arc<dyn ferrofin_traits::library::MusicManager> =
         Arc::new(FerrofinMusicManager::new(Arc::clone(&item_repository)));
-    let search: Arc<dyn ferrofin_traits::library::SearchManager> =
-        Arc::new(FerrofinSearchManager::new(Arc::clone(&item_repository)));
+    let search: Arc<dyn ferrofin_traits::library::SearchManager> = Arc::new(
+        FerrofinSearchManager::new(Arc::clone(&item_repository), Arc::clone(&users)),
+    );
     // Kept concrete so the "Migrate Trickplay Image Location" task can call the
     // inherent `move_generated_trickplay_data` helper.
     let trickplay_impl = Arc::new(FerrofinTrickplayManager::new(
@@ -686,6 +667,33 @@ pub async fn build_app_state(
     );
     let virtual_folders: Arc<dyn ferrofin_traits::library::VirtualFolderManager> =
         virtual_folders_impl.clone();
+    // Built after the virtual-folder manager: the refresh path reads the
+    // owning library's saved options through it (C# `BaseItemManager`).
+    let providers: Arc<dyn ferrofin_traits::providers::ProviderManager> = Arc::new(
+        LocalProviderManager::new(Vec::new())
+            .with_image_store(
+                Arc::clone(&item_persistence_service),
+                metadata_library.clone(),
+            )
+            .with_remote_images(Arc::clone(&tmdb_client), Arc::clone(&item_repository))
+            .with_remote_search_providers(search_providers)
+            .with_dynamic_fetchers(wasm_host.provider_names())
+            .with_studios(Arc::clone(&studios_client))
+            // The other "Choose Image" providers: fanart.tv (movies/series/
+            // artists/albums), TheAudioDb (artists/albums) and OMDb's poster
+            // (movies/trailers/episodes; inert without an API key).
+            .with_fanart(Arc::clone(&fanart_client))
+            .with_audiodb(Arc::clone(&audiodb_client))
+            .with_omdb(Arc::clone(&omdb_client))
+            // Enables the kind-filtered built-in external-id descriptors the
+            // Identify dialog renders as id input fields.
+            .with_item_types(item_type_lookup.as_ref())
+            // The library-options gate for an on-demand refresh: without it a
+            // `POST /Items/{id}/Refresh` ignores the library's metadata/image
+            // fetcher checkboxes that the scan honours.
+            .with_virtual_folders(Arc::clone(&virtual_folders)),
+    );
+
     // The virtual-folder manager gives `/Items/Latest` each library's collection
     // type (C# `CollectionFolder.CollectionType`), which is why the user-view
     // manager is built after it.

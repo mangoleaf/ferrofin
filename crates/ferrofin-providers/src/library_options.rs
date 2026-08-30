@@ -21,6 +21,61 @@ use ferrofin_model::configuration::{
 };
 use ferrofin_model::entities::ImageType;
 
+/// The `TypeOptions` entry a library saved for item type `kind`, if any.
+fn type_entry<'a>(
+    options: Option<&'a ferrofin_model::configuration::LibraryOptions>,
+    kind: &str,
+) -> Option<&'a ferrofin_model::configuration::TypeOptions> {
+    options?.type_options.iter().find(|t| {
+        t.type_
+            .as_deref()
+            .is_some_and(|t| t.eq_ignore_ascii_case(kind))
+    })
+}
+
+/// Whether the library enables metadata fetcher `name` for item type `kind`.
+///
+/// Port of `BaseItemManager.IsMetadataFetcherEnabled` (v10.11.8
+/// `MediaBrowser.Controller/BaseItemManager/BaseItemManager.cs`): when the
+/// library saved a `TypeOptions` entry for the kind, the answer is exactly
+/// `libraryTypeOptions.MetadataFetchers.Contains(name, OrdinalIgnoreCase)` —
+/// so an EMPTY list disables every remote fetcher. With no entry the library
+/// never customised that type and the built-in default (enabled) stands.
+///
+/// This is the ONE gate: C# routes both the scan and the on-demand
+/// `POST /Items/{id}/Refresh` through `ProviderManager.CanRefreshMetadata`,
+/// which calls it. Anything in Ferrofin that fetches remote metadata must ask
+/// here too, or clearing the checkboxes stops meaning anything.
+#[must_use]
+pub fn metadata_fetcher_enabled(
+    options: Option<&ferrofin_model::configuration::LibraryOptions>,
+    kind: &str,
+    name: &str,
+) -> bool {
+    type_entry(options, kind).is_none_or(|t| {
+        t.metadata_fetchers
+            .iter()
+            .any(|f| f.eq_ignore_ascii_case(name))
+    })
+}
+
+/// Whether the library enables image fetcher `name` for item type `kind`.
+///
+/// Port of `BaseItemManager.IsImageFetcherEnabled`, the image half of the same
+/// gate (`ProviderManager.CanRefreshImages`).
+#[must_use]
+pub fn image_fetcher_enabled(
+    options: Option<&ferrofin_model::configuration::LibraryOptions>,
+    kind: &str,
+    name: &str,
+) -> bool {
+    type_entry(options, kind).is_none_or(|t| {
+        t.image_fetchers
+            .iter()
+            .any(|f| f.eq_ignore_ascii_case(name))
+    })
+}
+
 /// The advertised provider names — the EXACT strings clients round-trip in
 /// `TypeOptions.MetadataFetchers` / `ImageFetchers` (and the flat reader
 /// lists), and therefore the strings the scanner's per-library gate matches
@@ -671,6 +726,76 @@ pub fn all_metadata_plugins() -> Vec<MetadataPluginSummary> {
 mod tests {
     use super::{all_metadata_plugins, library_options_info};
     use ferrofin_model::configuration::MetadataPluginType;
+
+    use super::{image_fetcher_enabled, metadata_fetcher_enabled};
+    use ferrofin_model::configuration::{LibraryOptions, TypeOptions};
+
+    /// `BaseItemManager.IsMetadataFetcherEnabled` /
+    /// `IsImageFetcherEnabled`: a saved `TypeOptions` entry is the whole
+    /// answer, so an EMPTY fetcher list turns every remote provider OFF for
+    /// that type — clearing the dashboard checkboxes has to mean something.
+    #[test]
+    fn an_empty_fetcher_list_disables_every_remote_provider() {
+        let cleared = LibraryOptions {
+            type_options: vec![TypeOptions {
+                type_: Some("Movie".to_owned()),
+                metadata_fetchers: Vec::new(),
+                image_fetchers: Vec::new(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(!metadata_fetcher_enabled(
+            Some(&cleared),
+            "Movie",
+            super::fetcher_names::TMDB
+        ));
+        assert!(!image_fetcher_enabled(
+            Some(&cleared),
+            "Movie",
+            super::fetcher_names::TMDB
+        ));
+        // A type the library never customised keeps the built-in default…
+        assert!(metadata_fetcher_enabled(
+            Some(&cleared),
+            "Series",
+            super::fetcher_names::TMDB
+        ));
+        // …as does a library with no saved options at all.
+        assert!(metadata_fetcher_enabled(
+            None,
+            "Movie",
+            super::fetcher_names::TMDB
+        ));
+    }
+
+    #[test]
+    fn a_listed_fetcher_is_enabled_case_insensitively() {
+        let ticked = LibraryOptions {
+            type_options: vec![TypeOptions {
+                type_: Some("movie".to_owned()),
+                metadata_fetchers: vec!["themoviedb".to_owned()],
+                image_fetchers: vec!["TheMovieDb".to_owned()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(metadata_fetcher_enabled(
+            Some(&ticked),
+            "Movie",
+            super::fetcher_names::TMDB
+        ));
+        assert!(image_fetcher_enabled(
+            Some(&ticked),
+            "Movie",
+            super::fetcher_names::TMDB
+        ));
+        assert!(!metadata_fetcher_enabled(
+            Some(&ticked),
+            "Movie",
+            super::fetcher_names::TVDB
+        ));
+    }
 
     #[test]
     fn movie_options_expose_real_fetchers_and_savers() {

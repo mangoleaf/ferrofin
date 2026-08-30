@@ -17,7 +17,18 @@
 //!   `max_list_order`, and the name range/substring predicates are applied as in
 //!   C#. The `is_favorite` user-data path is honored via a `UserData` join.
 
-use ferrofin_util::sort_name::create_sort_name;
+/// A `Person` row's `SortName`.
+///
+/// `Person` is the only 10.11.8 entity that overrides
+/// `EnableAlphaNumericSorting => false` (`MediaBrowser.Controller/Entities/
+/// Person.cs`), which sends `BaseItem.CreateSortName` down its first branch:
+/// `return Name.TrimStart();` — the name verbatim, NOT the lowercased,
+/// article-stripped, number-padded alphanumeric key every other kind gets. A
+/// person stored as `alice parity` instead of `Alice Parity` sorts and searches
+/// in a different place than Jellyfin puts it.
+fn person_sort_name(name: &str) -> String {
+    name.trim_start().to_owned()
+}
 use std::collections::HashMap;
 
 use async_trait::async_trait;
@@ -132,7 +143,7 @@ impl FerrofinPeopleRepository {
             .bind(person_type)
             .bind(name)
             .bind(&clean)
-            .bind(create_sort_name(name))
+            .bind(person_sort_name(name))
             .bind(crate::kinds::presentation_unique_key(
                 BaseItemKind::Person,
                 Uuid::parse_str(target).unwrap_or_default(),
@@ -795,7 +806,7 @@ impl PeopleRepository for FerrofinPeopleRepository {
                 .bind(type_name)
                 .bind(name)
                 .bind(&clean)
-                .bind(create_sort_name(name))
+                .bind(person_sort_name(name))
                 .execute(&mut *tx)
                 .await
                 .map_err(db_err)?;
@@ -950,6 +961,21 @@ impl PeopleRepository for FerrofinPeopleRepository {
 
 #[cfg(test)]
 mod tests {
+    /// `Person` is the only 10.11.8 entity with
+    /// `EnableAlphaNumericSorting => false`, so `BaseItem.CreateSortName`
+    /// returns `Name.TrimStart()` — the name verbatim, not the lowercased
+    /// alphanumeric key every other kind gets.
+    #[test]
+    fn a_person_sorts_by_its_name_verbatim() {
+        assert_eq!(super::person_sort_name("Alice Parity"), "Alice Parity");
+        assert_eq!(super::person_sort_name("  The Rock"), "The Rock");
+        // NOT the alphanumeric pipeline (which lowercases and strips "the ").
+        assert_ne!(
+            super::person_sort_name("The Rock"),
+            ferrofin_util::sort_name::create_sort_name("The Rock")
+        );
+    }
+
     use super::FerrofinPeopleRepository;
     use crate::test_support::{seed_item, test_db};
     use ferrofin_db::entities::base_items::PeopleEntity;

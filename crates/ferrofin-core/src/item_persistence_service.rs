@@ -92,7 +92,7 @@ async fn music_genre_row(
         r#"INSERT INTO "BaseItems"
            ("Id","Type","Name","CleanName","SortName","IsFolder","IsInMixedFolder",
             "IsLocked","IsMovie","IsRepeat","IsSeries","IsVirtualItem")
-           SELECT ?1,?2,?3,?4,?5,1,0,0,0,0,0,0
+           SELECT ?1,?2,?3,?4,?5,0,0,0,0,0,0,0
            WHERE NOT EXISTS (
                SELECT 1 FROM "BaseItems" WHERE "Type" = ?2 AND "CleanName" = ?4)"#,
     )
@@ -837,7 +837,15 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
             // (which resolves the id → BaseItems.CleanName) matches. Faithful to
             // Jellyfin, where genres/studios are BaseItems; here their id is the
             // shared value id the DTO layer already emits for genre_items.
-            if let Some(type_name) = by_name_type_name(*type_) {
+            // A music item's genre materializes ONLY as a `MusicGenre` row.
+            // Upstream keeps the two disjoint — `LibraryManager.GetMusicGenre`
+            // for audio, `GetGenre` otherwise — so a real 10.11.8 library has
+            // `Ambient` as a MusicGenre and nothing else; writing a `Genre` row
+            // too returns the name twice from `/Search/Hints` and lists a
+            // phantom entry on the Genres tab.
+            let music_genre =
+                owner_is_music && *type_ == i32::from(ferrofin_db::enums::ItemValueType::Genre);
+            if let (false, Some(type_name)) = (music_genre, by_name_type_name(*type_)) {
                 sqlx::query(
                     // `SortName` persisted, not derived on read — see
                     // `people_repository`. Without it the Genres/Studios tabs
@@ -852,7 +860,7 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
                        ("Id","Type","Name","CleanName","SortName","PresentationUniqueKey",
                         "IsFolder","IsInMixedFolder",
                         "IsLocked","IsMovie","IsRepeat","IsSeries","IsVirtualItem")
-                       VALUES (?1,?2,?3,?4,?5,?6,1,0,0,0,0,0,0)"#,
+                       VALUES (?1,?2,?3,?4,?5,?6,?7,0,0,0,0,0,0)"#,
                 )
                 .bind(&value_id)
                 .bind(type_name)
@@ -869,11 +877,19 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
                         None,
                     )
                 }))
+                // `IsFolder` follows the C# class, not the by-name-ness:
+                // `MusicArtist : Folder`, but `Genre`/`MusicGenre`/`Studio`
+                // are plain `BaseItem`s, so the controller's
+                // `if (item.IsFolder) result.IsFolder = true;` never fires for
+                // them and a genre hint carries no `IsFolder` at all.
+                .bind(i32::from(
+                    by_name_kind(*type_) == Some(BaseItemKind::MusicArtist),
+                ))
                 .execute(&mut *tx)
                 .await
                 .map_err(db_err)?;
             }
-            if owner_is_music && *type_ == i32::from(ferrofin_db::enums::ItemValueType::Genre) {
+            if music_genre {
                 music_genre_row(&mut tx, value, &clean).await?;
             }
         }

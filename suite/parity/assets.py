@@ -247,6 +247,82 @@ def read_signatures(base, token, c):
     return out
 
 
+# --------------------------------------------- content negotiation / route binding
+#
+# `read_signatures` only ever asks for a transform WITH an explicit `/jpg/` segment,
+# so two whole classes of divergence were structurally invisible to this layer:
+#
+#   1. output-format negotiation — C# `ImageController.GetClientSupportedFormats`
+#      derives the format list from the request's `Accept` header (and the `?Accept=`
+#      query value); WebP is offered ONLY when advertised, so `Accept: */*` must come
+#      back JPEG. Ferrofin used to hardcode `[Webp, Jpg, Png]` and hand WebP to every
+#      client, forever.
+#   2. `{format}` route binding — C# binds `[FromRoute, Required] ImageFormat`, so an
+#      unbindable segment is a model-binding failure (400). Ferrofin used to fall back
+#      to the default format list and answer 200 with an unrequested container.
+#
+# Both are compared as DECLARED properties (status class, Content-Type, decoded
+# format) — never as bytes, which the two encoders cannot match.
+NEGOTIATION_OPS = {
+    "GET /Items/{itemId}/Images/{imageType}": "negotiation",
+    "GET /Items/{itemId}/Images/{imageType}/{imageIndex}": "negotiation",
+    "GET /Items/{itemId}/Images/{imageType}/{imageIndex}/{tag}/{format}"
+    "/{maxWidth}/{maxHeight}/{percentPlayed}/{unplayedCount}": "binding",
+}
+
+
+def _decoded_sig(base, path, token, extra=None):
+    """(status_class, content-type, decoded format) — the declared properties only."""
+    st, h, body = raw_headers("GET", base, path, token, extra)
+    if st != 200:
+        return (st // 100, "", "")
+    return (2, (h.get("content-type") or "").split(";")[0].strip().lower(), image_info(body)[0])
+
+
+def negotiation_signatures(base, token, c):
+    """{op_key: tuple of sub-signatures} for the format-negotiation and route-binding
+    behaviour of the item-image ops. Empty when the context has no item."""
+    it, tag = c.get("item"), c.get("tag")
+    if not it:
+        return {}
+    # Accept matrix on a transform that names NO format. `*/*` must NOT enable WebP
+    # (`SupportsFormat(..., Webp, acceptAll: false)`); an explicit `image/webp` must.
+    negotiate = tuple(
+        _decoded_sig(base, f"/Items/{it}/Images/Primary?maxWidth=100", token, extra)
+        for extra in (
+            None,
+            {"Accept": "*/*"},
+            {"Accept": "image/jpeg"},
+            {"Accept": "image/webp,image/apng,image/*,*/*;q=0.8"},
+        )
+    ) + (
+        # the `?Accept=` query form of the same switch
+        _decoded_sig(base, f"/Items/{it}/Images/Primary?maxWidth=100&Accept=webp", token),
+    )
+    # Route-segment binding on the positional URL: a non-member `{format}` and a
+    # non-numeric `{percentPlayed}` are 400s; a numeric enum ordinal binds (3 = Png).
+    binding = tuple(
+        _decoded_sig(base, f"/Items/{it}/Images/Primary/0/{tag}/{seg}", token)
+        for seg in ("ts/100/100/0/0", "jpeg/100/100/0/0", "3/100/100/0/0",
+                    "jpg/100/100/abc/0", "webp/100/100/0/0")
+    )
+    return {op: (negotiate if which == "negotiation" else binding)
+            for op, which in NEGOTIATION_OPS.items()}
+
+
+def primary_image_path(base, token, item):
+    """The stored `Path` of an item's Primary image, as `/Items/{id}/Images` reports it.
+
+    The property diff compares DERIVED properties of the served bytes, which is only
+    meaningful when both servers are serving the same SOURCE file. When they are not,
+    a dimension mismatch says nothing about the image endpoint — so the row must fail
+    naming that, instead of implying a resize bug."""
+    for info in (get_json(base, f"/Items/{item}/Images", token) or []):
+        if info.get("ImageType") == "Primary":
+            return info.get("Path") or ""
+    return ""
+
+
 def file_sig(base, path, token, ranged=False):
     """Signature of a served file: (2, 'file', sha256, content-type, accept-ranges,
     content-disposition) — plus the 206 status, Content-Range and sha256 of a 100-byte Range
@@ -344,6 +420,32 @@ def run(ferrofin_url, jellyfin_url):
                     "classification": "" if ok else "flagged: asset property diff vs Jellyfin (verify)",
                     "note": f"H={h} J={j}"}
 
+    # Format negotiation + route binding, folded into the same rows.
+    hneg = negotiation_signatures(ferrofin_url, ht, hc)
+    jneg = negotiation_signatures(jellyfin_url, jt, jc)
+    for op, h in hneg.items():
+        j = jneg.get(op)
+        row = rows.get(op)
+        if row is None:
+            continue
+        if h != j:
+            row["deep_verified"] = False
+            row["classification"] = "flagged: asset property diff vs Jellyfin (verify)"
+            row["note"] += f" | negotiation/binding H={h} J={j}"
+
+    # Source-image guard: a dimension diff on the item-image ops only means the image
+    # endpoint when both servers hold the SAME Primary file. Name it when they do not.
+    hpath = primary_image_path(ferrofin_url, ht, hc["item"]) if hc.get("item") else ""
+    jpath = primary_image_path(jellyfin_url, jt, jc["item"]) if jc.get("item") else ""
+    if hpath != jpath:
+        for op in NEGOTIATION_OPS:
+            row = rows.get(op)
+            if row is None:
+                continue
+            row["deep_verified"] = False
+            row["classification"] = "flagged: asset property diff vs Jellyfin (verify)"
+            row["note"] += f" | SOURCE IMAGE MISMATCH H={hpath!r} J={jpath!r}"
+
     hw, jw = write_effects(ferrofin_url, ht, hc), write_effects(jellyfin_url, jt, jc)
     for op in sorted(hw):
         h_ok, j_ok = hw[op], jw.get(op)
@@ -398,10 +500,15 @@ def selfcheck():
     import inspect
     import re
     declared = set()
-    for fn in (read_signatures, write_effects):
+    for fn in (read_signatures, write_effects, negotiation_signatures):
         declared.update(re.findall(r'"((?:GET|HEAD|POST|DELETE) /[^"]+)"', inspect.getsource(fn)))
     bad = sorted(k for k in declared if k not in valid)
+    declared.update(NEGOTIATION_OPS)
+    bad = sorted(k for k in declared if k not in valid)
     assert not bad, f"asset op-keys not in spec: {bad}"
+    # The negotiation/binding fold only ever tightens a row: it can turn a green row
+    # red, never the other way round.
+    assert set(NEGOTIATION_OPS).issubset(valid)
     print(f"ok: image parser, sig_match, {len(declared)} asset op-keys valid")
 
 
