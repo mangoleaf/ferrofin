@@ -9,6 +9,14 @@ Signals wired now (Phase 0):
   route    registered / 501-stub   <- ferrofin-api handlers::REAL_ROUTES
   depth    REAL / PARTIAL / HOLLOW / STUB   <- REAL_ROUTES + optional classify.tsv overlay
   deep_verified / classification / last_verified   <- parity/seed.json (fix-loop results)
+  verification_method  body-diff / property   <- the layer that produced the row
+
+`deep_verified` alone is not the headline: a row is counted as DEEP-VERIFIED only
+when its `verification_method` is "body-diff", i.e. the response (or a write's
+read-back) was itself diffed clean. Rows verified by named invariants instead —
+because the body is provably non-comparable between two independent instances —
+carry "property" and are counted and rendered in their own section. A reader must
+be able to tell the two apart without reading the probe source.
 
 Columns left null are untested and are filled by later layers (contract sweep =
 status_conformant/schema_valid; differential replay = deep_verified at scale).
@@ -129,6 +137,12 @@ def build_rows(spec, real, overlay, curated, sweep, owners):
                 "schema_valid": sw.get("schema_valid"),
                 "note": sw.get("note", ""),
                 "deep_verified": s.get("deep_verified"),
+                # HOW the row was verified. "body-diff" is the ledger's headline
+                # claim (the responses/read-backs themselves diffed clean);
+                # "property" means only named invariants were compared, which is
+                # a weaker claim and is counted and rendered separately below.
+                # A layer that does not say defaults to "body-diff".
+                "verification_method": s.get("verification_method") or "body-diff",
                 "classification": s.get("classification", ""),
                 "last_verified": s.get("last_verified") if s else None,
             })
@@ -136,9 +150,20 @@ def build_rows(spec, real, overlay, curated, sweep, owners):
     return rows
 
 
+def is_property(r):
+    """Verified by invariants rather than by diffing the response itself."""
+    return r["deep_verified"] is True and r.get("verification_method") == "property"
+
+
 def render_md(rows):
     total = len(rows)
-    deep = sum(1 for r in rows if r["deep_verified"] is True)
+    # The headline number means exactly what its heading says: the response (or
+    # the write's read-back) was diffed clean, field for field. Rows verified
+    # some OTHER way are real verification but a weaker claim, so they are
+    # counted and listed on their own — folding them in would redefine the
+    # number instead of earning it.
+    deep = sum(1 for r in rows if r["deep_verified"] is True and not is_property(r))
+    prop = sum(1 for r in rows if is_property(r))
     classified = sum(1 for r in rows if r["classification"] and r["deep_verified"] is not True)
     untested = sum(1 for r in rows if r["deep_verified"] is None and not r["classification"])
     depth_counts = defaultdict(int)
@@ -158,8 +183,14 @@ def render_md(rows):
     sv_run = sum(1 for r in rows if r["schema_valid"] is not None)
     layer1 = (f"Layer 1: {sc_yes}/{sc_run} status-conformant · {sv_yes}/{sv_run} schema-valid"
               if sc_run or sv_run else "status-conformance + schema-validation not yet run — Layer 1")
-    out.append(f"**{deep}/{total} deep-verified · {classified} classified-divergence · "
+    out.append(f"**{deep}/{total} deep-verified · {prop} property-verified · "
+               f"{classified} classified-divergence · "
                f"{untested} untested**  \n_{layer1}_\n")
+    out.append("_deep-verified = the response (or a write's read-back) was diffed field-for-field "
+               "against Jellyfin 10.11.8 and came back clean. property-verified = the body is "
+               "provably non-comparable between two independent instances, so named invariants "
+               "were compared instead; a weaker claim, listed separately and never counted in "
+               "the deep-verified number._\n")
     out.append("## Depth (what the wired handler actually does)\n")
     out.append("| depth | ops | % |")
     out.append("|---|---:|---:|")
@@ -171,22 +202,39 @@ def render_md(rows):
     out.append("## Ownership (core vs compiled-in extensions)\n")
     out.append("_Extensions must not dilute or flatter core's coverage number — "
                "each owner's deep-verified share stands alone._\n")
-    out.append("| owner | ops | deep-verified | classified | untested |")
-    out.append("|---|---:|---:|---:|---:|")
+    out.append("| owner | ops | deep-verified | property-verified | classified | untested |")
+    out.append("|---|---:|---:|---:|---:|---:|")
     by_owner = defaultdict(list)
     for r in rows:
         by_owner[r["owner"]].append(r)
     for owner in sorted(by_owner, key=lambda o: (o != "core", o)):
         rs = by_owner[owner]
-        d = sum(1 for r in rs if r["deep_verified"] is True)
+        d = sum(1 for r in rs if r["deep_verified"] is True and not is_property(r))
+        p = sum(1 for r in rs if is_property(r))
         c = sum(1 for r in rs if r["classification"] and r["deep_verified"] is not True)
         u = sum(1 for r in rs if r["deep_verified"] is None and not r["classification"])
-        out.append(f"| {owner} | {len(rs)} | {d} ({100 * d // len(rs)}%) | {c} | {u} |")
+        out.append(f"| {owner} | {len(rs)} | {d} ({100 * d // len(rs)}%) | {p} | {c} | {u} |")
     out.append("")
     out.append("## Deep-verified (response + read-back diffed clean vs Jellyfin 10.11.8)\n")
     for r in rows:
-        if r["deep_verified"] is True:
-            out.append(f"- ✅ `{r['operation']}`")
+        if r["deep_verified"] is True and not is_property(r):
+            # A green row can still carry a recorded divergence (e.g. a probe
+            # that is only meaningful at a pinned limit, or a candidate universe
+            # that is empty on both servers). Show it here — dropping the note
+            # is how a real difference becomes invisible.
+            note = f" — {r['classification']}" if r["classification"] not in ("", "ok") else ""
+            out.append(f"- ✅ `{r['operation']}`{note}")
+    out.append("")
+    out.append("## Property-verified (invariants agreed — the bodies were NOT diffed)\n")
+    out.append("_These endpoints' responses cannot be compared between two independent "
+               "instances (upstream orders them `Random`, or the two servers run different "
+               "algorithms by design). Named properties were compared on both servers "
+               "instead. This is a real verification and a weaker one: it is not part of the "
+               "deep-verified count._\n")
+    for r in rows:
+        if is_property(r):
+            note = f" — {r['classification']}" if r["classification"] not in ("", "ok") else ""
+            out.append(f"- ◐ `{r['operation']}`{note}")
     out.append("")
     out.append("## Classified divergence (accepted — not a bug)\n")
     for r in rows:
@@ -194,14 +242,17 @@ def render_md(rows):
             out.append(f"- ⚠️ `{r['operation']}` — {r['classification']}")
     out.append("")
     out.append("## Full ledger\n")
-    out.append("_deep/status/schema: ✅ pass · ⚠️ fail · · untested_\n")
+    out.append("_status/schema: ✅ pass · ⚠️ fail · · untested_  \n"
+               "_deep: ✅ bodies diffed clean · ◐ property-verified (invariants only, "
+               "not counted as deep) · ⚠️ fail · · untested_\n")
     out.append("| operation | route | depth | status | schema | deep | classification |")
     out.append("|---|---|---|---|---|---|---|")
     mark = {True: "✅", False: "⚠️", None: "·"}
     for r in rows:
+        deep_mark = "◐" if is_property(r) else mark[r["deep_verified"]]
         out.append(f"| `{r['operation']}` | {r['route']} | {r['depth']} | "
                    f"{mark[r['status_conformant']]} | {mark[r['schema_valid']]} | "
-                   f"{mark[r['deep_verified']]} | {r['classification']} |")
+                   f"{deep_mark} | {r['classification']} |")
     out.append("")
     return "\n".join(out)
 
@@ -266,7 +317,14 @@ def check(rows, curated):
     keys = {norm(*r["operation"].split(" ", 1)) for r in rows}
     unmatched = [k for k in curated if k not in keys]
     assert not unmatched, f"curated rows match no spec op: {unmatched}"
-    print(f"ok: {len(rows)} ops, all {len(curated)} curated rows matched")
+    # Every row must declare HOW it was verified, from a closed set — an
+    # unrecognised method would silently fall into the headline deep count.
+    bad = [r["operation"] for r in rows
+           if r["verification_method"] not in ("body-diff", "property")]
+    assert not bad, f"unknown verification_method on: {bad}"
+    prop = sum(1 for r in rows if is_property(r))
+    print(f"ok: {len(rows)} ops, all {len(curated)} curated rows matched, "
+          f"{prop} property-verified (excluded from the deep-verified count)")
 
 
 def main():
@@ -290,8 +348,10 @@ def main():
     with open(os.path.join(ROOT, "suite/parity/LEDGER.md"), "w") as f:
         f.write(render_md(rows))
 
-    deep = sum(1 for r in rows if r["deep_verified"] is True)
-    print(f"wrote parity/ledger.json + parity/LEDGER.md — {len(rows)} ops, {deep} deep-verified")
+    deep = sum(1 for r in rows if r["deep_verified"] is True and not is_property(r))
+    prop = sum(1 for r in rows if is_property(r))
+    print(f"wrote parity/ledger.json + parity/LEDGER.md — {len(rows)} ops, "
+          f"{deep} deep-verified (bodies diffed), {prop} property-verified")
 
 
 if __name__ == "__main__":

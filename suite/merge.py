@@ -3,7 +3,8 @@
 
 Reads, all at a single Ferrofin SHA:
   - suite/registry.json          variant id → contract operation (the join key, M1)
-  - suite/parity/ledger.json           per-op parity depth + deep_verified + classification
+  - suite/parity/ledger.json           per-op parity depth + deep_verified +
+                                       verification_method + classification
   - perf (per variant latencies), from EITHER
         suite/perf/results/raw/{ferrofin,jellyfin}-summary.json   (a fresh `suite/run.sh perf`)
         or the latest entry of suite/perf/bench-data.json       (fallback)
@@ -12,7 +13,8 @@ Reads, all at a single Ferrofin SHA:
 
 Writes suite/results/run-<sha>.json and upserts it into suite/results/runs.json (the trend the
 viewer reads). Fairness rules baked in (not left to the reader):
-  - a row is `comparable` only if the op is deep_verified, both servers answered 200 for it, and
+  - a row is `comparable` only if the op is deep_verified BY A BODY DIFF (a
+    property-verified row does not qualify), both servers answered 200 for it, and
     Ferrofin's body SHAPE matches the reviewed shape baseline — an UNREVIEWED change in
     Ferrofin's own body is exactly "fast because the body went hollow" and excludes the row
     until acked (MERGE_ACK_SHAPES=1 advances the baseline). Ferrofin-vs-Jellyfin shape is
@@ -402,7 +404,14 @@ def main():
         if op is None:
             continue  # a benched name not in the registry — self-test would have caught new ones
         pr = par.get(op, {})
-        deep = bool(pr.get("deep_verified"))
+        # The honesty gate is BODY-diffed parity, not merely a green ledger cell.
+        # A "property" row (gen-ledger.py `verification_method`) had its
+        # invariants compared, not its response — so the two servers may be
+        # returning genuinely different work, and a latency comparison of
+        # different work is not a comparison. Those rows stay non-comparable
+        # here, exactly as they were before they had any verdict at all.
+        deep = (bool(pr.get("deep_verified"))
+                and pr.get("verification_method", "body-diff") == "body-diff")
         benched_ops.add(op)
         if deep:
             deep_ops.add(op)

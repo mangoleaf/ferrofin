@@ -406,6 +406,12 @@ def audio_fixtures(fixtures):
 # /Shows Similar were byte-identical copies of the /Movies row and proved
 # nothing about their own controller path — they never touched an album, an
 # artist or a series seed at all.
+# /Items, /Movies and /Trailers are NOT listed on purpose: `LibraryController
+# .GetSimilarItems` dispatches on the SEED's kind, never on the route, so all
+# three want the movie seed `any_item` already carries — and the loop fixture
+# has no Trailer item to seed /Trailers with anyway. (/Trailers' own 404,
+# nil-seed and count contract is issued against /Trailers by the reads.py
+# `similar_invariants_trailers` probe, not here.)
 SIMILAR_SEEDS = {
     "/Albums/{itemId}/Similar": "_album",
     "/Artists/{itemId}/Similar": "_artist",

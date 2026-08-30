@@ -1601,11 +1601,12 @@ impl FerrofinDtoService {
             dto.series_name = item.series_name.clone();
         }
 
-        // Series air days/time — C# `DtoService.cs:1421-1423`
-        // (`dto.AirDays = series.AirDays; dto.AirTime = series.AirTime;`).
-        // `Series.AirDays` is a runtime-only property (`Series.cs:31` sets it to
-        // `Array.Empty<DayOfWeek>()` in the constructor and 10.11.8 persists no
-        // `AirDays` column), so a DB-loaded series always serializes `[]` —
+        // Series air days/time — C# v10.11.8 `DtoService.cs:1243-1244`
+        // (`dto.AirDays = series.AirDays; dto.AirTime = series.AirTime;`;
+        // master carries the same two lines at `DtoService.cs:1422-1423`).
+        // `Series.AirDays` is a runtime-only property (v10.11.8 `Series.cs:31`
+        // sets it to `Array.Empty<DayOfWeek>()` in the constructor and 10.11.8
+        // persists no `AirDays` column), so a DB-loaded series always serializes `[]` —
         // never null. Ferrofin omitted the field entirely, which is the
         // null-where-Jellyfin-sends-non-null shape strict clients crash on.
         if kind == BaseItemKind::Series {
@@ -3554,8 +3555,8 @@ mod tests {
     // `/Items/{id}/Ancestors` are exactly such pages.
     #[tokio::test]
     async fn a_series_dto_carries_an_empty_air_days_array_never_null() {
-        // C# `DtoService.cs:1421` `dto.AirDays = series.AirDays`, and
-        // `Series.cs:31` initialises `AirDays = Array.Empty<DayOfWeek>()` — a
+        // C# v10.11.8 `DtoService.cs:1243` `dto.AirDays = series.AirDays`, and
+        // v10.11.8 `Series.cs:31` initialises `AirDays = Array.Empty<DayOfWeek>()` — a
         // non-nullable array 10.11.8 never persists, so every Series DTO
         // serializes `"AirDays": []`. Ferrofin omitted the key entirely, the
         // null-where-Jellyfin-sends-non-null shape strict clients crash on.

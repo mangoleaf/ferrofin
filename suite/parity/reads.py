@@ -56,19 +56,36 @@ def item(op, tmpl):
     return {"op": op, "kind": "item", "url": lambda c, i: tmpl.format(u=c["user"], i=i)}
 
 
-def multi(op, urls):
+def multi(op, legs):
     """Several URLs folded into ONE ledger row (rows are keyed by op, so a second
-    entry would clobber the first). Every leg is diffed; the buckets are unioned."""
-    return {"op": op, "kind": "multi",
-            "urls": [(lambda c, u=u: u.format(**c)) for u in urls]}
+    entry would clobber the first). Every leg is diffed; the buckets are unioned.
+
+    A leg is a URL template, or a `(template, project)` pair whose
+    `project(body)` narrows what is compared. A projection is allowed ONLY where
+    the rest of the body is provably non-comparable between two independent
+    instances — the Suggestions paging leg is the one case (see there) — never to
+    make a divergence disappear."""
+    out = []
+    for leg in legs:
+        tmpl, project = leg if isinstance(leg, tuple) else (leg, None)
+        out.append({"tmpl": tmpl,
+                    "url": (lambda c, t=tmpl: t.format(**c)),
+                    "project": project})
+    return {"op": op, "kind": "multi", "legs": out}
 
 
 def invariant(op, fn):
     """A row verified by PROPERTIES rather than a body diff, for an endpoint whose
     body genuinely cannot match (see `similar_invariants`). `fn(base, token, ctx)`
     returns a flat dict of named facts; the row is clean when both servers report
-    the identical dict AND no fact is False."""
-    return {"op": op, "kind": "invariant", "fn": fn}
+    the identical dict AND no fact is False.
+
+    This is a WEAKER claim than the ledger's headline ("response + read-back
+    diffed clean"), so the row is stamped `verification_method: "property"` and
+    `gen-ledger.py` counts and renders it in its own section. Never let a
+    property row into the body-diff count — that would redefine the number
+    instead of earning it."""
+    return {"op": op, "kind": "invariant", "fn": fn, "method": "property"}
 
 
 # ------------------------------------------------------- /Similar invariants
@@ -109,7 +126,19 @@ def _related_keys(dto):
 
 
 def _people(dto):
-    """The (Name, Type) pairs master's scorer matches on."""
+    """The (Name, Type) pairs master's scorer matches on.
+
+    Master matches candidates by `PeopleId` alone
+    (`MovieSimilarItemsProvider.cs:271-297`: the candidate side carries NO
+    PersonType predicate, and the weight comes from the SOURCE row's type) —
+    and `PeopleId` IS the pair, because "the Peoples table has one row per
+    (Name, PersonType)" (`Jellyfin.Server.Implementations/Item/PeopleRepository.cs:47`;
+    `People.PersonType` is a column on the People row, not on the map). Ferrofin's
+    SQL joins the same way (`similar_items_repository.rs:70-77`, `pm2` on
+    `PeopleId`). So a (Name, Type) intersection re-derives exactly what both
+    sides compute — it is not a stronger model, and a person credited as
+    Director on the seed and Writer on a candidate scores 0 in all three.
+    """
     return {((p or {}).get("Name"), (p or {}).get("Type")) for p in dto.get("People") or []}
 
 
@@ -139,6 +168,13 @@ def _obeys_own_candidate_rule(base, token, ctx, seed_dto, items, limit):
       deterministic here: the answer must be the model's top-N, IN ORDER, by
       (score desc, SortName asc), recomputed independently from the DTO fields.
       Nothing weaker would notice a scorer that quietly stopped weighting.
+      The (score desc) half is master's (`MovieSimilarItemsProvider.cs:189-195`
+      is `OrderByDescending(score)`); the SortName/Id tiebreak is FERROFIN's
+      own — master has no tiebreak at all, so equal-scoring rows fall out in
+      whatever order the DB handed them. This clause therefore pins Ferrofin's
+      rule, which is strictly more determined than the C#'s, not a re-derivation
+      of it. That is a deliberate choice recorded on the ledger rows, not a
+      claim about upstream.
     """
     if ctx.get("server") != "ferrofin":
         seed_gt = {("g", g) for g in seed_dto.get("Genres") or []} \
@@ -155,12 +191,35 @@ def _obeys_own_candidate_rule(base, token, ctx, seed_dto, items, limit):
     return [i.get("Name") for i in items] == expected
 
 
-def similar_invariants(base, token, ctx):
+SIMILAR_ALIASES = ("Items", "Movies", "Trailers", "Albums", "Artists")
+
+
+def similar_invariants_for(alias):
+    """The invariant probe bound to ONE alias.
+
+    `LibraryController.GetSimilarItems` is a single method behind six
+    `[HttpGet]` attributes, but "they are the same method" is a claim to TEST,
+    not to assume: each ledger row must exercise its OWN route, or /Trailers'
+    404 / nil-seed / count contract is never actually issued against
+    /Trailers. (Probing one alias for every row is the same duplication this
+    harness fixed in sweep.py.)"""
+    def probe(base, token, ctx):
+        return similar_invariants(base, token, ctx, alias)
+    probe.__name__ = f"similar_invariants_{alias.lower()}"
+    probe.alias = alias
+    return probe
+
+
+def similar_invariants(base, token, ctx, alias="Movies"):
     """The properties a /{kind}/{itemId}/Similar answer must have on BOTH servers.
 
     Every value is comparable across servers, so a divergence surfaces as a
     normal diff row. Bounds that must tolerate a Jellyfin quirk say so and cite
-    the C#; nothing here is widened to make Ferrofin pass."""
+    the C#; nothing here is widened to make Ferrofin pass.
+
+    `alias` is the route this row owns: every fact below is issued against
+    `/{alias}/{seed}/Similar`, so each of the three property rows is its own
+    measurement."""
     u, seed = ctx["user"], ctx["movie"]
     facts = {}
     st, sb = token_get(base, f"/Items/{seed}?userId={u}&fields={SIMILAR_FIELDS}", token)
@@ -170,7 +229,7 @@ def similar_invariants(base, token, ctx):
     facts["seed_has_related_keys"] = bool(seed_keys)
 
     limit = 12
-    st, b = token_get(base, f"/Movies/{seed}/Similar?userId={u}&limit={limit}"
+    st, b = token_get(base, f"/{alias}/{seed}/Similar?userId={u}&limit={limit}"
                             f"&fields={SIMILAR_FIELDS}", token)
     items = (b or {}).get("Items") or []
     facts["status_200"] = st == 200
@@ -198,15 +257,15 @@ def similar_invariants(base, token, ctx):
     #   `if (item is null) { return NotFound(); }`
     #   `itemId.IsEmpty() ? (user is null ? RootFolder : GetUserRootFolder()) : ...`
     missing = "aaaaaaaaaaaaaaaaaaaaaaaaaaaa0099"
-    st, _ = http("GET", base + f"/Movies/{missing}/Similar?userId={u}", token)
+    st, _ = http("GET", base + f"/{alias}/{missing}/Similar?userId={u}", token)
     facts["unknown_seed_is_404"] = st == 404
-    st, nb = token_get(base, f"/Movies/00000000000000000000000000000000/Similar?userId={u}", token)
+    st, nb = token_get(base, f"/{alias}/00000000000000000000000000000000/Similar?userId={u}", token)
     facts["nil_seed_is_200_empty"] = st == 200 and not ((nb or {}).get("Items") or [])
 
     # `if (item is Episode || (item is IItemByName && item is not MusicArtist))
     #  return new QueryResult<BaseItemDto>();`
     if ctx.get("episode"):
-        st, eb = token_get(base, f"/Items/{ctx['episode']}/Similar?userId={u}", token)
+        st, eb = token_get(base, f"/{alias}/{ctx['episode']}/Similar?userId={u}", token)
         facts["episode_seed_short_circuits"] = st == 200 and not ((eb or {}).get("Items") or [])
 
     # Every alias is ONE C# method (`LibraryController.GetSimilarItems`, six
@@ -217,8 +276,8 @@ def similar_invariants(base, token, ctx):
     # servers are set-stable across repeated draws.
     wide = 1000
     sets = []
-    for alias in ("Items", "Movies", "Trailers", "Albums", "Artists"):
-        _, ab = token_get(base, f"/{alias}/{seed}/Similar?userId={u}&limit={wide}", token)
+    for other in SIMILAR_ALIASES:
+        _, ab = token_get(base, f"/{other}/{seed}/Similar?userId={u}&limit={wide}", token)
         sets.append(tuple(sorted(i.get("Name") or i.get("Id") or ""
                                  for i in ((ab or {}).get("Items") or []))))
     facts["aliases_agree"] = len(set(sets)) == 1
@@ -262,8 +321,22 @@ READS = [
         # wrong, and dropping the leg would only hide it.
         "/Items/Suggestions?userId={u}&type=MusicArtist&limit=100000&enableTotalRecordCount=true",
         "/Items/Suggestions?userId={u}&type=TvChannel&limit=100000&enableTotalRecordCount=true",
-        # Paging contract: StartIndex echoes and TotalRecordCount is page-independent.
-        "/Items/Suggestions?userId={u}&type=Movie&limit=3&startIndex=7&enableTotalRecordCount=true",
+        # Paging contract only. `SuggestionsController` orders `(Random,
+        # Descending)` (v10.11.8 SuggestionsController.cs:83) on BOTH servers,
+        # so a page NARROWER than the universe draws a different subset per
+        # call — measured 2026-08-29: three consecutive calls returned three
+        # different triples on each server. The full-limit legs above are the
+        # ones that compare Items; here the Items array is provably
+        # non-comparable and the leg is projected onto what IS determined:
+        # StartIndex echoes, TotalRecordCount is page-independent, and the page
+        # holds exactly `limit` rows. Diffing the Items here would keep the row
+        # red forever and destroy its ability to signal when the two REAL
+        # divergences (item universe, MediaSources/MediaStreams fields) are
+        # fixed — a probe that can never go green is not a gate.
+        ("/Items/Suggestions?userId={u}&type=Movie&limit=3&startIndex=7&enableTotalRecordCount=true",
+         lambda b: {"StartIndex": b.get("StartIndex"),
+                    "TotalRecordCount": b.get("TotalRecordCount"),
+                    "PageLength": len(b.get("Items") or [])}),
     ]),
     user("GET /Movies/Recommendations", "/Movies/Recommendations?userId={u}"),
     user("GET /Search/Hints", "/Search/Hints?userId={u}&searchTerm=a&limit=20"),
@@ -272,20 +345,38 @@ READS = [
     # A movie seed cannot be body-diffed (Random order + a deliberately different
     # candidate algorithm) — verified by properties instead, see
     # `similar_invariants`.
-    invariant("GET /Items/{itemId}/Similar", similar_invariants),
+    invariant("GET /Items/{itemId}/Similar", similar_invariants_for("Items")),
     item("GET /Items/{itemId}/Ancestors", "/Items/{i}/Ancestors?userId={u}"),
     item("GET /Items/{itemId}/PlaybackInfo", "/Items/{i}/PlaybackInfo?userId={u}"),
     item("GET /Items/{itemId}/Images", "/Items/{i}/Images"),
-    invariant("GET /Movies/{itemId}/Similar", similar_invariants),
-    invariant("GET /Trailers/{itemId}/Similar", similar_invariants),
+    invariant("GET /Movies/{itemId}/Similar", similar_invariants_for("Movies")),
+    invariant("GET /Trailers/{itemId}/Similar", similar_invariants_for("Trailers")),
     # The NON-movie seeds ARE diffable: upstream master serves Series/MusicAlbum/
     # MusicArtist from the same flat Genres/Tags query 10.11.8 builds, so the two
-    # servers run the same algorithm. `limit` is far above the fixture's pool, so
-    # Jellyfin's Random cannot return a random SUBSET, and parity_diff aligns the
-    # array by Name — order is invisible, the SET and TotalRecordCount are not.
+    # servers run the same algorithm — INCLUDING its
+    # `OrderBy = [(ItemSortBy.Random, Ascending)]`, which Ferrofin now emits too
+    # (it briefly ordered SortName, which answered a different ITEM at
+    # limit<universe: `/Items/{audio}/Similar?limit=1` gave "Track 02" on five
+    # straight Ferrofin calls while Jellyfin alternated 02/03).
+    #
+    # What that costs the probe, stated plainly: Random on both sides means the
+    # ORDER can never be diffed, and neither can any page narrower than the
+    # candidate pool. So `limit` is pinned FAR above the fixture's pool, where
+    # the answer is the whole set and therefore fully determined; parity_diff
+    # aligns the array by Name, so what these rows actually gate is the SET,
+    # TotalRecordCount and every per-item DTO field. A narrower page here would
+    # be red forever on both servers and prove nothing.
+    #
     # These rows were never probed at all before (sweep fed all six aliases a
     # MOVIE id), which is why the music/series similarity path went unverified.
     user("GET /Shows/{itemId}/Similar", "/Shows/{series}/Similar?userId={u}&limit=1000"),
+    # NOTE: green-but-vacuous on the current fixture — gen-fixtures.sh gives each
+    # of the 3 albums a UNIQUE genre, so the candidate universe is empty on BOTH
+    # servers and this row diffs `{"Items": [], "TotalRecordCount": 0}` against
+    # itself. Recorded in classifications.json so a ledger reader sees it; the
+    # fixture now shares a genre across two artists, which bites at the next
+    # wipe-and-provision. Until then the album matching is covered by the
+    # `an_album_seed_matches_albums_sharing_a_genre_only` unit test.
     user("GET /Albums/{itemId}/Similar", "/Albums/{album_id}/Similar?userId={u}&limit=1000"),
     user("GET /Artists/{itemId}/Similar", "/Artists/{artist_id}/Similar?userId={u}&limit=1000"),
     # by-name + shows (need the NFO metadata + shows fixture); {genre}/{studio}/{person} are
@@ -405,15 +496,24 @@ def run(ferrofin_url, jellyfin_url):
     pairs = correlate(path_id_map(ferrofin_url, ht, hu), path_id_map(jellyfin_url, jt, ju))
     rows = {}
 
-    def record(op, clean, total, buckets):
+    def record(op, clean, total, buckets, method="body-diff"):
+        """`method` is HOW the row was verified, and it is written into the
+        results row: "body-diff" means the ledger's headline claim (the
+        responses themselves diffed clean), "property" means only the named
+        invariants agreed. gen-ledger.py counts and renders the two separately
+        so the headline keeps meaning what it says."""
         if total == 0:
             rows[op] = {"deep_verified": None, "classification": "",
+                        "verification_method": method,
                         "note": "no comparable response (both empty/non-200)"}
             return
         n = sum(len(buckets[k]) for k in ("mismatch", "missing", "extra"))
         if n == 0:
             rows[op] = {"deep_verified": True, "classification": "ok",
-                        "note": f"{clean}/{total} clean"}
+                        "verification_method": method,
+                        "note": f"{clean}/{total} clean"
+                                + ("" if method == "body-diff"
+                                   else " (properties agreed; bodies not diffed)")}
         else:
             sample = "; ".join(f"{m['path']}(J={m.get('j')} H={m.get('h')})"
                                for m in buckets["mismatch"][:3])
@@ -427,6 +527,7 @@ def run(ferrofin_url, jellyfin_url):
                 return seen
             rows[op] = {"deep_verified": False,
                         "classification": "flagged: read diff vs Jellyfin (verify)",
+                        "verification_method": method,
                         "note": f"{clean}/{total} clean; mismatch:{len(buckets['mismatch'])} "
                                 f"missing:{len(buckets['missing'])} extra:{len(buckets['extra'])} | {sample}",
                         "diffs": {
@@ -451,16 +552,30 @@ def run(ferrofin_url, jellyfin_url):
                     # agreeing on a broken invariant is not parity.
                     buckets["mismatch"].append({"path": key, "j": j, "h": h})
             n = sum(len(v) for v in buckets.values())
-            record(ep["op"], 1 if n == 0 else 0, 1, buckets)
+            record(ep["op"], 1 if n == 0 else 0, 1, buckets, method=ep["method"])
         elif ep["kind"] == "multi":
             agg = {"mismatch": [], "missing": [], "extra": []}
             clean = tested = 0
-            for url in ep["urls"]:
-                hs, hb = token_get(ferrofin_url, url(hc), ht)
-                js, jb = token_get(jellyfin_url, url(jc), jt)
-                if hb is None or jb is None:
-                    continue
+            for leg in ep["legs"]:
+                hs, hb = token_get(ferrofin_url, leg["url"](hc), ht)
+                js, jb = token_get(jellyfin_url, leg["url"](jc), jt)
                 tested += 1
+                # A leg that does not answer 200-with-JSON on both sides is a
+                # RESULT, not a reason to skip: `continue`-ing here made a
+                # status divergence (exactly what the type=MusicArtist and
+                # type=TvChannel legs exist to catch) silently invisible.
+                if hs != js:
+                    agg["mismatch"].append(
+                        {"path": f"{leg['tmpl']} :: status", "j": js, "h": hs})
+                    continue
+                if hb is None or jb is None:
+                    agg["mismatch"].append(
+                        {"path": f"{leg['tmpl']} :: body",
+                         "j": "no JSON" if jb is None else "json",
+                         "h": "no JSON" if hb is None else "json"})
+                    continue
+                if leg["project"]:
+                    hb, jb = leg["project"](hb), leg["project"](jb)
                 n, b = diff_counts(jb, hb)
                 if n == 0:
                     clean += 1
@@ -483,6 +598,13 @@ def run(ferrofin_url, jellyfin_url):
             for hid, jid in pairs:
                 hs, hb = token_get(ferrofin_url, ep["url"](hc, hid), ht)
                 js, jb = token_get(jellyfin_url, ep["url"](jc, jid), jt)
+                if hs != js:
+                    # Same blind spot the multi branch had: a status divergence
+                    # is the loudest kind of divergence and must not vanish
+                    # into a `continue`.
+                    tested += 1
+                    agg["mismatch"].append({"path": f"[{hid}] :: status", "j": js, "h": hs})
+                    continue
                 if hb is None or jb is None:
                     continue
                 tested += 1
@@ -564,17 +686,36 @@ def selfcheck():
         if ep["kind"] == "user":
             ep["url"](ctx)  # raises KeyError if a placeholder has no context key
         elif ep["kind"] == "multi":
-            for u in ep["urls"]:
-                u(ctx)
+            for leg in ep["legs"]:
+                leg["url"](ctx)
     # The invariant rows must carry a callable, and the diff-shaped folding of
     # its facts must flag both a disagreement AND a fact both servers fail.
     assert all(callable(ep["fn"]) for ep in READS if ep["kind"] == "invariant")
+    # ...and each invariant row must own a DISTINCT alias, or three ledger rows
+    # are one measurement of the same route.
+    aliases = [ep["fn"].alias for ep in READS if ep["kind"] == "invariant"]
+    assert len(aliases) == len(set(aliases)), f"invariant rows share an alias: {aliases}"
+    assert set(aliases) <= set(SIMILAR_ALIASES), aliases
+    # Every invariant row is stamped `property`, never the body-diff method the
+    # ledger headline counts.
+    assert all(ep["method"] == "property" for ep in READS if ep["kind"] == "invariant")
+    # A projected multi leg must project BOTH sides to the same key set, and
+    # must not be able to project a body away to nothing.
+    for ep in READS:
+        if ep["kind"] != "multi":
+            continue
+        for leg in ep["legs"]:
+            if leg["project"]:
+                got = leg["project"]({"StartIndex": 7, "TotalRecordCount": 500,
+                                      "Items": [{"Name": "x"}]})
+                assert got and all(v is not None for v in got.values()), got
     hf, jf = {"a": True, "b": True, "c": False}, {"a": True, "b": False, "c": False}
     bad = [k for k in sorted(set(hf) | set(jf))
            if hf.get(k) != jf.get(k) or hf.get(k) is False]
     assert bad == ["b", "c"], f"invariant folding wrong: {bad}"
     print(f"ok: diff, Path-align, correlation, {len(READS)} read op-keys valid, "
-          f"user/multi templates fillable, invariant folding")
+          f"user/multi templates fillable, invariant folding, "
+          f"{len(aliases)} distinct invariant aliases, projections total")
 
 
 if __name__ == "__main__":

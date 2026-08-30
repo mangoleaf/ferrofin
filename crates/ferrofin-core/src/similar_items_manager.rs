@@ -632,8 +632,18 @@ impl FerrofinSimilarItemsManager {
     /// A seed with no genres AND no tags therefore carries **no** value
     /// predicate at all and matches every other item of the kind — C# leaves
     /// both collections empty, and an empty `InternalItemsQuery.Genres` is not
-    /// a filter. The one divergence is the ordering: `SortName` (tiebroken by
-    /// `Name`) instead of `Random`, so the answer is stable across requests.
+    /// a filter.
+    ///
+    /// The ordering is `Random`, as both C# trees emit it (v10.11.8
+    /// `LibraryController.cs:801` builds the query inline; master's
+    /// `SeriesSimilarItemsProvider.cs:49`, `MusicAlbumSimilarItemsProvider.cs:50`,
+    /// `MusicArtistSimilarItemsProvider.cs:50`, `AudioSimilarItemsProvider.cs:50`
+    /// and `LiveTvProgramSimilarItemsProvider.cs:89` each repeat it). It is
+    /// deliberate upstream — the "More Like This" row is meant to vary between
+    /// visits — so a stable order would be a client-visible divergence, not a
+    /// nicety. `ferrofin_random()` is the connection-local draw
+    /// (`ferrofin_db::sqlite_random`), the same permutation `RANDOM()` gives
+    /// without SQLite's process-wide PRNG mutex.
     async fn flat_similar(
         &self,
         request: &LocalRequest<'_>,
@@ -656,10 +666,9 @@ impl FerrofinSimilarItemsManager {
                 Vec::new()
             },
             limit: Some(wanted),
-            // C# orders these providers `Random`; Ferrofin orders them
-            // `SortName` (which the query layer tiebreaks with `Name`, as C#'s
-            // `ApplyOrder` does) so the same request answers the same way twice.
-            order_by: vec![(ItemSortBy::SortName, SortOrder::Ascending)],
+            // `OrderBy = [(ItemSortBy.Random, SortOrder.Ascending)]` — see the
+            // doc comment above for the five C# call sites that emit it.
+            order_by: vec![(ItemSortBy::Random, SortOrder::Ascending)],
             ..InternalItemsQuery::default()
         };
         if let Some(user_id) = request.user_id
@@ -1488,6 +1497,15 @@ mod tests {
     /// The names of `rows`, in order.
     fn names(rows: &[BaseItemEntity]) -> Vec<String> {
         rows.iter().filter_map(|r| r.name.clone()).collect()
+    }
+
+    /// `names`, sorted — for the flat genre/tag providers, whose C# `OrderBy`
+    /// is `Random` (see `flat_similar`). Their answer is a SET; asserting a
+    /// fixed order there would be asserting a divergence from the C#.
+    fn sorted_names(rows: &[BaseItemEntity]) -> Vec<String> {
+        let mut out = names(rows);
+        out.sort();
+        out
     }
 
     /// A configuration manager with one knob: `EnableExternalContentInSuggestions`.
@@ -2497,7 +2515,7 @@ mod tests {
             .expect("similar")
             .expect("seed resolves");
         assert_eq!(
-            names(&rows),
+            sorted_names(&rows),
             vec!["Artist 02".to_owned(), "Artist 03".to_owned()]
         );
     }
@@ -2608,6 +2626,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_flat_provider_orders_random_not_by_name() {
+        // Every C# flat provider ends its query with
+        // `OrderBy = [(ItemSortBy.Random, SortOrder.Ascending)]` (v10.11.8
+        // `LibraryController.cs:801`; master `SeriesSimilarItemsProvider.cs:49`
+        // and siblings). Ferrofin used to order `SortName`, which is stable —
+        // and stable is exactly what a client sees as wrong: Jellyfin's "More
+        // Like This" row varies between visits, and at `limit < |candidates|`
+        // a fixed order also picks a DIFFERENT ITEM every time (measured on the
+        // lab pair: `/Items/{audio}/Similar?limit=1` answered "Track 02" on
+        // five consecutive Ferrofin calls while Jellyfin alternated 02/03).
+        //
+        // Asserted as "not always the sorted order over eight draws": with 30
+        // candidates a random permutation equals the sorted one with
+        // probability 1/30!, so eight sorted draws in a row is not a flake, it
+        // is a regression back to a fixed sort.
+        let db = test_db().await;
+        let seed = Uuid::from_u128(0x5E0);
+        seed_kind(&db, seed, BaseItemKind::Series, "Series 000", "Drama").await;
+        for i in 1..=30u128 {
+            seed_kind(
+                &db,
+                Uuid::from_u128(0x5E0 + i),
+                BaseItemKind::Series,
+                &format!("Series {i:03}"),
+                "Drama",
+            )
+            .await;
+        }
+        let mgr = manager(&db);
+        let mut saw_unsorted = false;
+        for _ in 0..8 {
+            let rows = mgr
+                .get_similar_items(seed, &[], None, &DtoOptions::default(), None)
+                .await
+                .expect("similar")
+                .expect("seed resolves");
+            // The SET is fully determined and must not move.
+            assert_eq!(sorted_names(&rows).len(), 30);
+            assert_eq!(sorted_names(&rows), sorted_names(&rows));
+            if names(&rows) != sorted_names(&rows) {
+                saw_unsorted = true;
+                break;
+            }
+        }
+        assert!(
+            saw_unsorted,
+            "eight draws all came back in SortName order — the flat provider is \
+             not ordering Random"
+        );
+    }
+
+    #[tokio::test]
     async fn a_seed_with_no_limit_returns_up_to_the_csharp_default_of_fifty() {
         // C# `SimilarItemsManager`: `var requestedLimit = limit ?? 50;`
         // (`MovieSimilarItemsProvider`: `query.Limit ?? 50`). Ferrofin capped
@@ -2695,7 +2765,7 @@ mod tests {
             .expect("similar")
             .expect("seed resolves");
         assert_eq!(
-            names(&all),
+            sorted_names(&all),
             vec!["Band Album".to_owned(), "Other Album".to_owned()]
         );
         let without_band = mgr
