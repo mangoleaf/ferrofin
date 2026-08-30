@@ -275,6 +275,18 @@ pub struct InternalItemsQuery {
     /// folders instead. Empty on a Ferrofin-written database, where items hang
     /// off the collection folder directly.
     pub parent_physical_folder_ids: Vec<Uuid>,
+    /// The `AggregateFolder` whose plug-in folders count as children of
+    /// [`Self::parent_id`].
+    ///
+    /// **Derived, not set by callers** — the item repository fills it in when
+    /// `parent_id` names the `UserRootFolder`. Port of
+    /// `UserRootFolder.GetEligibleChildrenForRecursiveChildren`
+    /// (UserRootFolder.cs:96-102), which concatenates
+    /// `LibraryManager.RootFolder.VirtualChildren` onto its own children:
+    /// `LibraryManager.CreateRootFolder` parents the playlists folder to the
+    /// **aggregate** and registers it as a virtual child, so the user root
+    /// lists a row that does not carry its id as `ParentId`.
+    pub virtual_child_parent_id: Option<Uuid>,
     /// The parent item kind, if known.
     pub parent_type: Option<BaseItemKind>,
     /// Restrict to descendants of these ancestors.
@@ -505,6 +517,7 @@ impl Default for InternalItemsQuery {
             parent_id: Uuid::nil(),
             physical_children_only: false,
             parent_physical_folder_ids: Vec::new(),
+            virtual_child_parent_id: None,
             parent_type: None,
             ancestor_ids: Vec::new(),
             linked_child_ancestor_ids: Vec::new(),

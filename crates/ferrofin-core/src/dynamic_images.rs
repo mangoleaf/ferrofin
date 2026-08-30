@@ -10,6 +10,7 @@
 //! | `MusicGenreImageProvider`   | `MusicGenre` | 4 random `MusicAlbum`/`MusicVideo`/`Audio` with the genre + Primary |
 //! | `PlaylistImageProvider`     | `Playlist`   | the playlist's members (episode → its series, song → its album)   |
 //! | `PhotoAlbumImageProvider`   | `PhotoAlbum` | the album's first child with a Primary (`BaseFolderImageProvider`) |
+//! | `FolderImageProvider`       | any `Folder` | the folder's first descendant with a Primary (`BaseFolderImageProvider`) |
 //! | `ArtistImageProvider`       | `MusicArtist`| none — upstream returns `Array.Empty` (see [`ArtistSources`])       |
 //!
 //! `CollectionFolderImageProvider` (the library tiles) is ported separately by
@@ -17,6 +18,16 @@
 //! (`UserView`) has nothing to act on here: Ferrofin never persists `UserView`
 //! rows — a user's views *are* the `CollectionFolder` rows, whose tile that
 //! same pass already draws.
+//!
+//! `FolderImageProvider` is the generic-folder arm: it `Supports` every
+//! `Folder` that is not a `PhotoAlbum`/`MusicAlbum` and not
+//! [`is_top_parent`](crate::kinds::is_top_parent) (`FolderImageProvider.cs:21-33`),
+//! which is what gives the `UserRootFolder` and the `AggregateFolder` a Primary
+//! while leaving the playlists folder and the physical library folders without
+//! one. Like the photo album it goes through `CreateSingleImage`, **not** a
+//! collage: verified by md5 on a live 10.11.8 pair, the user root's
+//! `poster.png` is a byte-identical COPY of the `Movies (synth)` library tile,
+//! which is where its 960×540 (`PrimaryImageAspectRatio` 1.7778) comes from.
 //!
 //! Every provider here supports only `ImageType.Primary`, and the base class
 //! routes all five kinds to `CreateSquareCollage` — a
@@ -100,6 +111,8 @@ pub enum DynamicImageKind {
     PhotoAlbum,
     /// `ArtistImageProvider` — supported, but upstream gives it no sources.
     MusicArtist,
+    /// `FolderImageProvider` — a generic folder that is not a top parent.
+    Folder,
 }
 
 impl DynamicImageKind {
@@ -113,6 +126,14 @@ impl DynamicImageKind {
             BaseItemKind::Playlist => Some(Self::Playlist),
             BaseItemKind::PhotoAlbum => Some(Self::PhotoAlbum),
             BaseItemKind::MusicArtist => Some(Self::MusicArtist),
+            // `FolderImageProvider : BaseFolderImageProvider<Folder>` — every
+            // `Folder`, minus the two album kinds handled above and minus the
+            // top parents, which `DynamicImageProviders::folder_supported`
+            // filters (it needs the parent row, which this pure lookup has
+            // not got).
+            BaseItemKind::Folder | BaseItemKind::UserRootFolder | BaseItemKind::AggregateFolder => {
+                Some(Self::Folder)
+            }
             _ => None,
         }
     }
@@ -212,6 +233,12 @@ impl DynamicImageProviders {
             BaseItemKind::MusicGenre,
             BaseItemKind::Playlist,
             BaseItemKind::PhotoAlbum,
+            // `FolderImageProvider`. The library tiles this copies from are
+            // drawn by `refresh_library_images`, which runs BEFORE this pass
+            // (library_scan.rs), so the root's source is already on disk.
+            BaseItemKind::Folder,
+            BaseItemKind::UserRootFolder,
+            BaseItemKind::AggregateFolder,
         ] {
             let rows = self
                 .items
@@ -263,6 +290,9 @@ impl DynamicImageProviders {
         let Ok(item_id) = Uuid::parse_str(&item.id) else {
             return Ok(ItemUpdateType::None);
         };
+        if kind == DynamicImageKind::Folder && !self.folder_supported(item).await? {
+            return Ok(ItemUpdateType::None);
+        }
         let mut images = self.items.get_image_infos(item_id).await?;
         let item_dir = self.item_dir(item_id);
         if let Some(primary) = images.iter().find(|i| i.image_type == ImageType::Primary) {
@@ -295,7 +325,10 @@ impl DynamicImageProviders {
                 item_dir.display()
             ))
         })?;
-        let output = if kind == DynamicImageKind::PhotoAlbum {
+        let output = if matches!(
+            kind,
+            DynamicImageKind::PhotoAlbum | DynamicImageKind::Folder
+        ) {
             copy_single_image(&item_dir, &sources[0])?
         } else {
             let output = item_dir.join(format!("{PRIMARY_STEM}.png"));
@@ -331,6 +364,40 @@ impl DynamicImageProviders {
         Ok(ItemUpdateType::ImageUpdate)
     }
 
+    /// `FolderImageProvider.Supports` for a row [`DynamicImageKind::for_entity`]
+    /// already classified as a generic folder (`FolderImageProvider.cs:21-33`):
+    /// false for a top parent.
+    ///
+    /// The parent row is read only for a folder that could be one — a row with
+    /// no `ParentId` (the two roots) is answered without a query.
+    async fn folder_supported(&self, item: &BaseItemEntity) -> Result<bool, ServiceError> {
+        let kind = kind_from_type_name(&item.type_);
+        let collection_type = row_collection_type(item);
+        if let Some(kind) = kind
+            && crate::kinds::is_top_parent(kind, None, collection_type.as_deref())
+        {
+            return Ok(false);
+        }
+        let Some(parent) = item
+            .parent_id
+            .as_deref()
+            .and_then(|p| Uuid::parse_str(p).ok())
+            .filter(|p| !p.is_nil())
+        else {
+            return Ok(true);
+        };
+        let parent_kind = self
+            .items
+            .retrieve_item(parent)
+            .await?
+            .and_then(|row| kind_from_type_name(&row.type_));
+        Ok(!crate::kinds::is_top_parent(
+            kind.unwrap_or(BaseItemKind::Folder),
+            parent_kind,
+            collection_type.as_deref(),
+        ))
+    }
+
     /// The item's art folder (`{root}/{ID}`).
     fn item_dir(&self, item_id: Uuid) -> PathBuf {
         self.metadata_dir.join(guid_to_db(item_id))
@@ -361,7 +428,9 @@ impl DynamicImageProviders {
                 .await
             }
             DynamicImageKind::Playlist => self.playlist_sources(item_id).await,
-            DynamicImageKind::PhotoAlbum => self.photo_album_sources(item_id).await,
+            DynamicImageKind::PhotoAlbum | DynamicImageKind::Folder => {
+                self.folder_sources(item_id).await
+            }
             DynamicImageKind::MusicArtist => Ok(ArtistSources::image_paths()),
         }
     }
@@ -462,9 +531,11 @@ impl DynamicImageProviders {
         Ok(None)
     }
 
-    /// `BaseFolderImageProvider.GetItemsWithImages`: the album's first
-    /// descendant with a Primary — files before folders, then by sort name.
-    async fn photo_album_sources(&self, album_id: Uuid) -> Result<Vec<String>, ServiceError> {
+    /// `BaseFolderImageProvider.GetItemsWithImages` (BaseFolderImageProvider.cs:32-45),
+    /// shared by `PhotoAlbumImageProvider` and `FolderImageProvider`: the
+    /// folder's first descendant with a Primary — files before folders, then by
+    /// sort name, `Limit = 1`.
+    async fn folder_sources(&self, album_id: Uuid) -> Result<Vec<String>, ServiceError> {
         let ids = self
             .items
             .get_item_ids(&InternalItemsQuery {
@@ -611,6 +682,18 @@ fn remove_other_primaries(item_dir: &Path, keep: &Path) {
             tracing::debug!(%err, path = %candidate.display(), "stale primary not removed");
         }
     }
+}
+
+/// The row's `CollectionType`, read out of the serialized `Data` blob (where
+/// `ItemRepository` keeps it) — the `IHasCollectionType` value
+/// `BaseItem.IsTopParent` tests for `livetv`.
+fn row_collection_type(item: &BaseItemEntity) -> Option<String> {
+    let data = item.data.as_deref()?;
+    let value: serde_json::Value = serde_json::from_str(data).ok()?;
+    value
+        .get("CollectionType")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
 }
 
 #[cfg(test)]
@@ -1107,6 +1190,61 @@ mod tests {
         let primary = fx.primary_of(playlist).await.expect("playlist primary");
         let decoded = image::open(&primary.path).expect("png");
         assert_eq!((decoded.width(), decoded.height()), (600, 600));
+    }
+
+    /// `FolderImageProvider` (`FolderImageProvider.cs` +
+    /// `BaseFolderImageProvider.cs`): the `UserRootFolder` copies its first
+    /// descendant's Primary verbatim — this is `CreateSingleImage`
+    /// (`File.Copy`), NOT a collage. Verified on a live 10.11.8 pair, where the
+    /// root's `poster.png` is byte-identical to the `Movies (synth)` library
+    /// tile.
+    ///
+    /// The playlists folder in the same tree gets nothing: it is a
+    /// `BasePluginFolder`, so `BaseItem.IsTopParent` is true and `Supports`
+    /// rejects it — which is exactly what a real 10.11.8 database shows.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_user_root_copies_a_library_tile_and_skips_the_plugin_folder() {
+        let fx = fixture().await;
+        let media = fx.media_dir();
+        let tile = write_png(&media, "library-tile.png", [3, 4, 5]);
+        let user_root = fx
+            .seed(BaseItemKind::UserRootFolder, "Media Folders", None, None)
+            .await;
+        let aggregate = fx
+            .seed(BaseItemKind::AggregateFolder, "root", None, None)
+            .await;
+        let library = fx
+            .seed(BaseItemKind::CollectionFolder, "Movies", None, Some(&tile))
+            .await;
+        fx.persistence
+            .set_parent_id(library, user_root)
+            .await
+            .expect("parent");
+        fx.persistence
+            .set_ancestors(library, &[user_root])
+            .await
+            .expect("ancestors");
+        let playlists = fx
+            .seed(BaseItemKind::PlaylistsFolder, "Playlists", None, None)
+            .await;
+        fx.persistence
+            .set_parent_id(playlists, aggregate)
+            .await
+            .expect("parent");
+
+        fx.providers.refresh_all().await.expect("pass");
+
+        let primary = fx.primary_of(user_root).await.expect("root primary");
+        assert!(primary.path.ends_with("primary.png"), "{}", primary.path);
+        assert_eq!(
+            std::fs::read(&primary.path).unwrap(),
+            std::fs::read(&tile).unwrap(),
+            "CreateSingleImage copies the file; it does not draw a collage"
+        );
+        assert!(
+            fx.primary_of(playlists).await.is_none(),
+            "a BasePluginFolder is IsTopParent, so FolderImageProvider skips it"
+        );
     }
 
     /// `PhotoAlbumImageProvider` (`BaseFolderImageProvider`): the first photo

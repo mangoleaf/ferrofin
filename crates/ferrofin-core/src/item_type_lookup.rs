@@ -342,6 +342,20 @@ pub fn user_root_folder_id(
     derive_item_id_with(mode, BaseItemKind::UserRootFolder, default_user_views_path)
 }
 
+/// The `AggregateFolder` item id for the physical root directory —
+/// `GetNewItemId(RootFolderPath, typeof(AggregateFolder))`, the row
+/// `LibraryManager.CreateRootFolder()` materializes at `{program data}/root`.
+///
+/// This is the parent every `BasePluginFolder` (the playlists folder) and every
+/// physical library folder hangs off on a 10.11.8 database, so the derivation
+/// has to reproduce Jellyfin's id exactly — it does: md5 over UTF-16LE of
+/// `"MediaBrowser.Controller.Entities.AggregateFolder" + "root"` is
+/// `f27caa37-e514-2225-cced-ed48f6553502`, the id a live 10.11.8 serves.
+#[must_use]
+pub fn aggregate_folder_id(mode: &IdDerivation, root_folder_path: &str) -> Option<uuid::Uuid> {
+    derive_item_id_with(mode, BaseItemKind::AggregateFolder, root_folder_path)
+}
+
 /// `FileSystem.GetValidFilename(name).Trim().TrimEnd('.')` — the sanitized
 /// single path segment every by-name `GetPath` builds from an item name.
 fn valid_filename(name: &str) -> String {
@@ -527,13 +541,34 @@ mod tests {
     /// `/config/metadata/Year/2026` (stored as `%MetadataPath%/Year/2026`).
     #[test]
     fn root_and_year_ids_match_a_real_database() {
-        use super::{by_name_item_id, user_root_folder_id, year_item_id, year_path};
+        use super::{
+            aggregate_folder_id, by_name_item_id, user_root_folder_id, year_item_id, year_path,
+        };
         let mode = IdDerivation::Jellyfin {
             program_data_path: Some("/config".to_owned()),
         };
         assert_eq!(
             user_root_folder_id(&mode, "/config/root/default"),
             Some(uuid::Uuid::parse_str("E9D5075A-555C-1CBC-394E-EC4CEF295274").expect("uuid")),
+        );
+        // The `AggregateFolder` at `{program data}/root` — `CreateRootFolder()`.
+        // Read off a live 10.11.8 database (`BaseItems` row `root`).
+        assert_eq!(
+            aggregate_folder_id(&mode, "/config/root"),
+            Some(uuid::Uuid::parse_str("F27CAA37-E514-2225-CCED-ED48F6553502").expect("uuid")),
+        );
+        // …and the playlists folder it owns. 10.11.8 stores
+        // `Emby.Server.Implementations.Playlists.PlaylistsFolder`; the
+        // `ManualPlaylistsFolder` spelling is only `GetClientTypeName()` and
+        // hashing it yields a DIFFERENT id, which is how a second playlists
+        // folder appears beside Jellyfin's on an adopted database.
+        assert_eq!(
+            derive_item_id_with(
+                &mode,
+                BaseItemKind::PlaylistsFolder,
+                "/config/data/playlists"
+            ),
+            Some(uuid::Uuid::parse_str("1071671E-7BFF-A053-2E93-0DEBEE501D2E").expect("uuid")),
         );
         assert_eq!(
             year_path("/config/metadata/Year", "2026"),

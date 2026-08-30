@@ -235,27 +235,34 @@ pub(crate) async fn ensure_container(
     Ok(Some(id))
 }
 
-/// Parents a container to the user root, if it has no parent yet and the root
-/// row exists.
+/// Parents a container to the root row it belongs under, if it is not there
+/// already and that root row exists.
 ///
-/// Both guards matter: a row that already has a parent is not ours to move, and
-/// `BaseItems.ParentId` is a foreign key, so pointing at a root that has not
-/// been provisioned yet would fail the statement.
+/// The existence guard matters: `BaseItems.ParentId` is a foreign key, so
+/// pointing at a root that has not been provisioned yet would fail the
+/// statement. The `<>` arm is what moves a container an earlier version filed
+/// under the wrong root — the playlists folder belongs under the
+/// `AggregateFolder` (`CreateRootFolder`), and Ferrofin used to hang it off the
+/// `UserRootFolder`. A container's root is fixed by design, so re-aiming it is
+/// idempotent rather than destructive.
 async fn attach_to_root(db: &Database, id: Uuid, root: Uuid) -> Result<(), ServiceError> {
     if !row_exists(db, root).await? {
         return Ok(());
     }
-    sqlx::query(r#"UPDATE "BaseItems" SET "ParentId" = ?2 WHERE "Id" = ?1 AND "ParentId" IS NULL"#)
-        .bind(guid_to_db(id))
-        .bind(guid_to_db(root))
-        .execute(db.writer())
-        .await
-        .map_err(db_err)?;
+    sqlx::query(
+        r#"UPDATE "BaseItems" SET "ParentId" = ?2
+           WHERE "Id" = ?1 AND ("ParentId" IS NULL OR "ParentId" <> ?2)"#,
+    )
+    .bind(guid_to_db(id))
+    .bind(guid_to_db(root))
+    .execute(db.writer())
+    .await
+    .map_err(db_err)?;
     Ok(())
 }
 
 /// Whether a `BaseItems` row with this id exists.
-async fn row_exists(db: &Database, id: Uuid) -> Result<bool, ServiceError> {
+pub(crate) async fn row_exists(db: &Database, id: Uuid) -> Result<bool, ServiceError> {
     let found: Option<String> =
         sqlx::query_scalar(r#"SELECT "Id" FROM "BaseItems" WHERE "Id" = ?1"#)
             .bind(guid_to_db(id))
@@ -263,6 +270,131 @@ async fn row_exists(db: &Database, id: Uuid) -> Result<bool, ServiceError> {
             .await
             .map_err(db_err)?;
     Ok(found.is_some())
+}
+
+/// Inserts one of the two root folders (`AggregateFolder`/`UserRootFolder`) —
+/// a parentless, top-parentless folder row at a fixed path.
+///
+/// Port of the row `LibraryManager.CreateRootFolder()` persists: `Name`,
+/// `SortName` and `CleanName` all the directory's own name, `Path` the
+/// directory, `PresentationUniqueKey` the id in simple form. The NOT NULL flag
+/// columns are spelled out because the pinned 10.11.8 schema gives them no
+/// defaults.
+pub(crate) async fn insert_root_folder(
+    db: &Database,
+    id: Uuid,
+    kind: BaseItemKind,
+    name: &str,
+    path: &str,
+) -> Result<(), ServiceError> {
+    let type_name = stored_type_name(kind)
+        .ok_or_else(|| ServiceError::backend(format!("no stored type name for {kind:?}")))?;
+    sqlx::query(
+        r#"INSERT OR IGNORE INTO "BaseItems"
+             ("Id", "Type", "Name", "SortName", "CleanName", "Path",
+              "IsFolder", "IsInMixedFolder", "IsLocked", "IsMovie",
+              "IsRepeat", "IsSeries", "IsVirtualItem",
+              "PresentationUniqueKey", "DateCreated")
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, 0, 0, 0, 0, 0, 0, ?7, ?8)"#,
+    )
+    .bind(guid_to_db(id))
+    .bind(type_name)
+    .bind(name)
+    .bind(ferrofin_util::sort_name::create_sort_name(name))
+    .bind(name.to_lowercase())
+    .bind(path)
+    .bind(id.as_simple().to_string())
+    .bind(ferrofin_db::store::datetime_to_db(chrono::Utc::now()))
+    .execute(db.writer())
+    .await
+    .map_err(db_err)?;
+    Ok(())
+}
+
+/// Moves a container row onto a different id (and stored type), carrying
+/// everything that points at it.
+///
+/// Insert-then-repoint-then-delete, in that order: `BaseItems` children and
+/// `AncestorIds` rows are re-aimed while both rows exist, so the final `DELETE`
+/// cascades over nothing. Rewriting the primary key in place would silently
+/// orphan every child instead — `BaseItems` is the target of ten
+/// `ON DELETE CASCADE` foreign keys.
+pub(crate) async fn rekey_container(
+    db: &Database,
+    legacy: Uuid,
+    correct: Uuid,
+    kind: BaseItemKind,
+) -> Result<(), ServiceError> {
+    let type_name = stored_type_name(kind)
+        .ok_or_else(|| ServiceError::backend(format!("no stored type name for {kind:?}")))?;
+    let (legacy_db, correct_db) = (guid_to_db(legacy), guid_to_db(correct));
+    let mut tx = db.writer().begin().await.map_err(db_err)?;
+    sqlx::query(
+        r#"INSERT INTO "BaseItems"
+             ("Id", "Type", "Name", "SortName", "CleanName", "Path",
+              "IsFolder", "IsInMixedFolder", "IsLocked", "IsMovie",
+              "IsRepeat", "IsSeries", "IsVirtualItem",
+              "ParentId", "TopParentId", "PresentationUniqueKey", "DateCreated")
+           SELECT ?2, ?3, "Name", "SortName", "CleanName", "Path",
+                  "IsFolder", "IsInMixedFolder", "IsLocked", "IsMovie",
+                  "IsRepeat", "IsSeries", "IsVirtualItem",
+                  "ParentId", ?2, ?4, "DateCreated"
+             FROM "BaseItems" WHERE "Id" = ?1"#,
+    )
+    .bind(&legacy_db)
+    .bind(&correct_db)
+    .bind(type_name)
+    .bind(correct.as_simple().to_string())
+    .execute(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    for sql in [
+        r#"UPDATE "BaseItems" SET "ParentId" = ?2 WHERE "ParentId" = ?1"#,
+        r#"UPDATE "BaseItems" SET "TopParentId" = ?2 WHERE "TopParentId" = ?1"#,
+        r#"UPDATE OR IGNORE "AncestorIds" SET "ParentItemId" = ?2 WHERE "ParentItemId" = ?1"#,
+        r#"UPDATE OR IGNORE "AncestorIds" SET "ItemId" = ?2 WHERE "ItemId" = ?1"#,
+    ] {
+        sqlx::query(sql)
+            .bind(&legacy_db)
+            .bind(&correct_db)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+    }
+    // Last, once nothing points at it any more, so the ON DELETE CASCADE has
+    // nothing left to take with it.
+    sqlx::query(r#"DELETE FROM "BaseItems" WHERE "Id" = ?1"#)
+        .bind(&legacy_db)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+    tx.commit().await.map_err(db_err)
+}
+
+/// Parents a plug-in folder to the `AggregateFolder` and makes it its own top
+/// parent — `LibraryManager.CreateRootFolder`'s
+/// `folder.ParentId = rootFolder.Id`.
+///
+/// Scoped to the two states a Ferrofin server can have produced (parentless, or
+/// hung off the `UserRootFolder`), so a row deliberately parented elsewhere is
+/// never moved.
+pub(crate) async fn reparent_virtual_child(
+    db: &Database,
+    id: Uuid,
+    aggregate: Uuid,
+    user_root: Uuid,
+) -> Result<(), ServiceError> {
+    sqlx::query(
+        r#"UPDATE "BaseItems" SET "ParentId" = ?2, "TopParentId" = ?1
+           WHERE "Id" = ?1 AND ("ParentId" IS NULL OR "ParentId" = ?3)"#,
+    )
+    .bind(guid_to_db(id))
+    .bind(guid_to_db(aggregate))
+    .bind(guid_to_db(user_root))
+    .execute(db.writer())
+    .await
+    .map_err(db_err)?;
+    Ok(())
 }
 
 /// The literal Jellyfin writes into `BaseItems.Path` in place of the data

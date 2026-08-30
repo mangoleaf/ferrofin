@@ -34,6 +34,7 @@ use ferrofin_traits::persistence::{
     ItemRepository, ItemTypeLookup, ItemWithCounts, PlaylistAccessColumns, PlaylistItemsWithAccess,
 };
 
+use crate::aggregate_folder::RootFolderIds;
 use crate::db_error::{db_err, media_stream_type_disc};
 use crate::item_type_lookup::stored_type_name;
 use crate::translate_query::{
@@ -51,6 +52,9 @@ use sqlx::{FromRow, QueryBuilder, Row, Sqlite};
 pub struct FerrofinItemRepository {
     db: Database,
     item_type_lookup: Arc<dyn ItemTypeLookup>,
+    /// The `UserRootFolder`/`AggregateFolder` ids, injected once by the
+    /// composition root (see [`FerrofinItemRepository::with_root_ids`]).
+    roots: Option<RootFolderIds>,
 }
 
 impl std::fmt::Debug for FerrofinItemRepository {
@@ -89,7 +93,21 @@ impl FerrofinItemRepository {
         Self {
             db,
             item_type_lookup,
+            roots: None,
         }
+    }
+
+    /// Injects the two root-folder ids resolved once at startup, so a browse
+    /// of the `UserRootFolder` can add the `AggregateFolder`'s virtual children
+    /// without a lookup.
+    ///
+    /// Both are process constants (derived from the application paths), so the
+    /// concat costs one `Uuid` comparison on the browse path and **zero**
+    /// extra queries. Left unset, the repository behaves exactly as before.
+    #[must_use]
+    pub fn with_root_ids(mut self, roots: RootFolderIds) -> Self {
+        self.roots = Some(roots);
+        self
     }
 
     /// Resolves the virtual library views a browse names into the physical
@@ -117,6 +135,21 @@ impl FerrofinItemRepository {
         // contents.
         let wants_parent =
             filter.parent_id != Uuid::nil() && !filter.recursive && !filter.physical_children_only;
+        // Every item on the server descends from the `AggregateFolder` (it IS
+        // the physical root — `AggregateFolder.IsPhysicalRoot`), so a recursive
+        // query scoped to it is a query with no scope at all. Jellyfin reaches
+        // the same answer through its ancestor closure, which carries the
+        // aggregate on every scanned row.
+        if filter.recursive
+            && !filter.physical_children_only
+            && self
+                .roots
+                .is_some_and(|roots| filter.parent_id == roots.aggregate)
+        {
+            let mut resolved = filter.clone();
+            resolved.parent_id = Uuid::nil();
+            return Ok(Some(resolved));
+        }
         // A *recursive* browse of a library is scoped by top parent, not by the
         // ancestor closure — C# `SetTopParentIdsOrAncestors`, which swaps a
         // `CollectionFolder`/`UserView` parent for its top parents and leaves
@@ -156,6 +189,27 @@ impl FerrofinItemRepository {
         }
 
         let mut resolved = None;
+        if wants_parent && let Some(roots) = self.roots {
+            // `UserRootFolder.GetEligibleChildrenForRecursiveChildren`
+            // (UserRootFolder.cs:96-102) concatenates
+            // `LibraryManager.RootFolder.VirtualChildren` — the plug-in folders
+            // `CreateRootFolder` parented to the AGGREGATE — onto its own
+            // children. Two id comparisons, no query.
+            if filter.parent_id == roots.user_root {
+                resolved
+                    .get_or_insert_with(|| filter.clone())
+                    .virtual_child_parent_id = Some(roots.aggregate);
+            } else if filter.parent_id == roots.aggregate {
+                // `Folder.GetChildren` (Folder.cs:1348-1360): "the true root
+                // should return our users root folder children" when
+                // `IsPhysicalRoot`. Measured on 10.11.8:
+                // `/Items?parentId={aggregate}` answers with exactly the user
+                // root's children.
+                let r = resolved.get_or_insert_with(|| filter.clone());
+                r.parent_id = roots.user_root;
+                r.virtual_child_parent_id = Some(roots.aggregate);
+            }
+        }
         if wants_parent {
             let folders = self
                 .physical_folders_by_view(&[filter.parent_id])
@@ -1973,6 +2027,121 @@ mod tests {
 
     fn repo(db: &Database) -> FerrofinItemRepository {
         FerrofinItemRepository::new(db.clone(), Arc::new(ItemTypeLookup::new()))
+    }
+
+    /// A browse of the `UserRootFolder` lists the `AggregateFolder`'s virtual
+    /// children alongside its own — `UserRootFolder.
+    /// GetEligibleChildrenForRecursiveChildren` (UserRootFolder.cs:96-102)
+    /// concatenating `LibraryManager.RootFolder.VirtualChildren`.
+    #[tokio::test]
+    async fn a_user_root_browse_concatenates_the_aggregates_virtual_children() {
+        use crate::aggregate_folder::RootFolderIds;
+        use crate::test_support::seed_folder_item;
+        let db = test_db().await;
+        let user_root = Uuid::from_u128(0xC001);
+        let aggregate = Uuid::from_u128(0xC002);
+        seed_folder_item(&db, aggregate, BaseItemKind::AggregateFolder, "root", None).await;
+        seed_folder_item(&db, user_root, BaseItemKind::UserRootFolder, "MF", None).await;
+        seed_folder_item(
+            &db,
+            Uuid::from_u128(0xC010),
+            BaseItemKind::CollectionFolder,
+            "Movies",
+            Some(user_root),
+        )
+        .await;
+        seed_folder_item(
+            &db,
+            Uuid::from_u128(0xC020),
+            BaseItemKind::PlaylistsFolder,
+            "Playlists",
+            Some(aggregate),
+        )
+        .await;
+        // A plain child of the aggregate — a physical library folder on an
+        // adopted database. `AddVirtualChild` never saw it, so the user root
+        // must not list it.
+        seed_folder_item(
+            &db,
+            Uuid::from_u128(0xC021),
+            BaseItemKind::Folder,
+            "movies",
+            Some(aggregate),
+        )
+        .await;
+        let query = InternalItemsQuery {
+            parent_id: user_root,
+            ..InternalItemsQuery::default()
+        };
+
+        let plain = repo(&db).get_item_list(&query).await.expect("plain");
+        assert_eq!(
+            plain.len(),
+            1,
+            "without the root ids the browse is a plain ParentId equality"
+        );
+
+        let wired = repo(&db)
+            .with_root_ids(RootFolderIds {
+                user_root,
+                aggregate,
+            })
+            .get_item_list(&query)
+            .await
+            .expect("wired");
+        let names: Vec<&str> = wired.iter().filter_map(|r| r.name.as_deref()).collect();
+        assert_eq!(names.len(), 2, "got {names:?}");
+        assert!(names.contains(&"Movies") && names.contains(&"Playlists"));
+        assert!(
+            !names.contains(&"movies"),
+            "the aggregate's physical folders are not virtual children"
+        );
+    }
+
+    /// `/Items?parentId={aggregate}` answers with the user root's children —
+    /// `Folder.GetChildren` (Folder.cs:1348-1360): "the true root should return
+    /// our users root folder children".
+    #[tokio::test]
+    async fn a_browse_of_the_physical_root_answers_with_the_user_roots_children() {
+        use crate::aggregate_folder::RootFolderIds;
+        use crate::test_support::seed_folder_item;
+        let db = test_db().await;
+        let user_root = Uuid::from_u128(0xD001);
+        let aggregate = Uuid::from_u128(0xD002);
+        seed_folder_item(&db, aggregate, BaseItemKind::AggregateFolder, "root", None).await;
+        seed_folder_item(&db, user_root, BaseItemKind::UserRootFolder, "MF", None).await;
+        seed_folder_item(
+            &db,
+            Uuid::from_u128(0xD010),
+            BaseItemKind::CollectionFolder,
+            "Movies",
+            Some(user_root),
+        )
+        .await;
+        seed_folder_item(
+            &db,
+            Uuid::from_u128(0xD020),
+            BaseItemKind::PlaylistsFolder,
+            "Playlists",
+            Some(aggregate),
+        )
+        .await;
+
+        let rows = repo(&db)
+            .with_root_ids(RootFolderIds {
+                user_root,
+                aggregate,
+            })
+            .get_item_list(&InternalItemsQuery {
+                parent_id: aggregate,
+                ..InternalItemsQuery::default()
+            })
+            .await
+            .expect("browse");
+
+        let mut names: Vec<&str> = rows.iter().filter_map(|r| r.name.as_deref()).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["Movies", "Playlists"]);
     }
 
     #[test]

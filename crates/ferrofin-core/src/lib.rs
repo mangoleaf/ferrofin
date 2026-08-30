@@ -149,6 +149,7 @@
 
 pub mod access_schedule_repository;
 pub mod activity_manager;
+pub mod aggregate_folder;
 pub mod api_key_manager;
 pub mod app_paths;
 pub mod application_host;
@@ -226,6 +227,7 @@ pub mod years;
 mod test_support;
 
 pub use activity_manager::FerrofinActivityManager;
+pub use aggregate_folder::{AggregateFolderStore, RootFolderIds};
 pub use api_key_manager::FerrofinApiKeyManager;
 pub use app_paths::FerrofinServerApplicationPaths;
 pub use application_host::{FerrofinServerApplicationHost, HostNetworkInfo};

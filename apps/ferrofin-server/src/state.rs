@@ -315,19 +315,13 @@ pub async fn build_app_state(
     // ---- leaf: lookup + repositories (Database-only) ----------------------
     let item_type_lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
         Arc::new(ItemTypeLookup::new());
-    let item_repository: Arc<dyn ferrofin_traits::persistence::ItemRepository> = Arc::new(
-        FerrofinItemRepository::new(db.clone(), Arc::clone(&item_type_lookup)),
-    );
-    let item_count_service: Arc<dyn ferrofin_traits::persistence::ItemCountService> =
-        Arc::new(FerrofinItemCountService::new(db.clone()));
-    let item_persistence_impl = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
-    let item_persistence_service: Arc<dyn ferrofin_traits::persistence::ItemPersistenceService> =
-        Arc::clone(&item_persistence_impl) as _;
     // The per-database item-id derivation mode: Jellyfin 10.11.8 parity
     // (case-sensitive + data-dir-relative rewrite) for fresh and adopted
     // databases, grandfathered lowercase for pre-parity Ferrofin ones
     // (`FerrofinMeta.item_id_derivation`, seeded by migration 0009). Resolved
-    // here because the people repository needs it for per-name person ids.
+    // here because the people repository needs it for per-name person ids —
+    // and, before the repositories, because the two root-folder ids they are
+    // handed derive from it.
     let id_derivation = ferrofin_core::item_type_lookup::IdDerivation::from_meta(
         db.meta_get("item_id_derivation")
             .await
@@ -335,6 +329,30 @@ pub async fn build_app_state(
             .as_deref(),
         Some(paths.program_data_path()),
     );
+    // `LibraryManager.CreateRootFolder()`: the `AggregateFolder` at
+    // `{program data}/root` and the plug-in folders it owns. ONE-SHOT startup
+    // work — the browse and count paths take the resolved ids as constants and
+    // never re-probe, which is what keeps `/Library/MediaFolders` off the
+    // writer connection.
+    let aggregate_store = ferrofin_core::AggregateFolderStore::new(
+        db.clone(),
+        id_derivation.clone(),
+        paths.root_folder_path(),
+        paths.data_path(),
+    );
+    let root_folder_ids = aggregate_store
+        .ensure()
+        .await
+        .context("failed to provision the aggregate root folder")?;
+    let item_repository: Arc<dyn ferrofin_traits::persistence::ItemRepository> = Arc::new(
+        FerrofinItemRepository::new(db.clone(), Arc::clone(&item_type_lookup))
+            .with_root_ids(root_folder_ids),
+    );
+    let item_count_service: Arc<dyn ferrofin_traits::persistence::ItemCountService> =
+        Arc::new(FerrofinItemCountService::new(db.clone()).with_root_ids(root_folder_ids));
+    let item_persistence_impl = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+    let item_persistence_service: Arc<dyn ferrofin_traits::persistence::ItemPersistenceService> =
+        Arc::clone(&item_persistence_impl) as _;
     // One-shot: rewrite clean columns written by a Ferrofin version whose
     // `get_clean_value` stripped punctuation, so by-name lookups of a
     // punctuated name resolve without waiting for a full rescan.
@@ -709,6 +727,9 @@ pub async fn build_app_state(
     let user_views: Arc<dyn ferrofin_traits::library::UserViewManager> = Arc::new(
         FerrofinUserViewManager::new(Arc::clone(&item_repository))
             .with_playlists_store(Arc::clone(&item_persistence_service), playlists_path)
+            // The provisioned row's parent is the `AggregateFolder`, the way
+            // `CreateRootFolder` parents it.
+            .with_root_folder_path(paths.root_folder_path())
             .with_metadata_path(paths.internal_metadata_path())
             .with_id_derivation(id_derivation.clone())
             .with_virtual_folders(Arc::clone(&virtual_folders))

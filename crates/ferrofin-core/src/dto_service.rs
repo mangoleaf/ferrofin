@@ -426,12 +426,17 @@ fn is_live_tv_program(kind: BaseItemKind) -> bool {
 }
 
 /// The kind a client sees as the DTO's `Type` — C# `GetClientTypeName`, which
-/// `LiveTvChannel`/`LiveTvProgram` override to `"TvChannel"`/`"Program"`. Every
-/// other kind passes through.
+/// `LiveTvChannel`/`LiveTvProgram` override to `"TvChannel"`/`"Program"` and
+/// `PlaylistsFolder` to `"ManualPlaylistsFolder"` (PlaylistsFolder.cs:52-55).
+/// Every other kind passes through.
 fn client_kind(kind: BaseItemKind) -> BaseItemKind {
     match kind {
         BaseItemKind::LiveTvChannel => BaseItemKind::TvChannel,
         BaseItemKind::LiveTvProgram => BaseItemKind::Program,
+        // The stored row is `…Playlists.PlaylistsFolder` (the class 10.11.8
+        // actually has); `ManualPlaylistsFolder` exists only as this client
+        // name, and it is what every Jellyfin client sees.
+        BaseItemKind::PlaylistsFolder => BaseItemKind::ManualPlaylistsFolder,
         other => other,
     }
 }
@@ -1090,12 +1095,16 @@ impl FerrofinDtoService {
                 // (C# AttachUserSpecificInfo folder branch); leaf items leave it unset.
                 // The branch keys on the runtime C# `IsFolder` (`folder_emits_counts`):
                 // pure by-name kinds never enter it, a MusicArtist only when
-                // physically parented. `Folder.FillUserDataDtoValues`
-                // (Folder.cs:1973) then gates the count itself on
+                // physically parented. `Folder.FillUserDataDtoValues` then
+                // returns early unless `SupportsUserDataFromChildren`
+                // (Folder.cs:1798-1803 — every `ICollectionFolder`, which
+                // includes `BasePluginFolder`, plus `UserView`/`UserRootFolder`/
+                // `Channel`), and gates the count itself on
                 // `SupportsPlayedStatus`, which the top-level containers
                 // (UserRootFolder/CollectionFolder/UserView/AggregateFolder) and
                 // MusicAlbum/PhotoAlbum override to false.
                 if folder_emits_counts(item)
+                    && kinds::supports_user_data_from_children(kind)
                     && kinds::supports_played_status(kind)
                     && let Some(c) = prefetched.played_counts.get(&item_id).copied()
                 {
@@ -1103,6 +1112,21 @@ impl FerrofinDtoService {
                         .user_data
                         .get_or_insert_with(|| empty_user_data_dto(item_id));
                     ud.unplayed_item_count = Some(c.total - c.played);
+                }
+                // …and `RecursiveItemCount` = `GetRecursiveChildCount(user)`
+                // (Folder.cs:701-714 — recursive, non-folder, non-virtual, total
+                // record count), which is the SAME number the batch above
+                // already computed as `total`. `FillUserDataDtoValues`
+                // (Folder.cs:1805-1808) gates it on `SupportsUserDataFromChildren`
+                // — false for every library, `UserView`, the `UserRootFolder`
+                // and `Channel`, true for the `AggregateFolder` — plus the
+                // requested field.
+                if folder_emits_counts(item)
+                    && kinds::supports_user_data_from_children(kind)
+                    && options.contains_field(ItemFields::RecursiveItemCount)
+                    && let Some(c) = prefetched.played_counts.get(&item_id).copied()
+                {
+                    dto.recursive_item_count = Some(c.total);
                 }
             }
         }

@@ -54,9 +54,17 @@ def user(op, url):
     return {"op": op, "kind": "user", "url": lambda c: url.format(**c)}
 
 
-def item(op, tmpl):
+def item(op, tmpl, extra_seeds=()):
     # tmpl contains {u} and {i}; filled per server (own user + own correlated item id).
-    return {"op": op, "kind": "item", "url": lambda c, i: tmpl.format(u=c["user"], i=i)}
+    #
+    # `extra_seeds` names additional per-server context keys to probe with the
+    # SAME template, appended to the Path-correlated media pairs. It exists for
+    # seeds a media item can never reach: the playlists folder's ancestor chain
+    # is the only one that climbs to the `AggregateFolder` (a movie's stops at
+    # the `UserRootFolder`), so without it the whole aggregate-root model is
+    # untested by this layer.
+    return {"op": op, "kind": "item", "url": lambda c, i: tmpl.format(u=c["user"], i=i),
+            "extra_seeds": tuple(extra_seeds)}
 
 
 def multi(op, legs, seed=None, reap=None):
@@ -601,7 +609,12 @@ READS = [
     # candidate algorithm) — verified by properties instead, see
     # `similar_invariants`.
     invariant("GET /Items/{itemId}/Similar", similar_invariants_for("Items")),
-    item("GET /Items/{itemId}/Ancestors", "/Items/{i}/Ancestors?userId={u}"),
+    # …plus the PLAYLISTS FOLDER, whose single ancestor is the `AggregateFolder`
+    # `LibraryManager.CreateRootFolder()` parents it to (LibraryManager.cs:855-885).
+    # The five movie seeds all stop at the `UserRootFolder`, so this leg is what
+    # actually exercises the aggregate hop.
+    item("GET /Items/{itemId}/Ancestors", "/Items/{i}/Ancestors?userId={u}",
+         extra_seeds=("playlists_folder",)),
     item("GET /Items/{itemId}/PlaybackInfo", "/Items/{i}/PlaybackInfo?userId={u}"),
     item("GET /Items/{itemId}/Images", "/Items/{i}/Images"),
     invariant("GET /Movies/{itemId}/Similar", similar_invariants_for("Movies")),
@@ -775,12 +788,25 @@ def resolve_named(base, token, user_id):
         items = (get_json(base, "/Devices", token) or {}).get("Items") or []
         return items[0]["Id"] if items and items[0].get("Id") else ""
 
+    def playlists_folder_id():
+        """The `{data}/playlists` folder, found by Path the way C#
+        `CollectionManager.FindFolders` finds a container — never by Type, since
+        `ManualPlaylistsFolder` is a client type name both servers now emit."""
+        items = (get_json(base, "/Library/MediaFolders", token) or {}).get("Items") or []
+        for it in items:
+            if (it.get("Path") or "").replace("\\", "/").endswith("/playlists"):
+                return it.get("Id") or ""
+        return ""
+
     artist = first_named("/Artists")
     lyric_ids = lyric_seed_ids(base, token, user_id)
     channels = (get_json(base, f"/LiveTv/Channels?userId={user_id}&limit=1", token) or {}).get("Items") or []
     listings_providers = (get_json(base, "/System/Configuration/livetv", token) or {}).get("ListingProviders") or []
     return {
         "channel": channels[0]["Id"] if channels else "",
+        # The `PlaylistsFolder` — the one seed whose ancestor chain reaches the
+        # `AggregateFolder`.
+        "playlists_folder": playlists_folder_id(),
         # The fixture's XMLTV listings provider, per server: Jellyfin and
         # Ferrofin each mint their own id, and both the mapping-options and
         # lineups reads take it as a query parameter.
@@ -975,7 +1001,8 @@ def run(ferrofin_url, jellyfin_url):
             agg = {"mismatch": [], "missing": [], "extra": []}
             legs = []
             clean = tested = 0
-            for hid, jid in pairs:
+            extra = [(hc.get(k) or "", jc.get(k) or "") for k in ep.get("extra_seeds", ())]
+            for hid, jid in list(pairs) + [p for p in extra if p[0] and p[1]]:
                 hs, hb = token_get(ferrofin_url, ep["url"](hc, hid), ht)
                 js, jb = token_get(jellyfin_url, ep["url"](jc, jid), jt)
                 if hs != js:
@@ -1065,7 +1092,7 @@ def selfcheck():
     ctx = {"user": "U", "u": "U", "genre": "G", "studio": "S", "person": "P", "series": "SE",
            "task": "T", "device": "D", "artist": "A", "artist_id": "AID", "musicgenre": "MG",
            "channel": "CH", "album_id": "ALB", "movie": "MOV", "episode": "EP",
-           "listings_provider": "LP",
+           "listings_provider": "LP", "playlists_folder": "PLF",
            "lyric_lrc": "L1", "lyric_elrc": "L2", "lyric_txt": "L3"}
     # The context keys the self-check invents must be the ones resolve_named
     # actually produces, or this guard passes while the live run KeyErrors.

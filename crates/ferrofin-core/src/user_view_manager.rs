@@ -95,7 +95,7 @@ fn live_tv_view_id_with(
 const LIVE_TV_VIEW_NAME: &str = "Live TV";
 
 /// The display name of the auto-provisioned playlists media folder
-/// (C# `ManualPlaylistsFolder.Name`).
+/// (C# `PlaylistsFolder.Name`).
 pub(crate) const PLAYLISTS_FOLDER_NAME: &str = "Playlists";
 
 /// The concrete user-view manager.
@@ -104,7 +104,7 @@ pub struct FerrofinUserViewManager {
     items: Arc<dyn ItemRepository>,
     /// The item store, set by the composition root. When present (together with a
     /// [`playlists_path`](Self::playlists_path)), [`get_media_folders`] lazily
-    /// provisions the [`BaseItemKind::ManualPlaylistsFolder`] row on first read —
+    /// provisions the [`BaseItemKind::PlaylistsFolder`] row on first read —
     /// the same self-healing stance `FerrofinVirtualFolderManager` takes for a
     /// library's `CollectionFolder`. `None` in unit tests keeps the manager
     /// read-only.
@@ -114,6 +114,13 @@ pub struct FerrofinUserViewManager {
     /// The on-disk playlists directory (`{data}/playlists`), the provisioned
     /// folder's `Path`. Only meaningful alongside [`persistence`](Self::persistence).
     playlists_path: Option<PathBuf>,
+    /// The physical root directory (`{program data}/root`), whose
+    /// `AggregateFolder` row is the playlists folder's parent
+    /// (`LibraryManager.CreateRootFolder`: `folder.ParentId = rootFolder.Id`).
+    /// `None` in unit tests: the row is then provisioned parentless and the
+    /// startup [`AggregateFolderStore`](crate::AggregateFolderStore) repair
+    /// attaches it.
+    root_folder_path: Option<PathBuf>,
     /// The per-database item-id derivation mode (see
     /// [`item_type_lookup::IdDerivation`]).
     id_derivation: item_type_lookup::IdDerivation,
@@ -150,6 +157,7 @@ impl FerrofinUserViewManager {
             items,
             persistence: None,
             playlists_path: None,
+            root_folder_path: None,
             id_derivation: item_type_lookup::IdDerivation::LegacyLowercase,
             virtual_folders: None,
             db: None,
@@ -189,9 +197,19 @@ impl FerrofinUserViewManager {
         self
     }
 
+    /// Attaches the physical root directory, so a newly provisioned playlists
+    /// folder is parented to the `AggregateFolder` the way
+    /// `LibraryManager.CreateRootFolder` parents it. Called once by the
+    /// composition root.
+    #[must_use]
+    pub fn with_root_folder_path(mut self, root_folder_path: impl Into<PathBuf>) -> Self {
+        self.root_folder_path = Some(root_folder_path.into());
+        self
+    }
+
     /// Attaches the item store and the playlists directory so
     /// [`get_media_folders`](UserViewManager::get_media_folders) can lazily
-    /// provision the `ManualPlaylistsFolder` row (and create its directory) on
+    /// provision the `PlaylistsFolder` row (and create its directory) on
     /// first read. Called once by the composition root.
     #[must_use]
     pub fn with_playlists_store(
@@ -234,22 +252,52 @@ impl FerrofinUserViewManager {
         Ok(views.into_iter().filter(|v| !is_live_tv(v)).collect())
     }
 
-    /// The deterministic `ManualPlaylistsFolder` item id (`GetNewItemIdInternal`
-    /// over the folder path).
+    /// The deterministic `PlaylistsFolder` item id (`GetNewItemIdInternal` over
+    /// the folder path).
+    ///
+    /// `PlaylistsFolder`, not `ManualPlaylistsFolder`: 10.11.8 has no class of
+    /// the latter name — it is only `PlaylistsFolder.GetClientTypeName()`
+    /// (PlaylistsFolder.cs:52-55) — and `GetNewItemIdInternal` hashes
+    /// `type.FullName + key`, so the fabricated name yields a DIFFERENT id for
+    /// the same directory. Ferrofin used to write it, which meant an adopted
+    /// Jellyfin database grew a second playlists folder beside its own.
     fn playlists_folder_id(&self, playlists_path: &std::path::Path) -> Option<Uuid> {
         item_type_lookup::derive_item_id_with(
             &self.id_derivation,
-            BaseItemKind::ManualPlaylistsFolder,
+            BaseItemKind::PlaylistsFolder,
             &playlists_path.to_string_lossy(),
         )
     }
 
-    /// Upserts the `ManualPlaylistsFolder` row (and its directory) when it is
+    /// The `AggregateFolder` row the playlists folder hangs off, when it is
+    /// there. Read on the cold provisioning path only — never on a warm read,
+    /// which returns at the single existence probe above it.
+    async fn aggregate_parent(
+        &self,
+        persistence: &Arc<dyn ItemPersistenceService>,
+    ) -> Result<Option<Uuid>, ServiceError> {
+        let Some(root) = self.root_folder_path.as_deref() else {
+            return Ok(None);
+        };
+        let Some(id) =
+            item_type_lookup::aggregate_folder_id(&self.id_derivation, &root.to_string_lossy())
+        else {
+            return Ok(None);
+        };
+        // `BaseItems.ParentId` is a foreign key: pointing at a row that is not
+        // there would fail the insert outright.
+        Ok(persistence.item_exists(id).await?.then_some(id))
+    }
+
+    /// Upserts the `PlaylistsFolder` row (and its directory) when it is
     /// missing (idempotent). No-op without an item store + playlists path wired.
     ///
-    /// Port of Jellyfin's lazy `GetUserRootFolder()` provisioning of its
-    /// `ManualPlaylistsFolder` child: the folder is `Name="Playlists"`,
-    /// `Path={data}/playlists`, and appears among the media folders.
+    /// Port of `LibraryManager.CreateRootFolder()`'s plug-in-folder step
+    /// (LibraryManager.cs:855-885): the folder is `Name="Playlists"`,
+    /// `Path={data}/playlists`, its `ParentId` is the **`AggregateFolder`**,
+    /// and `rootFolder.AddVirtualChild(folder)` is what still puts it among the
+    /// user root's children (ported as the virtual-children concat in
+    /// `item_repository`/`item_count_service`).
     async fn ensure_playlists_folder(&self) -> Result<(), ServiceError> {
         let (Some(persistence), Some(playlists_path)) = (&self.persistence, &self.playlists_path)
         else {
@@ -261,7 +309,8 @@ impl FerrofinUserViewManager {
         if persistence.item_exists(id).await? {
             return Ok(());
         }
-        // Create the backing directory (C# `ManualPlaylistsFolder` lives on disk).
+        let parent = self.aggregate_parent(persistence).await?;
+        // Create the backing directory (C# `PlaylistsFolder` lives on disk).
         tokio::fs::create_dir_all(playlists_path)
             .await
             .map_err(|e| ServiceError::backend(format!("create playlists directory: {e}")))?;
@@ -279,12 +328,14 @@ impl FerrofinUserViewManager {
             // with a lowercase `Id` where Jellyfin sends uppercase, which is
             // why the suite scored this operation as diverging from upstream.
             id: ferrofin_db::store::guid_to_db(id),
-            type_: item_type_lookup::stored_type_name(BaseItemKind::ManualPlaylistsFolder)
+            type_: item_type_lookup::stored_type_name(BaseItemKind::PlaylistsFolder)
                 .unwrap_or_default()
                 .to_owned(),
             name: Some(PLAYLISTS_FOLDER_NAME.to_owned()),
             sort_name: Some(create_sort_name(PLAYLISTS_FOLDER_NAME)),
             path: Some(playlists_path.to_string_lossy().into_owned()),
+            parent_id: parent.map(ferrofin_db::store::guid_to_db),
+            top_parent_id: Some(ferrofin_db::store::guid_to_db(id)),
             is_folder: true,
             date_created: Some(Utc::now()),
             ..BaseItemEntity::default()
@@ -397,7 +448,7 @@ impl UserViewManager for FerrofinUserViewManager {
     async fn get_media_folders(&self, user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError> {
         // Jellyfin's LibraryController.GetMediaFolders returns
         // GetUserRootFolder().Children sorted by SortName — the library collection
-        // folders plus the auto-provisioned ManualPlaylistsFolder. Provision the
+        // folders plus the auto-provisioned PlaylistsFolder. Provision the
         // playlists folder on first read (lazy, self-healing), then project the
         // user-root child kinds, name-sorted.
         self.ensure_playlists_folder().await?;
@@ -1905,7 +1956,7 @@ mod tests {
         let playlists = folders
             .iter()
             .find(|f| {
-                f.type_ == "Emby.Server.Implementations.Playlists.ManualPlaylistsFolder"
+                f.type_ == "Emby.Server.Implementations.Playlists.PlaylistsFolder"
                     && f.name.as_deref() == Some("Playlists")
             })
             .expect("Playlists media folder present");

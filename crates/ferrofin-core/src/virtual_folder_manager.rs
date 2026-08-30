@@ -211,6 +211,13 @@ impl FerrofinVirtualFolderManager {
             }
             let root_id = root.ensure().await?;
             persistence.set_parent_id(id, root_id).await?;
+            // …and the ancestor closure, which a Ferrofin database never
+            // carried for a library row. A 10.11.8 database holds exactly one
+            // `AncestorIds` row per `CollectionFolder`, pointing at the user
+            // root, and it is what makes an internal recursive query scoped to
+            // the root resolve to the libraries — the source set
+            // `FolderImageProvider` copies the root's Primary from.
+            persistence.set_ancestors(id, &[root_id]).await?;
             // Backfill for a row written before the type was stored (an older
             // Ferrofin database, or one adopted from Jellyfin mid-migration).
             // Guarded by the same in-process `parented` set, so it costs one
@@ -241,6 +248,7 @@ impl FerrofinVirtualFolderManager {
         persistence
             .save_items(std::slice::from_ref(&entity))
             .await?;
+        persistence.set_ancestors(id, &[root_id]).await?;
         if let Ok(mut set) = self.parented.lock() {
             set.insert(id);
         }

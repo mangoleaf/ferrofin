@@ -166,14 +166,22 @@ async fn playlists_folder(
     // `…Playlists.PlaylistsFolder`. Asking for the other one would never find
     // Jellyfin's folder and would quietly create a second beside it.
     let path = format!("{}/playlists", paths.data_path());
-    let (mode, root) = container_identity(db, paths).await?;
+    let (mode, _root) = container_identity(db, paths).await?;
+    // The playlists folder's parent is the **AggregateFolder**, not the user
+    // root: `LibraryManager.CreateRootFolder` sets `folder.ParentId =
+    // rootFolder.Id` where `rootFolder` is the aggregate, and only
+    // `AddVirtualChild` puts the folder among the user root's children
+    // (LibraryManager.cs:855-885). Parenting it to the user root instead gives
+    // the right `ChildCount` for the wrong reason and answers
+    // `GET /Items/{playlistsId}/Ancestors` with the wrong row.
+    let aggregate = crate::item_type_lookup::aggregate_folder_id(&mode, &paths.root_folder_path());
     let container = crate::item_persistence_service::ensure_container(
         db,
         BaseItemKind::PlaylistsFolder,
         "Playlists",
         &path,
         &mode,
-        root,
+        aggregate,
     )
     .await?;
     if let Some(id) = container {

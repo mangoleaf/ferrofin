@@ -220,7 +220,8 @@ pub fn supports_ancestors(kind: BaseItemKind) -> bool {
 /// Structural and by-name rows return `false` and the overrides say why:
 /// `Folder.CanDelete` refuses the root (`UserRootFolder.IsRoot`),
 /// `AggregateFolder`/`CollectionFolder`/`UserView`/`BasePluginFolder`
-/// (`ManualPlaylistsFolder`) are hard `false`, and so are `Genre`/
+/// (the playlists folder, under either of its two spellings) are hard `false`,
+/// and so are `Genre`/
 /// `MusicGenre`/`Studio`/`Year` (the `Person` row is metadata-only as well).
 /// `MusicArtist.CanDelete` is `!IsAccessedByName`, i.e. only a physically
 /// parented artist folder is deletable — hence `has_parent`.
@@ -236,6 +237,7 @@ pub fn can_delete(kind: BaseItemKind, has_parent: bool) -> bool {
         | BaseItemKind::CollectionFolder
         | BaseItemKind::UserView
         | BaseItemKind::ManualPlaylistsFolder
+        | BaseItemKind::PlaylistsFolder
         | BaseItemKind::Genre
         | BaseItemKind::MusicGenre
         | BaseItemKind::Studio
@@ -249,6 +251,86 @@ pub fn can_delete(kind: BaseItemKind, has_parent: bool) -> bool {
 /// Whether items of this kind track played/unplayed status
 /// (C# `BaseItem.SupportsPlayedStatus`).
 ///
+/// Port of `BaseItem.IsTopParent` (`BaseItem.cs:733-757`): true for a
+/// `BasePluginFolder` or a `Channel`, for an `IHasCollectionType` whose
+/// collection type is `livetv`, and for anything whose parent row is an
+/// `AggregateFolder`.
+///
+/// This is the guard `FolderImageProvider.Supports` applies
+/// (`FolderImageProvider.cs:21-33`): a top-parent folder never gets a dynamic
+/// Primary. Confirmed against a live 10.11.8 database — the `PlaylistsFolder`
+/// row and the physical `/media/*` `Folder` rows have no image row, while the
+/// `UserRootFolder` and the `AggregateFolder` do.
+///
+/// `parent_kind` is the stored kind of the row's `ParentId`, or [`None`] when
+/// the row has no parent (a root, which is therefore not a top parent).
+#[must_use]
+pub fn is_top_parent(
+    kind: BaseItemKind,
+    parent_kind: Option<BaseItemKind>,
+    collection_type: Option<&str>,
+) -> bool {
+    // `BasePluginFolder` and its 10.11.8 subclass, plus `Channel`.
+    if matches!(
+        kind,
+        BaseItemKind::BasePluginFolder
+            | BaseItemKind::PlaylistsFolder
+            | BaseItemKind::ManualPlaylistsFolder
+            | BaseItemKind::Channel
+    ) {
+        return true;
+    }
+    if collection_type.is_some_and(|t| t.eq_ignore_ascii_case("livetv")) {
+        return true;
+    }
+    parent_kind == Some(BaseItemKind::AggregateFolder)
+}
+
+/// Whether a folder of this kind derives user data (and `RecursiveItemCount`)
+/// from its descendants — port of `Folder.SupportsUserDataFromChildren`
+/// (`Folder.cs:139-175`).
+///
+/// Upstream's comment on the exclusions is "these are just far too slow":
+/// `ICollectionFolder`, `UserView`, `UserRootFolder` and `Channel` opt out, as
+/// do the by-name rows. Everything else that is a folder — including the
+/// `AggregateFolder` — opts in, which is exactly why a live 10.11.8 emits
+/// `RecursiveItemCount` on the physical root and not on the user root beside
+/// it.
+///
+/// `ICollectionFolder` is wider than "a library": `BasePluginFolder`
+/// implements it too (`BasePluginFolder.cs:12`), so the playlists folder opts
+/// out under either of its stored spellings — measured, a live 10.11.8 serves
+/// its `Playlists` row with neither `RecursiveItemCount` nor
+/// `UserData.UnplayedItemCount`.
+///
+/// This is the whole of `FillUserDataDtoValues`'s entry guard
+/// (`Folder.cs:1798-1803`), so it gates the unplayed count as well as the
+/// recursive one.
+#[must_use]
+pub fn supports_user_data_from_children(kind: BaseItemKind) -> bool {
+    if !is_folder(kind) {
+        return false;
+    }
+    !matches!(
+        kind,
+        BaseItemKind::CollectionFolder
+            | BaseItemKind::UserView
+            | BaseItemKind::UserRootFolder
+            | BaseItemKind::Channel
+            // `ICollectionFolder` via `BasePluginFolder`.
+            | BaseItemKind::BasePluginFolder
+            | BaseItemKind::PlaylistsFolder
+            | BaseItemKind::ManualPlaylistsFolder
+            // `IItemByName` without dual access — the by-name grouping rows
+            // Ferrofin materializes as folders.
+            | BaseItemKind::Genre
+            | BaseItemKind::MusicGenre
+            | BaseItemKind::Studio
+            | BaseItemKind::Person
+            | BaseItemKind::Year
+    )
+}
+
 /// `BaseItem` defaults to `false` and `Folder` overrides it to `true`
 /// (`Folder.cs:84`), so ordinary media and the folders that aggregate it
 /// support it — but seven container kinds override it back to `false`:
@@ -680,6 +762,11 @@ mod tests {
             BaseItemKind::CollectionFolder,
             BaseItemKind::UserView,
             BaseItemKind::ManualPlaylistsFolder,
+            // …under BOTH spellings: 10.11.8 stores
+            // `…Playlists.PlaylistsFolder` and only *renders* it as
+            // `ManualPlaylistsFolder`, and a `BasePluginFolder` is hard `false`
+            // whichever name the row carries.
+            BaseItemKind::PlaylistsFolder,
             BaseItemKind::Genre,
             BaseItemKind::Year,
             BaseItemKind::Person,
@@ -699,6 +786,68 @@ mod tests {
         ] {
             assert!(can_delete(kind, false), "{kind:?}");
         }
+    }
+
+    /// `Folder.SupportsUserDataFromChildren` (`Folder.cs:139-175`) — the gate
+    /// on `RecursiveItemCount`. The split is the reason a live 10.11.8 emits
+    /// the field on the `AggregateFolder` and not on the `UserRootFolder`.
+    #[test]
+    fn only_the_folders_upstream_allows_derive_user_data_from_children() {
+        use super::is_top_parent;
+        use super::supports_user_data_from_children as supports;
+        for kind in [
+            BaseItemKind::CollectionFolder,
+            BaseItemKind::UserView,
+            BaseItemKind::UserRootFolder,
+            BaseItemKind::Channel,
+            BaseItemKind::Genre,
+            BaseItemKind::Studio,
+            BaseItemKind::Year,
+            BaseItemKind::Person,
+            // Not a folder at all.
+            BaseItemKind::Movie,
+        ] {
+            assert!(!supports(kind), "{kind:?}");
+        }
+        for kind in [
+            BaseItemKind::AggregateFolder,
+            BaseItemKind::Folder,
+            BaseItemKind::Season,
+            BaseItemKind::Series,
+            BaseItemKind::MusicAlbum,
+            BaseItemKind::Playlist,
+        ] {
+            assert!(supports(kind), "{kind:?}");
+        }
+        // `BasePluginFolder : Folder, ICollectionFolder` (BasePluginFolder.cs:12),
+        // so the playlists folder is excluded under both spellings — a live
+        // 10.11.8 serves its `Playlists` row with neither `RecursiveItemCount`
+        // nor `UserData.UnplayedItemCount`.
+        assert!(!supports(BaseItemKind::PlaylistsFolder));
+        assert!(!supports(BaseItemKind::ManualPlaylistsFolder));
+        assert!(!supports(BaseItemKind::BasePluginFolder));
+        // `BaseItem.IsTopParent` (BaseItem.cs:733-757), the guard
+        // `FolderImageProvider.Supports` applies.
+        assert!(is_top_parent(BaseItemKind::PlaylistsFolder, None, None));
+        assert!(is_top_parent(
+            BaseItemKind::ManualPlaylistsFolder,
+            None,
+            None
+        ));
+        assert!(is_top_parent(BaseItemKind::Channel, None, None));
+        assert!(is_top_parent(
+            BaseItemKind::Folder,
+            Some(BaseItemKind::AggregateFolder),
+            None
+        ));
+        assert!(is_top_parent(BaseItemKind::UserView, None, Some("livetv")));
+        assert!(!is_top_parent(BaseItemKind::UserRootFolder, None, None));
+        assert!(!is_top_parent(BaseItemKind::AggregateFolder, None, None));
+        assert!(!is_top_parent(
+            BaseItemKind::Folder,
+            Some(BaseItemKind::CollectionFolder),
+            None
+        ));
     }
 
     #[test]

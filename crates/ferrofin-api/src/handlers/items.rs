@@ -549,12 +549,25 @@ fn short_type(item: &BaseItemEntity) -> &str {
 /// `None` when no view contains it (the C# `FirstOrDefault` miss, which ends
 /// the walk). Items Ferrofin scanned already parent straight to their
 /// `CollectionFolder`, so the hop only fires on adopted data.
+///
+/// A **plug-in folder** under the aggregate is exempt: `CreateRootFolder`
+/// parents the playlists folder to the `AggregateFolder` and registers it with
+/// `AddVirtualChild` (LibraryManager.cs:855-885), so it is a *virtual* child,
+/// not a resolved physical library root, and no `CollectionFolder` will ever
+/// carry its path. Translating it would find nothing and end the walk, which is
+/// how a playlist came back with an EMPTY ancestor chain where Jellyfin answers
+/// `[Playlists, root]`.
 async fn translate_parent_item(
     state: &AppState,
     item: &BaseItemEntity,
     grandparent: Option<&BaseItemEntity>,
 ) -> Result<Option<BaseItemEntity>, ApiError> {
-    if grandparent.is_none_or(|g| short_type(g) != "AggregateFolder") {
+    if grandparent.is_none_or(|g| short_type(g) != "AggregateFolder")
+        || matches!(
+            short_type(item),
+            "PlaylistsFolder" | "ManualPlaylistsFolder" | "BasePluginFolder"
+        )
+    {
         return Ok(Some(item.clone()));
     }
     let Some(path) = item.path.as_deref() else {

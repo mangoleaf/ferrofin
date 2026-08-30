@@ -403,6 +403,36 @@ pub(crate) fn append_predicates<'a>(
                     &to_guid_strings(&filter.parent_physical_folder_ids),
                 );
             }
+            // …and the `AggregateFolder`'s virtual children, when the parent is
+            // the `UserRootFolder` (C#
+            // `UserRootFolder.GetEligibleChildrenForRecursiveChildren`, which
+            // concatenates `LibraryManager.RootFolder.VirtualChildren`).
+            //
+            // Narrowed to the plug-in-folder types on purpose:
+            // `AddVirtualChild` has exactly ONE call site in 10.11.8
+            // (LibraryManager.cs:883, the playlists folder), and the
+            // aggregate's other children — the physical library folders,
+            // `%AppDataPath%/collections`, the recordings folder — must not
+            // leak into the user root's children.
+            if let Some(aggregate) = filter.virtual_child_parent_id {
+                qb.push(r#" OR (bi."ParentId" = "#)
+                    .push_bind(guid_to_db(aggregate))
+                    .push(r#" AND bi."Type" IN ("#);
+                let mut first = true;
+                for kind in [
+                    BaseItemKind::PlaylistsFolder,
+                    BaseItemKind::ManualPlaylistsFolder,
+                ] {
+                    if let Some(name) = stored_type_name(kind) {
+                        if !first {
+                            qb.push(", ");
+                        }
+                        first = false;
+                        qb.push_bind(name.to_owned());
+                    }
+                }
+                qb.push("))");
+            }
             qb.push(")");
         }
     }

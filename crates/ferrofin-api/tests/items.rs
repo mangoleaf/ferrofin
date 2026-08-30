@@ -332,6 +332,13 @@ const AGGREGATE_ID: Uuid = Uuid::from_u128(0xA66);
 const COLLECTION_FOLDER_ID: Uuid = Uuid::from_u128(0xC0F);
 /// The `UserRootFolder` the collection folder parents to.
 const USER_ROOT_ID: Uuid = Uuid::from_u128(0x500);
+
+/// The `PlaylistsFolder` `CreateRootFolder` parents to the `AggregateFolder`
+/// and registers as a virtual child (LibraryManager.cs:855-885).
+const PLAYLISTS_FOLDER_ID: Uuid = Uuid::from_u128(0x9F1);
+
+/// A playlist inside it — the chain that exercises the plug-in-folder exemption.
+const PLAYLIST_ID: Uuid = Uuid::from_u128(0x9F2);
 /// The physical folder's on-disk path (= one of the library's locations).
 const PHYSICAL_PATH: &str = "/media/movies-real";
 
@@ -362,6 +369,16 @@ impl LibraryManager for OkLibrary {
         &self,
         item_id: Uuid,
     ) -> Result<Option<Vec<BaseItemEntity>>, ServiceError> {
+        if item_id == PLAYLIST_ID {
+            return Ok(Some(vec![
+                item_entity(
+                    PLAYLISTS_FOLDER_ID,
+                    "Playlists",
+                    BaseItemKind::PlaylistsFolder,
+                ),
+                item_entity(AGGREGATE_ID, "root", BaseItemKind::AggregateFolder),
+            ]));
+        }
         if !self.adopted_tree {
             return Ok((item_id == self.item_id).then(Vec::new));
         }
@@ -1224,6 +1241,52 @@ async fn ancestors_translate_physical_root_to_the_users_view() {
             "{uri}: the view, then the user root: {translated}"
         );
     }
+}
+
+/// A plug-in folder under the `AggregateFolder` is NOT translated: it is a
+/// virtual child (`AddVirtualChild`), not a resolved physical library root, so
+/// no `CollectionFolder` carries its path. Translating it found nothing and
+/// ended the walk, which answered a playlist's ancestors with an EMPTY array
+/// where Jellyfin answers `[Playlists, root]`.
+#[tokio::test]
+async fn ancestors_keep_a_plugin_folder_and_the_physical_root() {
+    let state = ok_state_with(OkLibrary {
+        item_id: Uuid::from_u128(0x56),
+        adopted_tree: true,
+    })
+    .with_virtual_folders(Arc::new(OneLibrary));
+    let router = create_router(state);
+
+    let res = router
+        .oneshot(
+            Request::builder()
+                .uri(format!("/Items/{PLAYLIST_ID}/Ancestors?userId={USER_ID}"))
+                .header("X-Emby-Token", "valid")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = json_body(res).await;
+    let ids: Vec<String> = body
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["Id"].as_str().unwrap().to_ascii_uppercase())
+        .collect();
+    assert_eq!(
+        ids,
+        vec![
+            PLAYLISTS_FOLDER_ID
+                .simple()
+                .to_string()
+                .to_ascii_uppercase(),
+            AGGREGATE_ID.simple().to_string().to_ascii_uppercase(),
+        ],
+        "the playlists folder, then the physical root: {body}"
+    );
 }
 
 /// `GET /Items/{itemId}/Ancestors` for a missing item is a `404`.
