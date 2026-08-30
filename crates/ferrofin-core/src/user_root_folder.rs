@@ -10,11 +10,33 @@
 //! library to the root and `GET /Items/Root` resolve a real row.
 //!
 //! `LibraryManager.CreateRootFolder()` also creates the **playlists** plugin
-//! folder at `{DataPath}/playlists`, parents it to the root
-//! (`folder.ParentId = rootFolder.Id`) and adds it as a virtual child, and
-//! `UserRootFolder.GetChildCount(user)` counts it — so upstream's root has one
-//! more child than the libraries alone. This store provisions it for the same
-//! reason and at the same moment.
+//! folder at `{DataPath}/playlists` and `UserRootFolder.GetChildCount(user)`
+//! counts it — so upstream's root has one more child than the libraries alone.
+//! This store provisions it for the same reason and at the same moment.
+//!
+//! ONE DELIBERATE STRUCTURAL DIVERGENCE, so nobody reads the line above as a
+//! faithful port. Upstream has **two** roots: the `AggregateFolder` at
+//! `RootFolderPath` and this `UserRootFolder` at `DefaultUserViewsPath`.
+//! `CreateRootFolder()` sets `folder.ParentId = rootFolder.Id` where
+//! `rootFolder` is the **AggregateFolder**, then `AddVirtualChild(folder)`;
+//! the user root only picks the folder up at read time, because
+//! `UserRootFolder.GetEligibleChildrenForRecursiveChildren` is
+//! `base.Children.ToList()` followed by
+//! `list.AddRange(LibraryManager.RootFolder.VirtualChildren)` — an **append**,
+//! and `IsPreSorted => true`, so it is never re-sorted.
+//!
+//! Ferrofin has no `AggregateFolder` row and parents the playlists folder to
+//! the user root as a real database child instead. That is what makes
+//! `ChildCount` correct at all: it is served by the grouped child-count query
+//! over `ParentId`, which cannot see a row that is not a real child. The price
+//! is that the folder sorts inline by `SortName` on
+//! `GET /Items?parentId=<root>` where upstream appends it last, and that the
+//! stored `ParentId` names the user root rather than the aggregate root. Both
+//! are recorded, with the live measurement and the C# citations, under
+//! `GET /Items/Root` in `suite/parity/classifications.json`. It is not an
+//! adoption hazard — Jellyfin's own `CreateRootFolder()` repairs the column at
+//! startup, and `Folder.AddChildren` dedupes by `Guid`, so the row can never
+//! be counted twice.
 //!
 //! Jellyfin renames the row from its directory name (`default`) to
 //! `Media Folders` on its first metadata refresh (`UserRootFolder.

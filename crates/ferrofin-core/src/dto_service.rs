@@ -4459,6 +4459,84 @@ mod tests {
         );
     }
 
+    /// `BasePluginFolder.CanDelete() => false` (v10.11.8
+    /// `MediaBrowser.Controller/Entities/BasePluginFolder.cs:24`), and
+    /// `PlaylistsFolder : BasePluginFolder` — so the Playlists folder must
+    /// report `CanDelete: false`, which live 10.11.8 does on both
+    /// `GET /Library/MediaFolders` and `GET /Items?parentId=<root>`.
+    ///
+    /// This is a DTO-level test on purpose. `CanDelete` is resolved from the
+    /// **stored** kind (`row_kind`, not `client_kind`), and the stored kind is
+    /// `PlaylistsFolder` on a fresh or adopted 10.11.8 database — while an
+    /// older Ferrofin wrote `ManualPlaylistsFolder` at the same path. A table
+    /// that knew only the second spelling let the row fall through to the
+    /// `_ => true` arm and served `CanDelete: true`, and no lab whose row had
+    /// been adopted under the legacy type could see it. Both spellings are
+    /// seeded here, both with a parent, so neither route can regress.
+    ///
+    /// The fake permissions reader grants deletion (`Ok(Some((true, false)))`),
+    /// so a `false` here can only come from the kind table — not from the
+    /// user's `EnableContentDeletion` policy, which is the other half of
+    /// C# `BaseItem.CanDelete(user)`.
+    #[tokio::test]
+    async fn the_playlists_plugin_folder_can_never_be_deleted() {
+        let db = test_db().await;
+        let root = Uuid::new_v4();
+        seed_folder_item(
+            &db,
+            root,
+            BaseItemKind::UserRootFolder,
+            "Media Folders",
+            None,
+        )
+        .await;
+        let user = seed_user(&db, Uuid::new_v4()).await;
+        let svc = service(db.clone());
+        let options = DtoOptions {
+            fields: vec![ItemFields::CanDelete],
+            ..DtoOptions::default()
+        };
+
+        for kind in [
+            BaseItemKind::PlaylistsFolder,
+            BaseItemKind::ManualPlaylistsFolder,
+        ] {
+            let id = Uuid::new_v4();
+            seed_folder_item(&db, id, kind, "Playlists", Some(root)).await;
+            let item = fetch_item(&db, id).await;
+            let dto = svc
+                .get_base_item_dto(&item, &options, Some(&user), None)
+                .await
+                .unwrap();
+            assert_eq!(
+                dto.can_delete,
+                Some(false),
+                "{kind:?} is a BasePluginFolder — CanDelete() is a hard false"
+            );
+            // A library alongside it stays false too, and an ordinary media
+            // folder stays true — so the assertion above is not a table that
+            // simply says "no" to everything.
+            assert_eq!(
+                dto.type_,
+                BaseItemKind::ManualPlaylistsFolder,
+                "clients see GetClientTypeName() under either stored spelling"
+            );
+        }
+
+        let plain = Uuid::new_v4();
+        seed_folder_item(&db, plain, BaseItemKind::Folder, "Some Folder", Some(root)).await;
+        let item = fetch_item(&db, plain).await;
+        let dto = svc
+            .get_base_item_dto(&item, &options, Some(&user), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            dto.can_delete,
+            Some(true),
+            "the permission is granted, so a deletable kind must still say true"
+        );
+    }
+
     /// `PlaylistsFolder.GetClientTypeName()` returns `"ManualPlaylistsFolder"`
     /// (v10.11.8 `Emby.Server.Implementations/Playlists/PlaylistsFolder.cs:50`),
     /// which is why 10.11.8 ships no class of that name yet every client sees

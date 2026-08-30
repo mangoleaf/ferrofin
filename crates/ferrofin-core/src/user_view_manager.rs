@@ -441,14 +441,61 @@ pub(crate) struct LatestParent {
     collection_type: Option<CollectionType>,
 }
 
+/// The `IHasCollectionType.CollectionType` of a latest-items parent row —
+/// the C# `switch (parent.CollectionType)` input.
+///
+/// - `CollectionFolder` carries the library's own configured type, looked up
+///   by id (`CollectionFolder.CollectionType`, CollectionFolder.cs:32);
+/// - the playlists plugin folder is the constant `playlists`
+///   (`PlaylistsFolder.CollectionType`, v10.11.8
+///   `Emby.Server.Implementations/Playlists/PlaylistsFolder.cs:29`) —
+///   recognised under BOTH spellings, since this classifies a **stored** row
+///   and 10.11.8 persists `…Playlists.PlaylistsFolder` while an older Ferrofin
+///   wrote the `GetClientTypeName()` name `ManualPlaylistsFolder`;
+/// - everything else reports `None`: a `UserView` (its `ViewType` is not
+///   persisted at this seam) and, deliberately, a bare `BasePluginFolder` —
+///   the abstract base declares `CollectionType => null`
+///   (BasePluginFolder.cs:14) and only `PlaylistsFolder` overrides it, so this
+///   arm must NOT be widened to the base class even though
+///   [`LatestParent::is_collection_folder`] does recognise it.
+///
+/// Lifted out of the `classify` closure so it can be pinned directly: getting
+/// it wrong loses `CollectionType::playlists` on a playlists parent, which is
+/// invisible until the media-type rules downstream quietly change.
+fn latest_parent_collection_type(
+    kind: Option<BaseItemKind>,
+    id: Uuid,
+    library_types: &HashMap<Uuid, Option<CollectionType>>,
+) -> Option<CollectionType> {
+    match kind {
+        Some(BaseItemKind::CollectionFolder) => library_types.get(&id).copied().flatten(),
+        Some(BaseItemKind::ManualPlaylistsFolder | BaseItemKind::PlaylistsFolder) => {
+            Some(CollectionType::playlists)
+        }
+        _ => None,
+    }
+}
+
 impl LatestParent {
     /// C# `parent is ICollectionFolder`: a library `CollectionFolder`, or the
-    /// plugin-folder line (`ManualPlaylistsFolder : BasePluginFolder :
-    /// ICollectionFolder`).
+    /// plugin-folder line (`PlaylistsFolder : BasePluginFolder :
+    /// ICollectionFolder`, v10.11.8
+    /// `MediaBrowser.Controller/Entities/BasePluginFolder.cs:12`).
+    ///
+    /// Both spellings, because this classifies a **stored** row: 10.11.8
+    /// persists the FQN `…Playlists.PlaylistsFolder`, while
+    /// `ManualPlaylistsFolder` is only `GetClientTypeName()` — the spelling an
+    /// older Ferrofin wrote. Missing either one drops the parent out of the
+    /// `top_parent_ids` branch below and loses `CollectionType::playlists`.
     fn is_collection_folder(&self) -> bool {
         matches!(
             self.kind,
-            Some(BaseItemKind::CollectionFolder | BaseItemKind::ManualPlaylistsFolder)
+            Some(
+                BaseItemKind::CollectionFolder
+                    | BaseItemKind::BasePluginFolder
+                    | BaseItemKind::ManualPlaylistsFolder
+                    | BaseItemKind::PlaylistsFolder
+            )
         )
     }
 
@@ -600,13 +647,7 @@ impl FerrofinUserViewManager {
         let classify = |row: &BaseItemEntity| -> Option<LatestParent> {
             let id = Uuid::parse_str(&row.id).ok()?;
             let kind = item_type_lookup::kind_from_type_name(&row.type_);
-            let collection_type = match kind {
-                Some(BaseItemKind::CollectionFolder) => {
-                    collection_types.get(&id).copied().flatten()
-                }
-                Some(BaseItemKind::ManualPlaylistsFolder) => Some(CollectionType::playlists),
-                _ => None,
-            };
+            let collection_type = latest_parent_collection_type(kind, id, &collection_types);
             Some(LatestParent {
                 id,
                 kind,
@@ -1768,6 +1809,84 @@ mod tests {
             kind: Some(kind),
             collection_type,
         }
+    }
+
+    /// `PlaylistsFolder.CollectionType => playlists` (v10.11.8
+    /// `Emby.Server.Implementations/Playlists/PlaylistsFolder.cs:29`), under
+    /// the stored spelling and the `GetClientTypeName()` one alike — a
+    /// `CollectionFolder` reports its configured library type, and every other
+    /// kind reports `None`.
+    #[test]
+    fn a_playlists_parent_reports_the_playlists_collection_type() {
+        let library = Uuid::new_v4();
+        let playlists = Uuid::new_v4();
+        let types: HashMap<Uuid, Option<CollectionType>> =
+            [(library, Some(CollectionType::movies))]
+                .into_iter()
+                .collect();
+
+        for kind in [
+            BaseItemKind::PlaylistsFolder,
+            BaseItemKind::ManualPlaylistsFolder,
+        ] {
+            assert_eq!(
+                latest_parent_collection_type(Some(kind), playlists, &types),
+                Some(CollectionType::playlists),
+                "{kind:?}"
+            );
+        }
+        assert_eq!(
+            latest_parent_collection_type(Some(BaseItemKind::CollectionFolder), library, &types),
+            Some(CollectionType::movies),
+            "a library still reports its own configured type"
+        );
+        // `BasePluginFolder.CollectionType => null` (BasePluginFolder.cs:14):
+        // it is an `ICollectionFolder` WITHOUT a collection type, so the two
+        // predicates deliberately disagree on it.
+        assert_eq!(
+            latest_parent_collection_type(Some(BaseItemKind::BasePluginFolder), playlists, &types),
+            None
+        );
+        assert!(parent(BaseItemKind::BasePluginFolder, None).is_collection_folder());
+        assert_eq!(
+            latest_parent_collection_type(Some(BaseItemKind::UserView), playlists, &types),
+            None
+        );
+        assert_eq!(latest_parent_collection_type(None, playlists, &types), None);
+    }
+
+    /// `PlaylistsFolder : BasePluginFolder : ICollectionFolder` (v10.11.8
+    /// `MediaBrowser.Controller/Entities/BasePluginFolder.cs:12`), so a
+    /// playlists parent must classify as an `ICollectionFolder` — that is what
+    /// puts it on the `top_parent_ids` branch of
+    /// `LibraryManager.SetTopParentIdsOrAncestors` instead of the ancestor
+    /// closure.
+    ///
+    /// Pinned under BOTH spellings because this classifies a **stored** row:
+    /// 10.11.8 persists `…Playlists.PlaylistsFolder`, while
+    /// `ManualPlaylistsFolder` is only `GetClientTypeName()` and the spelling
+    /// an older Ferrofin wrote. Recognising just one of them silently moved
+    /// `GET /Items/Latest?parentId=<playlistsFolder>` onto the wrong branch.
+    #[test]
+    fn the_playlists_folder_classifies_as_a_collection_folder() {
+        for kind in [
+            BaseItemKind::PlaylistsFolder,
+            BaseItemKind::ManualPlaylistsFolder,
+            BaseItemKind::BasePluginFolder,
+            BaseItemKind::CollectionFolder,
+        ] {
+            assert!(
+                parent(kind, None).is_collection_folder(),
+                "{kind:?} is an ICollectionFolder"
+            );
+        }
+        // A `UserView` is the other branch, and an ordinary folder is neither
+        // — so the assertion above is not a predicate that says yes to
+        // everything.
+        assert!(!parent(BaseItemKind::UserView, None).is_collection_folder());
+        assert!(parent(BaseItemKind::UserView, None).is_user_view());
+        assert!(!parent(BaseItemKind::Folder, None).is_collection_folder());
+        assert!(!parent(BaseItemKind::Series, None).is_collection_folder());
     }
 
     /// The `includeItemTypes` narrowing for grouped views: every `UserView`

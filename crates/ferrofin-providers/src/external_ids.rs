@@ -792,6 +792,20 @@ mod tests {
     /// is stable, so intra-provider order is part of the response and a set
     /// comparison would not have caught the MusicBrainz block being
     /// transcribed out of order.
+    ///
+    /// READ THIS BEFORE "FIXING" A FAILURE HERE. The intra-provider sequence
+    /// — the seven `MusicBrainz` entries, the four `TheAudioDb` ones — is
+    /// **not derivable from the C# source**. `ProviderManager.AddParts`
+    /// (`ProviderManager.cs:145`) sorts only by `ProviderName`, and LINQ
+    /// `OrderBy` is stable, so what survives inside one name is the order
+    /// `GetExports<IExternalId>()` handed over: .NET reflection/DI discovery
+    /// order for that assembly. This vector is therefore pinned
+    /// EMPIRICALLY against a running 10.11.8 server, not derived — the live
+    /// server is the only available oracle. If a future runtime or plugin-load
+    /// change reorders the exports, upstream's own response moves and this
+    /// test is reporting a real contract change; re-measure against a live
+    /// 10.11.8 before editing the expectation, and never reorder the table to
+    /// match a guess.
     #[test]
     fn identify_fields_match_the_live_10_11_8_bytes() {
         let keys = |kind| -> Vec<String> {

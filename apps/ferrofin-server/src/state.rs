@@ -651,33 +651,37 @@ pub async fn build_app_state(
     // the filesystem scanner the library manager runs on `queue_library_scan`.
     // Kept concrete so the library monitor can take it as its `WatchRootsSource`
     // (the roots of every library with realtime monitoring enabled).
-    // The playlists media folder lives at `{data}/playlists` (C#
-    // `ManualPlaylistsFolder`); the user-view seam provisions it lazily. Both
-    // seams need the path: the user-view manager creates the folder, and the
-    // virtual-folder manager reports it among the root's physical locations
-    // (`LibraryManager.CreateRootFolder` adds it as a virtual child of the
-    // root, so `GET /Library/PhysicalPaths` lists it).
+    // The playlists media folder lives at `{data}/playlists` (stored as
+    // `PlaylistsFolder`; `ManualPlaylistsFolder` is only its
+    // `GetClientTypeName()`). Both seams need the path: the user-root store
+    // provisions the folder, and the virtual-folder manager reports it among
+    // the root's physical locations (`LibraryManager.CreateRootFolder` adds it
+    // as a virtual child of the root, so `GET /Library/PhysicalPaths` lists
+    // it).
     let playlists_path = std::path::PathBuf::from(paths.data_path()).join("playlists");
-    let virtual_folders_impl = Arc::new(
-        ferrofin_core::FerrofinVirtualFolderManager::new(paths.default_user_views_path())
-            .with_item_store(Arc::clone(&item_persistence_service))
-            .with_id_derivation(id_derivation.clone())
-            .with_playlists_path(playlists_path.clone()),
-    );
-    let virtual_folders: Arc<dyn ferrofin_traits::library::VirtualFolderManager> =
-        virtual_folders_impl.clone();
     // The `UserRootFolder` provisioner (`GetUserRootFolder()` /
     // `CreateRootFolder()`): the row `Items/Root` resolves to, the parent of
     // every library's `CollectionFolder`, and the parent of the playlists
     // plugin folder — which is what makes the root's `ChildCount` match
-    // upstream's. Built once and shared: the store memoizes its pass, so the
-    // two holders settle it together instead of each paying for it.
+    // upstream's. Built FIRST and shared by every holder: the store memoizes
+    // its whole pass in an `Arc<OnceCell>` that survives cloning, so the
+    // virtual-folder, user-view and library managers settle the root together
+    // instead of each re-probing it per request.
     let user_root_store = ferrofin_core::UserRootFolderStore::new(
         Arc::clone(&item_persistence_service),
         id_derivation.clone(),
         paths.default_user_views_path(),
     )
-    .with_playlists(db.clone(), playlists_path);
+    .with_playlists(db.clone(), playlists_path.clone());
+    let virtual_folders_impl = Arc::new(
+        ferrofin_core::FerrofinVirtualFolderManager::new(paths.default_user_views_path())
+            .with_item_store(Arc::clone(&item_persistence_service))
+            .with_id_derivation(id_derivation.clone())
+            .with_playlists_path(playlists_path)
+            .with_user_root(user_root_store.clone()),
+    );
+    let virtual_folders: Arc<dyn ferrofin_traits::library::VirtualFolderManager> =
+        virtual_folders_impl.clone();
     // The virtual-folder manager gives `/Items/Latest` each library's collection
     // type (C# `CollectionFolder.CollectionType`), which is why the user-view
     // manager is built after it.

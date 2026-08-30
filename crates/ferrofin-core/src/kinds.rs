@@ -219,9 +219,21 @@ pub fn supports_ancestors(kind: BaseItemKind) -> bool {
 ///
 /// Structural and by-name rows return `false` and the overrides say why:
 /// `Folder.CanDelete` refuses the root (`UserRootFolder.IsRoot`),
-/// `AggregateFolder`/`CollectionFolder`/`UserView`/`BasePluginFolder`
-/// (`ManualPlaylistsFolder`) are hard `false`, and so are `Genre`/
-/// `MusicGenre`/`Studio`/`Year` (the `Person` row is metadata-only as well).
+/// `AggregateFolder`/`CollectionFolder`/`UserView`/`BasePluginFolder` are hard
+/// `false`, and so are `Genre`/`MusicGenre`/`Studio`/`Year` (the `Person` row
+/// is metadata-only as well).
+///
+/// The playlists folder is listed under **both** spellings on purpose.
+/// `BasePluginFolder.CanDelete() => false` (v10.11.8
+/// `MediaBrowser.Controller/Entities/BasePluginFolder.cs:24`) and
+/// `PlaylistsFolder : BasePluginFolder`, but the two names reach this table by
+/// different routes: `PlaylistsFolder` is what the row is *stored* as (the FQN
+/// `Emby.Server.Implementations.Playlists.PlaylistsFolder` a fresh or adopted
+/// 10.11.8 database carries), while `ManualPlaylistsFolder` is only
+/// `GetClientTypeName()` — and what an older Ferrofin wrote into the column.
+/// `DtoService` resolves `CanDelete` from the **stored** kind, so a table that
+/// knew only the client-facing spelling would report `CanDelete: true` on
+/// exactly the databases that spell it the upstream way.
 /// `MusicArtist.CanDelete` is `!IsAccessedByName`, i.e. only a physically
 /// parented artist folder is deletable — hence `has_parent`.
 ///
@@ -235,7 +247,9 @@ pub fn can_delete(kind: BaseItemKind, has_parent: bool) -> bool {
         | BaseItemKind::AggregateFolder
         | BaseItemKind::CollectionFolder
         | BaseItemKind::UserView
+        | BaseItemKind::BasePluginFolder
         | BaseItemKind::ManualPlaylistsFolder
+        | BaseItemKind::PlaylistsFolder
         | BaseItemKind::Genre
         | BaseItemKind::MusicGenre
         | BaseItemKind::Studio
@@ -679,6 +693,14 @@ mod tests {
             BaseItemKind::AggregateFolder,
             BaseItemKind::CollectionFolder,
             BaseItemKind::UserView,
+            BaseItemKind::BasePluginFolder,
+            // Both spellings of the plugin folder: `PlaylistsFolder` is the
+            // STORED type (`BasePluginFolder.CanDelete() => false`), and
+            // `ManualPlaylistsFolder` is `GetClientTypeName()` — which is what
+            // an older Ferrofin persisted. `has_parent` is `true` here because
+            // upstream really does parent this row, so the `MusicArtist` arm
+            // must not be what saves it.
+            BaseItemKind::PlaylistsFolder,
             BaseItemKind::ManualPlaylistsFolder,
             BaseItemKind::Genre,
             BaseItemKind::Year,
@@ -744,6 +766,10 @@ mod tests {
             BaseItemKind::Season,
             BaseItemKind::BoxSet,
             BaseItemKind::Folder,
+            // Neither `BasePluginFolder` nor `PlaylistsFolder` overrides
+            // `SupportsPlayedStatus`, so both spellings keep `Folder`'s `true`
+            // — pinned so the stored-kind switch cannot silently move it.
+            BaseItemKind::PlaylistsFolder,
             BaseItemKind::ManualPlaylistsFolder,
         ] {
             assert!(supports_played_status(kind), "{kind:?}");
