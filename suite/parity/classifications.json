@@ -1,6 +1,6 @@
 {
   "_comment": "Curated ACCEPTED divergences (not bugs). Highest-precedence classification in gen-ledger: overrides the auto 'flagged: verify' from the Layer-2 read diff. deep_verified stays as the live layers report it (these do not diff clean vs Jellyfin by design). Sourced from the parity-triage workflow verdicts (parity/triage-findings.json) + the roadmap synthesis, minus the ops since fixed (Filters2 WI-2, Collections add/remove WI-6, Images Size WI-1).",
-  "last_verified": "2026-08-30 batch C4 (the external-change webhooks): the five /Library webhook ops had never been issued by any layer ('write: deferred to Layer-2 journey', every flag null). j_library_webhooks now creates a probe movie and a probe series on the shared media mount, reports them by path, and refreshes them by external id with an unmatched-id negative control on each. POST /Library/Media/Updated is verified on both servers (effect); the four id-selecting ops are recorded here as the upstream DtoOptions(false) defect that makes an id match impossible on Jellyfin. 2026-08-30 batch C3 (untested writes: lyrics): the three REMOTE lyric ops are recorded undiffable-by-construction — Jellyfin 10.11.8 ships no ILyricProvider at all, so its success leg does not exist. The four LOCAL lyric ops are NOT classified: they are now earned live (GET /Audio/{itemId}/Lyrics body-diffs 54 fields across an .lrc/.elrc/.txt seed in reads.py; POST/DELETE are effect rows in journeys.py's j_lyrics). 2026-08-29 batch A3 (stale seed rows + the MediaStream probe-value residual): the 'instance/probe-noise' framing on GET /Items/{itemId} and /PlaybackInfo was disproven by cross-probing both containers' ffprobe binaries (byte-identical output) and replaced with a bitrate-only jellyfin-bug entry; the three 2026-08-11 'verified' seeds for DisplayPreferences, LiveTv/Timers/Defaults and MusicGenres were deleted after the underlying server bugs were fixed, so those rows now earn deep_verified from a live probe instead of a sentence. 2026-08-30 batch C1 (RemoteSearch identify), reviewer round 2: the padded-provider-id defect (.NET NumberStyles.Integer allows surrounding whitespace, Rust's str::parse does not) is fixed in crates/ferrofin-providers and is now probed live; the non-numeric-id divergence, which the first round left as a code comment only, is recorded here for all four TMDB-backed kinds with its measurement, so the end-of-campaign sweep does not rediscover it as an unexplained red. 2026-08-29 batch C1 (RemoteSearch identify, part 1): the RemoteSearch family had never been executed by any layer (sweep.py skips non-GET verbs and no journey covered it). j_remote_search_identify now probes Movie/Series/BoxSet/Person/Trailer on both servers; the first four diff clean after the provider fixes, and Trailer is recorded here as the OMDb-key divergence rather than left as an unexplained red. 2026-08-29 batch B1 (music by-name), reviewer round 2: the instant-mix genre-id regression and the by-name ItemValue.Type count defect are fixed in the server; four stale records (two of which said \"out-of-scope\") are rewritten with the evidence rather than deleted, and three new open-work records are added for divergences the fixes made visible.",
+  "last_verified": "2026-08-30 batch E1 (the SyncPlay push differential): the 21 \"verified-by-push-probe\" records are DELETED, not amended. Their sentence — \"the response body carries no signal here … verified end-to-end over two real WebSockets\" — was false twice: GET /SyncPlay/{id} and POST /SyncPlay/New return real, diffable bodies, and the probe it cited (suite/ws/probe_remote_control.py) runs against Ferrofin ONLY, asserts message PRESENCE rather than any field, and writes no results file, so gen-ledger could never ingest it. The sentence hid a real port gap: Jellyfin pushed a Stop command on New/Join that Ferrofin never sent. Five of the ops are now earned live by the new two-server layer suite/parity/push.py (verification method `push-diff`); the other sixteen revert to what they always were — untested — and are open work for the rest of the SyncPlay wave.\n2026-08-30 batch C4 (the external-change webhooks): the five /Library webhook ops had never been issued by any layer ('write: deferred to Layer-2 journey', every flag null). j_library_webhooks now creates a probe movie and a probe series on the shared media mount, reports them by path, and refreshes them by external id with an unmatched-id negative control on each. POST /Library/Media/Updated is verified on both servers (effect); the four id-selecting ops are recorded here as the upstream DtoOptions(false) defect that makes an id match impossible on Jellyfin. 2026-08-30 batch C3 (untested writes: lyrics): the three REMOTE lyric ops are recorded undiffable-by-construction — Jellyfin 10.11.8 ships no ILyricProvider at all, so its success leg does not exist. The four LOCAL lyric ops are NOT classified: they are now earned live (GET /Audio/{itemId}/Lyrics body-diffs 54 fields across an .lrc/.elrc/.txt seed in reads.py; POST/DELETE are effect rows in journeys.py's j_lyrics). 2026-08-29 batch A3 (stale seed rows + the MediaStream probe-value residual): the 'instance/probe-noise' framing on GET /Items/{itemId} and /PlaybackInfo was disproven by cross-probing both containers' ffprobe binaries (byte-identical output) and replaced with a bitrate-only jellyfin-bug entry; the three 2026-08-11 'verified' seeds for DisplayPreferences, LiveTv/Timers/Defaults and MusicGenres were deleted after the underlying server bugs were fixed, so those rows now earn deep_verified from a live probe instead of a sentence. 2026-08-30 batch C1 (RemoteSearch identify), reviewer round 2: the padded-provider-id defect (.NET NumberStyles.Integer allows surrounding whitespace, Rust's str::parse does not) is fixed in crates/ferrofin-providers and is now probed live; the non-numeric-id divergence, which the first round left as a code comment only, is recorded here for all four TMDB-backed kinds with its measurement, so the end-of-campaign sweep does not rediscover it as an unexplained red. 2026-08-29 batch C1 (RemoteSearch identify, part 1): the RemoteSearch family had never been executed by any layer (sweep.py skips non-GET verbs and no journey covered it). j_remote_search_identify now probes Movie/Series/BoxSet/Person/Trailer on both servers; the first four diff clean after the provider fixes, and Trailer is recorded here as the OMDb-key divergence rather than left as an unexplained red. 2026-08-29 batch B1 (music by-name), reviewer round 2: the instant-mix genre-id regression and the by-name ItemValue.Type count defect are fixed in the server; four stale records (two of which said \"out-of-scope\") are rewritten with the evidence rather than deleted, and three new open-work records are added for divergences the fixes made visible.",
   "rows": {
     "DELETE /Intros/Show/{SeriesId}/{SeasonId}": {
       "category": "expected-extension",
@@ -222,10 +222,6 @@
       "category": "verified",
       "classification": "verified 2026-08-29 (batch B1, reviewer round 2). SUPERSEDES the earlier \"accepted-divergence: Ferrofin does not lazily CREATE a by-name item on a GET\" record — the lazy create is now ported (`CreateItemByName<Studio>`, LibraryManager.cs:1289; see GET /Genres/{genreName}), so the route 200s as Jellyfin's does. TURNING THAT 404 INTO A 200 EXPOSED A SECOND, OLDER DEFECT, and it is recorded here because a status-only check called the row clean while the body was wrong: C# `ItemCountService.GetItemCountsForNameItem` (ItemCountService.cs:140-168) switches on the by-name kind and pins the ItemValue type per arm (`ItemValueType.Studios` for Studio, `.Genre` for Genre/MusicGenre, `.Artist|.AlbumArtist` for MusicArtist), while `item_count_service::item_value_counts_sql` matched on `CleanValue` alone. A by-name Studio therefore inherited the counts of any same-named GENRE — measured live, twice: /Studios/Action H ChildCount=201 MovieCount=200 SeriesCount=1 vs J all 0, /Studios/Drama H ChildCount=202 vs J 0. Fixed by porting the per-kind switch (`by_name_count_value_types`), with unit tests for the Studio/Genre collision and the MusicArtist arm. reads.py now probes this route with TWO legs, the second deliberately a name that collides with a genre, so the blind spot cannot reopen. Live after the fix: /Studios/Action and /Studios/Drama diffs=0, and the REAL studios still count 254/250/4 on both servers (the fix restricts, it does not zero)."
     },
-    "GET /SyncPlay/{id}": {
-      "category": "verified-by-push-probe",
-      "classification": "verified-by-push-probe: the response body carries no signal here — the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py)."
-    },
     "GET /System/ActivityLog/Entries": {
       "category": "instance",
       "classification": "instance: activity-log entries differ per instance/run."
@@ -417,86 +413,6 @@
     "POST /Startup/User": {
       "category": "accepted-divergence",
       "classification": "accepted-divergence: post-setup the first user already has a password and the contract is 403 (the Forbid guard upstream added in v12, ported by Ferrofin); Jellyfin 10.11.8 predates it and answers 204, silently re-setting the admin password. The journey asserts the correct contract (H=403 J=204)."
-    },
-    "POST /SyncPlay/Buffering": {
-      "category": "verified-by-push-probe",
-      "classification": "verified-by-push-probe: the response body carries no signal here — the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py)."
-    },
-    "POST /SyncPlay/Join": {
-      "category": "verified-by-push-probe",
-      "classification": "verified-by-push-probe: the response body carries no signal here — the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py)."
-    },
-    "POST /SyncPlay/Leave": {
-      "category": "verified-by-push-probe",
-      "classification": "verified-by-push-probe: the response body carries no signal here — the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py)."
-    },
-    "POST /SyncPlay/MovePlaylistItem": {
-      "category": "verified-by-push-probe",
-      "classification": "verified-by-push-probe: the response body carries no signal here — the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py)."
-    },
-    "POST /SyncPlay/New": {
-      "category": "verified-by-push-probe",
-      "classification": "verified-by-push-probe: the response body carries no signal here — the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py)."
-    },
-    "POST /SyncPlay/NextItem": {
-      "category": "verified-by-push-probe",
-      "classification": "verified-by-push-probe: the response body carries no signal here — the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py)."
-    },
-    "POST /SyncPlay/Pause": {
-      "category": "verified-by-push-probe",
-      "classification": "verified-by-push-probe: the response body carries no signal here — the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py)."
-    },
-    "POST /SyncPlay/Ping": {
-      "category": "verified-by-push-probe",
-      "classification": "verified-by-push-probe: the response body carries no signal here — the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py)."
-    },
-    "POST /SyncPlay/PreviousItem": {
-      "category": "verified-by-push-probe",
-      "classification": "verified-by-push-probe: the response body carries no signal here — the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py)."
-    },
-    "POST /SyncPlay/Queue": {
-      "category": "verified-by-push-probe",
-      "classification": "verified-by-push-probe: the response body carries no signal here — the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py)."
-    },
-    "POST /SyncPlay/Ready": {
-      "category": "verified-by-push-probe",
-      "classification": "verified-by-push-probe: the response body carries no signal here — the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py)."
-    },
-    "POST /SyncPlay/RemoveFromPlaylist": {
-      "category": "verified-by-push-probe",
-      "classification": "verified-by-push-probe: the response body carries no signal here — the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py)."
-    },
-    "POST /SyncPlay/Seek": {
-      "category": "verified-by-push-probe",
-      "classification": "verified-by-push-probe: the response body carries no signal here — the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py)."
-    },
-    "POST /SyncPlay/SetIgnoreWait": {
-      "category": "verified-by-push-probe",
-      "classification": "verified-by-push-probe: the response body carries no signal here — the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py)."
-    },
-    "POST /SyncPlay/SetNewQueue": {
-      "category": "verified-by-push-probe",
-      "classification": "verified-by-push-probe: the response body carries no signal here — the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py)."
-    },
-    "POST /SyncPlay/SetPlaylistItem": {
-      "category": "verified-by-push-probe",
-      "classification": "verified-by-push-probe: the response body carries no signal here — the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py)."
-    },
-    "POST /SyncPlay/SetRepeatMode": {
-      "category": "verified-by-push-probe",
-      "classification": "verified-by-push-probe: the response body carries no signal here — the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py)."
-    },
-    "POST /SyncPlay/SetShuffleMode": {
-      "category": "verified-by-push-probe",
-      "classification": "verified-by-push-probe: the response body carries no signal here — the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py)."
-    },
-    "POST /SyncPlay/Stop": {
-      "category": "verified-by-push-probe",
-      "classification": "verified-by-push-probe: the response body carries no signal here — the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py)."
-    },
-    "POST /SyncPlay/Unpause": {
-      "category": "verified-by-push-probe",
-      "classification": "verified-by-push-probe: the response body carries no signal here — the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py)."
     }
   }
 }

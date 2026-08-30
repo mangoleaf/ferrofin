@@ -10,6 +10,16 @@ Two authenticated sessions (a controller and a target), each with a live
 /socket, then every remote-control and SyncPlay verb, asserting on what the
 *receiving socket* actually gets. Prints a PASS/FAIL table and exits non-zero
 if anything expected never arrived.
+
+THIS IS THE SMOKE TEST, NOT THE DIFFERENTIAL. It runs against Ferrofin ONLY,
+asserts Ferrofin's own message shape rather than comparing it with anything, and
+writes no results file — so no ledger row can ever be earned here, and for years
+21 SyncPlay ops wore a curated sentence citing it while a real port gap (Jellyfin
+pushed a Stop that Ferrofin never sent) sat underneath. The two-server
+differential is `suite/parity/push.py`: the same sockets opened on BOTH servers,
+the pushed messages diffed against each other, and the verdict folded into the
+ledger under the `push-diff` method. Keep this file for breadth; take verdicts
+from that one.
 """
 
 import os

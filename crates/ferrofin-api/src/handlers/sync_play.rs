@@ -64,16 +64,19 @@ async fn sync_play_session(
 /// The SyncPlay authorization requirement a route carries — port of
 /// `Jellyfin.Api.Auth.SyncPlayAccessPolicy.SyncPlayAccessRequirementType`.
 ///
-/// Jellyfin also puts `SyncPlayHasAccess` on the controller class, ANDed with
-/// each route's own requirement. It is not evaluated separately here because
-/// every one of the three below already implies it: `HasAccess` holds when the
-/// user may create *or* join groups, or is already in one — which is exactly
-/// what `CreateGroup` / `JoinGroup` / `IsInGroup` each establish.
+/// Jellyfin puts `SyncPlayHasAccess` on the controller class, ANDed with each
+/// route's own requirement. `CreateGroup` / `JoinGroup` / `IsInGroup` each imply
+/// it, so it is not evaluated twice for them — but `POST /SyncPlay/Ping` carries
+/// NO route-level policy upstream, and so is gated by the class-level
+/// `HasAccess` alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 // The shared `Group` postfix is upstream's naming (`SyncPlayAccessRequirementType`),
 // kept so the table below reads against the C# it ports.
 #[allow(clippy::enum_variant_names)]
 enum SyncPlayAccess {
+    /// The class-level requirement: the policy allows joining groups, or the
+    /// user is already in one. `POST /SyncPlay/Ping` carries only this.
+    HasAccess,
     /// `POST /SyncPlay/New` — the user's policy must allow creating groups.
     CreateGroup,
     /// `Join` / `List` / `{id}` — the policy must allow joining groups.
@@ -100,6 +103,12 @@ async fn require_access(
     };
     let access = SyncPlayUserAccessType::from_stored(user.sync_play_access);
     let permitted = match required {
+        // `user.SyncPlayAccess is CreateAndJoinGroups or JoinGroups
+        //  || _syncPlayManager.IsUserActive(userId)` — short-circuited, so the
+        // manager is only consulted when the policy alone does not allow it.
+        SyncPlayAccess::HasAccess => {
+            access.can_join_groups() || mgr.is_user_active(user_uuid(&user)?).await?
+        }
         SyncPlayAccess::CreateGroup => access.can_create_groups(),
         SyncPlayAccess::JoinGroup => access.can_join_groups(),
         SyncPlayAccess::IsInGroup => mgr.is_user_active(user_uuid(&user)?).await?,
@@ -120,7 +129,18 @@ async fn dispatch(
     auth: &AuthorizationInfo,
     request: PlaybackRequest,
 ) -> Result<StatusCode, ApiError> {
-    require_access(state, auth, SyncPlayAccess::IsInGroup).await?;
+    dispatch_with(state, auth, SyncPlayAccess::IsInGroup, request).await
+}
+
+/// [`dispatch`] with an explicit access requirement — `Ping` is the one verb
+/// upstream does not gate on `SyncPlayIsInGroup`.
+async fn dispatch_with(
+    state: &AppState,
+    auth: &AuthorizationInfo,
+    access: SyncPlayAccess,
+    request: PlaybackRequest,
+) -> Result<StatusCode, ApiError> {
+    require_access(state, auth, access).await?;
     let mgr = manager(state)?;
     let session = sync_play_session(state, auth).await?;
     mgr.handle_request(&session, request).await?;
@@ -432,12 +452,22 @@ async fn set_shuffle_mode(
 }
 
 /// `POST /SyncPlay/Ping` — report the caller's measured ping.
+///
+/// The one playback verb with NO `[Authorize(Policy = Policies.SyncPlayIsInGroup)]`
+/// upstream, so a session in no group gets `204` plus a `NotInGroup` push rather
+/// than a `403` (`SyncPlayController.SyncPlayPing`, `SyncPlayManager.HandleRequest`).
 async fn ping(
     RequireAuth(auth): RequireAuth,
     State(state): State<AppState>,
     Json(body): Json<PingRequestDto>,
 ) -> Result<StatusCode, ApiError> {
-    dispatch(&state, &auth, PlaybackRequest::Ping { ping: body.ping }).await
+    dispatch_with(
+        &state,
+        &auth,
+        SyncPlayAccess::HasAccess,
+        PlaybackRequest::Ping { ping: body.ping },
+    )
+    .await
 }
 
 /// Registers the `/SyncPlay/*` routes.

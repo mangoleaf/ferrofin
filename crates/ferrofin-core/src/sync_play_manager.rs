@@ -246,7 +246,10 @@ struct Group {
     queue: PlayQueue,
     position_ticks: i64,
     last_activity: DateTime<Utc>,
-    last_updated: DateTime<Utc>,
+    /// Whether playback should resume once every member reports Ready — the
+    /// `WaitingGroupState.ResumePlaying` flag, set when the group entered
+    /// `Waiting` from `Playing`.
+    resume_playing: bool,
 }
 
 impl Group {
@@ -259,21 +262,31 @@ impl Group {
             queue: PlayQueue::default(),
             position_ticks: 0,
             last_activity: now,
-            last_updated: now,
+            resume_playing: false,
         }
     }
 
-    fn info(&self) -> GroupInfoDto {
-        let mut participants: Vec<String> =
-            self.members.iter().map(|m| m.user_name.clone()).collect();
-        participants.sort();
-        participants.dedup();
+    /// Port of `Group.GetInfo()`.
+    ///
+    /// `LastUpdatedAt` is the instant the DTO is BUILT — upstream passes
+    /// `DateTime.UtcNow` straight into the constructor, so the value advances on
+    /// every read rather than freezing at the last mutation. `Participants` is
+    /// LINQ `Distinct()` over the participant dictionary: first-occurrence order,
+    /// not sorted.
+    fn info(&self, now: DateTime<Utc>) -> GroupInfoDto {
+        let mut seen = std::collections::HashSet::new();
+        let participants: Vec<String> = self
+            .members
+            .iter()
+            .filter(|m| seen.insert(m.user_name.clone()))
+            .map(|m| m.user_name.clone())
+            .collect();
         GroupInfoDto {
             group_id: self.id,
             group_name: self.name.clone(),
             state: self.state,
             participants,
-            last_updated_at: self.last_updated,
+            last_updated_at: now,
         }
     }
 
@@ -312,6 +325,18 @@ impl Group {
 
     fn remove_member(&mut self, session_id: &str) {
         self.members.retain(|m| m.session_id != session_id);
+    }
+
+    /// Port of `IGroupStateContext.SetBuffering(session, buffering)`.
+    fn set_buffering(&mut self, session_id: &str, buffering: bool) {
+        if let Some(m) = self.member_mut(session_id) {
+            m.is_buffering = buffering;
+        }
+    }
+
+    /// Whether any member is still buffering (`IGroupStateContext.IsBuffering`).
+    fn is_buffering(&self) -> bool {
+        self.members.iter().any(|m| m.is_buffering)
     }
 
     fn set_all_buffering(&mut self, buffering: bool) {
@@ -385,7 +410,6 @@ impl Group {
     /// broadcast. `now` is threaded in for determinism/testability.
     #[allow(clippy::too_many_lines)] // one match arm per PlaybackRequestType — a table, not logic
     fn handle(&mut self, request: &PlaybackRequest, now: DateTime<Utc>) -> Vec<Outbound> {
-        self.last_updated = now;
         match request {
             PlaybackRequest::Play {
                 playing_queue,
@@ -500,6 +524,9 @@ impl Group {
             }
             PlaybackRequest::Seek { position_ticks } => {
                 self.position_ticks = (*position_ticks).max(0);
+                // `WaitingGroupState.HandleRequest(SeekGroupRequest)`: resume only
+                // if the group was playing when the seek arrived.
+                self.resume_playing = self.state == GroupStateType::Playing;
                 self.state = GroupStateType::Waiting;
                 self.last_activity = now;
                 self.set_all_buffering(true);
@@ -509,6 +536,8 @@ impl Group {
                 ]
             }
             PlaybackRequest::Buffer { .. } => {
+                // Same rule as Seek (`WaitingGroupState.HandleRequest(BufferGroupRequest)`).
+                self.resume_playing = self.state == GroupStateType::Playing;
                 self.state = GroupStateType::Waiting;
                 // Tell the members that are ready to hold while this one buffers.
                 vec![
@@ -578,6 +607,83 @@ impl Group {
                 self.command_env(SendCommandType::Unpause, self.unpause_when(now), now),
             )]
         } else {
+            Vec::new()
+        }
+    }
+
+    /// The group-state `SessionJoined` hook.
+    ///
+    /// `Group.CreateGroup` and `Group.SessionJoin` both END with
+    /// `_state.SessionJoined(this, _state.Type, session, ct)` — after the member
+    /// has been added and after the `GroupJoined`/`UserJoined` envelopes have gone
+    /// out. Omitting it is why a client that joined a Ferrofin group was never
+    /// told what to do with whatever it was already playing.
+    ///
+    /// * `Idle` — `IdleGroupState.SessionJoined` → `SendStopCommand`; because
+    ///   `prevState == Type` it is addressed to the joining session ONLY.
+    /// * `Playing` / `Paused` — both set `Waiting` and delegate to
+    ///   `WaitingGroupState.SessionJoined`, which is also the `Waiting` arm.
+    fn session_joined(&mut self, session_id: &str, now: DateTime<Utc>) -> Vec<Outbound> {
+        if self.state == GroupStateType::Idle {
+            return vec![Outbound::to(
+                Target::CurrentSession,
+                self.command_env(SendCommandType::Stop, self.last_activity, now),
+            )];
+        }
+        match self.state {
+            GroupStateType::Playing => {
+                // Pause the group and bank the time that has actually elapsed.
+                self.resume_playing = true;
+                self.advance_position(now);
+                self.last_activity = now;
+            }
+            // A fresh `WaitingGroupState` built from `Paused` defaults to false;
+            // an existing one (already `Waiting`) keeps the flag it holds.
+            GroupStateType::Paused => self.resume_playing = false,
+            _ => {}
+        }
+        self.state = GroupStateType::Waiting;
+        // Built after the state change, as upstream does — `IsPlaying` in the
+        // queue update must read `Waiting`, not the state the group just left.
+        let queue = self.play_queue_env(PlayQueueUpdateReason::NewPlaylist, now);
+        // Marked buffering BEFORE the AllReady command is addressed, so the
+        // joiner is not one of the sessions told to pause.
+        self.set_buffering(session_id, true);
+        vec![
+            Outbound::to(Target::CurrentSession, queue),
+            Outbound::to(
+                Target::AllReady,
+                self.command_env(SendCommandType::Pause, now, now),
+            ),
+        ]
+    }
+
+    /// The group-state `SessionLeaving` hook, run BEFORE the member is removed
+    /// (`Group.SessionLeave` calls `_state.SessionLeaving(...)` first).
+    ///
+    /// Only `WaitingGroupState` does anything: it clears the leaver's buffering
+    /// flag and, if the group was waiting on nobody else, either resumes
+    /// (`ResumePlaying`) or settles into `Paused`. `Idle`/`Playing`/`Paused`
+    /// leave silently.
+    fn session_leaving(&mut self, session_id: &str, now: DateTime<Utc>) -> Vec<Outbound> {
+        if self.state != GroupStateType::Waiting {
+            return Vec::new();
+        }
+        self.set_buffering(session_id, false);
+        if self.is_buffering() {
+            return Vec::new();
+        }
+        if self.resume_playing {
+            // `PlayingGroupState.HandleRequest(UnpauseGroupRequest)` with
+            // `prevState == Waiting`: a scheduled Unpause to the whole group.
+            self.state = GroupStateType::Playing;
+            self.last_activity = self.unpause_when(now);
+            vec![
+                Outbound::all(self.command_env(SendCommandType::Unpause, self.last_activity, now)),
+                Outbound::all(self.state_update_env(PlaybackRequestType::Unpause)),
+            ]
+        } else {
+            self.state = GroupStateType::Paused;
             Vec::new()
         }
     }
@@ -794,25 +900,30 @@ impl SyncPlayManager for FerrofinSyncPlayManager {
         group_name: &str,
     ) -> Result<GroupInfoDto, ServiceError> {
         let now = Utc::now();
-        let (info, joined_env) = {
+        let (info, joined_env, targets, outbound) = {
             let mut reg = self.lock();
             // A session may be in at most one group — leave the old one first.
             leave_locked(&mut reg, session);
             let group_id = Uuid::new_v4();
             let mut group = Group::new(group_id, group_name.trim().to_owned(), now);
             group.add_member(session);
-            let info = group.info();
+            let info = group.info(now);
             let joined = render_update(GroupUpdate::GroupJoined(GroupJoinedUpdate {
                 group_id,
                 data: info.clone(),
             }));
+            // `Group.CreateGroup` ends with the state hook — on a brand-new
+            // (Idle) group that is a Stop command to the creating session.
+            let outbound = group.session_joined(&session.session_id, now);
+            let targets = member_targets(&group);
             reg.groups.insert(group_id, group);
             reg.session_to_group
                 .insert(session.session_id.clone(), group_id);
             *reg.active_users.entry(session.user_id).or_insert(0) += 1;
-            (info, joined)
+            (info, joined, targets, outbound)
         };
         self.bus.send(&session.session_id, joined_env);
+        self.deliver(&targets, &session.session_id, &outbound);
         Ok(info)
     }
 
@@ -825,6 +936,8 @@ impl SyncPlayManager for FerrofinSyncPlayManager {
         let joined_env;
         let user_joined_env;
         let others: Vec<String>;
+        let targets: Vec<(String, bool)>;
+        let outbound: Vec<Outbound>;
         // The joiner must be able to see what the group is already playing (C#
         // `JoinGroup` -> `HasAccessToPlayQueue`). Read the queue under the lock,
         // then check without holding it.
@@ -887,8 +1000,7 @@ impl SyncPlayManager for FerrofinSyncPlayManager {
             let user_name = session.user_name.clone();
             let group = reg.groups.get_mut(&group_id).expect("group present");
             group.add_member(session);
-            group.last_updated = now;
-            let info = group.info();
+            let info = group.info(now);
             joined_env = render_update(GroupUpdate::GroupJoined(GroupJoinedUpdate {
                 group_id,
                 data: info,
@@ -903,6 +1015,9 @@ impl SyncPlayManager for FerrofinSyncPlayManager {
                 .filter(|m| m.session_id != session.session_id)
                 .map(|m| m.session_id.clone())
                 .collect();
+            // `Group.SessionJoin` ends with the state hook, after both envelopes.
+            outbound = group.session_joined(&session.session_id, now);
+            targets = member_targets(group);
             reg.session_to_group
                 .insert(session.session_id.clone(), group_id);
             *reg.active_users.entry(session.user_id).or_insert(0) += 1;
@@ -911,6 +1026,7 @@ impl SyncPlayManager for FerrofinSyncPlayManager {
         for sid in others {
             self.bus.send(&sid, user_joined_env.clone());
         }
+        self.deliver(&targets, &session.session_id, &outbound);
         Ok(())
     }
 
@@ -920,10 +1036,13 @@ impl SyncPlayManager for FerrofinSyncPlayManager {
             let mut reg = self.lock();
             leave_locked_with_notices(&mut reg, session, now)
         };
-        if let Some((left_env, user_left_env, others)) = notices {
-            self.bus.send(&session.session_id, left_env);
-            for sid in others {
-                self.bus.send(&sid, user_left_env.clone());
+        if let Some(n) = notices {
+            // The state hook runs (and broadcasts) BEFORE the member is removed,
+            // so the leaver still receives the group-wide resume it triggered.
+            self.deliver(&n.targets, &session.session_id, &n.outbound);
+            self.bus.send(&session.session_id, n.left_env);
+            for sid in n.others {
+                self.bus.send(&sid, n.user_left_env.clone());
             }
         } else {
             // Not in a group: tell the caller so its client can reset.
@@ -946,11 +1065,12 @@ impl SyncPlayManager for FerrofinSyncPlayManager {
     ) -> Result<Vec<GroupInfoDto>, ServiceError> {
         // A group is only listed when the caller could actually join it — C#
         // `ListGroups` filters on `HasAccessToPlayQueue`.
+        let now = Utc::now();
         let mut candidates: Vec<(GroupInfoDto, Vec<Uuid>)> = {
             let reg = self.lock();
             reg.groups
                 .values()
-                .map(|g| (g.info(), g.queue.item_ids()))
+                .map(|g| (g.info(now), g.queue.item_ids()))
                 .collect()
         };
         candidates.sort_by_key(|(info, _)| info.group_id);
@@ -982,11 +1102,12 @@ impl SyncPlayManager for FerrofinSyncPlayManager {
         session: &SyncPlaySession,
         group_id: Uuid,
     ) -> Result<GroupInfoDto, ServiceError> {
+        let now = Utc::now();
         let found = {
             let reg = self.lock();
             reg.groups
                 .get(&group_id)
-                .map(|g| (g.info(), g.queue.item_ids()))
+                .map(|g| (g.info(now), g.queue.item_ids()))
         };
         let not_found = || ServiceError::not_found(format!("sync-play group {group_id}"));
         let (info, queue) = found.ok_or_else(not_found)?;
@@ -1120,18 +1241,31 @@ fn leave_locked(reg: &mut Registry, session: &SyncPlaySession) {
     }
 }
 
-/// Like [`leave_locked`] but returns the `(GroupLeft, UserLeft, other-sessions)`
-/// broadcast plan, or `None` if the session was not in a group.
-#[allow(clippy::type_complexity)]
+/// The broadcast plan a leave produces: whatever the group-state `SessionLeaving`
+/// hook emitted (addressed against the membership as it was BEFORE the removal),
+/// then `GroupLeft` to the leaver and `UserLeft` to everyone else.
+struct LeaveNotices {
+    outbound: Vec<Outbound>,
+    targets: Vec<(String, bool)>,
+    left_env: String,
+    user_left_env: String,
+    others: Vec<String>,
+}
+
+/// Like [`leave_locked`] but returns the broadcast plan, or `None` if the session
+/// was not in a group.
 fn leave_locked_with_notices(
     reg: &mut Registry,
     session: &SyncPlaySession,
     now: DateTime<Utc>,
-) -> Option<(String, String, Vec<String>)> {
+) -> Option<LeaveNotices> {
     let group_id = reg.session_to_group.remove(&session.session_id)?;
     let group = reg.groups.get_mut(&group_id)?;
+    // `Group.SessionLeave` runs the state hook first, while the leaver is still
+    // a participant — so the targets it broadcasts to include it.
+    let outbound = group.session_leaving(&session.session_id, now);
+    let targets = member_targets(group);
     group.remove_member(&session.session_id);
-    group.last_updated = now;
     let left_env = render_update(GroupUpdate::GroupLeft(GroupLeftUpdate {
         group_id,
         data: group_id.to_string(),
@@ -1145,7 +1279,13 @@ fn leave_locked_with_notices(
         reg.groups.remove(&group_id);
     }
     decrement_user(reg, session.user_id);
-    Some((left_env, user_left_env, others))
+    Some(LeaveNotices {
+        outbound,
+        targets,
+        left_env,
+        user_left_env,
+        others,
+    })
 }
 
 /// Decrements a user's active-session counter, removing it at zero.
@@ -1178,6 +1318,15 @@ mod tests {
                 .iter()
                 .filter(|(s, _)| s == session_id)
                 .count()
+        }
+        fn bodies_for(&self, session_id: &str) -> Vec<String> {
+            self.sent
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(s, _)| s == session_id)
+                .map(|(_, b)| b.clone())
+                .collect()
         }
         fn bodies(&self) -> Vec<String> {
             self.sent
@@ -1242,7 +1391,8 @@ mod tests {
         assert_eq!(info.group_name, "movie night");
         assert_eq!(info.participants, vec!["alice".to_string()]);
         assert_eq!(info.state, GroupStateType::Idle);
-        assert_eq!(bus.count_for("s1"), 1); // GroupJoined push
+        // `Group.CreateGroup`: GroupJoined, then the Idle state's Stop command.
+        assert_eq!(bus.count_for("s1"), 2);
 
         assert_eq!(m.list_groups(&s).await.unwrap().len(), 1);
         assert!(m.is_user_active(s.user_id).await.unwrap());
@@ -1262,8 +1412,121 @@ mod tests {
 
         let g = m.get_group(&a, info.group_id).await.unwrap();
         assert_eq!(g.participants, vec!["alice".to_string(), "bob".to_string()]);
-        assert_eq!(bus.count_for("s1"), 2); // GroupJoined(create) + UserJoined(bob)
-        assert_eq!(bus.count_for("s2"), 1); // GroupJoined
+        // alice: GroupJoined + her own Stop, then UserJoined(bob).
+        assert_eq!(bus.count_for("s1"), 3);
+        // bob: GroupJoined + the Idle state's Stop.
+        assert_eq!(bus.count_for("s2"), 2);
+    }
+
+    /// `Group.CreateGroup` / `Group.SessionJoin` both end with
+    /// `_state.SessionJoined(...)`, which on an Idle group is a Stop command
+    /// addressed to the joining session only. Ferrofin used to push nothing.
+    #[tokio::test]
+    async fn joining_an_idle_group_pushes_group_joined_then_stop() {
+        let (m, bus) = mgr();
+        let a = session("s1", "alice");
+        let info = m.new_group(&a, "g").await.unwrap();
+
+        let creator = bus.bodies_for("s1");
+        assert_eq!(creator.len(), 2, "{creator:?}");
+        assert!(creator[0].contains("GroupJoined"));
+        assert!(creator[1].contains("SyncPlayCommand") && creator[1].contains("\"Stop\""));
+        // The all-zero playlist item id Jellyfin sends for an empty queue.
+        assert!(creator[1].contains("\"PlaylistItemId\":\"00000000000000000000000000000000\""));
+
+        let b = session("s2", "bob");
+        m.join_group(&b, info.group_id).await.unwrap();
+        let joiner = bus.bodies_for("s2");
+        assert_eq!(joiner.len(), 2, "{joiner:?}");
+        assert!(joiner[0].contains("GroupJoined"));
+        assert!(joiner[1].contains("SyncPlayCommand") && joiner[1].contains("\"Stop\""));
+        // The Stop is CurrentSession-scoped: alice only saw UserJoined.
+        let alice_after = &bus.bodies_for("s1")[2..];
+        assert_eq!(alice_after.len(), 1);
+        assert!(alice_after[0].contains("UserJoined"));
+    }
+
+    /// `PlayingGroupState.SessionJoined` -> `WaitingGroupState.SessionJoined`:
+    /// the joiner gets the play queue, the group drops to `Waiting`, and the
+    /// members that are ready are told to pause.
+    #[tokio::test]
+    async fn joining_a_playing_group_pushes_the_queue_and_pauses_the_ready() {
+        let (m, bus) = mgr();
+        let a = session("s1", "alice");
+        let info = m.new_group(&a, "g").await.unwrap();
+        m.handle_request(&a, play(2)).await.unwrap();
+        let before = bus.count_for("s1");
+
+        let b = session("s2", "bob");
+        m.join_group(&b, info.group_id).await.unwrap();
+
+        let joiner = bus.bodies_for("s2");
+        assert_eq!(joiner.len(), 2, "{joiner:?}");
+        assert!(joiner[0].contains("GroupJoined"));
+        assert!(joiner[1].contains("PlayQueue") && joiner[1].contains("NewPlaylist"));
+        // alice is ready, so she is the one told to pause (after UserJoined).
+        let alice_after = &bus.bodies_for("s1")[before..];
+        assert_eq!(alice_after.len(), 2, "{alice_after:?}");
+        assert!(alice_after[0].contains("UserJoined"));
+        assert!(alice_after[1].contains("SyncPlayCommand") && alice_after[1].contains("Pause"));
+        assert_eq!(
+            m.get_group(&a, info.group_id).await.unwrap().state,
+            GroupStateType::Waiting
+        );
+    }
+
+    /// `WaitingGroupState.SessionLeaving`: the buffering member the group was
+    /// waiting on leaves, so playback resumes for everyone still in it.
+    #[tokio::test]
+    async fn a_buffering_member_leaving_resumes_the_group() {
+        let (m, bus) = mgr();
+        let a = session("s1", "alice");
+        let info = m.new_group(&a, "g").await.unwrap();
+        m.handle_request(&a, play(2)).await.unwrap();
+        let b = session("s2", "bob");
+        m.join_group(&b, info.group_id).await.unwrap(); // -> Waiting, bob buffering
+        let before = bus.count_for("s1");
+
+        m.leave_group(&b).await.unwrap();
+
+        let alice_after = &bus.bodies_for("s1")[before..];
+        assert!(
+            alice_after
+                .iter()
+                .any(|x| x.contains("SyncPlayCommand") && x.contains("Unpause")),
+            "{alice_after:?}"
+        );
+        assert!(alice_after.iter().any(|x| x.contains("UserLeft")));
+        assert_eq!(
+            m.get_group(&a, info.group_id).await.unwrap().state,
+            GroupStateType::Playing
+        );
+    }
+
+    /// `Group.GetInfo()` stamps `DateTime.UtcNow` at DTO construction, so the
+    /// value advances on every read; Ferrofin used to freeze it at the last
+    /// mutation. `Participants` is LINQ `Distinct()` — first-join order.
+    #[tokio::test]
+    async fn group_info_is_stamped_per_read_and_keeps_join_order() {
+        let (m, _bus) = mgr();
+        let z = session("s1", "zoe");
+        let info = m.new_group(&z, "g").await.unwrap();
+        let adam = session("s2", "adam");
+        m.join_group(&adam, info.group_id).await.unwrap();
+
+        let first = m.get_group(&z, info.group_id).await.unwrap();
+        assert_eq!(
+            first.participants,
+            vec!["zoe".to_string(), "adam".to_string()]
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let second = m.get_group(&z, info.group_id).await.unwrap();
+        assert!(
+            second.last_updated_at > first.last_updated_at,
+            "LastUpdatedAt must advance between reads: {} !> {}",
+            second.last_updated_at,
+            first.last_updated_at
+        );
     }
 
     #[tokio::test]

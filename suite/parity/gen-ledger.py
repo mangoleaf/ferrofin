@@ -425,6 +425,16 @@ def build_curated():
     streams, st_stamp = load_layer2("suite/parity/stream-results.json")
     for k, v in streams.items():
         curated[k] = {**v, "last_verified": st_stamp}
+    # The Layer-2 PUSH differential (parity/push.py): ops whose observable effect is a
+    # server->client WebSocket message, captured on BOTH servers and diffed message-set
+    # and field-for-field. Most rows stamp `verification_method: "push-diff"` — the sixth
+    # member of the closed set, added because no HTTP response body carries the claim and
+    # borrowing `body-diff` for it would have inflated the headline. Spread like every
+    # other layer so the stamp survives (see the sweep comment above), and applied before
+    # the accepted-classification overlay so a curated divergence can still win the text.
+    push, p_stamp = load_layer2("suite/parity/push-results.json")
+    for k, v in push.items():
+        curated[k] = {**v, "last_verified": p_stamp}
     # Curated accepted-divergence classifications win the classification field over the auto
     # "flagged: verify" text (human decision > detector). deep_verified stays as the live layer
     # reported it (these diverge by design and are not deep-verified); a row not otherwise present

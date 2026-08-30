@@ -47,9 +47,15 @@ case "$stage" in
   parity)  exec "$ROOT/suite/parity/sweep.sh" "$@" ;;
   perf)    exec "$ROOT/suite/perf/run.sh" "$@" ;;
   push)
-    # Server→client pushes (remote control / cast + SyncPlay). The parity sweep
-    # diffs HTTP responses, which cannot see a WebSocket message at all — this
-    # opens two real sockets and asserts on what the receiving client gets.
+    # The Ferrofin-only SMOKE TEST for server→client pushes (remote control / cast
+    # + SyncPlay): it drives many more verbs than any parity layer, but it asserts
+    # only Ferrofin's own message shape, compares nothing against Jellyfin, and
+    # writes no results file — so it can never earn a ledger row.
+    #
+    # The DIFFERENTIAL is suite/parity/push.py: same sockets, but opened on BOTH
+    # servers, with the pushed messages diffed against each other (method
+    # `push-diff`) and folded into the ledger. It runs inside `suite/run.sh parity`.
+    #
     # Needs a Ferrofin already running (it does not manage containers):
     #   FERROFIN_BASE=http://127.0.0.1:8096 FERROFIN_USER=admin FERROFIN_PASS=… \
     #     suite/run.sh push

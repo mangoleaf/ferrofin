@@ -1250,6 +1250,38 @@ async fn sync_play_playback_verbs_require_group_membership() {
     }
 }
 
+/// `POST /SyncPlay/Ping` is the ONE playback verb upstream leaves off
+/// `Policies.SyncPlayIsInGroup` (`SyncPlayController.SyncPlayPing` carries no
+/// `[Authorize]` of its own), so the class-level `SyncPlayHasAccess` decides:
+/// the policy allows joining groups, OR the user is already in one.
+#[tokio::test]
+async fn sync_play_ping_needs_only_has_access() {
+    for (access, active, expected) in [
+        // Not in any group, but the policy allows joining — upstream answers
+        // 204 and pushes `NotInGroup`; Ferrofin used to answer 403.
+        (CREATE_AND_JOIN, false, StatusCode::NO_CONTENT),
+        (JOIN_ONLY, false, StatusCode::NO_CONTENT),
+        // No policy and no membership: refused.
+        (NO_SYNC_PLAY, false, StatusCode::FORBIDDEN),
+        // No policy, but in a group already (downgraded mid-session).
+        (NO_SYNC_PLAY, true, StatusCode::NO_CONTENT),
+    ] {
+        let (state, reached) = policy_state(access, active);
+        let (status, _) = send(state, "POST", "/SyncPlay/Ping", Body::from(r#"{"Ping":5}"#)).await;
+        assert_eq!(status, expected, "access {access} active {active}");
+        assert_eq!(
+            reached.load(std::sync::atomic::Ordering::SeqCst),
+            expected == StatusCode::NO_CONTENT,
+            "access {access} active {active}"
+        );
+    }
+
+    // ...and the gate is still real for the verbs that DO carry `IsInGroup`.
+    let (state, _) = policy_state(CREATE_AND_JOIN, false);
+    let (status, _) = send(state, "POST", "/SyncPlay/Pause", Body::from("{}")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
 #[tokio::test]
 async fn sync_play_leave_requires_group_membership() {
     let (state, reached) = policy_state(CREATE_AND_JOIN, false);

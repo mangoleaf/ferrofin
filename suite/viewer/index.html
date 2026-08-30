@@ -14,7 +14,7 @@
     /* One colour per VERIFICATION METHOD (parity/verification.py). Only body-diff
        is the headline green; every weaker method reads as a different, cooler
        thing so a glance cannot mistake one for the other. */
-    --m-body: #3fb950; --m-effect: #58a6ff; --m-prop: #a371f7;
+    --m-body: #3fb950; --m-push: #2dd4bf; --m-effect: #58a6ff; --m-prop: #a371f7;
     --m-status: #8b949e; --m-empty: #4d5760;
   }
   * { box-sizing: border-box; }
@@ -123,7 +123,8 @@
     <select id="ldeep">
       <option value="">verified: all</option>
       <option value="body-diff">✅ deep-verified (bodies diffed) — the headline</option>
-      <option value="other">◐⊙▫∅ verified another way (NOT the headline)</option>
+      <option value="other">⇄◐⊙▫∅ verified another way (NOT the headline)</option>
+      <option value="push-diff">⇄ push-diff — the pushed WebSocket messages diffed</option>
       <option value="effect">⊙ effect — a write&#39;s own read-back</option>
       <option value="property">◐ property — derived properties agreed</option>
       <option value="status-class">▫ status-class only</option>
@@ -310,6 +311,8 @@ function renderTrend() {
 const VMETHODS = {
   "body-diff":   { g: "✅", label: "body-diff",    c: "var(--m-body)",
     t: "THE HEADLINE — the response itself (or a write's read-back) was diffed against Jellyfin 10.11.8, every non-volatile field, or the served file's sha256, and came back clean" },
+  "push-diff":   { g: "⇄", label: "push-diff",    c: "var(--m-push)",
+    t: "NOT the headline — the server\u2192client WebSocket messages the op caused were captured on BOTH servers and diffed: the ordered sequence of message types per receiving socket AND every non-volatile field of each message's payload, plus the HTTP response body where there is one. It asserts nothing about sockets the probe never opened, nor about timing beyond its bounded quiet window" },
   "effect":      { g: "⊙", label: "effect",       c: "var(--m-effect)",
     t: "a write was applied and its effect confirmed on each server's OWN read-back; no body was diffed and the two servers' responses were never compared with each other" },
   "property":    { g: "◐", label: "property",     c: "var(--m-prop)",
