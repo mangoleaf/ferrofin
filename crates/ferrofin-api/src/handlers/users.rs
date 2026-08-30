@@ -586,13 +586,18 @@ async fn delete_user(
     let user = load_user(&state, user_id).await?;
     state.sessions.revoke_user_tokens(user_id, "").await?;
     state.users.delete_user(user_id).await?;
-    // Port of `UserDeletedLogger`.
+    // Port of `UserDeletedLogger`, which writes
+    // `new ActivityLog(…, "UserDeleted", Guid.Empty)` — deliberately NOT the
+    // deleted user's id, so the entry survives as a server-level event and the
+    // `hasUserId=true` filter (`ActivityLogEntryQuery.HasUserId`) excludes it.
+    // `ActivityLogCreate::user_id = None` is stored as the empty guid, which is
+    // the same value Jellyfin puts on the wire.
     log_activity(
         &state,
         ferrofin_traits::activity::ActivityLogCreate {
             name: format!("User {} has been deleted", user.username),
             type_: "UserDeleted".to_owned(),
-            user_id: Some(user_id),
+            user_id: None,
             ..Default::default()
         },
     )

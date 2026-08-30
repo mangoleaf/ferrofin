@@ -551,16 +551,26 @@ def tasks_projection(body):
 
     `Order` is listed EXPLICITLY because parity_diff aligns arrays by Name: the
     wire order would otherwise never be compared, and it is C# behaviour
-    (`_taskManager.ScheduledTasks.OrderBy(o => o.Name)`), not an accident. `Id`
-    and `Key` are already dropped by the global VOLATILE denylist (Jellyfin's Id
-    is md5(type FullName), Ferrofin's is the task key — a pre-existing accepted
-    divergence)."""
+    (`_taskManager.ScheduledTasks.OrderBy(o => o.Name)`), not an accident.
+
+    `WireId` is listed explicitly for the same reason and it is NOT cosmetic:
+    `Id` is in the global VOLATILE denylist, so without this alias the one field
+    that addresses a task — the field every `/ScheduledTasks/{taskId}` URL, every
+    dashboard link and every stored bookmark carries — would sit invisible under
+    a 600-field green diff. It is a PORTABLE value, not an instance one:
+    `ScheduledTaskWorker.Id` is `ScheduledTask.GetType().FullName.GetMD5()
+    .ToString("N")` (v10.11.8:219), the same on every Jellyfin install, so two
+    servers that disagree on it have mutually incompatible task URLs. Ferrofin
+    used to emit the task key here, which 404s on Jellyfin and vice versa;
+    `ferrofin_traits::tasks::task_id_for_key` now reproduces the C# derivation.
+    The map is keyed by `Key`, so the key SET is compared by the same walk."""
     if not isinstance(body, list):
         return body
     return {
         "Order": [t.get("Name") for t in body],
-        "Tasks": {t.get("Key"): {k: v for k, v in t.items()
-                                 if k != "LastExecutionResult"}
+        "Tasks": {t.get("Key"): {**{k: v for k, v in t.items()
+                                    if k != "LastExecutionResult"},
+                                 "WireId": t.get("Id")}
                   for t in body},
     }
 
@@ -1292,13 +1302,20 @@ def selfcheck():
     # comparable (parity_diff aligns arrays by Name and would never see it) and
     # must drop ONLY LastExecutionResult.
     proj = tasks_projection([
-        {"Key": "B", "Name": "Bee", "IsHidden": False, "LastExecutionResult": {"Status": "x"}},
-        {"Key": "A", "Name": "Ay", "IsHidden": True},
+        {"Key": "B", "Id": "id-b", "Name": "Bee", "IsHidden": False,
+         "LastExecutionResult": {"Status": "x"}},
+        {"Key": "A", "Id": "id-a", "Name": "Ay", "IsHidden": True},
     ])
     assert proj["Order"] == ["Bee", "Ay"], proj
     assert set(proj["Tasks"]) == {"A", "B"}, proj
     assert "LastExecutionResult" not in proj["Tasks"]["B"], proj
     assert proj["Tasks"]["B"]["IsHidden"] is False and proj["Tasks"]["A"]["Name"] == "Ay"
+    # The task Id must survive the VOLATILE denylist under an alias, or the one
+    # field that ADDRESSES a task is invisible to this row's diff.
+    assert verification.parity_diff.VOLATILE.match("Id"), "the alias exists because of this"
+    assert not verification.parity_diff.VOLATILE.match("WireId"), "…and must survive it"
+    assert proj["Tasks"]["B"]["WireId"] == "id-b", proj
+    assert proj["Tasks"]["A"]["WireId"] == "id-a", proj
     # Method derivation: two EMPTY result envelopes agreeing on their own zeros is
     # not the body-diff headline, and a pair that compared nothing at all is not a
     # verdict. Both are the shapes that silently inflated the count before.

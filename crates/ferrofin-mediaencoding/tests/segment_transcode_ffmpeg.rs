@@ -208,7 +208,10 @@ fn start_req<'a>(
         state,
         output_path,
         arguments: args,
-        log_path: output_path.with_extension("log"),
+        log_dir: output_path
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_default(),
         working_dir: None,
     }
 }

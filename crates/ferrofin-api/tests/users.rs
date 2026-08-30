@@ -1467,7 +1467,10 @@ async fn delete_user_records_deletion() {
 #[tokio::test]
 async fn delete_user_writes_a_user_deleted_activity_entry() {
     // Port of upstream's UserDeletedLogger: the dashboard activity feed gets
-    // "User bob has been deleted" tagged with the deleted user's id.
+    // "User bob has been deleted" tagged with `Guid.Empty` — NOT the deleted
+    // user's id. Live Jellyfin 10.11.8 puts
+    // `UserId: "00000000000000000000000000000000"` on this entry; tagging it
+    // with the real id also leaked it into the `hasUserId=true` filter.
     let activity = Arc::new(ferrofin_api::test_support::RecordingActivity::default());
     let router = create_router(state_with_activity(
         Arc::new(MemUsers::default()),
@@ -1490,7 +1493,10 @@ async fn delete_user_writes_a_user_deleted_activity_entry() {
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].type_, "UserDeleted");
     assert_eq!(entries[0].name, "User bob has been deleted");
-    assert_eq!(entries[0].user_id, Some(BOB_ID));
+    assert_eq!(
+        entries[0].user_id, None,
+        "UserDeletedLogger passes Guid.Empty"
+    );
 }
 
 #[tokio::test]
