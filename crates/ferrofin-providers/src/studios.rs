@@ -17,7 +17,11 @@
 //! network failure, yields no image rather than an error — exactly like the
 //! upstream provider returning `null`.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+
+use ferrofin_traits::plugins::PluginManager;
+
+use crate::plugin_config::{ConfigSource, StudioImagesConfig};
 
 /// The default artwork repository — Jellyfin's `emby-artwork` studios tree
 /// (`PluginConfiguration.RepositoryUrl` default).
@@ -31,19 +35,27 @@ pub const PROVIDER_NAME: &str = "Artwork Repository";
 /// holds a process-lifetime cache of the repository manifest.
 pub struct StudiosClient {
     http: reqwest::Client,
-    /// Repository base URL, trailing slashes trimmed.
-    repo_url: String,
-    /// The cached `thumbs.txt` studio-name list.
+    /// The operator's explicit repository override (`FERROFIN_STUDIOS_REPO_URL`
+    /// / config `studios_repo_url`), trailing slashes trimmed. `None` when the
+    /// operator set nothing, which is when the dashboard's `RepositoryUrl`
+    /// governs.
+    configured_repo_url: Option<String>,
+    /// The Studio Images plugin's dashboard settings (`RepositoryUrl`).
+    plugin: ConfigSource,
+    /// The cached `thumbs.txt` studio-name list, keyed by the repository URL it
+    /// was fetched from — the URL is now a runtime setting, so a cache that did
+    /// not remember which repo it came from would serve the old repo's names
+    /// after an admin changed it.
     // ponytail: cached for the process lifetime (studio artwork changes rarely,
     // a restart re-fetches). Upstream re-fetches after 1 day; add a TTL only if
     // a long-running server must pick up repo changes without a restart.
-    manifest: Mutex<Option<Vec<String>>>,
+    manifest: Mutex<Option<(String, Vec<String>)>>,
 }
 
 impl std::fmt::Debug for StudiosClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StudiosClient")
-            .field("repo_url", &self.repo_url)
+            .field("configured_repo_url", &self.configured_repo_url)
             .field(
                 "manifest_cached",
                 &self.manifest.lock().is_ok_and(|m| m.is_some()),
@@ -66,19 +78,46 @@ impl StudiosClient {
     }
 
     /// A client against a custom repository URL (trailing slashes trimmed); an
-    /// empty URL falls back to [`DEFAULT_REPO_URL`].
+    /// empty URL leaves the repository to the dashboard setting, and then to
+    /// [`DEFAULT_REPO_URL`].
     #[must_use]
     pub fn with_repo_url(repo_url: &str) -> Self {
         let trimmed = repo_url.trim_end_matches('/');
-        let repo_url = if trimmed.is_empty() {
-            DEFAULT_REPO_URL
-        } else {
-            trimmed
-        };
         Self {
             http: reqwest::Client::new(),
-            repo_url: repo_url.to_owned(),
+            configured_repo_url: (!trimmed.is_empty()).then(|| trimmed.to_owned()),
+            plugin: ConfigSource::new(),
             manifest: Mutex::new(None),
+        }
+    }
+
+    /// Binds the plugin manager, making the Studio Images settings page's
+    /// `RepositoryUrl` live. Called once by the composition root.
+    pub fn attach_plugin_manager(&self, plugins: Arc<dyn PluginManager>) {
+        self.plugin.attach(plugins);
+    }
+
+    /// The repository base URL for this lookup.
+    ///
+    /// `StudiosImageProvider.RepositoryUrl` is
+    /// `Plugin.Instance.Configuration.RepositoryUrl` read at call time
+    /// (v10.11.8 `StudiosImageProvider.cs:190`), so the dashboard governs. An
+    /// operator who set `FERROFIN_STUDIOS_REPO_URL` still wins: an explicit
+    /// env/file setting is the more specific instruction, and that knob shipped
+    /// before this plugin had an identity. With neither set, the C# default.
+    async fn repo_url(&self) -> String {
+        if let Some(configured) = &self.configured_repo_url {
+            return configured.clone();
+        }
+        let cfg: StudioImagesConfig = self
+            .plugin
+            .load(crate::builtin_plugins::STUDIO_IMAGES.id)
+            .await;
+        let trimmed = cfg.repository_url.trim_end_matches('/');
+        if trimmed.is_empty() {
+            DEFAULT_REPO_URL.to_owned()
+        } else {
+            trimmed.to_owned()
         }
     }
 
@@ -93,13 +132,14 @@ impl StudiosClient {
 
     /// The repository manifest (`thumbs.txt`) as a list of studio folder names,
     /// fetched once and cached. Any failure yields an empty list (best-effort).
-    async fn manifest(&self) -> Vec<String> {
+    async fn manifest(&self, repo_url: &str) -> Vec<String> {
         if let Ok(guard) = self.manifest.lock()
-            && let Some(cached) = guard.as_ref()
+            && let Some((cached_url, cached)) = guard.as_ref()
+            && cached_url == repo_url
         {
             return cached.clone();
         }
-        let url = format!("{}/thumbs.txt", self.repo_url);
+        let url = format!("{repo_url}/thumbs.txt");
         let list = match self.http.get(&url).send().await {
             Ok(resp) => match resp.text().await {
                 Ok(body) => body
@@ -121,7 +161,7 @@ impl StudiosClient {
         // Cache even an empty result: a repo that 404s should not be re-hit on
         // every studio; a restart clears it.
         if let Ok(mut guard) = self.manifest.lock() {
-            *guard = Some(list.clone());
+            *guard = Some((repo_url.to_owned(), list.clone()));
         }
         list
     }
@@ -130,7 +170,11 @@ impl StudiosClient {
     /// the manager's) exercise matching without touching the network.
     #[cfg(test)]
     pub(crate) fn seed_manifest(&self, entries: Vec<String>) {
-        *self.manifest.lock().expect("manifest lock") = Some(entries);
+        let url = self
+            .configured_repo_url
+            .clone()
+            .unwrap_or_else(|| DEFAULT_REPO_URL.to_owned());
+        *self.manifest.lock().expect("manifest lock") = Some((url, entries));
     }
 
     /// Downloads `url`, returning its bytes; `None` on any failure
@@ -150,11 +194,12 @@ impl StudiosClient {
         if target.is_empty() {
             return None;
         }
-        let manifest = self.manifest().await;
+        let repo_url = self.repo_url().await;
+        let manifest = self.manifest(&repo_url).await;
         let matched = manifest
             .into_iter()
             .find(|entry| Self::comparable_name(entry).eq_ignore_ascii_case(&target))?;
-        Some(format!("{}/images/{matched}/thumb.jpg", self.repo_url))
+        Some(format!("{repo_url}/images/{matched}/thumb.jpg"))
     }
 }
 
@@ -181,12 +226,47 @@ mod tests {
         assert_eq!(StudiosClient::comparable_name("A-B"), "A-B");
     }
 
-    #[test]
-    fn with_repo_url_trims_and_falls_back() {
+    #[tokio::test]
+    async fn with_repo_url_trims_and_falls_back() {
         let c = StudiosClient::with_repo_url("https://example.test/studios/");
-        assert_eq!(c.repo_url, "https://example.test/studios");
+        assert_eq!(c.repo_url().await, "https://example.test/studios");
+        // No operator override and no attached plugin manager → the C# default.
         let c = StudiosClient::with_repo_url("");
-        assert_eq!(c.repo_url, DEFAULT_REPO_URL);
+        assert!(c.configured_repo_url.is_none());
+        assert_eq!(c.repo_url().await, DEFAULT_REPO_URL);
+    }
+
+    /// The dashboard's `RepositoryUrl` governs when the operator set no
+    /// override, and the manifest cache is re-keyed when it changes — a cache
+    /// that ignored the URL would answer the new repo with the old repo's names.
+    #[tokio::test]
+    async fn the_dashboard_repository_url_is_live_and_rekeys_the_cache() {
+        let plugins = crate::plugin_config::tests_support::manager_with(
+            crate::builtin_plugins::STUDIO_IMAGES.id,
+            br#"{"RepositoryUrl":"https://example.test/art/"}"#.to_vec(),
+        );
+        let client = StudiosClient::with_repo_url("");
+        client.attach_plugin_manager(plugins);
+        assert_eq!(client.repo_url().await, "https://example.test/art");
+
+        // Seed the cache against the OLD repo; the new URL must not read it.
+        *client.manifest.lock().unwrap() =
+            Some((DEFAULT_REPO_URL.to_owned(), vec!["Netflix".to_owned()]));
+        // The lookup goes to the configured repo, whose manifest is unreachable
+        // (example.test does not resolve), so no stale match leaks through.
+        assert!(client.thumb_url("Netflix").await.is_none());
+    }
+
+    /// An operator's explicit override still wins over the dashboard.
+    #[tokio::test]
+    async fn the_operator_override_beats_the_dashboard() {
+        let plugins = crate::plugin_config::tests_support::manager_with(
+            crate::builtin_plugins::STUDIO_IMAGES.id,
+            br#"{"RepositoryUrl":"https://dashboard.test/art"}"#.to_vec(),
+        );
+        let client = StudiosClient::with_repo_url("https://operator.test/art");
+        client.attach_plugin_manager(plugins);
+        assert_eq!(client.repo_url().await, "https://operator.test/art");
     }
 
     /// The thumb URL is built from the *manifest entry's* casing (not the item's),
@@ -195,7 +275,7 @@ mod tests {
     #[tokio::test]
     async fn thumb_url_matches_case_and_punctuation_insensitively() {
         let client = StudiosClient::new();
-        *client.manifest.lock().unwrap() = Some(vec![
+        client.seed_manifest(vec![
             "Walt Disney Pictures".to_owned(),
             "Netflix".to_owned(),
         ]);
@@ -217,7 +297,7 @@ mod tests {
     #[tokio::test]
     async fn empty_manifest_is_cached_and_yields_no_image() {
         let client = StudiosClient::new();
-        *client.manifest.lock().unwrap() = Some(Vec::new());
+        client.seed_manifest(Vec::new());
         assert!(client.thumb_url("Netflix").await.is_none());
     }
 
@@ -229,15 +309,23 @@ mod tests {
         // Port 1 refuses immediately; no network egress.
         let client = StudiosClient::with_repo_url("http://127.0.0.1:1/studios");
         assert!(client.thumb_url("Netflix").await.is_none());
-        assert_eq!(client.manifest.lock().unwrap().as_deref(), Some(&[][..]));
+        assert_eq!(
+            client
+                .manifest
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|(u, l)| (u.as_str(), l.len())),
+            Some(("http://127.0.0.1:1/studios", 0))
+        );
         // Cached empty → second call still None (and would not re-fetch).
         assert!(client.thumb_url("Netflix").await.is_none());
     }
 
-    #[test]
-    fn default_and_debug_are_wired() {
+    #[tokio::test]
+    async fn default_and_debug_are_wired() {
         let client = StudiosClient::default();
-        assert_eq!(client.repo_url, DEFAULT_REPO_URL);
+        assert_eq!(client.repo_url().await, DEFAULT_REPO_URL);
         let rendered = format!("{client:?}");
         assert!(rendered.contains("StudiosClient"));
         assert!(rendered.contains("manifest_cached"));

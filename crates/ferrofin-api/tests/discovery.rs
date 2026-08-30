@@ -793,7 +793,13 @@ async fn similar_items_treats_a_nil_seed_as_the_root_folder() {
 async fn user_scoped_suggestions_alias_forwards() {
     // The legacy `/Users/{userId}/Suggestions` form (hidden from OpenAPI
     // upstream, still served) folds the path user into the query and forwards.
-    let user = uuid::Uuid::from_u128(0x11);
+    //
+    // The id is the CALLER'S own: naming a different user is an administrator
+    // action (`RequestHelpers.GetUserId`), and this test is about the fold, not
+    // about the role gate — `suggestions_alias_forbids_another_users_id` below
+    // owns that. It used to pass `0x11`, an id the stub resolves to no account,
+    // which only worked because the resolver silently degraded to "no user".
+    let user = USER_ID;
     let (status, body) = get(&format!("/Users/{user}/Suggestions?type=Movie")).await;
     assert_eq!(status, StatusCode::OK);
     let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).expect("suggestions");
@@ -803,4 +809,32 @@ async fn user_scoped_suggestions_alias_forwards() {
         get(&format!("/Items/Suggestions?userId={user}&type=Movie")).await;
     assert_eq!(modern_status, StatusCode::OK);
     assert_eq!(body, modern_body);
+}
+
+/// A non-administrator naming ANOTHER user's id is `403`, on both the alias and
+/// the modern form.
+///
+/// Port of C# `RequestHelpers.GetUserId` (v10.11.8 `RequestHelpers.cs:77-82`):
+/// `if (!userId.Value.Equals(authenticatedUserId) && !isAdministrator) throw new
+/// SecurityException("Forbidden")`, which `ExceptionMiddleware` (`:129`) maps to
+/// `403`. Measured on the lane-3 lab pair with a freshly created non-admin
+/// account: Jellyfin answered `403` to `/Items?userId={admin}`,
+/// `/Users/{admin}/Items` and `/Items/Suggestions?userId={admin}` while Ferrofin
+/// answered `200` with the other account's data — a cross-user read, not a
+/// cosmetic divergence.
+///
+/// The stub caller is `USER_ID` with a `UserDto` carrying no `Policy`, i.e. not
+/// an administrator, so this exercises the refusing branch.
+#[tokio::test]
+async fn suggestions_alias_forbids_another_users_id() {
+    let other = uuid::Uuid::from_u128(0x11);
+    let (status, _) = get(&format!("/Users/{other}/Suggestions?type=Movie")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = get(&format!("/Items/Suggestions?userId={other}&type=Movie")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    // The all-zero id is "not provided", NOT "user 00000000-…", so it is the
+    // caller's own request and must still succeed.
+    let nil = uuid::Uuid::nil();
+    let (status, _) = get(&format!("/Items/Suggestions?userId={nil}&type=Movie")).await;
+    assert_eq!(status, StatusCode::OK);
 }

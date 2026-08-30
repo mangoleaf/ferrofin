@@ -575,9 +575,23 @@ pub trait LibraryManager: Send + Sync {
         let mut years = self.get_distinct_years(query).await?;
         years.retain(|y| *y > 0);
         // `.Distinct()` upstream; sorting first is what makes `dedup` total.
-        // This ascending order is also the list's resting order, because C#
-        // `GetOrderBy` returns an empty array for an absent `sortBy` and
-        // `LibraryManager.Sort` is then a no-op.
+        //
+        // Ascending is Ferrofin's RESTING order (no `sortBy`), and it is a
+        // KNOWN DIVERGENCE, not parity — do not read the C# no-op as agreement.
+        // Upstream's `GetAllItems` is
+        // `items.Select(i => i.ProductionYear ?? 0).Where(i => i > 0).Distinct()`
+        // (v10.11.8 YearsController.cs:220-227): LINQ `Distinct()` preserves
+        // FIRST-OCCURRENCE order, so the resting order is the order years first
+        // appear in `Folder.GetRecursiveChildren` — the in-memory folder walk.
+        // `GetOrderBy` returning `Array.Empty` for an absent `sortBy` (and
+        // `LibraryManager.Sort` then doing nothing) is what LEAVES that
+        // enumeration order in place; it does not produce a sorted list.
+        // Reproducing it would mean reproducing Jellyfin's BaseItem tree walk,
+        // which Ferrofin does not have (see "There is no domain-object
+        // hierarchy" in CLAUDE.md), so a deterministic ascending order is the
+        // chosen behaviour and the divergence is recorded on the `GET /Years`
+        // row of `suite/parity/classifications.json`. Every probe leg pins
+        // `sortBy=SortName`, where the two agree exactly, including under paging.
         years.sort_unstable();
         years.dedup();
         sort_years(&mut years, &query.order_by);

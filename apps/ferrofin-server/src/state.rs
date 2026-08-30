@@ -1067,6 +1067,19 @@ pub async fn build_app_state(
         )
         .with_download_cap_mb(config.max_plugin_download_mb),
     );
+    // Jellyfin's five in-tree provider plugins read their settings through
+    // `Plugin.Instance.Configuration` at call time, so an admin's save on a
+    // settings page takes effect on the next lookup with no restart. The
+    // metadata clients are built far above this line (they are leaves with no
+    // manager dependencies), so the manager is handed to them here instead of
+    // through their constructors — each holds a `ConfigSource` that is unbound,
+    // and therefore serves the C# defaults, until this runs.
+    tmdb_client.attach_plugin_manager(Arc::clone(&plugins));
+    omdb_client.attach_plugin_manager(Arc::clone(&plugins));
+    musicbrainz_client.attach_plugin_manager(Arc::clone(&plugins));
+    audiodb_client.attach_plugin_manager(Arc::clone(&plugins));
+    studios_client.attach_plugin_manager(Arc::clone(&plugins));
+
     let subtitle_providers: Vec<Arc<dyn ferrofin_traits::subtitles::SubtitleProvider>> =
         vec![Arc::new(ferrofin_providers::OpenSubtitlesProvider::new(
             Arc::clone(&plugins),

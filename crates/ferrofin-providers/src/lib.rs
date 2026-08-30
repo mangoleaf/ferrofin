@@ -29,6 +29,7 @@ pub mod omdb;
 #[cfg(feature = "opensubtitles")]
 pub mod opensubtitles;
 pub mod playlist_file;
+pub mod plugin_config;
 pub mod provider_manager;
 pub mod similarity;
 pub mod studios;

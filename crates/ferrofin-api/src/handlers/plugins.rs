@@ -33,7 +33,7 @@ use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
-use ferrofin_model::plugins::{PluginInfo, PluginStatus};
+use ferrofin_model::plugins::{PluginInfo, PluginManifest, PluginStatus};
 use ferrofin_model::updates::{PackageInfo, RepositoryInfo};
 use ferrofin_traits::plugins::PluginDescriptor;
 use uuid::Uuid;
@@ -70,6 +70,63 @@ async fn require_admin(
     ))
 }
 
+/// Parses a .NET `Version` into its four components, `-1` for any the string
+/// omitted — the shape `System.Version` itself holds.
+///
+/// Every versioned plugin route binds `[FromRoute, Required] Version version`,
+/// so the framework parses before the action runs: a string that is not a
+/// `Version` is a model-binding failure (`400`), never a lookup miss. `Version`
+/// accepts **two to four** dot-separated non-negative `Int32`s, so `"10"` and
+/// `"notaversion"` both fail here exactly as they do upstream.
+fn parse_dotnet_version(raw: &str) -> Option<[i64; 4]> {
+    let parts: Vec<&str> = raw.split('.').collect();
+    if !(2..=4).contains(&parts.len()) {
+        return None;
+    }
+    let mut out = [-1i64; 4];
+    for (slot, part) in out.iter_mut().zip(parts) {
+        let value: i64 = part.parse().ok()?;
+        if value < 0 || value > i64::from(i32::MAX) {
+            return None;
+        }
+        *slot = value;
+    }
+    Some(out)
+}
+
+/// Resolves the plugin a versioned route addresses, porting
+/// `IPluginManager.GetPlugin(id, version)`.
+///
+/// `GetPlugin` with a version is
+/// `_plugins.FirstOrDefault(p => p.Id.Equals(id) && p.Version.Equals(version))`
+/// (v10.11.8 `PluginManager.cs:300-310`), and `Version.Equals` compares **all
+/// four** components — so `10.11.8` does not match an installed `10.11.8.0`.
+/// Ferrofin ignored the path version entirely, which made every versioned route
+/// succeed for any version a client cared to send. Measured on the lane-3 lab
+/// pair against Jellyfin 10.11.8, `DELETE /Plugins/{omdb}/{version}`:
+/// `10.11.8.0` -> 204 on both; `9.9.9.9` -> J 404 / F 204; `10.11.8` -> J 404 /
+/// F 204; `notaversion` -> J 400 / F 204.
+async fn plugin_at_version(
+    state: &AppState,
+    plugin_id: Uuid,
+    version: &str,
+) -> Result<PluginDescriptor, ApiError> {
+    let requested = parse_dotnet_version(version)
+        .ok_or_else(|| ApiError::BadRequest(format!("{version} is not a version")))?;
+    let not_found = || ApiError::NotFound(format!("plugin {plugin_id} {version}"));
+    let descriptor = state
+        .plugins
+        .get_plugin(plugin_id)
+        .await?
+        .ok_or_else(not_found)?;
+    // A stored version that is not a `Version` can never equal one, so it is a
+    // miss rather than a server error — the same answer upstream gives.
+    if parse_dotnet_version(&descriptor.version) != Some(requested) {
+        return Err(not_found());
+    }
+    Ok(descriptor)
+}
+
 /// Projects a manager [`PluginDescriptor`] into the `PluginInfo` wire DTO.
 ///
 /// The `enabled` flag becomes `Active`/`Disabled` (the only two states a
@@ -103,7 +160,13 @@ async fn get_plugins(
     State(state): State<AppState>,
     RequireAuth(_auth): RequireAuth,
 ) -> Result<Json<Vec<PluginInfo>>, ApiError> {
-    let plugins = state.plugins.list_plugins().await?;
+    let mut plugins = state.plugins.list_plugins().await?;
+    // `PluginsController.GetPlugins` is `_pluginManager.Plugins.OrderBy(p => p.Name)`
+    // (v10.11.8 PluginsController.cs:55-57). Registration order is not the wire
+    // order: a stock Jellyfin answers AudioDB, MusicBrainz, OMDb, Studio Images,
+    // TMDb for the same five plugins Ferrofin registers TMDb-first, and the
+    // dashboard renders the list in the order it arrives.
+    plugins.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(Json(plugins.into_iter().map(to_plugin_info).collect()))
 }
 
@@ -177,9 +240,10 @@ async fn update_plugin_configuration(
 async fn enable_plugin(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path((plugin_id, _version)): Path<(Uuid, String)>,
+    Path((plugin_id, version)): Path<(Uuid, String)>,
 ) -> Result<StatusCode, ApiError> {
     require_admin(&state, &auth).await?;
+    plugin_at_version(&state, plugin_id, &version).await?;
     state.plugins.enable_plugin(plugin_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -201,23 +265,30 @@ async fn enable_plugin(
 async fn disable_plugin(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path((plugin_id, _version)): Path<(Uuid, String)>,
+    Path((plugin_id, version)): Path<(Uuid, String)>,
 ) -> Result<StatusCode, ApiError> {
     require_admin(&state, &auth).await?;
+    plugin_at_version(&state, plugin_id, &version).await?;
     state.plugins.disable_plugin(plugin_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 /// `DELETE /Plugins/{pluginId}` — uninstall a plugin.
 ///
-/// Compiled-in plugins cannot be removed at runtime, so a known plugin yields
-/// `400` (and an unknown one `404`) — never a faked success.
+/// A staged WASM plugin is really removed. A plugin that reports
+/// `CanUninstall: false` — Jellyfin's five in-tree metadata providers — is
+/// ignored with a warning and answered `204`, which is what upstream's
+/// `InstallationManager.UninstallPlugin` + `PluginsController` do. A
+/// compiled-in extension (which reports `CanUninstall: true` only to surface
+/// jellyfin-web's toggle) yields `400`, and an unknown id `404` — never a faked
+/// success.
 #[utoipa::path(
     delete,
     path = "/Plugins/{pluginId}",
     params(("pluginId" = String, Path, description = "Plugin id")),
     responses(
-        (status = 400, description = "Compiled-in plugin cannot be uninstalled"),
+        (status = 204, description = "Plugin uninstalled, or non-removable and ignored"),
+        (status = 400, description = "Compiled-in extension cannot be uninstalled"),
         (status = 404, description = "Plugin not found")
     ),
     tag = "ferrofin"
@@ -241,7 +312,8 @@ async fn uninstall_plugin(
         ("version" = String, Path, description = "Plugin version")
     ),
     responses(
-        (status = 400, description = "Compiled-in plugin cannot be uninstalled"),
+        (status = 204, description = "Plugin uninstalled, or non-removable and ignored"),
+        (status = 400, description = "Compiled-in extension cannot be uninstalled"),
         (status = 404, description = "Plugin not found")
     ),
     tag = "ferrofin"
@@ -249,9 +321,16 @@ async fn uninstall_plugin(
 async fn uninstall_plugin_by_version(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path((plugin_id, _version)): Path<(Uuid, String)>,
+    Path((plugin_id, version)): Path<(Uuid, String)>,
 ) -> Result<StatusCode, ApiError> {
     require_admin(&state, &auth).await?;
+    // A staged WASM plugin is removable before it is in the registry (the
+    // artifact exists, the descriptor does not), so a registry miss here still
+    // falls through to `remove_plugin`, which looks for the file first. The
+    // version gate only applies to a plugin the registry KNOWS.
+    if state.plugins.get_plugin(plugin_id).await?.is_some() {
+        plugin_at_version(&state, plugin_id, &version).await?;
+    }
     state.plugins.remove_plugin(plugin_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -272,8 +351,9 @@ async fn uninstall_plugin_by_version(
 )]
 async fn get_plugin_image(
     State(state): State<AppState>,
-    Path((plugin_id, _version)): Path<(Uuid, String)>,
+    Path((plugin_id, version)): Path<(Uuid, String)>,
 ) -> Result<Response, ApiError> {
+    plugin_at_version(&state, plugin_id, &version).await?;
     match state.plugins.plugin_image(plugin_id).await? {
         Some(image) => {
             Ok(([(header::CONTENT_TYPE, image.content_type)], image.data).into_response())
@@ -300,19 +380,27 @@ async fn get_plugin_manifest(
     State(state): State<AppState>,
     RequireAuth(_auth): RequireAuth,
     Path(plugin_id): Path<Uuid>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> Result<Json<PluginManifest>, ApiError> {
     let Some(d) = state.plugins.get_plugin(plugin_id).await? else {
         return Err(ApiError::NotFound(format!("plugin {plugin_id}")));
     };
-    // The vendored contract does not pin a manifest schema; project the fields the
-    // descriptor carries (a faithful read for a compiled-in plugin).
-    Ok(Json(serde_json::json!({
-        "Id": d.id,
-        "Name": d.name,
-        "Version": d.version,
-        "Description": d.description,
-        "Status": if d.enabled { "Active" } else { "Disabled" },
-    })))
+    // `PluginManifest` is the wire type upstream returns here, and it is the one
+    // DTO in the API that is camelCase (every property carries an explicit
+    // `[JsonPropertyName]`), with `Id` spelled `guid`. See
+    // [`PluginManifest::manifestless`] for why the descriptive fields are empty:
+    // a plugin with no `meta.json` on disk gets a dummy record carrying only
+    // id/name/version/status, which is exactly Ferrofin's situation for every
+    // plugin it has.
+    Ok(Json(PluginManifest::manifestless(
+        d.id,
+        d.name,
+        d.version,
+        if d.enabled {
+            PluginStatus::Active
+        } else {
+            PluginStatus::Disabled
+        },
+    )))
 }
 
 /// `GET /Repositories` — the configured package repositories.

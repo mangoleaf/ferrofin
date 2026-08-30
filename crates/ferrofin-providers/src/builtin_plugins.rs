@@ -22,23 +22,55 @@
 //! root turns each [`BuiltinPlugin`] into a `ferrofin_core::RegisteredPlugin`,
 //! because `RegisteredPlugin` lives above this crate in the dependency graph.
 //!
-//! **Open work item — the configurations are stored and served but not yet
-//! read.** `POST /Plugins/{id}/Configuration` persists them and the pages
-//! render them, but the provider clients (`TmdbClient`, `OmdbClient`,
-//! `MusicBrainzClient`, `AudioDbClient`, `StudiosClient`) are constructed in
-//! `apps/ferrofin-server/src/state.rs` *before* the plugin manager exists, so
-//! none of them holds a [`PluginManager`] to read through the way
-//! [`OpenSubtitlesProvider`] does. Un-defer path: move the
-//! `registered_plugins`/`FerrofinPluginManager`/`wasm_host` block above the
-//! metadata-client block in `state.rs`, inject `Arc<dyn PluginManager>` into
-//! the five clients, and read each setting at call time —
-//! `IncludeAdult`/`MaxCastMembers`/`MaxCrewMembers`/`Hide*`/`ExcludeTags*`/
-//! `ImportSeasonName` and the five image sizes for TMDb, `CastAndCrew` for
-//! OMDb, `Server`/`RateLimit`/`ReplaceArtistName` for MusicBrainz,
-//! `ReplaceAlbumName` for AudioDB, `RepositoryUrl` for Studio Images. Until
-//! then the server-config equivalents Ferrofin already has
-//! (`musicbrainz_base_url`, `omdb_api_key`, the studios repo URL) remain the
-//! effective knobs.
+//! **The configurations are live.** The composition root
+//! (`apps/ferrofin-server/src/state.rs`) hands the plugin manager to
+//! `TmdbClient`, `OmdbClient`, `MusicBrainzClient`, `AudioDbClient` and
+//! `StudiosClient` through [`ConfigSource`](crate::plugin_config::ConfigSource), and each reads its
+//! settings at call time the way `Plugin.Instance.Configuration` is read
+//! upstream — an admin's save on a settings page changes the next lookup, with
+//! no restart. Wired settings, with the C# read site each was ported from:
+//!
+//! | plugin | setting | effect |
+//! |---|---|---|
+//! | TMDb | `TmdbApiKey` | replaces the built-in project key (`TmdbClientManager.cs:40`) |
+//! | TMDb | `IncludeAdult` | `include_adult` on every search (`:396,424,467`) |
+//! | TMDb | `MaxCastMembers` / `HideMissingCastMembers` | cast cap + profile-less filter (`TmdbMovieProvider.cs:258`, `TmdbSeriesProvider.cs:329`, `TmdbEpisodeProvider.cs:212`) |
+//! | TMDb | `MaxCrewMembers` / `HideMissingCrewMembers` | crew cap + filter, after the wanted-kind filter (`TmdbMovieProvider.cs:300`) |
+//! | TMDb | `PosterSize`/`BackdropSize`/`LogoSize`/`ProfileSize`/`StillSize` | the CDN size segment, `original` when unset (`TmdbClientManager.cs:514-590`) |
+//! | OMDb | `CastAndCrew` | whether OMDb's director/writer/actors are imported (`OmdbProvider.cs:417`) |
+//! | MusicBrainz | `Server` | the web-service base URL (`MusicBrainzArtistProvider.ReloadConfig`) |
+//! | MusicBrainz | `RateLimit` | seconds between requests (same) |
+//! | MusicBrainz | `ReplaceArtistName` | rename a searched artist to MusicBrainz's spelling (`:146`) |
+//! | AudioDB | `ReplaceAlbumName` | rename an album to `strAlbum` (`AudioDbAlbumProvider.cs:90`) |
+//! | Studio Images | `RepositoryUrl` | the artwork repository (`StudiosImageProvider.cs:190`) |
+//!
+//! For `Server`, `RepositoryUrl` and the OMDb key, an operator who set the
+//! pre-existing server config (`FERROFIN_MUSICBRAINZ_BASE_URL`,
+//! `FERROFIN_STUDIOS_REPO_URL`, `FERROFIN_OMDB_KEY`) still wins over the
+//! dashboard — an explicit env/file setting is the more specific instruction,
+//! and those knobs shipped before these plugins had an identity.
+//!
+//! **Two TMDb settings remain OPEN WORK, because the behaviour they gate has
+//! never been ported at all** — they are not "accepted", and reading the config
+//! for them would be a switch wired to nothing:
+//!
+//! - `ExcludeTagsMovies` / `ExcludeTagsSeries` gate whether `keywords` joins the
+//!   `append_to_response` (`TmdbClientManager.cs:68,142`) so that
+//!   `movieResult.Keywords.Keywords` become the item's Tags
+//!   (`TmdbMovieProvider.cs:250-257`). Ferrofin never requests `keywords` and
+//!   never writes TMDB tags, so it behaves as if both flags were permanently
+//!   ON. Un-defer path: add `keywords` to the `details()` append when the flag
+//!   is clear, parse `keywords.keywords[].name` (movies) /
+//!   `keywords.results[].name` (TV) onto `TmdbDetails::tags`, and merge it in
+//!   `apply_details` next to `studios`, which already has the
+//!   `merge_multi_value` shape.
+//! - `ImportSeasonName` overwrites a season's name with TMDB's
+//!   (`TmdbSeasonProvider.cs:73-76`). Ferrofin always names a season
+//!   `Season {n}` (`library_scan.rs`, `season_display_name`), so there is
+//!   nothing for the flag to switch. Un-defer path: give the season metadata
+//!   pass the cached `SeasonDetails::name` (already fetched for the poster) and
+//!   apply it under the flag, with the same "only when it differs" guard the
+//!   AudioDB rename uses.
 //!
 //! [`PluginManager`]: ferrofin_traits::plugins::PluginManager
 //! [`OpenSubtitlesProvider`]: crate::opensubtitles::OpenSubtitlesProvider

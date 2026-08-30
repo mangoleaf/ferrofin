@@ -34,27 +34,60 @@ use crate::error::ApiError;
 use crate::handlers::query_parse::{parse_csv_enums_lenient, parse_csv_uuids, parse_pipe_strings};
 use crate::state::AppState;
 
+/// The effective user id for a request, porting C#
+/// `RequestHelpers.GetUserId` (v10.11.8 `Jellyfin.Api/Helpers/RequestHelpers.cs`
+/// lines 67-85) in both of its halves:
+///
+/// 1. An absent **or all-zero** `user_id` is "not provided" — upstream tests
+///    `userId.IsNullOrEmpty()` and `Guid.Empty` is empty — so it falls back to
+///    the authenticated caller. Rejecting a nil made
+///    `?userId=00000000-0000-0000-0000-000000000000` a `400` here against a
+///    `200` upstream, a shape jellyfin-web sends whenever it has no user id in
+///    hand yet.
+/// 2. Naming **another** user's id requires the administrator role: upstream
+///    throws `SecurityException("Forbidden")`, which `ExceptionMiddleware`
+///    (`:129`) maps to `403`. Without it any authenticated account could read
+///    another account's user-scoped data by passing its guid.
+///
+/// The role lookup only runs when the caller actually named a different user
+/// (jellyfin-web always sends its own id), so the common path adds no work. An
+/// API-key caller is elevated upstream and is elevated here.
+async fn effective_user_id(
+    state: &AppState,
+    auth: &AuthorizationInfo,
+    user_id: Option<Uuid>,
+) -> Result<Uuid, ApiError> {
+    let authenticated = auth.user_id();
+    let Some(requested) = user_id.filter(|id| !id.is_nil()) else {
+        return Ok(authenticated);
+    };
+    if requested == authenticated || auth.is_api_key {
+        return Ok(requested);
+    }
+    let elevated = match &auth.user {
+        Some(user) => super::users::is_administrator(state, user).await?,
+        None => false,
+    };
+    if elevated {
+        Ok(requested)
+    } else {
+        Err(ApiError::Forbidden("Forbidden".to_owned()))
+    }
+}
+
 /// Resolves the effective user for a request: the explicit `user_id` query
 /// parameter when present, otherwise the authenticated caller.
 ///
-/// Mirrors Jellyfin's `RequestHelpers.GetUserId`. A `user_id` that resolves to
-/// no account is a `400`; a caller with neither an explicit id nor an
-/// authenticated user is likewise rejected.
-///
-/// An **all-zero** `user_id` is "not provided", not "user 00000000-…": C#
-/// `RequestHelpers.GetUserId` tests `userId.IsNullOrEmpty()`, and
-/// `Guid.Empty` is empty, so an explicit nil falls back to the authenticated
-/// caller. Rejecting it made `?userId=00000000-0000-0000-0000-000000000000`
-/// a `400` here against a `200` upstream — a shape jellyfin-web sends whenever
-/// it has no user id in hand yet.
+/// The id itself comes from [`effective_user_id`] (the full
+/// `RequestHelpers.GetUserId` port, nil-fallback *and* the administrator gate).
+/// A `user_id` that resolves to no account is a `400`; a caller with neither an
+/// explicit id nor an authenticated user is likewise rejected.
 pub(crate) async fn resolve_user(
     state: &AppState,
     auth: &AuthorizationInfo,
     user_id: Option<Uuid>,
 ) -> Result<UserEntity, ApiError> {
-    let effective = user_id
-        .filter(|id| !id.is_nil())
-        .unwrap_or_else(|| auth.user_id());
+    let effective = effective_user_id(state, auth, user_id).await?;
     if effective.is_nil() {
         return Err(ApiError::BadRequest("no user for request".to_owned()));
     }
@@ -92,14 +125,21 @@ pub(crate) fn user_uuid(user: &UserEntity) -> Result<Uuid, ApiError> {
 /// Resolves the effective user *optionally*: like [`resolve_user`] but a nil
 /// effective id yields [`None`] rather than a `400`.
 ///
-/// Mirrors the controllers (counts/ancestors/delete) that accept an API-key
-/// caller with no user — Jellyfin's `userId.IsNullOrEmpty() ? null : GetUserById`.
+/// Mirrors the controllers (counts/ancestors/delete/instant-mix) that accept an
+/// API-key caller with no user — C# runs `RequestHelpers.GetUserId` FIRST and
+/// only then `userId.IsNullOrEmpty() ? null : GetUserById(...)`
+/// (`InstantMixController.cs:82-85`), so the same nil-falls-back-to-caller rule
+/// applies here and `None` is reached only when there is genuinely no user at
+/// all. Resolving the id through [`effective_user_id`] instead of
+/// `user_id.unwrap_or(caller)` is load-bearing: an explicit all-zero `userId`
+/// used to yield `None` on this path and strip `UserData` off every DTO the
+/// instant-mix routes returned, against a fully populated `UserData` upstream.
 pub(crate) async fn resolve_user_opt(
     state: &AppState,
     auth: &AuthorizationInfo,
     user_id: Option<Uuid>,
 ) -> Result<Option<UserEntity>, ApiError> {
-    let effective = user_id.unwrap_or_else(|| auth.user_id());
+    let effective = effective_user_id(state, auth, user_id).await?;
     if effective.is_nil() {
         return Ok(None);
     }

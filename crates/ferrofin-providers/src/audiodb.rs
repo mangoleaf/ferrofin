@@ -31,6 +31,12 @@ pub struct AudioDbArtist {
 /// Mapped album metadata + artwork.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct AudioDbAlbum {
+    /// The album title AudioDB has (`strAlbum`), present **only** when the
+    /// plugin's `ReplaceAlbumName` setting is on. C#
+    /// `AudioDbAlbumProvider.cs:90` overwrites `item.Name` with it under
+    /// exactly that condition, so a `None` here means "leave the scanned name
+    /// alone", not "AudioDB had no title".
+    pub name: Option<String>,
     /// The album description (English), if any.
     pub description: Option<String>,
     /// Release year, if any.
@@ -75,6 +81,8 @@ struct AlbumResult {
 
 #[derive(Debug, Deserialize)]
 struct AlbumWire {
+    #[serde(rename = "strAlbum")]
+    name: Option<String>,
     #[serde(rename = "strDescriptionEN")]
     description: Option<String>,
     #[serde(rename = "intYearReleased")]
@@ -88,10 +96,12 @@ struct AlbumWire {
 }
 
 /// A TheAudioDb client. Cheap to clone (wraps a [`reqwest::Client`]).
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct AudioDbClient {
     http: reqwest::Client,
     base_url: String,
+    /// The AudioDB plugin's dashboard settings (`ReplaceAlbumName`).
+    plugin: crate::plugin_config::ConfigSource,
 }
 
 impl Default for AudioDbClient {
@@ -107,7 +117,17 @@ impl AudioDbClient {
         Self {
             http: reqwest::Client::new(),
             base_url: API_BASE.to_owned(),
+            plugin: crate::plugin_config::ConfigSource::new(),
         }
+    }
+
+    /// Binds the plugin manager, making the AudioDB settings page's
+    /// `ReplaceAlbumName` live. Called once by the composition root.
+    pub fn attach_plugin_manager(
+        &self,
+        plugins: std::sync::Arc<dyn ferrofin_traits::plugins::PluginManager>,
+    ) {
+        self.plugin.attach(plugins);
     }
 
     /// Points the client at `base_url` (a mock server) for tests.
@@ -116,6 +136,7 @@ impl AudioDbClient {
         Self {
             http: reqwest::Client::new(),
             base_url: base_url.to_owned(),
+            plugin: crate::plugin_config::ConfigSource::new(),
         }
     }
 
@@ -158,7 +179,19 @@ impl AudioDbClient {
         let mut images = Vec::new();
         push_image(&mut images, wire.thumb, ImageType::Primary);
         push_image(&mut images, wire.cd_art, ImageType::Disc);
+        // `if (Plugin.Instance.Configuration.ReplaceAlbumName &&
+        //     !string.IsNullOrWhiteSpace(result.strAlbum)) item.Name = result.strAlbum;`
+        // — off by default, and the blank guard is upstream's, not a
+        // convenience: AudioDB returns `""` for albums it has no title for and
+        // wiping a scanned album's name with it would be data loss.
+        let cfg: crate::plugin_config::AudioDbConfig =
+            self.plugin.load(crate::builtin_plugins::AUDIODB.id).await;
         Some(AudioDbAlbum {
+            name: if cfg.replace_album_name {
+                non_blank(wire.name)
+            } else {
+                None
+            },
             description: non_blank(wire.description),
             year: wire.year.as_deref().and_then(|y| y.trim().parse().ok()),
             genre: non_blank(wire.genre),

@@ -29,6 +29,9 @@ struct RecordingPlugins {
     repositories: Mutex<Vec<RepositoryInfo>>,
     /// Configs written by `set_plugin_configuration`, in order.
     configs_written: Mutex<Vec<(Uuid, Vec<u8>)>>,
+    /// Extra plugins `list_plugins` reports, in REGISTRATION order — the
+    /// ordering test needs a registry whose order is not already alphabetical.
+    extra: Mutex<Vec<PluginDescriptor>>,
 }
 
 impl RecordingPlugins {
@@ -53,7 +56,9 @@ impl RecordingPlugins {
 #[async_trait::async_trait]
 impl PluginManager for RecordingPlugins {
     async fn list_plugins(&self) -> Result<Vec<PluginDescriptor>, ServiceError> {
-        Ok(vec![Self::descriptor()])
+        let mut all = vec![Self::descriptor()];
+        all.extend(self.extra.lock().expect("extra lock").iter().cloned());
+        Ok(all)
     }
     async fn get_plugin(&self, id: Uuid) -> Result<Option<PluginDescriptor>, ServiceError> {
         Ok((id == known_id()).then(Self::descriptor))
@@ -235,6 +240,51 @@ async fn enable_and_disable() {
     assert_eq!(missing.status(), StatusCode::NOT_FOUND);
 }
 
+/// A versioned plugin route resolves through `GetPlugin(id, version)`, and
+/// `Version.Equals` compares all four components.
+///
+/// Measured on the lane-3 lab pair, `DELETE /Plugins/{omdb}/{version}` against
+/// Jellyfin 10.11.8: `10.11.8.0` -> 204, `9.9.9.9` -> 404, `10.11.8` -> 404
+/// (three components != four), `notaversion` -> 400 (the `[FromRoute] Version`
+/// model binder refuses before the action runs). Ferrofin ignored the path
+/// version entirely and answered every one of them identically.
+#[tokio::test]
+async fn versioned_routes_match_the_installed_version() {
+    // The stub's descriptor is version "1.2.3".
+    for (version, expect) in [
+        ("1.2.3", StatusCode::NO_CONTENT),
+        ("9.9.9.9", StatusCode::NOT_FOUND),
+        ("1.2.3.0", StatusCode::NOT_FOUND),
+        ("1.2", StatusCode::NOT_FOUND),
+        ("notaversion", StatusCode::BAD_REQUEST),
+        ("1", StatusCode::BAD_REQUEST),
+        ("-1.2.3", StatusCode::BAD_REQUEST),
+    ] {
+        let resp = router(Arc::new(RecordingPlugins::default()))
+            .oneshot(authed(
+                "POST",
+                &format!("/Plugins/{}/{version}/Enable", known_id()),
+                Body::empty(),
+            ))
+            .await
+            .expect("resp");
+        assert_eq!(resp.status(), expect, "Enable at {version}");
+    }
+    // The image route takes the same gate (`AllowAnonymous` upstream, so no
+    // auth header here) — a wrong version is a miss, not the plugin's image.
+    let resp = router(Arc::new(RecordingPlugins::default()))
+        .oneshot(
+            axum::http::Request::builder()
+                .method("GET")
+                .uri(format!("/Plugins/{}/9.9.9.9/Image", known_id()))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("resp");
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
 #[tokio::test]
 async fn uninstall_is_rejected_for_compiled_in() {
     let fake = Arc::new(RecordingPlugins::default());
@@ -309,7 +359,47 @@ async fn manifest_read() {
         .await
         .expect("resp");
     assert_eq!(ok.status(), StatusCode::OK);
-    assert!(body_string(ok).await.contains("\"Name\":\"Demo\""));
+    // `PluginManifest` is the one camelCase DTO on this surface — every C#
+    // property carries an explicit `[JsonPropertyName]`, and `Id` is spelled
+    // `guid`. A stock Jellyfin 10.11.8 answers this route for its five in-tree
+    // provider plugins with exactly these thirteen keys (measured on the
+    // lane-3 lab pair), so the shape, not just the name, is the assertion.
+    let body = body_string(ok).await;
+    let manifest: serde_json::Value = serde_json::from_str(&body).expect("manifest json");
+    let mut keys: Vec<&str> = manifest
+        .as_object()
+        .expect("object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        vec![
+            "assemblies",
+            "autoUpdate",
+            "category",
+            "changelog",
+            "description",
+            "guid",
+            "name",
+            "overview",
+            "owner",
+            "status",
+            "targetAbi",
+            "timestamp",
+            "version",
+        ],
+        "manifest must be the camelCase PluginManifest, not a PascalCase projection"
+    );
+    assert_eq!(manifest["name"], "Demo");
+    assert_eq!(manifest["guid"], known_id().simple().to_string());
+    assert_eq!(manifest["status"], "Active");
+    // The descriptive fields stay EMPTY: a plugin with no `meta.json` gets the
+    // dummy record `PluginManager.CreatePluginInstance` builds, which sets only
+    // id/name/version/status (`PluginManager.cs:560-575`).
+    assert_eq!(manifest["description"], "");
+    assert_eq!(manifest["autoUpdate"], true);
 
     let missing = router(fake)
         .oneshot(authed(
@@ -536,4 +626,50 @@ async fn plugin_route_strips_credentials_and_reserved_headers() {
         .await
         .expect("resp");
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// `GET /Plugins` is `_pluginManager.Plugins.OrderBy(p => p.Name)`
+/// (v10.11.8 `PluginsController.cs:55-57`) — the wire order is alphabetical, not
+/// registration order.
+///
+/// Measured on the lane-3 lab pair before the fix: Jellyfin returned AudioDB,
+/// MusicBrainz, OMDb, Studio Images, TMDb for its five in-tree provider plugins
+/// while Ferrofin returned them TMDb-first, in the order the composition root
+/// registers them.
+#[tokio::test]
+async fn plugins_are_listed_by_name() {
+    let fake = Arc::new(RecordingPlugins::default());
+    for (n, name) in ["Zulu", "alpha", "Studio Images", "AudioDB"]
+        .iter()
+        .enumerate()
+    {
+        fake.extra
+            .lock()
+            .expect("extra lock")
+            .push(PluginDescriptor {
+                id: Uuid::from_u128(100 + n as u128),
+                name: (*name).to_owned(),
+                ..RecordingPlugins::descriptor()
+            });
+    }
+    let resp = router(fake)
+        .oneshot(authed("GET", "/Plugins", Body::empty()))
+        .await
+        .expect("resp");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_str(&body_string(resp).await).expect("plugins json");
+    let names: Vec<&str> = body
+        .as_array()
+        .expect("array")
+        .iter()
+        .map(|p| p["Name"].as_str().expect("name"))
+        .collect();
+    // `Ord` on `String` is bytewise, which puts every capitalised name before a
+    // lowercase one — the same order .NET's default string comparer produces
+    // for this set, and the same order the live Jellyfin returned.
+    assert_eq!(
+        names,
+        vec!["AudioDB", "Demo", "Studio Images", "Zulu", "alpha"]
+    );
 }

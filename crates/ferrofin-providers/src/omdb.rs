@@ -36,8 +36,8 @@ const ROTTEN_TOMATOES: &str = "Rotten Tomatoes";
 /// The sentinel OMDb returns for a field it has no value for.
 const NOT_AVAILABLE: &str = "N/A";
 
-/// An OMDb client. Cheap to clone (wraps a [`reqwest::Client`]).
-#[derive(Debug, Clone)]
+/// An OMDb client. Held behind an `Arc` at the call site.
+#[derive(Debug)]
 pub struct OmdbClient {
     http: reqwest::Client,
     api_key: SecretString,
@@ -51,9 +51,32 @@ pub struct OmdbClient {
     /// same season within a single scan. Same TTL, same effect on a scan; a
     /// restart re-fetches where Jellyfin would not.
     seasons: SeasonCache,
+    /// The OMDb plugin's dashboard settings (`CastAndCrew`).
+    plugin: crate::plugin_config::ConfigSource,
 }
 
 impl OmdbClient {
+    /// Binds the plugin manager, making the OMDb settings page's `CastAndCrew`
+    /// live. Called once by the composition root.
+    pub fn attach_plugin_manager(
+        &self,
+        plugins: std::sync::Arc<dyn ferrofin_traits::plugins::PluginManager>,
+    ) {
+        self.plugin.attach(plugins);
+    }
+
+    /// Whether OMDb's director/writer/actor credits are imported.
+    ///
+    /// `OmdbProvider.ParseAdditionalMetadata` returns before adding any person
+    /// when `Plugin.Instance.Configuration.CastAndCrew` is false
+    /// (v10.11.8 `OmdbProvider.cs:417`), and that `bool` has no initializer —
+    /// so the shipped default is OFF and only the settings page turns it on.
+    pub async fn cast_and_crew(&self) -> bool {
+        let cfg: crate::plugin_config::OmdbConfig =
+            self.plugin.load(crate::builtin_plugins::OMDB.id).await;
+        cfg.cast_and_crew
+    }
+
     /// Builds a client with the given API key. An empty (or whitespace) key
     /// leaves the client [disabled](Self::is_enabled).
     #[must_use]
@@ -63,6 +86,7 @@ impl OmdbClient {
             api_key: SecretString::from(api_key.trim()),
             base_url: API_BASE.to_owned(),
             seasons: Arc::default(),
+            plugin: crate::plugin_config::ConfigSource::new(),
         }
     }
 

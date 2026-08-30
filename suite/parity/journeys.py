@@ -109,6 +109,11 @@ JOURNEY_METHOD.update({op: verification.EFFECT for op in (
     "DELETE /LiveTv/Recordings/{recordingId}",
     "DELETE /LiveTv/Timers/{timerId}",
     "DELETE /PlayingItems/{itemId}",
+    # Not a body diff and not merely a status class: the write is issued and the
+    # EFFECT is read back on each server's own `/Plugins` — a non-removable
+    # plugin must still be installed after its 204.
+    "DELETE /Plugins/{pluginId}",
+    "DELETE /Plugins/{pluginId}/{version}",
     "DELETE /Playlists/{playlistId}/Items",
     "DELETE /Playlists/{playlistId}/Users/{userId}",
     "DELETE /Sessions/{sessionId}/User/{userId}",
@@ -333,10 +338,20 @@ def j_playlist_instant_mix(base, token, user, mid, _m2):
     (`if (item is T typedItem) return typedItem; return null;`), so a
     non-playlist id is a 404 upstream.
 
-    Two facts, both comparable across servers:
+    Three facts, all comparable across servers:
 
-    1. a genuine playlist of audio seeds a NON-EMPTY, all-`Audio` mix, and
-    2. a movie id on this route is a 404.
+    1. a movie id on this route is a 404;
+    2. the mix is all-`Audio` with a self-consistent `TotalRecordCount`;
+    3. the mix holds the WHOLE audio library — every track, not merely "some".
+
+    (3) is the assertion with teeth, and it is exact rather than "non-empty":
+    a `Playlist` has no `Genres`, so `GetInstantMixFromPlaylist` calls
+    `GetInstantMixFromGenres(item.Genres)` with an EMPTY list, `GenreIds` is
+    empty, and the query is left unfiltered — every audio item under the 200-row
+    cap comes back (v10.11.8 `InstantMixController.cs` +
+    `MusicManager.GetInstantMixFromGenreIds`). So the count is determined by the
+    fixture, and a server returning one arbitrary track — which "non-empty"
+    would have passed — fails.
 
     The ORDER of the mix is deliberately not asserted: C#
     `GetInstantMixFromGenreIds` sorts `(ItemSortBy.Random, Ascending)` and so
@@ -344,9 +359,11 @@ def j_playlist_instant_mix(base, token, user, mid, _m2):
     created and deleted inside the journey, symmetrically on both servers.
     """
     r = {}
-    tracks = [i["Id"] for i in (q(base, "/Items?includeItemTypes=Audio&recursive=true"
-                                        "&limit=3&sortBy=SortName", token, user) or {})
-              .get("Items") or []]
+    library = (q(base, "/Items?includeItemTypes=Audio&recursive=true"
+                       "&limit=1000&sortBy=SortName", token, user) or {}).get("Items") or []
+    # The whole audio library, capped where the C# caps the mix (`limit: 200`).
+    expected = min(len(library), 200)
+    tracks = [i["Id"] for i in library[:3]]
     if not tracks:
         r["GET /Playlists/{itemId}/InstantMix"] = False
         return r
@@ -359,7 +376,7 @@ def j_playlist_instant_mix(base, token, user, mid, _m2):
         if pid:
             mix = q(base, f"/Playlists/{pid}/InstantMix?limit=200", token, user) or {}
             items = mix.get("Items") or []
-            mix_ok = (bool(items)
+            mix_ok = (len(items) == expected
                       and mix.get("TotalRecordCount") == len(items)
                       and all(i.get("Type") == "Audio" for i in items))
         # The type guard: a MOVIE id on the playlists route is not found.
@@ -368,6 +385,57 @@ def j_playlist_instant_mix(base, token, user, mid, _m2):
     finally:
         if pid:
             http("DELETE", f"{base}/Items/{pid}", token)
+    return r
+
+
+#: OMDb's in-tree plugin guid — the `Id` override on
+#: `MediaBrowser.Providers/Plugins/Omdb/Plugin.cs`, so it is present on any
+#: stock Jellyfin AND on Ferrofin, and its installed version is the server's.
+#: OMDb rather than TMDb on purpose: TMDb is the id an earlier reviewer flipped
+#: to `Status: "Restart"` on this pair, and a journey should not be reading a
+#: field somebody else perturbed.
+OMDB_PLUGIN_ID = "a628c0da-fac5-4c7e-9d1a-7134223f14c8"
+SERVER_PLUGIN_VERSION = "10.11.8.0"
+
+
+def j_plugin_uninstall(base, token, _user, _m, _m2):
+    """`DELETE /Plugins/{id}` and `/Plugins/{id}/{version}` on a SHARED plugin id.
+
+    Both rows carried "the two servers share no plugin id, so there is nothing to
+    diff". They now share five — Jellyfin's in-tree metadata providers — and the
+    behaviour underneath is not what the note assumed either: a plugin reporting
+    `CanUninstall: false` is refused IN SILENCE. `InstallationManager.
+    UninstallPlugin` logs "Attempt to delete non removable plugin … ignoring
+    request" and returns, while `PluginsController` answers `204` anyway
+    (v10.11.8). Every plugin compiled into Jellyfin's own tree takes that path,
+    so the honest expectation is 204-and-still-installed, which Ferrofin used to
+    answer 400.
+
+    The version-bearing form additionally resolves through
+    `GetPlugin(id, version)`, whose `Version.Equals` compares all four
+    components — so a three-component spelling of the installed version is a
+    miss, and a non-`Version` string fails the `[FromRoute] Version` model
+    binder with a 400 before the action runs.
+
+    This journey MUTATES NOTHING: every leg is the documented no-op, and the
+    read-back asserts the plugin is still installed on each server afterwards.
+    """
+    r = {}
+    installed = lambda: any(p.get("Id", "").replace("-", "").lower()
+                            == OMDB_PLUGIN_ID.replace("-", "")
+                            for p in (get_json(base, "/Plugins", token) or []))
+    if not installed():
+        # No shared plugin on this server: report the rows unverified rather
+        # than passing an assertion about an absent thing.
+        return r
+    bare = http("DELETE", f"{base}/Plugins/{OMDB_PLUGIN_ID}", token)[0]
+    r["DELETE /Plugins/{pluginId}"] = bare == 204 and installed()
+    exact = http("DELETE", f"{base}/Plugins/{OMDB_PLUGIN_ID}/{SERVER_PLUGIN_VERSION}", token)[0]
+    wrong = http("DELETE", f"{base}/Plugins/{OMDB_PLUGIN_ID}/9.9.9.9", token)[0]
+    short = http("DELETE", f"{base}/Plugins/{OMDB_PLUGIN_ID}/10.11.8", token)[0]
+    unparseable = http("DELETE", f"{base}/Plugins/{OMDB_PLUGIN_ID}/notaversion", token)[0]
+    r["DELETE /Plugins/{pluginId}/{version}"] = (
+        exact == 204 and wrong == 404 and short == 404 and unparseable == 400 and installed())
     return r
 
 
@@ -1449,7 +1517,7 @@ def j_backup(base, token, user, _m, _m2):
 
 JOURNEYS = [j_startup,   # first: see its docstring
             j_favorites, j_played, j_rating, j_playlist, j_playlist_instant_mix,
-            j_collection, j_users, j_item_edit,
+            j_plugin_uninstall, j_collection, j_users, j_item_edit,
             j_api_keys, j_user_item_data, j_display_prefs, j_scheduled_task_triggers,
             j_device_options, j_playstate, j_capabilities, j_user_config, j_system_config,
             j_playlist_share, j_item_delete, j_capabilities_query, j_environment_validate,

@@ -23,7 +23,11 @@ use tokio::time::Instant;
 
 /// The default MusicBrainz web-service base.
 pub const DEFAULT_BASE_URL: &str = "https://musicbrainz.org";
-/// The minimum interval between requests to the official server (MB policy).
+/// The minimum interval between requests to the official server (MB policy),
+/// and the `RateLimit` default the settings page ships
+/// (`PluginConfiguration.DefaultRateLimit`). The plugin's setter refuses to go
+/// below it while musicbrainz.org itself is selected — see
+/// [`MusicBrainzConfig::normalized`](crate::plugin_config::MusicBrainzConfig::normalized).
 const MIN_INTERVAL: Duration = Duration::from_secs(1);
 
 /// A resolved album identity: the release id and/or its release-group id.
@@ -54,6 +58,10 @@ struct ArtistSearch {
 #[derive(Debug, Deserialize)]
 struct Entity {
     id: String,
+    /// The matched entity's own name — needed by the artist provider's
+    /// `ReplaceArtistName` setting, which renames the item to it.
+    #[serde(default)]
+    name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -247,11 +255,26 @@ fn non_empty(value: Option<String>) -> Option<String> {
     value.map(|v| v.trim().to_owned()).filter(|v| !v.is_empty())
 }
 
+/// An artist search hit: the MusicBrainz id and the name MusicBrainz has for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtistNameMatch {
+    /// The `MusicBrainzArtist` id.
+    pub id: String,
+    /// MusicBrainz's own name for the artist, when it published one.
+    pub name: Option<String>,
+}
+
 /// A MusicBrainz client. Cheap to clone semantics via `Arc` at the call site;
 /// serializes requests behind a ≥1s throttle.
 pub struct MusicBrainzClient {
     http: reqwest::Client,
-    base_url: String,
+    /// The operator's explicit server override (`FERROFIN_MUSICBRAINZ_BASE_URL`
+    /// / config `musicbrainz_base_url`). `None` when the operator set nothing,
+    /// which is when the dashboard's `Server` governs.
+    configured_base_url: Option<String>,
+    /// The MusicBrainz plugin's dashboard settings (`Server`, `RateLimit`,
+    /// `ReplaceArtistName`).
+    plugin: crate::plugin_config::ConfigSource,
     user_agent: String,
     /// Timestamp of the last request, for the rate limit.
     last_request: Mutex<Option<Instant>>,
@@ -260,7 +283,8 @@ pub struct MusicBrainzClient {
 impl std::fmt::Debug for MusicBrainzClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MusicBrainzClient")
-            .field("base_url", &self.base_url)
+            .field("configured_base_url", &self.configured_base_url)
+            .field("plugin", &self.plugin)
             .finish_non_exhaustive()
     }
 }
@@ -271,30 +295,71 @@ impl MusicBrainzClient {
     #[must_use]
     pub fn new(base_url: &str, version: &str) -> Self {
         let base = base_url.trim_end_matches('/');
-        let base_url = if base.is_empty() {
-            DEFAULT_BASE_URL
-        } else {
-            base
-        };
         Self {
             http: reqwest::Client::new(),
-            base_url: base_url.to_owned(),
+            configured_base_url: (!base.is_empty()).then(|| base.to_owned()),
+            plugin: crate::plugin_config::ConfigSource::new(),
             // MB requires contact info; the project URL satisfies the policy.
             user_agent: format!("Ferrofin/{version} ( https://github.com/ )"),
             last_request: Mutex::new(None),
         }
     }
 
-    /// Blocks until at least [`MIN_INTERVAL`] has elapsed since the previous
-    /// request, then records now — the ≤1 req/sec throttle.
-    async fn throttle(&self) {
+    /// Binds the plugin manager, making the MusicBrainz settings page's
+    /// `Server` / `RateLimit` / `ReplaceArtistName` live. Called once by the
+    /// composition root.
+    pub fn attach_plugin_manager(
+        &self,
+        plugins: std::sync::Arc<dyn ferrofin_traits::plugins::PluginManager>,
+    ) {
+        self.plugin.attach(plugins);
+    }
+
+    /// The plugin's settings for this call, C#-normalized.
+    ///
+    /// `MusicBrainzArtistProvider.ReloadConfig` re-points the shared `Query`
+    /// at `Configuration.Server` whenever the settings page is saved; reading
+    /// per call is the same observable behaviour without an event bus. An
+    /// operator who set `FERROFIN_MUSICBRAINZ_BASE_URL` still wins over the
+    /// dashboard (an explicit env/file setting is the more specific
+    /// instruction, and that knob shipped before this plugin had an identity).
+    pub(crate) async fn settings(&self) -> crate::plugin_config::MusicBrainzConfig {
+        let mut cfg: crate::plugin_config::MusicBrainzConfig = self
+            .plugin
+            .load(crate::builtin_plugins::MUSICBRAINZ.id)
+            .await;
+        if let Some(base) = &self.configured_base_url {
+            cfg.server.clone_from(base);
+        }
+        cfg.normalized()
+    }
+
+    /// Blocks until at least `interval` has elapsed since the previous request,
+    /// then records now — the ≤1 req/sec throttle, whose period is the
+    /// plugin's `RateLimit` (seconds between requests).
+    async fn throttle(&self, interval: std::time::Duration) {
         let mut last = self.last_request.lock().await;
         if let Some(prev) = *last
-            && let Some(wait) = MIN_INTERVAL.checked_sub(prev.elapsed())
+            && let Some(wait) = interval.checked_sub(prev.elapsed())
         {
             tokio::time::sleep(wait).await;
         }
         *last = Some(Instant::now());
+    }
+
+    /// `RateLimit` seconds as a `Duration`.
+    ///
+    /// A negative or non-finite value (only reachable by hand-editing
+    /// `config.json` — the settings page writes a number input) would panic
+    /// `Duration::from_secs_f64`, so it falls back to [`MIN_INTERVAL`], the
+    /// published MusicBrainz policy floor. Falling back to *zero* there would
+    /// turn a typo into an unthrottled crawl of a public service.
+    fn interval(rate_limit: f64) -> Duration {
+        if rate_limit.is_finite() && rate_limit > 0.0 {
+            Duration::from_secs_f64(rate_limit)
+        } else {
+            MIN_INTERVAL
+        }
     }
 
     /// GETs `path?{query}&fmt=json` as an authenticated (User-Agent) MB call,
@@ -304,12 +369,13 @@ impl MusicBrainzClient {
         path: &str,
         query: &[(&str, String)],
     ) -> Option<T> {
-        self.throttle().await;
+        let cfg = self.settings().await;
+        self.throttle(Self::interval(cfg.rate_limit)).await;
         let mut q: Vec<(&str, String)> = vec![("fmt", "json".to_owned())];
         q.extend(query.iter().cloned());
         let resp = self
             .http
-            .get(format!("{}{path}", self.base_url))
+            .get(format!("{}{path}", cfg.server))
             .header(reqwest::header::USER_AGENT, &self.user_agent)
             .query(&q)
             .send()
@@ -325,9 +391,30 @@ impl MusicBrainzClient {
     /// `MusicBrainzArtistProvider`'s search. Uses `artist:"…"` / `artistaccent`
     /// lucene the same way the C# builds it.
     pub async fn search_artist(&self, name: &str) -> Option<String> {
+        Some(self.search_artist_match(name).await?.id)
+    }
+
+    /// The first artist search hit, id **and** name.
+    ///
+    /// The name is what `MusicBrainzArtistProvider.cs:146` writes back over the
+    /// item's when `ReplaceArtistName` is on
+    /// (`result.Item.Name = singleResult.Name`); [`replace_artist_name`] says
+    /// whether it should be.
+    ///
+    /// [`replace_artist_name`]: Self::replace_artist_name
+    pub async fn search_artist_match(&self, name: &str) -> Option<ArtistNameMatch> {
         let query = artist_query(name);
         let result: ArtistSearch = self.get("/ws/2/artist", &[("query", query)]).await?;
-        result.artists.into_iter().next().map(|a| a.id)
+        let hit = result.artists.into_iter().next()?;
+        Some(ArtistNameMatch {
+            id: hit.id,
+            name: non_empty(hit.name),
+        })
+    }
+
+    /// Whether the MusicBrainz settings page's `ReplaceArtistName` is on.
+    pub async fn replace_artist_name(&self) -> bool {
+        self.settings().await.replace_artist_name
     }
 
     /// Resolves an album's ids from its name + the album artist (by MB id when
