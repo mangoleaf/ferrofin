@@ -77,9 +77,18 @@ def user(op, url, project=None):
     return {"op": op, "kind": "user", "url": lambda c: url.format(**c), "project": project}
 
 
-def item(op, tmpl):
+def item(op, tmpl, extra=()):
     # tmpl contains {u} and {i}; filled per server (own user + own correlated item id).
-    return {"op": op, "kind": "item", "url": lambda c, i: tmpl.format(u=c["user"], i=i)}
+    #
+    # `extra` adds URLs that are NOT id-correlated pairs: each is formatted with
+    # that server's own context, so an id which both servers derive identically
+    # (a Live TV channel — `GetInternalChannelId` hashes only the tuner's own
+    # id) can be pinned on the same row. They are diffed and recorded exactly
+    # like a correlated pair, status divergence included; they are extra legs,
+    # never a replacement for the pairs.
+    return {"op": op, "kind": "item",
+            "url": lambda c, i: tmpl.format(u=c["user"], i=i),
+            "extra": [(lambda c, t=t: t.format(**c)) for t in extra]}
 
 
 def multi(op, legs):
@@ -719,7 +728,14 @@ READS = [
     user("GET /Movies/Recommendations", "/Movies/Recommendations?userId={u}"),
     user("GET /Search/Hints", "/Search/Hints?userId={u}&searchTerm=a&limit=20"),
     # item-scoped — correlated by Path, each server queried with its own id
-    item("GET /Items/{itemId}", "/Items/{i}?userId={u}&fields=Path,MediaSources,MediaStreams,Overview,Genres"),
+    # …plus a Live TV channel, which Jellyfin resolves through this very route
+    # because `GuideManager.GetChannel` stores every channel as a real
+    # `BaseItems` row parented to the Live TV view. The channel id is NOT
+    # correlated by Path — it does not need to be: `GetInternalChannelId` hashes
+    # the tuner's own id, so both servers mint the same GUID from the same
+    # lineup, and each side is asked for its own `{channel}` anyway.
+    item("GET /Items/{itemId}", "/Items/{i}?userId={u}&fields=Path,MediaSources,MediaStreams,Overview,Genres",
+         extra=["/Items/{channel}?userId={user}&fields=Path,MediaSources,MediaStreams,Overview,Genres"]),
     # A movie seed cannot be body-diffed (Random order + a deliberately different
     # candidate algorithm) — verified by properties instead, see
     # `similar_invariants`.
@@ -948,6 +964,31 @@ READS = [
         post_leg("/LiveTv/Programs", lambda c: guide_window_body(c, {
             "Limit": 3, "SortBy": ["StartDate", "SortName"],
             "SortOrder": ["Ascending", "Ascending"]})),
+        # 9-10. THE BINDER'S REJECTION STATUS. The array arm of
+        #    `JsonDelimitedCollectionConverter` stays strict, so
+        #    `{"SortBy":["NotASort"]}` is a body-binding FAILURE — and ASP.NET's
+        #    `[ApiController]` filter answers it 400 with ValidationProblemDetails
+        #    (v10.11.8 Jellyfin.Api/BaseJellyfinApiController.cs:12-18; nothing in
+        #    the tree replaces the default `InvalidModelStateResponseFactory`).
+        #    axum's `Json` rejection is 422 `text/plain`, so every body-taking
+        #    Ferrofin route diverged until `ferrofin-api`'s `JsonBody` extractor
+        #    replaced it. Leg 10 pins the OPPOSITE half of the same defect:
+        #    serde's derived impl binds a JSON sequence to a struct positionally,
+        #    so Ferrofin answered `[]` with 200 and the WHOLE guide where
+        #    System.Text.Json 400s — a malformed body silently accepted as a
+        #    valid one.
+        #
+        #    Only the STATUS is the assertion here, and that is deliberate:
+        #    `post_leg_outcome` settles `hs != js` BEFORE the 200 check, so a
+        #    Ferrofin 422-or-200 against a Jellyfin 400 fails this row as
+        #    `status`, and once both answer 400 the leg records as `unavailable`
+        #    and compares nothing. The `errors` dictionary is NOT diffed: its
+        #    keys and messages carry .NET type names
+        #    ("Jellyfin.Data.Enums.ItemSortBy") and its `traceId` is a
+        #    per-request ASP.NET activity id — neither is reproducible, and
+        #    neither belongs in parity_diff.VOLATILE.
+        post_leg("/LiveTv/Programs", lambda c: {"SortBy": ["NotASort"]}),
+        post_leg("/LiveTv/Programs", lambda c: []),
     ]),
     user("GET /LiveTv/Programs/Recommended", "/LiveTv/Programs/Recommended?userId={u}&isAiring=true&limit=5"),
     user("GET /LiveTv/Timers/Defaults", "/LiveTv/Timers/Defaults"),
@@ -1496,6 +1537,24 @@ def run(ferrofin_url, jellyfin_url):
                 else:
                     for k in agg:
                         agg[k].extend(b[k])
+            for url_of in ep.get("extra") or ():
+                hu, ju = url_of(hc), url_of(jc)
+                hs, hb = token_get(ferrofin_url, hu, ht)
+                js, jb = token_get(jellyfin_url, ju, jt)
+                if hs != js:
+                    tested += 1
+                    agg["mismatch"].append({"path": f"[{hu}] :: status", "j": js, "h": hs})
+                    continue
+                if hb is None or jb is None:
+                    continue
+                tested += 1
+                n, b, compared = diff_stats(jb, hb)
+                legs.append((jb, hb, compared))
+                if n == 0:
+                    clean += 1
+                else:
+                    for k in agg:
+                        agg[k].extend(b[k])
             record(ep["op"], clean, tested, agg, agg_method(legs))
     return rows, len(pairs)
 
@@ -1588,6 +1647,12 @@ def selfcheck():
     for ep in READS:
         if ep["kind"] == "user":
             ep["url"](ctx)  # raises KeyError if a placeholder has no context key
+        elif ep["kind"] == "item":
+            # The correlated template is formatted with an id at run time; the
+            # `extra` legs are formatted from the context alone, so a bad
+            # placeholder in one must fail HERE and not mid-run.
+            for url_of in ep.get("extra") or ():
+                url_of(ctx)
         elif ep["kind"] == "multi":
             for leg in ep["legs"]:
                 leg["url"](ctx)
@@ -1600,7 +1665,15 @@ def selfcheck():
             remote_search = ep["op"].startswith("POST /Items/RemoteSearch")
             for leg in ep["legs"]:
                 body = leg["body"](ctx)
-                assert isinstance(body, dict), f"{ep['op']}: a leg body must be a dict"
+                # A leg body is normally a DTO object. The two exceptions are
+                # the binder-rejection legs on POST /LiveTv/Programs, whose
+                # whole point is to post a body the model binder must REFUSE —
+                # a JSON sequence where the DTO is an object. Allowing a list
+                # here is not a loosened assertion: those legs assert a status,
+                # and a leg that could not post a malformed body could not
+                # assert anything about how a malformed body is answered.
+                assert isinstance(body, (dict, list)), \
+                    f"{ep['op']}: a leg body must be a JSON object or array"
                 if remote_search:
                     assert "SearchInfo" in body, \
                         f"{ep['op']}: a RemoteSearch body without SearchInfo makes Jellyfin 500"

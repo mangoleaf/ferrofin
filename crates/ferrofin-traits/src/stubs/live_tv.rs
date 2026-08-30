@@ -382,6 +382,37 @@ pub trait LiveTvManager: Send + Sync {
     /// when the channel is unknown.
     async fn get_channel_stream_url(&self, id: Uuid) -> Result<Option<String>, ServiceError>;
 
+    /// Stamps the Live-TV-only fields onto already-projected channel DTOs,
+    /// matching each by its own `Id`.
+    ///
+    /// Port of `ILiveTvManager.AddChannelInfo` (v10.11.8
+    /// src/Jellyfin.LiveTv/LiveTvManager.cs:954-1010): `Number`,
+    /// `ChannelNumber`, `ChannelType`, the `ExternalServiceId` provider id and
+    /// — when `options.add_current_program` — the airing `CurrentProgram`.
+    /// Upstream calls it from **`DtoService` itself** (Emby.Server.Implementations/
+    /// Dto/DtoService.cs:192 and :203, dispatching on `item is LiveTvChannel`),
+    /// which is why an ordinary `GET /Items/{id}` of a channel comes back with
+    /// its channel number: the post-pass is part of projecting a channel, not
+    /// part of the Live TV routes.
+    ///
+    /// Ids that are not channels are left untouched, so a mixed page is safe to
+    /// hand over whole.
+    ///
+    /// The default does nothing — the "no Live TV configured" state.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn add_channel_info(
+        &self,
+        dtos: &mut [BaseItemDto],
+        options: &DtoOptions,
+        user: Option<&UserEntity>,
+    ) -> Result<(), ServiceError> {
+        let _ = (dtos, options, user);
+        Ok(())
+    }
+
     // ---- live streams ----------------------------------------------------
 
     /// The playable media sources for a Live TV channel, or empty when the id

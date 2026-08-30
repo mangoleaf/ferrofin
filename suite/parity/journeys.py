@@ -1415,6 +1415,16 @@ def j_livetv_series_timers(base, token, user, _m, _m2):
             before = set(series_timer_ids(base, token))
             defaults = get_json(base, f"/LiveTv/Timers/Defaults?programId={prog['Id']}", token) or {}
             defaults["Priority"] = 3 + n * 5          # non-default: the create must DISCARD it
+            # …and a client-chosen Name, which the create must KEEP:
+            # `LiveTvDtoService.GetSeriesTimerInfo` binds `Name = dto.Name`
+            # (v10.11.8 LiveTvDtoService.cs:499) and neither
+            # `DefaultLiveTvService.CreateSeriesTimer` (:263-309) nor
+            # `UpdateSeriesTimerAsync`'s whitelist (:314-334) ever writes it, so
+            # create is the ONLY place a name can be set. The two names are also
+            # what makes the ordering legs below a real collation probe:
+            # `StringComparison.InvariantCulture` sorts "apple" before "Banana",
+            # code-point order sorts them the other way round.
+            defaults["Name"] = ("apple parity g5", "Banana parity g5")[n]
             st, _ = http("POST", f"{base}/LiveTv/SeriesTimers", token, json.dumps(defaults))
             fresh = [i for i in series_timer_ids(base, token) if i not in before]
             created += fresh
@@ -1432,6 +1442,7 @@ def j_livetv_series_timers(base, token, user, _m, _m2):
                 # non-default one, so a server that honours it fails here — and
                 # would then also make the sort leg below meaningless.
                 "posted_priority_discarded": (dto or {}).get("Priority") == 0,
+                "posted_name_kept": (dto or {}).get("Name") == defaults["Name"],
             }
             create_ok = create_ok and all(evidence[f"created{n}"].values())
         evidence["two_distinct_ids"] = len(set(created)) == 2
@@ -1565,7 +1576,12 @@ def j_livetv_series_timers(base, token, user, _m, _m2):
             evidence,
             order_default=order_of(""),
             order_priority_asc=order_of("?sortBy=Priority"),
-            order_priority_desc=order_of("?sortBy=Priority&sortOrder=Descending")))
+            order_priority_desc=order_of("?sortBy=Priority&sortOrder=Descending"),
+            # The default (name) order, reversed: with the two posted names above
+            # this is the collation leg — a server comparing by Unicode scalar
+            # instead of CLDR root collation answers ["apple…", "Banana…"] here
+            # where upstream answers ["Banana…", "apple…"].
+            order_name_desc=order_of("?sortOrder=Descending")))
 
         # --- delete: gone, its timers gone, and a second delete is not a silent 204 ----
         st, _ = http("DELETE", f"{base}/LiveTv/SeriesTimers/{sid}", token)

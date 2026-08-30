@@ -1017,10 +1017,28 @@ impl MediaSourceManager for FerrofinMediaSourceManager {
         _enable_path_substitution: bool,
         user_id: Option<Uuid>,
     ) -> Result<Vec<MediaSourceInfo>, ServiceError> {
-        let Some(mut item) = self.items.retrieve_item(item_id).await? else {
-            // Not a library item — it may be a Live TV channel, or a DVR
-            // recording (which upstream resolves through the same Live TV
-            // media-source provider).
+        let stored = self.items.retrieve_item(item_id).await?;
+        // The Live TV branch is chosen by what the id IS, not by whether a row
+        // was found. A channel is a real `BaseItems` row (the guide refresh
+        // mirrors the lineup, exactly as `GuideManager.GetChannel` stores each
+        // channel item), yet its playable sources still come from the tuner:
+        // upstream reaches them through `LiveTvMediaSourceProvider`, which
+        // `MediaSourceManager.GetPlaybackMediaSources` selects on the item's
+        // type. Keying on "the row was missing" instead would have made every
+        // channel report an unplayable static source the moment the rows
+        // started existing. A DVR recording has no row at all and takes the
+        // same branch.
+        let is_channel = stored
+            .as_ref()
+            .and_then(|row| crate::item_type_lookup::kind_from_type_name(&row.type_))
+            .is_some_and(|kind| {
+                matches!(
+                    kind,
+                    ferrofin_model::data::BaseItemKind::LiveTvChannel
+                        | ferrofin_model::data::BaseItemKind::TvChannel
+                )
+            });
+        if stored.is_none() || is_channel {
             let mut sources = self.channel_media_source(item_id).await?;
             if sources.is_empty() {
                 sources = self.recording_media_source(item_id).await?;
@@ -1038,6 +1056,9 @@ impl MediaSourceManager for FerrofinMediaSourceManager {
             self.apply_playback_permissions(&mut sources, item_id, None, user_id)
                 .await?;
             return Ok(sources);
+        }
+        let Some(mut item) = stored else {
+            return Ok(Vec::new());
         };
         // An ALTERNATE version (PrimaryVersionId set) resolves through its
         // primary, so playing any version yields the full merged source list

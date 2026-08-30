@@ -26,6 +26,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAdmin;
 use crate::error::ApiError;
+use crate::extract::JsonBody;
 use crate::state::AppState;
 
 /// Query parameters for `GET /Devices`.
@@ -156,7 +157,7 @@ async fn update_device_options(
     State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
     Query(query): Query<DeviceIdQuery>,
-    Json(options): Json<DeviceOptionsDto>,
+    JsonBody(options): JsonBody<DeviceOptionsDto>,
 ) -> Result<axum::http::StatusCode, ApiError> {
     let id = require_id(query.id.as_deref())?;
     state

@@ -31,8 +31,10 @@ use ferrofin_model::media_info::MediaProtocol;
 use ferrofin_model::querying::{ItemFields, QueryResult};
 use ferrofin_traits::dto::DtoService;
 use ferrofin_traits::error::ServiceError;
+use ferrofin_traits::library::UserViewManager;
 use ferrofin_traits::media_encoding::MediaEncoder;
 use ferrofin_traits::options::{DtoOptions, InternalItemsQuery};
+use ferrofin_traits::persistence::{ItemPersistenceService, ItemRepository};
 use ferrofin_traits::stubs::{LiveStreamFile, LiveTvChannelQuery, LiveTvManager};
 use serde::de::DeserializeOwned;
 
@@ -359,6 +361,17 @@ pub struct FerrofinLiveTvManager {
     /// The account-less Schedules Direct surface (country list), sharing the
     /// fetcher and caching under the application cache directory.
     schedules_direct: SchedulesDirect,
+    /// The `BaseItems` seam the guide refresh mirrors the channel lineup
+    /// through, and the Live TV `UserView` the rows parent to.
+    ///
+    /// A `OnceLock` for the same composition-root cycle the `dto` field breaks:
+    /// the item store and the user-view manager are both built after this
+    /// manager. Absent in unit tests, where the guide refresh simply writes no
+    /// item rows — the same state a server has before its first guide refresh.
+    item_store: OnceLock<LiveTvItemStore>,
+    /// The resolved Live TV `UserView` id, memoized after the first successful
+    /// lookup (it is stable for the life of the database).
+    live_tv_view: OnceLock<Uuid>,
     /// The registered tuner backends, one per tuner *kind*.
     ///
     /// Port of `TunerHostManager._tunerHosts` (v10.11.8 TunerHostManager.cs:44),
@@ -368,6 +381,19 @@ pub struct FerrofinLiveTvManager {
     /// media-source/stream paths — so a tuner kind is added by registering an
     /// implementation, never by adding a `match`.
     hosts: Vec<Arc<dyn crate::tuner_host::TunerHost>>,
+}
+
+/// The item-layer services the guide refresh needs to keep `BaseItems` in step
+/// with the channel lineup.
+#[derive(Clone)]
+struct LiveTvItemStore {
+    /// Writes and deletes the channel item rows.
+    persistence: Arc<dyn ItemPersistenceService>,
+    /// Reads back the channel rows already stored, for the delete half of
+    /// `GuideManager.CleanDatabase`.
+    items: Arc<dyn ItemRepository>,
+    /// Resolves (and provisions) the Live TV `UserView` the rows parent to.
+    views: Arc<dyn UserViewManager>,
 }
 
 impl std::fmt::Debug for FerrofinLiveTvManager {
@@ -547,6 +573,8 @@ impl FerrofinLiveTvManager {
             hosts,
             users: None,
             server_id,
+            item_store: OnceLock::new(),
+            live_tv_view: OnceLock::new(),
             tuner_flag: Arc::new(AtomicBool::new(false)),
             dto: OnceLock::new(),
             paths: LiveTvPaths::default(),
@@ -616,6 +644,114 @@ impl FerrofinLiveTvManager {
     /// field doc). A second call is ignored.
     pub fn set_dto(&self, dto: Arc<dyn DtoService>) {
         let _ = self.dto.set(dto);
+    }
+
+    /// Attaches the item layer the guide refresh mirrors channels into: the
+    /// persistence service that writes the rows, the repository that reads back
+    /// the ones already stored, and the user-view manager that resolves the
+    /// Live TV `UserView` they parent to.
+    ///
+    /// The composition-root form (a second call is ignored), for the same
+    /// reason [`set_dto`](Self::set_dto) exists: all three are constructed
+    /// after this manager.
+    pub fn set_item_store(
+        &self,
+        persistence: Arc<dyn ItemPersistenceService>,
+        items: Arc<dyn ItemRepository>,
+        views: Arc<dyn UserViewManager>,
+    ) {
+        let _ = self.item_store.set(LiveTvItemStore {
+            persistence,
+            items,
+            views,
+        });
+    }
+
+    /// The Live TV `UserView` every channel item parents to (C#
+    /// `GetInternalLiveTvFolder()`), memoized after the first resolution.
+    ///
+    /// `None` means the item layer is not wired or the view could not be
+    /// provisioned; a channel then simply carries no `ParentId`, which is what
+    /// it carried before this path existed.
+    async fn live_tv_view_id(&self) -> Option<Uuid> {
+        if let Some(id) = self.live_tv_view.get() {
+            return Some(*id);
+        }
+        let store = self.item_store.get()?;
+        let id = store
+            .views
+            .get_internal_live_tv_folder_id()
+            .await
+            .inspect_err(|error| {
+                tracing::warn!(%error, "live tv: could not resolve the Live TV view folder");
+            })
+            .ok()
+            .flatten()?;
+        let _ = self.live_tv_view.set(id);
+        Some(id)
+    }
+
+    /// Mirrors the current channel lineup into `BaseItems`.
+    ///
+    /// Port of `GuideManager.GetChannel`'s `CreateItem`/`UpdateItemAsync`
+    /// (v10.11.8 src/Jellyfin.LiveTv/Guide/GuideManager.cs:375-468) and the
+    /// `CleanDatabase(newChannelIdList, [BaseItemKind.LiveTvChannel], …)` that
+    /// follows the refresh (:147): every channel in the lineup is a real item
+    /// row parented to the Live TV view, and a row whose channel has left every
+    /// tuner's lineup is deleted.
+    ///
+    /// This is what makes a channel reachable through the ordinary item
+    /// universe. Without it a channel lives only in `FerrofinLiveTvChannels`,
+    /// and every route that resolves an item through `BaseItems` — starting
+    /// with `GET /Items/{itemId}` — answers 404 for an id
+    /// `GET /LiveTv/Channels` has just handed the client.
+    ///
+    /// The two tables are written from THIS one path, so they cannot drift
+    /// apart: `FerrofinLiveTvChannels` stays the tuner-facing record (stream
+    /// URL, tuner host, codecs) and `BaseItems` its item-universe mirror.
+    async fn sync_channel_items(&self) -> Result<(), ServiceError> {
+        let Some(store) = self.item_store.get() else {
+            return Ok(());
+        };
+        let view_id = self.live_tv_view_id().await;
+        let rows = crate::guide_repository::channel_rows(&self.db).await?;
+        let entities: Vec<_> = rows
+            .iter()
+            .map(|row| channel_entity(row, parse_dt, view_id))
+            .collect();
+        if !entities.is_empty() {
+            store.persistence.save_items(&entities).await?;
+        }
+        // `CleanDatabase`: the stored channel items the refreshed lineup no
+        // longer names. A lineup that came back empty because every tuner was
+        // unreachable must NOT wipe the channels — `BaseTunerHost.GetChannels`
+        // falls back to its cache rather than reporting none, and
+        // `replace_channels` is likewise never reached on a failed fetch.
+        if entities.is_empty() {
+            return Ok(());
+        }
+        let keep: std::collections::HashSet<String> =
+            entities.iter().map(|e| e.id.to_uppercase()).collect();
+        let stored = store
+            .items
+            .get_item_list(&InternalItemsQuery {
+                include_item_types: vec![BaseItemKind::LiveTvChannel],
+                ..InternalItemsQuery::default()
+            })
+            .await?;
+        let stale: Vec<Uuid> = stored
+            .iter()
+            .filter(|row| !keep.contains(&row.id.to_uppercase()))
+            .filter_map(|row| Uuid::parse_str(&row.id).ok())
+            .collect();
+        if !stale.is_empty() {
+            tracing::info!(
+                count = stale.len(),
+                "live tv: removing channel items that left the lineup"
+            );
+            store.persistence.delete_items(&stale).await?;
+        }
+        Ok(())
     }
 
     /// The wired DTO service, or the honest error when the composition root
@@ -1240,13 +1376,22 @@ impl LiveTvManager for FerrofinLiveTvManager {
         // page (`RemoveFields(dtoOptions)`), so the channel DTOs themselves
         // lack CanDelete/CanDownload/DisplayPreferencesId/Etag on the list.
         let mut list_options = options.clone();
-        remove_fields(&mut list_options);
-        let entities: Vec<_> = page.iter().map(|r| channel_entity(r, parse_dt)).collect();
-        let mut dtos = self
+        crate::projection::remove_fields(&mut list_options);
+        let view_id = self.live_tv_view_id().await;
+        let entities: Vec<_> = page
+            .iter()
+            .map(|r| channel_entity(r, parse_dt, view_id))
+            .collect();
+        // `AddChannelInfo` is NOT applied here: upstream runs it from inside
+        // `DtoService.GetBaseItemDtos` (v10.11.8 DtoService.cs:168-192, which
+        // buckets `item is LiveTvChannel` and calls
+        // `LivetvManager.AddChannelInfo` at the end), so the projection below
+        // already carries `Number`/`ChannelNumber`/`ChannelType` and the
+        // current programme — and so does an ordinary `GET /Items/{id}` of the
+        // same channel, which is the whole point of putting it there.
+        let dtos = self
             .dto_service()?
             .get_base_item_dtos(&entities, &list_options, query.user.as_ref(), None, true)
-            .await?;
-        self.add_channel_info(&mut dtos, &page, &list_options, query.user.as_ref())
             .await?;
         Ok(QueryResult::new(Some(start_index), Some(total), dtos))
     }
@@ -1261,16 +1406,14 @@ impl LiveTvManager for FerrofinLiveTvManager {
         let Some(row) = row else { return Ok(None) };
         // The single-channel path keeps every requested field (upstream's
         // `GetChannel` never calls `RemoveFields`); only the CurrentProgram
-        // projection inside `add_channel_info` strips them.
-        let entity = channel_entity(&row, parse_dt);
-        let mut dtos = vec![
+        // projection inside `add_channel_info` strips them. `AddChannelInfo`
+        // itself runs inside the DTO service (DtoService.cs:201-204).
+        let entity = channel_entity(&row, parse_dt, self.live_tv_view_id().await);
+        Ok(Some(
             self.dto_service()?
                 .get_base_item_dto(&entity, options, user, None)
                 .await?,
-        ];
-        self.add_channel_info(&mut dtos, std::slice::from_ref(&row), options, user)
-            .await?;
-        Ok(dtos.pop())
+        ))
     }
 
     async fn get_programs(
@@ -1461,6 +1604,10 @@ impl LiveTvManager for FerrofinLiveTvManager {
                 }
             }
         }
+        // The lineup is settled; mirror it into `BaseItems` before the guide
+        // goes in, exactly as `RefreshChannelsInternal` stores each channel
+        // item (and cleans the departed ones) before it fetches programmes.
+        self.sync_channel_items().await?;
         // `GuideManager.RefreshChannelsInternal` asks each listings provider for
         // exactly `[now - 1h, now - 1h + GuideDays)` and keeps nothing else
         // (v10.11.8 GuideManager.cs:215-231). Ingesting the whole document
@@ -1493,6 +1640,83 @@ impl LiveTvManager for FerrofinLiveTvManager {
             start_date: start,
             end_date: start + chrono::Duration::days(self.guide_days().await),
         })
+    }
+
+    async fn add_channel_info(
+        &self,
+        dtos: &mut [BaseItemDto],
+        options: &DtoOptions,
+        user: Option<&UserEntity>,
+    ) -> Result<(), ServiceError> {
+        // Port of `LiveTvManager.AddChannelInfo` (v10.11.8 LiveTvManager.cs:954-1010).
+        // The C# receives `(dto, LiveTvChannel)` pairs because `DtoService`
+        // already has the typed items in hand; here the rows are looked up by
+        // the DTOs' own ids, in ONE query for the page — an id that is not a
+        // channel simply has no row and its DTO is left untouched, so a mixed
+        // `/Items` page costs one query and changes nothing.
+        let ids: Vec<Uuid> = dtos.iter().map(|dto| dto.id).collect();
+        let rows = crate::guide_repository::channel_rows_by_ids(&self.db, &ids).await?;
+        if rows.is_empty() {
+            return Ok(());
+        }
+        for dto in dtos.iter_mut() {
+            let Some(row) = rows.get(&dto.id) else {
+                continue;
+            };
+            dto.number.clone_from(&row.number);
+            dto.channel_number.clone_from(&row.number);
+            dto.channel_type = Some(if row.channel_type == "Radio" {
+                ChannelType::Radio
+            } else {
+                ChannelType::Tv
+            });
+            // `GuideManager.GetChannel` stores `ProviderIds[ExternalServiceId]
+            // = "Emby"`; the DTO service projected `{}` (the guide cache has no
+            // `BaseItemProviders` rows), so fill it here when the field was
+            // requested.
+            if let Some(provider_ids) = dto.provider_ids.as_mut() {
+                provider_ids.insert("ExternalServiceId".to_owned(), "Emby".to_owned());
+            }
+        }
+        if !options.add_current_program {
+            return Ok(());
+        }
+
+        // One airing query for the page: `MaxStartDate = MinEndDate = now`,
+        // `Limit = channel count`, start-date ascending.
+        let now = Utc::now();
+        let channel_ids: Vec<Uuid> = rows.keys().copied().collect();
+        let query = InternalItemsQuery {
+            channel_ids: channel_ids.clone(),
+            max_start_date: Some(now),
+            min_end_date: Some(now),
+            limit: i32::try_from(channel_ids.len()).ok(),
+            order_by: vec![(ItemSortBy::StartDate, SortOrder::Ascending)],
+            user: user.cloned(),
+            ..InternalItemsQuery::default()
+        };
+        let program_rows = self.query_program_rows(&query, now).await?;
+        // Both list and single paths strip the four fields for the programme
+        // DTOs (`AddChannelInfo` calls `RemoveFields` before projecting them).
+        let mut program_options = options.clone();
+        remove_fields(&mut program_options);
+        let program_dtos = self
+            .program_dtos(&program_rows, &program_options, user)
+            .await?;
+        let mut by_channel: HashMap<Uuid, BaseItemDto> = HashMap::new();
+        for program in program_dtos {
+            if let Some(channel_id) = program.channel_id {
+                // First per channel wins (rows are start-date ascending, and
+                // C# takes `FirstOrDefault`).
+                by_channel.entry(channel_id).or_insert(program);
+            }
+        }
+        for dto in dtos.iter_mut() {
+            if let Some(program) = by_channel.remove(&dto.id) {
+                dto.current_program = Some(Box::new(program));
+            }
+        }
+        Ok(())
     }
 
     async fn get_channel_stream_url(&self, id: Uuid) -> Result<Option<String>, ServiceError> {
@@ -1880,8 +2104,17 @@ impl LiveTvManager for FerrofinLiveTvManager {
         timer.base.type_ = Some("SeriesTimer".to_owned());
         timer.base.service_name = Some(ferrofin_traits::stubs::LIVE_TV_SERVICE_NAME.to_owned());
         timer.base.server_id = Some(self.server_id.clone());
-        timer.base.name = Some(program.title.clone());
-        timer.base.overview.clone_from(&program.overview);
+        // Name/Overview are the CLIENT's and are never recomputed from the
+        // programme: `LiveTvDtoService.GetSeriesTimerInfo` binds `Name =
+        // dto.Name` / `Overview = dto.Overview` (v10.11.8
+        // LiveTvDtoService.cs:497-499), `DefaultLiveTvService.CreateSeriesTimer`
+        // (:263-309) never touches either, and the read projection
+        // `GetSeriesTimerInfoDto` (:121) emits `Name = info.Name`. Overwriting
+        // them here made a client-chosen series name impossible to store at
+        // all, because `UpdateSeriesTimerAsync`'s whitelist (:314-334) has no
+        // Name either — and it was pure divergence, since
+        // `get_new_timer_defaults` already seeds both from the programme, which
+        // is the body the client posts back.
         if let Ok(channel_id) = Uuid::parse_str(&program.channel_id) {
             timer.base.channel_id = channel_id;
         }
@@ -2247,78 +2480,6 @@ fn radio_or_tv_media_type(channel_type: &str) -> &'static str {
 }
 
 impl FerrofinLiveTvManager {
-    /// Port of `LiveTvManager.AddChannelInfo`: the channel-only DTO fields
-    /// (`Number`/`ChannelNumber`/`ChannelType`, the `ExternalServiceId`
-    /// provider id), plus — when `options.add_current_program` — each
-    /// channel's currently-airing programme, fetched with ONE query for the
-    /// whole page and projected through the programme DTO path.
-    async fn add_channel_info(
-        &self,
-        dtos: &mut [BaseItemDto],
-        rows: &[ChannelRow],
-        options: &DtoOptions,
-        user: Option<&UserEntity>,
-    ) -> Result<(), ServiceError> {
-        for (dto, row) in dtos.iter_mut().zip(rows) {
-            dto.number.clone_from(&row.number);
-            dto.channel_number.clone_from(&row.number);
-            dto.channel_type = Some(if row.channel_type == "Radio" {
-                ChannelType::Radio
-            } else {
-                ChannelType::Tv
-            });
-            // `GuideManager.GetChannel` stores `ProviderIds[ExternalServiceId]
-            // = "Emby"`; the DTO service projected `{}` (the guide cache has no
-            // `BaseItemProviders` rows), so fill it here when the field was
-            // requested.
-            if let Some(provider_ids) = dto.provider_ids.as_mut() {
-                provider_ids.insert("ExternalServiceId".to_owned(), "Emby".to_owned());
-            }
-        }
-        if !options.add_current_program || rows.is_empty() {
-            return Ok(());
-        }
-
-        // One airing query for the page: `MaxStartDate = MinEndDate = now`,
-        // `Limit = channel count`, start-date ascending.
-        let now = Utc::now();
-        let channel_ids: Vec<Uuid> = rows
-            .iter()
-            .filter_map(|r| Uuid::parse_str(&r.id).ok())
-            .collect();
-        let query = InternalItemsQuery {
-            channel_ids: channel_ids.clone(),
-            max_start_date: Some(now),
-            min_end_date: Some(now),
-            limit: i32::try_from(channel_ids.len()).ok(),
-            order_by: vec![(ItemSortBy::StartDate, SortOrder::Ascending)],
-            user: user.cloned(),
-            ..InternalItemsQuery::default()
-        };
-        let program_rows = self.query_program_rows(&query, now).await?;
-        // Both list and single paths strip the four fields for the programme
-        // DTOs (`AddChannelInfo` calls `RemoveFields` before projecting them).
-        let mut program_options = options.clone();
-        remove_fields(&mut program_options);
-        let program_dtos = self
-            .program_dtos(&program_rows, &program_options, user)
-            .await?;
-        let mut by_channel: HashMap<Uuid, BaseItemDto> = HashMap::new();
-        for program in program_dtos {
-            if let Some(channel_id) = program.channel_id {
-                // First per channel wins (rows are start-date ascending, and
-                // C# takes `FirstOrDefault`).
-                by_channel.entry(channel_id).or_insert(program);
-            }
-        }
-        for dto in dtos.iter_mut() {
-            if let Some(program) = by_channel.remove(&dto.id) {
-                dto.current_program = Some(Box::new(program));
-            }
-        }
-        Ok(())
-    }
-
     /// Runs the guide's program query, returning the typed rows the DTO path
     /// consumes. Shared by `get_programs`, `get_program` and the channel
     /// current-program pass.
@@ -3868,59 +4029,101 @@ fn day_pattern(days: &[DayOfWeek]) -> Option<ferrofin_model::live_tv::DayPattern
     }
 }
 
+/// The CLDR root collator the name segments compare through, built once.
+///
+/// `Collator::try_new` reads ICU4X's *baked* root collation data, so the only
+/// way it can fail is a build without that data — in which case the sort
+/// degrades to code-point order rather than taking the process down, and says
+/// so once.
+fn invariant_collator() -> Option<&'static icu_collator::CollatorBorrowed<'static>> {
+    static COLLATOR: std::sync::OnceLock<Option<icu_collator::CollatorBorrowed<'static>>> =
+        std::sync::OnceLock::new();
+    COLLATOR
+        .get_or_init(|| {
+            match icu_collator::Collator::try_new(
+                icu_collator::CollatorPreferences::default(),
+                icu_collator::options::CollatorOptions::default(),
+            ) {
+                Ok(collator) => Some(collator),
+                Err(error) => {
+                    tracing::error!(
+                        %error,
+                        "live tv: CLDR root collation data is unavailable; \
+                         name sorting falls back to code-point order"
+                    );
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
 /// Compares two names the way every Jellyfin name sort does.
 ///
 /// Port of `AlphanumericComparator.CompareValues` (v10.11.8
 /// Jellyfin.Extensions/AlphanumericComparator.cs): the strings are walked in
 /// alternating digit/non-digit runs, digit runs compare as numbers (leading
-/// zeros trimmed, then by length, then lexically) and everything else compares
-/// as text.
+/// zeros trimmed, then by length) and every run then compares as *text* under
+/// `StringComparison.InvariantCulture` — CLDR root collation, which is what
+/// [`invariant_collator`] supplies. Master replaced the whole class with
+/// `StringComparer.Create(CultureInfo.InvariantCulture, CompareOptions.NumericOrdering)`
+/// (MediaBrowser.Controller/Sorting/SortExtensions.cs:13, commit 098e8c6fed),
+/// so both trees demand invariant collation; only the run segmentation differs
+/// between them, and this keeps 10.11.8's, which is what the contract is pinned
+/// to (`"Show 007" > "Show 7"` via the trailing length tie-break).
 ///
-/// One knowing divergence: upstream's text comparison is
-/// `StringComparison.InvariantCulture`, a culture-aware collation. Rust has no
-/// collation in `std`, so this compares by Unicode scalar order. The two agree
-/// on ASCII; two names differing only by accent or case-collation could sort
-/// differently, which is an open work item — porting it needs a collation
-/// dependency, and adding one is not this batch's call.
+/// Code-point order is NOT a stand-in for it even on plain ASCII: root
+/// collation orders by letter at the primary level and puts lowercase before
+/// uppercase at the tertiary level, so `"apple" < "Banana"` where
+/// `'B'(0x42) < 'a'(0x61)` says the opposite.
 fn alphanumeric_compare(a: &str, b: &str) -> std::cmp::Ordering {
     use std::cmp::Ordering;
-    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
-    if a.is_empty() || b.is_empty() {
-        return a.len().cmp(&b.len());
+    // The C# `len1`/`len2` are UTF-16 lengths, used for the empty checks and
+    // the trailing `len1 - len2` tie-break; a char count carries the same
+    // meaning here.
+    let (bytes_a, bytes_b) = (a.as_bytes(), b.as_bytes());
+    let by_length = || a.chars().count().cmp(&b.chars().count());
+    if bytes_a.is_empty() || bytes_b.is_empty() {
+        return by_length();
     }
+    // Run boundaries are always char boundaries: `is_ascii_digit` is false for
+    // every byte of a multi-byte sequence, so a digit run can neither start nor
+    // end inside one.
     let (mut pos_a, mut pos_b) = (0_usize, 0_usize);
     loop {
         let (start_a, start_b) = (pos_a, pos_b);
-        let is_num_a = a[pos_a].is_ascii_digit();
-        let is_num_b = b[pos_b].is_ascii_digit();
+        let is_num_a = bytes_a[pos_a].is_ascii_digit();
+        let is_num_b = bytes_b[pos_b].is_ascii_digit();
         pos_a += 1;
         pos_b += 1;
-        while pos_a < a.len() && a[pos_a].is_ascii_digit() == is_num_a {
+        while pos_a < bytes_a.len() && bytes_a[pos_a].is_ascii_digit() == is_num_a {
             pos_a += 1;
         }
-        while pos_b < b.len() && b[pos_b].is_ascii_digit() == is_num_b {
+        while pos_b < bytes_b.len() && bytes_b[pos_b].is_ascii_digit() == is_num_b {
             pos_b += 1;
         }
         let mut span_a = &a[start_a..pos_a];
         let mut span_b = &b[start_b..pos_b];
         if is_num_a && is_num_b {
-            while span_a.first() == Some(&'0') {
-                span_a = &span_a[1..];
-            }
-            while span_b.first() == Some(&'0') {
-                span_b = &span_b[1..];
-            }
+            // "Trim leading zeros so we can compare the length of the strings
+            // to find the largest number" — and the C# keeps the TRIMMED spans
+            // for the text compare that follows.
+            span_a = span_a.trim_start_matches('0');
+            span_b = span_b.trim_start_matches('0');
             match span_a.len().cmp(&span_b.len()) {
                 Ordering::Equal => {}
                 other => return other,
             }
         }
-        match span_a.cmp(span_b) {
-            Ordering::Equal => {}
-            other => return other,
+        let ordering = match invariant_collator() {
+            Some(collator) => collator.compare(span_a, span_b),
+            None => span_a.cmp(span_b),
+        };
+        if ordering != Ordering::Equal {
+            return ordering;
         }
-        if pos_a >= a.len() || pos_b >= b.len() {
-            return a.len().cmp(&b.len());
+        if pos_a >= bytes_a.len() || pos_b >= bytes_b.len() {
+            return by_length();
         }
     }
 }
@@ -5064,10 +5267,8 @@ mod tests {
         // Info reports enabled once a tuner is configured.
         assert!(mgr.get_live_tv_info().await.expect("info").is_enabled);
 
-        let channels = mgr
-            .get_channels(&LiveTvChannelQuery::default(), &DtoOptions::default())
-            .await
-            .expect("chans");
+        let channels =
+            channels_with_info(&mgr, &LiveTvChannelQuery::default(), &DtoOptions::default()).await;
         assert_eq!(channels.total_record_count, 2);
         assert_eq!(channels.items[0].name.as_deref(), Some("Channel One"));
         assert_eq!(channels.items[0].channel_number.as_deref(), Some("1"));
@@ -5297,6 +5498,141 @@ mod tests {
         .expect("provider");
         mgr.refresh_guide().await.expect("refresh");
         mgr
+    }
+
+    /// The Live TV `UserView` the channel items must parent to. A fake because
+    /// provisioning the row is `ferrofin-core`'s job (and its test's); what this
+    /// test is about is that the guide refresh USES it.
+    struct FixedLiveTvView(Uuid);
+
+    #[async_trait::async_trait]
+    impl ferrofin_traits::library::UserViewManager for FixedLiveTvView {
+        async fn get_user_views(
+            &self,
+            _user_id: Uuid,
+        ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+            Ok(Vec::new())
+        }
+        async fn get_media_folders(
+            &self,
+            _user_id: Uuid,
+        ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+            Ok(Vec::new())
+        }
+        async fn get_latest_items(
+            &self,
+            _query: &ferrofin_traits::options::LatestItemsQuery,
+            _options: &DtoOptions,
+        ) -> Result<Vec<(Option<BaseItemEntity>, Vec<BaseItemEntity>)>, ServiceError> {
+            Ok(Vec::new())
+        }
+        async fn get_internal_live_tv_folder_id(&self) -> Result<Option<Uuid>, ServiceError> {
+            Ok(Some(self.0))
+        }
+    }
+
+    /// The stored `BaseItems` channel-item rows, id-ordered.
+    async fn stored_channel_items(
+        mgr: &FerrofinLiveTvManager,
+    ) -> Vec<(String, Option<String>, Option<String>)> {
+        crate::guide_repository::test_support::stored_channel_items(&mgr.db)
+            .await
+            .expect("channel items")
+    }
+
+    /// A guide refresh mirrors the lineup into `BaseItems` and removes the rows
+    /// that left it.
+    ///
+    /// Port of `GuideManager.GetChannel`'s `CreateItem`/`UpdateItemAsync`
+    /// (v10.11.8 GuideManager.cs:375-468) plus
+    /// `CleanDatabase(newChannelIdList, [BaseItemKind.LiveTvChannel], …)`
+    /// (:147). Without the first half `GET /Items/{channelId}` answers 404 for
+    /// an id `GET /LiveTv/Channels` just handed the client; without the second,
+    /// a removed tuner's channels haunt every recursive query for ever.
+    #[tokio::test]
+    async fn a_guide_refresh_stores_the_lineup_as_items_and_cleans_the_departed() {
+        let view = Uuid::from_u128(0x2b2b_ca16_aacc_8a14_d53a_11bb_829e_afa5);
+        let mut sources = HashMap::new();
+        sources.insert("http://tuner/playlist.m3u".to_owned(), M3U.to_owned());
+        let mgr = manager_with(FakeFetcher(sources)).await;
+        let item_type_lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
+            Arc::new(ferrofin_core::ItemTypeLookup::new());
+        let persistence: Arc<dyn ferrofin_traits::persistence::ItemPersistenceService> = Arc::new(
+            ferrofin_core::FerrofinItemPersistenceService::new(mgr.db.clone()),
+        );
+        let items: Arc<dyn ferrofin_traits::persistence::ItemRepository> = Arc::new(
+            ferrofin_core::FerrofinItemRepository::new(mgr.db.clone(), item_type_lookup),
+        );
+        // The parent row has to exist: `BaseItems.ParentId` is a real foreign
+        // key, which is exactly why upstream's `GetInternalLiveTvFolder()`
+        // CREATES the view before a channel is stored under it.
+        persistence
+            .save_items(&[BaseItemEntity {
+                id: ferrofin_db::store::guid_to_db(view),
+                type_: "MediaBrowser.Controller.Entities.UserView".to_owned(),
+                name: Some("Live TV".to_owned()),
+                is_folder: true,
+                ..BaseItemEntity::default()
+            }])
+            .await
+            .expect("live tv view");
+        mgr.set_item_store(
+            Arc::clone(&persistence),
+            items,
+            Arc::new(FixedLiveTvView(view)),
+        );
+        mgr.save_tuner_host(TunerHostInfo {
+            type_: Some("m3u".to_owned()),
+            url: Some("http://tuner/playlist.m3u".to_owned()),
+            ..TunerHostInfo::default()
+        })
+        .await
+        .expect("tuner");
+        mgr.refresh_guide().await.expect("refresh");
+
+        let lineup = channel_ids(&mgr).await;
+        assert_eq!(lineup.len(), 2);
+        let stored = stored_channel_items(&mgr).await;
+        assert_eq!(
+            stored.len(),
+            2,
+            "every channel in the lineup is an item row"
+        );
+        let parent = ferrofin_db::store::guid_to_db(view);
+        for (id, parent_id, top_parent_id) in &stored {
+            assert!(
+                lineup.contains(&Uuid::parse_str(id).expect("guid")),
+                "a stored channel item is one of the lineup's channels"
+            );
+            // `item.ParentId = parentFolderId`, and the same id is the row's
+            // TopParentId — which is what puts a channel in the recursive user
+            // universe.
+            assert_eq!(parent_id.as_deref(), Some(parent.as_str()));
+            assert_eq!(top_parent_id.as_deref(), Some(parent.as_str()));
+        }
+
+        // A channel item whose channel is no longer in any tuner's lineup goes
+        // on the next refresh — and only that one.
+        let ghost = Uuid::new_v4();
+        persistence
+            .save_items(&[BaseItemEntity {
+                id: ferrofin_db::store::guid_to_db(ghost),
+                type_: crate::projection::CHANNEL_TYPE_NAME.to_owned(),
+                name: Some("Departed".to_owned()),
+                ..BaseItemEntity::default()
+            }])
+            .await
+            .expect("ghost");
+        assert_eq!(stored_channel_items(&mgr).await.len(), 3);
+
+        mgr.refresh_guide().await.expect("second refresh");
+        let after = stored_channel_items(&mgr).await;
+        assert_eq!(after.len(), 2, "the departed channel item was cleaned");
+        assert!(
+            !after
+                .iter()
+                .any(|(id, ..)| Uuid::parse_str(id).ok() == Some(ghost))
+        );
     }
 
     /// The ids of the channels in the lineup, in order.
@@ -6846,6 +7182,48 @@ mod tests {
         assert!(duplicate_showings_to_cancel(&[showing("aa", 0), showing("bb", 60)]).is_empty());
     }
 
+    /// `AlphanumericComparator.CompareValues`, against the C# as the oracle.
+    ///
+    /// The digit-run arms are v10.11.8's (`Jellyfin.Extensions/AlphanumericComparator.cs`),
+    /// including the trailing `len1 - len2` tie-break master dropped when it
+    /// moved to `CompareOptions.NumericOrdering`; the text arm is the
+    /// `StringComparison.InvariantCulture` BOTH trees ask for.
+    #[test]
+    fn alphanumeric_compare_matches_the_upstream_comparator() {
+        // Numbers sort as numbers, not as text.
+        assert_eq!(
+            alphanumeric_compare("Show 2", "Show 10"),
+            std::cmp::Ordering::Less
+        );
+        // Leading zeros do not change the NUMBER, but upstream's final
+        // `return len1 - len2` still breaks the tie on the raw lengths.
+        assert_eq!(
+            alphanumeric_compare("Show 007", "Show 7"),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            alphanumeric_compare("Show", "Show 1"),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(alphanumeric_compare("", "a"), std::cmp::Ordering::Less);
+        // `StringComparison.InvariantCulture` is CLDR root collation, not
+        // code-point order: the primary level orders by letter, so a lowercase
+        // 'a' sorts before an uppercase 'B' even though 'B'(0x42) < 'a'(0x61).
+        assert_eq!(
+            alphanumeric_compare("apple parity", "Banana parity"),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(alphanumeric_compare("a", "B"), std::cmp::Ordering::Less);
+        // …and the tertiary level puts lowercase before uppercase within a
+        // letter, which code-point order has backwards.
+        assert_eq!(alphanumeric_compare("a", "A"), std::cmp::Ordering::Less);
+        // A multi-byte run is segmented on char boundaries, not byte ones.
+        assert_eq!(
+            alphanumeric_compare("Café 2", "Café 10"),
+            std::cmp::Ordering::Less
+        );
+    }
+
     /// `GetDayPattern`, `AlphanumericComparator` and `GetSeriesTimers`' ordering,
     /// against the C# as the oracle — including upstream's inverted priority arm.
     #[test]
@@ -6894,23 +7272,6 @@ mod tests {
             None
         );
 
-        // Numbers sort as numbers, not as text.
-        assert_eq!(
-            alphanumeric_compare("Show 2", "Show 10"),
-            std::cmp::Ordering::Less
-        );
-        // Leading zeros do not change the NUMBER, but upstream's final
-        // `return len1 - len2` still breaks the tie on the raw lengths.
-        assert_eq!(
-            alphanumeric_compare("Show 007", "Show 7"),
-            std::cmp::Ordering::Greater
-        );
-        assert_eq!(
-            alphanumeric_compare("Show", "Show 1"),
-            std::cmp::Ordering::Less
-        );
-        assert_eq!(alphanumeric_compare("", "a"), std::cmp::Ordering::Less);
-
         let timer = |name: &str, priority: i32| SeriesTimerInfoDto {
             base: ferrofin_model::live_tv::BaseTimerInfoDto {
                 name: Some(name.to_owned()),
@@ -6956,16 +7317,52 @@ mod tests {
 
     // ---- Channel query/projection (plan A) --------------------------------
 
+    /// `get_channels` plus the `AddChannelInfo` pass the DTO service runs for
+    /// it.
+    ///
+    /// In production this is one call: upstream's `DtoService.GetBaseItemDtos`
+    /// buckets `item is LiveTvChannel` and finishes the DTOs through
+    /// `LivetvManager.AddChannelInfo` (v10.11.8 DtoService.cs:168-192), and
+    /// `FerrofinDtoService` does the same. These tests project through
+    /// `FakeDto`, which has no Live TV seam, so the second half is applied here
+    /// — the same two steps in the same order, over the same options the list
+    /// path strips.
+    async fn channels_with_info(
+        mgr: &FerrofinLiveTvManager,
+        query: &LiveTvChannelQuery,
+        options: &DtoOptions,
+    ) -> ferrofin_model::querying::QueryResult<BaseItemDto> {
+        let mut page = mgr.get_channels(query, options).await.expect("channels");
+        let mut list_options = options.clone();
+        crate::projection::remove_fields(&mut list_options);
+        mgr.add_channel_info(&mut page.items, &list_options, None)
+            .await
+            .expect("channel info");
+        page
+    }
+
+    /// [`channels_with_info`]'s single-channel twin (the detail path strips
+    /// nothing).
+    async fn channel_with_info(
+        mgr: &FerrofinLiveTvManager,
+        id: Uuid,
+        options: &DtoOptions,
+    ) -> Option<BaseItemDto> {
+        let mut dto = vec![mgr.get_channel(id, None, options).await.expect("get")?];
+        mgr.add_channel_info(&mut dto, options, None)
+            .await
+            .expect("channel info");
+        dto.pop()
+    }
+
     /// The list path: `AddChannelInfo` fields land, the four detail fields are
     /// stripped (`RemoveFields`), and each channel carries its currently-airing
     /// programme from the one page-wide airing query.
     #[tokio::test]
     async fn channel_list_attaches_channel_info_and_current_program() {
         let mgr = manager_with_relative_guide().await;
-        let channels = mgr
-            .get_channels(&LiveTvChannelQuery::default(), &DtoOptions::default())
-            .await
-            .expect("channels");
+        let channels =
+            channels_with_info(&mgr, &LiveTvChannelQuery::default(), &DtoOptions::default()).await;
         assert_eq!(channels.total_record_count, 2);
         assert_eq!(channels.start_index, 0);
 
@@ -7153,10 +7550,8 @@ mod tests {
             .items[0]
             .id;
 
-        let channel = mgr
-            .get_channel(id, None, &DtoOptions::default())
+        let channel = channel_with_info(&mgr, id, &DtoOptions::default())
             .await
-            .expect("get")
             .expect("some");
         assert_eq!(channel.etag.as_deref(), Some("fake-etag"));
         assert_eq!(

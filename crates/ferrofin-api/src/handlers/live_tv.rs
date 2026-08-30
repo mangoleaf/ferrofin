@@ -45,6 +45,7 @@ use ferrofin_traits::stubs::LiveTvChannelQuery;
 
 use crate::auth::{RequireAdmin, RequireLiveTvAccess, RequireLiveTvManagement};
 use crate::error::ApiError;
+use crate::extract::JsonBody;
 use crate::handlers::items::resolve_user_opt;
 use crate::handlers::query_parse::{
     de_comma_delimited, de_pipe_delimited, parse_csv_enums_lenient, parse_csv_uuids,
@@ -700,7 +701,7 @@ async fn get_programs(
 async fn post_programs(
     State(state): State<AppState>,
     RequireLiveTvAccess(auth): RequireLiveTvAccess,
-    Json(body): Json<GetProgramsDto>,
+    JsonBody(body): JsonBody<GetProgramsDto>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     let user = match body.user_id.filter(|id| !id.is_nil()) {
         Some(id) => resolve_user_opt(&state, &auth, Some(id)).await?,
@@ -834,7 +835,7 @@ async fn query_programs_inner(
 async fn add_tuner_host(
     State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
-    Json(info): Json<TunerHostInfo>,
+    JsonBody(info): JsonBody<TunerHostInfo>,
 ) -> Result<Json<TunerHostInfo>, ApiError> {
     let m = live_tv(&state)?;
     let saved = m.save_tuner_host(info).await?;
@@ -862,7 +863,7 @@ async fn delete_tuner_host(
 async fn add_listing_provider(
     State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
-    Json(info): Json<ListingsProviderInfo>,
+    JsonBody(info): JsonBody<ListingsProviderInfo>,
 ) -> Result<Json<ListingsProviderInfo>, ApiError> {
     let m = live_tv(&state)?;
     let saved = m.save_listing_provider(info).await?;
@@ -1306,7 +1307,7 @@ struct SetChannelMappingDto {
 async fn set_channel_mapping(
     State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
-    Json(dto): Json<SetChannelMappingDto>,
+    JsonBody(dto): JsonBody<SetChannelMappingDto>,
 ) -> Result<Json<TunerChannelMapping>, ApiError> {
     let manager = live_tv(&state)?;
     let mut provider = manager
@@ -1403,7 +1404,7 @@ async fn get_timer(
 async fn create_timer(
     State(state): State<AppState>,
     RequireLiveTvManagement(_auth): RequireLiveTvManagement,
-    Json(timer): Json<TimerInfoDto>,
+    JsonBody(timer): JsonBody<TimerInfoDto>,
 ) -> Result<axum::http::StatusCode, ApiError> {
     let program_id = timer.base.program_id.clone();
     let id = live_tv(&state)?.create_timer(timer).await?;
@@ -1443,7 +1444,7 @@ async fn update_timer(
     State(state): State<AppState>,
     RequireLiveTvManagement(_auth): RequireLiveTvManagement,
     Path(timer_id): Path<String>,
-    Json(timer): Json<TimerInfoDto>,
+    JsonBody(timer): JsonBody<TimerInfoDto>,
 ) -> Result<axum::http::StatusCode, ApiError> {
     live_tv(&state)?.update_timer(&timer_id, timer).await?;
     Ok(axum::http::StatusCode::NO_CONTENT)
@@ -1557,7 +1558,7 @@ async fn get_series_timer(
 async fn create_series_timer(
     State(state): State<AppState>,
     RequireLiveTvManagement(_auth): RequireLiveTvManagement,
-    Json(timer): Json<SeriesTimerInfoDto>,
+    JsonBody(timer): JsonBody<SeriesTimerInfoDto>,
 ) -> Result<axum::http::StatusCode, ApiError> {
     let program_id = timer.base.program_id.clone();
     let id = live_tv(&state)?.create_series_timer(timer).await?;
@@ -1576,7 +1577,7 @@ async fn update_series_timer(
     State(state): State<AppState>,
     RequireLiveTvManagement(_auth): RequireLiveTvManagement,
     Path(timer_id): Path<String>,
-    Json(timer): Json<SeriesTimerInfoDto>,
+    JsonBody(timer): JsonBody<SeriesTimerInfoDto>,
 ) -> Result<axum::http::StatusCode, ApiError> {
     live_tv(&state)?
         .update_series_timer(&timer_id, timer)
@@ -1816,7 +1817,7 @@ mod tests {
             post_programs(
                 State(state.clone()),
                 auth(),
-                Json(GetProgramsDto::default())
+                JsonBody(GetProgramsDto::default())
             )
             .await
             .unwrap()
@@ -1844,7 +1845,7 @@ mod tests {
         let err = add_tuner_host(
             State(state.clone()),
             admin_auth(),
-            Json(TunerHostInfo::default()),
+            JsonBody(TunerHostInfo::default()),
         )
         .await
         .unwrap_err();
@@ -2182,7 +2183,7 @@ mod tests {
         let map = set_channel_mapping(
             State(state),
             admin_auth(),
-            Json(SetChannelMappingDto {
+            JsonBody(SetChannelMappingDto {
                 provider_id: "p".into(),
                 tuner_channel_id: "t".into(),
                 provider_channel_id: "c".into(),
@@ -2469,7 +2470,7 @@ mod tests {
         let mapping = set_channel_mapping(
             State(state),
             admin_auth(),
-            Json(SetChannelMappingDto {
+            JsonBody(SetChannelMappingDto {
                 provider_id: "prov1".into(),
                 tuner_channel_id: "10".into(),
                 provider_channel_id: "HBO".into(),
@@ -2494,7 +2495,7 @@ mod tests {
         let err = set_channel_mapping(
             State(state),
             admin_auth(),
-            Json(SetChannelMappingDto {
+            JsonBody(SetChannelMappingDto {
                 provider_id: "missing".into(),
                 tuner_channel_id: "1".into(),
                 provider_channel_id: "2".into(),
@@ -2735,7 +2736,7 @@ mod tests {
 
         let fake = std::sync::Arc::new(FakeLiveTv::default());
         let state = fake_state().with_live_tv(fake.clone());
-        let _ = post_programs(State(state), auth(), Json(body))
+        let _ = post_programs(State(state), auth(), JsonBody(body))
             .await
             .expect("ok");
         let query = fake.programs_query.lock().unwrap().clone().expect("called");

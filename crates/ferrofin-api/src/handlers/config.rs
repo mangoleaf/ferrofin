@@ -25,6 +25,7 @@ use serde_json::Value;
 
 use crate::auth::{RequireAdmin, RequireAuth};
 use crate::error::ApiError;
+use crate::extract::{JsonBody, JsonValueBody};
 use crate::state::AppState;
 
 /// The on-disk file backing a persisted named configuration, or `None` when
@@ -83,7 +84,7 @@ async fn get_configuration(
 async fn update_configuration(
     State(state): State<AppState>,
     _auth: RequireAdmin,
-    Json(configuration): Json<ServerConfiguration>,
+    JsonBody(configuration): JsonBody<ServerConfiguration>,
 ) -> Result<StatusCode, ApiError> {
     state.config.update_configuration(&configuration).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -118,7 +119,7 @@ async fn get_default_metadata_options(_auth: RequireAdmin) -> Json<MetadataOptio
 async fn update_branding_configuration(
     State(state): State<AppState>,
     _auth: RequireAdmin,
-    Json(dto): Json<BrandingOptionsDto>,
+    JsonBody(dto): JsonBody<BrandingOptionsDto>,
 ) -> Result<StatusCode, ApiError> {
     let mut current = state.config.get_branding().await?;
     current.login_disclaimer = dto.login_disclaimer;
@@ -302,7 +303,7 @@ async fn update_named_configuration(
     State(state): State<AppState>,
     _auth: RequireAdmin,
     Path(key): Path<String>,
-    Json(body): Json<Value>,
+    JsonValueBody(body): JsonValueBody<Value>,
 ) -> Result<StatusCode, ApiError> {
     if key.eq_ignore_ascii_case("branding") {
         let branding: BrandingOptions = serde_json::from_value(body).map_err(|_| {

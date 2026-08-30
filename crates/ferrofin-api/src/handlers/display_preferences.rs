@@ -37,6 +37,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
+use crate::extract::JsonBody;
 use crate::state::AppState;
 
 /// The rewind skip length (ms) stored when the `skipBackLength` custom pref is
@@ -257,7 +258,7 @@ async fn update_display_preferences(
     RequireAuth(auth): RequireAuth,
     Path(display_preferences_id): Path<String>,
     Query(params): Query<DisplayPreferencesParams>,
-    Json(mut dto): Json<DisplayPreferencesDto>,
+    JsonBody(mut dto): JsonBody<DisplayPreferencesDto>,
 ) -> Result<StatusCode, ApiError> {
     let user_id = params.user_id.unwrap_or_else(|| auth.user_id());
     let client = params

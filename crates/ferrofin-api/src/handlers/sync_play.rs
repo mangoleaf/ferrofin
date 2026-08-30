@@ -34,6 +34,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
+use crate::extract::JsonBody;
 use crate::handlers::items::{resolve_user_opt, user_uuid};
 use crate::handlers::session_ctx::current_session;
 use crate::state::AppState;
@@ -133,7 +134,7 @@ async fn dispatch(
 async fn new_group(
     RequireAuth(auth): RequireAuth,
     State(state): State<AppState>,
-    Json(body): Json<NewGroupRequestDto>,
+    JsonBody(body): JsonBody<NewGroupRequestDto>,
 ) -> Result<Json<GroupInfoDto>, ApiError> {
     require_access(&state, &auth, SyncPlayAccess::CreateGroup).await?;
     let mgr = manager(&state)?;
@@ -145,7 +146,7 @@ async fn new_group(
 async fn join_group(
     RequireAuth(auth): RequireAuth,
     State(state): State<AppState>,
-    Json(body): Json<JoinGroupRequestDto>,
+    JsonBody(body): JsonBody<JoinGroupRequestDto>,
 ) -> Result<StatusCode, ApiError> {
     require_access(&state, &auth, SyncPlayAccess::JoinGroup).await?;
     let mgr = manager(&state)?;
@@ -195,7 +196,7 @@ async fn get_group(
 async fn set_new_queue(
     RequireAuth(auth): RequireAuth,
     State(state): State<AppState>,
-    Json(body): Json<PlayRequestDto>,
+    JsonBody(body): JsonBody<PlayRequestDto>,
 ) -> Result<StatusCode, ApiError> {
     dispatch(
         &state,
@@ -213,7 +214,7 @@ async fn set_new_queue(
 async fn set_playlist_item(
     RequireAuth(auth): RequireAuth,
     State(state): State<AppState>,
-    Json(body): Json<SetPlaylistItemRequestDto>,
+    JsonBody(body): JsonBody<SetPlaylistItemRequestDto>,
 ) -> Result<StatusCode, ApiError> {
     dispatch(
         &state,
@@ -229,7 +230,7 @@ async fn set_playlist_item(
 async fn remove_from_playlist(
     RequireAuth(auth): RequireAuth,
     State(state): State<AppState>,
-    Json(body): Json<RemoveFromPlaylistRequestDto>,
+    JsonBody(body): JsonBody<RemoveFromPlaylistRequestDto>,
 ) -> Result<StatusCode, ApiError> {
     dispatch(
         &state,
@@ -247,7 +248,7 @@ async fn remove_from_playlist(
 async fn move_playlist_item(
     RequireAuth(auth): RequireAuth,
     State(state): State<AppState>,
-    Json(body): Json<MovePlaylistItemRequestDto>,
+    JsonBody(body): JsonBody<MovePlaylistItemRequestDto>,
 ) -> Result<StatusCode, ApiError> {
     dispatch(
         &state,
@@ -264,7 +265,7 @@ async fn move_playlist_item(
 async fn queue(
     RequireAuth(auth): RequireAuth,
     State(state): State<AppState>,
-    Json(body): Json<QueueRequestDto>,
+    JsonBody(body): JsonBody<QueueRequestDto>,
 ) -> Result<StatusCode, ApiError> {
     dispatch(
         &state,
@@ -305,7 +306,7 @@ async fn stop(
 async fn seek(
     RequireAuth(auth): RequireAuth,
     State(state): State<AppState>,
-    Json(body): Json<SeekRequestDto>,
+    JsonBody(body): JsonBody<SeekRequestDto>,
 ) -> Result<StatusCode, ApiError> {
     dispatch(
         &state,
@@ -321,7 +322,7 @@ async fn seek(
 async fn buffering(
     RequireAuth(auth): RequireAuth,
     State(state): State<AppState>,
-    Json(body): Json<BufferRequestDto>,
+    JsonBody(body): JsonBody<BufferRequestDto>,
 ) -> Result<StatusCode, ApiError> {
     dispatch(
         &state,
@@ -340,7 +341,7 @@ async fn buffering(
 async fn ready(
     RequireAuth(auth): RequireAuth,
     State(state): State<AppState>,
-    Json(body): Json<ReadyRequestDto>,
+    JsonBody(body): JsonBody<ReadyRequestDto>,
 ) -> Result<StatusCode, ApiError> {
     dispatch(
         &state,
@@ -359,7 +360,7 @@ async fn ready(
 async fn set_ignore_wait(
     RequireAuth(auth): RequireAuth,
     State(state): State<AppState>,
-    Json(body): Json<IgnoreWaitRequestDto>,
+    JsonBody(body): JsonBody<IgnoreWaitRequestDto>,
 ) -> Result<StatusCode, ApiError> {
     dispatch(
         &state,
@@ -375,7 +376,7 @@ async fn set_ignore_wait(
 async fn next_item(
     RequireAuth(auth): RequireAuth,
     State(state): State<AppState>,
-    Json(body): Json<NextItemRequestDto>,
+    JsonBody(body): JsonBody<NextItemRequestDto>,
 ) -> Result<StatusCode, ApiError> {
     dispatch(
         &state,
@@ -391,7 +392,7 @@ async fn next_item(
 async fn previous_item(
     RequireAuth(auth): RequireAuth,
     State(state): State<AppState>,
-    Json(body): Json<PreviousItemRequestDto>,
+    JsonBody(body): JsonBody<PreviousItemRequestDto>,
 ) -> Result<StatusCode, ApiError> {
     dispatch(
         &state,
@@ -407,7 +408,7 @@ async fn previous_item(
 async fn set_repeat_mode(
     RequireAuth(auth): RequireAuth,
     State(state): State<AppState>,
-    Json(body): Json<SetRepeatModeRequestDto>,
+    JsonBody(body): JsonBody<SetRepeatModeRequestDto>,
 ) -> Result<StatusCode, ApiError> {
     dispatch(
         &state,
@@ -421,7 +422,7 @@ async fn set_repeat_mode(
 async fn set_shuffle_mode(
     RequireAuth(auth): RequireAuth,
     State(state): State<AppState>,
-    Json(body): Json<SetShuffleModeRequestDto>,
+    JsonBody(body): JsonBody<SetShuffleModeRequestDto>,
 ) -> Result<StatusCode, ApiError> {
     dispatch(
         &state,
@@ -435,7 +436,7 @@ async fn set_shuffle_mode(
 async fn ping(
     RequireAuth(auth): RequireAuth,
     State(state): State<AppState>,
-    Json(body): Json<PingRequestDto>,
+    JsonBody(body): JsonBody<PingRequestDto>,
 ) -> Result<StatusCode, ApiError> {
     dispatch(&state, &auth, PlaybackRequest::Ping { ping: body.ping }).await
 }

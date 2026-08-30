@@ -257,9 +257,7 @@ impl FerrofinUserViewManager {
     /// the row on first read. Ferrofin only ever read such a row, so the view
     /// never existed and `/UserViews` served one fewer view than Jellyfin.
     async fn ensure_live_tv_view(&self, user_id: Uuid) -> Result<(), ServiceError> {
-        let (Some(persistence), Some(metadata_path), Some(db)) =
-            (&self.persistence, &self.metadata_path, &self.db)
-        else {
+        let Some(db) = &self.db else {
             return Ok(());
         };
         // The C# `GetEnabledUsers()` guard: a user without Live TV access never
@@ -269,12 +267,27 @@ impl FerrofinUserViewManager {
         {
             return Ok(());
         }
+        self.provision_live_tv_view().await.map(|_| ())
+    }
+
+    /// Provisions the Live TV `UserView` row (and its directory) if absent and
+    /// returns its id — the user-less half of [`Self::ensure_live_tv_view`].
+    ///
+    /// This is what `LiveTvManager.GetInternalLiveTvFolder()` does: it takes no
+    /// user, because the folder is the parent every channel ITEM is stored
+    /// under, and item rows exist whether or not a given user may see them.
+    /// `None` means the manager has no item store or metadata path wired.
+    async fn provision_live_tv_view(&self) -> Result<Option<Uuid>, ServiceError> {
+        let (Some(persistence), Some(metadata_path)) = (&self.persistence, &self.metadata_path)
+        else {
+            return Ok(None);
+        };
         let view_path = metadata_path.join("views").join("livetv");
         let Some(id) = self.live_tv_view_id(&view_path) else {
-            return Ok(());
+            return Ok(None);
         };
         if persistence.item_exists(id).await? {
-            return Ok(());
+            return Ok(Some(id));
         }
         // C# `Directory.CreateDirectory(path)` inside `GetNamedView`.
         tokio::fs::create_dir_all(&view_path)
@@ -308,7 +321,7 @@ impl FerrofinUserViewManager {
         persistence
             .save_items(std::slice::from_ref(&entity))
             .await?;
-        Ok(())
+        Ok(Some(id))
     }
 }
 
@@ -329,6 +342,10 @@ impl UserViewManager for FerrofinUserViewManager {
         };
         let views = self.items.get_item_list(&query).await?;
         self.without_disabled_live_tv(user_id, views).await
+    }
+
+    async fn get_internal_live_tv_folder_id(&self) -> Result<Option<Uuid>, ServiceError> {
+        self.provision_live_tv_view().await
     }
 
     async fn get_media_folders(&self, user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError> {

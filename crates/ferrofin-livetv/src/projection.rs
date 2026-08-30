@@ -30,13 +30,6 @@ pub const PROGRAM_TYPE_NAME: &str = "MediaBrowser.Controller.LiveTv.LiveTvProgra
 /// `"Recording"`, which is a timer-side concept.
 pub const RECORDING_TYPE_NAME: &str = "MediaBrowser.Controller.Entities.Video";
 
-/// The synthetic "Live TV" folder every channel parents to.
-///
-/// Upstream parents channels under `GetInternalLiveTvFolder()` — a real
-/// `BaseItems` folder row. Ferrofin has no such row, so a fixed id stands in;
-/// clients only echo `ParentId`, they never fetch it for a channel.
-pub const LIVE_TV_FOLDER_ID: Uuid = Uuid::from_u128(0x6c74_7666_6f6c_6465_725f_5f6e_735f_3031);
-
 /// One `FerrofinLiveTvChannels` row, as the query paths read it.
 #[derive(Debug, Clone, sqlx::FromRow)]
 #[sqlx(rename_all = "PascalCase")]
@@ -45,6 +38,11 @@ pub struct ChannelRow {
     pub id: String,
     /// The tuner `tvg-id` (empty when the M3U carried none).
     pub tvg_id: String,
+    /// The TUNER's own id for this entry (`hdhr_10.1`, `m3u_{md5}{md5}`) —
+    /// C# `ChannelInfo.Id`, which `GuideManager.GetChannel` stores as the
+    /// item's `ExternalId` and which the internal GUID is derived from.
+    #[sqlx(default)]
+    pub external_id: String,
     /// The display name.
     pub name: String,
     /// The channel number, if any.
@@ -264,25 +262,44 @@ pub fn channel_sort_name(number: Option<&str>, name: &str) -> String {
 /// Port of `GuideManager.GetChannel`'s item shape: `LiveTvChannel` type, no
 /// path (the tuner URL is resolved at stream time, not stored on the item),
 /// the `CreateSortName` sort key, and the first-seen `DateCreated`.
+///
+/// `CleanName` and `PresentationUniqueKey` are deliberately left unset: the
+/// item store derives both at write time (C# `SaveItem` likewise stamps
+/// `CleanName = GetCleanValue(item.Name)` itself), so a value set here would be
+/// one nothing reads.
 #[must_use]
 pub fn channel_entity(
     row: &ChannelRow,
     parse_dt: fn(&str) -> Option<DateTime<Utc>>,
+    live_tv_view_id: Option<Uuid>,
 ) -> BaseItemEntity {
+    // `item.ParentId = parentFolderId` where the parent is
+    // `GetInternalLiveTvFolder()` — the Live TV `UserView` row. It is also the
+    // row's `TopParentId`, which is what puts a channel inside the recursive
+    // user universe (`scope_to_user_libraries` treats a Live TV view as
+    // standing for itself).
+    let parent = live_tv_view_id.map(db_guid);
     BaseItemEntity {
         id: row.id.clone(),
         type_: CHANNEL_TYPE_NAME.to_owned(),
         name: Some(row.name.clone()),
         media_type: Some(channel_media_type(&row.channel_type).to_owned()),
         sort_name: Some(channel_sort_name(row.number.as_deref(), &row.name)),
-        external_id: Some(if row.tvg_id.is_empty() {
-            row.name.clone()
-        } else {
+        // `ExternalId` is `channelInfo.Id` — the TUNER's id (`hdhr_10.1`), not
+        // the listing's `tvg-id`. It is what `GetInternalChannelId` hashed to
+        // mint this row's GUID, so the two must agree or a re-scan cannot
+        // recognise its own channel.
+        external_id: Some(if row.external_id.is_empty() {
             row.tvg_id.clone()
+        } else {
+            row.external_id.clone()
         }),
         external_service_id: Some("Emby".to_owned()),
+        // `LiveTvChannel.GetBlockUnratedType() => UnratedItem.LiveTvChannel`.
+        unrated_type: Some("LiveTvChannel".to_owned()),
         date_created: row.date_created.as_deref().and_then(parse_dt),
-        parent_id: Some(db_guid(LIVE_TV_FOLDER_ID)),
+        parent_id: parent.clone(),
+        top_parent_id: parent,
         is_folder: false,
         ..BaseItemEntity::default()
     }
@@ -618,9 +635,11 @@ mod tests {
 
     #[test]
     fn channel_entity_has_no_path_and_the_emby_service_id() {
+        let view = Uuid::from_u128(0x2b2b_ca16_aacc_8a14_d53a_11bb_829e_afa5);
         let row = ChannelRow {
             id: "CCCCCCCC-0000-0000-0000-000000000003".to_owned(),
             tvg_id: "parity1".to_owned(),
+            external_id: "hdhr_10.1".to_owned(),
             name: "Parity One".to_owned(),
             number: Some("1".to_owned()),
             channel_type: "Tv".to_owned(),
@@ -629,15 +648,21 @@ mod tests {
             is_series: false,
             is_kids: false,
         };
-        let entity = channel_entity(&row, parse);
+        let entity = channel_entity(&row, parse, Some(view));
         assert_eq!(entity.type_, CHANNEL_TYPE_NAME);
         assert_eq!(entity.path, None); // upstream channel items carry no path
         assert_eq!(entity.media_type.as_deref(), Some("Video"));
         assert_eq!(entity.sort_name.as_deref(), Some("00001.0-Parity One"));
         assert_eq!(entity.external_service_id.as_deref(), Some("Emby"));
+        assert_eq!(entity.unrated_type.as_deref(), Some("LiveTvChannel"));
+        // `ExternalId` is the TUNER's id, which is what the GUID was hashed
+        // from — never the listing's tvg-id.
+        assert_eq!(entity.external_id.as_deref(), Some("hdhr_10.1"));
+        // ParentId == TopParentId == the Live TV UserView row.
+        assert_eq!(entity.parent_id.as_deref(), Some(db_guid(view).as_str()));
         assert_eq!(
-            entity.parent_id.as_deref(),
-            Some(db_guid(LIVE_TV_FOLDER_ID).as_str())
+            entity.top_parent_id.as_deref(),
+            Some(db_guid(view).as_str())
         );
     }
 

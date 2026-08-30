@@ -23,7 +23,7 @@ use crate::projection::{ChannelRow, ChannelUserData};
 /// Fails when the database read fails.
 pub async fn channel_rows(db: &Database) -> Result<Vec<ChannelRow>, ServiceError> {
     sqlx::query_as(
-        r#"SELECT "Id","TvgId","Name","Number","ChannelType","DateCreated",
+        r#"SELECT "Id","TvgId","ExternalId","Name","Number","ChannelType","DateCreated",
                   EXISTS(SELECT 1 FROM "FerrofinLiveTvPrograms" p
                          WHERE p."ChannelId" = "FerrofinLiveTvChannels"."Id" AND p."IsMovie" = 1) AS "IsMovie",
                   EXISTS(SELECT 1 FROM "FerrofinLiveTvPrograms" p
@@ -46,7 +46,7 @@ pub async fn channel_rows(db: &Database) -> Result<Vec<ChannelRow>, ServiceError
 /// Fails when the database read fails.
 pub async fn channel_row(db: &Database, id: Uuid) -> Result<Option<ChannelRow>, ServiceError> {
     sqlx::query_as(
-        r#"SELECT "Id","TvgId","Name","Number","ChannelType","DateCreated",
+        r#"SELECT "Id","TvgId","ExternalId","Name","Number","ChannelType","DateCreated",
                   0 AS "IsMovie", 0 AS "IsSeries", 0 AS "IsKids"
            FROM "FerrofinLiveTvChannels" WHERE "Id" = ?1"#,
     )
@@ -54,6 +54,49 @@ pub async fn channel_row(db: &Database, id: Uuid) -> Result<Option<ChannelRow>, 
     .fetch_optional(db.pool())
     .await
     .map_err(db_err)
+}
+
+/// The channels among `ids`, keyed by their `Uuid`.
+///
+/// One query for a whole page: `AddChannelInfo` runs over every DTO the
+/// projection produced, and a per-DTO lookup would be an N+1 on the channel
+/// list. Ids that are not channels are simply absent from the map, which is
+/// how a mixed page (an ordinary `/Items` response) costs one query and
+/// changes nothing.
+///
+/// # Errors
+///
+/// Fails when the database read fails.
+pub async fn channel_rows_by_ids(
+    db: &Database,
+    ids: &[Uuid],
+) -> Result<std::collections::HashMap<Uuid, ChannelRow>, ServiceError> {
+    let mut out = std::collections::HashMap::new();
+    // One bind per id, so the page has to be chunked: a recursive `/Items` page
+    // can name thousands of items and a channel only has to be one of them for
+    // this lookup to run.
+    for chunk in ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+        let mut qb: sqlx::QueryBuilder<'_, sqlx::Sqlite> = sqlx::QueryBuilder::new(
+            r#"SELECT "Id","TvgId","ExternalId","Name","Number","ChannelType","DateCreated",
+                  0 AS "IsMovie", 0 AS "IsSeries", 0 AS "IsKids"
+           FROM "FerrofinLiveTvChannels" WHERE "Id" IN ("#,
+        );
+        let mut separated = qb.separated(", ");
+        for id in chunk {
+            separated.push_bind(guid_to_db(*id));
+        }
+        qb.push(")");
+        let rows: Vec<ChannelRow> = qb
+            .build_query_as()
+            .fetch_all(db.pool())
+            .await
+            .map_err(db_err)?;
+        out.extend(
+            rows.into_iter()
+                .filter_map(|row| Uuid::parse_str(&row.id).ok().map(|id| (id, row))),
+        );
+    }
+    Ok(out)
 }
 
 /// The user's channel user-data rows, keyed by the stored channel id:
@@ -256,6 +299,22 @@ pub mod test_support {
         .await
         .map_err(db_err)?;
         Ok(())
+    }
+
+    /// The stored `BaseItems` channel-item rows as
+    /// `(Id, ParentId, TopParentId)`, id-ordered — what the guide refresh's
+    /// `BaseItems` mirror wrote.
+    pub async fn stored_channel_items(
+        db: &Database,
+    ) -> Result<Vec<(String, Option<String>, Option<String>)>, ServiceError> {
+        sqlx::query_as(
+            r#"SELECT "Id","ParentId","TopParentId" FROM "BaseItems"
+               WHERE "Type" = ?1 ORDER BY "Id""#,
+        )
+        .bind(crate::projection::CHANNEL_TYPE_NAME)
+        .fetch_all(db.pool())
+        .await
+        .map_err(db_err)
     }
 
     /// Marks an item favourite for a user, the way the playstate path stores it.

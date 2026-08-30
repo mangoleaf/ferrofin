@@ -1057,6 +1057,33 @@ pub trait UserViewManager: Send + Sync {
         query: &crate::options::LatestItemsQuery,
         options: &DtoOptions,
     ) -> Result<Vec<(Option<BaseItemEntity>, Vec<BaseItemEntity>)>, ServiceError>;
+
+    /// The id of the Live TV `UserView` row every Live TV channel item is
+    /// parented to, provisioning the view if it does not exist yet.
+    ///
+    /// Port of `LiveTvManager.GetInternalLiveTvFolder()` (v10.11.8
+    /// src/Jellyfin.LiveTv/LiveTvManager.cs:1258-1262), which is
+    /// `GetNamedView(name, CollectionType.livetv, name)` — and `GetNamedView`
+    /// (LibraryManager.cs:2856-2898) CREATES the folder and its row on first
+    /// read. `GuideManager.GetChannel` passes the result as every channel
+    /// item's `ParentId`, so the guide refresh needs it before it can store a
+    /// channel as an item.
+    ///
+    /// Unlike [`get_user_views`](Self::get_user_views) this has NO per-user
+    /// Live TV gate: upstream's `GetInternalLiveTvFolder` takes no user, and
+    /// the channel rows exist regardless of who may see them (visibility is
+    /// decided by the query scope, not by whether the row was written).
+    ///
+    /// The default returns `None` — a service with no item store behind it
+    /// cannot provision anything, and a caller must treat that as "no parent
+    /// known", never as an error.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn get_internal_live_tv_folder_id(&self) -> Result<Option<Uuid>, ServiceError> {
+        Ok(None)
+    }
 }
 
 fn _assert_object_safe_user_view_manager(_: &dyn UserViewManager) {}

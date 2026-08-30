@@ -40,6 +40,7 @@ use uuid::Uuid;
 
 use crate::auth::{RequireAdmin, RequireAuth};
 use crate::error::ApiError;
+use crate::extract::JsonSeqBody;
 use crate::state::AppState;
 
 /// Ports Jellyfin's `RequiresElevation` policy for the plugin-mutating
@@ -340,7 +341,7 @@ async fn get_repositories(
 async fn set_repositories(
     State(state): State<AppState>,
     RequireAdmin(auth): RequireAdmin,
-    Json(repositories): Json<Vec<RepositoryInfo>>,
+    JsonSeqBody(repositories): JsonSeqBody<Vec<RepositoryInfo>>,
 ) -> Result<StatusCode, ApiError> {
     require_admin(&state, &auth).await?;
     state.plugins.set_repositories(repositories).await?;

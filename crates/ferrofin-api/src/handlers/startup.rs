@@ -29,6 +29,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::auth::FirstTimeSetupOrElevated;
 use crate::error::ApiError;
+use crate::extract::JsonBody;
 use crate::handlers::items::user_uuid;
 use crate::state::AppState;
 
@@ -128,7 +129,7 @@ async fn get_startup_configuration(
 async fn update_initial_configuration(
     State(state): State<AppState>,
     FirstTimeSetupOrElevated(_): FirstTimeSetupOrElevated,
-    Json(body): Json<StartupConfigurationDto>,
+    JsonBody(body): JsonBody<StartupConfigurationDto>,
 ) -> Result<StatusCode, ApiError> {
     let mut config = (*state.config.configuration().await?).clone();
     config.server_name = body.server_name.unwrap_or_default();
@@ -161,7 +162,7 @@ async fn update_initial_configuration(
 async fn set_remote_access(
     State(state): State<AppState>,
     FirstTimeSetupOrElevated(_): FirstTimeSetupOrElevated,
-    Json(body): Json<StartupRemoteAccessDto>,
+    JsonBody(body): JsonBody<StartupRemoteAccessDto>,
 ) -> Result<StatusCode, ApiError> {
     let path = crate::handlers::config::named_config_file(&state, "network").ok_or_else(|| {
         ApiError::from(ferrofin_traits::error::ServiceError::backend(
@@ -265,7 +266,7 @@ async fn get_first_user(
 async fn update_startup_user(
     State(state): State<AppState>,
     FirstTimeSetupOrElevated(_): FirstTimeSetupOrElevated,
-    Json(body): Json<StartupUserDto>,
+    JsonBody(body): JsonBody<StartupUserDto>,
 ) -> Result<StatusCode, ApiError> {
     let user = state
         .users

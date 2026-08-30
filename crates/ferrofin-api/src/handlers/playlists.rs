@@ -45,6 +45,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
+use crate::extract::JsonBody;
 use crate::handlers::query_parse::parse_csv_uuids;
 use crate::state::AppState;
 
@@ -91,9 +92,9 @@ async fn create_playlist(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
     Query(query): Query<CreatePlaylistQuery>,
-    body: Option<Json<CreatePlaylistDto>>,
+    body: Option<JsonBody<CreatePlaylistDto>>,
 ) -> Result<Json<PlaylistCreationResult>, ApiError> {
-    let body = body.map(|Json(b)| b).unwrap_or_default();
+    let body = body.map(|JsonBody(b)| b).unwrap_or_default();
 
     let query_ids = parse_csv_uuids(query.ids.as_deref())?;
     let item_id_list = if query_ids.is_empty() {
@@ -181,7 +182,7 @@ async fn update_playlist(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
     Path(playlist_id): Path<Uuid>,
-    Json(body): Json<UpdatePlaylistDto>,
+    JsonBody(body): JsonBody<UpdatePlaylistDto>,
 ) -> Result<StatusCode, ApiError> {
     let calling_user_id = auth.user_id();
     require_edit(
@@ -585,9 +586,9 @@ async fn update_playlist_user(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
     Path((playlist_id, user_id)): Path<(Uuid, Uuid)>,
-    body: Option<Json<UpdatePlaylistUserDto>>,
+    body: Option<JsonBody<UpdatePlaylistUserDto>>,
 ) -> Result<StatusCode, ApiError> {
-    let body = body.map(|Json(b)| b).unwrap_or_default();
+    let body = body.map(|JsonBody(b)| b).unwrap_or_default();
     let access = state
         .playlists
         .get_playlist_access(playlist_id, auth.user_id())

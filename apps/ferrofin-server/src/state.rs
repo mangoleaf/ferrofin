@@ -696,6 +696,17 @@ pub async fn build_app_state(
             .with_database(db.clone()),
     );
 
+    // Close the Live TV ↔ item-layer cycle: the guide refresh mirrors the
+    // channel lineup into `BaseItems` (C# `GuideManager.GetChannel` →
+    // `LibraryManager.CreateItem`), parented to the Live TV `UserView` this
+    // manager provisions, so a channel resolves through the ordinary item
+    // routes and not just through `/LiveTv/Channels`.
+    live_tv_impl.set_item_store(
+        Arc::clone(&item_persistence_service),
+        Arc::clone(&item_repository),
+        Arc::clone(&user_views),
+    );
+
     // Built here rather than earlier so it can take the library configuration.
     // Two things read it: the remote-image ("Choose Image") language filter
     // resolves `LibraryOptions.PreferredMetadataLanguage` through it, and the
@@ -1268,7 +1279,7 @@ pub async fn build_app_state(
         ));
 
     // ---- dto (consumes many of the above) ---------------------------------
-    let dto: Arc<dyn ferrofin_traits::dto::DtoService> = Arc::new(
+    let dto_impl = Arc::new(
         FerrofinDtoService::new(
             db.clone(),
             server_id.clone(),
@@ -1284,6 +1295,11 @@ pub async fn build_app_state(
         // Jellyfin's link providers use the plugin's configured server.
         .with_musicbrainz_server(&config.musicbrainz_base_url),
     );
+    // `DtoService` finishes a Live TV channel's DTO itself (C#
+    // `DtoService.LivetvManager.AddChannelInfo`), so it needs the Live TV
+    // manager — which needs the DTO service. Both sides are late-bound seams.
+    dto_impl.set_live_tv(Arc::clone(&live_tv));
+    let dto: Arc<dyn ferrofin_traits::dto::DtoService> = dto_impl;
     // Close the Live TV ↔ media-sources ↔ DTO cycle: the channel/programme
     // projections run through the same DTO service as every other item.
     live_tv_impl.set_dto(Arc::clone(&dto));

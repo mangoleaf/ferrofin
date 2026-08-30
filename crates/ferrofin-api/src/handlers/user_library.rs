@@ -40,6 +40,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
+use crate::extract::JsonBody;
 use crate::handlers::items::{resolve_user, user_uuid};
 use crate::handlers::session_ctx::notify_user_data_changed;
 use crate::state::AppState;
@@ -370,7 +371,7 @@ async fn update_item_user_data(
     RequireAuth(auth): RequireAuth,
     Path(item_id): Path<Uuid>,
     Query(query): Query<UserIdQuery>,
-    Json(update): Json<UpdateUserItemDataDto>,
+    JsonBody(update): JsonBody<UpdateUserItemDataDto>,
 ) -> Result<Json<UserItemDataDto>, ApiError> {
     let user = resolve_user(&state, &auth, query.user_id).await?;
     let user_uuid = user_uuid(&user)?;
@@ -775,7 +776,7 @@ async fn update_item_user_data_for_user(
     state: State<AppState>,
     auth: RequireAuth,
     Path((user_id, item_id)): Path<(Uuid, Uuid)>,
-    update: Json<UpdateUserItemDataDto>,
+    update: JsonBody<UpdateUserItemDataDto>,
 ) -> Result<Json<UserItemDataDto>, ApiError> {
     let query = UserIdQuery {
         user_id: Some(user_id),

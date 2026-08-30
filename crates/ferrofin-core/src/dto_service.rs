@@ -52,7 +52,7 @@
 #![allow(clippy::assigning_clones)]
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use ferrofin_db::Database;
@@ -614,6 +614,15 @@ pub struct FerrofinDtoService {
     /// The MusicBrainz root the "Links" row points music items at — the
     /// configured mirror, as C# uses `Plugin.Instance.Configuration.Server`.
     musicbrainz_server: String,
+    /// The Live TV manager that finishes a channel's DTO.
+    ///
+    /// Upstream's `DtoService` holds `Lazy<ILiveTvManager> LivetvManager` for
+    /// exactly this and for exactly this reason: the Live TV manager needs the
+    /// DTO service, so one of the two references has to be resolved late.
+    /// `Arc<OnceLock<_>>` rather than a plain `OnceLock` because this service
+    /// is `Clone` and the composition root wires the seam after the clones
+    /// exist — every copy must see the value once it lands.
+    live_tv: Arc<OnceLock<Arc<dyn ferrofin_traits::stubs::LiveTvManager>>>,
 }
 
 impl std::fmt::Debug for FerrofinDtoService {
@@ -653,7 +662,17 @@ impl FerrofinDtoService {
             chapters,
             trickplay,
             musicbrainz_server: ferrofin_providers::musicbrainz::DEFAULT_BASE_URL.to_owned(),
+            live_tv: Arc::new(OnceLock::new()),
         }
+    }
+
+    /// Attaches the Live TV manager whose `AddChannelInfo` finishes a channel
+    /// DTO (C# `DtoService.LivetvManager`). A second call is ignored.
+    ///
+    /// Without it a channel projects as an ordinary item: no `Number`, no
+    /// `ChannelNumber`, no `ChannelType`, no `CurrentProgram`.
+    pub fn set_live_tv(&self, live_tv: Arc<dyn ferrofin_traits::stubs::LiveTvManager>) {
+        let _ = self.live_tv.set(live_tv);
     }
 
     /// Points the music "Links" row at a configured MusicBrainz mirror. Empty
@@ -1070,9 +1089,27 @@ impl FerrofinDtoService {
             dto.primary_image_aspect_ratio = self.primary_aspect_ratio(item_id, &images).await;
         }
 
-        // Display-preferences id (the item id in `N` form, hyphen-stripped).
+        // Display-preferences id. `BaseItem.DisplayPreferencesId`
+        // (v10.11.8 MediaBrowser.Controller/Entities/BaseItem.cs:243-251) keys
+        // display prefs by the item's TYPE, not by the item —
+        // `thisType == typeof(Folder) ? Id : thisType.FullName.GetMD5()` — with
+        // `CollectionFolder` overriding it back to `Id`
+        // (CollectionFolder.cs:55). Two episodes of the same series therefore
+        // share one key, which is what makes "sort this view by X" stick across
+        // a library instead of being re-chosen per item.
         if options.contains_field(ItemFields::DisplayPreferencesId) {
-            dto.display_preferences_id = Some(item_id.simple().to_string());
+            let keyed_by_own_id = matches!(
+                item.type_.as_str(),
+                "MediaBrowser.Controller.Entities.Folder"
+                    | "MediaBrowser.Controller.Entities.CollectionFolder"
+            );
+            dto.display_preferences_id = Some(if keyed_by_own_id {
+                item_id.simple().to_string()
+            } else {
+                ferrofin_common::extensions::get_md5(&item.type_)
+                    .simple()
+                    .to_string()
+            });
         }
 
         // User-specific play-state.
@@ -2050,6 +2087,19 @@ impl ferrofin_traits::dto::DtoService for FerrofinDtoService {
                 attach_child_count(&mut dto, item, &prefetched.child_counts);
             }
             out.push(dto);
+        }
+        // Upstream's `DtoService` finishes a Live TV channel's DTO ITSELF
+        // (v10.11.8 Emby.Server.Implementations/Dto/DtoService.cs:168-192): it
+        // buckets `item is LiveTvChannel` while projecting the page and hands
+        // the bucket to `LivetvManager.AddChannelInfo` at the end. That is why
+        // an ordinary `GET /Items/{id}` of a channel comes back carrying its
+        // channel number and currently-airing programme — the post-pass belongs
+        // to projecting a channel, not to the `/LiveTv/*` routes. The `any`
+        // guard keeps an ordinary page from costing a lookup.
+        if let Some(live_tv) = self.live_tv.get()
+            && items.iter().any(|item| is_live_tv_channel(row_kind(item)))
+        {
+            live_tv.add_channel_info(&mut out, options, user).await?;
         }
         Ok(out)
     }
@@ -3592,6 +3642,65 @@ mod tests {
         assert_eq!(dtos[0].air_days.as_deref(), Some(&[][..]));
         // Only a Series carries it — C# guards on `item is Series tmp`.
         assert_eq!(dtos[1].air_days, None);
+    }
+    /// `DisplayPreferencesId` keys display prefs by TYPE, not by item.
+    ///
+    /// Port of `BaseItem.DisplayPreferencesId` (v10.11.8
+    /// MediaBrowser.Controller/Entities/BaseItem.cs:243-251):
+    /// `thisType == typeof(Folder) ? Id : thisType.FullName.GetMD5()`, with
+    /// `CollectionFolder` overriding back to `Id` (CollectionFolder.cs:55).
+    /// The expected hashes were reproduced against a live Jellyfin 10.11.8.
+    #[tokio::test]
+    async fn display_preferences_are_keyed_by_type_not_by_item() {
+        let db = test_db().await;
+        let movie = Uuid::new_v4();
+        let other_movie = Uuid::new_v4();
+        let library = Uuid::new_v4();
+        seed_named_item(&db, movie, BaseItemKind::Movie, "Solaris").await;
+        seed_named_item(&db, other_movie, BaseItemKind::Movie, "Stalker").await;
+        seed_named_item(&db, library, BaseItemKind::CollectionFolder, "Movies").await;
+        let rows = vec![
+            fetch_item(&db, movie).await,
+            fetch_item(&db, other_movie).await,
+            fetch_item(&db, library).await,
+        ];
+
+        let svc = FerrofinDtoService::new(
+            db,
+            "server-1".into(),
+            Arc::new(FakeLibrary::default()),
+            Arc::new(FakeUserData),
+            Arc::new(FakeCounts),
+            Arc::new(FakeImages),
+            Arc::new(FakeSources::default()),
+            Arc::new(RecordingChapters::default()) as Arc<dyn ChapterManager>,
+            Arc::new(FakeTrickplay),
+        );
+        let options = DtoOptions {
+            fields: vec![ItemFields::DisplayPreferencesId],
+            ..DtoOptions::default()
+        };
+        let dtos = svc
+            .get_base_item_dtos(&rows, &options, None, None, true)
+            .await
+            .expect("dtos");
+
+        // Two different films share one key — that is the whole point of the
+        // type-keyed rule, and what makes a view's chosen sort stick.
+        assert_eq!(
+            dtos[0].display_preferences_id.as_deref(),
+            Some("dbf7709c41faaa746463d67978eb863d"),
+            "MD5(UTF-16LE(\"MediaBrowser.Controller.Entities.Movies.Movie\")) as a .NET Guid"
+        );
+        assert_eq!(
+            dtos[1].display_preferences_id,
+            dtos[0].display_preferences_id
+        );
+        // A CollectionFolder overrides back to its own id.
+        assert_eq!(
+            dtos[2].display_preferences_id.as_deref(),
+            Some(library.simple().to_string().as_str())
+        );
     }
 
     #[tokio::test]

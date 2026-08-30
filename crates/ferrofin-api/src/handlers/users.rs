@@ -55,6 +55,7 @@ use uuid::Uuid;
 
 use crate::auth::{RequireAdmin, RequireAuth};
 use crate::error::ApiError;
+use crate::extract::JsonBody;
 use crate::handlers::items::user_uuid;
 use crate::state::AppState;
 
@@ -354,7 +355,7 @@ async fn log_activity(state: &AppState, entry: ferrofin_traits::activity::Activi
 async fn authenticate_by_name(
     State(state): State<AppState>,
     parts: Parts,
-    Json(body): Json<AuthenticateByNameRequest>,
+    JsonBody(body): JsonBody<AuthenticateByNameRequest>,
 ) -> Result<Json<AuthenticationResult>, ApiError> {
     let auth = auth_info(&parts);
     let request = AuthenticationRequest {
@@ -415,7 +416,7 @@ async fn authenticate_by_name(
 async fn authenticate_with_quick_connect(
     State(state): State<AppState>,
     parts: Parts,
-    Json(body): Json<QuickConnectDto>,
+    JsonBody(body): JsonBody<QuickConnectDto>,
 ) -> Result<Json<AuthenticationResult>, ApiError> {
     // Validate the secret (it has already been authorized on another device),
     // then open a session for that user *directly* — no password — so the client
@@ -652,7 +653,7 @@ async fn notify_user_updated(state: &AppState, user_id: Uuid) {
 async fn create_user_by_name(
     State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
-    Json(body): Json<CreateUserByName>,
+    JsonBody(body): JsonBody<CreateUserByName>,
 ) -> Result<Json<UserDto>, ApiError> {
     let new_user = state.users.create_user(&body.name).await?;
     let id = user_uuid(&new_user)?;
@@ -694,7 +695,7 @@ async fn update_user(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
     Query(query): Query<UserIdQuery>,
-    Json(body): Json<UserDto>,
+    JsonBody(body): JsonBody<UserDto>,
 ) -> Result<StatusCode, ApiError> {
     let user_id = query.user_id.unwrap_or_else(|| auth.user_id());
     let user = load_user(&state, user_id).await?;
@@ -736,7 +737,7 @@ async fn update_user_policy(
     State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
     Path(user_id): Path<Uuid>,
-    Json(new_policy): Json<UserPolicy>,
+    JsonBody(new_policy): JsonBody<UserPolicy>,
 ) -> Result<StatusCode, ApiError> {
     let user = load_user(&state, user_id).await?;
     let was_admin = is_administrator(&state, &user).await?;
@@ -799,7 +800,7 @@ async fn update_user_configuration(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
     Query(query): Query<UserIdQuery>,
-    Json(config): Json<UserConfiguration>,
+    JsonBody(config): JsonBody<UserConfiguration>,
 ) -> Result<StatusCode, ApiError> {
     let user_id = query.user_id.unwrap_or_else(|| auth.user_id());
     let user = load_user(&state, user_id).await?;
@@ -830,7 +831,7 @@ async fn update_user_password(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
     Query(query): Query<UserIdQuery>,
-    Json(body): Json<UpdateUserPassword>,
+    JsonBody(body): JsonBody<UpdateUserPassword>,
 ) -> Result<StatusCode, ApiError> {
     let user_id = query.user_id.unwrap_or_else(|| auth.user_id());
     let user = load_user(&state, user_id).await?;
@@ -908,7 +909,7 @@ async fn log_password_changed(state: &AppState, user_id: Uuid, username: &str) {
 )]
 async fn forgot_password(
     State(state): State<AppState>,
-    Json(body): Json<ForgotPasswordDto>,
+    JsonBody(body): JsonBody<ForgotPasswordDto>,
 ) -> Result<Json<ForgotPasswordResult>, ApiError> {
     let contact_admin = || {
         Ok(Json(ForgotPasswordResult {
@@ -949,7 +950,7 @@ async fn forgot_password(
 )]
 async fn forgot_password_pin(
     State(state): State<AppState>,
-    Json(body): Json<ForgotPasswordPinDto>,
+    JsonBody(body): JsonBody<ForgotPasswordPinDto>,
 ) -> Result<Json<PinRedeemResult>, ApiError> {
     let dir = std::path::PathBuf::from(state.config.application_paths().data_path());
     let mut users_reset = Vec::new();
@@ -1048,7 +1049,7 @@ async fn update_user_for_user(
     state: State<AppState>,
     auth: RequireAuth,
     Path(user_id): Path<Uuid>,
-    body: Json<UserDto>,
+    body: JsonBody<UserDto>,
 ) -> Result<StatusCode, ApiError> {
     let query = UserIdQuery {
         user_id: Some(user_id),
@@ -1062,7 +1063,7 @@ async fn update_user_configuration_for_user(
     state: State<AppState>,
     auth: RequireAuth,
     Path(user_id): Path<Uuid>,
-    config: Json<UserConfiguration>,
+    config: JsonBody<UserConfiguration>,
 ) -> Result<StatusCode, ApiError> {
     let query = UserIdQuery {
         user_id: Some(user_id),
@@ -1075,7 +1076,7 @@ async fn update_user_password_for_user(
     state: State<AppState>,
     auth: RequireAuth,
     Path(user_id): Path<Uuid>,
-    body: Json<UpdateUserPassword>,
+    body: JsonBody<UpdateUserPassword>,
 ) -> Result<StatusCode, ApiError> {
     let query = UserIdQuery {
         user_id: Some(user_id),

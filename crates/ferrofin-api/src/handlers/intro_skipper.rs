@@ -48,6 +48,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
+use crate::extract::{JsonBody, JsonValueBody};
 use crate::state::AppState;
 
 /// The compiled-in Intro Skipper extension id (mirrors `EXTENSION_ID` in
@@ -295,7 +296,7 @@ async fn update_timestamps(
     State(state): State<AppState>,
     RequireAuth(_auth): RequireAuth,
     Path(id): Path<Uuid>,
-    Json(timestamps): Json<TimeStamps>,
+    JsonBody(timestamps): JsonBody<TimeStamps>,
 ) -> Result<StatusCode, ApiError> {
     let Some(item) = state.library.get_item_by_id(id).await? else {
         return Err(ApiError::NotFound(format!("item {id}")));
@@ -428,7 +429,7 @@ async fn create_segment(
     RequireAuth(_auth): RequireAuth,
     Path(item_id): Path<Uuid>,
     Query(query): Query<CreateSegmentQuery>,
-    Json(segment): Json<SegmentInput>,
+    JsonBody(segment): JsonBody<SegmentInput>,
 ) -> Result<StatusCode, ApiError> {
     if state.library.get_item_by_id(item_id).await?.is_none() {
         return Err(ApiError::NotFound(format!("item {item_id}")));
@@ -764,7 +765,7 @@ async fn get_analyzer_actions(
 async fn update_analyzer_actions(
     State(_state): State<AppState>,
     RequireAuth(_auth): RequireAuth,
-    Json(_request): Json<serde_json::Value>,
+    JsonValueBody(_request): JsonValueBody<serde_json::Value>,
 ) -> StatusCode {
     StatusCode::NO_CONTENT
 }
@@ -836,7 +837,7 @@ struct TransformationRegistration {
 async fn register_transformation(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Json(payload): Json<TransformationRegistration>,
+    JsonBody(payload): JsonBody<TransformationRegistration>,
 ) -> Result<StatusCode, ApiError> {
     require_elevation(&state, &auth).await?;
     let Some(service) = state.file_transformations.as_ref() else {

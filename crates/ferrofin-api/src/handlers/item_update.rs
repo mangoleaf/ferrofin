@@ -33,6 +33,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAdmin;
 use crate::error::ApiError;
+use crate::extract::JsonBody;
 use crate::state::AppState;
 
 /// `POST /Items/{itemId}` — applies an edited item and persists it.
@@ -54,7 +55,7 @@ pub(crate) async fn update_item(
     State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
     Path(item_id): Path<Uuid>,
-    Json(request): Json<Box<UpdateItemRequest>>,
+    JsonBody(request): JsonBody<Box<UpdateItemRequest>>,
 ) -> Result<StatusCode, ApiError> {
     let mut item = state
         .library
