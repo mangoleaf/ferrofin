@@ -64,7 +64,10 @@ use crate::state::AppState;
 #[serde(rename_all = "camelCase")]
 struct ThemeMediaQuery {
     /// Optional. Filter by user id, and attach user data.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     user_id: Option<Uuid>,
     /// Optional. Whether parents should be searched when the item has none.
     #[serde(default)]

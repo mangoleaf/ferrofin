@@ -54,7 +54,10 @@ struct GetLogEntriesQuery {
     #[serde(default, rename = "type")]
     type_: Option<String>,
     /// Filter by item id.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     item_id: Option<Uuid>,
     /// Filter by username (substring).
     #[serde(default)]

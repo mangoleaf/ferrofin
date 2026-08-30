@@ -87,7 +87,10 @@ fn is_eligible_for_grouping(collection_type: Option<CollectionType>) -> bool {
 #[serde(rename_all = "camelCase")]
 struct UserViewsQuery {
     /// The target user; defaults to the authenticated caller when absent.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     user_id: Option<Uuid>,
 }
 

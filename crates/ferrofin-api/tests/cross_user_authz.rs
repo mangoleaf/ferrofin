@@ -6,13 +6,21 @@
 //! when the caller is an administrator — otherwise `SecurityException("Forbidden")`,
 //! which the exception middleware maps to `403`.
 //!
-//! Ferrofin had ported only the first half in nine handlers, so any authenticated
-//! account could read and write another account's data by passing its guid
-//! (proven live: a non-admin overwrote the administrator's display-preferences
-//! row). Every gated route now routes through the one
+//! Ferrofin had ported only the first half across **thirteen** ungated handler
+//! sites, so any authenticated account could read and write another account's
+//! data by passing its guid (proven live: a non-admin overwrote the
+//! administrator's display-preferences row). A fourteenth site, `GET /Devices`,
+//! kept its hand-rolled fallback behind the elevation policy — which neutralises
+//! only the administrator half — and so still mis-handled the all-zero guid
+//! (`404` here against `200` upstream) until it was routed through the same
+//! helper. Every one of the fourteen now goes through the one
 //! `handlers::items::effective_user_id`, and this file is the table that keeps
 //! them there: for each route, a non-administrator naming another user must be
 //! refused, while the self path and the administrator path must still work.
+//!
+//! The count in this sentence is load-bearing — it is the drift alarm for the
+//! sweep. Adding a handler that takes a `userId` without routing it through
+//! `effective_user_id` is the defect this file exists to catch.
 //!
 //! Routes whose *post-gate* body needs a live manager are covered in their own
 //! domain files (`display_preferences.rs`, `quick_connect.rs`, `playlists.rs`,

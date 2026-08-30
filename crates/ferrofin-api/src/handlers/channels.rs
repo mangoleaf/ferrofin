@@ -40,7 +40,10 @@ use crate::state::AppState;
 #[serde(rename_all = "camelCase")]
 struct ChannelUserQuery {
     /// Optional target user; defaults to the authenticated caller.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     user_id: Option<Uuid>,
 }
 

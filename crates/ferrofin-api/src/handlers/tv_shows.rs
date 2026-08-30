@@ -94,7 +94,10 @@ fn series_presentation_key(series: &BaseItemEntity) -> String {
 #[serde(rename_all = "camelCase")]
 struct NextUpParams {
     /// The target user; defaults to the authenticated caller when absent.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     user_id: Option<Uuid>,
     /// The index of the first record to return.
     #[serde(default)]
@@ -106,10 +109,16 @@ struct NextUpParams {
     #[serde(default)]
     fields: Option<String>,
     /// Restrict to a single series.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     series_id: Option<Uuid>,
     /// Localizes the search to a specific parent item/folder.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     parent_id: Option<Uuid>,
     /// Whether image information is included.
     #[serde(default)]
@@ -189,7 +198,10 @@ async fn get_next_up(
 #[serde(rename_all = "camelCase")]
 struct UpcomingParams {
     /// The target user; scopes visibility and attaches user data when present.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     user_id: Option<Uuid>,
     /// The index of the first record to return.
     #[serde(default)]
@@ -201,7 +213,10 @@ struct UpcomingParams {
     #[serde(default)]
     fields: Option<String>,
     /// Localizes the search to a specific parent item/folder.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     parent_id: Option<Uuid>,
     /// Whether image information is included.
     #[serde(default)]
@@ -280,7 +295,10 @@ async fn get_upcoming_episodes(
 #[serde(rename_all = "camelCase")]
 struct EpisodesParams {
     /// The target user; scopes visibility and attaches user data when present.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     user_id: Option<Uuid>,
     /// Comma-delimited additional fields.
     #[serde(default)]
@@ -289,7 +307,10 @@ struct EpisodesParams {
     #[serde(default)]
     season: Option<i32>,
     /// Filter by season id.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     season_id: Option<Uuid>,
     /// Filter by items that are missing episodes or not.
     #[serde(default)]
@@ -299,14 +320,20 @@ struct EpisodesParams {
     /// Accepted for wire compatibility but not yet applied: the
     /// `UserViewBuilder.FilterForAdjacency` sibling filter needs the un-ported
     /// domain tree (documented deferral).
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     #[allow(dead_code)]
     adjacent_to: Option<Uuid>,
     /// Skip through the list until a given item is found.
     ///
     /// Accepted for wire compatibility but not yet applied: the alternate-version
     /// primary-episode remap needs the un-ported domain tree (documented deferral).
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     #[allow(dead_code)]
     start_item_id: Option<Uuid>,
     /// The index of the first record to return.
@@ -452,7 +479,10 @@ async fn get_episodes(
 #[serde(rename_all = "camelCase")]
 struct SeasonsParams {
     /// The target user; scopes visibility and attaches user data when present.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     user_id: Option<Uuid>,
     /// Comma-delimited additional fields.
     #[serde(default)]
@@ -464,7 +494,10 @@ struct SeasonsParams {
     #[serde(default)]
     is_missing: Option<bool>,
     /// Return items that are siblings of a supplied item (deferred).
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     adjacent_to: Option<Uuid>,
     /// Whether image information is included.
     #[serde(default)]
@@ -551,7 +584,10 @@ struct SimilarParams {
     #[serde(default)]
     exclude_artist_ids: Option<String>,
     /// The target user; scopes visibility and attaches user data when present.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     user_id: Option<Uuid>,
     /// The maximum number of records to return.
     #[serde(default)]

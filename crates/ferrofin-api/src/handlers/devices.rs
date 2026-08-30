@@ -26,6 +26,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAdmin;
 use crate::error::ApiError;
+use crate::handlers::items::effective_user_id;
 use crate::state::AppState;
 
 /// Query parameters for `GET /Devices`.
@@ -34,7 +35,10 @@ use crate::state::AppState;
 struct GetDevicesQuery {
     /// Optional. Restricts the result to a single user's devices; defaults to
     /// the authenticated caller (Jellyfin's `RequestHelpers.GetUserId`).
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     user_id: Option<Uuid>,
 }
 
@@ -61,9 +65,17 @@ struct DeleteDevicesQuery {
 
 /// `GET /Devices` — the devices visible to a user.
 ///
-/// Port of `DevicesController.GetDevices`: resolves the target user (the caller
-/// when `userId` is absent, per `RequestHelpers.GetUserId`) and returns that
-/// user's device info DTOs.
+/// Port of `DevicesController.GetDevices`: resolves the target user through the
+/// crate's one port of `RequestHelpers.GetUserId` ([`effective_user_id`]) and
+/// returns that user's device info DTOs.
+///
+/// The elevation policy neutralises only the *second* half of that helper (the
+/// administrator gate); the first half still applies, and hand-rolling it as
+/// `user_id.unwrap_or(caller)` dropped it: an all-zero `userId` is "not
+/// provided" upstream and falls back to the caller, but was looked up literally
+/// here. Measured on the lane-3 pair as the administrator —
+/// `GET /Devices?userId=00000000-0000-0000-0000-000000000000` was `404` on
+/// Ferrofin against `200` with the caller's devices on Jellyfin 10.11.8.
 #[utoipa::path(
     get,
     path = "/Devices",
@@ -76,7 +88,7 @@ async fn get_devices(
     RequireAdmin(auth): RequireAdmin,
     Query(query): Query<GetDevicesQuery>,
 ) -> Result<Json<QueryResult<DeviceInfoDto>>, ApiError> {
-    let user_id = query.user_id.unwrap_or_else(|| auth.user_id());
+    let user_id = effective_user_id(&state, &auth, query.user_id).await?;
     let devices = state.devices.get_devices_for_user(Some(user_id)).await?;
     Ok(Json(devices))
 }

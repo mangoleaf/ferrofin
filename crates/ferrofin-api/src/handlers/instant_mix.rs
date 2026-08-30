@@ -41,7 +41,10 @@ use crate::state::AppState;
 #[serde(rename_all = "camelCase")]
 struct InstantMixQuery {
     /// The target user; scopes visibility and attaches user data when present.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     user_id: Option<Uuid>,
     /// The maximum number of records to return.
     #[serde(default)]
@@ -78,16 +81,25 @@ impl InstantMixQuery {
     }
 }
 
-/// The query parameters for the obsolete `?id=` InstantMix variants.
+/// The `?id=` parameter of the obsolete InstantMix variants.
+///
+/// It is a **separate** extractor rather than a `#[serde(flatten)]` field on
+/// [`InstantMixQuery`]: `flatten` makes serde buffer every other parameter as a
+/// self-describing `Content::Str`, and `ContentDeserializer` will not parse a
+/// number out of a string the way `serde_urlencoded`'s own value deserializer
+/// does. That turned `?id=<guid>&limit=100` — the exact request the parity read
+/// layer issues — into `400 invalid type: string "100", expected i32`, measured
+/// live on the lane-3 pair as `H=400 J=200`. Two `Query<T>` extractors both read
+/// the same URI, which is how `audio.rs` composes its query too.
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct InstantMixByIdQuery {
+struct InstantMixIdQuery {
     /// The seed item id (passed as a query parameter in the obsolete routes).
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     id: Option<Uuid>,
-    /// The rest of the query, shared with the by-path routes.
-    #[serde(flatten)]
-    rest: InstantMixQuery,
 }
 
 /// Applies the caller's `limit`, projects the mix to DTOs, and wraps the page in
@@ -297,12 +309,13 @@ async fn from_music_genre_name(
 async fn from_artist_by_id(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Query(query): Query<InstantMixByIdQuery>,
+    Query(seed): Query<InstantMixIdQuery>,
+    Query(query): Query<InstantMixQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
-    let id = query
+    let id = seed
         .id
         .ok_or_else(|| ApiError::BadRequest("missing id".to_owned()))?;
-    instant_mix_from_item(&state, &auth, id, &query.rest, None).await
+    instant_mix_from_item(&state, &auth, id, &query, None).await
 }
 
 /// `GET /MusicGenres/InstantMix` — the obsolete `?id=` genre variant.
@@ -318,12 +331,13 @@ async fn from_artist_by_id(
 async fn from_music_genre_by_id(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Query(query): Query<InstantMixByIdQuery>,
+    Query(seed): Query<InstantMixIdQuery>,
+    Query(query): Query<InstantMixQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
-    let id = query
+    let id = seed
         .id
         .ok_or_else(|| ApiError::BadRequest("missing id".to_owned()))?;
-    instant_mix_from_item(&state, &auth, id, &query.rest, None).await
+    instant_mix_from_item(&state, &auth, id, &query, None).await
 }
 
 /// Registers this controller's real routes onto `router`.

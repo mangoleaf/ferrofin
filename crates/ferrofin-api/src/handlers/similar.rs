@@ -41,7 +41,10 @@ struct SimilarParams {
     #[serde(default)]
     exclude_artist_ids: Option<String>,
     /// The target user; scopes visibility and attaches user data when present.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     user_id: Option<Uuid>,
     /// The maximum number of records to return.
     #[serde(default)]

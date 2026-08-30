@@ -255,7 +255,10 @@ fn redeem_reset_pins(
 #[serde(rename_all = "camelCase")]
 struct UserIdQuery {
     /// The target user; defaults to the authenticated caller when absent.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     user_id: Option<Uuid>,
 }
 

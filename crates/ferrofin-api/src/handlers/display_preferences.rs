@@ -57,7 +57,10 @@ const DEFAULT_SKIP_FORWARD_LENGTH_MS: i32 = 30_000;
 #[serde(rename_all = "camelCase")]
 struct DisplayPreferencesParams {
     /// Optional user id; defaults to the authenticated caller.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     user_id: Option<Uuid>,
     /// The required client name.
     #[serde(default)]

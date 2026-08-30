@@ -43,7 +43,10 @@ struct AuthorizeQuery {
     #[serde(default)]
     code: String,
     /// The user to authorize as; defaults to the caller when absent.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     user_id: Option<Uuid>,
 }
 

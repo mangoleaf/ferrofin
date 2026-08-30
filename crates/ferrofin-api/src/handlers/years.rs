@@ -31,7 +31,10 @@ use crate::state::AppState;
 #[serde(rename_all = "camelCase")]
 struct YearsQuery {
     /// The target user; defaults to the authenticated caller when absent.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     user_id: Option<Uuid>,
     /// The index of the first record to return.
     #[serde(default)]
@@ -40,7 +43,10 @@ struct YearsQuery {
     #[serde(default)]
     limit: Option<i32>,
     /// Localizes the browse to a specific parent when set.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     parent_id: Option<Uuid>,
     /// Whether to search descendants recursively (Jellyfin defaults to `true`).
     #[serde(default)]
@@ -150,7 +156,10 @@ async fn get_years(
 #[serde(rename_all = "camelCase")]
 struct YearQuery {
     /// The target user; defaults to the authenticated caller when absent.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     user_id: Option<Uuid>,
 }
 

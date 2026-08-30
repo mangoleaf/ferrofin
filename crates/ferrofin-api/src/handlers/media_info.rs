@@ -82,7 +82,11 @@ impl TranscoderSupport for FerrofinTranscoderSupport {
 #[serde(rename_all = "camelCase")]
 struct PlaybackInfoQuery {
     /// The target user; defaults to the authenticated caller when absent.
-    #[serde(default, alias = "UserId")]
+    #[serde(
+        default,
+        alias = "UserId",
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     user_id: Option<Uuid>,
     /// The requested audio stream index override.
     #[serde(default, alias = "AudioStreamIndex")]
@@ -666,7 +670,10 @@ struct OpenLiveStreamQuery {
     #[serde(default)]
     always_burn_in_subtitle_when_transcoding: Option<bool>,
     /// The target user; defaults to the authenticated caller when absent.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     user_id: Option<Uuid>,
     /// The play session id.
     #[serde(default)]
@@ -687,7 +694,10 @@ struct OpenLiveStreamQuery {
     #[serde(default)]
     max_audio_channels: Option<i32>,
     /// The item id whose source is opened.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     item_id: Option<Uuid>,
 }
 

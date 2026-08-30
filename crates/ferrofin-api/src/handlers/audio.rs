@@ -78,7 +78,10 @@ async fn get_audio_stream_by_container(
 #[serde(rename_all = "camelCase")]
 struct UniversalAudioUserQuery {
     /// Optional target user; defaults to the authenticated caller.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     user_id: Option<Uuid>,
 }
 

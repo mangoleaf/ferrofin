@@ -45,7 +45,10 @@ use crate::state::AppState;
 #[serde(rename_all = "camelCase")]
 struct GetSessionsQuery {
     /// Filter to sessions a given user may remote-control.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     controllable_by_user_id: Option<Uuid>,
     /// Filter by device id.
     #[serde(default)]

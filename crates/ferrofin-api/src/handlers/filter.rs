@@ -35,10 +35,16 @@ use crate::state::AppState;
 #[serde(rename_all = "camelCase")]
 struct FiltersLegacyQuery {
     /// The target user; scopes visibility when present.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     user_id: Option<Uuid>,
     /// Localizes the aggregation to a specific parent item/folder.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     parent_id: Option<Uuid>,
     /// Comma-delimited [`BaseItemKind`] set to include.
     #[serde(default)]
@@ -103,10 +109,16 @@ async fn get_query_filters_legacy(
 #[allow(clippy::struct_excessive_bools)]
 struct FiltersQuery {
     /// The target user; scopes visibility when present.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     user_id: Option<Uuid>,
     /// Localizes the aggregation to a specific parent item/folder.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     parent_id: Option<Uuid>,
     /// Comma-delimited [`BaseItemKind`] set to include.
     #[serde(default)]

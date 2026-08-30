@@ -42,7 +42,10 @@ use crate::state::AppState;
 #[serde(rename_all = "camelCase")]
 struct MarkPlayedQuery {
     /// The target user; defaults to the authenticated caller when absent.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     user_id: Option<Uuid>,
     /// Optional date the item was played (ISO-8601); defaults to now.
     #[serde(default)]
@@ -54,7 +57,10 @@ struct MarkPlayedQuery {
 #[serde(rename_all = "camelCase")]
 struct UserIdQuery {
     /// The target user; defaults to the authenticated caller when absent.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     user_id: Option<Uuid>,
 }
 

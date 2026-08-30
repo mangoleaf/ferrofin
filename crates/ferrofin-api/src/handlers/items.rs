@@ -168,7 +168,10 @@ pub(crate) async fn resolve_user_opt(
 #[serde(rename_all = "camelCase")]
 struct ItemsQuery {
     /// The target user; defaults to the authenticated caller when absent.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     user_id: Option<Uuid>,
     /// The index of the first item to return.
     #[serde(default)]
@@ -183,7 +186,10 @@ struct ItemsQuery {
     #[serde(default)]
     search_term: Option<String>,
     /// Localizes the query to a specific parent item/folder.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     parent_id: Option<Uuid>,
     /// Comma-delimited [`BaseItemKind`](ferrofin_model::data::BaseItemKind) set to include.
     #[serde(default)]
@@ -426,7 +432,10 @@ async fn get_items(
 #[serde(rename_all = "camelCase")]
 struct ItemQuery {
     /// The target user; defaults to the authenticated caller when absent.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     user_id: Option<Uuid>,
 }
 
@@ -549,7 +558,10 @@ async fn delete_items(
 #[serde(rename_all = "camelCase")]
 struct CountsQuery {
     /// Optional user whose library the counts are scoped to.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     user_id: Option<Uuid>,
     /// Optional favourite-only filter.
     #[serde(default)]
@@ -587,7 +599,10 @@ async fn get_item_counts(
 #[serde(rename_all = "camelCase")]
 struct AncestorsQuery {
     /// Optional user to scope visibility and attach user data.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     user_id: Option<Uuid>,
 }
 
@@ -696,7 +711,10 @@ async fn get_ancestors(
 #[serde(rename_all = "camelCase")]
 struct ResumeQuery {
     /// The target user; defaults to the authenticated caller when absent.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     user_id: Option<Uuid>,
     /// The index of the first item to return.
     #[serde(default)]
@@ -708,7 +726,10 @@ struct ResumeQuery {
     #[serde(default)]
     search_term: Option<String>,
     /// Localizes the query to a specific parent item/folder.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     parent_id: Option<Uuid>,
     /// Comma-delimited [`MediaType`](ferrofin_model::data::MediaType) set.
     #[serde(default)]

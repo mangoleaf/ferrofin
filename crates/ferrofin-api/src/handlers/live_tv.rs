@@ -96,6 +96,7 @@ struct ChannelsQuery {
     #[serde(rename = "type")]
     type_: Option<ferrofin_model::live_tv::ChannelType>,
     /// The target user; defaults to the authenticated caller when absent.
+    #[serde(deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid")]
     user_id: Option<Uuid>,
     /// The index of the first record to return.
     start_index: Option<i32>,
@@ -214,6 +215,7 @@ async fn get_channel(
 #[serde(rename_all = "camelCase", default)]
 struct UserIdQuery {
     /// The target user; defaults to the authenticated caller when absent.
+    #[serde(deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid")]
     user_id: Option<Uuid>,
 }
 
@@ -231,6 +233,7 @@ struct ProgramsQuery {
     /// Comma-delimited channel ids to return guide information for.
     channel_ids: Option<String>,
     /// The target user; defaults to the authenticated caller when absent.
+    #[serde(deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid")]
     user_id: Option<Uuid>,
     /// The minimum programme start date.
     #[serde(deserialize_with = "deserialize_optional_date_time")]
@@ -281,6 +284,7 @@ struct ProgramsQuery {
     /// Filter to the programmes a series timer records.
     series_timer_id: Option<String>,
     /// Filter to the programmes of one library series.
+    #[serde(deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid")]
     library_series_id: Option<Uuid>,
     /// Comma-delimited additional DTO fields.
     fields: Option<String>,
@@ -448,6 +452,7 @@ impl GetProgramsDto {
 #[allow(clippy::struct_excessive_bools)] // one field per contract parameter
 struct RecommendedProgramsQuery {
     /// The target user; defaults to the authenticated caller when absent.
+    #[serde(deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid")]
     user_id: Option<Uuid>,
     /// The index of the first record to return.
     start_index: Option<i32>,
@@ -886,6 +891,7 @@ struct RecordingsQuery {
     /// Restrict to one channel.
     channel_id: Option<String>,
     /// The user whose data the recordings are projected for.
+    #[serde(deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid")]
     user_id: Option<Uuid>,
     /// The index of the first record to return.
     start_index: Option<i32>,
@@ -977,7 +983,10 @@ async fn get_recordings(
 #[serde(rename_all = "camelCase")]
 struct LiveTvUserQuery {
     /// Optional target user; defaults to the authenticated caller.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     user_id: Option<Uuid>,
 }
 
