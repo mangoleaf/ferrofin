@@ -1416,6 +1416,7 @@ dependencies = [
  "ferrofin-common",
  "ferrofin-db",
  "ferrofin-model",
+ "ferrofin-naming",
  "ferrofin-traits",
  "ferrofin-util",
  "quick-xml",

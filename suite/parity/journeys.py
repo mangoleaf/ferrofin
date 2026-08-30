@@ -1117,6 +1117,172 @@ def j_remote_subtitles(base, token, user, mid, _m2):
     return r
 
 
+# ---------------------------------------------------------------- remote search ("Identify")
+
+# The per-result field set compared for every RemoteSearch row. Nothing is excluded:
+# a candidate that differs in ANY of these between the two servers fails the row.
+IDENTIFY_FIELDS = ("Name", "ProviderIds", "ProductionYear", "PremiereDate", "Overview", "ImageUrl")
+
+
+def remote_search(base, token, kind, search_info, provider=None):
+    """POST /Items/RemoteSearch/{kind}; returns (status, results-list)."""
+    body = {"SearchInfo": search_info}
+    if provider:
+        body["SearchProviderName"] = provider
+    st, raw = http("POST", f"{base}/Items/RemoteSearch/{kind}", token, json.dumps(body))
+    try:
+        out = json.loads(raw) if raw else []
+    except ValueError:
+        out = []
+    return st, (out if isinstance(out, list) else [])
+
+
+def identify(results, fields=IDENTIFY_FIELDS):
+    """Every result projected onto the compared field set, order preserved."""
+    return [{k: r.get(k) for k in fields} for r in results]
+
+
+def j_remote_search_identify(base, token, user, _m, _m2):
+    """The Identify flow: POST /Items/RemoteSearch/{Movie,Series,BoxSet,Person,Trailer}.
+
+    These are POSTs by contract but SEARCHES by behaviour — v10.11.8
+    `ItemLookupController` only calls `IProviderManager.GetRemoteSearchResults` and returns
+    Ok, so nothing is mutated and there is no read-back. They live here because sweep.py is
+    GET/HEAD-only and reads.py correlates by Path.
+
+    They hit live remote providers, so the assertions are built to survive drift: both
+    servers are queried in the SAME run (so upstream sees one state), and every claim is
+    either pinned by ProviderId or is a structural invariant.
+
+    DELIBERATELY NOT COMPARED, and why:
+      * Rows from any provider other than the one pinned by `SearchProviderName`. The
+        provider SETS differ by owner-accepted design (CLAUDE.md "Current scope"):
+        Ferrofin's OMDb is inert without FERROFIN_OMDB_KEY while Jellyfin 10.11.8 ships a
+        hardcoded key (MediaBrowser.Providers/Plugins/Omdb/OmdbProvider.cs:257), and
+        Ferrofin compiles TheTVDB in where the oracle has no TVDB plugin installed.
+        Comparing totals would encode those as a permanent red. Provider identity is still
+        asserted: `tmdb_answers` goes false if the TMDB provider stops answering an
+        unfiltered search on either side, and every pinned assertion below is scoped to
+        TheMovieDb, so answering from the WRONG provider fails the row.
+    Everything else IS compared: for every search below the FULL candidate list is projected
+    onto IDENTIFY_FIELDS and compared element-for-element, order and count included. That is
+    safe despite TMDB's popularity drift only because both servers are queried seconds apart
+    in one run; if this row ever flakes, the fix is to keep the comparison and pin the search
+    harder (by ProviderId), never to widen it.
+      * `POST /Items/RemoteSearch/Trailer` cannot be verified without an OMDb key: OMDb is
+        the ONLY provider implementing `IRemoteMetadataProvider<Trailer, TrailerInfo>` in
+        v10.11.8, so a keyless Ferrofin can only ever answer []. The row is still probed
+        (both statuses, both bogus-term answers, both projections) so the divergence is
+        measured rather than assumed; see classifications.json.
+
+    Needs outbound TMDB reachability from both containers; with none, both sides return []
+    and the rows fail rather than passing vacuously.
+    """
+    r = {}
+    tmdb = "TheMovieDb"
+
+    # ---- Movie ---------------------------------------------------------------
+    # Name+Year: `TmdbMovieProvider` forwards Year to /search/movie and every row carries
+    # PremiereDate + ProductionYear from the release date.
+    _, named = remote_search(base, token, "Movie",
+                             {"Name": "The Matrix", "Year": 1999}, tmdb)
+    # A `Tmdb` id short-circuits the name search: exactly one row, with the IMDb id merged.
+    _, byid = remote_search(base, token, "Movie", {"ProviderIds": {"Tmdb": "603"}}, tmdb)
+    # An `Imdb` id resolves through TMDB's /find.
+    _, byimdb = remote_search(base, token, "Movie",
+                              {"ProviderIds": {"Imdb": "tt0133093"}}, tmdb)
+    _, bogus = remote_search(base, token, "Movie", {"Name": "zzqqxxnotamovie12345"}, tmdb)
+    _, unfiltered = remote_search(base, token, "Movie", {"Name": "The Matrix", "Year": 1999})
+    ev = {"named": identify(named),
+          "byid": identify(byid),
+          "byimdb": identify(byimdb),
+          "bogus_empty": bogus == [],
+          "tmdb_answers": tmdb in {x.get("SearchProviderName") for x in unfiltered}}
+    r["POST /Items/RemoteSearch/Movie"] = Same(
+        bool(named) and len(byid) == 1 and bool(byimdb)
+        and all(x.get("PremiereDate") for x in named)
+        and ev["bogus_empty"] and ev["tmdb_answers"], ev)
+
+    # ---- Series --------------------------------------------------------------
+    # `TmdbSeriesProvider` leaves SearchSeriesAsync's year at 0, so a WRONG Year must not
+    # narrow the search; its mappers set PremiereDate and never ProductionYear; and the
+    # by-id branch carries Tmdb + Imdb + Tvdb.
+    _, s_named = remote_search(base, token, "Series", {"Name": "Breaking Bad"}, tmdb)
+    _, s_year = remote_search(base, token, "Series",
+                              {"Name": "Breaking Bad", "Year": 2019}, tmdb)
+    _, s_byid = remote_search(base, token, "Series", {"ProviderIds": {"Tmdb": "1396"}}, tmdb)
+    _, s_bogus = remote_search(base, token, "Series",
+                               {"Name": "zzzqqxnotarealshowxyz123"}, tmdb)
+    _, s_unfiltered = remote_search(base, token, "Series", {"Name": "Breaking Bad"})
+    ev = {"named": identify(s_named),
+          "year_ignored": "1396" in {x.get("ProviderIds", {}).get("Tmdb") for x in s_year},
+          "byid": identify(s_byid),
+          "bogus_empty": s_bogus == [],
+          "tmdb_answers": tmdb in {x.get("SearchProviderName") for x in s_unfiltered}}
+    r["POST /Items/RemoteSearch/Series"] = Same(
+        bool(s_named) and len(s_byid) == 1 and ev["year_ignored"]
+        and all(x.get("PremiereDate") for x in s_named)
+        and not any(x.get("ProductionYear") for x in s_named)
+        and ev["bogus_empty"] and ev["tmdb_answers"], ev)
+
+    # ---- BoxSet --------------------------------------------------------------
+    # `TmdbBoxSetProvider` short-circuits on tmdbId > 0 (one row, no Overview on any search
+    # DTO) and otherwise searches /search/collection by name.
+    _, b_named = remote_search(base, token, "BoxSet",
+                               {"Name": "The Lord of the Rings Collection"}, tmdb)
+    _, b_byid = remote_search(base, token, "BoxSet", {"ProviderIds": {"Tmdb": "119"},
+                                                      "Name": "The Matrix Collection"}, tmdb)
+    _, b_bogus = remote_search(base, token, "BoxSet",
+                               {"Name": "zzqxwv nonexistent collection 99812"}, tmdb)
+    ev = {"named": identify(b_named),
+          "byid": identify(b_byid),
+          "bogus_empty": b_bogus == []}
+    r["POST /Items/RemoteSearch/BoxSet"] = Same(
+        bool(b_named) and len(b_byid) == 1 and ev["bogus_empty"], ev)
+
+    # ---- Person --------------------------------------------------------------
+    # Only the by-id branch takes a language upstream (`GetPersonAsync(id, language,
+    # countryCode, …)`); `SearchPersonAsync(name, ct)` takes none. `bio_localized` compares
+    # each server against ITSELF, so it is drift-proof: it is true only when the fr and en
+    # biographies of the SAME person differ.
+    _, p_named = remote_search(base, token, "Person", {"Name": "Tom Hanks"}, tmdb)
+    _, p_fr = remote_search(base, token, "Person",
+                            {"ProviderIds": {"Tmdb": "31"}, "MetadataLanguage": "fr",
+                             "MetadataCountryCode": "FR"}, tmdb)
+    _, p_en = remote_search(base, token, "Person",
+                            {"ProviderIds": {"Tmdb": "31"}, "MetadataLanguage": "en",
+                             "MetadataCountryCode": "US"}, tmdb)
+    _, p_bogus = remote_search(base, token, "Person",
+                               {"Name": "zzqqxxnotarealpersonzzz"}, tmdb)
+    _, p_noprov = remote_search(base, token, "Person", {"Name": "Tom Hanks"}, "NoSuchProvider")
+    fr_bio = p_fr[0].get("Overview") if p_fr else None
+    en_bio = p_en[0].get("Overview") if p_en else None
+    ev = {"named": identify(p_named),
+          "byid_ids": [x.get("ProviderIds") for x in p_en],
+          "byid_name": [x.get("Name") for x in p_en],
+          "bio_localized": bool(fr_bio) and bool(en_bio) and fr_bio != en_bio,
+          "bogus_empty": p_bogus == [],
+          "provider_filter_empty": p_noprov == []}
+    r["POST /Items/RemoteSearch/Person"] = Same(
+        bool(p_named) and len(p_en) == 1 and ev["bio_localized"]
+        and ev["bogus_empty"] and ev["provider_filter_empty"], ev)
+
+    # ---- Trailer -------------------------------------------------------------
+    # OMDb is the only Trailer fetcher on either side, so this row measures the OMDb-key
+    # divergence rather than hiding it.
+    omdb = "The Open Movie Database"
+    t_st, t_named = remote_search(base, token, "Trailer",
+                                  {"Name": "Inception", "Year": 2010}, omdb)
+    _, t_bogus = remote_search(base, token, "Trailer",
+                               {"Name": "zzqxwvyunlikelytitle12345"}, omdb)
+    ev = {"status": t_st,
+          "named": identify(t_named),
+          "bogus_empty": t_bogus == []}
+    r["POST /Items/RemoteSearch/Trailer"] = Same(
+        t_st == 200 and bool(t_named) and ev["bogus_empty"], ev)
+    return r
+
+
 def j_backup(base, token, user, _m, _m2):
     """Backup create → manifest → list on the server's own data dir. The manifest must echo
     the posted options, the Manifest route must read the same manifest back by the returned
@@ -1151,6 +1317,7 @@ JOURNEYS = [j_startup,   # first: see its docstring
             j_authenticate, j_user_update, j_devices_delete, j_bulk_item_delete,
             j_subtitles_upload, j_quickconnect, j_system_and_refresh,
             j_forgot_password, j_backup, j_livetv, j_remote_subtitles,
+            j_remote_search_identify,
             # Destructive: merges/splits the shared movies, so it must run LAST so its
             # mutations can't corrupt the items other journeys read/refresh.
             j_merge_versions_controller]

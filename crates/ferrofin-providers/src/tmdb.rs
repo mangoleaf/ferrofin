@@ -67,6 +67,29 @@ struct SearchResponse {
     results: Vec<SearchHit>,
 }
 
+/// Appends TMDB's `language` query parameter when one was supplied.
+fn with_language(req: reqwest::RequestBuilder, language: Option<&str>) -> reqwest::RequestBuilder {
+    match language.filter(|l| !l.is_empty()) {
+        Some(lang) => req.query(&[("language", lang)]),
+        None => req,
+    }
+}
+
+/// Maps one raw `/search/*` or `/find/*` row onto a [`TmdbSearchHit`]. Pure —
+/// shared by the name search and the external-id lookup, whose payload rows are
+/// the same `SearchMovie`/`SearchTv` shape upstream.
+fn search_hit_from(hit: SearchHit) -> TmdbSearchHit {
+    let date = non_empty(hit.release_date.or(hit.first_air_date));
+    TmdbSearchHit {
+        tmdb_id: hit.id,
+        name: hit.title.or(hit.name),
+        year: year_from(date.as_deref()),
+        premiere_date: date,
+        poster_url: non_empty(hit.poster_path).map(|p| format!("{IMAGE_BASE}{p}")),
+        overview: non_empty(hit.overview),
+    }
+}
+
 /// One candidate from a TMDB name search (the "Identify" flow).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TmdbSearchHit {
@@ -76,6 +99,11 @@ pub struct TmdbSearchHit {
     pub name: Option<String>,
     /// The release / first-air year.
     pub year: Option<i32>,
+    /// The raw release / first-air date (`YYYY-MM-DD`), kept so the Identify
+    /// flow can emit `PremiereDate` — the C# providers set
+    /// `RemoteSearchResult.PremiereDate` from `ReleaseDate`/`FirstAirDate`, not
+    /// just the year.
+    pub premiere_date: Option<String>,
     /// The poster image URL (for the result thumbnail).
     pub poster_url: Option<String>,
     /// The plot overview.
@@ -203,6 +231,12 @@ pub struct TmdbDetails {
     /// The IMDb id (`ttNNNNNNN`), when known — the key for an OMDb Rotten
     /// Tomatoes lookup.
     pub imdb_id: Option<String>,
+    /// The TVDB id, when TMDB's `external_ids` carry one (series only) — the
+    /// third id `MapTvShowToRemoteSearchResult` stamps onto an Identify result.
+    pub tvdb_id: Option<String>,
+    /// The poster's absolute URL — `TmdbClientManager.GetPosterUrl(PosterPath)`
+    /// as the by-id Identify branch uses it.
+    pub poster_url: Option<String>,
 }
 
 /// One credited person from a title's `credits`.
@@ -319,6 +353,8 @@ struct DetailsResponse {
     #[serde(default)]
     first_air_date: Option<String>,
     #[serde(default)]
+    poster_path: Option<String>,
+    #[serde(default)]
     credits: Option<CreditsResponse>,
     #[serde(default)]
     release_dates: Option<ReleaseDatesResults>,
@@ -334,11 +370,15 @@ struct DetailsResponse {
     external_ids: Option<ExternalIds>,
 }
 
-/// TMDB `external_ids` — only the IMDb id is used (RT lookup key for series).
+/// TMDB `external_ids` — the IMDb id (RT lookup key for series) and the TVDB
+/// id, which `TmdbSeriesProvider.MapTvShowToRemoteSearchResult` stamps onto an
+/// Identify result alongside it.
 #[derive(Debug, Default, Deserialize)]
 struct ExternalIds {
     #[serde(default)]
     imdb_id: Option<String>,
+    #[serde(default)]
+    tvdb_id: Option<i64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -531,6 +571,36 @@ fn season_details_from(resp: SeasonResponse) -> SeasonDetails {
 /// `None` for an absent or empty string — TMDB returns `""` as often as `null`.
 fn non_empty(value: Option<String>) -> Option<String> {
     value.filter(|v| !v.is_empty())
+}
+
+/// Normalizes a metadata language for TMDB's `language` parameter — a port of
+/// `MediaBrowser.Providers.Plugins.Tmdb.TmdbUtils.NormalizeLanguage`.
+///
+/// `es-419` (Latin-American Spanish) becomes the closest regional variant TMDB
+/// knows; the region half is upper-cased because TMDB's API requires it; and
+/// Switzerland (`de-CH`/`fr-CH`/`it-CH`), which TMDB does not carry, degrades to
+/// the bare language. Blank in, blank out.
+#[must_use]
+pub fn normalize_language(language: Option<&str>, country_code: Option<&str>) -> Option<String> {
+    let language = language.filter(|l| !l.is_empty())?;
+    let mut language = language.to_owned();
+    if language.eq_ignore_ascii_case("es-419")
+        && let Some(country) = country_code.filter(|c| !c.is_empty())
+    {
+        language = if country.eq_ignore_ascii_case("AR") {
+            "es-AR".to_owned()
+        } else {
+            "es-MX".to_owned()
+        };
+    }
+    let parts: Vec<&str> = language.split('-').collect();
+    if parts.len() == 2 {
+        if parts[1].eq_ignore_ascii_case("CH") {
+            return Some(parts[0].to_owned());
+        }
+        return Some(format!("{}-{}", parts[0], parts[1].to_uppercase()));
+    }
+    Some(language)
 }
 
 /// One page of `/movie|tv/{id}/similar`.
@@ -804,18 +874,20 @@ impl TmdbClient {
     /// Searches TMDB's collections by name (`/search/collection`) — port of
     /// `TmdbClientManager.SearchCollectionAsync`, the box-set half of the
     /// Identify flow. Empty on no match or any error.
-    pub async fn search_collection(&self, name: &str) -> Vec<TmdbCollectionHit> {
+    pub async fn search_collection(
+        &self,
+        name: &str,
+        language: Option<&str>,
+    ) -> Vec<TmdbCollectionHit> {
         let name = name.trim();
         if name.is_empty() {
             return Vec::new();
         }
-        let Ok(resp) = self
+        let req = self
             .http
             .get(format!("{}/search/collection", self.base_url))
-            .query(&[("api_key", self.api_key.expose_secret()), ("query", name)])
-            .send()
-            .await
-        else {
+            .query(&[("api_key", self.api_key.expose_secret()), ("query", name)]);
+        let Ok(resp) = with_language(req, language).send().await else {
             return Vec::new();
         };
         if !resp.status().is_success() {
@@ -840,17 +912,15 @@ impl TmdbClient {
     /// `append_to_response=images`) — port of
     /// `TmdbClientManager.GetCollectionAsync`, which backs both
     /// `TmdbBoxSetProvider` and `TmdbBoxSetImageProvider`.
-    pub async fn collection(&self, tmdb_id: i64) -> Option<TmdbCollection> {
-        let resp = self
+    pub async fn collection(&self, tmdb_id: i64, language: Option<&str>) -> Option<TmdbCollection> {
+        let req = self
             .http
             .get(format!("{}/collection/{tmdb_id}", self.base_url))
             .query(&[
                 ("api_key", self.api_key.expose_secret()),
                 ("append_to_response", "images"),
-            ])
-            .send()
-            .await
-            .ok()?;
+            ]);
+        let resp = with_language(req, language).send().await.ok()?;
         if !resp.status().is_success() {
             return None;
         }
@@ -884,12 +954,14 @@ impl TmdbClient {
     }
 
     /// Searches TMDB by name/year and returns the candidate list (the "Identify"
-    /// flow). Empty on no match or any error.
+    /// flow). `language` is TMDB's `language` parameter, already normalized by
+    /// [`normalize_language`]. Empty on no match or any error.
     pub async fn search(
         &self,
         kind: TmdbKind,
         name: &str,
         year: Option<i32>,
+        language: Option<&str>,
     ) -> Vec<TmdbSearchHit> {
         let (path, year_param) = match kind {
             TmdbKind::Movie => ("search/movie", "year"),
@@ -902,6 +974,7 @@ impl TmdbClient {
         if let Some(y) = year {
             req = req.query(&[(year_param, y.to_string())]);
         }
+        req = with_language(req, language);
         let Ok(resp) = req.send().await else {
             return Vec::new();
         };
@@ -911,20 +984,7 @@ impl TmdbClient {
         let Ok(parsed) = resp.json::<SearchResponse>().await else {
             return Vec::new();
         };
-        parsed
-            .results
-            .into_iter()
-            .map(|hit| TmdbSearchHit {
-                tmdb_id: hit.id,
-                name: hit.title.or(hit.name),
-                year: year_from(hit.release_date.or(hit.first_air_date).as_deref()),
-                poster_url: hit
-                    .poster_path
-                    .filter(|p| !p.is_empty())
-                    .map(|p| format!("{IMAGE_BASE}{p}")),
-                overview: hit.overview.filter(|o| !o.is_empty()),
-            })
-            .collect()
+        parsed.results.into_iter().map(search_hit_from).collect()
     }
 
     /// One page of TMDB's "similar titles" for a movie or series
@@ -1101,21 +1161,20 @@ impl TmdbClient {
         kind: TmdbKind,
         source: &str,
         external_id: &str,
-    ) -> Option<i64> {
+        language: Option<&str>,
+    ) -> Option<Vec<TmdbSearchHit>> {
         let external_id = external_id.trim();
         if external_id.is_empty() {
             return None;
         }
-        let resp = self
+        let req = self
             .http
             .get(format!("{}/find/{external_id}", self.base_url))
             .query(&[
                 ("api_key", self.api_key.expose_secret()),
                 ("external_source", source),
-            ])
-            .send()
-            .await
-            .ok()?;
+            ]);
+        let resp = with_language(req, language).send().await.ok()?;
         if !resp.status().is_success() {
             return None;
         }
@@ -1124,28 +1183,53 @@ impl TmdbClient {
             TmdbKind::Movie => found.movie_results,
             TmdbKind::Series => found.tv_results,
         };
-        hits.into_iter().next().map(|hit| hit.id)
+        // `Some(vec![])` is a real answer, not a failure: the C# providers read
+        // `findResult?.MovieResults`/`TvResults` and, once that list exists, do
+        // NOT fall back to a name search. `None` is reserved for a request that
+        // never produced a payload.
+        Some(hits.into_iter().map(search_hit_from).collect())
+    }
+
+    /// The single TMDB id an external id resolves to, or `None` — the shape the
+    /// refresh path wants (`TmdbMovieProvider`/`TmdbSeriesProvider.GetMetadata`
+    /// take `TvResults[0].Id`).
+    pub async fn find_id_by_external_id(
+        &self,
+        kind: TmdbKind,
+        source: &str,
+        external_id: &str,
+    ) -> Option<i64> {
+        self.find_by_external_id(kind, source, external_id, None)
+            .await?
+            .into_iter()
+            .next()
+            .map(|hit| hit.tmdb_id)
     }
 
     /// Fetches full metadata for a title (overview, tagline, genres, studios,
     /// rating, certification, premiere date, runtime, and cast + key crew) via
     /// `/movie|tv/{id}?append_to_response=credits,release_dates|content_ratings`.
     /// `None` on any network/parse error.
-    pub async fn details(&self, kind: TmdbKind, tmdb_id: i64) -> Option<TmdbDetails> {
+    pub async fn details(
+        &self,
+        kind: TmdbKind,
+        tmdb_id: i64,
+        language: Option<&str>,
+    ) -> Option<TmdbDetails> {
         let (path, append) = match kind {
+            // The movie Identify branch needs `external_ids` too — `/movie/{id}`
+            // carries `imdb_id` directly, so only the series arm asks for it.
             TmdbKind::Movie => ("movie", "credits,release_dates,videos"),
             TmdbKind::Series => ("tv", "credits,content_ratings,videos,external_ids"),
         };
-        let resp = self
+        let req = self
             .http
             .get(format!("{}/{path}/{tmdb_id}", self.base_url))
             .query(&[
                 ("api_key", self.api_key.expose_secret()),
                 ("append_to_response", append),
-            ])
-            .send()
-            .await
-            .ok()?;
+            ]);
+        let resp = with_language(req, language).send().await.ok()?;
         if !resp.status().is_success() {
             return None;
         }
@@ -1202,6 +1286,7 @@ impl TmdbClient {
             .original_title
             .or(d.original_name)
             .filter(|s| !s.is_empty());
+        let external_ids = d.external_ids;
         Some(TmdbDetails {
             name: d
                 .title
@@ -1222,8 +1307,12 @@ impl TmdbClient {
             trailers,
             imdb_id: d
                 .imdb_id
-                .or_else(|| d.external_ids.and_then(|e| e.imdb_id))
+                .or_else(|| external_ids.as_ref().and_then(|e| e.imdb_id.clone()))
                 .filter(|s| !s.is_empty()),
+            tvdb_id: external_ids
+                .and_then(|e| e.tvdb_id)
+                .map(|id| id.to_string()),
+            poster_url: non_empty(d.poster_path).map(|p| format!("{IMAGE_BASE}{p}")),
         })
     }
 
@@ -1267,17 +1356,19 @@ impl TmdbClient {
     /// (`/person/{id}?append_to_response=images,external_ids`) — port of
     /// `TmdbClientManager.GetPersonAsync` as the "Identify" flow's
     /// already-identified branch uses it. `None` on any error.
-    pub async fn person_lookup(&self, tmdb_id: i64) -> Option<TmdbPersonHit> {
-        let resp = self
+    pub async fn person_lookup(
+        &self,
+        tmdb_id: i64,
+        language: Option<&str>,
+    ) -> Option<TmdbPersonHit> {
+        let req = self
             .http
             .get(format!("{}/person/{tmdb_id}", self.base_url))
             .query(&[
                 ("api_key", self.api_key.expose_secret()),
                 ("append_to_response", "images,external_ids"),
-            ])
-            .send()
-            .await
-            .ok()?;
+            ]);
+        let resp = with_language(req, language).send().await.ok()?;
         if !resp.status().is_success() {
             return None;
         }
@@ -1336,19 +1427,15 @@ impl TmdbClient {
     }
 }
 
-/// `/find/{external_id}`: the matching movies and TV series.
+/// `/find/{external_id}`: the matching movies and TV series. The rows are the
+/// same `SearchMovie`/`SearchTv` shape `/search/*` returns, which is why the C#
+/// providers map them through the same result builder.
 #[derive(Debug, Default, Deserialize)]
 struct FindResponse {
     #[serde(default)]
-    movie_results: Vec<IdOnly>,
+    movie_results: Vec<SearchHit>,
     #[serde(default)]
-    tv_results: Vec<IdOnly>,
-}
-
-#[derive(Debug, Deserialize)]
-struct IdOnly {
-    #[serde(default)]
-    id: i64,
+    tv_results: Vec<SearchHit>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1463,7 +1550,7 @@ mod tests {
         .await;
         let client = TmdbClient::new().with_base_url(&server.base_url);
 
-        let hits = client.search_collection("Matrix").await;
+        let hits = client.search_collection("Matrix", None).await;
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].tmdb_id, 2344);
         assert_eq!(
@@ -1474,7 +1561,7 @@ mod tests {
         assert_eq!(hits[1].poster_url, None);
         assert_eq!(hits[1].overview, None);
 
-        let details = client.collection(2344).await.expect("collection");
+        let details = client.collection(2344, None).await.expect("collection");
         assert_eq!(details.name, "The Matrix Collection");
         assert_eq!(details.overview.as_deref(), Some("Neo."));
         // TMDB's own pick first, then the rest of each list.
@@ -1516,7 +1603,7 @@ mod tests {
         assert!(hits[1].profile_url.is_none());
         assert!(client.search_person("  ").await.is_empty());
 
-        let person = client.person_lookup(287).await.expect("lookup");
+        let person = client.person_lookup(287, None).await.expect("lookup");
         assert_eq!(person.name.as_deref(), Some("Brad Pitt"));
         assert_eq!(person.biography.as_deref(), Some("An actor."));
         assert_eq!(person.imdb_id.as_deref(), Some("nm0000093"));
@@ -1526,36 +1613,88 @@ mod tests {
         );
     }
 
+    #[test]
+    fn normalize_language_matches_tmdb_utils() {
+        use super::normalize_language;
+        // Blank in, blank out.
+        assert_eq!(normalize_language(None, Some("US")), None);
+        assert_eq!(normalize_language(Some(""), Some("US")), None);
+        // A bare language is untouched.
+        assert_eq!(
+            normalize_language(Some("en"), Some("US")).as_deref(),
+            Some("en")
+        );
+        // The region half is upper-cased — TMDB's API requires it.
+        assert_eq!(
+            normalize_language(Some("pt-br"), Some("BR")).as_deref(),
+            Some("pt-BR")
+        );
+        // Switzerland is not a TMDB region: degrade to the bare language.
+        assert_eq!(
+            normalize_language(Some("de-CH"), Some("CH")).as_deref(),
+            Some("de")
+        );
+        assert_eq!(
+            normalize_language(Some("fr-ch"), None).as_deref(),
+            Some("fr")
+        );
+        // es-419 maps to the closest regional variant TMDB knows.
+        assert_eq!(
+            normalize_language(Some("es-419"), Some("AR")).as_deref(),
+            Some("es-AR")
+        );
+        assert_eq!(
+            normalize_language(Some("es-419"), Some("MX")).as_deref(),
+            Some("es-MX")
+        );
+        // …but only when a country code is supplied.
+        assert_eq!(
+            normalize_language(Some("es-419"), None).as_deref(),
+            Some("es-419")
+        );
+    }
+
     #[tokio::test]
     async fn find_by_external_id_picks_the_kinds_result_list() {
         let server = crate::mock_http::MockServer::start(vec![(
             "/find/tt0133093",
-            r#"{"movie_results":[{"id":603}],"tv_results":[{"id":1}]}"#.to_owned(),
+            r#"{"movie_results":[{"id":603,"title":"The Matrix","release_date":"1999-03-31"}],"tv_results":[{"id":1}]}"#.to_owned(),
         )])
         .await;
         let client = TmdbClient::new().with_base_url(&server.base_url);
+        let movie = client
+            .find_by_external_id(TmdbKind::Movie, "imdb_id", "tt0133093", None)
+            .await
+            .expect("movie find answered");
         assert_eq!(
-            client
-                .find_by_external_id(TmdbKind::Movie, "imdb_id", "tt0133093")
-                .await,
-            Some(603)
+            movie
+                .iter()
+                .map(|hit| (
+                    hit.tmdb_id,
+                    hit.name.as_deref(),
+                    hit.premiere_date.as_deref()
+                ))
+                .collect::<Vec<_>>(),
+            vec![(603, Some("The Matrix"), Some("1999-03-31"))]
         );
         assert_eq!(
             client
-                .find_by_external_id(TmdbKind::Series, "imdb_id", "tt0133093")
+                .find_id_by_external_id(TmdbKind::Series, "imdb_id", "tt0133093")
                 .await,
             Some(1)
         );
-        // Unknown id → the mock's `{}` → no match; blank → no request.
-        assert!(
+        // An answered `/find` with no rows is `Some(vec![])`, not a failure —
+        // the C# providers stop there rather than falling back to a name
+        // search. A blank id makes no request at all.
+        assert_eq!(
             client
-                .find_by_external_id(TmdbKind::Movie, "imdb_id", "tt0")
-                .await
-                .is_none()
+                .find_by_external_id(TmdbKind::Movie, "imdb_id", "tt0", None)
+                .await,
+            Some(Vec::new())
         );
         assert!(
             client
-                .find_by_external_id(TmdbKind::Movie, "imdb_id", " ")
+                .find_by_external_id(TmdbKind::Movie, "imdb_id", " ", None)
                 .await
                 .is_none()
         );
@@ -1564,7 +1703,7 @@ mod tests {
     #[tokio::test]
     async fn an_empty_collection_search_term_makes_no_request() {
         let client = TmdbClient::new().with_base_url("http://127.0.0.1:1");
-        assert!(client.search_collection("  ").await.is_empty());
+        assert!(client.search_collection("  ", None).await.is_empty());
     }
 
     #[tokio::test]
@@ -1588,7 +1727,7 @@ mod tests {
             client.similar_page(TmdbKind::Movie, 1, 1).await,
             (vec![], 0)
         );
-        assert!(client.collection(1).await.is_none());
+        assert!(client.collection(1, None).await.is_none());
     }
 
     #[tokio::test]

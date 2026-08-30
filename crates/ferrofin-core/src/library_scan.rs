@@ -3015,7 +3015,11 @@ impl LibraryScanner {
             if matches!(kind, TmdbKind::Series)
                 && !cache.series_tmdb.contains_key(&entity.id)
                 && let Some(name) = entity.name.clone().filter(|n| !n.is_empty())
-                && let Some(hit) = tmdb.search(kind, &name, year).await.into_iter().next()
+                && let Some(hit) = tmdb
+                    .search(kind, &name, year, None)
+                    .await
+                    .into_iter()
+                    .next()
             {
                 cache.series_tmdb.insert(entity.id.clone(), hit.tmdb_id);
             }
@@ -3032,7 +3036,7 @@ impl LibraryScanner {
             id
         } else {
             let name = entity.name.clone().filter(|n| !n.is_empty())?;
-            tmdb.search(kind, name.as_str(), year)
+            tmdb.search(kind, name.as_str(), year, None)
                 .await
                 .into_iter()
                 .next()
@@ -3045,7 +3049,7 @@ impl LibraryScanner {
         if matches!(kind, TmdbKind::Series) {
             cache.series_tmdb.insert(entity.id.clone(), tmdb_id);
         }
-        let details = tmdb.details(kind, tmdb_id).await?;
+        let details = tmdb.details(kind, tmdb_id, None).await?;
         apply_details(entity, &details);
         // Rotten Tomatoes critic rating via OMDb, keyed by the IMDb id.
         if wants_rating

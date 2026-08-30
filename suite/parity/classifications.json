@@ -1,6 +1,6 @@
 {
   "_comment": "Curated ACCEPTED divergences (not bugs). Highest-precedence classification in gen-ledger: overrides the auto 'flagged: verify' from the Layer-2 read diff. deep_verified stays as the live layers report it (these do not diff clean vs Jellyfin by design). Sourced from the parity-triage workflow verdicts (parity/triage-findings.json) + the roadmap synthesis, minus the ops since fixed (Filters2 WI-2, Collections add/remove WI-6, Images Size WI-1).",
-  "last_verified": "2026-08-29 batch B1 (music by-name), reviewer round 2: the instant-mix genre-id regression and the by-name ItemValue.Type count defect are fixed in the server; four stale records (two of which said \"out-of-scope\") are rewritten with the evidence rather than deleted, and three new open-work records are added for divergences the fixes made visible.",
+  "last_verified": "2026-08-29 batch C1 (RemoteSearch identify, part 1): the RemoteSearch family had never been executed by any layer (sweep.py skips non-GET verbs and no journey covered it). j_remote_search_identify now probes Movie/Series/BoxSet/Person/Trailer on both servers; the first four diff clean after the provider fixes, and Trailer is recorded here as the OMDb-key divergence rather than left as an unexplained red. 2026-08-29 batch B1 (music by-name), reviewer round 2: the instant-mix genre-id regression and the by-name ItemValue.Type count defect are fixed in the server; four stale records (two of which said \"out-of-scope\") are rewritten with the evidence rather than deleted, and three new open-work records are added for divergences the fixes made visible.",
   "rows": {
     "DELETE /Intros/Show/{SeriesId}/{SeasonId}": {
       "category": "expected-extension",
@@ -277,6 +277,10 @@
     "POST /Intros/ScanSeason/{SeriesId}/{SeasonId}": {
       "category": "expected-extension",
       "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises."
+    },
+    "POST /Items/RemoteSearch/Trailer": {
+      "category": "remote-opt-in",
+      "classification": "remote-opt-in: OMDb is the ONLY provider implementing IRemoteMetadataProvider<Trailer, TrailerInfo> upstream (v10.11.8: `git grep \"Trailer, TrailerInfo\"` matches only MediaBrowser.Providers/Plugins/Omdb/OmdbItemProvider.cs:31 plus ItemLookupController), and Jellyfin ships a hardcoded key \u2014 OmdbProvider.cs:257 `const string Url = \"https://www.omdbapi.com?apikey=2c9d9507\";`. Ferrofin's OMDb client is inert until FERROFIN_OMDB_KEY / config `omdb_api_key` is set (the owner-listed scope divergence in CLAUDE.md \"Current scope\"; omdb.rs `enabled()` is `!api_key.is_empty()`), so a keyless Ferrofin answers [] where the oracle answers 6 rows. Measured twice on the C1 lab pair: F 200 [] / J 200 six results for {\"Name\":\"Inception\",\"Year\":2010}; the bogus-term case is 200 [] on both. NOT a routing, auth or DTO gap \u2014 the same body against /Items/RemoteSearch/Movie returns matching TMDB results on both, and curl from inside the Ferrofin container reaches omdbapi.com fine. The two real port gaps this row would otherwise have surfaced ARE fixed and unit-tested (the index-number echo of OmdbItemProvider.cs:185-192, and the `_libraryManager.ParseName` pass at :110-117 that lifts the year out of the title); they cannot be observed live until the lab's Ferrofin service is given an OMDb key. Un-classify by setting FERROFIN_OMDB_KEY on the Ferrofin service only and re-running the j_remote_search_identify journey, which already probes this op on both servers."
     },
     "POST /Items/{itemId}": {
       "category": "instance",

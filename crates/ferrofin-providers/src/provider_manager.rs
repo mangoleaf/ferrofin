@@ -76,25 +76,128 @@ impl RemoteSearchProvider for TmdbSearchProvider {
         request: &RemoteSearchRequest,
     ) -> Result<Vec<RemoteSearchResult>, ServiceError> {
         let search_info = &request.search_info;
+        let language = crate::tmdb::normalize_language(
+            search_info.metadata_language.as_deref(),
+            search_info.metadata_country_code.as_deref(),
+        );
+        let language = language.as_deref();
+        let ids = search_info.provider_ids.as_ref();
+
+        // 1. A `Tmdb` id already on the item pins the title exactly — one
+        //    result, straight from `/movie|tv/{id}`, and no name search.
+        //    (C# parses the id with `int.Parse`/`Convert.ToInt32`, which THROWS
+        //    on a non-numeric value and takes the whole provider down with it;
+        //    we fall through to the remaining branches instead — Jellyfin bug,
+        //    not a behaviour to port.)
+        if let Some(tmdb_id) = provider_id_of(ids, "Tmdb").and_then(|id| id.parse::<i64>().ok())
+            && let Some(details) = self.tmdb.details(self.kind, tmdb_id, language).await
+        {
+            return Ok(vec![self.pinned_result(tmdb_id, details)]);
+        }
+
+        // 2./3. Else an `Imdb` id, else a `Tvdb` id, resolved through TMDB's
+        //       `/find` — the order both `TmdbMovieProvider` and
+        //       `TmdbSeriesProvider` use. Once `/find` answers, even with no
+        //       rows, the C# provider returns them rather than falling back to
+        //       a name search (`if (movieResults is null)` / `if (tvResults is
+        //       not null)`); only a request that produced no payload at all
+        //       moves on to the next branch.
+        for (key, source) in [("Imdb", "imdb_id"), ("Tvdb", "tvdb_id")] {
+            let Some(external) = provider_id_of(ids, key) else {
+                continue;
+            };
+            let Some(hits) = self
+                .tmdb
+                .find_by_external_id(self.kind, source, external, language)
+                .await
+            else {
+                continue;
+            };
+            return Ok(hits
+                .into_iter()
+                .map(|hit| {
+                    let mut result = self.hit_result(hit);
+                    // `TmdbSeriesProvider` stamps the id it searched by back
+                    // onto each row; `TmdbMovieProvider` does not.
+                    if self.kind == TmdbKind::Series {
+                        result
+                            .provider_ids
+                            .get_or_insert_with(HashMap::new)
+                            .insert(key.to_owned(), external.to_owned());
+                    }
+                    result
+                })
+                .collect());
+        }
+
+        // 4. Nothing identifies the item: search by name.
         let Some(name) = search_info.name.as_deref().filter(|n| !n.is_empty()) else {
             return Ok(Vec::new());
         };
-        let hits = self.tmdb.search(self.kind, name, search_info.year).await;
-        Ok(hits
-            .into_iter()
-            .map(|hit| RemoteSearchResult {
-                name: hit.name,
-                production_year: hit.year,
-                image_url: hit.poster_url,
-                overview: hit.overview,
-                provider_ids: Some(std::collections::HashMap::from([(
-                    "Tmdb".to_owned(),
-                    hit.tmdb_id.to_string(),
-                )])),
-                search_provider_name: Some("TheMovieDb".to_owned()),
-                ..RemoteSearchResult::default()
-            })
-            .collect())
+        // `TmdbMovieProvider` passes `searchInfo.Year` to `/search/movie`;
+        // `TmdbSeriesProvider` leaves `SearchSeriesAsync`'s `year` at its `0`
+        // default, so a series Identify search is deliberately unfiltered.
+        let year = match self.kind {
+            TmdbKind::Movie => search_info.year,
+            TmdbKind::Series => None,
+        };
+        let hits = self.tmdb.search(self.kind, name, year, language).await;
+        Ok(hits.into_iter().map(|hit| self.hit_result(hit)).collect())
+    }
+}
+
+impl TmdbSearchProvider {
+    /// One `/search/*` or `/find/*` row as an Identify candidate — the C#
+    /// name-search loop for movies, `MapSearchTvToRemoteSearchResult` for
+    /// series. The series mapper sets `PremiereDate` and never `ProductionYear`;
+    /// the movie one sets both, from the same release date.
+    fn hit_result(&self, hit: crate::tmdb::TmdbSearchHit) -> RemoteSearchResult {
+        RemoteSearchResult {
+            name: hit.name,
+            production_year: match self.kind {
+                TmdbKind::Movie => hit.year,
+                TmdbKind::Series => None,
+            },
+            premiere_date: hit.premiere_date.as_deref().and_then(parse_ymd),
+            image_url: hit.poster_url,
+            overview: hit.overview,
+            provider_ids: Some(HashMap::from([(
+                "Tmdb".to_owned(),
+                hit.tmdb_id.to_string(),
+            )])),
+            search_provider_name: Some(TMDB_PROVIDER_NAME.to_owned()),
+            ..RemoteSearchResult::default()
+        }
+    }
+
+    /// The single candidate a `Tmdb` id resolves to — the C# `GetMovieAsync`
+    /// branch / `MapTvShowToRemoteSearchResult`. Both carry the IMDb id when
+    /// TMDB knows it; the series mapper adds the TVDB id too, and neither
+    /// series mapper sets `ProductionYear`.
+    fn pinned_result(&self, tmdb_id: i64, details: TmdbDetails) -> RemoteSearchResult {
+        let mut provider_ids = HashMap::from([("Tmdb".to_owned(), tmdb_id.to_string())]);
+        // `TrySetProviderId` — only when TMDB actually has the id.
+        if let Some(imdb) = details.imdb_id.filter(|v| !v.is_empty()) {
+            provider_ids.insert("Imdb".to_owned(), imdb);
+        }
+        if self.kind == TmdbKind::Series
+            && let Some(tvdb) = details.tvdb_id.filter(|v| !v.is_empty())
+        {
+            provider_ids.insert("Tvdb".to_owned(), tvdb);
+        }
+        RemoteSearchResult {
+            name: details.name,
+            production_year: match self.kind {
+                TmdbKind::Movie => details.production_year,
+                TmdbKind::Series => None,
+            },
+            premiere_date: details.premiere_date.as_deref().and_then(parse_ymd),
+            image_url: details.poster_url,
+            overview: details.overview,
+            provider_ids: Some(provider_ids),
+            search_provider_name: Some(TMDB_PROVIDER_NAME.to_owned()),
+            ..RemoteSearchResult::default()
+        }
     }
 }
 
@@ -182,17 +285,57 @@ impl RemoteSearchProvider for TmdbBoxSetSearchProvider {
         request: &RemoteSearchRequest,
     ) -> Result<Vec<RemoteSearchResult>, ServiceError> {
         let search_info = &request.search_info;
+        let language = crate::tmdb::normalize_language(
+            search_info.metadata_language.as_deref(),
+            search_info.metadata_country_code.as_deref(),
+        );
+        let language = language.as_deref();
+
+        // A `Tmdb` collection id pins the box set exactly: `TmdbBoxSetProvider`
+        // short-circuits on `tmdbId > 0` and returns that one collection — or
+        // nothing at all when TMDB has no such collection — without ever
+        // running the name search. (C#'s `Convert.ToInt32` throws on a
+        // non-numeric id and takes the provider down with it; we fall through
+        // to the name search instead — Jellyfin bug, not a behaviour to port.)
+        if let Some(tmdb_id) = provider_id_of(search_info.provider_ids.as_ref(), "Tmdb")
+            .and_then(|id| id.parse::<i64>().ok())
+            .filter(|id| *id > 0)
+        {
+            let Some(collection) = self.tmdb.collection(tmdb_id, language).await else {
+                return Ok(Vec::new());
+            };
+            return Ok(vec![RemoteSearchResult {
+                name: Some(collection.name),
+                // `GetPosterUrl(collection.PosterPath)` — TMDB's own pick, which
+                // `TmdbClient::collection` pushes first as the Primary image.
+                image_url: collection
+                    .images
+                    .iter()
+                    .find(|image| image.image_type == ImageType::Primary)
+                    .map(|image| image.url.clone()),
+                provider_ids: Some(HashMap::from([(
+                    "Tmdb".to_owned(),
+                    collection.tmdb_id.to_string(),
+                )])),
+                search_provider_name: Some(TMDB_PROVIDER_NAME.to_owned()),
+                ..RemoteSearchResult::default()
+            }]);
+        }
+
         let Some(name) = search_info.name.as_deref().filter(|n| !n.is_empty()) else {
             return Ok(Vec::new());
         };
         Ok(self
             .tmdb
-            .search_collection(name)
+            .search_collection(name, language)
             .await
             .into_iter()
             .map(|hit| RemoteSearchResult {
                 name: Some(hit.name),
-                overview: hit.overview,
+                // No `Overview`: `TmdbBoxSetProvider.GetSearchResults` builds
+                // its rows from Name/SearchProviderName/ImageUrl/Tmdb only —
+                // the collection's overview is applied to the BoxSet entity in
+                // `GetMetadata`, never to a search DTO.
                 image_url: hit.poster_url,
                 // C# `TmdbBoxSetProvider` sets `MetadataProvider.Tmdb` on the
                 // box set itself — `TmdbCollection` is the key a *movie* uses
@@ -202,7 +345,7 @@ impl RemoteSearchProvider for TmdbBoxSetSearchProvider {
                     "Tmdb".to_owned(),
                     hit.tmdb_id.to_string(),
                 )])),
-                search_provider_name: Some("TheMovieDb".to_owned()),
+                search_provider_name: Some(TMDB_PROVIDER_NAME.to_owned()),
                 ..RemoteSearchResult::default()
             })
             .collect())
@@ -286,13 +429,30 @@ impl RemoteSearchProvider for OmdbSearchProvider {
                 .flatten(),
             episode: is_episode.then_some(search_info.index_number).flatten(),
         };
-        let name = search_info.name.as_deref().unwrap_or_default();
-        if name.is_empty() && known.imdb_id.is_none() {
+        let raw_name = search_info.name.as_deref().unwrap_or_default();
+        if raw_name.is_empty() && known.imdb_id.is_none() {
             return Ok(Vec::new());
         }
+        // `_libraryManager.ParseName(name)` — the raw name reaches OMDb only
+        // after the year and the release clutter have been lifted out of it,
+        // and an in-title year becomes the `&y=` filter when the caller did not
+        // supply one. Skipped on the id branch, exactly as in C#, where the
+        // whole block sits under `if (string.IsNullOrWhiteSpace(imdbId))`.
+        let (name, year) = if known.imdb_id.is_none() && !raw_name.trim().is_empty() {
+            let options = naming_options();
+            let parsed = ferrofin_naming::video::video_resolver::clean_date_time(raw_name, options);
+            let cleaned = ferrofin_naming::video::video_resolver::try_clean_string(
+                Some(&parsed.name),
+                options,
+            )
+            .unwrap_or(parsed.name);
+            (cleaned, search_info.year.or(parsed.year))
+        } else {
+            (raw_name.to_owned(), search_info.year)
+        };
         Ok(self
             .omdb
-            .search(self.kind, name, search_info.year, &known)
+            .search(self.kind, &name, year, &known)
             .await
             .into_iter()
             .map(|hit| RemoteSearchResult {
@@ -304,11 +464,26 @@ impl RemoteSearchProvider for OmdbSearchProvider {
                     .clone()
                     .map(|id| std::collections::HashMap::from([("Imdb".to_owned(), id)])),
                 name: hit.title,
-                search_provider_name: Some("The Open Movie Database".to_owned()),
+                // `ResultToMetadataResult` echoes the caller's index numbers
+                // back on every row (the Identify dialog carries an episode's
+                // season/episode through the candidate list).
+                index_number: search_info.index_number,
+                parent_index_number: search_info.parent_index_number,
+                search_provider_name: Some(OMDB_PROVIDER_NAME.to_owned()),
                 ..RemoteSearchResult::default()
             })
             .collect())
     }
+}
+
+/// The shared naming options backing the OMDb provider's `ParseName` port.
+///
+/// [`NamingOptions::new`] compiles the whole clean-name regex table, so it is
+/// built once for the process rather than per search request.
+fn naming_options() -> &'static ferrofin_naming::common::NamingOptions {
+    static OPTIONS: std::sync::OnceLock<ferrofin_naming::common::NamingOptions> =
+        std::sync::OnceLock::new();
+    OPTIONS.get_or_init(ferrofin_naming::common::NamingOptions::new)
 }
 
 /// The display name of the MusicBrainz providers (`Plugin.Name`).
@@ -635,9 +810,17 @@ impl RemoteSearchProvider for TmdbPersonSearchProvider {
         request: &RemoteSearchRequest,
     ) -> Result<Vec<RemoteSearchResult>, ServiceError> {
         let search_info = &request.search_info;
+        // `TmdbPersonProvider` passes `searchInfo.MetadataLanguage`/
+        // `MetadataCountryCode` into `GetPersonAsync`, which is what localizes
+        // the biography this branch returns. The NAME search takes no language
+        // upstream (`SearchPersonAsync(name, ct)`), so neither does ours.
+        let language = crate::tmdb::normalize_language(
+            search_info.metadata_language.as_deref(),
+            search_info.metadata_country_code.as_deref(),
+        );
         if let Some(tmdb_id) = provider_id_of(search_info.provider_ids.as_ref(), "Tmdb")
             .and_then(|id| id.trim().parse::<i64>().ok())
-            && let Some(person) = self.tmdb.person_lookup(tmdb_id).await
+            && let Some(person) = self.tmdb.person_lookup(tmdb_id, language.as_deref()).await
         {
             let mut provider_ids = HashMap::from([("Tmdb".to_owned(), person.tmdb_id.to_string())]);
             // `TrySetProviderId(Imdb, …)` — only when TMDB knows it.
@@ -748,6 +931,12 @@ pub struct LocalProviderManager {
     /// [`ItemTypeLookup`] table. Present enables the kind-filtered built-in
     /// external-id descriptors.
     kind_by_type_name: HashMap<String, BaseItemKind>,
+    /// Reads the server's `(PreferredMetadataLanguage, MetadataCountryCode)`,
+    /// which [`remote_search`](Self::remote_search) fills a blank
+    /// `SearchInfo.MetadataLanguage`/`MetadataCountryCode` from. Read live so a
+    /// `POST /System/Configuration` takes effect without a restart. Absent →
+    /// the request's own values (possibly none) are used unchanged.
+    metadata_defaults: Option<Arc<dyn Fn() -> (String, String) + Send + Sync>>,
 }
 
 impl std::fmt::Debug for LocalProviderManager {
@@ -768,6 +957,7 @@ impl std::fmt::Debug for LocalProviderManager {
             .field("has_omdb", &self.omdb.is_some())
             .field("dynamic_fetchers", &self.dynamic_fetchers.len())
             .field("kind_by_type_name", &self.kind_by_type_name.len())
+            .field("has_metadata_defaults", &self.metadata_defaults.is_some())
             .finish()
     }
 }
@@ -794,7 +984,50 @@ impl LocalProviderManager {
             audiodb: None,
             omdb: None,
             kind_by_type_name: HashMap::new(),
+            metadata_defaults: None,
         }
+    }
+
+    /// Supplies the server's `(PreferredMetadataLanguage, MetadataCountryCode)`
+    /// to the remote-search path — the port of `ProviderManager`'s
+    /// `searchInfo.SearchInfo.MetadataLanguage ??= Configuration.
+    /// PreferredMetadataLanguage` defaulting, which is what makes an Identify
+    /// search honour the server's configured language when the client sends
+    /// none.
+    ///
+    /// The closure is called once per search and read live, so a configuration
+    /// change applies without a restart.
+    #[must_use]
+    pub fn with_metadata_defaults(
+        mut self,
+        defaults: impl Fn() -> (String, String) + Send + Sync + 'static,
+    ) -> Self {
+        self.metadata_defaults = Some(Arc::new(defaults));
+        self
+    }
+
+    /// A copy of `request` whose blank `MetadataLanguage`/`MetadataCountryCode`
+    /// have been filled from the server configuration, or `None` when nothing
+    /// needed filling (the common case — no allocation, no clone).
+    ///
+    /// Port of `ProviderManager.GetRemoteSearchResults`'s two
+    /// `IsNullOrWhiteSpace` defaults.
+    fn with_metadata_language(&self, request: &RemoteSearchRequest) -> Option<RemoteSearchRequest> {
+        let blank = |v: &Option<String>| v.as_deref().is_none_or(|s| s.trim().is_empty());
+        let needs_language = blank(&request.search_info.metadata_language);
+        let needs_country = blank(&request.search_info.metadata_country_code);
+        if !needs_language && !needs_country {
+            return None;
+        }
+        let (language, country) = self.metadata_defaults.as_ref()?();
+        let mut seeded = request.clone();
+        if needs_language && !language.is_empty() {
+            seeded.search_info.metadata_language = Some(language);
+        }
+        if needs_country && !country.is_empty() {
+            seeded.search_info.metadata_country_code = Some(country);
+        }
+        Some(seeded)
     }
 
     /// Attaches the fanart.tv client as a remote image provider for movies,
@@ -942,7 +1175,7 @@ impl LocalProviderManager {
         let tmdb_id = match resolve_tmdb_id(tmdb, TmdbKind::Series, &stored).await {
             Some(id) => id,
             None => {
-                tmdb.search(TmdbKind::Series, series_name, series_year)
+                tmdb.search(TmdbKind::Series, series_name, series_year, None)
                     .await
                     .into_iter()
                     .next()?
@@ -984,12 +1217,12 @@ impl LocalProviderManager {
         let collection_id = if let Some(id) = collection_id {
             id
         } else {
-            let Some(hit) = tmdb.search_collection(name).await.into_iter().next() else {
+            let Some(hit) = tmdb.search_collection(name, None).await.into_iter().next() else {
                 return Ok(false);
             };
             hit.tmdb_id
         };
-        let Some(collection) = tmdb.collection(collection_id).await else {
+        let Some(collection) = tmdb.collection(collection_id, None).await else {
             return Ok(false);
         };
         if wants_fetch(options.metadata_refresh_mode) {
@@ -1148,7 +1381,7 @@ impl LocalProviderManager {
         tmdb_id: i64,
         options: &MetadataRefreshOptions,
     ) -> Result<bool, ServiceError> {
-        let Some(details) = tmdb.details(kind, tmdb_id).await else {
+        let Some(details) = tmdb.details(kind, tmdb_id, None).await else {
             return Ok(false);
         };
         // Metadata pass: apply the fetched fields onto the row and persist
@@ -1241,7 +1474,7 @@ impl LocalProviderManager {
         if wants_fetch(options.image_refresh_mode)
             && self.image_store.is_some()
             && let Some(url) = tmdb
-                .person_lookup(tmdb_id)
+                .person_lookup(tmdb_id, None)
                 .await
                 .and_then(|p| p.profile_url)
         {
@@ -1313,7 +1546,8 @@ impl LocalProviderManager {
                 } else {
                     let name = chosen_name.unwrap_or(&name);
                     let year = chosen.and_then(|r| r.production_year).or(year);
-                    let Some(hit) = tmdb.search(kind, name, year).await.into_iter().next() else {
+                    let Some(hit) = tmdb.search(kind, name, year, None).await.into_iter().next()
+                    else {
                         return Ok(ItemUpdateType::None);
                     };
                     hit.tmdb_id
@@ -1606,7 +1840,7 @@ impl LocalProviderManager {
                     && let Some((kind, name, year)) = title_lookup(entity)
                 {
                     tmdb_id = tmdb
-                        .search(kind, &name, year)
+                        .search(kind, &name, year, None)
                         .await
                         .into_iter()
                         .next()
@@ -1625,7 +1859,7 @@ impl LocalProviderManager {
                     && let Some(name) = name
                 {
                     collection_id = tmdb
-                        .search_collection(name)
+                        .search_collection(name, None)
                         .await
                         .into_iter()
                         .next()
@@ -1634,7 +1868,7 @@ impl LocalProviderManager {
                 let Some(collection_id) = collection_id else {
                     return Vec::new();
                 };
-                tmdb.collection(collection_id)
+                tmdb.collection(collection_id, None)
                     .await
                     .map(|c| {
                         c.images
@@ -1648,7 +1882,7 @@ impl LocalProviderManager {
                 // `TmdbPersonImageProvider`: the person's profile by Tmdb id,
                 // else the first name-search hit.
                 let person = match (stored_tmdb_id, name) {
-                    (Some(id), _) => tmdb.person_lookup(id).await,
+                    (Some(id), _) => tmdb.person_lookup(id, None).await,
                     (None, Some(name)) => tmdb.search_person(name).await.into_iter().next(),
                     (None, None) => None,
                 };
@@ -1785,13 +2019,13 @@ async fn resolve_tmdb_id(
         return Some(id);
     }
     if let Some(imdb) = provider_id_of_pairs(ids, "Imdb")
-        && let Some(id) = tmdb.find_by_external_id(kind, "imdb_id", imdb).await
+        && let Some(id) = tmdb.find_id_by_external_id(kind, "imdb_id", imdb).await
     {
         return Some(id);
     }
     if kind == TmdbKind::Series
         && let Some(tvdb) = provider_id_of_pairs(ids, "Tvdb")
-        && let Some(id) = tmdb.find_by_external_id(kind, "tvdb_id", tvdb).await
+        && let Some(id) = tmdb.find_id_by_external_id(kind, "tvdb_id", tvdb).await
     {
         return Some(id);
     }
@@ -2244,11 +2478,32 @@ impl ProviderManager for LocalProviderManager {
         // filter chain. With no fetcher registered this set is empty and the
         // loop below yields `[]`, exactly as Jellyfin returns when nothing
         // matches.
+        //
+        // OPEN WORK ITEM (`request.include_disabled_providers` + `item_id`):
+        // C# `ProviderManager.cs:826` also passes the reference item's
+        // `LibraryOptions` and the `IncludeDisabledProviders` flag into
+        // `GetMetadataProvidersInternal`, so a fetcher unticked in a library's
+        // "Metadata downloaders" list is dropped from an Identify search made
+        // against an item in that library. With no `ItemId` the C# builds a
+        // dummy item with default `LibraryOptions` — everything enabled — which
+        // is why the two agree on every Identify request the clients send today.
+        // Closing it needs `LocalProviderManager` to resolve an item's library
+        // options (it holds `items` but no library-options source), then to
+        // filter `remote_search_providers` by
+        // `library_options::disabled_metadata_fetchers` for the item's kind.
+        // Until then `include_disabled_providers` is inert on this path.
         let name_filter = request.search_provider_name.as_deref();
         let providers = self.remote_search_providers.iter().filter(|p| {
             p.supports(request.item_kind)
                 && name_filter.is_none_or(|n| p.name().eq_ignore_ascii_case(n))
         });
+
+        // A blank `MetadataLanguage`/`MetadataCountryCode` is filled from the
+        // server configuration BEFORE the providers run, exactly as the C#
+        // does — without it a client that sends no language always gets TMDB's
+        // en-US answer regardless of the server's setting.
+        let seeded = self.with_metadata_language(request);
+        let request = seeded.as_ref().unwrap_or(request);
 
         let mut result_list: Vec<RemoteSearchResult> = Vec::new();
 
@@ -2729,6 +2984,151 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tmdb_movie_identify_maps_release_date_and_honours_provider_ids() {
+        use super::{TmdbKind, TmdbSearchProvider};
+        // The mock matches by path SUBSTRING, first route wins: `year=1999`
+        // sits ahead of `/search/movie` so a movie search that forgot to
+        // forward `SearchInfo.Year` would fall through to the empty payload.
+        let server = crate::mock_http::MockServer::start(vec![
+            (
+                "year=1999",
+                r#"{"results":[{"id":603,"title":"The Matrix","release_date":"1999-03-31",
+                    "poster_path":"/m.jpg","overview":"Neo."}]}"#
+                    .to_owned(),
+            ),
+            ("/search/movie", r#"{"results":[]}"#.to_owned()),
+            (
+                "/movie/603",
+                r#"{"id":603,"title":"The Matrix","release_date":"1999-03-31",
+                    "poster_path":"/m.jpg","overview":"Neo.","imdb_id":"tt0133093"}"#
+                    .to_owned(),
+            ),
+            (
+                "/find/tt0133093",
+                r#"{"movie_results":[{"id":603,"title":"The Matrix","release_date":"1999-03-31",
+                    "poster_path":"/m.jpg"}],"tv_results":[]}"#
+                    .to_owned(),
+            ),
+        ])
+        .await;
+        let tmdb = Arc::new(crate::tmdb::TmdbClient::new().with_base_url(&server.base_url));
+        let provider = TmdbSearchProvider::new(tmdb, TmdbKind::Movie);
+
+        // Name search: `PremiereDate` AND `ProductionYear`, both from the
+        // release date (`TmdbMovieProvider.GetSearchResults`'s name branch).
+        let mut req = named_request(BaseItemKind::Movie, "The Matrix");
+        req.search_info.year = Some(1999);
+        let results = provider.get_search_results(&req).await.expect("results");
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].premiere_date.map(|d| d.to_rfc3339()).as_deref(),
+            Some("1999-03-31T00:00:00+00:00")
+        );
+        assert_eq!(results[0].production_year, Some(1999));
+        assert_eq!(
+            results[0].provider_ids.as_ref().expect("ids")["Tmdb"],
+            "603"
+        );
+
+        // A `Tmdb` id pins the title: exactly one result, with the IMDb id
+        // merged in, and the name is ignored entirely.
+        let mut req = named_request(BaseItemKind::Movie, "Something Else");
+        req.search_info.provider_ids = Some(HashMap::from([("Tmdb".to_owned(), "603".to_owned())]));
+        let results = provider.get_search_results(&req).await.expect("results");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name.as_deref(), Some("The Matrix"));
+        let ids = results[0].provider_ids.as_ref().expect("ids");
+        assert_eq!(ids["Tmdb"], "603");
+        assert_eq!(ids["Imdb"], "tt0133093");
+        assert_eq!(
+            results[0].image_url.as_deref(),
+            Some("https://image.tmdb.org/t/p/original/m.jpg")
+        );
+        assert_eq!(results[0].production_year, Some(1999));
+
+        // An `Imdb` id resolves through `/find`. The movie provider does NOT
+        // stamp the id it searched by back onto the row.
+        let results = provider
+            .get_search_results(&id_request(BaseItemKind::Movie, &[("Imdb", "tt0133093")]))
+            .await
+            .expect("results");
+        assert_eq!(results.len(), 1);
+        let ids = results[0].provider_ids.as_ref().expect("ids");
+        assert_eq!(ids["Tmdb"], "603");
+        assert!(!ids.contains_key("Imdb"));
+        assert!(results[0].premiere_date.is_some());
+    }
+
+    #[tokio::test]
+    async fn tmdb_series_identify_sets_premiere_date_and_drops_the_year_filter() {
+        use super::{TmdbKind, TmdbSearchProvider};
+        // `first_air_date_year` first: `TmdbSeriesProvider` leaves
+        // `SearchSeriesAsync`'s year at 0, so forwarding one is the bug this
+        // ordering catches. `language=de` likewise proves the language rides
+        // along.
+        let server = crate::mock_http::MockServer::start(vec![
+            ("first_air_date_year", r#"{"results":[]}"#.to_owned()),
+            (
+                "language=de",
+                r#"{"results":[{"id":1396,"name":"Breaking Bad (de)",
+                    "first_air_date":"2008-01-20"}]}"#
+                    .to_owned(),
+            ),
+            (
+                "/search/tv",
+                r#"{"results":[{"id":1396,"name":"Breaking Bad","first_air_date":"2008-01-20",
+                    "poster_path":"/bb.jpg","overview":"Chemistry."}]}"#
+                    .to_owned(),
+            ),
+            (
+                "/tv/1396",
+                r#"{"id":1396,"name":"Breaking Bad","first_air_date":"2008-01-20",
+                    "poster_path":"/bb.jpg","overview":"Chemistry.",
+                    "external_ids":{"imdb_id":"tt0903747","tvdb_id":81189}}"#
+                    .to_owned(),
+            ),
+        ])
+        .await;
+        let tmdb = Arc::new(crate::tmdb::TmdbClient::new().with_base_url(&server.base_url));
+        let provider = TmdbSearchProvider::new(tmdb, TmdbKind::Series);
+
+        // A wrong `Year` must not narrow the search, and the series mapper
+        // emits `PremiereDate` — never `ProductionYear`.
+        let mut req = named_request(BaseItemKind::Series, "Breaking Bad");
+        req.search_info.year = Some(2019);
+        let results = provider.get_search_results(&req).await.expect("results");
+        assert_eq!(
+            results.len(),
+            1,
+            "series search must ignore SearchInfo.Year"
+        );
+        assert_eq!(
+            results[0].premiere_date.map(|d| d.to_rfc3339()).as_deref(),
+            Some("2008-01-20T00:00:00+00:00")
+        );
+        assert_eq!(results[0].production_year, None);
+
+        // The metadata language reaches TMDB.
+        let mut req = named_request(BaseItemKind::Series, "Breaking Bad");
+        req.search_info.metadata_language = Some("de".to_owned());
+        let results = provider.get_search_results(&req).await.expect("results");
+        assert_eq!(results[0].name.as_deref(), Some("Breaking Bad (de)"));
+
+        // A `Tmdb` id pins the series and carries all three ids.
+        let results = provider
+            .get_search_results(&id_request(BaseItemKind::Series, &[("Tmdb", "1396")]))
+            .await
+            .expect("results");
+        assert_eq!(results.len(), 1);
+        let ids = results[0].provider_ids.as_ref().expect("ids");
+        assert_eq!(ids["Tmdb"], "1396");
+        assert_eq!(ids["Imdb"], "tt0903747");
+        assert_eq!(ids["Tvdb"], "81189");
+        assert_eq!(results[0].production_year, None);
+        assert!(results[0].premiere_date.is_some());
+    }
+
+    #[tokio::test]
     async fn omdb_trailer_identify_supports_trailers_as_movies() {
         use super::OmdbSearchProvider;
         let server = crate::mock_http::MockServer::start(vec![(
@@ -2752,6 +3152,113 @@ mod tests {
             results[0].provider_ids.as_ref().expect("ids")["Imdb"],
             "tt1375666"
         );
+    }
+
+    #[tokio::test]
+    async fn omdb_identify_parses_the_name_and_echoes_the_index_numbers() {
+        use super::OmdbSearchProvider;
+        // The only route is the query OMDb must be asked: the year lifted out
+        // of `Inception (2010)` and the cleaned title. Anything else falls to
+        // the mock's `{}` → no results.
+        let server = crate::mock_http::MockServer::start(vec![(
+            "s=Inception&type=movie&y=2010",
+            r#"{"Search":[{"Title":"Inception","Year":"2010","imdbID":"tt1375666",
+                "Type":"movie"}],"Response":"True"}"#
+                .to_owned(),
+        )])
+        .await;
+        let omdb = Arc::new(crate::omdb::OmdbClient::new("key").with_base_url(&server.base_url));
+        let provider = OmdbSearchProvider::for_trailers(omdb);
+
+        let mut req = named_request(BaseItemKind::Trailer, "Inception (2010)");
+        req.search_info.index_number = Some(3);
+        req.search_info.parent_index_number = Some(7);
+        let results = provider.get_search_results(&req).await.expect("results");
+        assert_eq!(
+            results.len(),
+            1,
+            "ParseName must lift the year out of the title before querying OMDb"
+        );
+        assert_eq!(results[0].name.as_deref(), Some("Inception"));
+        // `ResultToMetadataResult` echoes the caller's index numbers.
+        assert_eq!(results[0].index_number, Some(3));
+        assert_eq!(results[0].parent_index_number, Some(7));
+
+        // An explicit `Year` wins over the one in the title (C# `year ??=`).
+        let mut req = named_request(BaseItemKind::Trailer, "Inception (2010)");
+        req.search_info.year = Some(1999);
+        assert!(
+            provider
+                .get_search_results(&req)
+                .await
+                .expect("ok")
+                .is_empty(),
+            "an explicit Year must not be overwritten by the in-title year"
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_search_seeds_a_blank_metadata_language_from_the_config() {
+        /// Echoes the language/country it was handed back as the result name.
+        struct EchoLanguage;
+        #[async_trait]
+        impl RemoteSearchProvider for EchoLanguage {
+            #[allow(clippy::unnecessary_literal_bound)]
+            fn name(&self) -> &str {
+                "Echo"
+            }
+            fn supports(&self, kind: BaseItemKind) -> bool {
+                kind == BaseItemKind::Movie
+            }
+            async fn get_search_results(
+                &self,
+                request: &RemoteSearchRequest,
+            ) -> Result<Vec<RemoteSearchResult>, ServiceError> {
+                Ok(vec![RemoteSearchResult {
+                    name: Some(format!(
+                        "{}/{}",
+                        request
+                            .search_info
+                            .metadata_language
+                            .as_deref()
+                            .unwrap_or("-"),
+                        request
+                            .search_info
+                            .metadata_country_code
+                            .as_deref()
+                            .unwrap_or("-")
+                    )),
+                    ..RemoteSearchResult::default()
+                }])
+            }
+        }
+
+        let mgr = LocalProviderManager::default()
+            .with_remote_search_providers(vec![Arc::new(EchoLanguage)])
+            .with_metadata_defaults(|| ("fr".to_owned(), "FR".to_owned()));
+
+        // Blank → filled from the server configuration.
+        let out = mgr
+            .remote_search(&request(BaseItemKind::Movie))
+            .await
+            .expect("search");
+        assert_eq!(out[0].name.as_deref(), Some("fr/FR"));
+
+        // Supplied by the caller → left exactly as sent.
+        let mut req = request(BaseItemKind::Movie);
+        req.search_info.metadata_language = Some("de".to_owned());
+        req.search_info.metadata_country_code = Some("DE".to_owned());
+        let out = mgr.remote_search(&req).await.expect("search");
+        assert_eq!(out[0].name.as_deref(), Some("de/DE"));
+
+        // Without a configured source nothing is invented.
+        let bare = LocalProviderManager::default()
+            .with_remote_search_providers(vec![Arc::new(EchoLanguage)]);
+        let out = bare
+            .remote_search(&request(BaseItemKind::Movie))
+            .await
+            .expect("search");
+        assert_eq!(out[0].name.as_deref(), Some("-/-"));
     }
 
     #[tokio::test]
@@ -4417,6 +4924,64 @@ mod tests {
         // The box set carries `Tmdb`, as C# `TmdbBoxSetProvider` sets it —
         // `TmdbCollection` is a *movie*'s pointer at its collection.
         assert_eq!(results[0].provider_ids.as_ref().unwrap()["Tmdb"], "2344");
+        // …and NO overview: the C# search rows carry Name/ImageUrl/Tmdb only.
+        assert!(
+            results[0].overview.is_none(),
+            "the C# box-set search DTO has no Overview"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_box_set_identify_provider_pins_a_collection_by_tmdb_id() {
+        let server = crate::mock_http::MockServer::start(vec![
+            (
+                "/collection/119",
+                r#"{"id":119,"name":"The Lord of the Rings Collection","overview":"Middle-earth.",
+                    "poster_path":"/lotr.jpg"}"#
+                    .to_owned(),
+            ),
+            // TMDB has no collection 999999 — the mock stands in for that with
+            // a body the client cannot read, so `collection()` yields `None`.
+            ("/collection/999999", "<not json>".to_owned()),
+            (
+                "/search/collection",
+                r#"{"results":[{"id":2344,"name":"The Matrix Collection"}]}"#.to_owned(),
+            ),
+        ])
+        .await;
+        let tmdb = Arc::new(crate::tmdb::TmdbClient::new().with_base_url(&server.base_url));
+        let provider = super::TmdbBoxSetSearchProvider::new(tmdb);
+
+        // The id wins over a conflicting name and yields exactly one row.
+        let mut req = named_request(BaseItemKind::BoxSet, "The Matrix Collection");
+        req.search_info.provider_ids = Some(HashMap::from([("Tmdb".to_owned(), "119".to_owned())]));
+        let results = provider.get_search_results(&req).await.expect("results");
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].name.as_deref(),
+            Some("The Lord of the Rings Collection")
+        );
+        assert_eq!(results[0].provider_ids.as_ref().unwrap()["Tmdb"], "119");
+        assert_eq!(
+            results[0].image_url.as_deref(),
+            Some("https://image.tmdb.org/t/p/original/lotr.jpg")
+        );
+        assert!(results[0].overview.is_none());
+
+        // An id TMDB does not answer for returns nothing — C# returns
+        // `Enumerable.Empty` rather than falling back to the name search, which
+        // the live `/search/collection` route here would otherwise satisfy.
+        let mut req = named_request(BaseItemKind::BoxSet, "The Matrix Collection");
+        req.search_info.provider_ids =
+            Some(HashMap::from([("Tmdb".to_owned(), "999999".to_owned())]));
+        assert!(
+            provider
+                .get_search_results(&req)
+                .await
+                .expect("ok")
+                .is_empty(),
+            "an unanswered collection id must not fall back to the name search"
+        );
     }
 
     #[test]

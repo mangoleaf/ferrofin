@@ -521,6 +521,19 @@ pub async fn build_app_state(
             .with_fanart(Arc::clone(&fanart_client))
             .with_audiodb(Arc::clone(&audiodb_client))
             .with_omdb(Arc::clone(&omdb_client))
+            // The Identify search fills a blank SearchInfo.MetadataLanguage /
+            // MetadataCountryCode from the server configuration, read live so a
+            // `POST /System/Configuration` applies without a restart.
+            .with_metadata_defaults({
+                let config_mgr = Arc::clone(&config_mgr);
+                move || {
+                    let config = config_mgr.snapshot_shared();
+                    (
+                        config.preferred_metadata_language.clone(),
+                        config.metadata_country_code.clone(),
+                    )
+                }
+            })
             // Enables the kind-filtered built-in external-id descriptors the
             // Identify dialog renders as id input fields.
             .with_item_types(item_type_lookup.as_ref()),
