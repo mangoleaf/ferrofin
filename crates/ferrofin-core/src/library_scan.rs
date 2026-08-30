@@ -1476,8 +1476,22 @@ impl LibraryScanner {
                 .await?;
         }
         self.save_chapters(item_id, &probe.chapters).await?;
-        // Artwork — locked items skip the rewrite entirely: their image rows
-        // are user-owned.
+        // Artwork. TODO(parity, open work item — NOT an accepted divergence):
+        // upstream does NOT skip the whole pass for a locked row. v10.11.8
+        // `MediaBrowser.Providers/Manager/ProviderManager.cs:412` returns true
+        // for `provider is ILocalImageProvider` BEFORE the `item.IsLocked`
+        // check, so only the REMOTE image providers are gated — Jellyfin keeps
+        // re-discovering a sidecar `poster.jpg` on a locked item. Ferrofin
+        // skips everything, so a locked row's Primary freezes at whatever was
+        // stored (measured on the parity lab: a metadata-dir download stayed
+        // Primary where Jellyfin held the sidecar).
+        //
+        // It cannot be fixed here alone: `save_item_images` REPLACES the rows,
+        // so un-gating this while `item_update.rs` still auto-locks on any edit
+        // would let a scan overwrite a user-chosen image. The pair is
+        // (a) port `MetadataService`'s per-field merge rules and drop the
+        // auto-lock in `item_update.rs`, (b) narrow this gate to the remote arm
+        // (`if images.is_empty() && !locked` around `fetch_remote_images`).
         if !media.locked {
             let art = ArtworkPass {
                 entity,
@@ -6533,6 +6547,29 @@ fn distinct_ignoring_case<'a>(columns: impl Iterator<Item = Option<&'a str>>) ->
     out
 }
 
+/// The grouping key of .NET's `StringComparer.OrdinalIgnoreCase`.
+///
+/// Ordinal-ignore-case is *invariant simple* case folding: .NET upper-cases one
+/// char to exactly one char and leaves a char whose mapping is not 1:1 alone.
+/// Rust's `str::to_lowercase` is the *full* Unicode mapping, which is a
+/// different comparer — under it `\u{3c2}` (final sigma) and `\u{3c3}` are
+/// distinct, where .NET folds both to `\u{3a3}` and calls them equal. Folding
+/// per char and keeping only the 1:1 results reproduces .NET exactly, including
+/// its non-folds (`\u{df}` stays, because `ToUpperInvariant` cannot expand it
+/// to `SS`).
+fn ordinal_ignore_case_key(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| {
+            let mut upper = c.to_uppercase();
+            match (upper.next(), upper.next()) {
+                (Some(one), None) => one,
+                _ => c,
+            }
+        })
+        .collect()
+}
+
 /// The distinct values of a `|`-joined column across a set of children, ordered
 /// by descending frequency with ties keeping first-appearance order.
 ///
@@ -6551,10 +6588,11 @@ fn frequency_ordered_distinct<'a>(columns: impl Iterator<Item = Option<&'a str>>
         .map(str::trim)
         .filter(|v| !v.is_empty())
     {
-        if let Some(&at) = index.get(&value.to_lowercase()) {
+        let key = ordinal_ignore_case_key(value);
+        if let Some(&at) = index.get(&key) {
             order[at].1 += 1;
         } else {
-            index.insert(value.to_lowercase(), order.len());
+            index.insert(key, order.len());
             order.push((value.to_owned(), 1));
         }
     }
@@ -6881,6 +6919,29 @@ mod tests {
     use ferrofin_db::entities::base_items::BaseItemEntity;
     use ferrofin_model::data::BaseItemKind;
     use ferrofin_traits::persistence::ItemPersistenceService as _;
+
+    /// `AlbumMetadataService` groups the songs' artists with
+    /// `StringComparer.OrdinalIgnoreCase`, which folds one char to one char and
+    /// leaves the non-1:1 mappings alone. `str::to_lowercase` (the full Unicode
+    /// mapping) is a different comparer, and these are the pairs where they part.
+    #[test]
+    fn ordinal_ignore_case_matches_dotnet_not_full_case_mapping() {
+        let key = super::ordinal_ignore_case_key;
+        assert_eq!(key("Artist 01"), key("ARTIST 01"));
+        // Greek final sigma: .NET folds \u{3c2}/\u{3c3} together, `to_lowercase` does not.
+        assert_eq!(key("\u{3c2}"), key("\u{3c3}"));
+        assert_ne!("\u{3c2}".to_lowercase(), "\u{3c3}".to_lowercase());
+        // Turkish dotted capital I stays distinct from ASCII `i`, as in .NET.
+        assert_ne!(key("\u{130}"), key("i"));
+        // Sharp s does not expand: `ToUpperInvariant` cannot map it 1:1 to `SS`.
+        assert_ne!(key("\u{df}"), key("ss"));
+        // Frequency ordering itself is unaffected by the change.
+        let rows = [Some("B|a"), Some("A"), Some("b")];
+        assert_eq!(
+            super::frequency_ordered_distinct(rows.iter().copied()),
+            vec!["B".to_owned(), "a".to_owned()]
+        );
+    }
 
     // date_modified must be the file's mtime (stable across rescans), never the
     // scan time: it feeds ImageTags and the resize-cache key, so a churning value

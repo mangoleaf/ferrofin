@@ -1172,11 +1172,6 @@ fn append_provider_predicates(qb: &mut QueryBuilder<'_, Sqlite>, filter: &Intern
     }
 }
 
-/// Appends the ancestor / top-parent predicates.
-///
-/// `AncestorIds` is an `EXISTS` over the `AncestorIds` closure table; top-parent
-/// is a direct `TopParentId` in-list, widened for the by-name types when the
-/// caller asked for them.
 /// The stored type names of the by-name kinds this query can return.
 ///
 /// Port of `BaseItemRepository.GetItemByNameTypesInQuery` + `IsTypeInQuery`: a
@@ -1201,6 +1196,11 @@ fn item_by_name_types_in_query(filter: &InternalItemsQuery) -> Vec<String> {
     .collect()
 }
 
+/// Appends the ancestor / top-parent predicates.
+///
+/// `AncestorIds` is an `EXISTS` over the `AncestorIds` closure table; top-parent
+/// is a direct `TopParentId` in-list, widened for the by-name types when the
+/// caller asked for them.
 fn append_ancestor_predicates(qb: &mut QueryBuilder<'_, Sqlite>, filter: &InternalItemsQuery) {
     if !filter.top_parent_ids.is_empty() {
         // C# `BaseItemRepository.TranslateQuery`

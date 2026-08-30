@@ -288,9 +288,14 @@ def build_curated():
     terminal, t_stamp = load_layer2("suite/parity/terminal-results.json")
     for k, v in terminal.items():
         curated[k] = {**v, "last_verified": t_stamp}
-    # Layer-3 binary/asset differential (image/font/css): a live property/effect verdict for
-    # the ops that return non-JSON bodies, applied like the other live layers so a curated
-    # accepted-divergence classification can still override its auto-flag below.
+    # Layer-3 binary/asset differential (image/font/css): a live verdict for the ops that
+    # return non-JSON bodies, applied like the other live layers so a curated
+    # accepted-divergence classification can still override its auto-flag below. Most of
+    # these rows stamp `verification_method: "property"` themselves — two different image
+    # encoders cannot produce identical bytes, so the bar is the DECLARED properties
+    # (status, media type, decoded container, dimensions) and the row says so rather than
+    # borrowing the body-diff headline. Only the file family (same hardlinked fixture,
+    # compared by sha256) claims "body-diff".
     assets, as_stamp = load_layer2("suite/parity/asset-results.json")
     for k, v in assets.items():
         curated[k] = {**v, "last_verified": as_stamp}

@@ -17,6 +17,16 @@
 //!   `max_list_order`, and the name range/substring predicates are applied as in
 //!   C#. The `is_favorite` user-data path is honored via a `UserData` join.
 
+use std::collections::HashMap;
+
+use async_trait::async_trait;
+use ferrofin_db::Database;
+use ferrofin_db::entities::base_items::PeopleEntity;
+use ferrofin_db::store::{guid_to_db, opt_datetime_to_db};
+use ferrofin_model::data::BaseItemKind;
+use ferrofin_model::querying::QueryResult;
+use sqlx::QueryBuilder;
+
 /// A `Person` row's `SortName`.
 ///
 /// `Person` is the only 10.11.8 entity that overrides
@@ -29,15 +39,6 @@
 fn person_sort_name(name: &str) -> String {
     name.trim_start().to_owned()
 }
-use std::collections::HashMap;
-
-use async_trait::async_trait;
-use ferrofin_db::Database;
-use ferrofin_db::entities::base_items::PeopleEntity;
-use ferrofin_db::store::{guid_to_db, opt_datetime_to_db};
-use ferrofin_model::data::BaseItemKind;
-use ferrofin_model::querying::QueryResult;
-use sqlx::QueryBuilder;
 use sqlx::Sqlite;
 use uuid::Uuid;
 

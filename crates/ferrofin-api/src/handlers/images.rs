@@ -245,21 +245,69 @@ fn accept_query_param(uri: &axum::http::Uri) -> Option<&str> {
     })
 }
 
-/// Parses a Jellyfin `ImageFormat` the way ASP.NET's `EnumTypeModelBinder` binds
-/// one: an enum **member name** (case-insensitive) or a **defined** integer
-/// ordinal. Anything else fails to bind.
-///
-/// Two consequences are load-bearing and both were measured against 10.11.8:
-/// `jpeg` is *not* an `ImageFormat` member so it does not bind (Jellyfin `400`s
-/// on it in the route segment), and an undefined ordinal such as `-1` does not
-/// bind either, because `SuppressBindingUndefinedValueToEnumType` is on by
-/// default — which is why `5` (`Svg`) is accepted but `-1` is a `400`.
-fn parse_image_format(format: &str) -> Option<ImageFormat> {
-    let trimmed = format.trim();
-    if let Ok(ordinal) = trimmed.parse::<i32>() {
-        return ImageFormat::try_from(ordinal).ok();
+/// The C# integer discriminant of an [`ImageFormat`] — the ordinal ASP.NET's
+/// enum binder accepts on the wire and the value `Enum.Parse` ORs together.
+fn image_format_ordinal(format: ImageFormat) -> i32 {
+    match format {
+        ImageFormat::Bmp => 0,
+        ImageFormat::Gif => 1,
+        ImageFormat::Jpg => 2,
+        ImageFormat::Png => 3,
+        ImageFormat::Webp => 4,
+        ImageFormat::Svg => 5,
     }
-    match trimmed.to_ascii_lowercase().as_str() {
+}
+
+/// The outcome of .NET's `Enum.Parse(typeof(ImageFormat), value, ignoreCase: true)`.
+///
+/// The three arms are distinct because the two request arms of the image routes
+/// treat them differently — see [`parse_image_format`] (route) and
+/// [`bind_query_image_format`] (query).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImageFormatBinding {
+    /// Parsed, and the result names a declared member.
+    Defined(ImageFormat),
+    /// Parsed, but the result names no declared member (`(ImageFormat)6`).
+    /// `Enum.Parse` happily produces these: any integer is accepted, and a
+    /// comma-separated list is bitwise-ORed even on a non-`[Flags]` enum.
+    Undefined,
+    /// Did not parse at all: neither a member name nor an integer.
+    Unparseable,
+}
+
+/// Port of `Enum.Parse(typeof(ImageFormat), value, ignoreCase: true)`.
+///
+/// .NET's enum parser is looser than it looks, and every rule here was measured
+/// against a live 10.11.8 (`?format=` on `/Items/{id}/Images/Primary`):
+///
+/// * leading/trailing whitespace is trimmed (`" 3 "` binds `Png`);
+/// * an integer is accepted with a sign and leading zeros (`"+3"`, `"03"`) and
+///   is **not** range-checked here (`"-1"`, `"6"` parse fine);
+/// * a comma-separated list is parsed part-by-part and bitwise-ORed, even
+///   though `ImageFormat` is not `[Flags]` — `"Jpg,Png"` is `2 | 3 == 3`
+///   (`Png`), and 10.11.8 really does answer `image/png` for it;
+/// * a value that overflows the enum's `Int32` backing store throws inside
+///   `Enum.Parse`, i.e. it is a *parse failure*, not an undefined value.
+fn bind_image_format(format: &str) -> ImageFormatBinding {
+    let mut combined: i32 = 0;
+    for part in format.split(',') {
+        let part = part.trim();
+        let Some(value) = image_format_member(part).map_or_else(
+            || part.parse::<i32>().ok(),
+            |member| Some(image_format_ordinal(member)),
+        ) else {
+            return ImageFormatBinding::Unparseable;
+        };
+        combined |= value;
+    }
+    ImageFormat::try_from(combined)
+        .map_or(ImageFormatBinding::Undefined, ImageFormatBinding::Defined)
+}
+
+/// One `ImageFormat` **member name**, matched case-insensitively as
+/// `Enum.Parse(..., ignoreCase: true)` does.
+fn image_format_member(name: &str) -> Option<ImageFormat> {
+    match name.to_ascii_lowercase().as_str() {
         "bmp" => Some(ImageFormat::Bmp),
         "gif" => Some(ImageFormat::Gif),
         "jpg" => Some(ImageFormat::Jpg),
@@ -267,6 +315,55 @@ fn parse_image_format(format: &str) -> Option<ImageFormat> {
         "webp" => Some(ImageFormat::Webp),
         "svg" => Some(ImageFormat::Svg),
         _ => None,
+    }
+}
+
+/// Binds the **route** `{format}` segment: `[FromRoute, Required] ImageFormat`,
+/// which MVC hands to `EnumTypeModelBinder` with
+/// `SuppressBindingUndefinedValueToEnumType` left at its default — so an
+/// undefined value is a model-binding error just like an unparseable one.
+/// `None` here means the caller must answer `400`.
+///
+/// Measured on 10.11.8: `jpeg`, `bogus`, `-1`, `6` and a value that overflows
+/// `Int32` are all `400` (`{"errors":{"format":["The value '-1' is invalid."]}}`),
+/// while `jpg`, `JPG`, `5` and `Jpg,Png` bind.
+fn parse_image_format(format: &str) -> Option<ImageFormat> {
+    match bind_image_format(format) {
+        ImageFormatBinding::Defined(f) => Some(f),
+        ImageFormatBinding::Undefined | ImageFormatBinding::Unparseable => None,
+    }
+}
+
+/// Binds the **query** `?format=` value: `[FromQuery] ImageFormat?`, which is a
+/// *nullable* enum and therefore does **not** get `EnumTypeModelBinder`'s
+/// undefined-value check. The two arms consequently diverge, and 10.11.8 was
+/// measured on every case below:
+///
+/// * unparseable (`bogus`, `jpeg`, `3.0`, an `Int32` overflow) — the conversion
+///   fails, the nullable parameter stays `null`, and the request proceeds with
+///   the format **negotiated** from `Accept`: `200`, not `400`;
+/// * defined (`png`, `3`, `Jpg,Png`) — that format is used;
+/// * undefined (`-1`, `6`, `99`, `Jpg,Png,Webp` = `7`) — the value binds, and
+///   then `ImageFormatExtensions.GetMimeType` throws
+///   `InvalidEnumArgumentException`. That derives from `ArgumentException`,
+///   which `ExceptionMiddleware.GetStatusCode` maps to `400`.
+///
+/// # Errors
+///
+/// [`ApiError::BadRequest`] for an undefined enum value, mirroring that throw.
+/// (Jellyfin's body there is `text/plain` "Error processing request." from its
+/// exception middleware; Ferrofin's error bodies are uniformly JSON, which is a
+/// server-wide shape difference rather than an image-contract one.)
+fn bind_query_image_format(format: Option<&str>) -> Result<Option<ImageFormat>, ApiError> {
+    let Some(raw) = format else {
+        return Ok(None);
+    };
+    match bind_image_format(raw) {
+        ImageFormatBinding::Defined(f) => Ok(Some(f)),
+        ImageFormatBinding::Unparseable => Ok(None),
+        ImageFormatBinding::Undefined => Err(ApiError::BadRequest(format!(
+            "The value of argument 'format' ({raw}) is invalid for Enum type 'ImageFormat'."
+        ))),
     }
 }
 
@@ -335,10 +432,7 @@ async fn serve_image_file(
             quality: query.quality.unwrap_or(90),
             // C# `GetOutputFormats(format)`: an explicit `format` wins outright,
             // otherwise the list is derived from what the *client* advertised.
-            supported_output_formats: query
-                .format
-                .as_deref()
-                .and_then(parse_image_format)
+            supported_output_formats: bind_query_image_format(query.format.as_deref())?
                 .map_or_else(
                     || {
                         client_supported_formats(
@@ -1508,6 +1602,69 @@ mod tests {
         assert_eq!(parse_image_format("-1"), None);
         assert_eq!(parse_image_format("6"), None);
         assert_eq!(parse_image_format(""), None);
+        // `Enum.Parse` looseness the route arm inherits, all measured on 10.11.8:
+        // whitespace/sign/leading zeros bind, and a comma list is ORed.
+        assert_eq!(parse_image_format(" 3 "), Some(ImageFormat::Png));
+        assert_eq!(parse_image_format("+3"), Some(ImageFormat::Png));
+        assert_eq!(parse_image_format("03"), Some(ImageFormat::Png));
+        assert_eq!(parse_image_format("Jpg,Png"), Some(ImageFormat::Png)); // 2 | 3
+        assert_eq!(parse_image_format("Webp,1"), Some(ImageFormat::Svg)); // 4 | 1
+        assert_eq!(parse_image_format("Jpg,Png,Webp"), None); // 7 is undefined
+        assert_eq!(parse_image_format("Png,bogus"), None);
+        assert_eq!(parse_image_format("99999999999999999999"), None); // Int32 overflow
+    }
+
+    /// The QUERY arm is a *nullable* enum, so it skips the undefined-value check
+    /// the route arm gets: an unparseable value falls back to negotiation
+    /// (`200`), while an undefined ordinal throws through to a `400`. Every case
+    /// below was measured against 10.11.8 on
+    /// `/Items/{id}/Images/Primary?maxWidth=100&format=…`.
+    #[test]
+    fn query_format_nulls_on_unparseable_and_400s_on_undefined() {
+        // absent / unparseable -> None -> negotiate (Jellyfin answers 200 jpeg)
+        for raw in [
+            None,
+            Some(""),
+            Some("bogus"),
+            Some("jpeg"),
+            Some("ts"),
+            Some("3.0"),
+            Some("0x3"),
+            Some("Png,bogus"),
+            Some("99999999999999999999"),
+        ] {
+            assert_eq!(
+                bind_query_image_format(raw).expect("no 400"),
+                None,
+                "{raw:?} should bind to null"
+            );
+        }
+        // defined -> that format
+        for (raw, want) in [
+            ("png", ImageFormat::Png),
+            ("3", ImageFormat::Png),
+            ("webp", ImageFormat::Webp),
+            ("5", ImageFormat::Svg),
+            (" 3 ", ImageFormat::Png),
+            ("+3", ImageFormat::Png),
+            ("Jpg,Png", ImageFormat::Png),
+            ("Webp,1", ImageFormat::Svg),
+        ] {
+            assert_eq!(
+                bind_query_image_format(Some(raw)).expect("no 400"),
+                Some(want)
+            );
+        }
+        // undefined -> 400 (C# `InvalidEnumArgumentException` -> `ArgumentException`)
+        for raw in ["-1", "6", "7", "99", "Jpg,Png,Webp"] {
+            assert!(
+                matches!(
+                    bind_query_image_format(Some(raw)),
+                    Err(ApiError::BadRequest(_))
+                ),
+                "{raw} should be a 400"
+            );
+        }
     }
 
     #[test]
