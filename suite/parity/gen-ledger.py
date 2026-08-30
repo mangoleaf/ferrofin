@@ -144,7 +144,11 @@ def build_rows(spec, real, overlay, curated, sweep, owners):
                 "depth": depth,
                 "status_conformant": sw.get("status_conformant"),
                 "schema_valid": sw.get("schema_valid"),
-                "note": sw.get("note", ""),
+                # The note of the layer that OWNS the row (curated precedence),
+                # falling back to the sweep's. It used to be sweep-only, so a
+                # reads-owned row's evidence ("984 field(s) compared") never
+                # reached the ledger at all.
+                "note": s.get("note") or sw.get("note", ""),
                 "deep_verified": s.get("deep_verified"),
                 # HOW the row was verified, verbatim from the layer that produced
                 # it — never defaulted. `check()` rejects a verdict with no method,
@@ -189,6 +193,30 @@ def is_flagged(r):
 def is_accepted(r):
     return (r["classification"] and r["deep_verified"] is not True
             and not is_open_work(r) and not is_flagged(r))
+
+
+#: "N field(s) compared" / "N fields compared", however a layer phrases it.
+COMPARED_RE = re.compile(r"(\d+) fields?\(?s?\)? compared")
+
+
+def evidence(r):
+    """One phrase saying how MUCH was compared, for the deep-verified listing.
+
+    `✅` says a body was diffed; it does not say whether that body had 984
+    comparable leaves or one. `GET /Localization/Cultures` (984) and
+    `GET /System/Info/Public` (1 — `Version`, every other field VOLATILE) render
+    the same tick, and a reader had to open the probe to tell them apart.
+    """
+    note = r.get("note") or ""
+    m = COMPARED_RE.search(note)
+    if m:
+        n = int(m.group(1))
+        return f"{n} field{'' if n == 1 else 's'} compared"
+    if "'file'" in note or '"file"' in note:
+        return "sha256 of the served bytes"
+    if "text/vtt" in note or "text/srt" in note or "application/x-subrip" in note:
+        return "exact decoded text"
+    return ""
 
 
 def render_md(rows):
@@ -274,21 +302,26 @@ def render_md(rows):
                    f"| {fl} | {u} |")
     out.append("")
 
-    def listing(method):
+    def listing(method, show_evidence=False):
         glyph = verification.METHODS[method][0]
         for r in rows:
             if verified_by(r, method):
+                ev = f" _({evidence(r)})_" if show_evidence and evidence(r) else ""
                 # A green row can still carry a recorded divergence (e.g. a probe
                 # that is only meaningful at a pinned limit, or a candidate universe
                 # that is empty on both servers). Show it here — dropping the note
                 # is how a real difference becomes invisible.
                 note = f" — {r['classification']}" if r["classification"] not in ("", "ok") else ""
-                out.append(f"- {glyph} `{r['operation']}`{note}")
+                out.append(f"- {glyph} `{r['operation']}`{ev}{note}")
         out.append("")
 
     out.append("## Deep-verified (response + read-back diffed clean vs Jellyfin 10.11.8)\n")
-    out.append("_The headline. Nothing else on this page is counted in it._\n")
-    listing(verification.HEADLINE)
+    out.append("_The headline. Nothing else on this page is counted in it._  \n"
+               "_The parenthesis is HOW MUCH was compared — the number of non-volatile "
+               "leaves the diff actually walked. A clean diff of one leaf and a clean diff "
+               "of 984 are both real and they are not the same evidence, so the page says "
+               "which it was._\n")
+    listing(verification.HEADLINE, show_evidence=True)
     for m, (glyph, label, meaning) in verification.METHODS.items():
         if m == verification.HEADLINE:
             continue
@@ -322,14 +355,21 @@ def render_md(rows):
     out.append("## Full ledger\n")
     out.append("_status/schema: ✅ pass · ⚠️ fail · · untested_  \n")
     legend = " · ".join(f"{g} {m}" for m, (g, _l, _d) in verification.METHODS.items())
-    out.append(f"_verified: {legend} · ⚠️ fail · · untested. Only ✅ is deep-verified._\n")
+    out.append(f"_verified: {legend} · ⚠️ fail · · untested · ⛔ a verdict with no declared "
+               "method (rejected before this file is written; it must never appear). "
+               "Only ✅ is deep-verified._\n")
     out.append("| operation | route | depth | status | schema | verified | classification |")
     out.append("|---|---|---|---|---|---|---|")
     mark = {True: "✅", False: "⚠️", None: "·"}
     for r in rows:
         vm = r["verification_method"]
-        deep_mark = (verification.METHODS[vm][0] if r["deep_verified"] is True and vm
-                     else mark[r["deep_verified"]])
+        if r["deep_verified"] is True:
+            # An unstamped verdict must NEVER borrow the body-diff tick. `check()`
+            # runs before anything is written, so this branch is unreachable — it
+            # renders a refusal rather than a claim if it ever is reached.
+            deep_mark = verification.METHODS[vm][0] if vm else "⛔"
+        else:
+            deep_mark = mark[r["deep_verified"]]
         out.append(f"| `{r['operation']}` | {r['route']} | {r['depth']} | "
                    f"{mark[r['status_conformant']]} | {mark[r['schema_valid']]} | "
                    f"{deep_mark} | {r['classification']} |")
@@ -450,7 +490,8 @@ def check(rows, curated):
     assert not [r for r in rows if is_open_work(r) and is_accepted(r)]
     assert not [r for r in rows if is_flagged(r) and is_accepted(r)]
     by = Counter(r["verification_method"] for r in rows if r["deep_verified"] is True)
-    other = ", ".join(f"{n} {m}" for m, n in sorted(by.items()) if m != verification.HEADLINE)
+    other = ", ".join(f"{n} {m}" for m, n in sorted(by.items(), key=lambda kv: kv[0] or "")
+                      if m != verification.HEADLINE)
     print(f"ok: {len(rows)} ops, all {len(curated)} curated rows matched, "
           f"{by[verification.HEADLINE]} deep-verified (the headline), "
           f"verified another way: {other or 'none'}")
@@ -463,9 +504,16 @@ def main():
     sweep = load_sweep()
     owners = load_extension_routes()
 
+    # The rule is enforced on EVERY generation, not only when someone types
+    # --check. It used to be check-on-request: `sweep.sh` ran bare `gen-ledger.py`,
+    # no CI job or bats test ran `--check`, and an unstamped verdict row was
+    # written to ledger.json AND LEDGER.md complete — rendering the body-diff tick
+    # and absorbed into "verified another way" — before the process happened to
+    # die on an unrelated sort. A rule enforced only when a human asks for it is
+    # the same defect this file exists to close.
+    _guards_fire()
+    check(build_rows(spec, real, {}, curated, sweep, owners), curated)
     if "--check" in sys.argv:
-        _guards_fire()
-        check(build_rows(spec, real, {}, curated, sweep, owners), curated)
         return
 
     classify_path = next((a for a in sys.argv[1:] if not a.startswith("--")), None)
@@ -480,7 +528,8 @@ def main():
 
     deep = sum(1 for r in rows if is_headline(r))
     by = Counter(r["verification_method"] for r in rows if r["deep_verified"] is True)
-    other = ", ".join(f"{n} {m}" for m, n in sorted(by.items()) if m != verification.HEADLINE)
+    other = ", ".join(f"{n} {m}" for m, n in sorted(by.items(), key=lambda kv: kv[0] or "")
+                      if m != verification.HEADLINE)
     print(f"wrote parity/ledger.json + parity/LEDGER.md — {len(rows)} ops, "
           f"{deep} deep-verified (bodies diffed); verified another way: {other or 'none'}")
 

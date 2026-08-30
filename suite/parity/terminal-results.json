@@ -1,22 +1,25 @@
 {
   "errors": [],
   "generated_by": "suite/parity/terminal.py",
-  "last_verified": "446f0ae 2026-08-24",
+  "last_verified": "d9dc2ca 2026-08-29",
   "rows": {
     "POST /Backup/Restore": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True (post-restore LoginDisclaimer='parity-before') J=True (post-restore LoginDisclaimer='parity-before')"
+      "note": "H=True (post-restore LoginDisclaimer='parity-before') J=True (post-restore LoginDisclaimer='parity-before') (effect verdict; no body exists to diff)",
+      "verification_method": "effect"
     },
     "POST /System/Restart": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True (container running after restart: True) J=True (container running after restart: True)"
+      "note": "H=True (container running after restart: True) J=True (container running after restart: True) (effect verdict; no body exists to diff)",
+      "verification_method": "effect"
     },
     "POST /System/Shutdown": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True (container running after shutdown: False) J=True (container running after shutdown: False)"
+      "note": "H=True (container running after shutdown: False) J=True (container running after shutdown: False) (effect verdict; no body exists to diff)",
+      "verification_method": "effect"
     }
   }
 }

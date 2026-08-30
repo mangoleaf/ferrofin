@@ -241,10 +241,15 @@ def read_signatures(base, token, c):
         else:
             out[op] = (st // 100, "")                   # non-200: status class parity
         methods[op] = SIG_PROPERTY
+    # A HEAD has NO BODY, so nothing is ever served, decoded or measured here: the
+    # signature is the status class plus a content-type family, which is verbatim
+    # what the closed set defines as `status-class` ("at most also a content-type
+    # family"). These 13 rows were stamped `property` and rendered "declared
+    # properties agreed" while agreeing on nothing but a header.
     for op, path in heads:
         st, ct, _ = raw("HEAD", base, path, token)
         out[op] = (st // 100, ct_family(ct) if st == 200 else "")
-        methods[op] = SIG_PROPERTY
+        methods[op] = SIG_STATUS_CLASS
     # File-family ops. Both servers serve the SAME hardlinked fixture file, so the bar is the
     # file's sha256 plus the headers a download client depends on (type, ranges, disposition).
     fi, fs = c.get("file_item"), c.get("file_src")
@@ -478,11 +483,15 @@ def run(ferrofin_url, jellyfin_url):
         h, j = hsig[op], jsig.get(op)
         ok = j is not None and sig_match(h, j)
         method = hmethod.get(op, SIG_PROPERTY)
-        # HONESTY DOWNGRADE. Every signature helper falls back to `(status // 100, "")`
-        # when the server did not serve the thing. Two of those matching proves only
-        # that BOTH refused — no image was decoded, no media type compared, no property
-        # of any asset examined — so the row must not read as "properties agreed". A
-        # Ferrofin that 404'd every by-name image request would otherwise pass 16 rows.
+        # HONESTY DOWNGRADE. A signature is `(status_class, kind_label, *evidence)`,
+        # and a row where `evidence` is absent or entirely falsy established nothing
+        # but the status class: the `(status // 100, "")` every helper falls back to
+        # when the server served nothing, a headers-only HEAD, or a 200 whose body
+        # was EMPTY (`/Branding/Css` at `(2, "css", False)`, the deliberately
+        # nonexistent `/FallbackFont/Fonts/nonexistent.woff2` at `(2, "none", False)`).
+        # None of those decoded an image or compared a property, so none may read as
+        # "properties agreed" — a Ferrofin that 404'd every by-name image request
+        # would otherwise pass 16 rows.
         if verification.bare_status_class(h) and verification.bare_status_class(j or ()):
             method = SIG_STATUS_CLASS
         rows[op] = {"deep_verified": bool(ok),
@@ -606,7 +615,9 @@ def selfcheck():
     # property comparison, and must never be rendered as one.
     assert verification.bare_status_class((4, "")) and verification.bare_status_class((2, ""))
     assert not verification.bare_status_class((2, "image", "png", 600, 600))
-    assert not verification.bare_status_class((2, "css", False))
+    # An empty 200 body and a headers-only HEAD are status-class, not property.
+    assert verification.bare_status_class((2, "css", False))
+    assert verification.bare_status_class((2, "image"))
     # Every write row names the route it actually requested: the indexed upload must
     # POST to an INDEXED url, or the row reports a different endpoint's status.
     assert 'f"/Items/{it}/Images/Backdrop/0", token,' in inspect.getsource(write_effects)

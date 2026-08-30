@@ -22,6 +22,15 @@ suite/run.sh push     # against a RUNNING Ferrofin → WebSocket push checks (ca
 suite/viewer/serve.sh # → http://127.0.0.1:8125/suite/viewer/   (THE dashboard, one page)
 ```
 
+The viewer reads the same `suite/parity/ledger.json` that `LEDGER.md` is rendered
+from, and prints the same number: **the headline counts `verification_method:
+"body-diff"` and nothing else.** Every ledger row on that page carries its method
+(glyph, colour and label), the weaker methods are filterable on their own, and a
+verdict with no declared method — which `gen-ledger.py` now refuses to write —
+renders `⛔` and is counted nowhere. It used to print the raw `deep_verified` flag,
+228, against `LEDGER.md`'s 41, with all 228 rows drawn as the same ✅: one file, two
+published numbers, the stronger one unearned.
+
 `push` is the odd one out: it manages no containers and needs a Ferrofin
 already running (`FERROFIN_BASE`/`FERROFIN_USER`/`FERROFIN_PASS`). It exists
 because body diffing is blind to the server→client half of the API — for

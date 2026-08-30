@@ -11,6 +11,11 @@
     --bg: #0f1115; --panel: #171a21; --line: #262b36; --fg: #e6e9ef; --muted: #8b93a7;
     --accent: #58a6ff; --good: #3fb950; --bad: #f85149; --warn: #d29922;
     --real: #3fb950; --partial: #d29922; --hollow: #db6d28; --stub: #f85149; --none: #6e7681;
+    /* One colour per VERIFICATION METHOD (parity/verification.py). Only body-diff
+       is the headline green; every weaker method reads as a different, cooler
+       thing so a glance cannot mistake one for the other. */
+    --m-body: #3fb950; --m-effect: #58a6ff; --m-prop: #a371f7;
+    --m-status: #8b949e; --m-empty: #4d5760;
   }
   * { box-sizing: border-box; }
   body { margin: 0; background: var(--bg); color: var(--fg);
@@ -116,17 +121,26 @@
     <select id="ldepth"><option value="">depth: all</option></select>
     <select id="lowner"><option value="">owner: all</option></select>
     <select id="ldeep">
-      <option value="">deep: all</option>
-      <option value="true">✅ verified</option>
-      <option value="class">⚠️ classified</option>
+      <option value="">verified: all</option>
+      <option value="body-diff">✅ deep-verified (bodies diffed) — the headline</option>
+      <option value="other">◐⊙▫∅ verified another way (NOT the headline)</option>
+      <option value="effect">⊙ effect — a write&#39;s own read-back</option>
+      <option value="property">◐ property — derived properties agreed</option>
+      <option value="status-class">▫ status-class only</option>
+      <option value="empty-corpus">∅ empty-corpus — two empty result sets</option>
+      <option value="class">⚠️ classified divergence (accepted)</option>
+      <option value="openwork">⛏ open work (NOT accepted)</option>
+      <option value="flagged">🔍 flagged by a detector, unreviewed</option>
       <option value="untested">· untested</option>
     </select>
     <span id="lstats" class="muted"></span>
   </div>
   <div class="bar" id="lbar"></div>
+  <div class="muted" id="lleg" style="font-size:11px;margin:-4px 0 10px"></div>
   <table id="ledger"><thead><tr>
     <th class="l">operation</th><th class="l">owner</th><th class="l">depth</th><th>status</th><th>schema</th>
-    <th>deep</th><th class="l">classification</th>
+    <th title="only ✅ body-diff is counted as deep-verified">verified</th>
+    <th class="l">method — what was actually compared</th><th class="l">classification</th>
   </tr></thead><tbody></tbody></table>
 </main>
 
@@ -283,34 +297,110 @@ function renderTrend() {
 }
 
 // ── full parity ledger (all contract ops — port of the retired :8123 viewer) ──
+//
+// HOW a row was verified is part of the row, not a footnote. This page used to
+// print `deep_verified === true` — 228 — while LEDGER.md, generated from the SAME
+// ledger.json, printed 41, and rendered all 228 with one identical ✅. That is the
+// exact defect the verification_method stamp exists to close, re-opened by the
+// dashboard the README calls "THE dashboard, one page": whoever reads this page
+// reads the number. The headline here counts body-diff and nothing else, every row
+// shows its method, and the weaker methods are a different colour and glyph.
+//
+// Mirrors parity/verification.py — the closed set lives there; this is its rendering.
+const VMETHODS = {
+  "body-diff":   { g: "✅", label: "body-diff",    c: "var(--m-body)",
+    t: "THE HEADLINE — the response itself (or a write's read-back) was diffed against Jellyfin 10.11.8, every non-volatile field, or the served file's sha256, and came back clean" },
+  "effect":      { g: "⊙", label: "effect",       c: "var(--m-effect)",
+    t: "a write was applied and its effect confirmed on each server's OWN read-back; no body was diffed and the two servers' responses were never compared with each other" },
+  "property":    { g: "◐", label: "property",     c: "var(--m-prop)",
+    t: "named properties derived from the response agreed (decoded format/dimensions, media type, container signature, normalised playlist, named invariants); the bodies were NOT diffed" },
+  "status-class":{ g: "▫", label: "status-class", c: "var(--m-status)",
+    t: "only the HTTP status class agreed (at most also a content-type family) — nothing was served, or a deliberately-bogus id was refused by both. The weakest verdict in the ledger" },
+  "empty-corpus":{ g: "∅", label: "empty-corpus", c: "var(--m-empty)",
+    t: "both servers returned an EMPTY result set, so only the empty envelope's own zeros were compared — an unconditional-empty handler would pass identically" },
+};
+const HEADLINE_METHOD = "body-diff";
+const isOpenWork = (x) => (x.classification || "").startsWith("open-work");
+const isFlagged  = (x) => (x.classification || "").startsWith("flagged");
+const isAccepted = (x) => !!x.classification && x.deep_verified !== true
+                          && !isOpenWork(x) && !isFlagged(x);
+
 let LEDGER = [];
 function renderLedger() {
   const q = lq.value.trim().toLowerCase();
   const fd = ldepth.value, fv = ldeep.value, fo = lowner.value;
-  const mark = (v) => v === true ? "✅" : v === false ? "⚠️" : "·";
   const rows = LEDGER.filter(x => {
     if (fd && x.depth !== fd) return false;
     if (fo && (x.owner || "core") !== fo) return false;
-    if (fv === "true" && x.deep_verified !== true) return false;
-    if (fv === "class" && !(x.classification && x.deep_verified !== true)) return false;
+    const vm = x.deep_verified === true ? x.verification_method : null;
+    if (fv === "other" && !(vm && vm !== HEADLINE_METHOD)) return false;
+    if (fv in VMETHODS && vm !== fv) return false;
+    if (fv === "class" && !isAccepted(x)) return false;
+    if (fv === "openwork" && !(isOpenWork(x) && x.deep_verified !== true)) return false;
+    if (fv === "flagged" && !(isFlagged(x) && x.deep_verified !== true)) return false;
     if (fv === "untested" && (x.deep_verified !== null || x.classification)) return false;
-    if (q && !(`${x.operation} ${x.classification || ""}`.toLowerCase().includes(q))) return false;
+    if (q && !(`${x.operation} ${x.classification || ""} ${x.verification_method || ""}`
+               .toLowerCase().includes(q))) return false;
     return true;
   });
   const total = LEDGER.length;
-  const deep = LEDGER.filter(x => x.deep_verified === true).length;
-  const cls = LEDGER.filter(x => x.classification && x.deep_verified !== true).length;
-  lstats.textContent = `${total} ops · ${deep} deep-verified · ${cls} classified · ${total - deep - cls} untested · showing ${rows.length}`;
+  const by = {};
+  for (const x of LEDGER) if (x.deep_verified === true) {
+    const m = x.verification_method || "UNSTAMPED";
+    by[m] = (by[m] || 0) + 1;
+  }
+  // The headline is body-diff ONLY. An unstamped verdict is counted nowhere and
+  // shown as a defect: gen-ledger.py --check refuses to write one, so a non-zero
+  // count here means someone hand-edited ledger.json.
+  const deep = by[HEADLINE_METHOD] || 0;
+  const unstamped = by["UNSTAMPED"] || 0;
+  const other = Object.entries(by)
+    .filter(([m]) => m !== HEADLINE_METHOD && m !== "UNSTAMPED")
+    .reduce((n, [, v]) => n + v, 0);
+  const cls = LEDGER.filter(isAccepted).length;
+  const work = LEDGER.filter(x => isOpenWork(x) && x.deep_verified !== true).length;
+  const flag = LEDGER.filter(x => isFlagged(x) && x.deep_verified !== true).length;
+  const untested = LEDGER.filter(x => x.deep_verified === null && !x.classification).length;
+  lstats.innerHTML =
+    `${total} ops · <b style="color:var(--m-body)">${deep} deep-verified</b> ` +
+    `(bodies diffed — the only thing that number means) · ${other} verified another way · ` +
+    `${cls} classified · ${work} open work · ${flag} flagged (unreviewed) · ${untested} untested` +
+    (unstamped ? ` · <b class="bad">${unstamped} UNSTAMPED (counted nowhere)</b>` : "") +
+    ` · showing ${rows.length}`;
+  lleg.innerHTML = "verified: " + Object.entries(VMETHODS).map(([m, v]) =>
+      `<span title="${v.t}" style="color:${v.c}">${v.g} ${v.label}</span>`).join(" · ")
+    + ` · <span style="color:var(--warn)">⚠️ classified</span>`
+    + ` · <span style="color:var(--none)">· untested</span>`
+    + ` — only ✅ <b>body-diff</b> is counted as deep-verified.`;
   const seg = (n, c) => n ? `<span style="width:${100 * n / total}%;background:${c}"></span>` : "";
-  lbar.innerHTML = seg(deep, "var(--good)") + seg(cls, "var(--warn)") + seg(total - deep - cls, "var(--none)");
-  ledger.tBodies[0].innerHTML = rows.map(x => `<tr>
+  lbar.innerHTML = Object.entries(VMETHODS).map(([m, v]) => seg(by[m] || 0, v.c)).join("")
+    + seg(unstamped, "var(--bad)") + seg(cls + work + flag, "var(--warn)")
+    + seg(untested, "var(--none)");
+  const mark = (v) => v === true ? "✅" : v === false ? "⚠️" : "·";
+  ledger.tBodies[0].innerHTML = rows.map(x => {
+    const vm = x.deep_verified === true ? x.verification_method : null;
+    const v = vm ? VMETHODS[vm] : null;
+    // A verdict with no declared method must never borrow the body-diff tick.
+    const glyph = x.deep_verified !== true ? mark(x.deep_verified) : v ? v.g : "⛔";
+    // ✅ says a body was diffed; it does not say whether that body had 984
+    // comparable leaves or one (GET /System/Info/Public compares exactly one:
+    // Version). Show how much, the way LEDGER.md does.
+    const m = /(\d+) fields?\(?s?\)? compared/.exec(x.note || "");
+    const ev = m ? ` <span class="muted">(${m[1]} field${m[1] === "1" ? "" : "s"})</span>`
+      : /['"]file['"]/.test(x.note || "") ? ` <span class="muted">(sha256)</span>` : "";
+    const cell = v
+      ? `<span style="color:${v.c}" title="${v.t}">${v.label}</span>${ev}`
+      : x.deep_verified === true ? `<span class="bad">UNSTAMPED — no method declared</span>`
+      : x.deep_verified === false ? `<span class="muted">not verified</span>` : "";
+    return `<tr>
     <td class="l">${opCell(x.operation)}</td>
     <td class="l">${ownerBadge(x.owner)}</td>
     <td class="l"><span class="pill d-${x.depth}">${x.depth}</span></td>
     <td>${mark(x.status_conformant)}</td><td>${mark(x.schema_valid)}</td>
-    <td title="${x.deep_verified === true ? "verified" : x.deep_verified === false ? "classified" : "untested"}">${mark(x.deep_verified)}</td>
+    <td title="${v ? v.t : x.deep_verified === false ? "classified / not verified" : "untested"}">${glyph}</td>
+    <td class="l">${cell}</td>
     <td class="l muted">${x.classification || ""}</td>
-  </tr>`).join("");
+  </tr>`; }).join("");
 }
 
 fetch("/suite/results/runs.json?t=" + Date.now()).then(r => r.json()).then(d => {

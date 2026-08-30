@@ -339,8 +339,15 @@ STREAM_METHOD.update({op: verification.STATUS_CLASS for op in (
     "GET /Audio/{itemId}/hls/{segmentId}/stream.aac",
     "GET /Audio/{itemId}/hls/{segmentId}/stream.mp3",
 )})
-# Everything else (HEAD mirrors, playlists, transcoded segments, the trickplay tile)
-# compares declared properties.
+# Every HEAD mirror. `head_sig` returns `(status_class, content-type family)` and
+# nothing else — a HEAD has no body, so no playlist was parsed, no container
+# probed, no property of any stream examined. That is the closed set's definition
+# of `status-class` ("at most also a content-type family"), so these seven rows
+# say so instead of reading as "declared properties agreed".
+STREAM_METHOD.update({op: verification.STATUS_CLASS for op in STREAM_OPS
+                      if op.startswith("HEAD ")})
+# Everything else (playlists, transcoded segments, the trickplay tile) compares
+# declared properties derived from a real body.
 STREAM_METHOD.update({op: verification.PROPERTY for op in STREAM_OPS
                       if op not in STREAM_METHOD})
 

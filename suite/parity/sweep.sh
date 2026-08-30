@@ -44,7 +44,13 @@ echo ">> Layer-3 stream-signature differential (direct / HLS / subtitles / trick
 python3 ../parity/streams.py
 echo ">> terminal phase: restore / restart / shutdown (ends the differential)"
 python3 ../parity/terminal.py
-echo ">> regenerating ledger"
+# gen-ledger.py VALIDATES BEFORE IT WRITES on every run (not only under --check):
+# a row that carries a verdict without declaring which verification method earned
+# it, a method outside the closed set, a method on a row with no verdict, or an
+# open-work/unreviewed-flag row rendered as an accepted divergence all abort the
+# leg here with nothing written. This line used to be a bare regenerate, and the
+# rule it is supposed to enforce ran nowhere on any automated path.
+echo ">> regenerating ledger (validates first — an unstamped verdict fails the leg)"
 python3 ../parity/gen-ledger.py
 # (No fingerprint capture here: merge.py's shape check runs against the committed
 # suite/results/shape-baseline.json + the perf leg's own captures — a parity-leg capture

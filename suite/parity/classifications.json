@@ -266,10 +266,6 @@
       "category": "expected-extension",
       "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises."
     },
-    "POST /Items/{itemId}": {
-      "category": "instance",
-      "classification": "instance/methodology: the metadata edit persists correctly on Ferrofin (read-back reflects it); Jellyfin's read-back didn't reflect the synthetic tag-edit body (oracle/body difference), so this is not a Ferrofin defect."
-    },
     "POST /Items/{itemId}/RemoteSearch/Subtitles/{subtitleId}": {
       "category": "remote-opt-in",
       "classification": "remote-opt-in: needs an opensubtitles.com account and the public internet. With OPENSUBTITLES_USERNAME/PASSWORD/API_KEY set, the parity leg installs the plugin on the oracle, configures both, and the remote-subtitle journey (search -> download -> stream read-back -> provider file) runs live."

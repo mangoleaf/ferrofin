@@ -1,226 +1,270 @@
 {
   "generated_by": "suite/parity/assets.py",
-  "last_verified": "446f0ae 2026-08-24",
+  "last_verified": "16a48e1 2026-08-29",
   "rows": {
     "DELETE /Branding/Splashscreen": {
       "classification": "",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect verdict; bodies not diffed)",
+      "verification_method": "effect"
     },
     "DELETE /Items/{itemId}/Images/{imageType}": {
-      "classification": "",
-      "deep_verified": true,
-      "note": "H=True J=True"
+      "classification": "flagged: asset write effect diff vs Jellyfin (verify)",
+      "deep_verified": false,
+      "note": "H=True J=False",
+      "verification_method": "effect"
     },
     "DELETE /Items/{itemId}/Images/{imageType}/{imageIndex}": {
       "classification": "",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect verdict; bodies not diffed)",
+      "verification_method": "effect"
     },
     "DELETE /UserImage": {
       "classification": "",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect verdict; bodies not diffed)",
+      "verification_method": "effect"
     },
     "GET /Artists/{name}/Images/{imageType}/{imageIndex}": {
       "classification": "",
       "deep_verified": true,
-      "note": "H=(4, '') J=(4, '')"
+      "note": "H=(4, '') J=(4, '') (status class only; nothing was served on either server)",
+      "verification_method": "status-class"
     },
     "GET /Branding/Css": {
       "classification": "",
       "deep_verified": true,
-      "note": "H=(2, 'css', False) J=(2, 'css', False)"
+      "note": "H=(2, 'css', False) J=(2, 'css', False) (status class only; nothing was served on either server)",
+      "verification_method": "status-class"
     },
     "GET /Branding/Css.css": {
       "classification": "",
       "deep_verified": true,
-      "note": "H=(2, 'css', False) J=(2, 'css', False)"
+      "note": "H=(2, 'css', False) J=(2, 'css', False) (status class only; nothing was served on either server)",
+      "verification_method": "status-class"
     },
     "GET /Branding/Splashscreen": {
       "classification": "",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect verdict; bodies not diffed)",
+      "verification_method": "effect"
     },
     "GET /FallbackFont/Fonts/{name}": {
       "classification": "",
       "deep_verified": true,
-      "note": "H=(2, 'none', False) J=(2, 'none', False)"
+      "note": "H=(2, 'none', False) J=(2, 'none', False) (status class only; nothing was served on either server)",
+      "verification_method": "status-class"
     },
     "GET /Genres/{name}/Images/{imageType}": {
       "classification": "",
       "deep_verified": true,
-      "note": "H=(2, 'image', 'png', 600, 600) J=(2, 'image', 'png', 600, 600)"
+      "note": "H=(2, 'image', 'png', 600, 600) J=(2, 'image', 'png', 600, 600) (declared properties agreed; bytes not diffed)",
+      "verification_method": "property"
     },
     "GET /Genres/{name}/Images/{imageType}/{imageIndex}": {
       "classification": "",
       "deep_verified": true,
-      "note": "H=(2, 'image', 'png', 600, 600) J=(2, 'image', 'png', 600, 600)"
+      "note": "H=(2, 'image', 'png', 600, 600) J=(2, 'image', 'png', 600, 600) (declared properties agreed; bytes not diffed)",
+      "verification_method": "property"
     },
     "GET /Items/{itemId}/Download": {
       "classification": "",
       "deep_verified": true,
-      "note": "H=(2, 'file', '2801fdb3955d4f5acf8822b4a3414a72eeecd9b68f4a0083d30e46f15ff58f7c', 'video/x-matroska', 'bytes', 'attachment; filename=\"Movie 0001 (2020).mkv\"; filename*=UTF-8\\'\\'Movie%200001%20%282020%29.mkv') J=(2, 'file', '2801fdb3955d4f5acf8822b4a3414a72eeecd9b68f4a0083d30e46f15ff58f7c', 'video/x-matroska', 'bytes', 'attachment; filename=\"Movie 0001 (2020).mkv\"; filename*=UTF-8\\'\\'Movie%200001%20%282020%29.mkv')"
+      "note": "H=(2, 'file', '2801fdb3955d4f5acf8822b4a3414a72eeecd9b68f4a0083d30e46f15ff58f7c', 'video/x-matroska', 'bytes', 'attachment; filename=\"Movie 0001 (2020).mkv\"; filename*=UTF-8\\'\\'Movie%200001%20%282020%29.mkv') J=(2, 'file', '2801fdb3955d4f5acf8822b4a3414a72eeecd9b68f4a0083d30e46f15ff58f7c', 'video/x-matroska', 'bytes', 'attachment; filename=\"Movie 0001 (2020).mkv\"; filename*=UTF-8\\'\\'Movie%200001%20%282020%29.mkv')",
+      "verification_method": "body-diff"
     },
     "GET /Items/{itemId}/File": {
       "classification": "",
       "deep_verified": true,
-      "note": "H=(2, 'file', '2801fdb3955d4f5acf8822b4a3414a72eeecd9b68f4a0083d30e46f15ff58f7c', 'video/x-matroska', 'bytes', '', 206, 'bytes 0-99/775053', 'fd69399658b25b328773da41ebdbb9df83f303b7332d2fadb010235d40e71982') J=(2, 'file', '2801fdb3955d4f5acf8822b4a3414a72eeecd9b68f4a0083d30e46f15ff58f7c', 'video/x-matroska', 'bytes', '', 206, 'bytes 0-99/775053', 'fd69399658b25b328773da41ebdbb9df83f303b7332d2fadb010235d40e71982')"
+      "note": "H=(2, 'file', '2801fdb3955d4f5acf8822b4a3414a72eeecd9b68f4a0083d30e46f15ff58f7c', 'video/x-matroska', 'bytes', '', 206, 'bytes 0-99/775053', 'fd69399658b25b328773da41ebdbb9df83f303b7332d2fadb010235d40e71982') J=(2, 'file', '2801fdb3955d4f5acf8822b4a3414a72eeecd9b68f4a0083d30e46f15ff58f7c', 'video/x-matroska', 'bytes', '', 206, 'bytes 0-99/775053', 'fd69399658b25b328773da41ebdbb9df83f303b7332d2fadb010235d40e71982')",
+      "verification_method": "body-diff"
     },
     "GET /Items/{itemId}/Images/{imageType}": {
       "classification": "flagged: asset property diff vs Jellyfin (verify)",
       "deep_verified": false,
-      "note": "H=(2, 'image', 'jpeg', 2000, 3000) J=(2, 'image', 'jpeg', 320, 240)"
+      "note": "H=(2, 'image', 'jpeg', 2000, 3000) J=(2, 'image', 'jpeg', 320, 240) | SOURCE IMAGE MISMATCH H='/config/metadata/library/D37ECB9D-75B0-C0A8-E9EC-B0A864EC670E/primary.jpg' J='/media/synth/movies/Movie 0001 (2020)/poster.jpg'",
+      "verification_method": "property"
     },
     "GET /Items/{itemId}/Images/{imageType}/{imageIndex}": {
       "classification": "flagged: asset property diff vs Jellyfin (verify)",
       "deep_verified": false,
-      "note": "H=(2, 'image', 'jpeg', 2000, 3000) J=(2, 'image', 'jpeg', 320, 240)"
+      "note": "H=(2, 'image', 'jpeg', 2000, 3000) J=(2, 'image', 'jpeg', 320, 240) | SOURCE IMAGE MISMATCH H='/config/metadata/library/D37ECB9D-75B0-C0A8-E9EC-B0A864EC670E/primary.jpg' J='/media/synth/movies/Movie 0001 (2020)/poster.jpg'",
+      "verification_method": "property"
     },
     "GET /Items/{itemId}/Images/{imageType}/{imageIndex}/{tag}/{format}/{maxWidth}/{maxHeight}/{percentPlayed}/{unplayedCount}": {
       "classification": "flagged: asset property diff vs Jellyfin (verify)",
       "deep_verified": false,
-      "note": "H=(2, 'image', 'jpeg', 67, 100) J=(2, 'image', 'jpeg', 100, 75)"
+      "note": "H=(2, 'image', 'jpeg', 67, 100) J=(2, 'image', 'jpeg', 100, 75) | SOURCE IMAGE MISMATCH H='/config/metadata/library/D37ECB9D-75B0-C0A8-E9EC-B0A864EC670E/primary.jpg' J='/media/synth/movies/Movie 0001 (2020)/poster.jpg'",
+      "verification_method": "property"
     },
     "GET /MusicGenres/{name}/Images/{imageType}": {
       "classification": "",
       "deep_verified": true,
-      "note": "H=(4, '') J=(4, '')"
+      "note": "H=(4, '') J=(4, '') (status class only; nothing was served on either server)",
+      "verification_method": "status-class"
     },
     "GET /MusicGenres/{name}/Images/{imageType}/{imageIndex}": {
       "classification": "",
       "deep_verified": true,
-      "note": "H=(4, '') J=(4, '')"
+      "note": "H=(4, '') J=(4, '') (status class only; nothing was served on either server)",
+      "verification_method": "status-class"
     },
     "GET /Persons/{name}/Images/{imageType}": {
       "classification": "",
       "deep_verified": true,
-      "note": "H=(4, '') J=(4, '')"
+      "note": "H=(4, '') J=(4, '') (status class only; nothing was served on either server)",
+      "verification_method": "status-class"
     },
     "GET /Persons/{name}/Images/{imageType}/{imageIndex}": {
       "classification": "",
       "deep_verified": true,
-      "note": "H=(4, '') J=(4, '')"
+      "note": "H=(4, '') J=(4, '') (status class only; nothing was served on either server)",
+      "verification_method": "status-class"
     },
     "GET /Playback/BitrateTest": {
       "classification": "",
       "deep_verified": true,
-      "note": "H=(2, 'font-or-binary', True) J=(2, 'font-or-binary', True)"
+      "note": "H=(2, 'font-or-binary', True) J=(2, 'font-or-binary', True) (declared properties agreed; bytes not diffed)",
+      "verification_method": "property"
     },
     "GET /Studios/{name}/Images/{imageType}": {
       "classification": "",
       "deep_verified": true,
-      "note": "H=(4, '') J=(4, '')"
+      "note": "H=(4, '') J=(4, '') (status class only; nothing was served on either server)",
+      "verification_method": "status-class"
     },
     "GET /Studios/{name}/Images/{imageType}/{imageIndex}": {
       "classification": "",
       "deep_verified": true,
-      "note": "H=(4, '') J=(4, '')"
+      "note": "H=(4, '') J=(4, '') (status class only; nothing was served on either server)",
+      "verification_method": "status-class"
     },
     "GET /System/Logs/Log": {
       "classification": "",
       "deep_verified": true,
-      "note": "H=(2, 'text/plain', True) J=(2, 'text/plain', True)"
+      "note": "H=(2, 'text/plain', True) J=(2, 'text/plain', True) (declared properties agreed; bytes not diffed)",
+      "verification_method": "property"
     },
     "GET /UserImage": {
       "classification": "",
       "deep_verified": true,
-      "note": "H=(4, '') J=(4, '')"
+      "note": "H=(4, '') J=(4, '') (status class only; nothing was served on either server)",
+      "verification_method": "status-class"
     },
     "GET /Videos/{videoId}/{mediaSourceId}/Attachments/{index}": {
       "classification": "",
       "deep_verified": true,
-      "note": "H=(2, 'file', '6038a160b491e121c1f12c7bccb4a9c8730296e3adc1086a059404ed84b7451c', 'application/x-truetype-font', '', '') J=(2, 'file', '6038a160b491e121c1f12c7bccb4a9c8730296e3adc1086a059404ed84b7451c', 'application/x-truetype-font', '', '')"
+      "note": "H=(2, 'file', '6038a160b491e121c1f12c7bccb4a9c8730296e3adc1086a059404ed84b7451c', 'application/x-truetype-font', '', '') J=(2, 'file', '6038a160b491e121c1f12c7bccb4a9c8730296e3adc1086a059404ed84b7451c', 'application/x-truetype-font', '', '')",
+      "verification_method": "body-diff"
     },
     "HEAD /Artists/{name}/Images/{imageType}/{imageIndex}": {
       "classification": "",
       "deep_verified": true,
-      "note": "H=(4, '') J=(4, '')"
+      "note": "H=(4, '') J=(4, '') (status class only; nothing was served on either server)",
+      "verification_method": "status-class"
     },
     "HEAD /Genres/{name}/Images/{imageType}": {
       "classification": "",
       "deep_verified": true,
-      "note": "H=(2, 'image') J=(2, 'image')"
+      "note": "H=(2, 'image') J=(2, 'image') (status class only; nothing was served on either server)",
+      "verification_method": "status-class"
     },
     "HEAD /Genres/{name}/Images/{imageType}/{imageIndex}": {
       "classification": "",
       "deep_verified": true,
-      "note": "H=(2, 'image') J=(2, 'image')"
+      "note": "H=(2, 'image') J=(2, 'image') (status class only; nothing was served on either server)",
+      "verification_method": "status-class"
     },
     "HEAD /Items/{itemId}/Images/{imageType}": {
       "classification": "",
       "deep_verified": true,
-      "note": "H=(2, 'image') J=(2, 'image')"
+      "note": "H=(2, 'image') J=(2, 'image') (status class only; nothing was served on either server)",
+      "verification_method": "status-class"
     },
     "HEAD /Items/{itemId}/Images/{imageType}/{imageIndex}": {
       "classification": "",
       "deep_verified": true,
-      "note": "H=(2, 'image') J=(2, 'image')"
+      "note": "H=(2, 'image') J=(2, 'image') (status class only; nothing was served on either server)",
+      "verification_method": "status-class"
     },
     "HEAD /Items/{itemId}/Images/{imageType}/{imageIndex}/{tag}/{format}/{maxWidth}/{maxHeight}/{percentPlayed}/{unplayedCount}": {
       "classification": "",
       "deep_verified": true,
-      "note": "H=(2, 'image') J=(2, 'image')"
+      "note": "H=(2, 'image') J=(2, 'image') (status class only; nothing was served on either server)",
+      "verification_method": "status-class"
     },
     "HEAD /MusicGenres/{name}/Images/{imageType}": {
       "classification": "",
       "deep_verified": true,
-      "note": "H=(4, '') J=(4, '')"
+      "note": "H=(4, '') J=(4, '') (status class only; nothing was served on either server)",
+      "verification_method": "status-class"
     },
     "HEAD /MusicGenres/{name}/Images/{imageType}/{imageIndex}": {
       "classification": "",
       "deep_verified": true,
-      "note": "H=(4, '') J=(4, '')"
+      "note": "H=(4, '') J=(4, '') (status class only; nothing was served on either server)",
+      "verification_method": "status-class"
     },
     "HEAD /Persons/{name}/Images/{imageType}": {
       "classification": "",
       "deep_verified": true,
-      "note": "H=(4, '') J=(4, '')"
+      "note": "H=(4, '') J=(4, '') (status class only; nothing was served on either server)",
+      "verification_method": "status-class"
     },
     "HEAD /Persons/{name}/Images/{imageType}/{imageIndex}": {
       "classification": "",
       "deep_verified": true,
-      "note": "H=(4, '') J=(4, '')"
+      "note": "H=(4, '') J=(4, '') (status class only; nothing was served on either server)",
+      "verification_method": "status-class"
     },
     "HEAD /Studios/{name}/Images/{imageType}": {
       "classification": "",
       "deep_verified": true,
-      "note": "H=(4, '') J=(4, '')"
+      "note": "H=(4, '') J=(4, '') (status class only; nothing was served on either server)",
+      "verification_method": "status-class"
     },
     "HEAD /Studios/{name}/Images/{imageType}/{imageIndex}": {
       "classification": "",
       "deep_verified": true,
-      "note": "H=(4, '') J=(4, '')"
+      "note": "H=(4, '') J=(4, '') (status class only; nothing was served on either server)",
+      "verification_method": "status-class"
     },
     "HEAD /UserImage": {
       "classification": "",
       "deep_verified": true,
-      "note": "H=(4, '') J=(4, '')"
+      "note": "H=(4, '') J=(4, '') (status class only; nothing was served on either server)",
+      "verification_method": "status-class"
     },
     "POST /Branding/Splashscreen": {
       "classification": "",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect verdict; bodies not diffed)",
+      "verification_method": "effect"
     },
     "POST /Items/{itemId}/Images/{imageType}": {
       "classification": "",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect verdict; bodies not diffed)",
+      "verification_method": "effect"
     },
     "POST /Items/{itemId}/Images/{imageType}/{imageIndex}": {
       "classification": "",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect verdict; bodies not diffed)",
+      "verification_method": "effect"
     },
     "POST /Items/{itemId}/Images/{imageType}/{imageIndex}/Index": {
       "classification": "",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect verdict; bodies not diffed)",
+      "verification_method": "effect"
     },
     "POST /UserImage": {
       "classification": "",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect verdict; bodies not diffed)",
+      "verification_method": "effect"
     }
   }
 }

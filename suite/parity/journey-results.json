@@ -1,572 +1,685 @@
 {
   "errors": {},
   "generated_by": "suite/parity/journeys.py",
-  "last_verified": "446f0ae 2026-08-24",
+  "last_verified": "d9dc2ca 2026-08-29",
   "rows": {
     "DELETE /Auth/Keys/{key}": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "DELETE /Collections/{collectionId}/Items": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "DELETE /Devices": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "DELETE /Items": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (status-class; bodies not diffed)",
+      "verification_method": "status-class"
     },
     "DELETE /Items/{itemId}": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "DELETE /Library/VirtualFolders": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "DELETE /Library/VirtualFolders/Paths": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "DELETE /LiveTv/Recordings/{recordingId}": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "DELETE /LiveTv/Timers/{timerId}": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "DELETE /PlayingItems/{itemId}": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "DELETE /Playlists/{playlistId}/Items": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "DELETE /Playlists/{playlistId}/Users/{userId}": {
       "classification": "flagged: Jellyfin read-back differed (verify: oracle setup or Ferrofin extra)",
       "deep_verified": false,
-      "note": "H=True J=False"
+      "note": "H=True J=False (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "DELETE /ScheduledTasks/Running/{taskId}": {
-      "classification": "flagged: Jellyfin read-back differed (verify: oracle setup or Ferrofin extra)",
-      "deep_verified": false,
-      "note": "H=True J=False"
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True (status-class; bodies not diffed)",
+      "verification_method": "status-class"
     },
     "DELETE /Sessions/{sessionId}/User/{userId}": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "DELETE /UserFavoriteItems/{itemId}": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "DELETE /UserItems/{itemId}/Rating": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "DELETE /UserPlayedItems/{itemId}": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "DELETE /Users/{userId}": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "DELETE /Videos/ActiveEncodings": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "DELETE /Videos/{itemId}/AlternateSources": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "DELETE /Videos/{itemId}/Subtitles/{index}": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "GET /Backup": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "GET /Backup/Manifest": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "GET /Devices/Options": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "GET /LiveTv/LiveRecordings/{recordingId}/stream": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (property; bodies not diffed)",
+      "verification_method": "property"
     },
     "GET /LiveTv/LiveStreamFiles/{streamId}/stream.{container}": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (property; bodies not diffed)",
+      "verification_method": "property"
     },
     "GET /LiveTv/Programs/{programId}": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "GET /LiveTv/Recordings/{recordingId}": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "GET /LiveTv/Timers/{timerId}": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "GET /Playlists/{playlistId}": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "GET /Playlists/{playlistId}/Items": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "GET /Playlists/{playlistId}/Users": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "GET /Playlists/{playlistId}/Users/{userId}": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "GET /QuickConnect/Connect": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "GET /System/Configuration/{key}": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "GET /Users/{userId}": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "POST /Auth/Keys": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "POST /Backup/Create": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "POST /ClientLog/Document": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "POST /Collections": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "POST /Collections/{collectionId}/Items": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "POST /Devices/Options": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "POST /DisplayPreferences/{displayPreferencesId}": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "POST /Environment/ValidatePath": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (status-class; bodies not diffed)",
+      "verification_method": "status-class"
     },
     "POST /Items/{itemId}": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "POST /Items/{itemId}/ContentType": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (status-class; bodies not diffed)",
+      "verification_method": "status-class"
     },
     "POST /Items/{itemId}/PlaybackInfo": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "POST /Items/{itemId}/Refresh": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (status-class; bodies not diffed)",
+      "verification_method": "status-class"
     },
     "POST /Library/Refresh": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (status-class; bodies not diffed)",
+      "verification_method": "status-class"
     },
     "POST /Library/VirtualFolders": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "POST /Library/VirtualFolders/LibraryOptions": {
       "classification": "flagged: Ferrofin read-back did not reflect the write (verify: real gap vs read-back method)",
       "deep_verified": false,
-      "note": "H=False J=True"
+      "note": "H=False J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "POST /Library/VirtualFolders/Name": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "POST /Library/VirtualFolders/Paths": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "POST /Library/VirtualFolders/Paths/Update": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "POST /LiveStreams/Close": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "POST /LiveStreams/Open": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "POST /LiveTv/ListingProviders": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "POST /LiveTv/Timers": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "POST /LiveTv/TunerHosts": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "POST /MergeVersions/MergeEpisodes": {
       "classification": "flagged: write effect not observed on either server (likely corpus/setup)",
       "deep_verified": false,
-      "note": "H=False J=False"
+      "note": "H=False J=False (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "POST /MergeVersions/MergeMovies": {
       "classification": "flagged: write effect not observed on either server (likely corpus/setup)",
       "deep_verified": false,
-      "note": "H=False J=False"
+      "note": "H=False J=False (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "POST /MergeVersions/SplitEpisodes": {
       "classification": "flagged: write effect not observed on either server (likely corpus/setup)",
       "deep_verified": false,
-      "note": "H=False J=False"
+      "note": "H=False J=False (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "POST /MergeVersions/SplitMovies": {
       "classification": "flagged: write effect not observed on either server (likely corpus/setup)",
       "deep_verified": false,
-      "note": "H=False J=False"
+      "note": "H=False J=False (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "POST /PlayingItems/{itemId}": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "POST /PlayingItems/{itemId}/Progress": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "POST /Playlists": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "POST /Playlists/{playlistId}": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (status-class; bodies not diffed)",
+      "verification_method": "status-class"
     },
     "POST /Playlists/{playlistId}/Items": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "POST /Playlists/{playlistId}/Items/{itemId}/Move/{newIndex}": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "POST /Playlists/{playlistId}/Users/{userId}": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "POST /QuickConnect/Authorize": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (status-class; bodies not diffed)",
+      "verification_method": "status-class"
     },
     "POST /QuickConnect/Initiate": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "POST /ScheduledTasks/Running/{taskId}": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (status-class; bodies not diffed)",
+      "verification_method": "status-class"
     },
     "POST /ScheduledTasks/{taskId}/Triggers": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "POST /Sessions/Capabilities": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "POST /Sessions/Capabilities/Full": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "POST /Sessions/Logout": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "POST /Sessions/Playing": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "POST /Sessions/Playing/Ping": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (status-class; bodies not diffed)",
+      "verification_method": "status-class"
     },
     "POST /Sessions/Playing/Progress": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "POST /Sessions/Playing/Stopped": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "POST /Sessions/Viewing": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (status-class; bodies not diffed)",
+      "verification_method": "status-class"
     },
     "POST /Sessions/{sessionId}/Command": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (status-class; bodies not diffed)",
+      "verification_method": "status-class"
     },
     "POST /Sessions/{sessionId}/Command/{command}": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (status-class; bodies not diffed)",
+      "verification_method": "status-class"
     },
     "POST /Sessions/{sessionId}/Message": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (status-class; bodies not diffed)",
+      "verification_method": "status-class"
     },
     "POST /Sessions/{sessionId}/Playing": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (status-class; bodies not diffed)",
+      "verification_method": "status-class"
     },
     "POST /Sessions/{sessionId}/Playing/{command}": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (status-class; bodies not diffed)",
+      "verification_method": "status-class"
     },
     "POST /Sessions/{sessionId}/System/{command}": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (status-class; bodies not diffed)",
+      "verification_method": "status-class"
     },
     "POST /Sessions/{sessionId}/User/{userId}": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "POST /Sessions/{sessionId}/Viewing": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (status-class; bodies not diffed)",
+      "verification_method": "status-class"
     },
     "POST /Startup/Complete": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "POST /Startup/Configuration": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "POST /Startup/RemoteAccess": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "POST /Startup/User": {
       "classification": "flagged: Jellyfin read-back differed (verify: oracle setup or Ferrofin extra)",
       "deep_verified": false,
-      "note": "H=True J=False"
+      "note": "H=True J=False (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "POST /System/Configuration": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "POST /System/Configuration/Branding": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "POST /System/Configuration/{key}": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "POST /System/Ping": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (status-class; bodies not diffed)",
+      "verification_method": "status-class"
     },
     "POST /UserFavoriteItems/{itemId}": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "POST /UserItems/{itemId}/Rating": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "POST /UserItems/{itemId}/UserData": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "POST /UserPlayedItems/{itemId}": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "POST /Users": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "POST /Users/AuthenticateByName": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "POST /Users/AuthenticateWithQuickConnect": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "POST /Users/Configuration": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "POST /Users/ForgotPassword": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "POST /Users/ForgotPassword/Pin": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "POST /Users/New": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "POST /Users/Password": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "POST /Users/{userId}/Policy": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "POST /Videos/MergeVersions": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     },
     "POST /Videos/{itemId}/Subtitles": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "H=True J=True"
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
     }
   }
 }

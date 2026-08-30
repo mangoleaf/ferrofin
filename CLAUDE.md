@@ -271,8 +271,12 @@ declares HOW it was verified, from the closed set in `suite/parity/verification.
 servers returned an `empty-corpus`) is real verification and is counted and rendered
 separately; it never joins the headline. A row with no method, or one outside the set, fails
 `gen-ledger.py --check` — there is no default, because a default is how a weak probe borrows a
-strong claim. Read the counts off the ledger rather than quoting this paragraph, and
-regenerate it (`python3 suite/parity/gen-ledger.py`) after any parity run. Working end-to-end: authentication/users/QuickConnect,
+strong claim. That rule is enforced by machine, not by habit: `gen-ledger.py` VALIDATES BEFORE
+IT WRITES on every run (so the parity leg aborts rather than shipping an unstamped verdict),
+CI runs `--check` plus a negative test that the guard refuses, and `suite/viewer/` — the
+dashboard — counts `body-diff` only, exactly as `LEDGER.md` does. Read the counts off the
+ledger rather than quoting this paragraph, and regenerate it
+(`python3 suite/parity/gen-ledger.py`) after any parity run. Working end-to-end: authentication/users/QuickConnect,
 library scan + live filesystem watch, browse/query/DTO, images, sessions/playstate/remote
 control, WebSocket push, playlists/collections, direct play + live HLS transcode (subtitle
 burn-in, fMP4 HEVC/AV1), Live TV (M3U/XMLTV + DVR timers), SyncPlay, all 20 scheduled tasks,

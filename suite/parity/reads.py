@@ -661,13 +661,19 @@ def run(ferrofin_url, jellyfin_url):
         return (verification.BODY_DIFF if verification.BODY_DIFF in seen
                 else verification.EMPTY_CORPUS)
 
-    def record(op, clean, total, buckets, method, note=None):
+    def record(op, clean, total, buckets, method, note=None, compared=None):
         """`method` is HOW the row was verified, from `verification.METHODS`, and it
         is written into the results row. There is no default: gen-ledger.py counts
         only `body-diff` in the headline, so a row that agreed on named invariants
         ("property"), or on two empty result envelopes ("empty-corpus"), must say so
         rather than borrowing a claim it did not earn. `method=None` means the probe
-        compared nothing at all — recorded untested, never verified."""
+        compared nothing at all — recorded untested, never verified.
+
+        `compared` is the number of leaf comparisons the diff actually performed,
+        carried into the note the way the sweep layer carries it. Without it the
+        page said "1/1 clean" for a row that compared 984 fields and for a row
+        that compared one, and a reader could not tell a thick body diff from a
+        thin one without opening this file."""
         if total == 0 or (method is None and not any(buckets.values())):
             rows[op] = {"deep_verified": None, "classification": "",
                         "verification_method": None,
@@ -680,9 +686,10 @@ def run(ferrofin_url, jellyfin_url):
                       verification.EMPTY_CORPUS: " (both result sets EMPTY; only the envelope"
                                                  " zeros compared — handler logic unexercised)",
                       }.get(method, "")
+            depth = f"; {compared} field(s) compared" if compared is not None else ""
             rows[op] = {"deep_verified": True, "classification": "ok",
                         "verification_method": method,
-                        "note": f"{clean}/{total} clean" + detail}
+                        "note": f"{clean}/{total} clean{depth}" + detail}
         else:
             sample = "; ".join(f"{m['path']}(J={m.get('j')} H={m.get('h')})"
                                for m in buckets["mismatch"][:3])
@@ -721,7 +728,8 @@ def run(ferrofin_url, jellyfin_url):
                     # agreeing on a broken invariant is not parity.
                     buckets["mismatch"].append({"path": key, "j": j, "h": h})
             n = sum(len(v) for v in buckets.values())
-            record(ep["op"], 1 if n == 0 else 0, 1, buckets, ep["method"])
+            record(ep["op"], 1 if n == 0 else 0, 1, buckets, ep["method"],
+                   compared=len(set(jf) | set(hf)))
         elif ep["kind"] == "multi":
             agg = {"mismatch": [], "missing": [], "extra": []}
             legs = []
@@ -752,7 +760,8 @@ def run(ferrofin_url, jellyfin_url):
                     clean += 1
                 for k in agg:
                     agg[k].extend(b[k])
-            record(ep["op"], clean, tested, agg, agg_method(legs))
+            record(ep["op"], clean, tested, agg, agg_method(legs),
+                   compared=sum(c for _j, _h, c in legs))
         elif ep["kind"] in ("plain", "user"):
             path = ep["url"](hc if ep["kind"] == "user" else {})
             jpath = ep["url"](jc if ep["kind"] == "user" else {})
@@ -767,7 +776,7 @@ def run(ferrofin_url, jellyfin_url):
                 continue
             n, buckets, compared = diff_stats(jb, hb)
             record(ep["op"], 1 if n == 0 else 0, 1, buckets,
-                   agg_method([(jb, hb, compared)]))
+                   agg_method([(jb, hb, compared)]), compared=compared)
         else:  # item — aggregate over correlated pairs
             agg = {"mismatch": [], "missing": [], "extra": []}
             legs = []
@@ -792,7 +801,8 @@ def run(ferrofin_url, jellyfin_url):
                 else:
                     for k in agg:
                         agg[k].extend(b[k])
-            record(ep["op"], clean, tested, agg, agg_method(legs))
+            record(ep["op"], clean, tested, agg, agg_method(legs),
+                   compared=sum(c for _j, _h, c in legs))
     return rows, len(pairs)
 
 

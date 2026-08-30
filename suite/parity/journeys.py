@@ -86,9 +86,120 @@ JOURNEY_METHOD.update({op: verification.PROPERTY for op in (
 )})
 
 
+# The effect rows: a write was issued against BOTH servers and its effect confirmed
+# on each server's OWN read-back. Enumerated, not defaulted. `effect` used to be
+# whatever `journey_method` returned for an op nobody had classified, which is the
+# same shape of defect the whole stamping exercise exists to remove — a new journey
+# op would inherit the strongest verdict this layer can issue without anyone
+# deciding that it had earned it. `--check` now fails on an op that appears in no
+# list below.
+JOURNEY_METHOD.update({op: verification.EFFECT for op in (
+    "DELETE /Auth/Keys/{key}",
+    "DELETE /Collections/{collectionId}/Items",
+    "DELETE /Devices",
+    "DELETE /Items/{itemId}",
+    "DELETE /Library/VirtualFolders",
+    "DELETE /Library/VirtualFolders/Paths",
+    "DELETE /LiveTv/Recordings/{recordingId}",
+    "DELETE /LiveTv/Timers/{timerId}",
+    "DELETE /PlayingItems/{itemId}",
+    "DELETE /Playlists/{playlistId}/Items",
+    "DELETE /Playlists/{playlistId}/Users/{userId}",
+    "DELETE /Sessions/{sessionId}/User/{userId}",
+    "DELETE /UserFavoriteItems/{itemId}",
+    "DELETE /UserItems/{itemId}/Rating",
+    "DELETE /UserPlayedItems/{itemId}",
+    "DELETE /Users/{userId}",
+    "DELETE /Videos/ActiveEncodings",
+    "DELETE /Videos/{itemId}/AlternateSources",
+    "DELETE /Videos/{itemId}/Subtitles/{index}",
+    "GET /Backup",
+    "GET /Backup/Manifest",
+    "GET /Devices/Options",
+    "GET /LiveTv/Programs/{programId}",
+    "GET /LiveTv/Recordings/{recordingId}",
+    "GET /LiveTv/Timers/{timerId}",
+    "GET /Playlists/{playlistId}",
+    "GET /Playlists/{playlistId}/Items",
+    "GET /Playlists/{playlistId}/Users",
+    "GET /Playlists/{playlistId}/Users/{userId}",
+    "GET /QuickConnect/Connect",
+    "GET /System/Configuration/{key}",
+    "GET /Users/{userId}",
+    "POST /Auth/Keys",
+    "POST /Backup/Create",
+    "POST /ClientLog/Document",
+    "POST /Collections",
+    "POST /Collections/{collectionId}/Items",
+    "POST /Devices/Options",
+    "POST /DisplayPreferences/{displayPreferencesId}",
+    "POST /Items/{itemId}",
+    "POST /Items/{itemId}/PlaybackInfo",
+    "POST /Items/{itemId}/RemoteSearch/Subtitles/{subtitleId}",
+    "POST /Library/VirtualFolders",
+    "POST /Library/VirtualFolders/LibraryOptions",
+    "POST /Library/VirtualFolders/Name",
+    "POST /Library/VirtualFolders/Paths",
+    "POST /Library/VirtualFolders/Paths/Update",
+    "POST /LiveStreams/Close",
+    "POST /LiveStreams/Open",
+    "POST /LiveTv/ListingProviders",
+    "POST /LiveTv/Timers",
+    "POST /LiveTv/TunerHosts",
+    "POST /MergeVersions/MergeEpisodes",
+    "POST /MergeVersions/MergeMovies",
+    "POST /MergeVersions/SplitEpisodes",
+    "POST /MergeVersions/SplitMovies",
+    "POST /PlayingItems/{itemId}",
+    "POST /PlayingItems/{itemId}/Progress",
+    "POST /Playlists",
+    "POST /Playlists/{playlistId}/Items",
+    "POST /Playlists/{playlistId}/Items/{itemId}/Move/{newIndex}",
+    "POST /Playlists/{playlistId}/Users/{userId}",
+    "POST /QuickConnect/Initiate",
+    "POST /ScheduledTasks/{taskId}/Triggers",
+    "POST /Sessions/Capabilities",
+    "POST /Sessions/Capabilities/Full",
+    "POST /Sessions/Logout",
+    "POST /Sessions/Playing",
+    "POST /Sessions/Playing/Progress",
+    "POST /Sessions/Playing/Stopped",
+    "POST /Sessions/{sessionId}/User/{userId}",
+    "POST /Startup/Complete",
+    "POST /Startup/Configuration",
+    "POST /Startup/RemoteAccess",
+    "POST /Startup/User",
+    "POST /System/Configuration",
+    "POST /System/Configuration/Branding",
+    "POST /System/Configuration/{key}",
+    "POST /UserFavoriteItems/{itemId}",
+    "POST /UserItems/{itemId}/Rating",
+    "POST /UserItems/{itemId}/UserData",
+    "POST /UserPlayedItems/{itemId}",
+    "POST /Users",
+    "POST /Users/AuthenticateByName",
+    "POST /Users/AuthenticateWithQuickConnect",
+    "POST /Users/Configuration",
+    "POST /Users/ForgotPassword",
+    "POST /Users/ForgotPassword/Pin",
+    "POST /Users/New",
+    "POST /Users/Password",
+    "POST /Users/{userId}/Policy",
+    "POST /Videos/MergeVersions",
+    "POST /Videos/{itemId}/Subtitles",
+)})
+
+
 def journey_method(op):
-    """Declared method for a journey op; effect is the layer's default shape."""
-    return JOURNEY_METHOD.get(op, verification.EFFECT)
+    """The declared method for a journey op. There is NO default: an op that no list
+    in `JOURNEY_METHOD` names raises, and `--check` turns that into a hard failure
+    before any results file is written."""
+    try:
+        return JOURNEY_METHOD[op]
+    except KeyError:
+        raise KeyError(
+            f"{op!r} declares no verification_method — add it to JOURNEY_METHOD "
+            f"(effect / status-class / property; journeys never body-diff)") from None
 
 
 
@@ -986,12 +1097,18 @@ def j_livetv(base, token, user, _m, _m2):
     # Provisioning (sweep.provision_livetv) added the tuner host and the listings provider;
     # their effect is what this journey runs on: channels from the tuner, programmes from
     # the guide.
+    # EFFECT, at one remove: the POST is issued by sweep.provision_livetv (the tuner
+    # host must exist before this layer runs at all), and what is confirmed here is
+    # its effect on each server's own read-back — no tuner host, no channels. The
+    # row is not a read of the POST's response and never was; the note says so.
     r["POST /LiveTv/TunerHosts"] = bool(channels)
     if not channels:
         return r
     ch = channels[0]["Id"]
     programs = (get_json(base, f"/LiveTv/Programs?channelIds={ch}&isAiring=true&userId={user}", token)
                 or {}).get("Items") or []
+    # Same shape: the listings provider is provisioned upstream and its effect is
+    # the guide having programmes on this server.
     r["POST /LiveTv/ListingProviders"] = bool(programs)
     # --- live stream -------------------------------------------------------------------
     _, raw = http("POST", f"{base}/Items/{ch}/PlaybackInfo?userId={user}", token, json.dumps({}))
@@ -1269,6 +1386,9 @@ def selfcheck():
         assert m != verification.BODY_DIFF, f"{k}: journeys never diff a body"
     stale = sorted(k for k in JOURNEY_METHOD if k not in declared)
     assert not stale, f"JOURNEY_METHOD names ops no journey declares: {stale}"
+    undeclared = sorted(k for k in declared if k not in JOURNEY_METHOD)
+    assert not undeclared, (f"{len(undeclared)} journey op(s) declare no "
+                            f"verification_method: {undeclared}")
     import collections
     by = collections.Counter(journey_method(k) for k in declared)
     print(f"ok: combine logic, {len(declared)} journey op-keys all valid spec paths, "
