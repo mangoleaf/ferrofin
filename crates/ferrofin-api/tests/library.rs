@@ -19,7 +19,8 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use ferrofin_api::create_router;
 use ferrofin_api::test_support::{
-    authed_state_with_library_and_monitor, elevated_state_with_library_and_monitor,
+    RecordingTasks, authed_state_with_library_and_monitor, elevated_state_with_library_and_monitor,
+    elevated_state_with_library_monitor_and_tasks,
 };
 use ferrofin_db::entities::base_items::{BaseItemEntity, PeopleEntity};
 use ferrofin_model::data::CollectionType;
@@ -322,10 +323,6 @@ fn router_with(items: Vec<SeededItem>) -> (axum::Router, Arc<RecordingMonitor>) 
 
 /// `router_with` for a caller satisfying `RequiresElevation` — needed by
 /// `POST /Library/Refresh`, which is admin-only upstream.
-fn elevated_router_with(items: Vec<SeededItem>) -> (axum::Router, Arc<RecordingMonitor>) {
-    router_with_auth(items, true)
-}
-
 fn router_with_auth(
     items: Vec<SeededItem>,
     elevated: bool,
@@ -444,8 +441,14 @@ async fn media_updated_rejects_null_path() {
     let body = r#"{"Updates":[{"Path":"/a/x.mkv"},{"UpdateType":"Deleted"}]}"#;
     let status = post(router, "/Library/Media/Updated", Some(body)).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    // The batch is rejected before any path is reported (mirrors the C# throw).
-    assert!(reported(&monitor).is_empty());
+    // NOT atomic, and deliberately so. C# is
+    //   foreach (var item in dto.Updates)
+    //       _libraryMonitor.ReportFileSystemChanged(
+    //           item.Path ?? throw new ArgumentException("Item path can't be null."));
+    // (v10.11.8 LibraryController.cs:648-651) — the throw is INSIDE the loop, so
+    // every path ahead of the null one has already been reported. Asserting an
+    // empty list here would pin a batch-atomicity Jellyfin does not have.
+    assert_eq!(reported(&monitor), vec!["/a/x.mkv".to_owned()]);
 }
 
 #[tokio::test]
@@ -476,10 +479,34 @@ async fn movies_updated_empty_imdb_falls_back_to_tmdb() {
 
 #[tokio::test]
 async fn refresh_library_returns_204() {
-    // Moved from batch14: `POST /Library/Refresh` queues a scan and returns 204.
-    // Re-homed onto this file's `router_with`/`post` harness, whose
-    // `RecordingLibrary::queue_library_scan` returns `Ok(())`.
-    let (router, _monitor) = elevated_router_with(seeded_items());
+    // `POST /Library/Refresh` answers 204 — and does it by driving the task
+    // registry, which is the whole observable effect of the route. C#'s
+    // `LibraryManager.ValidateMediaLibrary` is, verbatim,
+    // `_taskManager.CancelIfRunningAndQueue<RefreshMediaLibraryTask>()`
+    // (v10.11.8 LibraryManager.cs:1117-1123): cancel first so a scan already in
+    // flight restarts rather than being rejected, then queue. That routing is
+    // what puts "Scan Media Library" into GET /ScheduledTasks as Running, which
+    // is what jellyfin-web's "Scan all libraries" button reports to the operator.
+    // Asserting only the 204 would pass just as well against a no-op handler.
+    let tasks = Arc::new(RecordingTasks::default());
+    let monitor = Arc::new(RecordingMonitor::default());
+    let library: Arc<RecordingLibrary> = Arc::new(RecordingLibrary {
+        items: seeded_items(),
+    });
+    let state = elevated_state_with_library_monitor_and_tasks(
+        library,
+        monitor,
+        Arc::clone(&tasks) as Arc<dyn ferrofin_traits::tasks::TaskManager>,
+    );
+    let router = ferrofin_api::create_router(state);
     let status = post(router, "/Library/Refresh", None).await;
     assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        *tasks.cancelled.lock().expect("cancelled"),
+        vec!["RefreshLibrary".to_owned()]
+    );
+    assert_eq!(
+        *tasks.started.lock().expect("started"),
+        vec!["RefreshLibrary".to_owned()]
+    );
 }

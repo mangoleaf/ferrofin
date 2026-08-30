@@ -1902,6 +1902,53 @@ impl ActivityManager for RecordingActivity {
     }
 }
 
+/// A [`TaskManager`] that RECORDS which tasks were started and cancelled.
+///
+/// `POST /Library/Refresh` ports C#'s
+/// `_taskManager.CancelIfRunningAndQueue<RefreshMediaLibraryTask>()`
+/// (`LibraryManager.ValidateMediaLibrary`, v10.11.8): routing through the task
+/// registry IS that route's observable effect — it is what puts "Scan Media
+/// Library" into `GET /ScheduledTasks` as Running. A fake that cannot be read
+/// back cannot tell the port from a no-op, so this one can.
+#[derive(Default)]
+pub struct RecordingTasks {
+    /// Task ids passed to [`TaskManager::start_task`], in call order.
+    pub started: std::sync::Mutex<Vec<String>>,
+    /// Task ids passed to [`TaskManager::cancel_task`], in call order.
+    pub cancelled: std::sync::Mutex<Vec<String>>,
+}
+
+#[async_trait]
+impl TaskManager for RecordingTasks {
+    async fn get_tasks(&self) -> Result<Vec<TaskInfo>, ServiceError> {
+        Ok(Vec::new())
+    }
+    async fn get_task(&self, _task_id: &str) -> Result<Option<TaskInfo>, ServiceError> {
+        Ok(None)
+    }
+    async fn start_task(&self, task_id: &str) -> Result<(), ServiceError> {
+        self.started
+            .lock()
+            .expect("started lock")
+            .push(task_id.to_owned());
+        Ok(())
+    }
+    async fn cancel_task(&self, task_id: &str) -> Result<(), ServiceError> {
+        self.cancelled
+            .lock()
+            .expect("cancelled lock")
+            .push(task_id.to_owned());
+        Ok(())
+    }
+    async fn update_triggers(
+        &self,
+        _task_id: &str,
+        _triggers: &[TaskTriggerInfo],
+    ) -> Result<(), ServiceError> {
+        Ok(())
+    }
+}
+
 /// A fake [`TaskManager`]; every method is unused by INFRA-level tests.
 pub struct FakeTasks;
 
@@ -2418,6 +2465,21 @@ pub fn elevated_state_with_library_and_monitor(
     library: Arc<dyn LibraryManager>,
     monitor: Arc<dyn LibraryMonitor>,
 ) -> AppState {
+    elevated_state_with_library_monitor_and_tasks(library, monitor, Arc::new(FakeTasks))
+}
+
+/// As [`elevated_state_with_library_and_monitor`], but with a caller-supplied
+/// [`TaskManager`] so a test can assert which task a route started.
+///
+/// `POST /Library/Refresh` ports C#'s
+/// `_taskManager.CancelIfRunningAndQueue<RefreshMediaLibraryTask>()`; routing
+/// through the registry IS the route's observable effect, so it needs a fake
+/// the test can read back.
+pub fn elevated_state_with_library_monitor_and_tasks(
+    library: Arc<dyn LibraryManager>,
+    monitor: Arc<dyn LibraryMonitor>,
+    tasks: Arc<dyn ferrofin_traits::tasks::TaskManager>,
+) -> AppState {
     AppState::new(
         library,
         Arc::new(FakeUsers),
@@ -2450,7 +2512,7 @@ pub fn elevated_state_with_library_and_monitor(
         Arc::new(FakeDisplayPreferences),
         Arc::new(FakeActivity),
         Arc::new(FakeFileSystem),
-        Arc::new(FakeTasks),
+        tasks,
     )
     .with_library_monitor(monitor)
 }
