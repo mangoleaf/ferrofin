@@ -46,7 +46,8 @@ use crate::fetch::SourceFetcher;
 use crate::m3u::parse_m3u;
 use crate::mapping::{
     EpgChannel, EpgChannelData, TunerChannel, epg_channel_for_tuner_channel,
-    is_listing_provider_enabled_for_tuner, m3u_channel_id, tuner_channel_mapping,
+    eq_ordinal_ignore_case, is_listing_provider_enabled_for_tuner, m3u_channel_id,
+    tuner_channel_mapping,
 };
 use crate::projection::{
     ChannelRow, ProgramRow as GuideProgramRow, channel_entity, program_entity, remove_fields,
@@ -218,14 +219,21 @@ pub struct FerrofinLiveTvManager {
     /// `AsyncNonKeyedLocker(1)` around the whole of `OpenLiveStreamInternal`);
     /// a `tokio::sync::Mutex` because this one *is* held across awaits.
     open_lock: Arc<tokio::sync::Mutex<()>>,
-    /// Serializes guide refreshes, so two of them can never interleave.
+    /// Serializes the WRITE half of a guide refresh, so two passes can never
+    /// interleave their inserts and prunes.
     ///
     /// Port of `_taskManager.CancelIfRunningAndQueue<RefreshGuideScheduledTask>()`:
     /// upstream there is exactly ONE guide-refresh task, and queuing it cancels
     /// the running one. Ferrofin reaches `refresh_guide` from the scheduled task
-    /// AND inline from the tuner-host/listings-provider writes, so without this
-    /// two passes could overlap and one's `CleanDatabase` prune would delete the
-    /// listings the other had just written.
+    /// AND from the queued refresh the tuner-host/listings-provider writes
+    /// trigger, so without this two passes could overlap and one's
+    /// `CleanDatabase` prune would delete the listings the other had just
+    /// written.
+    ///
+    /// It is taken AFTER every fetch has returned, never around one: upstream
+    /// cancels the in-flight refresh, we queue behind it, and queuing behind a
+    /// lock that is waiting on a third-party HTTP source is how one wedged tuner
+    /// URL stalls the whole subsystem.
     guide_lock: Arc<tokio::sync::Mutex<()>>,
     /// The account-less Schedules Direct surface (country list), sharing the
     /// fetcher and caching under the application cache directory.
@@ -527,7 +535,7 @@ impl FerrofinLiveTvManager {
             .into_iter()
             .find(|p| {
                 p.id.as_deref()
-                    .is_some_and(|pid| pid.eq_ignore_ascii_case(id))
+                    .is_some_and(|pid| eq_ordinal_ignore_case(pid, id))
             })
             .ok_or_else(|| ServiceError::not_found(format!("listings provider {id}")))
     }
@@ -543,7 +551,7 @@ impl FerrofinLiveTvManager {
     /// type it has no provider for.
     fn listings_provider_name(provider_type: Option<&str>) -> Result<&'static str, ServiceError> {
         match provider_type {
-            Some(t) if t.eq_ignore_ascii_case("xmltv") => Ok("XmlTV"),
+            Some(t) if eq_ordinal_ignore_case(t, "xmltv") => Ok("XmlTV"),
             other => Err(ServiceError::not_found(format!(
                 "Couldn't find provider of type {}",
                 other.unwrap_or_default()
@@ -830,7 +838,9 @@ impl LiveTvManager for FerrofinLiveTvManager {
         // `LiveTvController.DeleteTunerHost` filters with
         // `StringComparison.OrdinalIgnoreCase`; the stored key is a
         // BINARY-collated TEXT primary key, so the match must say NOCASE or a
-        // case-differing id silently deletes nothing.
+        // case-differing id silently deletes nothing. SQLite's NOCASE folds
+        // ASCII only, which is exact here: both servers mint this id as
+        // `Guid.NewGuid().ToString("N")`, so the key space is 32 hex digits.
         sqlx::query(r#"DELETE FROM "FerrofinLiveTvTunerHosts" WHERE "Id" = ?1 COLLATE NOCASE"#)
             .bind(id)
             .execute(self.db.writer())
@@ -990,19 +1000,19 @@ impl LiveTvManager for FerrofinLiveTvManager {
         let already = info.channel_mappings.iter().any(|pair| {
             pair.name
                 .as_deref()
-                .is_some_and(|n| n.eq_ignore_ascii_case(tuner_channel_id))
+                .is_some_and(|n| eq_ordinal_ignore_case(n, tuner_channel_id))
                 && pair
                     .value
                     .as_deref()
-                    .is_some_and(|v| v.eq_ignore_ascii_case(provider_channel_id))
+                    .is_some_and(|v| eq_ordinal_ignore_case(v, provider_channel_id))
         });
         info.channel_mappings.retain(|pair| {
             !pair
                 .name
                 .as_deref()
-                .is_some_and(|n| n.eq_ignore_ascii_case(tuner_channel_id))
+                .is_some_and(|n| eq_ordinal_ignore_case(n, tuner_channel_id))
         });
-        if !tuner_channel_id.eq_ignore_ascii_case(provider_channel_id) && !already {
+        if !eq_ordinal_ignore_case(tuner_channel_id, provider_channel_id) && !already {
             info.channel_mappings.push(NameValuePair {
                 name: Some(tuner_channel_id.to_owned()),
                 value: Some(provider_channel_id.to_owned()),
@@ -1014,9 +1024,14 @@ impl LiveTvManager for FerrofinLiveTvManager {
         let provider_channels = self.provider_channels(&info).await?;
         let epg = EpgChannelData::new(&provider_channels);
 
-        // `CancelIfRunningAndQueue<RefreshGuideScheduledTask>()`: the mapping
-        // only moves listings once the guide has been rebuilt through it.
-        self.refresh_guide().await?;
+        // Upstream ends here with `CancelIfRunningAndQueue<RefreshGuideScheduledTask>()`
+        // and returns: the mapping moves listings only once the guide has been
+        // rebuilt through it, but that rebuild is the TASK's work, not the
+        // request's. Ferrofin queues it the same way, one layer out
+        // (`handlers::live_tv::queue_guide_refresh`), so a POST does not block on
+        // an M3U/XMLTV fetch. The response below is computed from the saved
+        // configuration and the tuner lineup, exactly as the C# computes it —
+        // it never depended on the refresh having finished.
 
         tuner_channels
             .iter()
@@ -1024,7 +1039,7 @@ impl LiveTvManager for FerrofinLiveTvManager {
             .find(|row| {
                 row.id
                     .as_deref()
-                    .is_some_and(|id| id.eq_ignore_ascii_case(tuner_channel_id))
+                    .is_some_and(|id| eq_ordinal_ignore_case(id, tuner_channel_id))
             })
             // C# `.First(...)` throws `InvalidOperationException` (500) for a
             // tuner channel that is not in the lineup; 404 is the honest answer
@@ -1186,7 +1201,7 @@ impl LiveTvManager for FerrofinLiveTvManager {
         // id}`, and a first segment naming no registered `ILiveTvService` is
         // `ArgumentException("Service not found.")` — HTTP 400.
         let service = id.split_once(STREAM_ID_DELIMITER).map_or(id, |(s, _)| s);
-        if !service.eq_ignore_ascii_case(live_tv_service_key()) {
+        if !eq_ordinal_ignore_case(service, live_tv_service_key()) {
             return Err(ServiceError::invalid_input("Service not found."));
         }
         // The prefix names the one built-in service, whose
@@ -1201,43 +1216,57 @@ impl LiveTvManager for FerrofinLiveTvManager {
     }
 
     async fn refresh_guide(&self) -> Result<(), ServiceError> {
-        // One guide refresh at a time — see `guide_lock`. Two overlapping
-        // passes would each prune against their own kept set, and the loser
-        // would delete what the winner had just written.
-        let _guard = self.guide_lock.lock().await;
-
+        // FETCH FIRST, OUTSIDE THE LOCK. `guide_lock` exists to keep two passes
+        // from interleaving their WRITES (see the field doc); holding it across
+        // the tuner/guide fetches would put unbounded third-party network I/O
+        // inside it, so one wedged M3U source would stall every later refresh —
+        // a failure mode upstream does not have, because its one scheduled task
+        // is CANCELLED when the next run is queued rather than queued behind.
+        //
         // `GuideManager.RefreshChannels` collects the ids this pass (re)wrote
         // and then drops everything else through `CleanDatabase` — but only
         // when nothing threw: its catch sets `cleanDatabase = false`, so a
         // tuner or guide that could not be read never empties the cache.
         let mut clean_database = true;
-        let mut kept_channels: HashSet<String> = HashSet::new();
+        let mut tuner_bodies: Vec<(String, String)> = Vec::new();
         for tuner in self.get_tuner_hosts().await? {
             let (Some(id), Some(url)) = (tuner.id.as_deref(), tuner.url.as_deref()) else {
                 clean_database = false;
                 continue;
             };
             match self.fetcher.fetch(url).await {
-                Ok(body) => kept_channels.extend(self.replace_channels(id, &body).await?),
+                Ok(body) => tuner_bodies.push((id.to_owned(), body)),
                 Err(e) => {
                     clean_database = false;
                     tracing::warn!(%url, error = %e, "live tv: tuner fetch failed");
                 }
             }
         }
-        let mut kept_programs: HashSet<String> = HashSet::new();
+        let mut guide_bodies: Vec<(ListingsProviderInfo, String)> = Vec::new();
         for provider in self.get_listing_providers().await? {
             let Some(path) = provider.path.as_deref() else {
                 clean_database = false;
                 continue;
             };
             match self.fetcher.fetch(path).await {
-                Ok(body) => kept_programs.extend(self.insert_programs(&body, &provider).await?),
+                Ok(body) => guide_bodies.push((provider.clone(), body)),
                 Err(e) => {
                     clean_database = false;
                     tracing::warn!(%path, error = %e, "live tv: guide fetch failed");
                 }
             }
+        }
+
+        // Now the write half, one pass at a time. Channels go in before
+        // programmes because `insert_programs` joins against the stored lineup.
+        let _guard = self.guide_lock.lock().await;
+        let mut kept_channels: HashSet<String> = HashSet::new();
+        for (id, body) in &tuner_bodies {
+            kept_channels.extend(self.replace_channels(id, body).await?);
+        }
+        let mut kept_programs: HashSet<String> = HashSet::new();
+        for (provider, body) in &guide_bodies {
+            kept_programs.extend(self.insert_programs(body, provider).await?);
         }
         if clean_database {
             // `CleanDatabase(newChannelIdList, [LiveTvChannel], …)` then
@@ -3251,6 +3280,20 @@ mod tests {
         }
     }
 
+    /// A [`SourceFetcher`] that never answers, counting how many callers got as
+    /// far as asking. The shape of a wedged M3U/XMLTV source.
+    #[derive(Default)]
+    struct HangingFetcher(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    #[async_trait::async_trait]
+    impl SourceFetcher for HangingFetcher {
+        async fn fetch(&self, _url: &str) -> Result<String, ferrofin_traits::error::ServiceError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::future::pending::<()>().await;
+            unreachable!()
+        }
+    }
+
     /// A [`SourceFetcher`] whose bodies can be swapped between refreshes, for
     /// the tests that need a second pass to see different upstream content.
     struct SwappableFetcher(std::sync::Mutex<HashMap<String, String>>);
@@ -3268,11 +3311,17 @@ mod tests {
     }
 
     async fn manager_with(fetcher: FakeFetcher) -> FerrofinLiveTvManager {
+        manager_with_fetcher(std::sync::Arc::new(fetcher)).await
+    }
+
+    async fn manager_with_fetcher(
+        fetcher: std::sync::Arc<dyn SourceFetcher>,
+    ) -> FerrofinLiveTvManager {
         let db = Database::connect_in_memory().await.expect("db");
         db.run_migrations().await.expect("migrate");
         FerrofinLiveTvManager::new(
             db,
-            std::sync::Arc::new(fetcher),
+            fetcher,
             "srv".to_owned(),
             std::env::temp_dir().join("ferrofin-livetv-manager-tests"),
         )
@@ -5575,6 +5624,12 @@ mod tests {
         assert_eq!(row.provider_channel_id.as_deref(), Some("one.tv"));
         assert_eq!(row.provider_channel_name.as_deref(), Some("Channel One"));
 
+        // The rebuild is the QUEUED task's work, not the POST's (upstream
+        // `CancelIfRunningAndQueue`, ported one layer out as
+        // `handlers::live_tv::queue_guide_refresh`) — so the test runs it, the
+        // way the queued task would.
+        mgr.refresh_guide().await.expect("queued refresh");
+
         // And it has an EFFECT: the airing now binds to both channels, because
         // the guide join runs through `GetEpgChannelFromTunerChannel`.
         assert_eq!(
@@ -5598,6 +5653,7 @@ mod tests {
         mgr.set_channel_mapping(&provider_id, &two, "one.tv")
             .await
             .expect("re-post");
+        mgr.refresh_guide().await.expect("queued refresh");
         assert!(
             mgr.get_listing_providers().await.expect("p")[0]
                 .channel_mappings
@@ -5614,6 +5670,7 @@ mod tests {
         mgr.set_channel_mapping(&provider_id, &two, "one.tv")
             .await
             .expect("remap");
+        mgr.refresh_guide().await.expect("queued refresh");
         assert_eq!(
             mgr.get_listing_providers().await.expect("p")[0]
                 .channel_mappings
@@ -5626,6 +5683,7 @@ mod tests {
         mgr.set_channel_mapping(&provider_id, &two, &two)
             .await
             .expect("unmap");
+        mgr.refresh_guide().await.expect("queued refresh");
         assert!(
             mgr.get_listing_providers().await.expect("p")[0]
                 .channel_mappings
@@ -5677,6 +5735,36 @@ mod tests {
                 "{args:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_wedged_source_does_not_hold_the_guide_lock() {
+        // `guide_lock` serializes the WRITE half only. Held across the fetches,
+        // one unreachable tuner URL would park the lock forever and every later
+        // refresh — scheduled or queued by a configuration write — would stall
+        // behind it. Two concurrent refreshes must therefore BOTH reach their
+        // fetch, even though neither can ever finish.
+        let entered = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mgr = manager_with_fetcher(std::sync::Arc::new(HangingFetcher(entered.clone()))).await;
+        mgr.save_tuner_host(TunerHostInfo {
+            url: Some("http://tuner/playlist.m3u".to_owned()),
+            ..TunerHostInfo::default()
+        })
+        .await
+        .expect("tuner");
+
+        let both = async { tokio::join!(mgr.refresh_guide(), mgr.refresh_guide()) };
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(250), both)
+                .await
+                .is_err(),
+            "the fetcher never answers, so neither refresh can complete"
+        );
+        assert_eq!(
+            entered.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the second refresh must reach its fetch while the first is still in flight"
+        );
     }
 
     #[tokio::test]

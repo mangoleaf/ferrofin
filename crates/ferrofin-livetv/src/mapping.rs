@@ -75,6 +75,76 @@ pub fn m3u_channel_id(tuner_url: &str, stream_url: &str) -> String {
     )
 }
 
+/// Compares two strings the way .NET's `StringComparison.OrdinalIgnoreCase` does.
+///
+/// Every `string.Equals(…, StringComparison.OrdinalIgnoreCase)` in
+/// `ListingsManager` runs through here. .NET folds ORDINALLY, not ASCII-only: it
+/// maps each char through the invariant simple uppercase table and compares the
+/// results, so `"kanal ö"` and `"KANAL Ö"` are equal there.
+/// `str::eq_ignore_ascii_case` leaves every non-ASCII char alone, which matches
+/// on Jellyfin and misses here for any channel name, tvg-id or mapping key
+/// outside ASCII.
+#[must_use]
+pub fn eq_ordinal_ignore_case(a: &str, b: &str) -> bool {
+    a.chars()
+        .map(ordinal_upper)
+        .eq(b.chars().map(ordinal_upper))
+}
+
+/// The folded lookup key of a
+/// `Dictionary<string, ChannelInfo>(StringComparer.OrdinalIgnoreCase)`.
+///
+/// Same folding as [`eq_ordinal_ignore_case`], materialized — `EpgChannelData`'s
+/// three indices are ordinal-ignore-case dictionaries, so both the insert and the
+/// lookup key go through this.
+#[must_use]
+pub fn ordinal_ignore_case_key(value: &str) -> String {
+    value.chars().map(ordinal_upper).collect()
+}
+
+/// One char through .NET's invariant SIMPLE uppercase mapping.
+///
+/// `char.ToUpperInvariant` is a 1:1 table — it never expands one char into
+/// several, so `ß` stays `ß`. Rust's `char::to_uppercase` is the FULL mapping
+/// (`ß` → `SS`), so a multi-char expansion is discarded and the original char
+/// kept: that is what keeps this ordinal rather than linguistic.
+fn ordinal_upper(c: char) -> char {
+    let mut upper = c.to_uppercase();
+    match (upper.next(), upper.next()) {
+        (Some(one), None) => one,
+        _ => c,
+    }
+}
+
+/// Where `needle` occurs in `haystack`, folded ordinally, as a `[start, end)`
+/// byte range of `haystack`.
+///
+/// Backs the `Replace(…, StringComparison.OrdinalIgnoreCase)` inside
+/// `GetEpgChannelFromTunerChannel`. The range is in HAYSTACK bytes, not folded
+/// ones, because folding is per char and can change a char's byte length
+/// (`ſ` → `S`) — an offset taken in the folded string would not map back.
+fn find_ordinal_ignore_case(haystack: &str, needle: &str) -> Option<(usize, usize)> {
+    let folded_needle = ordinal_ignore_case_key(needle);
+    if folded_needle.is_empty() {
+        return Some((0, 0));
+    }
+    for (at, _) in haystack.char_indices() {
+        let mut folded = String::new();
+        let mut end = at;
+        for (offset, c) in haystack[at..].char_indices() {
+            folded.push(ordinal_upper(c));
+            end = at + offset + c.len_utf8();
+            if folded.len() >= folded_needle.len() {
+                break;
+            }
+        }
+        if folded == folded_needle {
+            return Some((at, end));
+        }
+    }
+    None
+}
+
 /// Whether `info` takes its listings from the tuner host `tuner_host_id`.
 ///
 /// Port of `ListingsManager.IsListingProviderEnabledForTuner`.
@@ -87,7 +157,7 @@ pub fn is_listing_provider_enabled_for_tuner(
         || info
             .enabled_tuners
             .iter()
-            .any(|t| t.eq_ignore_ascii_case(tuner_host_id))
+            .any(|t| eq_ordinal_ignore_case(t, tuner_host_id))
 }
 
 /// Resolves `channel_id` through the provider's manual channel mappings.
@@ -102,7 +172,7 @@ pub fn mapped_channel<'a>(channel_id: &'a str, mappings: &'a [NameValuePair]) ->
         .find(|m| {
             m.name
                 .as_deref()
-                .is_some_and(|n| n.eq_ignore_ascii_case(channel_id))
+                .is_some_and(|n| eq_ordinal_ignore_case(n, channel_id))
         })
         .and_then(|m| m.value.as_deref())
         .unwrap_or(channel_id)
@@ -118,11 +188,11 @@ pub fn mapped_channel<'a>(channel_id: &'a str, mappings: &'a [NameValuePair]) ->
 // "by id / by number / by name", and the prefix is what names each index.
 #[allow(clippy::struct_field_names)]
 pub struct EpgChannelData {
-    /// Channels keyed by lower-cased id.
+    /// Channels keyed by the ordinally folded id.
     by_id: HashMap<String, EpgChannel>,
-    /// Channels keyed by lower-cased number.
+    /// Channels keyed by the ordinally folded number.
     by_number: HashMap<String, EpgChannel>,
-    /// Channels keyed by lower-cased [normalized name](normalize_name).
+    /// Channels keyed by the ordinally folded [normalized name](normalize_name).
     by_name: HashMap<String, EpgChannel>,
 }
 
@@ -133,15 +203,15 @@ impl EpgChannelData {
         let mut data = Self::default();
         for channel in channels {
             data.by_id
-                .insert(channel.id.to_ascii_lowercase(), channel.clone());
+                .insert(ordinal_ignore_case_key(&channel.id), channel.clone());
             if !channel.number.is_empty() {
                 data.by_number
-                    .insert(channel.number.to_ascii_lowercase(), channel.clone());
+                    .insert(ordinal_ignore_case_key(&channel.number), channel.clone());
             }
             let normalized = normalize_name(&channel.name);
             if !normalized.trim().is_empty() {
                 data.by_name
-                    .insert(normalized.to_ascii_lowercase(), channel.clone());
+                    .insert(ordinal_ignore_case_key(&normalized), channel.clone());
             }
         }
         data
@@ -150,19 +220,19 @@ impl EpgChannelData {
     /// The channel with this id, if any.
     #[must_use]
     pub fn by_id(&self, id: &str) -> Option<&EpgChannel> {
-        self.by_id.get(&id.to_ascii_lowercase())
+        self.by_id.get(&ordinal_ignore_case_key(id))
     }
 
     /// The channel with this number, if any.
     #[must_use]
     pub fn by_number(&self, number: &str) -> Option<&EpgChannel> {
-        self.by_number.get(&number.to_ascii_lowercase())
+        self.by_number.get(&ordinal_ignore_case_key(number))
     }
 
     /// The channel with this already-[normalized](normalize_name) name, if any.
     #[must_use]
     pub fn by_name(&self, name: &str) -> Option<&EpgChannel> {
-        self.by_name.get(&name.to_ascii_lowercase())
+        self.by_name.get(&ordinal_ignore_case_key(name))
     }
 }
 
@@ -265,16 +335,15 @@ pub fn tuner_channel_mapping(
 /// Port of the `.json.schedulesdirect.org` branch inside
 /// `GetEpgChannelFromTunerChannel`: the suffix goes, then any leading `I`.
 fn strip_schedules_direct(tuner_channel_id: &str) -> String {
-    let lowered = tuner_channel_id.to_ascii_lowercase();
-    if !lowered.contains(SCHEDULES_DIRECT_SUFFIX) {
+    if find_ordinal_ignore_case(tuner_channel_id, SCHEDULES_DIRECT_SUFFIX).is_none() {
         return tuner_channel_id.to_owned();
     }
     // `Replace(..., OrdinalIgnoreCase)` — every occurrence, whatever its case.
     let mut out = String::with_capacity(tuner_channel_id.len());
     let mut rest = tuner_channel_id;
-    while let Some(at) = rest.to_ascii_lowercase().find(SCHEDULES_DIRECT_SUFFIX) {
+    while let Some((at, end)) = find_ordinal_ignore_case(rest, SCHEDULES_DIRECT_SUFFIX) {
         out.push_str(&rest[..at]);
-        rest = &rest[at + SCHEDULES_DIRECT_SUFFIX.len()..];
+        rest = &rest[end..];
     }
     out.push_str(rest);
     out.trim_start_matches('I').to_owned()
@@ -323,6 +392,77 @@ mod tests {
             ),
             "m3u_5581ab8b17869acbac4cc454abc40168446c98aa7b6e4352b95b322018c4eebf"
         );
+    }
+
+    #[test]
+    fn ordinal_folding_matches_dotnet_not_just_ascii() {
+        use super::{eq_ordinal_ignore_case, ordinal_ignore_case_key};
+        // `StringComparison.OrdinalIgnoreCase` folds the WHOLE ordinal range,
+        // not the ASCII half: these pairs are equal on Jellyfin, and
+        // `eq_ignore_ascii_case` misses every one of them.
+        assert!(eq_ordinal_ignore_case("Kanal Ö", "kanal ö"));
+        assert!(eq_ordinal_ignore_case("ČT sport", "čt SPORT"));
+        assert!(eq_ordinal_ignore_case("ТВ Центр", "тв центр"));
+        assert!(
+            !"Kanal Ö".eq_ignore_ascii_case("kanal ö"),
+            "the ASCII fold misses it"
+        );
+        // Still ordinal, never linguistic: `char.ToUpperInvariant` is a 1:1
+        // table, so `ß` does not become `SS` and the two stay different.
+        assert!(!eq_ordinal_ignore_case("straße", "STRASSE"));
+        assert!(eq_ordinal_ignore_case("straße", "STRAßE"));
+        // Different strings stay different, and the key agrees with the compare.
+        assert!(!eq_ordinal_ignore_case("parity1", "parity2"));
+        assert_eq!(ordinal_ignore_case_key("Ö1"), ordinal_ignore_case_key("ö1"));
+        assert_ne!(ordinal_ignore_case_key("Ö1"), ordinal_ignore_case_key("O1"));
+    }
+
+    #[test]
+    fn a_non_ascii_channel_name_and_id_still_match_the_guide() {
+        // The regression this closes: an accented tuner channel matched on
+        // Jellyfin and missed on Ferrofin, so its airings vanished from the
+        // guide with no error anywhere.
+        let epg = EpgChannelData::new(&[epg("ÖRF.at", "Kanal Ö", "1")]);
+        assert_eq!(epg.by_id("örf.at").map(|c| c.id.as_str()), Some("ÖRF.at"));
+        let tuner = TunerChannel {
+            id: String::new(),
+            tuner_channel_id: String::new(),
+            number: String::new(),
+            name: "kanal-ö".to_owned(),
+            tuner_host_id: "t1".to_owned(),
+        };
+        assert_eq!(
+            epg_channel_for_tuner_channel(&[], &tuner, &epg).map(|c| c.name.as_str()),
+            Some("Kanal Ö"),
+        );
+        // …and so does a mapping keyed on a non-ASCII tuner channel id.
+        let mapped = TunerChannel {
+            id: "Ö-1".to_owned(),
+            ..tuner.clone()
+        };
+        assert_eq!(
+            epg_channel_for_tuner_channel(&[pair("ö-1", "örf.at")], &mapped, &epg)
+                .map(|c| c.id.as_str()),
+            Some("ÖRF.at"),
+        );
+        // Provider-to-tuner enablement is the same comparison.
+        assert!(is_listing_provider_enabled_for_tuner(
+            &ListingsProviderInfo {
+                enable_all_tuners: false,
+                enabled_tuners: vec!["TÜNER-1".to_owned()],
+                ..ListingsProviderInfo::default()
+            },
+            "tüner-1",
+        ));
+    }
+
+    #[test]
+    fn the_schedules_direct_suffix_is_stripped_case_insensitively_around_non_ascii() {
+        // `Replace(…, OrdinalIgnoreCase)` keeps the text around the match
+        // verbatim — including chars whose folded form is a different byte
+        // length, which is why the search reports haystack offsets.
+        assert_eq!(strip_schedules_direct("IÖ1.JSON.SchedulesDirect.ORG"), "Ö1");
+        assert_eq!(strip_schedules_direct("Ö1"), "Ö1");
     }
 
     #[test]

@@ -1484,6 +1484,13 @@ def j_livetv_admin(base, token, user, _m, _m2):
     # guide refresh, so Jellyfin's channel items linger until the next one, while
     # Ferrofin's cascade away with the host row. The configuration is what both
     # servers agree the delete means.
+    #
+    # That narrowing hides a REAL difference unless the difference is written down
+    # somewhere the ledger reads, so it is: `classifications.json` carries
+    # `DELETE /LiveTv/TunerHosts` as an accepted divergence with `scope: side-path`
+    # — a note gen-ledger renders in its own section next to this row's verdict,
+    # that can never be counted as this row's verdict, and that can never absorb a
+    # future red. Change one, change the other.
     st, _ = http("DELETE", f"{base}/LiveTv/TunerHosts?id={tuner_id.upper()}", token)
     tuner_gone = not _livetv_config(base, token)[0]
     # RESTORE the tuner host and rebuild the guide behind it.

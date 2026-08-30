@@ -42,6 +42,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import verification  # noqa: E402  — the closed set of verification methods
 
 METHODS = ("get", "post", "put", "delete", "patch", "head")
+
+#: What a curated classification COVERS, from `classifications.json`'s `scope`.
+#: "op" — it explains this operation's divergence (the default, and the only one
+#: that can render as an accepted divergence). "side-path" — it records a real
+#: difference on a path this row's verdict does not cover, so it is listed on its
+#: own and can neither absorb a failing verdict nor be counted as accepted.
+SCOPES = {"op", "side-path"}
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
@@ -156,10 +163,24 @@ def build_rows(spec, real, overlay, curated, sweep, owners):
                 # verdict. See parity/verification.py for what each name claims.
                 "verification_method": s.get("verification_method"),
                 "classification": s.get("classification", ""),
+                # WHAT the classification covers. "op" (the default) means it
+                # explains this operation's divergence; "side-path" means it
+                # records something the row's own verdict does NOT cover, and so
+                # may never stand in for one. See `is_side_path`.
+                "classification_scope": s.get("classification_scope", "op"),
                 "last_verified": s.get("last_verified") if s else None,
             })
     rows.sort(key=lambda r: (r["operation"].split(" ", 1)[1], r["operation"]))
     return rows
+
+
+#: status/verdict glyphs for a row with no (or a failed) verdict.
+MARKS = {True: "✅", False: "⚠️", None: "·"}
+
+
+def mark_of(r):
+    """The verdict glyph for a row that is NOT a clean verified one."""
+    return MARKS[r["deep_verified"]]
 
 
 def is_headline(r):
@@ -176,6 +197,12 @@ def is_open_work(r):
 
     These must never render under the "accepted — not a bug" heading: a reader
     scanning that section would take a real gap for a closed question.
+
+    Nor is the item closed by a green verdict on the same op: a probe exercises
+    the path the fixture can reach, and the gap can live on a path it cannot —
+    an unported provider backend behind an op whose one CONFIGURED provider
+    diffs clean. The section therefore lists every open-work row and prints the
+    verdict beside it, instead of hiding the ones that happen to be green.
     """
     return r["classification"].startswith("open-work")
 
@@ -190,8 +217,39 @@ def is_flagged(r):
     return r["classification"].startswith("flagged")
 
 
+def is_side_path(r):
+    """The classification covers a path the row's OWN verdict does not.
+
+    Two shapes, both real: an ERROR path the contract never takes (Jellyfin 500s
+    on an input Ferrofin answers honestly), and a SIDE EFFECT the probe
+    deliberately does not assert (the two servers agree on the write itself, and
+    differ on when a dependent cache converges). Either way the note explains
+    something ELSE, so it must not be read as this row's verdict:
+
+      - it can never make the row "accepted — not a bug" (that heading is a
+        claim about the op, and a live probe still has to earn or fail its own
+        verdict); and
+      - it is listed even when the row is green, because deleting the only
+        record of a real difference is how the difference becomes invisible.
+    """
+    return r.get("classification_scope") == "side-path" and bool(r["classification"])
+
+
 def is_accepted(r):
     return (r["classification"] and r["deep_verified"] is not True
+            and not is_open_work(r) and not is_flagged(r) and not is_side_path(r))
+
+
+def is_unexplained_failure(r):
+    """A live probe returned FALSE and nothing on this page explains it.
+
+    Until this existed, a `False` verdict on an op carrying ANY classification
+    landed under "accepted — not a bug": a measured failure rendered as a
+    settled decision. That is the exact masking shape this ledger exists to
+    prevent, so a failure now has to be either explained (accepted / open work /
+    a detector flag someone will triage) or listed here as unexplained.
+    """
+    return (r["deep_verified"] is False and not is_accepted(r)
             and not is_open_work(r) and not is_flagged(r))
 
 
@@ -230,7 +288,9 @@ def render_md(rows):
     by_method = Counter(r["verification_method"] for r in rows if r["deep_verified"] is True)
     other = sum(n for m, n in by_method.items() if m != verification.HEADLINE)
     accepted = sum(1 for r in rows if is_accepted(r))
-    openwork = sum(1 for r in rows if is_open_work(r) and r["deep_verified"] is not True)
+    openwork = sum(1 for r in rows if is_open_work(r))
+    sidepath = sum(1 for r in rows if is_side_path(r))
+    failing = sum(1 for r in rows if is_unexplained_failure(r))
     flagged = sum(1 for r in rows if is_flagged(r) and r["deep_verified"] is not True)
     untested = sum(1 for r in rows if r["deep_verified"] is None and not r["classification"])
     depth_counts = defaultdict(int)
@@ -252,7 +312,13 @@ def render_md(rows):
               if sc_run or sv_run else "status-conformance + schema-validation not yet run — Layer 1")
     out.append(f"**{deep}/{total} deep-verified · {other} verified another way · "
                f"{accepted} classified-divergence · {openwork} open work · "
-               f"{flagged} flagged (unreviewed) · {untested} untested**  \n_{layer1}_\n")
+               f"{failing} unexplained FAIL · {flagged} flagged (unreviewed) · "
+               f"{untested} untested**  \n_{layer1}_\n")
+    out.append(f"_Plus {sidepath} recorded side-path divergence(s) — notes attached to ops "
+               "whose own verdict covers a different path, counted nowhere above so they "
+               "can neither flatter nor absorb it. Sections are not a partition: an "
+               "open-work row can also be green on the path a probe could reach, and it is "
+               "listed in both places on purpose._\n")
     out.append("_deep-verified means exactly one thing: "
                f"{verification.METHODS[verification.HEADLINE][2]}. "
                "It is the ONLY method counted in that number. Every other verified row "
@@ -295,7 +361,7 @@ def render_md(rows):
         d = sum(1 for r in rs if is_headline(r))
         o = sum(1 for r in rs if r["deep_verified"] is True and not is_headline(r))
         c = sum(1 for r in rs if is_accepted(r))
-        w = sum(1 for r in rs if is_open_work(r) and r["deep_verified"] is not True)
+        w = sum(1 for r in rs if is_open_work(r))
         fl = sum(1 for r in rs if is_flagged(r) and r["deep_verified"] is not True)
         u = sum(1 for r in rs if r["deep_verified"] is None and not r["classification"])
         out.append(f"| {owner} | {len(rs)} | {d} ({100 * d // len(rs)}%) | {o} | {c} | {w} "
@@ -339,10 +405,41 @@ def render_md(rows):
     out.append("## Open work (NOT accepted — a named divergence still to port)\n")
     out.append("_These are real gaps with an owner and a path, kept OUT of the accepted "
                "section: rendering an unfinished port under \"accepted\" is how a gap "
-               "quietly becomes a decision._\n")
+               "quietly becomes a decision. Every one is listed, INCLUDING the ones whose "
+               "live verdict is green — a probe can only exercise what the fixture "
+               "configures, so a clean diff on the configured path does not close a gap "
+               "on an unconfigured one. The glyph is that row's verdict, not the item's "
+               "status._\n")
     for r in rows:
-        if is_open_work(r) and r["deep_verified"] is not True:
-            out.append(f"- ⛏ `{r['operation']}` — {r['classification']}")
+        if is_open_work(r):
+            vm = r["verification_method"]
+            glyph = (verification.METHODS[vm][0] if r["deep_verified"] is True and vm
+                     else mark_of(r))
+            out.append(f"- ⛏ {glyph} `{r['operation']}` — {r['classification']}")
+    out.append("")
+    out.append("## Recorded side-path divergence (the row's own verdict does not cover it)\n")
+    out.append("_A real, evidenced difference on a path this op's verdict says nothing "
+               "about — an error input the contract never sends, or a side effect the "
+               "probe deliberately does not assert. Kept OUT of both the accepted count "
+               "and the verdict: a note here can never make a row green, and a row going "
+               "red here is an unexplained failure, not a settled decision._\n")
+    for r in rows:
+        if is_side_path(r):
+            vm = r["verification_method"]
+            glyph = (verification.METHODS[vm][0] if r["deep_verified"] is True and vm
+                     else mark_of(r))
+            out.append(f"- 📎 {glyph} `{r['operation']}` — {r['classification']}")
+    out.append("")
+    out.append("## Live probe FAILED — unexplained (not accepted, not classified)\n")
+    out.append("_A layer ran this op against both servers and the verdict was FALSE, and "
+               "nothing on this page explains it. These used to disappear: any op with a "
+               "classification string rendered under \"accepted — not a bug\" the moment "
+               "its probe went red, which turned a measured regression into a settled "
+               "decision._\n")
+    for r in rows:
+        if is_unexplained_failure(r):
+            note = f" — {r['classification']}" if r["classification"] not in ("", "ok") else ""
+            out.append(f"- ❌ `{r['operation']}`{note}")
     out.append("")
     out.append("## Flagged by a detector — UNREVIEWED (not accepted, not verified)\n")
     out.append("_A probe recorded a divergence and wrote its own text. Nobody has looked at "
@@ -355,12 +452,13 @@ def render_md(rows):
     out.append("## Full ledger\n")
     out.append("_status/schema: ✅ pass · ⚠️ fail · · untested_  \n")
     legend = " · ".join(f"{g} {m}" for m, (g, _l, _d) in verification.METHODS.items())
+    # (the 📎 prefix in the classification column is added below)
     out.append(f"_verified: {legend} · ⚠️ fail · · untested · ⛔ a verdict with no declared "
                "method (rejected before this file is written; it must never appear). "
                "Only ✅ is deep-verified._\n")
     out.append("| operation | route | depth | status | schema | verified | classification |")
     out.append("|---|---|---|---|---|---|---|")
-    mark = {True: "✅", False: "⚠️", None: "·"}
+    mark = MARKS
     for r in rows:
         vm = r["verification_method"]
         if r["deep_verified"] is True:
@@ -370,9 +468,13 @@ def render_md(rows):
             deep_mark = verification.METHODS[vm][0] if vm else "⛔"
         else:
             deep_mark = mark[r["deep_verified"]]
+        # A side-path note is prefixed IN THE TABLE too: read as a bare
+        # classification next to a verdict, it looks like the reason for that
+        # verdict, which is the one thing it is not.
+        cls = f"📎 (side-path) {r['classification']}" if is_side_path(r) else r["classification"]
         out.append(f"| `{r['operation']}` | {r['route']} | {r['depth']} | "
                    f"{mark[r['status_conformant']]} | {mark[r['schema_valid']]} | "
-                   f"{deep_mark} | {r['classification']} |")
+                   f"{deep_mark} | {cls} |")
     out.append("")
     return "\n".join(out)
 
@@ -432,6 +534,11 @@ def build_curated():
     for k, v in accepted.items():
         row = curated.get(k, {"deep_verified": None})
         row["classification"] = v["classification"]
+        # `scope` says what the note COVERS: "op" (the default — this operation's
+        # divergence) or "side-path" (a path the row's own verdict does not
+        # cover, so the note may never stand in for a verdict). See
+        # `is_side_path`.
+        row["classification_scope"] = v.get("scope", "op")
         row["last_verified"] = a_stamp
         curated[k] = row
     return curated
@@ -444,7 +551,7 @@ def _guards_fire():
     three shapes are exactly what used to slip into the headline silently.
     """
     base = {"operation": "GET /x", "deep_verified": True, "classification": "",
-            "verification_method": None}
+            "verification_method": None, "classification_scope": "op"}
     def rejected(row):
         try:
             check([{**base, **row}], {})
@@ -457,6 +564,23 @@ def _guards_fire():
     assert rejected({"verification_method": "hand-wave"}), "an unknown method must be rejected"
     assert rejected({"deep_verified": None, "verification_method": "body-diff"}), \
         "a method with no verdict must be rejected"
+    assert rejected({"deep_verified": None, "verification_method": None,
+                     "classification": "x", "classification_scope": "sort-of"}), \
+        "a classification scope outside the closed set must be rejected"
+    assert rejected({"deep_verified": None, "verification_method": None,
+                     "classification": "", "classification_scope": "side-path"}), \
+        "a side-path scope with no classification must be rejected"
+    # The masking channel, asserted as a PROPERTY rather than trusted: a
+    # side-path note on a row whose live probe went False is an unexplained
+    # failure, never an accepted divergence.
+    masked = {"operation": "GET /x", "deep_verified": False, "verification_method": "body-diff",
+              "classification": "jellyfin-bug, error path only: …",
+              "classification_scope": "side-path"}
+    assert not is_accepted(masked), "a side-path note must never render as accepted"
+    assert is_unexplained_failure(masked), "a failure it does not explain must surface"
+    op_scoped = {**masked, "classification_scope": "op"}
+    assert is_accepted(op_scoped) and not is_unexplained_failure(op_scoped), \
+        "an op-scoped classification still explains its own row"
 
 
 def check(rows, curated):
@@ -489,6 +613,18 @@ def check(rows, curated):
     # "accepted — not a bug" — that heading is a claim about a HUMAN decision.
     assert not [r for r in rows if is_open_work(r) and is_accepted(r)]
     assert not [r for r in rows if is_flagged(r) and is_accepted(r)]
+    # `scope` is a closed set: a typo would silently fall back to "op" and let a
+    # side-path note absorb a verdict again.
+    bad_scope = [(r["operation"], r.get("classification_scope")) for r in rows
+                 if r.get("classification_scope") not in SCOPES]
+    assert not bad_scope, f"classification scope outside {sorted(SCOPES)}: {bad_scope[:10]}"
+    # A scope only means something on a row that HAS a classification.
+    scoped_blank = [r["operation"] for r in rows
+                    if r.get("classification_scope") == "side-path" and not r["classification"]]
+    assert not scoped_blank, f"side-path scope with no classification: {scoped_blank[:10]}"
+    # And the masking channel itself: a note about a side path must never be
+    # counted as this operation's accepted divergence.
+    assert not [r for r in rows if is_side_path(r) and is_accepted(r)]
     by = Counter(r["verification_method"] for r in rows if r["deep_verified"] is True)
     other = ", ".join(f"{n} {m}" for m, n in sorted(by.items(), key=lambda kv: kv[0] or "")
                       if m != verification.HEADLINE)

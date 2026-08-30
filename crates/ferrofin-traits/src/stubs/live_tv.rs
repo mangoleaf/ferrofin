@@ -284,7 +284,11 @@ pub trait LiveTvManager: Send + Sync {
     ///
     /// Port of `ListingsManager.SetChannelMapping`: a pair whose two ids are
     /// equal is the "unmap" gesture (the existing pair is removed and no new
-    /// one stored), and the guide is refreshed so the mapping takes effect.
+    /// one stored). The mapping only MOVES listings once the guide has been
+    /// rebuilt through it, and — as upstream — that rebuild is the queued
+    /// refresh task's work, not this call's: the caller queues it
+    /// (`CancelIfRunningAndQueue<RefreshGuideScheduledTask>()`), and the row
+    /// returned here is computed from the saved configuration either way.
     async fn set_channel_mapping(
         &self,
         provider_id: &str,
@@ -349,6 +353,12 @@ pub trait LiveTvManager: Send + Sync {
 
     /// Refreshes the channel lineup and guide by fetching every configured
     /// tuner host (M3U) and listing provider (XMLTV) and rewriting the cache.
+    ///
+    /// Port of `GuideManager.RefreshGuide`, i.e. the body of upstream's
+    /// `RefreshGuideScheduledTask`. It is the TASK's work: a configuration write
+    /// queues it and returns (`handlers::live_tv::queue_guide_refresh`) rather
+    /// than awaiting it, because the fetches are third-party network I/O and an
+    /// admin request must not hang on them.
     async fn refresh_guide(&self) -> Result<(), ServiceError>;
 
     /// Resolves a channel id to the tuner stream URL that plays it, or `None`
