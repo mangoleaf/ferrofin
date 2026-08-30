@@ -85,11 +85,15 @@ impl RemoteSearchProvider for TmdbSearchProvider {
 
         // 1. A `Tmdb` id already on the item pins the title exactly — one
         //    result, straight from `/movie|tv/{id}`, and no name search.
-        //    (C# parses the id with `int.Parse`/`Convert.ToInt32`, which THROWS
-        //    on a non-numeric value and takes the whole provider down with it;
-        //    we fall through to the remaining branches instead — Jellyfin bug,
-        //    not a behaviour to port.)
-        if let Some(tmdb_id) = provider_id_of(ids, "Tmdb").and_then(|id| id.parse::<i64>().ok())
+        //    A padded id (` 603 `) still pins it: see
+        //    `parse_numeric_provider_id` for why `int.Parse`/`Convert.ToInt32`
+        //    accept the whitespace that `str::parse` alone rejects.
+        //    (Those same C# calls THROW on a NON-NUMERIC value and take the
+        //    whole provider down with it; we fall through to the remaining
+        //    branches instead — Jellyfin bug, not a behaviour to port. Recorded
+        //    as an accepted divergence in suite/parity/classifications.json
+        //    under `POST /Items/RemoteSearch/Movie`, with the measurement.)
+        if let Some(tmdb_id) = provider_id_of(ids, "Tmdb").and_then(parse_numeric_provider_id)
             && let Some(details) = self.tmdb.details(self.kind, tmdb_id, language).await
         {
             return Ok(vec![self.pinned_result(tmdb_id, details)]);
@@ -102,13 +106,25 @@ impl RemoteSearchProvider for TmdbSearchProvider {
         //       a name search (`if (movieResults is null)` / `if (tvResults is
         //       not null)`); only a request that produced no payload at all
         //       moves on to the next branch.
+        // `FindByExternalIdAsync`'s `language` argument is NOT the same value on
+        // the two providers: `TmdbMovieProvider.cs:96-101`/`:106-111` pass
+        // `TmdbUtils.GetImageLanguagesParam(...)` (so TMDB's `/find` sees
+        // `language=en,null`), while `TmdbSeriesProvider.cs:73` passes the bare
+        // `MetadataLanguage`. Upstream's asymmetry, ported as-is.
+        let find_language = match self.kind {
+            TmdbKind::Movie => Some(crate::tmdb::image_languages_param(
+                search_info.metadata_language.as_deref(),
+                search_info.metadata_country_code.as_deref(),
+            )),
+            TmdbKind::Series => language.map(ToOwned::to_owned),
+        };
         for (key, source) in [("Imdb", "imdb_id"), ("Tvdb", "tvdb_id")] {
             let Some(external) = provider_id_of(ids, key) else {
                 continue;
             };
             let Some(hits) = self
                 .tmdb
-                .find_by_external_id(self.kind, source, external, language)
+                .find_by_external_id(self.kind, source, external, find_language.as_deref())
                 .await
             else {
                 continue;
@@ -294,11 +310,13 @@ impl RemoteSearchProvider for TmdbBoxSetSearchProvider {
         // A `Tmdb` collection id pins the box set exactly: `TmdbBoxSetProvider`
         // short-circuits on `tmdbId > 0` and returns that one collection — or
         // nothing at all when TMDB has no such collection — without ever
-        // running the name search. (C#'s `Convert.ToInt32` throws on a
-        // non-numeric id and takes the provider down with it; we fall through
-        // to the name search instead — Jellyfin bug, not a behaviour to port.)
+        // running the name search. A padded id still pins it — see
+        // `parse_numeric_provider_id`. (C#'s `Convert.ToInt32` throws on a
+        // NON-NUMERIC id and takes the provider down with it; we fall through
+        // to the name search instead — Jellyfin bug, not a behaviour to port,
+        // recorded with its measurement in suite/parity/classifications.json.)
         if let Some(tmdb_id) = provider_id_of(search_info.provider_ids.as_ref(), "Tmdb")
-            .and_then(|id| id.parse::<i64>().ok())
+            .and_then(parse_numeric_provider_id)
             .filter(|id| *id > 0)
         {
             let Some(collection) = self.tmdb.collection(tmdb_id, language).await else {
@@ -505,6 +523,22 @@ fn provider_id_of<'a>(ids: Option<&'a HashMap<String, String>>, key: &str) -> Op
         .find(|(k, _)| k.eq_ignore_ascii_case(key))
         .map(|(_, v)| v.as_str())
         .filter(|v| !v.trim().is_empty())
+}
+
+/// A numeric provider id parsed the way .NET parses it.
+///
+/// Every TMDB provider turns the stored id into an `int` with
+/// `int.Parse(id, CultureInfo.InvariantCulture)` (`TmdbMovieProvider.cs:59`,
+/// `TmdbPersonProvider.cs`) or `Convert.ToInt32(id, CultureInfo.InvariantCulture)`
+/// (`TmdbSeriesProvider.cs:58`, `TmdbBoxSetProvider.cs:44`). Both resolve to
+/// `NumberStyles.Integer` — `AllowLeadingWhite | AllowTrailingWhite | AllowLeadingSign`
+/// — so a padded id (` 603 `, which is what pasting into the Identify dialog produces)
+/// pins the title upstream. Rust's `str::parse` already takes the leading sign but
+/// rejects the surrounding whitespace, so the trim is the whole difference: without it
+/// a padded id silently falls through to the name search and Identify answers with the
+/// wrong title.
+fn parse_numeric_provider_id(raw: &str) -> Option<i64> {
+    raw.trim().parse::<i64>().ok()
 }
 
 /// `AlbumInfoExtensions.GetReleaseId` / `GetReleaseGroupId`: the album's own
@@ -819,7 +853,7 @@ impl RemoteSearchProvider for TmdbPersonSearchProvider {
             search_info.metadata_country_code.as_deref(),
         );
         if let Some(tmdb_id) = provider_id_of(search_info.provider_ids.as_ref(), "Tmdb")
-            .and_then(|id| id.trim().parse::<i64>().ok())
+            .and_then(parse_numeric_provider_id)
             && let Some(person) = self.tmdb.person_lookup(tmdb_id, language.as_deref()).await
         {
             let mut provider_ids = HashMap::from([("Tmdb".to_owned(), person.tmdb_id.to_string())]);
@@ -1531,7 +1565,7 @@ impl LocalProviderManager {
             .map(str::trim)
             .filter(|n| !n.is_empty());
         let stored_tmdb_id =
-            provider_id_of_pairs(&provider_ids, "Tmdb").and_then(|id| id.parse::<i64>().ok());
+            provider_id_of_pairs(&provider_ids, "Tmdb").and_then(parse_numeric_provider_id);
         // Resolve what to fetch: movies/series by their stored/chosen TMDB id
         // (an IMDb/TVDB id resolves through TMDB's `/find`), else by title;
         // seasons/episodes via their parent series. Music/other kinds have no
@@ -1829,8 +1863,7 @@ impl LocalProviderManager {
             return Vec::new();
         };
         let name = entity_name(entity);
-        let stored_tmdb_id =
-            provider_id_of_pairs(ids, "Tmdb").and_then(|id| id.parse::<i64>().ok());
+        let stored_tmdb_id = provider_id_of_pairs(ids, "Tmdb").and_then(parse_numeric_provider_id);
         match source {
             RemoteImageSource::TmdbTitle(kind) => {
                 // The stored Tmdb id (or an Imdb/Tvdb id via `/find`) pins the
@@ -2015,7 +2048,7 @@ async fn resolve_tmdb_id(
     kind: TmdbKind,
     ids: &[(String, String)],
 ) -> Option<i64> {
-    if let Some(id) = provider_id_of_pairs(ids, "Tmdb").and_then(|v| v.parse::<i64>().ok()) {
+    if let Some(id) = provider_id_of_pairs(ids, "Tmdb").and_then(parse_numeric_provider_id) {
         return Some(id);
     }
     if let Some(imdb) = provider_id_of_pairs(ids, "Imdb")
@@ -3057,6 +3090,167 @@ mod tests {
         assert_eq!(ids["Tmdb"], "603");
         assert!(!ids.contains_key("Imdb"));
         assert!(results[0].premiere_date.is_some());
+    }
+
+    /// A provider id with surrounding whitespace must still pin the title.
+    ///
+    /// `int.Parse(id, CultureInfo.InvariantCulture)` and
+    /// `Convert.ToInt32(id, CultureInfo.InvariantCulture)` both default to
+    /// `NumberStyles.Integer`, which is `AllowLeadingWhite | AllowTrailingWhite |
+    /// AllowLeadingSign` — so upstream pins on `" 603 "`. Rust's `str::parse` does not,
+    /// and without the trim the id branch is skipped and Identify silently answers with
+    /// the NAME search: the exact defect (wrong title, or nothing at all) that the id
+    /// branch exists to prevent. Every route below is keyed on the id, so a provider
+    /// that dropped the trim would fall through to the `*_search` route and fail here.
+    #[tokio::test]
+    async fn a_padded_provider_id_still_pins_the_title() {
+        use super::{
+            TmdbBoxSetSearchProvider, TmdbKind, TmdbPersonSearchProvider, TmdbSearchProvider,
+        };
+        let server = crate::mock_http::MockServer::start(vec![
+            (
+                "/movie/603",
+                r#"{"id":603,"title":"The Matrix","release_date":"1999-03-31"}"#.to_owned(),
+            ),
+            (
+                "/tv/1396",
+                r#"{"id":1396,"name":"Breaking Bad","first_air_date":"2008-01-20"}"#.to_owned(),
+            ),
+            (
+                "/collection/119",
+                r#"{"id":119,"name":"The Lord of the Rings Collection"}"#.to_owned(),
+            ),
+            ("/person/31", r#"{"id":31,"name":"Tom Hanks"}"#.to_owned()),
+            // The name-search fallbacks answer with the WRONG title, so a dropped
+            // trim shows up as a wrong name rather than as an empty list.
+            (
+                "/search/movie",
+                r#"{"results":[{"id":1,"title":"Wrong Movie"}]}"#.to_owned(),
+            ),
+            (
+                "/search/tv",
+                r#"{"results":[{"id":2,"name":"Wrong Series"}]}"#.to_owned(),
+            ),
+            (
+                "/search/collection",
+                r#"{"results":[{"id":3,"name":"Wrong Collection"}]}"#.to_owned(),
+            ),
+            (
+                "/search/person",
+                r#"{"results":[{"id":4,"name":"Wrong Person"}]}"#.to_owned(),
+            ),
+        ])
+        .await;
+        let tmdb = Arc::new(crate::tmdb::TmdbClient::new().with_base_url(&server.base_url));
+
+        for (kind, padded, expected) in [
+            (BaseItemKind::Movie, " 603 ", "The Matrix"),
+            (BaseItemKind::Series, "\t1396\n", "Breaking Bad"),
+            (
+                BaseItemKind::BoxSet,
+                " 119",
+                "The Lord of the Rings Collection",
+            ),
+            (BaseItemKind::Person, "31 ", "Tom Hanks"),
+        ] {
+            let provider: Box<dyn super::RemoteSearchProvider> = match kind {
+                BaseItemKind::Movie => {
+                    Box::new(TmdbSearchProvider::new(tmdb.clone(), TmdbKind::Movie))
+                }
+                BaseItemKind::Series => {
+                    Box::new(TmdbSearchProvider::new(tmdb.clone(), TmdbKind::Series))
+                }
+                BaseItemKind::BoxSet => Box::new(TmdbBoxSetSearchProvider::new(tmdb.clone())),
+                _ => Box::new(TmdbPersonSearchProvider::new(tmdb.clone())),
+            };
+            // A conflicting name is present precisely so the name search is a
+            // reachable, and visibly wrong, alternative.
+            let mut req = named_request(kind, "Something Else Entirely");
+            req.search_info.provider_ids =
+                Some(HashMap::from([("Tmdb".to_owned(), padded.to_owned())]));
+            let results = provider.get_search_results(&req).await.expect("results");
+            assert_eq!(results.len(), 1, "{kind:?} padded id {padded:?}");
+            assert_eq!(
+                results[0].name.as_deref(),
+                Some(expected),
+                "{kind:?} padded id {padded:?} fell through to the name search"
+            );
+        }
+    }
+
+    /// The two providers hand `/find` DIFFERENT `language` values — the movie provider the
+    /// image-languages list (`TmdbMovieProvider.cs:96-101`), the series provider the bare
+    /// metadata language (`TmdbSeriesProvider.cs:73`). The mock matches by path SUBSTRING
+    /// and first route wins, so routing on the encoded query string makes the outgoing
+    /// request itself the assertion: send the wrong one and the row never comes back.
+    #[tokio::test]
+    async fn the_find_branch_sends_the_language_each_c_sharp_provider_sends() {
+        use super::{TmdbKind, TmdbSearchProvider};
+        let server = crate::mock_http::MockServer::start(vec![
+            (
+                // `fr,null,en`, url-encoded — the movie arm only.
+                "language=fr%2Cnull%2Cen",
+                r#"{"movie_results":[{"id":603,"title":"The Matrix"}],"tv_results":[]}"#.to_owned(),
+            ),
+            (
+                // The bare `fr` — the series arm only.
+                "language=fr",
+                r#"{"movie_results":[],"tv_results":[{"id":1396,"name":"Breaking Bad"}]}"#
+                    .to_owned(),
+            ),
+            (
+                "/find/",
+                r#"{"movie_results":[],"tv_results":[]}"#.to_owned(),
+            ),
+        ])
+        .await;
+        let tmdb = Arc::new(crate::tmdb::TmdbClient::new().with_base_url(&server.base_url));
+
+        let mut req = id_request(BaseItemKind::Movie, &[("Imdb", "tt0133093")]);
+        req.search_info.metadata_language = Some("fr".to_owned());
+        req.search_info.metadata_country_code = Some("FR".to_owned());
+        let results = TmdbSearchProvider::new(tmdb.clone(), TmdbKind::Movie)
+            .get_search_results(&req)
+            .await
+            .expect("results");
+        assert_eq!(
+            results.len(),
+            1,
+            "movie /find must send the image-languages list"
+        );
+        assert_eq!(results[0].name.as_deref(), Some("The Matrix"));
+
+        let mut req = id_request(BaseItemKind::Series, &[("Imdb", "tt0903747")]);
+        req.search_info.metadata_language = Some("fr".to_owned());
+        req.search_info.metadata_country_code = Some("FR".to_owned());
+        let results = TmdbSearchProvider::new(tmdb, TmdbKind::Series)
+            .get_search_results(&req)
+            .await
+            .expect("results");
+        assert_eq!(results.len(), 1, "series /find must send the bare language");
+        assert_eq!(results[0].name.as_deref(), Some("Breaking Bad"));
+    }
+
+    /// `TmdbUtils.GetImageLanguagesParam` — the value `TmdbMovieProvider` hands to
+    /// `FindByExternalIdAsync`, which is NOT the bare language the series provider sends.
+    #[test]
+    fn image_languages_param_matches_tmdb_utils() {
+        use crate::tmdb::image_languages_param;
+        assert_eq!(image_languages_param(Some("en"), Some("US")), "en,null");
+        assert_eq!(image_languages_param(Some("fr"), Some("FR")), "fr,null,en");
+        // A 5-letter code supplies both halves; the region is upper-cased first.
+        assert_eq!(
+            image_languages_param(Some("pt-br"), Some("BR")),
+            "pt-BR,pt,null,en"
+        );
+        // `NormalizeLanguage` runs first: de-CH degrades to de.
+        assert_eq!(
+            image_languages_param(Some("de-CH"), Some("CH")),
+            "de,null,en"
+        );
+        // Blank preference is not "en", so English is still appended.
+        assert_eq!(image_languages_param(None, Some("US")), "null,en");
+        assert_eq!(image_languages_param(Some(""), None), "null,en");
     }
 
     #[tokio::test]

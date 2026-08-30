@@ -1119,9 +1119,66 @@ def j_remote_subtitles(base, token, user, mid, _m2):
 
 # ---------------------------------------------------------------- remote search ("Identify")
 
-# The per-result field set compared for every RemoteSearch row. Nothing is excluded:
-# a candidate that differs in ANY of these between the two servers fails the row.
-IDENTIFY_FIELDS = ("Name", "ProviderIds", "ProductionYear", "PremiereDate", "Overview", "ImageUrl")
+# The two servers must be asked the SAME question at the SAME moment, because the answers
+# come from live TMDB. The runner cannot give us that: journeys() runs Ferrofin's ENTIRE
+# suite before Jellyfin's, so a naive per-leg probe would separate the two legs by every
+# other journey — minutes, not seconds, of TMDB popularity drift. So this journey queries
+# BOTH servers itself, case by case, back-to-back, on whichever leg runs first, and the
+# second leg reads its own server's answers out of the cache.
+PAIR = {}              # base -> (peer_base, peer_token); registered by journeys()
+_IDENTIFY_CACHE = {}   # base -> {case_key: (status, [rows])}
+
+TMDB = "TheMovieDb"
+OMDB = "The Open Movie Database"
+
+# Every RemoteSearch this journey asserts: case -> (kind, SearchInfo, SearchProviderName).
+IDENTIFY_CASES = {
+    # -- Movie. Name+Year: TmdbMovieProvider forwards Year to /search/movie and every row
+    #    carries PremiereDate + ProductionYear from the release date.
+    "m_named":    ("Movie",  {"Name": "The Matrix", "Year": 1999}, TMDB),
+    #    A `Tmdb` id short-circuits the name search: one row, with the IMDb id merged.
+    "m_byid":     ("Movie",  {"ProviderIds": {"Tmdb": "603"}}, TMDB),
+    #    The SAME id, whitespace-padded. `int.Parse(id, CultureInfo.InvariantCulture)`
+    #    defaults to NumberStyles.Integer (AllowLeadingWhite|AllowTrailingWhite), so
+    #    upstream still pins the title; a server whose parse rejects the padding falls
+    #    through to the name search — and the deliberately-wrong Name here makes that
+    #    visible as a WRONG title rather than as an empty list.
+    "m_padded":   ("Movie",  {"ProviderIds": {"Tmdb": " 603 "}, "Name": "Zzz Not A Movie"}, TMDB),
+    #    An `Imdb` id resolves through TMDB's /find.
+    "m_byimdb":   ("Movie",  {"ProviderIds": {"Imdb": "tt0133093"}}, TMDB),
+    "m_bogus":    ("Movie",  {"Name": "zzqqxxnotamovie12345"}, TMDB),
+    "m_unfilt":   ("Movie",  {"Name": "The Matrix", "Year": 1999}, None),
+    # -- Series. TmdbSeriesProvider leaves SearchSeriesAsync's year at 0, so a WRONG Year
+    #    must not narrow the search; its mappers set PremiereDate and never ProductionYear;
+    #    and the by-id branch carries Tmdb + Imdb + Tvdb.
+    "s_named":    ("Series", {"Name": "Breaking Bad"}, TMDB),
+    "s_year":     ("Series", {"Name": "Breaking Bad", "Year": 2019}, TMDB),
+    "s_byid":     ("Series", {"ProviderIds": {"Tmdb": "1396"}}, TMDB),
+    "s_padded":   ("Series", {"ProviderIds": {"Tmdb": " 1396 "}, "Name": "Zzz Not A Show"}, TMDB),
+    "s_bogus":    ("Series", {"Name": "zzzqqxnotarealshowxyz123"}, TMDB),
+    "s_unfilt":   ("Series", {"Name": "Breaking Bad"}, None),
+    # -- BoxSet. TmdbBoxSetProvider short-circuits on tmdbId > 0 (one row, and no Overview
+    #    on any search DTO) and otherwise searches /search/collection by name.
+    "b_named":    ("BoxSet", {"Name": "The Lord of the Rings Collection"}, TMDB),
+    "b_byid":     ("BoxSet", {"ProviderIds": {"Tmdb": "119"},
+                              "Name": "The Matrix Collection"}, TMDB),
+    "b_padded":   ("BoxSet", {"ProviderIds": {"Tmdb": " 119 "},
+                              "Name": "The Matrix Collection"}, TMDB),
+    "b_bogus":    ("BoxSet", {"Name": "zzqxwv nonexistent collection 99812"}, TMDB),
+    # -- Person. Only the by-id branch takes a language upstream (`GetPersonAsync(id,
+    #    language, countryCode, …)`); `SearchPersonAsync(name, ct)` takes none.
+    "p_named":    ("Person", {"Name": "Tom Hanks"}, TMDB),
+    "p_fr":       ("Person", {"ProviderIds": {"Tmdb": "31"}, "MetadataLanguage": "fr",
+                              "MetadataCountryCode": "FR"}, TMDB),
+    "p_en":       ("Person", {"ProviderIds": {"Tmdb": "31"}, "MetadataLanguage": "en",
+                              "MetadataCountryCode": "US"}, TMDB),
+    "p_padded":   ("Person", {"ProviderIds": {"Tmdb": " 31 "}, "Name": "Zzz Nobody"}, TMDB),
+    "p_bogus":    ("Person", {"Name": "zzqqxxnotarealpersonzzz"}, TMDB),
+    "p_noprov":   ("Person", {"Name": "Tom Hanks"}, "NoSuchProvider"),
+    # -- Trailer. OMDb is the only Trailer fetcher on either side.
+    "t_named":    ("Trailer", {"Name": "Inception", "Year": 2010}, OMDB),
+    "t_bogus":    ("Trailer", {"Name": "zzqxwvyunlikelytitle12345"}, OMDB),
+}
 
 
 def remote_search(base, token, kind, search_info, provider=None):
@@ -1137,9 +1194,43 @@ def remote_search(base, token, kind, search_info, provider=None):
     return st, (out if isinstance(out, list) else [])
 
 
-def identify(results, fields=IDENTIFY_FIELDS):
-    """Every result projected onto the compared field set, order preserved."""
-    return [{k: r.get(k) for k in fields} for r in results]
+def identify_responses(base, token):
+    """Every IDENTIFY_CASES answer for `base`, with both servers queried case-adjacently.
+
+    The first leg to ask drives the whole probe: for each case it hits its own server and
+    then, within milliseconds, the peer registered in PAIR, and caches both. The second leg
+    then reads its OWN server's recorded answers. Each leg's evidence is still its own
+    server's response — the runner's cross-server equality does exactly as much work as
+    before — but the two responses being compared were produced seconds apart instead of
+    being separated by an entire journey suite."""
+    if base in _IDENTIFY_CACHE:
+        return _IDENTIFY_CACHE[base]
+    legs = [(base, token)]
+    peer = PAIR.get(base)
+    if peer and peer[0]:
+        legs.append(peer)
+    per_leg = {b: {} for b, _ in legs}
+    for case, (kind, info, provider) in IDENTIFY_CASES.items():
+        for b, t in legs:
+            per_leg[b][case] = remote_search(b, t, kind, info, provider)
+    _IDENTIFY_CACHE.update(per_leg)
+    return _IDENTIFY_CACHE[base]
+
+
+def identify(results):
+    """Every candidate, WHOLE — the raw JSON object, every key, order preserved.
+
+    Nothing is projected away. `RemoteSearchResult` has exactly 12 properties in the
+    vendored contract (Name, SearchProviderName, ProviderIds, ImageUrl, Overview,
+    PremiereDate, ProductionYear, IndexNumber, IndexNumberEnd, ParentIndexNumber,
+    AlbumArtist, Artists) and not one of them is per-instance — no ids, no timestamps, no
+    paths — so a whole-object comparison is both safe across two independent servers and
+    the strictest thing available. It deliberately includes key PRESENCE: a server that
+    emits `"Overview": null` where the other omits the key fails the row, which is what
+    this batch's BoxSet fix (stop emitting Overview at all) actually changed, and what a
+    `dict.get()` projection would have missed. It also catches a field neither side is
+    supposed to send, which an explicit field list cannot."""
+    return results
 
 
 def j_remote_search_identify(base, token, user, _m, _m2):
@@ -1150,9 +1241,10 @@ def j_remote_search_identify(base, token, user, _m, _m2):
     Ok, so nothing is mutated and there is no read-back. They live here because sweep.py is
     GET/HEAD-only and reads.py correlates by Path.
 
-    They hit live remote providers, so the assertions are built to survive drift: both
-    servers are queried in the SAME run (so upstream sees one state), and every claim is
-    either pinned by ProviderId or is a structural invariant.
+    They hit live remote providers, so the assertions are built to survive drift: the two
+    servers are asked each question back-to-back (see `identify_responses` — the runner's
+    own per-leg ordering is NOT relied on, and must not be), and every claim is either
+    pinned by ProviderId or is a structural invariant.
 
     DELIBERATELY NOT COMPARED, and why:
       * Rows from any provider other than the one pinned by `SearchProviderName`. The
@@ -1164,122 +1256,100 @@ def j_remote_search_identify(base, token, user, _m, _m2):
         asserted: `tmdb_answers` goes false if the TMDB provider stops answering an
         unfiltered search on either side, and every pinned assertion below is scoped to
         TheMovieDb, so answering from the WRONG provider fails the row.
-    Everything else IS compared: for every search below the FULL candidate list is projected
-    onto IDENTIFY_FIELDS and compared element-for-element, order and count included. That is
-    safe despite TMDB's popularity drift only because both servers are queried seconds apart
-    in one run; if this row ever flakes, the fix is to keep the comparison and pin the search
-    harder (by ProviderId), never to widen it.
+      * A NON-NUMERIC provider id. Upstream's `int.Parse`/`Convert.ToInt32` throws and
+        ProviderManager's catch-all swallows the whole provider, so Jellyfin answers [];
+        Ferrofin declines to port the crash and falls through to the remaining branches.
+        Measured and recorded as an accepted divergence in classifications.json rather
+        than probed here, because asserting it would freeze a Jellyfin bug into the gate.
+    Everything else IS compared: for every case below the FULL candidate list is compared
+    as raw JSON, element-for-element, key-for-key, order and count included (see
+    `identify`). If this row ever flakes on TMDB ranking drift, the fix is to pin the
+    search harder (by ProviderId), never to widen the comparison.
       * `POST /Items/RemoteSearch/Trailer` cannot be verified without an OMDb key: OMDb is
         the ONLY provider implementing `IRemoteMetadataProvider<Trailer, TrailerInfo>` in
         v10.11.8, so a keyless Ferrofin can only ever answer []. The row is still probed
-        (both statuses, both bogus-term answers, both projections) so the divergence is
-        measured rather than assumed; see classifications.json.
+        (both statuses, both bogus-term answers, both whole-body projections) so the
+        divergence is measured rather than assumed; see classifications.json. NOTE for
+        whoever sets a key: the Trailer row is the one that exercises OMDb's IndexNumber /
+        ParentIndexNumber echo and its `Artists` list, and `identify` compares those,
+        because it compares the whole object.
 
     Needs outbound TMDB reachability from both containers; with none, both sides return []
     and the rows fail rather than passing vacuously.
     """
     r = {}
-    tmdb = "TheMovieDb"
+    a = identify_responses(base, token)
+    rows = {case: a[case][1] for case in IDENTIFY_CASES}
+    status = {case: a[case][0] for case in IDENTIFY_CASES}
+
+    def pinned(case, tmdb_id):
+        """The one candidate an id-pinned search must return, named by its Tmdb id."""
+        got = rows[case]
+        return len(got) == 1 and (got[0].get("ProviderIds") or {}).get("Tmdb") == tmdb_id
 
     # ---- Movie ---------------------------------------------------------------
-    # Name+Year: `TmdbMovieProvider` forwards Year to /search/movie and every row carries
-    # PremiereDate + ProductionYear from the release date.
-    _, named = remote_search(base, token, "Movie",
-                             {"Name": "The Matrix", "Year": 1999}, tmdb)
-    # A `Tmdb` id short-circuits the name search: exactly one row, with the IMDb id merged.
-    _, byid = remote_search(base, token, "Movie", {"ProviderIds": {"Tmdb": "603"}}, tmdb)
-    # An `Imdb` id resolves through TMDB's /find.
-    _, byimdb = remote_search(base, token, "Movie",
-                              {"ProviderIds": {"Imdb": "tt0133093"}}, tmdb)
-    _, bogus = remote_search(base, token, "Movie", {"Name": "zzqqxxnotamovie12345"}, tmdb)
-    _, unfiltered = remote_search(base, token, "Movie", {"Name": "The Matrix", "Year": 1999})
-    ev = {"named": identify(named),
-          "byid": identify(byid),
-          "byimdb": identify(byimdb),
-          "bogus_empty": bogus == [],
-          "tmdb_answers": tmdb in {x.get("SearchProviderName") for x in unfiltered}}
+    ev = {"named": identify(rows["m_named"]),
+          "byid": identify(rows["m_byid"]),
+          "padded": identify(rows["m_padded"]),
+          "byimdb": identify(rows["m_byimdb"]),
+          "bogus_empty": rows["m_bogus"] == [],
+          "tmdb_answers": TMDB in {x.get("SearchProviderName") for x in rows["m_unfilt"]}}
     r["POST /Items/RemoteSearch/Movie"] = Same(
-        bool(named) and len(byid) == 1 and bool(byimdb)
-        and all(x.get("PremiereDate") for x in named)
+        bool(rows["m_named"]) and pinned("m_byid", "603") and pinned("m_padded", "603")
+        and bool(rows["m_byimdb"])
+        and all(x.get("PremiereDate") for x in rows["m_named"])
         and ev["bogus_empty"] and ev["tmdb_answers"], ev)
 
     # ---- Series --------------------------------------------------------------
-    # `TmdbSeriesProvider` leaves SearchSeriesAsync's year at 0, so a WRONG Year must not
-    # narrow the search; its mappers set PremiereDate and never ProductionYear; and the
-    # by-id branch carries Tmdb + Imdb + Tvdb.
-    _, s_named = remote_search(base, token, "Series", {"Name": "Breaking Bad"}, tmdb)
-    _, s_year = remote_search(base, token, "Series",
-                              {"Name": "Breaking Bad", "Year": 2019}, tmdb)
-    _, s_byid = remote_search(base, token, "Series", {"ProviderIds": {"Tmdb": "1396"}}, tmdb)
-    _, s_bogus = remote_search(base, token, "Series",
-                               {"Name": "zzzqqxnotarealshowxyz123"}, tmdb)
-    _, s_unfiltered = remote_search(base, token, "Series", {"Name": "Breaking Bad"})
-    ev = {"named": identify(s_named),
-          "year_ignored": "1396" in {x.get("ProviderIds", {}).get("Tmdb") for x in s_year},
-          "byid": identify(s_byid),
-          "bogus_empty": s_bogus == [],
-          "tmdb_answers": tmdb in {x.get("SearchProviderName") for x in s_unfiltered}}
+    ev = {"named": identify(rows["s_named"]),
+          "year_ignored": "1396" in {(x.get("ProviderIds") or {}).get("Tmdb")
+                                     for x in rows["s_year"]},
+          "byid": identify(rows["s_byid"]),
+          "padded": identify(rows["s_padded"]),
+          "bogus_empty": rows["s_bogus"] == [],
+          "tmdb_answers": TMDB in {x.get("SearchProviderName") for x in rows["s_unfilt"]}}
     r["POST /Items/RemoteSearch/Series"] = Same(
-        bool(s_named) and len(s_byid) == 1 and ev["year_ignored"]
-        and all(x.get("PremiereDate") for x in s_named)
-        and not any(x.get("ProductionYear") for x in s_named)
+        bool(rows["s_named"]) and pinned("s_byid", "1396") and pinned("s_padded", "1396")
+        and ev["year_ignored"]
+        and all(x.get("PremiereDate") for x in rows["s_named"])
+        and not any(x.get("ProductionYear") for x in rows["s_named"])
         and ev["bogus_empty"] and ev["tmdb_answers"], ev)
 
     # ---- BoxSet --------------------------------------------------------------
-    # `TmdbBoxSetProvider` short-circuits on tmdbId > 0 (one row, no Overview on any search
-    # DTO) and otherwise searches /search/collection by name.
-    _, b_named = remote_search(base, token, "BoxSet",
-                               {"Name": "The Lord of the Rings Collection"}, tmdb)
-    _, b_byid = remote_search(base, token, "BoxSet", {"ProviderIds": {"Tmdb": "119"},
-                                                      "Name": "The Matrix Collection"}, tmdb)
-    _, b_bogus = remote_search(base, token, "BoxSet",
-                               {"Name": "zzqxwv nonexistent collection 99812"}, tmdb)
-    ev = {"named": identify(b_named),
-          "byid": identify(b_byid),
-          "bogus_empty": b_bogus == []}
+    ev = {"named": identify(rows["b_named"]),
+          "byid": identify(rows["b_byid"]),
+          "padded": identify(rows["b_padded"]),
+          "bogus_empty": rows["b_bogus"] == []}
     r["POST /Items/RemoteSearch/BoxSet"] = Same(
-        bool(b_named) and len(b_byid) == 1 and ev["bogus_empty"], ev)
+        bool(rows["b_named"]) and pinned("b_byid", "119") and pinned("b_padded", "119")
+        and ev["bogus_empty"], ev)
 
     # ---- Person --------------------------------------------------------------
-    # Only the by-id branch takes a language upstream (`GetPersonAsync(id, language,
-    # countryCode, …)`); `SearchPersonAsync(name, ct)` takes none. `bio_localized` compares
-    # each server against ITSELF, so it is drift-proof: it is true only when the fr and en
-    # biographies of the SAME person differ.
-    _, p_named = remote_search(base, token, "Person", {"Name": "Tom Hanks"}, tmdb)
-    _, p_fr = remote_search(base, token, "Person",
-                            {"ProviderIds": {"Tmdb": "31"}, "MetadataLanguage": "fr",
-                             "MetadataCountryCode": "FR"}, tmdb)
-    _, p_en = remote_search(base, token, "Person",
-                            {"ProviderIds": {"Tmdb": "31"}, "MetadataLanguage": "en",
-                             "MetadataCountryCode": "US"}, tmdb)
-    _, p_bogus = remote_search(base, token, "Person",
-                               {"Name": "zzqqxxnotarealpersonzzz"}, tmdb)
-    _, p_noprov = remote_search(base, token, "Person", {"Name": "Tom Hanks"}, "NoSuchProvider")
-    fr_bio = p_fr[0].get("Overview") if p_fr else None
-    en_bio = p_en[0].get("Overview") if p_en else None
-    ev = {"named": identify(p_named),
-          "byid_ids": [x.get("ProviderIds") for x in p_en],
-          "byid_name": [x.get("Name") for x in p_en],
+    # `bio_localized` compares each server against ITSELF, so it is drift-proof: it is true
+    # only when the fr and en biographies of the SAME person differ, which is the effect of
+    # the language reaching /person/{id}. The fr and en rows are ALSO cross-compared whole
+    # (`byid_fr`/`byid_en`), so the biography TEXT the language fix changes is diffed, not
+    # merely asserted to be two different strings.
+    fr_bio = rows["p_fr"][0].get("Overview") if rows["p_fr"] else None
+    en_bio = rows["p_en"][0].get("Overview") if rows["p_en"] else None
+    ev = {"named": identify(rows["p_named"]),
+          "byid_en": identify(rows["p_en"]),
+          "byid_fr": identify(rows["p_fr"]),
+          "padded": identify(rows["p_padded"]),
           "bio_localized": bool(fr_bio) and bool(en_bio) and fr_bio != en_bio,
-          "bogus_empty": p_bogus == [],
-          "provider_filter_empty": p_noprov == []}
+          "bogus_empty": rows["p_bogus"] == [],
+          "provider_filter_empty": rows["p_noprov"] == []}
     r["POST /Items/RemoteSearch/Person"] = Same(
-        bool(p_named) and len(p_en) == 1 and ev["bio_localized"]
+        bool(rows["p_named"]) and pinned("p_en", "31") and pinned("p_fr", "31")
+        and pinned("p_padded", "31") and ev["bio_localized"]
         and ev["bogus_empty"] and ev["provider_filter_empty"], ev)
 
     # ---- Trailer -------------------------------------------------------------
-    # OMDb is the only Trailer fetcher on either side, so this row measures the OMDb-key
-    # divergence rather than hiding it.
-    omdb = "The Open Movie Database"
-    t_st, t_named = remote_search(base, token, "Trailer",
-                                  {"Name": "Inception", "Year": 2010}, omdb)
-    _, t_bogus = remote_search(base, token, "Trailer",
-                               {"Name": "zzqxwvyunlikelytitle12345"}, omdb)
-    ev = {"status": t_st,
-          "named": identify(t_named),
-          "bogus_empty": t_bogus == []}
+    ev = {"status": status["t_named"],
+          "named": identify(rows["t_named"]),
+          "bogus_empty": rows["t_bogus"] == []}
     r["POST /Items/RemoteSearch/Trailer"] = Same(
-        t_st == 200 and bool(t_named) and ev["bogus_empty"], ev)
+        status["t_named"] == 200 and bool(rows["t_named"]) and ev["bogus_empty"], ev)
     return r
 
 
@@ -1339,10 +1409,21 @@ def run_all(base, token, user):
 
 def journeys(ferrofin_url, jellyfin_url):
     ht, hu = bring_up(ferrofin_url, "ferrofin")
+    jt = ju = None
+    if jellyfin_url:
+        # Both servers are authenticated BEFORE either suite runs, so a journey whose
+        # oracle is a live third party (j_remote_search_identify) can ask them the same
+        # question back-to-back instead of inheriting the leg-after-leg ordering below.
+        # bring_up is idempotent, so hoisting it changes nothing else.
+        jt, ju = bring_up(jellyfin_url, "jellyfin")
+    PAIR.clear()
+    _IDENTIFY_CACHE.clear()
+    PAIR[ferrofin_url] = (jellyfin_url, jt)
+    if jellyfin_url:
+        PAIR[jellyfin_url] = (ferrofin_url, ht)
     h = run_all(ferrofin_url, ht, hu)
     j = {}
     if jellyfin_url:
-        jt, ju = bring_up(jellyfin_url, "jellyfin")
         j = run_all(jellyfin_url, jt, ju)
 
     rows = {}
@@ -1407,9 +1488,51 @@ def selfcheck():
     assert combine(Same(False, {"a": 1}), Same(True, {"a": 1})) is False
     assert evidence_diff({"a": 1, "b": 2}, {"a": 1, "b": 3}) == "b: H=2 J=3"
     assert evidence_diff({"a": 1}, {"a": 1}) == "(no key differs)"
-    # Every journey advertises only op keys that exist in the vendored spec.
+
+    # `identify` compares WHOLE candidate objects, so key presence counts. A row that
+    # emits a null where the other omits the key must NOT compare equal — that asymmetry
+    # is exactly what the BoxSet Overview fix changed.
+    assert identify([{"Name": "X"}]) != identify([{"Name": "X", "Overview": None}])
+    assert identify([{"Name": "X"}]) == identify([{"Name": "X"}])
+    # ...and order and count count too.
+    assert identify([{"Name": "A"}, {"Name": "B"}]) != identify([{"Name": "B"}, {"Name": "A"}])
+    assert identify([{"Name": "A"}]) != identify([{"Name": "A"}, {"Name": "A"}])
+
+    # Every field the contract gives RemoteSearchResult is inside that comparison, because
+    # nothing is projected away. Asserted against the spec so a contract bump that adds a
+    # property cannot silently escape the diff.
     import glob
     spec = json.load(open(sorted(glob.glob(os.path.join(ROOT, "contracts/jellyfin-openapi-*.json")))[-1]))
+    rsr = set(spec["components"]["schemas"]["RemoteSearchResult"]["properties"])
+    sample = {k: None for k in rsr}
+    assert identify([sample])[0].keys() == rsr, "identify() must carry every contract field"
+
+    # `identify_responses` asks BOTH servers each case back-to-back, not leg-after-leg:
+    # the interleaving is what makes an element-for-element diff of live TMDB answers
+    # honest, so it is checked here rather than asserted in a docstring.
+    global remote_search
+    real, order = remote_search, []
+    try:
+        remote_search = lambda b, t, k, i, p=None: (order.append((b, k)) or (200, [{"Name": b}]))
+        PAIR.clear(); _IDENTIFY_CACHE.clear()
+        PAIR["F"] = ("J", "jtok")
+        PAIR["J"] = ("F", "ftok")
+        got_f = identify_responses("F", "ftok")
+        got_j = identify_responses("J", "jtok")            # served from the cache
+    finally:
+        remote_search = real
+    assert len(order) == 2 * len(IDENTIFY_CASES), order
+    # Adjacent pairs, one case at a time — never all of F's then all of J's.
+    assert [b for b, _ in order] == ["F", "J"] * len(IDENTIFY_CASES), order
+    # ...and the adjacent pair is the SAME case on both servers.
+    kinds = [k for _, k in order]
+    assert kinds[0::2] == kinds[1::2] == [c[0] for c in IDENTIFY_CASES.values()], kinds
+    # Each leg still reports its OWN server's answers, so the cross-server equality the
+    # runner performs is doing real work.
+    assert got_f["m_byid"][1] == [{"Name": "F"}] and got_j["m_byid"][1] == [{"Name": "J"}]
+    PAIR.clear(); _IDENTIFY_CACHE.clear()
+
+    # Every journey advertises only op keys that exist in the vendored spec.
     valid = {f"{m.upper()} {p}" for p, it in spec["paths"].items() for m in it if m in
              ("get", "post", "put", "delete", "patch")}
     class Rec(dict):

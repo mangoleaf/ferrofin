@@ -603,6 +603,37 @@ pub fn normalize_language(language: Option<&str>, country_code: Option<&str>) ->
     Some(language)
 }
 
+/// `TmdbUtils.GetImageLanguagesParam`: the normalized preferred language, its bare
+/// two-letter half when it carried a region, `null`, and `en` as the final fallback —
+/// comma separated (`"fr,null,en"`, `"en,null"`).
+///
+/// `TmdbMovieProvider` hands exactly this string to `FindByExternalIdAsync`'s
+/// `language` argument (`TmdbMovieProvider.cs:96-101` and `:106-111` at v10.11.8), so
+/// TMDB's `/find` sees `language=en,null` for a movie. `TmdbSeriesProvider.cs:73` passes
+/// the bare `MetadataLanguage` instead. That asymmetry is upstream's, and it is ported
+/// rather than smoothed over: `/find` is the branch an IMDb/TVDB Identify search takes,
+/// and sending TMDB a different `language` than the oracle does is how the two servers
+/// would drift apart on a localized title.
+#[must_use]
+pub fn image_languages_param(language: Option<&str>, country_code: Option<&str>) -> String {
+    let preferred = normalize_language(language, country_code).unwrap_or_default();
+    let mut languages = Vec::new();
+    if !preferred.is_empty() {
+        languages.push(preferred.clone());
+        // TMDB carries two-letter codes only, so a 5-letter code supplies both halves.
+        if preferred.len() == 5 {
+            languages.push(preferred[..2].to_owned());
+        }
+    }
+    languages.push("null".to_owned());
+    // English is always the final fallback (and a blank preference is not "en", so it
+    // still gets one — the C# yields `"null,en"` there, not `"null"`).
+    if !preferred.eq_ignore_ascii_case("en") {
+        languages.push("en".to_owned());
+    }
+    languages.join(",")
+}
+
 /// One page of `/movie|tv/{id}/similar`.
 #[derive(Debug, Deserialize)]
 struct SimilarResponse {
