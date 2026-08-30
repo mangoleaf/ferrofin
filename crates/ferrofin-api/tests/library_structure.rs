@@ -439,7 +439,7 @@ async fn update_library_options_by_name_and_missing_is_404() {
         .unwrap();
     assert_eq!(ok.status(), StatusCode::NO_CONTENT);
 
-    // No name (only id) → 404 at this filesystem seam.
+    // Only an id, and it matches no library → 404.
     let missing = router
         .oneshot(
             Request::builder()
@@ -455,6 +455,97 @@ async fn update_library_options_by_name_and_missing_is_404() {
         .await
         .unwrap();
     assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+}
+
+/// `GET /Library/VirtualFolders` as JSON, for tests that key off the projected `ItemId`.
+async fn folders(router: &axum::Router) -> serde_json::Value {
+    let res = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/Library/VirtualFolders")
+                .header("X-Emby-Token", TOKEN)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+/// `POST /Library/VirtualFolders/LibraryOptions` keyed by `id` alone — no `Name`, which
+/// is what jellyfin-web sends.
+async fn post_options(router: &axum::Router, id: &str, trickplay: bool) -> StatusCode {
+    router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/Library/VirtualFolders/LibraryOptions")
+                .header("X-Emby-Token", TOKEN)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(format!(
+                    r#"{{"Id":"{id}","LibraryOptions":{{"EnableTrickplayImageExtraction":{trickplay},"PathInfos":[]}}}}"#
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+}
+
+/// The id-only form is the *only* one a real client can use — `UpdateLibraryOptionsDto`
+/// carries `Guid Id` and nothing else — and the id it echoes back is the dashless
+/// `ItemId` from `GET /Library/VirtualFolders`. C# resolves it with
+/// `GetItemById<CollectionFolder>(request.Id)`, a `Guid` lookup that does not care how
+/// the id was spelled, so both spellings must resolve and the option must round-trip.
+#[tokio::test]
+async fn update_library_options_by_projected_item_id_round_trips() {
+    let (state, vf) = working_state();
+    ferrofin_traits::library::VirtualFolderManager::add_virtual_folder(
+        &*vf,
+        "Lib",
+        None,
+        &ferrofin_model::configuration::LibraryOptions::default(),
+    )
+    .await
+    .unwrap();
+    let router = create_router(state);
+
+    // The id exactly as the server projects it: dashless, no `Name` in the body.
+    let listed = folders(&router).await;
+    let projected = listed[0]["ItemId"].as_str().unwrap().to_owned();
+    assert!(
+        !projected.contains('-'),
+        "ItemId must be projected dashless like Guid.ToString(\"N\"), got {projected}"
+    );
+    assert_eq!(
+        post_options(&router, &projected, true).await,
+        StatusCode::NO_CONTENT
+    );
+    let after = folders(&router).await;
+    assert_eq!(
+        after[0]["LibraryOptions"]["EnableTrickplayImageExtraction"],
+        serde_json::json!(true),
+        "the write must be reflected in the read-back"
+    );
+
+    // The same id hyphenated must resolve too — C#'s `Guid` lookup is format-agnostic.
+    let hyphenated = uuid::Uuid::parse_str(&projected).unwrap().to_string();
+    assert!(hyphenated.contains('-'));
+    assert_eq!(
+        post_options(&router, &hyphenated, false).await,
+        StatusCode::NO_CONTENT
+    );
+    let after = folders(&router).await;
+    assert_eq!(
+        after[0]["LibraryOptions"]["EnableTrickplayImageExtraction"],
+        serde_json::json!(false)
+    );
 }
 
 #[tokio::test]

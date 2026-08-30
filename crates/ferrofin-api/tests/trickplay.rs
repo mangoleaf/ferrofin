@@ -400,13 +400,28 @@ async fn trickplay_playlist_ok_and_not_found() {
         Arc::new(FakeLyrics),
         Arc::new(FakeSubtitles),
     );
-    let (ok, body) = call(
-        app.clone(),
-        "GET",
-        &format!("/Videos/{ITEM_ID}/Trickplay/320/tiles.m3u8"),
-    )
-    .await;
-    assert_eq!(ok, StatusCode::OK);
+    let response = create_router(app.clone())
+        .oneshot(
+            Request::builder()
+                .uri(format!("/Videos/{ITEM_ID}/Trickplay/320/tiles.m3u8"))
+                .header("X-Emby-Token", "tok")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    // `Content(playlist, mime, Encoding.UTF8)` upstream: the charset rides on the header.
+    assert_eq!(
+        response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("application/vnd.apple.mpegurl; charset=utf-8")
+    );
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
     assert!(String::from_utf8_lossy(&body).contains("#EXTM3U"));
 
     let (missing, _) = call(

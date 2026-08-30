@@ -462,14 +462,17 @@ def j_virtualfolder_crud(base, token, user, _m, _m2):
                  json.dumps({"Name": name, "PathInfo": {"Path": tv}}))
     r["POST /Library/VirtualFolders/Paths/Update"] = st < 300 and find() is not None
 
-    # Toggle a library option and verify it round-trips through GET.
+    # Toggle a library option and verify it round-trips through GET. Keyed by `Id` alone,
+    # which is the only key a real client has (`UpdateLibraryOptionsDto` is `{Guid Id,
+    # LibraryOptions}` — no Name), and asserted on the WHOLE options object, not just the
+    # flipped flag: C# replaces the options wholesale, so anything the server silently
+    # drops or rewrites on the way through is a divergence this row should catch.
     opts = (find() or {}).get("LibraryOptions") or {}
-    want = not opts.get("EnablePhotos", True)
-    opts["EnablePhotos"] = want
+    opts["EnablePhotos"] = not opts.get("EnablePhotos", True)
     st, _ = http("POST", f"{base}/Library/VirtualFolders/LibraryOptions", token,
                  json.dumps({"Id": lib_id, "LibraryOptions": opts}))
-    got = ((find() or {}).get("LibraryOptions") or {}).get("EnablePhotos")
-    r["POST /Library/VirtualFolders/LibraryOptions"] = st < 300 and got == want
+    got = (find() or {}).get("LibraryOptions")
+    r["POST /Library/VirtualFolders/LibraryOptions"] = st < 300 and got == opts
 
     st, _ = http("DELETE", f"{base}/Library/VirtualFolders/Paths?name={qn}&path={qtv}"
                           f"&refreshLibrary=false", token)

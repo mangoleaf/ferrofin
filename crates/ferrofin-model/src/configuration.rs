@@ -716,9 +716,13 @@ impl Default for LibraryOptions {
         Self {
             enabled: true,
             enable_photos: true,
-            // Jellyfin's LibraryOptions ctor default: realtime monitoring on.
-            // (It was false while Ferrofin's watcher was a no-op.)
-            enable_realtime_monitor: true,
+            // Jellyfin's `LibraryOptions` ctor never assigns `EnableRealtimeMonitor`
+            // (`v10.11.8:MediaBrowser.Model/Configuration/LibraryOptions.cs` — the
+            // ctor sets 15 other properties, and the field is declared with no
+            // initializer), so a default-constructed library has it off. The
+            // per-library "Enable real time monitoring" checkbox turns it on, and
+            // jellyfin-web sends the flag explicitly when a library is created.
+            enable_realtime_monitor: false,
             enable_lufs_scan: false,
             enable_chapter_image_extraction: false,
             extract_chapter_images_during_library_scan: false,

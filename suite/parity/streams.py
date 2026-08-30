@@ -300,6 +300,12 @@ STREAM_OPS = [
     "GET /Videos/{itemId}/Trickplay/{width}/{index}.jpg",
 ]
 
+# The two ops that depend on trickplay actually having been generated on both servers.
+TRICKPLAY_OPS = (
+    "GET /Videos/{itemId}/Trickplay/{width}/tiles.m3u8",
+    "GET /Videos/{itemId}/Trickplay/{width}/{index}.jpg",
+)
+
 
 def trickplay_width(base, token, c):
     item = get_json(base, f"/Items/{c['episode']}?userId={c['user']}&fields=Trickplay", token) or {}
@@ -312,25 +318,34 @@ def trickplay_width(base, token, c):
 
 def enable_trickplay(base, token):
     """Turn trickplay extraction on for the Shows library (LibraryOptions) and start the
-    generation task; returns the task id to wait on (None when nothing could be started)."""
+    generation task.
+
+    Returns `(task_id, reason)`. `task_id` is None when nothing could be started, and
+    `reason` then names the step that failed — every failure here silently degrades both
+    trickplay rows to UNRESOLVED, so the cause has to travel with them — a bare
+    `unresolved` once hid a real 404 on the enabling write."""
     folders = get_json(base, "/Library/VirtualFolders", token) or []
     shows = next((f for f in folders if (f.get("CollectionType") or "").lower() == "tvshows"), None)
     if not shows:
-        return None
+        return None, "no tvshows library in GET /Library/VirtualFolders"
     opts = shows.get("LibraryOptions") or {}
     opts["EnableTrickplayImageExtraction"] = True
+    # Id only, exactly as jellyfin-web does: UpdateLibraryOptionsDto carries a Guid Id and
+    # nothing else, so posting a Name here would be testing a route no client can use.
     st, _ = http("POST", f"{base}/Library/VirtualFolders/LibraryOptions", token,
                  json.dumps({"Id": shows.get("ItemId"), "LibraryOptions": opts}))
     if st >= 300:
-        return None
+        return None, f"POST /Library/VirtualFolders/LibraryOptions -> {st}"
     tasks = get_json(base, "/ScheduledTasks", token) or []
     # By key first: both servers also ship a "Move Trickplay Images" task whose name matches.
     task = (next((t for t in tasks if (t.get("Key") or "") == "RefreshTrickplayImages"), None)
             or next((t for t in tasks if "generate trickplay" in (t.get("Name") or "").lower()), None))
     if not task:
-        return None
+        return None, "no RefreshTrickplayImages scheduled task"
     st, _ = http("POST", f"{base}/ScheduledTasks/Running/{task['Id']}", token, "")
-    return task["Id"] if st < 300 else None
+    if st >= 300:
+        return None, f"POST /ScheduledTasks/Running/{task['Id']} -> {st}"
+    return task["Id"], ""
 
 
 def wait_task(base, token, task_id):
@@ -456,8 +471,16 @@ def run(ferrofin_url, jellyfin_url):
         print("!! ffprobe not on PATH: segment rows compare MIME + container magic only",
               file=sys.stderr)
     # Both generation tasks run concurrently; wait for each.
-    th, tj = enable_trickplay(ferrofin_url, ht), enable_trickplay(jellyfin_url, jt)
+    (th, why_h), (tj, why_j) = enable_trickplay(ferrofin_url, ht), enable_trickplay(jellyfin_url, jt)
     tp_h, tp_j = wait_task(ferrofin_url, ht, th), wait_task(jellyfin_url, jt, tj)
+    if th and not tp_h:
+        why_h = f"generation task {th} still running after {TRICKPLAY_WAIT_S}s"
+    if tj and not tp_j:
+        why_j = f"generation task {tj} still running after {TRICKPLAY_WAIT_S}s"
+    blocked = "; ".join(f"{n} could not generate trickplay ({w})"
+                        for n, w in (("ferrofin", why_h), ("jellyfin", why_j)) if w)
+    if blocked:
+        print(f"!! {blocked}", file=sys.stderr)
     print(f"trickplay generated: ferrofin={tp_h} jellyfin={tp_j}")
     hs, js = signatures(ferrofin_url, ht, hc), signatures(jellyfin_url, jt, jc)
     rows = {}
@@ -473,6 +496,12 @@ def run(ferrofin_url, jellyfin_url):
         rows[op] = {"deep_verified": bool(ok),
                     "classification": "" if ok else "flagged: stream signature diff vs Jellyfin (verify)",
                     "note": f"H={describe(h)} J={describe(j)}"}
+    # A trickplay row that could not be probed must say *why* it could not be probed;
+    # otherwise a broken enabling write reads as an inconclusive fixture problem.
+    if blocked:
+        for op in TRICKPLAY_OPS:
+            if op in rows and not rows[op]["deep_verified"]:
+                rows[op]["note"] = f'{rows[op]["note"]} [{blocked}]'
     return rows
 
 
@@ -499,6 +528,7 @@ def selfcheck():
     valid = {f"{m.upper()} {p}" for p, item in spec["paths"].items() for m in item if m in ("get", "head")}
     declared = set(re.findall(r'"((?:GET|HEAD) /[^"]+)"', inspect.getsource(signatures)))
     assert declared == set(STREAM_OPS), (declared ^ set(STREAM_OPS))
+    assert set(TRICKPLAY_OPS) <= set(STREAM_OPS), set(TRICKPLAY_OPS) - set(STREAM_OPS)
     bad = sorted(k for k in declared if k not in valid)
     assert not bad, f"stream op-keys not in spec: {bad}"
     # playlist normalisation: noise stripped, durations rounded, segments counted.

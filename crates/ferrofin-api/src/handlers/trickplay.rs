@@ -69,7 +69,14 @@ async fn get_trickplay_hls_playlist(
         .await?;
     match playlist {
         Some(text) if !text.is_empty() => Ok((
-            [(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")],
+            // C# returns `Content(playlist, MimeTypes.GetMimeType("playlist.m3u8"),
+            // Encoding.UTF8)`, and ASP.NET folds that encoding into the header — so the
+            // wire value carries the charset. (The HLS controllers use a plain
+            // `FileContentResult`/`Content` without an encoding, hence no charset there.)
+            [(
+                header::CONTENT_TYPE,
+                "application/vnd.apple.mpegurl; charset=utf-8",
+            )],
             text,
         )
             .into_response()),

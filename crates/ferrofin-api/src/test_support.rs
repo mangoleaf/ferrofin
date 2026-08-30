@@ -1983,6 +1983,28 @@ impl FakeVirtualFolders {
         }
     }
 
+    /// The `ItemId` this fake projects for `name`.
+    ///
+    /// The real manager derives a deterministic `CollectionFolder` id from the
+    /// library's path and projects it **dashless** (`Guid.ToString("N")`, as
+    /// `LibraryManager.GetVirtualFolderInfo` does). The fake only needs the same
+    /// *shape* — a stable id in the same spelling — so id-keyed handlers are
+    /// exercised against the wire format clients actually echo back. (Any stable
+    /// name→bytes fold does; this one just tiles the name over the 16 id bytes.)
+    #[must_use]
+    pub fn projected_item_id(name: &str) -> String {
+        let src = name.as_bytes();
+        let mut bytes = [0u8; 16];
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = src
+                .get(i % src.len().max(1))
+                .copied()
+                .unwrap_or(0)
+                .wrapping_add(u8::try_from(i).unwrap_or(0));
+        }
+        Uuid::from_bytes(bytes).simple().to_string()
+    }
+
     /// The uniform failure used when [`Self::fail`] is set.
     fn guard(&self) -> Result<(), ServiceError> {
         if self.fail {
@@ -2018,6 +2040,7 @@ impl VirtualFolderManager for FakeVirtualFolders {
                 locations: options.path_infos.iter().map(|p| p.path.clone()).collect(),
                 collection_type,
                 library_options: Some(options.clone()),
+                item_id: Some(Self::projected_item_id(name)),
                 ..ferrofin_model::entities_media::VirtualFolderInfo::default()
             },
         );

@@ -470,11 +470,15 @@ struct UpdateLibraryOptionsBody {
 ///
 /// **Id vs name.** C# looks the library up by its `CollectionFolder` item id
 /// (`GetItemById<CollectionFolder>(request.Id)`), and jellyfin-web sends only that
-/// `Id` (no `Name`). Ferrofin's virtual-folder seam is keyed by the library `Name`
-/// (its directory name), but the `CollectionFolder` row now carries the same
-/// deterministic id it projects into `VirtualFolderInfo.ItemId`, so we resolve the
-/// posted `Id` back to its name via `get_virtual_folders`. `Name` is still honored
-/// when supplied; a request matching no library (by either) is a `404`.
+/// `Id` (no `Name` — `UpdateLibraryOptionsDto` has no such field). Ferrofin's
+/// virtual-folder seam is keyed by the library `Name` (its directory name), so we
+/// resolve the posted `Id` back to a name via `get_virtual_folders`. That
+/// projection spells `ItemId` dashless (`Guid.ToString("N")`, as
+/// `LibraryManager.GetVirtualFolderInfo` does), so the match must be made on the
+/// **parsed** `Uuid` — comparing `id.to_string()` (hyphenated) against the
+/// projected string can never succeed. Parsing also makes the route
+/// format-agnostic the way C#'s `Guid` lookup is. `Name` is still honored when
+/// supplied; a request matching no library (by either) is a `404`.
 #[utoipa::path(
     post,
     path = "/Library/VirtualFolders/LibraryOptions",
@@ -499,13 +503,12 @@ async fn update_library_options(
         let id = body
             .id
             .ok_or_else(|| ApiError::NotFound("library (no Id or Name supplied)".to_owned()))?;
-        let wanted = id.to_string();
         state
             .virtual_folders
             .get_virtual_folders()
             .await?
             .into_iter()
-            .find(|f| f.item_id.as_deref() == Some(wanted.as_str()))
+            .find(|f| f.item_id.as_deref().and_then(|s| Uuid::parse_str(s).ok()) == Some(id))
             .and_then(|f| f.name)
             .ok_or_else(|| ApiError::NotFound(format!("library {id}")))?
     };
