@@ -24,6 +24,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use ferrofin_db::Database;
+use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_db::entities::playback::UserDataEntity;
 use ferrofin_db::store::{guid_to_db, opt_datetime_to_db};
 use ferrofin_model::data::BaseItemKind;
@@ -481,6 +482,104 @@ impl FerrofinUserDataManager {
     }
 }
 
+/// The synthetic `UserData.Key` for an item that has **no** stored row.
+///
+/// Port of the fallback in C# `UserDataManager.GetUserData(User, BaseItem)`:
+///
+/// ```csharp
+/// return item.UserData?...FirstOrDefault()
+///        ?? new UserItemData { Key = item.GetUserDataKeys()[0] };
+/// ```
+///
+/// So a `Year` reports `"Year-2020"`, a `Studio` `"Studio-Acme"`, an `Audio` its
+/// `<artist>-<album>-…` composite and an `Episode` its series' key with the
+/// `SSSEEE` suffix — never the item guid, which is only ever the *last* key in
+/// the list. Ferrofin used to answer with the guid on every row.
+///
+/// Everything is read off the `BaseItems` row the caller is already projecting;
+/// `providers` carries the `BaseItemProviders` rows **only when the caller's
+/// query hydrated them** (see
+/// [`UserDataManager::get_user_data_dtos_for_rows`]). An episode's series is
+/// reconstructed from its `SeriesId` alone — with no provider ids a series'
+/// only key is its own guid, so the suffix rule needs no second row read.
+fn row_fallback_key(
+    item: &BaseItemEntity,
+    item_id: Uuid,
+    providers: &HashMap<Uuid, Vec<(String, String)>>,
+) -> String {
+    let kind = kind_from_type_name(&item.type_).unwrap_or(BaseItemKind::Folder);
+    let empty: Vec<(String, String)> = Vec::new();
+    let own_providers = providers.get(&item_id).unwrap_or(&empty);
+    let series_id = item
+        .series_id
+        .as_deref()
+        .and_then(|s| Uuid::parse_str(s).ok());
+    let series_providers = series_id
+        .and_then(|id| providers.get(&id))
+        .unwrap_or(&empty);
+    let source = key_source(item, item_id, kind, own_providers);
+    // Only a Season or an Episode consults its series (the same gate the write
+    // path uses); every other kind ignores the argument entirely.
+    let series_source = match (kind, series_id) {
+        (BaseItemKind::Season | BaseItemKind::Episode, Some(series)) => Some(KeySource {
+            item_id: series,
+            kind: BaseItemKind::Series,
+            tvdb: provider_value(series_providers, "Tvdb"),
+            imdb: provider_value(series_providers, "Imdb"),
+            custom: provider_value(series_providers, "Custom"),
+            name: item.series_name.as_deref(),
+            ..KeySource::default()
+        }),
+        _ => None,
+    };
+    user_data_keys(&source, series_source.as_ref())
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| item_id.to_string())
+}
+
+/// The key-derivation view of a `BaseItems` row.
+fn key_source<'a>(
+    item: &'a BaseItemEntity,
+    item_id: Uuid,
+    kind: BaseItemKind,
+    providers: &'a [(String, String)],
+) -> KeySource<'a> {
+    KeySource {
+        item_id,
+        kind,
+        tmdb: provider_value(providers, "Tmdb"),
+        imdb: provider_value(providers, "Imdb"),
+        tvdb: provider_value(providers, "Tvdb"),
+        custom: provider_value(providers, "Custom"),
+        musicbrainz_album: provider_value(providers, "MusicBrainzAlbum"),
+        musicbrainz_release_group: provider_value(providers, "MusicBrainzReleaseGroup"),
+        musicbrainz_artist: provider_value(providers, "MusicBrainzArtist"),
+        episode_title: item.episode_title.as_deref(),
+        is_series: item.is_series,
+        index_number: item.index_number,
+        parent_index_number: item.parent_index_number,
+        name: item.name.as_deref(),
+        album: item.album.as_deref(),
+        // `AlbumArtists` is a delimited list; the C# key uses the first.
+        album_artist: item
+            .album_artists
+            .as_deref()
+            .and_then(|a| a.split('|').next())
+            .filter(|a| !a.is_empty()),
+        extra_type: item.extra_type.and_then(extra_type_name),
+        run_time_ticks: item.run_time_ticks,
+    }
+}
+
+/// Looks a provider id up case-insensitively, the way C# `TryGetProviderId` does.
+fn provider_value<'a>(providers: &'a [(String, String)], want: &str) -> Option<&'a str> {
+    providers
+        .iter()
+        .find(|(id, _)| id.eq_ignore_ascii_case(want))
+        .map(|(_, v)| v.as_str())
+}
+
 /// Maps a [`UserDataEntity`] row to the presentation DTO (C#
 /// `GetUserItemDataDto`). Playback fields carry over verbatim; the
 /// item-dependent `PlayedPercentage`/`UnplayedItemCount` are left unset here
@@ -557,65 +656,88 @@ impl UserDataManager for FerrofinUserDataManager {
         item_ids: &[Uuid],
         user_id: Uuid,
     ) -> Result<std::collections::HashMap<Uuid, UserItemDataDto>, ServiceError> {
-        // The bool tracks whether the stored DTO came from the item's own guid
-        // row, so a later one can displace a provider-keyed stand-in.
-        let mut map: std::collections::HashMap<Uuid, (UserItemDataDto, bool)> =
-            std::collections::HashMap::with_capacity(item_ids.len());
-        // One IN-query per chunk instead of one query per item.
-        for chunk in item_ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
-            let placeholders = (2..=chunk.len() + 1)
-                .map(|i| format!("?{i}"))
-                .collect::<Vec<_>>()
-                .join(",");
-            // Every row for these items, not just the guid-keyed one. An
-            // adopted item carries a row per `CustomDataKey`, and filtering to
-            // `lower(ItemId)` here made a page disagree with the per-item
-            // endpoint about the same item whenever the default row was absent
-            // — favourite on `/Items/{id}`, not favourite in the listing.
-            //
-            // The per-item path resolves ties by derived-key priority; doing
-            // that here would mean deriving keys for a whole page, which is the
-            // N+1 this batch exists to avoid. Instead: prefer the guid row,
-            // else take the lowest key deterministically. The two agree
-            // wherever a guid row exists, which is every item either server has
-            // ever written — the id is always the last key saved.
-            let sql = format!(
-                r#"SELECT * FROM "UserData"
-                   WHERE "UserId" = ?1 AND "ItemId" IN ({placeholders})
-                   ORDER BY "CustomDataKey""#,
-            );
-            let mut query = sqlx::query_as::<_, UserDataEntity>(&sql).bind(guid_to_db(user_id));
-            for id in chunk {
-                query = query.bind(guid_to_db(*id));
-            }
-            let rows = query.fetch_all(self.db.pool()).await.map_err(db_err)?;
-            for row in rows {
-                let Ok(item_id) = Uuid::parse_str(&row.item_id) else {
-                    continue;
-                };
-                let is_default = row.custom_data_key == item_id.to_string();
-                match map.entry(item_id) {
-                    std::collections::hash_map::Entry::Vacant(slot) => {
-                        slot.insert((to_dto(&row, item_id), is_default));
-                    }
-                    // A later guid row displaces an earlier provider-keyed one;
-                    // nothing displaces the guid row.
-                    std::collections::hash_map::Entry::Occupied(mut slot) if is_default => {
-                        slot.insert((to_dto(&row, item_id), true));
-                    }
-                    std::collections::hash_map::Entry::Occupied(_) => {}
-                }
-            }
-        }
+        let mut map = self.stored_user_data_dtos(item_ids, user_id).await?;
         // Items without a stored row get the empty-row DTO, matching the
-        // per-item path's `unwrap_or_else(empty_row)` fallback.
+        // per-item path's `unwrap_or_else(empty_row)` fallback. With only an id
+        // in hand the synthetic key can only be the guid; the row-aware form
+        // (`get_user_data_dtos_for_rows`) derives the real one.
         for &item_id in item_ids {
             map.entry(item_id)
-                .or_insert_with(|| (to_dto(&Self::empty_row(item_id, user_id), item_id), true));
+                .or_insert_with(|| to_dto(&Self::empty_row(item_id, user_id), item_id));
         }
-        Ok(map.into_iter().map(|(id, (dto, _))| (id, dto)).collect())
+        Ok(map)
     }
 
+    async fn get_user_data_dtos_for_rows(
+        &self,
+        items: &[BaseItemEntity],
+        user_id: Uuid,
+        include_provider_ids: bool,
+    ) -> Result<std::collections::HashMap<Uuid, UserItemDataDto>, ServiceError> {
+        let ids: Vec<Uuid> = items
+            .iter()
+            .filter_map(|i| Uuid::parse_str(&i.id).ok())
+            .collect();
+        let mut map = self.stored_user_data_dtos(&ids, user_id).await?;
+        // Only the rows with no stored user data need a synthesized key.
+        let missing: Vec<&BaseItemEntity> = items
+            .iter()
+            .filter(|i| Uuid::parse_str(&i.id).is_ok_and(|id| !map.contains_key(&id)))
+            .collect();
+        if missing.is_empty() {
+            return Ok(map);
+        }
+        // Provider ids, one batched read, and only when the caller's query
+        // hydrated them (see the trait doc). Season/Episode keys come from the
+        // SERIES, so its providers are read in the same pass.
+        let providers = if include_provider_ids {
+            let mut wanted: Vec<Uuid> = Vec::new();
+            for item in &missing {
+                let kind = kind_from_type_name(&item.type_).unwrap_or(BaseItemKind::Folder);
+                if uses_provider_ids(kind)
+                    && let Ok(id) = Uuid::parse_str(&item.id)
+                {
+                    wanted.push(id);
+                }
+                if matches!(kind, BaseItemKind::Season | BaseItemKind::Episode)
+                    && let Some(series) = item
+                        .series_id
+                        .as_deref()
+                        .and_then(|s| Uuid::parse_str(s).ok())
+                {
+                    wanted.push(series);
+                }
+            }
+            self.provider_ids_batch(&wanted).await?
+        } else {
+            HashMap::new()
+        };
+        for item in missing {
+            let Ok(item_id) = Uuid::parse_str(&item.id) else {
+                continue;
+            };
+            let key = row_fallback_key(item, item_id, &providers);
+            map.insert(item_id, {
+                let mut row = Self::empty_row(item_id, user_id);
+                row.custom_data_key = key;
+                to_dto(&row, item_id)
+            });
+        }
+        Ok(map)
+    }
+
+    async fn get_user_data_batch(
+        &self,
+        item_ids: &[Uuid],
+        user_id: Uuid,
+    ) -> Result<HashMap<Uuid, UserItemDataDto>, ServiceError> {
+        // Identical semantics to the per-item loop this used to run (the stored
+        // row when present, the empty row otherwise) in one chunked `IN` query —
+        // the loop was an N+1 that issued one round trip per candidate item
+        // (~100 per `/Items/Latest` request, which post-filters the whole
+        // candidate set by played state).
+        self.get_user_data_dtos(item_ids, user_id).await
+    }
     async fn set_likes(
         &self,
         user_id: Uuid,
@@ -632,19 +754,6 @@ impl UserDataManager for FerrofinUserDataManager {
         row.likes = likes;
         self.upsert_row(&row).await?;
         Ok(to_dto(&row, item_id))
-    }
-
-    async fn get_user_data_batch(
-        &self,
-        item_ids: &[Uuid],
-        user_id: Uuid,
-    ) -> Result<HashMap<Uuid, UserItemDataDto>, ServiceError> {
-        // Identical semantics to the per-item loop this used to run (the stored
-        // row when present, the empty row otherwise) in one chunked `IN` query —
-        // the loop was an N+1 that issued one round trip per candidate item
-        // (~100 per `/Items/Latest` request, which post-filters the whole
-        // candidate set by played state).
-        self.get_user_data_dtos(item_ids, user_id).await
     }
 
     async fn update_play_state(
@@ -846,11 +955,113 @@ impl UserDataManager for FerrofinUserDataManager {
     }
 }
 
+impl FerrofinUserDataManager {
+    /// The `BaseItemProviders` rows for `ids`, keyed by item id — one chunked
+    /// `IN` read instead of the per-item query the write path makes.
+    async fn provider_ids_batch(
+        &self,
+        ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, Vec<(String, String)>>, ServiceError> {
+        let mut out: HashMap<Uuid, Vec<(String, String)>> = HashMap::new();
+        if ids.is_empty() {
+            return Ok(out);
+        }
+        for chunk in ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+            let placeholders = (1..=chunk.len())
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                r#"SELECT "ItemId", "ProviderId", "ProviderValue" FROM "BaseItemProviders"
+                   WHERE "ItemId" IN ({placeholders})"#,
+            );
+            let mut query = sqlx::query_as::<_, (String, String, String)>(&sql);
+            for id in chunk {
+                query = query.bind(guid_to_db(*id));
+            }
+            for (item_id, provider, value) in
+                query.fetch_all(self.db.pool()).await.map_err(db_err)?
+            {
+                if let Ok(id) = Uuid::parse_str(&item_id) {
+                    out.entry(id).or_default().push((provider, value));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// The stored `UserData` DTOs for these items, keyed by item id — items
+    /// with no row are simply absent from the map.
+    ///
+    /// Split out of [`UserDataManager::get_user_data_dtos`] so the row-aware
+    /// form can reuse the identical read and differ only in the key it
+    /// synthesizes for a missing row.
+    async fn stored_user_data_dtos(
+        &self,
+        item_ids: &[Uuid],
+        user_id: Uuid,
+    ) -> Result<std::collections::HashMap<Uuid, UserItemDataDto>, ServiceError> {
+        // The bool tracks whether the stored DTO came from the item's own guid
+        // row, so a later one can displace a provider-keyed stand-in.
+        let mut map: std::collections::HashMap<Uuid, (UserItemDataDto, bool)> =
+            std::collections::HashMap::with_capacity(item_ids.len());
+        // One IN-query per chunk instead of one query per item.
+        for chunk in item_ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+            let placeholders = (2..=chunk.len() + 1)
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            // Every row for these items, not just the guid-keyed one. An
+            // adopted item carries a row per `CustomDataKey`, and filtering to
+            // `lower(ItemId)` here made a page disagree with the per-item
+            // endpoint about the same item whenever the default row was absent
+            // — favourite on `/Items/{id}`, not favourite in the listing.
+            //
+            // The per-item path resolves ties by derived-key priority; doing
+            // that here would mean deriving keys for a whole page, which is the
+            // N+1 this batch exists to avoid. Instead: prefer the guid row,
+            // else take the lowest key deterministically. The two agree
+            // wherever a guid row exists, which is every item either server has
+            // ever written — the id is always the last key saved.
+            let sql = format!(
+                r#"SELECT * FROM "UserData"
+                   WHERE "UserId" = ?1 AND "ItemId" IN ({placeholders})
+                   ORDER BY "CustomDataKey""#,
+            );
+            let mut query = sqlx::query_as::<_, UserDataEntity>(&sql).bind(guid_to_db(user_id));
+            for id in chunk {
+                query = query.bind(guid_to_db(*id));
+            }
+            let rows = query.fetch_all(self.db.pool()).await.map_err(db_err)?;
+            for row in rows {
+                let Ok(item_id) = Uuid::parse_str(&row.item_id) else {
+                    continue;
+                };
+                let is_default = row.custom_data_key == item_id.to_string();
+                match map.entry(item_id) {
+                    std::collections::hash_map::Entry::Vacant(slot) => {
+                        slot.insert((to_dto(&row, item_id), is_default));
+                    }
+                    // A later guid row displaces an earlier provider-keyed one;
+                    // nothing displaces the guid row.
+                    std::collections::hash_map::Entry::Occupied(mut slot) if is_default => {
+                        slot.insert((to_dto(&row, item_id), true));
+                    }
+                    std::collections::hash_map::Entry::Occupied(_) => {}
+                }
+            }
+        }
+        Ok(map.into_iter().map(|(id, (dto, _))| (id, dto)).collect())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::configuration_manager::default_server_configuration;
-    use crate::test_support::{seed_item, seed_provider_id, seed_user, test_db};
+    use crate::test_support::{
+        fetch_item, seed_item, seed_named_item, seed_provider_id, seed_user, test_db,
+    };
     use ferrofin_model::configuration::ServerConfiguration;
 
     /// A config manager whose configuration is the factory default.
@@ -1331,6 +1542,155 @@ mod tests {
             .expect("some");
         assert!(!dto.is_favorite);
         assert_eq!(dto.play_count, 0);
+    }
+
+    /// C# `GetUserData(User, BaseItem)` synthesizes the missing row with
+    /// `Key = item.GetUserDataKeys()[0]` — `"Year-2020"` for a year, never the
+    /// item guid. Ferrofin answered with the guid on every by-name row.
+    #[tokio::test]
+    async fn a_row_less_year_reports_its_derived_key_not_its_guid() {
+        let db = test_db().await;
+        let user = Uuid::from_u128(1);
+        let year = Uuid::from_u128(0xF101);
+        seed_user(&db, user).await;
+        seed_named_item(&db, year, BaseItemKind::Year, "2020").await;
+        let row = fetch_item(&db, year).await;
+        let mgr = FerrofinUserDataManager::new(db, config());
+
+        let map = mgr
+            .get_user_data_dtos_for_rows(std::slice::from_ref(&row), user, false)
+            .await
+            .expect("rows");
+        assert_eq!(map[&year].key, "Year-2020");
+        assert!(!map[&year].is_favorite);
+    }
+
+    /// The same rule across the by-name kinds — `Studio-…`, `Genre-…`,
+    /// `Person-…` (`Genre.cs:37`, `Person.cs:40`, `Studio.cs:…`).
+    #[tokio::test]
+    async fn row_less_by_name_items_report_their_type_prefixed_keys() {
+        let db = test_db().await;
+        let user = Uuid::from_u128(1);
+        seed_user(&db, user).await;
+        let mut rows = Vec::new();
+        for (n, kind, name, want) in [
+            (0xF201_u128, BaseItemKind::Studio, "Acme", "Studio-Acme"),
+            (0xF202, BaseItemKind::Genre, "Drama", "Genre-Drama"),
+            (
+                0xF203,
+                BaseItemKind::Person,
+                "Bob Parity",
+                "Person-Bob Parity",
+            ),
+        ] {
+            let id = Uuid::from_u128(n);
+            seed_named_item(&db, id, kind, name).await;
+            rows.push((id, fetch_item(&db, id).await, want));
+        }
+        let entities: Vec<_> = rows.iter().map(|(_, e, _)| e.clone()).collect();
+        let mgr = FerrofinUserDataManager::new(db, config());
+
+        let map = mgr
+            .get_user_data_dtos_for_rows(&entities, user, false)
+            .await
+            .expect("rows");
+        for (id, _, want) in &rows {
+            assert_eq!(&map[id].key, want, "item {id}");
+        }
+    }
+
+    /// An `Episode` is keyed through its SERIES plus `SSSEEE`
+    /// (`TV/Episode.cs:158`), so a row-less episode reports
+    /// `<series key>001002`, not its own guid.
+    #[tokio::test]
+    async fn a_row_less_episode_is_keyed_through_its_series() {
+        let db = test_db().await;
+        let user = Uuid::from_u128(1);
+        let series = Uuid::from_u128(0xF401);
+        let episode = Uuid::from_u128(0xF402);
+        seed_user(&db, user).await;
+        seed_named_item(&db, series, BaseItemKind::Series, "Show").await;
+        seed_named_item(&db, episode, BaseItemKind::Episode, "Ep").await;
+        sqlx::query(
+            r#"UPDATE "BaseItems"
+               SET "SeriesId" = ?2, "ParentIndexNumber" = 1, "IndexNumber" = 2
+               WHERE "Id" = ?1"#,
+        )
+        .bind(guid_to_db(episode))
+        .bind(guid_to_db(series))
+        .execute(db.writer())
+        .await
+        .expect("link episode to series");
+        let row = fetch_item(&db, episode).await;
+        let mgr = FerrofinUserDataManager::new(db, config());
+
+        let map = mgr
+            .get_user_data_dtos_for_rows(std::slice::from_ref(&row), user, false)
+            .await
+            .expect("rows");
+        assert_eq!(map[&episode].key, format!("{series}001002"));
+    }
+
+    /// Provider ids join the derivation only when the caller says its query
+    /// hydrated them (C# `.Include(e => e.Provider)`), which is what makes the
+    /// same movie report its guid in a plain list and `tt…` by id.
+    #[tokio::test]
+    async fn provider_keys_appear_only_when_provider_ids_were_hydrated() {
+        let db = test_db().await;
+        let user = Uuid::from_u128(1);
+        let movie = Uuid::from_u128(0xF501);
+        seed_user(&db, user).await;
+        seed_item(&db, movie, BaseItemKind::Movie).await;
+        seed_provider_id(&db, movie, "Imdb", "tt0111161").await;
+        let row = fetch_item(&db, movie).await;
+        let mgr = FerrofinUserDataManager::new(db, config());
+
+        let listed = mgr
+            .get_user_data_dtos_for_rows(std::slice::from_ref(&row), user, false)
+            .await
+            .expect("list");
+        assert_eq!(listed[&movie].key, movie.to_string());
+
+        let by_id = mgr
+            .get_user_data_dtos_for_rows(std::slice::from_ref(&row), user, true)
+            .await
+            .expect("by id");
+        assert_eq!(by_id[&movie].key, "tt0111161");
+    }
+
+    /// A **stored** row still reports its own `CustomDataKey`; the derivation
+    /// only fills the missing-row case (C# `item.UserData?…FirstOrDefault() ??`).
+    ///
+    /// `save_user_data` writes one row per derived key, and
+    /// [`FerrofinUserDataManager::preferred_row`] deliberately prefers the guid
+    /// row (see its doc comment), so the stored answer here is the guid — the
+    /// pre-existing behaviour, unchanged by the missing-row derivation.
+    #[tokio::test]
+    async fn a_stored_row_keeps_its_own_key() {
+        let db = test_db().await;
+        let user = Uuid::from_u128(1);
+        let year = Uuid::from_u128(0xF301);
+        seed_user(&db, user).await;
+        seed_named_item(&db, year, BaseItemKind::Year, "2021").await;
+        let row = fetch_item(&db, year).await;
+        let mgr = FerrofinUserDataManager::new(db, config());
+        mgr.save_user_data(
+            user,
+            year,
+            &UpdateUserItemDataDto {
+                is_favorite: Some(true),
+                ..UpdateUserItemDataDto::default()
+            },
+        )
+        .await
+        .expect("save");
+
+        let map = mgr
+            .get_user_data_dtos_for_rows(std::slice::from_ref(&row), user, false)
+            .await
+            .expect("rows");
+        assert_eq!(map[&year].key, year.to_string());
+        assert!(map[&year].is_favorite);
     }
 
     #[tokio::test]

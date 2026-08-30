@@ -218,6 +218,7 @@ impl PluginManager for MemPlugins {
             enabled: true,
             has_image: false,
             can_uninstall: false,
+            configuration_file_name: None,
         }))
     }
     async fn enable_plugin(&self, _id: Uuid) -> Result<(), ServiceError> {

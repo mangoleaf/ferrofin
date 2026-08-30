@@ -306,6 +306,36 @@ def with_item_order(body):
     return out
 
 
+# ------------------------------------------------------------------- /Years
+#
+# `/Years` carries ONE field that cannot be diffed, and it is an upstream bug.
+# `YearsController.GetYears` builds its result as
+#
+#     new QueryResult(startIndex, totalCount == -1 ? ibnItemsArray.Count : totalCount, dtos)
+#
+# where `totalCount` is the OUT-PARAM of
+# `folder.GetRecursiveChildren(user, query, out totalCount)`
+# (Folder.cs:1450-1458) — the count of the underlying MEDIA items, not of the
+# years. With a user resolved (which `RequestHelpers.GetUserId` always does) that
+# branch always runs, so the lab's Jellyfin answers `TotalRecordCount: 559` while
+# returning 3 years, and the value tracks the filter (Series -> 8, Audio -> 9,
+# parentId=Movies -> 500). Ferrofin reports the distinct-year count, which is
+# what the field means and what pages the list.
+#
+# So this ONE key is dropped from the leg comparison and recorded as an accepted
+# jellyfin-bug divergence in classifications.json with that citation. Everything
+# else about the page — the year SET, the ORDER (added below as a diffable
+# field), and StartIndex — is compared strictly, and the companion
+# `GET /Years/{year}` row diffs the whole per-year DTO with nothing removed.
+# Ferrofin's own total is gated where it can be asserted per-server: the
+# `items_root_ancestors_and_years_over_real_http` integration test requires it to
+# equal the distinct-year count and to be unchanged by `limit`/`startIndex`.
+def years_page(body):
+    out = with_item_order(body)
+    out.pop("TotalRecordCount", None)
+    return out
+
+
 # Providers Ferrofin compiles in that the lab's stock Jellyfin 10.11.8 does not
 # ship. Verified against that server's own `GET /Plugins`, which lists only
 # AudioDB and MusicBrainz — so these are structurally extra BY DESIGN (see
@@ -542,6 +572,29 @@ def similar_invariants(base, token, ctx, alias="Movies"):
 
 READS = [
     plain("GET /System/Info", "/System/Info"),
+    # The dashboard's plugin-page LIST. Jellyfin serves five entries here — its
+    # five IN-TREE provider plugins, compiled into `MediaBrowser.Providers` —
+    # and Ferrofin served `[]`, recorded (backwards) as "plugin configuration
+    # pages come from external plugins Ferrofin doesn't host". Both filter legs
+    # are probed so the `enableInMainMenu` predicate is exercised in both
+    # directions rather than only where it happens to select everything.
+    multi("GET /web/ConfigurationPages", [
+        "/web/ConfigurationPages",
+        "/web/ConfigurationPages?enableInMainMenu=false",
+        "/web/ConfigurationPages?enableInMainMenu=true",
+    ]),
+    # ...and the configuration those pages edit. The ids are the `Id` overrides
+    # on the five `Plugin.cs` files, so they are the same on any Jellyfin; the
+    # bodies are each plugin's `PluginConfiguration` defaults. Ferrofin 404'd all
+    # five, which is what made the settings unreachable rather than merely
+    # unstyled.
+    multi("GET /Plugins/{pluginId}/Configuration", [
+        "/Plugins/b8715ed1-6c47-4528-9ad3-f72deb539cd4/Configuration",   # TMDb
+        "/Plugins/872a7849-1171-458d-a6fb-3de3d442ad30/Configuration",   # Studio Images
+        "/Plugins/a628c0da-fac5-4c7e-9d1a-7134223f14c8/Configuration",   # OMDb
+        "/Plugins/8c95c4d2-e50c-4fb0-a4f3-6c06ff0f9a1a/Configuration",   # MusicBrainz
+        "/Plugins/a629c0da-fac5-4c7e-931a-7174223f14c8/Configuration",   # AudioDB
+    ]),
     plain("GET /System/Endpoint", "/System/Endpoint"),
     plain("GET /Localization/Cultures", "/Localization/Cultures"),
     plain("GET /Users/Me", "/Users/Me"),
@@ -549,7 +602,14 @@ READS = [
     user("GET /UserViews", "/UserViews?userId={u}"),
     user("GET /Library/MediaFolders", "/Library/MediaFolders"),
     user("GET /Library/VirtualFolders", "/Library/VirtualFolders"),
-    user("GET /Items", "/Items?userId={u}&recursive=true&includeItemTypes=Movie&limit=50&sortBy=SortName&fields=Path"),
+    # An AUDIO leg alongside the movie one: the movie page can never see a
+    # field that only an `Audio` DTO carries, and `HasLyrics` — which C#
+    # `DtoService` emits on every Audio row outside the `ItemFields` system —
+    # was missing from every Ferrofin audio DTO with nothing to catch it.
+    multi("GET /Items", [
+        "/Items?userId={u}&recursive=true&includeItemTypes=Movie&limit=50&sortBy=SortName&fields=Path",
+        "/Items?userId={u}&recursive=true&includeItemTypes=Audio&limit=50&sortBy=SortName&fields=Path",
+    ]),
     user("GET /Items/Latest", "/Items/Latest?userId={u}&limit=20&fields=Path"),
     user("GET /UserItems/Resume", "/UserItems/Resume?userId={u}&limit=12&fields=Path"),
     user("GET /Shows/NextUp", "/Shows/NextUp?userId={u}&limit=24"),
@@ -663,6 +723,47 @@ READS = [
         ("/MusicGenres?userId={u}&includeItemTypes=Movie", with_item_order),
     ]),
     user("GET /MusicGenres/{genreName}", "/MusicGenres/{musicgenre}?userId={u}"),
+    # `/Years` had NO depth probe at all — the only coverage was the breadth
+    # sweep's single-item align, and it could not see that the handler ignored
+    # every filter and sort parameter in the C# signature (measured: J
+    # `?includeItemTypes=Series` -> ["2021"], F -> all three years; `?recursive=
+    # false` -> J [], F all three; `?sortBy=SortName&sortOrder=Descending` a
+    # silent no-op). `years_page` keeps the whole body except the one upstream-
+    # buggy key (see its comment) and ADDS the year order as a diffable field.
+    multi("GET /Years", [
+        ("/Years?userId={u}&sortBy=SortName&sortOrder=Ascending", years_page),
+        ("/Years?userId={u}&sortBy=SortName&sortOrder=Descending", years_page),
+        ("/Years?userId={u}&sortBy=SortName&includeItemTypes=Series", years_page),
+        ("/Years?userId={u}&sortBy=SortName&includeItemTypes=Movie", years_page),
+        ("/Years?userId={u}&sortBy=SortName&excludeItemTypes=Movie", years_page),
+        ("/Years?userId={u}&sortBy=SortName&mediaTypes=Audio", years_page),
+        # `recursive=false` walks the ROOT's direct children (the library
+        # folders), which carry no ProductionYear — so the honest answer is an
+        # empty page, and Ferrofin used to return every year in the library.
+        ("/Years?userId={u}&sortBy=SortName&recursive=false", years_page),
+        ("/Years?userId={u}&sortBy=SortName&limit=1&startIndex=1", years_page),
+        # An empty-guid userId is "not provided" upstream
+        # (`RequestHelpers.GetUserId` tests `userId.IsNullOrEmpty()`), not a
+        # rejected id; Ferrofin used to 400 here.
+        ("/Years?userId=00000000-0000-0000-0000-000000000000&sortBy=SortName", years_page),
+    ]),
+    # Full per-year DTO diff, nothing projected away: the item counts
+    # (`ChildCount`/`MovieCount`/`SeriesCount`/`AlbumCount`/`SongCount`), the
+    # `UserData.Key`, `DisplayPreferencesId`, `SortName` and `Path`. The counts
+    # were 0 on every Ferrofin year before this batch, and the first two fields
+    # were invisible to every row in the campaign while they sat in
+    # `parity_diff.VOLATILE`.
+    multi("GET /Years/{year}", [
+        "/Years/{year1}?userId={u}",
+        "/Years/{year2}?userId={u}",
+        "/Years/{year3}?userId={u}",
+        # A year the fixture has no item for is still materialized on demand
+        # (`LibraryManager.GetYear` always creates) and must report zero counts
+        # on both — the regression guard for on-demand Year creation.
+        "/Years/1850?userId={u}",
+        # An explicitly-empty userId falls back to the authenticated caller.
+        "/Years/{year1}?userId=00000000-0000-0000-0000-000000000000",
+    ]),
     # Instant mixes are shuffled: the diff aligns by Name, so the SET of tracks is what is
     # compared (with the whole fixture under `limit`, both sides hold every track).
     user("GET /Artists/InstantMix", "/Artists/InstantMix?id={artist_id}&userId={u}&limit=100"),
@@ -766,6 +867,16 @@ def resolve_named(base, token, user_id):
         items = (get_json(base, "/Devices", token) or {}).get("Items") or []
         return items[0]["Id"] if items and items[0].get("Id") else ""
 
+    def first_years(n):
+        """The first `n` year NAMES, sortBy-pinned, padded so a short fixture
+        still formats every leg (a repeated year is diffed twice, never skipped)."""
+        items = (get_json(base, f"/Years?userId={user_id}&sortBy=SortName"
+                                f"&sortOrder=Ascending&limit={n}", token)
+                 or {}).get("Items") or []
+        names = [i.get("Name") for i in items if i.get("Name")]
+        return (names + [names[-1]] * n)[:n] if names else ["0"] * n
+
+    years = first_years(3)
     artist = first_named("/Artists")
     lyric_ids = lyric_seed_ids(base, token, user_id)
     channels = (get_json(base, f"/LiveTv/Channels?userId={user_id}&limit=1", token) or {}).get("Items") or []
@@ -786,6 +897,13 @@ def resolve_named(base, token, user_id):
         "artist": urllib.parse.quote(artist.get("Name") or ""),
         "artist_id": artist.get("Id") or "",
         "musicgenre": first_name("/MusicGenres"),
+        # The fixture's production years, by SortName so both servers pick the
+        # same three (a Year's SortName is the zero-padded value, so this is
+        # numeric order). Names, not ids — but the ids agree anyway, since a
+        # by-name id is MD5(TypeFullName + metadata path).
+        "year1": years[0],
+        "year2": years[1],
+        "year3": years[2],
         # The three tracks `seed_lyrics` writes to, in LYRIC_SEEDS order.
         "lyric_lrc": lyric_ids[0],
         "lyric_elrc": lyric_ids[1],
@@ -1028,6 +1146,22 @@ def selfcheck():
     assert dc({"Type": "UserRootFolder", "ChildCount": 4},
               {"Type": "UserRootFolder", "ChildCount": 3})[0] == 1, \
         "the user root is not ICollectionFolder/UserView — its ChildCount is real"
+    # `UserData.Key` is COMPARED, not masked — that is what caught Ferrofin
+    # answering with the item guid on every row — and the one exemption is the
+    # degenerate case where both sides are bare GUIDs (a Live TV programme,
+    # whose id is minted per scan).
+    assert dc({"UserData": {"Key": "Year-2020"}},
+              {"UserData": {"Key": "ed00b5b8-bc89-dd6e-2a09-006c4d9c5309"}})[0] == 1, \
+        "a derived key against a guid is a real mismatch"
+    assert dc({"UserData": {"Key": "Year-2020"}},
+              {"UserData": {"Key": "Year-2021"}})[0] == 1
+    assert dc({"UserData": {"Key": "f95eb75c-8a0b-0843-d0ee-267d9cfa7ce4"}},
+              {"UserData": {"Key": "d79aab57-f0cb-5d8a-aaa9-39d31ca2937e"}})[0] == 0, \
+        "two per-scan guids are what Id is already volatile for"
+    # `DisplayPreferencesId` is compared too: it is MD5(type FullName), the same
+    # 32 hex digits on both servers for a given kind.
+    assert dc({"DisplayPreferencesId": "ff93de5e82fcf2878bb0087b4854a1a5"},
+              {"DisplayPreferencesId": "ed00b5b8bc89dd6e2a09006c4d9c5309"})[0] == 1
     # array align by Path across divergent ids
     j = {"Items": [{"Path": "/m/a.mkv", "Id": "j1", "Name": "A"}]}
     h = {"Items": [{"Path": "/m/a.mkv", "Id": "h1", "Name": "A"}]}
@@ -1051,7 +1185,8 @@ def selfcheck():
     ctx = {"user": "U", "u": "U", "genre": "G", "studio": "S", "person": "P", "series": "SE",
            "task": "T", "device": "D", "artist": "A", "artist_id": "AID", "musicgenre": "MG",
            "channel": "CH", "album_id": "ALB", "movie": "MOV", "episode": "EP",
-           "lyric_lrc": "L1", "lyric_elrc": "L2", "lyric_txt": "L3"}
+           "lyric_lrc": "L1", "lyric_elrc": "L2", "lyric_txt": "L3",
+           "year1": "2020", "year2": "2021", "year3": "2022"}
     # The context keys the self-check invents must be the ones resolve_named
     # actually produces, or this guard passes while the live run KeyErrors.
     import inspect

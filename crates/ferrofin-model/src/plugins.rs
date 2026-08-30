@@ -100,8 +100,9 @@ pub struct PluginPageInfo {
 ///
 /// Port of `MediaBrowser.Model.Plugins.ConfigurationPageInfo`. In Jellyfin this
 /// is projected from a plugin's [`PluginPageInfo`] plus the owning plugin id;
-/// Ferrofin ships no dynamic plugin host, so the list is always empty, but the
-/// type is part of the wire contract.
+/// Ferrofin projects it from the compiled-in registry the same way — Jellyfin's
+/// five in-tree provider plugins, the curated extensions, and any loaded WASM
+/// plugin each contribute their pages.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
 pub struct ConfigurationPageInfo {

@@ -29,12 +29,13 @@ use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::configuration::{LibraryOptions, MediaPathInfo, UserConfiguration};
 use ferrofin_model::data::{BaseItemKind, CollectionType};
 use ferrofin_model::dto::{
-    ItemCounts, MediaSourceInfo, NameIdPair, RecommendationType, UpdateUserItemDataDto, UserDto,
-    UserItemDataDto,
+    ItemCounts, MediaSourceInfo, NameIdPair, RecommendationType, SortOrder, UpdateUserItemDataDto,
+    UserDto, UserItemDataDto,
 };
 use ferrofin_model::entities::CollectionTypeOptions;
 use ferrofin_model::entities::{ImageType, MediaStreamType};
 use ferrofin_model::entities_media::VirtualFolderInfo;
+use ferrofin_model::live_tv::ItemSortBy;
 use ferrofin_model::media_info::LiveStreamRequest;
 use ferrofin_model::querying::{QueryFiltersLegacy, QueryResult};
 use ferrofin_model::search::{SearchHint, SearchQuery};
@@ -95,6 +96,49 @@ pub struct SimilarItemsRecommendation {
 #[must_use]
 pub fn image_type_allows_multiple(image_type: ImageType) -> bool {
     matches!(image_type, ImageType::Backdrop | ImageType::Chapter)
+}
+
+/// Applies a `/Years` sort order to the distinct year list.
+///
+/// Port of `_libraryManager.Sort(extractedItems, user, RequestHelpers.GetOrderBy(
+/// sortBy, sortOrder))` in `YearsController.GetYears`, restricted to the keys a
+/// `Year` item can actually be ordered by. Upstream sorts full `Year` entities,
+/// whose orderable state is only their name/`SortName` (`"0000002020"`) and
+/// `ProductionYear` — all three collapse to the numeric year — plus `Random`,
+/// which C# implements as `OrderBy(_ => Guid.NewGuid())` and which is
+/// reproduced here with the same construct.
+///
+/// An empty `order_by` is a no-op, exactly as upstream: `GetOrderBy` returns
+/// `Array.Empty<...>()` for an absent `sortBy` and `LibraryManager.Sort` then
+/// returns its input untouched. Any other key leaves the order alone rather
+/// than inventing one — a `Year` carries no runtime, rating or play state to
+/// sort on.
+fn sort_years(years: &mut Vec<i32>, order_by: &[(ItemSortBy, SortOrder)]) {
+    let Some((key, order)) = order_by.first().copied() else {
+        return;
+    };
+    match key {
+        ItemSortBy::SortName
+        | ItemSortBy::Name
+        | ItemSortBy::ProductionYear
+        | ItemSortBy::PremiereDate
+        | ItemSortBy::Default => {
+            years.sort_unstable();
+            if order == SortOrder::Descending {
+                years.reverse();
+            }
+        }
+        ItemSortBy::Random => {
+            // C# `ItemSortBy.Random` => `OrderBy(i => Guid.NewGuid())`.
+            let mut keyed: Vec<(Uuid, i32)> = years.iter().map(|y| (Uuid::new_v4(), *y)).collect();
+            keyed.sort_unstable_by_key(|(k, _)| *k);
+            if order == SortOrder::Descending {
+                keyed.reverse();
+            }
+            *years = keyed.into_iter().map(|(_, y)| y).collect();
+        }
+        _ => {}
+    }
 }
 
 /// Orchestrates the item library: queries, counts, people, genres, deletion.
@@ -504,7 +548,16 @@ pub trait LibraryManager: Send + Sync {
     }
 
     /// Gets the library's production years, resolved to their by-name `Year`
-    /// item rows, sorted ascending and paged by `start_index`/`limit`.
+    /// item rows, ordered by `query.order_by` and paged by
+    /// `start_index`/`limit`.
+    ///
+    /// The reported total is the number of **distinct years**, captured before
+    /// paging (C# `ibnItemsArray.Count`). Jellyfin only reaches that expression
+    /// when `totalCount == -1`; with a user resolved it instead reports the
+    /// out-param of `Folder.GetRecursiveChildren(user, query, out totalCount)`,
+    /// which counts the underlying *media* items (559 for a 3-year fixture).
+    /// That is an upstream bug — a paging total unrelated to the page — and is
+    /// not ported; see `suite/parity/classifications.json`.
     ///
     /// Port of `YearsController.GetYears`: Jellyfin walks the (localized) item
     /// tree, collects each item's distinct `ProductionYear`, and resolves each
@@ -521,8 +574,16 @@ pub trait LibraryManager: Send + Sync {
     ) -> Result<QueryResult<BaseItemEntity>, ServiceError> {
         let mut years = self.get_distinct_years(query).await?;
         years.retain(|y| *y > 0);
+        // `.Distinct()` upstream; sorting first is what makes `dedup` total.
+        // This ascending order is also the list's resting order, because C#
+        // `GetOrderBy` returns an empty array for an absent `sortBy` and
+        // `LibraryManager.Sort` is then a no-op.
         years.sort_unstable();
         years.dedup();
+        sort_years(&mut years, &query.order_by);
+        // C# captures `ibnItemsArray.Count` BEFORE `Skip`/`Take`, so the total
+        // is the number of distinct years, not the size of the page.
+        let total = i32::try_from(years.len()).unwrap_or(i32::MAX);
         let start = usize::try_from(query.start_index.unwrap_or(0).max(0)).unwrap_or(0);
         // Page the year list first, then resolve the slice in one query. Every
         // year resolves (the scan materializes them and the lookup creates any
@@ -546,11 +607,7 @@ pub trait LibraryManager: Send + Sync {
             .into_iter()
             .flatten()
             .collect();
-        Ok(QueryResult::new(
-            query.start_index,
-            Some(i32::try_from(items.len()).unwrap_or(i32::MAX)),
-            items,
-        ))
+        Ok(QueryResult::new(query.start_index, Some(total), items))
     }
 
     /// Gets aggregated legacy query-filter values for the matching items.
@@ -820,6 +877,41 @@ pub trait UserDataManager: Send + Sync {
         Ok(map)
     }
 
+    /// Row-aware form of [`Self::get_user_data_dtos`].
+    ///
+    /// When an item has **no** stored `UserData` row, C#
+    /// `UserDataManager.GetUserData(User, BaseItem)` synthesizes one keyed by
+    /// `item.GetUserDataKeys()[0]` — `"Year-2020"` for a year, `"Studio-Acme"`
+    /// for a studio, `"<series guid>001001"` for an episode. Deriving that needs
+    /// the item's *metadata*, not just its id, so the id-only batch above can
+    /// only ever answer with the guid.
+    ///
+    /// The DTO service already holds the rows it is projecting, so passing them
+    /// through costs nothing and keeps the derivation off the N+1 path. The
+    /// default delegates to the id-only form, leaving fakes and any impl that
+    /// has not overridden it exactly as they were.
+    ///
+    /// `include_provider_ids` mirrors upstream's **navigation hydration**: the
+    /// key of a movie/series/album is a provider id when the query that loaded
+    /// the row ran `.Include(e => e.Provider)`, which
+    /// `BaseItemRepository.ApplyNavigations` does only for
+    /// `ItemFields.ProviderIds` (:442-445) while `RetrieveItem` always does
+    /// (:825-829). Pass `false` and the derivation behaves as it does on a plain
+    /// list query, which is what Jellyfin answers there.
+    async fn get_user_data_dtos_for_rows(
+        &self,
+        items: &[BaseItemEntity],
+        user_id: Uuid,
+        include_provider_ids: bool,
+    ) -> Result<std::collections::HashMap<Uuid, UserItemDataDto>, ServiceError> {
+        let _ = include_provider_ids;
+        let ids: Vec<Uuid> = items
+            .iter()
+            .filter_map(|i| Uuid::parse_str(&i.id).ok())
+            .collect();
+        self.get_user_data_dtos(&ids, user_id).await
+    }
+
     /// Sets — or clears, when `likes` is `None` — a user's like flag for an item,
     /// returning the refreshed data DTO.
     ///
@@ -1023,6 +1115,25 @@ pub trait MediaSourceManager: Send + Sync {
                 streams
                     .iter()
                     .any(|s| s.stream_type == ferrofin_model::entities::MediaStreamType::Subtitle)
+            })
+            .map(|(id, _)| id)
+            .collect())
+    }
+
+    /// The subset of `item_ids` that carry at least one **lyric** stream.
+    ///
+    /// Backs the DTO builder's `HasLyrics`, which C# emits on every `Audio` DTO
+    /// outside the `ItemFields` system
+    /// (`DtoService.cs:308-311`). Same shape as
+    /// [`Self::get_item_ids_with_subtitles`], including the ids-only override.
+    async fn get_item_ids_with_lyrics(&self, item_ids: &[Uuid]) -> Result<Vec<Uuid>, ServiceError> {
+        let map = self.get_media_streams_batch(item_ids).await?;
+        Ok(map
+            .into_iter()
+            .filter(|(_, streams)| {
+                streams
+                    .iter()
+                    .any(|s| s.stream_type == ferrofin_model::entities::MediaStreamType::Lyric)
             })
             .map(|(id, _)| id)
             .collect())
@@ -1444,7 +1555,10 @@ fn _assert_object_safe_similar_items_manager(_: &dyn SimilarItemsManager) {}
 mod tests {
     use uuid::Uuid;
 
-    use super::{SearchResult, SimilarItemsRecommendation, image_type_allows_multiple};
+    use super::{
+        ItemSortBy, SearchResult, SimilarItemsRecommendation, SortOrder,
+        image_type_allows_multiple, sort_years,
+    };
     use ferrofin_model::dto::RecommendationType;
     use ferrofin_model::entities::ImageType;
 
@@ -1467,6 +1581,41 @@ mod tests {
         ] {
             assert!(!image_type_allows_multiple(other), "{other:?}");
         }
+    }
+
+    #[test]
+    fn sort_years_is_a_no_op_without_an_order() {
+        // C# `GetOrderBy` returns `Array.Empty` for an absent `sortBy`, and
+        // `LibraryManager.Sort` then returns its input untouched.
+        let mut years = vec![2020, 2021, 2022];
+        sort_years(&mut years, &[]);
+        assert_eq!(years, vec![2020, 2021, 2022]);
+    }
+
+    #[test]
+    fn sort_years_honours_sort_name_in_both_directions() {
+        let mut years = vec![2021, 2020, 2022];
+        sort_years(&mut years, &[(ItemSortBy::SortName, SortOrder::Ascending)]);
+        assert_eq!(years, vec![2020, 2021, 2022]);
+        sort_years(&mut years, &[(ItemSortBy::SortName, SortOrder::Descending)]);
+        assert_eq!(years, vec![2022, 2021, 2020]);
+    }
+
+    #[test]
+    fn sort_years_leaves_unorderable_keys_alone() {
+        // A `Year` carries no runtime to sort on; upstream's comparer would
+        // compare equal, which is a stable no-op.
+        let mut years = vec![2022, 2020, 2021];
+        sort_years(&mut years, &[(ItemSortBy::Runtime, SortOrder::Ascending)]);
+        assert_eq!(years, vec![2022, 2020, 2021]);
+    }
+
+    #[test]
+    fn sort_years_random_keeps_the_same_multiset() {
+        let mut years = vec![2020, 2021, 2022, 2023];
+        sort_years(&mut years, &[(ItemSortBy::Random, SortOrder::Ascending)]);
+        years.sort_unstable();
+        assert_eq!(years, vec![2020, 2021, 2022, 2023]);
     }
 
     #[test]

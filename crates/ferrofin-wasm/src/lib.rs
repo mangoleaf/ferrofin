@@ -687,6 +687,7 @@ fn load_one(
         enabled: true, // the plugin manager overlays persisted state
         has_image: false,
         can_uninstall: false,
+        configuration_file_name: None,
     };
 
     // Re-tag the spec with the real identity + its private-HTTP grant, then
@@ -1688,6 +1689,7 @@ mod tests {
             enabled: true,
             has_image: false,
             can_uninstall: false,
+            configuration_file_name: None,
         }
     }
 

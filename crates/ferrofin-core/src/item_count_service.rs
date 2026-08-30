@@ -164,6 +164,69 @@ impl FerrofinItemCountService {
         }
         Ok(out)
     }
+
+    /// Counts each `Year` item's items by type off `BaseItems."ProductionYear"`
+    /// — the C# `SetItemByNameInfo` Year arm (`query.Years = [year]`).
+    ///
+    /// A row whose `Name` does not parse as an integer keeps the all-zero
+    /// default, matching the `when int.TryParse(...)` guard that makes the C#
+    /// switch fall through to `default: return;` and leave the counts unset.
+    async fn production_year_counts(
+        &self,
+        rows: &[NameItemRow<'_>],
+        related_item_kinds: &[BaseItemKind],
+        mut out: HashMap<Uuid, ItemCounts>,
+    ) -> Result<HashMap<Uuid, ItemCounts>, ServiceError> {
+        // The row's Name is already in hand from the page the caller projected.
+        let year_by_id: Vec<(Uuid, i64)> = rows
+            .iter()
+            .filter_map(|row| {
+                row.name
+                    .and_then(|name| name.trim().parse::<i32>().ok())
+                    .map(|year| (row.id, i64::from(year)))
+            })
+            .collect();
+        if year_by_id.is_empty() {
+            return Ok(out);
+        }
+
+        let type_names: Vec<&'static str> = related_item_kinds
+            .iter()
+            .filter_map(|k| stored_type_name(*k))
+            .collect();
+
+        let distinct_years: Vec<i64> = year_by_id
+            .iter()
+            .map(|(_, y)| *y)
+            .collect::<HashSet<i64>>()
+            .into_iter()
+            .collect();
+
+        let mut by_year: HashMap<i64, HashMap<String, i32>> = HashMap::new();
+        for chunk in distinct_years.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+            let sql = production_year_counts_sql(chunk.len(), type_names.len());
+            let mut query = sqlx::query_as::<_, (i64, String, i64)>(&sql);
+            for year in chunk {
+                query = query.bind(*year);
+            }
+            for t in &type_names {
+                query = query.bind(*t);
+            }
+            for (year, type_, count) in query.fetch_all(self.db.pool()).await.map_err(db_err)? {
+                by_year
+                    .entry(year)
+                    .or_default()
+                    .insert(type_, i32::try_from(count).unwrap_or(i32::MAX));
+            }
+        }
+
+        for (id, year) in year_by_id {
+            if let Some(by_type) = by_year.get(&year) {
+                out.insert(id, counts_from_type_map(by_type));
+            }
+        }
+        Ok(out)
+    }
 }
 
 #[async_trait]
@@ -274,6 +337,20 @@ impl ItemCountService for FerrofinItemCountService {
         // CleanName/ItemValues path below would count zero for a Person.
         if kind == BaseItemKind::Person {
             return self.people_name_counts(rows, related_item_kinds, out).await;
+        }
+
+        // A Year is not an `ItemValues` row either. The pinned 10.11.8
+        // `ItemValueType` enum is Artist=0, AlbumArtist=1, Genre=2, Studios=3,
+        // Tags=4, InheritedTags=6 — no Year — so the CleanName join below
+        // matched nothing and every `/Years/{year}` reported `ChildCount: 0`.
+        // C# `DtoService.SetItemByNameInfo` counts a Year by the production
+        // year column instead: `case BaseItemKind.Year when int.TryParse(dto.Name,
+        // NumberStyles.Integer, CultureInfo.InvariantCulture, out var year):
+        // query.Years = [year];`.
+        if kind == BaseItemKind::Year {
+            return self
+                .production_year_counts(rows, related_item_kinds, out)
+                .await;
         }
 
         // Each row's CleanName rides along on the row the caller is already
@@ -671,6 +748,29 @@ fn item_value_counts_sql(cleans: usize, types: usize) -> String {
     sql
 }
 
+/// The per-year item-count aggregate: `years` bound production years and, when
+/// `types` is non-zero, that many stored `Type` names to restrict to.
+///
+/// Port of the C# Year arm's `query.Years = [year]` with
+/// `IncludeItemTypes = relatedItemKinds`. `IX_BaseItems_ProductionYear` is not
+/// part of the pinned Jellyfin schema, so this is a scan of the type-filtered
+/// rows — the same shape the C# query planner runs.
+fn production_year_counts_sql(years: usize, types: usize) -> String {
+    let mut sql = format!(
+        r#"SELECT bi."ProductionYear", bi."Type", COUNT(DISTINCT bi."Id")
+           FROM "BaseItems" bi
+           WHERE bi."ProductionYear" IN ({})"#,
+        placeholders(years)
+    );
+    if types > 0 {
+        sql.push_str(r#" AND bi."Type" IN ("#);
+        sql.push_str(&placeholders(types));
+        sql.push(')');
+    }
+    sql.push_str(r#" GROUP BY bi."ProductionYear", bi."Type""#);
+    sql
+}
+
 /// Builds a `?, ?, …` placeholder list of length `n`.
 fn placeholders(n: usize) -> String {
     if n == 0 {
@@ -986,6 +1086,107 @@ mod tests {
             .await
             .expect("no linked");
         assert_eq!(none.total, 0);
+    }
+
+    /// A `Year` is not an `ItemValues` row, so the CleanName path counted zero
+    /// for it and every `/Years/{year}` reported `ChildCount: 0`. C#
+    /// `SetItemByNameInfo` counts a Year by `query.Years = [year]` — the
+    /// production-year column.
+    #[tokio::test]
+    async fn item_counts_for_a_year_count_by_production_year() {
+        let db = test_db().await;
+        let service = svc(&db);
+
+        let year = Uuid::from_u128(0xCC01);
+        seed_named_item(&db, year, BaseItemKind::Year, "2020").await;
+        set_clean_name(&db, year, "2020").await;
+
+        for (n, kind, production_year) in [
+            (0xCC02_u128, BaseItemKind::Movie, 2020),
+            (0xCC03, BaseItemKind::Movie, 2020),
+            (0xCC04, BaseItemKind::Series, 2020),
+            // A different year must not be counted.
+            (0xCC05, BaseItemKind::Movie, 2021),
+        ] {
+            let id = Uuid::from_u128(n);
+            seed_named_item(&db, id, kind, &format!("Item {n}")).await;
+            sqlx::query(r#"UPDATE "BaseItems" SET "ProductionYear" = ?2 WHERE "Id" = ?1"#)
+                .bind(guid_to_db(id))
+                .bind(i64::from(production_year))
+                .execute(db.writer())
+                .await
+                .expect("set production year");
+        }
+
+        let counts = service
+            .get_item_counts_for_name_item(
+                BaseItemKind::Year,
+                year,
+                &[BaseItemKind::Movie, BaseItemKind::Series],
+                &InternalItemsQuery::default(),
+            )
+            .await
+            .expect("year counts");
+        assert_eq!(counts.movie_count, 2);
+        assert_eq!(counts.series_count, 1);
+        assert_eq!(counts.item_count, 3);
+    }
+
+    /// C# guards the Year arm with `when int.TryParse(dto.Name, …)`; a Year row
+    /// whose name is not an integer falls through to `default: return;` and
+    /// keeps unset (zero) counts.
+    #[tokio::test]
+    async fn item_counts_for_a_non_numeric_year_are_zero() {
+        let db = test_db().await;
+        let service = svc(&db);
+        let year = Uuid::from_u128(0xCD01);
+        seed_named_item(&db, year, BaseItemKind::Year, "not-a-year").await;
+        set_clean_name(&db, year, "not-a-year").await;
+
+        let counts = service
+            .get_item_counts_for_name_item(
+                BaseItemKind::Year,
+                year,
+                &[BaseItemKind::Movie],
+                &InternalItemsQuery::default(),
+            )
+            .await
+            .expect("counts");
+        assert_eq!(counts, ItemCounts::default());
+    }
+
+    /// The batch form must give each year its own counts, not one year's to all.
+    #[tokio::test]
+    async fn item_counts_for_several_years_are_per_year() {
+        let db = test_db().await;
+        let service = svc(&db);
+        let y2020 = Uuid::from_u128(0xCE01);
+        let y2021 = Uuid::from_u128(0xCE02);
+        seed_named_item(&db, y2020, BaseItemKind::Year, "2020").await;
+        seed_named_item(&db, y2021, BaseItemKind::Year, "2021").await;
+        for (n, production_year) in [(0xCE03_u128, 2020), (0xCE04, 2021), (0xCE05, 2021)] {
+            let id = Uuid::from_u128(n);
+            seed_named_item(&db, id, BaseItemKind::Movie, &format!("M{n}")).await;
+            sqlx::query(r#"UPDATE "BaseItems" SET "ProductionYear" = ?2 WHERE "Id" = ?1"#)
+                .bind(guid_to_db(id))
+                .bind(i64::from(production_year))
+                .execute(db.writer())
+                .await
+                .expect("set production year");
+        }
+
+        let rows = stored_rows(&db, &[y2020, y2021]).await;
+        let counts = service
+            .get_item_counts_for_name_items(
+                BaseItemKind::Year,
+                &name_rows(&rows),
+                &[BaseItemKind::Movie],
+                &InternalItemsQuery::default(),
+            )
+            .await
+            .expect("batch year counts");
+        assert_eq!(counts[&y2020].movie_count, 1);
+        assert_eq!(counts[&y2021].movie_count, 2);
     }
 
     #[tokio::test]

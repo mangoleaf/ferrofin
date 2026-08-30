@@ -148,6 +148,8 @@ struct Prefetched {
     /// unconditional `HasSubtitles` on video DTOs (C# emits it outside the
     /// `ItemFields` system) via one ids-only query per page.
     has_subtitles: std::collections::HashSet<Uuid>,
+    /// The page's `Audio` ids carrying a lyric stream — the DTO's `HasLyrics`.
+    has_lyrics: std::collections::HashSet<Uuid>,
     /// The requesting user's content permissions (populated only when the
     /// `CanDelete`/`CanDownload` fields are requested and a user is present),
     /// so the whole page gates on one `Permissions` query.
@@ -1062,9 +1064,11 @@ impl FerrofinDtoService {
             dto.primary_image_aspect_ratio = self.primary_aspect_ratio(item_id, &images).await;
         }
 
-        // Display-preferences id (the item id in `N` form, hyphen-stripped).
+        // Display-preferences id: keyed by TYPE, not by item (C#
+        // `BaseItem.DisplayPreferencesId`), so every movie in the library shares
+        // one display-preferences row.
         if options.contains_field(ItemFields::DisplayPreferencesId) {
-            dto.display_preferences_id = Some(item_id.simple().to_string());
+            dto.display_preferences_id = Some(display_preferences_id(kind, item_id));
         }
 
         // User-specific play-state.
@@ -1495,6 +1499,12 @@ impl FerrofinDtoService {
             Self::attach_artists(dto, item, prefetched);
         }
 
+        // `HasLyrics` — C# emits it on every `Audio` DTO, `false` included
+        // (`DtoService.cs:308-311`), outside the `ItemFields` system.
+        if matches!(kind, BaseItemKind::Audio | BaseItemKind::AudioBook) {
+            dto.has_lyrics = Some(prefetched.has_lyrics.contains(&item_id));
+        }
+
         // Video extras.
         if kinds::is_video(kind) {
             dto.video_type = Some(VideoType::VideoFile);
@@ -1868,11 +1878,53 @@ fn access_filter_for(user: Option<&UserEntity>) -> ferrofin_traits::options::Int
     }
 }
 
+/// The id that keys display preferences for an item of this kind.
+///
+/// Port of `BaseItem.DisplayPreferencesId` (`MediaBrowser.Controller/Entities/
+/// BaseItem.cs:244-251`):
+///
+/// ```csharp
+/// var thisType = GetType();
+/// return thisType == typeof(Folder) ? Id : thisType.FullName.GetMD5();
+/// ```
+///
+/// So it is a function of the item's **type**, not of the item: every `Movie`
+/// on the server reports `dbf7709c41faaa746463d67978eb863d`, and every `Year`
+/// reports `ff93de5e82fcf2878bb0087b4854a1a5`. Ferrofin used to answer with the
+/// item id, which gave each item a private display-preferences row — the
+/// opposite of the sharing the field exists for, and a per-item divergence on
+/// every DTO.
+///
+/// Two kinds keep the item id: a plain `Folder` (the `typeof(Folder)` arm
+/// above) and `CollectionFolder`, which overrides the property with
+/// `=> Id` (`CollectionFolder.cs:55`) so each library folder keeps its own
+/// view settings. A kind with no stored type name has no `FullName` to hash and
+/// keeps its id.
+fn display_preferences_id(kind: BaseItemKind, item_id: Uuid) -> String {
+    if matches!(kind, BaseItemKind::Folder | BaseItemKind::CollectionFolder) {
+        return item_id.simple().to_string();
+    }
+    crate::item_type_lookup::stored_type_name(kind).map_or_else(
+        || item_id.simple().to_string(),
+        |name| {
+            ferrofin_common::extensions::get_md5(name)
+                .simple()
+                .to_string()
+        },
+    )
+}
+
 /// Sums the per-kind counts into the total child count (port of
 /// `ItemCounts.TotalItemCount`).
+///
+/// All **eleven** counts, including `BoxSetCount` and `BookCount`:
+/// `MediaBrowser.Model/Dto/ItemCounts.cs:84-87` sums them too, even though the
+/// nine assigned onto the DTO in `SetItemByNameInfo` do not include them.
 fn total_item_count(counts: &ferrofin_model::dto::ItemCounts) -> i32 {
     counts.album_count
         + counts.artist_count
+        + counts.book_count
+        + counts.box_set_count
         + counts.episode_count
         + counts.movie_count
         + counts.music_video_count
@@ -1974,7 +2026,14 @@ impl ferrofin_traits::dto::DtoService for FerrofinDtoService {
         // A single item is a batch of one: the same prefetched projection path
         // as a page, so a per-item N+1 fallback no longer exists for new
         // handlers to reach.
-        self.get_base_item_dtos(std::slice::from_ref(item), options, user, owner_id, true)
+        //
+        // `retrieved_by_id: true` — this is the projection of a row the caller
+        // fetched by id, and C# `BaseItemRepository.RetrieveItem` unconditionally
+        // `.Include(e => e.Provider)`s (BaseItemRepository.cs:825-829) where a
+        // list query only does so for `ItemFields.ProviderIds` (:442-445). That
+        // difference is observable: it decides whether a movie's `UserData.Key`
+        // is its IMDb id or its guid.
+        self.project(std::slice::from_ref(item), options, user, owner_id, true)
             .await?
             .pop()
             .ok_or_else(|| ServiceError::Backend("projection returned no DTO".to_owned()))
@@ -1988,10 +2047,57 @@ impl ferrofin_traits::dto::DtoService for FerrofinDtoService {
         owner_id: Option<Uuid>,
         _skip_visibility_check: bool,
     ) -> Result<Vec<BaseItemDto>, ServiceError> {
+        self.project(items, options, user, owner_id, false).await
+    }
+
+    async fn get_item_by_name_dto(
+        &self,
+        item: &BaseItemEntity,
+        options: &DtoOptions,
+        tagged_item_ids: Option<&[Uuid]>,
+        user: Option<&UserEntity>,
+    ) -> Result<BaseItemDto, ServiceError> {
+        let mut prefetched = self
+            .prefetch(std::slice::from_ref(item), options, user, false)
+            .await?;
+        // Single-item page: the id cannot repeat, so every entry moves.
+        let mut dto = self
+            .build_dto(item, options, user, None, &mut prefetched, false)
+            .await?;
+
+        // When the caller pre-supplies the tagged items, count them by kind
+        // (port of the static `SetItemByNameInfo` overload); otherwise fall back
+        // to the count-service path.
+        if options.contains_field(ItemFields::ItemCounts) {
+            if let Some(ids) = tagged_item_ids.filter(|ids| !ids.is_empty()) {
+                self.set_tagged_counts(&mut dto, ids).await?;
+            } else {
+                self.set_item_by_name_info(&mut dto, user).await?;
+            }
+        }
+        Ok(dto)
+    }
+}
+
+impl FerrofinDtoService {
+    /// The shared projection body behind [`DtoService::get_base_item_dto`] and
+    /// [`DtoService::get_base_item_dtos`].
+    ///
+    /// `retrieved_by_id` says the rows came from the by-id read
+    /// (`RetrieveItem`), which upstream always hydrates provider ids for; a list
+    /// query hydrates them only when `ItemFields.ProviderIds` was requested.
+    async fn project(
+        &self,
+        items: &[BaseItemEntity],
+        options: &DtoOptions,
+        user: Option<&UserEntity>,
+        owner_id: Option<Uuid>,
+        retrieved_by_id: bool,
+    ) -> Result<Vec<BaseItemDto>, ServiceError> {
         // Visibility filtering needs the domain tree (`IsVisible`), which is not
         // ported at this layer; the caller is expected to have filtered the set,
         // so every input row is projected.
-        let mut prefetched = self.prefetch(items, options, user).await?;
+        let mut prefetched = self.prefetch(items, options, user, retrieved_by_id).await?;
         // Ids the page lists more than once (a playlist may repeat a track).
         // Their prefetched entries are read once per occurrence, so they keep
         // cloning while every unique id moves its entry out — see `take_or_clone`.
@@ -2046,36 +2152,6 @@ impl ferrofin_traits::dto::DtoService for FerrofinDtoService {
         Ok(out)
     }
 
-    async fn get_item_by_name_dto(
-        &self,
-        item: &BaseItemEntity,
-        options: &DtoOptions,
-        tagged_item_ids: Option<&[Uuid]>,
-        user: Option<&UserEntity>,
-    ) -> Result<BaseItemDto, ServiceError> {
-        let mut prefetched = self
-            .prefetch(std::slice::from_ref(item), options, user)
-            .await?;
-        // Single-item page: the id cannot repeat, so every entry moves.
-        let mut dto = self
-            .build_dto(item, options, user, None, &mut prefetched, false)
-            .await?;
-
-        // When the caller pre-supplies the tagged items, count them by kind
-        // (port of the static `SetItemByNameInfo` overload); otherwise fall back
-        // to the count-service path.
-        if options.contains_field(ItemFields::ItemCounts) {
-            if let Some(ids) = tagged_item_ids.filter(|ids| !ids.is_empty()) {
-                self.set_tagged_counts(&mut dto, ids).await?;
-            } else {
-                self.set_item_by_name_info(&mut dto, user).await?;
-            }
-        }
-        Ok(dto)
-    }
-}
-
-impl FerrofinDtoService {
     /// Bulk-loads every relation `build_dto` reads for `items` — one query per
     /// relation family for the whole page instead of one (or more) per item.
     /// The per-item N+1 convoyed the 2-connection pool under concurrent load.
@@ -2085,6 +2161,7 @@ impl FerrofinDtoService {
         items: &[BaseItemEntity],
         options: &DtoOptions,
         user: Option<&UserEntity>,
+        retrieved_by_id: bool,
     ) -> Result<Prefetched, ServiceError> {
         let ids: Vec<Uuid> = items.iter().map(row_id).collect();
         let want_images =
@@ -2097,7 +2174,22 @@ impl FerrofinDtoService {
         let user_data_fut = async {
             if want_user_data && let Some(u) = user {
                 let user_id = parse_user_id(&u.id)?;
-                self.user_data.get_user_data_dtos(&ids, user_id).await
+                // Row-aware: the synthetic `Key` for an item with no stored
+                // user-data row is derived from the item's metadata (C#
+                // `item.GetUserDataKeys()[0]`), and the rows are already here.
+                //
+                // Provider ids participate in that derivation only when the
+                // row's own query hydrated them — `.Include(e => e.Provider)`
+                // runs for `ItemFields.ProviderIds`
+                // (`BaseItemRepository.ApplyNavigations`, :442-445) and
+                // unconditionally in `RetrieveItem` (:825-829). Measured on
+                // 10.11.8: the same movie's key is its guid in a plain list and
+                // `tt0111161` with `Fields=ProviderIds` or by id.
+                let hydrate_providers =
+                    retrieved_by_id || options.contains_field(ItemFields::ProviderIds);
+                self.user_data
+                    .get_user_data_dtos_for_rows(items, user_id, hydrate_providers)
+                    .await
             } else {
                 Ok(HashMap::new())
             }
@@ -2435,6 +2527,42 @@ impl FerrofinDtoService {
                 .into_iter()
                 .collect()
         };
+        // `HasLyrics` on every Audio DTO. C# `DtoService` sets it outside the
+        // `ItemFields` system — `if (item is Audio audio) dto.HasLyrics =
+        // audio.GetMediaStreams().Any(s => s.Type == MediaStreamType.Lyric);`
+        // (DtoService.cs:308-311) — so it is emitted whether or not the caller
+        // asked for stream fields, and unlike `HasSubtitles` it is emitted as
+        // `false` too. Ferrofin omitted the key entirely on every audio row.
+        let audio_ids: Vec<Uuid> = items
+            .iter()
+            // `item is Audio` in C#, which `AudioBook : Audio` satisfies and a
+            // `MusicVideo` (a Video) does not.
+            .filter(|i| matches!(row_kind(i), BaseItemKind::Audio | BaseItemKind::AudioBook))
+            .map(row_id)
+            .collect();
+        let has_lyrics: std::collections::HashSet<Uuid> = if audio_ids.is_empty() {
+            std::collections::HashSet::new()
+        } else if want_streams {
+            // The page's streams are already in hand — read them instead of
+            // paying a second round trip (same reasoning as `has_subtitles`).
+            audio_ids
+                .iter()
+                .copied()
+                .filter(|id| {
+                    media_streams.get(id).is_some_and(|streams| {
+                        streams.iter().any(|s| {
+                            s.stream_type == ferrofin_model::entities::MediaStreamType::Lyric
+                        })
+                    })
+                })
+                .collect()
+        } else {
+            self.media_sources
+                .get_item_ids_with_lyrics(&audio_ids)
+                .await?
+                .into_iter()
+                .collect()
+        };
         // One Permissions read gates the whole page's CanDelete/CanDownload
         // (C# `BaseItem.CanDelete(user)`/`CanDownload(user)` per item).
         let content_permissions = match user {
@@ -2471,6 +2599,7 @@ impl FerrofinDtoService {
             played_counts,
             alternates,
             has_subtitles,
+            has_lyrics,
             content_permissions,
             person_ids_by_name,
             alt_referenced,
@@ -3183,6 +3312,8 @@ mod tests {
     struct FakeSources {
         /// Ids whose canned stream list carries no subtitle stream.
         without_subtitles: std::collections::HashSet<Uuid>,
+        /// Ids whose canned stream list carries a lyric stream.
+        with_lyrics: std::collections::HashSet<Uuid>,
     }
 
     #[async_trait]
@@ -3194,6 +3325,16 @@ mod tests {
             // Every video in these fixtures "has subtitles", so the DTO's
             // HasSubtitles emit path is exercised.
             Ok(item_ids.to_vec())
+        }
+        async fn get_item_ids_with_lyrics(
+            &self,
+            item_ids: &[Uuid],
+        ) -> Result<Vec<Uuid>, ServiceError> {
+            Ok(item_ids
+                .iter()
+                .copied()
+                .filter(|id| self.with_lyrics.contains(id))
+                .collect())
         }
         async fn get_media_streams(
             &self,
@@ -3224,6 +3365,14 @@ mod tests {
                             index: 1,
                             stream_type: ferrofin_model::entities::MediaStreamType::Subtitle,
                             codec: Some("subrip".to_owned()),
+                            ..MediaStream::default()
+                        });
+                    }
+                    if self.with_lyrics.contains(id) {
+                        streams.push(MediaStream {
+                            index: 2,
+                            stream_type: ferrofin_model::entities::MediaStreamType::Lyric,
+                            codec: Some("lrc".to_owned()),
                             ..MediaStream::default()
                         });
                     }
@@ -3831,6 +3980,7 @@ mod tests {
             db,
             FakeSources {
                 without_subtitles: std::iter::once(bare).collect(),
+                ..FakeSources::default()
             },
         );
 
@@ -3846,6 +3996,56 @@ mod tests {
         );
     }
 
+    /// C# `DtoService`: `if (item is Audio audio) dto.HasLyrics = audio
+    /// .GetMediaStreams().Any(s => s.Type == MediaStreamType.Lyric);` — on
+    /// EVERY audio DTO, `false` included, and never on a video. Ferrofin omitted
+    /// the key entirely, so jellyfin-web saw no lyrics on any track.
+    #[tokio::test]
+    async fn audio_dtos_emit_has_lyrics_both_ways_and_videos_do_not() {
+        let db = test_db().await;
+        let with = Uuid::from_u128(0x5C01);
+        let without = Uuid::from_u128(0x5C02);
+        let movie = Uuid::from_u128(0x5C03);
+        seed_named_item(&db, with, BaseItemKind::Audio, "Lyric Track").await;
+        seed_named_item(&db, without, BaseItemKind::Audio, "Bare Track").await;
+        seed_named_item(&db, movie, BaseItemKind::Movie, "Film").await;
+        let items = vec![
+            fetch_item(&db, with).await,
+            fetch_item(&db, without).await,
+            fetch_item(&db, movie).await,
+        ];
+        let svc = service_with_sources(
+            db,
+            FakeSources {
+                with_lyrics: std::iter::once(with).collect(),
+                ..FakeSources::default()
+            },
+        );
+
+        // Streams prefetched (all fields): the answer is read off them.
+        let dtos = svc
+            .get_base_item_dtos(&items, &DtoOptions::default(), None, None, true)
+            .await
+            .unwrap();
+        assert_eq!(dtos[0].has_lyrics, Some(true));
+        assert_eq!(
+            dtos[1].has_lyrics,
+            Some(false),
+            "emitted as false, not omitted"
+        );
+        assert_eq!(dtos[2].has_lyrics, None, "a video is not an Audio");
+
+        // Nothing prefetched: the ids-only query answers instead.
+        let lean = DtoOptions::with_all_fields(false);
+        let lean_dtos = svc
+            .get_base_item_dtos(&items, &lean, None, None, true)
+            .await
+            .unwrap();
+        assert_eq!(lean_dtos[0].has_lyrics, Some(true));
+        assert_eq!(lean_dtos[1].has_lyrics, Some(false));
+        assert_eq!(lean_dtos[2].has_lyrics, None);
+    }
+
     /// With no stream-bearing field requested nothing is prefetched to read, so
     /// the ids-only query is still the answer — dropping it outright would nil
     /// `HasSubtitles` for every caller asking for a lean DTO.
@@ -3859,6 +4059,7 @@ mod tests {
             db,
             FakeSources {
                 without_subtitles: std::iter::once(bare).collect(),
+                ..FakeSources::default()
             },
         );
 
@@ -5320,5 +5521,61 @@ mod tests {
         assert_eq!(dto.run_time_ticks, Some(36_000_000_000));
         assert_eq!(dto.genres, Some(vec!["News".to_owned()]));
         assert_eq!(dto.tags, Some(vec!["News".to_owned()]));
+    }
+
+    /// `BaseItem.DisplayPreferencesId` is `thisType.FullName.GetMD5()`, so it is
+    /// per-TYPE. Pinned against the values a live 10.11.8 returns.
+    #[test]
+    fn display_preferences_id_is_the_type_name_md5() {
+        let item = Uuid::from_u128(0xD1D1);
+        assert_eq!(
+            display_preferences_id(BaseItemKind::Year, item),
+            "ff93de5e82fcf2878bb0087b4854a1a5"
+        );
+        assert_eq!(
+            display_preferences_id(BaseItemKind::Movie, item),
+            "dbf7709c41faaa746463d67978eb863d"
+        );
+        // Two items of the same kind SHARE the id — the whole point of the field.
+        assert_eq!(
+            display_preferences_id(BaseItemKind::Movie, Uuid::from_u128(0xD2D2)),
+            display_preferences_id(BaseItemKind::Movie, item)
+        );
+    }
+
+    /// The two kinds that keep the item id: `typeof(Folder)` (the C# equality
+    /// test) and `CollectionFolder`, which overrides the property with `=> Id`.
+    #[test]
+    fn folders_keep_their_own_display_preferences_id() {
+        let item = Uuid::from_u128(0xD3D3);
+        let simple = item.simple().to_string();
+        assert_eq!(display_preferences_id(BaseItemKind::Folder, item), simple);
+        assert_eq!(
+            display_preferences_id(BaseItemKind::CollectionFolder, item),
+            simple
+        );
+        // A `UserView` has no override, so it hashes like everything else.
+        assert_ne!(display_preferences_id(BaseItemKind::UserView, item), simple);
+    }
+
+    /// `ItemCounts.TotalItemCount()` sums ELEVEN counts, `BoxSetCount` and
+    /// `BookCount` included (`ItemCounts.cs:84-87`).
+    #[test]
+    fn total_item_count_includes_box_sets_and_books() {
+        let counts = ferrofin_model::dto::ItemCounts {
+            movie_count: 1,
+            series_count: 1,
+            episode_count: 1,
+            artist_count: 1,
+            program_count: 1,
+            trailer_count: 1,
+            song_count: 1,
+            album_count: 1,
+            music_video_count: 1,
+            box_set_count: 1,
+            book_count: 1,
+            item_count: 99,
+        };
+        assert_eq!(total_item_count(&counts), 11);
     }
 }

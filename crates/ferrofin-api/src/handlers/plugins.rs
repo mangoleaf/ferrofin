@@ -79,7 +79,7 @@ fn to_plugin_info(d: PluginDescriptor) -> PluginInfo {
     PluginInfo {
         name: d.name,
         version: d.version,
-        configuration_file_name: None,
+        configuration_file_name: d.configuration_file_name,
         description: d.description,
         id: d.id,
         can_uninstall: d.can_uninstall,

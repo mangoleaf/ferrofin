@@ -662,7 +662,7 @@ async fn get_latest_media(
 /// The stored `Type` column holds the full CLR type name (e.g.
 /// `MediaBrowser.Controller.Entities.Movies.Movie`), so compare its last dotted
 /// segment against the serde name of the kind (Jellyfin's `BaseItemKind` names).
-fn type_name_matches(stored: &str, kind: ferrofin_model::data::BaseItemKind) -> bool {
+pub(crate) fn type_name_matches(stored: &str, kind: ferrofin_model::data::BaseItemKind) -> bool {
     let short = stored.rsplit('.').next().unwrap_or(stored);
     // Compare against the serialized name in place: a borrowed `&str` against
     // the kind's name, no allocation of the stored name.

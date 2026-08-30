@@ -10,6 +10,7 @@
 
 pub mod audiodb;
 pub mod books;
+pub mod builtin_plugins;
 pub mod container_types;
 pub mod error;
 pub mod external_ids;

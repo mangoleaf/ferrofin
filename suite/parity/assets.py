@@ -190,6 +190,35 @@ SIG_EFFECT = verification.EFFECT
 SIG_STATUS_CLASS = verification.STATUS_CLASS
 
 
+# The pages every stock Jellyfin serves: its five IN-TREE provider plugins
+# (`MediaBrowser.Providers/Plugins/{Tmdb,StudioImages,Omdb,MusicBrainz,AudioDb}/
+# Plugin.cs`, each a `BasePlugin<PluginConfiguration>, IHasWebPages`). Plus one
+# lowercase spelling (the C# match is `OrdinalIgnoreCase`) and two negative
+# controls, so a server that answered 200 to any name could not pass.
+CONFIG_PAGE_NAMES = ["TMDb", "tmdb", "Studio Images", "OMDb", "MusicBrainz", "AudioDB",
+                     "NoSuchPlugin", ""]
+
+
+def config_page_signature(base, token):
+    """`(2|4, 'configpage', ((name, status, media-type, sha256), ...))`.
+
+    The body is hashed, not sampled: these are embedded resources served
+    verbatim on both servers, so byte-identity is the right bar. The
+    Content-Type is compared as the bare media type — Jellyfin spells the
+    charset `UTF-8` and Ferrofin `utf-8`, which is the same header value under
+    RFC 9110 and not a divergence worth a row.
+    """
+    import hashlib
+    sig = []
+    for name in CONFIG_PAGE_NAMES:
+        st, h, body = raw_headers(
+            "GET", base, "/web/ConfigurationPage?name=" + urllib.parse.quote(name), token)
+        media = (h.get("content-type") or "").split(";")[0].strip().lower()
+        sig.append((name, st, media, hashlib.sha256(body).hexdigest() if st == 200 else ""))
+    served = any(entry[1] == 200 for entry in sig)
+    return (2 if served else 4, "configpage", tuple(sig))
+
+
 def read_signatures(base, token, c):
     """`({op_key: signature}, {op_key: verification_method})`, where signature is a
     comparable tuple derived from the response. For a 200 image:
@@ -271,6 +300,23 @@ def read_signatures(base, token, c):
         out["GET /Videos/{videoId}/{mediaSourceId}/Attachments/{index}"] = file_sig(
             base, f"/Videos/{fi}/{fs}/Attachments/3", token)
         methods["GET /Videos/{videoId}/{mediaSourceId}/Attachments/{index}"] = SIG_BODY_DIFF
+    # The dashboard's plugin configuration PAGES. These are embedded HTML
+    # resources served verbatim (C# `GetManifestResourceStream` +
+    # `MimeTypes.GetMimeType`), so unlike an image they CAN and must be compared
+    # byte-for-byte — which is why they live in this layer rather than the JSON
+    # read set.
+    #
+    # The breadth sweep can never see them: `name` is an OPTIONAL query
+    # parameter, so `with_user_query` never fills it and the row only ever
+    # compared the nameless refusal — trivially 404=404 on both while Jellyfin
+    # served five pages and Ferrofin served none.
+    #
+    # `tmdb` is probed alongside `TMDb` because the C# match is
+    # `StringComparison.OrdinalIgnoreCase`; `NoSuchPlugin` and the empty name are
+    # the negative controls, so a server that answered 200 to everything could
+    # not pass.
+    out["GET /web/ConfigurationPage"] = config_page_signature(base, token)
+    methods["GET /web/ConfigurationPage"] = SIG_BODY_DIFF
     # A log file's contents differ per instance by nature: type + non-empty is the contract.
     logs = get_json(base, "/System/Logs", token) or []
     name = logs[0]["Name"] if logs and logs[0].get("Name") else "missing.log"
@@ -608,6 +654,10 @@ def selfcheck():
         "GET /Items/{itemId}/Download",
         "GET /Items/{itemId}/File",
         "GET /Videos/{videoId}/{mediaSourceId}/Attachments/{index}",
+        # The plugin configuration pages are embedded resources served verbatim
+        # on both servers (`GetManifestResourceStream`), and Ferrofin vendors
+        # the same 10.11.8 files — so this row really does compare sha256s.
+        "GET /web/ConfigurationPage",
     }, byte_exact
     assert (SIG_PROPERTY, SIG_BODY_DIFF) == ("property", "body-diff")
     assert {SIG_PROPERTY, SIG_BODY_DIFF, SIG_EFFECT, SIG_STATUS_CLASS} <= verification.VALID

@@ -901,6 +901,23 @@ pub trait MediaStreamRepository: Send + Sync {
             .collect())
     }
 
+    /// The subset of `item_ids` with at least one **lyric** stream row.
+    ///
+    /// Backs the DTO builder's `HasLyrics` (C# `DtoService`:
+    /// `if (item is Audio audio) dto.HasLyrics = audio.GetMediaStreams()
+    /// .Any(s => s.Type == MediaStreamType.Lyric);`). Same shape, and same
+    /// reason for an ids-only override, as [`Self::get_item_ids_with_subtitles`].
+    async fn get_item_ids_with_lyrics(&self, item_ids: &[Uuid]) -> Result<Vec<Uuid>, ServiceError> {
+        let map = self.get_media_streams_batch(item_ids).await?;
+        // Stored `StreamType` discriminant 5 = Lyric
+        // (`ferrofin_core::db_error::media_stream_type_disc`).
+        Ok(map
+            .into_iter()
+            .filter(|(_, rows)| rows.iter().any(|r| r.stream_type == 5))
+            .map(|(id, _)| id)
+            .collect())
+    }
+
     /// Gets the distinct language codes for a stream type across the library.
     async fn get_media_stream_languages(
         &self,

@@ -92,6 +92,18 @@ impl RegisteredPlugin {
         }
     }
 
+    /// Reports `CanUninstall: false`, undoing the `true` [`Self::new`] forces.
+    ///
+    /// That `true` exists to surface jellyfin-web's enable/disable toggle for a
+    /// compiled-in **extension**. Jellyfin's own in-tree provider plugins
+    /// (TMDb, OMDb, MusicBrainz, AudioDB, Studio Images) report `false`, and
+    /// they are the row `GET /Plugins` is diffed against, so they opt back out.
+    #[must_use]
+    pub fn non_removable(mut self) -> Self {
+        self.descriptor.can_uninstall = false;
+        self
+    }
+
     /// Sets the plugin's default configuration JSON.
     #[must_use]
     pub fn with_default_config(mut self, config: Vec<u8>) -> Self {
@@ -1128,6 +1140,7 @@ mod tests {
             enabled,
             has_image: false,
             can_uninstall: false,
+            configuration_file_name: None,
         }
     }
 

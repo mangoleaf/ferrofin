@@ -10,15 +10,24 @@ per-server paths) and are skipped.
 import re
 
 # Keys that legitimately differ between two independent instances/scans (from parity.js).
+# `Key` and `DisplayPreferencesId` are NOT here, and must not come back:
+#   * `UserData.Key` is `item.GetUserDataKeys()[0]` — a deterministic function of
+#     the item's name/type/provider ids (`"Year-2020"`, `"Studio-Acme"`,
+#     `"<series guid>001001"`), identical on two servers whose item GUIDs already
+#     agree. Masking it hid a Ferrofin bug that answered with the item guid on
+#     EVERY row of the whole surface. The other `Key`s in the contract
+#     (`TaskInfo`, `TaskResult`, `ExternalIdInfo`, `CustomDatabaseOption`) are
+#     deterministic too, and measured equal on the lab pair.
+#   * `DisplayPreferencesId` is `thisType.FullName.GetMD5()` (BaseItem.cs:244-251)
+#     — per TYPE, the same 32 hex digits on every server for a given kind.
 VOLATILE = re.compile("^(" + "|".join([
-    "Id", "Key", "ItemId", "ImageTags", "ServerId", "ServerName", "Etag", "ETag", "PlaySessionId",
+    "Id", "ItemId", "ImageTags", "ServerId", "ServerName", "Etag", "ETag", "PlaySessionId",
     "ImageBlurHashes",
     # Divergent-GUID family: item GUIDs derive per-scan, so every id that references another item
     # differs between independent servers (documented deferral — resolved by the shared-DB path).
     # id-correlation aligns the items themselves by Path; these cross-references still can't match.
     "ParentId", "SeriesId", "SeasonId", "AlbumId", "ParentLogoItemId", "ParentBackdropItemId",
     "ParentThumbItemId", "ParentArtItemId", "ParentPrimaryImageItemId", "PrimaryImageItemId",
-    "DisplayPreferencesId",
     # BlurHash: valid, but not byte-identical to Jellyfin's Skia 128px downsample (documented deferral).
     "BlurHash",
     # Per-instance derived values: ImageTag is an md5(path+mtime) cache tag (mtime differs per scan);
@@ -36,6 +45,30 @@ VOLATILE = re.compile("^(" + "|".join([
 ]) + ")$")
 
 ALIGN_KEYS = ("Path", "Name", "Id")
+
+# A bare GUID, in either the hyphenated "D" or the dashless "N" spelling.
+_GUID = re.compile(r"^[0-9a-fA-F]{8}-?(?:[0-9a-fA-F]{4}-?){3}[0-9a-fA-F]{12}$")
+
+
+def _degenerate_key(k, jv, hv):
+    """A `Key` that is JUST an item GUID on both sides carries no information the
+    already-volatile `Id` does not.
+
+    `UserData.Key` is `item.GetUserDataKeys()[0]`, which is a real, comparable
+    value for every kind whose key rule has metadata to work with — `"Year-2020"`,
+    `"Studio-Acme"`, `"Artist 01-Album 01"`, `"<series guid>001001"`, a movie's
+    `tt…`. That is why `Key` is NOT in `VOLATILE`: masking it hid a Ferrofin bug
+    that answered with the item guid everywhere.
+
+    But the rule degenerates to the item's own id for a kind with nothing else
+    (a Live TV programme, whose keys are provider ids it does not have), and a
+    Live TV programme's id is minted per scan — J `f95eb75c-…` vs H `d79aab57-…`
+    for the same airing. Comparing two per-scan GUIDs is exactly what `Id` is
+    volatile for, so this skips that one degenerate case and nothing else: a
+    guid against a derived key still mismatches, loudly.
+    """
+    return k == "Key" and isinstance(jv, str) and isinstance(hv, str) \
+        and bool(_GUID.match(jv)) and bool(_GUID.match(hv))
 
 
 def _kind(x):
@@ -91,6 +124,8 @@ def diff(j, h, path, out, volatile=VOLATILE, stats=None):
     if tj == "object":
         for k in set(j) | set(h):
             if volatile.match(k):
+                continue
+            if k in j and k in h and _degenerate_key(k, j[k], h[k]):
                 continue
             p = f"{path}.{k}" if path else k
             if k not in h:

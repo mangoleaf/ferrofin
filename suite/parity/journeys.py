@@ -83,6 +83,11 @@ JOURNEY_METHOD.update({op: verification.PROPERTY for op in (
     # A read whose bar is "non-empty on both", not a write effect.
     "GET /Items/{itemId}/RemoteSearch/Subtitles/{language}",
     "GET /Providers/Subtitles/Subtitles/{subtitleId}",
+    # A read verified by PROPERTIES, not a body diff: the mix is ordered
+    # `(ItemSortBy.Random, Ascending)` on both servers, so the page is
+    # legitimately different on consecutive calls and only its shape and the
+    # typed-lookup refusal are comparable. See `j_playlist_instant_mix`.
+    "GET /Playlists/{itemId}/InstantMix",
 )})
 
 
@@ -312,6 +317,57 @@ def j_playlist(base, token, user, mid, m2):
         st, _ = http("POST", f"{base}/Playlists/{pid}?name=Renamed", token, "{}")
         r["POST /Playlists/{playlistId}"] = st < 300
         http("DELETE", f"{base}/Items/{pid}", token)   # cleanup
+    return r
+
+
+def j_playlist_instant_mix(base, token, user, mid, _m2):
+    """`GET /Playlists/{itemId}/InstantMix` — the typed lookup and a real mix.
+
+    The fixture holds **zero** playlists, so the positive leg of this route had
+    never been exercised by any layer: the breadth sweep fed it `any_item` (a
+    movie), Jellyfin 404'd, Ferrofin answered 200, and the difference was
+    recorded as "a harmless superset". It is not — it is a missing type guard.
+    Every other route on `InstantMixController` resolves its seed with
+    `GetItemById<BaseItem>`; this one alone uses `GetItemById<Playlist>`, and
+    `LibraryManager.GetItemById<T>` returns `null` when the item is not a `T`
+    (`if (item is T typedItem) return typedItem; return null;`), so a
+    non-playlist id is a 404 upstream.
+
+    Two facts, both comparable across servers:
+
+    1. a genuine playlist of audio seeds a NON-EMPTY, all-`Audio` mix, and
+    2. a movie id on this route is a 404.
+
+    The ORDER of the mix is deliberately not asserted: C#
+    `GetInstantMixFromGenreIds` sorts `(ItemSortBy.Random, Ascending)` and so
+    does Ferrofin now, so consecutive calls legitimately differ. The playlist is
+    created and deleted inside the journey, symmetrically on both servers.
+    """
+    r = {}
+    tracks = [i["Id"] for i in (q(base, "/Items?includeItemTypes=Audio&recursive=true"
+                                        "&limit=3&sortBy=SortName", token, user) or {})
+              .get("Items") or []]
+    if not tracks:
+        r["GET /Playlists/{itemId}/InstantMix"] = False
+        return r
+    st, raw = http("POST", f"{base}/Playlists", token,
+                   json.dumps({"Name": "Parity Mix PL", "Ids": tracks, "UserId": user,
+                               "MediaType": "Audio"}))
+    pid = json.loads(raw).get("Id") if st < 300 and raw else None
+    try:
+        mix_ok = False
+        if pid:
+            mix = q(base, f"/Playlists/{pid}/InstantMix?limit=200", token, user) or {}
+            items = mix.get("Items") or []
+            mix_ok = (bool(items)
+                      and mix.get("TotalRecordCount") == len(items)
+                      and all(i.get("Type") == "Audio" for i in items))
+        # The type guard: a MOVIE id on the playlists route is not found.
+        guard_ok = http("GET", f"{base}/Playlists/{mid}/InstantMix?userId={user}", token)[0] == 404
+        r["GET /Playlists/{itemId}/InstantMix"] = bool(mix_ok and guard_ok)
+    finally:
+        if pid:
+            http("DELETE", f"{base}/Items/{pid}", token)
     return r
 
 
@@ -1392,7 +1448,8 @@ def j_backup(base, token, user, _m, _m2):
 
 
 JOURNEYS = [j_startup,   # first: see its docstring
-            j_favorites, j_played, j_rating, j_playlist, j_collection, j_users, j_item_edit,
+            j_favorites, j_played, j_rating, j_playlist, j_playlist_instant_mix,
+            j_collection, j_users, j_item_edit,
             j_api_keys, j_user_item_data, j_display_prefs, j_scheduled_task_triggers,
             j_device_options, j_playstate, j_capabilities, j_user_config, j_system_config,
             j_playlist_share, j_item_delete, j_capabilities_query, j_environment_validate,

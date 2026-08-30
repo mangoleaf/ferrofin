@@ -41,6 +41,7 @@ impl RecordingPlugins {
             enabled: true,
             has_image: true,
             can_uninstall: true,
+            configuration_file_name: None,
         }
     }
 
