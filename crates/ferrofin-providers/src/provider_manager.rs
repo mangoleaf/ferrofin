@@ -2607,31 +2607,65 @@ impl ProviderManager for LocalProviderManager {
         &self,
         request: &RemoteSearchRequest,
     ) -> Result<Vec<RemoteSearchResult>, ServiceError> {
-        // Select the providers that serve this item kind, then (if a provider
-        // name was supplied) narrow to that provider — a port of the C#
+        // Port of `ProviderManager.GetRemoteSearchResults` (`ProviderManager.cs:787`).
+        //
+        // The reference item decides the gate: `ItemId` set → the real row and
+        // ITS library's `LibraryOptions`; `ItemId` empty → the C# builds a dummy
+        // `new TItemType()` with a fresh `LibraryOptions`, where every type
+        // entry is absent and therefore every fetcher enabled. `typeOptions` is
+        // keyed on `item.GetType().Name`, i.e. the REFERENCE item's type, which
+        // is the requested kind when there is no reference.
+        let reference = match (&self.items, request.item_id) {
+            (Some(items), id) if !id.is_nil() => items.retrieve_item(id).await?,
+            _ => None,
+        };
+        let library = match &reference {
+            Some(entity) => self.library_options_for(entity).await,
+            None => None,
+        };
+        let kind = match &reference {
+            Some(entity) => short_kind(entity).to_owned(),
+            None => format!("{:?}", request.item_kind),
+        };
+        // `CanRefreshMetadata` (`ProviderManager.cs:462`): `includeDisabled`
+        // short-circuits to true before every other test, and a LOCKED
+        // reference item drops every non-local provider outright.
+        let locked = reference.as_ref().is_some_and(|e| e.is_locked);
+        let can_refresh = |name: &str| {
+            request.include_disabled_providers
+                || (!locked && metadata_fetcher_enabled(library.as_ref(), &kind, name))
+        };
+
+        // Select the providers that serve this item kind, drop the ones the
+        // library's "Metadata downloaders" list unticked, then (if a provider
+        // name was supplied) narrow to that provider — the C#
         // `GetMetadataProvidersInternal(...).OfType<IRemoteSearchProvider>()`
         // filter chain. With no fetcher registered this set is empty and the
         // loop below yields `[]`, exactly as Jellyfin returns when nothing
         // matches.
-        //
-        // OPEN WORK ITEM (`request.include_disabled_providers` + `item_id`):
-        // C# `ProviderManager.cs:826` also passes the reference item's
-        // `LibraryOptions` and the `IncludeDisabledProviders` flag into
-        // `GetMetadataProvidersInternal`, so a fetcher unticked in a library's
-        // "Metadata downloaders" list is dropped from an Identify search made
-        // against an item in that library. With no `ItemId` the C# builds a
-        // dummy item with default `LibraryOptions` — everything enabled — which
-        // is why the two agree on every Identify request the clients send today.
-        // Closing it needs `LocalProviderManager` to resolve an item's library
-        // options (it holds `items` but no library-options source), then to
-        // filter `remote_search_providers` by
-        // `library_options::disabled_metadata_fetchers` for the item's kind.
-        // Until then `include_disabled_providers` is inert on this path.
         let name_filter = request.search_provider_name.as_deref();
-        let providers = self.remote_search_providers.iter().filter(|p| {
-            p.supports(request.item_kind)
-                && name_filter.is_none_or(|n| p.name().eq_ignore_ascii_case(n))
-        });
+        let mut providers: Vec<_> = self
+            .remote_search_providers
+            .iter()
+            .filter(|p| {
+                p.supports(request.item_kind)
+                    && name_filter.is_none_or(|n| p.name().eq_ignore_ascii_case(n))
+                    && can_refresh(p.name())
+            })
+            .collect();
+        // `.OrderBy(GetConfiguredOrder(metadataFetcherOrder, i.Name))` with
+        // `.ThenBy(GetDefaultOrder)` — a provider the library did not rank sorts
+        // after every ranked one, and ties keep registration order (the sort is
+        // stable, as `OrderBy` is).
+        let order = crate::library_options::metadata_fetcher_order(library.as_ref(), &kind);
+        if !order.is_empty() {
+            providers.sort_by_key(|p| {
+                order
+                    .iter()
+                    .position(|n| n.eq_ignore_ascii_case(p.name()))
+                    .unwrap_or(usize::MAX)
+            });
+        }
 
         // A blank `MetadataLanguage`/`MetadataCountryCode` is filled from the
         // server configuration BEFORE the providers run, exactly as the C#
@@ -3559,6 +3593,163 @@ mod tests {
             .await
             .expect("search");
         assert_eq!(out[0].name.as_deref(), Some("-/-"));
+    }
+
+    /// One library whose `TypeOptions` the gate reads. Only
+    /// `get_virtual_folders` is exercised; every mutation is unreachable here.
+    struct OneLibrary(ferrofin_model::entities_media::VirtualFolderInfo);
+
+    #[async_trait]
+    impl ferrofin_traits::library::VirtualFolderManager for OneLibrary {
+        async fn get_virtual_folders(
+            &self,
+        ) -> Result<Vec<ferrofin_model::entities_media::VirtualFolderInfo>, ServiceError> {
+            Ok(vec![self.0.clone()])
+        }
+        async fn get_physical_paths(&self) -> Result<Vec<String>, ServiceError> {
+            Ok(Vec::new())
+        }
+        async fn add_virtual_folder(
+            &self,
+            _name: &str,
+            _collection_type: Option<ferrofin_model::entities::CollectionTypeOptions>,
+            _options: &ferrofin_model::configuration::LibraryOptions,
+        ) -> Result<(), ServiceError> {
+            unimplemented!()
+        }
+        async fn remove_virtual_folder(&self, _name: &str) -> Result<(), ServiceError> {
+            unimplemented!()
+        }
+        async fn rename_virtual_folder(&self, _n: &str, _new: &str) -> Result<(), ServiceError> {
+            unimplemented!()
+        }
+        async fn add_media_path(
+            &self,
+            _n: &str,
+            _p: &ferrofin_model::configuration::MediaPathInfo,
+        ) -> Result<(), ServiceError> {
+            unimplemented!()
+        }
+        async fn update_media_path(
+            &self,
+            _n: &str,
+            _p: &ferrofin_model::configuration::MediaPathInfo,
+        ) -> Result<(), ServiceError> {
+            unimplemented!()
+        }
+        async fn remove_media_path(&self, _n: &str, _p: &str) -> Result<(), ServiceError> {
+            unimplemented!()
+        }
+        async fn update_library_options(
+            &self,
+            _n: &str,
+            _o: &ferrofin_model::configuration::LibraryOptions,
+        ) -> Result<(), ServiceError> {
+            unimplemented!()
+        }
+    }
+
+    /// Port check for `ProviderManager.GetRemoteSearchResults`
+    /// (`ProviderManager.cs:787`) → `GetMetadataProvidersInternal` →
+    /// `CanRefreshMetadata` (`:462`) → `BaseItemManager.IsMetadataFetcherEnabled`.
+    ///
+    /// An Identify search SCOPED to an item resolves that item's library and
+    /// drops every remote fetcher the library's "Metadata downloaders" list
+    /// leaves unticked. An UNSCOPED search builds a dummy with default
+    /// `LibraryOptions`, where nothing is unticked, so it keeps the provider —
+    /// which is why the two only diverge once `ItemId` is sent.
+    #[tokio::test]
+    async fn remote_search_honours_the_librarys_metadata_fetcher_checkboxes() {
+        let library_id = Uuid::from_u128(0x5001);
+        let artist_id = Uuid::from_u128(0x5002);
+
+        let mut entity = BaseItemEntity {
+            id: ferrofin_db::store::guid_to_db(artist_id),
+            type_: "MediaBrowser.Controller.Entities.Audio.MusicArtist".to_owned(),
+            name: Some("Radiohead".to_owned()),
+            // The resolved artist's TopParentId is what makes the library
+            // lookup possible at all — an accessed-by-name artist has none and
+            // the gate stays inert (`library_options_for` returns None).
+            top_parent_id: Some(ferrofin_db::store::guid_to_db(library_id)),
+            ..BaseItemEntity::default()
+        };
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut rows = HashMap::new();
+        rows.insert(artist_id, entity.clone());
+
+        let folders = |fetchers: Vec<String>| {
+            Arc::new(OneLibrary(
+                ferrofin_model::entities_media::VirtualFolderInfo {
+                    name: Some("Music".to_owned()),
+                    item_id: Some(library_id.to_string()),
+                    library_options: Some(ferrofin_model::configuration::LibraryOptions {
+                        type_options: vec![ferrofin_model::configuration::TypeOptions {
+                            type_: Some("MusicArtist".to_owned()),
+                            metadata_fetchers: fetchers,
+                            ..ferrofin_model::configuration::TypeOptions::default()
+                        }],
+                        ..ferrofin_model::configuration::LibraryOptions::default()
+                    }),
+                    ..ferrofin_model::entities_media::VirtualFolderInfo::default()
+                },
+            )) as Arc<dyn ferrofin_traits::library::VirtualFolderManager>
+        };
+        let provider = || {
+            Arc::new(FakeProvider {
+                name: "MusicBrainz".to_owned(),
+                kind: BaseItemKind::MusicArtist,
+                results: vec![result_with(
+                    "Radiohead",
+                    &[("MusicBrainzArtist", "a74b")],
+                    None,
+                )],
+                fail: false,
+            }) as Arc<dyn RemoteSearchProvider>
+        };
+        let manager = |fetchers: Vec<String>, rows: HashMap<Uuid, BaseItemEntity>| {
+            LocalProviderManager::default()
+                .with_remote_search_providers(vec![provider()])
+                .with_virtual_folders(folders(fetchers))
+                .with_remote_images(
+                    Arc::new(crate::tmdb::TmdbClient::new()),
+                    Arc::new(FakeItems {
+                        rows,
+                        seen: tx.clone(),
+                    }),
+                )
+        };
+
+        // Unticked: the library lists no MusicArtist metadata fetcher.
+        let mgr = manager(Vec::new(), rows.clone());
+        let mut scoped = request(BaseItemKind::MusicArtist);
+        scoped.item_id = artist_id;
+        assert!(
+            mgr.remote_search(&scoped).await.unwrap().is_empty(),
+            "an unticked fetcher is dropped from a scoped search"
+        );
+
+        // The same request UNSCOPED keeps it — no reference item, so the C#
+        // dummy's default LibraryOptions enable everything.
+        let unscoped = request(BaseItemKind::MusicArtist);
+        assert_eq!(mgr.remote_search(&unscoped).await.unwrap().len(), 1);
+
+        // `IncludeDisabledProviders` short-circuits `CanRefreshMetadata`
+        // (`ProviderManager.cs:474`) before the fetcher list is consulted.
+        let mut forced = scoped.clone();
+        forced.include_disabled_providers = true;
+        assert_eq!(mgr.remote_search(&forced).await.unwrap().len(), 1);
+
+        // Ticked: the provider survives the scoped search.
+        let ticked = manager(vec!["MusicBrainz".to_owned()], rows.clone());
+        assert_eq!(ticked.remote_search(&scoped).await.unwrap().len(), 1);
+
+        // A LOCKED reference item drops every remote provider outright
+        // ("If locked only allow local providers", `ProviderManager.cs:478`).
+        entity.is_locked = true;
+        let mut locked_rows = HashMap::new();
+        locked_rows.insert(artist_id, entity);
+        let locked = manager(vec!["MusicBrainz".to_owned()], locked_rows);
+        assert!(locked.remote_search(&scoped).await.unwrap().is_empty());
     }
 
     #[tokio::test]

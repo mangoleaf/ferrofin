@@ -869,11 +869,24 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
                     // and this insert bypasses `upsert_item`, so without it
                     // the column stays NULL where Jellyfin writes
                     // `Genre-Action` — 23,186 such rows on a real library.
-                    r#"INSERT OR IGNORE INTO "BaseItems"
+                    // The existence guard is by **type and name**, not by id
+                    // (`OR IGNORE` keys on the PRIMARY KEY, which is the
+                    // `ItemValueId` — a fresh guid every first write). A
+                    // `MusicArtist` the scanner resolved from an artist
+                    // DIRECTORY already carries that CleanName under its
+                    // path-derived id, and `item_repository::push_by_name_join`
+                    // joins `agg.cval = bi."CleanName"`, so a second row here
+                    // would list every artist TWICE on /Artists. Same shape as
+                    // `music_genre_row`, and the same reason an adopted
+                    // Jellyfin database (whose by-name rows carry Jellyfin's
+                    // ids) must not get a duplicate laid beside each row.
+                    r#"INSERT INTO "BaseItems"
                        ("Id","Type","Name","CleanName","SortName","PresentationUniqueKey",
                         "IsFolder","IsInMixedFolder",
                         "IsLocked","IsMovie","IsRepeat","IsSeries","IsVirtualItem")
-                       VALUES (?1,?2,?3,?4,?5,?6,?7,0,0,0,0,0,0)"#,
+                       SELECT ?1,?2,?3,?4,?5,?6,?7,0,0,0,0,0,0
+                       WHERE NOT EXISTS (
+                           SELECT 1 FROM "BaseItems" WHERE "Type" = ?2 AND "CleanName" = ?4)"#,
                 )
                 .bind(&value_id)
                 .bind(type_name)
@@ -1596,8 +1609,10 @@ mod tests {
     use ferrofin_traits::persistence::{ItemPersistenceService, LinkedChildrenService};
     use uuid::Uuid;
 
+    use crate::item_type_lookup::stored_type_name;
     use crate::linked_children_service::FerrofinLinkedChildrenService;
     use crate::test_support::{seed_item, test_db};
+    use ferrofin_db::store::guid_to_db;
 
     use super::FerrofinItemPersistenceService;
 
@@ -1993,6 +2008,64 @@ mod tests {
         .await
         .expect("count");
         assert_eq!(coltrane, 0);
+    }
+
+    /// The by-name materializer must be a NO-OP once the scanner has resolved a
+    /// folder-backed `MusicArtist` of the same `CleanName`
+    /// (`MusicArtistResolver`). `item_repository::push_by_name_join` joins
+    /// `agg.cval = bi."CleanName"`, so a second row of the same name makes
+    /// /Artists list that artist twice — the failure a previous attempt at this
+    /// port was rolled back for.
+    #[tokio::test]
+    async fn save_item_values_does_not_duplicate_a_resolved_music_artist() {
+        let db = test_db().await;
+        let track = Uuid::new_v4();
+        seed_item(&db, track, BaseItemKind::Audio).await;
+
+        // The row the scanner writes: path-derived id, real media Path, parented
+        // into the music library (so it has a TopParentId).
+        let resolved = Uuid::new_v4();
+        sqlx::query(
+            r#"INSERT INTO "BaseItems"
+               ("Id","Type","Name","CleanName","Path","IsFolder","IsInMixedFolder",
+                "IsLocked","IsMovie","IsRepeat","IsSeries","IsVirtualItem")
+               VALUES (?1,?2,'Miles Davis','miles davis','/media/music/Miles Davis',
+                       1,0,0,0,0,0,0)"#,
+        )
+        .bind(guid_to_db(resolved))
+        .bind(stored_type_name(BaseItemKind::MusicArtist).expect("type name"))
+        .execute(db.pool())
+        .await
+        .expect("seed resolved artist");
+
+        let svc = FerrofinItemPersistenceService::new(db.clone());
+        svc.save_item_values(track, &[(1, "Miles Davis".to_owned())])
+            .await
+            .expect("save values");
+
+        let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+            r#"SELECT bi."Id", bi."Path" FROM "BaseItems" bi
+               WHERE bi."Type" LIKE '%.MusicArtist' AND bi."CleanName" = 'miles davis'"#,
+        )
+        .fetch_all(db.pool())
+        .await
+        .expect("query artists");
+        assert_eq!(rows.len(), 1, "one row per artist: {rows:?}");
+        assert_eq!(rows[0].0, guid_to_db(resolved), "the scanned row survives");
+        assert_eq!(rows[0].1.as_deref(), Some("/media/music/Miles Davis"));
+
+        // The ItemValues link is still written — the artist is still browsable
+        // through the by-name aggregate, it just resolves to the scanned row.
+        let linked: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*) FROM "ItemValuesMap" m
+               JOIN "ItemValues" v ON v."ItemValueId" = m."ItemValueId"
+               WHERE m."ItemId" = ?1 AND v."Type" = 1 AND v."Value" = 'Miles Davis'"#,
+        )
+        .bind(guid_to_db(track))
+        .fetch_one(db.pool())
+        .await
+        .expect("count links");
+        assert_eq!(linked, 1);
     }
 
     // The library scan rebuilds entities from disk with no merge link and a

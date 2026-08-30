@@ -226,6 +226,14 @@ JOURNEY_BODY_DIFF = frozenset((
 ))
 JOURNEY_METHOD.update({op: verification.BODY_DIFF for op in JOURNEY_BODY_DIFF})
 
+# MusicArtist is deliberately NOT in that list. Its evidence is a candidate list plus the
+# library-gate assertions, and the candidate list is ORDER-normalised (see the row's
+# comment: MusicBrainz orders tie-scored artists differently between two independent live
+# queries against the SAME server). Every field of every candidate is still compared and
+# the candidate set is still exact, but "whole raw body, order included" is not what this
+# row does, so it does not claim that headline.
+JOURNEY_METHOD["POST /Items/RemoteSearch/MusicArtist"] = verification.PROPERTY
+
 
 def journey_method(op):
     """The declared method for a journey op. There is NO default: an op that no list
@@ -1694,6 +1702,21 @@ _IDENTIFY_CACHE = {}   # base -> {case_key: (status, [rows])}
 
 TMDB = "TheMovieDb"
 OMDB = "The Open Movie Database"
+MUSICBRAINZ = "MusicBrainz"
+
+# MusicBrainz enforces a hard per-client rate limit and answers an over-rate query with an
+# EMPTY list rather than an error, so two servers asked back-to-back can disagree for a
+# reason that is not a parity fact. Cases named here are paced apart and retried while the
+# answer is empty. An empty answer that SURVIVES the retries is reported and diffed as-is
+# — never skipped, and never "compared only when both are non-empty".
+# Measured on the lab pair: with both containers behind ONE egress IP, the limiter needs
+# roughly 40 s of cumulative quiet before it answers the second server. 6 s of spacing with
+# a linear backoff over 5 attempts clears that with margin. If both servers end up empty
+# anyway, the row goes RED with `named_count: 0` on both sides — the honest outcome, since
+# a search neither server answered is a search this row did not verify.
+MB_PACED = {"ma_named"}
+MB_SPACING_S = 6.0
+MB_RETRIES = 5
 
 # Every RemoteSearch this journey asserts: case -> (kind, SearchInfo, SearchProviderName).
 IDENTIFY_CASES = {
@@ -1742,14 +1765,33 @@ IDENTIFY_CASES = {
     # -- Trailer. OMDb is the only Trailer fetcher on either side.
     "t_named":    ("Trailer", {"Name": "Inception", "Year": 2010}, OMDB),
     "t_bogus":    ("Trailer", {"Name": "zzqxwvyunlikelytitle12345"}, OMDB),
+    # -- MusicArtist. MusicBrainz is the only ArtistInfo fetcher on either side. UNSCOPED
+    #    (no ItemId), so upstream builds its dummy reference item with default
+    #    LibraryOptions and every fetcher is enabled — the leg that proves the two servers
+    #    agree on the search itself, before the library gate is brought into it below.
+    #    NO bogus-term case here, deliberately: MusicBrainz answers an over-rate query with
+    #    an empty list, so `[] == []` on a nonsense name would be satisfied by the rate
+    #    limiter as readily as by the search, and an assertion that cannot fail is worse
+    #    than no assertion. It would also burn the quota the leg below actually needs.
+    "ma_named":   ("MusicArtist", {"Name": "Radiohead"}, MUSICBRAINZ),
 }
 
 
-def remote_search(base, token, kind, search_info, provider=None):
-    """POST /Items/RemoteSearch/{kind}; returns (status, results-list)."""
+def remote_search(base, token, kind, search_info, provider=None,
+                  item_id=None, include_disabled=None):
+    """POST /Items/RemoteSearch/{kind}; returns (status, results-list).
+
+    `item_id` scopes the search to an existing row, which is what makes upstream read that
+    item's library options and drop the fetchers its "Metadata downloaders" list leaves
+    unticked (ProviderManager.cs:787 -> CanRefreshMetadata:462). `include_disabled` is the
+    short-circuit that puts them back."""
     body = {"SearchInfo": search_info}
     if provider:
         body["SearchProviderName"] = provider
+    if item_id:
+        body["ItemId"] = item_id
+    if include_disabled is not None:
+        body["IncludeDisabledProviders"] = include_disabled
     st, raw = http("POST", f"{base}/Items/RemoteSearch/{kind}", token, json.dumps(body))
     try:
         out = json.loads(raw) if raw else []
@@ -1775,8 +1817,18 @@ def identify_responses(base, token):
         legs.append(peer)
     per_leg = {b: {} for b, _ in legs}
     for case, (kind, info, provider) in IDENTIFY_CASES.items():
-        for b, t in legs:
-            per_leg[b][case] = remote_search(b, t, kind, info, provider)
+        paced = case in MB_PACED
+        for attempt in range(MB_RETRIES if paced else 1):
+            for b, t in legs:
+                if paced:
+                    time.sleep(MB_SPACING_S)
+                per_leg[b][case] = remote_search(b, t, kind, info, provider)
+            if not paced or all(per_leg[b][case][1] for b, _ in legs):
+                break
+            # Back off before re-asking: an empty list here is far more often the rate
+            # limiter than a real answer, and the retries are what let a genuinely empty
+            # answer be reported honestly instead of being written off as throttling.
+            time.sleep(MB_SPACING_S * (attempt + 1))
     _IDENTIFY_CACHE.update(per_leg)
     return _IDENTIFY_CACHE[base]
 
@@ -1914,6 +1966,68 @@ def j_remote_search_identify(base, token, user, _m, _m2):
           "bogus_empty": rows["t_bogus"] == []}
     r["POST /Items/RemoteSearch/Trailer"] = Same(
         status["t_named"] == 200 and bool(rows["t_named"]) and ev["bogus_empty"], ev)
+
+    # ---- MusicArtist ---------------------------------------------------------
+    # Two halves. (a) the UNSCOPED search, whole-object compared like every case above.
+    #     ONE deliberate relaxation, and it is a relaxation of ORDER only: the candidate
+    #     lists are sorted by (Name, MusicBrainzArtist id) before comparison, because
+    #     MusicBrainz returns tie-SCORED artists in an order that two independent live
+    #     queries genuinely do not agree on (measured: 6 rows of the 25 swap between
+    #     back-to-back queries against the SAME server). Every field of every candidate is
+    #     still compared, and the candidate SET is still compared exactly — a row present
+    #     on one side and not the other still fails.
+    # (b) the SCOPED search, which is the deterministic half and the one this row exists
+    #     for: with `ItemId` set, upstream resolves the item's library and drops every
+    #     fetcher its "Metadata downloaders" list leaves unticked (ProviderManager.cs:787
+    #     -> GetMetadataProvidersInternal:440 -> CanRefreshMetadata:462 ->
+    #     BaseItemManager.IsMetadataFetcherEnabled). On the synthetic fixture that list is
+    #     empty for MusicArtist, so the correct answer is [] with NO outbound request at
+    #     all — no rate limiter can reach this assertion. `IncludeDisabledProviders` is
+    #     the short-circuit (:474) that puts the provider back.
+    #
+    # Resolving the id is itself the detector for the MusicArtistResolver port: a server
+    # whose artists are accessed-by-name rows carry no TopParentId, are invisible to this
+    # user-scoped recursive query, and there is no id to scope with. That MUST fail the
+    # row — never skip it — which is what `artist_resolved` records.
+    def artist_by_path(b, t):
+        q = ("/Items?userId=%s&recursive=true&includeItemTypes=MusicArtist&fields=Path"
+             "&sortBy=Path" % user)
+        found = (get_json(b, q, t) or {}).get("Items") or []
+        return (found[0].get("Id"), found[0].get("Path")) if found else (None, None)
+
+    def sorted_candidates(rowset):
+        return sorted(rowset, key=lambda x: (x.get("Name") or "",
+                                             (x.get("ProviderIds") or {}).get("MusicBrainzArtist")
+                                             or ""))
+
+    artist_id, artist_path = artist_by_path(base, token)
+    scoped = forced = None
+    if artist_id:
+        _, scoped = remote_search(base, token, "MusicArtist", {"Name": "Radiohead"},
+                                  MUSICBRAINZ, item_id=artist_id)
+        for attempt in range(MB_RETRIES):
+            time.sleep(MB_SPACING_S)
+            _, forced = remote_search(base, token, "MusicArtist", {"Name": "Radiohead"},
+                                      MUSICBRAINZ, item_id=artist_id, include_disabled=True)
+            if forced:
+                break
+            time.sleep(MB_SPACING_S * (attempt + 1))
+    ev = {"named": sorted_candidates(rows["ma_named"]),
+          # Surfaced so a reader can tell a real disagreement from the rate limiter at a
+          # glance: BOTH counts zero means neither server got an answer.
+          "named_count": len(rows["ma_named"]),
+          "forced_count": len(forced or []),
+          "artist_resolved": bool(artist_id),
+          "artist_path": artist_path,
+          # The gate: the library ticks no MusicArtist metadata fetcher, so a scoped
+          # search must answer [] even though the unscoped one answers.
+          "gate_drops_the_fetcher": scoped == [],
+          # …and lifting the gate must put the SAME provider back.
+          "include_disabled_restores": bool(forced)
+          and {x.get("SearchProviderName") for x in forced} == {MUSICBRAINZ}}
+    r["POST /Items/RemoteSearch/MusicArtist"] = Same(
+        bool(artist_id) and bool(rows["ma_named"])
+        and ev["gate_drops_the_fetcher"] and ev["include_disabled_restores"], ev)
     return r
 
 

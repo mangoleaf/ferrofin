@@ -1100,13 +1100,41 @@ impl FerrofinDtoService {
                 // (UserRootFolder/CollectionFolder/UserView/AggregateFolder) and
                 // MusicAlbum/PhotoAlbum override to false.
                 if folder_emits_counts(item)
-                    && kinds::supports_played_status(kind)
                     && let Some(c) = prefetched.played_counts.get(&item_id).copied()
                 {
-                    let ud = dto
-                        .user_data
-                        .get_or_insert_with(|| empty_user_data_dto(item_id));
-                    ud.unplayed_item_count = Some(c.total - c.played);
+                    // `Folder.FillUserDataDtoValues` (Folder.cs:1798) runs two
+                    // INDEPENDENT gates behind `SupportsUserDataFromChildren`:
+                    // RecursiveItemCount on the FIELD alone (:1805), the
+                    // unplayed count on `SupportsPlayedStatus` (:1810). They are
+                    // not the same set — `MusicArtist.SupportsPlayedStatus` is
+                    // false (MusicArtist.cs:47), which is why Jellyfin's artist
+                    // body carries `RecursiveItemCount` and no
+                    // `UnplayedItemCount`. Both read the same recursive
+                    // non-folder/non-virtual count the prefetch already ran, so
+                    // this costs no extra query.
+                    if options.contains_field(ItemFields::RecursiveItemCount) {
+                        dto.recursive_item_count = Some(c.total);
+                    }
+                    if kinds::supports_played_status(kind) {
+                        let unplayed = c.total - c.played;
+                        let ud = dto
+                            .user_data
+                            .get_or_insert_with(|| empty_user_data_dto(item_id));
+                        ud.unplayed_item_count = Some(unplayed);
+                        // Folder.cs:1828 — the folder's own played state is
+                        // derived from its children, and deliberately keys off
+                        // `itemDto.RecursiveItemCount`, so it degrades to the
+                        // `unplayed == 0` arm when the field was not requested.
+                        if let Some(total) = dto.recursive_item_count.filter(|t| *t > 0) {
+                            let unplayed_percentage =
+                                (f64::from(unplayed) / f64::from(total)) * 100.0;
+                            let played_percentage = 100.0 - unplayed_percentage;
+                            ud.played_percentage = Some(played_percentage);
+                            ud.played = played_percentage >= 100.0;
+                        } else {
+                            ud.played = unplayed == 0;
+                        }
+                    }
                 }
             }
         }
@@ -2858,6 +2886,107 @@ mod tests {
         assert!((percent_of_ticks(36_000_000_000, 72_000_000_000) - 50.0).abs() < 1e-9);
         // Tiny fractions stay positive and precise enough for display.
         assert!(percent_of_ticks(1, 72_000_000_000) > 0.0);
+    }
+
+    /// `Folder.FillUserDataDtoValues` (Folder.cs:1798) runs RecursiveItemCount
+    /// and UnplayedItemCount behind the SAME `SupportsUserDataFromChildren`
+    /// gate but on DIFFERENT inner conditions — the field for the first, and
+    /// `SupportsPlayedStatus` for the second. `MusicArtist.SupportsPlayedStatus`
+    /// is false (MusicArtist.cs:47), which is why a live 10.11.8 artist body
+    /// carries `RecursiveItemCount: 3` and no `UnplayedItemCount` at all.
+    #[tokio::test]
+    async fn folder_dto_carries_recursive_item_count_independently_of_played_status() {
+        let db = test_db().await;
+        let season_id = Uuid::new_v4();
+        seed_folder_item(&db, season_id, BaseItemKind::Season, "Season 1", None).await;
+        let artist_id = Uuid::new_v4();
+        seed_folder_item(
+            &db,
+            artist_id,
+            BaseItemKind::MusicArtist,
+            "OnDisk",
+            Some(season_id),
+        )
+        .await;
+        let byname_id = Uuid::new_v4();
+        seed_folder_item(&db, byname_id, BaseItemKind::MusicArtist, "ByName", None).await;
+        let leaf_id = Uuid::new_v4();
+        seed_named_item(&db, leaf_id, BaseItemKind::Movie, "A Movie").await;
+
+        let user = seed_user(&db, Uuid::new_v4()).await;
+        let season = fetch_item(&db, season_id).await;
+        let artist = fetch_item(&db, artist_id).await;
+        let byname = fetch_item(&db, byname_id).await;
+        let leaf = fetch_item(&db, leaf_id).await;
+        let svc = service(db);
+        let options = DtoOptions::default();
+
+        // FakeCounts reports 1 played of 4 leaf descendants.
+        let season_dto = svc
+            .get_base_item_dto(&season, &options, Some(&user), None)
+            .await
+            .unwrap();
+        assert_eq!(season_dto.recursive_item_count, Some(4));
+        let ud = season_dto.user_data.as_ref().unwrap();
+        assert_eq!(ud.unplayed_item_count, Some(3));
+        // Folder.cs:1828 — 100 - (3/4 × 100).
+        assert!((ud.played_percentage.unwrap() - 25.0).abs() < 1e-9);
+        assert!(!ud.played);
+
+        // The artist shape: the count, and NO unplayed count.
+        let artist_dto = svc
+            .get_base_item_dto(&artist, &options, Some(&user), None)
+            .await
+            .unwrap();
+        assert_eq!(artist_dto.recursive_item_count, Some(4));
+        assert_eq!(
+            artist_dto.user_data.as_ref().unwrap().unplayed_item_count,
+            None
+        );
+
+        // An accessed-by-name artist is not a runtime folder, and a leaf never
+        // is — `SupportsUserDataFromChildren` returns early for both.
+        for item in [&byname, &leaf] {
+            let dto = svc
+                .get_base_item_dto(item, &options, Some(&user), None)
+                .await
+                .unwrap();
+            assert_eq!(dto.recursive_item_count, None);
+        }
+
+        // The field is opt-in: without `ItemFields::RecursiveItemCount` the
+        // count is absent, and `Played` falls back to the `unplayed == 0` arm.
+        let mut narrow = DtoOptions::default();
+        narrow
+            .fields
+            .retain(|f| *f != ItemFields::RecursiveItemCount);
+        let narrow_dto = svc
+            .get_base_item_dto(&season, &narrow, Some(&user), None)
+            .await
+            .unwrap();
+        assert_eq!(narrow_dto.recursive_item_count, None);
+        let narrow_ud = narrow_dto.user_data.as_ref().unwrap();
+        assert_eq!(narrow_ud.unplayed_item_count, Some(3));
+        assert_eq!(narrow_ud.played_percentage, None);
+        assert!(!narrow_ud.played);
+
+        // The batch (prefetched) path agrees with the single-item path.
+        let batch = svc
+            .get_base_item_dtos(
+                &[season.clone(), artist.clone()],
+                &options,
+                Some(&user),
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(batch[0].recursive_item_count, Some(4));
+        assert_eq!(batch[1].recursive_item_count, Some(4));
+        assert_eq!(
+            batch[1].user_data.as_ref().unwrap().unplayed_item_count,
+            None
+        );
     }
 
     #[tokio::test]

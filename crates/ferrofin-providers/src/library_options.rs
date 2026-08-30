@@ -59,6 +59,21 @@ pub fn metadata_fetcher_enabled(
     })
 }
 
+/// The library's configured `MetadataFetcherOrder` for item type `kind` — the
+/// order `GetMetadataProvidersInternal` sorts remote providers by
+/// (`ProviderManager.cs:445`). Empty when the library pins no order, in which
+/// case the providers keep their registration order (upstream's
+/// `GetDefaultOrder` tie-break).
+#[must_use]
+pub fn metadata_fetcher_order(
+    options: Option<&ferrofin_model::configuration::LibraryOptions>,
+    kind: &str,
+) -> Vec<String> {
+    type_entry(options, kind)
+        .map(|t| t.metadata_fetcher_order.clone())
+        .unwrap_or_default()
+}
+
 /// Whether the library enables image fetcher `name` for item type `kind`.
 ///
 /// Port of `BaseItemManager.IsImageFetcherEnabled`, the image half of the same
