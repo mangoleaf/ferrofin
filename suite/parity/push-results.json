@@ -1,0 +1,133 @@
+{
+  "errors": [
+    "a non-lifecycle message was drained by a settle window, so the leg after it was measured against an incomplete capture \u2014 LibraryChanged: j=1"
+  ],
+  "generated_by": "suite/parity/push.py",
+  "last_verified": "c7f49a9 2026-08-31",
+  "observations": [
+    "agreed (socket lifecycle) \u2014 ForceKeepAlive: h=12, j=12",
+    "agreed (socket lifecycle) \u2014 KeepAlive: h=12, j=12"
+  ],
+  "rows": {
+    "GET /SyncPlay/List": {
+      "classification": "flagged: a settle window drained a non-lifecycle message, so this run's capture was incomplete",
+      "deep_verified": null,
+      "note": "withdrawn (incomplete capture) \u2014 H=200 J=200 | groups H=1 J=1 (one each: the group this run made) | 5 field(s) compared",
+      "verification_method": null
+    },
+    "GET /SyncPlay/{id}": {
+      "classification": "flagged: a settle window drained a non-lifecycle message, so this run's capture was incomplete",
+      "deep_verified": null,
+      "note": "withdrawn (incomplete capture) \u2014 H=200 J=200 | 5 field(s) compared | LastUpdatedAt advances per read: H=0.0s/0.0s J=0.0s/0.0s",
+      "verification_method": null
+    },
+    "POST /SyncPlay/Buffering": {
+      "classification": "flagged: a settle window drained a non-lifecycle message, so this run's capture was incomplete",
+      "deep_verified": null,
+      "note": "withdrawn (incomplete capture) \u2014 buffer@idle Idle\u2192Idle; buffer@waiting/resume-armed Waiting\u2192Waiting; buffer@playing Playing\u2192Waiting; buffer@waiting/wrong-item Waiting\u2192Waiting; buffer@playing/ignored Playing\u2192Playing; buffer@paused Paused\u2192Waiting; buffer@waiting/resume-disarmed Waiting\u2192Waiting | buffer@idle/ctrl H/J 1/1; buffer@idle/peer H/J 0/0; buffer@waiting/resume-armed/ctrl H/J 1/1; buffer@waiting/resume-armed/peer H/J 1/1; buffer@playing/ctrl H/J 2/2; buffer@playing/peer H/J 1/1; buffer@waiting/wrong-item/ctrl H/J 1/1; buffer@waiting/wrong-item/peer H/J 0/0; buffer@playing/ignored/ctrl H/J 0/0; buffer@playing/ignored/peer H/J 0/0; buffer@paused/ctrl H/J 2/2; buffer@paused/peer H/J 1/1; buffer@waiting/resume-disarmed/ctrl H/J 2/2; buffer@waiting/resume-disarmed/peer H/J 1/1 | When\u2212EmittedAt: SyncPlayCommand/Stop H=-16.378s J=-16.375s; SyncPlayCommand/Pause H=+0.000s J=-0.000s; SyncPlayCommand/Pause H=-1.960s J=-1.960s; SyncPlayCommand/Pause H=-7.845s J=-7.846s | position (tolerance \u00b10.02s): PositionTicks H=133933892 J=133935252 \u0394=-0ms; PositionTicks H=9601100 J=9595340 \u0394=+1ms; StartPositionTicks H=133933892 J=133935252 \u0394=-0ms | 76 field(s) compared (pushed messages)",
+      "verification_method": null
+    },
+    "POST /SyncPlay/Join": {
+      "classification": "flagged: a settle window drained a non-lifecycle message, so this run's capture was incomplete",
+      "deep_verified": null,
+      "note": "withdrawn (incomplete capture) \u2014 H=204 J=204 | join/joiner H/J 2/2; join/member H/J 1/1 | When\u2212EmittedAt: SyncPlayCommand/Stop H=-2.721s J=-2.716s | 18 field(s) compared (pushed messages)",
+      "verification_method": null
+    },
+    "POST /SyncPlay/Leave": {
+      "classification": "flagged: a settle window drained a non-lifecycle message, so this run's capture was incomplete",
+      "deep_verified": null,
+      "note": "withdrawn (incomplete capture) \u2014 H=204 J=204 | leave/leaver H/J 1/1; leave/member H/J 1/1 | 8 field(s) compared (pushed messages)",
+      "verification_method": null
+    },
+    "POST /SyncPlay/MovePlaylistItem": {
+      "classification": "flagged: a settle window drained a non-lifecycle message, so this run's capture was incomplete",
+      "deep_verified": null,
+      "note": "withdrawn (incomplete capture) \u2014 move@idle Idle\u2192Idle | move@idle/ctrl H/J 1/1; move@idle/peer H/J 1/1 | 26 field(s) compared (pushed messages)",
+      "verification_method": null
+    },
+    "POST /SyncPlay/New": {
+      "classification": "flagged: a settle window drained a non-lifecycle message, so this run's capture was incomplete",
+      "deep_verified": null,
+      "note": "withdrawn (incomplete capture) \u2014 H=200 J=200 | new/creator H/J 2/2 | When\u2212EmittedAt: SyncPlayCommand/Stop H=+0.000s J=-0.003s | 17 field(s) compared (13 pushed + 4 body)",
+      "verification_method": null
+    },
+    "POST /SyncPlay/NextItem": {
+      "classification": "flagged: a settle window drained a non-lifecycle message, so this run's capture was incomplete",
+      "deep_verified": null,
+      "note": "withdrawn (incomplete capture) \u2014 nextitem@waiting/wrong-item Waiting\u2192Waiting; nextitem@waiting Waiting\u2192Waiting; nextitem@waiting/no-room Waiting\u2192Idle | nextitem@waiting/wrong-item/ctrl H/J 0/0; nextitem@waiting/wrong-item/peer H/J 0/0; nextitem@waiting/ctrl H/J 1/1; nextitem@waiting/peer H/J 1/1; nextitem@waiting/no-room/ctrl H/J 0/0; nextitem@waiting/no-room/peer H/J 0/0 | 24 field(s) compared (pushed messages)",
+      "verification_method": null
+    },
+    "POST /SyncPlay/Pause": {
+      "classification": "flagged: a settle window drained a non-lifecycle message, so this run's capture was incomplete",
+      "deep_verified": null,
+      "note": "withdrawn (incomplete capture) \u2014 pause@idle Idle\u2192Idle; pause@playing Playing\u2192Paused; pause@playing/again Playing\u2192Paused; pause@paused Paused\u2192Paused; pause@playing/third Playing\u2192Paused; pause@playing/fourth Playing\u2192Paused; pause@playing/fifth Playing\u2192Paused; pause@waiting Waiting\u2192Waiting | pause@idle/ctrl H/J 1/1; pause@idle/peer H/J 0/0; pause@playing/ctrl H/J 2/2; pause@playing/peer H/J 2/2; pause@playing/again/ctrl H/J 2/2; pause@playing/again/peer H/J 2/2; pause@paused/ctrl H/J 1/1; pause@paused/peer H/J 0/0; pause@playing/third/ctrl H/J 2/2; pause@playing/third/peer H/J 2/2; pause@playing/fourth/ctrl H/J 2/2; pause@playing/fourth/peer H/J 2/2; pause@playing/fifth/ctrl H/J 2/2; pause@playing/fifth/peer H/J 2/2; pause@waiting/ctrl H/J 1/1; pause@waiting/peer H/J 1/1 | When\u2212EmittedAt: SyncPlayCommand/Stop H=-3.938s J=-3.938s; SyncPlayCommand/Pause H=+0.000s J=-0.000s; SyncPlayCommand/Pause H=+0.000s J=-0.000s; SyncPlayCommand/Pause H=+0.000s J=-0.000s; SyncPlayCommand/Pause H=+0.000s J=-0.000s; SyncPlayCommand/Pause H=-1.959s J=-1.959s; SyncPlayCommand/Pause H=+0.000s J=-0.000s; SyncPlayCommand/Pause H=+0.000s J=-0.000s; SyncPlayCommand/Pause H=+0.000s J=-0.000s; SyncPlayCommand/Pause H=+0.000s J=-0.000s; SyncPlayCommand/Pause H=+0.000s J=-0.000s; SyncPlayCommand/Pause H=+0.000s J=-0.000s | position (tolerance \u00b10.02s): PositionTicks H=11588534 J=11594283 \u0394=-1ms; PositionTicks H=21216600 J=21221264 \u0394=-0ms; PositionTicks H=9599370 J=9605674 \u0394=-1ms; PositionTicks H=9601100 J=9595340 \u0394=+1ms; PositionTicks H=9610814 J=9605343 \u0394=+1ms | 132 field(s) compared (pushed messages)",
+      "verification_method": null
+    },
+    "POST /SyncPlay/Ping": {
+      "classification": "flagged: a settle window drained a non-lifecycle message, so this run's capture was incomplete",
+      "deep_verified": null,
+      "note": "withdrawn (incomplete capture) \u2014 H=204 J=204 | ping/controller H/J 1/1 | 4 field(s) compared (pushed messages) (the not-in-group leg: accepted (no IsInGroup policy) + a NotInGroup push)",
+      "verification_method": null
+    },
+    "POST /SyncPlay/PreviousItem": {
+      "classification": "flagged: a settle window drained a non-lifecycle message, so this run's capture was incomplete",
+      "deep_verified": null,
+      "note": "withdrawn (incomplete capture) \u2014 previtem@idle Idle\u2192Waiting; previtem@waiting Waiting\u2192Waiting; previtem@waiting/no-room Waiting\u2192Idle | previtem@idle/ctrl H/J 1/1; previtem@idle/peer H/J 1/1; previtem@waiting/ctrl H/J 1/1; previtem@waiting/peer H/J 1/1; previtem@waiting/no-room/ctrl H/J 0/0; previtem@waiting/no-room/peer H/J 0/0 | 48 field(s) compared (pushed messages)",
+      "verification_method": null
+    },
+    "POST /SyncPlay/Queue": {
+      "classification": "flagged: a settle window drained a non-lifecycle message, so this run's capture was incomplete",
+      "deep_verified": null,
+      "note": "withdrawn (incomplete capture) \u2014 queue@idle Idle\u2192Idle; queue@idle/nothing Idle\u2192Idle | queue@idle/ctrl H/J 1/1; queue@idle/peer H/J 1/1; queue@idle/nothing/ctrl H/J 0/0; queue@idle/nothing/peer H/J 0/0 | 26 field(s) compared (pushed messages)",
+      "verification_method": null
+    },
+    "POST /SyncPlay/Ready": {
+      "classification": "flagged: a settle window drained a non-lifecycle message, so this run's capture was incomplete",
+      "deep_verified": null,
+      "note": "withdrawn (incomplete capture) \u2014 ready@idle Idle\u2192Idle; ready@waiting/wrong-item Waiting\u2192Waiting; ready@waiting/first Waiting\u2192Waiting; ready@waiting/last Waiting\u2192Playing; ready@playing Playing\u2192Playing; ready@waiting/first-2 Waiting\u2192Waiting; ready@waiting/last-2 Waiting\u2192Playing; ready@paused Paused\u2192Paused; ready@waiting/first-3 Waiting\u2192Waiting; ready@waiting/last-3 Waiting\u2192Playing; ready@waiting/correcting Waiting\u2192Waiting | ready@idle/ctrl H/J 1/1; ready@idle/peer H/J 0/0; ready@waiting/wrong-item/ctrl H/J 0/0; ready@waiting/wrong-item/peer H/J 1/1; ready@waiting/first/ctrl H/J 1/1; ready@waiting/first/peer H/J 0/0; ready@waiting/last/ctrl H/J 2/2; ready@waiting/last/peer H/J 2/2; ready@playing/ctrl H/J 1/1; ready@playing/peer H/J 0/0; ready@waiting/first-2/ctrl H/J 1/1; ready@waiting/first-2/peer H/J 0/0; ready@waiting/last-2/ctrl H/J 2/2; ready@waiting/last-2/peer H/J 2/2; ready@paused/ctrl H/J 1/1; ready@paused/peer H/J 0/0; ready@waiting/first-3/ctrl H/J 1/1; ready@waiting/first-3/peer H/J 0/0; ready@waiting/last-3/ctrl H/J 2/2; ready@waiting/last-3/peer H/J 2/2; ready@waiting/correcting/ctrl H/J 2/2; ready@waiting/correcting/peer H/J 1/1 | When\u2212EmittedAt: SyncPlayCommand/Stop H=-22.596s J=-22.594s; SyncPlayCommand/Pause H=-1.203s J=-1.205s; SyncPlayCommand/Unpause H=+1.000s J=+1.000s; SyncPlayCommand/Unpause H=+1.000s J=+1.000s; SyncPlayCommand/Unpause H=-7.179s J=-7.179s; SyncPlayCommand/Pause H=-1.204s J=-1.205s; SyncPlayCommand/Unpause H=+1.000s J=+1.000s; SyncPlayCommand/Unpause H=+1.000s J=+1.000s; SyncPlayCommand/Pause H=-8.175s J=-8.175s; SyncPlayCommand/Pause H=-1.204s J=-1.205s; SyncPlayCommand/Unpause H=+1.000s J=+1.000s; SyncPlayCommand/Unpause H=+1.000s J=+1.000s; SyncPlayCommand/Seek H=-5.884s J=-5.884s | position (tolerance \u00b10.02s): PositionTicks H=9601100 J=9595340 \u0394=+1ms; PositionTicks H=9610814 J=9605343 \u0394=+1ms | 130 field(s) compared (pushed messages)",
+      "verification_method": null
+    },
+    "POST /SyncPlay/RemoveFromPlaylist": {
+      "classification": "flagged: a settle window drained a non-lifecycle message, so this run's capture was incomplete",
+      "deep_verified": null,
+      "note": "withdrawn (incomplete capture) \u2014 remove@idle/keeps-playing Idle\u2192Idle; remove@idle/clear-keeps-playing-item Idle\u2192Idle; remove@idle/clear-everything Idle\u2192Idle | remove@idle/keeps-playing/ctrl H/J 1/1; remove@idle/keeps-playing/peer H/J 1/1; remove@idle/clear-keeps-playing-item/ctrl H/J 1/1; remove@idle/clear-keeps-playing-item/peer H/J 1/1; remove@idle/clear-everything/ctrl H/J 2/2; remove@idle/clear-everything/peer H/J 1/1 | When\u2212EmittedAt: SyncPlayCommand/Stop H=+0.000s J=-0.000s | 68 field(s) compared (pushed messages)",
+      "verification_method": null
+    },
+    "POST /SyncPlay/Seek": {
+      "classification": "flagged: pushed messages or response differ (verify against the C#)",
+      "deep_verified": false,
+      "note": "seek@idle Idle\u2192Idle; seek@waiting Waiting\u2192Waiting; seek@waiting/past-the-end Waiting\u2192Waiting; seek@playing Playing\u2192Waiting; seek@paused Paused\u2192Waiting | seek@idle/ctrl H/J 1/1; seek@idle/peer H/J 0/1; seek@waiting/ctrl H/J 2/2; seek@waiting/peer H/J 2/2; seek@waiting/past-the-end/ctrl H/J 2/2; seek@waiting/past-the-end/peer H/J 2/2; seek@playing/ctrl H/J 2/2; seek@playing/peer H/J 2/2; seek@paused/ctrl H/J 2/2; seek@paused/peer H/J 2/2 | When\u2212EmittedAt: SyncPlayCommand/Stop H=-10.160s J=-10.157s; SyncPlayCommand/Seek H=+0.000s J=-0.000s; SyncPlayCommand/Seek H=+0.000s J=-0.000s; SyncPlayCommand/Seek H=+0.000s J=-0.000s; SyncPlayCommand/Seek H=+0.000s J=-0.000s; SyncPlayCommand/Seek H=+0.000s J=-0.000s; SyncPlayCommand/Seek H=+0.000s J=-0.000s; SyncPlayCommand/Seek H=+0.000s J=-0.000s; SyncPlayCommand/Seek H=+0.000s J=-0.000s | position (tolerance \u00b10.02s): PositionTicks H=10230000 J=10230000 \u0394=+0ms; PositionTicks H=2000000 J=2000000 \u0394=+0ms; PositionTicks H=3000000 J=3000000 \u0394=+0ms; PositionTicks H=5000000 J=5000000 \u0394=+0ms | seek@idle/peer: pushed message sequence differs \u2014 H=[] J=['LibraryChanged'] | 94 field(s) compared (pushed messages)",
+      "verification_method": "push-diff"
+    },
+    "POST /SyncPlay/SetIgnoreWait": {
+      "classification": "flagged: a settle window drained a non-lifecycle message, so this run's capture was incomplete",
+      "deep_verified": null,
+      "note": "withdrawn (incomplete capture) \u2014 ignorewait@idle Idle\u2192Idle; ignorewait@paused Paused\u2192Paused; ignorewait@waiting Waiting\u2192Playing; ignorewait@playing Playing\u2192Playing | ignorewait@idle/ctrl H/J 0/0; ignorewait@idle/peer H/J 0/0; ignorewait@paused/ctrl H/J 0/0; ignorewait@paused/peer H/J 0/0; ignorewait@waiting/ctrl H/J 2/2; ignorewait@waiting/peer H/J 2/2; ignorewait@playing/ctrl H/J 0/0; ignorewait@playing/peer H/J 0/0 | When\u2212EmittedAt: SyncPlayCommand/Unpause H=+1.000s J=+1.000s; SyncPlayCommand/Unpause H=+1.000s J=+1.000s | position (tolerance \u00b10.02s): PositionTicks H=9601100 J=9595340 \u0394=+1ms | 22 field(s) compared (pushed messages)",
+      "verification_method": null
+    },
+    "POST /SyncPlay/SetNewQueue": {
+      "classification": "flagged: a settle window drained a non-lifecycle message, so this run's capture was incomplete",
+      "deep_verified": null,
+      "note": "withdrawn (incomplete capture) \u2014 setnewqueue@idle Idle\u2192Waiting; setnewqueue@idle/steps Idle\u2192Waiting; setnewqueue@idle/play Idle\u2192Waiting; setnewqueue@playing Playing\u2192Waiting; setnewqueue@waiting Waiting\u2192Waiting; setnewqueue@paused Paused\u2192Waiting; setnewqueue@waiting/refused Waiting\u2192Idle | setnewqueue@idle/ctrl H/J 1/1; setnewqueue@idle/peer H/J 1/1; setnewqueue@idle/steps/ctrl H/J 1/1; setnewqueue@idle/steps/peer H/J 1/1; setnewqueue@idle/play/ctrl H/J 1/1; setnewqueue@idle/play/peer H/J 1/1; setnewqueue@playing/ctrl H/J 1/1; setnewqueue@playing/peer H/J 1/1; setnewqueue@waiting/ctrl H/J 1/1; setnewqueue@waiting/peer H/J 1/1; setnewqueue@paused/ctrl H/J 1/1; setnewqueue@paused/peer H/J 1/1; setnewqueue@waiting/refused/ctrl H/J 0/0; setnewqueue@waiting/refused/peer H/J 0/0 | 144 field(s) compared (pushed messages)",
+      "verification_method": null
+    },
+    "POST /SyncPlay/SetPlaylistItem": {
+      "classification": "flagged: a settle window drained a non-lifecycle message, so this run's capture was incomplete",
+      "deep_verified": null,
+      "note": "withdrawn (incomplete capture) \u2014 setplaylistitem@idle Idle\u2192Waiting; setplaylistitem@waiting/unknown Waiting\u2192Idle | setplaylistitem@idle/ctrl H/J 1/1; setplaylistitem@idle/peer H/J 1/1; setplaylistitem@waiting/unknown/ctrl H/J 0/0; setplaylistitem@waiting/unknown/peer H/J 0/0 | 24 field(s) compared (pushed messages)",
+      "verification_method": null
+    },
+    "POST /SyncPlay/Stop": {
+      "classification": "flagged: a settle window drained a non-lifecycle message, so this run's capture was incomplete",
+      "deep_verified": null,
+      "note": "withdrawn (incomplete capture) \u2014 stop@waiting Waiting\u2192Idle; stop@idle Idle\u2192Idle; stop@paused Paused\u2192Idle; stop@playing/teardown Playing\u2192Idle | stop@waiting/ctrl H/J 1/1; stop@waiting/peer H/J 1/1; stop@idle/ctrl H/J 1/1; stop@idle/peer H/J 0/0; stop@paused/ctrl H/J 1/1; stop@paused/peer H/J 1/1; stop@playing/teardown/ctrl H/J 1/1; stop@playing/teardown/peer H/J 1/1 | When\u2212EmittedAt: SyncPlayCommand/Stop H=-1.973s J=-1.969s; SyncPlayCommand/Stop H=-1.973s J=-1.969s; SyncPlayCommand/Stop H=-35.033s J=-35.028s; SyncPlayCommand/Stop H=-1.960s J=-1.960s; SyncPlayCommand/Stop H=-1.960s J=-1.960s; SyncPlayCommand/Stop H=-7.181s J=-7.181s; SyncPlayCommand/Stop H=-7.181s J=-7.181s | position (tolerance \u00b10.02s): PositionTicks H=21216600 J=21221264 \u0394=-0ms; PositionTicks H=9601100 J=9595340 \u0394=+1ms | 42 field(s) compared (pushed messages)",
+      "verification_method": null
+    },
+    "POST /SyncPlay/Unpause": {
+      "classification": "flagged: a settle window drained a non-lifecycle message, so this run's capture was incomplete",
+      "deep_verified": null,
+      "note": "withdrawn (incomplete capture) \u2014 unpause@playing Playing\u2192Playing; unpause@waiting/forced Waiting\u2192Playing; unpause@waiting/forced-2 Waiting\u2192Playing; unpause@waiting/forced-3 Waiting\u2192Playing; unpause@idle Idle\u2192Waiting; unpause@waiting/arms-resume Waiting\u2192Waiting; unpause@waiting/forced-4 Waiting\u2192Playing; unpause@paused Paused\u2192Playing; unpause@idle/again Idle\u2192Waiting; unpause@waiting/arms-resume-2 Waiting\u2192Waiting | unpause@playing/ctrl H/J 1/1; unpause@playing/peer H/J 0/0; unpause@waiting/forced/ctrl H/J 2/2; unpause@waiting/forced/peer H/J 2/2; unpause@waiting/forced-2/ctrl H/J 2/2; unpause@waiting/forced-2/peer H/J 2/2; unpause@waiting/forced-3/ctrl H/J 2/2; unpause@waiting/forced-3/peer H/J 2/2; unpause@idle/ctrl H/J 1/1; unpause@idle/peer H/J 1/1; unpause@waiting/arms-resume/ctrl H/J 1/1; unpause@waiting/arms-resume/peer H/J 1/1; unpause@waiting/forced-4/ctrl H/J 2/2; unpause@waiting/forced-4/peer H/J 2/2; unpause@paused/ctrl H/J 2/2; unpause@paused/peer H/J 2/2; unpause@idle/again/ctrl H/J 1/1; unpause@idle/again/peer H/J 1/1; unpause@waiting/arms-resume-2/ctrl H/J 1/1; unpause@waiting/arms-resume-2/peer H/J 1/1 | When\u2212EmittedAt: SyncPlayCommand/Unpause H=-0.961s J=-0.963s; SyncPlayCommand/Unpause H=+1.000s J=+1.000s; SyncPlayCommand/Unpause H=+1.000s J=+1.000s; SyncPlayCommand/Unpause H=+1.000s J=+1.000s; SyncPlayCommand/Unpause H=+1.000s J=+1.000s; SyncPlayCommand/Unpause H=+1.000s J=+1.000s; SyncPlayCommand/Unpause H=+1.000s J=+1.000s; SyncPlayCommand/Unpause H=+1.000s J=+1.000s; SyncPlayCommand/Unpause H=+1.000s J=+1.000s; SyncPlayCommand/Unpause H=+1.000s J=+1.000s; SyncPlayCommand/Unpause H=+1.000s J=+1.000s | position (tolerance \u00b10.02s): PositionTicks H=10230000 J=10230000 \u0394=+0ms; PositionTicks H=11588534 J=11594283 \u0394=-1ms; PositionTicks H=2000000 J=2000000 \u0394=+0ms; PositionTicks H=3000000 J=3000000 \u0394=+0ms | 184 field(s) compared (pushed messages)",
+      "verification_method": null
+    }
+  }
+}

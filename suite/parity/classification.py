@@ -110,6 +110,14 @@ CATEGORIES = {
     # This one is a live defect on BOTH trees that Ferrofin declines to port.
     "jellyfin-bug-not-ported": PENDING,
     # --- notes on rows verified elsewhere ----------------------------------
+    # A note whose subject is a SIDE PATH of the op — an error path the contract
+    # never takes, or a side effect the probe deliberately does not assert. The
+    # row's own verdict is earned elsewhere (a journey read-back, a push probe),
+    # so the note claims nothing about it and must never bucket as SETTLED.
+    # `gen-ledger.check` asserts exactly that; five Live TV rows carried
+    # `scope: side-path` with an `accepted-divergence`/`jellyfin-bug` category
+    # and tripped it the first time both halves met on one tree.
+    "side-path-note": NOTE,
     "verified": NOTE,
     "verified-by-push-probe": NOTE,
     # The row's BODY cannot be compared across two instances — each server's own

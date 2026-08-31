@@ -1,6 +1,6 @@
 {
   "generated_by": "suite/parity/assets.py",
-  "last_verified": "16a48e1 2026-08-29",
+  "last_verified": "c7f49a9 2026-08-31",
   "rows": {
     "DELETE /Branding/Splashscreen": {
       "classification": "",
@@ -9,9 +9,9 @@
       "verification_method": "effect"
     },
     "DELETE /Items/{itemId}/Images/{imageType}": {
-      "classification": "flagged: asset write effect diff vs Jellyfin (verify)",
-      "deep_verified": false,
-      "note": "H=True J=False",
+      "classification": "",
+      "deep_verified": true,
+      "note": "H=True J=True (effect verdict; bodies not diffed)",
       "verification_method": "effect"
     },
     "DELETE /Items/{itemId}/Images/{imageType}/{imageIndex}": {
@@ -81,21 +81,21 @@
       "verification_method": "body-diff"
     },
     "GET /Items/{itemId}/Images/{imageType}": {
-      "classification": "flagged: asset property diff vs Jellyfin (verify)",
-      "deep_verified": false,
-      "note": "H=(2, 'image', 'jpeg', 2000, 3000) J=(2, 'image', 'jpeg', 320, 240) | SOURCE IMAGE MISMATCH H='/config/metadata/library/D37ECB9D-75B0-C0A8-E9EC-B0A864EC670E/primary.jpg' J='/media/synth/movies/Movie 0001 (2020)/poster.jpg'",
+      "classification": "",
+      "deep_verified": true,
+      "note": "H=(2, 'image', 'jpeg', 320, 240) J=(2, 'image', 'jpeg', 320, 240) (declared properties agreed; bytes not diffed)",
       "verification_method": "property"
     },
     "GET /Items/{itemId}/Images/{imageType}/{imageIndex}": {
-      "classification": "flagged: asset property diff vs Jellyfin (verify)",
-      "deep_verified": false,
-      "note": "H=(2, 'image', 'jpeg', 2000, 3000) J=(2, 'image', 'jpeg', 320, 240) | SOURCE IMAGE MISMATCH H='/config/metadata/library/D37ECB9D-75B0-C0A8-E9EC-B0A864EC670E/primary.jpg' J='/media/synth/movies/Movie 0001 (2020)/poster.jpg'",
+      "classification": "",
+      "deep_verified": true,
+      "note": "H=(2, 'image', 'jpeg', 320, 240) J=(2, 'image', 'jpeg', 320, 240) (declared properties agreed; bytes not diffed)",
       "verification_method": "property"
     },
     "GET /Items/{itemId}/Images/{imageType}/{imageIndex}/{tag}/{format}/{maxWidth}/{maxHeight}/{percentPlayed}/{unplayedCount}": {
-      "classification": "flagged: asset property diff vs Jellyfin (verify)",
-      "deep_verified": false,
-      "note": "H=(2, 'image', 'jpeg', 67, 100) J=(2, 'image', 'jpeg', 100, 75) | SOURCE IMAGE MISMATCH H='/config/metadata/library/D37ECB9D-75B0-C0A8-E9EC-B0A864EC670E/primary.jpg' J='/media/synth/movies/Movie 0001 (2020)/poster.jpg'",
+      "classification": "",
+      "deep_verified": true,
+      "note": "H=(2, 'image', 'jpeg', 100, 75) J=(2, 'image', 'jpeg', 100, 75) (declared properties agreed; bytes not diffed)",
       "verification_method": "property"
     },
     "GET /MusicGenres/{name}/Images/{imageType}": {
@@ -128,6 +128,12 @@
       "note": "H=(2, 'font-or-binary', True) J=(2, 'font-or-binary', True) (declared properties agreed; bytes not diffed)",
       "verification_method": "property"
     },
+    "GET /Plugins/{pluginId}/{version}/Image": {
+      "classification": "",
+      "deep_verified": true,
+      "note": "H=(4, '', (('TMDb', 404, '', ''), ('Studio Images', 404, '', ''), ('OMDb', 404, '', ''), ('MusicBrainz', 404, '', ''), ('AudioDB', 404, '', ''), ('unknown', 404, '', ''))) J=(4, '', (('TMDb', 404, '', ''), ('Studio Images', 404, '', ''), ('OMDb', 404, '', ''), ('MusicBrainz', 404, '', ''), ('AudioDB', 404, '', ''), ('unknown', 404, '', ''))) (status class only; nothing was served on either server)",
+      "verification_method": "status-class"
+    },
     "GET /Studios/{name}/Images/{imageType}": {
       "classification": "",
       "deep_verified": true,
@@ -139,6 +145,12 @@
       "deep_verified": true,
       "note": "H=(4, '') J=(4, '') (status class only; nothing was served on either server)",
       "verification_method": "status-class"
+    },
+    "GET /System/Logs": {
+      "classification": "",
+      "deep_verified": true,
+      "note": "H=(2, 'application/json', True, True, True) J=(2, 'application/json', True, True, True) (declared properties agreed; bytes not diffed)",
+      "verification_method": "property"
     },
     "GET /System/Logs/Log": {
       "classification": "",
@@ -156,6 +168,12 @@
       "classification": "",
       "deep_verified": true,
       "note": "H=(2, 'file', '6038a160b491e121c1f12c7bccb4a9c8730296e3adc1086a059404ed84b7451c', 'application/x-truetype-font', '', '') J=(2, 'file', '6038a160b491e121c1f12c7bccb4a9c8730296e3adc1086a059404ed84b7451c', 'application/x-truetype-font', '', '')",
+      "verification_method": "body-diff"
+    },
+    "GET /web/ConfigurationPage": {
+      "classification": "",
+      "deep_verified": true,
+      "note": "H=(2, 'configpage', (('TMDb', 200, 'text/html', '8ea72f7088765434fed0612fc264f83533646d9f00b1da21ee6bbd133885a62c'), ('tmdb', 200, 'text/html', '8ea72f7088765434fed0612fc264f83533646d9f00b1da21ee6bbd133885a62c'), ('Studio Images', 200, 'text/html', 'd849d2d660fe49ec73c510652c8b3840c3baf5f924b2b2af0bf20351369ccb8a'), ('OMDb', 200, 'text/html', '33ad017fa8e259cc5ed4c92ecdacb2ca1bce50535b314e41b768cfdee0b354e2'), ('MusicBrainz', 200, 'text/html', '7ad2faea6026a12c81a59ad66ad7daee71a1b1f7566a66ac9fa7f7160bbc32d6'), ('AudioDB', 200, 'text/html', 'b85c415e6c1293223c37edd08e0fb2528ad2e4bebde4d44f0c696e70579201be'), ('NoSuchPlugin', 404, 'application/json', ''), ('', 404, 'application/json', ''))) J=(2, 'configpage', (('TMDb', 200, 'text/html', '8ea72f7088765434fed0612fc264f83533646d9f00b1da21ee6bbd133885a62c'), ('tmdb', 200, 'text/html', '8ea72f7088765434fed0612fc264f83533646d9f00b1da21ee6bbd133885a62c'), ('Studio Images', 200, 'text/html', 'd849d2d660fe49ec73c510652c8b3840c3baf5f924b2b2af0bf20351369ccb8a'), ('OMDb', 200, 'text/html', '33ad017fa8e259cc5ed4c92ecdacb2ca1bce50535b314e41b768cfdee0b354e2'), ('MusicBrainz', 200, 'text/html', '7ad2faea6026a12c81a59ad66ad7daee71a1b1f7566a66ac9fa7f7160bbc32d6'), ('AudioDB', 200, 'text/html', 'b85c415e6c1293223c37edd08e0fb2528ad2e4bebde4d44f0c696e70579201be'), ('NoSuchPlugin', 404, 'application/json', ''), ('', 404, 'application/json', '')))",
       "verification_method": "body-diff"
     },
     "HEAD /Artists/{name}/Images/{imageType}/{imageIndex}": {
