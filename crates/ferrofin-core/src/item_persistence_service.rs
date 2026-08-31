@@ -17,6 +17,7 @@ use async_trait::async_trait;
 use ferrofin_db::Database;
 use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_db::store::{datetime_to_db, guid_to_db, opt_datetime_to_db};
+use sqlx::{QueryBuilder, Sqlite};
 use uuid::Uuid;
 
 use ferrofin_traits::error::ServiceError;
@@ -44,6 +45,19 @@ fn by_name_kind(value_type: i32) -> Option<BaseItemKind> {
         1 => Some(BaseItemKind::MusicArtist),
         2 => Some(BaseItemKind::Genre),
         3 => Some(BaseItemKind::Studio),
+        _ => None,
+    }
+}
+
+/// The `ItemValues.Type` discriminant whose value space a by-name kind lives in
+/// — the inverse of [`by_name_kind`]. `MusicGenre` is deliberately absent: it
+/// shares `Genre`'s value space, so its row takes a derived id instead of the
+/// (already claimed) `ItemValueId`. See [`music_genre_row`].
+fn by_name_value_type(kind: BaseItemKind) -> Option<i32> {
+    match kind {
+        BaseItemKind::MusicArtist => Some(1),
+        BaseItemKind::Genre => Some(2),
+        BaseItemKind::Studio => Some(3),
         _ => None,
     }
 }
@@ -91,10 +105,12 @@ async fn music_genre_row(
     sqlx::query(
         // `PresentationUniqueKey` for the same reason the sibling by-name insert
         // writes one: a by-name row's key is `{Type}-{Name}`
-        // (`kinds::presentation_unique_key`), this insert bypasses
-        // `upsert_item`, and nothing else would set it. A real 10.11.8 leaves
-        // the column NULL for exactly ONE kind — `LiveTvProgram` — so a keyless
-        // `MusicGenre` is a Ferrofin-only shape.
+        // (`kinds::presentation_unique_key`) — a real 10.11.8 scanner row reads
+        // back as `MusicGenre-Ambient` — this insert bypasses `upsert_item`,
+        // nothing else would set it, and the column is what `GetItemValues`
+        // groups on. A real 10.11.8 leaves the column NULL for exactly ONE
+        // kind — `LiveTvProgram` — so a keyless `MusicGenre` is a Ferrofin-only
+        // shape.
         r#"INSERT INTO "BaseItems"
            ("Id","Type","Name","CleanName","SortName","PresentationUniqueKey",
             "IsFolder","IsInMixedFolder",
@@ -696,14 +712,21 @@ impl FerrofinItemPersistenceService {
         // A caller-supplied value always wins — that is what carries the
         // per-kind `CreateSortName` overrides (episode/season) the scanner
         // computes, which drive the client's play queue.
+        //
+        // The fallback goes through `kinds::sort_name_for`, not
+        // `create_sort_name` directly, because `CreateSortName` has a per-kind
+        // branch: `Person` overrides `EnableAlphaNumericSorting => false` and
+        // keeps its name verbatim. Deriving the generic key for a `Person` here
+        // lower-cased rows the people repository had written correctly.
+        let sort_kind = crate::item_type_lookup::kind_from_type_name(&item.type_);
         let sort_name = item.sort_name.clone().or_else(|| {
             let forced = item.forced_sort_name.as_deref().filter(|f| !f.is_empty());
             match forced {
                 Some(f) => Some(ferrofin_util::sort_name::forced_sort_key(f)),
-                None => item
-                    .name
-                    .as_deref()
-                    .map(ferrofin_util::sort_name::create_sort_name),
+                None => item.name.as_deref().map(|n| match sort_kind {
+                    Some(kind) => crate::kinds::sort_name_for(kind, n),
+                    None => ferrofin_util::sort_name::create_sort_name(n),
+                }),
             }
         });
         sqlx::query(sql)
@@ -1106,11 +1129,24 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
                     // and this insert bypasses `upsert_item`, so without it
                     // the column stays NULL where Jellyfin writes
                     // `Genre-Action` — 23,186 such rows on a real library.
-                    r#"INSERT OR IGNORE INTO "BaseItems"
+                    // The existence guard is by **type and name**, not by id
+                    // (`OR IGNORE` keys on the PRIMARY KEY, which is the
+                    // `ItemValueId` — a fresh guid every first write). A
+                    // `MusicArtist` the scanner resolved from an artist
+                    // DIRECTORY already carries that CleanName under its
+                    // path-derived id, and `item_repository::push_by_name_join`
+                    // joins `agg.cval = bi."CleanName"`, so a second row here
+                    // would list every artist TWICE on /Artists. Same shape as
+                    // `music_genre_row`, and the same reason an adopted
+                    // Jellyfin database (whose by-name rows carry Jellyfin's
+                    // ids) must not get a duplicate laid beside each row.
+                    r#"INSERT INTO "BaseItems"
                        ("Id","Type","Name","CleanName","SortName","PresentationUniqueKey",
                         "IsFolder","IsInMixedFolder",
                         "IsLocked","IsMovie","IsRepeat","IsSeries","IsVirtualItem")
-                       VALUES (?1,?2,?3,?4,?5,?6,?7,0,0,0,0,0,0)"#,
+                       SELECT ?1,?2,?3,?4,?5,?6,?7,0,0,0,0,0,0
+                       WHERE NOT EXISTS (
+                           SELECT 1 FROM "BaseItems" WHERE "Type" = ?2 AND "CleanName" = ?4)"#,
                 )
                 .bind(&value_id)
                 .bind(type_name)
@@ -1144,6 +1180,135 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
             }
         }
         tx.commit().await.map_err(db_err)
+    }
+
+    async fn ensure_by_name_item(
+        &self,
+        kind: BaseItemKind,
+        name: &str,
+        path: &str,
+    ) -> Result<Option<Uuid>, ServiceError> {
+        let name = name.trim();
+        let (Some(type_name), false) = (stored_type_name(kind), name.is_empty()) else {
+            return Ok(None);
+        };
+        let clean = get_clean_value(name);
+        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        // An existing row wins, whatever id it carries — Jellyfin's own on an
+        // adopted database, or the one a scan materialized.
+        let existing: Option<String> = sqlx::query_scalar(
+            r#"SELECT "Id" FROM "BaseItems" WHERE "Type" = ?1 AND "CleanName" = ?2 LIMIT 1"#,
+        )
+        .bind(type_name)
+        .bind(&clean)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        if let Some(id) = existing {
+            tx.rollback().await.map_err(db_err)?;
+            return Ok(Uuid::parse_str(&id).ok());
+        }
+        // Mint the id the SCANNER would mint for this name, not a fresh one, so
+        // that a later scan of content carrying this value converges on THIS
+        // row instead of inserting a second one beside it: the `ItemValues` id
+        // for the value-backed kinds (what `save_item_values` uses), the
+        // derived id for `MusicGenre` (what `music_genre_row` uses).
+        let id = match by_name_value_type(kind) {
+            Some(value_type) => {
+                let fresh = guid_to_db(Uuid::new_v4());
+                sqlx::query(
+                    r#"INSERT OR IGNORE INTO "ItemValues" ("ItemValueId","CleanValue","Type","Value")
+                       VALUES (?1,?2,?3,?4)"#,
+                )
+                .bind(&fresh)
+                .bind(&clean)
+                .bind(value_type)
+                .bind(name)
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?;
+                let value_id: String = sqlx::query_scalar(
+                    r#"SELECT "ItemValueId" FROM "ItemValues" WHERE "Type" = ?1 AND "Value" = ?2"#,
+                )
+                .bind(value_type)
+                .bind(name)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(db_err)?;
+                Uuid::parse_str(&value_id).ok()
+            }
+            None if kind == BaseItemKind::MusicGenre => {
+                crate::item_type_lookup::derive_item_id(BaseItemKind::MusicGenre, name)
+            }
+            None => None,
+        };
+        let Some(id) = id else {
+            tx.rollback().await.map_err(db_err)?;
+            return Ok(None);
+        };
+        sqlx::query(
+            // `IsFolder` is 0: `Genre`, `MusicGenre` and `Studio` all derive
+            // from `BaseItem`, not `Folder`, and a parentless `MusicArtist` is
+            // `IsAccessedByName`, whose `IsFolder` is `!IsAccessedByName`
+            // (`MusicArtist.cs:33`). A real 10.11.8 stores 0 on the row a GET
+            // lazily creates.
+            r#"INSERT OR IGNORE INTO "BaseItems"
+               ("Id","Type","Name","CleanName","SortName","PresentationUniqueKey","Path",
+                "DateCreated","DateModified",
+                "IsFolder","IsInMixedFolder","IsLocked","IsMovie","IsRepeat","IsSeries","IsVirtualItem")
+               VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?8,0,0,0,0,0,0,0)"#,
+        )
+        .bind(guid_to_db(id))
+        .bind(type_name)
+        .bind(name)
+        .bind(&clean)
+        .bind(ferrofin_util::sort_name::create_sort_name(name))
+        .bind(crate::kinds::presentation_unique_key(
+            kind,
+            id,
+            Some(name),
+            None,
+            None,
+            None,
+        ))
+        .bind(path)
+        .bind(chrono::Utc::now())
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
+        Ok(Some(id))
+    }
+
+    async fn by_name_rows_without_path(
+        &self,
+        kind: BaseItemKind,
+    ) -> Result<Vec<(Uuid, String)>, ServiceError> {
+        let Some(type_name) = stored_type_name(kind) else {
+            return Ok(Vec::new());
+        };
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            r#"SELECT "Id", "Name" FROM "BaseItems"
+               WHERE "Type" = ?1 AND "Path" IS NULL AND "Name" IS NOT NULL"#,
+        )
+        .bind(type_name)
+        .fetch_all(self.db.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(id, name)| Uuid::parse_str(&id).ok().map(|id| (id, name)))
+            .collect())
+    }
+
+    async fn set_item_path(&self, id: Uuid, path: &str) -> Result<(), ServiceError> {
+        sqlx::query(r#"UPDATE "BaseItems" SET "Path" = ?2 WHERE "Id" = ?1"#)
+            .bind(guid_to_db(id))
+            .bind(path)
+            .execute(self.db.writer())
+            .await
+            .map_err(db_err)?;
+        Ok(())
     }
 
     async fn item_exists(&self, id: Uuid) -> Result<bool, ServiceError> {
@@ -1547,8 +1712,8 @@ fn scan_upsert_sql() -> &'static str {
 /// # Errors
 /// Returns [`ServiceError`] if the read or the write fails.
 pub async fn backfill_missing_sort_names(db: &Database) -> Result<usize, ServiceError> {
-    let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
-        r#"SELECT "Id", "Name", "ForcedSortName" FROM "BaseItems"
+    let rows: Vec<(String, String, Option<String>, String)> = sqlx::query_as(
+        r#"SELECT "Id", "Name", "ForcedSortName", "Type" FROM "BaseItems"
            WHERE "SortName" IS NULL AND "Name" IS NOT NULL AND "Name" <> ''
              AND "Type" <> 'PLACEHOLDER'"#,
     )
@@ -1560,10 +1725,17 @@ pub async fn backfill_missing_sort_names(db: &Database) -> Result<usize, Service
     }
 
     let mut tx = db.writer().begin().await.map_err(db_err)?;
-    for (id, name, forced) in &rows {
+    for (id, name, forced, type_name) in &rows {
+        // `Type` is selected so the per-kind `CreateSortName` branch applies:
+        // a `Person` keeps its name verbatim (`EnableAlphaNumericSorting =>
+        // false`). Backfilling the generic key here wrote the WRONG value into
+        // exactly the rows this function exists to repair.
         let sort_name = match forced.as_deref().filter(|f| !f.is_empty()) {
             Some(f) => ferrofin_util::sort_name::forced_sort_key(f),
-            None => ferrofin_util::sort_name::create_sort_name(name),
+            None => match crate::item_type_lookup::kind_from_type_name(type_name) {
+                Some(kind) => crate::kinds::sort_name_for(kind, name),
+                None => ferrofin_util::sort_name::create_sort_name(name),
+            },
         };
         sqlx::query(r#"UPDATE "BaseItems" SET "SortName" = ?1 WHERE "Id" = ?2"#)
             .bind(sort_name)
@@ -1574,6 +1746,105 @@ pub async fn backfill_missing_sort_names(db: &Database) -> Result<usize, Service
     }
     tx.commit().await.map_err(db_err)?;
     Ok(rows.len())
+}
+
+/// Fills in `BaseItems."PresentationUniqueKey"` for the by-name rows written
+/// before the write path derived it — run once at startup, cheap thereafter.
+///
+/// Why this exists at all: the by-name inserts are
+/// `INSERT ... WHERE NOT EXISTS` / `INSERT OR IGNORE`, so writing the column in
+/// the insert (as `music_genre_row` and `insert_named_item` now do) is INERT on
+/// every database that already holds the row. On this campaign's own lab that
+/// was every scanner-created music genre: `MusicGenre|Ambient`, `Jazz` and
+/// `Rock` still read back `PresentationUniqueKey NULL` after the fix shipped.
+/// The column is what `GetItemValues` GROUPs on, and SQLite groups all NULLs
+/// together, so a set of unkeyed by-name rows collapses to ONE representative
+/// — the whole tab silently loses names.
+///
+/// Upstream needs no such pass because it recomputes the key on every
+/// `SaveItems`: `MetadataService.BeforeSaveInternal`
+/// (`MediaBrowser.Providers/Manager/MetadataService.cs:332-338`, identical on
+/// v10.11.8 and master) assigns `item.CreatePresentationUniqueKey()` whenever
+/// it differs. A Jellyfin by-name row is unkeyed only until its first metadata
+/// refresh runs — `CreateItemByName` calls `CreateItem` and queues no refresh
+/// itself — which is why a live 10.11.8 shows a MIXTURE of keyed and unkeyed
+/// by-name rows. So the value written here is exactly the value Jellyfin's own
+/// next refresh of that row would write, which is what makes the pass safe on
+/// an adopted database: it moves a row forward to Jellyfin's settled state,
+/// never to a value Jellyfin would not produce.
+///
+/// Scoped to the four by-name kinds whose key is a pure function of the name
+/// (`Genre-…`, `MusicGenre-…`, `Studio-…`, `Artist-…` — see
+/// [`crate::kinds::presentation_unique_key`]). `Person` is deliberately absent:
+/// [`crate::people_repository::FerrofinPeopleRepository::repair_person_items`]
+/// already repairs that kind, together with the `Path` column and the metadata
+/// directory that only it knows how to build. Every other kind derives its key
+/// from an id or a parent chain, where NULL is not the same kind of damage and
+/// a blanket rewrite would be a guess.
+///
+/// Only NULL/empty keys are touched, so an already-keyed row — the whole of an
+/// adopted, refreshed Jellyfin database — is left byte-identical. Returns the
+/// number of rows repaired.
+///
+/// # Errors
+/// Returns [`ServiceError`] if the read or the write fails.
+pub async fn backfill_missing_presentation_keys(db: &Database) -> Result<usize, ServiceError> {
+    let kinds = [
+        BaseItemKind::Genre,
+        BaseItemKind::MusicGenre,
+        BaseItemKind::Studio,
+        BaseItemKind::MusicArtist,
+    ];
+    let type_names: Vec<&'static str> =
+        kinds.iter().copied().filter_map(stored_type_name).collect();
+    if type_names.is_empty() {
+        return Ok(0);
+    }
+    let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
+        r#"SELECT "Id", "Name", "Type" FROM "BaseItems"
+           WHERE coalesce("PresentationUniqueKey", '') = ''
+             AND "Name" IS NOT NULL AND "Name" <> '' AND "Type" IN ("#,
+    );
+    let mut sep = qb.separated(", ");
+    for t in &type_names {
+        sep.push_bind(*t);
+    }
+    qb.push(")");
+    let rows: Vec<(String, String, String)> = qb
+        .build_query_as()
+        .fetch_all(db.pool())
+        .await
+        .map_err(db_err)?;
+
+    let mut pending: Vec<(String, String)> = Vec::new();
+    for (id, name, type_name) in &rows {
+        let Some((kind, uuid)) =
+            crate::item_type_lookup::kind_from_type_name(type_name).zip(Uuid::parse_str(id).ok())
+        else {
+            continue;
+        };
+        pending.push((
+            id.clone(),
+            crate::kinds::presentation_unique_key(kind, uuid, Some(name), None, None, None),
+        ));
+    }
+    if pending.is_empty() {
+        return Ok(0);
+    }
+    let mut tx = db.writer().begin().await.map_err(db_err)?;
+    for (id, key) in &pending {
+        sqlx::query(
+            r#"UPDATE "BaseItems" SET "PresentationUniqueKey" = ?2
+               WHERE "Id" = ?1 AND coalesce("PresentationUniqueKey", '') = ''"#,
+        )
+        .bind(id)
+        .bind(key)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+    }
+    tx.commit().await.map_err(db_err)?;
+    Ok(pending.len())
 }
 
 /// The `PresentationUniqueKey` to store for `item`.
@@ -1736,8 +2007,10 @@ mod tests {
     use ferrofin_traits::persistence::{ItemPersistenceService, LinkedChildrenService};
     use uuid::Uuid;
 
+    use crate::item_type_lookup::stored_type_name;
     use crate::linked_children_service::FerrofinLinkedChildrenService;
     use crate::test_support::{seed_item, test_db};
+    use ferrofin_db::store::guid_to_db;
 
     use super::{
         FerrofinItemPersistenceService, container_row, ensure_container, seed_container_data,
@@ -2072,6 +2345,129 @@ mod tests {
         );
     }
 
+    /// The by-name key backfill: an unkeyed scanner-created row gets the key
+    /// upstream's next metadata refresh would give it, an already-keyed row is
+    /// left byte-identical, and a kind whose key is not name-derived is not
+    /// touched at all.
+    ///
+    /// This is the half the batch's first cut was missing: writing the key in
+    /// `music_genre_row`'s `INSERT ... WHERE NOT EXISTS` is INERT on every
+    /// database that already holds the row, and the campaign's own lab proved
+    /// it — `MusicGenre|Ambient`/`Jazz`/`Rock` still read back NULL after the
+    /// "fix" shipped.
+    #[tokio::test]
+    async fn backfill_missing_presentation_keys_repairs_only_unkeyed_by_name_rows() {
+        async fn key(db: &ferrofin_db::Database, id: Uuid) -> Option<String> {
+            sqlx::query_scalar(r#"SELECT "PresentationUniqueKey" FROM "BaseItems" WHERE "Id" = ?1"#)
+                .bind(ferrofin_db::store::guid_to_db(id))
+                .fetch_one(db.pool())
+                .await
+                .expect("query")
+        }
+        let db = test_db().await;
+        let unkeyed = Uuid::from_u128(0xB201);
+        let keyed = Uuid::from_u128(0xB202);
+        let artist = Uuid::from_u128(0xB203);
+        let movie = Uuid::from_u128(0xB204);
+        crate::test_support::seed_named_item(&db, unkeyed, BaseItemKind::MusicGenre, "Ambient")
+            .await;
+        crate::test_support::seed_named_item(&db, keyed, BaseItemKind::Genre, "Action").await;
+        crate::test_support::seed_named_item(&db, artist, BaseItemKind::MusicArtist, "Bjork").await;
+        crate::test_support::seed_named_item(&db, movie, BaseItemKind::Movie, "Heat").await;
+        // The unkeyed shapes are BOTH real: Ferrofin's inserts left NULL, and
+        // Jellyfin's lazily-created rows can carry ''.
+        sqlx::query(r#"UPDATE "BaseItems" SET "PresentationUniqueKey" = NULL WHERE "Id" = ?1"#)
+            .bind(ferrofin_db::store::guid_to_db(unkeyed))
+            .execute(db.writer())
+            .await
+            .expect("null key");
+        sqlx::query(r#"UPDATE "BaseItems" SET "PresentationUniqueKey" = '' WHERE "Id" = ?1"#)
+            .bind(ferrofin_db::store::guid_to_db(artist))
+            .execute(db.writer())
+            .await
+            .expect("empty key");
+        sqlx::query(
+            r#"UPDATE "BaseItems" SET "PresentationUniqueKey" = 'Genre-Action' WHERE "Id" = ?1"#,
+        )
+        .bind(ferrofin_db::store::guid_to_db(keyed))
+        .execute(db.writer())
+        .await
+        .expect("already keyed");
+        sqlx::query(r#"UPDATE "BaseItems" SET "PresentationUniqueKey" = NULL WHERE "Id" = ?1"#)
+            .bind(ferrofin_db::store::guid_to_db(movie))
+            .execute(db.writer())
+            .await
+            .expect("null movie key");
+
+        assert_eq!(
+            super::backfill_missing_presentation_keys(&db)
+                .await
+                .expect("backfill"),
+            2,
+            "only the two unkeyed BY-NAME rows"
+        );
+        assert_eq!(
+            key(&db, unkeyed).await.as_deref(),
+            Some("MusicGenre-Ambient")
+        );
+        // `MusicArtist` is spelled `Artist-` in the key (MusicArtist.cs:152).
+        assert_eq!(key(&db, artist).await.as_deref(), Some("Artist-Bjork"));
+        assert_eq!(
+            key(&db, keyed).await.as_deref(),
+            Some("Genre-Action"),
+            "an adopted, refreshed Jellyfin row comes through byte-identical"
+        );
+        assert_eq!(
+            key(&db, movie).await,
+            None,
+            "a Movie's key is derived from its id/primary version, not its name — not this pass's"
+        );
+        assert_eq!(
+            super::backfill_missing_presentation_keys(&db)
+                .await
+                .expect("second run"),
+            0,
+            "the pass is a no-op once repaired"
+        );
+    }
+
+    /// The backfill applies the per-kind `CreateSortName` branch: `Person`
+    /// overrides `EnableAlphaNumericSorting => false` on both trees, so its key
+    /// is the name verbatim. Writing the generic lower-cased key here would
+    /// corrupt exactly the rows this pass exists to repair.
+    #[tokio::test]
+    async fn backfill_missing_sort_names_uses_the_person_rule_for_a_person() {
+        async fn read(db: &ferrofin_db::Database, id: Uuid) -> Option<String> {
+            sqlx::query_scalar(r#"SELECT "SortName" FROM "BaseItems" WHERE "Id" = ?1"#)
+                .bind(ferrofin_db::store::guid_to_db(id))
+                .fetch_one(db.pool())
+                .await
+                .expect("query")
+        }
+        let db = test_db().await;
+        let person = Uuid::from_u128(0xB101);
+        let movie = Uuid::from_u128(0xB102);
+        crate::test_support::seed_named_item(&db, person, BaseItemKind::Person, "The Rock").await;
+        crate::test_support::seed_named_item(&db, movie, BaseItemKind::Movie, "The Rock").await;
+        sqlx::query(r#"UPDATE "BaseItems" SET "SortName" = NULL"#)
+            .execute(db.writer())
+            .await
+            .expect("null them out");
+
+        assert_eq!(
+            super::backfill_missing_sort_names(&db)
+                .await
+                .expect("backfill"),
+            2
+        );
+        assert_eq!(read(&db, person).await.as_deref(), Some("The Rock"));
+        assert_eq!(
+            read(&db, movie).await.as_deref(),
+            Some("rock"),
+            "every other kind still gets the alphanumeric key"
+        );
+    }
+
     // A caller-supplied sort name wins: that is what carries the per-kind
     // `CreateSortName` overrides (episode/season) the scanner computes, and
     // those drive the client's play queue.
@@ -2207,6 +2603,64 @@ mod tests {
         .await
         .expect("count");
         assert_eq!(coltrane, 0);
+    }
+
+    /// The by-name materializer must be a NO-OP once the scanner has resolved a
+    /// folder-backed `MusicArtist` of the same `CleanName`
+    /// (`MusicArtistResolver`). `item_repository::push_by_name_join` joins
+    /// `agg.cval = bi."CleanName"`, so a second row of the same name makes
+    /// /Artists list that artist twice — the failure a previous attempt at this
+    /// port was rolled back for.
+    #[tokio::test]
+    async fn save_item_values_does_not_duplicate_a_resolved_music_artist() {
+        let db = test_db().await;
+        let track = Uuid::new_v4();
+        seed_item(&db, track, BaseItemKind::Audio).await;
+
+        // The row the scanner writes: path-derived id, real media Path, parented
+        // into the music library (so it has a TopParentId).
+        let resolved = Uuid::new_v4();
+        sqlx::query(
+            r#"INSERT INTO "BaseItems"
+               ("Id","Type","Name","CleanName","Path","IsFolder","IsInMixedFolder",
+                "IsLocked","IsMovie","IsRepeat","IsSeries","IsVirtualItem")
+               VALUES (?1,?2,'Miles Davis','miles davis','/media/music/Miles Davis',
+                       1,0,0,0,0,0,0)"#,
+        )
+        .bind(guid_to_db(resolved))
+        .bind(stored_type_name(BaseItemKind::MusicArtist).expect("type name"))
+        .execute(db.pool())
+        .await
+        .expect("seed resolved artist");
+
+        let svc = FerrofinItemPersistenceService::new(db.clone());
+        svc.save_item_values(track, &[(1, "Miles Davis".to_owned())])
+            .await
+            .expect("save values");
+
+        let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+            r#"SELECT bi."Id", bi."Path" FROM "BaseItems" bi
+               WHERE bi."Type" LIKE '%.MusicArtist' AND bi."CleanName" = 'miles davis'"#,
+        )
+        .fetch_all(db.pool())
+        .await
+        .expect("query artists");
+        assert_eq!(rows.len(), 1, "one row per artist: {rows:?}");
+        assert_eq!(rows[0].0, guid_to_db(resolved), "the scanned row survives");
+        assert_eq!(rows[0].1.as_deref(), Some("/media/music/Miles Davis"));
+
+        // The ItemValues link is still written — the artist is still browsable
+        // through the by-name aggregate, it just resolves to the scanned row.
+        let linked: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*) FROM "ItemValuesMap" m
+               JOIN "ItemValues" v ON v."ItemValueId" = m."ItemValueId"
+               WHERE m."ItemId" = ?1 AND v."Type" = 1 AND v."Value" = 'Miles Davis'"#,
+        )
+        .bind(guid_to_db(track))
+        .fetch_one(db.pool())
+        .await
+        .expect("count links");
+        assert_eq!(linked, 1);
     }
 
     // The library scan rebuilds entities from disk with no merge link and a

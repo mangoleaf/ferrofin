@@ -22,11 +22,15 @@
 //!   (the C# `EnsureController` + `OnSessionControllerConnected`).
 //! - `ProcessMessageAsync` is a **no-op** — exactly as upstream
 //!   (`=> Task.CompletedTask`); inbound frames are routed elsewhere.
-//! - The keep-alive timer (`_keepAlive`) and `Closed`-event watchlist are
-//!   **dropped**: this crate runs no scheduler (Wave 8 owns lifecycle timers),
-//!   and liveness is the connection's own [`WebSocketConnection::is_open`]. A
-//!   single `ForceKeepAlive` is still pushed on connect, matching the C#
-//!   post-registration send.
+//! - The connect-time `ForceKeepAlive` is sent here, matching the C#
+//!   post-registration send (`KeepAliveWebSocket`, :168-176). The `_keepAlive`
+//!   WATCHDOG that follows it does not live in this crate — it has to sit where
+//!   the socket's own frames are, so it is ported into the axum socket loop
+//!   (`ferrofin-api::handlers::websocket::handle_socket`): every
+//!   `IntervalFactor * WebSocketLostTimeout`, a socket silent for more than
+//!   `ForceKeepAliveFactor * WebSocketLostTimeout` is prodded again, and one
+//!   past the full timeout leaves the watchlist. Liveness itself is the
+//!   connection's own [`WebSocketConnection::is_open`].
 //! - The [`WebSocketManager`] upgrade (`WebSocketRequestHandler(HttpContext)`)
 //!   performs the ASP.NET protocol upgrade in place; in this port the real
 //!   socket upgrade belongs to the HTTP layer (Wave 7). The port validates the

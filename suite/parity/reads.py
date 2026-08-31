@@ -23,6 +23,7 @@ import os
 import re
 import string
 import urllib.parse
+import string
 import sys
 import time
 
@@ -40,20 +41,41 @@ CORRELATE_LIMIT = 5   # item-scoped endpoints are exercised against this many Pa
 MB_PACE = 2.5
 MB_RETRIES = 4
 
+def agg_method(legs, status_only=0):
+    """The honest method for an aggregate of diffed (jbody, hbody, compared) legs.
+
+    None when no leg compared anything and none even agreed on a status
+    (untested); `status-class` when the ONLY thing any leg established was
+    that both servers answered the same status with no body; `empty-corpus`
+    when every leg that compared anything was two empty result envelopes
+    agreeing on their own zeros; `body-diff` as soon as one leg compared
+    real content.
+
+    `status_only` is passed rather than inferred because a bodiless leg
+    leaves no (jbody, hbody) pair to inspect — and a row whose every leg is
+    bodiless must not be able to reach the headline by having had many of
+    them.
+    """
+    seen = [m for m in (verification.read_method(j, h, c) for j, h, c in legs)
+            if m is not None]
+    if not seen:
+        return verification.STATUS_CLASS if status_only else None
+    return (verification.BODY_DIFF if verification.BODY_DIFF in seen
+            else verification.EMPTY_CORPUS)
+
 
 def token_get(base, path, token, method="GET"):
-    # `method` exists for the handful of contract READS upstream models as a
-    # POST — `POST /Plugins/{pluginId}/Manifest` is `GetPluginManifest`, a pure
-    # read with a POST verb. Diffing those bodies is the same job; only the verb
-    # differs, and hardcoding GET is what kept that row on a hand-written
-    # "no shared plugin id" note instead of a measurement.
-    st, raw = http(method, base + path, token)
-    if st != 200 or not raw:
-        return st, None
-    try:
-        return st, json.loads(raw)
-    except ValueError:
-        return st, None
+    """`(status, parsed_json_or_None)` — the 200-only view, for the row kinds
+    whose contract is "a body to diff, or no evidence at all".
+
+    `method` exists for the handful of contract READS upstream models as a POST
+    — `POST /Plugins/{pluginId}/Manifest` is `GetPluginManifest`, a pure read
+    with a POST verb. Diffing those bodies is the same job; only the verb
+    differs, and hardcoding GET is what kept that row on a hand-written
+    "no shared plugin id" note instead of a measurement."""
+    st, body, _raw = token_probe(base, path, token, method)
+    return st, (body if st == 200 else None)
+
 
 def token_post(base, path, token, body):
     """POST `body` as JSON; returns `(status, parsed body or None)`."""
@@ -64,6 +86,23 @@ def token_post(base, path, token, body):
         return st, json.loads(raw)
     except ValueError:
         return st, None
+
+
+def token_probe(base, path, token, method="GET"):
+    """`(status, parsed_json_or_None, raw)` for ANY status.
+
+    Separate from [`token_get`] because a non-200 still HAS a body and that body
+    is part of the wire contract. `token_get` throwing it away is what let a
+    404-vs-404 leg be scored clean while the two servers were in fact answering
+    with two different documents (Jellyfin an RFC 9110 ProblemDetails, Ferrofin
+    its own `{"error": …}`)."""
+    st, raw = http(method, base + path, token)
+    if not raw:
+        return st, None, raw
+    try:
+        return st, json.loads(raw), raw
+    except ValueError:
+        return st, None, raw
 
 # ---------------------------------------------------------------- endpoint set
 
@@ -162,9 +201,21 @@ def multi(op, legs, seed=None, reap=None, method="GET", caveats=None):
     out = []
     for leg in legs:
         tmpl, project = leg if isinstance(leg, tuple) else (leg, None)
-        out.append({"tmpl": tmpl,
-                    "url": (lambda c, t=tmpl: t.format(**c)),
-                    "project": project})
+
+        def build(c, t=tmpl):
+            """The leg's URL, or None when a seed it needs resolved to nothing.
+
+            A leg is then SKIPPED, not substituted. The `{key}_last` seeds used
+            to fall back to `{key}` when only one name was shared, which turned
+            the extra leg into a byte-identical copy of the first one: no new
+            coverage, and double the row's published `field(s) compared`.
+            Skipping is honest; duplicating is not."""
+            for _lit, field, _spec, _conv in string.Formatter().parse(t):
+                if field and c.get(field) is None:
+                    return None
+            return t.format(**c)
+
+        out.append({"tmpl": tmpl, "url": build, "project": project})
     return {"op": op, "kind": "multi", "legs": out, "seed": seed, "reap": reap,
             "http_method": method, "caveats": list(caveats or ())}
 
@@ -409,6 +460,19 @@ def lyric_ids(ctx):
 def lyric_visible(base, token, aid):
     """True once the server serves the uploaded lyric back."""
     return http("GET", f"{base}/Audio/{aid}/Lyrics", token)[0] == 200
+
+
+def seed_by_name_music_genre(base, token, ctx):
+    """`CreateItemByName<MusicGenre>` for a name only NON-music items carry, on
+    BOTH servers, so the `/MusicGenres` legs below compare the same universe.
+
+    This is a deliberate, named WRITE — `GET /MusicGenres/{name}` is
+    `CreateItemByName` upstream (`LibraryManager.cs:1289`), so both servers
+    materialize the row. Without it the movie-genre legs would depend on which
+    earlier probe happened to have created the row first, which is not a
+    measurement. Returns the status so a divergence is visible.
+    """
+    return http("GET", f"{base}/MusicGenres/{ctx['genre']}?userId={ctx['u']}", token)[0]
 
 
 def seed_lyrics(base, token, ctx):
@@ -1979,9 +2043,61 @@ READS = [
     user("GET /Artists/{itemId}/Similar", "/Artists/{artist_id}/Similar?userId={u}&limit=1000"),
     # by-name + shows (need the NFO metadata + shows fixture); {genre}/{studio}/{person} are
     # URL-encoded names shared across servers, {series} is the per-server first-series id.
-    user("GET /Genres/{genreName}", "/Genres/{genre}?userId={u}"),
-    user("GET /Studios/{name}", "/Studios/{studio}?userId={u}"),
-    user("GET /Persons/{name}", "/Persons/{person}?userId={u}"),
+    # FOUR legs. `GenresController.GetGenre` has three behaviours, not one
+    # (v10.11.8 :159-208 and master, byte-identical apart from
+    # `.AddClientFields`): a plain name is `CreateItemByName`, a name carrying
+    # `BaseItem.SlugChar` ('-') is looked up through the `&` / `/` / `?`
+    # substitutions and creates NOTHING, and a miss returns a
+    # default-constructed `Genre` — the route cannot 404. A single-name leg saw
+    # only the first, which is how Ferrofin shipped a slug branch that minted a
+    # bogus genre for every hyphenated mis-spelling.
+    multi("GET /Genres/{genreName}", [
+        "/Genres/{genre}?userId={u}",
+        "/Genres/{genre_last}?userId={u}",
+        # The slug SUCCESS path: `R-B` must resolve the genre named `R&B`
+        # (added to suite/perf/gen-fixtures.sh; until the fixture is
+        # re-provisioned this leg is the MISS path on both servers, which is
+        # still an agreement worth asserting).
+        "/Genres/R-B?userId={u}",
+        # The slug MISS path — safe to repeat, because neither server creates
+        # on it. Before the port Ferrofin answered here with a freshly minted
+        # genre row (Name/Path/SortName present, LocationType FileSystem)
+        # against Jellyfin's all-zero DTO.
+        "/Genres/Diag-No-Such-F2?userId={u}",
+    ]),
+    # TWO legs, and the second one is the point: a by-name Studio whose name is
+    # also a GENRE name. `ItemCountService` restricts the `ItemValues` match to
+    # the value type the kind owns (`ItemValueType.Studios` for a Studio,
+    # `ItemCountService.cs:150-168`); without that restriction the studio
+    # inherits every item carrying the same-named genre. The `{studio}` leg
+    # cannot see it — a real studio name does not collide — so the collision is
+    # probed explicitly. This is also the body of a route the by-name lazy
+    # create turned from a 404 into a 200, which is exactly when a status-only
+    # check stops being enough.
+    # The third leg is the LAST shared studio by SortName, not the first: the
+    # single-name sample cannot stand in for the listing, and on this lab the
+    # pair diverged on exactly the studio `{studio}` never reaches.
+    multi("GET /Studios/{name}", [
+        "/Studios/{studio}?userId={u}",
+        "/Studios/{genre}?userId={u}",
+        "/Studios/{studio_last}?userId={u}",
+    ]),
+    # `PersonsController.GetPerson` is the ONE person endpoint that builds
+    # `new DtoOptions()` (= all fields), where `GetPersons` builds
+    # `new DtoOptions { Fields = fields }` (= none) — so the deep-verified
+    # `GET /Persons` row is blind to the whole row body and only this one sees
+    # it. Two names, because `Person.GetPath` puts each under a first-letter
+    # subfolder (`/People/A/…`, `/People/B/…`) and one name exercises one
+    # branch of that.
+    multi("GET /Persons/{name}", [
+        "/Persons/{person}?userId={u}",
+        "/Persons/{person_last}?userId={u}",
+    ]),
+    # A `Year` counts by `ProductionYear`, not through `ItemValues`
+    # (`ItemCountService.cs:170-181`) — a distinct branch of the same by-name
+    # count path, and unprobed until now: Ferrofin answered ChildCount 0 for
+    # every year against Jellyfin's real totals.
+    user("GET /Years/{year}", "/Years/{year}?userId={u}"),
     user("GET /Shows/{seriesId}/Seasons", "/Shows/{series}/Seasons?userId={u}"),
     user("GET /Shows/{seriesId}/Episodes", "/Shows/{series}/Episodes?userId={u}"),
     # by-name music (needs the music fixture: tagged tracks → identical artists/genres on
@@ -2004,8 +2120,34 @@ READS = [
         ("/MusicGenres?userId={u}&nameLessThan=Jb", with_item_order),
         ("/MusicGenres?userId={u}&includeItemTypes=Audio", with_item_order),
         ("/MusicGenres?userId={u}&includeItemTypes=Movie", with_item_order),
+        # NAME-ISOLATED legs. The unfiltered list legs above cannot be made to
+        # agree by any honest means: Jellyfin's `CreateItemByName` never assigns
+        # `PresentationUniqueKey` (`LibraryManager.cs:1289-1329` on master,
+        # `:1052-1092` on v10.11.8), so every lazily created by-name row lands
+        # with an EMPTY key and `GetItemValues`'s
+        # `.GroupBy(e => e.PresentationUniqueKey)` collapses all of them into one
+        # arbitrary representative — which one survives changes with the filter.
+        # Ferrofin writes a real `{Type}-{Name}` key and does not collapse.
+        # Narrowing to a single name takes the collapse out of the comparison
+        # while still comparing the row, its counts and the total: this is the
+        # honest way to earn depth here, NOT widening VOLATILE.
+        ("/MusicGenres?userId={u}&limit=100&nameStartsWith={musicgenre}", with_item_order),
+        ("/MusicGenres?userId={u}&limit=100&nameStartsWith={genre}", with_item_order),
+        ("/MusicGenres?userId={u}&limit=100&nameStartsWith={genre}&includeItemTypes=Movie",
+         with_item_order),
+    ], seed=seed_by_name_music_genre),
+    # The SAME slug branch as `GenresController.GetGenre`, but NOT the same
+    # fallback: `MusicGenresController.GetMusicGenre` keeps
+    # `if (item is null) return NotFound()` on both trees (v10.11.8 :164-167,
+    # master :165-168) where the genres controller has `item ??= new Genre()`.
+    # Both slug legs are therefore 404=404 agreements, and that asymmetry is
+    # exactly what these legs pin: a port that copied the genres fallback here
+    # answered 200 against Jellyfin's 404, and only the wire showed it.
+    multi("GET /MusicGenres/{genreName}", [
+        "/MusicGenres/{musicgenre}?userId={u}",
+        "/MusicGenres/R-B?userId={u}",
+        "/MusicGenres/Diag-No-Such-F2?userId={u}",
     ]),
-    user("GET /MusicGenres/{genreName}", "/MusicGenres/{musicgenre}?userId={u}"),
     # `/Years` had NO depth probe at all — the only coverage was the breadth
     # sweep's single-item align, and it could not see that the handler ignored
     # every filter and sort parameter in the C# signature (measured: J
@@ -2075,7 +2217,25 @@ READS = [
     # Instant mixes are shuffled: the diff aligns by Name, so the SET of tracks is what is
     # compared (with the whole fixture under `limit`, both sides hold every track).
     user("GET /Artists/InstantMix", "/Artists/InstantMix?id={artist_id}&userId={u}&limit=100"),
-    user("GET /MusicGenres/InstantMix", "/MusicGenres/InstantMix?name={musicgenre}&userId={u}&limit=100"),
+    # `/MusicGenres/InstantMix` takes `id`, not `name` (C#
+    # `GetInstantMixFromMusicGenreById([FromQuery, Required] Guid id)`). Probed with
+    # `name=` both servers 400 on the missing `id`, the harness recorded "H=400 J=400"
+    # as agreement, and the route was never actually compared.
+    user("GET /MusicGenres/InstantMix",
+         "/MusicGenres/InstantMix?id={musicgenre_id}&userId={u}&limit=100"),
+    # The by-NAME instant mix, which had no row at all. Two legs, and the second
+    # is the one that matters: a genre name with no `MusicGenre` row. C#
+    # `GetInstantMixFromGenres` resolves every name through
+    # `GetMusicGenre(i).Id` = `CreateItemByName`, so its id list is never short;
+    # dropping an unresolved name instead leaves `GenreIds` empty, and an empty
+    # `GenreIds` emits NO predicate — the mix then answers with the whole audio
+    # library. Measured H=9 J=0 before the fix. Probing a movie genre here is a
+    # WRITE on both servers by design (it materializes the row), which is why it
+    # is a deliberate, named leg rather than a lucky seed.
+    multi("GET /MusicGenres/{name}/InstantMix", [
+        "/MusicGenres/{musicgenre}/InstantMix?userId={u}&limit=100",
+        "/MusicGenres/{genre}/InstantMix?userId={u}&limit=100",
+    ]),
     # Live TV (needs the tuner fixture): channels are keyed by Name across servers; the
     # airing programmes by Name too (the guide is identical on both).
     # Tuner DISCOVERY. `LiveTvController.DiscoverTuners([FromQuery] bool
@@ -2459,13 +2619,71 @@ def correlate(hmap, jmap):
 
 # ---------------------------------------------------------------- run
 
+# The by-name context keys whose value is a NAME both servers must be asked
+# about, mapped to the companion per-server id key (or None).
+#
+# "first by SortName on each server" is NOT enough to guarantee that, and the
+# failure is specific to this family: /Genres/{name}, /Studios/{name},
+# /Artists/{name}, /MusicGenres/{name} and /Years/{year} are `CreateItemByName`
+# upstream, so PROBING one of them against Jellyfin materializes a row. A lab
+# that has been swept therefore accumulates by-name rows on one side, the two
+# listings drift, and the row reports `Name(J="Action" H="Ambient")` — a
+# question asked wrong, not a divergence. Seeding from the first name present on
+# BOTH listings fixes the question and narrows nothing: the same full body is
+# diffed, and a name one server is genuinely missing still fails the listing row
+# (`GET /Genres`, `GET /MusicGenres`, … are full-body diffs of the whole list).
+NAMED_SEEDS = {"genre": None, "studio": None, "person": None, "year": None,
+               "artist": "artist_id", "musicgenre": "musicgenre_id"}
+
+
+def reconcile_named(hc, jc):
+    """Re-seeds every [`NAMED_SEEDS`] key to a name BOTH servers list, in the
+    Ferrofin listing's SortName order. Returns the keys that had no shared name
+    (a real fixture divergence, left for the listing row to report)."""
+    unshared = []
+    for key, id_key in NAMED_SEEDS.items():
+        h_items = hc["named_listings"].get(key) or []
+        j_items = jc["named_listings"].get(key) or []
+        j_by_name = {(i.get("Name") or ""): (i.get("Id") or "") for i in j_items}
+        shared = next((i for i in h_items if (i.get("Name") or "") in j_by_name), None)
+        if shared is None:
+            unshared.append(key)
+            continue
+        name = shared.get("Name") or ""
+        hc[key] = jc[key] = urllib.parse.quote(name)
+        if id_key:
+            hc[id_key], jc[id_key] = shared.get("Id") or "", j_by_name[name]
+    # A `{key}_last` seed too — the LAST shared name in the same order. A row
+    # probed with only `first_name` samples one end of the listing; on this lab
+    # the studios diverged on exactly the one the first-name leg never reaches.
+    #
+    # When FEWER THAN TWO names are shared there is no distinct "last" name, and
+    # the seed is left None so `multi()` SKIPS the leg. It used to fall back to
+    # the first shared name, which made the extra leg a byte-identical copy of
+    # the first: the row then published double the `field(s) compared` — the
+    # depth number the ledger renders — for no additional coverage. A corpus
+    # that narrows to one shared name should shrink the evidence, not inflate it.
+    for key in NAMED_SEEDS:
+        h_items = hc["named_listings"].get(key) or []
+        j_names = {(i.get("Name") or "") for i in jc["named_listings"].get(key) or []}
+        shared = [i.get("Name") or "" for i in h_items if (i.get("Name") or "") in j_names]
+        last = urllib.parse.quote(shared[-1]) if len(shared) >= 2 else None
+        hc[f"{key}_last"] = jc[f"{key}_last"] = last
+    return unshared
+
+
 def resolve_named(base, token, user_id):
     """Per-server context for the by-name/shows endpoints. Names are URL-encoded (shared across
     servers via the same NFO); the series id is per-server (same title on both)."""
+    def named_list(path):
+        """A by-name listing in SortName order — the whole list, so
+        `reconcile_named` can intersect it with the other server's."""
+        return (get_json(base, f"{path}?userId={user_id}&sortBy=SortName", token)
+                or {}).get("Items") or []
+
     def first_named(path):
         """The first item of a by-name listing, by SortName so both servers pick the same one."""
-        items = (get_json(base, f"{path}?userId={user_id}&limit=1&sortBy=SortName", token)
-                 or {}).get("Items") or []
+        items = named_list(path)
         return items[0] if items else {}
 
     def first_name(path):
@@ -2523,11 +2741,19 @@ def resolve_named(base, token, user_id):
         return {u["Id"]: u.get("Name") for u in (get_json(base, "/Users", token) or [])}
 
     artist = first_named("/Artists")
+    # By-name ids are per-server (each derives its own), like `artist_id`.
+    musicgenre = first_named("/MusicGenres")
     lyric_ids = lyric_seed_ids(base, token, user_id)
     channels = (get_json(base, f"/LiveTv/Channels?userId={user_id}&limit=1", token) or {}).get("Items") or []
     listings_providers = (get_json(base, "/System/Configuration/livetv", token) or {}).get("ListingProviders") or []
     return {
         "users_by_id": users_by_id(),
+        # Full by-name listings, consumed only by `reconcile_named`.
+        "named_listings": {"genre": named_list("/Genres"), "studio": named_list("/Studios"),
+                           "person": named_list("/Persons"), "year": named_list("/Years"),
+                           "artist": named_list("/Artists"),
+                           "musicgenre": named_list("/MusicGenres")},
+        "year": first_named("/Years").get("Name") or "",
         "channel": channels[0]["Id"] if channels else "",
         # The `PlaylistsFolder` — the one seed whose ancestor chain reaches the
         # `AggregateFolder`.
@@ -2569,6 +2795,8 @@ def resolve_named(base, token, user_id):
         "year1": years[0],
         "year2": years[1],
         "year3": years[2],
+        "musicgenre": urllib.parse.quote(musicgenre.get("Name") or ""),
+        "musicgenre_id": musicgenre.get("Id") or "",
         # The three tracks `seed_lyrics` writes to, in LYRIC_SEEDS order.
         "lyric_lrc": lyric_ids[0],
         "lyric_elrc": lyric_ids[1],
@@ -2637,6 +2865,7 @@ def run(ferrofin_url, jellyfin_url):
     ht, hu = bring_up(ferrofin_url, "ferrofin")
     jt, ju = bring_up(jellyfin_url, "jellyfin")
     hc, jc = resolve_named(ferrofin_url, ht, hu), resolve_named(jellyfin_url, jt, ju)
+    reconcile_named(hc, jc)
     # `similar_invariants` holds each server to ITS OWN documented algorithm.
     hc["server"], jc["server"] = "ferrofin", "jellyfin"
 
@@ -2668,22 +2897,6 @@ def run(ferrofin_url, jellyfin_url):
     # The lyric row seeds and reaps itself — see `multi(..., seed=, reap=)`.
 
     rows = {}
-
-    def agg_method(legs):
-        """The honest method for an aggregate of diffed (jbody, hbody, compared) legs.
-
-        None when no leg compared anything (untested); `empty-corpus` when every
-        leg was two EMPTY results (an `Items: []` envelope agreeing on its own
-        zeros, or a bare `[]` agreeing on nothing at all — see
-        `verification.is_empty_result`); `body-diff` as soon as one leg compared
-        real content.
-        """
-        seen = [m for m in (verification.read_method(j, h, c) for j, h, c in legs)
-                if m is not None]
-        if not seen:
-            return None
-        return (verification.BODY_DIFF if verification.BODY_DIFF in seen
-                else verification.EMPTY_CORPUS)
 
     def record(op, clean, total, buckets, method, note=None, compared=None, caveats=None):
         """`method` is HOW the row was verified, from `verification.METHODS`, and it
@@ -2779,12 +2992,20 @@ def run(ferrofin_url, jellyfin_url):
                           file=sys.stderr)
             agg = {"mismatch": [], "missing": [], "extra": []}
             legs = []
-            clean = tested = 0
+            clean = tested = status_only = 0
             try:
                 method = ep.get("http_method", "GET")
                 for leg in ep["legs"]:
-                    hs, hb = token_get(ferrofin_url, leg["url"](hc), ht, method)
-                    js, jb = token_get(jellyfin_url, leg["url"](jc), jt, method)
+                    hurl, jurl = leg["url"](hc), leg["url"](jc)
+                    if hurl is None or jurl is None:
+                        # An unseeded leg (see `reconcile_named`): not run, not
+                        # counted, and above all not silently duplicated onto
+                        # another leg's URL.
+                        print(f"  {ep['op']} leg skipped, unseeded: {leg['tmpl']}",
+                              file=sys.stderr)
+                        continue
+                    hs, hb, hraw = token_probe(ferrofin_url, hurl, ht, method)
+                    js, jb, jraw = token_probe(jellyfin_url, jurl, jt, method)
                     tested += 1
                     # A leg that does not answer 200-with-JSON on both sides is a
                     # RESULT, not a reason to skip: `continue`-ing here made a
@@ -2794,6 +3015,23 @@ def run(ferrofin_url, jellyfin_url):
                         agg["mismatch"].append(
                             {"path": f"{leg['tmpl']} :: status", "j": js, "h": hs})
                         continue
+                    if hb is None and jb is None:
+                        # Neither side sent a JSON body. If neither sent ANY
+                        # body, the status is genuinely all there is to compare
+                        # — recorded as `status-class` evidence, the weakest
+                        # verdict the ledger has, and NOT as a body diff. If a
+                        # body was sent that is not JSON, the bytes still have
+                        # to agree; two different opaque bodies behind the same
+                        # status are a divergence, not an agreement.
+                        if hraw or jraw:
+                            if (hraw or b"") != (jraw or b""):
+                                agg["mismatch"].append(
+                                    {"path": f"{leg['tmpl']} :: raw body",
+                                     "j": str(jraw)[:80], "h": str(hraw)[:80]})
+                                continue
+                        status_only += 1
+                        clean += 1
+                        continue
                     if hb is None or jb is None:
                         agg["mismatch"].append(
                             {"path": f"{leg['tmpl']} :: body",
@@ -2802,6 +3040,11 @@ def run(ferrofin_url, jellyfin_url):
                         continue
                     if leg["project"]:
                         hb, jb = leg["project"](hb), leg["project"](jb)
+                    # NOTE: reached for a non-200 too. An error body is part of
+                    # the wire contract — Jellyfin answers a parameterless
+                    # `NotFound()` with an RFC 9110 ProblemDetails — so it is
+                    # diffed like any other body, `traceId` aside (VOLATILE:
+                    # per-request, cannot match across instances).
                     n, b, compared = diff_stats(jb, hb)
                     legs.append((jb, hb, compared))
                     if n == 0:
@@ -2814,7 +3057,7 @@ def run(ferrofin_url, jellyfin_url):
                 if ep.get("reap"):
                     ep["reap"](ferrofin_url, ht, hc)
                     ep["reap"](jellyfin_url, jt, jc)
-            record(ep["op"], clean, tested, agg, agg_method(legs),
+            record(ep["op"], clean, tested, agg, agg_method(legs, status_only),
                    compared=[c for _j, _h, c in legs],
                    caveats=ep.get("caveats"))
         elif ep["kind"] == "posted":
@@ -3088,7 +3331,10 @@ def selfcheck():
            "season": "SEA", "audio_id": "AUD", "person_id": "PID",
            # user GUID -> username, for the projections that translate a
            # per-instance user id into a comparable identity.
-           "users_by_id": {"U": "bench"}}
+           "users_by_id": {"U": "bench"},
+           "musicgenre_id": "MGID", "year": "Y", "named_listings": {}}
+    # `reconcile_named` adds a `{key}_last` for every NAMED_SEEDS key.
+    ctx.update({f"{k}_last": f"{k.upper()}L" for k in NAMED_SEEDS})
     # The context keys the self-check invents must be the ones resolve_named
     # actually produces, or this guard passes while the live run KeyErrors.
     import inspect
@@ -3323,6 +3569,46 @@ def selfcheck():
     assert not verification.parity_diff.VOLATILE.match("WireId"), "…and must survive it"
     assert proj["Tasks"]["B"]["WireId"] == "id-b", proj
     assert proj["Tasks"]["A"]["WireId"] == "id-a", proj
+    # The by-name seeds must be reconciled ACROSS servers, or a lab that has
+    # accumulated a by-name row on one side asks the two servers about different
+    # names and calls the answer a divergence.
+    hc = {"named_listings": {k: [] for k in NAMED_SEEDS}}
+    jc = {"named_listings": {k: [] for k in NAMED_SEEDS}}
+    hc["named_listings"]["musicgenre"] = [{"Name": "Ambient", "Id": "H-AMB"},
+                                          {"Name": "Jazz", "Id": "H-JAZ"}]
+    jc["named_listings"]["musicgenre"] = [{"Name": "Action", "Id": "J-ACT"},
+                                          {"Name": "Jazz", "Id": "J-JAZ"}]
+    unshared = reconcile_named(hc, jc)
+    assert hc["musicgenre"] == jc["musicgenre"] == "Jazz", (hc["musicgenre"], jc["musicgenre"])
+    assert (hc["musicgenre_id"], jc["musicgenre_id"]) == ("H-JAZ", "J-JAZ")
+    # ...and a key with NO shared name is REPORTED, never silently seeded with
+    # two different names.
+    assert set(unshared) == set(NAMED_SEEDS) - {"musicgenre"}, unshared
+    assert "musicgenre" not in unshared
+    # Every reconciled key (and its id companion) must be one resolve_named produces.
+    seed_keys = set(NAMED_SEEDS) | {v for v in NAMED_SEEDS.values() if v}
+    assert seed_keys <= produced, f"NAMED_SEEDS keys resolve_named does not produce: {seed_keys - produced}"
+    # The two name-collision legs are the whole reason those rows are `multi`.
+    # A future edit that drops one silently restores the blind spot.
+    legs = {ep["op"]: [leg["tmpl"] for leg in ep["legs"]]
+            for ep in READS if ep["kind"] == "multi"}
+    assert any("/Studios/{genre}" in t for t in legs["GET /Studios/{name}"]), legs["GET /Studios/{name}"]
+    assert any("/MusicGenres/{genre}/InstantMix" in t
+               for t in legs["GET /MusicGenres/{name}/InstantMix"]), \
+        legs["GET /MusicGenres/{name}/InstantMix"]
+    # The slug branch is the second and third behaviour of `GetGenre`; a leg
+    # carrying `BaseItem.SlugChar` must survive on both genre rows or the
+    # blind spot that let a hyphenated GET mint a bogus genre reopens.
+    for op in ("GET /Genres/{genreName}", "GET /MusicGenres/{genreName}"):
+        assert any("-" in t.rsplit("/", 1)[-1].split("?")[0] for t in legs[op]), legs[op]
+    # The name-isolated `/MusicGenres` legs: without them the row's only
+    # comparison is against Jellyfin's PresentationUniqueKey collapse, which no
+    # correct server can reproduce.
+    assert any("nameStartsWith={genre}" in t for t in legs["GET /MusicGenres"]), \
+        legs["GET /MusicGenres"]
+    # A last-name leg on the two rows whose fixture holds more than one name.
+    for op in ("GET /Studios/{name}", "GET /Persons/{name}", "GET /Genres/{genreName}"):
+        assert any("_last}" in t for t in legs[op]), legs[op]
     # Method derivation: two EMPTY result envelopes agreeing on their own zeros is
     # not the body-diff headline, and a pair that compared nothing at all is not a
     # verdict. Both are the shapes that silently inflated the count before.
@@ -3334,13 +3620,66 @@ def selfcheck():
     assert verification.read_method({"Items": [{"Name": "x"}], "TotalRecordCount": 1},
                                     {"Items": [{"Name": "x"}], "TotalRecordCount": 1},
                                     2) == verification.BODY_DIFF
+    # A leg where BOTH servers answer the same status with no JSON body (two
+    # 404s) is an agreement, not a mismatch — but it must not add depth. The
+    # branch is asserted here as a pair of facts rather than re-run live.
+    import inspect as _inspect
+    _multi_src = _inspect.getsource(run)
+    assert "if hb is None and jb is None:" in _multi_src, \
+        "the both-sides-non-JSON agreement branch is gone"
+    assert _multi_src.index("if hb is None and jb is None:") \
+        < _multi_src.index("if hb is None or jb is None:"), \
+        "the agreement branch must precede the one-sided-body mismatch branch"
+    # ...and it may only be reached when there is NO body at all. A non-200 that
+    # DOES carry a JSON body is diffed like any other body: `token_probe`, not
+    # `token_get`, is what the multi legs read with, because Jellyfin's error
+    # bodies are part of the wire (an RFC 9110 ProblemDetails for a
+    # parameterless `NotFound()`) and discarding them scored two different
+    # documents as one clean leg.
+    # (the trailing `method` is the POST-shaped-read verb; what this guards is
+    # that the call is token_probe and not token_get.)
+    assert "token_probe(ferrofin_url, hurl, ht, method)" in _multi_src, \
+        "multi legs must read non-200 bodies, not discard them"
+    assert "token_get(ferrofin_url, hurl" not in _multi_src, \
+        "…and must not fall back to the 200-only reader"
+    assert token_probe.__doc__ and "ANY status" in token_probe.__doc__
+    assert ":: raw body" in _multi_src, \
+        "two different non-JSON bodies behind the same status must be a mismatch"
+    # A row whose every leg was bodiless may NOT reach the body-diff headline:
+    # it earned `status-class`, the weakest verdict the ledger has.
+    assert agg_method([], status_only=2) == verification.STATUS_CLASS
+    assert agg_method([], status_only=0) is None
+    assert agg_method([({"A": 1}, {"A": 1}, 1)], status_only=3) == verification.BODY_DIFF
+    # `traceId` is VOLATILE (per-request), but nothing ELSE about a ProblemDetails
+    # is — a Ferrofin error body that is not upstream's must still diff red.
+    _pd = {"type": "https://tools.ietf.org/html/rfc9110#section-15.5.5",
+           "title": "Not Found", "status": 404, "traceId": "00-abc-def-00"}
+    assert diff_stats(_pd, {k: v for k, v in _pd.items() if k != "traceId"})[0] == 0, \
+        "traceId must be VOLATILE on both sides"
+    assert diff_stats(_pd, {"error": "not found: music genre R-B"})[0] > 0, \
+        "a different error document must not diff clean"
+    # An unseeded `{key}_last` SKIPS its leg rather than duplicating the first
+    # one — the depth number the ledger publishes must not be inflatable by a
+    # corpus that narrowed.
+    _one = {"named_listings": {k: [] for k in NAMED_SEEDS}}
+    _one["named_listings"]["genre"] = [{"Name": "Action", "Id": "H1"}]
+    _other = {"named_listings": {k: [] for k in NAMED_SEEDS}}
+    _other["named_listings"]["genre"] = [{"Name": "Action", "Id": "J1"}]
+    reconcile_named(_one, _other)
+    assert _one["genre"] == "Action" and _one["genre_last"] is None, _one
+    _leg = next(leg for leg in dict(
+        (ep["op"], ep["legs"]) for ep in READS if ep["kind"] == "multi"
+    )["GET /Genres/{genreName}"] if "{genre_last}" in leg["tmpl"])
+    assert _leg["url"]({**ctx, "genre_last": None}) is None, \
+        "an unseeded leg must be skipped, not formatted with None"
     hf, jf = {"a": True, "b": True, "c": False}, {"a": True, "b": False, "c": False}
     bad = [k for k in sorted(set(hf) | set(jf))
            if hf.get(k) != jf.get(k) or hf.get(k) is False]
     assert bad == ["b", "c"], f"invariant folding wrong: {bad}"
     print(f"ok: diff, Path-align, correlation, {len(READS)} read op-keys valid, "
           f"user/multi templates fillable, invariant folding, "
-          f"{len(aliases)} distinct invariant aliases, projections total + declared")
+          f"{len(aliases)} distinct invariant aliases, projections total + declared, "
+          f"{len(NAMED_SEEDS)} by-name seeds reconciled cross-server, collision legs present")
 
 
 if __name__ == "__main__":

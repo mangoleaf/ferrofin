@@ -27,6 +27,7 @@ lrclib = []
 [dependencies]
 ferrofin-traits.workspace = true
 ferrofin-model.workspace = true
+ferrofin-naming.workspace = true
 ferrofin-util.workspace = true
 ferrofin-common.workspace = true
 ferrofin-db.workspace = true

@@ -15,6 +15,19 @@ Reading the set, strongest first:
   body-diff     The response itself was compared against Jellyfin's and matched —
                 every non-volatile field of the parsed body, or the bytes' sha256
                 for a served file. THE HEADLINE.
+  push-diff     The server→client WebSocket messages the operation CAUSED were
+                captured on both servers, per receiving socket, and compared:
+                the ordered sequence of message types that arrived (so "Jellyfin
+                pushed two, Ferrofin pushed one" is a red, not a pass), every
+                non-volatile field of each message's payload, and a command's
+                scheduling instant through the derived offset
+                `When − EmittedAt` (the two wall clocks themselves cannot cross
+                instances) — and, where the op returns a body, that body diffed
+                clean too. It says nothing about sockets the probe did not open,
+                and nothing about delivery timing beyond the probe's bounded
+                quiet window. Counted and listed separately; it is NOT the
+                headline, because no claim about the HTTP response alone is
+                being made.
   property      Named properties DERIVED from the response agreed on both servers:
                 a decoded image's format and dimensions, a media type, a container
                 signature, a normalised playlist, a set of named invariants. The
@@ -49,6 +62,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import parity_diff  # noqa: E402  — the same VOLATILE denylist the diff walks
 
 BODY_DIFF = "body-diff"
+PUSH_DIFF = "push-diff"
 PROPERTY = "property"
 EFFECT = "effect"
 STATUS_CLASS = "status-class"
@@ -63,6 +77,14 @@ METHODS = {
                 "the response (or a write's read-back) was itself diffed against "
                 "Jellyfin 10.11.8 — every non-volatile field, or the served file's "
                 "sha256 — and came back clean"),
+    PUSH_DIFF: ("⇄", "push-verified",
+                "the server→client WebSocket messages the op caused were captured "
+                "on BOTH servers and diffed — the ordered sequence of message "
+                "types per receiving socket, every non-volatile field of each "
+                "message's payload, and a command's scheduling instant via the "
+                "derived `When − EmittedAt` offset, plus the HTTP response body "
+                "where there is one; it asserts nothing about sockets the probe "
+                "never opened, nor about timing beyond its bounded quiet window"),
     PROPERTY: ("◐", "property-verified",
                "named properties derived from the response agreed on both servers "
                "(decoded format/dimensions, media type, container signature, "
@@ -240,7 +262,12 @@ def bare_status_class(sig):
 
 
 def selfcheck():
-    assert HEADLINE in VALID and len(VALID) == 5
+    assert HEADLINE in VALID and len(VALID) == 6
+    # push-diff is a SIXTH method, added deliberately (batch E1) rather than
+    # letting a pushed-message differential borrow the body-diff headline: no
+    # HTTP response body is what makes the claim, so it may not be counted as if
+    # one were. It must never become the headline.
+    assert PUSH_DIFF in VALID and PUSH_DIFF != HEADLINE
 
     # --- empty corpora, at every depth and under every key -------------------
     assert is_empty_envelope({"Items": [], "TotalRecordCount": 0, "StartIndex": 0})

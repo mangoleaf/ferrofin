@@ -42,6 +42,14 @@ VOLATILE = re.compile("^(" + "|".join([
     "StartupWizardCompleted", "CanSelfRestart",
     "TranscodingTempPath", "LogPath", "InternalMetadataPath", "ItemsByNamePath", "CachePath",
     "ProgramDataPath",
+    # `traceId` in an ASP.NET ProblemDetails error body: the W3C trace-context
+    # id of the ONE request that produced it (`00-<32 hex>-<16 hex>-00`), minted
+    # per request by the server that answered. Two independent instances cannot
+    # produce the same one, and the same instance cannot produce it twice — the
+    # textbook case this list is for. Scoped to that exact key; every other
+    # field of a ProblemDetails (`type`, `title`, `status`, `errors`) is still
+    # compared, which is what makes an error-body diff mean anything.
+    "traceId",
 ]) + ")$")
 
 ALIGN_KEYS = ("Path", "Name", "Id")

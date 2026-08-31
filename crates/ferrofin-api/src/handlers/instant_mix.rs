@@ -13,6 +13,13 @@
 //! [`MusicManager`](ferrofin_traits::library::MusicManager) seam, applies the
 //! caller's `limit`, and projects the songs to [`BaseItemDto`]s wrapped in a
 //! [`QueryResult`] whose total is the pre-limit count (mirroring C# `GetResult`).
+//!
+//! Every route builds its projection from the request's `fields`/image
+//! parameters, exactly as the C# controller does
+//! (`new DtoOptions { Fields = fields }.AddAdditionalDtoOptions(…)`). That is an
+//! object initializer, so a request with no `fields=` projects an EMPTY field
+//! list — not [`DtoOptions::default`], which is Jellyfin's *parameterless*
+//! constructor with all 47 fields on.
 
 use axum::extract::{Path, Query, State};
 use axum::routing::get;

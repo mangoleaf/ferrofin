@@ -90,6 +90,23 @@ pub(crate) async fn update_item(
         item.is_locked = true;
     }
     state.library.update_items(&[item], None).await?;
+    // External ids live in their own table (`BaseItemProviders`), so they are a
+    // second write rather than a column on the row. C# strips empty values and
+    // then ASSIGNS the dictionary, which is why this replaces the set instead of
+    // merging into it.
+    if let Some(ids) = &request.provider_ids {
+        let mut pairs: Vec<(String, String)> = ids
+            .iter()
+            .filter(|(_, v)| !v.is_empty())
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        // A HashMap has no order; sort so the write (and its test) is deterministic.
+        pairs.sort();
+        state
+            .library
+            .update_item_provider_ids(item_id, &pairs)
+            .await?;
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -156,6 +173,18 @@ pub(crate) struct UpdateItemRequest {
     artist_items: Option<Vec<NameGuidPair>>,
     #[serde(default)]
     album_artists: Option<Vec<NameGuidPair>>,
+    /// The item's external ids. C# assigns the whole dictionary
+    /// (`item.ProviderIds = request.ProviderIds`), so a key the client dropped
+    /// is REMOVED, not merged — and pairs with an empty value are stripped
+    /// first (`ItemUpdateController.UpdateItem`, v10.11.8 lines 402-410).
+    ///
+    /// An ABSENT key leaves the stored ids alone. The vendored contract types
+    /// `BaseItemDto.ProviderIds` as `nullable: true`, so a body without it is a
+    /// legal request; upstream's own model binder happens to reject one with a
+    /// 400 because its C# dictionary is non-nullable, and copying that quirk
+    /// would reject bodies Ferrofin's contract accepts.
+    #[serde(default)]
+    provider_ids: Option<std::collections::HashMap<String, String>>,
 }
 
 /// Deserializes an optional `i32` that may arrive as a number, a numeric string,

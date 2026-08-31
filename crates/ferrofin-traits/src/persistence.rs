@@ -528,6 +528,54 @@ pub trait ItemPersistenceService: Send + Sync {
     /// `CollectionFolder` row before parenting scanned children to it).
     async fn item_exists(&self, id: Uuid) -> Result<bool, ServiceError>;
 
+    /// Get-or-create the by-name item row for `(kind, name)`, returning its id.
+    ///
+    /// The write half of C# `LibraryManager.CreateItemByName<T>`
+    /// (`LibraryManager.cs:1289`), which backs `GetGenre`/`GetMusicGenre`/
+    /// `GetStudio`/`GetArtist`. Those are not read-only lookups upstream: a
+    /// `GET /MusicGenres/{anything}` materializes the row as a side effect,
+    /// which is why Jellyfin never 404s one.
+    ///
+    /// `path` is the item's metadata path (`<T>.GetPath(name)`), persisted on
+    /// the row. An existing row under **any** id (matched on `Type` +
+    /// `CleanName`) wins and is returned untouched — laying a second row beside
+    /// an adopted Jellyfin row, or beside one a scan already made, is the
+    /// duplicate-identity trap the by-name browses (which join on `CleanName`)
+    /// would then list twice.
+    ///
+    /// The default returns [`None`] — a service with no by-name provisioning,
+    /// which leaves the caller's own lookup behaviour unchanged.
+    async fn ensure_by_name_item(
+        &self,
+        kind: ferrofin_model::data::BaseItemKind,
+        name: &str,
+        path: &str,
+    ) -> Result<Option<Uuid>, ServiceError> {
+        let _ = (kind, name, path);
+        Ok(None)
+    }
+
+    /// The `(id, name)` of every by-name row of `kind` whose `Path` is `NULL`.
+    ///
+    /// Jellyfin's by-name rows always carry their metadata path and `DtoService`
+    /// emits it unconditionally; Ferrofin's scanner-materialized rows were
+    /// written without one, so the field was missing from every by-name DTO.
+    /// Paired with [`set_item_path`](Self::set_item_path) for a one-time
+    /// backfill. The default returns nothing (no rows to fix).
+    async fn by_name_rows_without_path(
+        &self,
+        kind: ferrofin_model::data::BaseItemKind,
+    ) -> Result<Vec<(Uuid, String)>, ServiceError> {
+        let _ = kind;
+        Ok(Vec::new())
+    }
+
+    /// Sets one item row's `Path`. The default is a no-op.
+    async fn set_item_path(&self, id: Uuid, path: &str) -> Result<(), ServiceError> {
+        let _ = (id, path);
+        Ok(())
+    }
+
     /// Replaces an item's ancestor-closure rows (`AncestorIds`) — the recursive
     /// `ParentId` chain up to and including the library's `CollectionFolder`.
     ///
@@ -923,7 +971,8 @@ pub trait MediaStreamRepository: Send + Sync {
     /// outside the `ItemFields` system (`if (item is Audio audio)
     /// dto.HasLyrics = audio.GetMediaStreams().Any(s => s.Type ==
     /// MediaStreamType.Lyric);`, v10.11.8
-    /// Emby.Server.Implementations/Dto/DtoService.cs:308-311). The default
+    /// Emby.Server.Implementations/Dto/DtoService.cs:308-311; the same line is
+    /// DtoService.cs:421 on upstream master). The default
     /// filters the full stream batch; the concrete repository overrides it with
     /// an ids-only query so a music page does not materialize stream rows —
     /// same shape, and same reason for the override, as

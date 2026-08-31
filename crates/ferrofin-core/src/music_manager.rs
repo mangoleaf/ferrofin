@@ -1,12 +1,13 @@
 //! [`FerrofinMusicManager`] — the concrete [`MusicManager`].
 //!
-//! Port of `Emby.Server.Implementations.Library.MusicManager` (the object-safe
-//! subset). The C# manager builds an "instant mix" — a shuffled playlist of songs
-//! related to a seed (a song, album, artist, or genre set). It leans on the
-//! `MusicArtist`/`MusicAlbum`/`Audio` object tree and a genre-similarity scorer;
-//! at this seam the seed is a [`Uuid`] (or genre names), the songs are
-//! [`BaseItemEntity`] audio rows served by the injected [`ItemRepository`], and
-//! the mix is "audio items sharing the seed's genres, newest-first, capped".
+//! Port of `Emby.Server.Implementations.Library.MusicManager`. The C# manager
+//! builds an "instant mix" — a shuffled playlist of songs related to a seed (a
+//! song, album, artist, playlist, folder, or genre set). It leans on the
+//! `MusicArtist`/`MusicAlbum`/`Audio` object tree; at this seam the seed is a
+//! [`Uuid`], the songs are [`BaseItemEntity`] audio rows served by the injected
+//! [`ItemRepository`], and the kind is recovered from the stored CLR type name
+//! ([`kind_from_type_name`]) so `GetInstantMixFromItem`'s `is` chain ports
+//! one-for-one.
 //!
 //! There is no genre-weighted similarity ranking to port: C#
 //! `GetInstantMixFromGenreIds` is a plain `IncludeItemTypes = [Audio]`,
@@ -17,14 +18,15 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use ferrofin_db::entities::base_items::BaseItemEntity;
+use ferrofin_db::entities::users::UserEntity;
 use ferrofin_db::store::guid_to_db;
-use ferrofin_model::data::{BaseItemKind, MediaType};
+use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::dto::SortOrder;
 use ferrofin_model::live_tv::ItemSortBy;
 use uuid::Uuid;
 
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::library::MusicManager;
+use ferrofin_traits::library::{MusicManager, UserManager};
 use ferrofin_traits::options::{DtoOptions, InternalItemsQuery};
 use ferrofin_traits::persistence::ItemRepository;
 
@@ -38,6 +40,8 @@ const INSTANT_MIX_LIMIT: i32 = 200;
 #[derive(Clone)]
 pub struct FerrofinMusicManager {
     items: Arc<dyn ItemRepository>,
+    users: Option<Arc<dyn UserManager>>,
+    by_name: Option<crate::by_name_store::ByNameStore>,
 }
 
 impl std::fmt::Debug for FerrofinMusicManager {
@@ -47,98 +51,178 @@ impl std::fmt::Debug for FerrofinMusicManager {
     }
 }
 
+/// The display genres of a row (its `Genres` column, pipe-split).
+fn row_genres(row: &BaseItemEntity) -> Vec<String> {
+    row.genres
+        .as_deref()
+        .map(|g| {
+            g.split('|')
+                .filter(|p| !p.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// C# `Jellyfin.Extensions.DistinctNames` — distinct, case-insensitive, first
+/// spelling wins, input order preserved.
+fn distinct_names(names: Vec<String>) -> Vec<String> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    names
+        .into_iter()
+        .filter(|n| seen.insert(n.to_lowercase()))
+        .collect()
+}
+
 impl FerrofinMusicManager {
     /// Creates a music manager over the injected item repository.
     #[must_use]
     pub fn new(items: Arc<dyn ItemRepository>) -> Self {
-        Self { items }
+        Self {
+            items,
+            users: None,
+            by_name: None,
+        }
     }
 
-    /// Builds the audio-item query for an instant mix scoped to `genres`
-    /// (empty = any genre), newest-first and capped.
+    /// Attaches the user seam so a mix is scoped to the caller's libraries —
+    /// C# builds every instant-mix query as `new InternalItemsQuery(user)`.
+    /// Without it (unit-test composition) the mix is unscoped.
+    #[must_use]
+    pub fn with_users(mut self, users: Arc<dyn UserManager>) -> Self {
+        self.users = Some(users);
+        self
+    }
+
+    /// Attaches the `CreateItemByName<T>` provisioner the C# reaches through
+    /// `_libraryManager.GetMusicGenre(name)`.
     ///
-    /// Per-user visibility scoping (the C# `user` filter) is deferred here, as in
-    /// the other library managers; the mix is genre-scoped over the whole audio
-    /// library.
-    fn instant_mix_query(genres: &[String]) -> InternalItemsQuery {
-        InternalItemsQuery {
-            include_item_types: vec![BaseItemKind::Audio],
-            media_types: vec![MediaType::Audio],
-            genres: genres.to_vec(),
-            recursive: true,
-            limit: Some(INSTANT_MIX_LIMIT),
-            // C# `GetInstantMixFromGenreIds`:
-            // `OrderBy = [(ItemSortBy.Random, SortOrder.Ascending)]`.
-            // A `DateCreated DESC` mix is not a mix — it hands back the same
-            // newest-first list on every call, so "instant mix" never shuffled.
-            order_by: vec![(ItemSortBy::Random, SortOrder::Ascending)],
-            ..Default::default()
-        }
+    /// This is load-bearing, not a convenience: `GetInstantMixFromGenres`
+    /// resolves every seed name with `GetMusicGenre(i).Id`, which **creates**
+    /// the row when none exists (`LibraryManager.cs:1289`), so the C# id list is
+    /// never short. Without the store a name that has no `MusicGenre` row drops
+    /// out, and an empty `genre_ids` list means *no genre predicate at all* —
+    /// the mix then answers with the whole audio library where Jellyfin answers
+    /// with the zero songs that genre actually has.
+    #[must_use]
+    pub fn with_by_name_store(mut self, store: crate::by_name_store::ByNameStore) -> Self {
+        self.by_name = Some(store);
+        self
     }
 
-    /// The instant-mix query for an explicit set of `MusicGenre` **ids** — the
-    /// shape C# `GetInstantMixFromGenreIds` is given directly when the seed is
-    /// itself a `MusicGenre`.
-    fn instant_mix_query_by_genre_ids(genre_ids: &[Uuid]) -> InternalItemsQuery {
-        InternalItemsQuery {
-            include_item_types: vec![BaseItemKind::Audio],
-            media_types: vec![MediaType::Audio],
-            genre_ids: genre_ids.to_vec(),
-            recursive: true,
-            limit: Some(INSTANT_MIX_LIMIT),
-            order_by: vec![(ItemSortBy::Random, SortOrder::Ascending)],
-            ..Default::default()
-        }
+    /// Resolves the query's `user` row, when both a user seam and an id exist.
+    async fn user_row(&self, user_id: Option<Uuid>) -> Result<Option<UserEntity>, ServiceError> {
+        let (Some(users), Some(id)) = (self.users.as_ref(), user_id) else {
+            return Ok(None);
+        };
+        users.get_user_by_id(id).await
     }
 
-    /// The distinct genres of every `Audio` descendant of `folder_id`, unioned
-    /// with the folder's own — C# `GetInstantMixFromFolder`, which concatenates
-    /// `GetRecursiveChildren(..., IncludeItemTypes = [Audio]).SelectMany(i =>
-    /// i.Genres)` with `item.Genres` and takes `DistinctNames()`.
-    async fn folder_genres(
+    /// Port of C# `GetInstantMixFromGenreIds`: audio items carrying any of
+    /// `genre_ids`, shuffled and capped. An empty id list means no genre
+    /// predicate — the same "whole audio library" answer the C# gives when no
+    /// genre resolves.
+    async fn mix_from_genre_ids(
         &self,
-        folder_id: Uuid,
-        own: Vec<String>,
-    ) -> Result<Vec<String>, ServiceError> {
+        genre_ids: &[Uuid],
+        user: Option<UserEntity>,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        let query = InternalItemsQuery {
+            include_item_types: vec![BaseItemKind::Audio],
+            genre_ids: genre_ids.to_vec(),
+            user,
+            recursive: true,
+            limit: Some(INSTANT_MIX_LIMIT),
+            order_by: vec![(ItemSortBy::Random, SortOrder::Ascending)],
+            ..Default::default()
+        };
+        self.items.get_item_list(&query).await
+    }
+
+    /// The `MusicGenre` item ids for `genres` — C#
+    /// `genres.DistinctNames().Select(i => _libraryManager.GetMusicGenre(i).Id)`.
+    ///
+    /// `GetMusicGenre` is `CreateItemByName<MusicGenre>`, **not** a lookup: it
+    /// materializes the row when none exists, so upstream every distinct name
+    /// contributes an id and the mix filters on a genre that may simply have no
+    /// songs. That distinction decides the answer, because
+    /// [`Self::mix_from_genre_ids`] with an EMPTY list emits no genre predicate
+    /// at all: a name that fails to resolve does not narrow the mix, it widens
+    /// it to the entire audio library.
+    ///
+    /// So the resolution is two-step, and the order is a deliberate perf
+    /// choice, not a semantic one: one batched read resolves every name that
+    /// already has a row (the steady state — zero writes), and only the
+    /// leftovers go through [`ByNameStore::ensure`](crate::by_name_store::ByNameStore::ensure).
+    /// A name still unresolved after that (no store wired, or a create that
+    /// failed) drops out — the C# `catch { return Guid.Empty; }` arm.
+    async fn music_genre_ids(&self, genres: &[String]) -> Result<Vec<Uuid>, ServiceError> {
+        let names = distinct_names(genres.to_vec());
+        if names.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = self
+            .items
+            .get_item_list(&InternalItemsQuery {
+                names: names.clone(),
+                include_item_types: vec![BaseItemKind::MusicGenre],
+                ..InternalItemsQuery::default()
+            })
+            .await?;
+        let mut ids: Vec<Uuid> = rows
+            .iter()
+            .filter_map(|r| Uuid::parse_str(&r.id).ok())
+            .collect();
+        let matched: std::collections::HashSet<String> =
+            rows.iter().filter_map(|r| r.clean_name.clone()).collect();
+        let Some(store) = &self.by_name else {
+            return Ok(ids);
+        };
+        for name in &names {
+            if matched.contains(&crate::text_util::get_clean_value(name)) {
+                continue;
+            }
+            if let Some(id) = store.ensure(BaseItemKind::MusicGenre, name).await? {
+                ids.push(id);
+            }
+        }
+        Ok(ids)
+    }
+
+    /// A mix seeded by a row's own display genres — the shared body of C#
+    /// `GetInstantMixFromAlbum`/`GetInstantMixFromArtist`/`GetInstantMixFromPlaylist`.
+    async fn mix_from_row_genres(
+        &self,
+        seed: &BaseItemEntity,
+        user: Option<UserEntity>,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        let genre_ids = self.music_genre_ids(&row_genres(seed)).await?;
+        self.mix_from_genre_ids(&genre_ids, user).await
+    }
+
+    /// Port of C# `GetInstantMixFromFolder`: the distinct genres of the
+    /// folder's recursive `Audio` children, unioned with the folder's own.
+    async fn mix_from_folder(
+        &self,
+        seed: &BaseItemEntity,
+        seed_id: Uuid,
+        user: Option<UserEntity>,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
         let children = self
             .items
             .get_item_list(&InternalItemsQuery {
+                ancestor_ids: vec![seed_id],
                 include_item_types: vec![BaseItemKind::Audio],
-                media_types: vec![MediaType::Audio],
-                parent_id: folder_id,
                 recursive: true,
-                ..Default::default()
+                user: user.clone(),
+                ..InternalItemsQuery::default()
             })
             .await?;
-        let mut genres = Vec::new();
-        for row in &children {
-            genres.extend(split_genres(row.genres.as_deref()));
-        }
-        genres.extend(own);
-        // `DistinctNames()` is case-insensitive on the name; keep first-seen order.
-        let mut seen: Vec<String> = Vec::new();
-        genres.retain(|g| {
-            let lower = g.to_lowercase();
-            if seen.contains(&lower) {
-                false
-            } else {
-                seen.push(lower);
-                true
-            }
-        });
-        Ok(genres)
+        let mut genres: Vec<String> = children.iter().flat_map(row_genres).collect();
+        genres.extend(row_genres(seed));
+        let genre_ids = self.music_genre_ids(&genres).await?;
+        self.mix_from_genre_ids(&genre_ids, user).await
     }
-}
-
-/// Splits a `BaseItems."Genres"` cell into its display genre names.
-fn split_genres(cell: Option<&str>) -> Vec<String> {
-    cell.map(|g| {
-        g.split('|')
-            .filter(|p| !p.is_empty())
-            .map(str::to_owned)
-            .collect()
-    })
-    .unwrap_or_default()
 }
 
 #[async_trait]
@@ -146,51 +230,39 @@ impl MusicManager for FerrofinMusicManager {
     async fn get_instant_mix_from_item(
         &self,
         item_id: Uuid,
-        _user_id: Option<Uuid>,
+        user_id: Option<Uuid>,
         _dto_options: &DtoOptions,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        // Port of `GetInstantMixFromItem`'s `is` chain, in the same order.
+        // The seed's KIND decides how the mix is seeded — reading its `Genres`
+        // column unconditionally is what made a MusicGenre seed (whose own
+        // column is empty) return the entire audio library.
         let Some(seed) = self.items.retrieve_item(item_id).await? else {
             return Ok(Vec::new());
         };
-        let kind = kind_from_type_name(&seed.type_);
-        let own_genres = split_genres(seed.genres.as_deref());
-
-        // Port of the C# `GetInstantMixFromItem` type ladder. Each arm differs;
-        // the previous code ran the Playlist/Album/Artist arm for every kind,
-        // which made a `MusicGenre` seed read its own (empty) `Genres` column
-        // and return an unfiltered all-audio mix, and dropped the seed from a
-        // song mix that upstream deliberately puts first.
-        match kind {
-            // `item is MusicGenre` => GetInstantMixFromGenreIds([item.Id]).
-            Some(BaseItemKind::MusicGenre) => {
-                let query = Self::instant_mix_query_by_genre_ids(&[item_id]);
-                self.items.get_item_list(&query).await
+        let user = self.user_row(user_id).await?;
+        match kind_from_type_name(&seed.type_) {
+            // A genre item stands for itself: filter on its own id.
+            Some(BaseItemKind::MusicGenre) => self.mix_from_genre_ids(&[item_id], user).await,
+            Some(BaseItemKind::Playlist | BaseItemKind::MusicAlbum | BaseItemKind::MusicArtist) => {
+                self.mix_from_row_genres(&seed, user).await
             }
-            // `item is Audio song` => [item, ..mix.Where(i => i.Id != item.Id)].
-            // The seed leads its own mix; it is not dropped.
+            // `item is Audio song` — and `AudioBook : Audio.Audio`
+            // (v10.11.8 MediaBrowser.Controller/Entities/AudioBook.cs:12), so
+            // the C# `is` test matches an audiobook too; a kind match on
+            // `Audio` alone would drop it past the chain into the empty arm.
             Some(BaseItemKind::Audio | BaseItemKind::AudioBook) => {
-                let query = Self::instant_mix_query(&own_genres);
-                let mut mix = self.items.get_item_list(&query).await?;
-                // Compare in the canonical stored GUID form — entity ids come
-                // back as stored TEXT.
-                mix.retain(|row| row.id != guid_to_db(item_id));
+                // `GetInstantMixFromSong` PREPENDS the seed and de-duplicates
+                // it out of the tail — it does not drop it.
+                let mut mix = self.mix_from_row_genres(&seed, user).await?;
+                let seed_key = guid_to_db(item_id);
+                mix.retain(|row| row.id != seed_key);
                 mix.insert(0, seed);
                 Ok(mix)
             }
-            // Playlist / MusicAlbum / MusicArtist: the row's own genres.
-            Some(BaseItemKind::Playlist | BaseItemKind::MusicAlbum | BaseItemKind::MusicArtist) => {
-                let query = Self::instant_mix_query(&own_genres);
-                self.items.get_item_list(&query).await
-            }
-            // `item is Folder folder` => the recursive Audio children's genres
-            // unioned with the folder's own. Checked last, as in the C# ladder,
-            // so the folder-ish music kinds above take their own arm first.
-            _ if seed.is_folder => {
-                let genres = self.folder_genres(item_id, own_genres).await?;
-                let query = Self::instant_mix_query(&genres);
-                self.items.get_item_list(&query).await
-            }
-            // C# falls off the end with `return new List<BaseItem>();`.
+            _ if seed.is_folder => self.mix_from_folder(&seed, item_id, user).await,
+            // C# falls off the end of the chain with an empty list — never
+            // with "every song in the library".
             _ => Ok(Vec::new()),
         }
     }
@@ -201,7 +273,7 @@ impl MusicManager for FerrofinMusicManager {
         user_id: Option<Uuid>,
         dto_options: &DtoOptions,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        // An artist seed uses the artist's genres, same as any other seed row.
+        // `GetInstantMixFromArtist` is the MusicArtist arm of the dispatch.
         self.get_instant_mix_from_item(artist_id, user_id, dto_options)
             .await
     }
@@ -209,11 +281,12 @@ impl MusicManager for FerrofinMusicManager {
     async fn get_instant_mix_from_genres(
         &self,
         genres: &[String],
-        _user_id: Option<Uuid>,
+        user_id: Option<Uuid>,
         _dto_options: &DtoOptions,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        let query = Self::instant_mix_query(genres);
-        self.items.get_item_list(&query).await
+        let user = self.user_row(user_id).await?;
+        let genre_ids = self.music_genre_ids(genres).await?;
+        self.mix_from_genre_ids(&genre_ids, user).await
     }
 }
 
@@ -222,9 +295,7 @@ mod tests {
     use super::*;
     use crate::item_repository::FerrofinItemRepository;
     use crate::item_type_lookup::ItemTypeLookup;
-    use crate::test_support::{
-        seed_item, seed_item_genre, seed_named_item, set_clean_name, test_db,
-    };
+    use crate::test_support::{seed_item, seed_item_genre, seed_named_item, test_db};
     use ferrofin_db::Database;
 
     fn manager(db: &Database) -> FerrofinMusicManager {
@@ -233,19 +304,41 @@ mod tests {
         FerrofinMusicManager::new(Arc::new(FerrofinItemRepository::new(db.clone(), lookup)))
     }
 
-    /// Seeds an audio row, sets its media type, and attaches a genre value (both
-    /// on the row and through `ItemValues`, since the mix query filters on the
-    /// latter).
+    /// The composed manager the server actually runs: the same repository plus
+    /// the `CreateItemByName` provisioner the C# reaches through
+    /// `_libraryManager.GetMusicGenre(name)`. Every test that asks how an
+    /// UNRESOLVED genre name behaves must use this one — without the store the
+    /// name simply drops, which is the bug, not the behaviour.
+    fn provisioned_manager(db: &Database, dir: &std::path::Path) -> FerrofinMusicManager {
+        let persistence: Arc<dyn ferrofin_traits::persistence::ItemPersistenceService> = Arc::new(
+            crate::item_persistence_service::FerrofinItemPersistenceService::new(db.clone()),
+        );
+        manager(db).with_by_name_store(crate::by_name_store::ByNameStore::new(
+            persistence,
+            dir.join("Genre"),
+            dir.join("MusicGenre"),
+            dir.join("Studio"),
+            dir.join("artists"),
+        ))
+    }
+
+    /// Writes the row's display `Genres` column — the seed the C# reads through
+    /// `item.Genres` before resolving it to genre ids.
+    async fn set_genres(db: &Database, id: Uuid, genres: &str) {
+        sqlx::query(r#"UPDATE "BaseItems" SET "Genres" = ?2 WHERE "Id" = ?1"#)
+            .bind(guid_to_db(id))
+            .bind(genres)
+            .execute(db.writer())
+            .await
+            .expect("set genres");
+    }
+
+    /// Seeds an audio row and attaches a genre both on the row and through
+    /// `ItemValues` — the latter is what materializes the browsable
+    /// `MusicGenre` row the mix query's `GenreIds` filter resolves against.
     async fn seed_song(db: &Database, id: Uuid, name: &str, genre: &str) {
         seed_named_item(db, id, BaseItemKind::Audio, name).await;
-        sqlx::query(
-            r#"UPDATE "BaseItems" SET "MediaType" = 'Audio', "Genres" = ?2 WHERE "Id" = ?1"#,
-        )
-        .bind(guid_to_db(id))
-        .bind(genre)
-        .execute(db.writer())
-        .await
-        .expect("set song fields");
+        set_genres(db, id, genre).await;
         seed_item_genre(db, id, genre).await;
     }
 
@@ -270,7 +363,7 @@ mod tests {
     /// C# `GetInstantMixFromSong`: `[item, .. mix.Where(i => i.Id != item.Id)]`
     /// — the seed LEADS its own mix and appears exactly once.
     #[tokio::test]
-    async fn instant_mix_from_song_puts_the_seed_first_exactly_once() {
+    async fn instant_mix_from_song_prepends_the_seed() {
         let db = test_db().await;
         let seed = Uuid::from_u128(0x101);
         seed_song(&db, seed, "Seed", "Rock").await;
@@ -281,54 +374,207 @@ mod tests {
             .get_instant_mix_from_item(seed, None, &DtoOptions::default())
             .await
             .expect("mix");
-        assert_eq!(mix.len(), 2);
-        assert_eq!(mix[0].id, guid_to_db(seed));
+        // C# `GetInstantMixFromSong` returns `[item, ..rest.Where(id != item)]`.
+        assert_eq!(mix.first().map(|r| r.id.clone()), Some(guid_to_db(seed)));
         assert_eq!(
             mix.iter().filter(|r| r.id == guid_to_db(seed)).count(),
             1,
-            "the seed must not be duplicated"
+            "the seed appears exactly once"
         );
+        assert_eq!(mix.len(), 2);
     }
 
-    /// C# `GetInstantMixFromItem`: `if (item is MusicGenre) return
-    /// GetInstantMixFromGenreIds([item.Id], …)` — the genre's OWN id seeds the
-    /// filter. Reading the genre row's (empty) `Genres` column instead returned
-    /// an unfiltered all-audio mix.
     #[tokio::test]
-    async fn instant_mix_from_music_genre_filters_by_that_genre() {
+    async fn instant_mix_from_music_genre_filters_to_that_genre() {
         let db = test_db().await;
-        seed_song(&db, Uuid::from_u128(0x201), "Jazz Song", "Jazz").await;
-        seed_song(&db, Uuid::from_u128(0x202), "Rock Song", "Rock").await;
-        // The by-name `MusicGenre` row the seed id points at; `genre_ids`
-        // resolves it to its `CleanName` and matches the songs' `ItemValues`.
-        let genre_id = Uuid::from_u128(0x203);
-        seed_named_item(&db, genre_id, BaseItemKind::MusicGenre, "Jazz").await;
-        set_clean_name(&db, genre_id, "Jazz").await;
+        seed_song(&db, Uuid::from_u128(0x101), "Rock A", "Rock").await;
+        seed_song(&db, Uuid::from_u128(0x102), "Rock B", "Rock").await;
+        seed_song(&db, Uuid::from_u128(0x103), "Jazz A", "Jazz").await;
         let mgr = manager(&db);
+        // The browsable MusicGenre row the scanner materialized for "Rock".
+        let rock = mgr
+            .items
+            .get_item_list(&InternalItemsQuery {
+                names: vec!["Rock".to_owned()],
+                include_item_types: vec![BaseItemKind::MusicGenre],
+                ..InternalItemsQuery::default()
+            })
+            .await
+            .expect("genre row");
+        let rock_id =
+            Uuid::parse_str(&rock.first().expect("a Rock MusicGenre row").id).expect("id");
 
         let mix = mgr
-            .get_instant_mix_from_item(genre_id, None, &DtoOptions::default())
+            .get_instant_mix_from_item(rock_id, None, &DtoOptions::default())
+            .await
+            .expect("mix");
+        // The regression this guards: a MusicGenre row's own `Genres` column is
+        // empty, so seeding from it returned the WHOLE audio library.
+        let mut names: Vec<&str> = mix.iter().filter_map(|r| r.name.as_deref()).collect();
+        names.sort_unstable();
+        assert_eq!(names, vec!["Rock A", "Rock B"]);
+    }
+
+    /// The regression the reviewer caught: a seed genre NAME with no
+    /// materialized `MusicGenre` row must narrow the mix to that genre's songs
+    /// (none), never widen it to the whole library.
+    ///
+    /// C# cannot reach the widened state, because
+    /// `GetInstantMixFromGenres` resolves each name with
+    /// `_libraryManager.GetMusicGenre(i).Id` — `CreateItemByName`
+    /// (`LibraryManager.cs:1247, 1289`), which always yields a real id. Dropping
+    /// the name instead leaves `GenreIds` empty, and an empty `GenreIds` emits
+    /// NO predicate (`translate_query.rs:1035`). Measured live before the fix:
+    /// `/MusicGenres/Comedy/InstantMix` H=9 (the entire audio library) J=0.
+    #[tokio::test]
+    async fn a_seed_genre_with_no_row_yields_no_songs_not_every_song() {
+        let db = test_db().await;
+        seed_song(&db, Uuid::from_u128(0x101), "Rock A", "Rock").await;
+        seed_song(&db, Uuid::from_u128(0x102), "Jazz A", "Jazz").await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mgr = provisioned_manager(&db, dir.path());
+
+        let mix = mgr
+            .get_instant_mix_from_genres(&["Comedy".to_owned()], None, &DtoOptions::default())
+            .await
+            .expect("mix");
+        assert!(
+            mix.is_empty(),
+            "an unmatched genre must filter to nothing, got {:?}",
+            mix.iter()
+                .filter_map(|r| r.name.as_deref())
+                .collect::<Vec<_>>()
+        );
+
+        // ...and the resolution MATERIALIZED the row, exactly as the GET route
+        // does upstream, so a second call resolves it by lookup.
+        let created = mgr
+            .items
+            .get_item_list(&InternalItemsQuery {
+                names: vec!["Comedy".to_owned()],
+                include_item_types: vec![BaseItemKind::MusicGenre],
+                ..InternalItemsQuery::default()
+            })
+            .await
+            .expect("genre rows");
+        assert_eq!(created.len(), 1, "GetMusicGenre creates the row");
+    }
+
+    /// A resolvable name still resolves through the batched read, and the
+    /// unresolved leftovers do not disturb it: a mix over both a real and an
+    /// absent genre returns exactly the real genre's songs.
+    #[tokio::test]
+    async fn a_mixed_seed_resolves_the_real_genre_and_creates_the_absent_one() {
+        let db = test_db().await;
+        seed_song(&db, Uuid::from_u128(0x101), "Rock A", "Rock").await;
+        seed_song(&db, Uuid::from_u128(0x102), "Jazz A", "Jazz").await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mgr = provisioned_manager(&db, dir.path());
+
+        let mix = mgr
+            .get_instant_mix_from_genres(
+                &["Rock".to_owned(), "Comedy".to_owned()],
+                None,
+                &DtoOptions::default(),
+            )
             .await
             .expect("mix");
         let names: Vec<&str> = mix.iter().filter_map(|r| r.name.as_deref()).collect();
-        assert_eq!(names, ["Jazz Song"], "only the seeded genre's songs");
+        assert_eq!(names, vec!["Rock A"]);
+        // The absent name still contributed an id (a genre with no songs), and
+        // the row it created is the one a later lookup finds.
+        let created = mgr
+            .items
+            .get_item_list(&InternalItemsQuery {
+                names: vec!["Comedy".to_owned()],
+                include_item_types: vec![BaseItemKind::MusicGenre],
+                ..InternalItemsQuery::default()
+            })
+            .await
+            .expect("genre rows");
+        assert_eq!(created.len(), 1);
     }
 
-    /// A seed that is neither music nor a folder falls off the end of the C#
-    /// ladder with an empty list.
+    /// A row-genre seed goes through the same resolution, so an album/artist
+    /// whose `Genres` column names a genre with no row must not widen either.
     #[tokio::test]
-    async fn instant_mix_from_a_movie_is_empty() {
+    async fn a_row_genre_seed_with_no_genre_row_yields_no_songs() {
         let db = test_db().await;
-        let movie = Uuid::from_u128(0x301);
-        seed_item(&db, movie, BaseItemKind::Movie).await;
-        seed_song(&db, Uuid::from_u128(0x302), "Song", "Rock").await;
+        seed_song(&db, Uuid::from_u128(0x101), "Rock A", "Rock").await;
+        let album = Uuid::from_u128(0x201);
+        seed_named_item(&db, album, BaseItemKind::MusicAlbum, "Album X").await;
+        // The column names a genre no `ItemValues` row backs.
+        set_genres(&db, album, "Comedy").await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mgr = provisioned_manager(&db, dir.path());
+
+        let mix = mgr
+            .get_instant_mix_from_item(album, None, &DtoOptions::default())
+            .await
+            .expect("mix");
+        assert!(mix.is_empty(), "got {}", mix.len());
+    }
+
+    /// `item is Audio song` matches an AUDIOBOOK too — `AudioBook : Audio.Audio`
+    /// (v10.11.8 MediaBrowser.Controller/Entities/AudioBook.cs:12) — so it takes
+    /// the song arm (its own row leads the mix) rather than falling off the end
+    /// of the chain into the empty answer.
+    #[tokio::test]
+    async fn instant_mix_from_an_audiobook_takes_the_song_arm() {
+        let db = test_db().await;
+        seed_song(&db, Uuid::from_u128(0x401), "Chapter Two", "Spoken").await;
+        let book = Uuid::from_u128(0x402);
+        seed_named_item(&db, book, BaseItemKind::AudioBook, "Chapter One").await;
+        set_genres(&db, book, "Spoken").await;
+        seed_item_genre(&db, book, "Spoken").await;
         let mgr = manager(&db);
 
-        assert!(
-            mgr.get_instant_mix_from_item(movie, None, &DtoOptions::default())
-                .await
-                .expect("mix")
-                .is_empty()
+        let mix = mgr
+            .get_instant_mix_from_item(book, None, &DtoOptions::default())
+            .await
+            .expect("mix");
+        assert_eq!(
+            mix.first().map(|r| r.id.clone()),
+            Some(guid_to_db(book)),
+            "the audiobook seed leads its own mix"
         );
+        assert!(
+            mix.iter().any(|r| r.name.as_deref() == Some("Chapter Two")),
+            "…and the genre's other tracks follow"
+        );
+    }
+
+    #[tokio::test]
+    async fn instant_mix_from_an_unsupported_kind_is_empty() {
+        let db = test_db().await;
+        seed_song(&db, Uuid::from_u128(0x101), "Song A", "Jazz").await;
+        let movie = Uuid::from_u128(0x103);
+        seed_item(&db, movie, BaseItemKind::Movie).await;
+        let mgr = manager(&db);
+
+        // C# falls off the end of the `is` chain with an empty list.
+        let mix = mgr
+            .get_instant_mix_from_item(movie, None, &DtoOptions::default())
+            .await
+            .expect("mix");
+        assert!(mix.is_empty(), "a non-music, non-folder seed mixes nothing");
+    }
+
+    #[tokio::test]
+    async fn instant_mix_from_album_uses_the_album_genres() {
+        let db = test_db().await;
+        seed_song(&db, Uuid::from_u128(0x101), "Rock A", "Rock").await;
+        seed_song(&db, Uuid::from_u128(0x102), "Jazz A", "Jazz").await;
+        let album = Uuid::from_u128(0x104);
+        seed_named_item(&db, album, BaseItemKind::MusicAlbum, "Album").await;
+        set_genres(&db, album, "Rock").await;
+        let mgr = manager(&db);
+
+        let mix = mgr
+            .get_instant_mix_from_item(album, None, &DtoOptions::default())
+            .await
+            .expect("mix");
+        let names: Vec<&str> = mix.iter().filter_map(|r| r.name.as_deref()).collect();
+        assert_eq!(names, vec!["Rock A"]);
     }
 }

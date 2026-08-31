@@ -5,7 +5,8 @@
 //! - `GET /Studios` — the library's studios as a [`QueryResult<BaseItemDto>`].
 //! - `GET /Studios/{name}` — a single studio by name.
 //!
-//! The per-name image routes are deferred to Batch 9.
+//! The per-name image routes (`/Studios/{name}/Images/{imageType}`) are
+//! registered by the image controller and probed by `suite/parity/assets.py`.
 
 use axum::extract::{Path, Query, State};
 use axum::routing::get;
@@ -53,9 +54,18 @@ async fn get_studios(
 
 /// `GET /Studios/{name}` — a single studio by name.
 ///
-/// Port of `StudiosController.GetStudio`. Jellyfin lazily creates the studio row
-/// when absent; that filesystem side effect is out of scope for this seam, so a
-/// missing studio is a `404`.
+/// Port of `StudiosController.GetStudio`, which is
+/// `_libraryManager.GetStudio(name)` == `CreateItemByName<Studio>`
+/// (`LibraryManager.cs:975-978` on v10.11.8, `:1212-1215` on master —
+/// byte-identical). The create happens inside `library.get_named_item`, so the
+/// `404` arm below is reachable only if the by-name store fails to mint a row.
+/// `StudiosController` has NO slug branch in either tree (only Genres and
+/// MusicGenres do), so a hyphenated studio name is looked up literally here.
+///
+/// `DtoOptions::default()` deliberately follows upstream MASTER (`new
+/// DtoOptions()`); v10.11.8 has `new DtoOptions().AddClientFields(User)`, whose
+/// only effect is adding `RecursiveItemCount`/`ChildCount` for a handful of
+/// legacy clients. Do not "fix" this toward 10.11.8.
 #[utoipa::path(
     get,
     path = "/Studios/{name}",

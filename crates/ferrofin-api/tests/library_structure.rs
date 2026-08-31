@@ -439,7 +439,7 @@ async fn update_library_options_by_name_and_missing_is_404() {
         .unwrap();
     assert_eq!(ok.status(), StatusCode::NO_CONTENT);
 
-    // No name (only id) → 404 at this filesystem seam.
+    // Only an id, and it matches no library → 404.
     let missing = router
         .oneshot(
             Request::builder()
@@ -455,6 +455,157 @@ async fn update_library_options_by_name_and_missing_is_404() {
         .await
         .unwrap();
     assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+}
+
+/// `GET /Library/VirtualFolders` as JSON, for tests that key off the projected `ItemId`.
+async fn folders(router: &axum::Router) -> serde_json::Value {
+    let res = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/Library/VirtualFolders")
+                .header("X-Emby-Token", TOKEN)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+/// `POST /Library/VirtualFolders/LibraryOptions` keyed by `id` alone — no `Name`, which
+/// is what jellyfin-web sends.
+async fn post_options(router: &axum::Router, id: &str, trickplay: bool) -> StatusCode {
+    router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/Library/VirtualFolders/LibraryOptions")
+                .header("X-Emby-Token", TOKEN)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(format!(
+                    r#"{{"Id":"{id}","LibraryOptions":{{"EnableTrickplayImageExtraction":{trickplay},"PathInfos":[]}}}}"#
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+}
+
+/// The id-only form is the *only* one a real client can use — `UpdateLibraryOptionsDto`
+/// carries `Guid Id` and nothing else — and the id it echoes back is the dashless
+/// `ItemId` from `GET /Library/VirtualFolders`. C# resolves it with
+/// `GetItemById<CollectionFolder>(request.Id)`, a `Guid` lookup that does not care how
+/// the id was spelled, so both spellings must resolve and the option must round-trip.
+#[tokio::test]
+async fn update_library_options_by_projected_item_id_round_trips() {
+    let (state, vf) = working_state();
+    ferrofin_traits::library::VirtualFolderManager::add_virtual_folder(
+        &*vf,
+        "Lib",
+        None,
+        &ferrofin_model::configuration::LibraryOptions::default(),
+    )
+    .await
+    .unwrap();
+    let router = create_router(state);
+
+    // The id exactly as the server projects it: dashless, no `Name` in the body.
+    let listed = folders(&router).await;
+    let projected = listed[0]["ItemId"].as_str().unwrap().to_owned();
+    assert!(
+        !projected.contains('-'),
+        "ItemId must be projected dashless like Guid.ToString(\"N\"), got {projected}"
+    );
+    assert_eq!(
+        post_options(&router, &projected, true).await,
+        StatusCode::NO_CONTENT
+    );
+    let after = folders(&router).await;
+    assert_eq!(
+        after[0]["LibraryOptions"]["EnableTrickplayImageExtraction"],
+        serde_json::json!(true),
+        "the write must be reflected in the read-back"
+    );
+
+    // The same id hyphenated must resolve too — C#'s `Guid` lookup is format-agnostic.
+    let hyphenated = uuid::Uuid::parse_str(&projected).unwrap().to_string();
+    assert!(hyphenated.contains('-'));
+    assert_eq!(
+        post_options(&router, &hyphenated, false).await,
+        StatusCode::NO_CONTENT
+    );
+    let after = folders(&router).await;
+    assert_eq!(
+        after[0]["LibraryOptions"]["EnableTrickplayImageExtraction"],
+        serde_json::json!(false)
+    );
+}
+
+/// Two libraries must project **distinct** `ItemId`s, and an id-keyed write must
+/// land on exactly the one it addressed.
+///
+/// The real manager derives the id from the library's path, so distinct libraries
+/// always differ; the fake's projection has to preserve that or a two-library test
+/// would silently key both rows to the same id and the "wrote the right one"
+/// assertion above would hold vacuously.
+#[tokio::test]
+async fn distinct_libraries_project_distinct_ids_and_writes_do_not_cross() {
+    let (state, vf) = working_state();
+    for name in ["Movies", "Shows"] {
+        ferrofin_traits::library::VirtualFolderManager::add_virtual_folder(
+            &*vf,
+            name,
+            None,
+            &ferrofin_model::configuration::LibraryOptions::default(),
+        )
+        .await
+        .unwrap();
+    }
+    let router = create_router(state);
+
+    let listed = folders(&router).await;
+    let ids: Vec<String> = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["ItemId"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(ids.len(), 2);
+    assert_ne!(
+        ids[0], ids[1],
+        "distinct libraries must not share an ItemId"
+    );
+
+    // The projection must separate names the *old* tiling fold mapped together:
+    // it filled the 16 id bytes with `name[i % len] + i`, so any name and its own
+    // repetition produced the identical id.
+    assert_ne!(
+        ferrofin_api::test_support::FakeVirtualFolders::projected_item_id("ab"),
+        ferrofin_api::test_support::FakeVirtualFolders::projected_item_id("abab"),
+        "a name and its repetition must not fold to the same ItemId"
+    );
+
+    assert_eq!(
+        post_options(&router, &ids[0], true).await,
+        StatusCode::NO_CONTENT
+    );
+    let after = folders(&router).await;
+    assert_eq!(
+        after[0]["LibraryOptions"]["EnableTrickplayImageExtraction"],
+        serde_json::json!(true)
+    );
+    assert_eq!(
+        after[1]["LibraryOptions"]["EnableTrickplayImageExtraction"],
+        serde_json::json!(false),
+        "the write must not leak onto the other library"
+    );
 }
 
 #[tokio::test]

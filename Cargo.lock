@@ -1223,6 +1223,7 @@ dependencies = [
  "ferrofin-model",
  "ferrofin-traits",
  "image",
+ "jpeg-encoder",
  "kamadak-exif",
  "rstest",
  "tempfile",
@@ -1420,6 +1421,7 @@ dependencies = [
  "ferrofin-common",
  "ferrofin-db",
  "ferrofin-model",
+ "ferrofin-naming",
  "ferrofin-traits",
  "ferrofin-util",
  "quick-xml",
@@ -2397,6 +2399,12 @@ dependencies = [
  "getrandom 0.4.3",
  "libc",
 ]
+
+[[package]]
+name = "jpeg-encoder"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a0370574b86f7eca156b9f298392b5e69a23f8c86f3f865add60bbc2e79467a6"
 
 [[package]]
 name = "js-sys"

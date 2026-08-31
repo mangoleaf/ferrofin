@@ -2265,6 +2265,53 @@ impl ActivityManager for RecordingActivity {
     }
 }
 
+/// A [`TaskManager`] that RECORDS which tasks were started and cancelled.
+///
+/// `POST /Library/Refresh` ports C#'s
+/// `_taskManager.CancelIfRunningAndQueue<RefreshMediaLibraryTask>()`
+/// (`LibraryManager.ValidateMediaLibrary`, v10.11.8): routing through the task
+/// registry IS that route's observable effect — it is what puts "Scan Media
+/// Library" into `GET /ScheduledTasks` as Running. A fake that cannot be read
+/// back cannot tell the port from a no-op, so this one can.
+#[derive(Default)]
+pub struct RecordingTasks {
+    /// Task ids passed to [`TaskManager::start_task`], in call order.
+    pub started: std::sync::Mutex<Vec<String>>,
+    /// Task ids passed to [`TaskManager::cancel_task`], in call order.
+    pub cancelled: std::sync::Mutex<Vec<String>>,
+}
+
+#[async_trait]
+impl TaskManager for RecordingTasks {
+    async fn get_tasks(&self) -> Result<Vec<TaskInfo>, ServiceError> {
+        Ok(Vec::new())
+    }
+    async fn get_task(&self, _task_id: &str) -> Result<Option<TaskInfo>, ServiceError> {
+        Ok(None)
+    }
+    async fn start_task(&self, task_id: &str) -> Result<(), ServiceError> {
+        self.started
+            .lock()
+            .expect("started lock")
+            .push(task_id.to_owned());
+        Ok(())
+    }
+    async fn cancel_task(&self, task_id: &str) -> Result<(), ServiceError> {
+        self.cancelled
+            .lock()
+            .expect("cancelled lock")
+            .push(task_id.to_owned());
+        Ok(())
+    }
+    async fn update_triggers(
+        &self,
+        _task_id: &str,
+        _triggers: &[TaskTriggerInfo],
+    ) -> Result<(), ServiceError> {
+        Ok(())
+    }
+}
+
 /// A fake [`TaskManager`]; every method is unused by INFRA-level tests.
 pub struct FakeTasks;
 
@@ -2359,6 +2406,37 @@ impl FakeVirtualFolders {
         }
     }
 
+    /// The `ItemId` this fake projects for `name`.
+    ///
+    /// The real manager derives a deterministic `CollectionFolder` id from the
+    /// library's path and projects it **dashless** (`Guid.ToString("N")`, as
+    /// `LibraryManager.GetVirtualFolderInfo` does). The fake only needs the same
+    /// *shape* — a stable id in the same spelling — so id-keyed handlers are
+    /// exercised against the wire format clients actually echo back.
+    ///
+    /// The fold is two FNV-1a-64 passes over the whole name (different offset
+    /// bases) concatenated into the 16 id bytes. Every byte of the name reaches
+    /// every id byte, so two libraries added to one fake get distinct ids — an
+    /// earlier version tiled the name across the bytes, which let distinct names
+    /// collide onto the same `ItemId` and would have silently keyed a two-library
+    /// test to one row.
+    #[must_use]
+    pub fn projected_item_id(name: &str) -> String {
+        /// FNV-1a over `data`, seeded with `basis`.
+        fn fnv1a64(data: &[u8], basis: u64) -> u64 {
+            const PRIME: u64 = 0x0000_0100_0000_01B3;
+            data.iter().fold(basis, |hash, byte| {
+                (hash ^ u64::from(*byte)).wrapping_mul(PRIME)
+            })
+        }
+        const OFFSET_BASIS: u64 = 0xCBF2_9CE4_8422_2325;
+        let src = name.as_bytes();
+        let mut bytes = [0u8; 16];
+        bytes[..8].copy_from_slice(&fnv1a64(src, OFFSET_BASIS).to_be_bytes());
+        bytes[8..].copy_from_slice(&fnv1a64(src, !OFFSET_BASIS).to_be_bytes());
+        Uuid::from_bytes(bytes).simple().to_string()
+    }
+
     /// The uniform failure used when [`Self::fail`] is set.
     fn guard(&self) -> Result<(), ServiceError> {
         if self.fail {
@@ -2394,6 +2472,7 @@ impl VirtualFolderManager for FakeVirtualFolders {
                 locations: options.path_infos.iter().map(|p| p.path.clone()).collect(),
                 collection_type,
                 library_options: Some(options.clone()),
+                item_id: Some(Self::projected_item_id(name)),
                 ..ferrofin_model::entities_media::VirtualFolderInfo::default()
             },
         );
@@ -2749,6 +2828,21 @@ pub fn elevated_state_with_library_and_monitor(
     library: Arc<dyn LibraryManager>,
     monitor: Arc<dyn LibraryMonitor>,
 ) -> AppState {
+    elevated_state_with_library_monitor_and_tasks(library, monitor, Arc::new(FakeTasks))
+}
+
+/// As [`elevated_state_with_library_and_monitor`], but with a caller-supplied
+/// [`TaskManager`] so a test can assert which task a route started.
+///
+/// `POST /Library/Refresh` ports C#'s
+/// `_taskManager.CancelIfRunningAndQueue<RefreshMediaLibraryTask>()`; routing
+/// through the registry IS the route's observable effect, so it needs a fake
+/// the test can read back.
+pub fn elevated_state_with_library_monitor_and_tasks(
+    library: Arc<dyn LibraryManager>,
+    monitor: Arc<dyn LibraryMonitor>,
+    tasks: Arc<dyn ferrofin_traits::tasks::TaskManager>,
+) -> AppState {
     AppState::new(
         library,
         Arc::new(FakeUsers),
@@ -2781,7 +2875,7 @@ pub fn elevated_state_with_library_and_monitor(
         Arc::new(FakeDisplayPreferences),
         Arc::new(FakeActivity),
         Arc::new(FakeFileSystem),
-        Arc::new(FakeTasks),
+        tasks,
     )
     .with_library_monitor(monitor)
 }

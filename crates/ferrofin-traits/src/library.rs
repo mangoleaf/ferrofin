@@ -328,6 +328,35 @@ pub trait LibraryManager: Send + Sync {
         parent_id: Option<Uuid>,
     ) -> Result<(), ServiceError>;
 
+    /// Replaces an item's whole external-id set (`BaseItemProviders`) with
+    /// `provider_ids`.
+    ///
+    /// The write behind C# `ItemUpdateController.UpdateItem`'s
+    /// `item.ProviderIds = request.ProviderIds` (v10.11.8
+    /// `Jellyfin.Api/Controllers/ItemUpdateController.cs:402-410`): an
+    /// **assignment**, so a key the request omits is removed, not merged. The
+    /// caller strips empty values first, exactly as the C# does.
+    ///
+    /// External ids live in their own table, not on [`BaseItemEntity`], so they
+    /// cannot ride along with [`update_items`](Self::update_items) — hence a
+    /// method of its own.
+    ///
+    /// The default is a no-op so the API-layer test doubles that implement this
+    /// trait keep compiling; the real manager persists through the item
+    /// repository. A double that asserts on this write overrides it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ServiceError`] if the ids cannot be persisted.
+    async fn update_item_provider_ids(
+        &self,
+        item_id: Uuid,
+        provider_ids: &[(String, String)],
+    ) -> Result<(), ServiceError> {
+        let _ = (item_id, provider_ids);
+        Ok(())
+    }
+
     /// Deletes an item, honoring the given [`DeleteOptions`].
     async fn delete_item(&self, id: Uuid, options: &DeleteOptions) -> Result<(), ServiceError>;
 
@@ -451,18 +480,68 @@ pub trait LibraryManager: Send + Sync {
         query: &InternalItemsQuery,
     ) -> Result<QueryResult<ItemWithCounts>, ServiceError>;
 
+    /// The all-default by-name row C# stands in with when a slug lookup
+    /// matches nothing — `item ??= new Genre()` in
+    /// `GenresController.GetGenre` (identical on v10.11.8 and master, and the
+    /// same line in `MusicGenresController`).
+    ///
+    /// It is why that route can never 404: the controller serializes a
+    /// default-constructed entity, so the client gets a 200 whose `Id` is
+    /// `Guid.Empty`, whose `LocationType` is `Virtual`, and which carries no
+    /// `Name` or `Path` at all. Only the row `Type` distinguishes it.
+    ///
+    /// The default here cannot name the stored type (the kind → CLR-name table
+    /// lives with the item repository), so the concrete manager overrides it.
+    fn empty_by_name_item(&self, kind: BaseItemKind) -> BaseItemEntity {
+        let _ = kind;
+        BaseItemEntity {
+            id: uuid::Uuid::nil().to_string().to_uppercase(),
+            ..BaseItemEntity::default()
+        }
+    }
+
+    /// Resolves the by-name item row of `kind` named `name` WITHOUT creating
+    /// one when nothing matches.
+    ///
+    /// The non-materializing sibling of [`Self::get_named_item`]. C# splits the
+    /// two the same way: `GetGenre`/`GetStudio` are `CreateItemByName<T>` and
+    /// write, while `GenresController.GetItemFromSlugName` runs plain
+    /// `GetItemList` queries and returns null on a miss — the slug branch must
+    /// never mint a row for a name that was only a mis-spelling of a real one.
+    async fn find_named_item(
+        &self,
+        kind: BaseItemKind,
+        name: &str,
+    ) -> Result<Option<BaseItemEntity>, ServiceError> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Ok(None);
+        }
+        let query = InternalItemsQuery {
+            name: Some(name.to_owned()),
+            include_item_types: vec![kind],
+            ..InternalItemsQuery::default()
+        };
+        Ok(self.get_item_list(&query).await?.into_iter().next())
+    }
+
     /// Resolves a single by-name item (genre, studio, artist, person, year, …)
     /// of the given [`BaseItemKind`] by its name, or `None` when no such row
-    /// exists.
+    /// exists — **materializing** it when it does not, for the kinds Jellyfin
+    /// materializes.
     ///
     /// Port of `ILibraryManager`'s by-name resolvers (`GetGenre`, `GetStudio`,
-    /// `GetArtist`, `GetPerson`, `GetMusicGenre`, `GetYear`). Jellyfin's
-    /// versions create the backing folder on disk when absent; that filesystem
-    /// side effect is out of scope for this portable seam, so a missing item is
-    /// reported as `None` and each controller applies its own empty/`404`
-    /// fallback. Matching is by cleaned name (Jellyfin's item-by-name id is
-    /// derived from the name), delegating to [`Self::get_item_list`] filtered to
-    /// `kind`; the first match wins, mirroring C# `FirstOrDefault`.
+    /// `GetArtist`, `GetMusicGenre`, `GetYear`), which are all
+    /// `CreateItemByName<T>`: they create the metadata folder and persist the
+    /// row as a side effect of the lookup, which is why those routes never 404
+    /// upstream. `GetPerson` is the exception — a plain lookup on both trees
+    /// (`LibraryManager.cs:958-968` on v10.11.8, `:1195-1205` on master) — so
+    /// `Person` is not in the provisioned set. Use [`Self::find_named_item`]
+    /// where the lookup must not write.
+    ///
+    /// Matching is by cleaned name (Jellyfin's item-by-name id is derived from
+    /// the name), delegating to [`Self::get_item_list`] filtered to `kind`; the
+    /// first match wins, mirroring C# `FirstOrDefault`.
     async fn get_named_item(
         &self,
         kind: BaseItemKind,
@@ -1229,7 +1308,8 @@ pub trait MediaSourceManager: Send + Sync {
     /// The subset of `item_ids` that carry at least one LYRIC stream.
     ///
     /// Backs the DTO builder's `HasLyrics` (C# emits it on every `Audio` DTO,
-    /// outside the `ItemFields` system — DtoService.cs:308-311). The default
+    /// outside the `ItemFields` system — v10.11.8 DtoService.cs:308-311,
+    /// `:421` on upstream master). The default
     /// derives it from [`Self::get_media_streams_batch`]; the concrete manager
     /// overrides it with a cheap ids-only query — same shape, and same reason
     /// for the override, as [`Self::get_item_ids_with_subtitles`].

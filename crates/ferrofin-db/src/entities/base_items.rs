@@ -537,3 +537,41 @@ pub struct KeyframeDataEntity {
     /// The item's total duration in ticks (`TotalDuration`).
     pub total_duration: i64,
 }
+
+/// Collects an item's artists/genres/studios/tags as
+/// `(ItemValueType discriminant, value)` pairs for the `ItemValues` filter
+/// tables (Artist = 0, AlbumArtist = 1, Genre = 2, Studios = 3, Tags = 4).
+///
+/// Port of the `GetItemValuesToSave` half of C# `BaseItemRepository.SaveItems`
+/// (v10.11.8 `Jellyfin.Server.Implementations/Item/BaseItemRepository.cs:674-735`;
+/// master's body is unchanged), which upstream runs on EVERY item save — so
+/// both the scanner and a provider refresh re-derive the by-name index from the
+/// row it just wrote.
+///
+/// Lives here, beside the entity it reads, because two crates need it and
+/// `ferrofin-providers` cannot depend on `ferrofin-core`.
+#[must_use]
+pub fn item_values_of(entity: &BaseItemEntity) -> Vec<(i32, String)> {
+    let split = |field: Option<&str>| -> Vec<String> {
+        field
+            .unwrap_or_default()
+            .split('|')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect()
+    };
+    let mut out = Vec::new();
+    // Artist (0) / AlbumArtist (1) materialize browsable MusicArtist items and
+    // back the artist filters; genres (2), studios (3), tags (4) as before.
+    out.extend(split(entity.artists.as_deref()).into_iter().map(|a| (0, a)));
+    out.extend(
+        split(entity.album_artists.as_deref())
+            .into_iter()
+            .map(|a| (1, a)),
+    );
+    out.extend(split(entity.genres.as_deref()).into_iter().map(|g| (2, g)));
+    out.extend(split(entity.studios.as_deref()).into_iter().map(|s| (3, s)));
+    out.extend(split(entity.tags.as_deref()).into_iter().map(|t| (4, t)));
+    out
+}

@@ -316,11 +316,42 @@ async fn get_file(
     serve_static_file(&path, request).await
 }
 
+/// The scheduled task `POST /Library/Refresh` starts, keyed exactly as Jellyfin
+/// keys it (`RefreshMediaLibraryTask.Key`), so a client that watches the
+/// dashboard's task list sees the same row move.
+///
+/// The task-manager seam addresses a task by its WIRE ID (the md5 of the C#
+/// type name), because that is what `POST /ScheduledTasks/Running/{taskId}`
+/// carries; upstream's `CancelIfRunningAndQueue<RefreshMediaLibraryTask>()`
+/// addresses it by TYPE. [`task_id_for_key`] is the one derivation both sides
+/// of that go through, so this route names the key and converts once.
+const REFRESH_LIBRARY_TASK_KEY: &str = "RefreshLibrary";
+
 /// `POST /Library/Refresh` — starts a library scan.
 ///
-/// Port of `LibraryController.RefreshLibrary`: queues a full library scan and
-/// returns `204`. C# swallows scan errors and still returns `204`; the queue is
-/// a documented no-op at this seam (the scan pipeline is a later wave).
+/// Port of `LibraryController.RefreshLibrary`
+/// (`Jellyfin.Api/Controllers/LibraryController.cs:332-343` at `v10.11.8`),
+/// whose body is `_libraryManager.ValidateMediaLibrary(...)` inside a
+/// `try { } catch (Exception ex) { LogError }` that returns `NoContent()`
+/// either way.
+///
+/// `LibraryManager.ValidateMediaLibrary` is, verbatim
+/// (`Emby.Server.Implementations/Library/LibraryManager.cs:1117-1123`):
+///
+/// ```text
+/// // Just run the scheduled task so that the user can see it
+/// _taskManager.CancelIfRunningAndQueue<RefreshMediaLibraryTask>();
+/// ```
+///
+/// So the scan is started **through the task registry**, not as a detached
+/// background job. That routing is the whole observable effect of this route:
+/// it is what puts "Scan Media Library" into `GET /ScheduledTasks` as `Running`
+/// and advances its `LastExecutionResult`, which is what jellyfin-web's
+/// "Scan all libraries" button reports back to the operator. A scan spawned
+/// beside the registry would leave that button looking like it did nothing.
+///
+/// Errors from either half are logged and swallowed, because the C# `catch`
+/// swallows them and still answers `204` — this route never returns a 5xx.
 #[utoipa::path(
     post,
     path = "/Library/Refresh",
@@ -330,9 +361,18 @@ async fn get_file(
 async fn refresh_library(
     State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
-) -> Result<axum::http::StatusCode, ApiError> {
-    state.library.queue_library_scan().await?;
-    Ok(axum::http::StatusCode::NO_CONTENT)
+) -> axum::http::StatusCode {
+    // `CancelIfRunningAndQueue`: cancel first so a scan already in flight is
+    // restarted rather than rejected. Cancelling an idle task is a no-op on
+    // both servers, so this is safe on the common path.
+    let task_id = ferrofin_traits::tasks::task_id_for_key(REFRESH_LIBRARY_TASK_KEY);
+    if let Err(err) = state.tasks.cancel_task(&task_id).await {
+        tracing::error!(%err, "Error refreshing library");
+    }
+    if let Err(err) = state.tasks.start_task(&task_id).await {
+        tracing::error!(%err, "Error refreshing library");
+    }
+    axum::http::StatusCode::NO_CONTENT
 }
 
 /// The query parameters accepted by `GET /Library/MediaFolders`.
@@ -684,16 +724,25 @@ async fn post_updated_media(
     RequireAuth(_auth): RequireAuth,
     JsonBody(dto): JsonBody<MediaUpdateInfoDto>,
 ) -> Result<axum::http::StatusCode, ApiError> {
-    let mut paths = Vec::with_capacity(dto.updates.len());
+    // Reported one at a time, in order, as the C# `foreach` does — NOT collected
+    // and then dispatched. The C# throws from inside the loop
+    // (`item.Path ?? throw new ArgumentException(...)`, and
+    // `ReportFileSystemChanged`'s own `ArgumentException.ThrowIfNullOrEmpty` for
+    // the empty string, both mapped to 400 by
+    // `Jellyfin.Api/Middleware/ExceptionMiddleware.cs:127`), so the entries
+    // BEFORE a bad one have already been reported when the 400 goes out.
+    // Validating the whole batch up front would be atomic where Jellyfin is not.
     for update in dto.updates {
         let path = update
             .path
             .filter(|p| !p.is_empty())
             .ok_or_else(|| ApiError::BadRequest("Item path can't be null.".to_owned()))?;
         let _ = update.update_type; // Accepted for parity; the monitor ignores it.
-        paths.push(path);
+        state
+            .library_monitor
+            .report_file_system_changed(&path)
+            .await?;
     }
-    report_paths(&state, paths).await?;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 

@@ -156,6 +156,7 @@ pub mod application_host;
 pub mod auth_cache;
 pub mod auth_providers;
 pub mod authorization_context;
+pub mod by_name_store;
 pub mod channel_manager;
 pub mod chapter_manager;
 pub mod chapter_repository;

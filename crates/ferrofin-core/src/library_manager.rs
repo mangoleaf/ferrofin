@@ -95,6 +95,10 @@ pub struct FerrofinLibraryManager {
     /// The `Year` by-name item provisioner (`GetYear`), set by the composition
     /// root. `None` (unit tests) resolves only persisted `Year` rows.
     years: Option<crate::years::YearStore>,
+    /// The `Genre`/`MusicGenre`/`Studio`/`MusicArtist` by-name provisioner
+    /// (`CreateItemByName<T>`), set by the composition root. `None` (unit
+    /// tests) resolves only persisted rows.
+    by_name: Option<crate::by_name_store::ByNameStore>,
 }
 
 /// What a queued scan covers.
@@ -151,6 +155,7 @@ impl FerrofinLibraryManager {
             chapters: None,
             user_root: None,
             years: None,
+            by_name: None,
         }
     }
 
@@ -212,6 +217,93 @@ impl FerrofinLibraryManager {
                 None => self.items.retrieve_item(id).await?,
             };
             *slot = row;
+        }
+        Ok(())
+    }
+
+    /// Attaches the `Genre`/`MusicGenre`/`Studio`/`MusicArtist` provisioner so a
+    /// by-name lookup creates the item on demand — the rest of the
+    /// `CreateItemByName<T>` family [`with_years`](Self::with_years) covers for
+    /// `Year`. Without it those lookups 404 a name the library does not carry,
+    /// where Jellyfin answers 200 with a freshly created row.
+    #[must_use]
+    pub fn with_by_name_store(mut self, store: crate::by_name_store::ByNameStore) -> Self {
+        self.by_name = Some(store);
+        self
+    }
+
+    /// Resolves each of `names` to its by-name row of `kind`, one slot per
+    /// input name in order, WITHOUT creating anything.
+    ///
+    /// One `CleanName IN (…)` query for the whole page (the batch form of the
+    /// C# `GetItemList(new InternalItemsQuery { Name = …, IncludeItemTypes =
+    /// [kind] }).FirstOrDefault()`). Shared by [`get_named_items`], which then
+    /// adds the `CreateItemByName` write, and by `find_named_item`, which does
+    /// not — the same split C# makes between `GetGenre` and
+    /// `GetItemFromSlugName`.
+    ///
+    /// [`get_named_items`]: ferrofin_traits::library::LibraryManager::get_named_items
+    async fn resolve_named_rows(
+        &self,
+        kind: BaseItemKind,
+        trimmed: &[String],
+    ) -> Result<Vec<Option<BaseItemEntity>>, ServiceError> {
+        let lookup: Vec<String> = trimmed.iter().filter(|n| !n.is_empty()).cloned().collect();
+        if lookup.is_empty() {
+            return Ok(vec![None; trimmed.len()]);
+        }
+        let rows = self
+            .items
+            .get_item_list(&InternalItemsQuery {
+                names: lookup,
+                include_item_types: vec![kind],
+                ..InternalItemsQuery::default()
+            })
+            .await?;
+        // Key by the row's stored CleanName (what the query matched on); first
+        // match wins, mirroring `FirstOrDefault`.
+        let mut by_clean: HashMap<String, BaseItemEntity> = HashMap::new();
+        for row in rows {
+            if let Some(clean) = row.clean_name.clone() {
+                by_clean.entry(clean).or_insert(row);
+            }
+        }
+        Ok(trimmed
+            .iter()
+            .map(|n| {
+                if n.is_empty() {
+                    None
+                } else {
+                    by_clean.get(&crate::text_util::get_clean_value(n)).cloned()
+                }
+            })
+            .collect())
+    }
+
+    /// `CreateItemByName<T>` for every by-name slot that came back empty.
+    ///
+    /// `Year` keeps its own provisioner (its names must parse as a positive
+    /// year); the other four go through [`ByNameStore`](crate::by_name_store::ByNameStore).
+    async fn create_missing_by_name(
+        &self,
+        kind: BaseItemKind,
+        names: &[String],
+        resolved: &mut [Option<BaseItemEntity>],
+    ) -> Result<(), ServiceError> {
+        if kind == BaseItemKind::Year {
+            return self.create_missing_years(names, resolved).await;
+        }
+        let Some(store) = &self.by_name else {
+            return Ok(());
+        };
+        for (name, slot) in names.iter().zip(resolved.iter_mut()) {
+            if slot.is_some() || name.is_empty() {
+                continue;
+            }
+            let Some(id) = store.ensure(kind, name).await? else {
+                continue;
+            };
+            *slot = self.items.retrieve_item(id).await?;
         }
         Ok(())
     }
@@ -357,47 +449,46 @@ impl LibraryManager for FerrofinLibraryManager {
         self.items.get_item_list(query).await
     }
 
+    fn empty_by_name_item(&self, kind: BaseItemKind) -> BaseItemEntity {
+        BaseItemEntity {
+            id: ferrofin_db::store::guid_to_db(Uuid::nil()),
+            type_: crate::item_type_lookup::stored_type_name(kind)
+                .unwrap_or_default()
+                .to_owned(),
+            ..BaseItemEntity::default()
+        }
+    }
+
+    async fn find_named_item(
+        &self,
+        kind: BaseItemKind,
+        name: &str,
+    ) -> Result<Option<BaseItemEntity>, ServiceError> {
+        // The resolve half of `get_named_items` with the `CreateItemByName`
+        // write left off — the slug branch of `GenresController` looks names up
+        // and must not materialize a row for one that matches nothing.
+        Ok(self
+            .resolve_named_rows(kind, std::slice::from_ref(&name.trim().to_owned()))
+            .await?
+            .into_iter()
+            .next()
+            .flatten())
+    }
+
     async fn get_named_items(
         &self,
         kind: BaseItemKind,
         names: &[String],
     ) -> Result<Vec<Option<BaseItemEntity>>, ServiceError> {
         let trimmed: Vec<String> = names.iter().map(|n| n.trim().to_owned()).collect();
-        let lookup: Vec<String> = trimmed.iter().filter(|n| !n.is_empty()).cloned().collect();
-        if lookup.is_empty() {
-            return Ok(vec![None; names.len()]);
-        }
-        // One `CleanName IN (…)` query for the whole page (the batch form of
-        // `get_named_item`, which matches by cleaned name filtered to `kind`).
-        let rows = self
-            .items
-            .get_item_list(&InternalItemsQuery {
-                names: lookup,
-                include_item_types: vec![kind],
-                ..InternalItemsQuery::default()
-            })
+        let mut resolved = self.resolve_named_rows(kind, &trimmed).await?;
+        // `CreateItemByName<T>`: a by-name lookup MATERIALIZES the item
+        // upstream (directory + row) rather than reporting it missing, so this
+        // is the read path's write. Deliberately not done in
+        // `get_named_item_ids`, the per-credit hot path — C# splits it the same
+        // way (`GetItemByNameId` derives, `CreateItemByName` writes).
+        self.create_missing_by_name(kind, &trimmed, &mut resolved)
             .await?;
-        // Key by the row's stored CleanName (what the query matched on); first
-        // match wins, mirroring `get_named_item`'s `FirstOrDefault`.
-        let mut by_clean: HashMap<String, BaseItemEntity> = HashMap::new();
-        for row in rows {
-            if let Some(clean) = row.clean_name.clone() {
-                by_clean.entry(clean).or_insert(row);
-            }
-        }
-        let mut resolved: Vec<Option<BaseItemEntity>> = trimmed
-            .iter()
-            .map(|n| {
-                if n.is_empty() {
-                    None
-                } else {
-                    by_clean.get(&crate::text_util::get_clean_value(n)).cloned()
-                }
-            })
-            .collect();
-        if kind == BaseItemKind::Year {
-            self.create_missing_years(&trimmed, &mut resolved).await?;
-        }
         Ok(resolved)
     }
 
@@ -518,6 +609,19 @@ impl LibraryManager for FerrofinLibraryManager {
             self.persistence.save_item_values(id, &values).await?;
         }
         Ok(())
+    }
+
+    async fn update_item_provider_ids(
+        &self,
+        item_id: Uuid,
+        provider_ids: &[(String, String)],
+    ) -> Result<(), ServiceError> {
+        // An assignment, not a merge (C# `item.ProviderIds = request.ProviderIds`):
+        // `replace_provider_ids` deletes the rows the new set lacks and upserts
+        // the rest in one transaction.
+        self.persistence
+            .replace_provider_ids(item_id, provider_ids)
+            .await
     }
 
     async fn delete_item(&self, id: Uuid, _options: &DeleteOptions) -> Result<(), ServiceError> {
@@ -1197,6 +1301,87 @@ mod tests {
         )
     }
 
+    /// `GET /MusicGenres/{name}` (and its `/Genres`, `/Studios`, `/Artists`
+    /// siblings) is `CreateItemByName<T>` upstream: the row is MATERIALIZED by
+    /// the lookup, which is why Jellyfin answers 200 for a name the library does
+    /// not carry and Ferrofin used to answer 404.
+    #[tokio::test]
+    async fn a_by_name_lookup_materializes_the_item_the_way_create_item_by_name_does() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = test_db().await;
+        let meta = tmp.path().join("metadata");
+        let store = crate::by_name_store::ByNameStore::new(
+            Arc::new(FerrofinItemPersistenceService::new(db.clone())),
+            meta.join("Genre"),
+            meta.join("MusicGenre"),
+            meta.join("Studio"),
+            meta.join("artists"),
+        );
+        let mgr = manager(&db).with_by_name_store(store);
+
+        for (kind, dir) in [
+            (BaseItemKind::MusicGenre, "MusicGenre"),
+            (BaseItemKind::Genre, "Genre"),
+            (BaseItemKind::Studio, "Studio"),
+            (BaseItemKind::MusicArtist, "artists"),
+        ] {
+            let row = mgr
+                .get_named_item(kind, "Zzznope")
+                .await
+                .expect("lookup")
+                .unwrap_or_else(|| panic!("{kind:?} materialized"));
+            assert_eq!(row.name.as_deref(), Some("Zzznope"));
+            assert_eq!(
+                row.path.as_deref(),
+                Some(meta.join(dir).join("Zzznope").to_string_lossy().as_ref()),
+                "{kind:?} carries its metadata path"
+            );
+        }
+
+        // Person is NOT a `CreateItemByName` kind — `GetPerson` is a plain
+        // query, and Jellyfin 404s an unknown person. Materializing one here
+        // would invent an item Jellyfin does not have.
+        assert!(
+            mgr.get_named_item(BaseItemKind::Person, "Zzznope")
+                .await
+                .expect("lookup")
+                .is_none()
+        );
+    }
+
+    /// The id-only resolution is the per-credit hot path (every credited name on
+    /// every DTO page). C# splits it the same way — `GetItemByNameId` derives,
+    /// only `CreateItemByName` writes — so this must stay read-only.
+    #[tokio::test]
+    async fn the_by_name_id_lookup_never_writes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = test_db().await;
+        let meta = tmp.path().join("metadata");
+        let mgr = manager(&db).with_by_name_store(crate::by_name_store::ByNameStore::new(
+            Arc::new(FerrofinItemPersistenceService::new(db.clone())),
+            meta.join("Genre"),
+            meta.join("MusicGenre"),
+            meta.join("Studio"),
+            meta.join("artists"),
+        ));
+
+        let ids = mgr
+            .get_named_item_ids(BaseItemKind::Genre, &["Zzznope".to_owned()])
+            .await
+            .expect("ids");
+        assert_eq!(ids, vec![None], "an unknown name resolves to nothing");
+        assert!(
+            mgr.get_item_list(&InternalItemsQuery {
+                include_item_types: vec![BaseItemKind::Genre],
+                ..InternalItemsQuery::default()
+            })
+            .await
+            .expect("list")
+            .is_empty(),
+            "no row was written on the id path"
+        );
+    }
+
     #[tokio::test]
     async fn update_items_reindexes_the_filter_facets() {
         let db = test_db().await;
@@ -1217,6 +1402,46 @@ mod tests {
             .expect("facets");
         assert_eq!(facets.genres, vec!["Sci-Fi".to_owned()]);
         assert_eq!(facets.tags, vec!["4K".to_owned(), "Christmas".to_owned()]);
+    }
+
+    /// The metadata editor's external ids reach the `BaseItemProviders` table and
+    /// REPLACE what was there — the write behind C# `item.ProviderIds = request.ProviderIds`.
+    #[tokio::test]
+    async fn update_item_provider_ids_replaces_the_stored_set() {
+        let db = test_db().await;
+        let id = Uuid::from_u128(0x7A);
+        seed_named_item(&db, id, BaseItemKind::Movie, "Solaris").await;
+        let mgr = manager(&db);
+
+        mgr.update_item_provider_ids(id, &[("Tvdb".to_owned(), "1".to_owned())])
+            .await
+            .expect("seed");
+        mgr.update_item_provider_ids(
+            id,
+            &[
+                ("Imdb".to_owned(), "tt0069293".to_owned()),
+                ("Tmdb".to_owned(), "593".to_owned()),
+            ],
+        )
+        .await
+        .expect("replace");
+
+        let ids = mgr
+            .get_item_list(&InternalItemsQuery {
+                any_provider_id_equals: vec![("Imdb".to_owned(), "tt0069293".to_owned())],
+                ..Default::default()
+            })
+            .await
+            .expect("lookup by the new id");
+        assert_eq!(ids.len(), 1, "the new id resolves the item");
+        let stale = mgr
+            .get_item_list(&InternalItemsQuery {
+                any_provider_id_equals: vec![("Tvdb".to_owned(), "1".to_owned())],
+                ..Default::default()
+            })
+            .await
+            .expect("lookup by the replaced id");
+        assert!(stale.is_empty(), "the replaced key is gone, not merged");
     }
 
     #[tokio::test]
@@ -1912,6 +2137,61 @@ mod tests {
                 .primary_version_id,
             None
         );
+    }
+
+    /// The `item ??= new Genre()` stand-in: an all-default row whose id is
+    /// `Guid.Empty` and whose only meaningful column is the `Type`, so the DTO
+    /// the controller serializes says `"Type": "Genre"` and nothing else.
+    #[tokio::test]
+    async fn the_empty_by_name_item_carries_only_its_kind() {
+        let db = test_db().await;
+        let mgr = manager(&db);
+        let empty = mgr.empty_by_name_item(BaseItemKind::MusicGenre);
+        assert_eq!(empty.id, ferrofin_db::store::guid_to_db(Uuid::nil()));
+        assert_eq!(
+            empty.type_,
+            crate::item_type_lookup::stored_type_name(BaseItemKind::MusicGenre).expect("known")
+        );
+        assert!(empty.name.is_none());
+        assert!(empty.path.is_none());
+        assert!(empty.sort_name.is_none());
+    }
+
+    /// `find_named_item` resolves an existing by-name row and, unlike
+    /// `get_named_item`, creates nothing when there is none — the split C#
+    /// makes between `GetGenre` (`CreateItemByName`) and the slug branch's
+    /// plain `GetItemList` lookups.
+    #[tokio::test]
+    async fn find_named_item_resolves_without_creating() {
+        let db = test_db().await;
+        let mgr = manager(&db);
+        let genre = Uuid::from_u128(0xE01);
+        crate::test_support::seed_named_item(&db, genre, BaseItemKind::Genre, "R&B").await;
+        crate::test_support::set_clean_name(&db, genre, "R&B").await;
+
+        let found = mgr
+            .find_named_item(BaseItemKind::Genre, "R&B")
+            .await
+            .expect("lookup");
+        assert_eq!(
+            found.map(|e| e.id),
+            Some(ferrofin_db::store::guid_to_db(genre))
+        );
+
+        assert!(
+            mgr.find_named_item(BaseItemKind::Genre, "No Such Genre")
+                .await
+                .expect("lookup")
+                .is_none()
+        );
+        let all_genres = mgr
+            .get_item_list(&InternalItemsQuery {
+                include_item_types: vec![BaseItemKind::Genre],
+                ..InternalItemsQuery::default()
+            })
+            .await
+            .expect("genre rows");
+        assert_eq!(all_genres.len(), 1, "the miss must not have minted a row");
     }
 
     #[tokio::test]

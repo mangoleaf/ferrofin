@@ -34,7 +34,7 @@ use uuid::Uuid;
 use crate::error::ProvidersError;
 use crate::library_options::{fetcher_names, image_fetcher_enabled, metadata_fetcher_enabled};
 use crate::tmdb::{TmdbClient, TmdbDetails, TmdbImage, TmdbKind};
-use ferrofin_db::entities::base_items::BaseItemEntity;
+use ferrofin_db::entities::base_items::{BaseItemEntity, item_values_of};
 
 /// A [`RemoteSearchProvider`] backed by TMDB (the "Identify" flow). One instance
 /// searches a single kind (movie or series), so it is registered once per kind.
@@ -72,30 +72,156 @@ impl RemoteSearchProvider for TmdbSearchProvider {
         item_kind == self.supported
     }
 
+    /// `TmdbMovieProvider.Order => 1` (`Movies/TmdbMovieProvider.cs:48`) and
+    /// `TmdbSeriesProvider.Order => 1` (`TV/TmdbSeriesProvider.cs:52`) — the
+    /// two kinds this instance can be built for both declare 1.
+    fn default_order(&self) -> i32 {
+        1
+    }
+
     async fn get_search_results(
         &self,
         request: &RemoteSearchRequest,
     ) -> Result<Vec<RemoteSearchResult>, ServiceError> {
         let search_info = &request.search_info;
+        let language = crate::tmdb::normalize_language(
+            search_info.metadata_language.as_deref(),
+            search_info.metadata_country_code.as_deref(),
+        );
+        let language = language.as_deref();
+        let ids = search_info.provider_ids.as_ref();
+
+        // 1. A `Tmdb` id already on the item pins the title exactly — one
+        //    result, straight from `/movie|tv/{id}`, and no name search.
+        //    A padded id (` 603 `) still pins it: see
+        //    `parse_numeric_provider_id` for why `int.Parse`/`Convert.ToInt32`
+        //    accept the whitespace that `str::parse` alone rejects.
+        //    (Those same C# calls THROW on a NON-NUMERIC value and take the
+        //    whole provider down with it; we fall through to the remaining
+        //    branches instead — Jellyfin bug, not a behaviour to port. Recorded
+        //    as an accepted divergence in suite/parity/classifications.json
+        //    under `POST /Items/RemoteSearch/Movie`, with the measurement.)
+        if let Some(tmdb_id) = provider_id_of(ids, "Tmdb").and_then(parse_numeric_provider_id)
+            && let Some(details) = self.tmdb.details(self.kind, tmdb_id, language).await
+        {
+            return Ok(vec![self.pinned_result(tmdb_id, details)]);
+        }
+
+        // 2./3. Else an `Imdb` id, else a `Tvdb` id, resolved through TMDB's
+        //       `/find` — the order both `TmdbMovieProvider` and
+        //       `TmdbSeriesProvider` use. Once `/find` answers, even with no
+        //       rows, the C# provider returns them rather than falling back to
+        //       a name search (`if (movieResults is null)` / `if (tvResults is
+        //       not null)`); only a request that produced no payload at all
+        //       moves on to the next branch.
+        // `FindByExternalIdAsync`'s `language` argument is NOT the same value on
+        // the two providers: `TmdbMovieProvider.cs:96-101`/`:106-111` pass
+        // `TmdbUtils.GetImageLanguagesParam(...)` (so TMDB's `/find` sees
+        // `language=en,null`), while `TmdbSeriesProvider.cs:73` passes the bare
+        // `MetadataLanguage`. Upstream's asymmetry, ported as-is.
+        let find_language = match self.kind {
+            TmdbKind::Movie => Some(crate::tmdb::image_languages_param(
+                search_info.metadata_language.as_deref(),
+                search_info.metadata_country_code.as_deref(),
+            )),
+            TmdbKind::Series => language.map(ToOwned::to_owned),
+        };
+        for (key, source) in [("Imdb", "imdb_id"), ("Tvdb", "tvdb_id")] {
+            let Some(external) = provider_id_of(ids, key) else {
+                continue;
+            };
+            let Some(hits) = self
+                .tmdb
+                .find_by_external_id(self.kind, source, external, find_language.as_deref())
+                .await
+            else {
+                continue;
+            };
+            return Ok(hits
+                .into_iter()
+                .map(|hit| {
+                    let mut result = self.hit_result(hit);
+                    // `TmdbSeriesProvider` stamps the id it searched by back
+                    // onto each row; `TmdbMovieProvider` does not.
+                    if self.kind == TmdbKind::Series {
+                        result
+                            .provider_ids
+                            .get_or_insert_with(HashMap::new)
+                            .insert(key.to_owned(), external.to_owned());
+                    }
+                    result
+                })
+                .collect());
+        }
+
+        // 4. Nothing identifies the item: search by name.
         let Some(name) = search_info.name.as_deref().filter(|n| !n.is_empty()) else {
             return Ok(Vec::new());
         };
-        let hits = self.tmdb.search(self.kind, name, search_info.year).await;
-        Ok(hits
-            .into_iter()
-            .map(|hit| RemoteSearchResult {
-                name: hit.name,
-                production_year: hit.year,
-                image_url: hit.poster_url,
-                overview: hit.overview,
-                provider_ids: Some(std::collections::HashMap::from([(
-                    "Tmdb".to_owned(),
-                    hit.tmdb_id.to_string(),
-                )])),
-                search_provider_name: Some("TheMovieDb".to_owned()),
-                ..RemoteSearchResult::default()
-            })
-            .collect())
+        // `TmdbMovieProvider` passes `searchInfo.Year` to `/search/movie`;
+        // `TmdbSeriesProvider` leaves `SearchSeriesAsync`'s `year` at its `0`
+        // default, so a series Identify search is deliberately unfiltered.
+        let year = match self.kind {
+            TmdbKind::Movie => search_info.year,
+            TmdbKind::Series => None,
+        };
+        let hits = self.tmdb.search(self.kind, name, year, language).await;
+        Ok(hits.into_iter().map(|hit| self.hit_result(hit)).collect())
+    }
+}
+
+impl TmdbSearchProvider {
+    /// One `/search/*` or `/find/*` row as an Identify candidate — the C#
+    /// name-search loop for movies, `MapSearchTvToRemoteSearchResult` for
+    /// series. The series mapper sets `PremiereDate` and never `ProductionYear`;
+    /// the movie one sets both, from the same release date.
+    fn hit_result(&self, hit: crate::tmdb::TmdbSearchHit) -> RemoteSearchResult {
+        RemoteSearchResult {
+            name: hit.name,
+            production_year: match self.kind {
+                TmdbKind::Movie => hit.year,
+                TmdbKind::Series => None,
+            },
+            premiere_date: hit.premiere_date.as_deref().and_then(parse_ymd),
+            image_url: hit.poster_url,
+            overview: hit.overview,
+            provider_ids: Some(HashMap::from([(
+                "Tmdb".to_owned(),
+                hit.tmdb_id.to_string(),
+            )])),
+            search_provider_name: Some(TMDB_PROVIDER_NAME.to_owned()),
+            ..RemoteSearchResult::default()
+        }
+    }
+
+    /// The single candidate a `Tmdb` id resolves to — the C# `GetMovieAsync`
+    /// branch / `MapTvShowToRemoteSearchResult`. Both carry the IMDb id when
+    /// TMDB knows it; the series mapper adds the TVDB id too, and neither
+    /// series mapper sets `ProductionYear`.
+    fn pinned_result(&self, tmdb_id: i64, details: TmdbDetails) -> RemoteSearchResult {
+        let mut provider_ids = HashMap::from([("Tmdb".to_owned(), tmdb_id.to_string())]);
+        // `TrySetProviderId` — only when TMDB actually has the id.
+        if let Some(imdb) = details.imdb_id.filter(|v| !v.is_empty()) {
+            provider_ids.insert("Imdb".to_owned(), imdb);
+        }
+        if self.kind == TmdbKind::Series
+            && let Some(tvdb) = details.tvdb_id.filter(|v| !v.is_empty())
+        {
+            provider_ids.insert("Tvdb".to_owned(), tvdb);
+        }
+        RemoteSearchResult {
+            name: details.name,
+            production_year: match self.kind {
+                TmdbKind::Movie => details.production_year,
+                TmdbKind::Series => None,
+            },
+            premiere_date: details.premiere_date.as_deref().and_then(parse_ymd),
+            image_url: details.poster_url,
+            overview: details.overview,
+            provider_ids: Some(provider_ids),
+            search_provider_name: Some(TMDB_PROVIDER_NAME.to_owned()),
+            ..RemoteSearchResult::default()
+        }
     }
 }
 
@@ -122,6 +248,15 @@ impl RemoteSearchProvider for TvdbSearchProvider {
 
     fn supports(&self, item_kind: BaseItemKind) -> bool {
         item_kind == BaseItemKind::Series
+    }
+
+    /// No oracle value exists: 10.11.8 ships **no** TVDB provider (TheTVDB is
+    /// an out-of-tree .NET plugin upstream, and compiled in here), so there is
+    /// no `IHasOrder` to port. It therefore takes `GetDefaultOrder`'s value for
+    /// a provider that declares none — the inherited 50, spelled out rather
+    /// than inherited silently so the absence of an oracle is on the record.
+    fn default_order(&self) -> i32 {
+        50
     }
 
     async fn get_search_results(
@@ -178,22 +313,72 @@ impl RemoteSearchProvider for TmdbBoxSetSearchProvider {
         item_kind == BaseItemKind::BoxSet
     }
 
+    /// `TmdbBoxSetProvider` implements `IRemoteMetadataProvider<BoxSet,…>` and
+    /// **not** `IHasOrder` (`BoxSets/TmdbBoxSetProvider.cs:20`), so upstream
+    /// gives it `GetDefaultOrder`'s 50 — deliberately NOT the 1 its sibling
+    /// movie/series providers declare.
+    fn default_order(&self) -> i32 {
+        50
+    }
+
     async fn get_search_results(
         &self,
         request: &RemoteSearchRequest,
     ) -> Result<Vec<RemoteSearchResult>, ServiceError> {
         let search_info = &request.search_info;
+        let language = crate::tmdb::normalize_language(
+            search_info.metadata_language.as_deref(),
+            search_info.metadata_country_code.as_deref(),
+        );
+        let language = language.as_deref();
+
+        // A `Tmdb` collection id pins the box set exactly: `TmdbBoxSetProvider`
+        // short-circuits on `tmdbId > 0` and returns that one collection — or
+        // nothing at all when TMDB has no such collection — without ever
+        // running the name search. A padded id still pins it — see
+        // `parse_numeric_provider_id`. (C#'s `Convert.ToInt32` throws on a
+        // NON-NUMERIC id and takes the provider down with it; we fall through
+        // to the name search instead — Jellyfin bug, not a behaviour to port,
+        // recorded with its measurement in suite/parity/classifications.json.)
+        if let Some(tmdb_id) = provider_id_of(search_info.provider_ids.as_ref(), "Tmdb")
+            .and_then(parse_numeric_provider_id)
+            .filter(|id| *id > 0)
+        {
+            let Some(collection) = self.tmdb.collection(tmdb_id, language).await else {
+                return Ok(Vec::new());
+            };
+            return Ok(vec![RemoteSearchResult {
+                name: Some(collection.name),
+                // `GetPosterUrl(collection.PosterPath)` — TMDB's own pick, which
+                // `TmdbClient::collection` pushes first as the Primary image.
+                image_url: collection
+                    .images
+                    .iter()
+                    .find(|image| image.image_type == ImageType::Primary)
+                    .map(|image| image.url.clone()),
+                provider_ids: Some(HashMap::from([(
+                    "Tmdb".to_owned(),
+                    collection.tmdb_id.to_string(),
+                )])),
+                search_provider_name: Some(TMDB_PROVIDER_NAME.to_owned()),
+                ..RemoteSearchResult::default()
+            }]);
+        }
+
         let Some(name) = search_info.name.as_deref().filter(|n| !n.is_empty()) else {
             return Ok(Vec::new());
         };
         Ok(self
             .tmdb
-            .search_collection(name)
+            .search_collection(name, language)
             .await
             .into_iter()
             .map(|hit| RemoteSearchResult {
                 name: Some(hit.name),
-                overview: hit.overview,
+                // No `Overview`: `TmdbBoxSetProvider.GetSearchResults` builds
+                // its rows from Name/SearchProviderName/ImageUrl/Tmdb only —
+                // the collection's overview is applied to the BoxSet entity in
+                // `GetMetadata`, never to a search DTO.
                 image_url: hit.poster_url,
                 // C# `TmdbBoxSetProvider` sets `MetadataProvider.Tmdb` on the
                 // box set itself — `TmdbCollection` is the key a *movie* uses
@@ -203,7 +388,7 @@ impl RemoteSearchProvider for TmdbBoxSetSearchProvider {
                     "Tmdb".to_owned(),
                     hit.tmdb_id.to_string(),
                 )])),
-                search_provider_name: Some("TheMovieDb".to_owned()),
+                search_provider_name: Some(TMDB_PROVIDER_NAME.to_owned()),
                 ..RemoteSearchResult::default()
             })
             .collect())
@@ -260,6 +445,18 @@ impl RemoteSearchProvider for OmdbSearchProvider {
         item_kind == self.supported
     }
 
+    /// Two different C# classes, two different orders:
+    /// `OmdbItemProvider.Order => 2` (`Omdb/OmdbItemProvider.cs:56`) serves
+    /// movie/series/trailer, while `OmdbEpisodeProvider.Order => 1`
+    /// (`Omdb/OmdbEpisodeProvider.cs:33`) serves episodes.
+    fn default_order(&self) -> i32 {
+        if self.supported == BaseItemKind::Episode {
+            1
+        } else {
+            2
+        }
+    }
+
     async fn get_search_results(
         &self,
         request: &RemoteSearchRequest,
@@ -287,13 +484,30 @@ impl RemoteSearchProvider for OmdbSearchProvider {
                 .flatten(),
             episode: is_episode.then_some(search_info.index_number).flatten(),
         };
-        let name = search_info.name.as_deref().unwrap_or_default();
-        if name.is_empty() && known.imdb_id.is_none() {
+        let raw_name = search_info.name.as_deref().unwrap_or_default();
+        if raw_name.is_empty() && known.imdb_id.is_none() {
             return Ok(Vec::new());
         }
+        // `_libraryManager.ParseName(name)` — the raw name reaches OMDb only
+        // after the year and the release clutter have been lifted out of it,
+        // and an in-title year becomes the `&y=` filter when the caller did not
+        // supply one. Skipped on the id branch, exactly as in C#, where the
+        // whole block sits under `if (string.IsNullOrWhiteSpace(imdbId))`.
+        let (name, year) = if known.imdb_id.is_none() && !raw_name.trim().is_empty() {
+            let options = naming_options();
+            let parsed = ferrofin_naming::video::video_resolver::clean_date_time(raw_name, options);
+            let cleaned = ferrofin_naming::video::video_resolver::try_clean_string(
+                Some(&parsed.name),
+                options,
+            )
+            .unwrap_or(parsed.name);
+            (cleaned, search_info.year.or(parsed.year))
+        } else {
+            (raw_name.to_owned(), search_info.year)
+        };
         Ok(self
             .omdb
-            .search(self.kind, name, search_info.year, &known)
+            .search(self.kind, &name, year, &known)
             .await
             .into_iter()
             .map(|hit| RemoteSearchResult {
@@ -305,11 +519,26 @@ impl RemoteSearchProvider for OmdbSearchProvider {
                     .clone()
                     .map(|id| std::collections::HashMap::from([("Imdb".to_owned(), id)])),
                 name: hit.title,
-                search_provider_name: Some("The Open Movie Database".to_owned()),
+                // `ResultToMetadataResult` echoes the caller's index numbers
+                // back on every row (the Identify dialog carries an episode's
+                // season/episode through the candidate list).
+                index_number: search_info.index_number,
+                parent_index_number: search_info.parent_index_number,
+                search_provider_name: Some(OMDB_PROVIDER_NAME.to_owned()),
                 ..RemoteSearchResult::default()
             })
             .collect())
     }
+}
+
+/// The shared naming options backing the OMDb provider's `ParseName` port.
+///
+/// [`NamingOptions::new`] compiles the whole clean-name regex table, so it is
+/// built once for the process rather than per search request.
+fn naming_options() -> &'static ferrofin_naming::common::NamingOptions {
+    static OPTIONS: std::sync::OnceLock<ferrofin_naming::common::NamingOptions> =
+        std::sync::OnceLock::new();
+    OPTIONS.get_or_init(ferrofin_naming::common::NamingOptions::new)
 }
 
 /// The display name of the MusicBrainz providers (`Plugin.Name`).
@@ -331,6 +560,22 @@ fn provider_id_of<'a>(ids: Option<&'a HashMap<String, String>>, key: &str) -> Op
         .find(|(k, _)| k.eq_ignore_ascii_case(key))
         .map(|(_, v)| v.as_str())
         .filter(|v| !v.trim().is_empty())
+}
+
+/// A numeric provider id parsed the way .NET parses it.
+///
+/// Every TMDB provider turns the stored id into an `int` with
+/// `int.Parse(id, CultureInfo.InvariantCulture)` (`TmdbMovieProvider.cs:59`,
+/// `TmdbPersonProvider.cs`) or `Convert.ToInt32(id, CultureInfo.InvariantCulture)`
+/// (`TmdbSeriesProvider.cs:58`, `TmdbBoxSetProvider.cs:44`). Both resolve to
+/// `NumberStyles.Integer` — `AllowLeadingWhite | AllowTrailingWhite | AllowLeadingSign`
+/// — so a padded id (` 603 `, which is what pasting into the Identify dialog produces)
+/// pins the title upstream. Rust's `str::parse` already takes the leading sign but
+/// rejects the surrounding whitespace, so the trim is the whole difference: without it
+/// a padded id silently falls through to the name search and Identify answers with the
+/// wrong title.
+fn parse_numeric_provider_id(raw: &str) -> Option<i64> {
+    raw.trim().parse::<i64>().ok()
 }
 
 /// `AlbumInfoExtensions.GetReleaseId` / `GetReleaseGroupId`: the album's own
@@ -474,6 +719,12 @@ impl RemoteSearchProvider for MusicBrainzAlbumSearchProvider {
         item_kind == BaseItemKind::MusicAlbum
     }
 
+    /// `MusicBrainzAlbumProvider.Order => 0`
+    /// (`MusicBrainz/MusicBrainzAlbumProvider.cs:46`) — it wants to be first.
+    fn default_order(&self) -> i32 {
+        0
+    }
+
     async fn get_search_results(
         &self,
         request: &RemoteSearchRequest,
@@ -547,6 +798,14 @@ impl RemoteSearchProvider for MusicBrainzArtistSearchProvider {
         item_kind == BaseItemKind::MusicArtist
     }
 
+    /// `MusicBrainzArtistProvider` implements `IRemoteMetadataProvider` and
+    /// `IDisposable` but **not** `IHasOrder`
+    /// (`MusicBrainz/MusicBrainzArtistProvider.cs:25`) — unlike its album
+    /// sibling, which declares 0. Upstream's default 50.
+    fn default_order(&self) -> i32 {
+        50
+    }
+
     async fn get_search_results(
         &self,
         request: &RemoteSearchRequest,
@@ -606,6 +865,15 @@ impl RemoteSearchProvider for AudioDbSearchProvider {
         item_kind == self.supported
     }
 
+    /// `AudioDbArtistProvider.Order => 1` (`AudioDb/AudioDbArtistProvider.cs:52`)
+    /// and `AudioDbAlbumProvider.Order => 1` (`AudioDb/AudioDbAlbumProvider.cs:53`)
+    /// — both kinds this instance can be built for declare 1, which puts
+    /// TheAudioDb after MusicBrainz's album provider (0) and before an
+    /// unranked one (50).
+    fn default_order(&self) -> i32 {
+        1
+    }
+
     async fn get_search_results(
         &self,
         _request: &RemoteSearchRequest,
@@ -642,14 +910,28 @@ impl RemoteSearchProvider for TmdbPersonSearchProvider {
         item_kind == BaseItemKind::Person
     }
 
+    /// `TmdbPersonProvider` implements `IRemoteMetadataProvider<Person,…>` and
+    /// **not** `IHasOrder` (`People/TmdbPersonProvider.cs:18`) — upstream's 50.
+    fn default_order(&self) -> i32 {
+        50
+    }
+
     async fn get_search_results(
         &self,
         request: &RemoteSearchRequest,
     ) -> Result<Vec<RemoteSearchResult>, ServiceError> {
         let search_info = &request.search_info;
+        // `TmdbPersonProvider` passes `searchInfo.MetadataLanguage`/
+        // `MetadataCountryCode` into `GetPersonAsync`, which is what localizes
+        // the biography this branch returns. The NAME search takes no language
+        // upstream (`SearchPersonAsync(name, ct)`), so neither does ours.
+        let language = crate::tmdb::normalize_language(
+            search_info.metadata_language.as_deref(),
+            search_info.metadata_country_code.as_deref(),
+        );
         if let Some(tmdb_id) = provider_id_of(search_info.provider_ids.as_ref(), "Tmdb")
-            .and_then(|id| id.trim().parse::<i64>().ok())
-            && let Some(person) = self.tmdb.person_lookup(tmdb_id).await
+            .and_then(parse_numeric_provider_id)
+            && let Some(person) = self.tmdb.person_lookup(tmdb_id, language.as_deref()).await
         {
             let mut provider_ids = HashMap::from([("Tmdb".to_owned(), person.tmdb_id.to_string())]);
             // `TrySetProviderId(Imdb, …)` — only when TMDB knows it.
@@ -702,6 +984,21 @@ pub trait RemoteSearchProvider: Send + Sync {
 
     /// Whether this provider can search for `item_kind`.
     fn supports(&self, item_kind: BaseItemKind) -> bool;
+
+    /// The provider's own precedence — `IHasOrder.Order` in the C#.
+    ///
+    /// `GetMetadataProvidersInternal` sorts remote providers by the library's
+    /// configured `MetadataFetcherOrder` and then `.ThenBy(GetDefaultOrder)`
+    /// (`ProviderManager.cs:459` / `:506`), where `GetDefaultOrder` is the
+    /// provider's `IHasOrder.Order` if it declares one and **50** if it does
+    /// not — "after items that want to be first (~0) but before items that
+    /// want to be last (~100)", in upstream's own words. The default here is
+    /// that same 50, so a provider that declares nothing sorts exactly where a
+    /// non-`IHasOrder` C# provider sorts. Ties keep registration order, since
+    /// `slice::sort_by_key` is stable and so is LINQ's `OrderBy`/`ThenBy`.
+    fn default_order(&self) -> i32 {
+        50
+    }
 
     /// Runs the search, returning raw candidate results (name/provider-ids set).
     /// `request` carries the shared
@@ -784,6 +1081,17 @@ pub struct LocalProviderManager {
     /// (`ProviderManager.GetRemoteSearchResults`). Read through a closure for
     /// the same reason. `None` → the C# default, `"US"`.
     server_metadata_country: Option<Arc<dyn Fn() -> String + Send + Sync>>,
+    /// Reads the server configuration's `MetadataOptions` array — the
+    /// SERVER-WIDE per-item-type provider options, which are a different thing
+    /// from a library's `TypeOptions`. `GetMetadataProvidersInternal` falls
+    /// back to `globalMetadataOptions.MetadataFetcherOrder` whenever the
+    /// library saved no `TypeOptions` entry for the kind
+    /// (`ProviderManager.cs:445`), so without this an admin's server-wide
+    /// fetcher order is silently ignored. Read live, like the language and
+    /// country readers above, so a `POST /System/Configuration` applies
+    /// without a restart. Absent → an empty global array, i.e. no
+    /// server-wide ranking.
+    metadata_options: Option<Arc<dyn Fn() -> Vec<MetadataOptions> + Send + Sync>>,
 }
 
 impl std::fmt::Debug for LocalProviderManager {
@@ -814,6 +1122,7 @@ impl std::fmt::Debug for LocalProviderManager {
             .field("dynamic_fetchers", &self.dynamic_fetchers.len())
             .field("kind_by_type_name", &self.kind_by_type_name.len())
             .field("http", &self.http)
+            .field("has_metadata_options", &self.metadata_options.is_some())
             .finish()
     }
 }
@@ -844,6 +1153,7 @@ impl LocalProviderManager {
             http: reqwest::Client::new(),
             server_metadata_language: None,
             server_metadata_country: None,
+            metadata_options: None,
         }
     }
 
@@ -895,6 +1205,32 @@ impl LocalProviderManager {
             .map(|f| f().trim().to_owned())
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| default.to_owned())
+    }
+
+    /// Attaches a reader for the server configuration's `MetadataOptions`
+    /// array, so the remote-search provider ordering can fall back to the
+    /// SERVER-WIDE `MetadataFetcherOrder` for a kind the library did not
+    /// customise (`ProviderManager.cs:445`).
+    ///
+    /// The closure is called once per search and read live, so a
+    /// `POST /System/Configuration` applies without a restart. Without it the
+    /// global array reads as empty and only a library's own order ranks
+    /// anything.
+    #[must_use]
+    pub fn with_metadata_options(
+        mut self,
+        options: impl Fn() -> Vec<MetadataOptions> + Send + Sync + 'static,
+    ) -> Self {
+        self.metadata_options = Some(Arc::new(options));
+        self
+    }
+
+    /// The server-wide [`MetadataOptions`] for item type `kind`, or `None`
+    /// when the configuration names no entry for it (or no reader is wired) —
+    /// `_configurationManager.GetMetadataOptionsForType(item.GetType().Name)`.
+    fn global_metadata_options_for(&self, kind: &str) -> Option<MetadataOptions> {
+        let all = self.metadata_options.as_ref()?();
+        crate::library_options::global_metadata_options(&all, kind).cloned()
     }
 
     /// Attaches the fanart.tv client as a remote image provider for movies,
@@ -1153,7 +1489,7 @@ impl LocalProviderManager {
             return Some(id);
         }
         Some(
-            tmdb.search(TmdbKind::Series, series_name, series_year)
+            tmdb.search(TmdbKind::Series, series_name, series_year, None)
                 .await
                 .into_iter()
                 .next()?
@@ -1193,12 +1529,12 @@ impl LocalProviderManager {
         let collection_id = if let Some(id) = collection_id {
             id
         } else {
-            let Some(hit) = tmdb.search_collection(name).await.into_iter().next() else {
+            let Some(hit) = tmdb.search_collection(name, None).await.into_iter().next() else {
                 return Ok(false);
             };
             hit.tmdb_id
         };
-        let Some(collection) = tmdb.collection(collection_id).await else {
+        let Some(collection) = tmdb.collection(collection_id, None).await else {
             return Ok(false);
         };
         if wants_fetch(options.metadata_refresh_mode) {
@@ -1271,6 +1607,21 @@ impl LocalProviderManager {
         if let Some(store) = &self.image_store {
             entity.date_last_refreshed = Some(Utc::now());
             store.save_items(std::slice::from_ref(entity)).await?;
+            // Re-derive the by-name index from the row that was just written.
+            // C# does BOTH halves in one call — `BaseItemRepository.SaveItems`
+            // saves the row and then rewrites `ItemValues`/`ItemValuesMap` for
+            // it (v10.11.8 `BaseItemRepository.cs:674-735`, unchanged on
+            // master), and a refresh reaches it through
+            // `MetadataService.SaveItemAsync` → `UpdateToRepositoryAsync` →
+            // `LibraryManager.UpdateItemAsync`. Ferrofin's editor path
+            // (`LibraryManager::update_items`) already did this; this path did
+            // not, so a refresh that changed `Studios`/`Genres`/`Tags` left the
+            // by-name browses and their counts describing the OLD values —
+            // `/Studios/{name}` reporting a studio the item no longer carries,
+            // and reporting nothing for the one it now does.
+            if let Ok(id) = Uuid::parse_str(&entity.id) {
+                store.save_item_values(id, &item_values_of(entity)).await?;
+            }
         }
         Ok(())
     }
@@ -1357,7 +1708,7 @@ impl LocalProviderManager {
         tmdb_id: i64,
         options: &MetadataRefreshOptions,
     ) -> Result<bool, ServiceError> {
-        let Some(details) = tmdb.details(kind, tmdb_id).await else {
+        let Some(details) = tmdb.details(kind, tmdb_id, None).await else {
             return Ok(false);
         };
         // Metadata pass: apply the fetched fields onto the row and persist
@@ -1450,7 +1801,7 @@ impl LocalProviderManager {
         if wants_fetch(options.image_refresh_mode)
             && self.image_store.is_some()
             && let Some(url) = tmdb
-                .person_lookup(tmdb_id)
+                .person_lookup(tmdb_id, None)
                 .await
                 .and_then(|p| p.profile_url)
         {
@@ -1548,7 +1899,7 @@ impl LocalProviderManager {
             .map(str::trim)
             .filter(|n| !n.is_empty());
         let stored_tmdb_id =
-            provider_id_of_pairs(&provider_ids, "Tmdb").and_then(|id| id.parse::<i64>().ok());
+            provider_id_of_pairs(&provider_ids, "Tmdb").and_then(parse_numeric_provider_id);
         // Resolve what to fetch: movies/series by their stored/chosen TMDB id
         // (an IMDb/TVDB id resolves through TMDB's `/find`), else by title;
         // seasons/episodes via their parent series. Music/other kinds have no
@@ -1563,7 +1914,8 @@ impl LocalProviderManager {
                 } else {
                     let name = chosen_name.unwrap_or(&name);
                     let year = chosen.and_then(|r| r.production_year).or(year);
-                    let Some(hit) = tmdb.search(kind, name, year).await.into_iter().next() else {
+                    let Some(hit) = tmdb.search(kind, name, year, None).await.into_iter().next()
+                    else {
                         return Ok(ItemUpdateType::None);
                     };
                     hit.tmdb_id
@@ -1908,8 +2260,7 @@ impl LocalProviderManager {
             return Vec::new();
         };
         let name = entity_name(entity);
-        let stored_tmdb_id =
-            provider_id_of_pairs(ids, "Tmdb").and_then(|id| id.parse::<i64>().ok());
+        let stored_tmdb_id = provider_id_of_pairs(ids, "Tmdb").and_then(parse_numeric_provider_id);
         match source {
             RemoteImageSource::TmdbTitle(kind) => {
                 // The stored Tmdb id (or an Imdb/Tvdb id via `/find`) pins the
@@ -1919,7 +2270,7 @@ impl LocalProviderManager {
                     && let Some((kind, name, year)) = title_lookup(entity)
                 {
                     tmdb_id = tmdb
-                        .search(kind, &name, year)
+                        .search(kind, &name, year, None)
                         .await
                         .into_iter()
                         .next()
@@ -1938,7 +2289,7 @@ impl LocalProviderManager {
                     && let Some(name) = name
                 {
                     collection_id = tmdb
-                        .search_collection(name)
+                        .search_collection(name, None)
                         .await
                         .into_iter()
                         .next()
@@ -1947,7 +2298,7 @@ impl LocalProviderManager {
                 let Some(collection_id) = collection_id else {
                     return Vec::new();
                 };
-                tmdb.collection(collection_id)
+                tmdb.collection(collection_id, None)
                     .await
                     .map(|c| {
                         c.images
@@ -2000,7 +2351,7 @@ impl LocalProviderManager {
                 // `TmdbPersonImageProvider`: the person's profile by Tmdb id,
                 // else the first name-search hit.
                 let person = match (stored_tmdb_id, name) {
-                    (Some(id), _) => tmdb.person_lookup(id).await,
+                    (Some(id), _) => tmdb.person_lookup(id, None).await,
                     (None, Some(name)) => tmdb.search_person(name).await.into_iter().next(),
                     (None, None) => None,
                 };
@@ -2183,17 +2534,17 @@ async fn resolve_tmdb_id(
     kind: TmdbKind,
     ids: &[(String, String)],
 ) -> Option<i64> {
-    if let Some(id) = provider_id_of_pairs(ids, "Tmdb").and_then(|v| v.parse::<i64>().ok()) {
+    if let Some(id) = provider_id_of_pairs(ids, "Tmdb").and_then(parse_numeric_provider_id) {
         return Some(id);
     }
     if let Some(imdb) = provider_id_of_pairs(ids, "Imdb")
-        && let Some(id) = tmdb.find_by_external_id(kind, "imdb_id", imdb).await
+        && let Some(id) = tmdb.find_id_by_external_id(kind, "imdb_id", imdb).await
     {
         return Some(id);
     }
     if kind == TmdbKind::Series
         && let Some(tvdb) = provider_id_of_pairs(ids, "Tvdb")
-        && let Some(id) = tmdb.find_by_external_id(kind, "tvdb_id", tvdb).await
+        && let Some(id) = tmdb.find_id_by_external_id(kind, "tvdb_id", tvdb).await
     {
         return Some(id);
     }
@@ -2314,6 +2665,10 @@ fn set_text(cur: &mut Option<String>, new: Option<&str>, replace: bool) {
 /// when empty, or overwritten when `replace` is set (the C# `FullRefresh`
 /// `ReplaceAllMetadata` behavior); a field TMDB did not return is left untouched.
 /// Mirrors the scanner's `apply_details` merge.
+// No per-kind `CreateSortName` branch here (the `Person` one in
+// `ferrofin-core`'s `kinds::sort_name_for`): the only caller is
+// `refresh_title`, whose `TmdbKind` is `Movie` or `Tv`, so a `Person` row
+// cannot reach this function.
 fn apply_tmdb_details(entity: &mut BaseItemEntity, details: &TmdbDetails, replace: bool) {
     // `ProviderUtils.MergeBaseItemData`: the name is replaced only on
     // `replaceData` (or when empty); the sort key follows the name
@@ -2793,64 +3148,84 @@ impl ProviderManager for LocalProviderManager {
         &self,
         request: &RemoteSearchRequest,
     ) -> Result<Vec<RemoteSearchResult>, ServiceError> {
-        // ── The reference item (C# `GetRemoteSearchResults`, v10.11.8
-        // `MediaBrowser.Providers/Manager/ProviderManager.cs:801-830`) ────────
-        // `ItemId` names the item being identified; ITS library's "Metadata
-        // downloaders" checkboxes decide which fetchers may run, and its
-        // `IsLocked` flag can shut them all out. With no id C# invents a dummy
-        // item under a fresh `new LibraryOptions()` — nothing customised — so
-        // an unattached search stays unfiltered.
-        let reference = match self.items.as_ref() {
-            Some(items) if !request.item_id.is_nil() => {
-                items.retrieve_item(request.item_id).await?
-            }
+        // Port of `ProviderManager.GetRemoteSearchResults` (v10.11.8
+        // `MediaBrowser.Providers/Manager/ProviderManager.cs:787-844`).
+        //
+        // The reference item decides the gate: `ItemId` set → the real row and
+        // ITS library's `LibraryOptions` (its "Metadata downloaders"
+        // checkboxes decide which fetchers may run, and its `IsLocked` flag can
+        // shut them all out); `ItemId` empty → the C# builds a dummy
+        // `new TItemType()` under a fresh `new LibraryOptions()`, where every
+        // type entry is absent and therefore every fetcher enabled, so an
+        // unattached search stays unfiltered. `typeOptions` is keyed on
+        // `item.GetType().Name`, i.e. the REFERENCE item's type — which for the
+        // dummy is the searched-for kind, whose `BaseItemKind` name is the same
+        // PascalCase string the checkbox list stores.
+        let reference = match (&self.items, request.item_id) {
+            (Some(items), id) if !id.is_nil() => items.retrieve_item(id).await?,
             _ => None,
         };
-        let library = match reference.as_ref() {
+        let library = match &reference {
             Some(entity) => self.library_options_for(entity).await,
             None => None,
         };
-        // C# keys the `TypeOptions` lookup on `item.GetType().Name`; for the
-        // dummy that is the searched-for kind, whose `BaseItemKind` name is the
-        // same PascalCase string the checkbox list stores.
-        let kind = reference.as_ref().map_or_else(
-            || format!("{:?}", request.item_kind),
-            |entity| short_kind(entity).to_owned(),
-        );
-        let locked = reference.as_ref().is_some_and(|entity| entity.is_locked);
+        let kind = match &reference {
+            Some(entity) => short_kind(entity).to_owned(),
+            None => format!("{:?}", request.item_kind),
+        };
+        // `CanRefreshMetadata` (`ProviderManager.cs:462`): `includeDisabled`
+        // short-circuits to true before every other test, and a LOCKED
+        // reference item drops every non-local provider outright.
+        let locked = reference.as_ref().is_some_and(|e| e.is_locked);
+        let can_refresh = |name: &str| {
+            request.include_disabled_providers
+                || (!locked && metadata_fetcher_enabled(library.as_ref(), &kind, name))
+        };
 
-        // Select the providers that serve this item kind, apply the C# gate,
-        // then (if a provider name was supplied) narrow to that provider — a
-        // port of `GetMetadataProvidersInternal(...).OfType<IRemoteSearchProvider>()`.
-        // With no fetcher registered, or every fetcher unticked, this set is
-        // empty and the loop below yields `[]`, exactly as Jellyfin does.
+        // Select the providers that serve this item kind, drop the ones the
+        // library's "Metadata downloaders" list unticked, then (if a provider
+        // name was supplied) narrow to that provider — the C#
+        // `GetMetadataProvidersInternal(...).OfType<IRemoteSearchProvider>()`
+        // filter chain. With no fetcher registered this set is empty and the
+        // loop below yields `[]`, exactly as Jellyfin returns when nothing
+        // matches.
         let name_filter = request.search_provider_name.as_deref();
         let mut providers: Vec<_> = self
             .remote_search_providers
             .iter()
-            .filter(|p| p.supports(request.item_kind))
-            // `CanRefreshMetadata` (ProviderManager.cs:462-491):
-            // `includeDisabled` short-circuits the whole gate; otherwise a
-            // locked item admits `ILocalMetadataProvider`/`IForcedProvider`
-            // only — and no remote-search provider is either — and the fetcher
-            // must be ticked in the owning library's list.
             .filter(|p| {
-                request.include_disabled_providers
-                    || (!locked
-                        && crate::library_options::metadata_fetcher_enabled(
-                            library.as_ref(),
-                            &kind,
-                            p.name(),
-                        ))
+                p.supports(request.item_kind)
+                    && name_filter.is_none_or(|n| p.name().eq_ignore_ascii_case(n))
+                    && can_refresh(p.name())
             })
-            .filter(|p| name_filter.is_none_or(|n| p.name().eq_ignore_ascii_case(n)))
             .collect();
-        // `.OrderBy(GetConfiguredOrder(metadataFetcherOrder, i.Name))` — stable,
-        // so fetchers the admin never ranked keep their registration order. The
-        // order decides which candidate survives `merge_search_result`'s
-        // first-writer-wins dedup by shared provider id.
+        // `.OrderBy(GetConfiguredOrder(metadataFetcherOrder, i.Name))` then
+        // `.ThenBy(GetDefaultOrder)` (`ProviderManager.cs:455-459`), where
+        //   metadataFetcherOrder = typeOptions?.MetadataFetcherOrder
+        //                          ?? globalMetadataOptions.MetadataFetcherOrder  (:445)
+        // Both halves matter and both used to be missing here. The `??` fires
+        // on a MISSING library `TypeOptions` entry only, which is why
+        // `metadata_fetcher_order` returns an Option: a saved-but-empty order
+        // list means "this library ranks nothing" and must not re-inherit the
+        // server-wide one. `GetConfiguredOrder` gives an unranked provider
+        // `int.MaxValue` (:502), so it sorts after every ranked one, and the
+        // `GetDefaultOrder` tie-break is the provider's own `IHasOrder.Order`
+        // (50 when it declares none, :506) — NOT registration order, which is
+        // what the bare stable sort used to substitute for it. Ties on both
+        // keys still keep registration order: `sort_by_key` is stable, as
+        // LINQ's `OrderBy`/`ThenBy` are.
+        let order = crate::library_options::metadata_fetcher_order(library.as_ref(), &kind)
+            .unwrap_or_else(|| {
+                self.global_metadata_options_for(&kind)
+                    .map(|o| o.metadata_fetcher_order)
+                    .unwrap_or_default()
+            });
         providers.sort_by_key(|p| {
-            crate::library_options::metadata_fetcher_rank(library.as_ref(), &kind, p.name())
+            let ranked = order
+                .iter()
+                .position(|n| n.eq_ignore_ascii_case(p.name()))
+                .unwrap_or(usize::MAX);
+            (ranked, p.default_order())
         });
 
         // `searchInfo.SearchInfo.MetadataLanguage`/`MetadataCountryCode` default
@@ -2919,8 +3294,22 @@ impl ProviderManager for LocalProviderManager {
         ))
     }
 
-    async fn get_metadata_options(&self, _item_id: Uuid) -> Result<MetadataOptions, ServiceError> {
-        Ok(MetadataOptions::default())
+    async fn get_metadata_options(&self, item_id: Uuid) -> Result<MetadataOptions, ServiceError> {
+        // `ProviderManager.GetMetadataOptions(BaseItem item)` (`:652`):
+        // `GetMetadataOptionsForType(item.GetType().Name) ?? new MetadataOptions()`
+        // — the server-wide entry for the item's own type, and a default
+        // (all-empty) one when the configuration names none. An unresolvable
+        // id has no type, so it takes the same default.
+        let kind = match (&self.items, item_id) {
+            (Some(items), id) if !id.is_nil() => items
+                .retrieve_item(id)
+                .await?
+                .map(|e| short_kind(&e).to_owned()),
+            _ => None,
+        };
+        Ok(kind
+            .and_then(|k| self.global_metadata_options_for(&k))
+            .unwrap_or_default())
     }
 
     async fn get_refresh_queue(&self) -> Result<Vec<Uuid>, ServiceError> {
@@ -2942,6 +3331,7 @@ mod tests {
 
     use async_trait::async_trait;
     use ferrofin_db::entities::base_items::BaseItemEntity;
+    use ferrofin_model::configuration::MetadataOptions;
     use ferrofin_model::data::BaseItemKind;
     use ferrofin_model::entities::ImageType;
     use ferrofin_model::providers::{
@@ -2980,6 +3370,40 @@ mod tests {
                 return Err(ServiceError::backend("boom"));
             }
             Ok(self.results.clone())
+        }
+    }
+
+    /// A provider whose only job is to be sortable: it declares an
+    /// `IHasOrder`-style order and returns one uniquely-identified result, so
+    /// the merged list's order IS the provider order.
+    struct OrderedProvider {
+        name: String,
+        order: i32,
+    }
+
+    #[async_trait]
+    impl RemoteSearchProvider for OrderedProvider {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn supports(&self, item_kind: BaseItemKind) -> bool {
+            item_kind == BaseItemKind::MusicArtist
+        }
+
+        fn default_order(&self) -> i32 {
+            self.order
+        }
+
+        async fn get_search_results(
+            &self,
+            _request: &RemoteSearchRequest,
+        ) -> Result<Vec<RemoteSearchResult>, ServiceError> {
+            Ok(vec![result_with(
+                &self.name,
+                &[("MusicBrainzArtist", &self.name)],
+                None,
+            )])
         }
     }
 
@@ -3368,6 +3792,312 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tmdb_movie_identify_maps_release_date_and_honours_provider_ids() {
+        use super::{TmdbKind, TmdbSearchProvider};
+        // The mock matches by path SUBSTRING, first route wins: `year=1999`
+        // sits ahead of `/search/movie` so a movie search that forgot to
+        // forward `SearchInfo.Year` would fall through to the empty payload.
+        let server = crate::mock_http::MockServer::start(vec![
+            (
+                "year=1999",
+                r#"{"results":[{"id":603,"title":"The Matrix","release_date":"1999-03-31",
+                    "poster_path":"/m.jpg","overview":"Neo."}]}"#
+                    .to_owned(),
+            ),
+            ("/search/movie", r#"{"results":[]}"#.to_owned()),
+            (
+                "/movie/603",
+                r#"{"id":603,"title":"The Matrix","release_date":"1999-03-31",
+                    "poster_path":"/m.jpg","overview":"Neo.","imdb_id":"tt0133093"}"#
+                    .to_owned(),
+            ),
+            (
+                "/find/tt0133093",
+                r#"{"movie_results":[{"id":603,"title":"The Matrix","release_date":"1999-03-31",
+                    "poster_path":"/m.jpg"}],"tv_results":[]}"#
+                    .to_owned(),
+            ),
+        ])
+        .await;
+        let tmdb = Arc::new(crate::tmdb::TmdbClient::new().with_base_url(&server.base_url));
+        let provider = TmdbSearchProvider::new(tmdb, TmdbKind::Movie);
+
+        // Name search: `PremiereDate` AND `ProductionYear`, both from the
+        // release date (`TmdbMovieProvider.GetSearchResults`'s name branch).
+        let mut req = named_request(BaseItemKind::Movie, "The Matrix");
+        req.search_info.year = Some(1999);
+        let results = provider.get_search_results(&req).await.expect("results");
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].premiere_date.map(|d| d.to_rfc3339()).as_deref(),
+            Some("1999-03-31T00:00:00+00:00")
+        );
+        assert_eq!(results[0].production_year, Some(1999));
+        assert_eq!(
+            results[0].provider_ids.as_ref().expect("ids")["Tmdb"],
+            "603"
+        );
+
+        // A `Tmdb` id pins the title: exactly one result, with the IMDb id
+        // merged in, and the name is ignored entirely.
+        let mut req = named_request(BaseItemKind::Movie, "Something Else");
+        req.search_info.provider_ids = Some(HashMap::from([("Tmdb".to_owned(), "603".to_owned())]));
+        let results = provider.get_search_results(&req).await.expect("results");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name.as_deref(), Some("The Matrix"));
+        let ids = results[0].provider_ids.as_ref().expect("ids");
+        assert_eq!(ids["Tmdb"], "603");
+        assert_eq!(ids["Imdb"], "tt0133093");
+        assert_eq!(
+            results[0].image_url.as_deref(),
+            Some("https://image.tmdb.org/t/p/original/m.jpg")
+        );
+        assert_eq!(results[0].production_year, Some(1999));
+
+        // An `Imdb` id resolves through `/find`. The movie provider does NOT
+        // stamp the id it searched by back onto the row.
+        let results = provider
+            .get_search_results(&id_request(BaseItemKind::Movie, &[("Imdb", "tt0133093")]))
+            .await
+            .expect("results");
+        assert_eq!(results.len(), 1);
+        let ids = results[0].provider_ids.as_ref().expect("ids");
+        assert_eq!(ids["Tmdb"], "603");
+        assert!(!ids.contains_key("Imdb"));
+        assert!(results[0].premiere_date.is_some());
+    }
+
+    /// A provider id with surrounding whitespace must still pin the title.
+    ///
+    /// `int.Parse(id, CultureInfo.InvariantCulture)` and
+    /// `Convert.ToInt32(id, CultureInfo.InvariantCulture)` both default to
+    /// `NumberStyles.Integer`, which is `AllowLeadingWhite | AllowTrailingWhite |
+    /// AllowLeadingSign` — so upstream pins on `" 603 "`. Rust's `str::parse` does not,
+    /// and without the trim the id branch is skipped and Identify silently answers with
+    /// the NAME search: the exact defect (wrong title, or nothing at all) that the id
+    /// branch exists to prevent. Every route below is keyed on the id, so a provider
+    /// that dropped the trim would fall through to the `*_search` route and fail here.
+    #[tokio::test]
+    async fn a_padded_provider_id_still_pins_the_title() {
+        use super::{
+            TmdbBoxSetSearchProvider, TmdbKind, TmdbPersonSearchProvider, TmdbSearchProvider,
+        };
+        let server = crate::mock_http::MockServer::start(vec![
+            (
+                "/movie/603",
+                r#"{"id":603,"title":"The Matrix","release_date":"1999-03-31"}"#.to_owned(),
+            ),
+            (
+                "/tv/1396",
+                r#"{"id":1396,"name":"Breaking Bad","first_air_date":"2008-01-20"}"#.to_owned(),
+            ),
+            (
+                "/collection/119",
+                r#"{"id":119,"name":"The Lord of the Rings Collection"}"#.to_owned(),
+            ),
+            ("/person/31", r#"{"id":31,"name":"Tom Hanks"}"#.to_owned()),
+            // The name-search fallbacks answer with the WRONG title, so a dropped
+            // trim shows up as a wrong name rather than as an empty list.
+            (
+                "/search/movie",
+                r#"{"results":[{"id":1,"title":"Wrong Movie"}]}"#.to_owned(),
+            ),
+            (
+                "/search/tv",
+                r#"{"results":[{"id":2,"name":"Wrong Series"}]}"#.to_owned(),
+            ),
+            (
+                "/search/collection",
+                r#"{"results":[{"id":3,"name":"Wrong Collection"}]}"#.to_owned(),
+            ),
+            (
+                "/search/person",
+                r#"{"results":[{"id":4,"name":"Wrong Person"}]}"#.to_owned(),
+            ),
+        ])
+        .await;
+        let tmdb = Arc::new(crate::tmdb::TmdbClient::new().with_base_url(&server.base_url));
+
+        for (kind, padded, expected) in [
+            (BaseItemKind::Movie, " 603 ", "The Matrix"),
+            (BaseItemKind::Series, "\t1396\n", "Breaking Bad"),
+            (
+                BaseItemKind::BoxSet,
+                " 119",
+                "The Lord of the Rings Collection",
+            ),
+            (BaseItemKind::Person, "31 ", "Tom Hanks"),
+        ] {
+            let provider: Box<dyn super::RemoteSearchProvider> = match kind {
+                BaseItemKind::Movie => {
+                    Box::new(TmdbSearchProvider::new(tmdb.clone(), TmdbKind::Movie))
+                }
+                BaseItemKind::Series => {
+                    Box::new(TmdbSearchProvider::new(tmdb.clone(), TmdbKind::Series))
+                }
+                BaseItemKind::BoxSet => Box::new(TmdbBoxSetSearchProvider::new(tmdb.clone())),
+                _ => Box::new(TmdbPersonSearchProvider::new(tmdb.clone())),
+            };
+            // A conflicting name is present precisely so the name search is a
+            // reachable, and visibly wrong, alternative.
+            let mut req = named_request(kind, "Something Else Entirely");
+            req.search_info.provider_ids =
+                Some(HashMap::from([("Tmdb".to_owned(), padded.to_owned())]));
+            let results = provider.get_search_results(&req).await.expect("results");
+            assert_eq!(results.len(), 1, "{kind:?} padded id {padded:?}");
+            assert_eq!(
+                results[0].name.as_deref(),
+                Some(expected),
+                "{kind:?} padded id {padded:?} fell through to the name search"
+            );
+        }
+    }
+
+    /// The two providers hand `/find` DIFFERENT `language` values — the movie provider the
+    /// image-languages list (`TmdbMovieProvider.cs:96-101`), the series provider the bare
+    /// metadata language (`TmdbSeriesProvider.cs:73`). The mock matches by path SUBSTRING
+    /// and first route wins, so routing on the encoded query string makes the outgoing
+    /// request itself the assertion: send the wrong one and the row never comes back.
+    #[tokio::test]
+    async fn the_find_branch_sends_the_language_each_c_sharp_provider_sends() {
+        use super::{TmdbKind, TmdbSearchProvider};
+        let server = crate::mock_http::MockServer::start(vec![
+            (
+                // `fr,null,en`, url-encoded — the movie arm only.
+                "language=fr%2Cnull%2Cen",
+                r#"{"movie_results":[{"id":603,"title":"The Matrix"}],"tv_results":[]}"#.to_owned(),
+            ),
+            (
+                // The bare `fr` — the series arm only.
+                "language=fr",
+                r#"{"movie_results":[],"tv_results":[{"id":1396,"name":"Breaking Bad"}]}"#
+                    .to_owned(),
+            ),
+            (
+                "/find/",
+                r#"{"movie_results":[],"tv_results":[]}"#.to_owned(),
+            ),
+        ])
+        .await;
+        let tmdb = Arc::new(crate::tmdb::TmdbClient::new().with_base_url(&server.base_url));
+
+        let mut req = id_request(BaseItemKind::Movie, &[("Imdb", "tt0133093")]);
+        req.search_info.metadata_language = Some("fr".to_owned());
+        req.search_info.metadata_country_code = Some("FR".to_owned());
+        let results = TmdbSearchProvider::new(tmdb.clone(), TmdbKind::Movie)
+            .get_search_results(&req)
+            .await
+            .expect("results");
+        assert_eq!(
+            results.len(),
+            1,
+            "movie /find must send the image-languages list"
+        );
+        assert_eq!(results[0].name.as_deref(), Some("The Matrix"));
+
+        let mut req = id_request(BaseItemKind::Series, &[("Imdb", "tt0903747")]);
+        req.search_info.metadata_language = Some("fr".to_owned());
+        req.search_info.metadata_country_code = Some("FR".to_owned());
+        let results = TmdbSearchProvider::new(tmdb, TmdbKind::Series)
+            .get_search_results(&req)
+            .await
+            .expect("results");
+        assert_eq!(results.len(), 1, "series /find must send the bare language");
+        assert_eq!(results[0].name.as_deref(), Some("Breaking Bad"));
+    }
+
+    /// `TmdbUtils.GetImageLanguagesParam` — the value `TmdbMovieProvider` hands to
+    /// `FindByExternalIdAsync`, which is NOT the bare language the series provider sends.
+    #[test]
+    fn image_languages_param_matches_tmdb_utils() {
+        use crate::tmdb::image_languages_param;
+        assert_eq!(image_languages_param(Some("en"), Some("US")), "en,null");
+        assert_eq!(image_languages_param(Some("fr"), Some("FR")), "fr,null,en");
+        // A 5-letter code supplies both halves; the region is upper-cased first.
+        assert_eq!(
+            image_languages_param(Some("pt-br"), Some("BR")),
+            "pt-BR,pt,null,en"
+        );
+        // `NormalizeLanguage` runs first: de-CH degrades to de.
+        assert_eq!(
+            image_languages_param(Some("de-CH"), Some("CH")),
+            "de,null,en"
+        );
+        // Blank preference is not "en", so English is still appended.
+        assert_eq!(image_languages_param(None, Some("US")), "null,en");
+        assert_eq!(image_languages_param(Some(""), None), "null,en");
+    }
+
+    #[tokio::test]
+    async fn tmdb_series_identify_sets_premiere_date_and_drops_the_year_filter() {
+        use super::{TmdbKind, TmdbSearchProvider};
+        // `first_air_date_year` first: `TmdbSeriesProvider` leaves
+        // `SearchSeriesAsync`'s year at 0, so forwarding one is the bug this
+        // ordering catches. `language=de` likewise proves the language rides
+        // along.
+        let server = crate::mock_http::MockServer::start(vec![
+            ("first_air_date_year", r#"{"results":[]}"#.to_owned()),
+            (
+                "language=de",
+                r#"{"results":[{"id":1396,"name":"Breaking Bad (de)",
+                    "first_air_date":"2008-01-20"}]}"#
+                    .to_owned(),
+            ),
+            (
+                "/search/tv",
+                r#"{"results":[{"id":1396,"name":"Breaking Bad","first_air_date":"2008-01-20",
+                    "poster_path":"/bb.jpg","overview":"Chemistry."}]}"#
+                    .to_owned(),
+            ),
+            (
+                "/tv/1396",
+                r#"{"id":1396,"name":"Breaking Bad","first_air_date":"2008-01-20",
+                    "poster_path":"/bb.jpg","overview":"Chemistry.",
+                    "external_ids":{"imdb_id":"tt0903747","tvdb_id":81189}}"#
+                    .to_owned(),
+            ),
+        ])
+        .await;
+        let tmdb = Arc::new(crate::tmdb::TmdbClient::new().with_base_url(&server.base_url));
+        let provider = TmdbSearchProvider::new(tmdb, TmdbKind::Series);
+
+        // A wrong `Year` must not narrow the search, and the series mapper
+        // emits `PremiereDate` — never `ProductionYear`.
+        let mut req = named_request(BaseItemKind::Series, "Breaking Bad");
+        req.search_info.year = Some(2019);
+        let results = provider.get_search_results(&req).await.expect("results");
+        assert_eq!(
+            results.len(),
+            1,
+            "series search must ignore SearchInfo.Year"
+        );
+        assert_eq!(
+            results[0].premiere_date.map(|d| d.to_rfc3339()).as_deref(),
+            Some("2008-01-20T00:00:00+00:00")
+        );
+        assert_eq!(results[0].production_year, None);
+
+        // The metadata language reaches TMDB.
+        let mut req = named_request(BaseItemKind::Series, "Breaking Bad");
+        req.search_info.metadata_language = Some("de".to_owned());
+        let results = provider.get_search_results(&req).await.expect("results");
+        assert_eq!(results[0].name.as_deref(), Some("Breaking Bad (de)"));
+
+        // A `Tmdb` id pins the series and carries all three ids.
+        let results = provider
+            .get_search_results(&id_request(BaseItemKind::Series, &[("Tmdb", "1396")]))
+            .await
+            .expect("results");
+        assert_eq!(results.len(), 1);
+        let ids = results[0].provider_ids.as_ref().expect("ids");
+        assert_eq!(ids["Tmdb"], "1396");
+        assert_eq!(ids["Imdb"], "tt0903747");
+        assert_eq!(ids["Tvdb"], "81189");
+        assert_eq!(results[0].production_year, None);
+        assert!(results[0].premiere_date.is_some());
+    }
+
+    #[tokio::test]
     async fn omdb_trailer_identify_supports_trailers_as_movies() {
         use super::OmdbSearchProvider;
         let server = crate::mock_http::MockServer::start(vec![(
@@ -3391,6 +4121,463 @@ mod tests {
             results[0].provider_ids.as_ref().expect("ids")["Imdb"],
             "tt1375666"
         );
+    }
+
+    #[tokio::test]
+    async fn omdb_identify_parses_the_name_and_echoes_the_index_numbers() {
+        use super::OmdbSearchProvider;
+        // The only route is the query OMDb must be asked: the year lifted out
+        // of `Inception (2010)` and the cleaned title. Anything else falls to
+        // the mock's `{}` → no results.
+        let server = crate::mock_http::MockServer::start(vec![(
+            "s=Inception&type=movie&y=2010",
+            r#"{"Search":[{"Title":"Inception","Year":"2010","imdbID":"tt1375666",
+                "Type":"movie"}],"Response":"True"}"#
+                .to_owned(),
+        )])
+        .await;
+        let omdb = Arc::new(crate::omdb::OmdbClient::new("key").with_base_url(&server.base_url));
+        let provider = OmdbSearchProvider::for_trailers(omdb);
+
+        let mut req = named_request(BaseItemKind::Trailer, "Inception (2010)");
+        req.search_info.index_number = Some(3);
+        req.search_info.parent_index_number = Some(7);
+        let results = provider.get_search_results(&req).await.expect("results");
+        assert_eq!(
+            results.len(),
+            1,
+            "ParseName must lift the year out of the title before querying OMDb"
+        );
+        assert_eq!(results[0].name.as_deref(), Some("Inception"));
+        // `ResultToMetadataResult` echoes the caller's index numbers.
+        assert_eq!(results[0].index_number, Some(3));
+        assert_eq!(results[0].parent_index_number, Some(7));
+
+        // An explicit `Year` wins over the one in the title (C# `year ??=`).
+        let mut req = named_request(BaseItemKind::Trailer, "Inception (2010)");
+        req.search_info.year = Some(1999);
+        assert!(
+            provider
+                .get_search_results(&req)
+                .await
+                .expect("ok")
+                .is_empty(),
+            "an explicit Year must not be overwritten by the in-title year"
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_search_seeds_a_blank_metadata_language_from_the_config() {
+        /// Echoes the language/country it was handed back as the result name.
+        struct EchoLanguage;
+        #[async_trait]
+        impl RemoteSearchProvider for EchoLanguage {
+            #[allow(clippy::unnecessary_literal_bound)]
+            fn name(&self) -> &str {
+                "Echo"
+            }
+            fn supports(&self, kind: BaseItemKind) -> bool {
+                kind == BaseItemKind::Movie
+            }
+            async fn get_search_results(
+                &self,
+                request: &RemoteSearchRequest,
+            ) -> Result<Vec<RemoteSearchResult>, ServiceError> {
+                Ok(vec![RemoteSearchResult {
+                    name: Some(format!(
+                        "{}/{}",
+                        request
+                            .search_info
+                            .metadata_language
+                            .as_deref()
+                            .unwrap_or("-"),
+                        request
+                            .search_info
+                            .metadata_country_code
+                            .as_deref()
+                            .unwrap_or("-")
+                    )),
+                    ..RemoteSearchResult::default()
+                }])
+            }
+        }
+
+        // The same two readers `apps/ferrofin-server` wires: `PreferredMetadataLanguage`
+        // and `MetadataCountryCode`, both read live off the server configuration.
+        let mgr = LocalProviderManager::default()
+            .with_remote_search_providers(vec![Arc::new(EchoLanguage)])
+            // No `ItemId` on this request, so no library is ever resolved — the
+            // folder seam is here only because it shares the builder.
+            .with_metadata_language(
+                Arc::new(OneLibrary(
+                    ferrofin_model::entities_media::VirtualFolderInfo::default(),
+                )),
+                Arc::new(|| "fr".to_owned()),
+            )
+            .with_metadata_country(Arc::new(|| "FR".to_owned()));
+
+        // Blank → filled from the server configuration.
+        let out = mgr
+            .remote_search(&request(BaseItemKind::Movie))
+            .await
+            .expect("search");
+        assert_eq!(out[0].name.as_deref(), Some("fr/FR"));
+
+        // Supplied by the caller → left exactly as sent.
+        let mut req = request(BaseItemKind::Movie);
+        req.search_info.metadata_language = Some("de".to_owned());
+        req.search_info.metadata_country_code = Some("DE".to_owned());
+        let out = mgr.remote_search(&req).await.expect("search");
+        assert_eq!(out[0].name.as_deref(), Some("de/DE"));
+
+        // With no configuration reader wired, the C# ServerConfiguration DEFAULTS
+        // stand — `PreferredMetadataLanguage = "en"` and `MetadataCountryCode =
+        // "US"` (v10.11.8 MediaBrowser.Model/Configuration/ServerConfiguration.cs
+        // :103, :109). Upstream has no "unset" state to model: the configuration
+        // object always carries those two strings, so `IsNullOrWhiteSpace` never
+        // leaves the request blank. Leaving them blank here instead would make an
+        // unwired manager the ONE shape a real Jellyfin cannot produce.
+        let bare = LocalProviderManager::default()
+            .with_remote_search_providers(vec![Arc::new(EchoLanguage)]);
+        let out = bare
+            .remote_search(&request(BaseItemKind::Movie))
+            .await
+            .expect("search");
+        assert_eq!(out[0].name.as_deref(), Some("en/US"));
+    }
+
+    /// One library whose `TypeOptions` the gate reads. Only
+    /// `get_virtual_folders` is exercised; every mutation is unreachable here.
+    struct OneLibrary(ferrofin_model::entities_media::VirtualFolderInfo);
+
+    #[async_trait]
+    impl ferrofin_traits::library::VirtualFolderManager for OneLibrary {
+        async fn get_virtual_folders(
+            &self,
+        ) -> Result<Vec<ferrofin_model::entities_media::VirtualFolderInfo>, ServiceError> {
+            Ok(vec![self.0.clone()])
+        }
+        async fn get_physical_paths(&self) -> Result<Vec<String>, ServiceError> {
+            Ok(Vec::new())
+        }
+        async fn add_virtual_folder(
+            &self,
+            _name: &str,
+            _collection_type: Option<ferrofin_model::entities::CollectionTypeOptions>,
+            _options: &ferrofin_model::configuration::LibraryOptions,
+        ) -> Result<(), ServiceError> {
+            unimplemented!()
+        }
+        async fn remove_virtual_folder(&self, _name: &str) -> Result<(), ServiceError> {
+            unimplemented!()
+        }
+        async fn rename_virtual_folder(&self, _n: &str, _new: &str) -> Result<(), ServiceError> {
+            unimplemented!()
+        }
+        async fn add_media_path(
+            &self,
+            _n: &str,
+            _p: &ferrofin_model::configuration::MediaPathInfo,
+        ) -> Result<(), ServiceError> {
+            unimplemented!()
+        }
+        async fn update_media_path(
+            &self,
+            _n: &str,
+            _p: &ferrofin_model::configuration::MediaPathInfo,
+        ) -> Result<(), ServiceError> {
+            unimplemented!()
+        }
+        async fn remove_media_path(&self, _n: &str, _p: &str) -> Result<(), ServiceError> {
+            unimplemented!()
+        }
+        async fn update_library_options(
+            &self,
+            _n: &str,
+            _o: &ferrofin_model::configuration::LibraryOptions,
+        ) -> Result<(), ServiceError> {
+            unimplemented!()
+        }
+    }
+
+    /// Port check for `ProviderManager.GetRemoteSearchResults`
+    /// (`ProviderManager.cs:787`) → `GetMetadataProvidersInternal` →
+    /// `CanRefreshMetadata` (`:462`) → `BaseItemManager.IsMetadataFetcherEnabled`.
+    ///
+    /// An Identify search SCOPED to an item resolves that item's library and
+    /// drops every remote fetcher the library's "Metadata downloaders" list
+    /// leaves unticked. An UNSCOPED search builds a dummy with default
+    /// `LibraryOptions`, where nothing is unticked, so it keeps the provider —
+    /// which is why the two only diverge once `ItemId` is sent.
+    /// `GetMetadataProvidersInternal`'s ordering, both halves
+    /// (`ProviderManager.cs:442-459`):
+    ///   metadataFetcherOrder = typeOptions?.MetadataFetcherOrder
+    ///                          ?? globalMetadataOptions.MetadataFetcherOrder
+    ///   .OrderBy(GetConfiguredOrder(...)).ThenBy(GetDefaultOrder)
+    ///
+    /// Registration order is DELIBERATELY the reverse of every expected answer
+    /// here, so a test that merely echoed the registration list would fail
+    /// case (a) immediately.
+    #[tokio::test]
+    async fn remote_search_orders_by_configured_then_default_order() {
+        let names = |out: &[RemoteSearchResult]| -> Vec<String> {
+            out.iter().filter_map(|r| r.name.clone()).collect()
+        };
+        let providers = || {
+            vec![
+                Arc::new(OrderedProvider {
+                    name: "Unranked".to_owned(),
+                    order: 50,
+                }) as Arc<dyn RemoteSearchProvider>,
+                Arc::new(OrderedProvider {
+                    name: "Second".to_owned(),
+                    order: 2,
+                }),
+                Arc::new(OrderedProvider {
+                    name: "First".to_owned(),
+                    order: 0,
+                }),
+            ]
+        };
+        let req = request(BaseItemKind::MusicArtist);
+
+        // (a) Nothing configured anywhere: `GetDefaultOrder` alone decides, and
+        //     it is the provider's own order — NOT the registration order.
+        let bare = LocalProviderManager::default().with_remote_search_providers(providers());
+        assert_eq!(
+            names(&bare.remote_search(&req).await.unwrap()),
+            ["First", "Second", "Unranked"],
+        );
+
+        // (b) The SERVER-WIDE MetadataOptions rank a provider the library did
+        //     not: `typeOptions?.… ?? globalMetadataOptions.…` fires because no
+        //     library resolves here. An unranked provider keeps `int.MaxValue`
+        //     and sorts after, still tie-broken by GetDefaultOrder.
+        let global = LocalProviderManager::default()
+            .with_remote_search_providers(providers())
+            .with_metadata_options(|| {
+                vec![MetadataOptions {
+                    item_type: Some("MusicArtist".to_owned()),
+                    metadata_fetcher_order: vec!["Unranked".to_owned()],
+                    ..MetadataOptions::default()
+                }]
+            });
+        assert_eq!(
+            names(&global.remote_search(&req).await.unwrap()),
+            ["Unranked", "First", "Second"],
+        );
+
+        // (c) The global entry is keyed on the item TYPE: an entry for another
+        //     type must not rank anything here.
+        let other_type = LocalProviderManager::default()
+            .with_remote_search_providers(providers())
+            .with_metadata_options(|| {
+                vec![MetadataOptions {
+                    item_type: Some("Movie".to_owned()),
+                    metadata_fetcher_order: vec!["Unranked".to_owned()],
+                    ..MetadataOptions::default()
+                }]
+            });
+        assert_eq!(
+            names(&other_type.remote_search(&req).await.unwrap()),
+            ["First", "Second", "Unranked"],
+        );
+    }
+
+    /// The library half of the same citation: a library that SAVED a
+    /// `TypeOptions` entry answers for itself, even when its order list is
+    /// EMPTY. `typeOptions?.MetadataFetcherOrder ?? global` fires on a MISSING
+    /// entry only, so an emptied order list must not re-inherit the
+    /// server-wide one — the leg the old `if !order.is_empty()` could not
+    /// express, since it could not tell "absent" from "empty".
+    #[tokio::test]
+    async fn a_saved_but_empty_library_order_does_not_inherit_the_global_one() {
+        let names = |out: &[RemoteSearchResult]| -> Vec<String> {
+            out.iter().filter_map(|r| r.name.clone()).collect()
+        };
+        let providers = || {
+            vec![
+                Arc::new(OrderedProvider {
+                    name: "Unranked".to_owned(),
+                    order: 50,
+                }) as Arc<dyn RemoteSearchProvider>,
+                Arc::new(OrderedProvider {
+                    name: "Second".to_owned(),
+                    order: 2,
+                }),
+                Arc::new(OrderedProvider {
+                    name: "First".to_owned(),
+                    order: 0,
+                }),
+            ]
+        };
+        let library_id = Uuid::from_u128(0x6001);
+        let artist_id = Uuid::from_u128(0x6002);
+        let entity = BaseItemEntity {
+            id: ferrofin_db::store::guid_to_db(artist_id),
+            type_: "MediaBrowser.Controller.Entities.Audio.MusicArtist".to_owned(),
+            name: Some("Radiohead".to_owned()),
+            top_parent_id: Some(ferrofin_db::store::guid_to_db(library_id)),
+            ..BaseItemEntity::default()
+        };
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut rows = HashMap::new();
+        rows.insert(artist_id, entity);
+        let with_library = |order: Vec<String>| {
+            LocalProviderManager::default()
+                .with_remote_search_providers(providers())
+                .with_metadata_options(|| {
+                    vec![MetadataOptions {
+                        item_type: Some("MusicArtist".to_owned()),
+                        metadata_fetcher_order: vec!["Unranked".to_owned()],
+                        ..MetadataOptions::default()
+                    }]
+                })
+                .with_virtual_folders(Arc::new(OneLibrary(
+                    ferrofin_model::entities_media::VirtualFolderInfo {
+                        name: Some("Music".to_owned()),
+                        item_id: Some(library_id.to_string()),
+                        library_options: Some(ferrofin_model::configuration::LibraryOptions {
+                            type_options: vec![ferrofin_model::configuration::TypeOptions {
+                                type_: Some("MusicArtist".to_owned()),
+                                metadata_fetchers: vec![
+                                    "Unranked".to_owned(),
+                                    "Second".to_owned(),
+                                    "First".to_owned(),
+                                ],
+                                metadata_fetcher_order: order,
+                                ..ferrofin_model::configuration::TypeOptions::default()
+                            }],
+                            ..ferrofin_model::configuration::LibraryOptions::default()
+                        }),
+                        ..ferrofin_model::entities_media::VirtualFolderInfo::default()
+                    },
+                ))
+                    as Arc<dyn ferrofin_traits::library::VirtualFolderManager>)
+                .with_remote_images(
+                    Arc::new(crate::tmdb::TmdbClient::new()),
+                    Arc::new(FakeItems {
+                        rows: rows.clone(),
+                        seen: tx.clone(),
+                    }),
+                )
+        };
+        let mut scoped = request(BaseItemKind::MusicArtist);
+        scoped.item_id = artist_id;
+        assert_eq!(
+            names(
+                &with_library(Vec::new())
+                    .remote_search(&scoped)
+                    .await
+                    .unwrap()
+            ),
+            ["First", "Second", "Unranked"],
+            "an emptied library order does not fall back to the global one"
+        );
+        // …and a library that DOES rank wins over the global ranking.
+        assert_eq!(
+            names(
+                &with_library(vec!["Second".to_owned()])
+                    .remote_search(&scoped)
+                    .await
+                    .unwrap()
+            ),
+            ["Second", "First", "Unranked"],
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_search_honours_the_librarys_metadata_fetcher_checkboxes() {
+        let library_id = Uuid::from_u128(0x5001);
+        let artist_id = Uuid::from_u128(0x5002);
+
+        let mut entity = BaseItemEntity {
+            id: ferrofin_db::store::guid_to_db(artist_id),
+            type_: "MediaBrowser.Controller.Entities.Audio.MusicArtist".to_owned(),
+            name: Some("Radiohead".to_owned()),
+            // The resolved artist's TopParentId is what makes the library
+            // lookup possible at all — an accessed-by-name artist has none and
+            // the gate stays inert (`library_options_for` returns None).
+            top_parent_id: Some(ferrofin_db::store::guid_to_db(library_id)),
+            ..BaseItemEntity::default()
+        };
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut rows = HashMap::new();
+        rows.insert(artist_id, entity.clone());
+
+        let folders = |fetchers: Vec<String>| {
+            Arc::new(OneLibrary(
+                ferrofin_model::entities_media::VirtualFolderInfo {
+                    name: Some("Music".to_owned()),
+                    item_id: Some(library_id.to_string()),
+                    library_options: Some(ferrofin_model::configuration::LibraryOptions {
+                        type_options: vec![ferrofin_model::configuration::TypeOptions {
+                            type_: Some("MusicArtist".to_owned()),
+                            metadata_fetchers: fetchers,
+                            ..ferrofin_model::configuration::TypeOptions::default()
+                        }],
+                        ..ferrofin_model::configuration::LibraryOptions::default()
+                    }),
+                    ..ferrofin_model::entities_media::VirtualFolderInfo::default()
+                },
+            )) as Arc<dyn ferrofin_traits::library::VirtualFolderManager>
+        };
+        let provider = || {
+            Arc::new(FakeProvider {
+                name: "MusicBrainz".to_owned(),
+                kind: BaseItemKind::MusicArtist,
+                results: vec![result_with(
+                    "Radiohead",
+                    &[("MusicBrainzArtist", "a74b")],
+                    None,
+                )],
+                fail: false,
+            }) as Arc<dyn RemoteSearchProvider>
+        };
+        let manager = |fetchers: Vec<String>, rows: HashMap<Uuid, BaseItemEntity>| {
+            LocalProviderManager::default()
+                .with_remote_search_providers(vec![provider()])
+                .with_virtual_folders(folders(fetchers))
+                .with_remote_images(
+                    Arc::new(crate::tmdb::TmdbClient::new()),
+                    Arc::new(FakeItems {
+                        rows,
+                        seen: tx.clone(),
+                    }),
+                )
+        };
+
+        // Unticked: the library lists no MusicArtist metadata fetcher.
+        let mgr = manager(Vec::new(), rows.clone());
+        let mut scoped = request(BaseItemKind::MusicArtist);
+        scoped.item_id = artist_id;
+        assert!(
+            mgr.remote_search(&scoped).await.unwrap().is_empty(),
+            "an unticked fetcher is dropped from a scoped search"
+        );
+
+        // The same request UNSCOPED keeps it — no reference item, so the C#
+        // dummy's default LibraryOptions enable everything.
+        let unscoped = request(BaseItemKind::MusicArtist);
+        assert_eq!(mgr.remote_search(&unscoped).await.unwrap().len(), 1);
+
+        // `IncludeDisabledProviders` short-circuits `CanRefreshMetadata`
+        // (`ProviderManager.cs:474`) before the fetcher list is consulted.
+        let mut forced = scoped.clone();
+        forced.include_disabled_providers = true;
+        assert_eq!(mgr.remote_search(&forced).await.unwrap().len(), 1);
+
+        // Ticked: the provider survives the scoped search.
+        let ticked = manager(vec!["MusicBrainz".to_owned()], rows.clone());
+        assert_eq!(ticked.remote_search(&scoped).await.unwrap().len(), 1);
+
+        // A LOCKED reference item drops every remote provider outright
+        // ("If locked only allow local providers", `ProviderManager.cs:478`).
+        entity.is_locked = true;
+        let mut locked_rows = HashMap::new();
+        locked_rows.insert(artist_id, entity);
+        let locked = manager(vec!["MusicBrainz".to_owned()], locked_rows);
+        assert!(locked.remote_search(&scoped).await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -3862,12 +5049,59 @@ mod tests {
         assert!(!mgr.get_all_metadata_plugins().await.unwrap().is_empty());
         assert!(mgr.get_refresh_queue().await.unwrap().is_empty());
 
-        // Metadata options fall back to the type default.
+        // With no config reader and no item store, `GetMetadataOptions` has
+        // nothing to look up and takes the `?? new MetadataOptions()` arm.
         let opts = mgr.get_metadata_options(id).await.unwrap();
-        assert_eq!(
-            opts,
-            ferrofin_model::configuration::MetadataOptions::default()
+        assert_eq!(opts, MetadataOptions::default());
+    }
+
+    /// `ProviderManager.GetMetadataOptions(item)` (`:652`) is
+    /// `GetMetadataOptionsForType(item.GetType().Name) ?? new MetadataOptions()`
+    /// — the SERVER-WIDE entry for the item's OWN type. It used to return the
+    /// default unconditionally, which made the server-wide options invisible.
+    #[tokio::test]
+    async fn get_metadata_options_resolves_the_items_own_type() {
+        let artist_id = Uuid::from_u128(0x7001);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut rows = HashMap::new();
+        rows.insert(
+            artist_id,
+            BaseItemEntity {
+                id: ferrofin_db::store::guid_to_db(artist_id),
+                type_: "MediaBrowser.Controller.Entities.Audio.MusicArtist".to_owned(),
+                ..BaseItemEntity::default()
+            },
         );
+        let mgr = LocalProviderManager::default()
+            .with_remote_images(
+                Arc::new(crate::tmdb::TmdbClient::new()),
+                Arc::new(FakeItems { rows, seen: tx }),
+            )
+            .with_metadata_options(|| {
+                vec![
+                    MetadataOptions {
+                        item_type: Some("Movie".to_owned()),
+                        metadata_fetcher_order: vec!["TheMovieDb".to_owned()],
+                        ..MetadataOptions::default()
+                    },
+                    MetadataOptions {
+                        item_type: Some("MusicArtist".to_owned()),
+                        metadata_fetcher_order: vec!["MusicBrainz".to_owned()],
+                        ..MetadataOptions::default()
+                    },
+                ]
+            });
+
+        let opts = mgr.get_metadata_options(artist_id).await.unwrap();
+        assert_eq!(opts.metadata_fetcher_order, ["MusicBrainz"], "its OWN type");
+
+        // An id no row answers for has no type, so it takes the default arm —
+        // NOT the first entry in the array.
+        let unknown = mgr
+            .get_metadata_options(Uuid::from_u128(0x7002))
+            .await
+            .unwrap();
+        assert_eq!(unknown, MetadataOptions::default());
     }
 
     /// An [`ItemRepository`] over a fixed map, reporting each `retrieve_item`
@@ -4141,6 +5375,10 @@ mod tests {
     /// A stored `(provider key, value)` id list.
     type IdPairs = Vec<(String, String)>;
 
+    /// One recorded `save_item_values` call: the item and its rewritten
+    /// `(ItemValueType discriminant, value)` index.
+    type RecordedItemValues = Vec<(Uuid, Vec<(i32, String)>)>;
+
     /// An [`ItemPersistenceService`] fake recording the writes a refresh makes
     /// (replaced id sets, upserted ids, saved rows) over a seeded id store.
     #[derive(Default)]
@@ -4149,6 +5387,7 @@ mod tests {
         replaced: std::sync::Mutex<Vec<(Uuid, IdPairs)>>,
         upserted: std::sync::Mutex<Vec<(Uuid, String, String)>>,
         saved: std::sync::Mutex<Vec<BaseItemEntity>>,
+        item_values: std::sync::Mutex<RecordedItemValues>,
     }
 
     #[async_trait]
@@ -4169,10 +5408,14 @@ mod tests {
         }
         async fn save_item_values(
             &self,
-            _item_id: Uuid,
-            _values: &[(i32, String)],
+            item_id: Uuid,
+            values: &[(i32, String)],
         ) -> Result<(), ServiceError> {
-            unimplemented!()
+            self.item_values
+                .lock()
+                .expect("lock")
+                .push((item_id, values.to_vec()));
+            Ok(())
         }
         async fn item_exists(&self, _id: Uuid) -> Result<bool, ServiceError> {
             unimplemented!()
@@ -4346,6 +5589,67 @@ mod tests {
         let upserted = store.upserted.lock().expect("lock");
         assert!(upserted.contains(&(item_id, "Tmdb".to_owned(), "603".to_owned())));
         assert!(upserted.contains(&(item_id, "Imdb".to_owned(), "tt0133093".to_owned())));
+    }
+
+    /// A refresh re-derives the by-name index from the row it just wrote.
+    ///
+    /// C# does both halves in one call: `BaseItemRepository.SaveItems` saves
+    /// the row and then rewrites `ItemValues`/`ItemValuesMap` for it (v10.11.8
+    /// `BaseItemRepository.cs:674-735`, unchanged on master). Ferrofin's
+    /// refresh path saved only the row, so a genre/studio a refresh replaced
+    /// left `/Genres`, `/Studios` and their counts describing the OLD value —
+    /// visible as a `/Studios/{name}` count that matches no item.
+    #[tokio::test]
+    async fn a_refresh_reindexes_the_rows_item_values() {
+        let server = crate::mock_http::MockServer::start(vec![(
+            "/movie/603",
+            r#"{"id":603,"title":"The Matrix","overview":"Neo.",
+                "genres":[{"id":878,"name":"Science Fiction"}],
+                "production_companies":[{"id":1,"name":"Village Roadshow"}]}"#
+                .to_owned(),
+        )])
+        .await;
+        let tmdb = Arc::new(crate::tmdb::TmdbClient::new().with_base_url(&server.base_url));
+        let store = Arc::new(RecordingStore::default());
+        let (item_id, mgr) = movie_manager("Matrix", tmdb, Arc::clone(&store));
+
+        let chosen = RemoteSearchResult {
+            name: Some("The Matrix".to_owned()),
+            provider_ids: Some(HashMap::from([("Tmdb".to_owned(), "603".to_owned())])),
+            ..RemoteSearchResult::default()
+        };
+        mgr.refresh_full_item(
+            item_id,
+            &MetadataRefreshOptions {
+                search_result: Some(chosen),
+                ..full_metadata_refresh()
+            },
+        )
+        .await
+        .expect("refresh");
+
+        let saved = store.saved.lock().expect("lock");
+        let written = saved.last().expect("a row was saved").clone();
+        drop(saved);
+        let reindexed = store.item_values.lock().expect("lock");
+        let (id, values) = reindexed.last().expect("the index was rewritten").clone();
+        assert_eq!(id, item_id);
+        assert_eq!(
+            values,
+            super::item_values_of(&written),
+            "the index is derived from the row that was just saved"
+        );
+        // The fetched genre and studio are what the by-name browses will now
+        // see — the whole point: before this, `/Genres` and `/Studios` kept
+        // answering from the pre-refresh values.
+        assert!(
+            values.contains(&(2, "Science Fiction".to_owned())),
+            "expected the fetched genre in the rewritten index, got {values:?}"
+        );
+        assert!(
+            values.contains(&(3, "Village Roadshow".to_owned())),
+            "expected the fetched studio in the rewritten index, got {values:?}"
+        );
     }
 
     #[tokio::test]
@@ -5312,6 +6616,64 @@ mod tests {
         // The box set carries `Tmdb`, as C# `TmdbBoxSetProvider` sets it —
         // `TmdbCollection` is a *movie*'s pointer at its collection.
         assert_eq!(results[0].provider_ids.as_ref().unwrap()["Tmdb"], "2344");
+        // …and NO overview: the C# search rows carry Name/ImageUrl/Tmdb only.
+        assert!(
+            results[0].overview.is_none(),
+            "the C# box-set search DTO has no Overview"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_box_set_identify_provider_pins_a_collection_by_tmdb_id() {
+        let server = crate::mock_http::MockServer::start(vec![
+            (
+                "/collection/119",
+                r#"{"id":119,"name":"The Lord of the Rings Collection","overview":"Middle-earth.",
+                    "poster_path":"/lotr.jpg"}"#
+                    .to_owned(),
+            ),
+            // TMDB has no collection 999999 — the mock stands in for that with
+            // a body the client cannot read, so `collection()` yields `None`.
+            ("/collection/999999", "<not json>".to_owned()),
+            (
+                "/search/collection",
+                r#"{"results":[{"id":2344,"name":"The Matrix Collection"}]}"#.to_owned(),
+            ),
+        ])
+        .await;
+        let tmdb = Arc::new(crate::tmdb::TmdbClient::new().with_base_url(&server.base_url));
+        let provider = super::TmdbBoxSetSearchProvider::new(tmdb);
+
+        // The id wins over a conflicting name and yields exactly one row.
+        let mut req = named_request(BaseItemKind::BoxSet, "The Matrix Collection");
+        req.search_info.provider_ids = Some(HashMap::from([("Tmdb".to_owned(), "119".to_owned())]));
+        let results = provider.get_search_results(&req).await.expect("results");
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].name.as_deref(),
+            Some("The Lord of the Rings Collection")
+        );
+        assert_eq!(results[0].provider_ids.as_ref().unwrap()["Tmdb"], "119");
+        assert_eq!(
+            results[0].image_url.as_deref(),
+            Some("https://image.tmdb.org/t/p/original/lotr.jpg")
+        );
+        assert!(results[0].overview.is_none());
+
+        // An id TMDB does not answer for returns nothing — C# returns
+        // `Enumerable.Empty` rather than falling back to the name search, which
+        // the live `/search/collection` route here would otherwise satisfy.
+        let mut req = named_request(BaseItemKind::BoxSet, "The Matrix Collection");
+        req.search_info.provider_ids =
+            Some(HashMap::from([("Tmdb".to_owned(), "999999".to_owned())]));
+        assert!(
+            provider
+                .get_search_results(&req)
+                .await
+                .expect("ok")
+                .is_empty(),
+            "an unanswered collection id must not fall back to the name search"
+        );
     }
 
     #[test]

@@ -44,6 +44,9 @@ use ferrofin_traits::drawing::ImageEncoder;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::options::{ImageCollageOptions, ImageProcessingOptions};
 use image::{DynamicImage, ImageFormat as CrateFormat, ImageReader, RgbaImage, imageops};
+use jpeg_encoder::{
+    ChromaSubsamplingMethod, ColorType as JpegColorType, Encoder as JpegEncoder, SamplingFactor,
+};
 
 /// Caps how many image encodes run concurrently on the blocking pool.
 ///
@@ -166,18 +169,7 @@ impl ImageCrateEncoder {
         }
 
         if format == CrateFormat::Jpeg {
-            let quality = quality.clamp(0, 100);
-            // Truncation is safe: quality is clamped to 0..=100.
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let quality = quality as u8;
-            let file = std::fs::File::create(output_path)
-                .map_err(|e| DrawingError::io(format!("create {output_path}"), e))?;
-            let mut writer = std::io::BufWriter::new(file);
-            let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut writer, quality);
-            image
-                .to_rgb8()
-                .write_with_encoder(encoder)
-                .map_err(|e| DrawingError::encode(format!("encode {output_path}"), e).into())
+            Self::write_jpeg(image, output_path, quality)
         } else if format == CrateFormat::WebP {
             // LOSSY WebP via libwebp (the `webp` crate), mirroring Skia's
             // `bitmap.Encode(stream, Webp, quality)`. The `image` crate's own
@@ -197,6 +189,86 @@ impl ImageCrateEncoder {
                 .save_with_format(output_path, format)
                 .map_err(|e| DrawingError::encode(format!("encode {output_path}"), e).into())
         }
+    }
+
+    /// Writes `image` to `output_path` as a baseline JPEG at `quality` (0-100)
+    /// with **4:2:0 chroma subsampling and optimized Huffman tables**, mirroring
+    /// the C# oracle's `bitmap.Encode(stream, SKEncodedImageFormat.Jpeg, quality)`.
+    ///
+    /// This routes around the `image` crate for the same reason the WebP branch
+    /// does. `image` 0.25's `JpegEncoder` hardcodes 4:4:4 (every component is
+    /// declared `h: 1, v: 1` in `new_with_quality`, at every quality), whereas
+    /// Skia's `SkJpegEncoder` defaults to `Downsample::k420` for all three of
+    /// Jellyfin's JPEG writes (`SkiaEncoder.cs` v10.11.8 lines 628, 670 and 778 —
+    /// resized image, pixmap, and the trickplay tile grid). A 4:4:4 tile is
+    /// roughly 3x the bytes of the 4:2:0 one, and `TrickplayManager.CreateTiles`
+    /// derives `TrickplayInfo.Bandwidth` straight from the tile's file length
+    /// (`Jellyfin.Server.Implementations/Trickplay/TrickplayManager.cs`), so the
+    /// subsampling was visible to clients as a ~3.4x inflated scrub-prefetch
+    /// budget, not just as bigger files on disk.
+    ///
+    /// `jpeg-encoder` is configured to match Skia on every knob that changes the
+    /// wire format:
+    ///
+    /// - **4:2:0 chroma subsampling**, as above. That crate's own default is
+    ///   quality-dependent (4:4:4 at `quality >= 90`, which is exactly the
+    ///   quality trickplay tiles are written at), so it is set explicitly rather
+    ///   than inherited.
+    /// - **Optimized Huffman tables** (libjpeg `optimize_coding = TRUE`), which
+    ///   `jpeg-encoder` leaves off. Measured on the wire against Jellyfin
+    ///   10.11.8: its tiles carry content-derived tables with 11/93/11/56
+    ///   symbols where libjpeg's standard tables have 12/162/12/162. On the flat,
+    ///   mostly-DC content a trickplay tile is made of, that difference alone is
+    ///   a factor of two in file size — for the same quantization tables (verified
+    ///   byte-identical between the two servers' tiles) and the same pixels
+    ///   (mean absolute difference 0.005/255).
+    /// - **Baseline, not progressive**, and box-averaged chroma downsampling
+    ///   (libjpeg's `h2v2_downsample`) — both already the crate's defaults.
+    ///
+    /// Optimized coding costs a second entropy pass over the image. Skia pays it
+    /// on every JPEG Jellyfin writes, and it halves what this server stores and
+    /// serves, so Ferrofin pays it too.
+    ///
+    /// The output is still not byte-identical to Skia's — no two independent
+    /// JPEG writers are — but the two now agree on subsampling, quantization and
+    /// entropy coding, which is everything a client can observe about the format.
+    ///
+    /// One recorded, decoder-invisible divergence remains: `jpeg-encoder`
+    /// hardcodes the SOF component identifiers to 0/1/2 (`init_components`,
+    /// v0.7.1), where libjpeg — and so Skia — writes the JFIF-conventional
+    /// 1/2/3. JPEG decoders bind components positionally and match the SOS
+    /// selectors against whatever the SOF declared, so no client can observe
+    /// this; the crate exposes no knob for it.
+    fn write_jpeg(
+        image: &DynamicImage,
+        output_path: &str,
+        quality: i32,
+    ) -> Result<(), ServiceError> {
+        let quality = quality.clamp(0, 100);
+        // Truncation is safe: quality is clamped to 0..=100.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let quality = quality as u8;
+        let rgb = image.to_rgb8();
+        // JPEG's frame header stores the dimensions in 16 bits, so anything wider
+        // or taller than 65535 cannot be written; Skia fails the same encode.
+        let (Ok(width), Ok(height)) = (u16::try_from(rgb.width()), u16::try_from(rgb.height()))
+        else {
+            return Err(ServiceError::InvalidInput(format!(
+                "cannot write {output_path}: {}x{} exceeds JPEG's 65535x65535 limit",
+                rgb.width(),
+                rgb.height()
+            )));
+        };
+        let file = std::fs::File::create(output_path)
+            .map_err(|e| DrawingError::io(format!("create {output_path}"), e))?;
+        let writer = std::io::BufWriter::new(file);
+        let mut encoder = JpegEncoder::new(writer, quality);
+        encoder.set_sampling_factor(SamplingFactor::F_2_2);
+        encoder.set_chroma_subsampling_method(ChromaSubsamplingMethod::Average);
+        encoder.set_optimized_huffman_tables(true);
+        encoder
+            .encode(rgb.as_raw(), width, height, JpegColorType::Rgb)
+            .map_err(|e| DrawingError::jpeg_encode(format!("encode {output_path}"), e).into())
     }
 
     /// Resizes `image` to exactly `size` using a high-quality Lanczos3 filter
@@ -668,6 +740,7 @@ mod tests {
     use super::*;
     use ferrofin_traits::options::ItemImageInfo;
     use image::{Rgba, RgbaImage};
+    use rstest::rstest;
     use std::path::PathBuf;
     use tempfile::TempDir;
 
@@ -916,6 +989,152 @@ mod tests {
         // The JPEG must decode back at the requested target size.
         let dims = enc.get_image_size(&output).await.expect("probe jpeg");
         assert_eq!(dims, ImageDimensions::new(200, 100));
+    }
+
+    /// The (horizontal, vertical) sampling factors of every component in a
+    /// JPEG's SOF marker, in declaration order (Y, Cb, Cr).
+    ///
+    /// `[(2, 2), (1, 1), (1, 1)]` is 4:2:0 — luma sampled twice per chroma
+    /// sample on both axes; `[(1, 1), (1, 1), (1, 1)]` is 4:4:4. The component
+    /// *identifiers* are deliberately not returned: `jpeg-encoder` numbers them
+    /// 0/1/2 where libjpeg (and therefore Skia) uses the JFIF-conventional
+    /// 1/2/3. Decoders bind components positionally, so that difference is
+    /// invisible to every client; the sampling factors are not.
+    fn jpeg_sampling_factors(bytes: &[u8]) -> Vec<(u8, u8)> {
+        let mut i = 2; // skip SOI
+        while i + 4 <= bytes.len() {
+            assert_eq!(bytes[i], 0xFF, "not a JPEG marker at offset {i}");
+            let marker = bytes[i + 1];
+            let length = (usize::from(bytes[i + 2]) << 8) | usize::from(bytes[i + 3]);
+            // SOF0 (baseline), SOF1 (extended sequential), SOF2 (progressive).
+            if (0xC0..=0xC2).contains(&marker) {
+                let count = usize::from(bytes[i + 9]);
+                return (0..count)
+                    .map(|k| {
+                        let sampling = bytes[i + 11 + 3 * k];
+                        (sampling >> 4, sampling & 0x0F)
+                    })
+                    .collect();
+            }
+            i += 2 + length;
+        }
+        panic!("no SOF marker found");
+    }
+
+    /// The number of symbols in each of a JPEG's Huffman tables (DHT segments),
+    /// in file order.
+    ///
+    /// libjpeg's *standard* tables always have 12/162 symbols per DC/AC table;
+    /// tables derived from the image's own statistics (`optimize_coding = TRUE`)
+    /// are shorter. Jellyfin 10.11.8's trickplay tile, measured on the wire,
+    /// carries 11/93/11/56 — so Skia optimizes, and a Ferrofin tile with the
+    /// standard 12/162/12/162 is twice the size for identical pixels.
+    fn jpeg_huffman_symbol_counts(bytes: &[u8]) -> Vec<usize> {
+        let mut counts = Vec::new();
+        let mut i = 2;
+        while i + 4 <= bytes.len() {
+            assert_eq!(bytes[i], 0xFF, "not a JPEG marker at offset {i}");
+            let marker = bytes[i + 1];
+            let length = (usize::from(bytes[i + 2]) << 8) | usize::from(bytes[i + 3]);
+            if marker == 0xDA {
+                break; // start of scan: no more tables
+            }
+            if marker == 0xC4 {
+                let segment = &bytes[i + 4..i + 2 + length];
+                let mut j = 0;
+                while j + 17 <= segment.len() {
+                    let symbols: usize =
+                        segment[j + 1..j + 17].iter().map(|c| usize::from(*c)).sum();
+                    counts.push(symbols);
+                    j += 17 + symbols;
+                }
+            }
+            i += 2 + length;
+        }
+        counts
+    }
+
+    /// Skia sets libjpeg's `optimize_coding`, so its Huffman tables are derived
+    /// from the image rather than being the standard 12/162-symbol pair. On the
+    /// flat content a trickplay tile is made of this is a 2x difference in bytes
+    /// — and `TrickplayManager` turns bytes straight into the `Bandwidth` a
+    /// client budgets its scrub prefetch from, so it is not a disk-space nicety.
+    #[tokio::test]
+    async fn jpeg_uses_optimized_huffman_tables() {
+        let dir = TempDir::new().expect("tempdir");
+        let input = fixture(&dir, "src.png", 64, 64);
+        let output = out_path(&dir, "out.jpg");
+
+        ImageCrateEncoder::new()
+            .encode_image(
+                &input,
+                Utc::now(),
+                &output,
+                false,
+                None,
+                90,
+                &ImageProcessingOptions {
+                    width: Some(32),
+                    height: Some(32),
+                    ..Default::default()
+                },
+                ImageFormat::Jpg,
+            )
+            .await
+            .expect("encode");
+
+        let counts = jpeg_huffman_symbol_counts(&std::fs::read(&output).expect("read jpeg"));
+        assert!(!counts.is_empty(), "no DHT segment found");
+        assert!(
+            counts.iter().all(|n| *n < 162),
+            "standard (unoptimized) libjpeg tables leaked through: {counts:?}"
+        );
+    }
+
+    /// Skia writes every JPEG with `SkJpegEncoder`'s default `Downsample::k420`
+    /// — at *every* quality, and on all three of Jellyfin's JPEG writes
+    /// (`SkiaEncoder.cs` v10.11.8 lines 628, 670, 778). A 4:4:4 JPEG is ~3x the
+    /// bytes, which `TrickplayManager` turns straight into an inflated
+    /// `TrickplayInfo.Bandwidth`, so the subsampling is user-visible and is
+    /// pinned here.
+    ///
+    /// The high-quality case is the one that regresses silently: `jpeg-encoder`'s
+    /// own default sampling factor flips to 4:4:4 at `quality >= 90`, which is
+    /// exactly the quality trickplay tiles are written at.
+    #[rstest]
+    #[case(80)]
+    #[case(90)]
+    #[case(100)]
+    #[tokio::test]
+    async fn jpeg_is_written_with_420_chroma_subsampling_at_every_quality(#[case] quality: i32) {
+        let dir = TempDir::new().expect("tempdir");
+        let input = fixture(&dir, "src.png", 64, 64);
+        let output = out_path(&dir, "out.jpg");
+        let enc = ImageCrateEncoder::new();
+
+        enc.encode_image(
+            &input,
+            Utc::now(),
+            &output,
+            false,
+            None,
+            quality,
+            &ImageProcessingOptions {
+                width: Some(32),
+                height: Some(32),
+                ..Default::default()
+            },
+            ImageFormat::Jpg,
+        )
+        .await
+        .expect("encode");
+
+        let bytes = std::fs::read(&output).expect("read jpeg");
+        assert_eq!(
+            jpeg_sampling_factors(&bytes),
+            vec![(2, 2), (1, 1), (1, 1)],
+            "quality {quality} must still be 4:2:0"
+        );
     }
 
     #[tokio::test]

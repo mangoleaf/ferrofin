@@ -400,13 +400,28 @@ async fn trickplay_playlist_ok_and_not_found() {
         Arc::new(FakeLyrics),
         Arc::new(FakeSubtitles),
     );
-    let (ok, body) = call(
-        app.clone(),
-        "GET",
-        &format!("/Videos/{ITEM_ID}/Trickplay/320/tiles.m3u8"),
-    )
-    .await;
-    assert_eq!(ok, StatusCode::OK);
+    let response = create_router(app.clone())
+        .oneshot(
+            Request::builder()
+                .uri(format!("/Videos/{ITEM_ID}/Trickplay/320/tiles.m3u8"))
+                .header("X-Emby-Token", "tok")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    // `Content(playlist, mime, Encoding.UTF8)` upstream: the charset rides on the header.
+    assert_eq!(
+        response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("application/vnd.apple.mpegurl; charset=utf-8")
+    );
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
     assert!(String::from_utf8_lossy(&body).contains("#EXTM3U"));
 
     let (missing, _) = call(
@@ -474,4 +489,63 @@ async fn trickplay_tile_serves_file_then_404() {
     )
     .await;
     assert_eq!(missing, StatusCode::NOT_FOUND);
+}
+
+/// The C# serves the tile with `PhysicalFile(path, MediaTypeNames.Image.Jpeg)`
+/// (v10.11.8 `TrickplayController.cs:100`), the overload that leaves
+/// `EnableRangeProcessing` at `false`. ASP.NET only emits `Accept-Ranges` inside
+/// that branch and ignores an inbound `Range`, so the tile must come back whole
+/// with `200` — never `206` — and must advertise no range support. Measured on
+/// Jellyfin 10.11.8 live: no `accept-ranges`, and `Range: bytes=0-99` returns the
+/// full 73 734-byte tile with `200`.
+#[tokio::test]
+async fn trickplay_tile_has_no_range_support() {
+    let mut path = std::env::temp_dir();
+    path.push(format!("ferrofin-tile-{}.jpg", Uuid::new_v4()));
+    let tile: Vec<u8> = (0..512u16)
+        .map(|b| u8::try_from(b % 251).unwrap())
+        .collect();
+    std::fs::write(&path, &tile).expect("write tile");
+
+    let app = state(
+        Arc::new(FakeMediaSegments),
+        Arc::new(CannedTrickplay {
+            tile_path: Some(path.to_string_lossy().into_owned()),
+        }),
+        Arc::new(FakeLyrics),
+        Arc::new(FakeSubtitles),
+    );
+
+    for range in [None, Some("bytes=0-99")] {
+        let mut builder = Request::builder()
+            .uri(format!("/Videos/{ITEM_ID}/Trickplay/320/0.jpg"))
+            .header("X-Emby-Token", "tok");
+        if let Some(r) = range {
+            builder = builder.header(axum::http::header::RANGE, r);
+        }
+        let response = create_router(app.clone())
+            .oneshot(builder.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "range={range:?}");
+        assert_eq!(
+            response.headers().get(axum::http::header::ACCEPT_RANGES),
+            None,
+            "range={range:?}: the no-range PhysicalFile overload advertises none"
+        );
+        assert_eq!(
+            response.headers().get(axum::http::header::CONTENT_RANGE),
+            None,
+            "range={range:?}"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            body.as_ref(),
+            tile.as_slice(),
+            "range={range:?}: whole tile"
+        );
+    }
+    std::fs::remove_file(&path).ok();
 }

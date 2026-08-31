@@ -160,8 +160,9 @@ struct Prefetched {
     /// `ItemFields` system) via one ids-only query per page.
     has_subtitles: std::collections::HashSet<Uuid>,
     /// The page's `Audio` ids carrying a lyric stream — the DTO's `HasLyrics`,
-    /// which C# emits on every `Audio` DTO outside the `ItemFields` system, so
-    /// it must be `false` and not absent when there is none.
+    /// which C# emits on every `Audio` DTO outside the `ItemFields` system
+    /// (v10.11.8 `DtoService.cs:308-311`; `:421` on upstream master), so it
+    /// must be `false` and not absent when there is none.
     has_lyrics: std::collections::HashSet<Uuid>,
     /// The requesting user's content permissions (populated only when the
     /// `CanDelete`/`CanDownload` fields are requested and a user is present),
@@ -430,6 +431,22 @@ fn row_kind(item: &BaseItemEntity) -> BaseItemKind {
 /// `LiveTvChannel` while callers may hand a `TvChannel` row directly.
 fn is_live_tv_channel(kind: BaseItemKind) -> bool {
     matches!(kind, BaseItemKind::LiveTvChannel | BaseItemKind::TvChannel)
+}
+
+/// `BaseItem.LocationType` for a row's stored `Path`.
+///
+/// Port of v10.11.8 `MediaBrowser.Controller/Entities/BaseItem.cs:319-336`
+/// (master `:327-344`, identical) plus `ManagedFileSystem.IsPathFile`
+/// (`:526-535`): no path at all is `Virtual`, a path carrying a URI scheme
+/// other than `file://` is `Remote`, and everything else is `FileSystem`.
+fn location_type_of(path: Option<&str>) -> LocationType {
+    match path.filter(|p| !p.is_empty()) {
+        None => LocationType::Virtual,
+        Some(p) if p.contains("://") && !p.to_ascii_lowercase().starts_with("file://") => {
+            LocationType::Remote
+        }
+        Some(_) => LocationType::FileSystem,
+    }
 }
 
 /// Whether this kind is a Live TV programme (C# `item is LiveTvProgram`).
@@ -1189,10 +1206,19 @@ impl FerrofinDtoService {
                     && kinds::supports_user_data_from_children(kind)
                     && let Some(c) = prefetched.played_counts.get(&item_id).copied()
                 {
-                    // `RecursiveItemCount` = `GetRecursiveChildCount(user)`
-                    // (Folder.cs:701-714 — recursive, non-folder, non-virtual,
-                    // total record count): the same query as the unplayed one
-                    // minus `IsPlayed = false`, which is exactly `total`.
+                    // `Folder.FillUserDataDtoValues` (Folder.cs:1798) runs two
+                    // INDEPENDENT gates behind `SupportsUserDataFromChildren`:
+                    // `RecursiveItemCount` on the FIELD alone (:1805) —
+                    // `GetRecursiveChildCount(user)` (Folder.cs:701-714:
+                    // recursive, non-folder, non-virtual, total record count,
+                    // i.e. the unplayed query minus `IsPlayed = false`, which is
+                    // exactly `total`) — and the unplayed count on
+                    // `SupportsPlayedStatus` (:1810). They are not the same set:
+                    // `MusicArtist.SupportsPlayedStatus` is false
+                    // (MusicArtist.cs:47), which is why Jellyfin's artist body
+                    // carries `RecursiveItemCount` and no `UnplayedItemCount`.
+                    // Both read the same recursive non-folder/non-virtual count
+                    // the prefetch already ran, so this costs no extra query.
                     if options.contains_field(ItemFields::RecursiveItemCount) {
                         dto.recursive_item_count = Some(c.total);
                     }
@@ -1202,10 +1228,12 @@ impl FerrofinDtoService {
                             .user_data
                             .get_or_insert_with(|| empty_user_data_dto(item_id));
                         ud.unplayed_item_count = Some(unplayed);
-                        // `if (itemDto?.RecursiveItemCount > 0)` — the DTO
-                        // field, so a caller that did not ask for
-                        // `RecursiveItemCount` takes the else branch, exactly
-                        // as upstream does.
+                        // `if (itemDto?.RecursiveItemCount > 0)`
+                        // (Folder.cs:1828) — the folder's own played state is
+                        // derived from its children off the DTO FIELD, so a
+                        // caller that did not ask for `RecursiveItemCount`
+                        // degrades to the `unplayed == 0` arm, exactly as
+                        // upstream does.
                         if let Some(total) = dto.recursive_item_count.filter(|t| *t > 0) {
                             let pct = 100.0 - (f64::from(unplayed) / f64::from(total)) * 100.0;
                             ud.played_percentage = Some(pct);
@@ -1415,6 +1443,14 @@ impl FerrofinDtoService {
             dto.date_last_media_added = item.date_last_media_added;
         }
 
+        // `AttachUserSpecificInfo` (`DtoService.cs:594`), inside its
+        // `if (item.IsFolder)`: the cumulative ticks ARE the folder's own
+        // `RunTimeTicks` column — the sum is computed once at scan time
+        // (`MetadataService.UpdateCumulativeRunTimeTicks`), not per request.
+        if options.contains_field(ItemFields::CumulativeRunTimeTicks) && item.is_folder {
+            dto.cumulative_run_time_ticks = item.run_time_ticks;
+        }
+
         if options.contains_field(ItemFields::Etag) {
             dto.etag = Some(compute_etag(item.date_last_saved));
         }
@@ -1544,11 +1580,20 @@ impl FerrofinDtoService {
         } else if is_live_tv_channel(kind) {
             dto.location_type = Some(LocationType::Remote);
         } else {
-            dto.location_type = Some(if item.is_virtual_item {
-                LocationType::Virtual
-            } else {
-                LocationType::FileSystem
-            });
+            // Port of `BaseItem.LocationType` (v10.11.8 BaseItem.cs:319-336,
+            // master :327-344 — identical): it is derived from the **Path**,
+            // not from `IsVirtualItem`. An empty path is `Virtual`; a path
+            // carrying a scheme other than `file://` is `Remote`
+            // (`ManagedFileSystem.IsPathFile`, :526-535); anything else is
+            // `FileSystem`. Keying it on `IsVirtualItem` reported `FileSystem`
+            // for every pathless row — including the default-constructed
+            // by-name item `GenresController.GetGenre` answers a slug miss
+            // with, where Jellyfin says `Virtual`.
+            //
+            // The `SourceType == SourceType.Channel → Remote` arm is not
+            // reachable here: `SourceType` is not a `BaseItems` column, and a
+            // channel-sourced item is served by the Live TV arms above.
+            dto.location_type = Some(location_type_of(item.path.as_deref()));
         }
 
         dto.audio = item.audio.and_then(program_audio_from_disc);
@@ -2906,6 +2951,32 @@ impl FerrofinDtoService {
 
 #[cfg(test)]
 mod tests {
+    /// `BaseItem.LocationType` reads the PATH, not `IsVirtualItem`.
+    ///
+    /// Keying it on `IsVirtualItem` said `FileSystem` for every pathless row —
+    /// including the default-constructed `Genre` upstream answers a slug miss
+    /// with, where a live 10.11.8 returns `"LocationType": "Virtual"`.
+    #[test]
+    fn location_type_follows_the_path_the_way_base_item_does() {
+        use super::location_type_of;
+        use ferrofin_model::entities::LocationType;
+        assert_eq!(location_type_of(None), LocationType::Virtual);
+        assert_eq!(location_type_of(Some("")), LocationType::Virtual);
+        assert_eq!(
+            location_type_of(Some("/media/movies/A.mkv")),
+            LocationType::FileSystem
+        );
+        assert_eq!(
+            location_type_of(Some("file:///media/movies/A.mkv")),
+            LocationType::FileSystem,
+            "`file://` is still a file (ManagedFileSystem.IsPathFile)"
+        );
+        assert_eq!(
+            location_type_of(Some("http://tuner.local/stream.ts")),
+            LocationType::Remote
+        );
+    }
+
     use super::*;
 
     use chrono::{DateTime, TimeZone as _, Utc};
@@ -3398,6 +3469,107 @@ mod tests {
         assert_eq!(narrow_dto.series_studio, None);
     }
 
+    /// `Folder.FillUserDataDtoValues` (Folder.cs:1798) runs RecursiveItemCount
+    /// and UnplayedItemCount behind the SAME `SupportsUserDataFromChildren`
+    /// gate but on DIFFERENT inner conditions — the field for the first, and
+    /// `SupportsPlayedStatus` for the second. `MusicArtist.SupportsPlayedStatus`
+    /// is false (MusicArtist.cs:47), which is why a live 10.11.8 artist body
+    /// carries `RecursiveItemCount: 3` and no `UnplayedItemCount` at all.
+    #[tokio::test]
+    async fn folder_dto_carries_recursive_item_count_independently_of_played_status() {
+        let db = test_db().await;
+        let season_id = Uuid::new_v4();
+        seed_folder_item(&db, season_id, BaseItemKind::Season, "Season 1", None).await;
+        let artist_id = Uuid::new_v4();
+        seed_folder_item(
+            &db,
+            artist_id,
+            BaseItemKind::MusicArtist,
+            "OnDisk",
+            Some(season_id),
+        )
+        .await;
+        let byname_id = Uuid::new_v4();
+        seed_folder_item(&db, byname_id, BaseItemKind::MusicArtist, "ByName", None).await;
+        let leaf_id = Uuid::new_v4();
+        seed_named_item(&db, leaf_id, BaseItemKind::Movie, "A Movie").await;
+
+        let user = seed_user(&db, Uuid::new_v4()).await;
+        let season = fetch_item(&db, season_id).await;
+        let artist = fetch_item(&db, artist_id).await;
+        let byname = fetch_item(&db, byname_id).await;
+        let leaf = fetch_item(&db, leaf_id).await;
+        let svc = service(db);
+        let options = DtoOptions::default();
+
+        // FakeCounts reports 1 played of 4 leaf descendants.
+        let season_dto = svc
+            .get_base_item_dto(&season, &options, Some(&user), None)
+            .await
+            .unwrap();
+        assert_eq!(season_dto.recursive_item_count, Some(4));
+        let ud = season_dto.user_data.as_ref().unwrap();
+        assert_eq!(ud.unplayed_item_count, Some(3));
+        // Folder.cs:1828 — 100 - (3/4 × 100).
+        assert!((ud.played_percentage.unwrap() - 25.0).abs() < 1e-9);
+        assert!(!ud.played);
+
+        // The artist shape: the count, and NO unplayed count.
+        let artist_dto = svc
+            .get_base_item_dto(&artist, &options, Some(&user), None)
+            .await
+            .unwrap();
+        assert_eq!(artist_dto.recursive_item_count, Some(4));
+        assert_eq!(
+            artist_dto.user_data.as_ref().unwrap().unplayed_item_count,
+            None
+        );
+
+        // An accessed-by-name artist is not a runtime folder, and a leaf never
+        // is — `SupportsUserDataFromChildren` returns early for both.
+        for item in [&byname, &leaf] {
+            let dto = svc
+                .get_base_item_dto(item, &options, Some(&user), None)
+                .await
+                .unwrap();
+            assert_eq!(dto.recursive_item_count, None);
+        }
+
+        // The field is opt-in: without `ItemFields::RecursiveItemCount` the
+        // count is absent, and `Played` falls back to the `unplayed == 0` arm.
+        let mut narrow = DtoOptions::default();
+        narrow
+            .fields
+            .retain(|f| *f != ItemFields::RecursiveItemCount);
+        let narrow_dto = svc
+            .get_base_item_dto(&season, &narrow, Some(&user), None)
+            .await
+            .unwrap();
+        assert_eq!(narrow_dto.recursive_item_count, None);
+        let narrow_ud = narrow_dto.user_data.as_ref().unwrap();
+        assert_eq!(narrow_ud.unplayed_item_count, Some(3));
+        assert_eq!(narrow_ud.played_percentage, None);
+        assert!(!narrow_ud.played);
+
+        // The batch (prefetched) path agrees with the single-item path.
+        let batch = svc
+            .get_base_item_dtos(
+                &[season.clone(), artist.clone()],
+                &options,
+                Some(&user),
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(batch[0].recursive_item_count, Some(4));
+        assert_eq!(batch[1].recursive_item_count, Some(4));
+        assert_eq!(
+            batch[1].user_data.as_ref().unwrap().unplayed_item_count,
+            None
+        );
+    }
+
     #[tokio::test]
     #[allow(clippy::too_many_lines)] // a flat sequence of per-kind assertions
     async fn folder_user_data_carries_unplayed_item_count() {
@@ -3793,7 +3965,10 @@ mod tests {
     struct FakeSources {
         /// Ids whose canned stream list carries no subtitle stream.
         without_subtitles: std::collections::HashSet<Uuid>,
-        /// Ids whose canned stream list carries a lyric stream.
+        /// Ids whose canned stream list carries a lyric stream. The ids-only
+        /// `get_item_ids_with_lyrics` filters on this set, like the real
+        /// repository, so the lean (nothing-prefetched) path can be asserted
+        /// in BOTH directions instead of only the positive one.
         with_lyrics: std::collections::HashSet<Uuid>,
     }
 
@@ -4601,6 +4776,122 @@ mod tests {
         assert_eq!(lean_dtos[0].has_lyrics, Some(true));
         assert_eq!(lean_dtos[1].has_lyrics, Some(false));
         assert_eq!(lean_dtos[2].has_lyrics, None);
+    }
+
+    /// `DtoService.cs:594`, inside `AttachUserSpecificInfo`'s `if (item.IsFolder)`:
+    /// `CumulativeRunTimeTicks` IS the folder's own `RunTimeTicks` column (the
+    /// sum `MetadataService.UpdateCumulativeRunTimeTicks` wrote at scan time),
+    /// field-gated, and only for folders.
+    #[tokio::test]
+    async fn a_folder_dto_emits_cumulative_run_time_ticks_from_its_own_column() {
+        let db = test_db().await;
+        let album = Uuid::from_u128(0x5D01);
+        let track = Uuid::from_u128(0x5D02);
+        seed_named_item(&db, album, BaseItemKind::MusicAlbum, "Album").await;
+        seed_named_item(&db, track, BaseItemKind::Audio, "Track").await;
+        let svc = service_with_sources(db.clone(), FakeSources::default());
+        let mut album_row = fetch_item(&db, album).await;
+        album_row.is_folder = true;
+        album_row.run_time_ticks = Some(60_000_000);
+        let mut track_row = fetch_item(&db, track).await;
+        track_row.run_time_ticks = Some(20_000_000);
+        let items = vec![album_row, track_row];
+
+        let dtos = svc
+            .get_base_item_dtos(&items, &DtoOptions::default(), None, None, true)
+            .await
+            .unwrap();
+        assert_eq!(dtos[0].cumulative_run_time_ticks, Some(60_000_000));
+        assert_eq!(dtos[0].run_time_ticks, Some(60_000_000), "and RunTimeTicks");
+        assert_eq!(
+            dtos[1].cumulative_run_time_ticks, None,
+            "not a folder, so no cumulative field"
+        );
+
+        // Field-gated, unlike `RunTimeTicks`.
+        let lean = DtoOptions::with_all_fields(false);
+        let dtos = svc
+            .get_base_item_dtos(&items, &lean, None, None, true)
+            .await
+            .unwrap();
+        assert_eq!(dtos[0].cumulative_run_time_ticks, None);
+        assert_eq!(dtos[0].run_time_ticks, Some(60_000_000));
+    }
+
+    /// C# `DtoService.cs:421`: `if (item is Audio audio) { dto.HasLyrics =
+    /// audio.GetMediaStreams().Any(s => s.Type == MediaStreamType.Lyric); }` —
+    /// assigned for EVERY Audio DTO, true or false, outside the `ItemFields`
+    /// system. Ferrofin never assigned it at all, so `HasLyrics` was missing
+    /// from every audio response Jellyfin sends it on.
+    #[tokio::test]
+    async fn audio_dto_emits_has_lyrics_from_the_prefetched_streams() {
+        let db = test_db().await;
+        let sung = Uuid::from_u128(0x5C01);
+        let bare = Uuid::from_u128(0x5C02);
+        let movie = Uuid::from_u128(0x5C03);
+        seed_named_item(&db, sung, BaseItemKind::Audio, "Sung").await;
+        seed_named_item(&db, bare, BaseItemKind::Audio, "Bare").await;
+        seed_named_item(&db, movie, BaseItemKind::Movie, "A Movie").await;
+        let items = vec![
+            fetch_item(&db, sung).await,
+            fetch_item(&db, bare).await,
+            fetch_item(&db, movie).await,
+        ];
+        let svc = service_with_sources(
+            db,
+            FakeSources {
+                with_lyrics: std::iter::once(sung).collect(),
+                ..FakeSources::default()
+            },
+        );
+
+        let dtos = svc
+            .get_base_item_dtos(&items, &DtoOptions::default(), None, None, true)
+            .await
+            .unwrap();
+
+        assert_eq!(dtos[0].has_lyrics, Some(true), "lyric stream present");
+        // False, not absent: Jellyfin sends `"HasLyrics": false` on a plain track.
+        assert_eq!(dtos[1].has_lyrics, Some(false));
+        assert_eq!(dtos[2].has_lyrics, None, "not an Audio item");
+    }
+
+    /// The lean-DTO path: with no stream field requested nothing is prefetched,
+    /// so the ids-only lyric query is the answer — and `HasLyrics` must still be
+    /// emitted, because C# does not gate it on `ItemFields`.
+    ///
+    /// Asserted in BOTH directions on purpose. The fake filters like the real
+    /// repository, so a projection that (wrongly) read the prefetched stream map
+    /// would find it empty here and answer `false` for the sung track — which is
+    /// exactly what the positive assertion catches.
+    #[tokio::test]
+    async fn has_lyrics_falls_back_to_the_query_when_streams_are_not_prefetched() {
+        let db = test_db().await;
+        let sung = Uuid::from_u128(0x5C04);
+        let bare = Uuid::from_u128(0x5C05);
+        seed_named_item(&db, sung, BaseItemKind::Audio, "Sung").await;
+        seed_named_item(&db, bare, BaseItemKind::Audio, "Bare").await;
+        let items = vec![fetch_item(&db, sung).await, fetch_item(&db, bare).await];
+        let svc = service_with_sources(
+            db,
+            FakeSources {
+                with_lyrics: std::iter::once(sung).collect(),
+                ..FakeSources::default()
+            },
+        );
+
+        let lean = DtoOptions::with_all_fields(false);
+        let dtos = svc
+            .get_base_item_dtos(&items, &lean, None, None, true)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            dtos[0].has_lyrics,
+            Some(true),
+            "the ids-only probe answered"
+        );
+        assert_eq!(dtos[1].has_lyrics, Some(false), "false, not absent");
     }
 
     /// With no stream-bearing field requested nothing is prefetched to read, so

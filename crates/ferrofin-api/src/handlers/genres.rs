@@ -6,10 +6,13 @@
 //! - `GET /Genres/{genreName}` — a single genre by name.
 //!
 //! Jellyfin routes the list to `GetMusicGenres` when the localized parent is a
-//! music collection folder; resolving a parent's collection type needs the
-//! un-ported `GetParentItem`, so the base (non-music) `get_genres` path is used
-//! here and the music-collection branch is noted deferred. The dedicated
-//! `MusicGenresController` still serves music genres directly.
+//! music collection folder; the base (non-music) `get_genres` path is used here
+//! and the dedicated `MusicGenresController` serves music genres directly.
+//! Since both now run the SAME query (only the by-name row kind returned
+//! differs — `BaseItemRepository.ByName.cs:44-52`), the parent-collection
+//! branch changes which of the two row kinds a music library's Genres tab
+//! lists; it is an open work item on `GET /Genres`, tracked in
+//! `suite/parity/classifications.json`, not something this file silently drops.
 
 use axum::extract::{Path, Query, State};
 use axum::routing::get;
@@ -21,7 +24,9 @@ use ferrofin_traits::options::DtoOptions;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
-use crate::handlers::by_name::{ByNameItemQuery, ByNameListQuery, project_query_result};
+use crate::handlers::by_name::{
+    ByNameItemQuery, ByNameListQuery, project_query_result, resolve_by_name_or_slug,
+};
 use crate::handlers::items::resolve_user;
 use crate::state::AppState;
 
@@ -62,17 +67,22 @@ async fn get_genres(
 
 /// `GET /Genres/{genreName}` — a single genre by name.
 ///
-/// Port of `GenresController.GetGenre`. Jellyfin returns an empty `Genre` when
-/// none matches; here a missing genre is a `404` so clients get a clear signal
-/// rather than a blank body.
+/// Port of `GenresController.GetGenre` (v10.11.8 and master carry the same
+/// body; master's only delta on the file is dropping `.AddClientFields(User)`,
+/// which Ferrofin follows).
+///
+/// Three behaviours, not one: a plain name materializes through
+/// `CreateItemByName`, a name containing `BaseItem.SlugChar` is looked up
+/// through the `&` / `/` / `?` substitutions WITHOUT creating anything, and a
+/// miss returns the default-constructed `Genre` — never a 404. See
+/// [`resolve_by_name_or_slug`].
 #[utoipa::path(
     get,
     path = "/Genres/{genreName}",
     params(("genreName" = String, Path, description = "The genre name")),
-    responses(
-        (status = 200, description = "Genre returned (BaseItemDto)"),
-        (status = 404, description = "Genre not found")
-    ),
+    // No 404 arm: upstream's `item ??= new Genre()` makes this route
+    // unconditionally a 200.
+    responses((status = 200, description = "Genre returned (BaseItemDto)")),
     tag = "ferrofin"
 )]
 async fn get_genre(
@@ -82,11 +92,12 @@ async fn get_genre(
     Query(query): Query<ByNameItemQuery>,
 ) -> Result<Json<BaseItemDto>, ApiError> {
     let user = resolve_user(&state, &auth, query.user_id).await?;
-    let item = state
-        .library
-        .get_named_item(BaseItemKind::Genre, &genre_name)
-        .await?
-        .ok_or_else(|| ApiError::NotFound(format!("genre {genre_name}")))?;
+    // `item ??= new Genre()`: upstream serializes a default-constructed
+    // entity rather than 404ing, so this route has no not-found arm at all.
+    let item = match resolve_by_name_or_slug(&state, BaseItemKind::Genre, &genre_name).await? {
+        Some(item) => item,
+        None => state.library.empty_by_name_item(BaseItemKind::Genre),
+    };
     let options = DtoOptions::default();
     let dto = state
         .dto

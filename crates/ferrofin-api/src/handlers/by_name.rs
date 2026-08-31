@@ -287,6 +287,61 @@ pub(crate) async fn project_item_rows(
     Ok(QueryResult::new(start_index, total, dtos))
 }
 
+/// `BaseItem.SlugChar` — `'-'`,
+/// `MediaBrowser.Controller/Entities/BaseItem.cs:98` on v10.11.8, `:100` on
+/// master (the declaration is byte-identical; only its line moved).
+const SLUG_CHAR: char = '-';
+
+/// Resolves a by-name route's `{name}` the way `GenresController.GetGenre` and
+/// `MusicGenresController.GetMusicGenre` do — the only two controllers in
+/// either tree that carry the slug branch (`git grep -l GetItemFromSlugName`).
+///
+/// A name WITHOUT the slug char goes through `LibraryManager.GetGenre`, which
+/// is `CreateItemByName<T>` and therefore materializes the row.
+///
+/// A name WITH it is a slug: upstream `GetItemFromSlugName<T>` runs three plain
+/// `GetItemList` lookups substituting `'-'` for `'&'`, then `'/'`, then `'?'`,
+/// and creates NOTHING. Creating here would mint a bogus genre for every
+/// hyphenated mis-spelling, which is exactly what Ferrofin used to do.
+///
+/// The three substitutions are the WHOLE list, deliberately. Upstream's
+/// consequence — that `/Genres/Sci-Fi` answers with the empty fallback even
+/// when a genre named exactly `Sci-Fi` exists, because a hyphen is only ever
+/// read as a slug — is real, and Ferrofin reproduces it. An earlier cut of this
+/// port added a fourth, non-creating lookup on the LITERAL name to reach that
+/// row. It was removed: a fourth candidate matches NEITHER tree (checked on
+/// both: `GetItemFromSlugName` is byte-identical on v10.11.8 and master and
+/// stops after `'?'`), and "Ferrofin matches neither tree" is the definition of
+/// the bug, not of a capability worth keeping — nothing shipped before this
+/// batch reached that row either, since the pre-existing behaviour here was the
+/// create-on-GET defect this batch removed. The upstream quirk itself is
+/// recorded, with the evidence, in `suite/parity/classifications.json`.
+///
+/// Returns [`None`] when nothing matches; the caller substitutes
+/// [`LibraryManager::empty_by_name_item`], which is upstream's `item ??= new
+/// Genre()`.
+///
+/// [`LibraryManager::empty_by_name_item`]: ferrofin_traits::library::LibraryManager::empty_by_name_item
+pub(crate) async fn resolve_by_name_or_slug(
+    state: &AppState,
+    kind: ferrofin_model::data::BaseItemKind,
+    name: &str,
+) -> Result<Option<ferrofin_db::entities::base_items::BaseItemEntity>, ApiError> {
+    if !name.contains(SLUG_CHAR) {
+        return Ok(state.library.get_named_item(kind, name).await?);
+    }
+    for candidate in [
+        name.replace(SLUG_CHAR, "&"),
+        name.replace(SLUG_CHAR, "/"),
+        name.replace(SLUG_CHAR, "?"),
+    ] {
+        if let Some(item) = state.library.find_named_item(kind, &candidate).await? {
+            return Ok(Some(item));
+        }
+    }
+    Ok(None)
+}
+
 /// Projects a page of [`ItemWithCounts`] aggregates into a
 /// [`QueryResult<BaseItemDto>`], mirroring `RequestHelpers.CreateQueryResult`.
 ///

@@ -44,6 +44,8 @@ echo ">> Layer-3 binary/asset differential"
 python3 ../parity/assets.py
 echo ">> Layer-3 stream-signature differential (direct / HLS / subtitles / trickplay)"
 python3 ../parity/streams.py
+echo ">> Layer-2 push differential (server->client WebSocket messages, both servers)"
+python3 ../parity/push.py
 echo ">> terminal phase: restore / restart / shutdown (ends the differential)"
 python3 ../parity/terminal.py
 # gen-ledger.py VALIDATES BEFORE IT WRITES on every run (not only under --check):

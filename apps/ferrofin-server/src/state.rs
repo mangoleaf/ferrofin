@@ -389,6 +389,20 @@ pub async fn build_app_state(
             tracing::warn!(%err, "person identity unification failed; person favorites may not round-trip");
         }
     }
+    // One-shot: rewrite `Person` rows missing their metadata `Path` /
+    // `PresentationUniqueKey`, or carrying the generic lower-cased sort key
+    // instead of the verbatim name Jellyfin sorts people by. C# recomputes all
+    // three on every save; Ferrofin's person inserts are `INSERT OR IGNORE`, so
+    // without this a row written by an older build stays wrong forever.
+    match people_repository_impl.repair_person_items().await {
+        Ok(0) => {}
+        Ok(repaired) => {
+            tracing::info!(repaired, "repaired person metadata paths and sort keys");
+        }
+        Err(err) => {
+            tracing::warn!(%err, "person metadata repair failed; person sort order and Path may diverge until the next scan");
+        }
+    }
     let people_repository: Arc<dyn ferrofin_traits::persistence::PeopleRepository> =
         people_repository_impl;
     let media_stream_repository: Arc<dyn ferrofin_traits::persistence::MediaStreamRepository> =
@@ -634,8 +648,6 @@ pub async fn build_app_state(
         Arc::new(FerrofinApiKeyManager::new(db.clone()));
     let display_preferences: Arc<dyn ferrofin_traits::configuration::DisplayPreferencesManager> =
         Arc::new(FerrofinDisplayPreferencesManager::new(db.clone()));
-    let music: Arc<dyn ferrofin_traits::library::MusicManager> =
-        Arc::new(FerrofinMusicManager::new(Arc::clone(&item_repository)));
     let search: Arc<dyn ferrofin_traits::library::SearchManager> = Arc::new(
         FerrofinSearchManager::new(Arc::clone(&item_repository), Arc::clone(&users)),
     );
@@ -740,6 +752,16 @@ pub async fn build_app_state(
             .with_fanart(Arc::clone(&fanart_client))
             .with_audiodb(Arc::clone(&audiodb_client))
             .with_omdb(Arc::clone(&omdb_client))
+            // The SERVER-WIDE per-item-type MetadataOptions. Identify's
+            // provider ordering falls back to this array's
+            // `MetadataFetcherOrder` for a kind whose library saved no
+            // `TypeOptions` entry (C# `ProviderManager.cs:445`); without it an
+            // admin's server-wide fetcher order is silently ignored. Read live
+            // for the same reason the language defaults are.
+            .with_metadata_options({
+                let config_mgr = Arc::clone(&config_mgr);
+                move || config_mgr.snapshot_shared().metadata_options.clone()
+            })
             // Enables the kind-filtered built-in external-id descriptors the
             // Identify dialog renders as id input fields.
             .with_item_types(item_type_lookup.as_ref())
@@ -761,7 +783,11 @@ pub async fn build_app_state(
                 })
             })
             // `SearchInfo.MetadataCountryCode`'s server-config fallback on the
-            // remote-search ("Identify") path.
+            // remote-search ("Identify") path. Together with
+            // `with_metadata_language` above this is the whole of C#
+            // `GetRemoteSearchResults`' two `IsNullOrWhiteSpace` defaults
+            // (`ProviderManager.cs:836-844`): an Identify search that sends no
+            // language/country gets the server's configured pair, read live.
             .with_metadata_country({
                 let config_mgr = Arc::clone(&config_mgr);
                 Arc::new(move || config_mgr.snapshot_shared().metadata_country_code.clone())
@@ -833,6 +859,28 @@ pub async fn build_app_state(
         id_derivation.clone(),
         paths.year_path(),
     );
+    // The rest of the `CreateItemByName<T>` family (`GetGenre`/`GetMusicGenre`/
+    // `GetStudio`/`GetArtist`): a by-name lookup upstream MATERIALIZES the row
+    // at `{metadata}/<Kind>/{name}` rather than 404-ing. Shared by the scan's
+    // post-pass (which backfills the `Path` on rows the scan itself wrote) and
+    // the library manager's on-demand `/MusicGenres/{name}` resolution.
+    let by_name_store = ferrofin_core::by_name_store::ByNameStore::new(
+        Arc::clone(&item_persistence_service),
+        paths.genre_path(),
+        paths.music_genre_path(),
+        paths.studio_path(),
+        paths.artists_path(),
+    );
+    // The instant mix resolves its seed genre NAMES through the same
+    // provisioner: C# `GetInstantMixFromGenres` calls
+    // `_libraryManager.GetMusicGenre(i).Id`, which creates the row. Without it
+    // an unresolved name empties `GenreIds`, and an empty `GenreIds` is no
+    // filter — the mix would answer with the whole audio library.
+    let music: Arc<dyn ferrofin_traits::library::MusicManager> = Arc::new(
+        FerrofinMusicManager::new(Arc::clone(&item_repository))
+            .with_users(Arc::clone(&users))
+            .with_by_name_store(by_name_store.clone()),
+    );
     let mut scanner = ferrofin_core::LibraryScanner::new(
         Arc::clone(&virtual_folders),
         Arc::clone(&file_system),
@@ -842,6 +890,7 @@ pub async fn build_app_state(
     // Materialize a `Year` item per distinct ProductionYear at the end of
     // every scan (needs the item repository wired via `with_music` below).
     .with_years(year_store.clone())
+    .with_by_name_store(by_name_store.clone())
     // OfficialRating → numeric parental score on each scanned row (the
     // Parental Rating sort and max-rating filters read the numeric column).
     .with_localization(Arc::new(LocalizationManager::new(
@@ -925,7 +974,8 @@ pub async fn build_app_state(
         // `Items/Root` creates the root on first use; `/Years/{year}` creates
         // the year on first use — both as Jellyfin does.
         .with_user_root(user_root_store)
-        .with_years(year_store),
+        .with_years(year_store)
+        .with_by_name_store(by_name_store),
     );
     let library: Arc<dyn ferrofin_traits::library::LibraryManager> = library_impl.clone();
     // The library monitor drives refreshes from two change sources: the

@@ -582,6 +582,16 @@ def build_curated():
     streams, st_stamp = load_layer2("suite/parity/stream-results.json")
     for k, v in streams.items():
         curated[k] = {**v, "last_verified": st_stamp}
+    # The Layer-2 PUSH differential (parity/push.py): ops whose observable effect is a
+    # server->client WebSocket message, captured on BOTH servers and diffed message-set
+    # and field-for-field. Most rows stamp `verification_method: "push-diff"` — the sixth
+    # member of the closed set, added because no HTTP response body carries the claim and
+    # borrowing `body-diff` for it would have inflated the headline. Spread like every
+    # other layer so the stamp survives (see the sweep comment above), and applied before
+    # the accepted-classification overlay so a curated divergence can still win the text.
+    push, p_stamp = load_layer2("suite/parity/push-results.json")
+    for k, v in push.items():
+        curated[k] = {**v, "last_verified": p_stamp}
     # Curated accepted-divergence classifications win the classification field over the auto
     # "flagged: verify" text (human decision > detector). deep_verified stays as the live layer
     # reported it (these diverge by design and are not deep-verified); a row not otherwise present
@@ -739,12 +749,28 @@ def check(rows, curated):
                      and not v["classification"].startswith(("flagged", "ok"))]
     assert not uncategorised, (f"{len(uncategorised)} curated row(s) carry a classification "
                                f"with no category: {uncategorised[:10]}")
+    # A pending-ratification row that has ALSO been marked open work is
+    # incoherent: one says Ferrofin is right, the other says Ferrofin owes a
+    # port. `classification.bucket` deliberately does NOT pick one — whoever
+    # wrote it must.
+    contradictory = [r["operation"] for r in rows
+                     if classification.PENDING_MARKER in r["classification"]
+                     and in_bucket(r, classification.OPEN_WORK)]
+    assert not contradictory, (f"row(s) claim both 'owner call pending' and 'open work': "
+                               f"{contradictory}")
+    # …and the third state must never render as a closed question.
+    assert not [r for r in rows
+                if in_bucket(r, classification.PENDING)
+                and in_bucket(r, classification.SETTLED)]
     by = Counter(r["verification_method"] for r in rows if r["deep_verified"] is True)
     other = ", ".join(f"{n} {m}" for m, n in sorted(by.items(), key=lambda kv: kv[0] or "")
                       if m != verification.HEADLINE)
+    pending = sum(1 for r in rows
+                  if in_bucket(r, classification.PENDING) and r["deep_verified"] is not True)
     print(f"ok: {len(rows)} ops, all {len(curated)} curated rows matched, "
           f"{by[verification.HEADLINE]} deep-verified (the headline), "
-          f"verified another way: {other or 'none'}")
+          f"verified another way: {other or 'none'}, "
+          f"{pending} awaiting owner ratification")
 
 
 def main():

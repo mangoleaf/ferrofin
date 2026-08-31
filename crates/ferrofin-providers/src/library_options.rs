@@ -46,6 +46,29 @@ fn type_entry<'a>(
 /// `POST /Items/{id}/Refresh` through `ProviderManager.CanRefreshMetadata`,
 /// which calls it. Anything in Ferrofin that fetches remote metadata must ask
 /// here too, or clearing the checkboxes stops meaning anything.
+///
+/// TWO ARMS OF `IsMetadataFetcherEnabled` ARE NOT PORTED HERE, named rather
+/// than left silent. Neither is reachable from this signature, which takes a
+/// kind and not the item:
+///
+/// 1. The NO-ENTRY arm falls back to the SERVER-WIDE options
+///    (`BaseItemManager.cs:45-46`): `itemConfig is null ||
+///    !itemConfig.DisabledMetadataFetchers.Contains(name)`. Ferrofin answers a
+///    flat `true`, so a server-wide *disabled* fetcher is honoured only where
+///    a library ticked its own list. The reader now exists —
+///    [`global_metadata_options`] plus `LocalProviderManager`'s
+///    `with_metadata_options` — but the scan reaches this function through
+///    `library_scan::FetcherPolicy`, which is built from `VirtualFolderInfo`
+///    alone and has no configuration handle. Port path: give `FetcherPolicy` a
+///    `MetadataOptions` slice from the scan's config manager and thread it
+///    through both call sites together, so the scan and the refresh keep
+///    answering with ONE implementation; it is a scan-path change and wants
+///    its own measurement.
+/// 2. The two `// Hack alert.` arms at `BaseItemManager.cs:29-37`: a `Channel`
+///    item is always enabled, and an item whose `SourceType` is `Channel` is
+///    enabled iff `!EnableMediaSourceDisplay`. The first is expressible from
+///    `kind` alone; the second needs the item row, so both belong with the
+///    same threading change rather than half of each.
 #[must_use]
 pub fn metadata_fetcher_enabled(
     options: Option<&ferrofin_model::configuration::LibraryOptions>,
@@ -80,6 +103,43 @@ pub fn metadata_fetcher_rank(
             .iter()
             .position(|f| f.eq_ignore_ascii_case(name))
             .unwrap_or(usize::MAX)
+    })
+}
+
+/// The library's configured `MetadataFetcherOrder` for item type `kind`, or
+/// `None` when the library saved no `TypeOptions` entry for the kind.
+///
+/// The `None` is load-bearing and is why this is not a bare `Vec`:
+/// `GetMetadataProvidersInternal` reads
+/// `typeOptions?.MetadataFetcherOrder ?? globalMetadataOptions.MetadataFetcherOrder`
+/// (`ProviderManager.cs:445`), and `??` fires on a MISSING entry only. A saved
+/// entry whose order list is empty is an answer — "this library ranks nothing"
+/// — and must NOT fall through to the server-wide order, or clearing the list
+/// in the UI would silently re-inherit the global one.
+#[must_use]
+pub fn metadata_fetcher_order(
+    options: Option<&ferrofin_model::configuration::LibraryOptions>,
+    kind: &str,
+) -> Option<Vec<String>> {
+    type_entry(options, kind).map(|t| t.metadata_fetcher_order.clone())
+}
+
+/// The server-wide [`MetadataOptions`] entry for item type `kind`.
+///
+/// Port of `MetadataConfigurationExtensions.GetMetadataOptionsForType`
+/// (v10.11.8 `MediaBrowser.Controller/Library/MetadataConfigurationExtensions.cs:21`):
+/// `Array.Find(config.MetadataOptions, i => i.ItemType == type)`, ordinal
+/// case-insensitive, `null` when the server configuration names no entry for
+/// the type.
+#[must_use]
+pub fn global_metadata_options<'a>(
+    all: &'a [ferrofin_model::configuration::MetadataOptions],
+    kind: &str,
+) -> Option<&'a ferrofin_model::configuration::MetadataOptions> {
+    all.iter().find(|o| {
+        o.item_type
+            .as_deref()
+            .is_some_and(|t| t.eq_ignore_ascii_case(kind))
     })
 }
 

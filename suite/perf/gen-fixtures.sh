@@ -68,16 +68,34 @@ link() { cp -l "$1" "$2" 2>/dev/null || cp "$1" "$2"; }
 GENRES=(Action Drama Comedy Thriller SciFi)
 STUDIOS=("Parity Pictures" "Ferrofin Studios")
 ACTORS=("Alice Parity" "Bob Parity" "Carol Ferrofin")
+# `R&B` is deliberately an ampersand name: `BaseItem.SlugChar` is '-', and
+# `GenresController.GetGenre` resolves `/Genres/R-B` by substituting it back
+# (`GetItemFromSlugName`, identical on v10.11.8 and master). Without a genre
+# whose real name carries `&`, the slug branch of that route is unprobeable.
+#
+# It is ADDED to every SLUG_GENRE_EVERY-th movie rather than folded into the
+# rotation. Widening the rotation to six was the obvious edit and the wrong one:
+# it repartitions the WHOLE shared corpus (500/5 movies per genre becomes
+# 500/6), so every count another batch recorded against the five original
+# genres — and this campaign's own "200 movies carry `action`" evidence — goes
+# stale at the next wipe-and-provision, and suite/perf-baseline.json stops being
+# comparable for the end-of-campaign perf gate. Appending leaves all five
+# original memberships byte-identical and adds one genre carried by
+# 500/SLUG_GENRE_EVERY movies.
+SLUG_GENRE_EVERY=50
+SLUG_GENRE="R&B"
 movie_nfo() { # $1=dir $2=title $3=index
   local i=$3 g1="${GENRES[$((i % 5))]}" g2="${GENRES[$(((i+2) % 5))]}" st="${STUDIOS[$((i % 2))]}"
   local a1="${ACTORS[$((i % 3))]}" a2="${ACTORS[$(((i+1) % 3))]}"
+  local g3=""
+  [ $((i % SLUG_GENRE_EVERY)) -eq 0 ] && g3="<genre>${SLUG_GENRE//&/&amp;}</genre>"
   # Movie 0001 carries a real IMDb id (remote fetchers stay off, so nothing is fetched for
   # it) — the opt-in remote-subtitle journey searches OpenSubtitles by that id on both.
   local ids=""
   [ "$i" -eq 1 ] && ids='<uniqueid type="imdb" default="true">tt0111161</uniqueid>'
   cat > "$1/movie.nfo" <<XML
 <?xml version="1.0" encoding="utf-8"?>
-<movie><title>$2</title><year>2020</year>$ids<genre>$g1</genre><genre>$g2</genre><studio>$st</studio><actor><name>$a1</name><role>Lead</role><type>Actor</type></actor><director>$a2</director></movie>
+<movie><title>$2</title><year>2020</year>$ids<genre>${g1//&/&amp;}</genre><genre>${g2//&/&amp;}</genre>$g3<studio>$st</studio><actor><name>$a1</name><role>Lead</role><type>Actor</type></actor><director>$a2</director></movie>
 XML
 }
 

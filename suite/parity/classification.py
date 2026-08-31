@@ -23,6 +23,14 @@ Reading the buckets, strongest claim first:
 
   accepted   A settled decision. Ferrofin differs from Jellyfin and that is
              correct (or deliberately tolerated). The question is CLOSED.
+  pending    Ferrofin is deliberately doing the thing the C# is understood to
+             have gotten wrong, with the upstream evidence on the row — and the
+             OWNER has not ruled on it yet. A third state, and it needs to
+             exist: "accepted" claims a human closed the question and
+             "open-work" claims Ferrofin still owes a port, and a
+             don't-port-Jellyfin's-bug call is NEITHER until the owner rules.
+             Rendering it as accepted is how a pending call quietly becomes a
+             settled one.
   note       A recorded fact about a row that carries no divergence of its own —
              either its verdict is earned somewhere else (a push probe, a
              journey, an obsolete-endpoint citation), or no body-level verdict is
@@ -43,6 +51,7 @@ Reading the buckets, strongest claim first:
 """
 
 ACCEPTED = "accepted"
+PENDING = "pending"
 NOTE = "note"
 LAB_STATE = "lab-state"
 NO_PROBE = "no-probe"
@@ -53,6 +62,13 @@ FLAGGED = "flagged"
 BUCKETS = {
     ACCEPTED: ("⚠️", "Classified divergence (accepted — not a bug)",
                "Settled decisions. An item here is a question that has been closed."),
+    PENDING: ("⚖️", "Awaiting owner ratification (NOT yet accepted)",
+              "Ferrofin is deliberately doing the thing the C# is understood to have "
+              "gotten wrong, with the upstream evidence recorded on the row. That is a "
+              "decision the OWNER makes, not an agent — so these are kept out of "
+              "\"accepted\" until it is made. Each one stays `deep_verified=false` "
+              "against the 10.11.8 oracle while it waits: the divergence is real and "
+              "visible, not filtered out of the diff."),
     NOTE: ("📝", "Recorded note (NOT a divergence, NOT a verdict)",
            "A fact worth keeping next to an op whose verdict is earned elsewhere — "
            "a push probe, a write journey, an obsolete-endpoint citation — or next "
@@ -88,6 +104,11 @@ CATEGORIES = {
     "expected-extension": ACCEPTED,
     "instance": ACCEPTED,
     "jellyfin-bug": ACCEPTED,
+    # --- Ferrofin is right, the owner has not ruled --------------------------
+    # Distinct from `jellyfin-bug`, which in this campaign means upstream MASTER
+    # already fixed it and Ferrofin ports the fixed form — a closed question.
+    # This one is a live defect on BOTH trees that Ferrofin declines to port.
+    "jellyfin-bug-not-ported": PENDING,
     # --- notes on rows verified elsewhere ----------------------------------
     "verified": NOTE,
     "verified-by-push-probe": NOTE,
@@ -124,6 +145,12 @@ VALID = frozenset(CATEGORIES)
 #: The one bucket whose heading claims a human closed the question.
 SETTLED = ACCEPTED
 
+#: The marker a classification carries in its TEXT while the owner has not yet
+#: ruled. Written by whoever recorded the divergence, and enforced from the text
+#: side as well as the category side: a row saying the owner has not ruled must
+#: not bucket as accepted even if its category says otherwise.
+PENDING_MARKER = "OWNER CALL PENDING"
+
 
 def bucket(category, classification):
     """The bucket a ledger row renders in, or `None` when it carries no
@@ -134,6 +161,13 @@ def bucket(category, classification):
     exactly `""`, `"ok"` and `"flagged: …"` — so a detector flag is the only
     thing left to recognise, and everything else is simply unclassified.
     """
+    if PENDING_MARKER in (classification or "") and CATEGORIES.get(category) in (None, ACCEPTED):
+        # The text overrides an `accepted` category, and ONLY that: a row that
+        # says the owner has not ruled cannot render under a heading claiming a
+        # human closed the question. It does not override `open-work` — that
+        # combination is incoherent and `gen-ledger.py --check` rejects it
+        # outright rather than silently picking one.
+        return PENDING
     if category:
         return CATEGORIES.get(category)
     if (classification or "").startswith("flagged"):
@@ -151,6 +185,17 @@ def selfcheck():
     assert bucket("open-work", "") == OPEN_WORK
     assert bucket("requires-livetv-tuner", "") == NO_PROBE
     assert bucket("instance", "") == ACCEPTED
+    assert bucket("jellyfin-bug", "") == ACCEPTED
+    # The third state: a deliberate don't-port-the-bug call the owner has not
+    # ruled on is NOT accepted, from either side — its own category, or the
+    # marker in its text overriding a category that would read as settled.
+    assert bucket("jellyfin-bug-not-ported", "") == PENDING
+    assert bucket("jellyfin-bug", f"x {PENDING_MARKER} y") == PENDING
+    assert bucket(None, f"{PENDING_MARKER}") == PENDING
+    assert PENDING != SETTLED
+    # …but the marker never demotes a stronger claim: an open-work row still
+    # says Ferrofin owes a port.
+    assert bucket("open-work", f"{PENDING_MARKER}") == OPEN_WORK
     # A status-only row is a NOTE, never a verdict and never an accepted divergence.
     assert bucket("status-class-only", "") == NOTE
     assert CATEGORIES["status-class-only"] != SETTLED

@@ -49,7 +49,14 @@ use uuid::Uuid;
 /// previously-cached resized images. Surfaced as the default of
 /// [`ImageProcessor::cache_version`] (a configurable setting) rather than a bare
 /// literal, so a host can force a cache flush without a recompile.
-const DEFAULT_CACHE_VERSION: char = '3';
+///
+/// Deliberately ahead of upstream's `'3'`. The JPEG encoder moved from 4:4:4 to
+/// Jellyfin's 4:2:0 chroma subsampling with optimized Huffman tables, so every
+/// image cached by an earlier Ferrofin is stale in a way upstream never had to
+/// invalidate. Without the bump an upgraded install keeps serving the old bytes
+/// from disk forever. The key is Ferrofin-local (its own cache directory) and
+/// never reaches the wire, so this does not diverge from the HTTP contract.
+const DEFAULT_CACHE_VERSION: char = '4';
 
 /// The image extensions that require a transparency-preserving output format.
 ///
@@ -131,7 +138,7 @@ pub struct ImageProcessor<F = StdFileMeta> {
 impl ImageProcessor<StdFileMeta> {
     /// Constructs an [`ImageProcessor`] over `encoder`, caching resized images
     /// beneath `image_cache_path`, using the real `std::fs`-backed [`FileMeta`]
-    /// and the default [`cache_version`](Self::with_cache_version) of `'3'`.
+    /// and the default [`cache_version`](Self::with_cache_version) of `'4'`.
     #[must_use]
     pub fn new(encoder: Arc<dyn ImageEncoder>, image_cache_path: impl Into<PathBuf>) -> Self {
         Self {
@@ -914,16 +921,24 @@ mod tests {
         assert_ne!(key_base, key_bigger);
 
         // Bumping the cache version changes the key (v= stamp is honoured).
-        let proc_v4 = processor_with(
+        // Pick a version that is not the current default, so bumping
+        // DEFAULT_CACHE_VERSION can never make this assert compare a key
+        // against itself and silently stop testing anything.
+        let other_version = if DEFAULT_CACHE_VERSION == '9' {
+            '8'
+        } else {
+            '9'
+        };
+        let proc_other = processor_with(
             Arc::new(ImageCrateEncoder::new()),
             &cache,
             FakeFs::default(),
         )
-        .with_cache_version('4');
-        let key_v4 = proc_v4
+        .with_cache_version(other_version);
+        let key_other = proc_other
             .cache_file_path(&input, &base, 90, dt, ImageFormat::Webp)
             .expect("key");
-        assert_ne!(key_base, key_v4);
+        assert_ne!(key_base, key_other);
     }
 
     #[tokio::test]

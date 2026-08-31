@@ -36,6 +36,33 @@ pub(crate) async fn stream_path(state: &AppState, item_id: Uuid) -> Result<Strin
         .ok_or_else(|| ApiError::NotFound(format!("no direct stream for item {item_id}")))
 }
 
+/// Serves the file at `path` for `request` **with range processing disabled**.
+///
+/// Mirrors ASP.NET Core's two-argument `PhysicalFile(path, contentType)`, the
+/// overload that leaves `FileResult.EnableRangeProcessing` at its `false`
+/// default. `FileResultExecutorBase.SetHeadersAndLog` only calls
+/// `SetAcceptRangeHeader` inside the `enableRangeProcessing` branch, so such a
+/// response advertises no `Accept-Ranges` **and** ignores an inbound `Range`:
+/// the client gets `200` with the whole file, never a `206`.
+///
+/// Reproduced here by stripping `Range`/`If-Range` from the request before
+/// [`serve_static_file`] sees them and dropping the `Accept-Ranges` the
+/// underlying `ServeFile` adds. Use this only for routes the C# serves through
+/// that overload — the trickplay tile is one; direct play and the HLS segments
+/// are not, and must keep their range support.
+pub(crate) async fn serve_static_file_without_ranges(
+    path: &str,
+    mut request: Request,
+) -> Result<Response, ApiError> {
+    request.headers_mut().remove(axum::http::header::RANGE);
+    request.headers_mut().remove(axum::http::header::IF_RANGE);
+    let mut response = serve_static_file(path, request).await?;
+    response
+        .headers_mut()
+        .remove(axum::http::header::ACCEPT_RANGES);
+    Ok(response)
+}
+
 /// Serves the file at `path` for `request`, honouring `Range`/`HEAD`.
 ///
 /// Delegates to [`tower_http::services::ServeFile`], which performs the

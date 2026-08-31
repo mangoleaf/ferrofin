@@ -152,13 +152,21 @@ fn named_entity(id: Uuid, name: &str) -> BaseItemEntity {
 
 /// A [`LibraryManager`] wired for by-name browse: the aggregate/list/people/
 /// filter reads return one seeded row so every Batch 1 route resolves.
-struct ByNameLibrary;
+///
+/// `created` records every `CreateItemByName` the handlers trigger, so a test
+/// can assert the slug branch resolves WITHOUT materializing anything.
+#[derive(Default, Clone)]
+struct ByNameLibrary {
+    created: Arc<std::sync::Mutex<Vec<(BaseItemKind, String)>>>,
+}
 
 const GENRE_ID: Uuid = Uuid::from_u128(0xAA01);
 const STUDIO_ID: Uuid = Uuid::from_u128(0xAA02);
 const ARTIST_ID: Uuid = Uuid::from_u128(0xAA03);
 const PERSON_ID: Uuid = Uuid::from_u128(0xAA04);
 const MUSIC_GENRE_ID: Uuid = Uuid::from_u128(0xAA05);
+const SLUG_GENRE_ID: Uuid = Uuid::from_u128(0xAA07);
+const LITERAL_HYPHEN_GENRE_ID: Uuid = Uuid::from_u128(0xAA08);
 const YEAR_ID: Uuid = Uuid::from_u128(0xAA06);
 
 fn one_aggregate(id: Uuid, name: &str) -> QueryResult<ItemWithCounts> {
@@ -207,7 +215,36 @@ impl LibraryManager for ByNameLibrary {
     ) -> Result<QueryResult<ItemWithCounts>, ServiceError> {
         Ok(one_aggregate(ARTIST_ID, "Miles Davis"))
     }
-    /// Backs the `get_named_item` default: resolves the by-name row by kind.
+    /// `CreateItemByName<T>`: resolve, and mint a row when nothing matches —
+    /// what the concrete manager does, and what the slug branch must NOT do.
+    async fn get_named_item(
+        &self,
+        kind: BaseItemKind,
+        name: &str,
+    ) -> Result<Option<BaseItemEntity>, ServiceError> {
+        if let Some(found) = self.find_named_item(kind, name).await? {
+            return Ok(Some(found));
+        }
+        // Only the kinds `by_name_store::PROVISIONED_KINDS` mints, plus Year:
+        // `LibraryManager.GetPerson` is a plain lookup on both trees and
+        // creates nothing, so a missing person stays missing.
+        if !matches!(
+            kind,
+            BaseItemKind::Genre
+                | BaseItemKind::MusicGenre
+                | BaseItemKind::Studio
+                | BaseItemKind::MusicArtist
+        ) {
+            return Ok(None);
+        }
+        self.created
+            .lock()
+            .expect("lock")
+            .push((kind, name.to_owned()));
+        Ok(Some(named_entity(Uuid::from_u128(0xAAFF), name)))
+    }
+    /// Backs the `find_named_item` default: resolves the by-name row by kind,
+    /// creating nothing.
     async fn get_item_list(
         &self,
         q: &InternalItemsQuery,
@@ -216,6 +253,15 @@ impl LibraryManager for ByNameLibrary {
         let name = q.name.clone().unwrap_or_default();
         let row = match kind {
             Some(BaseItemKind::Genre) if name == "Drama" => Some(named_entity(GENRE_ID, "Drama")),
+            // The slug-branch fixture: a genre whose real name carries the
+            // character `BaseItem.SlugChar` stands in for on the wire.
+            Some(BaseItemKind::Genre) if name == "R&B" => Some(named_entity(SLUG_GENRE_ID, "R&B")),
+            // A genre whose real name CONTAINS the slug char. Upstream can
+            // never reach it — `GetItemFromSlugName` only ever asks for the
+            // three substitutions — and neither may Ferrofin.
+            Some(BaseItemKind::Genre) if name == "Sci-Fi" => {
+                Some(named_entity(LITERAL_HYPHEN_GENRE_ID, "Sci-Fi"))
+            }
             Some(BaseItemKind::MusicGenre) if name == "Jazz" => {
                 Some(named_entity(MUSIC_GENRE_ID, "Jazz"))
             }
@@ -485,14 +531,25 @@ impl AuthorizationContext for OkAuth {
 }
 
 fn by_name_state() -> AppState {
-    by_name_state_with_dto(Arc::new(OkDto))
+    by_name_state_with(Arc::new(OkDto), ByNameLibrary::default())
+}
+
+/// The by-name test state over a caller-owned [`ByNameLibrary`], so a test can
+/// read back what the handlers created.
+fn by_name_state_with_library(library: ByNameLibrary) -> AppState {
+    by_name_state_with(Arc::new(OkDto), library)
 }
 
 /// The by-name test state, with the DTO service injected so a test can observe
 /// the [`DtoOptions`] the handlers build.
 fn by_name_state_with_dto(dto: Arc<dyn DtoService>) -> AppState {
+    by_name_state_with(dto, ByNameLibrary::default())
+}
+
+/// The by-name test state with both seams injected.
+fn by_name_state_with(dto: Arc<dyn DtoService>, library: ByNameLibrary) -> AppState {
     AppState::new(
-        Arc::new(ByNameLibrary),
+        Arc::new(library),
         Arc::new(OkUsers),
         Arc::new(FakeUserViews),
         Arc::new(FakeUserData),
@@ -573,10 +630,90 @@ async fn genre_by_name_returns_item() {
     assert_eq!(body["Name"], "Drama");
 }
 
+/// Upstream's `item ??= new Genre()`: `GenresController.GetGenre` has NO
+/// not-found arm on either tree, so an unresolvable name is a `200` carrying a
+/// default-constructed row — `Guid.Empty` id, no `Name`, no `Path`.
 #[tokio::test]
-async fn genre_by_name_missing_is_404() {
-    let response = get("/Genres/Nonexistent").await;
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+async fn genre_by_name_missing_is_the_empty_item_not_a_404() {
+    let response = get("/Genres/Diag-No-Such").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(body["Id"], "00000000000000000000000000000000");
+    assert!(body.get("Name").is_none(), "the empty item has no name");
+    assert!(body.get("Path").is_none(), "the empty item has no path");
+}
+
+/// The slug branch: `'-'` stands in for `&`, `/` and `?` on the wire, so
+/// `/Genres/R-B` must resolve the genre actually named `R&B`
+/// (`GenresController.GetItemFromSlugName`, identical on v10.11.8 and master).
+#[tokio::test]
+async fn genre_by_slug_name_resolves_through_the_ampersand_substitution() {
+    let response = get("/Genres/R-B").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(json_body(response).await["Name"], "R&B");
+}
+
+/// …and it tries EXACTLY three candidates. A name containing the slug char is
+/// read as a slug and nothing else, so a genre literally named `Sci-Fi` is
+/// unreachable — upstream's own consequence, verified byte-identical on
+/// v10.11.8 and master (`GetItemFromSlugName` substitutes `&`, `/`, `?` and
+/// returns). An earlier cut of this port added a fourth lookup on the literal
+/// name, which matched neither tree; this test is what stops it coming back.
+/// The fake resolves `Sci-Fi` when asked for it by that exact name, so a fourth
+/// candidate would return the row and fail the assertion.
+#[tokio::test]
+async fn a_hyphenated_name_is_only_ever_read_as_a_slug() {
+    let response = get("/Genres/Sci-Fi").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(
+        body["Id"], "00000000000000000000000000000000",
+        "upstream answers the empty Genre() here; reaching the literal row is a divergence"
+    );
+    assert!(body.get("Name").is_none());
+}
+
+/// …and the slug branch must never MATERIALIZE. Upstream's slug lookups are
+/// plain `GetItemList` calls; only the non-slug branch is `CreateItemByName`.
+/// The fake records every by-name creation, so a hyphenated miss that wrote a
+/// row would show up here.
+#[tokio::test]
+async fn a_slug_miss_creates_nothing() {
+    let library = ByNameLibrary::default();
+    let created = Arc::clone(&library.created);
+    let state = by_name_state_with_library(library);
+    let response = create_router(state.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/Genres/Diag-No-Such")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        created.lock().unwrap().is_empty(),
+        "a slug lookup must not mint a by-name row"
+    );
+
+    // …while a plain (slug-free) unknown name still goes through
+    // `CreateItemByName`, which is what makes `/Genres/{name}` never 404
+    // upstream.
+    let response = create_router(state)
+        .oneshot(
+            Request::builder()
+                .uri("/Genres/BrandNew")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        created.lock().unwrap().as_slice(),
+        &[(BaseItemKind::Genre, "BrandNew".to_owned())]
+    );
 }
 
 #[tokio::test]
@@ -585,8 +722,12 @@ async fn music_genres_list_and_by_name() {
     let response = get("/MusicGenres/Jazz").await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(json_body(response).await["Name"], "Jazz");
+    // Unlike the genres controller, this one keeps `if (item is null) return
+    // NotFound()` on both trees — so a slug that resolves nothing is a 404
+    // here and a 200 zero-DTO there. Measured against a live 10.11.8:
+    // `/MusicGenres/R-B` J=404, `/Genres/R-B` J=200.
     assert_eq!(
-        get("/MusicGenres/Nope").await.status(),
+        get("/MusicGenres/Nope-Nope").await.status(),
         StatusCode::NOT_FOUND
     );
 }
@@ -597,7 +738,10 @@ async fn studios_list_and_by_name() {
     assert_eq!(list.status(), StatusCode::OK);
     assert_eq!(json_body(list).await["Items"][0]["Name"], "A24");
     assert_eq!(get("/Studios/A24").await.status(), StatusCode::OK);
-    assert_eq!(get("/Studios/Nope").await.status(), StatusCode::NOT_FOUND);
+    // `StudiosController.GetStudio` is `CreateItemByName<Studio>` with no null
+    // check in either tree, so an unseen studio name is materialized and
+    // returned — never a 404.
+    assert_eq!(get("/Studios/Nope").await.status(), StatusCode::OK);
 }
 
 #[tokio::test]

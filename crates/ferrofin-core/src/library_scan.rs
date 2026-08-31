@@ -833,6 +833,11 @@ pub struct LibraryScanner {
     /// row per distinct scanned `ProductionYear`, so `/Years` lists every
     /// year without a write on the read path). Absent → no year pass.
     years: Option<crate::years::YearStore>,
+    /// The `Genre`/`MusicGenre`/`Studio`/`MusicArtist` by-name provisioner. The
+    /// scan uses it only to backfill the metadata `Path` of the by-name rows it
+    /// materialized itself — Jellyfin's carry one and the DTO emits it
+    /// unconditionally. Absent → those rows keep a `NULL` `Path`.
+    by_name: Option<crate::by_name_store::ByNameStore>,
     /// Studio artwork-repository client for the post-scan studio-thumb pass.
     /// Absent → Studio rows keep whatever images they already have.
     studios_client: Option<Arc<ferrofin_providers::StudiosClient>>,
@@ -899,6 +904,7 @@ impl LibraryScanner {
             audiodb: None,
             item_repository: None,
             years: None,
+            by_name: None,
             studios_client: None,
             metadata_dir: None,
             people: None,
@@ -940,6 +946,15 @@ impl LibraryScanner {
     #[must_use]
     pub fn with_years(mut self, years: crate::years::YearStore) -> Self {
         self.years = Some(years);
+        self
+    }
+
+    /// Attaches the by-name provisioner so every scan ends by filling in the
+    /// metadata `Path` of the `Genre`/`MusicGenre`/`Studio`/`MusicArtist` rows
+    /// the item-values step materialized without one.
+    #[must_use]
+    pub fn with_by_name_store(mut self, store: crate::by_name_store::ByNameStore) -> Self {
+        self.by_name = Some(store);
         self
     }
 
@@ -1635,6 +1650,27 @@ impl LibraryScanner {
         if let Err(err) = self.materialize_years().await {
             tracing::warn!(%err, "year pass failed");
         }
+        // Retire the parentless `MusicArtist` rows a PREVIOUS scan left behind
+        // (before `MusicArtistResolver` was ported) now that the same artist is
+        // resolved from its directory — otherwise /Artists lists each one twice.
+        if let Err(err) = self.retire_accessed_by_name_artists().await {
+            tracing::warn!(%err, "by-name artist retirement pass failed");
+        }
+        // Cumulative runtime for the folder kinds that support it, once every
+        // track has been probed — an album/artist reports the summed runtime of
+        // its children, which is a stored column, not a per-request rollup.
+        if let Err(err) = self.update_cumulative_run_time_ticks().await {
+            tracing::warn!(%err, "cumulative run time ticks pass failed");
+        }
+        // The metadata `Path` of the by-name rows the item-values step wrote
+        // (`{metadata}/Genre/Action`, …). Jellyfin's `CreateItemByName` sets it
+        // at insert time; here the row is a by-product of `save_item_values`,
+        // which has no notion of the metadata root, so it is filled once here.
+        if let Some(store) = &self.by_name
+            && let Err(err) = store.backfill_paths().await
+        {
+            tracing::warn!(%err, "by-name path backfill failed");
+        }
         // Studio thumbs from the artwork repository for the by-name Studio
         // rows the item-values step materialized, so the TV Networks /
         // Studios tabs carry artwork.
@@ -1668,6 +1704,132 @@ impl LibraryScanner {
                 tracing::warn!(%err, "dynamic image pass failed");
             }
         }
+    }
+
+    /// Drops the `IsAccessedByName` `MusicArtist` rows that a folder-resolved
+    /// artist of the same name has superseded.
+    ///
+    /// Before `MusicArtistResolver` was ported, an artist directory was walked
+    /// through without emitting a row and the only browsable `MusicArtist` was
+    /// the one `item_persistence_service::save_item_values` materialized off the
+    /// track's `AlbumArtist` `ItemValues` row — parentless, pathed at the
+    /// METADATA directory, and invisible to every user-scoped query (no
+    /// `TopParentId`). New writes can no longer create that twin (the by-name
+    /// insert is guarded on `(Type, CleanName)`), but an EXISTING database — a
+    /// Ferrofin one, or an adopted Jellyfin one whose artists were only ever
+    /// by-name — still holds it, and `item_repository::push_by_name_join` joins
+    /// by `CleanName`, so both rows would answer /Artists.
+    ///
+    /// Only a row that has a folder-backed twin is dropped: an artist that is
+    /// genuinely accessed-by-name (a compilation's `AlbumArtist` with no
+    /// directory of its own) keeps its row, exactly as it does upstream.
+    ///
+    /// `BaseItems.ParentId` cascades, but a retired row is parentless AND
+    /// childless — every album now hangs off the resolved artist — so nothing
+    /// cascades with it. Its user data is lost, which is the honest cost: the
+    /// row it was keyed to no longer exists.
+    async fn retire_accessed_by_name_artists(&self) -> Result<(), ServiceError> {
+        let Some(items) = &self.item_repository else {
+            return Ok(());
+        };
+        let artists = items
+            .get_item_list(&InternalItemsQuery {
+                include_item_types: vec![BaseItemKind::MusicArtist],
+                ..InternalItemsQuery::default()
+            })
+            .await?;
+        // A row counts as folder-backed when it carries a TopParentId — that is
+        // exactly what `scope_to_user_libraries` (`AddUserToQuery`) requires and
+        // what the resolver now sets.
+        let resolved: std::collections::HashSet<String> = artists
+            .iter()
+            .filter(|a| a.top_parent_id.as_ref().is_some_and(|t| !t.is_empty()))
+            .filter_map(|a| a.clean_name.clone())
+            .collect();
+        let stale: Vec<Uuid> = artists
+            .iter()
+            .filter(|a| a.top_parent_id.as_ref().is_none_or(String::is_empty))
+            .filter(|a| a.clean_name.as_ref().is_some_and(|c| resolved.contains(c)))
+            .filter_map(|a| Uuid::parse_str(&a.id).ok())
+            .collect();
+        if stale.is_empty() {
+            return Ok(());
+        }
+        tracing::info!(
+            retired = stale.len(),
+            "retiring by-name MusicArtist rows superseded by resolved artist folders"
+        );
+        self.persistence.delete_items(&stale).await
+    }
+
+    /// Port of `MetadataService.UpdateCumulativeRunTimeTicks`
+    /// (`MediaBrowser.Providers/Manager/MetadataService.cs:451`): a folder whose
+    /// `SupportsCumulativeRunTimeTicks` is true stores the summed runtime of its
+    /// **non-folder recursive children** in its own `RunTimeTicks` column —
+    /// `foreach (child) if (!child.IsFolder) ticks += child.RunTimeTicks ?? 0;`,
+    /// written even when the sum is zero (`Folder.cs:97` makes it false by
+    /// default; `MusicAlbum.cs:54` and `MusicArtist.cs:39` override it to true).
+    ///
+    /// That column is what `DtoService` emits as both `RunTimeTicks`
+    /// (`DtoService.cs:1111`, ungated) and `CumulativeRunTimeTicks`
+    /// (`DtoService.cs:594`), so with it `NULL` an album reported no runtime at
+    /// all while Jellyfin reported the sum of its tracks.
+    ///
+    /// The children come from the base
+    /// `MetadataService.GetChildrenForMetadataUpdates` — `GetRecursiveChildren()`
+    /// over the item hierarchy — which, now that `MusicArtistResolver` is
+    /// ported, is the artist's albums and their tracks.
+    ///
+    /// A real 10.11.8 stores `0` on a first-scanned artist. That is a race, not
+    /// the intended value: its own `DateLastRefreshed` shows the artist
+    /// refreshed BEFORE its tracks were probed, so the identical C# summed a set
+    /// of `NULL`s, while the album — same code, refreshed after — got the right
+    /// number. Ferrofin sums the probed ticks, so an artist reports its real
+    /// runtime; the divergence is recorded in `suite/parity/classifications.json`.
+    ///
+    /// `Playlist` is the third `SupportsCumulativeRunTimeTicks` kind
+    /// (`Playlist.cs:79`); its children are `LinkedChildren`, not scanned
+    /// descendants, so it belongs to the playlist write path rather than this
+    /// scan pass — an open work item, not a skipped one.
+    async fn update_cumulative_run_time_ticks(&self) -> Result<(), ServiceError> {
+        let Some(items) = &self.item_repository else {
+            return Ok(());
+        };
+        for kind in [BaseItemKind::MusicArtist, BaseItemKind::MusicAlbum] {
+            let folders = items
+                .get_item_list(&InternalItemsQuery {
+                    include_item_types: vec![kind],
+                    ..InternalItemsQuery::default()
+                })
+                .await?;
+            for folder in folders {
+                let Ok(id) = Uuid::parse_str(&folder.id) else {
+                    continue;
+                };
+                let children = items
+                    .get_item_list(&InternalItemsQuery {
+                        ancestor_ids: vec![id],
+                        recursive: true,
+                        ..InternalItemsQuery::default()
+                    })
+                    .await?;
+                let ticks: i64 = children
+                    .iter()
+                    .filter(|child| !child.is_folder)
+                    .map(|child| child.run_time_ticks.unwrap_or(0))
+                    .sum();
+                // `if (!folder.RunTimeTicks.HasValue || folder.RunTimeTicks.Value != ticks)`
+                if folder.run_time_ticks == Some(ticks) {
+                    continue;
+                }
+                let mut row = folder;
+                row.run_time_ticks = Some(ticks);
+                self.persistence
+                    .save_items(std::slice::from_ref(&row))
+                    .await?;
+            }
+        }
+        Ok(())
     }
 
     /// The post-scan year pass: reads the distinct `ProductionYear`s across
@@ -3012,7 +3174,11 @@ impl LibraryScanner {
             if matches!(kind, TmdbKind::Series)
                 && !cache.series_tmdb.contains_key(&entity.id)
                 && let Some(name) = entity.name.clone().filter(|n| !n.is_empty())
-                && let Some(hit) = tmdb.search(kind, &name, year).await.into_iter().next()
+                && let Some(hit) = tmdb
+                    .search(kind, &name, year, None)
+                    .await
+                    .into_iter()
+                    .next()
             {
                 cache.series_tmdb.insert(entity.id.clone(), hit.tmdb_id);
             }
@@ -3029,7 +3195,7 @@ impl LibraryScanner {
             id
         } else {
             let name = entity.name.clone().filter(|n| !n.is_empty())?;
-            tmdb.search(kind, name.as_str(), year)
+            tmdb.search(kind, name.as_str(), year, None)
                 .await
                 .into_iter()
                 .next()
@@ -3042,7 +3208,7 @@ impl LibraryScanner {
         if matches!(kind, TmdbKind::Series) {
             cache.series_tmdb.insert(entity.id.clone(), tmdb_id);
         }
-        let details = tmdb.details(kind, tmdb_id).await?;
+        let details = tmdb.details(kind, tmdb_id, None).await?;
         apply_details(entity, &details);
         // Rotten Tomatoes critic rating via OMDb, keyed by the IMDb id.
         if wants_rating
@@ -4861,20 +5027,21 @@ impl LibraryScanner {
         });
     }
 
-    /// Music library: any folder that directly contains audio files is a
-    /// `MusicAlbum` (its audio files become `Audio` tracks); subfolders are walked
-    /// so an `Artist/Album/` layout still yields the albums.
+    /// Music library: an artist directory is a `MusicArtist`
+    /// (`MusicArtistResolver`), a folder that directly contains audio files is a
+    /// `MusicAlbum` (`MusicAlbumResolver`, its audio files become `Audio`
+    /// tracks); anything else is walked so a deeper layout still yields rows.
     fn plan_music(&self, dir: &str, cf: Uuid, naming: &NamingOptions, out: &mut Vec<Planned>) {
         // The library root itself is the CollectionFolder — never an artist or
         // an album (upstream's `args.Parent.IsRoot` guard), so recurse into it.
         for entry in self.file_system.get_file_system_entries(dir) {
             if entry.type_ == FileSystemEntryType::Directory {
-                self.plan_music_node(&entry.path, cf, naming, out);
+                self.plan_music_node(&entry.path, cf, cf, false, naming, out);
             }
         }
         // Loose audio directly in the library root still becomes an album, so
         // stray files are browsable rather than invisible.
-        self.plan_music_album(dir, cf, naming, out);
+        self.plan_music_album(dir, cf, cf, naming, out);
     }
 
     /// Persists an item's probed chapter markers, when there are any and a
@@ -5076,26 +5243,120 @@ impl LibraryScanner {
         }
     }
 
-    /// Resolves one directory beneath a music library: a `MusicAlbum` (port of
-    /// `MusicAlbumResolver`), or a container to walk through — an artist folder
-    /// or one of its release subfolders (`albums`, `live`, …).
+    /// Resolves one directory beneath a music library: a `MusicArtist` (port of
+    /// `MusicArtistResolver`), a `MusicAlbum` (port of `MusicAlbumResolver`), or
+    /// a container to walk through — one of an artist's release subfolders
+    /// (`albums`, `live`, …) or an intermediate grouping directory.
     ///
-    /// An artist folder is walked, not turned into a row: the browsable
-    /// `MusicArtist` item comes from the by-name materializer, keyed by its
-    /// `ItemValues` id, and emitting a second path-keyed row here would list
-    /// every artist twice (the duplicate-identity trap the person work had to
-    /// unwind). Unifying the two identities is the prerequisite for resolving
-    /// the folder itself — see `brain/plans/PLAN_MUSIC_LIBRARY.md`.
-    fn plan_music_node(&self, dir: &str, cf: Uuid, naming: &NamingOptions, out: &mut Vec<Planned>) {
+    /// The order is upstream's resolver priority: `MusicArtistResolver` is
+    /// `ResolverPriority.Second` and `MusicAlbumResolver` `Third`, so a folder
+    /// that holds BOTH loose audio and an album subfolder is the artist.
+    ///
+    /// `in_artist` is upstream's `args.HasParent<MusicArtist>()` guard ("don't
+    /// allow nested artists"); its `HasParent<MusicAlbum>()` half is structural
+    /// here, because this function returns as soon as a directory resolves as an
+    /// album and so never recurses beneath one.
+    fn plan_music_node(
+        &self,
+        dir: &str,
+        cf: Uuid,
+        parent: Uuid,
+        in_artist: bool,
+        naming: &NamingOptions,
+        out: &mut Vec<Planned>,
+    ) {
+        if !in_artist
+            && self.is_music_artist(dir, naming)
+            && let Some((artist_id, artist)) = self.base_item(
+                BaseItemKind::MusicArtist,
+                cf,
+                parent,
+                file_stem(dir),
+                dir,
+                true,
+            )
+        {
+            out.push(Planned {
+                id: artist_id,
+                entity: artist,
+                ancestors: vec![cf],
+            });
+            for entry in self.file_system.get_file_system_entries(dir) {
+                if entry.type_ == FileSystemEntryType::Directory {
+                    self.plan_music_node(&entry.path, cf, artist_id, true, naming, out);
+                }
+            }
+            // Loose audio sitting DIRECTLY in a resolved artist folder is not
+            // an album, and used to be wrapped in one here. Upstream never
+            // wraps it: once the directory resolves as a `MusicArtist`, its
+            // child FILES go through the ordinary resolver chain, and
+            // `MusicAlbumResolver` cannot claim them — it resolves a
+            // DIRECTORY (`MusicAlbumResolver.Resolve` returns null unless
+            // `args.IsDirectory`), so an audio file becomes an `Audio` whose
+            // parent is the artist. Wrapping them invented a `MusicAlbum` row
+            // Jellyfin has no row for and stamped the artist's folder name
+            // into every such track's `Album`.
+            self.plan_loose_artist_audio(dir, cf, artist_id, naming, out);
+            return;
+        }
         if self.is_music_album(dir, naming, true) {
-            self.plan_music_album(dir, cf, naming, out);
+            self.plan_music_album(dir, cf, parent, naming, out);
             return;
         }
         for entry in self.file_system.get_file_system_entries(dir) {
             if entry.type_ == FileSystemEntryType::Directory {
-                self.plan_music_node(&entry.path, cf, naming, out);
+                self.plan_music_node(&entry.path, cf, parent, in_artist, naming, out);
             }
         }
+    }
+
+    /// Whether `dir` resolves as a `MusicArtist` — port of
+    /// `MusicArtistResolver.Resolve`
+    /// (`Emby.Server.Implementations/Library/Resolvers/Audio/MusicArtistResolver.cs:54`).
+    ///
+    /// Upstream's other guards are structural here and have no test of their
+    /// own: `!args.IsDirectory` (only directories reach this), the
+    /// `CollectionType.music` check (only the music arm calls it), the
+    /// nested-artist guard (the caller's `in_artist`), and `args.Parent.IsRoot`
+    /// — that one guards the AGGREGATE root, and a music library's artist
+    /// folders sit under the library folder, never under it. It must NOT be
+    /// translated into "skip depth 1", which would suppress every artist.
+    fn is_music_artist(&self, dir: &str, naming: &NamingOptions) -> bool {
+        let entries = self.file_system.get_file_system_entries(dir);
+        // `args.ContainsFileSystemEntryByName("artist.nfo")` short-circuits
+        // before every other test, and matches on the entry NAME regardless of
+        // whether the entry is a file or a directory.
+        if entries
+            .iter()
+            .any(|e| entry_name(&e.path).eq_ignore_ascii_case("artist.nfo"))
+        {
+            return true;
+        }
+        let parser = ferrofin_naming::audio::AlbumParser::new(naming);
+        // Upstream's `Parallel.ForEach` + `state.Stop()` is an early-exit `any`.
+        for entry in &entries {
+            if entry.type_ != FileSystemEntryType::Directory {
+                continue;
+            }
+            // A named artist subfolder ("albums", "live", …) says artist.
+            if naming
+                .artist_subfolders
+                .iter()
+                .any(|s| s.eq_ignore_ascii_case(entry_name(&entry.path)))
+            {
+                return true;
+            }
+            // A multi-disc folder is part of an ALBUM, never an artist signal.
+            if parser.is_multi_part(&entry.path) {
+                continue;
+            }
+            // `MusicAlbumResolver.IsMusicAlbum(path, dirService)` is
+            // `ContainsMusic(entries, allowSubfolders: true)`.
+            if self.is_music_album(&entry.path, naming, true) {
+                return true;
+            }
+        }
+        false
     }
 
     /// Emits the `MusicAlbum` row for `dir` plus its tracks — the audio files
@@ -5106,6 +5367,7 @@ impl LibraryScanner {
         &self,
         dir: &str,
         cf: Uuid,
+        parent: Uuid,
         naming: &NamingOptions,
         out: &mut Vec<Planned>,
     ) {
@@ -5117,7 +5379,7 @@ impl LibraryScanner {
         let Some((album_id, album)) = self.base_item(
             BaseItemKind::MusicAlbum,
             cf,
-            cf,
+            parent,
             album_name.clone(),
             dir,
             true,
@@ -5130,12 +5392,21 @@ impl LibraryScanner {
         // `MusicAlbum.cs:106`). Writing the name grouped every "Greatest Hits"
         // in the library into one row. The writer derives it — see
         // `kinds::presentation_unique_key`.
+        // AncestorIds is what the recursive-child count and every
+        // `ancestorIds=` filter read, so a resolved artist must appear in its
+        // albums' and tracks' chains.
+        let album_ancestors = if parent == cf {
+            vec![cf]
+        } else {
+            vec![cf, parent]
+        };
         out.push(Planned {
             id: album_id,
             entity: album,
-            ancestors: vec![cf],
+            ancestors: album_ancestors.clone(),
         });
-        let ancestors = vec![cf, album_id];
+        let mut ancestors = album_ancestors;
+        ancestors.push(album_id);
         for track in tracks {
             let Some((id, mut entity)) = self.base_item(
                 BaseItemKind::Audio,
@@ -5155,6 +5426,49 @@ impl LibraryScanner {
                 id,
                 entity,
                 ancestors: ancestors.clone(),
+            });
+        }
+    }
+
+    /// The audio files sitting directly in a resolved artist directory, as
+    /// `Audio` rows parented straight to the `MusicArtist` — no album.
+    ///
+    /// Subdirectories are deliberately NOT walked: `plan_music_node` has
+    /// already recursed into every child directory of the artist, so reusing
+    /// [`collect_album_tracks`](Self::collect_album_tracks) here (which also
+    /// pulls a multi-disc subfolder's tracks in) would plan those tracks
+    /// twice — once under their own album and once under the artist.
+    fn plan_loose_artist_audio(
+        &self,
+        dir: &str,
+        cf: Uuid,
+        artist_id: Uuid,
+        naming: &NamingOptions,
+        out: &mut Vec<Planned>,
+    ) {
+        for entry in self.file_system.get_file_system_entries(dir) {
+            if entry.type_ == FileSystemEntryType::Directory || !is_audio_file(&entry.path, naming)
+            {
+                continue;
+            }
+            let Some((id, mut entity)) = self.base_item(
+                BaseItemKind::Audio,
+                cf,
+                artist_id,
+                file_stem(&entry.path),
+                &entry.path,
+                false,
+            ) else {
+                continue;
+            };
+            entity.media_type = Some("Audio".to_owned());
+            // No `album` placeholder: there is no album. A file that carries an
+            // ALBUM tag still gets it from `apply_audio_metadata`; one that does
+            // not is albumless on both servers.
+            out.push(Planned {
+                id,
+                entity,
+                ancestors: vec![cf, artist_id],
             });
         }
     }
@@ -5816,6 +6130,15 @@ fn ctime_of(_meta: &std::fs::Metadata) -> Option<std::time::SystemTime> {
 /// as it does on Jellyfin.
 fn creation_time_from(times: &FileTimes) -> std::time::SystemTime {
     times.birth.unwrap_or_else(|| times.ctime.min(times.mtime))
+}
+
+/// The final path component, extension included — upstream's
+/// `FileSystemMetadata.Name`, which resolvers match entry names against.
+fn entry_name(path: &str) -> &str {
+    std::path::Path::new(path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(path)
 }
 
 /// The file name without its extension — a lightweight display name until real
@@ -6744,32 +7067,13 @@ fn assign_from_children(column: &mut Option<String>, values: &[String]) -> bool 
     true
 }
 
-/// Collects an item's genres/studios/tags as `(ItemValueType discriminant, value)`
-/// pairs for the `ItemValues` filter tables (Genre = 2, Studios = 3, Tags = 4).
-pub(crate) fn item_values_of(entity: &BaseItemEntity) -> Vec<(i32, String)> {
-    let split = |field: Option<&str>| -> Vec<String> {
-        field
-            .unwrap_or_default()
-            .split('|')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned)
-            .collect()
-    };
-    let mut out = Vec::new();
-    // Artist (0) / AlbumArtist (1) materialize browsable MusicArtist items and
-    // back the artist filters; genres (2), studios (3), tags (4) as before.
-    out.extend(split(entity.artists.as_deref()).into_iter().map(|a| (0, a)));
-    out.extend(
-        split(entity.album_artists.as_deref())
-            .into_iter()
-            .map(|a| (1, a)),
-    );
-    out.extend(split(entity.genres.as_deref()).into_iter().map(|g| (2, g)));
-    out.extend(split(entity.studios.as_deref()).into_iter().map(|s| (3, s)));
-    out.extend(split(entity.tags.as_deref()).into_iter().map(|t| (4, t)));
-    out
-}
+/// Collects an item's genres/studios/tags/artists as `(ItemValueType
+/// discriminant, value)` pairs for the `ItemValues` filter tables.
+///
+/// Re-exported from `ferrofin-db` so `ferrofin-providers` — which may not
+/// depend on `ferrofin-core` — can re-index an item it refreshed with exactly
+/// the same rule the scanner uses.
+pub(crate) use ferrofin_db::entities::base_items::item_values_of;
 
 /// Maps a probed [`ChapterInfo`](ferrofin_model::entities_media::ChapterInfo) to a
 /// persistable [`ChapterEntity`], numbered by its position in the file.
@@ -12391,6 +12695,179 @@ mod tests {
         assert_eq!(seasons[0].sort_name.as_deref(), Some("0001"));
     }
 
+    /// Port check for `MetadataService.UpdateCumulativeRunTimeTicks`: the
+    /// folder kinds whose `SupportsCumulativeRunTimeTicks` is true store the
+    /// summed runtime of their non-folder recursive children — the column both
+    /// `RunTimeTicks` and `CumulativeRunTimeTicks` are emitted from.
+    #[tokio::test]
+    async fn cumulative_run_time_ticks_sums_non_folder_recursive_children() {
+        let db = Database::connect_in_memory().await.unwrap();
+        db.run_migrations().await.unwrap();
+        let persistence: Arc<dyn ferrofin_traits::persistence::ItemPersistenceService> =
+            Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let items = crate::test_support::item_repository_over(db.clone());
+
+        let album = uuid::Uuid::from_u128(0x1001);
+        let artist = uuid::Uuid::from_u128(0x1002);
+        let series = uuid::Uuid::from_u128(0x1003);
+        let row =
+            |id: uuid::Uuid, kind: BaseItemKind, folder: bool, ticks: Option<i64>| BaseItemEntity {
+                id: ferrofin_db::store::guid_to_db(id),
+                type_: crate::item_type_lookup::stored_type_name(kind)
+                    .unwrap_or_default()
+                    .to_owned(),
+                name: Some(format!("{kind:?} {id}")),
+                is_folder: folder,
+                run_time_ticks: ticks,
+                ..BaseItemEntity::default()
+            };
+        let mut rows = vec![
+            row(album, BaseItemKind::MusicAlbum, true, None),
+            // A by-name artist: no children in the hierarchy, so its sum is 0 —
+            // and the C# writes 0 rather than leaving the column NULL.
+            row(artist, BaseItemKind::MusicArtist, true, None),
+            // Not a `SupportsCumulativeRunTimeTicks` kind (`Folder.cs:97`).
+            row(series, BaseItemKind::Series, true, None),
+        ];
+        for i in 0..3u128 {
+            let track = uuid::Uuid::from_u128(0x2000 + i);
+            let mut t = row(track, BaseItemKind::Audio, false, Some(20_000_000));
+            t.parent_id = Some(ferrofin_db::store::guid_to_db(album));
+            rows.push(t);
+        }
+        // A folder child must NOT be counted, only recursed through.
+        let inner = uuid::Uuid::from_u128(0x3001);
+        let mut disc = row(inner, BaseItemKind::Folder, true, Some(999));
+        disc.parent_id = Some(ferrofin_db::store::guid_to_db(album));
+        rows.push(disc);
+        persistence.save_items(&rows).await.unwrap();
+        for i in 0..3u128 {
+            persistence
+                .set_ancestors(uuid::Uuid::from_u128(0x2000 + i), &[album])
+                .await
+                .unwrap();
+        }
+        persistence.set_ancestors(inner, &[album]).await.unwrap();
+
+        let vf: Arc<dyn VirtualFolderManager> = Arc::new(FerrofinVirtualFolderManager::new(
+            std::path::PathBuf::from("/nonexistent"),
+        ));
+        let scanner = LibraryScanner::new(
+            vf,
+            Arc::new(FerrofinFileSystem::new()),
+            Arc::new(FerrofinItemPersistenceService::new(db.clone())),
+        )
+        .with_items(Arc::clone(&items));
+
+        scanner.update_cumulative_run_time_ticks().await.unwrap();
+
+        let ticks = |id: uuid::Uuid| {
+            let items = Arc::clone(&items);
+            async move {
+                items
+                    .retrieve_item(id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .run_time_ticks
+            }
+        };
+        assert_eq!(
+            ticks(album).await,
+            Some(60_000_000),
+            "3 tracks, not the disc folder"
+        );
+        assert_eq!(ticks(artist).await, Some(0), "written as 0, not left NULL");
+        assert_eq!(ticks(series).await, None, "Series does not support it");
+
+        // Idempotent: a second pass finds nothing to change.
+        scanner.update_cumulative_run_time_ticks().await.unwrap();
+        assert_eq!(ticks(album).await, Some(60_000_000));
+    }
+
+    /// The retirement pass drops an `IsAccessedByName` artist ONLY when a
+    /// folder-resolved artist of the same `CleanName` has superseded it — a
+    /// genuinely by-name artist (a compilation's AlbumArtist with no directory)
+    /// keeps its row, exactly as it does upstream.
+    #[tokio::test]
+    async fn retirement_drops_only_by_name_artists_a_resolved_folder_superseded() {
+        let db = Database::connect_in_memory().await.unwrap();
+        db.run_migrations().await.unwrap();
+        let persistence: Arc<dyn ferrofin_traits::persistence::ItemPersistenceService> =
+            Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let items = crate::test_support::item_repository_over(db.clone());
+
+        let library = uuid::Uuid::from_u128(0x4000);
+        let row = |id: uuid::Uuid, name: &str, top: Option<uuid::Uuid>| BaseItemEntity {
+            id: ferrofin_db::store::guid_to_db(id),
+            type_: crate::item_type_lookup::stored_type_name(BaseItemKind::MusicArtist)
+                .unwrap_or_default()
+                .to_owned(),
+            name: Some(name.to_owned()),
+            clean_name: Some(crate::text_util::get_clean_value(name)),
+            is_folder: true,
+            top_parent_id: top.map(ferrofin_db::store::guid_to_db),
+            parent_id: top.map(ferrofin_db::store::guid_to_db),
+            ..BaseItemEntity::default()
+        };
+        // The library the resolved artist parents into — `ParentId` is a real
+        // FK, so the row has to exist before the artists reference it.
+        persistence
+            .save_items(&[BaseItemEntity {
+                id: ferrofin_db::store::guid_to_db(library),
+                type_: crate::item_type_lookup::stored_type_name(BaseItemKind::CollectionFolder)
+                    .unwrap_or_default()
+                    .to_owned(),
+                name: Some("Music".to_owned()),
+                is_folder: true,
+                ..BaseItemEntity::default()
+            }])
+            .await
+            .unwrap();
+        let resolved = uuid::Uuid::from_u128(0x4001);
+        let superseded = uuid::Uuid::from_u128(0x4002);
+        let genuine = uuid::Uuid::from_u128(0x4003);
+        persistence
+            .save_items(&[
+                row(resolved, "Artist 01", Some(library)),
+                // The pre-port twin: same name, no TopParentId.
+                row(superseded, "Artist 01", None),
+                // No folder ever resolved this one — it must survive.
+                row(genuine, "Various Artists", None),
+            ])
+            .await
+            .unwrap();
+
+        let vf: Arc<dyn VirtualFolderManager> = Arc::new(FerrofinVirtualFolderManager::new(
+            std::path::PathBuf::from("/nonexistent"),
+        ));
+        let scanner = LibraryScanner::new(
+            vf,
+            Arc::new(FerrofinFileSystem::new()),
+            Arc::clone(&persistence),
+        )
+        .with_items(Arc::clone(&items));
+
+        scanner.retire_accessed_by_name_artists().await.unwrap();
+
+        assert!(
+            items.retrieve_item(resolved).await.unwrap().is_some(),
+            "the resolved artist survives"
+        );
+        assert!(
+            items.retrieve_item(superseded).await.unwrap().is_none(),
+            "the superseded by-name twin is retired"
+        );
+        assert!(
+            items.retrieve_item(genuine).await.unwrap().is_some(),
+            "a genuinely accessed-by-name artist keeps its row"
+        );
+
+        // Idempotent: a second pass finds nothing left to retire.
+        scanner.retire_accessed_by_name_artists().await.unwrap();
+        assert!(items.retrieve_item(resolved).await.unwrap().is_some());
+    }
+
     #[tokio::test]
     async fn scan_builds_music_album_with_tracks() {
         use ferrofin_traits::persistence::ItemRepository as _;
@@ -12410,9 +12887,10 @@ mod tests {
 
         let (db, cf) = scan_one(CollectionTypeOptions::music, "Music", &media).await;
 
-        // The artist folder is walked through, not turned into a row of its
-        // own (the browsable MusicArtist comes from the by-name materializer,
-        // so a path-keyed row here would duplicate every artist).
+        // `MusicArtistResolver` (priority Second): the artist folder holds a
+        // music album, so it resolves to a MusicArtist row of its own, parented
+        // into the library — which is what gives it a TopParentId and makes it
+        // reachable from a user-scoped recursive query.
         let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
             Arc::new(crate::item_type_lookup::ItemTypeLookup::new());
         let repo = crate::FerrofinItemRepository::new(db.clone(), lookup);
@@ -12423,9 +12901,26 @@ mod tests {
             })
             .await
             .expect("artists");
-        assert!(artists.is_empty(), "no path-keyed artist rows: {artists:?}");
+        // Exactly ONE row is also the de-duplication assertion: the track's
+        // `AlbumArtist` ItemValues row would otherwise materialize a parentless
+        // by-name MusicArtist with the same CleanName, and `push_by_name_join`
+        // joins on CleanName — so /Artists would list "Pink Floyd" twice. That
+        // double-listing is what a previous attempt at this port was rolled
+        // back for.
+        assert_eq!(artists.len(), 1, "exactly one artist row: {artists:?}");
+        let artist = &artists[0];
+        assert_eq!(artist.name.as_deref(), Some("Pink Floyd"));
+        assert_eq!(
+            artist.path.as_deref(),
+            Some(media.join("Pink Floyd").to_str().unwrap()),
+            "the artist is pathed at its MEDIA directory, not a metadata dir"
+        );
+        assert_eq!(artist.parent_id.as_deref(), Some(cf.as_str()));
+        assert_eq!(artist.top_parent_id.as_deref(), Some(cf.as_str()));
+        assert!(artist.is_folder);
 
-        // Exactly one album — CD2 folds in rather than becoming its own.
+        // Exactly one album — CD2 folds in rather than becoming its own — and it
+        // hangs off the ARTIST now, the way Jellyfin parents it.
         let album_row: (String, String, Option<String>) = sqlx::query_as(
             r#"SELECT "Id","ParentId","Name" FROM "BaseItems"
                WHERE "Type"='MediaBrowser.Controller.Entities.Audio.MusicAlbum'"#,
@@ -12433,8 +12928,30 @@ mod tests {
         .fetch_one(db.pool())
         .await
         .unwrap();
-        assert_eq!(album_row.1, cf, "album parents to the collection folder");
+        assert_eq!(album_row.1, artist.id, "album parents to the artist");
         assert_eq!(album_row.2.as_deref(), Some("The Wall"));
+
+        // AncestorIds is what every recursive count and `ancestorIds=` filter
+        // reads, so the artist has to be in the album's and the tracks' chains —
+        // asserted through the query path that consumes it.
+        let under_artist = repo
+            .get_item_list(&ferrofin_traits::options::InternalItemsQuery {
+                ancestor_ids: vec![uuid::Uuid::parse_str(&artist.id).unwrap()],
+                recursive: true,
+                ..Default::default()
+            })
+            .await
+            .expect("recursive children");
+        let mut kinds: Vec<_> = under_artist
+            .iter()
+            .map(|i| i.type_.rsplit('.').next().unwrap_or("").to_owned())
+            .collect();
+        kinds.sort_unstable();
+        assert_eq!(
+            kinds,
+            vec!["Audio", "Audio", "Audio", "MusicAlbum"],
+            "the artist's recursive children are its album and its 3 tracks"
+        );
 
         let tracks: Vec<(String, Option<String>)> = sqlx::query_as(
             r#"SELECT "ParentId","Album" FROM "BaseItems"
@@ -12449,6 +12966,143 @@ mod tests {
             "tracks parent to the album"
         );
         assert!(tracks.iter().all(|t| t.1.as_deref() == Some("The Wall")));
+    }
+
+    /// `MusicArtistResolver`'s `artist.nfo` shortcut fires before every other
+    /// test, so a folder with the sidecar and no album subfolder is still an
+    /// artist — and a folder holding a NAMED release container (`albums`,
+    /// `live`, …) is one too, with the albums inside it re-parented onto the
+    /// artist rather than onto the container.
+    #[tokio::test]
+    async fn scan_resolves_artists_from_nfo_and_from_release_subfolders() {
+        use ferrofin_traits::persistence::ItemRepository as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let media = tmp.path().join("music");
+
+        // (a) artist.nfo, no album beneath it at all.
+        let bare = media.join("Aphex Twin");
+        std::fs::create_dir_all(&bare).unwrap();
+        std::fs::write(bare.join("artist.nfo"), b"<artist/>").unwrap();
+
+        // (b) a named artist subfolder holding the actual album.
+        let container = media.join("Boards of Canada").join("albums");
+        let album = container.join("Music Has the Right to Children");
+        std::fs::create_dir_all(&album).unwrap();
+        std::fs::write(album.join("01 Wildlife Analysis.flac"), b"").unwrap();
+
+        let (db, _cf) = scan_one(CollectionTypeOptions::music, "Music", &media).await;
+        let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
+            Arc::new(crate::item_type_lookup::ItemTypeLookup::new());
+        let repo = crate::FerrofinItemRepository::new(db.clone(), lookup);
+        let mut artists = repo
+            .get_item_list(&ferrofin_traits::options::InternalItemsQuery {
+                include_item_types: vec![ferrofin_model::data::BaseItemKind::MusicArtist],
+                ..Default::default()
+            })
+            .await
+            .expect("artists");
+        artists.sort_by(|a, b| a.name.cmp(&b.name));
+        let names: Vec<_> = artists.iter().map(|a| a.name.clone()).collect();
+        assert_eq!(
+            names,
+            vec![
+                Some("Aphex Twin".to_owned()),
+                Some("Boards of Canada".to_owned())
+            ],
+            "both artists resolve"
+        );
+
+        // The release container itself is NOT an item; its album parents
+        // straight onto the artist.
+        let boc = artists
+            .iter()
+            .find(|a| a.name.as_deref() == Some("Boards of Canada"))
+            .expect("boc");
+        let albums = repo
+            .get_item_list(&ferrofin_traits::options::InternalItemsQuery {
+                include_item_types: vec![ferrofin_model::data::BaseItemKind::MusicAlbum],
+                ..Default::default()
+            })
+            .await
+            .expect("albums");
+        assert_eq!(albums.len(), 1);
+        assert_eq!(
+            albums[0].parent_id.as_deref(),
+            Some(boc.id.as_str()),
+            "album skips the `albums` container"
+        );
+    }
+
+    /// Loose audio directly inside a resolved artist folder is `Audio`
+    /// PARENTED TO THE ARTIST — not a synthetic album named after the artist.
+    ///
+    /// Upstream resolves the artist DIRECTORY as `MusicArtist` and then hands
+    /// its child files to the ordinary resolver chain; `MusicAlbumResolver`
+    /// only ever resolves a directory, so a stray track never acquires an
+    /// album. Wrapping it invented a `MusicAlbum` row Jellyfin has no row for.
+    /// The negative control is the second assertion: exactly ONE album exists
+    /// (the real one in the subfolder), and the multi-disc subfolder's tracks
+    /// are planned once, not twice.
+    #[tokio::test]
+    async fn loose_audio_in_an_artist_folder_parents_to_the_artist_not_a_fake_album() {
+        use ferrofin_traits::persistence::ItemRepository as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let media = tmp.path().join("music");
+
+        // An artist folder: one real album subfolder (which is what makes the
+        // directory resolve as an artist at all) plus a stray track beside it.
+        let artist = media.join("Burial");
+        let album = artist.join("Untrue");
+        std::fs::create_dir_all(&album).unwrap();
+        std::fs::write(album.join("01 Archangel.flac"), b"").unwrap();
+        std::fs::write(artist.join("Rival Dealer.flac"), b"").unwrap();
+
+        let (db, _cf) = scan_one(CollectionTypeOptions::music, "Music", &media).await;
+        let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
+            Arc::new(crate::item_type_lookup::ItemTypeLookup::new());
+        let repo = crate::FerrofinItemRepository::new(db.clone(), lookup);
+        let list = |kind| {
+            let repo = repo.clone();
+            async move {
+                repo.get_item_list(&ferrofin_traits::options::InternalItemsQuery {
+                    include_item_types: vec![kind],
+                    ..Default::default()
+                })
+                .await
+                .expect("query")
+            }
+        };
+
+        let artists = list(ferrofin_model::data::BaseItemKind::MusicArtist).await;
+        assert_eq!(artists.len(), 1);
+        let artist_id = artists[0].id.clone();
+
+        // Exactly one album — "Untrue". No album named after the artist folder.
+        let albums = list(ferrofin_model::data::BaseItemKind::MusicAlbum).await;
+        let album_names: Vec<_> = albums.iter().map(|a| a.name.clone()).collect();
+        assert_eq!(album_names, vec![Some("Untrue".to_owned())]);
+
+        let mut audio = list(ferrofin_model::data::BaseItemKind::Audio).await;
+        audio.sort_by(|a, b| a.name.cmp(&b.name));
+        assert_eq!(audio.len(), 2, "each track planned exactly once");
+        let stray = audio
+            .iter()
+            .find(|a| a.name.as_deref() == Some("Rival Dealer"))
+            .expect("the stray track");
+        assert_eq!(
+            stray.parent_id.as_deref(),
+            Some(artist_id.as_str()),
+            "the stray track parents to the ARTIST"
+        );
+        assert_eq!(stray.album, None, "and it is given no invented album name");
+        // The album's own track still parents to the album, unchanged.
+        let inside = audio
+            .iter()
+            .find(|a| a.name.as_deref() == Some("01 Archangel"))
+            .expect("the album track");
+        assert_eq!(inside.parent_id.as_deref(), Some(albums[0].id.as_str()));
     }
 
     // The art-dir helpers behind uploaded-image survival: stem parsing is the

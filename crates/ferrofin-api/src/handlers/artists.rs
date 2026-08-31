@@ -87,9 +87,11 @@ async fn get_album_artists(
 
 /// `GET /Artists/{name}` — a single artist by name.
 ///
-/// Port of `ArtistsController.GetArtistByName`. Jellyfin lazily creates the
-/// artist row when absent; that filesystem side effect is out of scope here, so
-/// a missing artist is a `404`.
+/// Port of `ArtistsController.GetArtistByName`, whose
+/// `LibraryManager.GetArtist(name)` is a `CreateItemByName<MusicArtist>` — it
+/// materializes the row on first lookup. That is ported (`by_name_store`), so
+/// this route resolves an artist Ferrofin has never scanned, exactly as
+/// upstream does; a name that resolves to nothing at all is a `404`.
 #[utoipa::path(
     get,
     path = "/Artists/{name}",
