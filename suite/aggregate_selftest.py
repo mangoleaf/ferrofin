@@ -50,7 +50,7 @@ def run(h50_fast, j50_fast, h50_tie, j50_tie):
     return {"meta": {"ferrofin_sha": "abc", "ferrofin": "vX",
                      "load": {"model": "open-loop"}},
             "headline": {"parity_coverage": 1.0, "comparable_rows": 2,
-                         "win_rate": 1.0, "ties": 0, "median_speedup": None},
+                         "win_rate": 1.0, "median_speedup": None},
             "operations": [op("fast", h50_fast, j50_fast),
                            op("tiny", h50_tie, j50_tie)]}
 

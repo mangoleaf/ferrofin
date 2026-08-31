@@ -105,7 +105,22 @@ def rebaseline_raw(baseline_file, rate, secs, names):
             sys.exit(f"rebaseline: {name} did not hold its open-loop rate — refusing to baseline a degraded window")
         endpoints[name] = {p: cur[p] for p in PCTS}
     doc = _read_baseline_file(baseline_file)
-    doc["raw"] = {"params": {"rate": int(rate), "secs": int(secs)}, "endpoints": endpoints}
+    # MERGE into the existing map rather than replacing it: rebaselining a
+    # single new sentinel (PERF_GATE_ENDPOINTS=x ./perf-gate.sh --rebaseline)
+    # must not drop the other sentinels' baselines. A full rebaseline names
+    # every sentinel and so overwrites every entry anyway.
+    kept = dict((doc.get("raw") or {}).get("endpoints") or {})
+    old_params = (doc.get("raw") or {}).get("params") or {}
+    partial = [n for n in kept if n not in endpoints]
+    if partial and old_params and (old_params.get("rate"), old_params.get("secs")) != (int(rate), int(secs)):
+        # params are per-FILE, so keeping rows captured at another rate under new
+        # params would mislabel every one of them in compare_raw's header.
+        sys.exit(f"rebaseline: refusing a partial rebaseline at {rate}/s × {secs}s when "
+                 f"{len(partial)} existing entries were captured at "
+                 f"{old_params.get('rate')}/s × {old_params.get('secs')}s "
+                 f"({', '.join(sorted(partial))}) — rebaseline the full sentinel set instead.")
+    kept.update(endpoints)
+    doc["raw"] = {"params": {"rate": int(rate), "secs": int(secs)}, "endpoints": kept}
     Path(baseline_file).write_text(json.dumps(doc, indent=2) + "\n")
     print(f"baselined {len(names)} endpoints @ {rate}/s × {secs}s → {baseline_file} [raw]",
           file=sys.stderr)
@@ -129,7 +144,7 @@ def compare_raw(baseline_file, factor, names):
     print(f"perf-gate: factor {factor}×, baseline @ {bp['rate']}/s × {bp.get('secs', '?')}s", file=err)
     print("endpoint".ljust(24) + "".join(f"{p} base→cur (×)".ljust(22) for p in PCTS) + "200%  verdict", file=err)
 
-    regressed = []
+    regressed, no_baseline = [], []
     for name in names:
         base = raw.get("endpoints", {}).get(name)
         cur = _load_raw(name)
@@ -146,7 +161,12 @@ def compare_raw(baseline_file, factor, names):
             print(name.ljust(24) + "RATE NOT HELD (open-loop window degraded — remeasure)", file=err)
             continue
         if not base:
-            print(name.ljust(24) + f"{fmt(cur['p50'])}/{fmt(cur['p95'])}/{fmt(cur['p99'])}   (no baseline — skipped)",
+            # NOT a pass: an added/renamed sentinel would otherwise be ungated
+            # forever with no verdict. Collected so the table still prints in
+            # full, then hard-failed after the loop (the retry path can't fix a
+            # missing baseline, so it must not go through `regressed`).
+            no_baseline.append(name)
+            print(name.ljust(24) + f"{fmt(cur['p50'])}/{fmt(cur['p95'])}/{fmt(cur['p99'])}   NO BASELINE",
                   file=err)
             continue
         tripped = classify(base, cur, factor, MIN_DELTA_MS)
@@ -159,6 +179,11 @@ def compare_raw(baseline_file, factor, names):
               file=err)
         if tripped:
             regressed.append(name)
+    if no_baseline:
+        print(f"perf-gate: no baseline entry for {', '.join(no_baseline)} — "
+              "run `./perf-gate.sh --rebaseline` (a sentinel without a baseline is not gated)",
+              file=err)
+        sys.exit(2)
     sys.stdout.write(" ".join(regressed))
 
 
@@ -218,10 +243,15 @@ def check_merged(run):
     base = merged["variants"]
     fails = []
     seen = set()
+    ungated = []
     for o in run["operations"]:
         op, p, par = o["op"], o["perf"], o["parity"]
         b = base.get(p["variant"])
         if b is None:
+            # Not fatal (new variants land in the registry between rebaselines,
+            # unlike the fixed 11 raw sentinels), but never silent: an ungated
+            # variant that nobody notices is how a regression walks in.
+            ungated.append(p["variant"])
             continue
         seen.add(p["variant"])
         if p["f_ok"] is not None and p["f_ok"] < 100:
@@ -248,6 +278,10 @@ def check_merged(run):
     vanished = sorted(set(base) - seen)
     if vanished:
         fails.append(f"baselined variants absent from this run: {', '.join(vanished)}")
+    if ungated:
+        print(f"gate: {len(ungated)} variant(s) in this run have no baseline entry and were "
+              f"NOT gated: {', '.join(sorted(ungated))} — `suite/run.sh gate --rebaseline` "
+              "to bring them under the gate", file=sys.stderr)
 
     if fails:
         print(f"PERF/PARITY GATE FAILED ({len(fails)} regressions vs baseline):", file=sys.stderr)

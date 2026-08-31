@@ -47,6 +47,13 @@ trap 'docker compose down -v >/dev/null 2>&1 || true' EXIT
 # Library list — the ONE construction in suite/lib.sh (this script used to
 # duplicate it inline; the copies drifted being the risk, not a bug yet).
 suite_build_libraries
+# The synthetic tree is MOUNTED and scanned here (docker-compose mounts
+# ./fixtures/media at /media/synth, and suite_build_libraries registers it
+# whenever FIXTURE_*>0), so the gate must generate it and refuse to measure
+# without it — gating a 20-item library against a 520-item baseline is the
+# silently-wrong-number case, and --rebaseline would enshrine it.
+suite_gen_fixtures
+suite_require_fixtures
 # …and refuse to start if that library does not exist on disk. Docker would
 # otherwise CREATE the missing mount point (root-owned, which then needs sudo to
 # clear), scan nothing, and report it as a memory problem.
@@ -56,6 +63,11 @@ BASE="http://localhost:$FERROFIN_HOST_PORT"
 
 run_endpoints() {   # $1 = space-separated endpoint names → results/raw/perfgate-ferrofin-<name>.json
   for name in $1; do
+    # Drop the previous capture FIRST. perf_gate.py failing (bad ctx, vegeta
+    # blowing up) is swallowed below, and a surviving stale file would be read
+    # by gate.py as this run's data — a PASS on yesterday's numbers, or a
+    # --rebaseline that baselines them. Absent file ⇒ "NO DATA" ⇒ failure.
+    rm -f "results/raw/perfgate-ferrofin-$name.json"
     python3 perf_gate.py --base "$BASE" --endpoint "$name" --rate "$RATE" --secs "$SECS" \
       </dev/null >/dev/null 2>&1 || true
   done

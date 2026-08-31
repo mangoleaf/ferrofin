@@ -73,7 +73,7 @@ def window_secs(rate):
     """Measured-window length for one endpoint: enough requests for stable
     tail percentiles rather than a flat wall-time (precision scales with
     SAMPLES; a flat 30 s at a 500/s calibrated rate collects 15k samples the
-    tails don't need, ×118 endpoints ×2 servers ×N runs = hours of nothing).
+    tails don't need, ×~140 endpoints ×2 servers ×N runs = hours of nothing).
     clamp(MIN_SAMPLES/rate, floor, cap) — the floor keeps a wall-clock-long
     enough window for cache/steady-state effects, the cap bounds the slow
     endpoints. Identical for both servers (derives only from the shared rate)."""

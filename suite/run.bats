@@ -137,15 +137,21 @@ STRIP
 
 @test "merge with MERGE_ALLOW_INCOMPLETE writes an incomplete record, out of the trend" {
   [ -f perf/results/raw/ferrofin-summary.json ] && skip "raw summaries present on this host"
-  before=$(python3 -c "import json;print(len(json.load(open('results/runs.json'))['runs']))")
-  MERGE_ALLOW_INCOMPLETE=1 run_out=$(MERGE_ALLOW_INCOMPLETE=1 python3 merge.py)
+  export OUTDIR
+  # MERGE_OUT_DIR keeps the record (and the trend it must NOT join) inside the
+  # test tmpdir — the old version wrote into the committed results/ and then
+  # `rm -f results/run-*-incomplete*.json`'d, which would also delete an
+  # operator's real incomplete record.
+  OUTDIR="$BATS_TEST_TMPDIR/results"; mkdir -p "$OUTDIR"
+  cp results/runs.json "$OUTDIR/runs.json"
+  before=$(python3 -c "import json,os;print(len(json.load(open(os.environ['OUTDIR']+'/runs.json'))['runs']))")
+  run_out=$(MERGE_ALLOW_INCOMPLETE=1 MERGE_OUT_DIR="$OUTDIR" MERGE_ALLOW_STALE_BUILD=1 python3 merge.py)
   [[ "$run_out" == *"INCOMPLETE, excluded from the trend"* ]]
-  after=$(python3 -c "import json;print(len(json.load(open('results/runs.json'))['runs']))")
+  after=$(python3 -c "import json,os;print(len(json.load(open(os.environ['OUTDIR']+'/runs.json'))['runs']))")
   [ "$before" -eq "$after" ]
-  python3 -c "import json,glob; \
-r=json.load(open(sorted(glob.glob('results/run-*-incomplete*.json'))[-1])); \
+  python3 -c "import json,glob,os; \
+r=json.load(open(sorted(glob.glob(os.environ['OUTDIR']+'/run-*-incomplete*.json'))[-1])); \
 assert r['meta']['incomplete'], 'incomplete stamp missing'"
-  rm -f results/run-*-incomplete*.json
 }
 
 # Skips rather than degrade: on a host without raw summaries the old version
@@ -156,12 +162,21 @@ assert r['meta']['incomplete'], 'incomplete stamp missing'"
 @test "merge produces a valid run record with the fairness fields" {
   [ -f perf/results/raw/ferrofin-summary.json ] || skip "no raw summaries on this host"
   # Optional legs pinned OFF: TTFS and the cold restarts are env-driven and
-  # their raw files may legitimately be absent; the mandatory manifest (all
-  # 118 variants, both servers) is still asserted strictly.
-  run env RUN_TRANSCODE=0 BENCH_COLD_ENDPOINTS="" python3 merge.py
+  # their raw files may legitimately be absent; the mandatory manifest (every
+  # registry variant, both servers) is still asserted strictly.
+  #
+  # MERGE_OUT_DIR: this test merges FOR REAL, and merge.py appends to the
+  # committed trend (results/runs.json + run-<sha>.json). Running the test
+  # suite must not mint a benchmark data point — it did, once, re-stamping
+  # week-old raw artifacts onto the checked-out SHA. MERGE_ALLOW_STALE_BUILD
+  # goes with it: whatever raw artifacts this host has are almost certainly
+  # from another build, and record SHAPE is what is under test here.
+  OUTDIR="$BATS_TEST_TMPDIR/results"
+  run env RUN_TRANSCODE=0 BENCH_COLD_ENDPOINTS="" MERGE_OUT_DIR="$OUTDIR" \
+      MERGE_ALLOW_STALE_BUILD=1 python3 merge.py
   [ "$status" -eq 0 ]
-  run python3 -c "import json,glob,os; \
-r=json.load(open(sorted(glob.glob('results/run-*.json'),key=os.path.getmtime)[-1])); \
+  run env OUTDIR="$OUTDIR" python3 -c "import json,glob,os; \
+r=json.load(open(sorted(glob.glob(os.environ['OUTDIR']+'/run-*.json'),key=os.path.getmtime)[-1])); \
 h=r['headline']; assert 'parity_coverage' in h and 'median_speedup' in h; \
 assert 'dropped_rows' in h and 'dropped_by_reason' in h; \
 assert r['operations'], 'record has no operations'; \

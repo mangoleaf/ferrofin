@@ -58,17 +58,24 @@ suite_require_media() {
       missing=1
     fi
   done
+  [ "$missing" = 0 ] || exit 1
+}
+
+# The synth half of the same guard, as a POSTcondition of suite_gen_fixtures —
+# before it, an empty fixtures/media is the normal fresh-worktree state, not an
+# error. Uses `find -type f`, not `ls -A`: run.sh pre-creates
+# fixtures/media/{movies,tv}, so a directory test can never fire.
+suite_require_fixtures() {
   local synth=0
   [ "${FIXTURE_MOVIES:-0}" -gt 0 ] && synth=1
   [ "${FIXTURE_SERIES:-0}" -gt 0 ] && synth=1
   [ "${FIXTURE_ARTISTS:-0}" -gt 0 ] && synth=1
-  if [ "$synth" = 1 ] && [ -z "$(ls -A fixtures/media 2>/dev/null)" ]; then
-    echo "synthetic fixtures are requested but suite/perf/fixtures/media is empty" >&2
-    echo "  (run suite/perf/run.sh once to generate them, or point" >&2
-    echo "   REAL_MEDIA_DIR at real media and set FIXTURE_*=0)" >&2
-    missing=1
-  fi
-  [ "$missing" = 0 ] || exit 1
+  [ "$synth" = 1 ] || return 0
+  [ -n "$(find fixtures/media -type f 2>/dev/null | head -1)" ] && return 0
+  echo "synthetic fixtures are requested but generation produced no files under" >&2
+  echo "  suite/perf/fixtures/media (check ffmpeg is installed and gen-fixtures.sh" >&2
+  echo "  ran, or point REAL_MEDIA_DIR at real media and set FIXTURE_*=0)" >&2
+  exit 1
 }
 
 # Export every bench.conf KEY=value that the process environment doesn't already

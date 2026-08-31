@@ -106,7 +106,6 @@ def aggregate(runs):
         "parity_coverage": heads[-1].get("parity_coverage"),
         "comparable_rows": dist([h.get("comparable_rows") for h in heads]),
         "win_rate": dist([h.get("win_rate") for h in heads]),
-        "ties": dist([h.get("ties") for h in heads]),
         # Distribution of paired per-endpoint speedups over always-comparable
         # endpoints — the defensible single number, WITH its spread.
         # paired_excluded_ties = endpoints whose medians differ by less than
@@ -140,7 +139,7 @@ def render_md(agg, sha):
                f"· **when:** {m.get('when')}")
     out.append(f"- **Parity coverage (exact): {h['parity_coverage']}** · "
                f"comparable rows {fmt_dist(h['comparable_rows'])} · "
-               f"win-rate {fmt_dist(h['win_rate'])} · ties {fmt_dist(h['ties'])}")
+               f"win-rate {fmt_dist(h['win_rate'])}")
     out.append(f"- Paired speedup over always-comparable endpoints: **{fmt_dist(h['paired_speedup'])}** "
                f"(ratio of per-endpoint medians; spread is IQR across endpoints; "
                f"{h['paired_excluded_ties']} endpoint(s) tied under the {h['noise_floor_ms']} ms "
@@ -174,6 +173,42 @@ def main():
     same = [r for r in live if r["meta"]["ferrofin_sha"] == sha]
     if not same:
         sys.exit(f"aggregate: no open-loop runs for SHA {sha!r}")
+    # Same SHA is NOT the same measurement. `suite/run.sh gate --measure` merges a
+    # deliberately reduced-load record (short windows, no transcode/cold legs) at
+    # whatever SHA is checked out; blending its windows into a published
+    # distribution would understate the spread and misstate the medians. Keep one
+    # methodology cohort, and SAY what was dropped — a silent filter reads as
+    # "all runs aggregated".
+    # Only knobs that SHAPE the measurement belong in the key. Gate-only knobs
+    # (PERF_GATE_*) and BENCH_RUNS also live in bench_config.values; keying on
+    # the whole dict would split two legitimate publish runs apart because
+    # someone edited PERF_GATE_FACTOR in between.
+    SHAPING = ("BENCH_MIN_SAMPLES", "BENCH_MIN_WINDOW_SECS", "BENCH_DURATION_SECS",
+               "BENCH_RATE", "BENCH_RATE_FRACTION", "BENCH_RATE_MAX", "BENCH_RATE_TOLERANCE",
+               "BENCH_GLOBAL_WARMUP_SECS", "BENCH_WARMUP_SECS", "BENCH_WARMUP_MIN_CALLS",
+               "BENCH_COLD_REQUESTS", "BENCH_COLD_ENDPOINTS")
+    def shape(m):
+        vals = (m.get("bench_config") or {}).get("values") or {}
+        return json.dumps([m.get("fixture_hash"),
+                           (m.get("load") or {}).get("duration_secs"),
+                           [str(vals.get(k)) for k in SHAPING]], sort_keys=True)
+    # Largest cohort, not newest: one `gate --measure` record merged after a
+    # BENCH_RUNS publish batch must not evict the batch and leave n=1 (whose
+    # IQRs are 0 by definition and read as a suspiciously tight distribution).
+    cohorts = {}
+    for r in same:
+        cohorts.setdefault(shape(r["meta"]), []).append(r)
+    # Largest cohort, ties to the NEWEST: max() keeps the first maximum and
+    # runs.json is oldest-first, which would publish the superseded methodology.
+    order = {id(r): i for i, r in enumerate(same)}
+    kept = max(cohorts.values(), key=lambda c: (len(c), order[id(c[-1])]))
+    if len(cohorts) > 1:
+        print(f"aggregate: {sha} has {len(cohorts)} methodology cohorts "
+              f"({', '.join(str(len(c)) for c in cohorts.values())} runs) — publishing the "
+              f"largest/newest ({len(kept)} runs, latest {kept[-1]['meta'].get('when')}) and "
+              f"excluding {len(same) - len(kept)}. A `gate --measure` record or a bench.conf "
+              "change between runs does this.", file=sys.stderr)
+    same = kept
 
     agg = aggregate(same)
     out = RESULTS / f"agg-{sha}.json"

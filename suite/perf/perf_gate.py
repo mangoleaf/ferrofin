@@ -3,7 +3,7 @@
 
 perf-gate.sh brings Ferrofin up, then calls this once per sentinel endpoint:
 
-    python3 perf_gate.py --base http://localhost:18096 --endpoint items_sortname \
+    python3 perf_gate.py --base http://localhost:18196 --endpoint items_sortname \
         --rate 25 --secs 10
 
 Open-loop like the comparison leg (workstream G): a fixed arrival rate, not a

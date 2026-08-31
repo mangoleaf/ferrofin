@@ -64,7 +64,7 @@ Plus **footprint**, which is a bigger Rust-vs-.NET story than percentiles:
 The headline latency is **steady state**, via two-stage warmup identical on both
 servers: one global pass cycling every endpoint after bring-up
 (`BENCH_GLOBAL_WARMUP_SECS` — .NET tier-1 promotion is per-method and mostly shared
-code, so promoting it once beats paying a long warmup 117 times), then a short
+code, so promoting it once beats paying a long warmup ~140 times, once per endpoint), then a short
 same-endpoint top-up at the measured rate before each window (`BENCH_WARMUP_SECS`).
 The comparison is never Rust-vs-quick-JIT. **Cold** is a real user experience too (server
 restart, first browse) and a legitimate Rust advantage, so it's published as its own

@@ -17,7 +17,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 ROOT="$(cd .. && pwd)"
 
-usage() { sed -n '2,16p' "$ROOT/suite/run.sh"; exit 1; }
+usage() { sed -n '2,15p' "$ROOT/suite/run.sh"; exit 1; }
 [ $# -ge 1 ] || usage
 stage="$1"; shift || true
 
@@ -34,7 +34,9 @@ case "$stage" in
     suite_load_env .env
     suite_mint_device_id calibrate
     suite_build_libraries
+    suite_require_media
     suite_gen_fixtures
+    suite_require_fixtures
     docker compose down -v >/dev/null 2>&1 || true
     rm -f results/raw/jellyfin-ctx.json   # fresh DB ⇒ saved tokens/ids are dead
     docker compose up -d jellyfin

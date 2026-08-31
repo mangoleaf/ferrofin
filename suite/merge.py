@@ -37,6 +37,10 @@ ROOT = Path(__file__).resolve().parent.parent
 SUITE = ROOT / "suite"
 RESULTS = SUITE / "results"
 RAW = RESULTS / "raw"
+# Where the RECORD is written (runs.json, run-<sha>.json, shape-baseline.json).
+# Overridable so a test can merge for real without appending a fabricated point
+# to the committed trend — inputs still come from RESULTS/RAW either way.
+OUT = Path(os.environ["MERGE_OUT_DIR"]) if os.environ.get("MERGE_OUT_DIR") else RESULTS
 
 # The methodology knobs (three-layer resolution: default < bench.conf < env)
 # live in suite/perf/config.py — the manifest check needs the cold-endpoint
@@ -200,6 +204,16 @@ def fixture_hash():
     return h.hexdigest()[:16]
 
 
+def rel(path):
+    """Repo-relative path for display, or the absolute one when OUT is elsewhere
+    (MERGE_OUT_DIR can point outside the repo — relative_to would raise, after
+    the record is already written)."""
+    try:
+        return path.relative_to(ROOT)
+    except ValueError:
+        return path
+
+
 def server_build():
     """The /health/live build identity run.sh captured for the ferrofin leg."""
     p = SUITE / "perf" / "results" / "raw" / "ferrofin-build.txt"
@@ -261,7 +275,10 @@ def manifest_check(v2op, perf, foot, cold):
     return sorted(skip), sorted(missing)
 
 
+# Read from the repo, written to OUT: MERGE_OUT_DIR redirects where a record
+# LANDS, and must not quietly remove the baseline this run is checked against.
 BASELINE_FILE = RESULTS / "shape-baseline.json"
+BASELINE_OUT = OUT / "shape-baseline.json"
 
 
 # Embedded diffs are capped per side so a whole-subtree divergence (hundreds of paths
@@ -365,6 +382,10 @@ def main():
     fp_h = load_json(RAW / "perf-fingerprints-ferrofin.json", {})
     fp_j = load_json(RAW / "perf-fingerprints-jellyfin.json", {})
     fixtures = fixture_hash()
+    # NOT RAW (= suite/results/raw): the perf leg writes this into its own
+    # suite/perf/results/raw, which is wiped every non-BENCH_ONLY run. A copy in
+    # suite/results/raw is never wiped and would stamp BENCH_ONLY onto later runs.
+    leg_mode = load_json(SUITE / "perf" / "results" / "raw" / "leg-mode.json", {})
     # MERGE_ACK_SHAPES=1 acks every changed shape; a comma-separated variant list
     # acks selectively (so an intended change can be accepted without also
     # admitting an unexplained one that landed in the same run).
@@ -373,11 +394,19 @@ def main():
     ack_set = set() if ack_all else {v.strip() for v in ack_env.split(",") if v.strip()}
     baseline = load_json(BASELINE_FILE)
     baseline_reset = None
+    if fp_h and not baseline:
+        print("!! no shape baseline at suite/results/shape-baseline.json — the shape-honesty "
+              "gate cannot run: every variant is seeded as new and none can be excluded.",
+              file=sys.stderr)
     if baseline and baseline.get("fixture_hash") != fixtures:
         # Different fixtures shape different bodies — comparing to this baseline would flag
         # every row for the wrong reason. Informational-only this run; reseed loudly.
         baseline_reset = f"fixture changed {baseline.get('fixture_hash')} → {fixtures}"
         baseline = None
+        print(f"!! shape baseline RESET ({baseline_reset}) — the shape-honesty gate is "
+              "DISARMED for this run: every variant is accepted as new and the baseline "
+              "is re-seeded from it. Review the bodies before trusting this record.",
+              file=sys.stderr)
     baseline_updates, acked = {}, []
     foot = footprint()
     perf_meta = (load_json(SUITE / "perf/results/raw/ferrofin-summary.json") or {}).get("meta")
@@ -544,6 +573,19 @@ def main():
     }
 
     sha = sh("git", "rev-parse", "--short", "HEAD") or "unknown"
+    # B1 covers MEASUREMENT (perf/run.sh refuses to measure an unverified
+    # binary); this covers MERGE. Without it, `suite/run.sh merge` happily
+    # re-stamps last week's raw artifacts onto today's HEAD and appends a
+    # fabricated point to the committed trend — observed, from a bats run.
+    build = server_build()
+    expect = sh("git", "describe", "--tags", "--always", "--dirty", "--abbrev=12")
+    if (build and expect
+            and build.removesuffix("-dirty") != expect.removesuffix("-dirty")
+            and not os.environ.get("MERGE_ALLOW_STALE_BUILD")):
+        sys.exit(f"merge: the raw artifacts were measured on build {build!r}, but the tree is "
+                 f"{expect!r}. Merging them would mint a trend point for code that was never "
+                 f"benchmarked. Re-run the perf leg, or set MERGE_ALLOW_STALE_BUILD=1 if you "
+                 f"deliberately want this record.")
     record = {
         "meta": {
             "ferrofin": sh("git", "describe", "--tags", "--always") or "dev",
@@ -570,6 +612,14 @@ def main():
             # /health/live during the perf leg (run.sh verified it against the
             # tree before measuring); None for records that predate the check.
             "server_build": server_build(),
+            # BENCH_ONLY keeps the other leg's PREVIOUS raw results, so the
+            # two sides of such a record were not measured together;
+            # BENCH_LEG_ORDER is publish's drift-cancelling alternation. Both
+            # are invisible in the numbers, so they are stamped here — read
+            # from the perf leg's own artifact, since the merge usually runs as
+            # a separate command whose environment has neither set.
+            "bench_only": leg_mode.get("bench_only"),
+            "leg_order": leg_mode.get("leg_order"),
             "skipped_variants": skipped or None,
             "incomplete": missing or None,
             **({"shape_baseline_reset": baseline_reset} if baseline_reset else {}),
@@ -580,7 +630,7 @@ def main():
         "operations": sorted(operations, key=lambda o: o["perf"]["variant"]),
     }
 
-    RESULTS.mkdir(parents=True, exist_ok=True)
+    OUT.mkdir(parents=True, exist_ok=True)
 
     # An incomplete record (MERGE_ALLOW_INCOMPLETE=1) is written for inspection
     # under its own name but NEVER enters the trend file — a record with holes
@@ -589,12 +639,12 @@ def main():
         # Numbered so successive incomplete runs of one SHA don't overwrite
         # each other's evidence (review carry-over, round 2).
         seq = 1
-        while (RESULTS / f"run-{sha}-incomplete-{seq}.json").exists():
+        while (OUT / f"run-{sha}-incomplete-{seq}.json").exists():
             seq += 1
-        out = RESULTS / f"run-{sha}-incomplete-{seq}.json"
+        out = OUT / f"run-{sha}-incomplete-{seq}.json"
         record["meta"]["run_label"] = f"{record['meta']['ferrofin']} (incomplete)"
         out.write_text(json.dumps(record, indent=2) + "\n")
-        print(f">> wrote {out.relative_to(ROOT)} — INCOMPLETE, excluded from the trend")
+        print(f">> wrote {rel(out)} — INCOMPLETE, excluded from the trend")
         return
 
     # The shape baseline advances only on a COMPLETE record, and only when something
@@ -607,7 +657,7 @@ def main():
         merged.update(baseline_updates)
         known = {v for v, _ in v2op.items()}
         merged = {v: e for v, e in merged.items() if v in known}
-        BASELINE_FILE.write_text(json.dumps(
+        BASELINE_OUT.write_text(json.dumps(
             {"fixture_hash": fixtures, "sha": sha, "variants": merged},
             indent=2, sort_keys=True) + "\n")
 
@@ -615,7 +665,7 @@ def main():
     # collapse an exact re-merge of the same raw artifacts so a second `run.sh merge`
     # doesn't double-count one measurement. Genuine reruns differ in every latency, so
     # their signatures differ; a re-merge is identical and overwrites its own entry.
-    runs = load_json(RESULTS / "runs.json", {"runs": []})
+    runs = load_json(OUT / "runs.json", {"runs": []})
     sig = run_signature(record)
     same_sha = [r for r in runs["runs"] if r["meta"]["ferrofin_sha"] == sha]
     dup = next((r for r in same_sha if run_signature(r) == sig), None)
@@ -625,7 +675,7 @@ def main():
         else f"{record['meta']['ferrofin']} ({seq})"
 
     # Numbered filename so reruns of one SHA don't clobber each other's record file.
-    out = RESULTS / (f"run-{sha}.json" if seq == 1 else f"run-{sha}-{seq}.json")
+    out = OUT / (f"run-{sha}.json" if seq == 1 else f"run-{sha}-{seq}.json")
     out.write_text(json.dumps(record, indent=2) + "\n")
 
     # Upsert into the trend file the viewer reads (newest last): replace only an exact
@@ -634,10 +684,10 @@ def main():
         runs["runs"] = [record if r is dup else r for r in runs["runs"]]
     else:
         runs["runs"] = runs["runs"] + [record]
-    (RESULTS / "runs.json").write_text(json.dumps(runs, indent=2) + "\n")
+    (OUT / "runs.json").write_text(json.dumps(runs, indent=2) + "\n")
 
     hl = headline
-    print(f">> wrote {out.relative_to(ROOT)}  (perf: {perf_src})")
+    print(f">> wrote {rel(out)}  (perf: {perf_src})")
     print(f"   comparable rows: {hl['comparable_rows']}/{len(operations)}  "
           f"median speedup: {hl['median_speedup']}  win-rate: {hl['win_rate']}  "
           f"parity coverage: {hl['parity_coverage']}")

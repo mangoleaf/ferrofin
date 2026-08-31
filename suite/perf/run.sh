@@ -52,6 +52,11 @@ verify_build() {  # $1=base url $2=target
 }
 
 mkdir -p results/raw fixtures/empty fixtures/media/movies fixtures/media/tv
+# Real-media check BEFORE the wipe below: aborting after it would destroy the
+# previous run's raw results, and `suite/run.sh merge` on them is the documented
+# recovery path. (The synthetic-fixture half runs after gen_fixtures.)
+suite_require_media
+
 # BENCH_ONLY=ferrofin|jellyfin re-runs one leg, keeping the other's raw results.
 # ctx files are exempt from the wipe: they are provisioning STATE, not results
 # — deleting one while its volume survives (BENCH_KEEP_DATA) made ready_ctx
@@ -60,10 +65,21 @@ mkdir -p results/raw fixtures/empty fixtures/media/movies fixtures/media/tv
 # whenever it actually wipes the volume.
 if [ -z "${BENCH_ONLY:-}" ]; then find results/raw -name '*.json' ! -name '*-ctx.json' -delete 2>/dev/null || true; fi
 
+# Written AFTER the wipe above (it deletes every non-ctx json in results/raw).
+# How this run's legs were shaped, for merge.py's meta. BENCH_ONLY is consumed
+# here and nowhere else, and the merge is a separate command with a clean
+# environment — without this file the resulting record looks affirmatively
+# whole when one of its two legs is actually an older measurement.
+printf '{"bench_only":%s,"leg_order":%s}\n' \
+  "$([ -n "${BENCH_ONLY:-}" ] && printf '"%s"' "$BENCH_ONLY" || echo null)" \
+  "$([ -n "${BENCH_LEG_ORDER:-}" ] && printf '"%s"' "$BENCH_LEG_ORDER" || echo null)" \
+  > results/raw/leg-mode.json
+
 # Library list + synthetic fixtures (shared bring-up — see suite/lib.sh).
 suite_build_libraries
 echo ">> libraries: $LIBRARIES"
 suite_gen_fixtures
+suite_require_fixtures
 
 # Wait for container start -> the server can actually SERVE, return elapsed
 # seconds (cold-start metric). Gated on SUITE_READY_PATH, never
