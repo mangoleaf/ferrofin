@@ -158,12 +158,32 @@ struct GroupMember {
 }
 
 /// The group's play queue (port of `PlayQueueManager`, essentials).
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct PlayQueue {
     items: Vec<SyncPlayQueueItem>,
     playing_index: i32,
     shuffle: GroupShuffleMode,
     repeat: GroupRepeatMode,
+}
+
+/// `PlayQueueManager()` (PlayQueueManager.cs:37-40) calls `Reset()`, which sets
+/// `PlayingItemIndex = NoPlayingItemIndex` (-1, :20 and :100) — a fresh queue
+/// has NOTHING playing.
+///
+/// This cannot be `#[derive(Default)]`: `i32::default()` is 0, which is a valid
+/// INDEX, so a queued-but-never-played group reported `PlayingItemIndex: 0` on
+/// the wire against Jellyfin's `-1`, `is_item_playing()` claimed an unplayed
+/// queue was playing, and `clear(false)` kept a phantom item Jellyfin does not
+/// keep. Measured live on the parity pair before this was fixed.
+impl Default for PlayQueue {
+    fn default() -> Self {
+        Self {
+            items: Vec::new(),
+            playing_index: NO_PLAYING_ITEM_INDEX,
+            shuffle: GroupShuffleMode::default(),
+            repeat: GroupRepeatMode::default(),
+        }
+    }
 }
 
 impl PlayQueue {
@@ -3128,6 +3148,35 @@ mod tests {
             m.get_group(&a, gid).await.unwrap().state,
             GroupStateType::Playing
         );
+    }
+
+    /// A queue that was created but never played reports NOTHING playing.
+    ///
+    /// `PlayQueueManager()` calls `Reset()` -> `PlayingItemIndex = -1`
+    /// (PlayQueueManager.cs:37-40, :20, :100). `#[derive(Default)]` gave 0,
+    /// which is a valid index, so an unplayed queue claimed to be playing its
+    /// first item and put `PlayingItemIndex: 0` on the wire where Jellyfin puts
+    /// `-1`. Found live on the parity pair by exercising RemoveFromPlaylist on a
+    /// group that had queued but never played.
+    #[test]
+    fn a_fresh_play_queue_has_nothing_playing() {
+        let q = PlayQueue::default();
+        assert_eq!(q.playing_index, NO_PLAYING_ITEM_INDEX);
+        assert!(!q.is_item_playing());
+    }
+
+    /// The same rule after `clear(false)`: "keep the playing item" cannot
+    /// resurrect one that never existed (`ClearPlaylist`, PlayQueueManager.cs:176-197).
+    #[test]
+    fn clearing_an_unplayed_queue_keeps_no_phantom_item() {
+        let mut q = PlayQueue::default();
+        q.clear(false);
+        assert!(
+            q.items.is_empty(),
+            "nothing was playing, so nothing is kept"
+        );
+        assert_eq!(q.playing_index, NO_PLAYING_ITEM_INDEX);
+        assert!(!q.is_item_playing());
     }
 
     #[tokio::test]
