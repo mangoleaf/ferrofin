@@ -1,0 +1,13 @@
+-- A guide programme carries its listing's `ShowId`.
+--
+-- `XmlTvListingsProvider.GetProgramInfo` (v10.11.8
+-- src/Jellyfin.LiveTv/Listings/XmlTvListingsProvider.cs:185-212) derives
+-- `ProgramInfo.ShowId` from the airing's own fields BEFORE the movie reset
+-- clears `EpisodeNumber`/`EpisodeTitle`, and `GuideManager.GetProgram`
+-- (GuideManager.cs:497-501) stores it on the `LiveTvProgram` item — where it is
+-- what a DVR series rule matches showings on. The post-reset row cannot
+-- reproduce it, so the value is computed at ingest and stored.
+--
+-- Ferrofin-owned table (`FerrofinLiveTvPrograms`), so the column is additive and
+-- the Jellyfin-pinned schema shape is untouched.
+ALTER TABLE "FerrofinLiveTvPrograms" ADD COLUMN "ShowId" TEXT;

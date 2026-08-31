@@ -901,6 +901,25 @@ pub trait MediaStreamRepository: Send + Sync {
             .collect())
     }
 
+    /// The subset of `item_ids` with at least one LYRIC stream row.
+    ///
+    /// Backs the DTO builder's `HasLyrics`, which C# emits on every `Audio` DTO
+    /// outside the `ItemFields` system (`dto.HasLyrics =
+    /// audio.GetMediaStreams().Any(s => s.Type == MediaStreamType.Lyric)`,
+    /// v10.11.8 Emby.Server.Implementations/Dto/DtoService.cs:308-311). The
+    /// default filters the full stream batch; the concrete repository overrides
+    /// it with an ids-only query so a music page does not materialize stream
+    /// rows.
+    async fn get_item_ids_with_lyrics(&self, item_ids: &[Uuid]) -> Result<Vec<Uuid>, ServiceError> {
+        let map = self.get_media_streams_batch(item_ids).await?;
+        // Stored `StreamType` discriminant 5 = Lyric.
+        Ok(map
+            .into_iter()
+            .filter(|(_, rows)| rows.iter().any(|r| r.stream_type == 5))
+            .map(|(id, _)| id)
+            .collect())
+    }
+
     /// Gets the distinct language codes for a stream type across the library.
     async fn get_media_stream_languages(
         &self,

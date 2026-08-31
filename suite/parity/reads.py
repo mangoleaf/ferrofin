@@ -532,6 +532,9 @@ guide_info_invariants.alias = "LiveTvGuideInfo"
 #: arbitrary BY DESIGN — see `recording_group_invariants`.
 PROBE_GROUP_GUID = "f0f0f0f0-1111-2222-3333-444444444444"
 
+# A GUID no plugin can have on either server, for the miss paths.
+PROBE_PLUGIN_GUID = "11111111-1111-1111-1111-111111111111"
+
 
 def recording_group_invariants(base, token, ctx):
     """`GET /LiveTv/Recordings/Groups/{groupId}` — an OBSOLETE endpoint whose
@@ -590,6 +593,192 @@ def recording_group_invariants(base, token, ctx):
 
 
 recording_group_invariants.alias = "LiveTvRecordingGroup"
+
+
+# ------------------------------------------------------------ plugin identity
+#
+# The two servers share NO plugin id. Ferrofin registers compiled-in extensions
+# and staged WASM components; stock Jellyfin 10.11.8 registers five bundled .NET
+# provider plugins (TMDb b8715ed1…, MusicBrainz 8c95c4d2…, OMDb a628c0da…,
+# AudioDB a629c0da…, Studio Images 872a7849…). An id-correlated BODY diff is
+# therefore impossible on every `{pluginId}` route, and seeding one server's id
+# on both would compare a hit against a miss — worse than not measuring.
+#
+# What IS diffable, and what found four real defects, is the SHAPE each server
+# gives its OWN plugin. Each op below gets its OWN probe exercising its OWN
+# route: four ledger rows must be four measurements, not one claimed four times.
+
+
+def plugin_seed(base, token):
+    """`(plugin id, version)` for a plugin THIS server has, or `("", "")`."""
+    plugins = token_get(base, "/Plugins", token)[1] or []
+    if not plugins:
+        return "", ""
+    pid = sorted(p["Id"] for p in plugins)[0]
+    return pid, next(p.get("Version") or "" for p in plugins if p["Id"] == pid)
+
+
+def plugin_configuration_invariants(base, token, ctx):
+    """`GET /Plugins/{pluginId}/Configuration`.
+
+    A plugin's configuration is where its API key, username and password live,
+    and `PluginsController` is `[Authorize(Policy = Policies.RequiresElevation)]`
+    at CLASS level with exactly one `[AllowAnonymous]` override, `GetPluginImage`
+    (v10.11.8 Jellyfin.Api/Controllers/PluginsController.cs:25 and :221).
+    """
+    del ctx
+    facts = {}
+    pid, _ = plugin_seed(base, token)
+    facts["plugin_seed_present"] = bool(pid)
+    if pid:
+        st, config = token_get(base, f"/Plugins/{pid}/Configuration", token)
+        facts["status"] = st
+        # The contract's `BasePluginConfiguration` is an OBJECT. Ferrofin used
+        # to store a posted `null` verbatim and serve the bare token back.
+        facts["is_object"] = isinstance(config, dict)
+    facts["unknown_id"] = token_get(
+        base, f"/Plugins/{PROBE_PLUGIN_GUID}/Configuration", token)[0]
+    facts["malformed_id"] = token_get(base, "/Plugins/notaguid/Configuration", token)[0]
+    facts["anonymous"] = token_get(
+        base, f"/Plugins/{PROBE_PLUGIN_GUID}/Configuration", None)[0]
+    facts["anonymous_list"] = token_get(base, "/Plugins", None)[0]
+    return facts
+
+
+plugin_configuration_invariants.alias = "PluginsConfiguration"
+
+
+def plugin_configuration_write_invariants(base, token, ctx):
+    """`POST /Plugins/{pluginId}/Configuration`.
+
+    Upstream deserializes the body into the plugin's own `ConfigurationType`
+    (v10.11.8 PluginsController.cs:186-201), which has three consequences a raw
+    byte-store does not have — and Ferrofin had none of them:
+
+      * `if (configuration is not null)` — a `null` body is a NO-OP that still
+        answers 204. Ferrofin stored the literal `null` and the next read
+        answered `null`, destroying the plugin's configuration from an
+        admin-reachable route.
+      * a key the type does not declare is DROPPED by the deserializer.
+      * the write is a full REPLACE: a key the body omits falls back to the C#
+        property default.
+
+    Every leg restores the snapshot it took, so the shared lab pair is left
+    exactly as it was found. The probe writes only values the server itself just
+    handed back, plus one deliberately-unknown key that must not survive.
+    """
+    del ctx
+    facts = {}
+    pid, _ = plugin_seed(base, token)
+    facts["plugin_seed_present"] = bool(pid)
+    facts["unknown_id"] = http("POST", base + f"/Plugins/{PROBE_PLUGIN_GUID}/Configuration",
+                               token, "{}")[0]
+    if not pid:
+        return facts
+    path = f"/Plugins/{pid}/Configuration"
+    snapshot = token_get(base, path, token)[1]
+    facts["snapshot_is_object"] = isinstance(snapshot, dict)
+    if not isinstance(snapshot, dict):
+        return facts
+
+    def post(body):
+        return http("POST", base + path, token, body)[0]
+
+    def read_back():
+        return token_get(base, path, token)[1]
+
+    # An identity write changes nothing.
+    facts["identity_write_status"] = post(json.dumps(snapshot))
+    facts["identity_write_is_a_noop"] = read_back() == snapshot
+    # A `null` body is a no-op that still answers 204.
+    facts["null_write_status"] = post("null")
+    facts["null_write_is_a_noop"] = read_back() == snapshot
+    # A key the plugin's configuration type does not declare is dropped.
+    probe_key = "FerrofinParityProbeUnknownKey"
+    facts["unknown_key_write_status"] = post(json.dumps({**snapshot, probe_key: "x"}))
+    facts["unknown_key_is_dropped"] = probe_key not in (read_back() or {})
+    # Restore, whatever the server did with the two writes above.
+    post(json.dumps(snapshot))
+    facts["restored"] = read_back() == snapshot
+    return facts
+
+
+plugin_configuration_write_invariants.alias = "PluginsConfigurationWrite"
+
+
+def plugin_manifest_invariants(base, token, ctx):
+    """`POST /Plugins/{pluginId}/Manifest`.
+
+    `MediaBrowser.Common/Plugins/PluginManifest.cs` gives every property an
+    explicit lowercase `[JsonPropertyName]`, so this one response is camelCase
+    against the server's PascalCase policy, and the id is spelled `guid` in the
+    dashless `N` form `JsonGuidConverter` writes. Ferrofin answered five
+    PascalCase keys and a hyphenated `Id` — not one key in common with what a
+    client reads.
+    """
+    del ctx
+    facts = {}
+    pid, _ = plugin_seed(base, token)
+    facts["plugin_seed_present"] = bool(pid)
+    if pid:
+        st, manifest = token_post(base, f"/Plugins/{pid}/Manifest", token, None)
+        manifest = manifest or {}
+        facts["status"] = st
+        facts["keys"] = ",".join(sorted(manifest))
+        facts["guid_dashless"] = "-" not in (manifest.get("guid") or "-")
+        facts["guid_matches_route"] = (
+            (manifest.get("guid") or "").replace("-", "").lower() == pid.replace("-", "").lower())
+        facts["auto_update_is_bool"] = isinstance(manifest.get("autoUpdate"), bool)
+        facts["assemblies_is_list"] = isinstance(manifest.get("assemblies"), list)
+        facts["status_value"] = manifest.get("status")
+        facts["timestamp"] = manifest.get("timestamp")
+    facts["unknown_id"] = token_post(
+        base, f"/Plugins/{PROBE_PLUGIN_GUID}/Manifest", token, None)[0]
+    facts["anonymous"] = token_post(
+        base, f"/Plugins/{PROBE_PLUGIN_GUID}/Manifest", None, None)[0]
+    return facts
+
+
+plugin_manifest_invariants.alias = "PluginsManifest"
+
+
+def plugin_image_invariants(base, token, ctx):
+    """`GET /Plugins/{pluginId}/{version}/Image`.
+
+    The 200 body is out of reach on both servers by construction — no plugin on
+    either reports `HasImage`, and a shared image subject would need the SAME
+    external plugin installed on both, which needs the .NET assembly loading
+    Ferrofin does not have. The status paths are fully diffable, and they are
+    where the defect was: `{version}` is a `Version` bound by the model binder
+    and matched with `Version.Equals` (v10.11.8 Emby.Server.Implementations/
+    Plugins/PluginManager.cs:293-311), and Ferrofin discarded the segment
+    entirely — `notaversion` answered as if it were the installed version.
+
+    This is also the ONE action upstream marks `[AllowAnonymous]`
+    (PluginsController.cs:221), against the controller's class-level elevation.
+    """
+    del ctx
+    facts = {}
+    pid, version = plugin_seed(base, token)
+    facts["plugin_seed_present"] = bool(pid)
+    facts["version_seed_present"] = bool(version)
+    if pid and version:
+        facts["installed_version"] = token_get(
+            base, f"/Plugins/{pid}/{version}/Image", token)[0]
+        facts["wrong_version"] = token_get(
+            base, f"/Plugins/{pid}/9.9.9.9/Image", token)[0]
+        facts["malformed_version"] = token_get(
+            base, f"/Plugins/{pid}/notaversion/Image", token)[0]
+        # `[AllowAnonymous]`: the same answer without a token.
+        facts["anonymous_installed_version"] = token_get(
+            base, f"/Plugins/{pid}/{version}/Image", None)[0]
+    facts["unknown_id"] = token_get(
+        base, f"/Plugins/{PROBE_PLUGIN_GUID}/1.0.0/Image", token)[0]
+    facts["malformed_id"] = token_get(base, "/Plugins/notaguid/1.0.0/Image", token)[0]
+    return facts
+
+
+plugin_image_invariants.alias = "PluginsImage"
 
 
 def similar_invariants_for(alias):
@@ -709,7 +898,75 @@ READS = [
     # ledger sources it from a full body diff rather than a Layer-1 spot check.
     user("GET /Items/Root", "/Items/Root?userId={u}"),
     user("GET /Library/VirtualFolders", "/Library/VirtualFolders"),
-    user("GET /Items", "/Items?userId={u}&recursive=true&includeItemTypes=Movie&limit=50&sortBy=SortName&fields=Path"),
+    # THREE legs, because the recursive item universe is what this op is, and a
+    # Movie-only leg cannot see a whole kind going missing from it.
+    multi("GET /Items", [
+        "/Items?userId={u}&recursive=true&includeItemTypes=Movie&limit=50&sortBy=SortName&fields=Path",
+        # The guide. Jellyfin stores every airing as a real `BaseItems` row
+        # parented to the channel and TOP-parented to the Live TV `UserView`
+        # (`CreateItems(newPrograms, currentChannel, …)`, v10.11.8
+        # src/Jellyfin.LiveTv/Guide/GuideManager.cs:277), so the recursive
+        # universe holds the whole guide. Ferrofin held none of it — measured
+        # F 0 / J 338 — while `/LiveTv/Programs` answered 338 on both, so the
+        # data was there and only the item rows were missing.
+        #
+        # PROJECTED, and this is the one leg on this row that is. Each server's
+        # guide is a ROLLING window anchored to its own last refresh
+        # (GuideManager.cs:215-231), and `/Items` — unlike `/LiveTv/Programs` —
+        # has NO `minStartDate`/`maxStartDate` to pin one with, so the two pages
+        # are index-aligned across two different windows and every airing's
+        # Name/StartDate/EndDate reads as a divergence the moment either server
+        # refreshes. That is per-instance refresh state, not a body difference.
+        # What the leg claims instead is exactly what it exists to claim: that
+        # the guide is REACHABLE through this route at all, in the same size and
+        # with the same DTO shape. The per-airing body IS fully diffed — by the
+        # `POST /LiveTv/Programs` legs inside the shared window, and by the
+        # `GET /Items/{itemId}` programme leg, which is seeded from inside that
+        # same window and so names the SAME airing on both servers.
+        ("/Items?userId={u}&recursive=true&includeItemTypes=LiveTvProgram"
+         "&limit=100000&sortBy=StartDate,SortName&enableTotalRecordCount=true",
+         lambda b: {"TotalRecordCount": b.get("TotalRecordCount"),
+                    "PageLength": len(b.get("Items") or []),
+                    "Types": sorted({i.get("Type") for i in (b.get("Items") or [])}),
+                    # The union of keys across the page: a field the mirror
+                    # failed to carry would drop out of it.
+                    "ItemKeys": sorted({k for i in (b.get("Items") or []) for k in i})}),
+        # …and the same page under `locationTypes=FileSystem`, which must be
+        # EMPTY on both. An airing has no file behind it, so
+        # `LiveTvProgram`'s constructor sets `IsVirtualItem = true` (v10.11.8
+        # MediaBrowser.Controller/LiveTv/LiveTvProgram.cs:26-29), and
+        # `ItemsController.GetItems` translates `locationTypes` onto
+        # `query.IsVirtualItem` (:437-447). Ferrofin ignored BOTH
+        # `locationTypes` and `excludeLocationTypes` entirely, so this leg
+        # answered with the whole guide where Jellyfin answers with nothing —
+        # a filter the client believes it applied and the server never did.
+        # This leg's assertion IS emptiness, so it is only meaningful next to
+        # the non-empty one above.
+        "/Items?userId={u}&recursive=true&includeItemTypes=LiveTvProgram"
+        "&locationTypes=FileSystem&limit=100000&enableTotalRecordCount=true",
+        # The unfiltered recursive page, projected to its TYPE CENSUS and total.
+        #
+        # The projection is not a narrowing of what is compared — every kind on
+        # this page is body-diffed by its own leg or its own row — it is the ONE
+        # thing no other leg can see: which kinds exist in the universe at all,
+        # and how the grouping collapses them. With a user and an EMPTY
+        # `includeItemTypes`, `EnableGroupByPresentationUniqueKey` is TRUE
+        # (Jellyfin.Server.Implementations/Item/BaseItemRepository.cs:1557-1589)
+        # and the query groups on `PresentationUniqueKey`. Only
+        # `MetadataService.UpdatePresentationUniqueKey` ever populates that
+        # column (MediaBrowser.Providers/Manager/MetadataService.cs:332-336) and
+        # the guide refresh calls `RefreshMetadata` on a CHANNEL only
+        # (GuideManager.cs:305) — so every airing's key is NULL, SQLite groups
+        # NULLs together, and the entire guide shows up here as exactly ONE
+        # `Program`. Verified in the oracle database: 4 channel rows carry their
+        # own id as the key, all 338 programme rows carry NULL. A mirror that
+        # minted a key per airing would move this census from 1 to 338 and put
+        # the whole guide on every user's home screen.
+        ("/Items?userId={u}&recursive=true&limit=100000&enableTotalRecordCount=true",
+         lambda b: {"TotalRecordCount": b.get("TotalRecordCount"),
+                    "TypeCensus": dict(sorted(collections.Counter(
+                        i.get("Type") for i in (b.get("Items") or [])).items()))}),
+    ]),
     user("GET /Items/Latest", "/Items/Latest?userId={u}&limit=20&fields=Path"),
     user("GET /UserItems/Resume", "/UserItems/Resume?userId={u}&limit=12&fields=Path"),
     user("GET /Shows/NextUp", "/Shows/NextUp?userId={u}&limit=24"),
@@ -762,11 +1019,30 @@ READS = [
     # correlated by Path — it does not need to be: `GetInternalChannelId` hashes
     # the tuner's own id, so both servers mint the same GUID from the same
     # lineup, and each side is asked for its own `{channel}` anyway.
+    # …and a guide programme, for the same reason and with the same identity
+    # argument: `LiveTvDtoService.GetInternalProgramId` hashes
+    # `{listingsProviderId}_{start:O}_{channelExternalId}`, all three of which
+    # both servers derive from the same XMLTV and the same M3U, so the GUID is
+    # the same on both (measured: 328 of 338 ids join exactly, the ten-row gap
+    # being the rolling guide window sliding between the two refreshes). The
+    # seed is picked inside the SHARED guide window so both sides name the same
+    # airing.
     item("GET /Items/{itemId}", "/Items/{i}?userId={u}&fields=Path,MediaSources,MediaStreams,Overview,Genres",
-         extra=["/Items/{channel}?userId={user}&fields=Path,MediaSources,MediaStreams,Overview,Genres"]),
+         extra=["/Items/{channel}?userId={user}&fields=Path,MediaSources,MediaStreams,Overview,Genres",
+                "/Items/{program}?userId={user}&fields=Path,MediaSources,MediaStreams,Overview,Genres"]),
     # A movie seed cannot be body-diffed (Random order + a deliberately different
     # candidate algorithm) — verified by properties instead, see
     # `similar_invariants`.
+    # The four plugin ops. All four are stamped `property`, never `body-diff`:
+    # no shared plugin id exists between a Rust server with compiled-in
+    # extensions and a stock Jellyfin with five bundled .NET provider plugins,
+    # so there is no shared subject to diff. What WOULD earn a body diff is the
+    # same plugin installed on both, which Jellyfin can only do with a .NET
+    # assembly — see the residual in classifications.json.
+    invariant("GET /Plugins/{pluginId}/Configuration", plugin_configuration_invariants),
+    invariant("POST /Plugins/{pluginId}/Configuration", plugin_configuration_write_invariants),
+    invariant("POST /Plugins/{pluginId}/Manifest", plugin_manifest_invariants),
+    invariant("GET /Plugins/{pluginId}/{version}/Image", plugin_image_invariants),
     invariant("GET /Items/{itemId}/Similar", similar_invariants_for("Items")),
     item("GET /Items/{itemId}/Ancestors", "/Items/{i}/Ancestors?userId={u}"),
     item("GET /Items/{itemId}/PlaybackInfo", "/Items/{i}/PlaybackInfo?userId={u}"),
@@ -1272,6 +1548,19 @@ def resolve_named(base, token, user_id):
     }
 
 
+def first_program_in_window(base, token, window):
+    """The id of the earliest airing inside `window`, or `""`.
+
+    Ordered by `StartDate,SortName` so a tie at the window edge resolves the
+    same way on both servers, exactly as the `/LiveTv/Programs` legs do.
+    """
+    url = "/LiveTv/Programs?limit=1&sortBy=StartDate,SortName&sortOrder=Ascending"
+    if window:
+        url += f"&minStartDate={window[0]}&maxStartDate={window[1]}"
+    items = (get_json(base, url, token) or {}).get("Items") or []
+    return items[0].get("Id") or "" if items else ""
+
+
 def shared_guide_window(bases_tokens):
     """The `[MinStartDate, MaxStartDate)` BOTH servers' guides cover, as ISO-8601 Z.
 
@@ -1331,6 +1620,12 @@ def run(ferrofin_url, jellyfin_url):
               "/LiveTv/Programs legs run UNPINNED", file=sys.stderr)
     for ctx in (hc, jc):
         ctx["guide_from"], ctx["guide_to"] = window or (None, None)
+    # The programme seed for the `GET /Items/{itemId}` extra leg, taken from
+    # INSIDE the shared window and ordered, so both servers name the same
+    # airing. `""` (no overlap, or no guide) makes the leg skip loudly rather
+    # than compare two different programmes — the same guard `{channel}` has.
+    for ctx, base, token in ((hc, ferrofin_url, ht), (jc, jellyfin_url, jt)):
+        ctx["program"] = first_program_in_window(base, token, window)
 
     pairs = correlate(path_id_map(ferrofin_url, ht, hu), path_id_map(jellyfin_url, jt, ju))
 
@@ -1667,7 +1962,7 @@ def selfcheck():
     # {u} vs "user" KeyError). Format each with a fully-populated context; a KeyError fails here.
     ctx = {"user": "U", "u": "U", "genre": "G", "studio": "S", "person": "P", "series": "SE",
            "task": "T", "device": "D", "artist": "A", "artist_id": "AID", "musicgenre": "MG",
-           "channel": "CH", "album_id": "ALB", "movie": "MOV", "episode": "EP",
+           "channel": "CH", "program": "PRG", "album_id": "ALB", "movie": "MOV", "episode": "EP",
            # The shared guide window `run` measures; `None` is the "no overlap
            # to name" case, and the self-check must exercise it too.
            "guide_from": None, "guide_to": None,
@@ -1776,7 +2071,8 @@ def selfcheck():
     # The allow-list is the `Similar` family plus each hand-written property row.
     # Naming them keeps a typo'd alias from silently colliding with a real one.
     assert set(aliases) <= set(SIMILAR_ALIASES) | {
-        "LiveTvGuideInfo", "LiveTvRecordingGroup"}, aliases
+        "LiveTvGuideInfo", "LiveTvRecordingGroup", "PluginsConfiguration",
+        "PluginsConfigurationWrite", "PluginsManifest", "PluginsImage"}, aliases
     # Every invariant row is stamped `property`, never the body-diff method the
     # ledger headline counts.
     assert all(ep["method"] == "property" for ep in READS if ep["kind"] == "invariant")

@@ -10,8 +10,14 @@
 //! rejected. Every mutating route (install/uninstall/repository-set/cancel/
 //! enable/disable/configuration-write) requires an administrator, porting
 //! Jellyfin's `RequiresElevation` policy; a WASM plugin's config JSON is
-//! handed straight to the guest, so config writes are guest input. Reads
-//! stay plain-auth.
+//! handed straight to the guest, so config writes are guest input. So do the
+//! READS: `PluginsController` carries `[Authorize(Policy =
+//! Policies.RequiresElevation)]` at CLASS level (v10.11.8
+//! Jellyfin.Api/Controllers/PluginsController.cs:25, byte-identical on master)
+//! with exactly one `[AllowAnonymous]` override, `GetPluginImage` (:221). A
+//! plugin's configuration holds its credentials — Ferrofin used to hand
+//! `{"ApiKey":…,"Username":…,"Password":…}` to any authenticated account,
+//! guest profiles included.
 //!
 //! - `GET /Plugins` — installed plugins
 //! - `GET|POST /Plugins/{id}/Configuration` — read/write a plugin's config
@@ -33,7 +39,7 @@ use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
-use ferrofin_model::plugins::{PluginInfo, PluginStatus};
+use ferrofin_model::plugins::{PluginInfo, PluginManifest, PluginStatus};
 use ferrofin_model::updates::{PackageInfo, RepositoryInfo};
 use ferrofin_traits::plugins::PluginDescriptor;
 use uuid::Uuid;
@@ -93,17 +99,109 @@ fn to_plugin_info(d: PluginDescriptor) -> PluginInfo {
     }
 }
 
+/// The `PluginManifest` a Ferrofin plugin has.
+///
+/// Port of the bundled-plugin arm of `PluginManager.RegisterBundledPlugin`
+/// (v10.11.8 Emby.Server.Implementations/Plugins/PluginManager.cs:562), which
+/// builds `new PluginManifest { Id, Status = Active, Name, Version }` and leaves
+/// every other property at the constructor default — empty strings,
+/// `DateTime.MinValue`, `AutoUpdate = true`, no assemblies. That is exactly
+/// Ferrofin's case for BOTH plugin tiers: a compiled-in extension and a
+/// `ferrofin:plugin` WASM component alike carry only the identity their code
+/// declares, and neither ships a manifest document with an owner, a category or
+/// a target ABI. A live 10.11.8 answers this route for its own bundled plugins
+/// the same way, down to `"description":""` while `GET /Plugins` reports a real
+/// description — the two fields have different sources upstream and must not be
+/// merged.
+fn to_plugin_manifest(d: PluginDescriptor) -> PluginManifest {
+    PluginManifest {
+        category: String::new(),
+        changelog: String::new(),
+        description: String::new(),
+        id: d.id,
+        name: d.name,
+        overview: String::new(),
+        owner: String::new(),
+        target_abi: String::new(),
+        timestamp: ferrofin_model::json::datetime::dotnet_min(),
+        version: d.version,
+        status: if d.enabled {
+            PluginStatus::Active
+        } else {
+            PluginStatus::Disabled
+        },
+        auto_update: true,
+        image_path: None,
+        assemblies: Vec::new(),
+    }
+}
+
+/// A .NET `Version` route segment, as its four `int` components with an absent
+/// component read as `-1`.
+///
+/// `PluginsController` binds `[FromRoute, Required] Version version` on all four
+/// `{version}` routes, so ASP.NET rejects an unparseable segment with a 400
+/// before the action runs, and `PluginManager.GetPlugin(id, version)` then
+/// matches with `p.Version.Equals(version)` (v10.11.8
+/// Emby.Server.Implementations/Plugins/PluginManager.cs:293-311). `Version`
+/// requires two to four non-negative components and treats an absent one as
+/// `-1`, which is why a live 10.11.8 answers 404 for `10.11.8` against an
+/// installed `10.11.8.0`.
+fn parse_dotnet_version(value: &str) -> Option<[i64; 4]> {
+    let mut parts = [-1_i64; 4];
+    let fields: Vec<&str> = value.split('.').collect();
+    if !(2..=4).contains(&fields.len()) {
+        return None;
+    }
+    for (slot, field) in parts.iter_mut().zip(&fields) {
+        // `int.Parse` with `NumberStyles.Integer` — no sign, no separators, and
+        // it must fit an `Int32`.
+        let parsed: i32 = field.parse().ok()?;
+        if parsed < 0 {
+            return None;
+        }
+        *slot = i64::from(parsed);
+    }
+    Some(parts)
+}
+
+/// The plugin at `plugin_id` **and** `version`, porting
+/// `IPluginManager.GetPlugin(Guid, Version)`.
+///
+/// A malformed version is a 400 (ASP.NET's model binder), a version that is not
+/// the installed one is a 404. Ferrofin used to discard the segment entirely, so
+/// `POST /Plugins/{id}/notaversion/Enable` returned 204 — it enabled the plugin
+/// on the strength of a string that is not a version at all.
+async fn plugin_at_version(
+    state: &AppState,
+    plugin_id: Uuid,
+    version: &str,
+) -> Result<PluginDescriptor, ApiError> {
+    let want = parse_dotnet_version(version)
+        .ok_or_else(|| ApiError::BadRequest(format!("The value '{version}' is not valid.")))?;
+    let found = state
+        .plugins
+        .get_plugin(plugin_id)
+        .await?
+        .filter(|d| parse_dotnet_version(&d.version) == Some(want));
+    found.ok_or_else(|| ApiError::NotFound(format!("plugin {plugin_id} {version}")))
+}
+
 /// `GET /Plugins` — list the installed plugins.
 #[utoipa::path(
     get,
     path = "/Plugins",
-    responses((status = 200, description = "Installed plugins returned", body = [PluginInfo])),
+    responses(
+        (status = 200, description = "Installed plugins returned", body = [PluginInfo]),
+        (status = 403, description = "Administrator access required")
+    ),
     tag = "ferrofin"
 )]
 async fn get_plugins(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAuth(auth): RequireAuth,
 ) -> Result<Json<Vec<PluginInfo>>, ApiError> {
+    require_admin(&state, &auth).await?;
     let plugins = state.plugins.list_plugins().await?;
     Ok(Json(plugins.into_iter().map(to_plugin_info).collect()))
 }
@@ -118,15 +216,19 @@ async fn get_plugins(
     params(("pluginId" = String, Path, description = "Plugin id")),
     responses(
         (status = 200, description = "Configuration returned"),
+        (status = 403, description = "Administrator access required"),
         (status = 404, description = "Plugin not found")
     ),
     tag = "ferrofin"
 )]
 async fn get_plugin_configuration(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAuth(auth): RequireAuth,
     Path(plugin_id): Path<Uuid>,
 ) -> Result<Response, ApiError> {
+    // A plugin's configuration is where its credentials live; the C# gates this
+    // read at class level (PluginsController.cs:25).
+    require_admin(&state, &auth).await?;
     let bytes = state.plugins.get_plugin_configuration(plugin_id).await?;
     Ok(([(header::CONTENT_TYPE, "application/json")], bytes).into_response())
 }
@@ -171,16 +273,18 @@ async fn update_plugin_configuration(
     ),
     responses(
         (status = 204, description = "Plugin enabled"),
-        (status = 404, description = "Plugin not found")
+        (status = 400, description = "Version is not a valid version string"),
+        (status = 404, description = "Plugin or version not found")
     ),
     tag = "ferrofin"
 )]
 async fn enable_plugin(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path((plugin_id, _version)): Path<(Uuid, String)>,
+    Path((plugin_id, version)): Path<(Uuid, String)>,
 ) -> Result<StatusCode, ApiError> {
     require_admin(&state, &auth).await?;
+    plugin_at_version(&state, plugin_id, &version).await?;
     state.plugins.enable_plugin(plugin_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -195,16 +299,18 @@ async fn enable_plugin(
     ),
     responses(
         (status = 204, description = "Plugin disabled"),
-        (status = 404, description = "Plugin not found")
+        (status = 400, description = "Version is not a valid version string"),
+        (status = 404, description = "Plugin or version not found")
     ),
     tag = "ferrofin"
 )]
 async fn disable_plugin(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path((plugin_id, _version)): Path<(Uuid, String)>,
+    Path((plugin_id, version)): Path<(Uuid, String)>,
 ) -> Result<StatusCode, ApiError> {
     require_admin(&state, &auth).await?;
+    plugin_at_version(&state, plugin_id, &version).await?;
     state.plugins.disable_plugin(plugin_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -250,9 +356,10 @@ async fn uninstall_plugin(
 async fn uninstall_plugin_by_version(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path((plugin_id, _version)): Path<(Uuid, String)>,
+    Path((plugin_id, version)): Path<(Uuid, String)>,
 ) -> Result<StatusCode, ApiError> {
     require_admin(&state, &auth).await?;
+    plugin_at_version(&state, plugin_id, &version).await?;
     state.plugins.remove_plugin(plugin_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -267,18 +374,30 @@ async fn uninstall_plugin_by_version(
     ),
     responses(
         (status = 200, description = "Image returned"),
-        (status = 404, description = "Plugin or image not found")
+        (status = 400, description = "Version is not a valid version string"),
+        (status = 404, description = "Plugin, version or image not found")
     ),
     tag = "ferrofin"
 )]
 async fn get_plugin_image(
     State(state): State<AppState>,
-    Path((plugin_id, _version)): Path<(Uuid, String)>,
+    Path((plugin_id, version)): Path<(Uuid, String)>,
 ) -> Result<Response, ApiError> {
+    // No auth extractor: this is the ONE action upstream marks
+    // `[AllowAnonymous]` (v10.11.8 PluginsController.cs:221), against the
+    // controller's class-level `RequiresElevation`.
+    plugin_at_version(&state, plugin_id, &version).await?;
     match state.plugins.plugin_image(plugin_id).await? {
-        Some(image) => {
-            Ok(([(header::CONTENT_TYPE, image.content_type)], image.data).into_response())
-        }
+        Some(image) => Ok((
+            [
+                (header::CONTENT_TYPE, image.content_type),
+                // `Response.Headers.ContentDisposition = "attachment"` before
+                // the `PhysicalFile(...)`, in both trees.
+                (header::CONTENT_DISPOSITION, "attachment".to_owned()),
+            ],
+            image.data,
+        )
+            .into_response()),
         None => Err(ApiError::NotFound(format!("image for plugin {plugin_id}"))),
     }
 }
@@ -292,28 +411,28 @@ async fn get_plugin_image(
     path = "/Plugins/{pluginId}/Manifest",
     params(("pluginId" = String, Path, description = "Plugin id")),
     responses(
-        (status = 200, description = "Manifest returned"),
+        (status = 200, description = "Manifest returned", body = PluginManifest),
+        (status = 403, description = "Administrator access required"),
         (status = 404, description = "Plugin not found")
     ),
     tag = "ferrofin"
 )]
 async fn get_plugin_manifest(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAuth(auth): RequireAuth,
     Path(plugin_id): Path<Uuid>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> Result<Json<PluginManifest>, ApiError> {
+    require_admin(&state, &auth).await?;
     let Some(d) = state.plugins.get_plugin(plugin_id).await? else {
         return Err(ApiError::NotFound(format!("plugin {plugin_id}")));
     };
-    // The vendored contract does not pin a manifest schema; project the fields the
-    // descriptor carries (a faithful read for a compiled-in plugin).
-    Ok(Json(serde_json::json!({
-        "Id": d.id,
-        "Name": d.name,
-        "Version": d.version,
-        "Description": d.description,
-        "Status": if d.enabled { "Active" } else { "Disabled" },
-    })))
+    // The vendored contract carries no `PluginManifest` schema component, which
+    // is why the Layer-1 sweep could never see the shape — but
+    // `MediaBrowser.Common/Plugins/PluginManifest.cs` pins it exactly, down to
+    // the per-property camelCase `[JsonPropertyName]`s and the `guid` spelling
+    // of the id. Ferrofin used to hand-roll five PascalCase keys and a
+    // hyphenated `Id` here, which shares not one key with what a client reads.
+    Ok(Json(to_plugin_manifest(d)))
 }
 
 /// `GET /Repositories` — the configured package repositories.

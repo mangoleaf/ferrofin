@@ -251,6 +251,14 @@ struct ItemsQuery {
     /// A single person name filter.
     #[serde(default)]
     person: Option<String>,
+    /// Comma-delimited [`LocationType`](ferrofin_model::entities::LocationType)
+    /// set to include. Drives `IsVirtualItem` — see
+    /// [`apply_location_types`](crate::handlers::query_parse::apply_location_types).
+    #[serde(default)]
+    location_types: Option<String>,
+    /// Comma-delimited `LocationType` set to exclude.
+    #[serde(default)]
+    exclude_location_types: Option<String>,
     /// Whether to compute the total record count (defaults `true`).
     #[serde(default)]
     enable_total_record_count: Option<bool>,
@@ -331,6 +339,14 @@ async fn get_items(
     if let Some(parent) = query.parent_id {
         internal.parent_id = parent;
     }
+    // `IsVirtualItem` is driven ONLY by these two parameters on this route
+    // (v10.11.8 Jellyfin.Api/Controllers/ItemsController.cs:437-447) — there is
+    // no `isVirtualItem` query parameter to set it directly.
+    crate::handlers::query_parse::apply_location_types(
+        &mut internal.is_virtual_item,
+        query.location_types.as_deref(),
+        query.exclude_location_types.as_deref(),
+    );
     // C# `ApplyFilters` translates the `filters` flag set onto the tri-state
     // fields, rejecting contradictory pairs with a `400`. Token parsing is
     // lenient + case-insensitive like ASP.NET's binder: jellyfin-web sends

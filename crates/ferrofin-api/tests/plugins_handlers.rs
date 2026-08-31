@@ -284,8 +284,19 @@ async fn plugin_image_served_and_missing() {
         ok.headers().get("content-type").unwrap().to_str().unwrap(),
         "image/png"
     );
+    // `Response.Headers.ContentDisposition = "attachment"` before the
+    // `PhysicalFile(...)` (v10.11.8 PluginsController.cs:236, unchanged on
+    // master).
+    assert_eq!(
+        ok.headers()
+            .get("content-disposition")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "attachment"
+    );
 
-    let missing = router(fake)
+    let missing = router(fake.clone())
         .oneshot(authed(
             "GET",
             &format!("/Plugins/{}/1.0/Image", Uuid::from_u128(9)),
@@ -296,6 +307,56 @@ async fn plugin_image_served_and_missing() {
     assert_eq!(missing.status(), StatusCode::NOT_FOUND);
 }
 
+/// The `{version}` segment is a `Version`, not decoration.
+///
+/// The C# binds `[FromRoute, Required] Version version` and looks the plugin up
+/// with `GetPlugin(id, version)`, so a malformed segment is a 400 from the model
+/// binder and a mismatched one is a 404 — and `Version.Equals` reads an absent
+/// component as `-1`, so `1.2.3` is NOT `1.2.3.0`. Ferrofin discarded the
+/// segment on all four `{version}` routes, which meant
+/// `POST /Plugins/{id}/notaversion/Enable` answered 204 and really did enable
+/// the plugin.
+#[tokio::test]
+async fn a_version_segment_selects_the_plugin() {
+    let fake = Arc::new(RecordingPlugins::default());
+    // Every `{version}` route, so none of them can drift back.
+    let routes = |version: &str| {
+        [
+            ("GET", format!("/Plugins/{}/{version}/Image", known_id())),
+            ("POST", format!("/Plugins/{}/{version}/Enable", known_id())),
+            ("POST", format!("/Plugins/{}/{version}/Disable", known_id())),
+            ("DELETE", format!("/Plugins/{}/{version}", known_id())),
+        ]
+    };
+    for (expected, version) in [
+        // A version that is not the installed one.
+        (StatusCode::NOT_FOUND, "9.9.9.9"),
+        // The fake installs "1.2.3", and `Version.Equals` reads the absent
+        // revision as -1, so the four-component spelling of the same number is
+        // a different version. A live 10.11.8 404s "10.11.8" against its
+        // installed "10.11.8.0" for exactly this reason.
+        (StatusCode::NOT_FOUND, "1.2.3.0"),
+        // Not a version at all — the model binder's 400.
+        (StatusCode::BAD_REQUEST, "notaversion"),
+        (StatusCode::BAD_REQUEST, "1"),
+        (StatusCode::BAD_REQUEST, "1.2.3.4.5"),
+        (StatusCode::BAD_REQUEST, "-1.0"),
+    ] {
+        for (method, uri) in routes(version) {
+            let resp = router(fake.clone())
+                .oneshot(authed(method, &uri, Body::empty()))
+                .await
+                .expect("resp");
+            assert_eq!(resp.status(), expected, "{method} {uri}");
+        }
+    }
+}
+
+/// The manifest is `MediaBrowser.Common/Plugins/PluginManifest.cs` on the wire:
+/// **camelCase**, the id spelled `guid` and dashless, and all thirteen fields
+/// present. The previous assertion here (`"Name":"Demo"`) cemented a five-key
+/// PascalCase blob that shares not one key with what Jellyfin sends, which is
+/// how the divergence survived a green test.
 #[tokio::test]
 async fn manifest_read() {
     let fake = Arc::new(RecordingPlugins::default());
@@ -308,7 +369,46 @@ async fn manifest_read() {
         .await
         .expect("resp");
     assert_eq!(ok.status(), StatusCode::OK);
-    assert!(body_string(ok).await.contains("\"Name\":\"Demo\""));
+    let manifest: serde_json::Value =
+        serde_json::from_str(&body_string(ok).await).expect("manifest json");
+    let mut keys: Vec<&str> = manifest
+        .as_object()
+        .expect("object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "assemblies",
+            "autoUpdate",
+            "category",
+            "changelog",
+            "description",
+            "guid",
+            "name",
+            "overview",
+            "owner",
+            "status",
+            "targetAbi",
+            "timestamp",
+            "version",
+        ]
+    );
+    // `JsonGuidConverter` writes `value.ToString("N")` — no dashes — under the
+    // key `guid`, not `Id`.
+    assert_eq!(manifest["guid"], known_id().simple().to_string());
+    assert_eq!(manifest["name"], "Demo");
+    assert_eq!(manifest["version"], "1.2.3");
+    assert_eq!(manifest["status"], "Active");
+    assert_eq!(manifest["autoUpdate"], true);
+    assert_eq!(manifest["assemblies"], serde_json::json!([]));
+    assert_eq!(manifest["timestamp"], "0001-01-01T00:00:00.0000000Z");
+    // A bundled plugin's manifest description is EMPTY even though
+    // `PluginInfo.Description` is not — they have different sources upstream
+    // (`PluginManager.cs:562` leaves it at the ctor default).
+    assert_eq!(manifest["description"], "");
 
     let missing = router(fake)
         .oneshot(authed(
@@ -380,7 +480,7 @@ async fn packages_are_empty_and_install_rejected() {
 }
 
 #[tokio::test]
-async fn plugin_mutations_require_an_administrator() {
+async fn plugin_routes_require_an_administrator() {
     // A plain authenticated user (no admin policy, not an API key) must get
     // 403 from every plugin-mutating route — install would otherwise let any
     // account stage arbitrary code for the next boot.
@@ -440,6 +540,34 @@ async fn plugin_mutations_require_an_administrator() {
             .expect("resp");
         assert_eq!(resp.status(), StatusCode::FORBIDDEN, "GET {uri}");
     }
+    // So are the PLUGIN reads. `PluginsController` carries the same class-level
+    // `[Authorize(Policy = Policies.RequiresElevation)]` (v10.11.8
+    // PluginsController.cs:25, identical on master) and overrides it for exactly
+    // one action. `GET /Plugins/{id}/Configuration` is where a plugin's API key,
+    // username and password live — Ferrofin previously served them to any
+    // authenticated account.
+    for (method, uri) in [
+        ("GET", "/Plugins".to_owned()),
+        ("GET", format!("/Plugins/{}/Configuration", known_id())),
+        ("POST", format!("/Plugins/{}/Manifest", known_id())),
+    ] {
+        let resp = router()
+            .oneshot(authed(method, &uri, Body::empty()))
+            .await
+            .expect("resp");
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{method} {uri}");
+    }
+    // …and the ONE action upstream marks `[AllowAnonymous]` (:221) still serves
+    // a plain user. Elevating it would break every plugin logo in the dashboard.
+    let image = router()
+        .oneshot(authed(
+            "GET",
+            &format!("/Plugins/{}/1.2.3/Image", known_id()),
+            Body::empty(),
+        ))
+        .await
+        .expect("resp");
+    assert_eq!(image.status(), StatusCode::OK);
 }
 
 /// Captures what the transport forwards to a plugin and answers with

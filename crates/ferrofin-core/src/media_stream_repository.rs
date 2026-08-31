@@ -170,6 +170,26 @@ impl MediaStreamRepository for FerrofinMediaStreamRepository {
         Ok(with_subs)
     }
 
+    async fn get_item_ids_with_lyrics(&self, item_ids: &[Uuid]) -> Result<Vec<Uuid>, ServiceError> {
+        // Same ids-only shape (and the same index) as the subtitle probe, with
+        // the Lyric discriminant — see [`subtitle_probe_sql`].
+        let mut with_lyrics = Vec::new();
+        for chunk in item_ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+            let sql = subtitle_probe_sql(chunk.len());
+            let mut query = sqlx::query_scalar::<_, String>(&sql)
+                .bind(i64::from(media_stream_type_disc(MediaStreamType::Lyric)));
+            for id in chunk {
+                query = query.bind(guid_to_db(*id));
+            }
+            for row in query.fetch_all(self.db.pool()).await.map_err(db_err)? {
+                if let Ok(id) = Uuid::parse_str(&row) {
+                    with_lyrics.push(id);
+                }
+            }
+        }
+        Ok(with_lyrics)
+    }
+
     async fn get_media_stream_languages(
         &self,
         stream_type: MediaStreamType,

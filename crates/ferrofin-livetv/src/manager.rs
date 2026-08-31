@@ -20,6 +20,7 @@ use uuid::Uuid;
 
 use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_db::entities::users::UserEntity;
+use ferrofin_db::enums::ItemValueType;
 use ferrofin_model::data::{BaseItemKind, MediaType};
 use ferrofin_model::dto::{BaseItemDto, MediaSourceInfo, MediaSourceType};
 use ferrofin_model::dto::{DayOfWeek, SortOrder};
@@ -42,9 +43,10 @@ use serde::de::DeserializeOwned;
 use crate::dvr::{ActiveRecording, RecorderKind, RecordingInput, TimerRecordingInfo};
 use crate::error::LiveTvError;
 use crate::fetch::SourceFetcher;
+use crate::guide_repository::PROGRAM_SELECT;
 use crate::projection::{
     ChannelRow, ProgramRow as GuideProgramRow, channel_entity, channel_item_update, program_entity,
-    remove_fields,
+    program_item_update, remove_fields,
 };
 use crate::schedules_direct::SchedulesDirect;
 use crate::stream::{LiveStreamHandle, LiveStreamKind, TunerStreamSource};
@@ -53,6 +55,14 @@ use crate::xmltv::parse_xmltv;
 /// SQLite's conservative default bind-parameter limit (`SQLITE_MAX_VARIABLE_NUMBER`
 /// is 999 before 3.32, 32766 after); multi-row inserts chunk to stay under it.
 const SQLITE_BIND_LIMIT: usize = 999;
+
+/// How many programme item rows one `save_items`/`delete_items` call carries.
+///
+/// The guide mirror is O(channels x guide-hours): a few hundred rows on a test
+/// fixture, tens of thousands on a real seven-day lineup. Both calls are
+/// multi-row statements, so the chunk exists to bound the statement size and the
+/// peak memory of one write, not to bound the number of writes.
+const PROGRAM_ITEM_WRITE_CHUNK: usize = 500;
 
 /// The C# type name whose MD5 prefixes every Live TV `LiveStreamId`.
 ///
@@ -245,19 +255,6 @@ fn internal_program_id(external_id: &str) -> Uuid {
     )
 }
 
-/// The columns a guide list read returns, joined to the owning channel for
-/// `ChannelName`. Held apart from the filters so the `WHERE`/`ORDER`/`LIMIT`
-/// builders can be shared with the total-record count.
-const PROGRAM_SELECT: &str = r#"SELECT p."Id",p."ChannelId",p."StartDate",p."EndDate",p."Title",p."EpisodeTitle",
-                      p."Overview",p."Genres",p."ProductionYear",p."OfficialRating",p."IsNew",
-                      p."IsRepeat",p."IsPremiere",p."IsMovie",p."IsSeries",p."IsNews",p."IsKids",
-                      p."IsSports",p."IsLive",p."ExternalId",p."ExternalSeriesId",
-                      p."SeasonNumber",p."EpisodeNumber",p."DateCreated",
-                      c."Name" AS "ChannelName",c."Number" AS "ChannelNumber",
-                      c."ChannelType" AS "ChannelMediaKind"
-               FROM "FerrofinLiveTvPrograms" p
-               JOIN "FerrofinLiveTvChannels" c ON c."Id" = p."ChannelId""#;
-
 /// [`PROGRAM_SELECT`]'s `FROM`/`JOIN` counting instead of selecting, so the
 /// total-record count runs the identical filter set.
 const PROGRAM_COUNT: &str = r#"SELECT COUNT(*)
@@ -281,7 +278,8 @@ const PROGRAM_UPSERT_CONFLICT: &str = r#" ON CONFLICT("Id") DO UPDATE SET
                     "IsNews"=excluded."IsNews","IsKids"=excluded."IsKids",
                     "IsSports"=excluded."IsSports","ExternalId"=excluded."ExternalId",
                     "IsLive"=excluded."IsLive","ExternalSeriesId"=excluded."ExternalSeriesId",
-                    "SeasonNumber"=excluded."SeasonNumber","EpisodeNumber"=excluded."EpisodeNumber""#;
+                    "SeasonNumber"=excluded."SeasonNumber","EpisodeNumber"=excluded."EpisodeNumber",
+                    "ShowId"=excluded."ShowId""#;
 
 /// The on-disk locations the Live TV engine reads and writes.
 ///
@@ -440,6 +438,9 @@ struct ProgramClass {
     external_id: Option<String>,
     /// `ProgramInfo.SeriesId`: the title's MD5 (`N`) when the airing is an episode.
     external_series_id: Option<String>,
+    /// `ProgramInfo.ShowId` — the showing-identity key a DVR series rule
+    /// matches on, derived from the airing's PRE-movie-reset fields.
+    show_id: String,
 }
 
 /// The listings provider's category lists (`ListingsProviderInfo`), each
@@ -474,6 +475,35 @@ impl CategoryClasses {
             .any(|c| list.iter().any(|l| fold(l) == fold(c)))
     }
 
+    /// `ProgramInfo.ShowId` for one airing, as
+    /// `XmlTvListingsProvider.GetProgramInfo` computes it (v10.11.8
+    /// XmlTvListingsProvider.cs:185-212).
+    ///
+    /// The block runs BEFORE the `IsMovie` reset four lines below it, so the
+    /// inputs are the RAW `<sub-title>`/episode number even for a movie, and
+    /// `IsSeries` is still the provider's own `Episode.Episode is not null`
+    /// rather than the widened value `GuideManager.GetProgram` later stores.
+    /// That is why the value is computed here, at ingest, and persisted: the
+    /// stored row has already had a movie's episode fields cleared and can no
+    /// longer reproduce it.
+    fn show_id(
+        prog: &crate::xmltv::XmltvProgramme,
+        season_number: Option<i32>,
+        episode_number: Option<i32>,
+    ) -> String {
+        derive_show_id(
+            &prog.title,
+            prog.sub_title.as_deref(),
+            season_number,
+            episode_number,
+            // `programInfo.IsSeries` at this point in the C# is the provider's
+            // `program.Episode.Episode is not null`.
+            episode_number.is_some(),
+            prog.is_previously_shown && !prog.is_new,
+            prog.start.map(|start| start.with_timezone(&Utc)),
+        )
+    }
+
     /// Port of the derived part of `XmlTvListingsProvider.GetProgramInfo`.
     fn classify(&self, prog: &crate::xmltv::XmltvProgramme) -> ProgramClass {
         let categories: Vec<String> = prog
@@ -500,6 +530,7 @@ impl CategoryClasses {
                 .to_string()
         });
         ProgramClass {
+            show_id: Self::show_id(prog, season_number, episode_number),
             is_movie,
             is_series,
             is_news: Self::any_in(&self.news, &categories),
@@ -781,6 +812,160 @@ impl FerrofinLiveTvManager {
         Ok(())
     }
 
+    /// Mirrors the ingested guide into `BaseItems`.
+    ///
+    /// The programme half of [`Self::sync_channel_items`], and deliberately the
+    /// same mechanism rather than a second one: upstream stores a programme
+    /// exactly as it stores a channel — `CreateItems(newPrograms, currentChannel,
+    /// …)` / `UpdateItemsAsync(updatedPrograms, …)` (v10.11.8
+    /// src/Jellyfin.LiveTv/Guide/GuideManager.cs:277-291) — and prunes it with
+    /// the `CleanDatabase(newProgramIdList, [BaseItemKind.LiveTvProgram], …)`
+    /// that sits one line below the channel one (:145-148).
+    ///
+    /// Without it the recursive item universe holds no airing at all:
+    /// `GET /Items?recursive=true&includeItemTypes=LiveTvProgram` is empty,
+    /// `GET /Items/{programId}` 404s for an id `GET /LiveTv/Programs` just
+    /// handed the client, and `GET /Genres` cannot list a genre that only the
+    /// guide carries.
+    ///
+    /// Called once, AFTER the listings-provider loop, not from inside
+    /// `insert_programs`: `insert_programs` runs once per provider and prunes
+    /// only the channels that provider's document covered, so a per-provider
+    /// clean here would delete the other providers' rows. Upstream's programme
+    /// `CleanDatabase` is likewise global, taken over every service's
+    /// accumulated id list. A provider whose fetch failed never reaches
+    /// `insert_programs` at all, so its cached rows are still in the table and
+    /// the mirror keeps them — the same "an unreachable source must not wipe the
+    /// guide" property the channel half gets from its own cache fallback.
+    async fn sync_program_items(&self) -> Result<(), ServiceError> {
+        let Some(store) = self.item_store.get() else {
+            return Ok(());
+        };
+        let view_id = self.live_tv_view_id().await;
+        let rows = crate::guide_repository::program_rows(&self.db).await?;
+        // The programme items already stored, read ONCE: the merge needs them
+        // (the C# loads `existingPrograms` before assigning) and so does
+        // `CleanDatabase`.
+        let stored = store
+            .items
+            .get_item_list(&InternalItemsQuery {
+                include_item_types: vec![BaseItemKind::LiveTvProgram],
+                ..InternalItemsQuery::default()
+            })
+            .await?;
+        let by_id: HashMap<String, &BaseItemEntity> = stored
+            .iter()
+            .map(|row| (row.id.to_uppercase(), row))
+            .collect();
+        let mut save: Vec<BaseItemEntity> = Vec::new();
+        // The genres to (re)write as `ItemValues`, for the rows whose genre list
+        // actually moved. A guide's genres are what make `GET /Genres` list a
+        // by-name row a library never produced ("News"), and re-writing all of
+        // them every refresh would be several statements per airing on a table
+        // that is O(channels x guide-hours).
+        let mut genres_to_write: Vec<(Uuid, Vec<String>)> = Vec::new();
+        for row in &rows {
+            let fresh = program_entity(row, parse_dt, view_id);
+            let stored_row = by_id.get(&fresh.id.to_uppercase());
+            let genres_changed = stored_row.is_none_or(|prev| prev.genres != fresh.genres);
+            match stored_row {
+                // `isNew` — `CreateItems` stores the item whole.
+                None => save.push(fresh.clone()),
+                // `isUpdated` — only the fields the listing owns are assigned
+                // onto the STORED row, and it is written back only when one of
+                // them actually changed.
+                Some(prev) => save.extend(program_item_update(prev, &fresh)),
+            }
+            if genres_changed && let Ok(id) = Uuid::parse_str(&fresh.id) {
+                genres_to_write.push((
+                    id,
+                    fresh
+                        .genres
+                        .as_deref()
+                        .map(|g| g.split('|').map(str::to_owned).collect())
+                        .unwrap_or_default(),
+                ));
+            }
+        }
+        for chunk in save.chunks(PROGRAM_ITEM_WRITE_CHUNK) {
+            store.persistence.save_items(chunk).await?;
+        }
+        for (id, genres) in genres_to_write {
+            let values: Vec<(i32, String)> = genres
+                .into_iter()
+                .map(|g| (i32::from(ItemValueType::Genre), g))
+                .collect();
+            store.persistence.save_item_values(id, &values).await?;
+        }
+        // `CleanDatabase(newProgramIdList, [BaseItemKind.LiveTvProgram], …)`
+        // (:147), guarded upstream only by the `cleanDatabase` flag a THROWN
+        // refresh clears — see the channel half for why an empty set here is a
+        // genuine empty set and not a swallowed failure.
+        let keep: std::collections::HashSet<String> =
+            rows.iter().map(|row| row.id.to_uppercase()).collect();
+        let stale: Vec<Uuid> = stored
+            .iter()
+            .filter(|row| !keep.contains(&row.id.to_uppercase()))
+            .filter_map(|row| Uuid::parse_str(&row.id).ok())
+            .collect();
+        if !stale.is_empty() {
+            tracing::info!(
+                count = stale.len(),
+                "live tv: removing programme items that left the guide"
+            );
+            for chunk in stale.chunks(PROGRAM_ITEM_WRITE_CHUNK) {
+                store.persistence.delete_items(chunk).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Re-expands every series timer over the guide that was just ingested.
+    ///
+    /// Port of `DefaultLiveTvService.RefreshSeriesTimers` (v10.11.8
+    /// src/Jellyfin.LiveTv/DefaultLiveTvService.cs:78-86): every stored series
+    /// timer runs through `UpdateTimersForSeriesTimer(timer, false, true)` —
+    /// `updateTimerSettings: false`, so a timer a user hand-edited keeps its
+    /// padding, and `deleteInvalidTimers: true`, so a pending timer whose airing
+    /// has left the guide goes.
+    ///
+    /// It is called from `RefreshGuide` and nowhere else (GuideManager.cs:150-156),
+    /// and that is the whole point: the guide window rolls forward every day, so
+    /// a series timer created on Monday only keeps recording Thursday's showings
+    /// if something re-expands it against the airings the refresh has just
+    /// brought in. Ferrofin ran the fan-out ONLY when a series timer was created
+    /// or edited, so a rule went stale the moment the guide moved past the
+    /// airings it was created against — measured on the parity pair, whose one
+    /// Ferrofin series timer had produced zero timers.
+    ///
+    /// One series timer's failure does not fail the refresh, mirroring how the
+    /// C# guide refresh treats a per-service error: the remaining rules still
+    /// get their pass.
+    async fn refresh_series_timers(&self) -> Result<(), ServiceError> {
+        let timers = self
+            .get_series_timers(&ferrofin_model::live_tv::SeriesTimerQuery::default())
+            .await?;
+        for timer in timers {
+            let Some(id) = timer.base.id.as_deref() else {
+                continue;
+            };
+            let Some(stored) = self.stored_series_timer(id).await? else {
+                continue;
+            };
+            if let Err(e) = self
+                .update_timers_for_series_timer(&stored, false, true)
+                .await
+            {
+                tracing::warn!(
+                    series_timer = %id,
+                    error = %e,
+                    "live tv: could not re-expand a series timer over the refreshed guide"
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// The wired DTO service, or the honest error when the composition root
     /// (or a test) never attached one.
     fn dto_service(&self) -> Result<&Arc<dyn DtoService>, ServiceError> {
@@ -1007,7 +1192,7 @@ impl FerrofinLiveTvManager {
         let touched = Self::channels_covered_by(&guide, &by_tvg);
 
         // Flatten to one (channel, programme) row per binding, then insert in
-        // chunked multi-row statements (25 columns per row) instead of one
+        // chunked multi-row statements (27 columns per row) instead of one
         // round-trip per programme.
         let rows: Vec<_> = guide
             .programmes
@@ -1059,14 +1244,14 @@ impl FerrofinLiveTvManager {
 
         let existing_dates = Self::clean_programs(&mut tx, &touched).await?;
 
-        for chunk in rows.chunks(SQLITE_BIND_LIMIT / 26) {
+        for chunk in rows.chunks(SQLITE_BIND_LIMIT / 27) {
             let mut qb: QueryBuilder<'_, Sqlite> = QueryBuilder::new(
                 r#"INSERT INTO "FerrofinLiveTvPrograms"
                    ("Id","ChannelId","StartDate","EndDate","Title","EpisodeTitle","Overview",
                     "Genres","ImageUrl","ProductionYear","EpisodeNum","IsNew","IsPremiere",
                     "IsRepeat","OfficialRating","IsMovie","IsSeries","IsNews","IsKids",
                     "IsSports","IsLive","ExternalId","ExternalSeriesId","SeasonNumber",
-                    "EpisodeNumber","DateCreated") "#,
+                    "EpisodeNumber","DateCreated","ShowId") "#,
             );
             qb.push_values(chunk, |mut b, row| {
                 let prog = row.prog;
@@ -1101,7 +1286,8 @@ impl FerrofinLiveTvManager {
                             .get(&row.id)
                             .and_then(Clone::clone)
                             .unwrap_or_else(|| now.clone()),
-                    );
+                    )
+                    .push_bind(&class.show_id);
             });
             qb.push(PROGRAM_UPSERT_CONFLICT);
             qb.build().execute(&mut *tx).await.map_err(db_err)?;
@@ -1654,6 +1840,13 @@ impl LiveTvManager for FerrofinLiveTvManager {
                 Err(e) => tracing::warn!(%path, error = %e, "live tv: guide fetch failed"),
             }
         }
+        // Every provider has spoken, so the programme table now holds exactly
+        // upstream's `newProgramIdList` across all services — the set its
+        // `CleanDatabase(newProgramIdList, [LiveTvProgram])` is taken over.
+        self.sync_program_items().await?;
+        // `RefreshGuide`'s tail: `coreService.RefreshSeriesTimers(ct)` (v10.11.8
+        // src/Jellyfin.LiveTv/Guide/GuideManager.cs:150-156).
+        self.refresh_series_timers().await?;
         Ok(())
     }
 
@@ -1667,6 +1860,50 @@ impl LiveTvManager for FerrofinLiveTvManager {
             start_date: start,
             end_date: start + chrono::Duration::days(self.guide_days().await),
         })
+    }
+
+    async fn add_info_to_program_dto(
+        &self,
+        dtos: &mut [BaseItemDto],
+        options: &DtoOptions,
+        user: Option<&UserEntity>,
+    ) -> Result<(), ServiceError> {
+        // `user` is upstream's unused trailing parameter — `AddInfoToProgramDto`
+        // threads it no further than its own signature.
+        let _ = user;
+        // Port of `LiveTvManager.AddInfoToProgramDto` (v10.11.8
+        // LiveTvManager.cs:535-576). The C# receives typed `LiveTvProgram`s
+        // because `DtoService` already holds them; here the guide rows are
+        // looked up by the DTOs' own ids, in ONE query for the page — an id that
+        // is not a programme has no row and its DTO is left untouched.
+        let ids: Vec<Uuid> = dtos.iter().map(|dto| dto.id).collect();
+        let rows = crate::guide_repository::program_rows_by_ids(&self.db, &ids).await?;
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let has_channel_info = options.fields.contains(&ItemFields::ChannelInfo);
+        let has_channel_image = options.fields.contains(&ItemFields::ChannelImage);
+        for dto in dtos.iter_mut() {
+            let Some(row) = rows.get(&dto.id) else {
+                continue;
+            };
+            Self::apply_program_info(dto, row, has_channel_info, has_channel_image);
+        }
+        // `AddInfoToProgramDto` tail-calls `AddRecordingInfo` over the same
+        // page, so a programme reached through `/Items` carries its
+        // `TimerId`/`SeriesTimerId` exactly as one reached through
+        // `/LiveTv/Programs` does.
+        let timers: Vec<TimerInfoDto> = self.get_timers().await?;
+        if timers.is_empty() {
+            return Ok(());
+        }
+        for dto in dtos.iter_mut() {
+            let Some(row) = rows.get(&dto.id) else {
+                continue;
+            };
+            Self::apply_recording_info(dto, row, &timers);
+        }
+        Ok(())
     }
 
     async fn add_channel_info(
@@ -2539,53 +2776,66 @@ impl FerrofinLiveTvManager {
         if rows.is_empty() {
             return Ok(Vec::new());
         }
-        let entities: Vec<_> = rows.iter().map(|r| program_entity(r, parse_dt)).collect();
+        let view_id = self.live_tv_view_id().await;
+        let entities: Vec<_> = rows
+            .iter()
+            .map(|r| program_entity(r, parse_dt, view_id))
+            .collect();
         let mut dtos = self
             .dto_service()?
             .get_base_item_dtos(&entities, options, user, None, true)
             .await?;
-        Self::add_info_to_program_dto(&mut dtos, rows, &options.fields);
+        // The rows are already in DTO order here, so the same two post-passes
+        // the `/Items` seam runs by id run by position.
+        let has_channel_info = options.fields.contains(&ItemFields::ChannelInfo);
+        let has_channel_image = options.fields.contains(&ItemFields::ChannelImage);
+        for (dto, row) in dtos.iter_mut().zip(rows) {
+            Self::apply_program_info(dto, row, has_channel_info, has_channel_image);
+        }
         self.add_recording_info(&mut dtos, rows).await?;
         Ok(dtos)
     }
 
-    /// Port of `LiveTvManager.AddInfoToProgramDto`: the airing fields the DTO
-    /// service does not project (`StartDate`, `EpisodeTitle`, the true-only
-    /// flags), and — only when the `ChannelInfo`/`ChannelImage` field was
-    /// requested — the owning channel's name/number/media type.
-    fn add_info_to_program_dto(
-        dtos: &mut [BaseItemDto],
-        rows: &[GuideProgramRow],
-        fields: &[ItemFields],
+    /// Port of `LiveTvManager.AddInfoToProgramDto`'s per-programme body
+    /// (v10.11.8 src/Jellyfin.LiveTv/LiveTvManager.cs:535-576): the airing
+    /// fields the DTO service does not project (`StartDate`, `EpisodeTitle`,
+    /// the true-only flags), and — only when the `ChannelInfo`/`ChannelImage`
+    /// field was requested — the owning channel's name/number/media type.
+    ///
+    /// Split out per-DTO because it has two callers that reach a programme by
+    /// different routes: `/LiveTv/Programs`, where the rows arrive in DTO
+    /// order, and the `DtoService` seam, where a programme is one item on an
+    /// arbitrary `/Items` page and its row is found by id.
+    fn apply_program_info(
+        dto: &mut BaseItemDto,
+        row: &GuideProgramRow,
+        has_channel_info: bool,
+        has_channel_image: bool,
     ) {
-        let has_channel_info = fields.contains(&ItemFields::ChannelInfo);
-        let has_channel_image = fields.contains(&ItemFields::ChannelImage);
-        for (dto, row) in dtos.iter_mut().zip(rows) {
-            dto.start_date = parse_dt(&row.start_date);
-            dto.episode_title.clone_from(&row.episode_title);
-            // C# `dto.IsNews |= program.IsNews` on a null `bool?`: a false flag
-            // stays null and is never serialized, so only true flags appear.
-            let flag = |on: bool| on.then_some(true);
-            dto.is_repeat = dto.is_repeat.or(flag(row.is_repeat));
-            dto.is_movie = dto.is_movie.or(flag(row.is_movie));
-            dto.is_series = dto.is_series.or(flag(row.is_series));
-            dto.is_sports = dto.is_sports.or(flag(row.is_sports));
-            dto.is_live = dto.is_live.or(flag(row.is_live));
-            dto.is_news = dto.is_news.or(flag(row.is_news));
-            dto.is_kids = dto.is_kids.or(flag(row.is_kids));
-            dto.is_premiere = dto.is_premiere.or(flag(row.is_premiere));
-            if has_channel_info || has_channel_image {
-                dto.channel_name = Some(row.channel_name.clone());
-                dto.media_type = if row.channel_media_kind == "Radio" {
-                    MediaType::Audio
-                } else {
-                    MediaType::Video
-                };
-                dto.channel_number.clone_from(&row.channel_number);
-                // `ChannelPrimaryImageTag` needs a channel primary image; the
-                // guide cache stores only the remote logo URL, which carries
-                // no local image tag.
-            }
+        dto.start_date = parse_dt(&row.start_date);
+        dto.episode_title.clone_from(&row.episode_title);
+        // C# `dto.IsNews |= program.IsNews` on a null `bool?`: a false flag
+        // stays null and is never serialized, so only true flags appear.
+        let flag = |on: bool| on.then_some(true);
+        dto.is_repeat = dto.is_repeat.or(flag(row.is_repeat));
+        dto.is_movie = dto.is_movie.or(flag(row.is_movie));
+        dto.is_series = dto.is_series.or(flag(row.is_series));
+        dto.is_sports = dto.is_sports.or(flag(row.is_sports));
+        dto.is_live = dto.is_live.or(flag(row.is_live));
+        dto.is_news = dto.is_news.or(flag(row.is_news));
+        dto.is_kids = dto.is_kids.or(flag(row.is_kids));
+        dto.is_premiere = dto.is_premiere.or(flag(row.is_premiere));
+        if has_channel_info || has_channel_image {
+            dto.channel_name = Some(row.channel_name.clone());
+            dto.media_type = if row.channel_media_kind == "Radio" {
+                MediaType::Audio
+            } else {
+                MediaType::Video
+            };
+            dto.channel_number.clone_from(&row.channel_number);
+            // `ChannelPrimaryImageTag` needs a channel primary image; the
+            // guide cache stores only the remote logo URL, which carries
+            // no local image tag.
         }
     }
 
@@ -2611,31 +2861,36 @@ impl FerrofinLiveTvManager {
             return Ok(());
         }
         for (dto, row) in dtos.iter_mut().zip(rows) {
-            let Some(external_id) = row.external_id.as_deref() else {
-                continue;
-            };
-            let timer = timers.iter().find(|t| {
-                t.base
-                    .program_id
-                    .as_deref()
-                    .is_some_and(|p| p.eq_ignore_ascii_case(external_id))
-            });
-            if let Some(timer) = timer {
-                if !matches!(
-                    timer.status,
-                    RecordingStatus::Cancelled | RecordingStatus::Error
-                ) {
-                    dto.timer_id.clone_from(&timer.base.id);
-                    dto.status = Some(recording_status_name(timer.status).to_owned());
-                }
-                if let Some(series_timer_id) =
-                    timer.series_timer_id.as_deref().filter(|s| !s.is_empty())
-                {
-                    dto.series_timer_id = Some(series_timer_id.to_owned());
-                }
-            }
+            Self::apply_recording_info(dto, row, &timers);
         }
         Ok(())
+    }
+
+    /// [`Self::add_recording_info`]'s per-programme body, over an
+    /// already-loaded timer list.
+    fn apply_recording_info(dto: &mut BaseItemDto, row: &GuideProgramRow, timers: &[TimerInfoDto]) {
+        let Some(external_id) = row.external_id.as_deref() else {
+            return;
+        };
+        let timer = timers.iter().find(|t| {
+            t.base
+                .program_id
+                .as_deref()
+                .is_some_and(|p| p.eq_ignore_ascii_case(external_id))
+        });
+        let Some(timer) = timer else {
+            return;
+        };
+        if !matches!(
+            timer.status,
+            RecordingStatus::Cancelled | RecordingStatus::Error
+        ) {
+            dto.timer_id.clone_from(&timer.base.id);
+            dto.status = Some(recording_status_name(timer.status).to_owned());
+        }
+        if let Some(series_timer_id) = timer.series_timer_id.as_deref().filter(|s| !s.is_empty()) {
+            dto.series_timer_id = Some(series_timer_id.to_owned());
+        }
     }
 
     // ---- DVR ------------------------------------------------------------
@@ -4271,31 +4526,53 @@ fn update_existing_timer_with_new_metadata(existing: &mut TimerInfoDto, updated:
 /// The identity a listings provider gives one SHOWING of a programme, which is
 /// what duplicate-showing suppression groups on.
 ///
-/// Port of `XmlTvListingsProvider.GetProgramInfo`'s `ShowId` block (v10.11.8
+/// The value is computed at ingest (`CategoryClasses::show_id`) and stored on
+/// the row, because upstream computes it from the airing's PRE-movie-reset
+/// fields — a movie has had its episode number and episode title cleared by the
+/// time it reaches this table, so re-deriving here would hash a different
+/// string for exactly the rows a movie series-rule looks at. The fallback covers
+/// rows written before the column existed, which no refresh has rewritten yet.
+///
+/// The one knowing gap: upstream's `else` arm takes the listings' own
+/// `program.ProgramId` when the guide supplies one
+/// (`<episode-num system="dd_progid">`); Ferrofin's XMLTV reader does not
+/// capture that element yet, so the MD5 arm always runs. A guide carrying
+/// dd_progid would group differently — porting it means reading the element in
+/// [`crate::xmltv`] and carrying it into `CategoryClasses::show_id`.
+fn program_show_id(program: &GuideProgramRow) -> String {
+    if let Some(stored) = program.show_id.as_deref().filter(|s| !s.is_empty()) {
+        return stored.to_owned();
+    }
+    derive_show_id(
+        &program.title,
+        program.episode_title.as_deref(),
+        program.season_number,
+        program.episode_number,
+        program.is_series,
+        program.is_repeat,
+        parse_dt(&program.start_date),
+    )
+}
+
+/// `XmlTvListingsProvider.GetProgramInfo`'s `ShowId` derivation (v10.11.8
 /// XmlTvListingsProvider.cs:186-213), bugs included: the season and episode
 /// branches REPLACE `uniqueString` rather than appending to it, so a programme
 /// with an episode number hashes `"-{episode}"` alone. Ported verbatim, because
 /// this value decides which showings a series timer drops.
-///
-/// Two knowing gaps, both open work items rather than choices:
-///   * upstream's `else` arm takes the listings' own `program.ProgramId` when the
-///     guide supplies one (`<episode-num system="dd_progid">`); Ferrofin's XMLTV
-///     reader does not capture that element yet, so the MD5 arm always runs. A
-///     guide carrying dd_progid would group differently — porting it means
-///     reading the element in `crate::xmltv` and carrying it to here.
-///   * this derives the value from the stored guide row instead of persisting it
-///     at ingest as `GuideManager` does. The inputs are all on the row, so the
-///     value is identical; it is a column Ferrofin does not need.
-fn program_show_id(program: &GuideProgramRow) -> String {
-    let mut unique = format!(
-        "{}{}",
-        program.title,
-        program.episode_title.as_deref().unwrap_or_default()
-    );
-    if let Some(season) = program.season_number {
+fn derive_show_id(
+    title: &str,
+    episode_title: Option<&str>,
+    season_number: Option<i32>,
+    episode_number: Option<i32>,
+    is_series: bool,
+    is_repeat: bool,
+    start: Option<DateTime<Utc>>,
+) -> String {
+    let mut unique = format!("{}{}", title, episode_title.unwrap_or_default());
+    if let Some(season) = season_number {
         unique = format!("-{season}");
     }
-    if let Some(episode) = program.episode_number {
+    if let Some(episode) = episode_number {
         unique = format!("-{episode}");
     }
     let mut show_id = ferrofin_common::extensions::get_md5(&unique)
@@ -4303,9 +4580,8 @@ fn program_show_id(program: &GuideProgramRow) -> String {
         .to_string();
     // "If we don't have valid episode info, assume it's a unique program,
     // otherwise recordings might be skipped."
-    if program.is_series && !program.is_repeat && program.episode_number.unwrap_or(0) == 0 {
-        let start = parse_dt(&program.start_date).unwrap_or_else(Utc::now);
-        show_id.push_str(&dotnet_ticks(start).to_string());
+    if is_series && !is_repeat && episode_number.unwrap_or(0) == 0 {
+        show_id.push_str(&dotnet_ticks(start.unwrap_or_else(Utc::now)).to_string());
     }
     show_id
 }
@@ -4526,7 +4802,7 @@ mod tests {
     use ferrofin_model::dto::{DayOfWeek, SortOrder};
     use ferrofin_model::live_tv::ItemSortBy;
 
-    use super::{FerrofinLiveTvManager, SourceFetcher, parse_dt};
+    use super::{DELETE_TIMER_SQL, FerrofinLiveTvManager, SourceFetcher, derive_show_id, parse_dt};
 
     use ferrofin_db::entities::base_items::BaseItemEntity;
     use ferrofin_db::entities::users::UserEntity;
@@ -5758,6 +6034,198 @@ mod tests {
         );
     }
 
+    /// The stored `BaseItems` programme rows, id-ordered.
+    async fn stored_program_items(
+        mgr: &FerrofinLiveTvManager,
+    ) -> Vec<(String, Option<String>, Option<String>, Option<String>)> {
+        crate::guide_repository::test_support::stored_program_items(&mgr.db)
+            .await
+            .expect("programme items")
+    }
+
+    /// A programme's `ShowId` is the listings provider's, byte for byte.
+    ///
+    /// The expected value is not this test's invention: it is the `ShowId`
+    /// column a real Jellyfin 10.11.8 wrote for the airing named
+    /// "Parity Show 16 on parity1" in the parity lab's database. `GetMD5`
+    /// hashes UTF-16LE bytes and wraps them in a .NET `Guid`, whose first three
+    /// fields print little-endian — get either half wrong and a DVR series rule
+    /// groups different showings than Jellyfin's would.
+    #[test]
+    fn a_show_id_matches_the_listings_provider_hash() {
+        assert_eq!(
+            derive_show_id(
+                "Parity Show 16 on parity1",
+                None,
+                None,
+                None,
+                false,
+                false,
+                None
+            ),
+            "b99e02d458f3a83412cf9e878f0464aa"
+        );
+        // The episode branch REPLACES the accumulated string rather than
+        // appending to it — upstream's code as written
+        // (XmlTvListingsProvider.cs:186-213).
+        assert_eq!(
+            derive_show_id(
+                "Ignored",
+                Some("Also ignored"),
+                Some(1),
+                Some(6),
+                true,
+                false,
+                None
+            ),
+            ferrofin_common::extensions::get_md5("-6")
+                .simple()
+                .to_string()
+        );
+    }
+
+    /// A guide refresh mirrors the ingested airings into `BaseItems` and
+    /// removes the rows that left the guide.
+    ///
+    /// Port of `GuideManager`'s `CreateItems(newPrograms, currentChannel, …)` /
+    /// `UpdateItemsAsync(updatedPrograms, …)` (v10.11.8 GuideManager.cs:277-291)
+    /// and the `CleanDatabase(newProgramIdList, [BaseItemKind.LiveTvProgram], …)`
+    /// one line below the channel one (:147). Without it
+    /// `GET /Items?recursive=true&includeItemTypes=LiveTvProgram` is empty and
+    /// `GET /Items/{programId}` 404s for an id `GET /LiveTv/Programs` just
+    /// handed the client.
+    #[tokio::test]
+    async fn a_guide_refresh_stores_its_airings_as_items_and_cleans_the_departed() {
+        let lab = program_item_lab().await;
+        let (mgr, persistence) = (&lab.mgr, &lab.persistence);
+        mgr.refresh_guide().await.expect("refresh");
+
+        let stored = stored_program_items(mgr).await;
+        assert_eq!(stored.len(), 1, "the guide's one airing is an item");
+        let channels = channel_ids(mgr).await;
+        let view = ferrofin_db::store::guid_to_db(lab.view);
+        let (id, parent_id, top_parent_id, presentation_key) = &stored[0];
+        // `CreateItems(newPrograms, currentChannel, …)` — the CHANNEL is the
+        // parent; `TopParentId` is the walk up to the Live TV view, and it is
+        // what puts the airing inside the recursive user universe.
+        assert!(
+            channels
+                .contains(&Uuid::parse_str(parent_id.as_deref().expect("parent")).expect("guid"))
+        );
+        assert_eq!(top_parent_id.as_deref(), Some(view.as_str()));
+        // NULL, because the guide refresh calls `RefreshMetadata` on a CHANNEL
+        // only (GuideManager.cs:305) and only `MetadataService` populates this
+        // column. SQLite groups NULLs together, so the whole guide collapses to
+        // one row on an unfiltered recursive page — which is what a real
+        // 10.11.8 does.
+        assert_eq!(presentation_key.as_deref(), None);
+
+        // An airing the guide no longer carries goes on the next refresh — and
+        // only that one.
+        let ghost = Uuid::new_v4();
+        persistence
+            .save_items(&[BaseItemEntity {
+                id: ferrofin_db::store::guid_to_db(ghost),
+                type_: crate::projection::PROGRAM_TYPE_NAME.to_owned(),
+                name: Some("Departed".to_owned()),
+                ..BaseItemEntity::default()
+            }])
+            .await
+            .expect("ghost");
+        assert_eq!(stored_program_items(mgr).await.len(), 2);
+
+        mgr.refresh_guide().await.expect("second refresh");
+        let after = stored_program_items(mgr).await;
+        assert_eq!(after.len(), 1, "the departed airing was cleaned");
+        assert_eq!(&after[0].0, id);
+    }
+
+    /// A guide refresh assigns only the properties the listing owns, onto the
+    /// item it LOADED — everything else on a programme survives it.
+    ///
+    /// The programme half of `a_guide_refresh_does_not_revert_an_edited_channel`,
+    /// and for the same reason: `GuideManager.GetProgram` (GuideManager.cs:473-640)
+    /// assigns onto the item pulled out of `existingPrograms`, while Ferrofin's
+    /// `save_items` is a full-column upsert that would revert every edit on the
+    /// guide timer.
+    #[tokio::test]
+    async fn a_guide_refresh_does_not_revert_an_edited_programme() {
+        let lab = program_item_lab().await;
+        let (mgr, persistence, items) = (&lab.mgr, &lab.persistence, &lab.items);
+        mgr.refresh_guide().await.expect("refresh");
+        let edited = Uuid::parse_str(&stored_program_items(mgr).await[0].0).expect("guid");
+
+        let mut row = channel_item(items, edited).await;
+        row.custom_rating = Some("PG".to_owned());
+        row.is_locked = true;
+        persistence.save_items(&[row]).await.expect("editor write");
+
+        mgr.refresh_guide().await.expect("second refresh");
+        let kept = channel_item(items, edited).await;
+        assert_eq!(kept.custom_rating.as_deref(), Some("PG"));
+        assert!(kept.is_locked);
+        // …and the fields the listing DOES own are still the guide's.
+        assert_eq!(kept.name.as_deref(), Some("Morning Show"));
+        assert_eq!(kept.tags.as_deref(), Some("News"));
+        assert_eq!(kept.genres.as_deref(), Some("News"));
+        assert!(kept.is_virtual_item);
+        assert_eq!(kept.unrated_type.as_deref(), Some("LiveTvProgram"));
+    }
+
+    /// The wiring a programme-item test needs: the channel lab plus a listings
+    /// provider whose XMLTV covers the lineup.
+    async fn program_item_lab() -> ChannelItemLab {
+        let view = Uuid::from_u128(0x2b2b_ca16_aacc_8a14_d53a_11bb_829e_afa5);
+        let mut sources = HashMap::new();
+        sources.insert("http://tuner/playlist.m3u".to_owned(), M3U.to_owned());
+        sources.insert("http://guide/xmltv.xml".to_owned(), dated(XMLTV));
+        let mgr = manager_with(FakeFetcher(sources)).await;
+        let item_type_lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
+            Arc::new(ferrofin_core::ItemTypeLookup::new());
+        let persistence: Arc<dyn ferrofin_traits::persistence::ItemPersistenceService> = Arc::new(
+            ferrofin_core::FerrofinItemPersistenceService::new(mgr.db.clone()),
+        );
+        let items: Arc<dyn ferrofin_traits::persistence::ItemRepository> = Arc::new(
+            ferrofin_core::FerrofinItemRepository::new(mgr.db.clone(), item_type_lookup),
+        );
+        persistence
+            .save_items(&[BaseItemEntity {
+                id: ferrofin_db::store::guid_to_db(view),
+                type_: "MediaBrowser.Controller.Entities.UserView".to_owned(),
+                name: Some("Live TV".to_owned()),
+                is_folder: true,
+                ..BaseItemEntity::default()
+            }])
+            .await
+            .expect("live tv view");
+        mgr.set_item_store(
+            Arc::clone(&persistence),
+            Arc::clone(&items),
+            Arc::new(FixedLiveTvView(view)),
+        );
+        let tuner = mgr
+            .save_tuner_host(TunerHostInfo {
+                type_: Some("m3u".to_owned()),
+                url: Some("http://tuner/playlist.m3u".to_owned()),
+                ..TunerHostInfo::default()
+            })
+            .await
+            .expect("tuner");
+        mgr.save_listing_provider(ListingsProviderInfo {
+            path: Some("http://guide/xmltv.xml".to_owned()),
+            ..ListingsProviderInfo::default()
+        })
+        .await
+        .expect("listings provider");
+        ChannelItemLab {
+            mgr,
+            persistence,
+            items,
+            view,
+            tuner,
+        }
+    }
+
     /// One stored channel item, whole.
     async fn channel_item(
         items: &Arc<dyn ferrofin_traits::persistence::ItemRepository>,
@@ -6917,6 +7385,61 @@ mod tests {
                 Err(ServiceError::NotFound(_))
             ),
             "cancelling an unknown series timer is a 404, not a silent 204"
+        );
+    }
+
+    /// A guide refresh RE-EXPANDS every series timer over the airings it just
+    /// ingested.
+    ///
+    /// `RefreshGuide` ends with `coreService.RefreshSeriesTimers(ct)` (v10.11.8
+    /// src/Jellyfin.LiveTv/Guide/GuideManager.cs:150-156), which runs
+    /// `UpdateTimersForSeriesTimer(timer, false, true)` over every stored rule
+    /// (DefaultLiveTvService.cs:78-86). Ferrofin ran the fan-out only on create
+    /// and edit, so a rule stopped producing timers as soon as the rolling guide
+    /// window moved past the airings it was created against — which is a series
+    /// recording that silently stops recording.
+    #[tokio::test]
+    async fn a_guide_refresh_re_expands_every_series_timer() {
+        let mgr = manager_with_series_guide().await;
+        let airings = airings_of(&mgr, "Recurring").await;
+        let future = airings
+            .iter()
+            .find(|r| parse_dt(&r.start_date).is_some_and(|s| s > Utc::now()))
+            .expect("a future airing");
+        let st_id = mgr
+            .create_series_timer(defaults_for(&mgr, future).await)
+            .await
+            .expect("create st");
+        let before = mgr.get_timers().await.expect("timers");
+        assert!(!before.is_empty(), "the create-time fan-out made timers");
+
+        // Drop every timer row the create-time fan-out made, WITHOUT touching
+        // the series timer — the state a rolling guide leaves behind once its
+        // airings have aged out and the rule has never been re-expanded. The
+        // rows are deleted rather than CANCELLED on purpose: `cancel_timer`
+        // stamps `IsManual`, which the next fan-out is required to honour, and
+        // the test would then measure that guard instead of the re-expansion.
+        for timer in &before {
+            let id = timer.base.id.clone().expect("timer id");
+            mgr.delete_by_id(DELETE_TIMER_SQL, &id)
+                .await
+                .expect("delete timer row");
+        }
+        assert!(mgr.get_timers().await.expect("t").is_empty());
+
+        // A refresh alone brings them back — no client call, no edit.
+        mgr.refresh_guide().await.expect("second refresh");
+        let after = mgr.get_timers().await.expect("timers again");
+        assert_eq!(
+            after.len(),
+            before.len(),
+            "a guide refresh re-expands the series timer over the refreshed guide"
+        );
+        assert!(
+            after
+                .iter()
+                .all(|t| t.series_timer_id.as_deref() == Some(st_id.as_str())),
+            "and every timer it re-made still belongs to the series timer"
         );
     }
 

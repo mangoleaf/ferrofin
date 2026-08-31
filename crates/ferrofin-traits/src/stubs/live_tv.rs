@@ -413,6 +413,43 @@ pub trait LiveTvManager: Send + Sync {
         Ok(())
     }
 
+    /// Stamps the Live-TV-only fields onto already-projected guide programme
+    /// DTOs, matching each by its own `Id`.
+    ///
+    /// Port of `ILiveTvManager.AddInfoToProgramDto` (v10.11.8
+    /// src/Jellyfin.LiveTv/LiveTvManager.cs:535-576): `StartDate`,
+    /// `EpisodeTitle` and the true-only airing flags always, the owning
+    /// channel's `ChannelName`/`MediaType`/`ChannelNumber` only when
+    /// `ItemFields.ChannelInfo` or `ItemFields.ChannelImage` was asked for, and
+    /// then the `AddRecordingInfo` pass that links an airing to the timer
+    /// recording it.
+    ///
+    /// The sibling of [`Self::add_channel_info`], and called from the same
+    /// place: `DtoService` buckets `item is LiveTvProgram` while projecting a
+    /// page and hands the bucket over (Emby.Server.Implementations/Dto/
+    /// DtoService.cs:168-192 and :201-207). That is why an ordinary
+    /// `GET /Items/{id}` of an airing comes back with its start date and
+    /// channel name — the post-pass belongs to projecting a programme, not to
+    /// the `/LiveTv/*` routes.
+    ///
+    /// Ids that are not programmes are left untouched, so a mixed page is safe
+    /// to hand over whole.
+    ///
+    /// The default does nothing — the "no Live TV configured" state.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn add_info_to_program_dto(
+        &self,
+        dtos: &mut [BaseItemDto],
+        options: &DtoOptions,
+        user: Option<&UserEntity>,
+    ) -> Result<(), ServiceError> {
+        let _ = (dtos, options, user);
+        Ok(())
+    }
+
     // ---- live streams ----------------------------------------------------
 
     /// The playable media sources for a Live TV channel, or empty when the id

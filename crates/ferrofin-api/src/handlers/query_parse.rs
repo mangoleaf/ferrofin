@@ -237,6 +237,43 @@ where
     }
 }
 
+/// Applies the `locationTypes` / `excludeLocationTypes` query parameters to a
+/// query's `IsVirtualItem`, exactly as `ItemsController.GetItems` does.
+///
+/// Port of v10.11.8 Jellyfin.Api/Controllers/ItemsController.cs:437-447:
+///
+/// ```text
+/// if (excludeLocationTypes.Any(t => t == LocationType.Virtual)) { query.IsVirtualItem = false; }
+/// if (locationTypes.Length > 0 && locationTypes.Length < 4)
+///     { query.IsVirtualItem = locationTypes.Contains(LocationType.Virtual); }
+/// ```
+///
+/// The `< 4` guard is upstream's: asking for ALL four location types is asking
+/// for no filter at all, so it must not collapse into
+/// `IsVirtualItem = Contains(Virtual)` and quietly become a virtual-only page.
+/// `LocationType` is the only thing either parameter can express here — the
+/// three non-`Virtual` values are indistinguishable in storage, and upstream
+/// reads them the same way.
+///
+/// Both parameters were unported, which is why
+/// `/Items?includeItemTypes=LiveTvProgram&locationTypes=FileSystem` returned the
+/// whole guide where Jellyfin returns nothing: an airing is `IsVirtualItem = 1`.
+pub(crate) fn apply_location_types(
+    is_virtual_item: &mut Option<bool>,
+    location_types: Option<&str>,
+    exclude_location_types: Option<&str>,
+) {
+    use ferrofin_model::entities::LocationType;
+    let excluded: Vec<LocationType> = parse_csv_enums_lenient(exclude_location_types);
+    if excluded.contains(&LocationType::Virtual) {
+        *is_virtual_item = Some(false);
+    }
+    let requested: Vec<LocationType> = parse_csv_enums_lenient(location_types);
+    if !requested.is_empty() && requested.len() < 4 {
+        *is_virtual_item = Some(requested.contains(&LocationType::Virtual));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{parse_csv_uuids, parse_pipe_strings};
@@ -376,5 +413,38 @@ mod tests {
             vec!["Action".to_owned(), "Sci-Fi".to_owned()]
         );
         assert!(parse_pipe_strings(None).is_empty());
+    }
+
+    /// `locationTypes`/`excludeLocationTypes` are the ONLY things that set
+    /// `IsVirtualItem` on `GET /Items` (v10.11.8
+    /// Jellyfin.Api/Controllers/ItemsController.cs:437-447). Both were unported,
+    /// which is why `?includeItemTypes=LiveTvProgram&locationTypes=FileSystem`
+    /// returned the whole guide where Jellyfin returns nothing — an airing is
+    /// `IsVirtualItem = 1`.
+    #[test]
+    fn location_types_drive_is_virtual_item() {
+        let apply = |loc: Option<&str>, excl: Option<&str>| {
+            let mut v = None;
+            super::apply_location_types(&mut v, loc, excl);
+            v
+        };
+        // Neither parameter: untouched.
+        assert_eq!(apply(None, None), None);
+        // `locationTypes=Virtual` asks for virtual items ONLY.
+        assert_eq!(apply(Some("Virtual"), None), Some(true));
+        // Any other subset asks for non-virtual ones.
+        assert_eq!(apply(Some("FileSystem"), None), Some(false));
+        assert_eq!(apply(Some("FileSystem,Remote,Offline"), None), Some(false));
+        // …but ALL FOUR is no filter at all — the `< 4` guard, which stops the
+        // "everything" request collapsing into a virtual-only page.
+        assert_eq!(apply(Some("FileSystem,Remote,Virtual,Offline"), None), None);
+        // `excludeLocationTypes` only reacts to Virtual.
+        assert_eq!(apply(None, Some("Virtual")), Some(false));
+        assert_eq!(apply(None, Some("Remote")), None);
+        // `locationTypes` is applied SECOND, so it wins over the exclusion —
+        // the order upstream evaluates them in.
+        assert_eq!(apply(Some("Virtual"), Some("Virtual")), Some(true));
+        // Unknown tokens are dropped by the lenient binder, not 400'd.
+        assert_eq!(apply(Some("Nonsense"), None), None);
     }
 }

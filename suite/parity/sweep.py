@@ -394,6 +394,23 @@ def resolve_fixtures(base, token, user):
     # The Live TV fixture provisions the tuner, so the lineup is right there.
     channels = get_json(base, f"/LiveTv/Channels?userId={user}&limit=1", token) or {}
     channel = ((channels.get("Items") or [{}])[0]).get("Id")
+    # `{pluginId}`/`{version}` were reported "unresolved path param", so FIVE
+    # plugin ops (Configuration GET/POST, Manifest, Image, DELETE) went unprobed
+    # on both servers. Each side is seeded from its OWN `GET /Plugins`, which is
+    # the same thing the `groupId` seed does above and for the same reason: the
+    # value only has to be a real one on the server being asked, and what the
+    # breadth row then measures is status parity — that both servers answer the
+    # same way for a plugin id that exists on them.
+    #
+    # The 200 BODY on these rows is out of reach by construction and must not be
+    # claimed: the two servers share no plugin id (Ferrofin ships compiled-in
+    # extensions and WASM components, stock Jellyfin ships five bundled .NET
+    # provider plugins), so no shared subject exists to body-diff. reads.py's
+    # `plugin_invariants` is what earns the verification, by holding each
+    # server's OWN answer to the same shape.
+    plugins = get_json(base, "/Plugins", token) or []
+    plugin = plugins[0].get("Id") if plugins else None
+    plugin_version = plugins[0].get("Version") if plugins else None
 
     def source_id(item_id):
         """The item's media source id from PlaybackInfo — what a client sends as
@@ -436,6 +453,13 @@ def resolve_fixtures(base, token, user):
         "_audio": audio, "_audio_src": source_id(audio),
         # Kind-correct seeds for the /Similar aliases (see `similar_fixtures`).
         "_album": album, "_artist": artist, "_series": series,
+        "pluginId": plugin,
+        # `{version}` occurs only under `/Plugins/`, and it must be the
+        # INSTALLED one: `PluginManager.GetPlugin(id, version)` matches with
+        # `Version.Equals` (v10.11.8 Emby.Server.Implementations/Plugins/
+        # PluginManager.cs:293-311), so any other string is a 404 and the row
+        # would measure the miss path instead of the hit path.
+        "_plugin_version": plugin_version,
     }
     return {k: v for k, v in fx.items() if v is not None}
 
@@ -490,7 +514,8 @@ QUERY_FILL = {
 # Path params whose meaning depends on where they appear. `(path prefix, param)
 # -> fixture key`: only a path under the prefix gets the value, so a name shared
 # by two unrelated id spaces cannot cross-contaminate.
-PATH_SCOPED = {("/LiveTv/", "channelId"): "_livetv_channel"}
+PATH_SCOPED = {("/LiveTv/", "channelId"): "_livetv_channel",
+               ("/Plugins/", "version"): "_plugin_version"}
 
 
 def scoped_fixtures(path, fixtures):
@@ -708,8 +733,19 @@ def selfcheck():
     fx = {"itemId": "abc", "userId": "u1"}
     url, skip = build_url("/Items/{itemId}", fx)
     assert url == "/Items/abc" and skip is None, (url, skip)
+    # `{pluginId}` used to be unresolvable, which skipped five plugin rows. It
+    # is seeded now, so the guard is the positive one: with a seed the URL
+    # builds, and WITHOUT one it still skips loudly rather than filling a blank.
+    url, skip = build_url("/Plugins/{pluginId}", {**fx, "pluginId": "abc123"})
+    assert url == "/Plugins/abc123" and skip is None, (url, skip)
     _, skip = build_url("/Plugins/{pluginId}", fx)
     assert skip and "pluginId" in skip
+    # …and `{version}` is path-scoped to /Plugins/, so it cannot leak into
+    # another route that happens to name a version.
+    scoped = scoped_fixtures("/Plugins/{pluginId}/{version}/Image",
+                             {**fx, "pluginId": "abc123", "_plugin_version": "1.0.0"})
+    url, skip = build_url("/Plugins/{pluginId}/{version}/Image", scoped)
+    assert url == "/Plugins/abc123/1.0.0/Image" and skip is None, (url, skip)
     # deep-diff field dedup collapses per-item [key] prefixes to one field each.
     df = dedup_fields({"missing": [{"path": "[Path=/a].Foo"}, {"path": "[Path=/b].Foo"}],
                        "extra": [], "mismatch": [{"path": "Bar"}]})

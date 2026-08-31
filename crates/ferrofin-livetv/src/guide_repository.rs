@@ -11,8 +11,20 @@ use uuid::Uuid;
 
 use ferrofin_traits::error::ServiceError;
 
-use crate::projection::{ChannelRow, ChannelUserData};
+use crate::projection::{ChannelRow, ChannelUserData, ProgramRow};
 
+/// The columns a guide list read returns, joined to the owning channel for
+/// `ChannelName`. Held apart from the filters so the `WHERE`/`ORDER`/`LIMIT`
+/// builders can be shared with the total-record count.
+pub(crate) const PROGRAM_SELECT: &str = r#"SELECT p."Id",p."ChannelId",p."StartDate",p."EndDate",p."Title",p."EpisodeTitle",
+                      p."Overview",p."Genres",p."ProductionYear",p."OfficialRating",p."IsNew",
+                      p."IsRepeat",p."IsPremiere",p."IsMovie",p."IsSeries",p."IsNews",p."IsKids",
+                      p."IsSports",p."IsLive",p."ExternalId",p."ExternalSeriesId",
+                      p."SeasonNumber",p."EpisodeNumber",p."DateCreated",p."ShowId",
+                      c."Name" AS "ChannelName",c."Number" AS "ChannelNumber",
+                      c."ChannelType" AS "ChannelMediaKind"
+               FROM "FerrofinLiveTvPrograms" p
+               JOIN "FerrofinLiveTvChannels" c ON c."Id" = p."ChannelId""#;
 /// Every channel in the lineup, in stored (`SortIndex`) order, each carrying
 /// the guide-derived movie/series/kids flags `GuideManager.RefreshChannels`
 /// aggregates onto upstream channel items (`isMovie |= program.IsMovie; ...`,
@@ -87,6 +99,58 @@ pub async fn channel_rows_by_ids(
         }
         qb.push(")");
         let rows: Vec<ChannelRow> = qb
+            .build_query_as()
+            .fetch_all(db.pool())
+            .await
+            .map_err(db_err)?;
+        out.extend(
+            rows.into_iter()
+                .filter_map(|row| Uuid::parse_str(&row.id).ok().map(|id| (id, row))),
+        );
+    }
+    Ok(out)
+}
+
+/// Every stored guide programme, channel-joined.
+///
+/// The mirror's source of truth: whatever `insert_programs` left in
+/// `FerrofinLiveTvPrograms` after the whole refresh is exactly upstream's
+/// `newProgramIdList` accumulated across every service.
+///
+/// # Errors
+///
+/// Fails when the database read fails.
+pub async fn program_rows(db: &Database) -> Result<Vec<ProgramRow>, ServiceError> {
+    sqlx::query_as(PROGRAM_SELECT)
+        .fetch_all(db.pool())
+        .await
+        .map_err(db_err)
+}
+
+/// The guide programmes among `ids`, keyed by their `Uuid`.
+///
+/// One query for a whole page, for the same reason [`channel_rows_by_ids`] is:
+/// the `DtoService` seam runs over every DTO on an `/Items` page and a per-DTO
+/// lookup would be an N+1. Ids that are not programmes are simply absent from
+/// the map, which is how a mixed page costs one query and changes nothing.
+///
+/// # Errors
+///
+/// Fails when the database read fails.
+pub async fn program_rows_by_ids(
+    db: &Database,
+    ids: &[Uuid],
+) -> Result<std::collections::HashMap<Uuid, ProgramRow>, ServiceError> {
+    let mut out = std::collections::HashMap::new();
+    for chunk in ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+        let mut qb: sqlx::QueryBuilder<'_, sqlx::Sqlite> = sqlx::QueryBuilder::new(PROGRAM_SELECT);
+        qb.push(r#" WHERE p."Id" IN ("#);
+        let mut separated = qb.separated(", ");
+        for id in chunk {
+            separated.push_bind(guid_to_db(*id));
+        }
+        qb.push(")");
+        let rows: Vec<ProgramRow> = qb
             .build_query_as()
             .fetch_all(db.pool())
             .await
@@ -312,6 +376,26 @@ pub mod test_support {
                WHERE "Type" = ?1 ORDER BY "Id""#,
         )
         .bind(crate::projection::CHANNEL_TYPE_NAME)
+        .fetch_all(db.pool())
+        .await
+        .map_err(db_err)
+    }
+
+    /// The stored `BaseItems` programme-item rows as
+    /// `(Id, ParentId, TopParentId, PresentationUniqueKey)`, id-ordered — what
+    /// the guide refresh's `BaseItems` mirror wrote.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the database read fails.
+    pub async fn stored_program_items(
+        db: &Database,
+    ) -> Result<Vec<(String, Option<String>, Option<String>, Option<String>)>, ServiceError> {
+        sqlx::query_as(
+            r#"SELECT "Id","ParentId","TopParentId","PresentationUniqueKey" FROM "BaseItems"
+               WHERE "Type" = ?1 ORDER BY "Id""#,
+        )
+        .bind(crate::projection::PROGRAM_TYPE_NAME)
         .fetch_all(db.pool())
         .await
         .map_err(db_err)

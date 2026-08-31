@@ -948,6 +948,10 @@ impl MediaSourceManager for FerrofinMediaSourceManager {
             .collect())
     }
 
+    async fn get_item_ids_with_lyrics(&self, item_ids: &[Uuid]) -> Result<Vec<Uuid>, ServiceError> {
+        self.streams.get_item_ids_with_lyrics(item_ids).await
+    }
+
     async fn get_item_ids_with_subtitles(
         &self,
         item_ids: &[Uuid],

@@ -205,14 +205,25 @@ fn push_group_head(qb: &mut QueryBuilder<'_, Sqlite>) {
 
 /// Closes the subquery [`push_group_head`] opened.
 ///
-/// `COALESCE` because a row without a key groups with nothing but itself.
-/// Jellyfin always writes one (2 nulls in 40,610 on a real library) and so does
-/// Ferrofin wherever versions are merged
-/// (`ItemPersistenceService::set_primary_version_id`), but a row written before
-/// that has none, and a bare `GROUP BY` would fold every keyless row into a
-/// single result.
+/// A BARE `GROUP BY` on the column, as upstream's
+/// `dbQuery.GroupBy(e => e.PresentationUniqueKey)` translates to (v10.11.8
+/// Jellyfin.Server.Implementations/Item/BaseItemRepository.cs:417). SQLite
+/// groups NULLs together, so every keyless row collapses into ONE result — and
+/// on a real 10.11.8 that is not an accident: it is how the entire Live TV
+/// guide shows up as a single `Program` row on an unfiltered recursive page
+/// instead of as tens of thousands of airings. Measured on the parity oracle:
+/// 338 `LiveTvProgram` rows, all with a NULL key, and exactly one `Program` in
+/// the page.
+///
+/// This used to be `COALESCE(key, Id)`, justified by "Jellyfin always writes
+/// one (2 nulls in 40,610 on a real library)". The guide disproves that: the
+/// one kind upstream deliberately leaves keyless is the one the COALESCE was
+/// hiding, and the COALESCE put the whole guide on every user's home query.
+/// The three Ferrofin write paths that left OTHER rows keyless are fixed at the
+/// insert, and migration 0027 backfills the rows they already wrote — so
+/// nothing but an airing reaches this `GROUP BY` without a key.
 fn push_group_tail(qb: &mut QueryBuilder<'_, Sqlite>) {
-    qb.push(r#" GROUP BY COALESCE(bi."PresentationUniqueKey", bi."Id")))"#);
+    qb.push(r#" GROUP BY bi."PresentationUniqueKey"))"#);
 }
 
 /// Builds the "latest media" statement for a tvshows/music library — C#

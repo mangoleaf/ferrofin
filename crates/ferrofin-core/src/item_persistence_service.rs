@@ -89,10 +89,17 @@ async fn music_genre_row(
         return Ok(());
     };
     sqlx::query(
+        // `PresentationUniqueKey` for the same reason the sibling by-name insert
+        // writes one: a by-name row's key is `{Type}-{Name}`
+        // (`kinds::presentation_unique_key`), this insert bypasses
+        // `upsert_item`, and nothing else would set it. A real 10.11.8 leaves
+        // the column NULL for exactly ONE kind — `LiveTvProgram` — so a keyless
+        // `MusicGenre` is a Ferrofin-only shape.
         r#"INSERT INTO "BaseItems"
-           ("Id","Type","Name","CleanName","SortName","IsFolder","IsInMixedFolder",
+           ("Id","Type","Name","CleanName","SortName","PresentationUniqueKey",
+            "IsFolder","IsInMixedFolder",
             "IsLocked","IsMovie","IsRepeat","IsSeries","IsVirtualItem")
-           SELECT ?1,?2,?3,?4,?5,0,0,0,0,0,0,0
+           SELECT ?1,?2,?3,?4,?5,?6,0,0,0,0,0,0,0
            WHERE NOT EXISTS (
                SELECT 1 FROM "BaseItems" WHERE "Type" = ?2 AND "CleanName" = ?4)"#,
     )
@@ -101,6 +108,14 @@ async fn music_genre_row(
     .bind(value)
     .bind(clean)
     .bind(ferrofin_util::sort_name::create_sort_name(value))
+    .bind(crate::kinds::presentation_unique_key(
+        BaseItemKind::MusicGenre,
+        id,
+        Some(value),
+        None,
+        None,
+        None,
+    ))
     .execute(&mut **tx)
     .await
     .map_err(db_err)?;
@@ -132,11 +147,20 @@ pub(crate) async fn insert_named_item(
         // browse. Upstream never creates one — a playlist lands in the
         // `ManualPlaylistsFolder` and a collection in the auto-provisioned
         // "Collections" library — and neither should this.
+        // `PresentationUniqueKey` is `BaseItem.CreatePresentationUniqueKey()` —
+        // the row's own id in the `N` form — and it is LOAD-BEARING here, not
+        // decorative: this row carries a `TopParentId`, so it is inside the
+        // recursive user universe, and that universe is queried with
+        // `GROUP BY PresentationUniqueKey` whenever a user asks for no
+        // particular kind. A keyless row shares the NULL group with every other
+        // keyless row (upstream's only ones are guide airings), so it would
+        // vanish from the user's own home query behind whichever row the group
+        // happened to elect.
         r#"INSERT INTO "BaseItems"
            ("Id", "Type", "IsFolder", "IsInMixedFolder", "IsLocked", "IsMovie",
             "IsRepeat", "IsSeries", "IsVirtualItem", "Name", "SortName",
-            "ParentId", "TopParentId")
-           VALUES (?1, ?2, ?3, 0, 0, 0, 0, 0, 0, ?4, ?5, ?6, ?6)"#,
+            "PresentationUniqueKey", "ParentId", "TopParentId")
+           VALUES (?1, ?2, ?3, 0, 0, 0, 0, 0, 0, ?4, ?5, ?7, ?6, ?6)"#,
     )
     .bind(guid_to_db(id))
     .bind(type_name)
@@ -144,6 +168,14 @@ pub(crate) async fn insert_named_item(
     .bind(name)
     .bind(ferrofin_util::sort_name::create_sort_name(name))
     .bind(container.map(guid_to_db))
+    .bind(crate::kinds::presentation_unique_key(
+        kind,
+        id,
+        Some(name),
+        None,
+        None,
+        None,
+    ))
     .execute(db.writer())
     .await
     .map_err(db_err)?;
@@ -1359,6 +1391,26 @@ fn derive_presentation_key(item: &BaseItemEntity) -> Option<String> {
     // off on every TV folder, which is why its 126 series all store own-id and
     // the adoption suite cannot see this.)
     if kind == BaseItemKind::Series && stored.is_some() {
+        return stored.map(str::to_owned);
+    }
+    // A guide programme keeps whatever it arrived with — which is nothing.
+    // `PresentationUniqueKey` is populated by exactly one thing upstream,
+    // `MetadataService.UpdatePresentationUniqueKey` (v10.11.8
+    // MediaBrowser.Providers/Manager/MetadataService.cs:332-336), and the guide
+    // refresh calls `RefreshMetadata` on a CHANNEL only (v10.11.8
+    // src/Jellyfin.LiveTv/Guide/GuideManager.cs:305) — an airing is written
+    // straight through by `CreateItems`/`UpdateItemsAsync` and never sees the
+    // metadata service. A real 10.11.8 database bears that out exactly: all four
+    // channel rows carry their own id as the key, all 338 programme rows carry
+    // NULL.
+    //
+    // The null is load-bearing, not cosmetic. `EnableGroupByPresentationUniqueKey`
+    // is TRUE for a user query with an empty `IncludeItemTypes`
+    // (Jellyfin.Server.Implementations/Item/BaseItemRepository.cs:1557-1589), and
+    // SQLite groups NULLs together — so the whole guide collapses to ONE row on
+    // an unfiltered recursive page. Minting a key per airing here would put the
+    // entire guide on every user's home screen.
+    if kind == BaseItemKind::LiveTvProgram {
         return stored.map(str::to_owned);
     }
     let derived = crate::kinds::presentation_unique_key(

@@ -78,6 +78,13 @@ struct TrailersQuery {
     /// Restrict to played / unplayed items.
     #[serde(default)]
     is_played: Option<bool>,
+    /// Comma-delimited [`LocationType`](ferrofin_model::entities::LocationType)
+    /// set to include; `IsVirtualItem` follows, as on `GET /Items`.
+    #[serde(default)]
+    location_types: Option<String>,
+    /// Comma-delimited `LocationType` set to exclude.
+    #[serde(default)]
+    exclude_location_types: Option<String>,
     /// Whether to compute the total record count (defaults `true`).
     #[serde(default)]
     enable_total_record_count: Option<bool>,
@@ -146,6 +153,14 @@ async fn get_trailers(
     if let Some(parent) = query.parent_id {
         internal.parent_id = parent;
     }
+    // `TrailersController.GetTrailers` hands its arguments straight to
+    // `ItemsController.GetItems`, so the same two parameters drive
+    // `IsVirtualItem` here.
+    crate::handlers::query_parse::apply_location_types(
+        &mut internal.is_virtual_item,
+        query.location_types.as_deref(),
+        query.exclude_location_types.as_deref(),
+    );
     let filters = parse_csv_enums_lenient(query.filters.as_deref());
     internal
         .apply_filters(&filters)

@@ -69,6 +69,76 @@ pub struct PluginInfo {
     pub status: PluginStatus,
 }
 
+/// A plugin's manifest, as `POST /Plugins/{pluginId}/Manifest` returns it.
+///
+/// Port of `MediaBrowser.Common/Plugins/PluginManifest.cs` (v10.11.8;
+/// byte-identical on master).
+///
+/// **This DTO is camelCase on purpose — do not "fix" it to PascalCase for
+/// consistency with the rest of the API.** Every property upstream carries an
+/// explicit lowercase `[JsonPropertyName]`, which overrides the server's
+/// PascalCase naming policy, and the id is spelled `guid`, not `Id`. Both were
+/// verified against a live 10.11.8, which answers this route with
+/// `{"category":…,"guid":"b8715ed16c4745289ad3f72deb539cd4",…}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginManifest {
+    /// The plugin's category.
+    pub category: String,
+
+    /// The changelog text.
+    pub changelog: String,
+
+    /// The manifest's own description, which is NOT
+    /// [`PluginInfo::description`]: that one comes from `IPlugin.Description`,
+    /// this one from the on-disk manifest, and a bundled plugin leaves it empty.
+    pub description: String,
+
+    /// The plugin's unique id. Spelled `guid` on the wire
+    /// (`[JsonPropertyName("guid")] public Guid Id`), in the dashless `N` form
+    /// `JsonGuidConverter` writes.
+    #[schema(value_type = String, format = "uuid")]
+    #[serde(rename = "guid", with = "crate::json::guid")]
+    pub id: Uuid,
+
+    /// The plugin's name.
+    pub name: String,
+
+    /// An overview of the plugin.
+    pub overview: String,
+
+    /// The plugin's owner.
+    pub owner: String,
+
+    /// The compatibility version the plugin targets.
+    pub target_abi: String,
+
+    /// The manifest's timestamp — `DateTime.MinValue` when it carries none.
+    #[schema(value_type = String, format = "date-time")]
+    #[serde(with = "crate::json::datetime")]
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+
+    /// The plugin's version.
+    pub version: String,
+
+    /// The plugin's operational status.
+    pub status: PluginStatus,
+
+    /// Whether the plugin should update itself automatically.
+    pub auto_update: bool,
+
+    /// The bundled image's path, relative to the plugin folder.
+    ///
+    /// `DefaultIgnoreCondition = WhenWritingNull` drops the key when there is
+    /// no image, which is why it is absent from a bundled plugin's manifest.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_path: Option<String>,
+
+    /// The assemblies to load, relative to the plugin folder. Always empty
+    /// here: Ferrofin loads no .NET assemblies.
+    pub assemblies: Vec<String>,
+}
+
 /// Defines a plugin's web page.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]

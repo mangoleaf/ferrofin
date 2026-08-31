@@ -493,6 +493,37 @@ impl Database {
         Ok(out)
     }
 
+    /// The `Studios` column of the rows among `ids` that have one, keyed by the
+    /// id in its stored (uppercase, hyphenated) GUID form.
+    ///
+    /// One query for a page of episodes/seasons, whose `SeriesStudio` is
+    /// `series.Studios.FirstOrDefault()` (v10.11.8
+    /// Emby.Server.Implementations/Dto/DtoService.cs:1228-1234 and :1256-1262)
+    /// — a value that lives on the SERIES row, not on the item being projected.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub async fn item_studios(&self, ids: &[String]) -> Result<Vec<(String, String)>> {
+        let mut out = Vec::with_capacity(ids.len());
+        for chunk in ids.chunks(crate::BATCH_BIND_CHUNK) {
+            let placeholders = (1..=chunk.len())
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                r#"SELECT "Id", "Studios" FROM "BaseItems"
+                   WHERE "Id" IN ({placeholders}) AND "Studios" IS NOT NULL AND "Studios" <> ''"#,
+            );
+            let mut query = sqlx::query_as::<_, (String, String)>(&sql);
+            for id in chunk {
+                query = query.bind(id);
+            }
+            out.extend(query.fetch_all(self.pool()).await?);
+        }
+        Ok(out)
+    }
+
     /// Names the `PhotoAlbum` rows among `ids`, keyed by the id in its stored
     /// (uppercase, hyphenated) GUID form.
     ///
