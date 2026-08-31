@@ -997,11 +997,52 @@ pub async fn build_app_state(
                 enabled: true,
                 has_image: false,
                 can_uninstall: false,
+                configuration_file_name: None,
             },
             None,
         )
         .with_default_config(br#"{"ApiKey":"","Username":"","Password":""}"#.to_vec()),
     ];
+    // Jellyfin's five IN-TREE provider plugins (TMDb, Studio Images, OMDb,
+    // MusicBrainz, AudioDB). They are compiled into `MediaBrowser.Providers`
+    // upstream, so every stock server has them and every dashboard shows their
+    // settings pages; Ferrofin ports all five as native providers but had never
+    // given them a plugin identity, which is why `/web/ConfigurationPages`,
+    // `/Plugins` and `/Plugins/{id}/Configuration` came back empty against
+    // Jellyfin's five entries.
+    //
+    // Registered UNCONDITIONALLY — outside the `disable_extensions` branch
+    // above. That flag exists so a benchmark leg compares against a
+    // plugin-free Jellyfin; these five are never absent from Jellyfin, so
+    // suppressing them would recreate the exact divergence being closed.
+    registered_plugins.extend(ferrofin_providers::builtin_plugins::ALL.iter().map(|p| {
+        ferrofin_core::RegisteredPlugin::new(
+            ferrofin_traits::plugins::PluginDescriptor {
+                id: p.id,
+                name: p.name.to_owned(),
+                // Upstream reports the server assembly's version for an in-tree
+                // plugin; Ferrofin's equivalent is the Jellyfin API version it
+                // speaks, with the .NET fourth component.
+                version: format!("{JELLYFIN_API_VERSION}.0"),
+                description: p.description.to_owned(),
+                enabled: true,
+                has_image: false,
+                can_uninstall: false,
+                configuration_file_name: Some(p.configuration_file_name.to_owned()),
+            },
+            None,
+        )
+        .non_removable()
+        .with_default_config(p.default_config.as_bytes().to_vec())
+        .with_config_page(ferrofin_core::PluginConfigPage {
+            // C# `GetPages()` yields exactly one page, named `Name`, with no
+            // main-menu flag — `GET /web/ConfigurationPage?name=TMDb` matches
+            // it case-insensitively.
+            name: p.name.to_owned(),
+            bytes: p.config_page.to_vec(),
+            enable_in_main_menu: false,
+        })
+    }));
     // Every curated extension surfaces as a plugin here.
     registered_plugins.extend(ferrofin_extensions::registered_plugins(&extensions));
     // Loaded WASM plugins surface on `/Plugins` exactly like compiled-in ones.
@@ -1053,6 +1094,19 @@ pub async fn build_app_state(
         .with_configuration(Arc::clone(&config_trait))
         .with_application_version(JELLYFIN_API_VERSION),
     );
+    // Jellyfin's five in-tree provider plugins read their settings through
+    // `Plugin.Instance.Configuration` at call time, so an admin's save on a
+    // settings page takes effect on the next lookup with no restart. The
+    // metadata clients are built far above this line (they are leaves with no
+    // manager dependencies), so the manager is handed to them here instead of
+    // through their constructors — each holds a `ConfigSource` that is unbound,
+    // and therefore serves the C# defaults, until this runs.
+    tmdb_client.attach_plugin_manager(Arc::clone(&plugins));
+    omdb_client.attach_plugin_manager(Arc::clone(&plugins));
+    musicbrainz_client.attach_plugin_manager(Arc::clone(&plugins));
+    audiodb_client.attach_plugin_manager(Arc::clone(&plugins));
+    studios_client.attach_plugin_manager(Arc::clone(&plugins));
+
     let subtitle_providers: Vec<Arc<dyn ferrofin_traits::subtitles::SubtitleProvider>> =
         vec![Arc::new(ferrofin_providers::OpenSubtitlesProvider::new(
             Arc::clone(&plugins),

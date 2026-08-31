@@ -27,7 +27,10 @@ use crate::state::AppState;
 #[serde(rename_all = "camelCase")]
 struct SuggestionsQuery {
     /// The target user; scopes visibility and attaches user data when present.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     user_id: Option<Uuid>,
     /// Comma-delimited [`MediaType`] set to include.
     #[serde(default)]

@@ -14,10 +14,11 @@ use axum::http::{Request, StatusCode};
 use ferrofin_api::create_router;
 use ferrofin_api::state::AppState;
 use ferrofin_api::test_support::{
-    FakeApiKeys, FakeAppHost, FakeClientEventLogger, FakeCollections, FakeDevices, FakeDto,
-    FakeLibrary, FakeLocalization, FakeLyrics, FakeMediaSegments, FakeMediaSources, FakeMusic,
-    FakePlaylists, FakeProviders, FakeQuickConnect, FakeSearch, FakeSessions, FakeSimilarItems,
-    FakeSubtitles, FakeTasks, FakeTrickplay, FakeTvSeries, FakeUserData, FakeUserViews, FakeUsers,
+    FakeAdminUsers, FakeApiKeys, FakeAppHost, FakeClientEventLogger, FakeCollections, FakeDevices,
+    FakeDto, FakeLibrary, FakeLocalization, FakeLyrics, FakeMediaSegments, FakeMediaSources,
+    FakeMusic, FakePlaylists, FakeProviders, FakeQuickConnect, FakeSearch, FakeSessions,
+    FakeSimilarItems, FakeSubtitles, FakeTasks, FakeTrickplay, FakeTvSeries, FakeUserData,
+    FakeUserViews, FakeUsers,
 };
 use ferrofin_db::entities::display_preferences::{
     DisplayPreferencesEntity, HomeSectionEntity, ItemDisplayPreferencesEntity,
@@ -35,6 +36,9 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 const USER_ID: Uuid = Uuid::from_u128(0x00D1_0000);
+
+/// Another account, never the caller — the target of the cross-user probes.
+const OTHER_USER_ID: Uuid = Uuid::from_u128(0x00D1_0001);
 
 /// A minimal authenticated user.
 fn user() -> UserEntity {
@@ -351,14 +355,25 @@ impl ferrofin_traits::configuration::DisplayPreferencesManager for StubDisplayPr
     }
 }
 
-/// Builds an [`AppState`] whose display-preferences manager is `prefs`.
+/// Builds an [`AppState`] whose display-preferences manager is `prefs`, with the
+/// caller reporting as an ordinary (non-administrator) account.
 fn state_with_display_prefs(
     prefs: Arc<dyn ferrofin_traits::configuration::DisplayPreferencesManager>,
+) -> AppState {
+    state_with_display_prefs_as(prefs, Arc::new(FakeUsers))
+}
+
+/// Builds an [`AppState`] whose display-preferences manager is `prefs` and whose
+/// caller's role comes from `users` — [`FakeUsers`] for an ordinary account,
+/// [`FakeAdminUsers`] for an administrator.
+fn state_with_display_prefs_as(
+    prefs: Arc<dyn ferrofin_traits::configuration::DisplayPreferencesManager>,
+    users: Arc<dyn ferrofin_traits::library::UserManager>,
 ) -> AppState {
     let auth = Arc::new(OkAuth);
     AppState::new(
         Arc::new(FakeLibrary),
-        Arc::new(FakeUsers),
+        users,
         Arc::new(FakeUserViews),
         Arc::new(FakeUserData),
         Arc::new(FakeMediaSources),
@@ -800,4 +815,94 @@ async fn display_preferences_round_trip_absent_key_is_empty_string() {
     assert_eq!(saved.tv_home.as_deref(), Some(""));
     assert_eq!(v["CustomPrefs"]["dashboardTheme"], serde_json::json!(""));
     assert_eq!(v["CustomPrefs"]["tvhome"], serde_json::json!(""));
+}
+
+/// The GET honours C# `RequestHelpers.GetUserId`: naming another user's id as a
+/// non-administrator is refused, not served.
+///
+/// Measured live before the fix (lane-3 pair, `bench` reading `probe`'s row):
+/// Ferrofin `200` with the other user's preferences, Jellyfin `403`.
+#[tokio::test]
+async fn display_preferences_get_cross_user_as_non_admin_is_forbidden() {
+    let app = state_with_display_prefs(Arc::new(StubDisplayPreferences::default()));
+    let (status, _) = get(
+        app,
+        &format!("/DisplayPreferences/home?client=web&userId={OTHER_USER_ID}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+/// The POST is the exploitable half — an ungated `userId` let any authenticated
+/// account **overwrite** another account's row. Refused for a non-administrator.
+#[tokio::test]
+async fn display_preferences_post_cross_user_as_non_admin_is_forbidden() {
+    let prefs = Arc::new(StubDisplayPreferences::default());
+    let app = state_with_display_prefs(prefs.clone());
+    let (status, _) = send(
+        app,
+        "POST",
+        &format!("/DisplayPreferences/home?client=web&userId={OTHER_USER_ID}"),
+        Body::from(r#"{"CustomPrefs":{},"ScrollDirection":"Horizontal","SortOrder":"Ascending","ShowBackdrop":false,"ShowSidebar":false,"RememberIndexing":false,"RememberSorting":false,"PrimaryImageHeight":250,"PrimaryImageWidth":250}"#),
+        Some("application/json"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    // Nothing was written: the refusal happens before the row is touched.
+    assert!(prefs.row.lock().unwrap().is_none());
+}
+
+/// The other half of the rule: an **administrator** naming another user's id is
+/// still served. A gate that refuses everyone is not a port of `GetUserId`.
+#[tokio::test]
+async fn display_preferences_cross_user_as_admin_is_allowed() {
+    let get_app = state_with_display_prefs_as(
+        Arc::new(StubDisplayPreferences::default()),
+        Arc::new(FakeAdminUsers),
+    );
+    let (status, _) = get(
+        get_app,
+        &format!("/DisplayPreferences/home?client=web&userId={OTHER_USER_ID}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let prefs = Arc::new(StubDisplayPreferences::default());
+    let post_app = state_with_display_prefs_as(prefs.clone(), Arc::new(FakeAdminUsers));
+    let (status, _) = send(
+        post_app,
+        "POST",
+        &format!("/DisplayPreferences/home?client=web&userId={OTHER_USER_ID}"),
+        Body::from(r#"{"CustomPrefs":{},"ScrollDirection":"Horizontal","SortOrder":"Ascending","ShowBackdrop":false,"ShowSidebar":false,"RememberIndexing":false,"RememberSorting":false,"PrimaryImageHeight":250,"PrimaryImageWidth":250}"#),
+        Some("application/json"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(prefs.row.lock().unwrap().is_some());
+}
+
+/// ...and a non-administrator naming **their own** id is served, exactly as
+/// omitting the parameter is.
+#[tokio::test]
+async fn display_preferences_self_as_non_admin_is_allowed() {
+    let app = state_with_display_prefs(Arc::new(StubDisplayPreferences::default()));
+    let (status, _) = get(
+        app,
+        &format!("/DisplayPreferences/home?client=web&userId={USER_ID}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let prefs = Arc::new(StubDisplayPreferences::default());
+    let app = state_with_display_prefs(prefs.clone());
+    let (status, _) = send(
+        app,
+        "POST",
+        &format!("/DisplayPreferences/home?client=web&userId={USER_ID}"),
+        Body::from(r#"{"CustomPrefs":{},"ScrollDirection":"Horizontal","SortOrder":"Ascending","ShowBackdrop":false,"ShowSidebar":false,"RememberIndexing":false,"RememberSorting":false,"PrimaryImageHeight":250,"PrimaryImageWidth":250}"#),
+        Some("application/json"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(prefs.row.lock().unwrap().is_some());
 }

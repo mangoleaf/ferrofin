@@ -34,18 +34,66 @@ use crate::error::ApiError;
 use crate::handlers::query_parse::{parse_csv_enums_lenient, parse_csv_uuids, parse_pipe_strings};
 use crate::state::AppState;
 
+/// The effective user id for a request, porting C#
+/// `RequestHelpers.GetUserId` (v10.11.8 `Jellyfin.Api/Helpers/RequestHelpers.cs`
+/// lines 67-85) in both of its halves:
+///
+/// 1. An absent **or all-zero** `user_id` is "not provided" — upstream tests
+///    `userId.IsNullOrEmpty()` and `Guid.Empty` is empty — so it falls back to
+///    the authenticated caller. Rejecting a nil made
+///    `?userId=00000000-0000-0000-0000-000000000000` a `400` here against a
+///    `200` upstream, a shape jellyfin-web sends whenever it has no user id in
+///    hand yet.
+/// 2. Naming **another** user's id requires the administrator role: upstream
+///    throws `SecurityException("Forbidden")`, which `ExceptionMiddleware`
+///    (`:129`) maps to `403`. Without it any authenticated account could read
+///    another account's user-scoped data by passing its guid.
+///
+/// The role lookup only runs when the caller actually named a different user
+/// (jellyfin-web always sends its own id), so the common path adds no work. An
+/// API-key caller is elevated upstream and is elevated here.
+///
+/// This is the **single** implementation of the rule for the whole crate: any
+/// handler that accepts a `userId` from the request must route it through here
+/// (directly, or via [`resolve_user`] / [`resolve_user_opt`]) rather than
+/// hand-rolling a `user_id.unwrap_or(caller)` fallback, which silently drops
+/// half 2 and lets any authenticated account act as any other.
+pub(crate) async fn effective_user_id(
+    state: &AppState,
+    auth: &AuthorizationInfo,
+    user_id: Option<Uuid>,
+) -> Result<Uuid, ApiError> {
+    let authenticated = auth.user_id();
+    let Some(requested) = user_id.filter(|id| !id.is_nil()) else {
+        return Ok(authenticated);
+    };
+    if requested == authenticated || auth.is_api_key {
+        return Ok(requested);
+    }
+    let elevated = match &auth.user {
+        Some(user) => super::users::is_administrator(state, user).await?,
+        None => false,
+    };
+    if elevated {
+        Ok(requested)
+    } else {
+        Err(ApiError::Forbidden("Forbidden".to_owned()))
+    }
+}
+
 /// Resolves the effective user for a request: the explicit `user_id` query
 /// parameter when present, otherwise the authenticated caller.
 ///
-/// Mirrors Jellyfin's `RequestHelpers.GetUserId`. A `user_id` that resolves to
-/// no account is a `400`; a caller with neither an explicit id nor an
-/// authenticated user is likewise rejected.
+/// The id itself comes from [`effective_user_id`] (the full
+/// `RequestHelpers.GetUserId` port, nil-fallback *and* the administrator gate).
+/// A `user_id` that resolves to no account is a `400`; a caller with neither an
+/// explicit id nor an authenticated user is likewise rejected.
 pub(crate) async fn resolve_user(
     state: &AppState,
     auth: &AuthorizationInfo,
     user_id: Option<Uuid>,
 ) -> Result<UserEntity, ApiError> {
-    let effective = user_id.unwrap_or_else(|| auth.user_id());
+    let effective = effective_user_id(state, auth, user_id).await?;
     if effective.is_nil() {
         return Err(ApiError::BadRequest("no user for request".to_owned()));
     }
@@ -83,14 +131,21 @@ pub(crate) fn user_uuid(user: &UserEntity) -> Result<Uuid, ApiError> {
 /// Resolves the effective user *optionally*: like [`resolve_user`] but a nil
 /// effective id yields [`None`] rather than a `400`.
 ///
-/// Mirrors the controllers (counts/ancestors/delete) that accept an API-key
-/// caller with no user — Jellyfin's `userId.IsNullOrEmpty() ? null : GetUserById`.
+/// Mirrors the controllers (counts/ancestors/delete/instant-mix) that accept an
+/// API-key caller with no user — C# runs `RequestHelpers.GetUserId` FIRST and
+/// only then `userId.IsNullOrEmpty() ? null : GetUserById(...)`
+/// (`InstantMixController.cs:82-85`), so the same nil-falls-back-to-caller rule
+/// applies here and `None` is reached only when there is genuinely no user at
+/// all. Resolving the id through [`effective_user_id`] instead of
+/// `user_id.unwrap_or(caller)` is load-bearing: an explicit all-zero `userId`
+/// used to yield `None` on this path and strip `UserData` off every DTO the
+/// instant-mix routes returned, against a fully populated `UserData` upstream.
 pub(crate) async fn resolve_user_opt(
     state: &AppState,
     auth: &AuthorizationInfo,
     user_id: Option<Uuid>,
 ) -> Result<Option<UserEntity>, ApiError> {
-    let effective = user_id.unwrap_or_else(|| auth.user_id());
+    let effective = effective_user_id(state, auth, user_id).await?;
     if effective.is_nil() {
         return Ok(None);
     }
@@ -113,7 +168,10 @@ pub(crate) async fn resolve_user_opt(
 #[serde(rename_all = "camelCase")]
 struct ItemsQuery {
     /// The target user; defaults to the authenticated caller when absent.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     user_id: Option<Uuid>,
     /// The index of the first item to return.
     #[serde(default)]
@@ -128,7 +186,10 @@ struct ItemsQuery {
     #[serde(default)]
     search_term: Option<String>,
     /// Localizes the query to a specific parent item/folder.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     parent_id: Option<Uuid>,
     /// Comma-delimited [`BaseItemKind`](ferrofin_model::data::BaseItemKind) set to include.
     #[serde(default)]
@@ -378,7 +439,10 @@ async fn get_items(
 #[serde(rename_all = "camelCase")]
 struct ItemQuery {
     /// The target user; defaults to the authenticated caller when absent.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     user_id: Option<Uuid>,
 }
 
@@ -501,7 +565,10 @@ async fn delete_items(
 #[serde(rename_all = "camelCase")]
 struct CountsQuery {
     /// Optional user whose library the counts are scoped to.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     user_id: Option<Uuid>,
     /// Optional favourite-only filter.
     #[serde(default)]
@@ -539,7 +606,10 @@ async fn get_item_counts(
 #[serde(rename_all = "camelCase")]
 struct AncestorsQuery {
     /// Optional user to scope visibility and attach user data.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     user_id: Option<Uuid>,
 }
 
@@ -691,7 +761,10 @@ async fn get_ancestors(
 #[serde(rename_all = "camelCase")]
 struct ResumeQuery {
     /// The target user; defaults to the authenticated caller when absent.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     user_id: Option<Uuid>,
     /// The index of the first item to return.
     #[serde(default)]
@@ -703,7 +776,10 @@ struct ResumeQuery {
     #[serde(default)]
     search_term: Option<String>,
     /// Localizes the query to a specific parent item/folder.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     parent_id: Option<Uuid>,
     /// Comma-delimited [`MediaType`](ferrofin_model::data::MediaType) set.
     #[serde(default)]

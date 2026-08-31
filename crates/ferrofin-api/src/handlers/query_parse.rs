@@ -85,6 +85,36 @@ pub(crate) fn parse_csv_uuids(raw: Option<&str>) -> Result<Vec<Uuid>, ApiError> 
         .collect()
 }
 
+/// Deserializes an optional [`Uuid`] query parameter the way ASP.NET binds a
+/// `Guid?`: an **empty or whitespace-only** value is *absent*, not malformed.
+///
+/// `SimpleTypeModelBinder` returns `null` for a nullable value type whose
+/// submitted value is empty, and the `Guid` type converter trims before parsing,
+/// so upstream answers `?userId=` and `?userId=%20` exactly as it answers a
+/// request with no `userId` at all. serde's own `Option<Uuid>` sees the key and
+/// tries to parse `""`, which made both shapes a `400` here against a `200`
+/// there — measured on the lane-3 pair against Jellyfin 10.11.8 for
+/// `/Items`, `/UserViews`, `/Persons`, `/Years`, `/Devices`, `/Channels`,
+/// `/Channels/Items/Latest`, `/LiveTv/Recordings/Folders`,
+/// `/LiveTv/Recordings/{id}` and `/Audio/{id}/universal`.
+///
+/// Every `Option<Uuid>` field of a `Query<…>` struct in this crate binds through
+/// here, so the rule has one implementation rather than one per handler. Request
+/// **bodies** deliberately do not: `System.Text.Json` rejects `"UserId": ""`
+/// upstream too, so a JSON body keeps serde's strict parse.
+pub(crate) fn empty_as_none_uuid<'de, D>(deserializer: D) -> Result<Option<Uuid>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<String>::deserialize(deserializer)?;
+    match raw.as_deref().map(str::trim) {
+        None | Some("") => Ok(None),
+        Some(value) => Uuid::parse_str(value)
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+    }
+}
+
 /// Splits a pipe-delimited value into owned strings, trimming and dropping empty
 /// tokens. Mirrors Jellyfin's `PipeDelimitedCollectionModelBinder`.
 pub(crate) fn parse_pipe_strings(raw: Option<&str>) -> Vec<String> {
@@ -100,9 +130,41 @@ pub(crate) fn parse_pipe_strings(raw: Option<&str>) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_csv_uuids, parse_pipe_strings};
+    use super::{empty_as_none_uuid, parse_csv_uuids, parse_pipe_strings};
     use ferrofin_model::data::BaseItemKind;
     use uuid::Uuid;
+
+    #[derive(Debug, serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct UserIdOnly {
+        #[serde(default, deserialize_with = "empty_as_none_uuid")]
+        user_id: Option<Uuid>,
+    }
+
+    #[test]
+    fn empty_user_id_binds_as_absent_like_asp_net() {
+        // ASP.NET binds an empty (or whitespace-only) value for a `Guid?` to
+        // null, so upstream answers these exactly as it answers a request with
+        // no `userId` at all. Measured on the lane-3 pair: every one of these
+        // spellings was `200` on Jellyfin 10.11.8 and `400` here.
+        for raw in ["", "userId=", "userId=%20", "userId=%20%20"] {
+            let bound: UserIdOnly = serde_urlencoded::from_str(raw)
+                .unwrap_or_else(|e| panic!("{raw:?} must bind, got {e}"));
+            assert_eq!(bound.user_id, None, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn a_real_user_id_still_binds_and_a_malformed_one_still_fails() {
+        let id = Uuid::from_u128(0x1234);
+        let bound: UserIdOnly = serde_urlencoded::from_str(&format!("userId={id}")).unwrap();
+        assert_eq!(bound.user_id, Some(id));
+        // Guid's type converter trims, so a padded id is still that id.
+        let padded: UserIdOnly = serde_urlencoded::from_str(&format!("userId=%20{id}%20")).unwrap();
+        assert_eq!(padded.user_id, Some(id));
+        // A non-empty value that is not a guid stays a bind failure (400).
+        assert!(serde_urlencoded::from_str::<UserIdOnly>("userId=not-a-guid").is_err());
+    }
 
     #[test]
     fn csv_enums_lenient_skips_unknown() {

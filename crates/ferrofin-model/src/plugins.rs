@@ -100,8 +100,9 @@ pub struct PluginPageInfo {
 ///
 /// Port of `MediaBrowser.Model.Plugins.ConfigurationPageInfo`. In Jellyfin this
 /// is projected from a plugin's [`PluginPageInfo`] plus the owning plugin id;
-/// Ferrofin ships no dynamic plugin host, so the list is always empty, but the
-/// type is part of the wire contract.
+/// Ferrofin projects it from the compiled-in registry the same way — Jellyfin's
+/// five in-tree provider plugins, the curated extensions, and any loaded WASM
+/// plugin each contribute their pages.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
 pub struct ConfigurationPageInfo {
@@ -129,4 +130,151 @@ pub struct ConfigurationPageInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default, with = "crate::json::guid::option")]
     pub plugin_id: Option<Uuid>,
+}
+
+/// A plugin's manifest, as `POST /Plugins/{pluginId}/Manifest` returns it.
+///
+/// Port of `MediaBrowser.Common.Plugins.PluginManifest`. Every property there
+/// carries an explicit `[JsonPropertyName]` in **camelCase**, so this one type
+/// does not follow the API's PascalCase default — `guid`, `targetAbi`,
+/// `autoUpdate` and the rest are the names on the wire, and `Id` is spelled
+/// `guid`. Ferrofin used to answer this route with a five-field PascalCase
+/// projection of its own, which no client written against Jellyfin could read.
+///
+/// The values are the ones upstream fills in for a plugin that has **no
+/// `meta.json` on disk**: `PluginManager.CreatePluginInstance` builds a "dummy
+/// record" (v10.11.8 `PluginManager.cs:560-575`) setting only `Id`, `Name`,
+/// `Version` and `Status`, so the string fields stay at their constructor
+/// defaults (empty), `Assemblies` is empty, `Timestamp` is `DateTime.MinValue`
+/// and `AutoUpdate` keeps its `true` property initializer. That is exactly what
+/// a stock Jellyfin returns for its five in-tree provider plugins, and every
+/// Ferrofin plugin — compiled-in or staged WASM — is that same
+/// manifest-less shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct PluginManifest {
+    /// The plugin's category.
+    pub category: String,
+
+    /// The changelog information.
+    pub changelog: String,
+
+    /// The plugin's description.
+    pub description: String,
+
+    /// The plugin's globally unique identifier (C# `Id`, spelled `guid`).
+    #[schema(value_type = String, format = "uuid")]
+    #[serde(rename = "guid", with = "crate::json::guid")]
+    pub id: Uuid,
+
+    /// The plugin's name.
+    pub name: String,
+
+    /// An overview of the plugin.
+    pub overview: String,
+
+    /// The plugin's owner.
+    pub owner: String,
+
+    /// The compatibility version for the plugin.
+    #[serde(rename = "targetAbi")]
+    pub target_abi: String,
+
+    /// The manifest's timestamp (`DateTime.MinValue` for a manifest-less plugin).
+    pub timestamp: String,
+
+    /// The plugin's version number.
+    pub version: String,
+
+    /// The plugin's operational status.
+    pub status: PluginStatus,
+
+    /// Whether this plugin should automatically update.
+    #[serde(rename = "autoUpdate")]
+    pub auto_update: bool,
+
+    /// The plugin's image path, relative to its folder. Omitted when absent —
+    /// upstream serializes with `DefaultIgnoreCondition = WhenWritingNull`.
+    #[serde(rename = "imagePath", skip_serializing_if = "Option::is_none")]
+    pub image_path: Option<String>,
+
+    /// The assemblies that should be loaded (always empty here: Ferrofin has no
+    /// .NET assembly loading, by design — see `docs/EXTENSIONS.md`).
+    pub assemblies: Vec<String>,
+}
+
+impl PluginManifest {
+    /// The manifest of a plugin with no `meta.json`, matching the C# dummy
+    /// record `PluginManager.CreatePluginInstance` builds.
+    ///
+    /// `DateTime.MinValue` serializes through Jellyfin's `JsonDateTimeConverter`
+    /// as `0001-01-01T00:00:00.0000000Z`; it is a constant here because a
+    /// manifest-less plugin has no timestamp to report.
+    #[must_use]
+    pub fn manifestless(id: Uuid, name: String, version: String, status: PluginStatus) -> Self {
+        Self {
+            category: String::new(),
+            changelog: String::new(),
+            description: String::new(),
+            id,
+            name,
+            overview: String::new(),
+            owner: String::new(),
+            target_abi: String::new(),
+            timestamp: "0001-01-01T00:00:00.0000000Z".to_owned(),
+            version,
+            status,
+            auto_update: true,
+            image_path: None,
+            assemblies: Vec::new(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod manifest_tests {
+    use super::{PluginManifest, PluginStatus};
+
+    #[test]
+    fn manifestless_serializes_with_the_csharp_camel_case_names() {
+        let id = uuid::Uuid::parse_str("b8715ed1-6c47-4528-9ad3-f72deb539cd4").expect("uuid");
+        let m = PluginManifest::manifestless(
+            id,
+            "TMDb".to_owned(),
+            "10.11.8.0".to_owned(),
+            PluginStatus::Active,
+        );
+        let v: serde_json::Value = serde_json::to_value(&m).expect("serialize");
+        // Byte-for-byte the key set a live Jellyfin 10.11.8 returns for TMDb.
+        let mut keys: Vec<&str> = v
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "assemblies",
+                "autoUpdate",
+                "category",
+                "changelog",
+                "description",
+                "guid",
+                "name",
+                "overview",
+                "owner",
+                "status",
+                "targetAbi",
+                "timestamp",
+                "version",
+            ],
+            "imagePath must be omitted when absent (WhenWritingNull)"
+        );
+        assert_eq!(v["guid"], "b8715ed16c4745289ad3f72deb539cd4");
+        assert_eq!(v["status"], "Active");
+        assert_eq!(v["autoUpdate"], true);
+        assert_eq!(v["timestamp"], "0001-01-01T00:00:00.0000000Z");
+        assert_eq!(v["description"], "");
+    }
 }

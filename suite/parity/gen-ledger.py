@@ -168,6 +168,12 @@ def build_rows(spec, real, overlay, curated, sweep, owners):
                 # records something the row's own verdict does NOT cover, and so
                 # may never stand in for one. See `is_side_path`.
                 "classification_scope": s.get("classification_scope", "op"),
+                # What the probe did NOT compare, verbatim from the layer. A
+                # green row whose probe projected a field away is honest only
+                # while the reader can see WHICH field, so these are rendered
+                # (see "Verified with a recorded caveat") rather than living in
+                # a comment in the probe source.
+                "caveats": list(s.get("caveats") or ()),
                 "last_verified": s.get("last_verified") if s else None,
             })
     rows.sort(key=lambda r: (r["operation"].split(" ", 1)[1], r["operation"]))
@@ -449,6 +455,33 @@ def render_md(rows):
         if is_flagged(r) and r["deep_verified"] is not True:
             out.append(f"- 🔍 `{r['operation']}` — {r['classification']}")
     out.append("")
+
+    # ---- green rows that still carry a divergence or a projection -----------
+    #
+    # A row can be `deep_verified` AND still hide something: a curated
+    # classification explaining a real behavioural difference, or a probe that
+    # projected a field out of the comparison. Both used to be visible only in
+    # the one-line `classification` cell of the 412-row table, which nobody
+    # scans. Rule: never delete the only record of a real divergence — so when
+    # the row goes green, the record moves HERE rather than disappearing.
+    caveated = [r for r in rows
+                if r["deep_verified"] is True and (r["caveats"] or r["classification"]
+                                                   not in ("", "ok"))]
+    out.append("## Verified WITH a recorded caveat\n")
+    out.append("_These rows diffed clean, and something about them is still worth "
+               "knowing: a field the probe did not compare, or an accepted divergence "
+               "underneath a green verdict. A green row is not the same as a row with "
+               "nothing left to say._\n")
+    if not caveated:
+        out.append("_(none)_\n")
+    for r in caveated:
+        glyph = verification.METHODS[r["verification_method"]][0]
+        out.append(f"- {glyph} `{r['operation']}`")
+        if r["classification"] not in ("", "ok"):
+            out.append(f"  - classification: {r['classification']}")
+        for c in r["caveats"]:
+            out.append(f"  - NOT compared: {c}")
+    out.append("")
     out.append("## Full ledger\n")
     out.append("_status/schema: ✅ pass · ⚠️ fail · · untested_  \n")
     legend = " · ".join(f"{g} {m}" for m, (g, _l, _d) in verification.METHODS.items())
@@ -541,6 +574,10 @@ def build_curated():
         row["classification_scope"] = v.get("scope", "op")
         row["last_verified"] = a_stamp
         curated[k] = row
+    # NB the overlay above SPREADS onto the live row, so a live layer's
+    # `caveats` survive a curated classification landing on the same op. They
+    # are different statements: the classification says why a divergence is
+    # accepted, the caveats say what the probe declined to compare.
     return curated
 
 
@@ -551,7 +588,8 @@ def _guards_fire():
     three shapes are exactly what used to slip into the headline silently.
     """
     base = {"operation": "GET /x", "deep_verified": True, "classification": "",
-            "verification_method": None, "classification_scope": "op"}
+            "verification_method": None, "classification_scope": "op",
+            "caveats": []}
     def rejected(row):
         try:
             check([{**base, **row}], {})
@@ -625,6 +663,11 @@ def check(rows, curated):
     # And the masking channel itself: a note about a side path must never be
     # counted as this operation's accepted divergence.
     assert not [r for r in rows if is_side_path(r) and is_accepted(r)]
+    # A caveat is a claim about a row's evidence, so it must belong to a row
+    # that HAS a verdict — a caveat on an untested row would read as "we
+    # verified this, except…" about a probe that never ran.
+    orphan = [r["operation"] for r in rows if r["caveats"] and r["deep_verified"] is None]
+    assert not orphan, f"caveats on rows with no verdict: {orphan[:10]}"
     by = Counter(r["verification_method"] for r in rows if r["deep_verified"] is True)
     other = ", ".join(f"{n} {m}" for m, n in sorted(by.items(), key=lambda kv: kv[0] or "")
                       if m != verification.HEADLINE)

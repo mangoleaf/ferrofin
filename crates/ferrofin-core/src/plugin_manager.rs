@@ -9,7 +9,9 @@
 //!
 //! Runtime installation / removal (a dynamic plugin host — WASM or `libloading`)
 //! is **Tier 2** and out of scope: [`remove_plugin`](PluginManager::remove_plugin)
-//! rejects a compiled-in plugin, and [`list_packages`](PluginManager::list_packages)
+//! rejects a compiled-in extension (and, like upstream, silently ignores a
+//! plugin that reports `CanUninstall: false`), and
+//! [`list_packages`](PluginManager::list_packages)
 //! returns `[]` (no repository fetch yet). See `docs/PLUGINS_UPSTREAM.md` for
 //! the compiled-in plugin design.
 
@@ -92,6 +94,18 @@ impl RegisteredPlugin {
             default_config: b"{}".to_vec(),
             config_pages: Vec::new(),
         }
+    }
+
+    /// Reports `CanUninstall: false`, undoing the `true` [`Self::new`] forces.
+    ///
+    /// That `true` exists to surface jellyfin-web's enable/disable toggle for a
+    /// compiled-in **extension**. Jellyfin's own in-tree provider plugins
+    /// (TMDb, OMDb, MusicBrainz, AudioDB, Studio Images) report `false`, and
+    /// they are the row `GET /Plugins` is diffed against, so they opt back out.
+    #[must_use]
+    pub fn non_removable(mut self) -> Self {
+        self.descriptor.can_uninstall = false;
+        self
     }
 
     /// Sets the plugin's default configuration JSON.
@@ -870,10 +884,31 @@ impl PluginManager for FerrofinPluginManager {
                 return Ok(());
             }
         }
-        if self.find(id).is_none() {
+        let Some(plugin) = self.find(id) else {
             return Err(ServiceError::not_found(format!("plugin {id}")));
+        };
+        // A plugin that reports `CanUninstall: false` is REFUSED IN SILENCE
+        // upstream: `InstallationManager.UninstallPlugin` logs
+        // "Attempt to delete non removable plugin {PluginName}, ignoring
+        // request" and returns, while `PluginsController.UninstallPlugin` goes
+        // on to answer `204` (v10.11.8 InstallationManager.cs +
+        // PluginsController.cs:136-152). That is not a Jellyfin bug to skip:
+        // every plugin compiled into Jellyfin's own server tree — the five
+        // in-tree metadata providers Ferrofin now registers — takes this exact
+        // path, so `DELETE /Plugins/{shared id}` is a `204` no-op on a stock
+        // server and used to be a `400` here.
+        if !plugin.descriptor.can_uninstall {
+            tracing::warn!(
+                plugin = %id,
+                name = %plugin.descriptor.name,
+                "attempt to delete non removable plugin, ignoring request"
+            );
+            return Ok(());
         }
-        // Compiled-in plugins have nothing to remove at runtime.
+        // Everything else compiled in reports `CanUninstall: true` only to
+        // surface jellyfin-web's enable/disable toggle (see
+        // `RegisteredPlugin::new`); there is still nothing to remove at
+        // runtime, and saying so beats a `204` that removed nothing.
         Err(ServiceError::invalid_input(
             "compiled-in plugins cannot be uninstalled at runtime",
         ))
@@ -1423,6 +1458,7 @@ mod tests {
             enabled,
             has_image: false,
             can_uninstall: false,
+            configuration_file_name: None,
         }
     }
 
@@ -1498,6 +1534,23 @@ mod tests {
             mgr.remove_plugin(id).await,
             Err(ServiceError::InvalidInput(_))
         ));
+    }
+
+    /// A plugin reporting `CanUninstall: false` is ignored, not refused —
+    /// upstream's `InstallationManager.UninstallPlugin` logs
+    /// "Attempt to delete non removable plugin … ignoring request" and returns,
+    /// while `PluginsController` still answers `204`. That is the path all five
+    /// of Jellyfin's in-tree provider plugins take, so `DELETE /Plugins/{id}`
+    /// on a shared id must be `204` here too (it was `400`).
+    #[tokio::test]
+    async fn remove_non_removable_plugin_is_a_silent_no_op() {
+        let id = Uuid::from_u128(31);
+        let (mgr, _dir) = manager(vec![
+            RegisteredPlugin::new(descriptor(id, "TMDb", true), None).non_removable(),
+        ]);
+        mgr.remove_plugin(id).await.expect("204, not a rejection");
+        // "Ignored" means IGNORED: the plugin is still installed afterwards.
+        assert!(mgr.get_plugin(id).await.expect("get").is_some());
     }
 
     #[tokio::test]

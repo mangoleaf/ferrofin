@@ -25,13 +25,12 @@ use crate::state::AppState;
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ConfigurationPagesQuery {
-    /// Optional filter on whether a page is enabled in the main menu. Unused
-    /// while the page list is empty, but accepted per the contract.
+    /// Optional filter on whether a page is enabled in the main menu.
     #[serde(default)]
     enable_in_main_menu: Option<bool>,
 }
 
-/// `GET /web/ConfigurationPages` — the plugin configuration pages (always empty).
+/// `GET /web/ConfigurationPages` — the registered plugins' configuration pages.
 ///
 /// Port of `DashboardController.GetConfigurationPages`.
 #[utoipa::path(
@@ -65,8 +64,10 @@ struct ConfigurationPageQuery {
 
 /// `GET /web/ConfigurationPage` — a single dashboard configuration page.
 ///
-/// Port of `DashboardController.GetDashboardConfigurationPage`: with no plugin
-/// pages installed, no page ever matches, so this always returns `404`.
+/// Port of `DashboardController.GetDashboardConfigurationPage`: the page whose
+/// name matches `name` case-insensitively, served with the MIME type its
+/// resource name implies. Anonymous, as upstream — the singular action carries
+/// no `[Authorize]` and Jellyfin registers no fallback policy.
 #[utoipa::path(
     get,
     path = "/web/ConfigurationPage",

@@ -81,7 +81,10 @@ async fn get_video_stream_by_container(
 #[serde(rename_all = "camelCase")]
 struct AdditionalPartsQuery {
     /// Optional. Filter by user id, and attach user data.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     user_id: Option<Uuid>,
 }
 

@@ -16,7 +16,7 @@
 //! - `GET /Channels/{channelId}/Items` — a channel's items (empty).
 //! - `GET /Channels/Items/Latest` — latest items across channels (empty).
 
-use axum::extract::Path;
+use axum::extract::{Path, Query, State};
 use axum::routing::get;
 use axum::{Json, Router};
 use ferrofin_model::channels::ChannelFeatures;
@@ -25,7 +25,27 @@ use ferrofin_model::querying::QueryResult;
 use uuid::Uuid;
 
 use crate::auth::RequireAuth;
+use crate::error::ApiError;
+use crate::handlers::items::effective_user_id;
 use crate::state::AppState;
+
+/// The `userId` query parameter the three user-scoped channel routes accept.
+///
+/// The result is empty either way, but the parameter is **not** inert: upstream
+/// runs `RequestHelpers.GetUserId` on it before it ever reaches the channel
+/// manager, so naming another user's id as a non-administrator is a `403` there
+/// and must be one here. Dropping the parameter on the floor turned that refusal
+/// into a `200`.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ChannelUserQuery {
+    /// Optional target user; defaults to the authenticated caller.
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
+    user_id: Option<Uuid>,
+}
 
 /// `GET /Channels` — the authenticated user's channels.
 ///
@@ -33,13 +53,19 @@ use crate::state::AppState;
 #[utoipa::path(
     get,
     path = "/Channels",
+    params(("userId" = Option<String>, Query, description = "User id.")),
     // Body schema omitted: `BaseItemDto` recurses without bound in the derived
     // `utoipa::ToSchema` (a `ferrofin-model` DTO defect) — see `items::get_items`.
     responses((status = 200, description = "Channels returned (QueryResult<BaseItemDto>)")),
     tag = "ferrofin"
 )]
-async fn get_channels(RequireAuth(_auth): RequireAuth) -> Json<QueryResult<BaseItemDto>> {
-    Json(QueryResult::default())
+async fn get_channels(
+    State(state): State<AppState>,
+    RequireAuth(auth): RequireAuth,
+    Query(query): Query<ChannelUserQuery>,
+) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
+    effective_user_id(&state, &auth, query.user_id).await?;
+    Ok(Json(QueryResult::default()))
 }
 
 /// `GET /Channels/Features` — features for every channel.
@@ -82,15 +108,21 @@ async fn get_channel_features(
 #[utoipa::path(
     get,
     path = "/Channels/{channelId}/Items",
-    params(("channelId" = String, Path, description = "Channel id")),
+    params(
+        ("channelId" = String, Path, description = "Channel id"),
+        ("userId" = Option<String>, Query, description = "User id.")
+    ),
     responses((status = 200, description = "Channel items returned (QueryResult<BaseItemDto>)")),
     tag = "ferrofin"
 )]
 async fn get_channel_items(
-    RequireAuth(_auth): RequireAuth,
+    State(state): State<AppState>,
+    RequireAuth(auth): RequireAuth,
     Path(_channel_id): Path<Uuid>,
-) -> Json<QueryResult<BaseItemDto>> {
-    Json(QueryResult::default())
+    Query(query): Query<ChannelUserQuery>,
+) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
+    effective_user_id(&state, &auth, query.user_id).await?;
+    Ok(Json(QueryResult::default()))
 }
 
 /// `GET /Channels/Items/Latest` — latest items across all channels.
@@ -99,13 +131,17 @@ async fn get_channel_items(
 #[utoipa::path(
     get,
     path = "/Channels/Items/Latest",
+    params(("userId" = Option<String>, Query, description = "User id.")),
     responses((status = 200, description = "Latest channel items returned (QueryResult<BaseItemDto>)")),
     tag = "ferrofin"
 )]
 async fn get_latest_channel_items(
-    RequireAuth(_auth): RequireAuth,
-) -> Json<QueryResult<BaseItemDto>> {
-    Json(QueryResult::default())
+    State(state): State<AppState>,
+    RequireAuth(auth): RequireAuth,
+    Query(query): Query<ChannelUserQuery>,
+) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
+    effective_user_id(&state, &auth, query.user_id).await?;
+    Ok(Json(QueryResult::default()))
 }
 
 /// Registers this controller's real routes onto `router`.

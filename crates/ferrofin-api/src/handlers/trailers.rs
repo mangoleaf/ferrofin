@@ -34,7 +34,10 @@ use crate::state::AppState;
 #[serde(rename_all = "camelCase")]
 struct TrailersQuery {
     /// The target user; defaults to the authenticated caller when absent.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     user_id: Option<Uuid>,
     /// The index of the first record to return.
     #[serde(default)]
@@ -49,7 +52,10 @@ struct TrailersQuery {
     #[serde(default)]
     search_term: Option<String>,
     /// Localizes the query to a specific parent item/folder.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     parent_id: Option<Uuid>,
     /// Comma-delimited [`ItemSortBy`] columns.
     #[serde(default)]

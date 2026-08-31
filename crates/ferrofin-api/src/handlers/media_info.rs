@@ -25,7 +25,7 @@ use uuid::Uuid;
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
 use crate::handlers::item_update::opt_i32;
-use crate::handlers::items::{resolve_user, user_uuid};
+use crate::handlers::items::{effective_user_id, resolve_user, user_uuid};
 use crate::state::AppState;
 
 /// The server's transcode capabilities, fed to the [`StreamBuilder`] so it knows
@@ -82,7 +82,11 @@ impl TranscoderSupport for FerrofinTranscoderSupport {
 #[serde(rename_all = "camelCase")]
 struct PlaybackInfoQuery {
     /// The target user; defaults to the authenticated caller when absent.
-    #[serde(default, alias = "UserId")]
+    #[serde(
+        default,
+        alias = "UserId",
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     user_id: Option<Uuid>,
     /// The requested audio stream index override.
     #[serde(default, alias = "AudioStreamIndex")]
@@ -666,7 +670,10 @@ struct OpenLiveStreamQuery {
     #[serde(default)]
     always_burn_in_subtitle_when_transcoding: Option<bool>,
     /// The target user; defaults to the authenticated caller when absent.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     user_id: Option<Uuid>,
     /// The play session id.
     #[serde(default)]
@@ -687,7 +694,10 @@ struct OpenLiveStreamQuery {
     #[serde(default)]
     max_audio_channels: Option<i32>,
     /// The item id whose source is opened.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     item_id: Option<Uuid>,
 }
 
@@ -783,11 +793,14 @@ async fn open_live_stream(
     Query(query): Query<OpenLiveStreamQuery>,
     body: Option<Json<OpenLiveStreamDto>>,
 ) -> Result<Json<LiveStreamResponse>, ApiError> {
-    let request = live_stream_request(
-        query,
-        body.map(|Json(dto)| dto).unwrap_or_default(),
-        auth.user_id(),
-    );
+    let dto = body.map(|Json(dto)| dto).unwrap_or_default();
+    // C# `userId ??= openLiveStreamDto?.UserId; userId =
+    // RequestHelpers.GetUserId(User, userId)`: the query id wins over the body
+    // id, and naming another user requires the administrator role. The resolved
+    // id is what the stream is opened AS, so an ungated one opened a live
+    // stream — and a tuner — under another account's identity.
+    let effective = effective_user_id(&state, &auth, query.user_id.or(dto.user_id)).await?;
+    let request = live_stream_request(query, dto, effective);
     let media_source = state.media_sources.open_live_stream(&request).await?;
     Ok(Json(LiveStreamResponse::new(media_source)))
 }
@@ -798,14 +811,20 @@ async fn open_live_stream(
 /// `MediaInfoController.OpenLiveStream`: the query wins, the body fills the
 /// gaps, and the documented defaults (direct play and direct stream on,
 /// burn-in off, HTTP the only direct-play protocol) apply last.
+///
+/// `effective_user` is the id the caller already resolved through
+/// [`effective_user_id`] — the `userId`/body-`UserId` pair folded and then run
+/// through the administrator gate — so the two raw ids are deliberately not
+/// consulted again here.
 fn live_stream_request(
     query: OpenLiveStreamQuery,
     dto: OpenLiveStreamDto,
-    authenticated_user: Uuid,
+    effective_user: Uuid,
 ) -> LiveStreamRequest {
     LiveStreamRequest {
         open_token: query.open_token.or(dto.open_token),
-        user_id: query.user_id.or(dto.user_id).unwrap_or(authenticated_user),
+        // Already resolved through `RequestHelpers.GetUserId` by the caller.
+        user_id: effective_user,
         play_session_id: query.play_session_id.or(dto.play_session_id),
         max_streaming_bitrate: query.max_streaming_bitrate.or(dto.max_streaming_bitrate),
         start_time_ticks: query.start_time_ticks.or(dto.start_time_ticks),
@@ -943,20 +962,19 @@ mod tests {
                 "DeviceProfile":{"Name":"ignored"}}"#,
         )
         .expect("body parses");
-        let request = super::live_stream_request(
-            super::OpenLiveStreamQuery::default(),
-            dto,
-            uuid::Uuid::nil(),
-        );
+        // The body's `UserId` is folded in and gated by the handler (C# does the
+        // same, `userId ??= dto.UserId` then `RequestHelpers.GetUserId`), so the
+        // resolved id is what this function is handed.
+        let body_user = uuid::Uuid::parse_str("85c9c1a0f0b74a1b8c4d9e2f3a4b5c6d").expect("guid");
+        assert_eq!(dto.user_id, Some(body_user));
+        let request =
+            super::live_stream_request(super::OpenLiveStreamQuery::default(), dto, body_user);
         assert_eq!(
             request.open_token.as_deref(),
             Some("prov_LiveTvChannel_abc_src")
         );
         assert_eq!(request.play_session_id.as_deref(), Some("parity-livetv"));
-        assert_eq!(
-            request.user_id,
-            uuid::Uuid::parse_str("85c9c1a0f0b74a1b8c4d9e2f3a4b5c6d").expect("guid")
-        );
+        assert_eq!(request.user_id, body_user);
         assert_eq!(
             request.item_id,
             uuid::Uuid::parse_str("11111111222233334444555566667777").expect("guid")
@@ -984,7 +1002,7 @@ mod tests {
         let request = super::live_stream_request(query, dto, user);
         assert_eq!(request.open_token.as_deref(), Some("from-query"));
         assert!(request.enable_direct_stream);
-        // Neither side named a user: the authenticated caller is it.
+        // The resolved id passes through untouched.
         assert_eq!(request.user_id, user);
     }
 

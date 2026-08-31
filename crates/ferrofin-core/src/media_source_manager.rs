@@ -851,6 +851,11 @@ impl MediaSourceManager for FerrofinMediaSourceManager {
         self.streams.get_item_ids_with_subtitles(item_ids).await
     }
 
+    async fn get_item_ids_with_lyrics(&self, item_ids: &[Uuid]) -> Result<Vec<Uuid>, ServiceError> {
+        // Same ids-only delegation as the subtitle probe.
+        self.streams.get_item_ids_with_lyrics(item_ids).await
+    }
+
     async fn get_media_attachments_batch(
         &self,
         item_ids: &[Uuid],

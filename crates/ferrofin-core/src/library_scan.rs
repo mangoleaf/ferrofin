@@ -2116,6 +2116,16 @@ impl LibraryScanner {
             && let (Some(adb), Some(rg)) = (&self.audiodb, release_group_id)
             && let Some(a) = adb.album(rg).await
         {
+            // `ReplaceAlbumName` (AudioDB settings page, off by default): the
+            // client only carries a name when the admin turned it on, and
+            // upstream OVERWRITES — `item.Name = result.strAlbum` — rather than
+            // filling a gap, so this is not gated on the existing name.
+            if let Some(name) = a.name
+                && updated.name.as_deref() != Some(name.as_str())
+            {
+                updated.name = Some(name);
+                changed = true;
+            }
             if updated.overview.is_none() && a.description.is_some() {
                 updated.overview = a.description;
                 changed = true;
@@ -2171,9 +2181,22 @@ impl LibraryScanner {
             // fanart below still run for tagged libraries (the same
             // remote-resolve-only gate as `enrich_one_album`).
             let mb_enabled = policy.metadata_enabled("MusicArtist", fetcher_names::MUSICBRAINZ);
+            // `ReplaceArtistName` (MusicBrainz settings page, off by default)
+            // renames the artist to MusicBrainz's spelling — but ONLY on the
+            // branch that RESOLVED the id by searching. C#
+            // `MusicBrainzArtistProvider.cs:135-150` puts the rename inside
+            // `if (string.IsNullOrWhiteSpace(musicBrainzId))`, so an artist
+            // whose mbid came from its own tags is never renamed.
+            let mut searched_name = None;
             let mbid = match artist_mbid.get(name) {
                 Some(id) => Some(id.clone()),
-                None if mb_enabled => mb.search_artist(name).await,
+                None if mb_enabled => match mb.search_artist_match(name).await {
+                    Some(hit) => {
+                        searched_name = hit.name;
+                        Some(hit.id)
+                    }
+                    None => None,
+                },
                 None => None,
             };
             let Some(id) = mbid else {
@@ -2190,6 +2213,14 @@ impl LibraryScanner {
             // resolved MusicBrainz artist id.
             let mut updated = artist.clone();
             let mut changed = false;
+            if let Some(mb_name) = searched_name
+                && mb_enabled
+                && updated.name.as_deref() != Some(mb_name.as_str())
+                && mb.replace_artist_name().await
+            {
+                updated.name = Some(mb_name);
+                changed = true;
+            }
             let mut images: Vec<ferrofin_providers::TmdbImage> = Vec::new();
             // MusicBrainz's own artist fields (C# `MusicBrainzArtistProvider`
             // writes more than the id): the life span, whose end is what the
@@ -2883,7 +2914,7 @@ impl LibraryScanner {
             // director/writer/actors unless the OMDb plugin's `CastAndCrew`
             // flag is set, and that bool has no initializer — so upstream's
             // default is OFF and Ferrofin matches it.
-            people: if OMDB_CAST_AND_CREW {
+            people: if omdb.cast_and_crew().await {
                 omdb_people(&item)
             } else {
                 Vec::new()
@@ -5944,14 +5975,6 @@ async fn apply_release_details(
     }
     changed
 }
-
-/// Whether OMDb's director/writer/actor credits are added to an item.
-///
-/// Port of the OMDb plugin's `PluginConfiguration.CastAndCrew`, an
-/// uninitialized `bool` — so upstream's default is `false` and OMDb adds no
-/// people. Ferrofin has no per-plugin config page for OMDb, so it matches the
-/// upstream default rather than inventing a different one.
-const OMDB_CAST_AND_CREW: bool = false;
 
 /// The ids a fetcher may resolve this row by: the sidecar's first, then any the
 /// row already carries from a previous scan.

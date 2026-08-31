@@ -17,7 +17,23 @@ use serde::Deserialize;
 /// The TMDB v3 REST base.
 const API_BASE: &str = "https://api.themoviedb.org/3";
 /// The TMDB image CDN base; `original` is the largest available size.
-const IMAGE_BASE: &str = "https://image.tmdb.org/t/p/original";
+/// Maps the `ImageType` a `/images` entry was listed under to the TMDb
+/// settings-page size that governs it.
+///
+/// `ConvertPostersToRemoteImageInfo` / `…Backdrops…` / `…Logos…` each pass their
+/// own `Plugin.Instance.Configuration.*Size` into the shared `GetUrl`
+/// (v10.11.8 `TmdbClientManager.cs:554-572`). A languaged backdrop is remapped
+/// to `Thumb` by the caller AFTER the URL is built there, so it keeps the
+/// backdrop size — hence `Thumb` maps to `Backdrop` here rather than to a size
+/// of its own.
+fn image_type_size(image_type: ImageType) -> crate::plugin_config::TmdbImageKind {
+    use crate::plugin_config::TmdbImageKind;
+    match image_type {
+        ImageType::Backdrop | ImageType::Thumb => TmdbImageKind::Backdrop,
+        ImageType::Logo => TmdbImageKind::Logo,
+        _ => TmdbImageKind::Poster,
+    }
+}
 /// Jellyfin's built-in TMDB v3 API key, used when no user key is configured so
 /// artwork works out of the box. Verbatim port of `TmdbUtils.ApiKey`.
 const DEFAULT_API_KEY: &str = "4219e299c89411838049ab0dab19ebd5";
@@ -435,6 +451,87 @@ struct ContentRatingCountry {
     rating: Option<String>,
 }
 
+/// Maps a title's `credits` block to [`TmdbPerson`]s under the TMDb settings
+/// page's cast/crew caps and profile filters.
+///
+/// Shared by the movie and series arms of [`TmdbClient::details`], which are one
+/// request here and two providers upstream (`TmdbMovieProvider.GetMetadata` /
+/// `TmdbSeriesProvider.GetPersons`) running the identical LINQ.
+fn credits_to_people(
+    credits: Option<CreditsResponse>,
+    cfg: &crate::plugin_config::TmdbConfig,
+) -> Vec<TmdbPerson> {
+    let mut people = Vec::new();
+    if let Some(credits) = credits {
+        // Cast: keep TMDB's billing order, then apply the TMDb settings
+        // page's `HideMissingCastMembers` filter and `MaxCastMembers` cap —
+        // `castQuery.Where(a => !IsNullOrEmpty(a.ProfilePath))` then
+        // `.OrderBy(a => a.Order).Take(config.MaxCastMembers)`
+        // (`TmdbMovieProvider.cs:258-268`, `TmdbSeriesProvider.cs:329-338`).
+        // The index is taken BEFORE the filter so a hidden actor does not
+        // renumber the ones after it: upstream keeps `actor.Order` as the
+        // SortOrder regardless of what the filter dropped.
+        for (order, c) in credits
+            .cast
+            .into_iter()
+            .enumerate()
+            .filter(|(_, c)| {
+                !cfg.hide_missing_cast_members
+                    || c.profile_path.as_deref().is_some_and(|p| !p.is_empty())
+            })
+            .take(cfg.max_cast_members)
+        {
+            if c.name.is_empty() {
+                continue;
+            }
+            people.push(TmdbPerson {
+                tmdb_id: c.id,
+                name: c.name,
+                person_type: "Actor".to_owned(),
+                role: c.character.filter(|r| !r.is_empty()),
+                sort_order: i32::try_from(order).unwrap_or(i32::MAX),
+                profile_url: c
+                    .profile_path
+                    .filter(|p| !p.is_empty())
+                    .map(|p| cfg.image_url(crate::plugin_config::TmdbImageKind::Profile, &p)),
+            });
+        }
+        // Crew: only the roles Jellyfin surfaces on the detail page, then
+        // the settings page's `HideMissingCrewMembers` filter and
+        // `MaxCrewMembers` cap. Upstream applies both AFTER the
+        // wanted-kind filter, so the cap counts kept crew, not raw credits.
+        for c in credits
+            .crew
+            .into_iter()
+            .filter(|c| crew_person_type(c.job.as_deref()).is_some())
+            .filter(|c| {
+                !cfg.hide_missing_crew_members
+                    || c.profile_path.as_deref().is_some_and(|p| !p.is_empty())
+            })
+            .take(cfg.max_crew_members)
+        {
+            let Some(person_type) = crew_person_type(c.job.as_deref()) else {
+                continue;
+            };
+            if c.name.is_empty() {
+                continue;
+            }
+            people.push(TmdbPerson {
+                tmdb_id: c.id,
+                name: c.name,
+                person_type: person_type.to_owned(),
+                role: c.job.filter(|r| !r.is_empty()),
+                sort_order: i32::MAX,
+                profile_url: c
+                    .profile_path
+                    .filter(|p| !p.is_empty())
+                    .map(|p| cfg.image_url(crate::plugin_config::TmdbImageKind::Profile, &p)),
+            });
+        }
+    }
+    people
+}
+
 /// Maps a TMDB crew `job` to the Jellyfin person type Ferrofin surfaces, or `None`
 /// to skip the credit.
 fn crew_person_type(job: Option<&str>) -> Option<&'static str> {
@@ -504,12 +601,16 @@ struct SeasonEpisode {
 /// Converts a raw season payload into [`SeasonDetails`], prefixing image paths
 /// with the TMDB image base and dropping empty strings. Pure — unit-testable
 /// without network.
-fn season_details_from(resp: SeasonResponse) -> SeasonDetails {
+fn season_details_from(
+    resp: SeasonResponse,
+    cfg: &crate::plugin_config::TmdbConfig,
+) -> SeasonDetails {
     let non_empty = |s: Option<String>| s.filter(|v| !v.is_empty());
     SeasonDetails {
         name: non_empty(resp.name),
         overview: non_empty(resp.overview),
-        poster: non_empty(resp.poster_path).map(|p| format!("{IMAGE_BASE}{p}")),
+        poster: non_empty(resp.poster_path)
+            .map(|p| cfg.image_url(crate::plugin_config::TmdbImageKind::Poster, &p)),
         episodes: resp
             .episodes
             .into_iter()
@@ -518,7 +619,8 @@ fn season_details_from(resp: SeasonResponse) -> SeasonDetails {
                 episode_number: ep.episode_number,
                 name: non_empty(ep.name),
                 overview: non_empty(ep.overview),
-                still_url: non_empty(ep.still_path).map(|p| format!("{IMAGE_BASE}{p}")),
+                still_url: non_empty(ep.still_path)
+                    .map(|p| cfg.image_url(crate::plugin_config::TmdbImageKind::Still, &p)),
                 air_date: non_empty(ep.air_date),
                 // TMDB reports 0 for "nobody has rated this", which is a
                 // missing rating, not a rating of zero.
@@ -623,13 +725,19 @@ pub struct TmdbCollection {
     pub images: Vec<RemoteImage>,
 }
 
-/// A TMDB artwork client. Cheap to clone (wraps a [`reqwest::Client`]).
-#[derive(Debug, Clone)]
+/// A TMDB artwork client. Held behind an `Arc` at the call site.
+#[derive(Debug)]
 pub struct TmdbClient {
     http: reqwest::Client,
+    /// The key to use when the TMDb settings page names none: Jellyfin's
+    /// built-in project key, or one the operator passed to
+    /// [`with_api_key`](TmdbClient::with_api_key).
     api_key: SecretString,
     /// API root, overridable for tests ([`with_base_url`](TmdbClient::with_base_url)).
     base_url: String,
+    /// The TMDb plugin's dashboard settings (`TmdbApiKey`, `IncludeAdult`, the
+    /// cast/crew caps, the five image sizes).
+    plugin: crate::plugin_config::ConfigSource,
 }
 
 impl Default for TmdbClient {
@@ -646,6 +754,7 @@ impl TmdbClient {
             http: reqwest::Client::new(),
             api_key: SecretString::from(DEFAULT_API_KEY),
             base_url: API_BASE.to_owned(),
+            plugin: crate::plugin_config::ConfigSource::new(),
         }
     }
 
@@ -660,7 +769,26 @@ impl TmdbClient {
                 key
             }),
             base_url: API_BASE.to_owned(),
+            plugin: crate::plugin_config::ConfigSource::new(),
         }
+    }
+
+    /// Binds the plugin manager, making the TMDb settings page live. Called
+    /// once by the composition root.
+    pub fn attach_plugin_manager(
+        &self,
+        plugins: std::sync::Arc<dyn ferrofin_traits::plugins::PluginManager>,
+    ) {
+        self.plugin.attach(plugins);
+    }
+
+    /// The TMDb plugin's settings for this call.
+    ///
+    /// Read per call, the way `Plugin.Instance.Configuration` is: an admin
+    /// saving the settings page changes the next lookup, with no restart. The
+    /// read is a few hundred bytes off disk in front of a TMDB round trip.
+    pub(crate) async fn settings(&self) -> crate::plugin_config::TmdbConfig {
+        self.plugin.load(crate::builtin_plugins::TMDB.id).await
     }
 
     /// Points the client at a different API root (a mock server in tests).
@@ -683,6 +811,11 @@ impl TmdbClient {
         name: &str,
         year: Option<i32>,
     ) -> Vec<RemoteImage> {
+        // The TMDb settings page governs the key, the adult filter, the
+        // cast/crew caps and the image sizes; read per call, the way
+        // `Plugin.Instance.Configuration` is (`TmdbClientManager`).
+        let cfg = self.settings().await;
+        let key = cfg.api_key(self.api_key.expose_secret());
         let path = match kind {
             TmdbKind::Movie => "search/movie",
             TmdbKind::Series => "search/tv",
@@ -695,7 +828,11 @@ impl TmdbClient {
         let mut req = self
             .http
             .get(format!("{}/{path}", self.base_url))
-            .query(&[("api_key", self.api_key.expose_secret()), ("query", name)]);
+            .query(&[("api_key", key), ("query", name)])
+            // `include_adult` is `Plugin.Instance.Configuration.IncludeAdult`
+            // on every TMDb search upstream (`TmdbClientManager.cs:396,424,467`);
+            // the API's own default is `false`, which is also the plugin's.
+            .query(&[("include_adult", cfg.include_adult.to_string())]);
         if let Some(y) = year {
             req = req.query(&[(year_param, y.to_string())]);
         }
@@ -725,13 +862,13 @@ impl TmdbClient {
         if let Some(poster) = hit.poster_path.filter(|p| !p.is_empty()) {
             images.push(RemoteImage {
                 image_type: ImageType::Primary,
-                url: format!("{IMAGE_BASE}{poster}"),
+                url: cfg.image_url(crate::plugin_config::TmdbImageKind::Poster, &poster),
             });
         }
         if let Some(backdrop) = hit.backdrop_path.filter(|p| !p.is_empty()) {
             images.push(RemoteImage {
                 image_type: ImageType::Backdrop,
-                url: format!("{IMAGE_BASE}{backdrop}"),
+                url: cfg.image_url(crate::plugin_config::TmdbImageKind::Backdrop, &backdrop),
             });
         }
         images
@@ -744,10 +881,19 @@ impl TmdbClient {
     /// [`season_details`](Self::season_details). `None`
     /// on no match or any network/parse error.
     pub async fn series_match(&self, name: &str, year: Option<i32>) -> Option<SeriesMatch> {
+        // The TMDb settings page governs the key, the adult filter, the
+        // cast/crew caps and the image sizes; read per call, the way
+        // `Plugin.Instance.Configuration` is (`TmdbClientManager`).
+        let cfg = self.settings().await;
+        let key = cfg.api_key(self.api_key.expose_secret());
         let mut req = self
             .http
             .get(format!("{}/search/tv", self.base_url))
-            .query(&[("api_key", self.api_key.expose_secret()), ("query", name)]);
+            .query(&[("api_key", key), ("query", name)])
+            // `include_adult` is `Plugin.Instance.Configuration.IncludeAdult`
+            // on every TMDb search upstream (`TmdbClientManager.cs:396,424,467`);
+            // the API's own default is `false`, which is also the plugin's.
+            .query(&[("include_adult", cfg.include_adult.to_string())]);
         if let Some(y) = year {
             req = req.query(&[("first_air_date_year", y.to_string())]);
         }
@@ -767,13 +913,13 @@ impl TmdbClient {
         if let Some(poster) = hit.poster_path.filter(|p| !p.is_empty()) {
             images.push(RemoteImage {
                 image_type: ImageType::Primary,
-                url: format!("{IMAGE_BASE}{poster}"),
+                url: cfg.image_url(crate::plugin_config::TmdbImageKind::Poster, &poster),
             });
         }
         if let Some(backdrop) = hit.backdrop_path.filter(|p| !p.is_empty()) {
             images.push(RemoteImage {
                 image_type: ImageType::Backdrop,
-                url: format!("{IMAGE_BASE}{backdrop}"),
+                url: cfg.image_url(crate::plugin_config::TmdbImageKind::Backdrop, &backdrop),
             });
         }
         Some(SeriesMatch {
@@ -786,11 +932,16 @@ impl TmdbClient {
     /// season name/overview/poster and every episode's name/overview/still, in a
     /// single request. `None` on any failure.
     pub async fn season_details(&self, tmdb_id: i64, season_number: i32) -> Option<SeasonDetails> {
+        // The TMDb settings page governs the key, the adult filter, the
+        // cast/crew caps and the image sizes; read per call, the way
+        // `Plugin.Instance.Configuration` is (`TmdbClientManager`).
+        let cfg = self.settings().await;
+        let key = cfg.api_key(self.api_key.expose_secret());
         let url = format!("{}/tv/{tmdb_id}/season/{season_number}", self.base_url);
         let resp = self
             .http
             .get(url)
-            .query(&[("api_key", self.api_key.expose_secret())])
+            .query(&[("api_key", key)])
             .send()
             .await
             .ok()?;
@@ -798,13 +949,18 @@ impl TmdbClient {
             return None;
         }
         let parsed = resp.json::<SeasonResponse>().await.ok()?;
-        Some(season_details_from(parsed))
+        Some(season_details_from(parsed, &cfg))
     }
 
     /// Searches TMDB's collections by name (`/search/collection`) — port of
     /// `TmdbClientManager.SearchCollectionAsync`, the box-set half of the
     /// Identify flow. Empty on no match or any error.
     pub async fn search_collection(&self, name: &str) -> Vec<TmdbCollectionHit> {
+        // The TMDb settings page governs the key, the adult filter, the
+        // cast/crew caps and the image sizes; read per call, the way
+        // `Plugin.Instance.Configuration` is (`TmdbClientManager`).
+        let cfg = self.settings().await;
+        let key = cfg.api_key(self.api_key.expose_secret());
         let name = name.trim();
         if name.is_empty() {
             return Vec::new();
@@ -812,7 +968,7 @@ impl TmdbClient {
         let Ok(resp) = self
             .http
             .get(format!("{}/search/collection", self.base_url))
-            .query(&[("api_key", self.api_key.expose_secret()), ("query", name)])
+            .query(&[("api_key", key), ("query", name)])
             .send()
             .await
         else {
@@ -831,7 +987,8 @@ impl TmdbClient {
                 tmdb_id: hit.id,
                 name: hit.name.unwrap_or_default(),
                 overview: non_empty(hit.overview),
-                poster_url: non_empty(hit.poster_path).map(|p| format!("{IMAGE_BASE}{p}")),
+                poster_url: non_empty(hit.poster_path)
+                    .map(|p| cfg.image_url(crate::plugin_config::TmdbImageKind::Poster, &p)),
             })
             .collect()
     }
@@ -841,13 +998,15 @@ impl TmdbClient {
     /// `TmdbClientManager.GetCollectionAsync`, which backs both
     /// `TmdbBoxSetProvider` and `TmdbBoxSetImageProvider`.
     pub async fn collection(&self, tmdb_id: i64) -> Option<TmdbCollection> {
+        // The TMDb settings page governs the key, the adult filter, the
+        // cast/crew caps and the image sizes; read per call, the way
+        // `Plugin.Instance.Configuration` is (`TmdbClientManager`).
+        let cfg = self.settings().await;
+        let key = cfg.api_key(self.api_key.expose_secret());
         let resp = self
             .http
             .get(format!("{}/collection/{tmdb_id}", self.base_url))
-            .query(&[
-                ("api_key", self.api_key.expose_secret()),
-                ("append_to_response", "images"),
-            ])
+            .query(&[("api_key", key), ("append_to_response", "images")])
             .send()
             .await
             .ok()?;
@@ -863,7 +1022,7 @@ impl TmdbClient {
             if let Some(path) = non_empty(path) {
                 images.push(RemoteImage {
                     image_type,
-                    url: format!("{IMAGE_BASE}{path}"),
+                    url: cfg.image_url(image_type_size(image_type), &path),
                 });
             }
         };
@@ -891,6 +1050,11 @@ impl TmdbClient {
         name: &str,
         year: Option<i32>,
     ) -> Vec<TmdbSearchHit> {
+        // The TMDb settings page governs the key, the adult filter, the
+        // cast/crew caps and the image sizes; read per call, the way
+        // `Plugin.Instance.Configuration` is (`TmdbClientManager`).
+        let cfg = self.settings().await;
+        let key = cfg.api_key(self.api_key.expose_secret());
         let (path, year_param) = match kind {
             TmdbKind::Movie => ("search/movie", "year"),
             TmdbKind::Series => ("search/tv", "first_air_date_year"),
@@ -898,7 +1062,11 @@ impl TmdbClient {
         let mut req = self
             .http
             .get(format!("{}/{path}", self.base_url))
-            .query(&[("api_key", self.api_key.expose_secret()), ("query", name)]);
+            .query(&[("api_key", key), ("query", name)])
+            // `include_adult` is `Plugin.Instance.Configuration.IncludeAdult`
+            // on every TMDb search upstream (`TmdbClientManager.cs:396,424,467`);
+            // the API's own default is `false`, which is also the plugin's.
+            .query(&[("include_adult", cfg.include_adult.to_string())]);
         if let Some(y) = year {
             req = req.query(&[(year_param, y.to_string())]);
         }
@@ -921,7 +1089,7 @@ impl TmdbClient {
                 poster_url: hit
                     .poster_path
                     .filter(|p| !p.is_empty())
-                    .map(|p| format!("{IMAGE_BASE}{p}")),
+                    .map(|p| cfg.image_url(crate::plugin_config::TmdbImageKind::Poster, &p)),
                 overview: hit.overview.filter(|o| !o.is_empty()),
             })
             .collect()
@@ -935,6 +1103,11 @@ impl TmdbClient {
     /// caller can walk the pages the way the C# provider does. Empty on any
     /// error.
     pub async fn similar_page(&self, kind: TmdbKind, tmdb_id: i64, page: i32) -> (Vec<i64>, i32) {
+        // The TMDb settings page governs the key, the adult filter, the
+        // cast/crew caps and the image sizes; read per call, the way
+        // `Plugin.Instance.Configuration` is (`TmdbClientManager`).
+        let cfg = self.settings().await;
+        let key = cfg.api_key(self.api_key.expose_secret());
         let path = match kind {
             TmdbKind::Movie => "movie",
             TmdbKind::Series => "tv",
@@ -942,10 +1115,7 @@ impl TmdbClient {
         let Ok(resp) = self
             .http
             .get(format!("{}/{path}/{tmdb_id}/similar", self.base_url))
-            .query(&[
-                ("api_key", self.api_key.expose_secret()),
-                ("page", &page.max(1).to_string()),
-            ])
+            .query(&[("api_key", key), ("page", &page.max(1).to_string())])
             .send()
             .await
         else {
@@ -968,6 +1138,11 @@ impl TmdbClient {
     /// via `/movie|tv/{id}/images` — the set `TmdbMovieImageProvider` /
     /// `TmdbSeriesImageProvider.GetImages` return. Empty on any error.
     pub async fn all_images(&self, kind: TmdbKind, tmdb_id: i64) -> Vec<TmdbImage> {
+        // The TMDb settings page governs the key, the adult filter, the
+        // cast/crew caps and the image sizes; read per call, the way
+        // `Plugin.Instance.Configuration` is (`TmdbClientManager`).
+        let cfg = self.settings().await;
+        let key = cfg.api_key(self.api_key.expose_secret());
         let path = match kind {
             TmdbKind::Movie => "movie",
             TmdbKind::Series => "tv",
@@ -975,7 +1150,7 @@ impl TmdbClient {
         let Ok(resp) = self
             .http
             .get(format!("{}/{path}/{tmdb_id}/images", self.base_url))
-            .query(&[("api_key", self.api_key.expose_secret())])
+            .query(&[("api_key", key)])
             .send()
             .await
         else {
@@ -987,6 +1162,9 @@ impl TmdbClient {
         let Ok(parsed) = resp.json::<ImagesResponse>().await else {
             return Vec::new();
         };
+        // Borrowed, not moved: the closure is called once per image family and
+        // each call's iterator is lazy, so it must not consume the config.
+        let cfg = &cfg;
         let map = |entries: Vec<ImageEntry>, image_type: ImageType| {
             entries.into_iter().filter_map(move |e| {
                 let path = e.file_path.filter(|p| !p.is_empty())?;
@@ -1000,7 +1178,7 @@ impl TmdbClient {
                 };
                 Some(TmdbImage {
                     image_type,
-                    url: format!("{IMAGE_BASE}{path}"),
+                    url: cfg.image_url(image_type_size(image_type), &path),
                     width: e.width,
                     height: e.height,
                     community_rating: e.vote_average,
@@ -1033,6 +1211,11 @@ impl TmdbClient {
         season: i32,
         episode: i32,
     ) -> Option<Vec<TmdbPerson>> {
+        // The TMDb settings page governs the key, the adult filter, the
+        // cast/crew caps and the image sizes; read per call, the way
+        // `Plugin.Instance.Configuration` is (`TmdbClientManager`).
+        let cfg = self.settings().await;
+        let key = cfg.api_key(self.api_key.expose_secret());
         let url = format!(
             "{}/tv/{series_tmdb_id}/season/{season}/episode/{episode}/credits",
             self.base_url
@@ -1040,7 +1223,7 @@ impl TmdbClient {
         let resp = self
             .http
             .get(url)
-            .query(&[("api_key", self.api_key.expose_secret())])
+            .query(&[("api_key", key)])
             .send()
             .await
             .ok()?;
@@ -1049,8 +1232,21 @@ impl TmdbClient {
         }
         let credits = resp.json::<CreditsResponse>().await.ok()?;
         let mut people = Vec::new();
+        // `TmdbEpisodeProvider` applies `HideMissingCastMembers` +
+        // `MaxCastMembers` to the cast and to the guest stars SEPARATELY (two
+        // `.Take(config.MaxCastMembers)` loops, `:212-267`), so the cap is
+        // per-list here too.
+        let hide_cast = cfg.hide_missing_cast_members;
+        let max_cast = cfg.max_cast_members;
         let mut push_cast = |entries: Vec<CastEntry>, person_type: &str| {
-            for (order, c) in entries.into_iter().enumerate() {
+            for (order, c) in entries
+                .into_iter()
+                .enumerate()
+                .filter(|(_, c)| {
+                    !hide_cast || c.profile_path.as_deref().is_some_and(|p| !p.is_empty())
+                })
+                .take(max_cast)
+            {
                 if c.name.is_empty() {
                     continue;
                 }
@@ -1063,13 +1259,22 @@ impl TmdbClient {
                     profile_url: c
                         .profile_path
                         .filter(|p| !p.is_empty())
-                        .map(|p| format!("{IMAGE_BASE}{p}")),
+                        .map(|p| cfg.image_url(crate::plugin_config::TmdbImageKind::Profile, &p)),
                 });
             }
         };
         push_cast(credits.cast, "Actor");
         push_cast(credits.guest_stars, "GuestStar");
-        for c in credits.crew {
+        for c in credits
+            .crew
+            .into_iter()
+            .filter(|c| crew_person_type(c.job.as_deref()).is_some())
+            .filter(|c| {
+                !cfg.hide_missing_crew_members
+                    || c.profile_path.as_deref().is_some_and(|p| !p.is_empty())
+            })
+            .take(cfg.max_crew_members)
+        {
             let Some(person_type) = crew_person_type(c.job.as_deref()) else {
                 continue;
             };
@@ -1085,7 +1290,7 @@ impl TmdbClient {
                 profile_url: c
                     .profile_path
                     .filter(|p| !p.is_empty())
-                    .map(|p| format!("{IMAGE_BASE}{p}")),
+                    .map(|p| cfg.image_url(crate::plugin_config::TmdbImageKind::Profile, &p)),
             });
         }
         Some(people)
@@ -1102,6 +1307,11 @@ impl TmdbClient {
         source: &str,
         external_id: &str,
     ) -> Option<i64> {
+        // The TMDb settings page governs the key, the adult filter, the
+        // cast/crew caps and the image sizes; read per call, the way
+        // `Plugin.Instance.Configuration` is (`TmdbClientManager`).
+        let cfg = self.settings().await;
+        let key = cfg.api_key(self.api_key.expose_secret());
         let external_id = external_id.trim();
         if external_id.is_empty() {
             return None;
@@ -1109,10 +1319,7 @@ impl TmdbClient {
         let resp = self
             .http
             .get(format!("{}/find/{external_id}", self.base_url))
-            .query(&[
-                ("api_key", self.api_key.expose_secret()),
-                ("external_source", source),
-            ])
+            .query(&[("api_key", key), ("external_source", source)])
             .send()
             .await
             .ok()?;
@@ -1132,6 +1339,11 @@ impl TmdbClient {
     /// `/movie|tv/{id}?append_to_response=credits,release_dates|content_ratings`.
     /// `None` on any network/parse error.
     pub async fn details(&self, kind: TmdbKind, tmdb_id: i64) -> Option<TmdbDetails> {
+        // The TMDb settings page governs the key, the adult filter, the
+        // cast/crew caps and the image sizes; read per call, the way
+        // `Plugin.Instance.Configuration` is (`TmdbClientManager`).
+        let cfg = self.settings().await;
+        let key = cfg.api_key(self.api_key.expose_secret());
         let (path, append) = match kind {
             TmdbKind::Movie => ("movie", "credits,release_dates,videos"),
             TmdbKind::Series => ("tv", "credits,content_ratings,videos,external_ids"),
@@ -1139,10 +1351,7 @@ impl TmdbClient {
         let resp = self
             .http
             .get(format!("{}/{path}/{tmdb_id}", self.base_url))
-            .query(&[
-                ("api_key", self.api_key.expose_secret()),
-                ("append_to_response", append),
-            ])
+            .query(&[("api_key", key), ("append_to_response", append)])
             .send()
             .await
             .ok()?;
@@ -1155,46 +1364,7 @@ impl TmdbClient {
             .release_date
             .or(d.first_air_date)
             .filter(|s| !s.is_empty());
-        let mut people = Vec::new();
-        if let Some(credits) = d.credits {
-            // Cast: keep TMDB's billing order.
-            for (order, c) in credits.cast.into_iter().enumerate() {
-                if c.name.is_empty() {
-                    continue;
-                }
-                people.push(TmdbPerson {
-                    tmdb_id: c.id,
-                    name: c.name,
-                    person_type: "Actor".to_owned(),
-                    role: c.character.filter(|r| !r.is_empty()),
-                    sort_order: i32::try_from(order).unwrap_or(i32::MAX),
-                    profile_url: c
-                        .profile_path
-                        .filter(|p| !p.is_empty())
-                        .map(|p| format!("{IMAGE_BASE}{p}")),
-                });
-            }
-            // Crew: only the roles Jellyfin surfaces on the detail page.
-            for c in credits.crew {
-                let Some(person_type) = crew_person_type(c.job.as_deref()) else {
-                    continue;
-                };
-                if c.name.is_empty() {
-                    continue;
-                }
-                people.push(TmdbPerson {
-                    tmdb_id: c.id,
-                    name: c.name,
-                    person_type: person_type.to_owned(),
-                    role: c.job.filter(|r| !r.is_empty()),
-                    sort_order: i32::MAX,
-                    profile_url: c
-                        .profile_path
-                        .filter(|p| !p.is_empty())
-                        .map(|p| format!("{IMAGE_BASE}{p}")),
-                });
-            }
-        }
+        let people = credits_to_people(d.credits, &cfg);
 
         let trailers = youtube_trailers(d.videos);
 
@@ -1231,6 +1401,11 @@ impl TmdbClient {
     /// `TmdbClientManager.SearchPersonAsync`, the "Identify" flow for a
     /// `Person`. Empty on no match or any error.
     pub async fn search_person(&self, name: &str) -> Vec<TmdbPersonHit> {
+        // The TMDb settings page governs the key, the adult filter, the
+        // cast/crew caps and the image sizes; read per call, the way
+        // `Plugin.Instance.Configuration` is (`TmdbClientManager`).
+        let cfg = self.settings().await;
+        let key = cfg.api_key(self.api_key.expose_secret());
         let name = name.trim();
         if name.is_empty() {
             return Vec::new();
@@ -1238,7 +1413,11 @@ impl TmdbClient {
         let Ok(resp) = self
             .http
             .get(format!("{}/search/person", self.base_url))
-            .query(&[("api_key", self.api_key.expose_secret()), ("query", name)])
+            .query(&[("api_key", key), ("query", name)])
+            // `include_adult` is `Plugin.Instance.Configuration.IncludeAdult`
+            // on every TMDb search upstream (`TmdbClientManager.cs:396,424,467`);
+            // the API's own default is `false`, which is also the plugin's.
+            .query(&[("include_adult", cfg.include_adult.to_string())])
             .send()
             .await
         else {
@@ -1256,7 +1435,8 @@ impl TmdbClient {
             .map(|hit| TmdbPersonHit {
                 tmdb_id: hit.id,
                 name: non_empty(hit.name),
-                profile_url: non_empty(hit.profile_path).map(|p| format!("{IMAGE_BASE}{p}")),
+                profile_url: non_empty(hit.profile_path)
+                    .map(|p| cfg.image_url(crate::plugin_config::TmdbImageKind::Profile, &p)),
                 biography: None,
                 imdb_id: None,
             })
@@ -1268,11 +1448,16 @@ impl TmdbClient {
     /// `TmdbClientManager.GetPersonAsync` as the "Identify" flow's
     /// already-identified branch uses it. `None` on any error.
     pub async fn person_lookup(&self, tmdb_id: i64) -> Option<TmdbPersonHit> {
+        // The TMDb settings page governs the key, the adult filter, the
+        // cast/crew caps and the image sizes; read per call, the way
+        // `Plugin.Instance.Configuration` is (`TmdbClientManager`).
+        let cfg = self.settings().await;
+        let key = cfg.api_key(self.api_key.expose_secret());
         let resp = self
             .http
             .get(format!("{}/person/{tmdb_id}", self.base_url))
             .query(&[
-                ("api_key", self.api_key.expose_secret()),
+                ("api_key", key),
                 ("append_to_response", "images,external_ids"),
             ])
             .send()
@@ -1290,7 +1475,7 @@ impl TmdbClient {
                 .images
                 .and_then(|i| i.profiles.into_iter().next())
                 .and_then(|i| non_empty(i.file_path))
-                .map(|path| format!("{IMAGE_BASE}{path}")),
+                .map(|path| cfg.image_url(crate::plugin_config::TmdbImageKind::Profile, &path)),
             biography: non_empty(p.biography),
             imdb_id: p.external_ids.and_then(|e| non_empty(e.imdb_id)),
         })
@@ -1299,10 +1484,15 @@ impl TmdbClient {
     /// Fetches a person's biography via `/person/{id}`, or `None` on any
     /// network/parse error or when TMDB has no biographical text.
     pub async fn person_details(&self, tmdb_id: i64) -> Option<TmdbPersonDetails> {
+        // The TMDb settings page governs the key, the adult filter, the
+        // cast/crew caps and the image sizes; read per call, the way
+        // `Plugin.Instance.Configuration` is (`TmdbClientManager`).
+        let cfg = self.settings().await;
+        let key = cfg.api_key(self.api_key.expose_secret());
         let resp = self
             .http
             .get(format!("{}/person/{tmdb_id}", self.base_url))
-            .query(&[("api_key", self.api_key.expose_secret())])
+            .query(&[("api_key", key)])
             .send()
             .await
             .ok()?;
@@ -1715,7 +1905,7 @@ mod tests {
             }"#,
         )
         .expect("parse");
-        let details = season_details_from(parsed);
+        let details = season_details_from(parsed, &crate::plugin_config::TmdbConfig::default());
         assert_eq!(details.name.as_deref(), Some("Season 2"));
         assert_eq!(details.overview.as_deref(), Some("The second season."));
         assert_eq!(

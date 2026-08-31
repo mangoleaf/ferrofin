@@ -646,8 +646,13 @@ async fn years_list_and_by_value() {
     let one = get("/Years/1999").await;
     assert_eq!(one.status(), StatusCode::OK);
     assert_eq!(json_body(one).await["Name"], "1999");
-    // Non-positive and absent years are 404.
-    assert_eq!(get("/Years/0").await.status(), StatusCode::NOT_FOUND);
+    // An absent year is 404; a NON-POSITIVE one is 400, because C#
+    // `LibraryManager.GetYear` throws `ArgumentOutOfRangeException("Years less
+    // than or equal to 0 are invalid.")` before the controller's `NotFound()`
+    // is ever reached (LibraryManager.cs:1020-1030). Measured on 10.11.8:
+    // `/Years/0` and `/Years/-1` are 400 there.
+    assert_eq!(get("/Years/0").await.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(get("/Years/-1").await.status(), StatusCode::BAD_REQUEST);
     assert_eq!(get("/Years/2020").await.status(), StatusCode::NOT_FOUND);
 }
 

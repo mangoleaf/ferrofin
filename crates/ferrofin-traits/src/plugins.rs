@@ -43,6 +43,11 @@ pub struct PluginDescriptor {
     /// Whether the plugin can be uninstalled at runtime. Always `false` for a
     /// compiled-in Tier-1 plugin.
     pub can_uninstall: bool,
+    /// The file the plugin persists its configuration into, when it names one
+    /// (C# `BasePlugin.ConfigurationFileName`, e.g. `Jellyfin.Plugin.Tmdb.xml`).
+    /// Reported verbatim on `GET /Plugins`; `None` omits the field, which is
+    /// what upstream does for a plugin that has no configuration.
+    pub configuration_file_name: Option<String>,
 }
 
 /// An installed plugin with a newer, installable version in the catalog.

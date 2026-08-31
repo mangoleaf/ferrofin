@@ -45,7 +45,7 @@ use ferrofin_traits::stubs::LiveTvChannelQuery;
 
 use crate::auth::{RequireAdmin, RequireAuth};
 use crate::error::ApiError;
-use crate::handlers::items::resolve_user_opt;
+use crate::handlers::items::{effective_user_id, resolve_user_opt};
 use crate::handlers::query_parse::{parse_csv_enums_lenient, parse_csv_uuids, parse_pipe_strings};
 use crate::state::AppState;
 
@@ -96,6 +96,7 @@ struct ChannelsQuery {
     #[serde(rename = "type")]
     type_: Option<ferrofin_model::live_tv::ChannelType>,
     /// The target user; defaults to the authenticated caller when absent.
+    #[serde(deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid")]
     user_id: Option<Uuid>,
     /// The index of the first record to return.
     start_index: Option<i32>,
@@ -214,6 +215,7 @@ async fn get_channel(
 #[serde(rename_all = "camelCase", default)]
 struct UserIdQuery {
     /// The target user; defaults to the authenticated caller when absent.
+    #[serde(deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid")]
     user_id: Option<Uuid>,
 }
 
@@ -231,6 +233,7 @@ struct ProgramsQuery {
     /// Comma-delimited channel ids to return guide information for.
     channel_ids: Option<String>,
     /// The target user; defaults to the authenticated caller when absent.
+    #[serde(deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid")]
     user_id: Option<Uuid>,
     /// The minimum programme start date.
     #[serde(deserialize_with = "deserialize_optional_date_time")]
@@ -281,6 +284,7 @@ struct ProgramsQuery {
     /// Filter to the programmes a series timer records.
     series_timer_id: Option<String>,
     /// Filter to the programmes of one library series.
+    #[serde(deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid")]
     library_series_id: Option<Uuid>,
     /// Comma-delimited additional DTO fields.
     fields: Option<String>,
@@ -448,6 +452,7 @@ impl GetProgramsDto {
 #[allow(clippy::struct_excessive_bools)] // one field per contract parameter
 struct RecommendedProgramsQuery {
     /// The target user; defaults to the authenticated caller when absent.
+    #[serde(deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid")]
     user_id: Option<Uuid>,
     /// The index of the first record to return.
     start_index: Option<i32>,
@@ -923,6 +928,7 @@ struct RecordingsQuery {
     /// Restrict to one channel.
     channel_id: Option<String>,
     /// The user whose data the recordings are projected for.
+    #[serde(deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid")]
     user_id: Option<Uuid>,
     /// The index of the first record to return.
     start_index: Option<i32>,
@@ -1008,12 +1014,32 @@ async fn get_recordings(
     ))
 }
 
+/// The lone `userId` query parameter shared by the recording routes that take
+/// one only to resolve the caller (C# `RequestHelpers.GetUserId`).
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LiveTvUserQuery {
+    /// Optional target user; defaults to the authenticated caller.
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
+    user_id: Option<Uuid>,
+}
+
 /// `GET /LiveTv/Recordings/{recordingId}` — a single recording (`404` if absent).
+///
+/// `userId` only attaches user data upstream, but it still runs through
+/// `RequestHelpers.GetUserId` (v10.11.8 `LiveTvController.cs:435`) BEFORE the
+/// lookup, so naming another user as a non-administrator is a `403` there and
+/// must be one here.
 async fn get_recording(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAuth(auth): RequireAuth,
     Path(recording_id): Path<Uuid>,
+    Query(query): Query<LiveTvUserQuery>,
 ) -> Result<Json<BaseItemDto>, ApiError> {
+    effective_user_id(&state, &auth, query.user_id).await?;
     live_tv(&state)?
         .get_recording(recording_id)
         .await?
@@ -1032,8 +1058,17 @@ async fn delete_recording(
 }
 
 /// `GET /LiveTv/Recordings/Folders` — recording folders (not modelled → empty).
-async fn get_recording_folders(RequireAuth(_auth): RequireAuth) -> Json<QueryResult<BaseItemDto>> {
-    Json(QueryResult::default())
+///
+/// Empty either way, but the `userId` gate still runs: upstream applies
+/// `RequestHelpers.GetUserId` before it asks the manager for folders, so an
+/// unentitled caller gets a `403` rather than an empty `200`.
+async fn get_recording_folders(
+    State(state): State<AppState>,
+    RequireAuth(auth): RequireAuth,
+    Query(query): Query<LiveTvUserQuery>,
+) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
+    effective_user_id(&state, &auth, query.user_id).await?;
+    Ok(Json(QueryResult::default()))
 }
 
 /// `GET /LiveTv/Recordings/Groups` — recording groups (deprecated; empty).
@@ -1872,7 +1907,18 @@ mod tests {
             .items
             .is_empty()
         );
-        assert!(get_recording_folders(auth()).await.0.items.is_empty());
+        assert!(
+            get_recording_folders(
+                State(state.clone()),
+                auth(),
+                Query(LiveTvUserQuery::default())
+            )
+            .await
+            .unwrap()
+            .0
+            .items
+            .is_empty()
+        );
         assert!(get_recording_groups(auth()).await.0.items.is_empty());
         assert!(get_recordings_series(auth()).await.0.items.is_empty());
         assert_eq!(

@@ -64,6 +64,7 @@ impl Extension for FileTransformationExtension {
             enabled: true,
             has_image: false,
             can_uninstall: false,
+            configuration_file_name: None,
         }
     }
 

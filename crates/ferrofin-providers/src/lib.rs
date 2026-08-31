@@ -10,6 +10,7 @@
 
 pub mod audiodb;
 pub mod books;
+pub mod builtin_plugins;
 pub mod container_types;
 pub mod error;
 pub mod external_ids;
@@ -28,6 +29,7 @@ pub mod omdb;
 #[cfg(feature = "opensubtitles")]
 pub mod opensubtitles;
 pub mod playlist_file;
+pub mod plugin_config;
 pub mod provider_manager;
 pub mod similarity;
 pub mod studios;

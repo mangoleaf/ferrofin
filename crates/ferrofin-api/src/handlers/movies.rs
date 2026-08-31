@@ -29,10 +29,16 @@ const DEFAULT_ITEM_LIMIT: i32 = 8;
 #[serde(rename_all = "camelCase")]
 struct RecommendationsQuery {
     /// The target user; scopes visibility and attaches user data when present.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     user_id: Option<Uuid>,
     /// Localizes the recommendations to a specific parent item/folder.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     parent_id: Option<Uuid>,
     /// The maximum number of categories to return.
     #[serde(default)]

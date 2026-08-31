@@ -69,7 +69,10 @@ const DISPLAY_EXTRA_TYPES: &[ExtraType] = &[
 #[serde(rename_all = "camelCase")]
 struct UserIdQuery {
     /// The target user; defaults to the authenticated caller when absent.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     user_id: Option<Uuid>,
 }
 
@@ -255,7 +258,10 @@ async fn set_favorite(
 #[serde(rename_all = "camelCase")]
 struct RatingQuery {
     /// The target user; defaults to the authenticated caller when absent.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     user_id: Option<Uuid>,
     /// Whether the rating is a "like"; absent clears the like.
     #[serde(default)]
@@ -521,10 +527,16 @@ async fn get_intros(
 #[serde(rename_all = "camelCase")]
 struct LatestQuery {
     /// The target user; defaults to the authenticated caller when absent.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     user_id: Option<Uuid>,
     /// Localizes the search to a specific parent item/folder.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     parent_id: Option<Uuid>,
     /// Comma-delimited [`ItemFields`](ferrofin_model::querying::ItemFields) to populate on
     /// each DTO. Absent/empty ⇒ the base DTO (matches Jellyfin's GetLatestMedia).
@@ -662,7 +674,7 @@ async fn get_latest_media(
 /// The stored `Type` column holds the full CLR type name (e.g.
 /// `MediaBrowser.Controller.Entities.Movies.Movie`), so compare its last dotted
 /// segment against the serde name of the kind (Jellyfin's `BaseItemKind` names).
-fn type_name_matches(stored: &str, kind: ferrofin_model::data::BaseItemKind) -> bool {
+pub(crate) fn type_name_matches(stored: &str, kind: ferrofin_model::data::BaseItemKind) -> bool {
     let short = stored.rsplit('.').next().unwrap_or(stored);
     // Compare against the serialized name in place: a borrowed `&str` against
     // the kind's name, no allocation of the stored name.

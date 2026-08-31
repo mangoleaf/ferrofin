@@ -821,9 +821,21 @@ fn state_as(
     user_data: Arc<RecordingUserData>,
     elevated: bool,
 ) -> AppState {
+    state_with_users(sessions, user_data, elevated, Arc::new(OkUsers))
+}
+
+/// [`state_as`], with the caller's role coming from `users`: [`OkUsers`] reports
+/// an ordinary account, `FakeAdminUsers` an administrator. The cross-user gate
+/// on `controllableByUserId` needs both sides.
+fn state_with_users(
+    sessions: Arc<RecordingSessions>,
+    user_data: Arc<RecordingUserData>,
+    elevated: bool,
+    users: Arc<dyn UserManager>,
+) -> AppState {
     AppState::new(
         Arc::new(OkLibrary),
-        Arc::new(OkUsers),
+        users,
         Arc::new(FakeUserViews),
         user_data,
         Arc::new(FakeMediaSources),
@@ -1813,4 +1825,56 @@ async fn user_scoped_playing_items_start_progress_stop_forward() {
         hls.stops.lock().unwrap().as_slice(),
         &[(Some("dev-1".to_owned()), Some("ps-1".to_owned()))]
     );
+}
+
+/// `GET /Sessions?controllableByUserId=` runs C# `RequestHelpers.GetUserId` on
+/// the filter (`SessionController.cs:60`), so a non-administrator naming another
+/// user is refused. Ferrofin passed the raw id straight to the session manager.
+#[tokio::test]
+async fn get_sessions_controllable_by_other_user_as_non_admin_is_forbidden() {
+    let (sessions, user_data) = recording();
+    let other = Uuid::from_u128(0x0055_0001);
+    let (status, _) = send(
+        state(sessions, user_data),
+        "GET",
+        &format!("/Sessions?controllableByUserId={other}"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+/// An administrator may still filter by another user's id.
+#[tokio::test]
+async fn get_sessions_controllable_by_other_user_as_admin_is_allowed() {
+    let (sessions, user_data) = recording();
+    let other = Uuid::from_u128(0x0055_0001);
+    let app = state_with_users(
+        sessions,
+        user_data,
+        false,
+        Arc::new(ferrofin_api::test_support::FakeAdminUsers),
+    );
+    let (status, _) = send(
+        app,
+        "GET",
+        &format!("/Sessions?controllableByUserId={other}"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+/// A non-administrator filtering by their own id is served.
+#[tokio::test]
+async fn get_sessions_controllable_by_self_as_non_admin_is_allowed() {
+    let (sessions, user_data) = recording();
+    let (status, _) = send(
+        state(sessions, user_data),
+        "GET",
+        &format!("/Sessions?controllableByUserId={USER_ID}"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
 }

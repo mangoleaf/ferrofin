@@ -296,6 +296,62 @@ async fn items_root_ancestors_and_years_over_real_http() {
             .all(|y| y["Type"] == "Year"),
         "{years}"
     );
+    // `TotalRecordCount` is the DISTINCT-YEAR count, captured before paging, and
+    // must not move with `limit`/`startIndex`. This is gated per-server rather
+    // than against Jellyfin because Jellyfin's value is its own bug: it reports
+    // the out-param of `folder.GetRecursiveChildren(user, query, out totalCount)`
+    // (v10.11.8 Folder.cs:1450-1458) — the count of the underlying MEDIA items,
+    // not of the years — so a 3-year fixture answers 559 there. Recorded as an
+    // accepted jellyfin-bug divergence in suite/parity/classifications.json.
+    assert_eq!(years["TotalRecordCount"], 2, "{years}");
+    for uri in [
+        "/Years?limit=1",
+        "/Years?limit=1&startIndex=1",
+        "/Years?startIndex=1",
+        "/Years?sortBy=SortName&sortOrder=Descending&limit=1",
+    ] {
+        let (status, page) = send(&router, &auth_header, "GET", uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {page}");
+        assert_eq!(
+            page["TotalRecordCount"], 2,
+            "{uri}: the total is the pre-paging distinct-year count: {page}"
+        );
+    }
+    // The sort parameters are honoured (C# `_libraryManager.Sort(extractedItems,
+    // user, RequestHelpers.GetOrderBy(sortBy, sortOrder))`); dropping them made
+    // `sortOrder=Descending` a silent no-op.
+    let (_, desc) = send(
+        &router,
+        &auth_header,
+        "GET",
+        "/Years?sortBy=SortName&sortOrder=Descending",
+    )
+    .await;
+    let ordered: Vec<&str> = desc["Items"]
+        .as_array()
+        .expect("Items")
+        .iter()
+        .filter_map(|y| y["Name"].as_str())
+        .collect();
+    assert_eq!(ordered, vec!["2004", "1999"], "{desc}");
+    // `recursive=false` walks the user root's DIRECT children — the library
+    // folders, which carry no ProductionYear — so the honest answer is empty.
+    let (_, shallow) = send(&router, &auth_header, "GET", "/Years?recursive=false").await;
+    assert_eq!(
+        shallow["Items"].as_array().expect("Items").len(),
+        0,
+        "{shallow}"
+    );
+    // An explicitly-nil userId is "not provided" upstream
+    // (`RequestHelpers.GetUserId` tests `userId.IsNullOrEmpty()`), not a bad id.
+    let (status, _) = send(
+        &router,
+        &auth_header,
+        "GET",
+        "/Years?userId=00000000-0000-0000-0000-000000000000",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
     let (status, year) = send(&router, &auth_header, "GET", "/Years/1999").await;
     assert_eq!(status, StatusCode::OK, "{year}");
     assert_eq!(year["Name"].as_str(), Some("1999"));
@@ -313,12 +369,18 @@ async fn items_root_ancestors_and_years_over_real_http() {
     let (status, year) = send(&router, &auth_header, "GET", "/Years/1850").await;
     assert_eq!(status, StatusCode::OK, "{year}");
     assert_eq!(year["Name"].as_str(), Some("1850"));
-    let (status, _) = send(&router, &auth_header, "GET", "/Years/0").await;
-    assert_eq!(
-        status,
-        StatusCode::NOT_FOUND,
-        "non-positive years are invalid"
-    );
+    // A non-positive year is a 400, not a 404: C# `LibraryManager.GetYear`
+    // throws `ArgumentOutOfRangeException("Years less than or equal to 0 are
+    // invalid.")` (LibraryManager.cs:1020-1030) before the controller's
+    // `NotFound()` can run. Measured on 10.11.8: `/Years/0` → 400.
+    for uri in ["/Years/0", "/Years/-1"] {
+        let (status, body) = send(&router, &auth_header, "GET", uri).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{uri} non-positive years are invalid: {body}"
+        );
+    }
 
     // ---- Ancestors climb library → root, with and without a user ----
     let movie_id = movies[0]["Id"].as_str().expect("movie id");

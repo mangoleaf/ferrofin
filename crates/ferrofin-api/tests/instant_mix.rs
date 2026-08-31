@@ -676,6 +676,32 @@ async fn music_genre_instant_mix_by_name_returns_songs() {
 }
 
 #[tokio::test]
+async fn artists_instant_mix_by_id_accepts_the_numeric_parameters() {
+    // Regression: the `?id=` variants used to carry the shared query as a
+    // `#[serde(flatten)]` field, which makes serde buffer every other parameter
+    // as a self-describing string — and `ContentDeserializer` will not parse an
+    // i32 out of `"100"` the way serde_urlencoded's own value deserializer does.
+    // `?id=<guid>&limit=100`, the exact request the parity read layer issues,
+    // was `400 invalid type: string "100", expected i32` live (H=400 J=200 on
+    // the lane-3 pair) while the no-parameter test above stayed green.
+    for query in [
+        "limit=100",
+        "limit=1&imageTypeLimit=1",
+        "limit=1&enableImages=true&enableUserData=false",
+    ] {
+        let (status, body) = get(&format!("/Artists/InstantMix?id={SEED_ID}&{query}")).await;
+        assert_eq!(status, StatusCode::OK, "?{query}");
+        let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).expect("mix");
+        assert!(!result.items.is_empty(), "?{query}");
+    }
+    // The limit is applied, not merely accepted.
+    let (status, body) = get(&format!("/Artists/InstantMix?id={SEED_ID}&limit=1")).await;
+    assert_eq!(status, StatusCode::OK);
+    let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).expect("mix");
+    assert_eq!(result.items.len(), 1);
+}
+
+#[tokio::test]
 async fn artists_instant_mix_by_id_returns_songs() {
     let (status, body) = get(&format!("/Artists/InstantMix?id={SEED_ID}")).await;
     assert_eq!(status, StatusCode::OK);

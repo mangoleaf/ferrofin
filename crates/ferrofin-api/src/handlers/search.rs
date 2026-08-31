@@ -32,7 +32,10 @@ struct SearchHintsQuery {
     #[serde(default)]
     limit: Option<i32>,
     /// The target user; scopes the search to a user's library when present.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     user_id: Option<Uuid>,
     /// The search term to filter on (required).
     search_term: String,
@@ -46,7 +49,10 @@ struct SearchHintsQuery {
     #[serde(default)]
     media_types: Option<String>,
     /// Localizes the search to a specific parent item/folder.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     parent_id: Option<Uuid>,
     /// Optional live-tv "is movie" filter.
     #[serde(default)]

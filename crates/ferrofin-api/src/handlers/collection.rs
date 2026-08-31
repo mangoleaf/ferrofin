@@ -40,7 +40,10 @@ struct CreateCollectionQuery {
     #[serde(default)]
     ids: Option<String>,
     /// Optional parent folder to create the collection within.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     parent_id: Option<Uuid>,
     /// Whether to lock the new collection's metadata against refresh.
     #[serde(default)]

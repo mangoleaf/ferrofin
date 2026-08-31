@@ -97,7 +97,10 @@ fn parse_image_type(raw: &str) -> Result<ImageType, ApiError> {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ImageQuery {
     /// The target user (user-image route only); defaults to the caller.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     user_id: Option<Uuid>,
     /// Optional explicit image index (query-string form of the route segment).
     #[serde(default)]

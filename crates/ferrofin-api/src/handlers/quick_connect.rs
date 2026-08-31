@@ -23,6 +23,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
+use crate::handlers::items::effective_user_id;
 use crate::state::AppState;
 
 /// Query parameters for `GET /QuickConnect/Connect` (the request secret).
@@ -42,7 +43,10 @@ struct AuthorizeQuery {
     #[serde(default)]
     code: String,
     /// The user to authorize as; defaults to the caller when absent.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     user_id: Option<Uuid>,
 }
 
@@ -137,7 +141,11 @@ async fn authorize(
     RequireAuth(auth): RequireAuth,
     Query(query): Query<AuthorizeQuery>,
 ) -> Result<Json<bool>, ApiError> {
-    let user_id = query.user_id.unwrap_or_else(|| auth.user_id());
+    // C# `userId = RequestHelpers.GetUserId(User, userId)`. This gate is
+    // load-bearing here beyond parity: authorizing a pending request mints a
+    // token for the *named* user on the pairing device, so an ungated `userId`
+    // let any authenticated account hand out a session as any other account.
+    let user_id = effective_user_id(&state, &auth, query.user_id).await?;
     Ok(Json(
         state
             .quick_connect

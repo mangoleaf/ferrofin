@@ -88,6 +88,11 @@ JOURNEY_METHOD.update({op: verification.PROPERTY for op in (
     # A read whose bar is "non-empty on both", not a write effect.
     "GET /Items/{itemId}/RemoteSearch/Subtitles/{language}",
     "GET /Providers/Subtitles/Subtitles/{subtitleId}",
+    # A read verified by PROPERTIES, not a body diff: the mix is ordered
+    # `(ItemSortBy.Random, Ascending)` on both servers, so the page is
+    # legitimately different on consecutive calls and only its shape and the
+    # typed-lookup refusal are comparable. See `j_playlist_instant_mix`.
+    "GET /Playlists/{itemId}/InstantMix",
 )})
 
 
@@ -111,6 +116,11 @@ JOURNEY_METHOD.update({op: verification.EFFECT for op in (
     "DELETE /LiveTv/Timers/{timerId}",
     "DELETE /LiveTv/TunerHosts",
     "DELETE /PlayingItems/{itemId}",
+    # Not a body diff and not merely a status class: the write is issued and the
+    # EFFECT is read back on each server's own `/Plugins` — a non-removable
+    # plugin must still be installed after its 204.
+    "DELETE /Plugins/{pluginId}",
+    "DELETE /Plugins/{pluginId}/{version}",
     "DELETE /Playlists/{playlistId}/Items",
     "DELETE /Playlists/{playlistId}/Users/{userId}",
     "DELETE /Sessions/{sessionId}/User/{userId}",
@@ -321,6 +331,120 @@ def j_playlist(base, token, user, mid, m2):
         st, _ = http("POST", f"{base}/Playlists/{pid}?name=Renamed", token, "{}")
         r["POST /Playlists/{playlistId}"] = st < 300
         http("DELETE", f"{base}/Items/{pid}", token)   # cleanup
+    return r
+
+
+def j_playlist_instant_mix(base, token, user, mid, _m2):
+    """`GET /Playlists/{itemId}/InstantMix` — the typed lookup and a real mix.
+
+    The fixture holds **zero** playlists, so the positive leg of this route had
+    never been exercised by any layer: the breadth sweep fed it `any_item` (a
+    movie), Jellyfin 404'd, Ferrofin answered 200, and the difference was
+    recorded as "a harmless superset". It is not — it is a missing type guard.
+    Every other route on `InstantMixController` resolves its seed with
+    `GetItemById<BaseItem>`; this one alone uses `GetItemById<Playlist>`, and
+    `LibraryManager.GetItemById<T>` returns `null` when the item is not a `T`
+    (`if (item is T typedItem) return typedItem; return null;`), so a
+    non-playlist id is a 404 upstream.
+
+    Three facts, all comparable across servers:
+
+    1. a movie id on this route is a 404;
+    2. the mix is all-`Audio` with a self-consistent `TotalRecordCount`;
+    3. the mix holds the WHOLE audio library — every track, not merely "some".
+
+    (3) is the assertion with teeth, and it is exact rather than "non-empty":
+    a `Playlist` has no `Genres`, so `GetInstantMixFromPlaylist` calls
+    `GetInstantMixFromGenres(item.Genres)` with an EMPTY list, `GenreIds` is
+    empty, and the query is left unfiltered — every audio item under the 200-row
+    cap comes back (v10.11.8 `InstantMixController.cs` +
+    `MusicManager.GetInstantMixFromGenreIds`). So the count is determined by the
+    fixture, and a server returning one arbitrary track — which "non-empty"
+    would have passed — fails.
+
+    The ORDER of the mix is deliberately not asserted: C#
+    `GetInstantMixFromGenreIds` sorts `(ItemSortBy.Random, Ascending)` and so
+    does Ferrofin now, so consecutive calls legitimately differ. The playlist is
+    created and deleted inside the journey, symmetrically on both servers.
+    """
+    r = {}
+    library = (q(base, "/Items?includeItemTypes=Audio&recursive=true"
+                       "&limit=1000&sortBy=SortName", token, user) or {}).get("Items") or []
+    # The whole audio library, capped where the C# caps the mix (`limit: 200`).
+    expected = min(len(library), 200)
+    tracks = [i["Id"] for i in library[:3]]
+    if not tracks:
+        r["GET /Playlists/{itemId}/InstantMix"] = False
+        return r
+    st, raw = http("POST", f"{base}/Playlists", token,
+                   json.dumps({"Name": "Parity Mix PL", "Ids": tracks, "UserId": user,
+                               "MediaType": "Audio"}))
+    pid = json.loads(raw).get("Id") if st < 300 and raw else None
+    try:
+        mix_ok = False
+        if pid:
+            mix = q(base, f"/Playlists/{pid}/InstantMix?limit=200", token, user) or {}
+            items = mix.get("Items") or []
+            mix_ok = (len(items) == expected
+                      and mix.get("TotalRecordCount") == len(items)
+                      and all(i.get("Type") == "Audio" for i in items))
+        # The type guard: a MOVIE id on the playlists route is not found.
+        guard_ok = http("GET", f"{base}/Playlists/{mid}/InstantMix?userId={user}", token)[0] == 404
+        r["GET /Playlists/{itemId}/InstantMix"] = bool(mix_ok and guard_ok)
+    finally:
+        if pid:
+            http("DELETE", f"{base}/Items/{pid}", token)
+    return r
+
+
+#: OMDb's in-tree plugin guid — the `Id` override on
+#: `MediaBrowser.Providers/Plugins/Omdb/Plugin.cs`, so it is present on any
+#: stock Jellyfin AND on Ferrofin, and its installed version is the server's.
+#: OMDb rather than TMDb on purpose: TMDb is the id an earlier reviewer flipped
+#: to `Status: "Restart"` on this pair, and a journey should not be reading a
+#: field somebody else perturbed.
+OMDB_PLUGIN_ID = "a628c0da-fac5-4c7e-9d1a-7134223f14c8"
+SERVER_PLUGIN_VERSION = "10.11.8.0"
+
+
+def j_plugin_uninstall(base, token, _user, _m, _m2):
+    """`DELETE /Plugins/{id}` and `/Plugins/{id}/{version}` on a SHARED plugin id.
+
+    Both rows carried "the two servers share no plugin id, so there is nothing to
+    diff". They now share five — Jellyfin's in-tree metadata providers — and the
+    behaviour underneath is not what the note assumed either: a plugin reporting
+    `CanUninstall: false` is refused IN SILENCE. `InstallationManager.
+    UninstallPlugin` logs "Attempt to delete non removable plugin … ignoring
+    request" and returns, while `PluginsController` answers `204` anyway
+    (v10.11.8). Every plugin compiled into Jellyfin's own tree takes that path,
+    so the honest expectation is 204-and-still-installed, which Ferrofin used to
+    answer 400.
+
+    The version-bearing form additionally resolves through
+    `GetPlugin(id, version)`, whose `Version.Equals` compares all four
+    components — so a three-component spelling of the installed version is a
+    miss, and a non-`Version` string fails the `[FromRoute] Version` model
+    binder with a 400 before the action runs.
+
+    This journey MUTATES NOTHING: every leg is the documented no-op, and the
+    read-back asserts the plugin is still installed on each server afterwards.
+    """
+    r = {}
+    installed = lambda: any(p.get("Id", "").replace("-", "").lower()
+                            == OMDB_PLUGIN_ID.replace("-", "")
+                            for p in (get_json(base, "/Plugins", token) or []))
+    if not installed():
+        # No shared plugin on this server: report the rows unverified rather
+        # than passing an assertion about an absent thing.
+        return r
+    bare = http("DELETE", f"{base}/Plugins/{OMDB_PLUGIN_ID}", token)[0]
+    r["DELETE /Plugins/{pluginId}"] = bare == 204 and installed()
+    exact = http("DELETE", f"{base}/Plugins/{OMDB_PLUGIN_ID}/{SERVER_PLUGIN_VERSION}", token)[0]
+    wrong = http("DELETE", f"{base}/Plugins/{OMDB_PLUGIN_ID}/9.9.9.9", token)[0]
+    short = http("DELETE", f"{base}/Plugins/{OMDB_PLUGIN_ID}/10.11.8", token)[0]
+    unparseable = http("DELETE", f"{base}/Plugins/{OMDB_PLUGIN_ID}/notaversion", token)[0]
+    r["DELETE /Plugins/{pluginId}/{version}"] = (
+        exact == 204 and wrong == 404 and short == 404 and unparseable == 400 and installed())
     return r
 
 
@@ -1679,7 +1803,8 @@ def j_backup(base, token, user, _m, _m2):
 
 
 JOURNEYS = [j_startup,   # first: see its docstring
-            j_favorites, j_played, j_rating, j_playlist, j_collection, j_users, j_item_edit,
+            j_favorites, j_played, j_rating, j_playlist, j_playlist_instant_mix,
+            j_plugin_uninstall, j_collection, j_users, j_item_edit,
             j_api_keys, j_user_item_data, j_display_prefs, j_scheduled_task_triggers,
             j_device_options, j_playstate, j_capabilities, j_user_config, j_system_config,
             j_playlist_share, j_item_delete, j_capabilities_query, j_environment_validate,

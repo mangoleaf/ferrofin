@@ -32,8 +32,13 @@ import verification                                  # noqa: E402
 CORRELATE_LIMIT = 5   # item-scoped endpoints are exercised against this many Path-aligned items
 
 
-def token_get(base, path, token):
-    st, raw = http("GET", base + path, token)
+def token_get(base, path, token, method="GET"):
+    # `method` exists for the handful of contract READS upstream models as a
+    # POST — `POST /Plugins/{pluginId}/Manifest` is `GetPluginManifest`, a pure
+    # read with a POST verb. Diffing those bodies is the same job; only the verb
+    # differs, and hardcoding GET is what kept that row on a hand-written
+    # "no shared plugin id" note instead of a measurement.
+    st, raw = http(method, base + path, token)
     if st != 200 or not raw:
         return st, None
     try:
@@ -67,7 +72,7 @@ def item(op, tmpl, extra_seeds=()):
             "extra_seeds": tuple(extra_seeds)}
 
 
-def multi(op, legs, seed=None, reap=None):
+def multi(op, legs, seed=None, reap=None, method="GET", caveats=None):
     """Several URLs folded into ONE ledger row (rows are keyed by op, so a second
     entry would clobber the first). Every leg is diffed; the buckets are unioned.
 
@@ -91,7 +96,8 @@ def multi(op, legs, seed=None, reap=None):
         out.append({"tmpl": tmpl,
                     "url": (lambda c, t=tmpl: t.format(**c)),
                     "project": project})
-    return {"op": op, "kind": "multi", "legs": out, "seed": seed, "reap": reap}
+    return {"op": op, "kind": "multi", "legs": out, "seed": seed, "reap": reap,
+            "http_method": method, "caveats": list(caveats or ())}
 
 
 def invariant(op, fn):
@@ -313,6 +319,61 @@ def reap_lyrics(base, token, ctx):
 def with_item_order(body):
     out = dict(body)
     out["_ItemNameOrder"] = [i.get("Name") for i in body.get("Items") or []]
+    return out
+
+
+# ------------------------------------------------------------------- /Years
+#
+# `/Years` carries ONE field that cannot be diffed, and it is an upstream bug.
+# `YearsController.GetYears` builds its result as
+#
+#     new QueryResult(startIndex, totalCount == -1 ? ibnItemsArray.Count : totalCount, dtos)
+#
+# where `totalCount` is the OUT-PARAM of
+# `folder.GetRecursiveChildren(user, query, out totalCount)`
+# (Folder.cs:1450-1458) — the count of the underlying MEDIA items, not of the
+# years. With a user resolved (which `RequestHelpers.GetUserId` always does) that
+# branch always runs, so the lab's Jellyfin answers `TotalRecordCount: 559` while
+# returning 3 years, and the value tracks the filter (Series -> 8, Audio -> 9,
+# parentId=Movies -> 500). Ferrofin reports the distinct-year count, which is
+# what the field means and what pages the list.
+#
+# So this ONE key is dropped from the leg comparison and recorded as an accepted
+# jellyfin-bug divergence in classifications.json with that citation. Everything
+# else about the page — the year SET, the ORDER (added below as a diffable
+# field), and StartIndex — is compared strictly, and the companion
+# `GET /Years/{year}` row diffs the whole per-year DTO with nothing removed.
+# Ferrofin's own total is gated where it can be asserted per-server: the
+# `items_root_ancestors_and_years_over_real_http` integration test requires it to
+# equal the distinct-year count and to be unchanged by `limit`/`startIndex`.
+def years_page(body):
+    out = with_item_order(body)
+    out.pop("TotalRecordCount", None)
+    return out
+
+
+def years_unordered(body):
+    """`years_page` with the year SEQUENCE normalised — for the no-sortBy leg.
+
+    This is the second projection in the whole read set, and it is allowed for
+    the same reason as the first: the removed thing is provably not comparable
+    between two independent instances, and its removal is DECLARED on the row's
+    `caveats` rather than buried here. `YearsController.GetAllItems` ends in
+    LINQ `Distinct()`, which preserves first-occurrence order, so with no
+    `sortBy` Jellyfin's order IS its `Folder.GetRecursiveChildren` enumeration
+    order — a walk of the in-memory BaseItem tree that Ferrofin does not have.
+
+    Everything else about the default call shape is still compared strictly:
+    the year set, and every field of every year DTO. Before this leg existed the
+    row's nine legs all pinned `sortBy=SortName` and the default shape — the one
+    jellyfin-web actually sends when a view has no sort — was never issued at
+    all."""
+    out = years_page(body)
+    order = out.pop("_ItemNameOrder", None)
+    if order is not None:
+        out["_ItemNameSet"] = sorted(order)
+    if isinstance(out.get("Items"), list):
+        out["Items"] = sorted(out["Items"], key=lambda i: str(i.get("Name")))
     return out
 
 
@@ -714,6 +775,55 @@ def similar_invariants(base, token, ctx, alias="Movies"):
 
 READS = [
     plain("GET /System/Info", "/System/Info"),
+    # The dashboard's plugin-page LIST. Jellyfin serves five entries here — its
+    # five IN-TREE provider plugins, compiled into `MediaBrowser.Providers` —
+    # and Ferrofin served `[]`, recorded (backwards) as "plugin configuration
+    # pages come from external plugins Ferrofin doesn't host". Both filter legs
+    # are probed so the `enableInMainMenu` predicate is exercised in both
+    # directions rather than only where it happens to select everything.
+    multi("GET /web/ConfigurationPages", [
+        "/web/ConfigurationPages",
+        "/web/ConfigurationPages?enableInMainMenu=false",
+        "/web/ConfigurationPages?enableInMainMenu=true",
+    ]),
+    # ...and the configuration those pages edit. The ids are the `Id` overrides
+    # on the five `Plugin.cs` files, so they are the same on any Jellyfin; the
+    # bodies are each plugin's `PluginConfiguration` defaults. Ferrofin 404'd all
+    # five, which is what made the settings unreachable rather than merely
+    # unstyled.
+    multi("GET /Plugins/{pluginId}/Configuration", [
+        "/Plugins/b8715ed1-6c47-4528-9ad3-f72deb539cd4/Configuration",   # TMDb
+        "/Plugins/872a7849-1171-458d-a6fb-3de3d442ad30/Configuration",   # Studio Images
+        "/Plugins/a628c0da-fac5-4c7e-9d1a-7134223f14c8/Configuration",   # OMDb
+        "/Plugins/8c95c4d2-e50c-4fb0-a4f3-6c06ff0f9a1a/Configuration",   # MusicBrainz
+        "/Plugins/a629c0da-fac5-4c7e-931a-7174223f14c8/Configuration",   # AudioDB
+    ]),
+    # The manifest of the same five shared ids. Upstream models
+    # `GetPluginManifest` as a POST; it is a read, so it is diffed here rather
+    # than journeyed. Its wire type is the ONE camelCase DTO on this surface
+    # (`PluginManifest` carries an explicit `[JsonPropertyName]` on every
+    # property and spells `Id` as `guid`), and Ferrofin answered with a
+    # five-field PascalCase projection of its own invention — 200 on both sides,
+    # unrelated bodies, invisible to the breadth sweep and covered by an
+    # "instance: the two servers share no plugin id" note that stopped being
+    # true the moment those five ids were registered.
+    #
+    # `status` is compared too, deliberately: it is the field
+    # `PluginManager.ProcessAlternative` flips to `Restart` in memory after an
+    # enable/disable, which is the one part of this surface that still diverges
+    # (see the classification on POST /Plugins/{pluginId}/{version}/Enable).
+    # On the lane-3 pair that makes the TMDb leg red TODAY — an earlier
+    # reviewer's Enable probe left Jellyfin's in-memory TMDb at
+    # `status: "Restart"`, `autoUpdate: false` — while the other four ids are
+    # byte-identical. Keeping the leg is the point: dropping the one id that can
+    # diverge would leave nothing here able to see the divergence at all.
+    multi("POST /Plugins/{pluginId}/Manifest", [
+        "/Plugins/b8715ed1-6c47-4528-9ad3-f72deb539cd4/Manifest",   # TMDb
+        "/Plugins/872a7849-1171-458d-a6fb-3de3d442ad30/Manifest",   # Studio Images
+        "/Plugins/a628c0da-fac5-4c7e-9d1a-7134223f14c8/Manifest",   # OMDb
+        "/Plugins/8c95c4d2-e50c-4fb0-a4f3-6c06ff0f9a1a/Manifest",   # MusicBrainz
+        "/Plugins/a629c0da-fac5-4c7e-931a-7174223f14c8/Manifest",   # AudioDB
+    ], method="POST"),
     plain("GET /System/Endpoint", "/System/Endpoint"),
     plain("GET /Localization/Cultures", "/Localization/Cultures"),
     plain("GET /Users/Me", "/Users/Me"),
@@ -721,7 +831,7 @@ READS = [
     user("GET /UserViews", "/UserViews?userId={u}"),
     user("GET /Library/MediaFolders", "/Library/MediaFolders"),
     user("GET /Library/VirtualFolders", "/Library/VirtualFolders"),
-    # Two legs, both order-checked (see `with_item_order`).
+    # Three legs. The first two are order-checked (see `with_item_order`).
     #
     # Leg 2 is the `UserRootFolder` browse, and it is not a duplicate of
     # `GET /Items/Root`: C# `ItemsController.GetItems` answers it from
@@ -731,11 +841,17 @@ READS = [
     # APPENDED rather than sorted in. Measured on 10.11.8, `sortBy=…`,
     # `limit=…&startIndex=…` and `includeItemTypes=…` all leave the answer
     # unchanged, so the leg pins the branch as well as the order.
+    #
+    # Leg 3 is an AUDIO leg alongside the movie one: the movie page can never
+    # see a field that only an `Audio` DTO carries, and `HasLyrics` — which C#
+    # `DtoService` emits on every Audio row outside the `ItemFields` system —
+    # was missing from every Ferrofin audio DTO with nothing to catch it.
     multi("GET /Items", [
         ("/Items?userId={u}&recursive=true&includeItemTypes=Movie&limit=50&sortBy=SortName&fields=Path",
          with_item_order),
         ("/Items?userId={u}&parentId={root}&sortBy=SortName&sortOrder=Descending&limit=2&startIndex=1",
          with_item_order),
+        "/Items?userId={u}&recursive=true&includeItemTypes=Audio&limit=50&sortBy=SortName&fields=Path",
     ]),
     user("GET /Items/Latest", "/Items/Latest?userId={u}&limit=20&fields=Path"),
     user("GET /UserItems/Resume", "/UserItems/Resume?userId={u}&limit=12&fields=Path"),
@@ -779,6 +895,15 @@ READS = [
          lambda b: {"StartIndex": b.get("StartIndex"),
                     "TotalRecordCount": b.get("TotalRecordCount"),
                     "PageLength": len(b.get("Items") or [])}),
+    ], caveats=[
+        "Items on the ONE narrow-page leg (limit=3&startIndex=7) — not on the "
+        "seven full-limit legs above, which diff the whole universe field for "
+        "field. `SuggestionsController` orders `(Random, Descending)` "
+        "(v10.11.8 SuggestionsController.cs:83) on BOTH servers, so a page "
+        "narrower than the universe draws a different subset per call (measured "
+        "2026-08-29: three consecutive calls returned three different triples on "
+        "each server). That leg compares what IS determined — the StartIndex "
+        "echo, the page-independent TotalRecordCount, and the page length.",
     ]),
     user("GET /Movies/Recommendations", "/Movies/Recommendations?userId={u}"),
     user("GET /Search/Hints", "/Search/Hints?userId={u}&searchTerm=a&limit=20"),
@@ -855,6 +980,72 @@ READS = [
         ("/MusicGenres?userId={u}&includeItemTypes=Movie", with_item_order),
     ]),
     user("GET /MusicGenres/{genreName}", "/MusicGenres/{musicgenre}?userId={u}"),
+    # `/Years` had NO depth probe at all — the only coverage was the breadth
+    # sweep's single-item align, and it could not see that the handler ignored
+    # every filter and sort parameter in the C# signature (measured: J
+    # `?includeItemTypes=Series` -> ["2021"], F -> all three years; `?recursive=
+    # false` -> J [], F all three; `?sortBy=SortName&sortOrder=Descending` a
+    # silent no-op). `years_page` keeps the whole body except the one upstream-
+    # buggy key (see its comment) and ADDS the year order as a diffable field.
+    multi("GET /Years", [
+        ("/Years?userId={u}&sortBy=SortName&sortOrder=Ascending", years_page),
+        ("/Years?userId={u}&sortBy=SortName&sortOrder=Descending", years_page),
+        ("/Years?userId={u}&sortBy=SortName&includeItemTypes=Series", years_page),
+        ("/Years?userId={u}&sortBy=SortName&includeItemTypes=Movie", years_page),
+        ("/Years?userId={u}&sortBy=SortName&excludeItemTypes=Movie", years_page),
+        ("/Years?userId={u}&sortBy=SortName&mediaTypes=Audio", years_page),
+        # `recursive=false` walks the ROOT's direct children (the library
+        # folders), which carry no ProductionYear — so the honest answer is an
+        # empty page, and Ferrofin used to return every year in the library.
+        ("/Years?userId={u}&sortBy=SortName&recursive=false", years_page),
+        ("/Years?userId={u}&sortBy=SortName&limit=1&startIndex=1", years_page),
+        # An empty-guid userId is "not provided" upstream
+        # (`RequestHelpers.GetUserId` tests `userId.IsNullOrEmpty()`), not a
+        # rejected id; Ferrofin used to 400 here.
+        ("/Years?userId=00000000-0000-0000-0000-000000000000&sortBy=SortName", years_page),
+        # THE DEFAULT CALL SHAPE — no sortBy at all, which every other leg pins.
+        # It is the one axis on which the two servers do NOT agree, so it is
+        # compared through `years_unordered`: every field of every year DTO, plus
+        # the year SET, with only the SEQUENCE normalised. See that function for
+        # why the sequence is not reproducible, and the row's `caveats` for the
+        # reader who never opens this file.
+        ("/Years?userId={u}", years_unordered),
+    ], caveats=[
+        "TotalRecordCount — dropped from every leg. Jellyfin reports the "
+        "recursive MEDIA-child count out-param of "
+        "`folder.GetRecursiveChildren(user, query, out totalCount)` "
+        "(v10.11.8 Folder.cs:1450-1458): 559 next to 3 Items on this fixture, "
+        "tracking the filter (Series -> 8, Audio -> 9, parentId=Movies -> 500). "
+        "Ferrofin reports the distinct-year count, which is what pages the list; "
+        "recorded as a jellyfin-bug and gated per-server by "
+        "`items_root_ancestors_and_years_over_real_http`.",
+        "Item ORDER on the no-sortBy leg only — the SET and every DTO field are "
+        "compared, the sequence is sorted on both sides first. `GetAllItems` is "
+        "`items.Select(ProductionYear).Where(> 0).Distinct()` "
+        "(v10.11.8 YearsController.cs:220-227) and LINQ `Distinct()` preserves "
+        "FIRST-OCCURRENCE order, so Jellyfin's resting order is the order years "
+        "appear in its in-memory `Folder.GetRecursiveChildren` walk (measured "
+        "2020,2022,2021); Ferrofin sorts ascending. Reproducing it needs the "
+        "BaseItem tree Ferrofin deliberately does not have. Every OTHER leg pins "
+        "`sortBy=SortName`, where the two agree exactly, including under paging.",
+    ]),
+    # Full per-year DTO diff, nothing projected away: the item counts
+    # (`ChildCount`/`MovieCount`/`SeriesCount`/`AlbumCount`/`SongCount`), the
+    # `UserData.Key`, `DisplayPreferencesId`, `SortName` and `Path`. The counts
+    # were 0 on every Ferrofin year before this batch, and the first two fields
+    # were invisible to every row in the campaign while they sat in
+    # `parity_diff.VOLATILE`.
+    multi("GET /Years/{year}", [
+        "/Years/{year1}?userId={u}",
+        "/Years/{year2}?userId={u}",
+        "/Years/{year3}?userId={u}",
+        # A year the fixture has no item for is still materialized on demand
+        # (`LibraryManager.GetYear` always creates) and must report zero counts
+        # on both — the regression guard for on-demand Year creation.
+        "/Years/1850?userId={u}",
+        # An explicitly-empty userId falls back to the authenticated caller.
+        "/Years/{year1}?userId=00000000-0000-0000-0000-000000000000",
+    ]),
     # Instant mixes are shuffled: the diff aligns by Name, so the SET of tracks is what is
     # compared (with the whole fixture under `limit`, both sides hold every track).
     user("GET /Artists/InstantMix", "/Artists/InstantMix?id={artist_id}&userId={u}&limit=100"),
@@ -1001,6 +1192,16 @@ def resolve_named(base, token, user_id):
         difference on the leg instead of being papered over by a constant."""
         return (get_json(base, "/Items/Root", token) or {}).get("Id") or ""
 
+    def first_years(n):
+        """The first `n` year NAMES, sortBy-pinned, padded so a short fixture
+        still formats every leg (a repeated year is diffed twice, never skipped)."""
+        items = (get_json(base, f"/Years?userId={user_id}&sortBy=SortName"
+                                f"&sortOrder=Ascending&limit={n}", token)
+                 or {}).get("Items") or []
+        names = [i.get("Name") for i in items if i.get("Name")]
+        return (names + [names[-1]] * n)[:n] if names else ["0"] * n
+
+    years = first_years(3)
     artist = first_named("/Artists")
     lyric_ids = lyric_seed_ids(base, token, user_id)
     channels = (get_json(base, f"/LiveTv/Channels?userId={user_id}&limit=1", token) or {}).get("Items") or []
@@ -1032,6 +1233,13 @@ def resolve_named(base, token, user_id):
         "artist": urllib.parse.quote(artist.get("Name") or ""),
         "artist_id": artist.get("Id") or "",
         "musicgenre": first_name("/MusicGenres"),
+        # The fixture's production years, by SortName so both servers pick the
+        # same three (a Year's SortName is the zero-padded value, so this is
+        # numeric order). Names, not ids — but the ids agree anyway, since a
+        # by-name id is MD5(TypeFullName + metadata path).
+        "year1": years[0],
+        "year2": years[1],
+        "year3": years[2],
         # The three tracks `seed_lyrics` writes to, in LYRIC_SEEDS order.
         "lyric_lrc": lyric_ids[0],
         "lyric_elrc": lyric_ids[1],
@@ -1074,7 +1282,7 @@ def run(ferrofin_url, jellyfin_url):
         return (verification.BODY_DIFF if verification.BODY_DIFF in seen
                 else verification.EMPTY_CORPUS)
 
-    def record(op, clean, total, buckets, method, note=None, compared=None):
+    def record(op, clean, total, buckets, method, note=None, compared=None, caveats=None):
         """`method` is HOW the row was verified, from `verification.METHODS`, and it
         is written into the results row. There is no default: gen-ledger.py counts
         only `body-diff` in the headline, so a row that agreed on named invariants
@@ -1086,7 +1294,12 @@ def run(ferrofin_url, jellyfin_url):
         carried into the note the way the sweep layer carries it. Without it the
         page said "1/1 clean" for a row that compared 984 fields and for a row
         that compared one, and a reader could not tell a thick body diff from a
-        thin one without opening this file."""
+        thin one without opening this file.
+
+        `caveats` is what this row did NOT compare, in plain words. It rides on
+        the row (not only in a comment in this file) so `gen-ledger.py` can print
+        it under the row: a green row with a projected-away field is honest only
+        while the reader can see which field."""
         if total == 0 or (method is None and not any(buckets.values())):
             rows[op] = {"deep_verified": None, "classification": "",
                         "verification_method": None,
@@ -1103,6 +1316,8 @@ def run(ferrofin_url, jellyfin_url):
             rows[op] = {"deep_verified": True, "classification": "ok",
                         "verification_method": method,
                         "note": f"{clean}/{total} clean{depth}" + detail}
+            if caveats:
+                rows[op]["caveats"] = list(caveats)
         else:
             sample = "; ".join(f"{m['path']}(J={m.get('j')} H={m.get('h')})"
                                for m in buckets["mismatch"][:3])
@@ -1124,6 +1339,8 @@ def run(ferrofin_url, jellyfin_url):
                             "extra": sorted(field_paths(buckets["extra"])),
                             "mismatch": sorted(field_paths(buckets["mismatch"])),
                         }}
+            if caveats:
+                rows[op]["caveats"] = list(caveats)
 
     for ep in READS:
         if ep["kind"] == "invariant":
@@ -1154,9 +1371,10 @@ def run(ferrofin_url, jellyfin_url):
             legs = []
             clean = tested = 0
             try:
+                method = ep.get("http_method", "GET")
                 for leg in ep["legs"]:
-                    hs, hb = token_get(ferrofin_url, leg["url"](hc), ht)
-                    js, jb = token_get(jellyfin_url, leg["url"](jc), jt)
+                    hs, hb = token_get(ferrofin_url, leg["url"](hc), ht, method)
+                    js, jb = token_get(jellyfin_url, leg["url"](jc), jt, method)
                     tested += 1
                     # A leg that does not answer 200-with-JSON on both sides is a
                     # RESULT, not a reason to skip: `continue`-ing here made a
@@ -1187,7 +1405,8 @@ def run(ferrofin_url, jellyfin_url):
                     ep["reap"](ferrofin_url, ht, hc)
                     ep["reap"](jellyfin_url, jt, jc)
             record(ep["op"], clean, tested, agg, agg_method(legs),
-                   compared=sum(c for _j, _h, c in legs))
+                   compared=sum(c for _j, _h, c in legs),
+                   caveats=ep.get("caveats"))
         elif ep["kind"] in ("plain", "user"):
             path = ep["url"](hc if ep["kind"] == "user" else {})
             jpath = ep["url"](jc if ep["kind"] == "user" else {})
@@ -1290,6 +1509,22 @@ def selfcheck():
     assert dc({"Type": "UserRootFolder", "ChildCount": 4},
               {"Type": "UserRootFolder", "ChildCount": 3})[0] == 1, \
         "the user root is not ICollectionFolder/UserView — its ChildCount is real"
+    # `UserData.Key` is COMPARED, not masked — that is what caught Ferrofin
+    # answering with the item guid on every row — and the one exemption is the
+    # degenerate case where both sides are bare GUIDs (a Live TV programme,
+    # whose id is minted per scan).
+    assert dc({"UserData": {"Key": "Year-2020"}},
+              {"UserData": {"Key": "ed00b5b8-bc89-dd6e-2a09-006c4d9c5309"}})[0] == 1, \
+        "a derived key against a guid is a real mismatch"
+    assert dc({"UserData": {"Key": "Year-2020"}},
+              {"UserData": {"Key": "Year-2021"}})[0] == 1
+    assert dc({"UserData": {"Key": "f95eb75c-8a0b-0843-d0ee-267d9cfa7ce4"}},
+              {"UserData": {"Key": "d79aab57-f0cb-5d8a-aaa9-39d31ca2937e"}})[0] == 0, \
+        "two per-scan guids are what Id is already volatile for"
+    # `DisplayPreferencesId` is compared too: it is MD5(type FullName), the same
+    # 32 hex digits on both servers for a given kind.
+    assert dc({"DisplayPreferencesId": "ff93de5e82fcf2878bb0087b4854a1a5"},
+              {"DisplayPreferencesId": "ed00b5b8bc89dd6e2a09006c4d9c5309"})[0] == 1
     # array align by Path across divergent ids
     j = {"Items": [{"Path": "/m/a.mkv", "Id": "j1", "Name": "A"}]}
     h = {"Items": [{"Path": "/m/a.mkv", "Id": "h1", "Name": "A"}]}
@@ -1305,16 +1540,31 @@ def selfcheck():
     spec = json.load(open(sorted(glob.glob(os.path.join(
         os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
         "contracts/jellyfin-openapi-*.json")))[-1]))
-    valid = {f"GET {p}" for p in spec["paths"]}
+    # A read row's verb is whatever the CONTRACT gives that path — almost always
+    # GET, but `POST /Plugins/{pluginId}/Manifest` is `GetPluginManifest`, a
+    # read behind a POST. Accepting only GET here is what made that row
+    # unprobeable, so the check is now "this method+path is in the spec", not
+    # "this path is a GET".
+    valid = {f"{m.upper()} {p}" for p, item in spec["paths"].items() for m in item
+             if m.lower() in ("get", "post", "put", "delete", "patch", "head", "options")}
     bad = [ep["op"] for ep in READS if ep["op"] not in valid]
     assert not bad, f"read op-keys not in spec: {bad}"
+    # ...and a non-GET row must actually DECLARE its verb, or it silently probes
+    # the wrong endpoint with the right name.
+    # NB `http_method`, not `method`: an `invariant()` row already uses `method`
+    # for its VERIFICATION method ("property"). Reusing that key here made every
+    # invariant row look like it was probing with a verb called "property".
+    mismatched = [ep["op"] for ep in READS
+                  if ep["op"].split(" ", 1)[0] != ep.get("http_method", "GET")]
+    assert not mismatched, f"row op verb != probe method: {mismatched}"
     # every {placeholder} in a user() URL must be a key resolve_named() produces (guards the
     # {u} vs "user" KeyError). Format each with a fully-populated context; a KeyError fails here.
     ctx = {"user": "U", "u": "U", "genre": "G", "studio": "S", "person": "P", "series": "SE",
            "task": "T", "device": "D", "artist": "A", "artist_id": "AID", "musicgenre": "MG",
            "channel": "CH", "album_id": "ALB", "movie": "MOV", "episode": "EP",
            "listings_provider": "LP", "playlists_folder": "PLF", "root": "ROOT",
-           "lyric_lrc": "L1", "lyric_elrc": "L2", "lyric_txt": "L3"}
+           "lyric_lrc": "L1", "lyric_elrc": "L2", "lyric_txt": "L3",
+           "year1": "2020", "year2": "2021", "year3": "2022"}
     # The context keys the self-check invents must be the ones resolve_named
     # actually produces, or this guard passes while the live run KeyErrors.
     import inspect
@@ -1372,6 +1622,46 @@ def selfcheck():
         for key in ep.get("extra_seeds", ()):
             assert ep["kind"] == "item", ep["op"]
             assert key in produced, f"{ep['op']}: extra seed {key!r} is not resolved"
+    # Every projected row must NAME what it projected away. A projection is the
+    # one way a "clean" row can be clean about less than it looks like, so an
+    # undeclared one is a defect in itself.
+    probe = {"StartIndex": 7, "TotalRecordCount": 500,
+             "Items": [{"Name": "x", "Id": "1"}, {"Name": "y", "Id": "2"}]}
+
+    def lossy(project):
+        """True when the projection DROPS or REWRITES something the body had.
+
+        An ADDITIVE projection (`with_item_order` only appends a derived
+        `_ItemNameOrder`) compares everything the body carried and needs no
+        caveat; a lossy one compares less, and that has to be declared.
+        """
+        got = project(dict(probe))
+        return any(k not in got or got[k] != v for k, v in probe.items())
+
+    undeclared = [ep["op"] for ep in READS
+                  if ep["kind"] == "multi"
+                  and any(leg["project"] and lossy(leg["project"]) for leg in ep["legs"])
+                  and not ep.get("caveats")]
+    assert not undeclared, f"lossy-projected rows with no declared caveats: {undeclared}"
+    # The detector must actually be able to tell the two apart.
+    assert lossy(years_page) and lossy(years_unordered) and not lossy(with_item_order)
+    # `years_unordered` must normalise the SEQUENCE and nothing else: two pages
+    # with the same years in different orders converge, one with a different
+    # year SET, or a differing DTO field, still diverges.
+    a = {"Items": [{"Name": "2020", "ChildCount": 5}, {"Name": "2022", "ChildCount": 1}],
+         "TotalRecordCount": 2, "StartIndex": 0}
+    b = {"Items": [{"Name": "2022", "ChildCount": 1}, {"Name": "2020", "ChildCount": 5}],
+         "TotalRecordCount": 559, "StartIndex": 0}
+    assert years_unordered(a) == years_unordered(b), "order alone must not diverge"
+    c = {"Items": [{"Name": "2020", "ChildCount": 5}, {"Name": "2021", "ChildCount": 1}],
+         "TotalRecordCount": 2, "StartIndex": 0}
+    assert years_unordered(a) != years_unordered(c), "a different year SET must still diverge"
+    d = {"Items": [{"Name": "2022", "ChildCount": 9}, {"Name": "2020", "ChildCount": 5}],
+         "TotalRecordCount": 2, "StartIndex": 0}
+    assert years_unordered(a) != years_unordered(d), "a differing DTO field must still diverge"
+    # ...and the ORDERED projection must still catch an order divergence, so the
+    # eight sortBy-pinned legs keep their teeth.
+    assert years_page(a) != years_page(b), "years_page must still compare order"
     # Method derivation: two EMPTY result envelopes agreeing on their own zeros is
     # not the body-diff headline, and a pair that compared nothing at all is not a
     # verdict. Both are the shapes that silently inflated the count before.
@@ -1389,7 +1679,7 @@ def selfcheck():
     assert bad == ["b", "c"], f"invariant folding wrong: {bad}"
     print(f"ok: diff, Path-align, correlation, {len(READS)} read op-keys valid, "
           f"user/multi templates fillable, invariant folding, "
-          f"{len(aliases)} distinct invariant aliases, projections total")
+          f"{len(aliases)} distinct invariant aliases, projections total + declared")
 
 
 if __name__ == "__main__":

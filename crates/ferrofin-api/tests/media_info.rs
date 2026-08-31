@@ -6,6 +6,7 @@
 //! a known on-disk path, so the PlaybackInfo body shape can be asserted.
 
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use async_trait::async_trait;
 use axum::body::Body;
@@ -483,6 +484,9 @@ impl DtoService for OkDto {
 /// path) from both the playback and static resolvers.
 struct OkMediaSources {
     path: String,
+    /// The last request `open_live_stream` was called with, so a test can read
+    /// back the user id the handler resolved.
+    opened: Mutex<Option<ferrofin_model::media_info::LiveStreamRequest>>,
 }
 
 fn media_source(path: &str) -> MediaSourceInfo {
@@ -526,9 +530,10 @@ impl MediaSourceManager for OkMediaSources {
     }
     async fn open_live_stream(
         &self,
-        _request: &ferrofin_model::media_info::LiveStreamRequest,
+        request: &ferrofin_model::media_info::LiveStreamRequest,
     ) -> Result<MediaSourceInfo, ServiceError> {
-        unimplemented!()
+        *self.opened.lock().expect("lock") = Some(request.clone());
+        Ok(media_source(&self.path))
     }
     async fn get_live_stream(&self, _id: &str) -> Result<MediaSourceInfo, ServiceError> {
         unimplemented!()
@@ -748,14 +753,30 @@ impl SessionManager for OkSessions {
 
 /// Assembles an [`AppState`] wired for the media-info paths.
 fn ok_state(item_id: Uuid, media_path: &str) -> AppState {
-    AppState::new(
-        Arc::new(OkLibrary { item_id }),
-        Arc::new(OkUsers),
-        Arc::new(OkUserViews { item_id }),
-        Arc::new(FakeUserData),
+    ok_state_full(
+        item_id,
         Arc::new(OkMediaSources {
             path: media_path.to_owned(),
+            opened: Mutex::new(None),
         }),
+        Arc::new(OkUsers),
+    )
+}
+
+/// [`ok_state`] with the media-source fake and the caller's role chosen by the
+/// test: [`OkUsers`] reports an ordinary account, `FakeAdminUsers` an
+/// administrator.
+fn ok_state_full(
+    item_id: Uuid,
+    media_sources: Arc<OkMediaSources>,
+    users: Arc<dyn ferrofin_traits::library::UserManager>,
+) -> AppState {
+    AppState::new(
+        Arc::new(OkLibrary { item_id }),
+        users,
+        Arc::new(OkUserViews { item_id }),
+        Arc::new(FakeUserData),
+        media_sources,
         Arc::new(OkSessions),
         Arc::new(FakeSystem),
         Arc::new(ferrofin_api::test_support::FakeAppHost),
@@ -836,4 +857,116 @@ async fn playback_info_post_returns_media_sources() {
     assert_eq!(response.status(), StatusCode::OK);
     let json = json_body(response).await;
     assert_eq!(json["MediaSources"][0]["Id"], "source-1");
+}
+
+/// `POST /LiveStreams/Open` folds `?userId=` and the body's `UserId` and then
+/// runs C# `RequestHelpers.GetUserId` on the result
+/// (v10.11.8 `MediaInfoController.cs`), so a non-administrator naming another
+/// user is refused. The resolved id is what the stream is opened AS — and for a
+/// Live TV source that is what opens the tuner — so an ungated one let any
+/// account open a stream under another identity.
+#[tokio::test]
+async fn open_live_stream_cross_user_as_non_admin_is_forbidden() {
+    let other = Uuid::from_u128(0x0BAD);
+    for uri in [
+        format!("/LiveStreams/Open?userId={other}"),
+        "/LiveStreams/Open".to_owned(),
+    ] {
+        let ms = Arc::new(OkMediaSources {
+            path: "/tmp/x.mkv".to_owned(),
+            opened: Mutex::new(None),
+        });
+        let app = ok_state_full(Uuid::from_u128(0x0177), ms.clone(), Arc::new(OkUsers));
+        // The second leg carries the id in the BODY, which C# folds in first.
+        let body = if uri.contains("userId") {
+            r#"{"OpenToken":"tok"}"#.to_owned()
+        } else {
+            format!(r#"{{"OpenToken":"tok","UserId":"{other}"}}"#)
+        };
+        let response = create_router(app)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(&uri)
+                    .header("Authorization", "Bearer t")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(body))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{uri}");
+        assert!(ms.opened.lock().expect("lock").is_none(), "{uri}");
+    }
+}
+
+/// An administrator may still open a stream on another user's behalf, and the
+/// request carries THAT user's id.
+#[tokio::test]
+async fn open_live_stream_cross_user_as_admin_is_allowed() {
+    let other = Uuid::from_u128(0x0BAD);
+    let ms = Arc::new(OkMediaSources {
+        path: "/tmp/x.mkv".to_owned(),
+        opened: Mutex::new(None),
+    });
+    let app = ok_state_full(
+        Uuid::from_u128(0x0177),
+        ms.clone(),
+        Arc::new(ferrofin_api::test_support::FakeAdminUsers),
+    );
+    let response = create_router(app)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/LiveStreams/Open?userId={other}"))
+                .header("Authorization", "Bearer t")
+                .header("Content-Type", "application/json")
+                .body(Body::from(r#"{"OpenToken":"tok"}"#))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        ms.opened
+            .lock()
+            .expect("lock")
+            .as_ref()
+            .expect("opened")
+            .user_id,
+        other
+    );
+}
+
+/// A non-administrator naming their own id is served, and the request carries
+/// their id — the first half of the rule still applies.
+#[tokio::test]
+async fn open_live_stream_self_as_non_admin_is_allowed() {
+    let ms = Arc::new(OkMediaSources {
+        path: "/tmp/x.mkv".to_owned(),
+        opened: Mutex::new(None),
+    });
+    let app = ok_state_full(Uuid::from_u128(0x0177), ms.clone(), Arc::new(OkUsers));
+    let response = create_router(app)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/LiveStreams/Open?userId={USER_ID}"))
+                .header("Authorization", "Bearer t")
+                .header("Content-Type", "application/json")
+                .body(Body::from(r#"{"OpenToken":"tok"}"#))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        ms.opened
+            .lock()
+            .expect("lock")
+            .as_ref()
+            .expect("opened")
+            .user_id,
+        USER_ID
+    );
 }

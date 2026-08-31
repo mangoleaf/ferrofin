@@ -133,6 +133,9 @@ struct StubDevices {
     options: Option<DeviceOptionsEntity>,
     /// Captured `(device_id, custom_name)` update calls.
     updates: Mutex<Vec<(String, Option<String>)>>,
+    /// Captured `get_devices_for_user` arguments — the id the handler *resolved*,
+    /// which is what the `RequestHelpers.GetUserId` port has to get right.
+    for_user: Mutex<Vec<Option<Uuid>>>,
 }
 
 #[async_trait]
@@ -176,8 +179,9 @@ impl DeviceManager for StubDevices {
     }
     async fn get_devices_for_user(
         &self,
-        _user_id: Option<Uuid>,
+        user_id: Option<Uuid>,
     ) -> Result<QueryResult<DeviceInfoDto>, ServiceError> {
+        self.for_user.lock().unwrap().push(user_id);
         Ok(QueryResult::from_items(self.known.clone()))
     }
     async fn delete_device(&self, _device: &DeviceEntity) -> Result<(), ServiceError> {
@@ -416,6 +420,67 @@ async fn get_devices_returns_the_users_devices() {
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["TotalRecordCount"], 2);
     assert_eq!(json["Items"][0]["Id"], "dev-1");
+}
+
+#[tokio::test]
+async fn get_devices_treats_an_all_zero_or_empty_user_id_as_absent() {
+    // Half 1 of C# `RequestHelpers.GetUserId` (v10.11.8
+    // `Jellyfin.Api/Helpers/RequestHelpers.cs`:73-77): `userId.IsNullOrEmpty()`
+    // is true for `Guid.Empty`, so an all-zero id falls back to the caller. The
+    // elevation policy on this controller neutralises only half 2, so the
+    // hand-rolled `unwrap_or(caller)` here still dropped this: measured on the
+    // lane-3 pair as the administrator, `?userId=<all-zero>` was `404` on
+    // Ferrofin against `200` with the caller's devices on Jellyfin 10.11.8.
+    //
+    // The empty and whitespace-only spellings are the same case: ASP.NET binds
+    // an empty value for a `Guid?` to `null`, and both were a `400` here.
+    for query in [
+        "",
+        "?userId=00000000-0000-0000-0000-000000000000",
+        "?userId=",
+        "?userId=%20",
+    ] {
+        let devices = Arc::new(StubDevices {
+            known: vec![device("dev-1")],
+            ..Default::default()
+        });
+        let app = state(
+            ok_auth(),
+            devices.clone(),
+            Arc::new(ferrofin_api::test_support::FakeApiKeys),
+            Arc::new(FakeClientEventLogger),
+            Arc::new(FakeConfig),
+        );
+        let (status, _) = call(app, "GET", &format!("/Devices{query}")).await;
+        assert_eq!(status, StatusCode::OK, "GET /Devices{query}");
+        assert_eq!(
+            devices.for_user.lock().unwrap().as_slice(),
+            [Some(USER_ID)],
+            "GET /Devices{query} must resolve to the caller, not the literal id"
+        );
+    }
+}
+
+#[tokio::test]
+async fn get_devices_honours_an_explicitly_named_user() {
+    // The other side of the same rule: a real id is passed through untouched
+    // (the caller here is an administrator — the controller's elevation policy
+    // guarantees that — so half 2 admits it).
+    let other = Uuid::from_u128(0x00C1_0001);
+    let devices = Arc::new(StubDevices {
+        known: vec![device("dev-1")],
+        ..Default::default()
+    });
+    let app = state(
+        ok_auth(),
+        devices.clone(),
+        Arc::new(ferrofin_api::test_support::FakeApiKeys),
+        Arc::new(FakeClientEventLogger),
+        Arc::new(FakeConfig),
+    );
+    let (status, _) = call(app, "GET", &format!("/Devices?userId={other}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(devices.for_user.lock().unwrap().as_slice(), [Some(other)]);
 }
 
 #[tokio::test]
