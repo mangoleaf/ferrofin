@@ -366,10 +366,20 @@ async fn get_packages(
 }
 
 /// Binds an `assemblyGuid` query parameter the way ASP.NET binds a `Guid?`:
-/// absent or empty is `None`, a value is parsed with the .NET format set, and
-/// anything unparseable is a `400` before the action body ever runs.
+/// absent, empty, or WHITESPACE-ONLY is `None`, a value is parsed with the
+/// .NET format set, and anything unparseable is a `400` before the action body
+/// ever runs.
+///
+/// The whitespace arm is not a guess: `SimpleTypeModelBinder` runs the value
+/// through `TypeConverter.ConvertFrom`, which trims, so a whitespace-only value
+/// reaches the action as null rather than as a binding failure. Measured on the
+/// pair before this was ported — `GET /Packages/{name}?assemblyGuid=%20` was
+/// 400 on Ferrofin and 200 on Jellyfin, while the empty and absent spellings
+/// already agreed. Same class as the query-binding fix batch S1 landed for
+/// every `Option<Uuid>`; this field is an `Option<String>` parsed here, so that
+/// sweep did not reach it.
 fn parse_assembly_guid(raw: Option<&str>) -> Result<Option<Uuid>, ApiError> {
-    match raw.filter(|g| !g.is_empty()) {
+    match raw.map(str::trim).filter(|g| !g.is_empty()) {
         Some(raw) => Ok(Some(
             ferrofin_util::guid_extensions::parse_dotnet_guid(raw).ok_or_else(|| {
                 ApiError::BadRequest(format!("assemblyGuid `{raw}` is not a valid GUID"))
@@ -665,4 +675,46 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
             "/Plugins/{pluginId}/web/{*path}",
             axum::routing::any(plugin_web_request),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_assembly_guid;
+
+    /// ASP.NET's `SimpleTypeModelBinder` runs a query value through
+    /// `TypeConverter.ConvertFrom`, which trims — so absent, empty and
+    /// whitespace-only all reach the action as `null`, and only a non-blank
+    /// unparseable value is a binding failure.
+    ///
+    /// Measured on the parity pair before the whitespace arm was ported:
+    /// `GET /Packages/{name}?assemblyGuid=%20` was 400 on Ferrofin and 200 on
+    /// Jellyfin. The row was recorded deep-verified while that divergence was
+    /// live, which is what this test exists to stop.
+    #[test]
+    fn a_blank_assembly_guid_binds_to_none_the_way_asp_net_does() {
+        for blank in [None, Some(""), Some(" "), Some("   "), Some("\t")] {
+            assert_eq!(
+                parse_assembly_guid(blank).expect("blank binds, never 400"),
+                None,
+                "blank spelling {blank:?} must bind to None"
+            );
+        }
+    }
+
+    #[test]
+    fn a_real_assembly_guid_still_parses_and_junk_is_still_a_400() {
+        let parsed = parse_assembly_guid(Some("a9d1d2d0-0000-4000-8000-000000000000"))
+            .expect("a valid guid parses");
+        assert!(parsed.is_some());
+        // Surrounding whitespace is trimmed, not rejected — same converter.
+        assert_eq!(
+            parse_assembly_guid(Some(" a9d1d2d0-0000-4000-8000-000000000000 "))
+                .expect("a padded guid parses"),
+            parsed
+        );
+        assert!(
+            parse_assembly_guid(Some("not-a-guid")).is_err(),
+            "a non-blank unparseable value is still a binding failure"
+        );
+    }
 }
