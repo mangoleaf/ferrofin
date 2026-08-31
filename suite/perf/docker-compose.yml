@@ -52,7 +52,7 @@ services:
       - ${REAL_MEDIA_DIR:-./fixtures/empty}:/media/movies-real:ro
       - ${REAL_TV_DIR:-./fixtures/empty}:/media/tv-real:ro
       - ./fixtures/media:/media/synth:ro
-      - ferrofin-data:/config
+      - ferrofin-config:/config
 
   jellyfin:
     image: ${JELLYFIN_IMAGE}
@@ -80,6 +80,6 @@ services:
 
 # Named volumes so `docker compose down -v` gives each run a clean DB.
 volumes:
-  ferrofin-data:
+  ferrofin-config:
   jellyfin-config:
   jellyfin-cache:
