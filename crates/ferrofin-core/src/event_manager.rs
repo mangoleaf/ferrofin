@@ -32,7 +32,24 @@ use ferrofin_traits::events::EventManager;
 /// deserializes it by the `event_type` it registered under. Returning
 /// [`ServiceError`] lets [`FerrofinEventManager::publish`] log-and-continue,
 /// matching the C# per-consumer `try/catch`.
-pub type EventConsumer = Arc<dyn Fn(&str) -> Result<(), ServiceError> + Send + Sync + 'static>;
+/// The future a consumer returns, awaited in registration order by
+/// [`FerrofinEventManager::publish`].
+pub type EventFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ServiceError>> + Send>>;
+
+/// A consumer callback: it inspects the payload synchronously and returns the
+/// work to await. A consumer whose effect must be *ordered* relative to later
+/// publishes (the activity-log writers) puts the work in the future; one whose
+/// effect is a fire-and-forget push (the WebSocket notifiers, which C# also
+/// treats as best-effort sends) may spawn and return a ready future.
+pub type EventConsumer = Arc<dyn Fn(&str) -> EventFuture + Send + Sync + 'static>;
+
+/// A consumer future that is already finished — for a consumer that did all its
+/// work synchronously or spawned it.
+#[must_use]
+pub fn consumer_done() -> EventFuture {
+    Box::pin(std::future::ready(Ok(())))
+}
 
 /// The concrete in-process event manager.
 ///
@@ -106,8 +123,13 @@ impl EventManager for FerrofinEventManager {
             guard.get(event_type).cloned().unwrap_or_default()
         };
 
+        // Awaited in registration order, exactly as the C# `EventManager`
+        // awaits each resolved `IEventConsumer<T>.OnEvent`. Order is
+        // observable: `AuthenticateNewSessionInternal` raises `SessionStarted`
+        // (awaited) before `AuthenticationSucceeded`, and the dashboard's
+        // activity feed shows the pair in that order.
         for consumer in consumers {
-            if let Err(err) = consumer(payload) {
+            if let Err(err) = consumer(payload).await {
                 // Mirror the C# per-consumer try/catch: log and continue so one
                 // failing subscriber never aborts the fan-out.
                 error!(
@@ -138,13 +160,13 @@ mod tests {
                 "PlaybackStart",
                 Arc::new(move |_payload: &str| {
                     hits.fetch_add(1, Ordering::SeqCst);
-                    Ok(())
+                    consumer_done()
                 }),
             );
         }
         manager.subscribe(
             "SomethingElse",
-            Arc::new(|_| panic!("wrong-name consumer must not fire")),
+            Arc::new(|_| -> EventFuture { panic!("wrong-name consumer must not fire") }),
         );
 
         manager.publish("PlaybackStart", "{}").await.unwrap();
@@ -161,7 +183,7 @@ mod tests {
             "AuthResult",
             Arc::new(move |payload: &str| {
                 *seen_c.write().unwrap() = payload.to_owned();
-                Ok(())
+                consumer_done()
             }),
         );
 
@@ -177,19 +199,54 @@ mod tests {
         let manager = FerrofinEventManager::new();
         let after = Arc::new(AtomicUsize::new(0));
 
-        manager.subscribe("E", Arc::new(|_| Err(ServiceError::backend("boom"))));
+        manager.subscribe(
+            "E",
+            Arc::new(|_| Box::pin(async { Err(ServiceError::backend("boom")) })),
+        );
         let after_c = Arc::clone(&after);
         manager.subscribe(
             "E",
             Arc::new(move |_| {
                 after_c.fetch_add(1, Ordering::SeqCst);
-                Ok(())
+                consumer_done()
             }),
         );
 
         // Publication still succeeds and the second consumer still ran.
         manager.publish("E", "{}").await.unwrap();
         assert_eq!(after.load(Ordering::SeqCst), 1);
+    }
+
+    /// C# `EventManager.PublishAsync` awaits each consumer in turn, so a
+    /// consumer's effect has landed before `publish` returns and before the
+    /// caller publishes its next event. `SessionManager` relies on this: it
+    /// raises `SessionStarted` and only then `AuthenticationSucceeded`, and the
+    /// dashboard activity feed shows the login pair in that order.
+    #[tokio::test]
+    async fn publish_awaits_each_consumer_in_registration_order() {
+        let manager = FerrofinEventManager::new();
+        let order = Arc::new(RwLock::new(Vec::<&'static str>::new()));
+
+        for name in ["first", "second", "third"] {
+            let order = Arc::clone(&order);
+            manager.subscribe(
+                "E",
+                Arc::new(move |_| {
+                    let order = Arc::clone(&order);
+                    Box::pin(async move {
+                        // Yield so a consumer that merely spawned its work
+                        // would lose the race and land out of order.
+                        tokio::task::yield_now().await;
+                        order.write().unwrap().push(name);
+                        Ok(())
+                    })
+                }),
+            );
+        }
+
+        manager.publish("E", "{}").await.unwrap();
+        // Already recorded when publish returned — not eventually.
+        assert_eq!(&*order.read().unwrap(), &["first", "second", "third"]);
     }
 
     #[tokio::test]

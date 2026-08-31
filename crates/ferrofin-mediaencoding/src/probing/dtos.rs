@@ -2,10 +2,15 @@
 //!
 //! These map the raw `ffprobe -print_format json` output onto strongly typed
 //! structs. Field names / `serde(rename)` keys match the upstream
-//! `[JsonPropertyName]` attributes byte-for-byte, and the value types match
-//! upstream's nullability: a C# non-nullable `int`/`bool` becomes a plain
-//! `i32`/`bool` here (absent key deserializes to `0`/`false`, exactly as the
-//! .NET deserializer leaves the CLR default), not an `Option`.
+//! `[JsonPropertyName]` attributes, and the value types match upstream
+//! *master*'s nullability, which is the behaviour Ferrofin ports: master made
+//! `Width`/`Height`/`Level`/`IsAvc` nullable so a stream for which ffprobe
+//! emits no such key keeps `null` instead of a fabricated `0`/`false`. The
+//! wire contract stays pinned to v10.11.8; only the *behaviour* tracks master.
+//!
+//! The one place the two disagree on a *key* is `codec_tag_string`, where
+//! master carries a trailing-`?` typo that stops the key deserializing at all
+//! — see [`MediaStreamInfo::codec_tag_string`].
 
 use std::collections::HashMap;
 
@@ -79,19 +84,23 @@ pub struct MediaStreamInfo {
     pub bit_rate: Option<String>,
     /// The width.
     ///
-    /// Upstream declares `public int Width` (non-nullable, v10.11.8
-    /// `MediaStreamInfo.cs:95`), so an absent ffprobe key means `0`, not null.
+    /// Upstream master declares `public int? Width` (nullable,
+    /// `MediaBrowser.MediaEncoding/Probing/MediaStreamInfo.cs:93`), so an
+    /// absent ffprobe key stays null. v10.11.8 (`:95`) had a non-nullable
+    /// `int` and so fabricated a `0`; master fixed that and Ferrofin follows
+    /// master.
     #[serde(default)]
-    pub width: i32,
+    pub width: Option<i32>,
     /// The reference frame count.
     #[serde(default)]
     pub refs: i32,
     /// The height.
     ///
-    /// Upstream declares `public int Height` (non-nullable, v10.11.8
-    /// `MediaStreamInfo.cs:109`), so an absent ffprobe key means `0`, not null.
+    /// Upstream master declares `public int? Height` (nullable,
+    /// `MediaBrowser.MediaEncoding/Probing/MediaStreamInfo.cs:107`), so an
+    /// absent ffprobe key stays null. v10.11.8 (`:109`) fabricated a `0`.
     #[serde(default)]
-    pub height: i32,
+    pub height: Option<i32>,
     /// The display aspect ratio.
     #[serde(default, rename = "display_aspect_ratio")]
     pub display_aspect_ratio: Option<String>,
@@ -119,10 +128,13 @@ pub struct MediaStreamInfo {
     pub pixel_format: Option<String>,
     /// The level.
     ///
-    /// Upstream declares `public int Level` (non-nullable, v10.11.8
-    /// `MediaStreamInfo.cs:172`), so an absent ffprobe key means `0`, not null.
+    /// Upstream master declares `public int? Level` (nullable,
+    /// `MediaBrowser.MediaEncoding/Probing/MediaStreamInfo.cs:170`), so an
+    /// absent ffprobe key stays null. v10.11.8 (`:172`) fabricated a `0`,
+    /// which is how it comes to report `Level: 0` on audio and subtitle
+    /// streams where a level is not a meaningful value.
     #[serde(default)]
-    pub level: i32,
+    pub level: Option<i32>,
     /// The time base.
     #[serde(default, rename = "time_base")]
     pub time_base: Option<String>,
@@ -131,18 +143,22 @@ pub struct MediaStreamInfo {
     pub codec_time_base: Option<String>,
     /// The codec tag string.
     ///
-    /// The pinned oracle (v10.11.8 `MediaStreamInfo.cs:206`) binds the plain
-    /// key `codec_tag_string`. A trailing-`?` typo exists on upstream *master*
-    /// only; binding that would make the key never deserialize, which in turn
-    /// misclassifies every `mjpeg` video stream as an embedded image.
+    /// Bound to the plain key `codec_tag_string`, which is what ffprobe
+    /// actually emits and what v10.11.8
+    /// (`MediaBrowser.MediaEncoding/Probing/MediaStreamInfo.cs:206`) binds. A
+    /// trailing-`?` typo was introduced on upstream *master* (`:204`); binding
+    /// that would make the key never deserialize, which in turn misclassifies
+    /// every `mjpeg` video stream as an embedded image. This is the one field
+    /// where master regressed, so the behaviour here follows v10.11.8.
     #[serde(default, rename = "codec_tag_string")]
     pub codec_tag_string: Option<String>,
     /// Whether the stream is AVC (`is_avc`, may be a JSON string).
     ///
-    /// Upstream declares `public bool IsAvc` (non-nullable, v10.11.8
-    /// `MediaStreamInfo.cs:235`), so an absent key means `false`, not null.
+    /// Upstream master declares `public bool? IsAvc` (nullable,
+    /// `MediaBrowser.MediaEncoding/Probing/MediaStreamInfo.cs:233`), so an
+    /// absent key stays null. v10.11.8 (`:235`) fabricated a `false`.
     #[serde(default, rename = "is_avc", deserialize_with = "de_bool_flexible")]
-    pub is_avc: bool,
+    pub is_avc: Option<bool>,
     /// The NAL length size.
     #[serde(default, rename = "nal_length_size")]
     pub nal_length_size: Option<String>,
@@ -259,7 +275,7 @@ pub struct MediaStreamInfoSideData {
 
 /// Deserializes a bool that ffprobe may encode as a JSON string
 /// (`"true"`/`"false"`), matching Jellyfin's `JsonBoolStringConverter`.
-fn de_bool_flexible<'de, D>(deserializer: D) -> Result<bool, D::Error>
+fn de_bool_flexible<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -270,15 +286,17 @@ where
         Str(String),
     }
 
-    // The C# target is a non-nullable `bool`, so anything unparseable or absent
-    // lands on the CLR default rather than on null.
+    // The master target is `bool?`, so an absent or unparseable value stays
+    // null rather than collapsing onto `false`.
     let opt = Option::<BoolOrString>::deserialize(deserializer)?;
     Ok(match opt {
-        None => false,
-        Some(BoolOrString::Bool(b)) => b,
-        Some(BoolOrString::Str(s)) => {
-            matches!(s.trim().to_ascii_lowercase().as_str(), "true" | "1")
-        }
+        None => None,
+        Some(BoolOrString::Bool(b)) => Some(b),
+        Some(BoolOrString::Str(s)) => match s.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" => Some(true),
+            "false" | "0" => Some(false),
+            _ => None,
+        },
     })
 }
 

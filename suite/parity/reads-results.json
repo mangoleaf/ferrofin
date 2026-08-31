@@ -1,7 +1,7 @@
 {
   "correlated_items": 5,
   "generated_by": "suite/parity/reads.py",
-  "last_verified": "16a48e1 2026-08-29",
+  "last_verified": "",
   "rows": {
     "GET /Albums/{itemId}/Similar": {
       "classification": "ok",
@@ -104,6 +104,12 @@
       "note": "0/1 clean; mismatch:1 missing:4 extra:0 | CanDelete(J=true H=false)",
       "verification_method": "body-diff"
     },
+    "GET /Audio/{itemId}/Lyrics": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "3/3 clean; 57 field(s) compared",
+      "verification_method": "body-diff"
+    },
     "GET /Devices/Info": {
       "classification": "ok",
       "deep_verified": true,
@@ -165,22 +171,26 @@
       "classification": "flagged: read diff vs Jellyfin (verify)",
       "deep_verified": false,
       "diffs": {
-        "extra": [
-          "Items[Path=/media/synth/movies/Movie 0001 (2020)/Movie 0001 (2020).mkv].CommunityRating",
-          "Items[Path=/media/synth/movies/Movie 0001 (2020)/Movie 0001 (2020).mkv].OfficialRating",
-          "Items[Path=/media/synth/movies/Movie 0001 (2020)/Movie 0001 (2020).mkv].OriginalTitle",
-          "Items[Path=/media/synth/movies/Movie 0001 (2020)/Movie 0001 (2020).mkv].PremiereDate"
-        ],
+        "extra": [],
         "mismatch": [
           "Items[Path=/media/synth/movies/Movie 0001 (2020)/Movie 0001 (2020).mkv].BackdropImageTags[]",
-          "Items[Path=/media/synth/movies/Movie 0001 (2020)/Movie 0001 (2020).mkv].UserData.LastPlayedDate",
-          "TotalRecordCount"
+          "Items[Path=/media/synth/movies/Movie 0001 (2020)/Movie 0001 (2020).mkv].UserData.PlayCount",
+          "Items[Path=/media/synth/movies/Movie 0001 (2020)/Movie 0001 (2020).mkv].UserData.Played",
+          "TotalRecordCount",
+          "_ItemNameOrder[3]",
+          "_ItemNameOrder[4]",
+          "_ItemNameOrder[]"
         ],
         "missing": [
-          "Items[Path=/media/synth/movies/Movie 0001 (2020)/Movie 0001 (2020).mkv].UserData.Likes"
+          "Items[Name=Collections].CollectionType",
+          "Items[Name=ParityCRUD] (whole item)",
+          "Items[Name=Recordings] (whole item)",
+          "Items[Path=/media/synth/movies/Movie 0001 (2020)/Movie 0001 (2020).mkv].UserData.LastPlayedDate",
+          "Items[Path=/media/synth/movies/Movie 0001 (2020)/Movie 0001 (2020).mkv].UserData.Likes",
+          "Items[Path=/media/synth/movies/Movie 0001 (2020)/Movie 0001 (2020).mkv].UserData.Rating"
         ]
       },
-      "note": "0/1 clean; mismatch:3 missing:1 extra:4 | Items[Path=/media/synth/movies/Movie 0001 (2020)/Movie 0001 (2020).mkv].UserData.LastPlayedDate(J=\"2026-08-30T05:15:38.789227Z\" H=\"2026-08-30T05:15:27.960211Z\"); Items[Path=/media/synth/movies/Movie 0001 (2020)/Movie 0001 (2020).mkv].BackdropImageTags[](J=len 2 H=len 0); TotalRecordCount(J=503 H=500)",
+      "note": "0/2 clean; mismatch:8 missing:6 extra:0 | Items[Path=/media/synth/movies/Movie 0001 (2020)/Movie 0001 (2020).mkv].BackdropImageTags[](J=len 3 H=len 0); Items[Path=/media/synth/movies/Movie 0001 (2020)/Movie 0001 (2020).mkv].UserData.PlayCount(J=2 H=0); Items[Path=/media/synth/movies/Movie 0001 (2020)/Movie 0001 (2020).mkv].UserData.Played(J=true H=false)",
       "verification_method": "body-diff"
     },
     "GET /Items/Filters": {
@@ -192,12 +202,12 @@
           "Genres[3]",
           "Genres[4]",
           "Genres[]",
-          "OfficialRatings[]",
+          "Tags[]",
           "Years[]"
         ],
         "missing": []
       },
-      "note": "0/1 clean; mismatch:5 missing:0 extra:0 | Genres[](J=len 6 H=len 5); Genres[3](J=\"News\" H=\"SciFi\"); Genres[4](J=\"SciFi\" H=\"Thriller\")",
+      "note": "0/1 clean; mismatch:5 missing:0 extra:0 | Years[](J=len 2 H=len 1); Genres[](J=len 6 H=len 5); Genres[3](J=\"News\" H=\"SciFi\")",
       "verification_method": "body-diff"
     },
     "GET /Items/Filters2": {
@@ -225,31 +235,22 @@
           " (whole item)"
         ]
       },
-      "note": "0/1 clean; mismatch:0 missing:3 extra:3 | ",
+      "note": "0/1 clean; mismatch:0 missing:9 extra:9 | ",
       "verification_method": "body-diff"
     },
     "GET /Items/Suggestions": {
       "classification": "flagged: read diff vs Jellyfin (verify)",
       "deep_verified": false,
       "diffs": {
-        "extra": [
-          "Items[Path=/media/synth/movies/Movie 0001 (2020)/Movie 0001 (2020).mkv].CommunityRating",
-          "Items[Path=/media/synth/movies/Movie 0001 (2020)/Movie 0001 (2020).mkv].ExternalUrls[Name=TMDB] (whole item)",
-          "Items[Path=/media/synth/movies/Movie 0001 (2020)/Movie 0001 (2020).mkv].OfficialRating",
-          "Items[Path=/media/synth/movies/Movie 0001 (2020)/Movie 0001 (2020).mkv].OriginalTitle",
-          "Items[Path=/media/synth/movies/Movie 0001 (2020)/Movie 0001 (2020).mkv].Overview",
-          "Items[Path=/media/synth/movies/Movie 0001 (2020)/Movie 0001 (2020).mkv].PremiereDate",
-          "Items[Path=/media/synth/movies/Movie 0001 (2020)/Movie 0001 (2020).mkv].ProviderIds.Tmdb"
-        ],
+        "extra": [],
         "mismatch": [
           "Items[Path=/media/synth/movies/Movie 0001 (2020)/Movie 0001 (2020).mkv].BackdropImageTags[]",
-          "Items[Path=/media/synth/movies/Movie 0001 (2020)/Movie 0001 (2020).mkv].LockData",
           "Items[Path=/media/synth/movies/Movie 0001 (2020)/Movie 0001 (2020).mkv].MediaSources[Path=/media/synth/movies/Movie 0001 (2020)/Movie 0001 (2020).mkv].Bitrate",
           "Items[Path=/media/synth/movies/Movie 0001 (2020)/Movie 0001 (2020).mkv].MediaSources[Path=/media/synth/movies/Movie 0001 (2020)/Movie 0001 (2020).mkv].MediaStreams[0].BitRate",
           "Items[Path=/media/synth/movies/Movie 0001 (2020)/Movie 0001 (2020).mkv].MediaStreams[0].BitRate",
-          "Items[Path=/media/synth/movies/Movie 0001 (2020)/Movie 0001 (2020).mkv].PrimaryImageAspectRatio",
-          "Items[Path=/media/synth/movies/Movie 0001 (2020)/Movie 0001 (2020).mkv].Taglines[]",
-          "Items[Path=/media/synth/movies/Movie 0001 (2020)/Movie 0001 (2020).mkv].UserData.LastPlayedDate",
+          "Items[Path=/media/synth/movies/Movie 0001 (2020)/Movie 0001 (2020).mkv].Tags[]",
+          "Items[Path=/media/synth/movies/Movie 0001 (2020)/Movie 0001 (2020).mkv].UserData.PlayCount",
+          "Items[Path=/media/synth/movies/Movie 0001 (2020)/Movie 0001 (2020).mkv].UserData.Played",
           "Items[Path=/media/synth/movies/Movie 0002 (2020)/Movie 0002 (2020).mkv].MediaSources[Path=/media/synth/movies/Movie 0002 (2020)/Movie 0002 (2020).mkv].Bitrate",
           "Items[Path=/media/synth/movies/Movie 0002 (2020)/Movie 0002 (2020).mkv].MediaSources[Path=/media/synth/movies/Movie 0002 (2020)/Movie 0002 (2020).mkv].MediaStreams[0].BitRate",
           "Items[Path=/media/synth/movies/Movie 0002 (2020)/Movie 0002 (2020).mkv].MediaStreams[0].BitRate",
@@ -1821,24 +1822,29 @@
           "Items[Path=/config/data/livetv/recordings/Parity Show 00 on parity1/Parity Show 00 on parity1 2026_08_30_02_00_00.ts] (whole item)",
           "Items[Path=/config/data/livetv/recordings/Parity Show 02 on parity1/Parity Show 02 on parity1 2026_08_30_04_00_00.ts] (whole item)",
           "Items[Path=/config/data/livetv/recordings/Parity Show 03 on parity1/Parity Show 03 on parity1 2026_08_30_05_00_00.ts] (whole item)",
+          "Items[Path=/config/data/livetv/recordings/Parity Show 15 on parity1/Parity Show 15 on parity1 2026_08_30_17_00_00.ts] (whole item)",
+          "Items[Path=/config/data/livetv/recordings/Parity Show 16 on parity1/Parity Show 16 on parity1 2026_08_30_18_00_00 - 1 - 2.ts] (whole item)",
+          "Items[Path=/config/data/livetv/recordings/Parity Show 16 on parity1/Parity Show 16 on parity1 2026_08_30_18_00_00 - 1.ts] (whole item)",
+          "Items[Path=/config/data/livetv/recordings/Parity Show 16 on parity1/Parity Show 16 on parity1 2026_08_30_18_00_00.ts] (whole item)",
+          "Items[Path=/config/data/livetv/recordings/Parity Show 18 on parity1/Parity Show 18 on parity1 2026_08_30_20_00_00.ts] (whole item)",
+          "Items[Path=/config/data/livetv/recordings/Parity Show 21 on parity1/Parity Show 21 on parity1 2026_08_30_23_00_00.ts] (whole item)",
+          "Items[Path=/media/synth/movies/Movie 0001 (2020)/Movie 0001 (2020).mkv].UserData.LastPlayedDate",
           "Items[Path=/media/synth/movies/Movie 0001 (2020)/Movie 0001 (2020).mkv].UserData.Likes",
+          "Items[Path=/media/synth/movies/Movie 0001 (2020)/Movie 0001 (2020).mkv].UserData.Rating",
           "Items[Path=/media/synth/music/Artist 01/Album 01/01 - Artist 01 Album 01 Track 01.flac].HasLyrics",
           "Items[Path=/media/synth/music/Artist 01/Album 01/02 - Artist 01 Album 01 Track 02.flac].HasLyrics",
           "Items[Path=/media/synth/music/Artist 01/Album 01/03 - Artist 01 Album 01 Track 03.flac].HasLyrics",
           "Items[Path=/media/synth/music/Artist 01/Album 01].CumulativeRunTimeTicks",
-          "Items[Path=/media/synth/music/Artist 01/Album 01].RecursiveItemCount",
           "Items[Path=/media/synth/music/Artist 01] (whole item)",
           "Items[Path=/media/synth/music/Artist 02/Album 01/01 - Artist 02 Album 01 Track 01.flac].HasLyrics",
           "Items[Path=/media/synth/music/Artist 02/Album 01/02 - Artist 02 Album 01 Track 02.flac].HasLyrics",
           "Items[Path=/media/synth/music/Artist 02/Album 01/03 - Artist 02 Album 01 Track 03.flac].HasLyrics",
           "Items[Path=/media/synth/music/Artist 02/Album 01].CumulativeRunTimeTicks",
-          "Items[Path=/media/synth/music/Artist 02/Album 01].RecursiveItemCount",
           "Items[Path=/media/synth/music/Artist 02] (whole item)",
           "Items[Path=/media/synth/music/Artist 03/Album 01/01 - Artist 03 Album 01 Track 01.flac].HasLyrics",
           "Items[Path=/media/synth/music/Artist 03/Album 01/02 - Artist 03 Album 01 Track 02.flac].HasLyrics",
           "Items[Path=/media/synth/music/Artist 03/Album 01/03 - Artist 03 Album 01 Track 03.flac].HasLyrics",
           "Items[Path=/media/synth/music/Artist 03/Album 01].CumulativeRunTimeTicks",
-          "Items[Path=/media/synth/music/Artist 03/Album 01].RecursiveItemCount",
           "Items[Path=/media/synth/music/Artist 03] (whole item)",
           "Items[Path=/media/synth/tv/Series 01/Season 01/Series 01 S01E01.mkv].MediaSources[Path=/media/synth/tv/Series 01/Season 01/Series 01 S01E01.mkv].MediaStreams[0].BitRate",
           "Items[Path=/media/synth/tv/Series 01/Season 01/Series 01 S01E01.mkv].MediaStreams[0].BitRate",
@@ -1852,64 +1858,47 @@
           "Items[Path=/media/synth/tv/Series 01/Season 01/Series 01 S01E03.mkv].MediaStreams[0].BitRate",
           "Items[Path=/media/synth/tv/Series 01/Season 01/Series 01 S01E03.mkv].SeriesStudio",
           "Items[Path=/media/synth/tv/Series 01/Season 01/Series 01 S01E03.mkv].Trickplay.8e6958d96fff9f4f1ebbe2b55945c691",
-          "Items[Path=/media/synth/tv/Series 01].RecursiveItemCount",
           "Items[Path=/media/synth/tv/Series 01].UserData.PlayedPercentage",
           "Items[Path=/media/synth/tv/Series 02/Season 01/Series 02 S01E01.mkv].SeriesStudio",
           "Items[Path=/media/synth/tv/Series 02/Season 01/Series 02 S01E02.mkv].SeriesStudio",
           "Items[Path=/media/synth/tv/Series 02/Season 01/Series 02 S01E03.mkv].SeriesStudio",
-          "Items[Path=/media/synth/tv/Series 02].RecursiveItemCount",
           "Items[Path=/media/synth/tv/Series 02].UserData.PlayedPercentage",
           "Items[Path=/media/synth/tv/Series 03/Season 01/Series 03 S01E01.mkv].SeriesStudio",
           "Items[Path=/media/synth/tv/Series 03/Season 01/Series 03 S01E02.mkv].SeriesStudio",
           "Items[Path=/media/synth/tv/Series 03/Season 01/Series 03 S01E03.mkv].SeriesStudio",
-          "Items[Path=/media/synth/tv/Series 03].RecursiveItemCount",
           "Items[Path=/media/synth/tv/Series 03].UserData.PlayedPercentage",
           "Items[Path=/media/synth/tv/Series 04/Season 01/Series 04 S01E01.mkv].SeriesStudio",
           "Items[Path=/media/synth/tv/Series 04/Season 01/Series 04 S01E02.mkv].SeriesStudio",
           "Items[Path=/media/synth/tv/Series 04/Season 01/Series 04 S01E03.mkv].SeriesStudio",
-          "Items[Path=/media/synth/tv/Series 04].RecursiveItemCount",
           "Items[Path=/media/synth/tv/Series 04].UserData.PlayedPercentage",
           "Items[Path=/media/synth/tv/Series 05/Season 01/Series 05 S01E01.mkv].SeriesStudio",
           "Items[Path=/media/synth/tv/Series 05/Season 01/Series 05 S01E02.mkv].SeriesStudio",
           "Items[Path=/media/synth/tv/Series 05/Season 01/Series 05 S01E03.mkv].SeriesStudio",
-          "Items[Path=/media/synth/tv/Series 05].RecursiveItemCount",
           "Items[Path=/media/synth/tv/Series 05].UserData.PlayedPercentage",
           "Items[Path=/media/synth/tv/Series 06/Season 01/Series 06 S01E01.mkv].SeriesStudio",
           "Items[Path=/media/synth/tv/Series 06/Season 01/Series 06 S01E02.mkv].SeriesStudio",
           "Items[Path=/media/synth/tv/Series 06/Season 01/Series 06 S01E03.mkv].SeriesStudio",
-          "Items[Path=/media/synth/tv/Series 06].RecursiveItemCount",
           "Items[Path=/media/synth/tv/Series 06].UserData.PlayedPercentage",
           "Items[Path=/media/synth/tv/Series 07/Season 01/Series 07 S01E01.mkv].SeriesStudio",
           "Items[Path=/media/synth/tv/Series 07/Season 01/Series 07 S01E02.mkv].SeriesStudio",
           "Items[Path=/media/synth/tv/Series 07/Season 01/Series 07 S01E03.mkv].SeriesStudio",
-          "Items[Path=/media/synth/tv/Series 07].RecursiveItemCount",
           "Items[Path=/media/synth/tv/Series 07].UserData.PlayedPercentage",
           "Items[Path=/media/synth/tv/Series 08/Season 01/Series 08 S01E01.mkv].SeriesStudio",
           "Items[Path=/media/synth/tv/Series 08/Season 01/Series 08 S01E02.mkv].SeriesStudio",
           "Items[Path=/media/synth/tv/Series 08/Season 01/Series 08 S01E03.mkv].SeriesStudio",
-          "Items[Path=/media/synth/tv/Series 08].RecursiveItemCount",
           "Items[Path=/media/synth/tv/Series 08].UserData.PlayedPercentage"
         ]
       },
-      "note": "0/8 clean; mismatch:1575 missing:73 extra:7 | Items[Path=/media/synth/movies/Movie 0009 (2020)/Movie 0009 (2020).mkv].MediaStreams[0].BitRate(J=6061020 H=5869020); Items[Path=/media/synth/movies/Movie 0009 (2020)/Movie 0009 (2020).mkv].MediaSources[Path=/media/synth/movies/Movie 0009 (2020)/Movie 0009 (2020).mkv].Bitrate(J=6253020 H=6061020); Items[Path=/media/synth/movies/Movie 0009 (2020)/Movie 0009 (2020).mkv].MediaSources[Path=/media/synth/movies/Movie 0009 (2020)/Movie 0009 (2020).mkv].MediaStreams[0].BitRate(J=6061020 H=5869020)",
+      "note": "0/8 clean; mismatch:1574 missing:70 extra:0 | TotalRecordCount(J=509 H=500); Items[Path=/media/synth/movies/Movie 0312 (2020)/Movie 0312 (2020).mkv].MediaStreams[0].BitRate(J=6061020 H=5869020); Items[Path=/media/synth/movies/Movie 0312 (2020)/Movie 0312 (2020).mkv].MediaSources[Path=/media/synth/movies/Movie 0312 (2020)/Movie 0312 (2020).mkv].Bitrate(J=6253020 H=6061020)",
       "verification_method": "body-diff"
     },
     "GET /Items/{itemId}": {
       "classification": "flagged: read diff vs Jellyfin (verify)",
       "deep_verified": false,
       "diffs": {
-        "extra": [
-          "CommunityRating",
-          "ExternalUrls[Name=TMDB] (whole item)",
-          "OfficialRating",
-          "OriginalTitle",
-          "Overview",
-          "PremiereDate",
-          "ProviderIds.Tmdb"
-        ],
+        "extra": [],
         "mismatch": [
           "BackdropImageTags[]",
-          "LockData",
           "MediaSources[Path=/media/synth/movies/Movie 0001 (2020)/Movie 0001 (2020).mkv].Bitrate",
           "MediaSources[Path=/media/synth/movies/Movie 0001 (2020)/Movie 0001 (2020).mkv].MediaStreams[0].BitRate",
           "MediaSources[Path=/media/synth/movies/Movie 0002 (2020)/Movie 0002 (2020).mkv].Bitrate",
@@ -1921,15 +1910,17 @@
           "MediaSources[Path=/media/synth/movies/Movie 0005 (2020)/Movie 0005 (2020).mkv].Bitrate",
           "MediaSources[Path=/media/synth/movies/Movie 0005 (2020)/Movie 0005 (2020).mkv].MediaStreams[0].BitRate",
           "MediaStreams[0].BitRate",
-          "PrimaryImageAspectRatio",
-          "Taglines[]",
-          "UserData.LastPlayedDate"
+          "Tags[]",
+          "UserData.PlayCount",
+          "UserData.Played"
         ],
         "missing": [
-          "UserData.Likes"
+          "UserData.LastPlayedDate",
+          "UserData.Likes",
+          "UserData.Rating"
         ]
       },
-      "note": "0/5 clean; mismatch:20 missing:1 extra:7 | UserData.LastPlayedDate(J=\"2026-08-30T05:15:38.789227Z\" H=\"2026-08-30T05:15:27.960211Z\"); Taglines[](J=len 0 H=len 1); MediaStreams[0].BitRate(J=6061020 H=5869020)",
+      "note": "0/5 clean; mismatch:19 missing:3 extra:0 | BackdropImageTags[](J=len 3 H=len 0); UserData.PlayCount(J=2 H=0); UserData.Played(J=true H=false)",
       "verification_method": "body-diff"
     },
     "GET /Items/{itemId}/Ancestors": {
@@ -1937,27 +1928,29 @@
       "deep_verified": false,
       "diffs": {
         "extra": [],
-        "mismatch": [],
+        "mismatch": [
+          "ChildCount",
+          "PrimaryImageAspectRatio",
+          "RecursiveItemCount"
+        ],
         "missing": [
           "PrimaryImageAspectRatio"
         ]
       },
-      "note": "0/5 clean; mismatch:0 missing:5 extra:0 | ",
+      "note": "0/6 clean; mismatch:8 missing:5 extra:0 | [Path=/config/root/default].ChildCount(J=7 H=5); [Path=/config/root/default].ChildCount(J=7 H=5); [Path=/config/root/default].ChildCount(J=7 H=5)",
       "verification_method": "body-diff"
     },
     "GET /Items/{itemId}/Images": {
       "classification": "flagged: read diff vs Jellyfin (verify)",
       "deep_verified": false,
       "diffs": {
-        "extra": [
-          " (whole item)"
-        ],
+        "extra": [],
         "mismatch": [],
         "missing": [
           " (whole item)"
         ]
       },
-      "note": "4/5 clean; mismatch:0 missing:3 extra:1 | ",
+      "note": "4/5 clean; mismatch:0 missing:3 extra:0 | ",
       "verification_method": "body-diff"
     },
     "GET /Items/{itemId}/PlaybackInfo": {
@@ -2019,16 +2012,19 @@
       "deep_verified": false,
       "diffs": {
         "extra": [
-          "Items[Path=/config/data/collections] (whole item)",
-          "Items[Path=/config/root/default/Movies (synth) Renamed] (whole item)"
+          "Items[Path=/config/data/collections] (whole item)"
         ],
-        "mismatch": [],
+        "mismatch": [
+          "TotalRecordCount"
+        ],
         "missing": [
           "Items[Path=/config/root/default/Collections] (whole item)",
+          "Items[Path=/config/root/default/Movies (synth)].PrimaryImageAspectRatio",
+          "Items[Path=/config/root/default/ParityCRUD] (whole item)",
           "Items[Path=/config/root/default/Recordings] (whole item)"
         ]
       },
-      "note": "0/1 clean; mismatch:0 missing:2 extra:2 | ",
+      "note": "0/1 clean; mismatch:1 missing:4 extra:1 | TotalRecordCount(J=7 H=5)",
       "verification_method": "body-diff"
     },
     "GET /Library/VirtualFolders": {
@@ -2046,6 +2042,12 @@
       "note": "0/1 clean; mismatch:1 missing:2 extra:0 | [Name=Shows (synth)].LibraryOptions.EnableTrickplayImageExtraction(J=true H=false)",
       "verification_method": "body-diff"
     },
+    "GET /LiveTv/ChannelMappingOptions": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "1/1 clean; 9 field(s) compared",
+      "verification_method": "body-diff"
+    },
     "GET /LiveTv/Channels": {
       "classification": "flagged: read diff vs Jellyfin (verify)",
       "deep_verified": false,
@@ -2057,7 +2059,7 @@
         ],
         "missing": []
       },
-      "note": "0/1 clean; mismatch:2 missing:0 extra:0 | Items[Name=Parity One].CurrentProgram.ChannelId(J=\"d53240a11ffc0b1a0c165896a3bdf7f4\" H=\"d692e56104035bb9b74a3745fb590e5c\"); Items[Name=Parity Two].CurrentProgram.ChannelId(J=\"dcd04dcd7fa074c3b728a1fa49acd10e\" H=\"92829bc026055492b1bf3ae2720f302e\")",
+      "note": "0/1 clean; mismatch:2 missing:0 extra:0 | Items[Name=Parity Two].CurrentProgram.ChannelId(J=\"dcd04dcd7fa074c3b728a1fa49acd10e\" H=\"d2edd01e2c875f7b9b8fbd7e8f5cdabe\"); Items[Name=Parity One].CurrentProgram.ChannelId(J=\"d53240a11ffc0b1a0c165896a3bdf7f4\" H=\"d8bfd5e0938050d8830ed2b266a40cec\")",
       "verification_method": "body-diff"
     },
     "GET /LiveTv/Channels/{channelId}": {
@@ -2070,7 +2072,7 @@
         ],
         "missing": []
       },
-      "note": "0/1 clean; mismatch:1 missing:0 extra:0 | CurrentProgram.ChannelId(J=\"d53240a11ffc0b1a0c165896a3bdf7f4\" H=\"d692e56104035bb9b74a3745fb590e5c\")",
+      "note": "0/1 clean; mismatch:1 missing:0 extra:0 | CurrentProgram.ChannelId(J=\"d53240a11ffc0b1a0c165896a3bdf7f4\" H=\"d8bfd5e0938050d8830ed2b266a40cec\")",
       "verification_method": "body-diff"
     },
     "GET /LiveTv/Info": {
@@ -2086,17 +2088,23 @@
       "note": "0/1 clean; mismatch:1 missing:0 extra:0 | EnabledUsers[0](J=\"f1157c8014ce44d0a9a727425c70ab6c\" H=\"97d64b44480d4afcabbc6c2cbe1c101d\")",
       "verification_method": "body-diff"
     },
+    "GET /LiveTv/ListingProviders/Lineups": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "1/1 clean; 2 field(s) compared",
+      "verification_method": "body-diff"
+    },
     "GET /LiveTv/Programs": {
       "classification": "flagged: read diff vs Jellyfin (verify)",
       "deep_verified": false,
       "diffs": {
         "extra": [],
         "mismatch": [
-          "Items[Name=Parity Show 03 on parity1].ChannelId"
+          "Items[Name=Parity Show 22 on parity1].ChannelId"
         ],
         "missing": []
       },
-      "note": "0/1 clean; mismatch:1 missing:0 extra:0 | Items[Name=Parity Show 03 on parity1].ChannelId(J=\"d53240a11ffc0b1a0c165896a3bdf7f4\" H=\"d692e56104035bb9b74a3745fb590e5c\")",
+      "note": "0/1 clean; mismatch:1 missing:0 extra:0 | Items[Name=Parity Show 22 on parity1].ChannelId(J=\"d53240a11ffc0b1a0c165896a3bdf7f4\" H=\"d8bfd5e0938050d8830ed2b266a40cec\")",
       "verification_method": "body-diff"
     },
     "GET /LiveTv/Programs/Recommended": {
@@ -2105,12 +2113,12 @@
       "diffs": {
         "extra": [],
         "mismatch": [
-          "Items[Name=Parity Show 03 on parity1].ChannelId",
-          "Items[Name=Parity Show 03 on parity2].ChannelId"
+          "Items[Name=Parity Show 22 on parity1].ChannelId",
+          "Items[Name=Parity Show 22 on parity2].ChannelId"
         ],
         "missing": []
       },
-      "note": "0/1 clean; mismatch:2 missing:0 extra:0 | Items[Name=Parity Show 03 on parity2].ChannelId(J=\"dcd04dcd7fa074c3b728a1fa49acd10e\" H=\"92829bc026055492b1bf3ae2720f302e\"); Items[Name=Parity Show 03 on parity1].ChannelId(J=\"d53240a11ffc0b1a0c165896a3bdf7f4\" H=\"d692e56104035bb9b74a3745fb590e5c\")",
+      "note": "0/1 clean; mismatch:2 missing:0 extra:0 | Items[Name=Parity Show 22 on parity1].ChannelId(J=\"d53240a11ffc0b1a0c165896a3bdf7f4\" H=\"d8bfd5e0938050d8830ed2b266a40cec\"); Items[Name=Parity Show 22 on parity2].ChannelId(J=\"dcd04dcd7fa074c3b728a1fa49acd10e\" H=\"d2edd01e2c875f7b9b8fbd7e8f5cdabe\")",
       "verification_method": "body-diff"
     },
     "GET /LiveTv/Timers/Defaults": {
@@ -2142,35 +2150,13 @@
       "classification": "flagged: read diff vs Jellyfin (verify)",
       "deep_verified": false,
       "diffs": {
-        "extra": [
-          "Items[Name=Movie 0031] (whole item)",
-          "Items[Name=Movie 0061] (whole item)",
-          "Items[Name=Movie 0091] (whole item)",
-          "Items[Name=Movie 0121] (whole item)",
-          "Items[Name=Movie 0151] (whole item)",
-          "Items[Name=Movie 0181] (whole item)",
-          "Items[Name=Movie 0211] (whole item)",
-          "Items[Name=Movie 0241] (whole item)"
-        ],
+        "extra": [],
         "mismatch": [
           ""
         ],
-        "missing": [
-          "Items[Name=Movie 0001] (whole item)",
-          "Items[Name=Movie 0002] (whole item)",
-          "Items[Name=Movie 0003] (whole item)",
-          "Items[Name=Movie 0004] (whole item)",
-          "Items[Name=Movie 0005] (whole item)",
-          "Items[Name=Movie 0006] (whole item)",
-          "Items[Name=Movie 0007] (whole item)",
-          "Items[Name=Movie 0008] (whole item)",
-          "Items[Name=Movie 0009] (whole item)",
-          "Items[Name=Movie 0010] (whole item)",
-          "Items[Name=Movie 0011] (whole item)",
-          "Items[Name=Movie 0012] (whole item)"
-        ]
+        "missing": []
       },
-      "note": "0/1 clean; mismatch:1 missing:12 extra:8 | [](J=len 1 H=len 3)",
+      "note": "0/1 clean; mismatch:1 missing:0 extra:0 | [](J=len 1 H=len 0)",
       "verification_method": "body-diff"
     },
     "GET /Movies/{itemId}/Similar": {
@@ -2232,8 +2218,20 @@
           "Path"
         ]
       },
-      "note": "0/1 clean; mismatch:5 missing:1 extra:0 | ChildCount(J=0 H=4); Name(J=\"Action\" H=\"Ambient\"); SortName(J=\"action\" H=\"ambient\")",
+      "note": "0/1 clean; mismatch:5 missing:1 extra:0 | SortName(J=\"action\" H=\"ambient\"); ChildCount(J=0 H=4); SongCount(J=0 H=3)",
       "verification_method": "body-diff"
+    },
+    "GET /Packages": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "1/1 clean; 48 field(s) compared",
+      "verification_method": "body-diff"
+    },
+    "GET /Packages/{name}": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "1/1 clean; 17 field(s) compared (named invariants agreed; bodies not diffed)",
+      "verification_method": "property"
     },
     "GET /Persons": {
       "classification": "ok",
@@ -2256,10 +2254,23 @@
       "note": "0/1 clean; mismatch:1 missing:1 extra:0 | SortName(J=\"Alice Parity\" H=\"alice parity\")",
       "verification_method": "body-diff"
     },
-    "GET /ScheduledTasks/{taskId}": {
+    "GET /Repositories": {
       "classification": "ok",
       "deep_verified": true,
-      "note": "1/1 clean; 9 field(s) compared",
+      "note": "1/1 clean; 3 field(s) compared",
+      "verification_method": "body-diff"
+    },
+    "GET /ScheduledTasks/{taskId}": {
+      "classification": "flagged: read diff vs Jellyfin (verify)",
+      "deep_verified": false,
+      "diffs": {
+        "extra": [],
+        "mismatch": [
+          "LastExecutionResult.Status"
+        ],
+        "missing": []
+      },
+      "note": "0/1 clean; mismatch:1 missing:0 extra:0 | LastExecutionResult.Status(J=\"Completed\" H=\"Cancelled\")",
       "verification_method": "body-diff"
     },
     "GET /Search/Hints": {
@@ -2330,13 +2341,25 @@
           "SearchHints[19].RunTimeTicks"
         ]
       },
-      "note": "0/1 clean; mismatch:28 missing:12 extra:17 | SearchHints[9].Type(J=\"Person\" H=\"Genre\"); SearchHints[9].Name(J=\"Alice Parity\" H=\"Action\"); SearchHints[10].Artists[](J=len 0 H=len 1)",
+      "note": "0/1 clean; mismatch:28 missing:12 extra:17 | SearchHints[9].Name(J=\"Alice Parity\" H=\"Action\"); SearchHints[9].Type(J=\"Person\" H=\"Genre\"); SearchHints[10].Type(J=\"Person\" H=\"MusicAlbum\")",
       "verification_method": "body-diff"
     },
     "GET /Sessions": {
-      "classification": "ok",
-      "deep_verified": true,
-      "note": "1/1 clean; 32 field(s) compared",
+      "classification": "flagged: read diff vs Jellyfin (verify)",
+      "deep_verified": false,
+      "diffs": {
+        "extra": [
+          " (whole item)"
+        ],
+        "mismatch": [
+          "Capabilities.PlayableMediaTypes[]",
+          "PlayableMediaTypes[]"
+        ],
+        "missing": [
+          " (whole item)"
+        ]
+      },
+      "note": "0/1 clean; mismatch:2 missing:70 extra:1 | [Id=99672c734dfd07e1ac16eb5ec9e87d7b].Capabilities.PlayableMediaTypes[](J=len 1 H=len 0); [Id=99672c734dfd07e1ac16eb5ec9e87d7b].PlayableMediaTypes[](J=len 1 H=len 0)",
       "verification_method": "body-diff"
     },
     "GET /Shows/NextUp": {
@@ -2425,20 +2448,20 @@
       "deep_verified": false,
       "diffs": {
         "extra": [
-          "Items[Path=/config/data/collections] (whole item)",
-          "Items[Path=/config/root/default/Movies (synth) Renamed] (whole item)"
+          "Items[Path=/config/data/collections] (whole item)"
         ],
         "mismatch": [
           "TotalRecordCount"
         ],
         "missing": [
           "Items[Path=/config/metadata/views/134ea3dcf722741c8892ad56d425dd3c] (whole item)",
-          "Items[Path=/config/metadata/views/folders] (whole item)",
           "Items[Path=/config/root/default/Collections] (whole item)",
+          "Items[Path=/config/root/default/Movies (synth)].PrimaryImageAspectRatio",
+          "Items[Path=/config/root/default/ParityCRUD] (whole item)",
           "Items[Path=/config/root/default/Recordings] (whole item)"
         ]
       },
-      "note": "0/1 clean; mismatch:1 missing:4 extra:2 | TotalRecordCount(J=8 H=6)",
+      "note": "0/1 clean; mismatch:1 missing:5 extra:1 | TotalRecordCount(J=8 H=5)",
       "verification_method": "body-diff"
     },
     "GET /Users/Me": {

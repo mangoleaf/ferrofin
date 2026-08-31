@@ -20,6 +20,7 @@ Offline self-check:
   parity/journeys.py --check
 """
 import json
+import re
 import os
 import sys
 import time
@@ -104,6 +105,10 @@ JOURNEY_METHOD.update({op: verification.PROPERTY for op in (
 # deciding that it had earned it. `--check` now fails on an op that appears in no
 # list below.
 JOURNEY_METHOD.update({op: verification.EFFECT for op in (
+    # A scripted login, then that login's own two activity rows read back — the
+    # order, the severity and the ShortOverview are compared per server, never
+    # against each other's bodies (Date/Id are per-run).
+    "GET /System/ActivityLog/Entries",
     "DELETE /Audio/{itemId}/Lyrics",
     "DELETE /Auth/Keys/{key}",
     "DELETE /Collections/{collectionId}/Items",
@@ -1802,6 +1807,61 @@ def j_backup(base, token, user, _m, _m2):
     return r
 
 
+def j_activity_log(base, token, user, _m, _m2):
+    """Log a throwaway user in and check the pair of activity entries the login writes.
+
+    `GET /System/ActivityLog/Entries` cannot be body-diffed — `Date` and `Id` are
+    per-run — but for a SCRIPTED action the rest is fully determined, and this is
+    what the C# consumers specify:
+
+      * `SessionManager.AuthenticateNewSessionInternal` awaits `LogSessionActivity`
+        (which raises `SessionStarted`) BEFORE publishing the authentication
+        result, so the feed reads SessionStarted then AuthenticationSucceeded.
+        Ferrofin wrote AuthenticationSucceeded from the HTTP handler and spawned
+        the SessionStarted write, so the pair came out backwards.
+      * `AuthenticationSucceededLogger` / `SessionStartedLogger` both set
+        `ShortOverview = string.Format(LabelIpAddressValue, RemoteEndPoint)`,
+        i.e. "IP address: <ip>". Ferrofin passed `RemoteEndPoint = null` on the
+        authenticate request, so every entry's ShortOverview was null.
+      * Both are `LogLevel.Information` (only `AuthenticationFailed` is Error).
+
+    Run identically on both servers, so it is a property assertion, not a body
+    diff — the row is stamped `effect`."""
+    r = {}
+    name = "actlogprobe"
+    _, uraw = http("POST", f"{base}/Users/New", token,
+                   json.dumps({"Name": name, "Password": "Parity!123"}))
+    uid = json.loads(uraw).get("Id") if uraw else None
+    if not uid:
+        return r
+    try:
+        auth = auth_device(base, name, "Parity!123", "parity-actlog")
+        if not auth.get("AccessToken"):
+            return r
+        entries = (get_json(base, "/System/ActivityLog/Entries?limit=10", token)
+                   or {}).get("Items") or []
+        # The newest AuthenticationSucceeded for this probe user, and whatever
+        # the feed put immediately after it (the feed is DateCreated DESC, so
+        # "after" is "written before").
+        idx = next((i for i, e in enumerate(entries)
+                    if e.get("Type") == "AuthenticationSucceeded"
+                    and name in (e.get("Name") or "")), None)
+        ok = idx is not None and idx + 1 < len(entries)
+        if ok:
+            succeeded, started = entries[idx], entries[idx + 1]
+            ip_re = re.compile(r"^IP address: \S+$")
+            ok = (started.get("Type") == "SessionStarted"
+                  and name in (started.get("Name") or "")
+                  and succeeded.get("Severity") == "Information"
+                  and started.get("Severity") == "Information"
+                  and bool(ip_re.match(succeeded.get("ShortOverview") or ""))
+                  and bool(ip_re.match(started.get("ShortOverview") or "")))
+        r["GET /System/ActivityLog/Entries"] = bool(ok)
+    finally:
+        http("DELETE", f"{base}/Users/{uid}", token)
+    return r
+
+
 JOURNEYS = [j_startup,   # first: see its docstring
             j_favorites, j_played, j_rating, j_playlist, j_playlist_instant_mix,
             j_plugin_uninstall, j_collection, j_users, j_item_edit,
@@ -1815,6 +1875,8 @@ JOURNEYS = [j_startup,   # first: see its docstring
             j_authenticate, j_user_update, j_devices_delete, j_bulk_item_delete,
             j_subtitles_upload, j_lyrics, j_quickconnect, j_system_and_refresh,
             j_forgot_password, j_backup, j_livetv, j_livetv_admin, j_remote_subtitles,
+            j_forgot_password, j_backup, j_livetv, j_remote_subtitles,
+            j_activity_log,
             # Destructive: merges/splits the shared movies, so it must run LAST so its
             # mutations can't corrupt the items other journeys read/refresh.
             j_merge_versions_controller]

@@ -41,6 +41,7 @@ use uuid::Uuid;
 use wasmtime::component::{Component, Linker};
 use wasmtime::{Config as WasmConfig, Engine};
 
+use ferrofin_core::event_manager::consumer_done;
 use ferrofin_core::{
     FerrofinEventManager, PluginConfigPage, RegisteredPlugin, ScheduledTask, TaskProgress,
 };
@@ -550,7 +551,7 @@ impl WasmPluginHost {
                     event_name,
                     Arc::new(move |payload: &str| {
                         if plugin.runtime.is_dead() {
-                            return Ok(());
+                            return consumer_done();
                         }
                         // Fast path: a fresh enabled flag needs no manager read
                         // and no spawn — deliver (or skip) synchronously. This
@@ -559,7 +560,7 @@ impl WasmPluginHost {
                             if enabled {
                                 plugin.runtime.deliver_event(event_name, payload);
                             }
-                            return Ok(());
+                            return consumer_done();
                         }
                         // Slow path (once per TTL): refresh the flag off-thread
                         // (the manager call is async), cache it, then deliver.
@@ -576,7 +577,9 @@ impl WasmPluginHost {
                                 plugin.runtime.deliver_event(event_name, &payload);
                             }
                         });
-                        Ok(())
+                        // Plugin delivery is best-effort and must never hold up
+                        // the publisher, so the slow path stays spawned.
+                        consumer_done()
                     }),
                 );
             }

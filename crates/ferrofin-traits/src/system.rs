@@ -88,6 +88,17 @@ pub trait ServerApplicationHost: Send + Sync {
     /// The server's friendly (display) name.
     fn friendly_name(&self) -> String;
 
+    /// The application **product** name (`IApplicationHost.Name` →
+    /// `ApplicationHost.ApplicationProductName`).
+    ///
+    /// A build constant, **not** the instance friendly name: C#
+    /// `ApplicationHost.Name => ApplicationProductName` (the entry assembly's
+    /// `ProductName`), while `FriendlyName` is `Configuration.ServerName ??
+    /// Environment.MachineName`. `SystemManager.GetPublicSystemInfo` carries
+    /// both as distinct fields (`ProductName` / `ServerName`).
+    /// `GET`/`POST /System/Ping` and `PublicSystemInfo.ProductName` return this.
+    fn name(&self) -> String;
+
     /// Builds the best externally reachable API URL for a request.
     async fn get_smart_api_url(&self, request: &RequestContext) -> Result<String, ServiceError>;
 

@@ -1,8 +1,14 @@
 {
   "errors": {},
   "generated_by": "suite/parity/journeys.py",
-  "last_verified": "d9dc2ca 2026-08-29",
+  "last_verified": "",
   "rows": {
+    "DELETE /Audio/{itemId}/Lyrics": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
+    },
     "DELETE /Auth/Keys/{key}": {
       "classification": "ok",
       "deep_verified": true,
@@ -45,6 +51,12 @@
       "note": "H=True J=True (effect; bodies not diffed)",
       "verification_method": "effect"
     },
+    "DELETE /LiveTv/ListingProviders": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
+    },
     "DELETE /LiveTv/Recordings/{recordingId}": {
       "classification": "ok",
       "deep_verified": true,
@@ -52,6 +64,12 @@
       "verification_method": "effect"
     },
     "DELETE /LiveTv/Timers/{timerId}": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
+    },
+    "DELETE /LiveTv/TunerHosts": {
       "classification": "ok",
       "deep_verified": true,
       "note": "H=True J=True (effect; bodies not diffed)",
@@ -76,9 +94,9 @@
       "verification_method": "effect"
     },
     "DELETE /ScheduledTasks/Running/{taskId}": {
-      "classification": "ok",
-      "deep_verified": true,
-      "note": "H=True J=True (status-class; bodies not diffed)",
+      "classification": "flagged: Jellyfin read-back differed (verify: oracle setup or Ferrofin extra)",
+      "deep_verified": false,
+      "note": "H=True J=False (status-class; bodies not diffed)",
       "verification_method": "status-class"
     },
     "DELETE /Sessions/{sessionId}/User/{userId}": {
@@ -219,6 +237,12 @@
       "note": "H=True J=True (effect; bodies not diffed)",
       "verification_method": "effect"
     },
+    "POST /Audio/{itemId}/Lyrics": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
+    },
     "POST /Auth/Keys": {
       "classification": "ok",
       "deep_verified": true,
@@ -310,9 +334,9 @@
       "verification_method": "effect"
     },
     "POST /Library/VirtualFolders/Name": {
-      "classification": "ok",
-      "deep_verified": true,
-      "note": "H=True J=True (effect; bodies not diffed)",
+      "classification": "flagged: Jellyfin read-back differed (verify: oracle setup or Ferrofin extra)",
+      "deep_verified": false,
+      "note": "H=True J=False (effect; bodies not diffed)",
       "verification_method": "effect"
     },
     "POST /Library/VirtualFolders/Paths": {
@@ -339,6 +363,12 @@
       "note": "H=True J=True (effect; bodies not diffed)",
       "verification_method": "effect"
     },
+    "POST /LiveTv/ChannelMappings": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
+    },
     "POST /LiveTv/ListingProviders": {
       "classification": "ok",
       "deep_verified": true,
@@ -356,6 +386,12 @@
       "deep_verified": true,
       "note": "H=True J=True (effect; bodies not diffed)",
       "verification_method": "effect"
+    },
+    "POST /LiveTv/Tuners/{tunerId}/Reset": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True (status-class; bodies not diffed)",
+      "verification_method": "status-class"
     },
     "POST /MergeVersions/MergeEpisodes": {
       "classification": "flagged: write effect not observed on either server (likely corpus/setup)",
@@ -430,6 +466,12 @@
       "verification_method": "status-class"
     },
     "POST /QuickConnect/Initiate": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True (effect; bodies not diffed)",
+      "verification_method": "effect"
+    },
+    "POST /Repositories": {
       "classification": "ok",
       "deep_verified": true,
       "note": "H=True J=True (effect; bodies not diffed)",

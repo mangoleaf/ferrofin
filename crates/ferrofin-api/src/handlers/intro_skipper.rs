@@ -239,7 +239,7 @@ async fn plugin_version(state: &AppState) -> String {
 async fn scan_running(state: &AppState) -> Result<bool, ApiError> {
     Ok(state
         .tasks
-        .get_task(DETECT_TASK_KEY)
+        .get_task(&ferrofin_traits::tasks::task_id_for_key(DETECT_TASK_KEY))
         .await?
         .is_some_and(|t| t.state == TaskState::Running))
 }
@@ -785,7 +785,10 @@ async fn scan_season(
             "a scan is already in progress".to_owned(),
         ));
     }
-    state.tasks.start_task(DETECT_TASK_KEY).await?;
+    state
+        .tasks
+        .start_task(&ferrofin_traits::tasks::task_id_for_key(DETECT_TASK_KEY))
+        .await?;
     Ok(StatusCode::ACCEPTED)
 }
 

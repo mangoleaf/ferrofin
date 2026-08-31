@@ -56,8 +56,16 @@ pub struct StartFfMpegRequest<'a> {
     pub output_path: &'a Path,
     /// The fully-built ffmpeg arguments (`commandLineArguments`).
     pub arguments: Vec<String>,
-    /// The stderr log target for this transcode (`FFmpeg.Transcode-*.log`).
-    pub log_path: PathBuf,
+    /// The server's **log directory** (`ApplicationPaths.LogDirectoryPath`).
+    ///
+    /// [`start_ffmpeg`](TranscodeManagerImpl::start_ffmpeg) names the file
+    /// inside it exactly as `TranscodeManager.StartFfMpeg` does — see
+    /// [`ffmpeg_log_file_name`]. Putting the ffmpeg stderr log *there* rather
+    /// than beside the playlist is what makes it reachable from
+    /// `GET /System/Logs` and downloadable from the dashboard, which is the
+    /// whole point of the C# comment on that line ("let's put it in the log
+    /// directory").
+    pub log_dir: PathBuf,
     /// The process working directory, if any (`workingDirectory`).
     pub working_dir: Option<PathBuf>,
     /// Environment variables for the ffmpeg child, from the hardware input
@@ -253,6 +261,10 @@ struct RunningJob {
     /// The segment file extension (e.g. `.ts`), for diagnostics/index scans.
     #[allow(dead_code)]
     segment_extension: String,
+    /// Where this job's ffmpeg stderr is being written — inside the server's
+    /// log directory, so a diagnostic can name a file the operator can actually
+    /// fetch from `GET /System/Logs/Log`.
+    log_path: PathBuf,
 }
 
 /// A registered transcode job: its identifying [`TranscodingJobHandle`] plus the
@@ -424,11 +436,12 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
             state,
             output_path,
             arguments,
-            log_path,
+            log_dir,
             working_dir,
             env,
             hardware_acceleration_type,
         } = request;
+        let log_path = prepare_ffmpeg_log(&log_dir, state)?;
 
         // Identify the job on its span (inherited by every event below) and log
         // the start; the full ffmpeg arg vector is diagnostic but verbose → debug.
@@ -510,6 +523,7 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
                 output_dir: directory,
                 playlist_path: output_path.to_path_buf(),
                 segment_extension,
+                log_path: stderr_log.clone(),
             },
         );
 
@@ -621,7 +635,9 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
                 // WARN: the client just sees failed segment requests. Name it
                 // here, with the stderr tail, so the operator has a trail.
                 let code = self.with_running(handle, |r| r.child.exit_code()).flatten();
-                let log = playlist_path.with_extension("log");
+                let log = self
+                    .with_running(handle, |r| r.log_path.clone())
+                    .unwrap_or_default();
                 tracing::warn!(
                     segment = index,
                     exit_code = code.unwrap_or(-1),
@@ -895,6 +911,67 @@ fn segment_file_extension(segment_container: Option<&str>) -> String {
         Some(container) if container.eq_ignore_ascii_case("mp4") => ".mp4".to_owned(),
         _ => ".ts".to_owned(),
     }
+}
+
+/// Resolves this job's ffmpeg stderr log path inside `log_dir`, creating the
+/// directory first.
+///
+/// Upstream opens the `FileStream` directly on
+/// `ApplicationPaths.LogDirectoryPath`, which its Serilog sink has already
+/// created at boot; here the directory may not exist yet on a fresh install, and
+/// a missing one would fail the spawn.
+fn prepare_ffmpeg_log(log_dir: &Path, state: &EncodingJobInfo) -> Result<PathBuf, String> {
+    std::fs::create_dir_all(log_dir)
+        .map_err(|e| format!("create log dir {}: {e}", log_dir.display()))?;
+    let path = log_dir.join(ffmpeg_log_file_name(state));
+    tracing::debug!(log = %path.display(), "ffmpeg stderr log");
+    Ok(path)
+}
+
+/// The ffmpeg stderr log file name for `state`, inside the server log directory.
+///
+/// Port of the naming block of `TranscodeManager.StartFfMpeg`
+/// (`MediaBrowser.MediaEncoding/Transcoding/TranscodeManager.cs:450-467` at
+/// `v10.11.8`):
+///
+/// ```text
+/// var logFilePrefix = "FFmpeg.Transcode-";
+/// if (state.VideoRequest is not null && IsCopyCodec(state.OutputVideoCodec))
+///     logFilePrefix = IsCopyCodec(state.OutputAudioCodec) ? "FFmpeg.Remux-" : "FFmpeg.DirectStream-";
+/// if (state.VideoRequest is null && IsCopyCodec(state.OutputAudioCodec))
+///     logFilePrefix = "FFmpeg.Remux-";
+/// … $"{logFilePrefix}{DateTime.Now:yyyy-MM-dd_HH-mm-ss}_{state.Request.MediaSourceId}_{Guid.NewGuid().ToString()[..8]}.log"
+/// ```
+///
+/// Two faithful substitutions, both because the value C# reads does not exist
+/// under that name here: `state.VideoRequest is not null` is
+/// [`EncodingJobInfo::is_input_video`] (the same predicate the hardware-decode
+/// port already spells that way), and `Request.MediaSourceId` is read from the
+/// resolved `MediaSource.Id`, which is the id the request pinned.
+///
+/// `DateTime.Now` is **local** time upstream, and stays local here — these names
+/// are read by a human next to `log_*.log` files stamped the same way.
+#[must_use]
+pub fn ffmpeg_log_file_name(state: &EncodingJobInfo) -> String {
+    let video_copy = EncodingJobInfo::is_copy_codec(state.output_video_codec.as_deref());
+    let audio_copy = EncodingJobInfo::is_copy_codec(state.output_audio_codec.as_deref());
+    let prefix = if state.is_input_video && video_copy {
+        if audio_copy {
+            "FFmpeg.Remux-"
+        } else {
+            "FFmpeg.DirectStream-"
+        }
+    } else if !state.is_input_video && audio_copy {
+        "FFmpeg.Remux-"
+    } else {
+        "FFmpeg.Transcode-"
+    };
+    let stamp = chrono::Local::now().format("%Y-%m-%d_%H-%M-%S");
+    let media_source_id = state.media_source.id.clone().unwrap_or_default();
+    // `Guid.NewGuid().ToString()[..8]` — the first 8 chars of the dashed form,
+    // i.e. 8 hex digits, purely to keep two same-second jobs apart.
+    let unique: String = uuid::Uuid::new_v4().simple().to_string()[..8].to_owned();
+    format!("{prefix}{stamp}_{media_source_id}_{unique}.log")
 }
 
 /// How many trailing bytes of an ffmpeg stderr log [`stderr_log_tail`] reads.
@@ -1384,11 +1461,11 @@ mod start_ffmpeg_tests {
 
     use super::{
         FileCleaner, FsFileCleaner, HLS_PING_TIMEOUT_MS, NoopSessionReporter, StartFfMpegRequest,
-        TranscodeManagerImpl,
+        TranscodeManagerImpl, ffmpeg_log_file_name,
     };
 
-    /// Builds a `StartFfMpegRequest` for `state`/`output_path` with `args`, its
-    /// log alongside the playlist.
+    /// Builds a `StartFfMpegRequest` for `state`/`output_path` with `args`,
+    /// logging into the output directory (the real server passes its log dir).
     fn ffmpeg_req<'a>(
         state: &'a EncodingJobInfo,
         output_path: &'a Path,
@@ -1401,7 +1478,10 @@ mod start_ffmpeg_tests {
             state,
             output_path,
             arguments: args,
-            log_path: output_path.with_extension("log"),
+            log_dir: output_path
+                .parent()
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_default(),
             working_dir: None,
         }
     }
@@ -1440,6 +1520,100 @@ mod start_ffmpeg_tests {
 
     fn manager() -> TranscodeManagerImpl<NoopSessionReporter> {
         TranscodeManagerImpl::new(NoopSessionReporter)
+    }
+
+    #[test]
+    fn the_ffmpeg_log_name_is_jellyfins_prefix_stamp_source_unique() {
+        // `TranscodeManager.StartFfMpeg` (v10.11.8:450-467). The whole point of
+        // the name is that it lands in the LOG directory and is recognisable
+        // there: `GET /System/Logs` lists it and the dashboard downloads it.
+        let tmp = tempfile::tempdir().unwrap();
+        let playlist = tmp.path().join("out.m3u8");
+        let mut st = state(&playlist, None);
+        st.media_source = MediaSourceInfo {
+            id: Some("abc123".to_owned()),
+            ..MediaSourceInfo::default()
+        };
+
+        // Video job, nothing copied -> full transcode.
+        st.output_video_codec = Some("libx264".to_owned());
+        st.output_audio_codec = Some("aac".to_owned());
+        let name = ffmpeg_log_file_name(&st);
+        assert!(name.starts_with("FFmpeg.Transcode-"), "{name}");
+        assert_eq!(
+            std::path::Path::new(&name)
+                .extension()
+                .and_then(|e| e.to_str()),
+            Some("log"),
+            "{name}"
+        );
+        assert!(name.contains("_abc123_"), "{name}");
+        // {prefix}{yyyy-MM-dd_HH-mm-ss}_{mediaSourceId}_{8 hex}.log
+        let tail = name.trim_end_matches(".log");
+        let unique = tail.rsplit('_').next().unwrap();
+        assert_eq!(unique.len(), 8, "{name}");
+        assert!(unique.chars().all(|c| c.is_ascii_hexdigit()), "{name}");
+        let stamp = &name["FFmpeg.Transcode-".len()..]
+            ["FFmpeg.Transcode-".len() - "FFmpeg.Transcode-".len().."0000-00-00_00-00-00".len()];
+        // `yyyy-MM-dd_HH-mm-ss`, local time as `DateTime.Now` is.
+        assert_eq!(stamp.len(), 19, "{name}");
+        assert_eq!(&stamp[4..5], "-", "{name}");
+        assert_eq!(&stamp[10..11], "_", "{name}");
+
+        // Video copied, audio transcoded -> DirectStream.
+        st.output_video_codec = Some("copy".to_owned());
+        assert!(ffmpeg_log_file_name(&st).starts_with("FFmpeg.DirectStream-"));
+
+        // Both copied -> Remux.
+        st.output_audio_codec = Some("copy".to_owned());
+        assert!(ffmpeg_log_file_name(&st).starts_with("FFmpeg.Remux-"));
+
+        // Audio-only job with a copied audio stream -> Remux (the second C# if).
+        st.is_input_video = false;
+        st.output_video_codec = None;
+        assert!(ffmpeg_log_file_name(&st).starts_with("FFmpeg.Remux-"));
+
+        // Audio-only job that re-encodes -> Transcode.
+        st.output_audio_codec = Some("libmp3lame".to_owned());
+        assert!(ffmpeg_log_file_name(&st).starts_with("FFmpeg.Transcode-"));
+
+        // Two jobs in the same second do not collide.
+        assert_ne!(ffmpeg_log_file_name(&st), ffmpeg_log_file_name(&st));
+    }
+
+    #[tokio::test]
+    async fn the_stderr_log_lands_in_the_log_directory_not_beside_the_playlist() {
+        // The regression this pins: Ferrofin used to write
+        // `{playlist}.log` into the transcode temp dir, so `GET /System/Logs`
+        // never listed a single ffmpeg log and the dashboard could not download
+        // one — while Jellyfin's listing is full of `FFmpeg.Transcode-*.log`.
+        let tmp = tempfile::tempdir().unwrap();
+        let playlist = tmp.path().join("session").join("out.m3u8");
+        let logs = tmp.path().join("logs");
+        let fake = FakeSegmentTranscoder::new(FakeScript {
+            segment_files: vec!["out0.ts".to_owned()],
+            extra_files: vec!["out.m3u8".to_owned()],
+            ..FakeScript::default()
+        });
+        let m = manager();
+        let st = state(&playlist, None);
+        let mut req = ffmpeg_req(&st, &playlist, vec!["-i".to_owned()]);
+        req.log_dir = logs.clone();
+        m.start_ffmpeg(&fake, req).await.expect("start");
+
+        // The log directory was created (the real spawn opens the file there,
+        // the fake only records the request)…
+        assert!(logs.is_dir(), "log dir created");
+        // …the spawn was told to write into it, under Jellyfin's name…
+        let spawned = fake.requests.lock().unwrap();
+        assert_eq!(spawned.len(), 1);
+        let log_path = &spawned[0].log_path;
+        assert_eq!(log_path.parent(), Some(logs.as_path()), "{log_path:?}");
+        let name = log_path.file_name().unwrap().to_string_lossy();
+        assert!(name.starts_with("FFmpeg."), "{name}");
+        assert_eq!(log_path.extension().and_then(|e| e.to_str()), Some("log"));
+        // …and nothing shaped like a log sits next to the playlist any more.
+        assert!(!playlist.with_extension("log").exists());
     }
 
     #[tokio::test]

@@ -14,7 +14,9 @@ export PARITY_ENV="${PARITY_ENV:-.env.loop}"
 suite_load_env "$PARITY_ENV"
 suite_mint_device_id parity
 suite_build_libraries   # LIBRARIES is parsed by sweep.py
+suite_require_media
 suite_gen_fixtures
+suite_require_fixtures
 
 echo ">> starting both servers"
 docker compose down -v >/dev/null 2>&1 || true

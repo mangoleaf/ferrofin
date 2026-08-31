@@ -4378,12 +4378,30 @@ impl LibraryScanner {
             let Some(owner) = owner_for_extra(&path, &movies_by_dir) else {
                 continue; // an extra with no resolvable movie is skipped
             };
+            // The extra's item KIND comes from its extra type, per
+            // `ExtraResolver.GetResolversForExtraType` (v10.11.8), which is a
+            // three-way switch, not a two-way one:
+            //   ExtraType.Trailer   => _trailerResolvers  (GenericVideoResolver<Trailer>)
+            //   ExtraType.ThemeSong => null               ("For audio we'll have
+            //                          to rely on the AudioResolver, which is a
+            //                          'built-in'") — so a theme song is an
+            //                          AUDIO item, not a video one
+            //   _                   => _videoResolvers
+            // A `Trailer` is what makes a `-trailer.*` file visible to
+            // `GET /Trailers` and `/Items?includeItemTypes=Trailer`; an `Audio`
+            // theme song is what makes `/Items/{id}/ThemeMedia` return it under
+            // `ThemeSongsResult` rather than as a stray Video row.
+            let (kind, media_type) = match extra_type {
+                ferrofin_model::entities::ExtraType::Trailer => (BaseItemKind::Trailer, "Video"),
+                ferrofin_model::entities::ExtraType::ThemeSong => (BaseItemKind::Audio, "Audio"),
+                _ => (BaseItemKind::Video, "Video"),
+            };
             let Some((id, mut entity)) =
-                self.base_item(BaseItemKind::Video, cf, cf, file_stem(&path), &path, false)
+                self.base_item(kind, cf, cf, file_stem(&path), &path, false)
             else {
                 continue;
             };
-            entity.media_type = Some("Video".to_owned());
+            entity.media_type = Some(media_type.to_owned());
             entity.extra_type = Some(extra_type as i32);
             entity.owner_id = Some(guid_to_db(owner));
             out.push(Planned {
@@ -4422,10 +4440,18 @@ impl LibraryScanner {
                 self.collect_movie_plan(&entry.path, root, cf, naming, out, extras, movies_by_dir);
                 continue;
             }
-            if !video_resolver::is_video_file(&entry.path, naming) {
+            // Upstream resolves EXTRAS first, over every file in the folder —
+            // `ExtraRuleResolver` has audio rules as well as video ones
+            // (`theme.mp3` is `ExtraRuleType.Filename` + `MediaType.Audio`), and
+            // `ExtraResolver.GetResolversForExtraType` sends a ThemeSong to the
+            // AudioResolver. Gating on `is_video_file` alone dropped every audio
+            // extra on the floor, so a movie's theme song was never ingested at
+            // all.
+            let is_video = video_resolver::is_video_file(&entry.path, naming);
+            let is_audio = is_audio_file(&entry.path, naming);
+            if !is_video && !is_audio {
                 continue;
             }
-            // Extras never become movies (upstream resolves extras first).
             let extra = ferrofin_naming::video::extra_rule_resolver::get_extra_info(
                 &entry.path,
                 naming,
@@ -4433,6 +4459,11 @@ impl LibraryScanner {
             );
             if let Some(extra_type) = extra.extra_type {
                 extras.push((entry.path.clone(), extra_type));
+                continue;
+            }
+            // An audio file that matched no extra rule is not a movie: a
+            // soundtrack sitting beside the film belongs to a music library.
+            if !is_video {
                 continue;
             }
             let (clean_name, year) = video_resolver::resolve_file(Some(&entry.path), naming, None)
@@ -11409,7 +11440,7 @@ mod tests {
                 name,
                 Arc::new(move |payload: &str| {
                     sink.lock().unwrap().push(payload.to_owned());
-                    Ok(())
+                    crate::event_manager::consumer_done()
                 }),
             );
         }
@@ -12050,6 +12081,12 @@ mod tests {
         std::fs::write(folder.join("Heat (1995).mkv"), b"").unwrap();
         std::fs::write(folder.join("Heat (1995)-trailer.mkv"), b"").unwrap();
         std::fs::write(folder.join("trailers").join("alt.mkv"), b"").unwrap();
+        // …plus the other two arms of `GetResolversForExtraType`: a behind-the-
+        // scenes extra (`_videoResolvers` -> Video) and a theme song (`null` ->
+        // the AudioResolver -> Audio).
+        std::fs::create_dir_all(folder.join("behind the scenes")).unwrap();
+        std::fs::write(folder.join("behind the scenes").join("making-of.mkv"), b"").unwrap();
+        std::fs::write(folder.join("theme.mp3"), b"").unwrap();
 
         let (db, _cf) = scan_one(CollectionTypeOptions::movies, "Movies", &media).await;
 
@@ -12080,6 +12117,63 @@ mod tests {
             trailers.len(),
             2,
             "both trailer spellings attach to the movie"
+        );
+
+        // C# resolves an `ExtraType.Trailer` extra with
+        // `GenericVideoResolver<Trailer>`, so the row's item TYPE is Trailer —
+        // which is what `GET /Trailers` (and `/Items?includeItemTypes=Trailer`)
+        // filters on. Stored as `Video`, both routes returned nothing.
+        let by_kind = repo
+            .get_item_list(&InternalItemsQuery {
+                include_item_types: vec![BaseItemKind::Trailer],
+                ..Default::default()
+            })
+            .await
+            .expect("trailers by kind");
+        assert_eq!(
+            by_kind.len(),
+            2,
+            "both trailer spellings are Trailer-kind items"
+        );
+        let mut names: Vec<&str> = by_kind
+            .iter()
+            .map(|i| i.name.as_deref().unwrap_or(""))
+            .collect();
+        names.sort_unstable();
+        assert_eq!(names, vec!["Heat (1995)-trailer", "alt"]);
+
+        // A non-trailer, non-theme extra keeps the `Video` kind
+        // (`_videoResolvers`).
+        let videos = repo
+            .get_item_list(&InternalItemsQuery {
+                include_item_types: vec![BaseItemKind::Video],
+                ..Default::default()
+            })
+            .await
+            .expect("videos");
+        assert_eq!(
+            videos.len(),
+            1,
+            "the behind-the-scenes extra is the fixture's only Video-kind row"
+        );
+        assert_eq!(videos[0].media_type.as_deref(), Some("Video"));
+
+        // `ExtraType.ThemeSong => null` in `GetResolversForExtraType`, with the
+        // comment "we'll have to rely on the AudioResolver": a theme song is an
+        // AUDIO item. Kinded Video, it never reached `ThemeSongsResult` and sat
+        // in the library as a stray video row instead.
+        let audio = repo
+            .get_item_list(&InternalItemsQuery {
+                include_item_types: vec![BaseItemKind::Audio],
+                ..Default::default()
+            })
+            .await
+            .expect("audio");
+        assert_eq!(audio.len(), 1, "the theme song is an Audio row");
+        assert_eq!(audio[0].media_type.as_deref(), Some("Audio"));
+        assert_eq!(
+            audio[0].extra_type,
+            Some(ferrofin_model::entities::ExtraType::ThemeSong as i32)
         );
     }
 

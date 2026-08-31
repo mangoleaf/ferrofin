@@ -24,7 +24,9 @@ Offline self-check:
 import base64
 import json
 import os
+import re
 import sys
+import time
 import urllib.parse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -365,8 +367,70 @@ def read_signatures(base, token, c):
     # the moment those ids were registered.
     out["GET /Plugins/{pluginId}/{version}/Image"] = _plugin_image_signature(base, token)
     methods["GET /Plugins/{pluginId}/{version}/Image"] = SIG_STATUS_CLASS
+    # `GET /System/Logs` lists the host's OWN log files, and `LogFile` has only
+    # four fields — two of which (DateCreated/DateModified) are already VOLATILE.
+    # That leaves Name and Size, and both are irreducibly per-instance: Jellyfin's
+    # Serilog sink writes `log_YYYYMMDD.log` (`%JELLYFIN_LOG_DIR%//log_.log`,
+    # rollingInterval Day) while Ferrofin's tracing-appender writes
+    # `log.YYYY-MM-DD.log`, and Size is each server's own log volume. Because Name
+    # is parity_diff's array-align key, the sweep's diff can only ever report
+    # "(whole item)" on both sides. So the body CANNOT be diffed — but the
+    # declared SHAPE can, and no layer asserted it:
+    #   * the exact 4-key `LogFile` contract (the schema is additionalProperties:false);
+    #   * the `.txt`/`.log` extension filter (`ManagedFileSystem.GetFiles`) — the
+    #     Jellyfin container also holds a `.jellyfin-log` file, which must be absent;
+    #   * a bare filename, never a path;
+    #   * the C# ordering rule, `OrderByDescending(DateModified)
+    #     .ThenByDescending(DateCreated).ThenBy(Name)`.
+    # NOTE: the ordering clause is vacuous while a container holds a single log
+    # file; it becomes real after a day rollover. It is kept because it is the
+    # only cross-server statement of that rule the harness makes.
+    #
+    # …plus one fact about the listing's CONTENTS that a Name/Size diff cannot
+    # reach and the assertions above are blind to: after a transcode, the log
+    # directory holds an `FFmpeg.(Transcode|Remux|DirectStream)-*.log`
+    # (`TranscodeManager.StartFfMpeg`). See `force_transcode` — the probe starts
+    # a real transcode itself so the fact is about THIS run, not about whatever
+    # the container happened to accumulate.
+    transcoded = force_transcode(base, token, c)
+    ffmpeg_log = ffmpeg_log_present(base, token) if transcoded else None
+    st, h, log_bytes = raw_headers("GET", base, "/System/Logs", token)
+    logs = []
+    if st == 200:
+        try:
+            logs = json.loads(log_bytes)
+        except ValueError:
+            logs = None
+    keys = {"DateCreated", "DateModified", "Size", "Name"}
+
+    def _utc(v):
+        return isinstance(v, str) and v.endswith("Z") and len(v) >= 20
+
+    def _sort_key(f):
+        # ThenBy(Name) is ASCENDING while the two dates are descending, so the
+        # name is inverted to make one monotonic tuple comparison.
+        return (f["DateModified"], f["DateCreated"], [-ord(ch) for ch in f["Name"]])
+
+    shape_ok = isinstance(logs, list) and len(logs) > 0 and all(
+        set(f) == keys
+        and isinstance(f.get("Name"), str) and "/" not in f["Name"]
+        and f["Name"].lower().endswith((".txt", ".log"))
+        and isinstance(f.get("Size"), int) and not isinstance(f.get("Size"), bool)
+        and f["Size"] >= 0
+        and _utc(f.get("DateCreated")) and _utc(f.get("DateModified"))
+        for f in logs)
+    order_ok = bool(shape_ok) and all(
+        _sort_key(logs[i]) >= _sort_key(logs[i + 1]) for i in range(len(logs) - 1))
+    # `ffmpeg_log` is None when no transcode could be started on this server — an
+    # UNPROVABLE fact, not a passing one. It compares equal across servers only
+    # when both were equally unable to run one, and `sig_match`'s FACT guard
+    # still fails the row the moment either side says False.
+    out["GET /System/Logs"] = ((2, ct_family(h.get("content-type")), shape_ok, order_ok, ffmpeg_log)
+                               if st == 200 else (st // 100, ""))
+    methods["GET /System/Logs"] = SIG_PROPERTY
+
     # A log file's contents differ per instance by nature: type + non-empty is the contract.
-    logs = get_json(base, "/System/Logs", token) or []
+    logs = logs if isinstance(logs, list) else []
     name = logs[0]["Name"] if logs and logs[0].get("Name") else "missing.log"
     st, h, body = raw_headers("GET", base, "/System/Logs/Log?name=" + urllib.parse.quote(name), token)
     out["GET /System/Logs/Log"] = ((2, (h.get("content-type") or "").split(";")[0].strip(), bool(body))
@@ -491,8 +555,37 @@ def file_sig(base, path, token, ranged=False):
     return sig
 
 
-def sig_match(h, j):
-    """Two signatures agree — with a small pixel tolerance on image dimensions."""
+#: Ops whose signature booleans are ASSERTIONS ABOUT THE RESPONSE, not data.
+#:
+#: For these, a `False` on either side fails the row even when both sides agree:
+#: agreeing on a broken invariant is not parity (the rule reads.py's invariant
+#: fold has always applied — `elif h != j or h is False`, reads.py:1094). The
+#: distinction matters because most signature booleans here are *data* — an
+#: empty `/Branding/Css` body is `False` and is the correct answer on a server
+#: with no branding CSS configured, and the status-class downgrade already
+#: records that row honestly.
+FACT_OPS = {
+    # (2, content-type, shape_ok, order_ok) — both are claims about the listing.
+    "GET /System/Logs",
+    # (2, content-type, non-empty) — a running server's log file is never empty,
+    # so a `False` here is a failure on both, not a shared legitimate answer.
+    "GET /System/Logs/Log",
+}
+
+
+def sig_match(h, j, facts=False):
+    """Two signatures agree — with a small pixel tolerance on image dimensions.
+
+    With `facts=True` (see [`FACT_OPS`]) a `False` **or a `None`** anywhere in
+    either signature fails the row. Those entries are assertions about the
+    response: two servers that both answer `False` have shown a shared failure,
+    not parity, and a `None` means the probe could not establish the fact at all
+    (e.g. no transcode could be started, so the ffmpeg-log claim was never
+    tested). A vacuous fact must not read as a verified one, and a bare
+    `h == j` would have recorded both as matches.
+    """
+    if facts and any(v is False or v is None for v in tuple(h) + tuple(j)):
+        return False
     if h[:2] != j[:2]:
         return False
     if len(h) == 5 and len(j) == 5 and h[1] == "image":   # (2,'image',fmt,w,h)
@@ -564,6 +657,75 @@ def write_effects(base, token, c):
     return r
 
 
+# ------------------------------------------------- the ffmpeg transcode log fact
+#
+# `TranscodeManager.StartFfMpeg` writes ffmpeg's stderr into
+# `ApplicationPaths.LogDirectoryPath` under a `FFmpeg.Transcode-` /
+# `FFmpeg.Remux-` / `FFmpeg.DirectStream-` name
+# (`MediaBrowser.MediaEncoding/Transcoding/TranscodeManager.cs:450-467` at
+# `v10.11.8`) — deliberately INTO the directory `/System/Logs` serves, so an
+# operator can download a failed transcode's log from the dashboard.
+#
+# That is a fact BOTH servers must satisfy and a Name/Size diff never could:
+# Ferrofin used to write the log beside the playlist in the transcode temp dir
+# (`playlist_path.with_extension("log")`), so a whole CLASS of file Jellyfin
+# produces was missing from its listing while the row's shape/order/extension
+# assertions all passed. The probe therefore RUNS a transcode first rather than
+# trusting whatever the container happens to hold.
+FFMPEG_LOG_RE = re.compile(r"^FFmpeg\.(Transcode|Remux|DirectStream)-")
+
+#: How long to wait for the log file to appear after the segment request, in
+#: seconds. The file is created when ffmpeg is spawned, i.e. before the segment
+#: is served, so this only covers listing latency.
+FFMPEG_LOG_WAIT_S = 10
+
+
+def force_transcode(base, token, c):
+    """Start one real HLS transcode (so the server writes an ffmpeg log).
+
+    Returns True when a segment was actually served — a False here makes the
+    `ffmpeg_log` fact unprovable rather than false, and is reported as such."""
+    m, ms = c.get("file_item"), c.get("file_src")
+    if not m:
+        return False
+    # Reuse the SAME deviceId the stream layer uses ("parity-streams"): a new
+    # one would register another device/session on each server and drift the
+    # `GET /Sessions` row for every later layer.
+    q = urllib.parse.urlencode({
+        "mediaSourceId": ms or m, "deviceId": "parity-streams",
+        "playSessionId": f"parity-logs-{ms or m}",
+        "videoCodec": "h264", "audioCodec": "aac", "audioBitRate": "128000",
+        "videoBitRate": "1000000", "maxWidth": "320", "segmentContainer": "ts",
+        "transcodingMaxAudioChannels": "2"})
+    st, _h, body = raw_headers("GET", base, f"/Videos/{m}/main.m3u8?{q}", token)
+    if st != 200 or not body:
+        return False
+    seg = next((ln.strip() for ln in body.decode("utf-8", "replace").splitlines()
+                if ln.strip() and not ln.startswith("#")), None)
+    if not seg:
+        return False
+    # The playlist's segment URI is relative to `/Videos/{itemId}/`.
+    st2, _h2, seg_body = raw_headers("GET", base, f"/Videos/{m}/{seg}", token)
+    return st2 == 200 and bool(seg_body)
+
+
+def ffmpeg_log_present(base, token):
+    """True once `GET /System/Logs` lists a `FFmpeg.*` log (bounded wait)."""
+    deadline = time.time() + FFMPEG_LOG_WAIT_S
+    while True:
+        st, _h, body = raw_headers("GET", base, "/System/Logs", token)
+        if st == 200:
+            try:
+                for f in json.loads(body):
+                    if FFMPEG_LOG_RE.match(f.get("Name") or ""):
+                        return True
+            except (ValueError, TypeError, AttributeError):
+                return False
+        if time.time() >= deadline:
+            return False
+        time.sleep(0.5)
+
+
 # ------------------------------------------------------------- run
 def run(ferrofin_url, jellyfin_url):
     ht, hu = bring_up(ferrofin_url, "ferrofin")
@@ -575,7 +737,7 @@ def run(ferrofin_url, jellyfin_url):
     jsig, _ = read_signatures(jellyfin_url, jt, jc)
     for op in sorted(hsig):
         h, j = hsig[op], jsig.get(op)
-        ok = j is not None and sig_match(h, j)
+        ok = j is not None and sig_match(h, j, facts=op in FACT_OPS)
         method = hmethod.get(op, SIG_PROPERTY)
         # HONESTY DOWNGRADE. A signature is `(status_class, kind_label, *evidence)`,
         # and a row where `evidence` is absent or entirely falsy established nothing
@@ -672,6 +834,24 @@ def selfcheck():
     assert not sig_match((2, "image", "jpeg", 100, 75), (2, "image", "jpeg", 100, 90))
     assert sig_match((4, ""), (4, ""))          # both 404 = parity
     assert not sig_match((2, "image", "jpeg", 100, 75), (4, ""))
+    # A FACT both servers fail is not parity, however equal the tuples are.
+    assert not sig_match((2, "application/json", False, False),
+                         (2, "application/json", False, False), facts=True)
+    assert not sig_match((2, "application/json", True, False),
+                         (2, "application/json", True, False), facts=True)
+    assert sig_match((2, "application/json", True, True),
+                     (2, "application/json", True, True), facts=True)
+    # An UNPROVABLE fact (None) is not a verified one, on either side.
+    assert not sig_match((2, "application/json", True, True, None),
+                         (2, "application/json", True, True, None), facts=True)
+    assert not sig_match((2, "application/json", True, True, True),
+                         (2, "application/json", True, True, None), facts=True)
+    assert sig_match((2, "application/json", True, True, True),
+                     (2, "application/json", True, True, True), facts=True)
+    # …and the guard is opt-in: an empty `/Branding/Css` body is DATA, and is
+    # the right answer on a server with no branding css. It stays a match and is
+    # downgraded to status-class by the caller.
+    assert sig_match((2, "css", False), (2, "css", False))
     # every op key is a canonical spec path.
     import glob
     spec = json.load(open(sorted(glob.glob(os.path.join(ROOT, "contracts/jellyfin-openapi-*.json")))[-1]))
@@ -689,6 +869,8 @@ def selfcheck():
     declared.update(NEGOTIATION_OPS)
     bad = sorted(k for k in declared if k not in valid)
     assert not bad, f"asset op-keys not in spec: {bad}"
+    # Every FACT_OPS key is a row this layer actually produces.
+    assert FACT_OPS <= declared, FACT_OPS - declared
     # The negotiation/binding fold only ever tightens a row: it can turn a green row
     # red, never the other way round.
     assert set(NEGOTIATION_OPS).issubset(valid)
@@ -716,10 +898,21 @@ def selfcheck():
     # An empty 200 body and a headers-only HEAD are status-class, not property.
     assert verification.bare_status_class((2, "css", False))
     assert verification.bare_status_class((2, "image"))
+    # The ffmpeg-log fact discriminates: it matches the three names
+    # `TranscodeManager.StartFfMpeg` builds and NOTHING either server's ordinary
+    # rolling log sink writes. Without this the fact would be satisfied by the
+    # server log itself and prove nothing.
+    assert FFMPEG_LOG_RE.match("FFmpeg.Transcode-2026-08-30_19-04-27_abc_85d50717.log")
+    assert FFMPEG_LOG_RE.match("FFmpeg.Remux-2026-08-30_18-14-14__4d20a545.log")
+    assert FFMPEG_LOG_RE.match("FFmpeg.DirectStream-2026-08-30_18-14-14__4d20a545.log")
+    assert not FFMPEG_LOG_RE.match("log.2026-08-30.log")        # Ferrofin's sink
+    assert not FFMPEG_LOG_RE.match("log_20260830.log")          # Jellyfin's sink
+    assert not FFMPEG_LOG_RE.match("FFmpeg.Something-else.log")  # not a transcode log
     # Every write row names the route it actually requested: the indexed upload must
     # POST to an INDEXED url, or the row reports a different endpoint's status.
     assert 'f"/Items/{it}/Images/Backdrop/0", token,' in inspect.getsource(write_effects)
-    print(f"ok: image parser, sig_match, {len(declared)} asset op-keys valid, "
+    print(f"ok: image parser, sig_match + fact guard, ffmpeg-log fact, "
+          f"{len(declared)} asset op-keys valid, "
           f"{len(byte_exact)} byte-exact rows, status-class downgrade, "
           f"write rows stamped {SIG_EFFECT!r}")
 

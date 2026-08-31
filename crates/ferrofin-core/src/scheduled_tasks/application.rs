@@ -62,6 +62,12 @@ impl ScheduledTask for PluginUpdateTask {
     fn key(&self) -> &str {
         "PluginUpdates"
     }
+    /// C# `PluginUpdateTask` implements `IConfigurableScheduledTask`, so the
+    /// `GET /ScheduledTasks` `isHidden`/`isEnabled` filters apply to it.
+    fn is_configurable(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "Update Plugins"
     }

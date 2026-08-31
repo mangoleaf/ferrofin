@@ -296,6 +296,7 @@ fn fake_app_host_methods_run() {
     assert_eq!(f.https_port(), 8920);
     assert!(!f.listen_with_https());
     assert_eq!(f.friendly_name(), "ferrofin-test");
+    assert_eq!(f.name(), "Jellyfin Server");
     assert_eq!(f.expand_virtual_path("/p"), "/p");
     assert_eq!(f.reverse_virtual_path("/p"), "/p");
     let ctx = RequestContext {

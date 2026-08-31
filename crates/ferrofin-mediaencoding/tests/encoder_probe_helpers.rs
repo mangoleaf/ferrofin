@@ -173,14 +173,22 @@ fn dtos_de_bool_flexible_accepts_bool_and_strings() {
     ]}"#;
     let r: InternalMediaInfoResult = serde_json::from_str(json).unwrap();
     let streams = r.streams.unwrap();
-    // `IsAvc` is a non-nullable `bool` upstream, so an unrecognized or absent
-    // value lands on the CLR default `false` rather than on null.
-    assert!(streams[0].is_avc);
-    assert!(!streams[1].is_avc);
-    assert!(streams[2].is_avc);
-    assert!(!streams[3].is_avc);
-    assert!(!streams[4].is_avc); // unrecognized string
-    assert!(!streams[5].is_avc); // absent
+    // `IsAvc` is `bool?` on upstream master
+    // (`MediaBrowser.MediaEncoding/Probing/MediaStreamInfo.cs:233`), so an ABSENT
+    // value stays null instead of being fabricated as `false` the way v10.11.8's
+    // non-nullable `bool` does. That half is upstream parity.
+    //
+    // The UNRECOGNIZED-string case below is NOT: `System.Text.Json` deserializing
+    // `"maybe"` into a `bool?` throws, so C# has no "null" answer here at all — it
+    // fails the whole probe parse. Ferrofin deliberately stays lenient and yields
+    // null for one junk field rather than discarding an entire ffprobe result, and
+    // this test pins that as a Ferrofin decision, not as upstream behaviour.
+    assert_eq!(streams[0].is_avc, Some(true));
+    assert_eq!(streams[1].is_avc, Some(false));
+    assert_eq!(streams[2].is_avc, Some(true));
+    assert_eq!(streams[3].is_avc, Some(false));
+    assert_eq!(streams[4].is_avc, None); // unrecognized string — Ferrofin leniency, see above
+    assert_eq!(streams[5].is_avc, None); // absent
 }
 
 #[test]

@@ -43,12 +43,13 @@ struct GetTasksQuery {
 
 /// `GET /ScheduledTasks` — the server's scheduled tasks, filtered.
 ///
-/// Port of `ScheduledTasksController.GetTasks`: lists every task, then applies
-/// the `isHidden`/`isEnabled` filters. This registry has no per-task *enabled*
-/// flag — a registered task is always enabled — so an `isEnabled=false` filter
-/// matches nothing while `isEnabled=true` keeps every task. The list is already
-/// ordered by key (the C# orders by name; both are stable orderings for the
-/// wire).
+/// Port of `ScheduledTasksController.GetTasks`: enumerates
+/// `_taskManager.ScheduledTasks.OrderBy(o => o.Name)` and applies the
+/// `isHidden`/`isEnabled` filters **only** to tasks implementing
+/// `IConfigurableScheduledTask` — a non-configurable task is yielded whatever
+/// the caller asked for. Both the ordering and that carve-out live in the task
+/// registry (`TaskManager::get_tasks_filtered`), which is the layer that knows
+/// which tasks are configurable.
 #[utoipa::path(
     get,
     path = "/ScheduledTasks",
@@ -64,15 +65,11 @@ async fn get_tasks(
     RequireAdmin(_auth): RequireAdmin,
     Query(query): Query<GetTasksQuery>,
 ) -> Result<Json<Vec<TaskInfo>>, ApiError> {
-    let tasks = state.tasks.get_tasks().await?;
-    let filtered = tasks
-        .into_iter()
-        .filter(|task| query.is_hidden.is_none_or(|want| want == task.is_hidden))
-        // Every registered task is enabled, so `is_enabled` only keeps tasks
-        // when the caller asks for enabled ones (or does not filter at all).
-        .filter(|_| query.is_enabled != Some(false))
-        .collect();
-    Ok(Json(filtered))
+    let tasks = state
+        .tasks
+        .get_tasks_filtered(query.is_hidden, query.is_enabled)
+        .await?;
+    Ok(Json(tasks))
 }
 
 /// `GET /ScheduledTasks/{taskId}` — a single task by id.

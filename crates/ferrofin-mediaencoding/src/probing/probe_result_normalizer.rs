@@ -275,16 +275,19 @@ impl<L: LocalizationManager> ProbeResultNormalizer<L> {
         format_info: Option<&MediaFormatInfo>,
         frames: &[MediaFrameInfo],
     ) -> Option<MediaStream> {
-        // Upstream builds this literal with `Level` and `IsAVC` set on EVERY
-        // stream type (v10.11.8 `ProbeResultNormalizer.cs:705-716`); both come
-        // from non-nullable C# fields, so audio and subtitle streams carry
-        // `0`/`false` rather than null. `Width`/`Height` are deliberately NOT
-        // set here — upstream assigns them only in the subtitle and video arms.
+        // Upstream master builds this literal with `Width`/`Height`/`Level`
+        // set on every stream type (master `ProbeResultNormalizer.cs:702-714`),
+        // all three from nullable fields — so a stream whose ffprobe output
+        // carries no such key keeps null. v10.11.8 instead set `Level` and
+        // `IsAVC` here from non-nullable fields, which is why it reports
+        // `Level: 0` / `IsAvc: false` on audio and subtitle streams. `IsAVC` is
+        // assigned in the video arm only on master (`:794`).
         let mut stream = MediaStream {
             codec: stream_info.codec_name.clone(),
             profile: stream_info.profile.clone(),
-            level: Some(f64::from(stream_info.level)),
-            is_avc: Some(stream_info.is_avc),
+            width: stream_info.width,
+            height: stream_info.height,
+            level: stream_info.level.map(f64::from),
             index: stream_info.index,
             pixel_format: stream_info.pixel_format.clone(),
             nal_length_size: stream_info.nal_length_size.clone(),
@@ -293,7 +296,7 @@ impl<L: LocalizationManager> ProbeResultNormalizer<L> {
             ..Default::default()
         };
 
-        // Filter out junk codec tags (v10.11.8 `ProbeResultNormalizer.cs:719-723`).
+        // Filter out junk codec tags (master `ProbeResultNormalizer.cs:716-720`).
         if let Some(tag) = stream_info.codec_tag_string.as_deref()
             && !tag.trim().is_empty()
             && !tag.to_ascii_lowercase().contains("[0]")
@@ -361,13 +364,6 @@ impl<L: LocalizationManager> ProbeResultNormalizer<L> {
                         Some(self.localization.get_language_display_name(lang));
                 }
 
-                // Graphical subtitles may carry width/height; upstream assigns
-                // them unconditionally from non-nullable ints, so a text
-                // subtitle reports `0` rather than null
-                // (v10.11.8 `ProbeResultNormalizer.cs:775-777`).
-                stream.width = Some(stream_info.width);
-                stream.height = Some(stream_info.height);
-
                 if stream.title.as_deref().is_none_or(str::is_empty)
                     && let Some(handler) = flat_tags
                         .as_ref()
@@ -378,6 +374,8 @@ impl<L: LocalizationManager> ProbeResultNormalizer<L> {
                 }
             }
             Some(CodecType::Video) => {
+                // master `ProbeResultNormalizer.cs:794`.
+                stream.is_avc = stream_info.is_avc;
                 stream.average_frame_rate =
                     get_frame_rate(stream_info.average_frame_rate.as_deref());
                 stream.real_frame_rate = get_frame_rate(stream_info.r_frame_rate.as_deref());
@@ -408,9 +406,6 @@ impl<L: LocalizationManager> ProbeResultNormalizer<L> {
                     stream.stream_type = MediaStreamType::Video;
                 }
 
-                // v10.11.8 `ProbeResultNormalizer.cs:822-824`.
-                stream.width = Some(stream_info.width);
-                stream.height = Some(stream_info.height);
                 stream.aspect_ratio = get_aspect_ratio(stream_info);
 
                 if stream_info.bits_per_sample > 0 {
@@ -1003,8 +998,12 @@ fn get_aspect_ratio(info: &MediaStreamInfo) -> Option<String> {
         && height > 0;
 
     if !parsed {
-        width = i64::from(info.width);
-        height = i64::from(info.height);
+        // master dereferences `info.Width.Value` here
+        // (`ProbeResultNormalizer.cs:1101-1102`), which throws on a null; `0`
+        // is the non-panicking equivalent, since the `> 0` guard below then
+        // rejects it and the ratio comes back null either way.
+        width = info.width.unwrap_or(0).into();
+        height = info.height.unwrap_or(0).into();
     }
 
     if width > 0 && height > 0 {

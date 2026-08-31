@@ -466,27 +466,28 @@ fn get_media_info_video_with_single_frame_mjpeg_success() {
     let mjpeg = &res.media_source.media_streams[2];
     assert_eq!(mjpeg.codec.as_deref(), Some("mjpeg"));
     // Every stream in this fixture carries the junk tag `[0][0][0][0]`, which
-    // `GetMediaStream` filters out (v10.11.8 `ProbeResultNormalizer.cs:719-723`),
+    // `GetMediaStream` filters out (master `ProbeResultNormalizer.cs:716-720`),
     // so the mjpeg stream has no codec tag to discriminate on and stays an
     // embedded image.
     assert_eq!(mjpeg.codec_tag, None);
     assert_eq!(mjpeg.stream_type, MediaStreamType::EmbeddedImage);
 
-    // `Level`/`IsAVC` come from non-nullable C# fields assigned on EVERY stream,
-    // so the audio stream reports `0`/`false` rather than null.
+    // ffprobe emits no `level`, `is_avc`, `width` or `height` on an audio
+    // stream. Upstream master's fields are all nullable
+    // (`MediaStreamInfo.cs:93/107/170/233`), so they stay null instead of the
+    // fabricated `0`/`false` v10.11.8's non-nullable value types produce, and
+    // `IsAVC` is assigned in the video arm only (master `:794`).
     let audio = &res.media_source.media_streams[1];
     assert_eq!(audio.stream_type, MediaStreamType::Audio);
-    assert_eq!(audio.level, Some(0.0));
-    assert_eq!(audio.is_avc, Some(false));
-    // Width/Height are assigned only in the subtitle and video arms upstream,
-    // so an audio stream leaves them null.
+    assert_eq!(audio.level, None);
+    assert_eq!(audio.is_avc, None);
     assert_eq!(audio.width, None);
     assert_eq!(audio.height, None);
 }
 
 /// An `mjpeg` video stream carrying a REAL codec tag is a video stream, not an
 /// embedded image — `GetMediaStream`'s only discriminator between the two
-/// (v10.11.8 `ProbeResultNormalizer.cs:806-817`). This is unreachable if the
+/// (master `ProbeResultNormalizer.cs:809-820`). This is unreachable if the
 /// `codec_tag_string` key fails to deserialize.
 #[test]
 fn get_media_stream_mjpeg_with_a_real_codec_tag_is_video() {
@@ -514,13 +515,19 @@ fn get_media_stream_mjpeg_with_a_real_codec_tag_is_video() {
     assert_eq!(junk.stream_type, MediaStreamType::EmbeddedImage);
 }
 
-/// A text subtitle has no ffprobe `width`/`height`, but upstream assigns them
-/// from non-nullable `int`s, so the wire carries `0` and not null
-/// (v10.11.8 `ProbeResultNormalizer.cs:775-777`).
+/// A text subtitle has no ffprobe `width`/`height`/`level`/`is_avc`, so on
+/// upstream master — where all four fields are nullable
+/// (`MediaStreamInfo.cs:93/107/170/233`) — the wire carries null, not the
+/// `0`/`false` v10.11.8's non-nullable value types fabricate. A graphical
+/// subtitle that *does* carry dimensions still reports them, because master
+/// assigns Width/Height in the shared initializer
+/// (`ProbeResultNormalizer.cs:706-707`).
 #[test]
-fn get_media_stream_text_subtitle_reports_zero_width_and_height() {
+fn get_media_stream_subtitle_reports_only_the_dimensions_ffprobe_gave() {
     let json = r#"{"streams":[
-        {"index":0,"codec_name":"subrip","codec_type":"subtitle"}
+        {"index":0,"codec_name":"subrip","codec_type":"subtitle"},
+        {"index":1,"codec_name":"dvd_subtitle","codec_type":"subtitle",
+         "width":720,"height":480}
     ],"format":{}}"#;
     let parsed: InternalMediaInfoResult = serde_json::from_str(json).expect("probe json parses");
     let res = normalizer().get_media_info(
@@ -531,16 +538,21 @@ fn get_media_stream_text_subtitle_reports_zero_width_and_height() {
         MediaProtocol::File,
     );
 
-    let sub = &res.media_source.media_streams[0];
-    assert_eq!(sub.stream_type, MediaStreamType::Subtitle);
-    assert_eq!(sub.width, Some(0));
-    assert_eq!(sub.height, Some(0));
-    assert_eq!(sub.level, Some(0.0));
-    assert_eq!(sub.is_avc, Some(false));
+    let text = &res.media_source.media_streams[0];
+    assert_eq!(text.stream_type, MediaStreamType::Subtitle);
+    assert_eq!(text.width, None);
+    assert_eq!(text.height, None);
+    assert_eq!(text.level, None);
+    assert_eq!(text.is_avc, None);
+
+    let graphical = &res.media_source.media_streams[1];
+    assert_eq!(graphical.stream_type, MediaStreamType::Subtitle);
+    assert_eq!(graphical.width, Some(720));
+    assert_eq!(graphical.height, Some(480));
 }
 
-/// `GetMediaAttachment` has no junk-tag filter (v10.11.8
-/// `ProbeResultNormalizer.cs:673-676`), so an attachment keeps `[0][0][0][0]`.
+/// `GetMediaAttachment` has no junk-tag filter (master
+/// `ProbeResultNormalizer.cs:671-675`), so an attachment keeps `[0][0][0][0]`.
 #[test]
 fn get_media_attachment_keeps_the_junk_codec_tag() {
     let json = r#"{"streams":[

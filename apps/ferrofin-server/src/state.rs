@@ -86,9 +86,10 @@ fn num_cpus_for_analysis() -> usize {
     std::thread::available_parallelism().map_or(1, |n| n.get() / 4)
 }
 
-/// The product / package identity advertised by the server, ported from
-/// Jellyfin's `ApplicationHost` constants.
-const PRODUCT_NAME: &str = "Jellyfin Server";
+// The product name lives in `ferrofin_core::application_host::PRODUCT_NAME`
+// (the port of `ApplicationHost.ApplicationProductName`) so that
+// `PublicSystemInfo.ProductName` and `GET /System/Ping` — which C# both source
+// from `_appHost.Name` — cannot drift apart.
 
 /// The package name reported in system info (`IStartupOptions.PackageName`).
 const PACKAGE_NAME: &str = "ferrofin-server";
@@ -220,12 +221,19 @@ impl ferrofin_core::system_manager::LibraryStorageProvider for VirtualFolderStor
             .await
             .unwrap_or_default()
             .into_iter()
-            .map(|vf| {
+            // C# `SystemManager.GetSystemStorageInfo` filters
+            // `.Where(e => !string.IsNullOrWhiteSpace(e.ItemId))` before parsing
+            // the guid ("this should not be null but for some users it is"), so
+            // a folder with no id is dropped rather than reported under
+            // Guid.Empty.
+            .filter_map(|vf| {
                 let id = vf
                     .item_id
-                    .and_then(|s| uuid::Uuid::parse_str(&s).ok())
-                    .unwrap_or_default();
-                (id, vf.name.unwrap_or_default(), vf.locations)
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())?;
+                let id = uuid::Uuid::parse_str(id).ok()?;
+                Some((id, vf.name.unwrap_or_default(), vf.locations))
             })
             .collect()
     }
@@ -1410,7 +1418,10 @@ pub async fn build_app_state(
                             tracing::debug!(%err, ?message_type, "failed to push event to sessions");
                         }
                     });
-                    Ok(())
+                    // A client push is best-effort and must never hold up the
+                    // publisher (a scan publishes LibraryChanged/RefreshProgress
+                    // repeatedly), so this one stays spawned.
+                    ferrofin_core::event_manager::consumer_done()
                 }),
             );
         };
@@ -1450,12 +1461,12 @@ pub async fn build_app_state(
                         let Ok(session) =
                             serde_json::from_str::<ferrofin_model::dto::SessionInfoDto>(payload)
                         else {
-                            return Ok(());
+                            return ferrofin_core::event_manager::consumer_done();
                         };
                         // A session with no user (an API key client) writes nothing,
                         // matching upstream's user-scoped loggers.
                         let Some(user_name) = session.user_name.filter(|n| !n.is_empty()) else {
-                            return Ok(());
+                            return ferrofin_core::event_manager::consumer_done();
                         };
                         let user_id = (!session.user_id.is_nil()).then_some(session.user_id);
                         let device = session.device_name.unwrap_or_default();
@@ -1470,10 +1481,15 @@ pub async fn build_app_state(
                             ..Default::default()
                         };
                         let activity = Arc::clone(&activity);
-                        tokio::spawn(async move {
+                        // Awaited, not spawned: C# `AuthenticateNewSessionInternal`
+                        // awaits `LogSessionActivity` (which raises SessionStarted)
+                        // *before* publishing AuthenticationSucceeded, so the two
+                        // rows land in that order. A spawned write always lost that
+                        // race and showed the dashboard's login pair backwards.
+                        Box::pin(async move {
                             let _ = activity.create_entry(entry).await;
-                        });
-                        Ok(())
+                            Ok(())
+                        })
                     }),
                 );
             };
@@ -1488,6 +1504,19 @@ pub async fn build_app_state(
             "SessionEnded",
             "SessionEnded",
             |user, device| format!("{user} has disconnected from {device}"),
+        );
+        // Port of `AuthenticationSucceededLogger`. It lives here, on the same
+        // awaited bus, rather than in the `/Users/AuthenticateByName` handler:
+        // C# raises this event from `AuthenticateNewSessionInternal` *after*
+        // `LogSessionActivity` has raised `SessionStarted`, so the dashboard's
+        // login pair reads SessionStarted then AuthenticationSucceeded. Writing
+        // it in the handler put it first. Registering it here also covers the
+        // Quick Connect path, which shares the same session-manager call.
+        log_session_event(
+            &event_bus,
+            "AuthenticationSucceeded",
+            "AuthenticationSucceeded",
+            |user, _device| format!("{user} successfully authenticated"),
         );
 
         // A scan that changed the library queues chapter-image extraction, so
@@ -1517,7 +1546,7 @@ pub async fn build_app_state(
                             let _ = task_manager.queue("RefreshChapterImages");
                         }
                     });
-                    Ok(())
+                    ferrofin_core::event_manager::consumer_done()
                 }),
             );
         }
@@ -1626,7 +1655,7 @@ pub async fn build_app_state(
                 // Report the emulated Jellyfin API version (clients gate on this), not
                 // Ferrofin's own crate version — see JELLYFIN_API_VERSION.
                 version: Some(JELLYFIN_API_VERSION.to_owned()),
-                product_name: Some(PRODUCT_NAME.to_owned()),
+                product_name: Some(ferrofin_core::application_host::PRODUCT_NAME.to_owned()),
                 system_id: Some(server_id.clone()),
                 package_name: Some(PACKAGE_NAME.to_owned()),
                 transcoding_temp_path: None,
@@ -1813,10 +1842,10 @@ pub async fn build_app_state(
                 let Ok(session) =
                     serde_json::from_str::<ferrofin_model::dto::SessionInfoDto>(payload)
                 else {
-                    return Ok(());
+                    return ferrofin_core::event_manager::consumer_done();
                 };
                 let Some(session_id) = session.id.filter(|id| !id.is_empty()) else {
-                    return Ok(());
+                    return ferrofin_core::event_manager::consumer_done();
                 };
                 let member = ferrofin_traits::stubs::SyncPlaySession {
                     session_id,
@@ -1828,7 +1857,7 @@ pub async fn build_app_state(
                     // Not a member of any group: a successful no-op.
                     let _ = sync_play.leave_group(&member).await;
                 });
-                Ok(())
+                ferrofin_core::event_manager::consumer_done()
             }),
         );
     }

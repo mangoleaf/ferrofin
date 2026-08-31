@@ -377,9 +377,13 @@ async fn scan_season_starts_task_or_conflicts() {
     )
     .await;
     assert_eq!(status, StatusCode::ACCEPTED);
+    // The handler addresses the task by its WIRE id (`ScheduledTaskWorker.Id`),
+    // not by its key — that is what `ITaskManager`'s lookup takes.
     assert_eq!(
         started.started.lock().unwrap().as_slice(),
-        ["IntroSkipper.Detect"]
+        [ferrofin_traits::tasks::task_id_for_key(
+            "IntroSkipper.Detect"
+        )]
     );
 
     // Already running → 409.

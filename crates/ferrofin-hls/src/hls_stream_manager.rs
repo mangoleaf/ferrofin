@@ -251,6 +251,18 @@ where
     C: EncodingOptionsProvider,
     S: SessionReporter,
 {
+    /// The server's log directory — where every ffmpeg stderr log goes.
+    ///
+    /// Upstream writes them into `ApplicationPaths.LogDirectoryPath`
+    /// ("FFmpeg writes debug/error info to stderr. This is useful when
+    /// debugging so let's put it in the log directory",
+    /// `TranscodeManager.StartFfMpeg`), which is the directory
+    /// `GET /System/Logs` lists and `GET /System/Logs/Log` serves. Writing them
+    /// beside the playlist instead kept them out of the dashboard entirely.
+    fn log_dir(&self) -> std::path::PathBuf {
+        std::path::PathBuf::from(self.paths.log_directory_path())
+    }
+
     /// Wires the trickplay store so master playlists advertise the
     /// `#EXT-X-IMAGE-STREAM-INF` tile playlists (the composition root calls
     /// this; without it the master lists no trickplay entries).
@@ -546,19 +558,19 @@ where
         if self.restart_breaker_open(&playlist_key) {
             return Err(ServiceError::backend(format!(
                 "transcode for this stream died {RESTART_FAILURE_LIMIT}+ times in a row \
-                 (source unreadable?); retrying after cooldown — see {}",
-                playlist_path.with_extension("log").display()
+                 (source unreadable?); retrying after cooldown — see the \
+                 FFmpeg.* logs in {}",
+                self.paths.log_directory_path()
             )));
         }
 
         // (Re)start the transcode from this segment and wait for it.
-        let log_path = playlist_path.with_extension("log");
         let start = StartFfMpegRequest {
             program: FFMPEG_PROGRAM,
             state: &plan.state,
             output_path: &playlist_path,
             arguments: plan.arguments.clone(),
-            log_path,
+            log_dir: self.log_dir(),
             working_dir: None,
             env: plan.ffmpeg_env.clone(),
             hardware_acceleration_type: plan.encoding_options.hardware_acceleration_type,
@@ -676,8 +688,9 @@ where
                 if self.restart_breaker_open(&playlist_key) {
                     return Err(ServiceError::backend(format!(
                         "transcode for this stream died {RESTART_FAILURE_LIMIT}+ times in a row \
-                         (source unreadable?); retrying after cooldown — see {}",
-                        plan.playlist_path.with_extension("log").display()
+                         (source unreadable?); retrying after cooldown — see the \
+                         FFmpeg.* logs in {}",
+                        self.paths.log_directory_path()
                     )));
                 }
                 // NEVER a select!/cancellation over the start: a cancelled
@@ -687,13 +700,12 @@ where
                 // regression).
                 let mut state = plan.state.clone();
                 state.wait_for_path = Some(start_segment.clone());
-                let log_path = plan.playlist_path.with_extension("log");
                 let start_request = StartFfMpegRequest {
                     program: FFMPEG_PROGRAM,
                     state: &state,
                     output_path: &plan.playlist_path,
                     arguments: plan.arguments.clone(),
-                    log_path,
+                    log_dir: self.log_dir(),
                     working_dir: None,
                     env: plan.ffmpeg_env.clone(),
                     hardware_acceleration_type: plan.encoding_options.hardware_acceleration_type,
@@ -818,7 +830,10 @@ where
             .await?;
         let playlist_path = plan.playlist_path.clone();
         let playlist_key = playlist_path.to_string_lossy().into_owned();
-        let log_path = playlist_path.with_extension("log");
+        // ffmpeg's stderr goes to the server log directory (upstream's
+        // `LogDirectoryPath`), so every diagnostic below points the operator at
+        // the directory `GET /System/Logs` lists rather than at a temp file.
+        let log_dir = self.log_dir();
 
         // `OnTranscodeBeginRequest` … `OnTranscodeEndRequest` (the guard's
         // drop): marks this request an active consumer of an ALREADY-RUNNING
@@ -848,8 +863,9 @@ where
                 if self.restart_breaker_open(&playlist_key) {
                     return Err(ServiceError::backend(format!(
                         "transcode for this stream died {RESTART_FAILURE_LIMIT}+ times in a row \
-                         (source unreadable?); retrying after cooldown — see {}",
-                        log_path.display()
+                         (source unreadable?); retrying after cooldown — see the \
+                         FFmpeg.* logs in {}",
+                        log_dir.display()
                     )));
                 }
                 let start = StartFfMpegRequest {
@@ -857,7 +873,7 @@ where
                     state: &plan.state,
                     output_path: &playlist_path,
                     arguments: plan.arguments.clone(),
-                    log_path: log_path.clone(),
+                    log_dir: log_dir.clone(),
                     working_dir: None,
                     env: plan.ffmpeg_env.clone(),
                     hardware_acceleration_type: plan.encoding_options.hardware_acceleration_type,
@@ -893,8 +909,8 @@ where
                     let failures = self.record_restart_failure(&playlist_key);
                     return Err(ServiceError::backend(format!(
                         "transcode exited before writing the live playlist \
-                         (consecutive failures: {failures}); see {}",
-                        log_path.display()
+                         (consecutive failures: {failures}); see the FFmpeg.* logs in {}",
+                        log_dir.display()
                     )));
                 }
             }
@@ -904,9 +920,9 @@ where
             .await
             .map_err(|e| {
                 ServiceError::backend(format!(
-                    "failed to read live playlist {} (see {}): {e}",
+                    "failed to read live playlist {} (see the FFmpeg.* logs in {}): {e}",
                     playlist_path.display(),
-                    log_path.display()
+                    log_dir.display()
                 ))
             })?;
         Ok(live_playlist_text(
@@ -969,13 +985,12 @@ where
             .plan(request, is_audio, Some(0), PlaylistKind::Vod)
             .await?;
         let output = plan.state.output_file_path.clone();
-        let log_path = Path::new(&output).with_extension("log");
         let start = StartFfMpegRequest {
             program: FFMPEG_PROGRAM,
             state: &plan.state,
             output_path: Path::new(&output),
             arguments: plan.arguments.clone(),
-            log_path,
+            log_dir: self.log_dir(),
             working_dir: None,
             env: plan.ffmpeg_env.clone(),
             hardware_acceleration_type: plan.encoding_options.hardware_acceleration_type,

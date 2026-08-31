@@ -86,9 +86,11 @@ async fn get_system_storage(
     Ok(Json(SystemStorageDto::from_system_storage_info(info)))
 }
 
-/// `GET`/`POST /System/Ping` — a liveness probe returning the server name.
+/// `GET`/`POST /System/Ping` — a liveness probe returning the product name.
 ///
-/// Port of `SystemController.PingSystem`; anonymous (returns `_appHost.Name`).
+/// Port of `SystemController.PingSystem`; anonymous. C# returns `_appHost.Name`,
+/// which is `ApplicationProductName` — the build constant "Jellyfin Server" —
+/// **not** the instance's friendly/server name (`_appHost.FriendlyName`).
 #[utoipa::path(
     get,
     path = "/System/Ping",
@@ -96,7 +98,7 @@ async fn get_system_storage(
     tag = "ferrofin"
 )]
 async fn ping_system(State(state): State<AppState>) -> Json<String> {
-    Json(state.app_host.friendly_name())
+    Json(state.app_host.name())
 }
 
 /// `POST /System/Restart` — begins the application restart process.

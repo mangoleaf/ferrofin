@@ -1005,6 +1005,12 @@ impl ScheduledTask for PeopleValidationTask {
     fn key(&self) -> &str {
         "RefreshPeople"
     }
+    /// C# `PeopleValidationTask` implements `IConfigurableScheduledTask`, so the
+    /// `GET /ScheduledTasks` `isHidden`/`isEnabled` filters apply to it.
+    fn is_configurable(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "Refresh People"
     }

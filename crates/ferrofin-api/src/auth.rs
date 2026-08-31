@@ -75,11 +75,13 @@ pub async fn auth_context_layer(
     next: Next,
 ) -> Result<Response, ApiError> {
     let (mut parts, body) = request.into_parts();
-    let ctx = request_context(
-        &parts.headers,
-        parts.uri.query(),
-        None, // the remote address layer is wired at the composition root
-    );
+    // C# `RequestHelpers.GetSession` re-logs session activity with
+    // `httpContext.GetNormalizedRemoteIP().ToString()` on every request, so a
+    // session's `RemoteEndPoint` tracks a roaming client. Without it every
+    // session reports an empty address and every activity-log `ShortOverview`
+    // built from it is null.
+    let remote = state.client_address(&parts).to_string();
+    let ctx = request_context(&parts.headers, parts.uri.query(), Some(remote));
     let info = state
         .auth_context()
         .get_authorization_info(&ctx)
@@ -115,7 +117,11 @@ impl FromRequestParts<AppState> for RequireAuth {
         {
             return Ok(Self(info.clone()));
         }
-        let ctx = request_context(&parts.headers, parts.uri.query(), None);
+        let ctx = request_context(
+            &parts.headers,
+            parts.uri.query(),
+            Some(state.client_address(parts).to_string()),
+        );
         let info = state.auth_service().authenticate(&ctx).await?;
         Ok(Self(info))
     }

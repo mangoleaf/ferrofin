@@ -35,6 +35,17 @@ pub struct AuthorizationInfo {
 
     /// Whether the token authenticated successfully.
     pub is_authenticated: bool,
+
+    /// The caller's normalized remote IP, when the transport knew one.
+    ///
+    /// C# has no such field: `HttpContext` is ambient, so every controller
+    /// reaches `HttpContext.GetNormalizedRemoteIP()` directly — notably
+    /// `RequestHelpers.GetSession`, which re-logs session activity with it on
+    /// every request. Ferrofin's handlers receive the resolved
+    /// [`AuthorizationInfo`] instead of the request, so the address rides along
+    /// here. Without it `SessionInfo.RemoteEndPoint` is blank and every
+    /// activity-log `ShortOverview` ("IP address: …") built from it is null.
+    pub remote_endpoint: Option<String>,
 }
 
 impl AuthorizationInfo {

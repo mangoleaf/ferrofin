@@ -1106,14 +1106,26 @@ impl MediaSourceManager for OkMediaSources {
 
 /// A [`SessionManager`] whose `authenticate_new_session` returns a canned
 /// session for [`USER_ID`]; every other method is unused.
-struct OkSessions;
+///
+/// It records each request's `remote_endpoint`, which is what C#
+/// `UserController.AuthenticateUserByName` fills from
+/// `HttpContext.GetNormalizedRemoteIP()` and what every activity-log
+/// `ShortOverview` ("IP address: …") is later built from.
+#[derive(Default)]
+struct OkSessions {
+    seen_remote: Arc<Mutex<Vec<Option<String>>>>,
+}
 
 #[async_trait]
 impl SessionManager for OkSessions {
     async fn authenticate_new_session(
         &self,
-        _request: &AuthenticationRequest,
+        request: &AuthenticationRequest,
     ) -> Result<AuthenticationResultData, ServiceError> {
+        self.seen_remote
+            .lock()
+            .expect("lock")
+            .push(request.remote_endpoint.clone());
         Ok(AuthenticationResultData {
             session: SessionInfoDto {
                 id: Some("session-1".to_owned()),
@@ -1315,7 +1327,18 @@ impl SessionManager for OkSessions {
 /// Assembles an [`AppState`] wired for the success paths. `library`/`views`/
 /// `media` share one item id and one media path; auth always succeeds.
 fn ok_state(item_id: Uuid, media_path: &str) -> AppState {
-    AppState::new(
+    ok_state_recording(item_id, media_path).0
+}
+
+/// [`ok_state`] plus the handle its [`OkSessions`] records authenticate
+/// requests' remote endpoints into.
+fn ok_state_recording(
+    item_id: Uuid,
+    media_path: &str,
+) -> (AppState, Arc<Mutex<Vec<Option<String>>>>) {
+    let sessions = Arc::new(OkSessions::default());
+    let seen_remote = Arc::clone(&sessions.seen_remote);
+    let state = AppState::new(
         Arc::new(OkLibrary { item_id }),
         Arc::new(OkUsers),
         Arc::new(OkUserViews { item_id }),
@@ -1323,7 +1346,7 @@ fn ok_state(item_id: Uuid, media_path: &str) -> AppState {
         Arc::new(OkMediaSources {
             path: media_path.to_owned(),
         }),
-        Arc::new(OkSessions),
+        sessions,
         Arc::new(FakeSystem),
         // FakeAppHost is fine — handlers under test never call it.
         Arc::new(ferrofin_api::test_support::FakeAppHost),
@@ -1351,7 +1374,8 @@ fn ok_state(item_id: Uuid, media_path: &str) -> AppState {
         Arc::new(ferrofin_api::test_support::FakeActivity),
         Arc::new(ferrofin_api::test_support::FakeFileSystem),
         Arc::new(ferrofin_api::test_support::FakeTasks),
-    )
+    );
+    (state, seen_remote)
 }
 
 /// Reads a response body into a JSON value.
@@ -1443,7 +1467,10 @@ async fn delete_user_records_deletion() {
 #[tokio::test]
 async fn delete_user_writes_a_user_deleted_activity_entry() {
     // Port of upstream's UserDeletedLogger: the dashboard activity feed gets
-    // "User bob has been deleted" tagged with the deleted user's id.
+    // "User bob has been deleted" tagged with `Guid.Empty` — NOT the deleted
+    // user's id. Live Jellyfin 10.11.8 puts
+    // `UserId: "00000000000000000000000000000000"` on this entry; tagging it
+    // with the real id also leaked it into the `hasUserId=true` filter.
     let activity = Arc::new(ferrofin_api::test_support::RecordingActivity::default());
     let router = create_router(state_with_activity(
         Arc::new(MemUsers::default()),
@@ -1466,7 +1493,10 @@ async fn delete_user_writes_a_user_deleted_activity_entry() {
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].type_, "UserDeleted");
     assert_eq!(entries[0].name, "User bob has been deleted");
-    assert_eq!(entries[0].user_id, Some(BOB_ID));
+    assert_eq!(
+        entries[0].user_id, None,
+        "UserDeletedLogger passes Guid.Empty"
+    );
 }
 
 #[tokio::test]
@@ -1614,6 +1644,34 @@ async fn authenticate_by_name_returns_authentication_result() {
     assert_eq!(json["ServerId"], "server-1");
     // ...and the minted access token the client must present on later requests.
     assert_eq!(json["AccessToken"], "canned-token");
+}
+
+/// C# `UserController.AuthenticateUserByName` sets
+/// `RemoteEndPoint = HttpContext.GetNormalizedRemoteIP().ToString()` on the
+/// authentication request. Ferrofin passed `None`, so `SessionInfo.RemoteEndPoint`
+/// was blank on every session and every activity-log `ShortOverview` derived from
+/// it ("IP address: …") came out null. With no `ConnectInfo` on the request the
+/// resolver falls back to loopback, exactly as `GetNormalizedRemoteIP` defaults it.
+#[tokio::test]
+async fn authenticate_by_name_carries_the_callers_address() {
+    let (state, seen_remote) = ok_state_recording(Uuid::from_u128(1), "");
+    let router = create_router(state);
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/Users/AuthenticateByName")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"Username":"alice","Pw":"secret"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        *seen_remote.lock().expect("lock"),
+        vec![Some("127.0.0.1".to_owned())]
+    );
 }
 
 #[tokio::test]

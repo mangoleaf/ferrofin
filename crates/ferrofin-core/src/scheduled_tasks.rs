@@ -141,6 +141,31 @@ pub trait ScheduledTask: Send + Sync {
         false
     }
 
+    /// Whether this task implements C# `IConfigurableScheduledTask`.
+    ///
+    /// Load-bearing for `GET /ScheduledTasks`: `ScheduledTasksController.GetTasks`
+    /// applies the `isHidden`/`isEnabled` filters **only** inside
+    /// `if (task.ScheduledTask is IConfigurableScheduledTask scheduledTask)`, so
+    /// a task that does not implement the interface is yielded whatever the
+    /// caller asked for. Exactly nine of Jellyfin 10.11.8's twenty tasks do
+    /// (`CleanActivityLog`, `DeleteCacheFiles`, `CleanLogFiles`,
+    /// `DeleteTranscodeFiles`, `OptimizeDatabaseTask`, `RefreshPeople`,
+    /// `PluginUpdates`, `RefreshGuide`, `RefreshInternetChannels`), so this
+    /// defaults to `false`.
+    fn is_configurable(&self) -> bool {
+        false
+    }
+
+    /// C# `IConfigurableScheduledTask.IsEnabled`.
+    ///
+    /// Only consulted when [`is_configurable`](ScheduledTask::is_configurable)
+    /// is `true`, and only by the `isEnabled` query filter — `TaskInfo` has no
+    /// `IsEnabled` field, so this never reaches the wire. Every configurable
+    /// task in 10.11.8 returns `true`.
+    fn is_enabled(&self) -> bool {
+        true
+    }
+
     /// The task's default triggers, fired by the scheduler unless overridden
     /// via [`FerrofinTaskManager::set_triggers`].
     fn default_triggers(&self) -> Vec<TaskTriggerInfo> {
@@ -158,6 +183,12 @@ pub trait ScheduledTask: Send + Sync {
 /// One registered task plus the registry-owned run state and last result.
 struct Registration {
     task: Arc<dyn ScheduledTask>,
+    /// The wire id (`ScheduledTaskWorker.Id`), derived once at registration.
+    ///
+    /// Upstream memoises it the same way (`_id ??= …`); here it also keeps the
+    /// MD5 off the read path, which projects every task on each
+    /// `GET /ScheduledTasks` and on each `ScheduledTasksInfo` socket push.
+    id: String,
     state: TaskState,
     last_result: Option<TaskResult>,
     /// Triggers set via [`FerrofinTaskManager::set_triggers`], overriding the
@@ -213,6 +244,12 @@ impl Registration {
     }
 
     /// Projects the registration onto the `ferrofin-model` wire DTO.
+    ///
+    /// `Id` and `Key` are the two distinct values `ScheduledTaskHelpers.GetTaskInfo`
+    /// sets: `Key` is `ScheduledTask.Key`, `Id` is `ScheduledTaskWorker.Id` — the
+    /// MD5 of the task type's name (see
+    /// [`task_id_for_key`](ferrofin_traits::tasks::task_id_for_key)), which is
+    /// what every client addresses the task by.
     fn to_info(&self) -> TaskInfo {
         let key = self.task.key().to_string();
         TaskInfo {
@@ -220,7 +257,7 @@ impl Registration {
             state: self.state,
             current_progress_percentage: (self.state == TaskState::Running)
                 .then(|| self.progress.current()),
-            id: Some(key.clone()),
+            id: Some(self.id.clone()),
             last_execution_result: self.last_result.clone(),
             triggers: self.effective_triggers(),
             description: Some(self.task.description().to_string()),
@@ -444,6 +481,7 @@ impl FerrofinTaskManager {
         let triggers_override = lock(&self.stored_overrides).get(&key).cloned();
         let last_result = lock(&self.stored_results).get(&key).cloned();
         let mut registration = Registration {
+            id: ferrofin_traits::tasks::task_id_for_key(&key),
             task,
             state: TaskState::Idle,
             last_result,
@@ -499,13 +537,56 @@ impl FerrofinTaskManager {
         });
     }
 
-    /// Lists every registered task as a wire [`TaskInfo`] (hidden tasks included),
-    /// ordered by key for a stable listing.
+    /// Lists every registered task as a wire [`TaskInfo`] (hidden tasks
+    /// included), ordered by display name.
+    ///
+    /// The order is C#'s: `ScheduledTasksController.GetTasks` and
+    /// `ScheduledTasksWebSocketListener.GetDataToSend` both enumerate
+    /// `_taskManager.ScheduledTasks.OrderBy(o => o.Name)`. It is the wire order
+    /// every client sees, so sorting by key instead is observable.
     #[must_use]
     pub fn list(&self) -> Vec<TaskInfo> {
+        self.list_filtered(None, None)
+    }
+
+    /// Lists the registered tasks the `isHidden`/`isEnabled` filters keep.
+    ///
+    /// Port of the loop in `ScheduledTasksController.GetTasks`: the filters are
+    /// applied **only** to tasks implementing `IConfigurableScheduledTask`; a
+    /// non-configurable task is yielded unconditionally. Ordered by name, as C#
+    /// orders before filtering.
+    #[must_use]
+    pub fn list_filtered(
+        &self,
+        is_hidden: Option<bool>,
+        is_enabled: Option<bool>,
+    ) -> Vec<TaskInfo> {
         let guard = lock(&self.tasks);
-        let mut infos: Vec<TaskInfo> = guard.values().map(Registration::to_info).collect();
-        infos.sort_by(|a, b| a.key.cmp(&b.key));
+        let mut infos: Vec<TaskInfo> = guard
+            .values()
+            .filter(|reg| {
+                if !reg.task.is_configurable() {
+                    return true;
+                }
+                is_hidden.is_none_or(|want| want == reg.task.is_hidden())
+                    && is_enabled.is_none_or(|want| want == reg.task.is_enabled())
+            })
+            .map(Registration::to_info)
+            .collect();
+        drop(guard);
+        // ORDINAL, where C#'s `OrderBy(o => o.Name)` is `Comparer<string>
+        // .Default` — `string.CompareTo`, i.e. a CurrentCulture compare. The two
+        // agree on all twenty of 10.11.8's task names (verified against the live
+        // wire order on both servers, byte for byte), because every one of them
+        // is ASCII and starts with an upper-case letter. They would NOT agree on
+        // a name whose first letter is lower-case (culture interleaves
+        // "audio…"/"Backup…", ordinal puts every upper-case name first), nor on
+        // names differing only by punctuation or diacritics, which a culture
+        // compare weights at a lower level than letters. Porting the culture
+        // comparator means an ICU collation dependency; this is a named, still
+        // open difference, not an accepted one, and it becomes visible the
+        // moment a task name breaks the ASCII/capitalised pattern.
+        infos.sort_by(|a, b| a.name.cmp(&b.name));
         infos
     }
 
@@ -513,6 +594,40 @@ impl FerrofinTaskManager {
     #[must_use]
     pub fn get(&self, key: &str) -> Option<TaskInfo> {
         lock(&self.tasks).get(key).map(Registration::to_info)
+    }
+
+    /// Resolves a wire task id (`ScheduledTaskWorker.Id`) to the registry key.
+    ///
+    /// The C# controller looks a task up by `Id` alone —
+    /// `_taskManager.ScheduledTasks.FirstOrDefault(i => string.Equals(i.Id,
+    /// taskId, StringComparison.OrdinalIgnoreCase))` — so the comparison is
+    /// case-insensitive and a *key* is deliberately not accepted here: Jellyfin
+    /// 404s on one, and a route that answered both would be a divergence a
+    /// client could see.
+    #[must_use]
+    fn key_for_id(&self, task_id: &str) -> Option<String> {
+        lock(&self.tasks)
+            .iter()
+            .find_map(|(key, reg)| reg.id.eq_ignore_ascii_case(task_id).then(|| key.clone()))
+    }
+
+    /// The wire id of the task registered under `key`.
+    ///
+    /// Reads the memoised [`Registration::id`], falling back to the derivation
+    /// for a key that is no longer registered (a run that finished after the
+    /// task was replaced).
+    #[must_use]
+    fn id_for_key(&self, key: &str) -> String {
+        lock(&self.tasks).get(key).map_or_else(
+            || ferrofin_traits::tasks::task_id_for_key(key),
+            |reg| reg.id.clone(),
+        )
+    }
+
+    /// [`key_for_id`](Self::key_for_id), with the C# `NotFound` for a miss.
+    fn resolve_id(&self, task_id: &str) -> Result<String, ServiceError> {
+        self.key_for_id(task_id)
+            .ok_or_else(|| ServiceError::not_found(format!("scheduled task {task_id}")))
     }
 
     /// Attaches the domain-event seam so run outcomes are published as
@@ -713,7 +828,7 @@ impl FerrofinTaskManager {
                 status,
                 name: Some(task.name().to_string()),
                 key: Some(key.to_string()),
-                id: Some(key.to_string()),
+                id: Some(self.id_for_key(key)),
                 error_message,
                 long_error_message: None,
             },
@@ -754,7 +869,7 @@ impl FerrofinTaskManager {
             status,
             name: Some(reg.task.name().to_string()),
             key: Some(key.to_string()),
-            id: Some(key.to_string()),
+            id: Some(reg.id.clone()),
             error_message: None,
             long_error_message: None,
         };
@@ -1085,18 +1200,26 @@ impl ferrofin_traits::tasks::TaskManager for FerrofinTaskManager {
         Ok(self.list())
     }
 
+    async fn get_tasks_filtered(
+        &self,
+        is_hidden: Option<bool>,
+        is_enabled: Option<bool>,
+    ) -> Result<Vec<TaskInfo>, ServiceError> {
+        Ok(self.list_filtered(is_hidden, is_enabled))
+    }
+
     async fn get_task(&self, task_id: &str) -> Result<Option<TaskInfo>, ServiceError> {
-        Ok(self.get(task_id))
+        Ok(self.key_for_id(task_id).and_then(|key| self.get(&key)))
     }
 
     async fn start_task(&self, task_id: &str) -> Result<(), ServiceError> {
         // The HTTP path queues (C# QueueScheduledTask): the request returns as
         // soon as the task is Running; the dashboard tracks state from there.
-        self.queue(task_id)
+        self.queue(&self.resolve_id(task_id)?)
     }
 
     async fn cancel_task(&self, task_id: &str) -> Result<(), ServiceError> {
-        self.cancel(task_id)
+        self.cancel(&self.resolve_id(task_id)?)
     }
 
     async fn update_triggers(
@@ -1104,7 +1227,7 @@ impl ferrofin_traits::tasks::TaskManager for FerrofinTaskManager {
         task_id: &str,
         triggers: &[TaskTriggerInfo],
     ) -> Result<(), ServiceError> {
-        self.set_triggers(task_id, triggers)
+        self.set_triggers(&self.resolve_id(task_id)?, triggers)
     }
 }
 
@@ -1161,6 +1284,130 @@ mod tests {
         }
     }
 
+    /// A minimal task whose key, name, hidden and configurable flags are set by
+    /// the test — the four axes `GET /ScheduledTasks` orders and filters on.
+    struct MetaTask {
+        key: &'static str,
+        name: &'static str,
+        hidden: bool,
+        configurable: bool,
+        enabled: bool,
+    }
+
+    #[allow(clippy::unnecessary_literal_bound)]
+    #[async_trait]
+    impl ScheduledTask for MetaTask {
+        fn key(&self) -> &str {
+            self.key
+        }
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn description(&self) -> &str {
+            "meta"
+        }
+        fn category(&self) -> &str {
+            "Test"
+        }
+        fn is_hidden(&self) -> bool {
+            self.hidden
+        }
+        fn is_configurable(&self) -> bool {
+            self.configurable
+        }
+        fn is_enabled(&self) -> bool {
+            self.enabled
+        }
+        async fn execute(&self, _progress: &TaskProgress) -> Result<(), ServiceError> {
+            Ok(())
+        }
+    }
+
+    fn meta_registry() -> FerrofinTaskManager {
+        let mgr = FerrofinTaskManager::new();
+        // Registered so that key order and name order disagree: by key it is
+        // Alpha, Bravo, Charlie; by name it is "A name", "B name", "C name"
+        // attached to Charlie, Alpha, Bravo respectively.
+        mgr.register(Arc::new(MetaTask {
+            key: "Charlie",
+            name: "A name",
+            hidden: false,
+            configurable: false,
+            enabled: true,
+        }));
+        mgr.register(Arc::new(MetaTask {
+            key: "Alpha",
+            name: "B name",
+            hidden: true,
+            configurable: true,
+            enabled: true,
+        }));
+        mgr.register(Arc::new(MetaTask {
+            key: "Bravo",
+            name: "C name",
+            hidden: false,
+            configurable: true,
+            enabled: false,
+        }));
+        mgr
+    }
+
+    /// C# `ScheduledTasksController.GetTasks` / `ScheduledTasksWebSocketListener`
+    /// both enumerate `_taskManager.ScheduledTasks.OrderBy(o => o.Name)`. The
+    /// registry used to sort by key, which is a different — and observable —
+    /// wire order.
+    #[test]
+    fn list_is_ordered_by_display_name_not_key() {
+        let list = meta_registry().list();
+        let names: Vec<&str> = list.iter().filter_map(|t| t.name.as_deref()).collect();
+        assert_eq!(names, vec!["A name", "B name", "C name"]);
+        let keys: Vec<&str> = list.iter().filter_map(|t| t.key.as_deref()).collect();
+        assert_eq!(keys, vec!["Charlie", "Alpha", "Bravo"]);
+        assert_ne!(keys, {
+            let mut sorted = keys.clone();
+            sorted.sort_unstable();
+            sorted
+        });
+    }
+
+    /// The C# applies `isHidden`/`isEnabled` only inside
+    /// `if (task.ScheduledTask is IConfigurableScheduledTask)`, so a
+    /// non-configurable task is yielded whatever the caller asked for.
+    #[test]
+    fn filters_apply_only_to_configurable_tasks() {
+        let mgr = meta_registry();
+
+        let keys = |infos: Vec<ferrofin_model::tasks::TaskInfo>| -> Vec<String> {
+            infos.into_iter().filter_map(|t| t.key).collect()
+        };
+
+        // Charlie is non-configurable, so it survives every filter.
+        assert_eq!(
+            keys(mgr.list_filtered(Some(true), None)),
+            vec!["Charlie", "Alpha"]
+        );
+        assert_eq!(
+            keys(mgr.list_filtered(Some(false), None)),
+            vec!["Charlie", "Bravo"]
+        );
+        assert_eq!(
+            keys(mgr.list_filtered(None, Some(true))),
+            vec!["Charlie", "Alpha"]
+        );
+        assert_eq!(
+            keys(mgr.list_filtered(None, Some(false))),
+            vec!["Charlie", "Bravo"]
+        );
+        assert_eq!(
+            keys(mgr.list_filtered(Some(true), Some(false))),
+            vec!["Charlie"]
+        );
+        assert_eq!(
+            keys(mgr.list_filtered(None, None)),
+            vec!["Charlie", "Alpha", "Bravo"]
+        );
+    }
+
     #[tokio::test]
     async fn register_list_and_run() {
         let mgr = FerrofinTaskManager::new();
@@ -1199,7 +1446,7 @@ mod tests {
             "TaskCompleted",
             Arc::new(move |payload: &str| {
                 let _ = tx.send(payload.to_owned());
-                Ok(())
+                crate::event_manager::consumer_done()
             }),
         );
         mgr.set_event_manager(Arc::new(events));
@@ -2148,8 +2395,12 @@ mod tests {
 
     #[tokio::test]
     async fn trait_delegates() {
-        use ferrofin_traits::tasks::TaskManager;
+        use ferrofin_traits::tasks::{TaskManager, task_id_for_key};
 
+        // The trait seam addresses tasks by their WIRE id
+        // (`ScheduledTaskWorker.Id`), never by the key — the C# controller's
+        // lookup is `string.Equals(i.Id, taskId, OrdinalIgnoreCase)`.
+        let id = task_id_for_key("counting");
         let mgr = FerrofinTaskManager::new();
         let runs = Arc::new(AtomicU32::new(0));
         mgr.register(Arc::new(CountingTask {
@@ -2161,12 +2412,27 @@ mod tests {
         // `get_tasks` mirrors the inherent list; `get_task` hits / misses.
         let tasks = TaskManager::get_tasks(&mgr).await.expect("tasks");
         assert_eq!(tasks.len(), 1);
-        assert_eq!(tasks[0].id.as_deref(), Some("counting"));
+        assert_eq!(tasks[0].id.as_deref(), Some(id.as_str()));
+        assert_eq!(tasks[0].key.as_deref(), Some("counting"));
+        assert!(
+            TaskManager::get_task(&mgr, &id)
+                .await
+                .expect("get")
+                .is_some()
+        );
+        // Case-insensitive, exactly as `OrdinalIgnoreCase` is.
+        assert!(
+            TaskManager::get_task(&mgr, &id.to_uppercase())
+                .await
+                .expect("get")
+                .is_some()
+        );
+        // The KEY is not an id: Jellyfin 404s on it, so Ferrofin must too.
         assert!(
             TaskManager::get_task(&mgr, "counting")
                 .await
                 .expect("get")
-                .is_some()
+                .is_none()
         );
         assert!(
             TaskManager::get_task(&mgr, "nope")
@@ -2176,12 +2442,10 @@ mod tests {
         );
 
         // `start_task` queues it; poll for the completed result.
-        TaskManager::start_task(&mgr, "counting")
-            .await
-            .expect("start");
+        TaskManager::start_task(&mgr, &id).await.expect("start");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let result = loop {
-            let info = TaskManager::get_task(&mgr, "counting")
+            let info = TaskManager::get_task(&mgr, &id)
                 .await
                 .expect("get")
                 .expect("info");
@@ -2193,20 +2457,22 @@ mod tests {
         };
         assert_eq!(runs.load(Ordering::SeqCst), 1);
         assert_eq!(result.status, TaskCompletionStatus::Completed);
+        // `TaskResult.Id` is the same wire id, `TaskResult.Key` the key
+        // (`ScheduledTaskWorker.OnTaskCompleted`).
+        assert_eq!(result.id.as_deref(), Some(id.as_str()));
+        assert_eq!(result.key.as_deref(), Some("counting"));
 
-        // Cancel and trigger updates delegate; unknown keys are NotFound.
-        TaskManager::cancel_task(&mgr, "counting")
-            .await
-            .expect("cancel");
+        // Cancel and trigger updates delegate; an unknown id is NotFound.
+        TaskManager::cancel_task(&mgr, &id).await.expect("cancel");
         let triggers = vec![TaskTriggerInfo {
             type_: TaskTriggerInfoType::StartupTrigger,
             ..TaskTriggerInfo::default()
         }];
-        TaskManager::update_triggers(&mgr, "counting", &triggers)
+        TaskManager::update_triggers(&mgr, &id, &triggers)
             .await
             .expect("update");
         assert_eq!(
-            TaskManager::get_task(&mgr, "counting")
+            TaskManager::get_task(&mgr, &id)
                 .await
                 .expect("get")
                 .expect("info")
@@ -2214,17 +2480,19 @@ mod tests {
                 .len(),
             1
         );
-        assert!(matches!(
-            TaskManager::start_task(&mgr, "nope").await,
-            Err(ServiceError::NotFound(_))
-        ));
-        assert!(matches!(
-            TaskManager::cancel_task(&mgr, "nope").await,
-            Err(ServiceError::NotFound(_))
-        ));
-        assert!(matches!(
-            TaskManager::update_triggers(&mgr, "nope", &triggers).await,
-            Err(ServiceError::NotFound(_))
-        ));
+        for miss in ["nope", "counting"] {
+            assert!(matches!(
+                TaskManager::start_task(&mgr, miss).await,
+                Err(ServiceError::NotFound(_))
+            ));
+            assert!(matches!(
+                TaskManager::cancel_task(&mgr, miss).await,
+                Err(ServiceError::NotFound(_))
+            ));
+            assert!(matches!(
+                TaskManager::update_triggers(&mgr, miss, &triggers).await,
+                Err(ServiceError::NotFound(_))
+            ));
+        }
     }
 }
