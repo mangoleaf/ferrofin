@@ -799,6 +799,22 @@ pub trait ItemCountService: Send + Sync {
         parent_ids: &[Uuid],
         user_id: Option<Uuid>,
     ) -> Result<HashMap<Uuid, i32>, ServiceError>;
+
+    /// How many LINKED children each of `parent_ids` has — C#
+    /// `Folder.LinkedChildren.Length`, the playlist-entry / merged-version edge
+    /// list, not the hierarchical `ParentId` children.
+    ///
+    /// Distinct from [`Self::get_child_count_batch`], which prefers linked
+    /// children but falls back to hierarchical ones and is only ever consulted
+    /// when the caller asked for the `ChildCount` field.
+    /// `DtoService.AttachUserSpecificInfo` needs the raw linked count for the
+    /// `MusicAlbum`/`Season`/`Playlist` shortcut, which runs with no field gate
+    /// at all (v10.11.8 Emby.Server.Implementations/Dto/DtoService.cs:472-486).
+    /// A parent with no linked children is absent from the map.
+    async fn get_linked_children_count_batch(
+        &self,
+        parent_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, i32>, ServiceError>;
 }
 
 fn _assert_object_safe_item_count_service(_: &dyn ItemCountService) {}

@@ -1115,15 +1115,30 @@ impl PluginManager for FerrofinPluginManager {
 /// file happens to hold would hand a client a shape its config type cannot
 /// bind. [`FerrofinPluginManager::set_plugin_configuration`] no longer writes a
 /// non-object, so this arm only covers a file damaged out of band.
+///
+/// The two sides are tested SEPARATELY, because only the stored side justifies
+/// discarding anything. A plugin registered with non-object DEFAULT bytes has
+/// no object to overlay onto — but the caller's saved configuration is not
+/// damaged and must survive, so it is returned as it is. Collapsing both cases
+/// into one `else` arm (which the original `let (Ok(Object), Ok(Object))`
+/// pattern did) threw away a perfectly valid stored config in favour of raw
+/// default bytes.
 fn merge_config(defaults: &[u8], stored: &[u8]) -> Vec<u8> {
-    let (Ok(serde_json::Value::Object(mut base)), Ok(serde_json::Value::Object(over))) = (
+    let parsed_stored = serde_json::from_slice::<serde_json::Value>(stored);
+    match (
         serde_json::from_slice::<serde_json::Value>(defaults),
-        serde_json::from_slice::<serde_json::Value>(stored),
-    ) else {
-        return defaults.to_vec();
-    };
-    base.extend(over);
-    serde_json::to_vec(&serde_json::Value::Object(base)).unwrap_or_else(|_| stored.to_vec())
+        parsed_stored,
+    ) {
+        (Ok(serde_json::Value::Object(mut base)), Ok(serde_json::Value::Object(over))) => {
+            base.extend(over);
+            serde_json::to_vec(&serde_json::Value::Object(base)).unwrap_or_else(|_| stored.to_vec())
+        }
+        // The stored document IS a usable object; there is simply nothing to
+        // merge it onto.
+        (_, Ok(serde_json::Value::Object(_))) => stored.to_vec(),
+        // The stored document is missing, unparseable or not an object.
+        _ => defaults.to_vec(),
+    }
 }
 
 /// Projects a posted configuration object onto the plugin's own schema, the way
@@ -1220,6 +1235,15 @@ mod tests {
         // A file damaged out of band answers with the schema, not with the
         // damage: the route's contract is a `BasePluginConfiguration` object.
         assert_eq!(merge_config(defaults, b"not json"), defaults);
+        assert_eq!(merge_config(defaults, b"[1,2]"), defaults);
+        // But a plugin whose DEFAULTS are not an object has nothing to overlay
+        // onto — and that is no reason to discard a perfectly good stored
+        // configuration. (It used to: one `let (Ok(Object), Ok(Object))` pattern
+        // covered both sides, so a plugin registered with non-object default
+        // bytes served those raw bytes and silently lost the admin's saved
+        // values.)
+        assert_eq!(merge_config(b"[]", stored), stored);
+        assert_eq!(merge_config(b"not json either", stored), stored);
     }
 
     /// `POST /Plugins/{id}/Configuration` deserializes into the plugin's own

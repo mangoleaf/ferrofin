@@ -552,6 +552,42 @@ impl ItemCountService for FerrofinItemCountService {
         }
         Ok(out)
     }
+
+    async fn get_linked_children_count_batch(
+        &self,
+        parent_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, i32>, ServiceError> {
+        if parent_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        // `Folder.LinkedChildren.Length` — the raw edge count, with no
+        // hierarchical fallback and no library→physical-folder translation: a
+        // library folder has no linked children, and the three kinds that read
+        // this (MusicAlbum/Season/Playlist) are never virtual views.
+        let ids: Vec<String> = parent_ids.iter().copied().map(guid_to_db).collect();
+        let mut sql = String::from(
+            r#"SELECT "ParentId", COUNT(*) FROM "FerrofinLinkedChildren" WHERE "ParentId" IN ("#,
+        );
+        sql.push_str(&placeholders(ids.len()));
+        sql.push_str(r#") GROUP BY "ParentId""#);
+        let mut query = sqlx::query_as::<_, (String, i64)>(&sql);
+        for id in &ids {
+            query = query.bind(id.as_str());
+        }
+        let grouped: HashMap<String, i64> = query
+            .fetch_all(self.db.pool())
+            .await
+            .map_err(db_err)?
+            .into_iter()
+            .collect();
+        let mut out = HashMap::with_capacity(parent_ids.len());
+        for parent in parent_ids {
+            if let Some(count) = grouped.get(&guid_to_db(*parent)) {
+                out.insert(*parent, i32::try_from(*count).unwrap_or(i32::MAX));
+            }
+        }
+        Ok(out)
+    }
 }
 
 /// Rolls a `stored-type-name → count` map up into an [`ItemCounts`], mapping each
@@ -857,6 +893,57 @@ mod tests {
             .expect("child counts");
         assert_eq!(counts[&view], 2, "the view counts through its folder");
         assert_eq!(counts[&plain], 1, "an ordinary parent counts its own");
+    }
+
+    /// `Folder.LinkedChildren.Length` — the RAW edge count, with none of
+    /// `get_child_count_batch`'s hierarchical fallback. A parent with no linked
+    /// children is ABSENT from the map, which is what lets the DTO shortcut
+    /// honour upstream's `if (folderChildCount > 0)` guard instead of writing a
+    /// spurious `ChildCount: 0`.
+    #[tokio::test]
+    async fn linked_children_count_batch_counts_only_edges() {
+        let db = test_db().await;
+        let service = svc(&db);
+        let playlist = Uuid::from_u128(0xE101);
+        let season = Uuid::from_u128(0xE102);
+        seed_item(&db, playlist, BaseItemKind::Playlist).await;
+        seed_item(&db, season, BaseItemKind::Season).await;
+        for n in [0xE103_u128, 0xE104] {
+            let child = Uuid::from_u128(n);
+            seed_item(&db, child, BaseItemKind::Audio).await;
+            sqlx::query(
+                r#"INSERT INTO "FerrofinLinkedChildren" ("ParentId", "ChildId", "ChildType")
+                   VALUES (?1, ?2, 0)"#,
+            )
+            .bind(guid_to_db(playlist))
+            .bind(guid_to_db(child))
+            .execute(db.writer())
+            .await
+            .expect("link child");
+        }
+        // A hierarchical child of the season, which must NOT be counted here.
+        let episode = Uuid::from_u128(0xE105);
+        seed_item(&db, episode, BaseItemKind::Episode).await;
+        sqlx::query(r#"UPDATE "BaseItems" SET "ParentId" = ?2 WHERE "Id" = ?1"#)
+            .bind(guid_to_db(episode))
+            .bind(guid_to_db(season))
+            .execute(db.writer())
+            .await
+            .expect("set parent");
+
+        let counts = service
+            .get_linked_children_count_batch(&[playlist, season])
+            .await
+            .expect("linked counts");
+        assert_eq!(Some(&2), counts.get(&playlist));
+        assert_eq!(None, counts.get(&season), "an empty array is an ABSENT key");
+        assert!(
+            service
+                .get_linked_children_count_batch(&[])
+                .await
+                .expect("empty")
+                .is_empty()
+        );
     }
 
     #[tokio::test]

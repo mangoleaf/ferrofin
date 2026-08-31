@@ -394,13 +394,21 @@ def resolve_fixtures(base, token, user):
     # The Live TV fixture provisions the tuner, so the lineup is right there.
     channels = get_json(base, f"/LiveTv/Channels?userId={user}&limit=1", token) or {}
     channel = ((channels.get("Items") or [{}])[0]).get("Id")
-    # `{pluginId}`/`{version}` were reported "unresolved path param", so FIVE
-    # plugin ops (Configuration GET/POST, Manifest, Image, DELETE) went unprobed
-    # on both servers. Each side is seeded from its OWN `GET /Plugins`, which is
-    # the same thing the `groupId` seed does above and for the same reason: the
-    # value only has to be a real one on the server being asked, and what the
-    # breadth row then measures is status parity — that both servers answer the
-    # same way for a plugin id that exists on them.
+    # `{pluginId}`/`{version}` were reported "unresolved path param" on five
+    # plugin ops. The seed un-skips the TWO the breadth sweep actually fires —
+    # `GET /Plugins/{id}/Configuration` and `GET /Plugins/{id}/{version}/Image`.
+    # The other three (POST Configuration, POST Manifest, DELETE
+    # {id}/{version}) are non-GET and are stamped "write: not fired by the
+    # breadth sweep" further down regardless of the seed, which is the SAFE
+    # behaviour and not an oversight: a fired DELETE would uninstall a bundled
+    # plugin on the shared Jellyfin container. Their Layer-2 probes in reads.py
+    # own them.
+    #
+    # Each side is seeded from its OWN `GET /Plugins`, which is the same thing
+    # the `groupId` seed does above and for the same reason: the value only has
+    # to be a real one on the server being asked, and what the breadth row then
+    # measures is status parity — that both servers answer the same way for a
+    # plugin id that exists on them.
     #
     # The 200 BODY on these rows is out of reach by construction and must not be
     # claimed: the two servers share no plugin id (Ferrofin ships compiled-in

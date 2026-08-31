@@ -219,9 +219,21 @@ fn push_group_head(qb: &mut QueryBuilder<'_, Sqlite>) {
 /// one (2 nulls in 40,610 on a real library)". The guide disproves that: the
 /// one kind upstream deliberately leaves keyless is the one the COALESCE was
 /// hiding, and the COALESCE put the whole guide on every user's home query.
-/// The three Ferrofin write paths that left OTHER rows keyless are fixed at the
-/// insert, and migration 0027 backfills the rows they already wrote — so
-/// nothing but an airing reaches this `GROUP BY` without a key.
+///
+/// **The bare `GROUP BY` is only safe while every other row carries a key, and
+/// that is a data invariant this statement cannot enforce.** Three Ferrofin
+/// write paths used to leave by-name rows keyless; they are fixed at the
+/// insert, and existing rows are repaired at boot — migration 0028 for the
+/// kinds whose key is their own id, and
+/// `ferrofin_db::presentation_key::backfill_by_name_presentation_keys` for the
+/// five whose key is `{Type}-{Name}`. The first attempt at that repair
+/// (migration 0027) was scoped `TopParentId IS NOT NULL` and therefore missed
+/// every by-name row, which is precisely where the keyless rows were: the lane
+/// pair measured `GET /Items?userId=…&ids=<three Person ids>` at ONE item
+/// against Jellyfin's three until 0028 landed. A new write path that skips the
+/// key reintroduces exactly that, and no query-shape test will see it — the
+/// guard is `presentation_key_backfill_rescues_a_grouped_query` plus the
+/// per-insert tests, not this comment.
 fn push_group_tail(qb: &mut QueryBuilder<'_, Sqlite>) {
     qb.push(r#" GROUP BY bi."PresentationUniqueKey"))"#);
 }

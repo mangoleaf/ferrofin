@@ -213,6 +213,14 @@ impl Database {
             head,
             "database migrations applied"
         );
+        // The by-name half of migration 0028's backfill. It cannot live in the
+        // chain because a by-name row's key is `{Type}-{Name.RemoveDiacritics()}`
+        // and SQLite has no `RemoveDiacritics`; see
+        // `presentation_key::backfill_by_name_presentation_keys` for why a
+        // keyless by-name row is an item-loss bug and not a cosmetic one. The
+        // pass is indexed on `Type` and idempotent, so a repaired database pays
+        // one index range scan per boot.
+        crate::presentation_key::backfill_by_name_presentation_keys(&self.writer).await?;
         Ok(())
     }
 

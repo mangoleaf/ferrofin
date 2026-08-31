@@ -1975,6 +1975,83 @@ mod tests {
         FerrofinItemRepository::new(db.clone(), Arc::new(ItemTypeLookup::new()))
     }
 
+    /// The regression the bare `GROUP BY "PresentationUniqueKey"` created.
+    ///
+    /// SQLite groups NULLs TOGETHER, so every keyless row in the recursive user
+    /// universe shares ONE group and all but one of them vanish. Three older
+    /// Ferrofin write paths left item-by-name rows keyless — and an
+    /// `ids=`-scoped user query is one of the shapes that reaches the grouped
+    /// subquery with no `TopParentId` filter in front of it
+    /// (`scope_to_user_libraries` returns `None` once `item_ids` is set), so
+    /// those rows were not merely mis-grouped, they were LOST.
+    ///
+    /// Measured on the lane pair before the repair landed:
+    /// `GET /Items?userId=…&ids=<three Person ids>` answered F 1 / J 3.
+    ///
+    /// The rows are inserted RAW here, without a key, precisely because the
+    /// shared fixture now writes one — the fixture is what a fixed insert
+    /// produces, and this test has to reproduce what an upgraded database
+    /// holds. Delete `backfill_by_name_presentation_keys` and this fails with
+    /// one row.
+    #[tokio::test]
+    async fn presentation_key_backfill_rescues_a_grouped_query() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let user = seed_user_with_defaults(&db, Uuid::from_u128(0x9101)).await;
+        let people = [
+            (Uuid::from_u128(0x9111), "Alice Parity"),
+            (Uuid::from_u128(0x9112), "Bob Parity"),
+            (Uuid::from_u128(0x9113), "Carol Ferrofin"),
+        ];
+        for (id, name) in people {
+            sqlx::query(
+                r#"INSERT INTO "BaseItems"
+                   ("Id","Type","Name","IsFolder","IsInMixedFolder","IsLocked",
+                    "IsMovie","IsRepeat","IsSeries","IsVirtualItem")
+                   VALUES (?1,'MediaBrowser.Controller.Entities.Person',?2,0,0,0,0,0,0,0)"#,
+            )
+            .bind(guid_to_db(id))
+            .bind(name)
+            .execute(db.writer())
+            .await
+            .expect("keyless person");
+        }
+        let query = InternalItemsQuery {
+            user: Some(user.clone()),
+            item_ids: people.iter().map(|(id, _)| *id).collect(),
+            ..InternalItemsQuery::default()
+        };
+        assert!(
+            crate::translate_query::group_by_presentation_unique_key(&query),
+            "the shape under test must actually group"
+        );
+        // The keyless state: all three share the NULL group.
+        assert_eq!(
+            1,
+            repository
+                .get_item_list(&query)
+                .await
+                .expect("keyless")
+                .len(),
+            "keyless by-name rows collapse into one group"
+        );
+
+        let repaired =
+            ferrofin_db::presentation_key::backfill_by_name_presentation_keys(db.writer())
+                .await
+                .expect("backfill");
+        assert_eq!(3, repaired);
+
+        let rows = repository.get_item_list(&query).await.expect("repaired");
+        let mut names: Vec<_> = rows.iter().filter_map(|r| r.name.clone()).collect();
+        names.sort();
+        assert_eq!(
+            vec!["Alice Parity", "Bob Parity", "Carol Ferrofin"],
+            names,
+            "every person survives the grouped query once it carries a key"
+        );
+    }
+
     #[test]
     fn placeholders_shapes() {
         assert_eq!(placeholders(0), "NULL");

@@ -142,6 +142,12 @@ struct Prefetched {
     /// Direct-child counts per folder item id (populated only when the
     /// `ChildCount` field is requested and a user is present).
     child_counts: HashMap<Uuid, i32>,
+    /// Linked-children counts (`Folder.LinkedChildren.Length`) for the page's
+    /// `MusicAlbum`/`Season`/`Playlist` rows, populated only when a user is
+    /// present. Backs the second half of upstream's ChildCount shortcut, which
+    /// runs with no `ItemFields` gate — so it cannot ride on `child_counts`,
+    /// which is field-gated.
+    linked_child_counts: HashMap<Uuid, i32>,
     /// Played/total leaf-descendant counts per folder item id (populated when
     /// user data is enabled and a user is present), for folder `UnplayedItemCount`.
     played_counts: HashMap<Uuid, ferrofin_traits::persistence::PlayedAndTotal>,
@@ -1232,6 +1238,21 @@ impl FerrofinDtoService {
         // The `SourceType == Library` guard costs nothing to honour here: the
         // three kinds named are library kinds, and the guide's `LiveTV`-sourced
         // rows are not among them.
+        //
+        // The shortcut has a SECOND half, which Ferrofin used to drop:
+        //     var folderChildCount = folder.LinkedChildren.Length;
+        //     // The default is an empty array, so we can't reliably use the
+        //     // count when it's empty
+        //     if (folderChildCount > 0) { dto.ChildCount ??= folderChildCount; }
+        // (DtoService.cs:481-486). It is what gives a Playlist a `ChildCount` on
+        // a page that asked for neither `ChildCount` nor `RecursiveItemCount` —
+        // a playlist's entries ARE its linked children, so the count is real
+        // there, while a MusicAlbum's/Season's linked-children array is empty
+        // and the `> 0` test keeps it out. The whole shortcut lives inside
+        // `AttachUserSpecificInfo`, which upstream calls only for a user; the
+        // first half is already user-gated in effect (`recursive_item_count` is
+        // only ever set under `user.is_some()`), so only this half needs to say
+        // so out loud.
         if dto.child_count.is_none()
             && matches!(
                 kind,
@@ -1239,6 +1260,13 @@ impl FerrofinDtoService {
             )
         {
             dto.child_count = dto.recursive_item_count;
+            if dto.child_count.is_none() && user.is_some() {
+                dto.child_count = prefetched
+                    .linked_child_counts
+                    .get(&item_id)
+                    .copied()
+                    .filter(|count| *count > 0);
+            }
         }
 
         // `if (options.ContainsField(ItemFields.CumulativeRunTimeTicks))
@@ -2597,6 +2625,35 @@ impl FerrofinDtoService {
             }
             _ => HashMap::new(),
         };
+        // `Folder.LinkedChildren.Length` for the three kinds whose ChildCount
+        // shortcut reads it. Behind `any(...)` so an ordinary page pays nothing,
+        // and behind the user gate because `AttachUserSpecificInfo` — where the
+        // shortcut lives — only runs for a user.
+        let linked_child_counts = {
+            let shortcut_ids: Vec<Uuid> = if user.is_some() {
+                items
+                    .iter()
+                    .filter(|i| {
+                        matches!(
+                            row_kind(i),
+                            BaseItemKind::MusicAlbum
+                                | BaseItemKind::Season
+                                | BaseItemKind::Playlist
+                        )
+                    })
+                    .map(row_id)
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            if shortcut_ids.is_empty() {
+                HashMap::new()
+            } else {
+                self.item_counts
+                    .get_linked_children_count_batch(&shortcut_ids)
+                    .await?
+            }
+        };
         // Played/total leaf counts for the page's folders in one pass, so folder
         // UserData can carry UnplayedItemCount (C# AttachUserSpecificInfo folder branch).
         let played_counts = match user {
@@ -2723,6 +2780,7 @@ impl FerrofinDtoService {
             chapters,
             trickplay,
             child_counts,
+            linked_child_counts,
             played_counts,
             alternates,
             has_subtitles,
@@ -3465,8 +3523,17 @@ mod tests {
     }
 
     /// An [`ItemCountService`] fake returning fixed name-item counts.
+    ///
+    /// `linked` is how many LINKED children every parent reports
+    /// (`Folder.LinkedChildren.Length`). It defaults to ZERO because that is
+    /// what a real `MusicAlbum`/`Season` has — upstream's own comment on the
+    /// `> 0` test is "the default is an empty array, so we can't reliably use
+    /// the count when it's empty" — and a fake that reported entries for every
+    /// folder would hide the guard.
     #[derive(Default)]
-    struct FakeCounts;
+    struct FakeCounts {
+        linked: i32,
+    }
 
     #[async_trait]
     impl ItemCountService for FakeCounts {
@@ -3542,6 +3609,17 @@ mod tests {
                     )
                 })
                 .collect())
+        }
+        async fn get_linked_children_count_batch(
+            &self,
+            parent_ids: &[Uuid],
+        ) -> Result<HashMap<Uuid, i32>, ServiceError> {
+            // A parent with no linked children is ABSENT from the map, exactly
+            // as the real service leaves it.
+            if self.linked == 0 {
+                return Ok(HashMap::new());
+            }
+            Ok(parent_ids.iter().map(|&p| (p, self.linked)).collect())
         }
         async fn get_child_count_batch(
             &self,
@@ -3957,7 +4035,7 @@ mod tests {
             "server-1".into(),
             library,
             Arc::new(FakeUserData),
-            Arc::new(FakeCounts),
+            Arc::new(FakeCounts::default()),
             Arc::new(FakeImages),
             Arc::new(FakeSources::default()),
             Arc::new(FakeChapters),
@@ -3972,7 +4050,7 @@ mod tests {
             "server-1".into(),
             Arc::new(FakeLibrary::default()),
             Arc::new(FakeUserData),
-            Arc::new(FakeCounts),
+            Arc::new(FakeCounts::default()),
             Arc::new(FakeImages),
             Arc::new(FakeSources::default()),
             Arc::new(ChaptersWithImages),
@@ -3984,6 +4062,23 @@ mod tests {
         service_with(db, Arc::new(FakeLibrary::default()))
     }
 
+    /// [`service`] whose count service reports `linked` linked children for
+    /// every parent — the `Folder.LinkedChildren.Length` half of upstream's
+    /// ChildCount shortcut.
+    fn service_with_linked_children(db: Database, linked: i32) -> FerrofinDtoService {
+        FerrofinDtoService::new(
+            db,
+            "server-1".into(),
+            Arc::new(FakeLibrary::default()),
+            Arc::new(FakeUserData),
+            Arc::new(FakeCounts { linked }),
+            Arc::new(FakeImages),
+            Arc::new(FakeSources::default()),
+            Arc::new(FakeChapters),
+            Arc::new(FakeTrickplay),
+        )
+    }
+
     /// [`service`] with a media-source fake whose canned streams the caller
     /// controls.
     fn service_with_sources(db: Database, sources: FakeSources) -> FerrofinDtoService {
@@ -3992,7 +4087,7 @@ mod tests {
             "server-1".into(),
             Arc::new(FakeLibrary::default()),
             Arc::new(FakeUserData),
-            Arc::new(FakeCounts),
+            Arc::new(FakeCounts::default()),
             Arc::new(FakeImages),
             Arc::new(sources),
             Arc::new(FakeChapters),
@@ -4022,7 +4117,7 @@ mod tests {
             "server-1".into(),
             Arc::new(FakeLibrary::default()),
             Arc::new(FakeUserData),
-            Arc::new(FakeCounts),
+            Arc::new(FakeCounts::default()),
             Arc::new(FakeImages),
             Arc::new(FakeSources::default()),
             Arc::new(FakeChapters),
@@ -4064,7 +4159,7 @@ mod tests {
             "server-1".into(),
             Arc::new(FakeLibrary::default()),
             Arc::new(FakeUserData),
-            Arc::new(FakeCounts),
+            Arc::new(FakeCounts::default()),
             Arc::new(FakeImages),
             Arc::new(FakeSources::default()),
             Arc::new(RecordingChapters::default()) as Arc<dyn ChapterManager>,
@@ -4116,7 +4211,7 @@ mod tests {
             "server-1".into(),
             Arc::new(FakeLibrary::default()),
             Arc::new(FakeUserData),
-            Arc::new(FakeCounts),
+            Arc::new(FakeCounts::default()),
             Arc::new(FakeImages),
             Arc::new(FakeSources::default()),
             Arc::clone(&chapters) as Arc<dyn ChapterManager>,
@@ -4886,6 +4981,77 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(no_field.child_count, None);
+    }
+
+    /// The `folder.LinkedChildren.Length` half of upstream's ChildCount
+    /// shortcut (v10.11.8 Emby.Server.Implementations/Dto/DtoService.cs:481-486).
+    ///
+    /// It runs with NO `ItemFields` gate, so a playlist page that asked for
+    /// neither `ChildCount` nor `RecursiveItemCount` still carries a count on
+    /// 10.11.8 — a playlist's entries ARE its linked children. Ferrofin ported
+    /// only `dto.ChildCount = dto.RecursiveItemCount;` and answered with no
+    /// `ChildCount` at all on exactly that page.
+    #[tokio::test]
+    async fn child_count_falls_back_to_the_linked_children_length() {
+        let db = test_db().await;
+        let playlist = Uuid::new_v4();
+        let season = Uuid::new_v4();
+        seed_folder_item(&db, playlist, BaseItemKind::Playlist, "Road Trip", None).await;
+        seed_folder_item(&db, season, BaseItemKind::Season, "Season 1", None).await;
+        let user = seed_user(&db, Uuid::new_v4()).await;
+        let playlist_row = fetch_item(&db, playlist).await;
+        let season_row = fetch_item(&db, season).await;
+        // Neither ChildCount nor RecursiveItemCount requested: the ONLY thing
+        // that can answer is the linked-children length.
+        let no_fields = DtoOptions {
+            fields: vec![],
+            ..DtoOptions::default()
+        };
+
+        let svc = service_with_linked_children(db.clone(), 7);
+        let dto = svc
+            .get_base_item_dto(&playlist_row, &no_fields, Some(&user), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            Some(7),
+            dto.child_count,
+            "a playlist reports its linked-children length"
+        );
+        // The batch path too — the prefetch is where the count comes from.
+        let dtos = svc
+            .get_base_item_dtos(
+                std::slice::from_ref(&playlist_row),
+                &no_fields,
+                Some(&user),
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(Some(7), dtos[0].child_count);
+
+        // `AttachUserSpecificInfo` runs only for a user.
+        let anon = svc
+            .get_base_item_dto(&playlist_row, &no_fields, None, None)
+            .await
+            .unwrap();
+        assert_eq!(None, anon.child_count);
+
+        // `if (folderChildCount > 0)`: an empty LinkedChildren array — what a
+        // real MusicAlbum and Season have — leaves ChildCount unset rather than
+        // reporting a spurious 0.
+        let empty = service_with_linked_children(db, 0);
+        for row in [&season_row, &playlist_row] {
+            assert_eq!(
+                None,
+                empty
+                    .get_base_item_dto(row, &no_fields, Some(&user), None)
+                    .await
+                    .unwrap()
+                    .child_count
+            );
+        }
     }
 
     #[tokio::test]

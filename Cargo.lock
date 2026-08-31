@@ -1200,6 +1200,7 @@ version = "0.4.1"
 dependencies = [
  "chrono",
  "ferrofin-model",
+ "ferrofin-util",
  "libsqlite3-sys",
  "serde",
  "sqlx",

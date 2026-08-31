@@ -119,36 +119,25 @@ pub fn presentation_unique_key(
         return Uuid::parse_str(primary)
             .map_or_else(|_| primary.to_owned(), |p| p.as_simple().to_string());
     }
-    // The by-name prefix is the CLR *type* name, not the stored CLR path — and
-    // `MusicArtist` is spelled `Artist` (`MusicArtist.cs:152`). Only these five
-    // kinds override the key; `Year` and everything else keep their own id,
-    // which is why the list is spelled out rather than derived from
-    // `is_item_by_name`.
-    let by_name_prefix = match kind {
-        BaseItemKind::Genre => Some("Genre"),
-        BaseItemKind::MusicGenre => Some("MusicGenre"),
-        BaseItemKind::Person => Some("Person"),
-        BaseItemKind::Studio => Some("Studio"),
-        BaseItemKind::MusicArtist => Some("Artist"),
-        _ => None,
-    };
-    match (kind, by_name_prefix) {
-        (BaseItemKind::Season, _) => match (series_key.filter(|k| !k.is_empty()), index_number) {
+    if kind == BaseItemKind::Season {
+        return match (series_key.filter(|k| !k.is_empty()), index_number) {
             (Some(series), Some(index)) => format!("{series}-{index:03}"),
             _ => own,
-        },
-        (_, Some(prefix)) => match name.filter(|n| !n.is_empty()) {
-            // Diacritics are removed and the case is kept, exactly as
-            // `GetUserDataKeys()[0]` builds it — a real 10.11.8 stores
-            // `Person-H. Jon Benjamin` and `Artist-Red Hot Chili Peppers`.
-            Some(name) => format!(
-                "{prefix}-{}",
-                ferrofin_util::string_extensions::remove_diacritics(name)
-            ),
-            None => own,
-        },
-        _ => own,
+        };
     }
+    // The by-name arm lives in `ferrofin_db::presentation_key` — the SAME
+    // function the boot-time repair calls, so a row this insert writes and a
+    // row the repair fixes cannot spell the key two different ways. (They did:
+    // migration 0027 backfilled the row's own id where this writes
+    // `Person-Bob Parity`.) Diacritics are removed and the case is kept,
+    // exactly as `GetUserDataKeys()[0]` builds it — a real 10.11.8 stores
+    // `Person-H. Jon Benjamin` and `Artist-Red Hot Chili Peppers`.
+    crate::item_type_lookup::stored_type_name(kind)
+        .zip(name.filter(|n| !n.is_empty()))
+        .and_then(|(type_name, name)| {
+            ferrofin_db::presentation_key::by_name_presentation_key(type_name, name)
+        })
+        .unwrap_or(own)
 }
 
 /// Whether this kind is an "item by name" — a genre, studio, year, person, or
