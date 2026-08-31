@@ -196,12 +196,13 @@ JOURNEY_METHOD.update({op: verification.PROPERTY for op in (
     # `UpdateTimerAsync` takes four fields and discards the rest of the posted
     # body: the projection is those four plus "did the discarded ones survive".
     "POST /LiveTv/Timers/{timerId}",
-    # Two named invariants compared across the two servers — the first user's
-    # name, and whether the provisioned credentials still authenticate. NOT the
-    # status: Ferrofin answers 403 (upstream master's Forbid guard) where
-    # Jellyfin 10.11.8 answers 204, which is the `jellyfin-bug` row in
-    # classifications.json and is pinned in Rust unit tests instead. See
-    # `j_startup`.
+    # Three named invariants carried across the two servers — the write's STATUS
+    # (Ferrofin 403 from upstream master's Forbid guard, Jellyfin 10.11.8 204),
+    # the first user's name, and whether the provisioned credentials still
+    # authenticate. The row asserts the refusal, so it is RED on the Jellyfin leg
+    # and stays red for as long as 10.11.8 lacks the guard: that is the
+    # `jellyfin-bug` row in classifications.json, not a gap in the probe. See
+    # `j_startup` for why the status is the only discriminator available here.
     "POST /Startup/User",
 )})
 JOURNEY_METHOD.update({op: verification.BODY_DIFF for op in (
@@ -297,26 +298,45 @@ def j_startup(base, token, user, _m, _m2):
     back = get_json(base, "/Startup/Configuration", token) or {}
     r["POST /Startup/Configuration"] = st < 300 and all(back.get(k) == v for k, v in cfg.items())
     # Post-setup the first user already has a password, and the two servers answer this write
-    # DIFFERENTLY BY CONSTRUCTION: Ferrofin ports upstream master, whose `Forbid` guard is
-    # security commit 62a5ded920, and answers 403; Jellyfin 10.11.8 predates that commit and
-    # answers 204, silently re-setting the provisioned admin's password. That status delta is
+    # DIFFERENTLY: Ferrofin ports upstream master, whose `Forbid` guard is security commit
+    # 62a5ded920, and REFUSES with 403; Jellyfin 10.11.8 predates that commit, performs the
+    # write, and silently re-sets the already-provisioned admin's password. That delta is
     # classified `jellyfin-bug` in classifications.json, with the C# for both trees.
     #
-    # This row therefore may NOT assert a status. It used to assert `st == 403` on BOTH
-    # servers, which made the Jellyfin leg false by construction and pinned the row at
-    # H=True J=False forever — a permanently-red row wearing a hand-written "accepted" label
-    # instead of a measurement. What it asserts instead is the invariant the guard exists to
-    # protect and which BOTH trees agree on: the provisioned admin is not clobbered. Sending
-    # the harness's own credentials keeps Jellyfin's 204 a no-op, so the effect is checkable
-    # on both — the name is unchanged and the credentials still authenticate.
+    # WHAT THIS ROW ASSERTS, and why it is the refusal itself: a post-setup
+    # POST /Startup/User must be REFUSED. Ferrofin satisfies that, Jellyfin does not, so the
+    # row is RED — which is the correct terminal state for a jellyfin-bug row, exactly as
+    # `DELETE /Playlists/{playlistId}/Users/{userId}` is red in this same layer, and not a
+    # probe weakness.
     #
-    # The status itself is deliberately kept OUT of the `Same` evidence: 403 vs 204 legitimately
-    # differs, and putting it there would re-file a known upstream bug as "the two servers ended
-    # in different states". Ferrofin's 403 is pinned exactly, and against master rather than
-    # against a 10.11.8 container that does not contain the fix, by the unit tests in
-    # crates/ferrofin-api/tests/startup.rs (404/403/ordering/empty-column, transliterated from
-    # upstream's own StartupControllerTests.cs). `st in (204, 403)` here is that split, not a
-    # widened tolerance.
+    # TWO WRONG VERSIONS OF THIS ROW, both recorded so neither is rediscovered as an idea:
+    #   * `st == 403` on both servers with NO evidence (the original). The status delta was
+    #     real, but it lived only in the boolean, so journey-results.json said "H=True
+    #     J=False" and named nothing. That is what let a hand-written "accepted" label stand
+    #     in for a measurement.
+    #   * `st in (204, 403)` plus "the admin was not clobbered" (batch F6's first attempt).
+    #     TRUE BY CONSTRUCTION: the payload is the harness's OWN credentials, so Jellyfin's
+    #     unguarded 204 re-sets the name to the name it already has and the password to the
+    #     password it already has. Measured on the F6 pair — Jellyfin, a server with NO guard
+    #     at all, returned evidence byte-identical to Ferrofin's and the row went GREEN. A
+    #     probe a guardless server passes cannot be evidence that the guard is present, and
+    #     it dropped the only Ferrofin-side discrimination the row had: a regression that
+    #     deleted the guard would have kept it green.
+    #
+    # WHY THE PAYLOAD IS STILL THE HARNESS'S OWN CREDENTIALS: not to make the assertion pass
+    # (it does not, on Jellyfin), but because Jellyfin ACTUALLY PERFORMS the write. Any other
+    # Name or Password renames the lab's admin or changes its password for every later probe
+    # on the pair, and StartupUserDto carries no third, harmless field. So "was the admin
+    # clobbered" cannot separate the two servers without damaging the lab, and it is kept
+    # only as a lab-safety invariant. The discriminator is the status, and the status is IN
+    # the `Same` evidence so the divergence is named in journey-results.json rather than
+    # living only in prose.
+    #
+    # Ferrofin's 403 is additionally pinned against MASTER — the only tree containing the fix,
+    # which no 10.11.8 container can witness — by the unit tests in
+    # crates/ferrofin-api/tests/startup.rs (404 / 403-with-ChangePassword-Times.Never /
+    # Forbid-before-BadRequest ordering / empty-Password-column), transliterated from
+    # upstream's own StartupControllerTests.cs.
     #
     # Jellyfin picks `Users.First()` from an unordered dictionary, so the call is only safe
     # while the admin is the ONLY user — a stray user from a failed cleanup would be the one
@@ -326,8 +346,9 @@ def j_startup(base, token, user, _m, _m2):
         back = get_json(base, "/Startup/User", token) or {}
         reauth = credentials_still_valid(base)
         r["POST /Startup/User"] = Same(
-            st in (204, 403) and back.get("Name") == USER and reauth == 200,
-            {"FirstUserName": back.get("Name"), "CredentialsStillValid": reauth == 200})
+            st == 403 and back.get("Name") == USER and reauth == 200,
+            {"Status": st, "FirstUserName": back.get("Name"),
+             "CredentialsStillValid": reauth == 200})
     else:
         r["POST /Startup/User"] = False   # not attempted: more than one user on the instance
     st, _ = http("POST", f"{base}/Startup/RemoteAccess", token,
@@ -2151,9 +2172,18 @@ def journeys(ferrofin_url, jellyfin_url):
                                       "nothing compared across the two"),
                 verification.STATUS_CLASS: "status only; nothing read back",
             }.get(method, "bodies not diffed")
+            # A row that returned `Same` on both servers collected comparable
+            # evidence even when one leg's assertion failed, and that evidence is
+            # the only place the divergence is NAMED. Rendering it only in the
+            # `agreed is False` branch above threw it away for every mixed row —
+            # `POST /Startup/User` reported "H=True J=False" and said nothing
+            # about the 403-vs-204 that made it so.
+            ev = ""
+            if isinstance(h_ok, Same) and isinstance(j_ok, Same) and h_ok.evidence != j_ok.evidence:
+                ev = f" [evidence: {evidence_diff(h_ok.evidence, j_ok.evidence)}]"
             rows[op] = {"deep_verified": deep, "classification": cls,
                         "verification_method": method,
-                        "note": f"H={h_ok} J={j_ok} ({method}; {detail})"}
+                        "note": f"H={h_ok} J={j_ok} ({method}; {detail}){ev}"}
         else:
             # No oracle: the row rests on Ferrofin alone, which is not a parity
             # verdict at all — there is nothing to have agreed with. Recorded
@@ -2211,6 +2241,13 @@ def selfcheck():
                          {"after": {"Year": None, "Name": "M"}}) \
         == "after{Year: H=2020 J=None}"
     assert evidence_diff({"a": 1}, {"a": 1}) == "(no key differs)"
+    # A MIXED row (one leg's assertion failed) still carries comparable evidence,
+    # and the runner must name it: `POST /Startup/User` is red BECAUSE the two
+    # servers' statuses differ, and a note that says only "H=True J=False" hides
+    # the very fact the row exists to record.
+    assert evidence_diff({"Status": 403, "FirstUserName": "bench"},
+                         {"Status": 204, "FirstUserName": "bench"}) \
+        == "Status: H=403 J=204"
     # A row may only KEEP a declared body-diff when both sides really compared.
     # Two rows declare it (the allowlist below pins which), but the guard itself is
     # exercised on a SYNTHETIC declaration so it is tested even when the real

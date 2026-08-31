@@ -23,9 +23,11 @@ Reading the buckets, strongest claim first:
 
   accepted   A settled decision. Ferrofin differs from Jellyfin and that is
              correct (or deliberately tolerated). The question is CLOSED.
-  note       A recorded fact about a row whose verdict comes from somewhere
-             else — a push probe, a journey, an obsolete-endpoint citation.
-             Not a divergence, and not evidence on its own.
+  note       A recorded fact about a row that carries no divergence of its own —
+             either its verdict is earned somewhere else (a push probe, a
+             journey, an obsolete-endpoint citation), or no body-level verdict is
+             reachable for it at all and the row says so. Not a divergence, and
+             not evidence on its own.
   lab-state  The two servers' DATA differ, not their code. The op is right and
              the diff is real; it is an artefact of a long-lived shared lab.
              NOT accepted: on a freshly-wiped pair the row must come back clean,
@@ -53,7 +55,9 @@ BUCKETS = {
                "Settled decisions. An item here is a question that has been closed."),
     NOTE: ("📝", "Recorded note (NOT a divergence, NOT a verdict)",
            "A fact worth keeping next to an op whose verdict is earned elsewhere — "
-           "a push probe, a write journey, an obsolete-endpoint citation. It claims "
+           "a push probe, a write journey, an obsolete-endpoint citation — or next "
+           "to one for which no body-level verdict is reachable, where the note "
+           "records what WAS measured and what would verify the rest. It claims "
            "nothing about this row on its own."),
     LAB_STATE: ("🧪", "Lab state (NOT accepted — the servers' DATA differ, not their code)",
                 "The diff is real and is NOT dropped from the compare. Its cause was "
@@ -87,6 +91,14 @@ CATEGORIES = {
     # --- notes on rows verified elsewhere ----------------------------------
     "verified": NOTE,
     "verified-by-push-probe": NOTE,
+    # The breadth sweep records `deep_verified` ONLY for a 200/200 pair (sweep.py:
+    # the diff lives inside `hs == 200 and js == 200`). An op that answers the same
+    # NON-2xx on both servers is therefore measured — its statuses agree, its row
+    # carries `status_conformant: true` — and yet carries no verdict at all, because
+    # there is no body anywhere to diff. `verified` was the only NOTE category
+    # available for such a row and its very name reads as the verdict the row does
+    # not have; this one says what is true instead.
+    "status-class-only": NOTE,
     # --- not accepted ------------------------------------------------------
     "lab-state": LAB_STATE,
     "remote-opt-in": NO_PROBE,
@@ -127,6 +139,9 @@ def selfcheck():
     assert bucket("open-work", "") == OPEN_WORK
     assert bucket("requires-livetv-tuner", "") == NO_PROBE
     assert bucket("instance", "") == ACCEPTED
+    # A status-only row is a NOTE, never a verdict and never an accepted divergence.
+    assert bucket("status-class-only", "") == NOTE
+    assert CATEGORIES["status-class-only"] != SETTLED
     # The defect this module exists to prevent: an unknown category must NOT
     # fall through to "accepted". It buckets nowhere, and `check()` rejects it.
     assert bucket("something-new", "") is None

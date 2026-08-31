@@ -22,6 +22,18 @@
 //!   `ArgumentException => Status400BadRequest`, so **every** `channelId` is a
 //!   `400` on a stock server, on both trees.
 //!
+//! CONTRACT NOTE (owner-visible, not an implementation detail): `400` is **not**
+//! among the responses the vendored 10.11.8 spec declares for either per-channel
+//! op — `.paths["/Channels/{channelId}/Features"].get.responses` and the `/Items`
+//! one are both `[200, 401, 403, 503]`. The undeclared status is the *spec's*
+//! divergence rather than ours: the C# reaches `400` by letting the
+//! `ArgumentNullException` escape the action into `ExceptionMiddleware`, a path
+//! the generated OpenAPI never sees, so the oracle emits it undeclared too and
+//! the wire stays symmetric. `contract_superset` is unaffected — it gates the
+//! route TABLE, not per-op response codes, and `400` is not `404`. Recorded here
+//! because "the wire carries a status the vendored contract does not declare" is
+//! the owner's call to keep or to raise upstream, never an agent's.
+//!
 //! Ferrofin used to answer `200` here — an empty item list, and a fabricated
 //! `ChannelFeatures` echoing back whatever UUID was asked for. That told a client
 //! "this channel exists and is empty" for a resource that cannot exist, and the

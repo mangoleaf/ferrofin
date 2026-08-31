@@ -786,6 +786,30 @@ def plugin_status(base, token, pid):
                  if p.get("Id") == pid), None)
 
 
+def restore_plugin_state(base, token, pid, ver, want):
+    """Put `pid` back to the `want` status ("Active"/"Disabled") it started in.
+
+    Called from a `finally`, because the mutate/restore pair is otherwise a real
+    poisoning hazard: an interrupt or a timed-out restore between the two calls
+    leaves the Jellyfin plugin Disabled in memory for the rest of the container's
+    life, which corrupts `plugin_manifest_invariants`' status_value and every
+    later GET /Plugins diff on this pair — the exact damage the mutation-hygiene
+    note at the top of this section exists to prevent. The `restored` fact makes
+    that visible after the fact; this prevents it.
+
+    It READS the status first and issues nothing when it already matches. That is
+    load-bearing, not an optimisation: on Jellyfin a toggle to the status the
+    plugin is already in early-returns from `ChangePluginState` into
+    `ProcessAlternative`, which pins the plugin at `Status = Restart` in memory
+    until the container restarts. A blind restore would be the poisoning it is
+    meant to undo.
+    """
+    if plugin_status(base, token, pid) == want:
+        return
+    verb = "Enable" if want == "Active" else "Disable"
+    http("POST", base + f"/Plugins/{pid}/{ver}/{verb}", token, None)
+
+
 def plugin_toggle_facts(base, token, verb):
     """The id-independent rejection facts for `POST /Plugins/{id}/{ver}/{verb}`.
 
@@ -836,10 +860,12 @@ def plugin_disable_invariants(base, token, ctx):
     facts["was_active_before"] = before == "Active"
     if before != "Active":
         return facts   # unknown starting state: measure nothing rather than guess
-    facts["disable_status"] = http(
-        "POST", base + f"/Plugins/{pid}/{ver}/Disable", token, None)[0]
-    facts["status_after_disable"] = plugin_status(base, token, pid)
-    http("POST", base + f"/Plugins/{pid}/{ver}/Enable", token, None)
+    try:
+        facts["disable_status"] = http(
+            "POST", base + f"/Plugins/{pid}/{ver}/Disable", token, None)[0]
+        facts["status_after_disable"] = plugin_status(base, token, pid)
+    finally:
+        restore_plugin_state(base, token, pid, ver, before)
     facts["restored"] = plugin_status(base, token, pid) == before
     return facts
 
@@ -862,11 +888,17 @@ def plugin_enable_invariants(base, token, ctx):
     facts["was_active_before"] = before == "Active"
     if before != "Active":
         return facts
-    http("POST", base + f"/Plugins/{pid}/{ver}/Disable", token, None)   # setup, not measured
-    facts["disabled_for_setup"] = plugin_status(base, token, pid) == "Disabled"
-    facts["enable_status"] = http(
-        "POST", base + f"/Plugins/{pid}/{ver}/Enable", token, None)[0]
-    facts["status_after_enable"] = plugin_status(base, token, pid)
+    try:
+        http("POST", base + f"/Plugins/{pid}/{ver}/Disable", token, None)   # setup, not measured
+        facts["disabled_for_setup"] = plugin_status(base, token, pid) == "Disabled"
+        facts["enable_status"] = http(
+            "POST", base + f"/Plugins/{pid}/{ver}/Enable", token, None)[0]
+        facts["status_after_enable"] = plugin_status(base, token, pid)
+    finally:
+        # The measured Enable is itself the restore, so this normally reads the
+        # status and issues nothing; it fires only when the run died between the
+        # setup Disable and the measurement.
+        restore_plugin_state(base, token, pid, ver, before)
     facts["restored"] = plugin_status(base, token, pid) == before
     return facts
 
