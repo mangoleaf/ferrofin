@@ -71,7 +71,7 @@ def plain(op, url):
     return {"op": op, "kind": "plain", "url": lambda c: url}
 
 
-def user(op, url, project=None):
+def user(op, url, project=None, caveats=None):
     # url may reference {u} (user id) plus resolved per-server context keys (genre/studio/person/
     # year/series/season). By-name values are URL-encoded and identical across servers (same NFO);
     # series/season ids are per-server (same title on both → clean diff).
@@ -80,7 +80,16 @@ def user(op, url, project=None):
     # translate a value that is genuinely per-instance into one that is not —
     # never to drop a field. The one user is /LiveTv/Info's EnabledUsers, which
     # is a list of raw user GUIDs; see there.
-    return {"op": op, "kind": "user", "url": lambda c: url.format(**c), "project": project}
+    #
+    # A projection on THIS kind rewrites the body before the diff, so it always
+    # narrows what a "clean" verdict covers, and `caveats` is mandatory for it —
+    # the selfcheck refuses a projected plain/user row that declares none. Like
+    # the `multi` caveats it rides on the results row, so `gen-ledger.py` prints
+    # it under the ledger entry instead of leaving it in a comment in this file.
+    ep = {"op": op, "kind": "user", "url": lambda c: url.format(**c), "project": project}
+    if caveats:
+        ep["caveats"] = list(caveats)
+    return ep
 
 
 def _extra_url(tmpl):
@@ -2225,7 +2234,19 @@ READS = [
     invariant("GET /LiveTv/Recordings/Groups/{groupId}", recording_group_invariants),
     user("GET /LiveTv/Info", "/LiveTv/Info",
          project=lambda b, c: {**b, "EnabledUsers": sorted(
-             c["users_by_id"].get(i, i) for i in (b.get("EnabledUsers") or []))}),
+             c["users_by_id"].get(i, i) for i in (b.get("EnabledUsers") or []))},
+         caveats=[
+             "`EnabledUsers` is NOT compared as it is served: each raw user GUID is "
+             "replaced by that server's own username before the diff, because the two "
+             "`bench` accounts were minted independently. Count, membership and "
+             "duplicates are still compared; the GUIDs themselves are not.",
+             "…and the substituted list is SORTED, so `EnabledUsers` ORDER is not "
+             "compared either. Upstream emits `_userManager.Users.Where(IsLiveTvEnabled)` "
+             "in store order (v10.11.8 LiveTvManager.cs:1207-1210), so order is a real "
+             "upstream signal — it is dropped only because the two stores were populated "
+             "in separate transactions. Pin the provisioning order on both servers and "
+             "the `sorted()` can go, restoring the check.",
+         ]),
     user("GET /LiveTv/TunerHosts/Types", "/LiveTv/TunerHosts/Types"),
     # The tuner/listings administration reads. Both bodies are derived entirely
     # from the shared fixture (the M3U's names/numbers/stream URLs and the
@@ -2873,7 +2894,8 @@ def run(ferrofin_url, jellyfin_url):
                 hb, jb = ep["project"](hb, hc), ep["project"](jb, jc)
             n, buckets, compared = diff_stats(jb, hb)
             record(ep["op"], 1 if n == 0 else 0, 1, buckets,
-                   agg_method([(jb, hb, compared)]), compared=[compared])
+                   agg_method([(jb, hb, compared)]), compared=[compared],
+                   caveats=ep.get("caveats"))
         else:  # item — aggregate over correlated pairs
             agg = {"mismatch": [], "missing": [], "extra": []}
             legs = []
@@ -3252,6 +3274,18 @@ def selfcheck():
                   and any(leg["project"] and lossy(leg["project"]) for leg in ep["legs"])
                   and not ep.get("caveats")]
     assert not undeclared, f"lossy-projected rows with no declared caveats: {undeclared}"
+    # …and the same rule for the OTHER kind that can project. This guard used to
+    # look at `multi` alone, so `GET /LiveTv/Info` — which substitutes a username
+    # for every `EnabledUsers` GUID and then sorts the list — earned a green
+    # body-diff row whose narrowing was documented only in a comment in this
+    # file. A `plain`/`user` projection rewrites the whole body before the diff,
+    # so there is nothing to sniff: having one AT ALL is what requires the
+    # declaration.
+    undeclared_top = [ep["op"] for ep in READS
+                      if ep["kind"] in ("plain", "user")
+                      and ep.get("project") and not ep.get("caveats")]
+    assert not undeclared_top, \
+        f"projected plain/user rows with no declared caveats: {undeclared_top}"
     # The detector must actually be able to tell the two apart.
     assert lossy(years_page) and lossy(years_unordered) and not lossy(with_item_order)
     # `years_unordered` must normalise the SEQUENCE and nothing else: two pages

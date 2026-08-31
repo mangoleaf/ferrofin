@@ -187,31 +187,16 @@ pub(crate) async fn insert_named_item(
         .map_err(db_err)
 }
 
-/// The `BaseItems` row a user-created container hangs off, provisioning it if
-/// this server has never had one.
+/// The id of the container row stored at `path`, or `None`.
 ///
-/// Upstream never leaves a created item parentless: `CreateCollectionAsync`
-/// goes through `EnsureLibraryFolder`, which auto-creates a container at
-/// `{data}/collections` on first use, and a playlist lands in the one at
-/// `{data}/playlists`. Ferrofin had neither link, so every collection and
-/// playlist it created was an orphan — reachable only by a query that names no
-/// scope, and invisible the moment one does.
-///
-/// **Matched by exact path**, the way `EnsureLibraryFolder` does
-/// (`FindFolders(path)`), and never by type: `CollectionFolder` is the type of
-/// *every* library, so a type match would file collections into whichever one
-/// sorted first. Two spellings are accepted because Jellyfin writes the
-/// literal `%AppDataPath%` token where Ferrofin writes the resolved path —
-/// both are equalities, not patterns, so a user library that happens to be
-/// called `collections` cannot be mistaken for this.
-pub(crate) async fn ensure_container(
-    db: &Database,
-    kind: BaseItemKind,
-    name: &str,
-    path: &str,
-    mode: &crate::item_type_lookup::IdDerivation,
-    parent: Option<Uuid>,
-) -> Result<Option<Uuid>, ServiceError> {
+/// **Matched by exact path**, the way `CollectionManager.EnsureLibraryFolder`
+/// does (`FindFolders(path)`), and never by type: `CollectionFolder` is the type
+/// of *every* library, so a type match would file collections into whichever one
+/// sorted first. Two spellings are accepted because Jellyfin writes the literal
+/// `%AppDataPath%` token where Ferrofin writes the resolved path — both are
+/// equalities, not patterns, so a user library that happens to be called
+/// `collections` cannot be mistaken for this.
+pub(crate) async fn container_at(db: &Database, path: &str) -> Result<Option<Uuid>, ServiceError> {
     let leaf = path.rsplit(['/', '\\']).next().unwrap_or(path);
     let jellyfin_form = format!("{JELLYFIN_DATA_PATH_TOKEN}/{leaf}");
     let existing: Option<String> = sqlx::query_scalar(
@@ -222,26 +207,77 @@ pub(crate) async fn ensure_container(
     .fetch_optional(db.pool())
     .await
     .map_err(db_err)?;
-    if let Some(id) = existing {
-        let id = Uuid::parse_str(&id).map_err(|e| {
-            ServiceError::backend(format!("container row {id} has an unusable id: {e}"))
-        })?;
+    existing
+        .map(|id| {
+            Uuid::parse_str(&id).map_err(|e| {
+                ServiceError::backend(format!("container row {id} has an unusable id: {e}"))
+            })
+        })
+        .transpose()
+}
+
+/// The `BaseItems` row a user-created container hangs off, provisioning it if
+/// this server has never had one.
+///
+/// Upstream never leaves a created item parentless: `CreateCollectionAsync`
+/// goes through `EnsureLibraryFolder`, which auto-creates a container at
+/// `{data}/collections` on first use, and a playlist lands in the one at
+/// `{data}/playlists`. Ferrofin had neither link, so every collection and
+/// playlist it created was an orphan — reachable only by a query that names no
+/// scope, and invisible the moment one does.
+///
+/// Matched by exact path — see [`container_at`] for why by path and never by
+/// type, and which two spellings are accepted.
+pub(crate) async fn ensure_container(
+    db: &Database,
+    kind: BaseItemKind,
+    name: &str,
+    path: &str,
+    mode: &crate::item_type_lookup::IdDerivation,
+    parent: Option<Uuid>,
+    data: Option<&str>,
+) -> Result<Option<Uuid>, ServiceError> {
+    if let Some(id) = container_at(db, path).await? {
         // Adopt a row that was created before the user root existed — the
         // parent is set on the first provision that CAN set it, rather than
         // staying null forever because the row is already there.
         if let Some(root) = parent {
             attach_to_root(db, id, root).await?;
         }
+        // …and the same for the `Data` blob, which an older Ferrofin left NULL:
+        // without it the row's `CollectionType` reads as absent forever.
+        if let Some(data) = data {
+            backfill_container_data(db, id, data).await?;
+        }
         return Ok(Some(id));
     }
 
     // Derived from the path, like every other folder id on both sides, so the
     // same directory yields the same id wherever it is scanned — under the
-    // database's CONFIGURED derivation, not a hardcoded one. Getting that wrong
-    // is not cosmetic: Jellyfin computes its own id for
-    // `%AppDataPath%/collections`, and if ours differs it does not recognise
-    // the row, creates a SECOND Collections library beside it, and the two-way
-    // swap this project rests on stops being clean.
+    // database's CONFIGURED derivation, not a hardcoded one.
+    //
+    // CORRECTION, measured on the parity pair 2026-08-31. This comment used to
+    // claim "Jellyfin computes its own id for `%AppDataPath%/collections`". It
+    // does not, and the claim is only true for the PLAYLISTS folder. Upstream's
+    // Collections library is created by `AddVirtualFolder`, so its row's `Path`
+    // is the shortcut directory `{RootFolderPath}/default/Collections` and its
+    // id is `GetNewItemIdInternal("root\default\Collections")` =
+    // `9d7ad6afe9afa2dab1a2f6e00ad28fa6`; Ferrofin's is derived from
+    // `{data}/collections` = `6f929a39bd27711ce6208fb0aef66e5b`. Both were read
+    // off the live pair. The playlists folder DOES match byte for byte
+    // (`1071671e7bffa0532e930debee501d2e`, `/config/data/playlists`) on both
+    // servers, because `CreateRootFolder` builds that one directly.
+    //
+    // TODO(open-work, tracked on `GET /Library/MediaFolders` in
+    // suite/parity/classifications.json): route the COLLECTIONS provision
+    // through the virtual-folder path (`{root}/default/Collections` +
+    // `.mblink` -> `{data}/collections`, registered so it shows in
+    // `GET /Library/VirtualFolders`) so the id converges. That is an id change
+    // for existing Ferrofin databases, so it needs a migration that re-parents
+    // the box sets hanging off the old id — which is why it is a named work
+    // item here and not a drive-by edit. Until then, adopting a Jellyfin
+    // database means `container_at` misses upstream's row and provisions a
+    // second Collections library beside it.
     let Some(id) = crate::item_type_lookup::derive_item_id_with(mode, kind, path) else {
         return Ok(None);
     };
@@ -264,7 +300,57 @@ pub(crate) async fn ensure_container(
     };
     insert_named_item(db, id, kind, name, true, parent).await?;
     set_container_path(db, id, path).await?;
+    if let Some(data) = data {
+        backfill_container_data(db, id, data).await?;
+    }
     Ok(Some(id))
+}
+
+/// The full `BaseItems` row for a container id, or `None`.
+///
+/// Lives here rather than in the manager that wants it because SQL belongs
+/// behind the persistence boundary (`crates/ferrofin-db/tests/sql_boundary.rs`).
+pub(crate) async fn container_row(
+    db: &Database,
+    id: Uuid,
+) -> Result<Option<BaseItemEntity>, ServiceError> {
+    sqlx::query_as::<_, BaseItemEntity>(r#"SELECT * FROM "BaseItems" WHERE "Id" = ?1"#)
+        .bind(guid_to_db(id))
+        .fetch_optional(db.pool())
+        .await
+        .map_err(db_err)
+}
+
+/// Writes the `Data` blob a provisioned container needs, but **only over an
+/// empty one**.
+///
+/// `Data` is where 10.11.8 keeps a `CollectionFolder`'s `CollectionType` — the
+/// auto-provisioned Collections library is created by
+/// `CollectionManager.EnsureLibraryFolder` through
+/// `AddVirtualFolder(name, CollectionTypeOptions.boxsets, …)`
+/// (v10.11.8 Emby.Server.Implementations/Collections/CollectionManager.cs:81-109),
+/// and a real Jellyfin row carries `{"…","CollectionType":"boxsets",…}` there.
+/// Ferrofin provisioned the row with no `Data` at all, so `DtoService`'s
+/// `collection_type_of` found nothing and the folder went out with a null
+/// `CollectionType` on `/Items?parentId={root}`, `/UserViews` and
+/// `/Library/MediaFolders` where Jellyfin sends `boxsets` — measured on the pair
+/// 2026-08-31.
+///
+/// The `Data IS NULL OR = ''` guard is what makes this safe on an ADOPTED
+/// database: Jellyfin's own blob carries `PhysicalLocationsList`,
+/// `PhysicalFolderIds` and the rest, and overwriting it with a one-key document
+/// would destroy the library's physical paths on swap-back.
+async fn backfill_container_data(db: &Database, id: Uuid, data: &str) -> Result<(), ServiceError> {
+    sqlx::query(
+        r#"UPDATE "BaseItems" SET "Data" = ?2
+           WHERE "Id" = ?1 AND ("Data" IS NULL OR "Data" = '')"#,
+    )
+    .bind(guid_to_db(id))
+    .bind(data)
+    .execute(db.writer())
+    .await
+    .map_err(db_err)?;
+    Ok(())
 }
 
 /// Parents a container to the root row it belongs under, if it is not there
@@ -1632,6 +1718,18 @@ pub(crate) async fn seed_presentation_key(db: &Database, id: Uuid, key: &str) {
         .expect("seed presentation key");
 }
 
+/// Test-only: plant the `Data` blob an ADOPTED Jellyfin row would carry, so the
+/// backfill's "only over an empty one" guard can be exercised.
+#[cfg(test)]
+pub(crate) async fn seed_container_data(db: &Database, id: Uuid, data: &str) {
+    sqlx::query(r#"UPDATE "BaseItems" SET "Data" = ?2 WHERE "Id" = ?1"#)
+        .bind(guid_to_db(id))
+        .bind(data)
+        .execute(db.writer())
+        .await
+        .expect("seed container data");
+}
+
 #[cfg(test)]
 mod tests {
     use ferrofin_model::data::BaseItemKind;
@@ -1641,7 +1739,81 @@ mod tests {
     use crate::linked_children_service::FerrofinLinkedChildrenService;
     use crate::test_support::{seed_item, test_db};
 
-    use super::FerrofinItemPersistenceService;
+    use super::{
+        FerrofinItemPersistenceService, container_row, ensure_container, seed_container_data,
+    };
+
+    /// `ensure_container` writes the `Data` blob it was given onto a row that
+    /// has none, and NEVER over one that already has content.
+    ///
+    /// The second half is the drop-in guarantee: an adopted Jellyfin row's blob
+    /// carries `PhysicalLocationsList`, `PhysicalFolderIds` and the rest, and
+    /// replacing it with the one-key document Ferrofin provisions would lose the
+    /// library's physical paths on swap-back.
+    #[tokio::test]
+    async fn a_container_data_blob_is_backfilled_but_never_overwritten() {
+        let db = test_db().await;
+        let mode = crate::item_type_lookup::IdDerivation::from_meta(
+            Some("jellyfin-10.11.8"),
+            Some("/data".to_owned()),
+        );
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp
+            .path()
+            .join("collections")
+            .to_string_lossy()
+            .into_owned();
+        let ours = r#"{"CollectionType":"boxsets"}"#;
+
+        let id = ensure_container(
+            &db,
+            BaseItemKind::CollectionFolder,
+            "Collections",
+            &path,
+            &mode,
+            None,
+            Some(ours),
+        )
+        .await
+        .expect("provision")
+        .expect("an id");
+        assert_eq!(
+            container_row(&db, id)
+                .await
+                .expect("row")
+                .expect("present")
+                .data
+                .as_deref(),
+            Some(ours),
+            "an empty Data column is backfilled"
+        );
+
+        let adopted = r#"{"PhysicalLocationsList":["/x"],"CollectionType":"boxsets"}"#;
+        seed_container_data(&db, id, adopted).await;
+        let again = ensure_container(
+            &db,
+            BaseItemKind::CollectionFolder,
+            "Collections",
+            &path,
+            &mode,
+            None,
+            Some(ours),
+        )
+        .await
+        .expect("provision")
+        .expect("an id");
+        assert_eq!(again, id, "the same row, not a second one");
+        assert_eq!(
+            container_row(&db, id)
+                .await
+                .expect("row")
+                .expect("present")
+                .data
+                .as_deref(),
+            Some(adopted),
+            "an adopted database's own Data survives"
+        );
+    }
 
     // A playlist (parent) and one of its members (child) both live in
     // `LinkedChildren`, whose BaseItems FK lacks `ON DELETE CASCADE`. Deleting

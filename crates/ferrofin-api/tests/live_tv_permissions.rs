@@ -69,12 +69,10 @@ impl LiveTvManager for CountingLiveTv {
         Ok(())
     }
 
-    #[allow(unused_variables)]
     async fn get_tuner_hosts(&self) -> Result<Vec<TunerHostInfo>, ServiceError> {
         unimplemented!("not probed by the gate tests")
     }
-    #[allow(unused_variables)]
-    async fn save_tuner_host(&self, info: TunerHostInfo) -> Result<TunerHostInfo, ServiceError> {
+    async fn save_tuner_host(&self, _info: TunerHostInfo) -> Result<TunerHostInfo, ServiceError> {
         unimplemented!("not probed by the gate tests")
     }
     fn tuner_host_types(&self) -> Vec<ferrofin_model::dto::NameIdPair> {
@@ -103,147 +101,126 @@ impl LiveTvManager for CountingLiveTv {
     ) -> Result<ferrofin_model::live_tv::TunerChannelMapping, ServiceError> {
         unimplemented!("not probed by the gate tests")
     }
-    #[allow(unused_variables)]
     async fn discover_tuners(
         &self,
-        discovery_duration_ms: u64,
-        new_devices_only: bool,
+        _discovery_duration_ms: u64,
+        _new_devices_only: bool,
     ) -> Result<Vec<TunerHostInfo>, ServiceError> {
         unimplemented!("not probed by the gate tests")
     }
-    #[allow(unused_variables)]
-    async fn delete_tuner_host(&self, id: &str) -> Result<(), ServiceError> {
+    async fn delete_tuner_host(&self, _id: &str) -> Result<(), ServiceError> {
         unimplemented!("not probed by the gate tests")
     }
-    #[allow(unused_variables)]
     async fn get_listing_providers(&self) -> Result<Vec<ListingsProviderInfo>, ServiceError> {
         unimplemented!("not probed by the gate tests")
     }
-    #[allow(unused_variables)]
     async fn save_listing_provider(
         &self,
-        info: ListingsProviderInfo,
+        _info: ListingsProviderInfo,
     ) -> Result<ListingsProviderInfo, ServiceError> {
         unimplemented!("not probed by the gate tests")
     }
-    #[allow(unused_variables)]
-    async fn delete_listing_provider(&self, id: &str) -> Result<(), ServiceError> {
+    async fn delete_listing_provider(&self, _id: &str) -> Result<(), ServiceError> {
         unimplemented!("not probed by the gate tests")
     }
-    #[allow(unused_variables)]
     async fn get_channels(
         &self,
-        query: &LiveTvChannelQuery,
-        options: &DtoOptions,
+        _query: &LiveTvChannelQuery,
+        _options: &DtoOptions,
     ) -> Result<QueryResult<BaseItemDto>, ServiceError> {
         unimplemented!("not probed by the gate tests")
     }
-    #[allow(unused_variables)]
     async fn get_channel(
         &self,
-        id: Uuid,
-        user: Option<&UserEntity>,
-        options: &DtoOptions,
+        _id: Uuid,
+        _user: Option<&UserEntity>,
+        _options: &DtoOptions,
     ) -> Result<Option<BaseItemDto>, ServiceError> {
         unimplemented!("not probed by the gate tests")
     }
-    #[allow(unused_variables)]
     async fn get_programs(
         &self,
-        query: &InternalItemsQuery,
-        options: &DtoOptions,
+        _query: &InternalItemsQuery,
+        _options: &DtoOptions,
     ) -> Result<QueryResult<BaseItemDto>, ServiceError> {
         unimplemented!("not probed by the gate tests")
     }
-    #[allow(unused_variables)]
     async fn get_recommended_programs(
         &self,
-        query: &InternalItemsQuery,
-        options: &DtoOptions,
+        _query: &InternalItemsQuery,
+        _options: &DtoOptions,
     ) -> Result<QueryResult<BaseItemDto>, ServiceError> {
         unimplemented!("not probed by the gate tests")
     }
-    #[allow(unused_variables)]
     async fn get_program(
         &self,
-        id: Uuid,
-        user: Option<&UserEntity>,
-        options: &DtoOptions,
+        _id: Uuid,
+        _user: Option<&UserEntity>,
+        _options: &DtoOptions,
     ) -> Result<Option<BaseItemDto>, ServiceError> {
         unimplemented!("not probed by the gate tests")
     }
-    #[allow(unused_variables)]
-    async fn reset_tuner(&self, id: &str) -> Result<(), ServiceError> {
+    async fn reset_tuner(&self, _id: &str) -> Result<(), ServiceError> {
         unimplemented!("not probed by the gate tests")
     }
-    #[allow(unused_variables)]
     async fn refresh_guide(&self) -> Result<(), ServiceError> {
         unimplemented!("not probed by the gate tests")
     }
-    #[allow(unused_variables)]
-    async fn get_channel_stream_url(&self, id: Uuid) -> Result<Option<String>, ServiceError> {
+    async fn get_channel_stream_url(&self, _id: Uuid) -> Result<Option<String>, ServiceError> {
         unimplemented!("not probed by the gate tests")
     }
-    #[allow(unused_variables)]
     async fn get_timers(&self) -> Result<Vec<TimerInfoDto>, ServiceError> {
         unimplemented!("not probed by the gate tests")
     }
-    #[allow(unused_variables)]
-    async fn get_timer(&self, id: &str) -> Result<Option<TimerInfoDto>, ServiceError> {
+    async fn get_timer(&self, _id: &str) -> Result<Option<TimerInfoDto>, ServiceError> {
         unimplemented!("not probed by the gate tests")
     }
-    #[allow(unused_variables)]
-    async fn create_timer(&self, timer: TimerInfoDto) -> Result<String, ServiceError> {
+    async fn create_timer(&self, _timer: TimerInfoDto) -> Result<String, ServiceError> {
         unimplemented!("not probed by the gate tests")
     }
-    #[allow(unused_variables)]
-    async fn update_timer(&self, id: &str, timer: TimerInfoDto) -> Result<(), ServiceError> {
+    async fn update_timer(&self, _id: &str, _timer: TimerInfoDto) -> Result<(), ServiceError> {
         unimplemented!("not probed by the gate tests")
     }
-    #[allow(unused_variables)]
     async fn get_series_timers(
         &self,
         _query: &ferrofin_model::live_tv::SeriesTimerQuery,
     ) -> Result<Vec<SeriesTimerInfoDto>, ServiceError> {
         unimplemented!("not probed by the gate tests")
     }
-    #[allow(unused_variables)]
-    async fn get_series_timer(&self, id: &str) -> Result<Option<SeriesTimerInfoDto>, ServiceError> {
+    async fn get_series_timer(
+        &self,
+        _id: &str,
+    ) -> Result<Option<SeriesTimerInfoDto>, ServiceError> {
         unimplemented!("not probed by the gate tests")
     }
-    #[allow(unused_variables)]
-    async fn create_series_timer(&self, timer: SeriesTimerInfoDto) -> Result<String, ServiceError> {
+    async fn create_series_timer(
+        &self,
+        _timer: SeriesTimerInfoDto,
+    ) -> Result<String, ServiceError> {
         unimplemented!("not probed by the gate tests")
     }
-    #[allow(unused_variables)]
     async fn update_series_timer(
         &self,
-        id: &str,
-        timer: SeriesTimerInfoDto,
+        _id: &str,
+        _timer: SeriesTimerInfoDto,
     ) -> Result<(), ServiceError> {
         unimplemented!("not probed by the gate tests")
     }
-    #[allow(unused_variables)]
-    async fn cancel_series_timer(&self, id: &str) -> Result<(), ServiceError> {
+    async fn cancel_series_timer(&self, _id: &str) -> Result<(), ServiceError> {
         unimplemented!("not probed by the gate tests")
     }
-    #[allow(unused_variables)]
     async fn get_recordings(&self) -> Result<QueryResult<BaseItemDto>, ServiceError> {
         unimplemented!("not probed by the gate tests")
     }
-    #[allow(unused_variables)]
-    async fn get_recording(&self, id: Uuid) -> Result<Option<BaseItemDto>, ServiceError> {
+    async fn get_recording(&self, _id: Uuid) -> Result<Option<BaseItemDto>, ServiceError> {
         unimplemented!("not probed by the gate tests")
     }
-    #[allow(unused_variables)]
-    async fn get_recording_path(&self, id: Uuid) -> Result<Option<String>, ServiceError> {
+    async fn get_recording_path(&self, _id: Uuid) -> Result<Option<String>, ServiceError> {
         unimplemented!("not probed by the gate tests")
     }
-    #[allow(unused_variables)]
-    async fn delete_recording(&self, id: Uuid) -> Result<(), ServiceError> {
+    async fn delete_recording(&self, _id: Uuid) -> Result<(), ServiceError> {
         unimplemented!("not probed by the gate tests")
     }
-    #[allow(unused_variables)]
     async fn get_schedules_direct_countries(&self) -> Result<Vec<u8>, ServiceError> {
         unimplemented!("not probed by the gate tests")
     }

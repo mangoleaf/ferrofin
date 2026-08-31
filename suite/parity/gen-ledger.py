@@ -279,6 +279,13 @@ def is_unexplained_failure(r):
 
 #: "N field(s) compared" / "N fields compared", however a layer phrases it.
 COMPARED_RE = re.compile(r"(\d+) fields?\(?s?\)? compared")
+#: reads.py/assets.py spell the same thing per LEG — "(14+4058+62 leaves compared)".
+#: This regex existing is not cosmetic: without it `evidence()` fell through to ""
+#: for EVERY reads-owned row, so the sentence printed under the deep-verified
+#: heading ("the parenthesis is how much was compared") was true of no row that
+#: layer owns, and `GET /LiveTv/TunerHosts/Types` (2 leaves) rendered exactly like
+#: `POST /LiveTv/Programs` (4438).
+LEAVES_RE = re.compile(r"((?:\d+\+)*\d+) leaves compared")
 
 
 def evidence(r):
@@ -288,12 +295,24 @@ def evidence(r):
     comparable leaves or one. `GET /Localization/Cultures` (984) and
     `GET /System/Info/Public` (1 — `Version`, every other field VOLATILE) render
     the same tick, and a reader had to open the probe to tell them apart.
+
+    A multi-leg row keeps its per-leg breakdown AND gains the total, in that
+    order: the breakdown is what shows a leg that compared nothing, and the total
+    is what lets a reader rank this row against a single-leg one.
     """
     note = r.get("note") or ""
     m = COMPARED_RE.search(note)
     if m:
         n = int(m.group(1))
         return f"{n} field{'' if n == 1 else 's'} compared"
+    m = LEAVES_RE.search(note)
+    if m:
+        legs = [int(x) for x in m.group(1).split("+")]
+        total = sum(legs)
+        unit = "leaf" if total == 1 else "leaves"
+        if len(legs) == 1:
+            return f"{total} {unit} compared"
+        return f"{m.group(1)} = {total} {unit} compared over {len(legs)} legs"
     if "'file'" in note or '"file"' in note:
         return "sha256 of the served bytes"
     if "text/vtt" in note or "text/srt" in note or "application/x-subrip" in note:
@@ -644,6 +663,18 @@ def _guards_fire():
     assert in_bucket(explained, classification.SETTLED) \
         and not is_unexplained_failure(explained), \
         "an op-scoped accepted classification still explains its own row"
+    # The deep-verified heading promises a leaf count in every parenthesis, so
+    # `evidence()` must read BOTH spellings the layers use. It read only
+    # "N fields compared", which reads.py never writes — so every reads-owned
+    # headline row rendered with no count at all and a 2-leaf diff looked exactly
+    # like a 4438-leaf one.
+    assert evidence({"note": "1/1 legs clean (2 leaves compared)"}) == "2 leaves compared"
+    assert evidence({"note": "1/1 legs clean (1 leaves compared)"}) == "1 leaf compared"
+    assert evidence({"note": "8/8 legs clean (14+4058+26 leaves compared)"}) \
+        == "14+4058+26 = 4098 leaves compared over 3 legs", \
+        "a multi-leg row keeps its per-leg breakdown AND gains the total"
+    assert evidence({"note": "984 fields compared"}) == "984 fields compared"
+    assert evidence({"note": "1/1 legs clean"}) == "", "no count claimed where none was recorded"
 
 
 def check(rows, curated):

@@ -131,6 +131,18 @@ async fn container_identity(
     Ok((mode, root))
 }
 
+/// The `Data` blob the auto-provisioned "Collections" library carries, and the
+/// only key of it Ferrofin reads or writes.
+///
+/// 10.11.8 keeps a `CollectionFolder`'s `CollectionType` in that column
+/// (`DtoService.AttachBasicFields` reads `IHasCollectionType.CollectionType`,
+/// `CollectionFolder.cs:32`), and its own row for this library says
+/// `"CollectionType":"boxsets"` because `CollectionManager.EnsureLibraryFolder`
+/// creates it with `CollectionTypeOptions.boxsets`. Only written over an EMPTY
+/// `Data` column — see `item_persistence_service::backfill_container_data` for
+/// why an adopted database's richer blob must survive untouched.
+const COLLECTIONS_FOLDER_DATA: &str = r#"{"CollectionType":"boxsets"}"#;
+
 /// The "Collections" library a created box set belongs to, adopting any
 /// orphans a previous version left behind.
 async fn collections_folder(
@@ -146,6 +158,12 @@ async fn collections_folder(
         &path,
         &mode,
         root,
+        // Upstream provisions this library through
+        // `AddVirtualFolder(name, CollectionTypeOptions.boxsets, …)`
+        // (v10.11.8 CollectionManager.cs:81-109), which is what puts
+        // `"CollectionType":"boxsets"` in the row's `Data` blob. Without it the
+        // folder went out with a null `CollectionType` everywhere it is listed.
+        Some(COLLECTIONS_FOLDER_DATA),
     )
     .await?;
     if let Some(id) = container {
@@ -182,6 +200,11 @@ async fn playlists_folder(
         &path,
         &mode,
         aggregate,
+        // No `Data`: `PlaylistsFolder.CollectionType` is a constant on the type
+        // (PlaylistsFolder.cs:29), not a persisted value — Jellyfin's own row
+        // carries an empty `Data` column, and `collection_type_of` answers
+        // `playlists` from the kind alone.
+        None,
     )
     .await?;
     if let Some(id) = container {
@@ -307,11 +330,25 @@ impl CollectionManager for FerrofinCollectionManager {
 
     async fn get_collections_folder(
         &self,
-        _create_if_needed: bool,
+        create_if_needed: bool,
     ) -> Result<Option<BaseItemEntity>, ServiceError> {
-        // Resolving/creating the "Collections" library folder needs the user-view
-        // tree (documented deferral).
-        Ok(None)
+        // Port of `CollectionManager.EnsureLibraryFolder`
+        // (v10.11.8 Emby.Server.Implementations/Collections/CollectionManager.cs
+        // :81-109): look the library up BY PATH, and provision it — directory,
+        // row, boxsets collection type and all — only when the caller asked for
+        // it. This used to answer `Ok(None)` unconditionally under a "documented
+        // deferral" comment; the tree it was said to need is the same
+        // `ensure_container` the create path has been using all along.
+        let path = format!("{}/collections", self.paths.data_path());
+        let id = if create_if_needed {
+            collections_folder(&self.db, &self.paths).await?
+        } else {
+            crate::item_persistence_service::container_at(&self.db, &path).await?
+        };
+        let Some(id) = id else {
+            return Ok(None);
+        };
+        crate::item_persistence_service::container_row(&self.db, id).await
     }
 }
 
@@ -803,7 +840,10 @@ mod tests {
     use crate::linked_children_service::FerrofinLinkedChildrenService;
     use crate::test_support::{item_repository_over, library_manager_over, seed_item, test_db};
 
-    use super::{FerrofinCollectionManager, FerrofinPlaylistManager};
+    use super::{
+        COLLECTIONS_FOLDER_DATA, FerrofinCollectionManager, FerrofinPlaylistManager,
+        collections_folder,
+    };
 
     /// Test paths under a temp root, so the provisioned containers land
     /// somewhere harmless.
@@ -867,6 +907,7 @@ mod tests {
             &path,
             &mode,
             Some(root),
+            Some(COLLECTIONS_FOLDER_DATA),
         )
         .await
         .expect("provision")
@@ -894,6 +935,7 @@ mod tests {
             &path,
             &mode,
             Some(root),
+            Some(COLLECTIONS_FOLDER_DATA),
         )
         .await
         .expect("provision")
@@ -904,6 +946,81 @@ mod tests {
             Some(ferrofin_db::store::guid_to_db(root)),
             "…now attached to the root"
         );
+    }
+
+    /// `get_collections_folder` is the real `EnsureLibraryFolder`: it answers
+    /// `None` before the library exists when the caller did not ask for it to be
+    /// created, and the provisioned row afterwards. It used to answer `None`
+    /// unconditionally.
+    #[tokio::test]
+    async fn get_collections_folder_looks_up_and_provisions() {
+        let db = test_db().await;
+        let manager = collection_manager_over(&db);
+        assert!(
+            manager
+                .get_collections_folder(false)
+                .await
+                .expect("lookup")
+                .is_none(),
+            "no library yet, and the caller did not ask for one"
+        );
+        let made = manager
+            .get_collections_folder(true)
+            .await
+            .expect("provision")
+            .expect("a row");
+        assert_eq!(made.name.as_deref(), Some("Collections"));
+        assert_eq!(made.data.as_deref(), Some(COLLECTIONS_FOLDER_DATA));
+        let found = manager
+            .get_collections_folder(false)
+            .await
+            .expect("lookup")
+            .expect("a row");
+        assert_eq!(found.id, made.id, "the same row, found by path");
+    }
+
+    /// The auto-provisioned Collections library carries
+    /// `"CollectionType":"boxsets"` in `Data` — the column 10.11.8 reads that
+    /// field from.
+    ///
+    /// Without it, `/Items?parentId={root}`, `/UserViews` and
+    /// `/Library/MediaFolders` all sent a null `CollectionType` for the folder
+    /// where Jellyfin sends `boxsets` (measured on the parity pair 2026-08-31).
+    #[tokio::test]
+    async fn the_collections_library_carries_the_boxsets_collection_type() {
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root_dir = tmp.path().to_string_lossy().into_owned();
+        let paths: Arc<dyn ferrofin_traits::system::ServerApplicationPaths> =
+            Arc::new(crate::app_paths::FerrofinServerApplicationPaths::new(
+                root_dir.clone(),
+                format!("{root_dir}/log"),
+                format!("{root_dir}/config"),
+                format!("{root_dir}/cache"),
+                format!("{root_dir}/web"),
+            ));
+        let id = collections_folder(&db, &paths)
+            .await
+            .expect("provision")
+            .expect("an id");
+        let data = crate::test_support::fetch_item(&db, id).await.data;
+        assert_eq!(
+            data.as_deref(),
+            Some(COLLECTIONS_FOLDER_DATA),
+            "the provisioned row carries the boxsets collection type"
+        );
+        // …and the DTO layer really reads it back as `boxsets`, which is the
+        // observable the parity pair measures.
+        let parsed: serde_json::Value =
+            serde_json::from_str(data.as_deref().expect("data")).expect("valid json");
+        assert_eq!(
+            parsed.get("CollectionType").and_then(|v| v.as_str()),
+            Some("boxsets")
+        );
+
+        // The other half — that an ADOPTED database's richer blob survives
+        // re-provisioning — lives in `item_persistence_service`'s own tests,
+        // because seeding it is SQL and SQL stays behind that boundary.
     }
 
     /// The provisioned container carries the id JELLYFIN would compute for that
@@ -956,6 +1073,7 @@ mod tests {
             &path,
             &mode,
             Some(root),
+            Some(COLLECTIONS_FOLDER_DATA),
         )
         .await
         .expect("provision")

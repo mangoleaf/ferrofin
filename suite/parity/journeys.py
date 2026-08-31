@@ -1711,6 +1711,12 @@ SERIES_TIMER_PER_INSTANCE = ("Id", "ExternalId", "ServerId")
 # there. The fixture guide is HOURLY, so ten minutes costs at most one candidate
 # programme and buys a subject that cannot start mid-journey.
 SERIES_TIMER_MIN_LEAD_S = 600
+#: The client-chosen name the third series-timer create posts. Lower-case on purpose,
+#: where every fixture programme title is capitalised: that is what makes the
+#: name-ordering legs a collation probe rather than a tautology (InvariantCulture puts
+#: "apple…" first, code-point order puts "Parity…" first). It must NOT match any
+#: programme title in the guide — see `j_livetv_series_timers`' docstring.
+RENAMED_SERIES_TIMER_NAME = "apple parity g5"
 RECORDING_START_WAIT_S = 60   # the recorder opens the tuner stream + the Recordings folder refreshes
 RECORDING_POLL_S = 5
 STREAM_PREFIX_BYTES = 16384   # ~87 TS packets: enough for is_mpegts, cheap to pull
@@ -2133,13 +2139,37 @@ def children_of(base, token, series_timer_id):
 
 
 def j_livetv_series_timers(base, token, user, _m, _m2):
-    """The series-timer lifecycle on the fixture tuner: pick two FUTURE programmes with
+    """The series-timer lifecycle on the fixture tuner: pick three FUTURE programmes with
     different titles from the guide, create a series timer from each programme's own
     `Timers/Defaults` body, read one back, update it, delete it, and confirm it and the
-    timers it scheduled are gone — then clean the second one up too.
+    timers it scheduled are gone — then clean the other two up.
 
-    Three assertions here are the ones that were missing, and each catches a real bug:
-      * two creates from two different programmes leave TWO rows with DIFFERENT ids.
+    THE NAME IS NOT A FREE PARAMETER, and an earlier version of this probe did not know
+    that. `GetTimersForSeries` (v10.11.8 DefaultLiveTvService.cs:803-821, the `query.Name` line is
+    820) builds the
+    fan-out query with `ExternalSeriesId = seriesTimer.SeriesId` and then, when that is
+    empty, `query.Name = seriesTimer.Name`. The XMLTV fixture publishes no series id, so
+    the fan-out matches programmes BY NAME on both servers. Overwriting `defaults["Name"]`
+    before the create therefore makes the series timer match NOTHING — measured on the
+    pair 2026-08-31, identically on both servers: unmodified defaults schedule 7 showings
+    (1 New, 6 Cancelled), renamed defaults schedule 0. The old probe renamed both creates
+    and then asserted the fan-out on one of them, so `posted_name_kept` and `fan_out` were
+    mutually exclusive and the row could not pass on ANY server, Jellyfin included. That
+    was a broken probe, not a Ferrofin gap.
+
+    So the two roles are split across different series timers, and BOTH are still measured:
+      * the first two creates leave `Name` exactly as `Timers/Defaults` published it, and
+        carry the fan-out;
+      * a third create on a THIRD programme posts a client-chosen `Name`, and carries
+        `posted_name_kept` plus the positive form of the rule above — a renamed series
+        timer with no SeriesId schedules nothing. The third programme is a different one
+        on purpose: `CreateSeriesTimer` re-parents any existing timer with the same
+        `ProgramId` onto the new series timer (:263-305), so building the renamed one on
+        a programme another series timer already owns would STEAL a showing from it and
+        make both rows lie.
+
+    The assertions here are the ones that were missing, and each catches a real bug:
+      * three creates from three different programmes leave THREE rows with DIFFERENT ids.
         `Timers/Defaults` hands every programme the same constant Id and clients post
         it straight back, so a server that honours it collapses every series timer
         onto one row and silently destroys the previous one.
@@ -2147,6 +2177,8 @@ def j_livetv_series_timers(base, token, user, _m, _m2):
         (`derives_its_id`), not the posted one and not a random GUID in DB casing.
       * creating a series timer SCHEDULES something: at least one timer carrying
         SeriesTimerId. A series timer that records nothing passes every status check.
+      * …and a series timer whose Name matches no programme schedules NOTHING, which is
+        the same rule read from the other side.
       * editing the series timer does not RESURRECT a showing the user cancelled by
         hand — the `IsManual` contract. Ferrofin wrote that flag on INSERT only, so
         cancelling a child (always an UPDATE) never raised it and the next edit put
@@ -2173,32 +2205,38 @@ def j_livetv_series_timers(base, token, user, _m, _m2):
                         time.gmtime(time.time() + SERIES_TIMER_MIN_LEAD_S))
     future = [p for p in programs if (p.get("StartDate") or "") > now]
     picked, seen = [], set()
-    for p in future:                      # two DIFFERENT titles: two independent series
+    for p in future:                      # three DIFFERENT titles: three independent series
         if p.get("Name") not in seen:
             seen.add(p.get("Name"))
             picked.append(p)
-        if len(picked) == 2:
+        if len(picked) == 3:
             break
-    if len(picked) < 2:
+    if len(picked) < 3:
         return r
     created = []
     try:
-        # --- create, twice, from two different programmes' defaults -------------------
+        # --- create, three times, from three different programmes' defaults ----------
+        # The first two keep the name `Timers/Defaults` published (so they fan out over
+        # the guide); the third posts a client-chosen one. See the docstring for why the
+        # two roles cannot live on the same series timer.
         create_ok, evidence = True, {}
+        # `RENAMED_SERIES_TIMER_NAME` is deliberately lower-case where the fixture's
+        # programme titles are capitalised: it is what makes the name-ordering legs
+        # below a real collation probe. `StringComparison.InvariantCulture` sorts
+        # "apple parity g5" BEFORE "Parity Show …"; code-point order sorts 'P' (U+0050)
+        # before 'a' (U+0061) and answers the other way round.
         for n, prog in enumerate(picked):
             before = set(series_timer_ids(base, token))
             defaults = get_json(base, f"/LiveTv/Timers/Defaults?programId={prog['Id']}", token) or {}
             defaults["Priority"] = 3 + n * 5          # non-default: the create must DISCARD it
-            # …and a client-chosen Name, which the create must KEEP:
-            # `LiveTvDtoService.GetSeriesTimerInfo` binds `Name = dto.Name`
-            # (v10.11.8 LiveTvDtoService.cs:499) and neither
-            # `DefaultLiveTvService.CreateSeriesTimer` (:263-309) nor
-            # `UpdateSeriesTimerAsync`'s whitelist (:314-334) ever writes it, so
-            # create is the ONLY place a name can be set. The two names are also
-            # what makes the ordering legs below a real collation probe:
-            # `StringComparison.InvariantCulture` sorts "apple" before "Banana",
-            # code-point order sorts them the other way round.
-            defaults["Name"] = ("apple parity g5", "Banana parity g5")[n]
+            if n == 2:
+                # A client-chosen Name, which the create must KEEP:
+                # `LiveTvDtoService.GetSeriesTimerInfo` binds `Name = dto.Name`
+                # (v10.11.8 LiveTvDtoService.cs:499) and neither
+                # `DefaultLiveTvService.CreateSeriesTimer` (:263-309) nor
+                # `UpdateSeriesTimerAsync`'s whitelist (:314-334) ever writes it, so
+                # create is the ONLY place a name can be set.
+                defaults["Name"] = RENAMED_SERIES_TIMER_NAME
             st, _ = http("POST", f"{base}/LiveTv/SeriesTimers", token, json.dumps(defaults))
             fresh = [i for i in series_timer_ids(base, token) if i not in before]
             created += fresh
@@ -2216,15 +2254,27 @@ def j_livetv_series_timers(base, token, user, _m, _m2):
                 # non-default one, so a server that honours it fails here — and
                 # would then also make the sort leg below meaningless.
                 "posted_priority_discarded": (dto or {}).get("Priority") == 0,
+                # For n in (0, 1) this says the create did not INVENT a name; for
+                # n == 2 it says the create honoured the client's.
                 "posted_name_kept": (dto or {}).get("Name") == defaults["Name"],
             }
             create_ok = create_ok and all(evidence[f"created{n}"].values())
-        evidence["two_distinct_ids"] = len(set(created)) == 2
-        create_ok = create_ok and evidence["two_distinct_ids"]
-        if len(created) < 2:
+        evidence["three_distinct_ids"] = len(set(created)) == 3
+        create_ok = create_ok and evidence["three_distinct_ids"]
+        if len(created) < 3:
             r["POST /LiveTv/SeriesTimers"] = Same(False, evidence)
             return r
-        sid, other = created[0], created[1]
+        sid, other, renamed = created[0], created[1], created[2]
+        # The other side of `GetTimersForSeries`' name rule (DefaultLiveTvService.cs
+        # :812-821): with `SeriesId` empty — which is every timer in this XMLTV fixture —
+        # the fan-out query is `Name = seriesTimer.Name`, so a series timer the client
+        # renamed matches no programme and schedules nothing at all. Measured identical
+        # on both servers. This leg is what keeps the split above honest: without it,
+        # moving `posted_name_kept` onto its own timer would have quietly dropped the
+        # only evidence that the name is what the fan-out keys on.
+        evidence["renamed_series_timer_schedules_nothing"] = \
+            len(children_of(base, token, renamed)) == 0
+        create_ok = create_ok and evidence["renamed_series_timer_schedules_nothing"]
         # …and the create SCHEDULED something: a series timer that records nothing
         # passes every status check ever written, which is how this went unnoticed.
         #
@@ -2343,19 +2393,24 @@ def j_livetv_series_timers(base, token, user, _m, _m2):
         # name order. Names are compared, not ids, so this is cross-server evidence.
         # Without distinct priorities the three lists would be identical and the leg
         # would pass on a server that drops sortBy on the floor, which is the bug.
-        def order_of(query):
+        def order_of(query, ids):
             items = (get_json(base, f"/LiveTv/SeriesTimers{query}", token) or {}).get("Items") or []
-            return [t.get("Name") for t in items if t.get("Id") in (sid, other)]
+            return [t.get("Name") for t in items if t.get("Id") in ids]
+        pair = (sid, other)
         r["POST /LiveTv/SeriesTimers"] = Same(create_ok, dict(
             evidence,
-            order_default=order_of(""),
-            order_priority_asc=order_of("?sortBy=Priority"),
-            order_priority_desc=order_of("?sortBy=Priority&sortOrder=Descending"),
-            # The default (name) order, reversed: with the two posted names above
-            # this is the collation leg — a server comparing by Unicode scalar
-            # instead of CLDR root collation answers ["apple…", "Banana…"] here
-            # where upstream answers ["Banana…", "apple…"].
-            order_name_desc=order_of("?sortOrder=Descending")))
+            order_default=order_of("", pair),
+            order_priority_asc=order_of("?sortBy=Priority", pair),
+            order_priority_desc=order_of("?sortBy=Priority&sortOrder=Descending", pair),
+            # The collation leg, and it is a DIFFERENT pair: `sid`/`other` both carry
+            # the fixture's capitalised programme titles, which sort the same way under
+            # either rule and so prove nothing. `renamed` carries the lower-case
+            # `RENAMED_SERIES_TIMER_NAME`, so a server comparing by Unicode scalar
+            # instead of CLDR root collation answers ["Parity Show …", "apple parity g5"]
+            # ascending and ["apple parity g5", "Parity Show …"] descending — the exact
+            # reverse of upstream on both.
+            order_name_asc=order_of("", (sid, renamed)),
+            order_name_desc=order_of("?sortOrder=Descending", (sid, renamed))))
 
         # --- delete: gone, its timers gone, and a second delete is not a silent 204 ----
         st, _ = http("DELETE", f"{base}/LiveTv/SeriesTimers/{sid}", token)
