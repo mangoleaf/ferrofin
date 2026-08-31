@@ -99,6 +99,10 @@ pub struct FerrofinLibraryManager {
     /// (`CreateItemByName<T>`), set by the composition root. `None` (unit
     /// tests) resolves only persisted rows.
     by_name: Option<crate::by_name_store::ByNameStore>,
+    /// The debounced `LibraryChanged` push (`LibraryChangedNotifier`), set by
+    /// the composition root. `None` (unit tests) means item writes announce
+    /// nothing, which is what every test that does not assert on the push wants.
+    changed: Option<Arc<crate::library_changed_notifier::LibraryChangedNotifier>>,
 }
 
 /// What a queued scan covers.
@@ -156,6 +160,7 @@ impl FerrofinLibraryManager {
             user_root: None,
             years: None,
             by_name: None,
+            changed: None,
         }
     }
 
@@ -316,6 +321,17 @@ impl FerrofinLibraryManager {
         chapters: Arc<dyn ferrofin_traits::persistence::ChapterRepository>,
     ) -> Self {
         self.chapters = Some(chapters);
+        self
+    }
+
+    /// Attaches the debounced `LibraryChanged` notifier so item writes
+    /// announce themselves to open clients.
+    #[must_use]
+    pub fn with_change_notifier(
+        mut self,
+        notifier: Arc<crate::library_changed_notifier::LibraryChangedNotifier>,
+    ) -> Self {
+        self.changed = Some(notifier);
         self
     }
 
@@ -585,7 +601,14 @@ impl LibraryManager for FerrofinLibraryManager {
         }
         // The parent linkage is already carried on each row's ParentId column; the
         // upsert is the single persistence path (C# CreateItems == save + register).
-        self.persistence.save_items(items).await
+        self.persistence.save_items(items).await?;
+        // `ItemAdded` (LibraryChangedNotifier): announce only after the write
+        // succeeded, so a failed save never tells clients to fetch a row that
+        // is not there.
+        if let Some(changed) = &self.changed {
+            changed.record_added(items);
+        }
+        Ok(())
     }
 
     async fn update_items(
@@ -608,6 +631,10 @@ impl LibraryManager for FerrofinLibraryManager {
             let values = crate::library_scan::item_values_of(item);
             self.persistence.save_item_values(id, &values).await?;
         }
+        // No `ItemUpdated` hook here: `save_items` above is the repository save,
+        // and the notifier is attached THERE so that every writer announces
+        // itself, not just this one. Recording it again here would be a
+        // duplicate the fold would have to drop.
         Ok(())
     }
 
@@ -665,7 +692,13 @@ impl LibraryManager for FerrofinLibraryManager {
             };
             ids.extend(self.items.get_item_ids(&child_query).await?);
         }
-        self.persistence.delete_items(&ids).await
+        self.persistence.delete_items(&ids).await?;
+        // `ItemRemoved` (LibraryChangedNotifier). `ids[0]` is the item itself;
+        // the rest are the cascaded children, which have no rows left to read.
+        if let Some(changed) = &self.changed {
+            changed.record_removed_subtree(&row, &ids[1..]);
+        }
+        Ok(())
     }
 
     async fn merge_versions(&self, ids: &[Uuid]) -> Result<(), ServiceError> {

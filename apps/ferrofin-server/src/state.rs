@@ -960,6 +960,20 @@ pub async fn build_app_state(
     let library_scanner = Arc::new(scanner);
     // Kept concrete so the library monitor can take it as a `LibraryScanTrigger`
     // (the `dyn LibraryManager` object does not carry that narrow impl).
+    // `ServerConfiguration.LibraryUpdateDuration` — how long the notifier waits
+    // for changes to stop before it pushes. A non-positive value would make the
+    // debounce fire instantly and push once per saved row, so it falls back to
+    // Jellyfin's default rather than honouring it.
+    let library_update_duration = u64::try_from(server_config.library_update_duration)
+        .ok()
+        .filter(|d| *d > 0)
+        .unwrap_or(ferrofin_core::library_changed_notifier::DEFAULT_LIBRARY_UPDATE_DURATION_SECS);
+    let change_notifier = Arc::new(
+        ferrofin_core::library_changed_notifier::LibraryChangedNotifier::new(
+            Arc::clone(&event_manager),
+            std::time::Duration::from_secs(library_update_duration),
+        ),
+    );
     let library_impl = Arc::new(
         FerrofinLibraryManager::new(
             Arc::clone(&item_repository),
@@ -968,6 +982,11 @@ pub async fn build_app_state(
             Arc::clone(&people_repository),
         )
         .with_scanner(Arc::clone(&library_scanner))
+        // `LibraryChangedNotifier`: item writes through the API (a metadata
+        // edit, a delete) announce themselves after `LibraryUpdateDuration`
+        // seconds of quiet. Without this only scans pushed `LibraryChanged`,
+        // so a client sitting on a library view never saw an edit land.
+        .with_change_notifier(Arc::clone(&change_notifier))
         // Chapter thumbnails are served from the chapter rows, not the item's
         // image rows.
         .with_chapters(Arc::clone(&chapter_repository))
@@ -1489,6 +1508,20 @@ pub async fn build_app_state(
         // `SendPlayCommand` -> `TranslateItemForInstantMix`).
         .with_music_manager(Arc::clone(&music)),
     );
+
+    // Every repository save announces itself (`ItemUpdated`), which is where
+    // Jellyfin's notifier hooks in. Attached here rather than at construction
+    // because the persistence service is built before the event bus exists.
+    item_persistence_impl.set_change_notifier(Arc::clone(&change_notifier));
+
+    // The notifier's per-user fan-out, attachable only now that the session
+    // manager exists. Until this line the notifier falls back to publishing one
+    // payload on the bus; after it, each user gets a payload filtered to the
+    // libraries they can actually see.
+    change_notifier.set_audience(Arc::new(SessionLibraryAudience {
+        sessions: Arc::clone(&sessions),
+        user_views: Arc::clone(&user_views),
+    }));
 
     // Forward domain events to client sessions over the WebSocket — the Rust
     // shape of Jellyfin's notifier entry points (`LibraryChangedNotifier`,
@@ -2014,6 +2047,66 @@ pub async fn build_app_state(
         lifecycle: lifecycle_concrete,
         background,
     })
+}
+
+use uuid::Uuid;
+
+/// The per-user fan-out for `LibraryChanged` (`LibraryChangedNotifier`'s
+/// `ISessionManager` + `ILibraryManager` collaborators).
+///
+/// "Which libraries can this user see" is answered by `UserViewManager` rather
+/// than the library manager, which also keeps this off an ownership ring: the
+/// library manager owns the notifier and the notifier owns this audience, so a
+/// strong handle back to the library would close the ring and leak both for the
+/// process lifetime.
+struct SessionLibraryAudience {
+    sessions: Arc<dyn ferrofin_traits::session::SessionManager>,
+    user_views: Arc<dyn ferrofin_traits::library::UserViewManager>,
+}
+
+#[async_trait::async_trait]
+impl ferrofin_traits::events::LibraryChangeAudience for SessionLibraryAudience {
+    async fn active_user_ids(&self) -> Result<Vec<Uuid>, ferrofin_traits::error::ServiceError> {
+        // The admin view of the session table (`_sessionManager.Sessions`):
+        // a nil user id with the api-key flag is the unfiltered enumeration.
+        let sessions = self
+            .sessions
+            .get_sessions(Uuid::nil(), None, None, None, true)
+            .await?;
+        let mut seen = std::collections::HashSet::new();
+        Ok(sessions
+            .into_iter()
+            .map(|s| s.user_id)
+            .filter(|id| !id.is_nil() && seen.insert(*id))
+            .collect())
+    }
+
+    async fn visible_library_ids(
+        &self,
+        user_id: Uuid,
+    ) -> Result<Vec<Uuid>, ferrofin_traits::error::ServiceError> {
+        Ok(self
+            .user_views
+            .get_user_views(user_id)
+            .await?
+            .iter()
+            .filter_map(|v| Uuid::parse_str(&v.id).ok())
+            .collect())
+    }
+
+    async fn deliver(
+        &self,
+        user_id: Uuid,
+        payload: &str,
+    ) -> Result<(), ferrofin_traits::error::ServiceError> {
+        self.sessions
+            .send_message_to_user_sessions(
+                &[user_id],
+                ferrofin_model::session::SessionMessageType::LibraryChanged,
+                payload,
+            )
+            .await
+    }
 }
 
 #[cfg(test)]

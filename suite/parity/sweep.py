@@ -327,14 +327,30 @@ def wait_for_scan(base, token):
         b = get_json(base, "/Items?userId=%s&recursive=true&includeItemTypes=Movie,Episode&limit=0"
                      % CTX_USER[base], token)
         return b.get("TotalRecordCount", 0) if b else -1
-    last, stable = -1, 0
+    last, stable, zeros = -1, 0, 0
     for _ in range(480):
         n = count()
         stable = stable + 1 if (n == last and n > 0) else 0
         if stable >= 8:
-            break
+            return
+        # A scan that never produces an item is not a slow scan, it is a broken
+        # provision, and the 40-minute cap below used to absorb it SILENTLY: the
+        # loop fell through and every layer then measured an empty library, so
+        # the run reported weaker numbers instead of failing. Seen 2026-08-31,
+        # when Jellyfin scanned nothing and the abort surfaced four layers later
+        # as "need >=2 movies, got 0". Three minutes of zeros is already
+        # pathological -- the healthy pair reaches hundreds of items in seconds.
+        zeros = zeros + 1 if n <= 0 else 0
+        if zeros >= 36:
+            raise RuntimeError(
+                "%s: still 0 Movie/Episode items after 3 minutes -- the scan never "
+                "started. Refusing to measure an empty library." % base)
         last = n
         time.sleep(5)
+    raise RuntimeError(
+        "%s: library scan never settled (last count %d). Refusing to measure a "
+        "half-scanned library -- every layer after this would report a number "
+        "that looks like a regression and is not one." % (base, last))
 
 
 CTX_USER = {}

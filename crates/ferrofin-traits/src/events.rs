@@ -39,6 +39,39 @@ pub trait EventManager: Send + Sync {
 
 fn _assert_object_safe_event_manager(_: &dyn EventManager) {}
 
+/// The per-user audience for a `LibraryChanged` push.
+///
+/// `LibraryChangedNotifier.SendChangeNotifications` does not broadcast one
+/// payload: it walks the distinct user ids that have a session, builds a
+/// `LibraryUpdateInfo` filtered to what THAT user can see
+/// (`TranslatePhysicalItemToUserLibrary`), skips the user entirely when the
+/// filtered result is empty, and sends the rest with
+/// `SendMessageToUserSessions`. Broadcasting instead would tell every signed-in
+/// client the item ids of libraries it has no access to.
+///
+/// This is the notifier's `ISessionManager` + `ILibraryManager` collaborators
+/// reduced to the three questions it actually asks, which keeps it object-safe
+/// and keeps `ferrofin-core`'s library manager from having to own a session
+/// manager that owns it back.
+#[async_trait]
+pub trait LibraryChangeAudience: Send + Sync {
+    /// The distinct user ids that currently have a session.
+    async fn active_user_ids(&self) -> Result<Vec<uuid::Uuid>, ServiceError>;
+
+    /// The collection-folder (library) ids `user_id` is allowed to see.
+    ///
+    /// `GetUserRootFolder().GetChildren(user, true).OfType<Folder>()`.
+    async fn visible_library_ids(
+        &self,
+        user_id: uuid::Uuid,
+    ) -> Result<Vec<uuid::Uuid>, ServiceError>;
+
+    /// Pushes one user's already-filtered payload to that user's sessions.
+    async fn deliver(&self, user_id: uuid::Uuid, payload: &str) -> Result<(), ServiceError>;
+}
+
+fn _assert_object_safe_library_change_audience(_: &dyn LibraryChangeAudience) {}
+
 /// Persists opaque diagnostic documents uploaded by clients.
 ///
 /// Port of `IClientEventLogger`.

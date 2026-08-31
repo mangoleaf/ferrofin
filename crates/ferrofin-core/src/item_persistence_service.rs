@@ -13,6 +13,8 @@
 //! normalization in C# and is not needed to persist already-mapped rows, so it
 //! is not taken here.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use ferrofin_db::Database;
 use ferrofin_db::entities::base_items::BaseItemEntity;
@@ -577,6 +579,17 @@ pub(crate) async fn adopt_orphans(
 #[derive(Clone)]
 pub struct FerrofinItemPersistenceService {
     db: Database,
+    /// The debounced `LibraryChanged` push. Set by the composition root.
+    ///
+    /// The hook lives HERE and not only on `LibraryManager` because that is
+    /// where Jellyfin's `ItemUpdated` fires from — `BaseItem.UpdateToRepositoryAsync`,
+    /// i.e. the repository save, which every writer funnels through. Hooking
+    /// only the library manager's own `update_items` caught API metadata edits
+    /// and missed provider, view and media-source writes entirely.
+    ///
+    /// A `OnceLock` rather than a constructor argument: this service is built
+    /// long before the event bus the notifier publishes on exists.
+    changed: std::sync::OnceLock<Arc<crate::library_changed_notifier::LibraryChangedNotifier>>,
 }
 
 impl std::fmt::Debug for FerrofinItemPersistenceService {
@@ -590,7 +603,24 @@ impl FerrofinItemPersistenceService {
     /// Creates the service over the given database.
     #[must_use]
     pub fn new(db: Database) -> Self {
-        Self { db }
+        Self {
+            db,
+            changed: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Attaches the `LibraryChanged` notifier so every item save announces
+    /// itself. Scans are deliberately NOT announced through here — they use
+    /// [`save_scanned_items`](ItemPersistenceService::save_scanned_items) and
+    /// publish one folded event at scan end instead, so a full scan cannot
+    /// accumulate a row per item for the length of the debounce.
+    /// Later calls are ignored — which notifier a save announces on is a
+    /// wiring decision, not a runtime one.
+    pub fn set_change_notifier(
+        &self,
+        notifier: Arc<crate::library_changed_notifier::LibraryChangedNotifier>,
+    ) {
+        let _ = self.changed.set(notifier);
     }
 
     /// One-shot startup pass: rewrites every stored `CleanName` / `CleanValue`
@@ -859,6 +889,12 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
     async fn save_items(&self, items: &[BaseItemEntity]) -> Result<(), ServiceError> {
         for item in items {
             self.upsert_item(item, UPSERT_SQL).await?;
+        }
+        // `ItemUpdated`. An item the caller also reported as ADDED is folded back
+        // out of the updated bucket by the notifier, so the library manager's
+        // `create_items` hook still wins for a creation.
+        if let Some(changed) = self.changed.get() {
+            changed.record_updated(items);
         }
         Ok(())
     }

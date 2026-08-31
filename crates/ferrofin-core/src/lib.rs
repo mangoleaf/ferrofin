@@ -180,6 +180,7 @@ pub mod item_repository;
 pub mod item_type_lookup;
 pub mod keyframe_repository;
 pub mod kinds;
+pub mod library_changed_notifier;
 pub mod library_manager;
 pub mod library_monitor;
 pub mod library_scan;
