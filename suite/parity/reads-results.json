@@ -1,7 +1,7 @@
 {
   "correlated_items": 5,
   "generated_by": "suite/parity/reads.py",
-  "last_verified": "c7f49a9 2026-08-31",
+  "last_verified": "ce44a3e 2026-08-31",
   "rows": {
     "GET /Albums/{itemId}/Similar": {
       "classification": "ok",
@@ -21,7 +21,7 @@
         ],
         "missing": []
       },
-      "note": "0/1 legs clean (38 leaves compared); mismatch:3 missing:0 extra:0 | Items[Name=Artist 02].RunTimeTicks(J=0 H=60000000); Items[Name=Artist 03].RunTimeTicks(J=0 H=60000000); Items[Name=Artist 01].RunTimeTicks(J=0 H=60000000)",
+      "note": "0/1 legs clean (38 leaves compared); mismatch:3 missing:0 extra:0 | Items[Name=Artist 01].RunTimeTicks(J=0 H=60000000); Items[Name=Artist 02].RunTimeTicks(J=0 H=60000000); Items[Name=Artist 03].RunTimeTicks(J=0 H=60000000)",
       "verification_method": "body-diff"
     },
     "GET /Artists/AlbumArtists": {
@@ -36,7 +36,7 @@
         ],
         "missing": []
       },
-      "note": "0/1 legs clean (38 leaves compared); mismatch:3 missing:0 extra:0 | Items[Name=Artist 02].RunTimeTicks(J=0 H=60000000); Items[Name=Artist 03].RunTimeTicks(J=0 H=60000000); Items[Name=Artist 01].RunTimeTicks(J=0 H=60000000)",
+      "note": "0/1 legs clean (38 leaves compared); mismatch:3 missing:0 extra:0 | Items[Name=Artist 01].RunTimeTicks(J=0 H=60000000); Items[Name=Artist 02].RunTimeTicks(J=0 H=60000000); Items[Name=Artist 03].RunTimeTicks(J=0 H=60000000)",
       "verification_method": "body-diff"
     },
     "GET /Artists/InstantMix": {
@@ -56,7 +56,7 @@
         ],
         "missing": []
       },
-      "note": "0/1 legs clean (26 leaves compared); mismatch:2 missing:0 extra:0 | Items[Name=Artist 03].RunTimeTicks(J=0 H=60000000); Items[Name=Artist 02].RunTimeTicks(J=0 H=60000000)",
+      "note": "0/1 legs clean (26 leaves compared); mismatch:2 missing:0 extra:0 | Items[Name=Artist 02].RunTimeTicks(J=0 H=60000000); Items[Name=Artist 03].RunTimeTicks(J=0 H=60000000)",
       "verification_method": "body-diff"
     },
     "GET /Artists/{name}": {
@@ -8068,7 +8068,7 @@
           "Items[Path=/media/synth/tv/Series 08/Season 01/Series 08 S01E03.mkv].MediaStreams[2].Width"
         ]
       },
-      "note": "4/8 legs clean (108006+929+226+4868+101+104+218+3 leaves compared); mismatch:1572 missing:6306 extra:0 | Items[Path=/media/synth/movies/Movie 0138 (2020)/Movie 0138 (2020).mkv].MediaSources[Path=/media/synth/movies/Movie 0138 (2020)/Movie 0138 (2020).mkv].Bitrate(J=6253020 H=6061020); Items[Path=/media/synth/movies/Movie 0138 (2020)/Movie 0138 (2020).mkv].MediaSources[Path=/media/synth/movies/Movie 0138 (2020)/Movie 0138 (2020).mkv].MediaStreams[0].BitRate(J=6061020 H=5869020); Items[Path=/media/synth/movies/Movie 0138 (2020)/Movie 0138 (2020).mkv].MediaStreams[0].BitRate(J=6061020 H=5869020)",
+      "note": "4/8 legs clean (108006+929+226+4868+101+104+218+3 leaves compared); mismatch:1572 missing:6306 extra:0 | Items[Path=/media/synth/movies/Movie 0038 (2020)/Movie 0038 (2020).mkv].MediaSources[Path=/media/synth/movies/Movie 0038 (2020)/Movie 0038 (2020).mkv].Bitrate(J=6253020 H=6061020); Items[Path=/media/synth/movies/Movie 0038 (2020)/Movie 0038 (2020).mkv].MediaSources[Path=/media/synth/movies/Movie 0038 (2020)/Movie 0038 (2020).mkv].MediaStreams[0].BitRate(J=6061020 H=5869020); Items[Path=/media/synth/movies/Movie 0038 (2020)/Movie 0038 (2020).mkv].MediaStreams[0].BitRate(J=6061020 H=5869020)",
       "verification_method": "body-diff"
     },
     "GET /Items/{itemId}": {
@@ -8142,7 +8142,7 @@
         ],
         "missing": []
       },
-      "note": "5/6 legs clean (44+44+44+44+44+23 leaves compared); mismatch:2 missing:0 extra:0 | [Path=/config/root].RecursiveItemCount(J=537 H=557); [Path=/config/root].PrimaryImageAspectRatio(J=1.3333333333333333 H=1.0)",
+      "note": "5/6 legs clean (44+44+44+44+44+23 leaves compared); mismatch:2 missing:0 extra:0 | [Path=/config/root].PrimaryImageAspectRatio(J=1.3333333333333333 H=1.0); [Path=/config/root].RecursiveItemCount(J=537 H=557)",
       "verification_method": "body-diff"
     },
     "GET /Items/{itemId}/ExternalIdInfos": {
@@ -8251,7 +8251,7 @@
         ],
         "missing": []
       },
-      "note": "0/5 legs clean (1177+1173+3450+65+2 leaves compared); mismatch:13 missing:0 extra:3 | TotalRecordCount(J=139 H=183); Images[](J=len 139 H=len 183); Images[138].Type(J=\"Primary\" H=\"Art\")",
+      "note": "0/5 legs clean (1177+1173+3450+65+2 leaves compared); mismatch:13 missing:0 extra:3 | Images[](J=len 139 H=len 183); Images[138].ProviderName(J=\"The Open Movie Database\" H=\"FanArt\"); Images[138].Url(J=\"https://m.media-amazon.com/images/M/MV5BMDAyY2FhYjctNDc5OS00MDNlLThiMGUtY2UxYWV\u2026 H=\"https://assets.fanart.tv/fanart/the-shawshank-redemption-518530e5614ca.png\")",
       "verification_method": "body-diff"
     },
     "GET /Items/{itemId}/RemoteImages/Providers": {
@@ -8544,7 +8544,7 @@
           "SearchHints[16].RunTimeTicks"
         ]
       },
-      "note": "0/1 legs clean (149 leaves compared); mismatch:22 missing:6 extra:6 | SearchHints[10].Type(J=\"Person\" H=\"MusicArtist\"); SearchHints[10].Name(J=\"Artist 01\" H=\"Action\"); SearchHints[11].Type(J=\"Person\" H=\"Genre\")",
+      "note": "0/1 legs clean (149 leaves compared); mismatch:22 missing:6 extra:6 | SearchHints[10].Name(J=\"Artist 01\" H=\"Action\"); SearchHints[10].Type(J=\"Person\" H=\"Genre\"); SearchHints[11].Name(J=\"Artist 02\" H=\"Action\")",
       "verification_method": "body-diff"
     },
     "GET /Sessions": {

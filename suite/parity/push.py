@@ -530,13 +530,29 @@ def residue_report(residue, proven=frozenset()):
                 f"a non-lifecycle message was drained by a settle window, so the "
                 f"leg after it was measured against an incomplete capture — {shown}")
         elif base in BACKGROUND_BROADCASTS or base in proven:
+            # The REASON the counts may differ is per message type, and saying
+            # the wrong one is worse than saying none: a reader who trusts
+            # "scheduled tasks" for a LibraryChanged delta looks in the wrong
+            # place for a real regression.
+            why = {
+                "ScheduledTaskEnded":
+                    "their task triggers were seeded at their own container "
+                    "start times, so a run of a few minutes catches a task "
+                    "finishing on one side and not the other",
+                "LibraryChanged":
+                    "each server's `LibraryUpdateDuration` debounce restarts on "
+                    "its OWN last item write, so the two fold their pending "
+                    "changes at different moments",
+            }.get(base, "they are on schedules of their own")
             observations.append(
                 f"BACKGROUND BROADCAST (not caused by any op this layer drives, so "
                 f"excluded from the compared sets and counted here instead) — {shown}. "
-                f"Both servers implement it; the counts differ because their task "
-                f"schedulers were seeded at their own start times. A count on ONE "
-                f"side only is timing, not a missing feature — a server that never "
-                f"sent one across many runs would be.")
+                f"Both servers implement it; the counts differ because {why}. A count "
+                f"on ONE side only is timing, not a missing feature — a server that "
+                f"never sent one across many runs would be."
+                + (" This type's allowance was EARNED this run by "
+                   "`prove_library_changed`, not assumed."
+                   if base in PROVEN else ""))
         elif counts.get("h", 0) != counts.get("j", 0):
             observations.append(
                 f"COUNT DELTA (socket lifecycle, no contract op owns it) — {shown}. "

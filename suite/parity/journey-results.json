@@ -1,7 +1,7 @@
 {
   "errors": {},
   "generated_by": "suite/parity/journeys.py",
-  "last_verified": "c7f49a9 2026-08-31",
+  "last_verified": "ce44a3e 2026-08-31",
   "notes": {
     "playlist_share_repeat_delete_status": {
       "ferrofin": 404,
@@ -352,9 +352,9 @@
       "verification_method": "body-diff"
     },
     "POST /Items/RemoteSearch/MusicArtist": {
-      "classification": "flagged: Ferrofin read-back did not reflect the write (verify: real gap vs read-back method)",
-      "deep_verified": false,
-      "note": "H=False(+evidence) J=True(+evidence) (property; named properties compared across the two servers; bodies NOT diffed) [evidence: named: H=[] J=[{'Name': 'Amnesiac', 'ProviderIds': {'MusicBrainzArtist': '042914f7-8bfa-4b0d-9fa6-ee1b8feacbd5'}, 'ProductionYear': 2006, 'PremiereDate': '2006-01-01T00:00:00.0000000Z', 'SearchProviderName': 'MusicBrainz', 'Artists': []}, {'Name': 'Amnesiac', 'ProviderIds': {'MusicBrainzArtist': '2fe2bb15-8b74-4b5b-abb3-167d8c11954f'}, 'SearchProviderName': 'MusicBrainz', 'Artists': []}, {'Name': 'Amnesiac Quartet', 'ProviderIds': {'MusicBrainzArtist': '7615d0d9-9640-4749-a7f9-5e7c162ab5fa'}, 'SearchProviderName': 'MusicBrainz', 'Artists': []}, {'Name': 'An Evening of Radiohead', 'ProviderIds': {'MusicBrainzArtist': '1545e981-65ca-4123-9223-ae8efd72cf54'}, 'ProductionYear': 2024, 'PremiereDate': '2024-01-01T00:00:00.0000000Z', 'SearchProviderName': 'MusicBrainz', 'Artists': []}, {'Name': 'Android paranoid', 'ProviderIds': {'MusicBrainzArtist': '7a75f877-3cd7-432c-8349-b09e6a59f975'}, 'SearchProviderName': 'MusicBrainz', 'Artists': []}, {'Name': 'Colin Greenwood', 'ProviderIds': {'MusicBrainzArtist': 'f23074f4-2c06-477a-bf1d-12fa66e087ee'}, 'ProductionYear': 1969, 'PremiereDate': '1969-06-26T00:00:00.0000000Z', 'SearchProviderName': 'MusicBrainz', 'Artists': []}, {'Name': 'DJ Radiohead', 'ProviderIds': {'MusicBrainzArtist': '118b7a68-9249-4f5a-91f4-1fd046c07f8f'}, 'SearchProviderName': 'MusicBrainz', 'Artists': []}, {'Name': 'Ed O\u2019Brien', 'ProviderIds': {'MusicBrainzArtist': '309d9809-cf74-493a-b56b-1378258f20fd'}, 'ProductionYear': 1968, 'PremiereDate': '1968-04-15T00:00:00.0000000Z', 'SearchProviderName': 'MusicBrainz', 'Artists': []}, {'Name': 'Fake Plastic Radiohead', 'ProviderIds': {'MusicBrainzArtist': 'b21ab3cc-88ed-4d2b-bd01-6edb83c37900'}, 'ProductionYear': 2021, 'PremiereDate': '2021-09-25T00:00:00.0000000Z', 'SearchProviderName': 'MusicBrainz', 'Artists': []}, {'Name': 'Gazz', 'ProviderIds': {'MusicBrainzArtist': '93ccea0f-cc7e-4057-91b1-b5b8ae6f9a91'}, 'SearchProviderName': 'MusicBrainz', 'Artists': []}, {'Name': 'Goyimbwoods', 'ProviderIds': {'MusicBrainzArtist': '7acdf668-b20f-4f98-b740-584b6b24a10e'}, 'ProductionYear': 2018, 'PremiereDate': '2018-01-01T00:00:00.0000000Z', 'SearchProviderName': 'MusicBrainz', 'Artists': []}, {'Name': 'In Rainbows', 'ProviderIds': {'MusicBrainzArtist': 'a6606aaa-6027-4d6d-8bea-0e8ee816b8f1'}, 'SearchProviderName': 'MusicBrainz', 'Artists': []}, {'Name': 'Karma Police', 'ProviderIds': {'MusicBrainzArtist': 'eef663a4-72f1-4773-9a8d-f9254e555847'}, 'SearchProviderName': 'MusicBrainz', 'Artists': []}, {'Name': 'On a Friday', 'ProviderIds': {'MusicBrainzArtist': 'c74f4726-2671-4011-81b6-f70da905c05a'}, 'ProductionYear': 1985, 'PremiereDate': '1985-01-01T00:00:00.0000000Z', 'SearchProviderName': 'MusicBrainz', 'Artists': []}, {'Name': 'Paranoid', 'ProviderIds': {'MusicBrainzArtist': '3093e58d-57ce-4757-9919-bfa603ab9a64'}, 'SearchProviderName': 'MusicBrainz', 'Artists': []}, {'Name': 'Philip Selway', 'ProviderIds': {'MusicBrainzArtist': '4ab74d13-d1eb-4895-b874-6da5d8b1aac3'}, 'ProductionYear': 1967, 'PremiereDate': '1967-05-23T00:00:00.0000000Z', 'SearchProviderName': 'MusicBrainz', 'Artists': []}, {'Name': 'Plank', 'ProviderIds': {'MusicBrainzArtist': '827df643-4099-40e3-9ba1-8aebbf351cc1'}, 'SearchProviderName': 'MusicBrainz', 'Artists': []}, {'Name': 'RadiOK', 'ProviderIds': {'MusicBrainzArtist': 'eb2bf67f-5b28-4c2b-afd7-e6c5576aac9a'}, 'ProductionYear': 2019, 'PremiereDate': '2019-01-01T00:00:00.0000000Z', 'SearchProviderName': 'MusicBrainz', 'Artists': []}, {'Name': 'Radiohead', 'ProviderIds': {'MusicBrainzArtist': 'a74b1b7f-71a5-4011-9441-d0b5e4122711'}, 'ProductionYear': 1991, 'PremiereDate': '1991-01-01T00:00:00.0000000Z', 'SearchProviderName': 'MusicBrainz', 'Artists': []}, {'Name': 'Radiohead 2', 'ProviderIds': {'MusicBrainzArtist': '33bfaa56-037f-4f7d-9a0a-c2412c636e56'}, 'SearchProviderName': 'MusicBrainz', 'Artists': []}, {'Name': 'Radiohead Cover Brasil', 'ProviderIds': {'MusicBrainzArtist': 'e48fc8b3-e8ab-4dd4-9dc8-6b0f06ef07d6'}, 'SearchProviderName': 'MusicBrainz', 'Artists': []}, {'Name': 'Secret Society', 'ProviderIds': {'MusicBrainzArtist': 'b7ab4150-9830-4951-87ed-250ab2cea021'}, 'SearchProviderName': 'MusicBrainz', 'Artists': []}, {'Name': 'The Bends', 'ProviderIds': {'MusicBrainzArtist': 'b5ed1065-9be0-4214-af07-66d532e64fd2'}, 'SearchProviderName': 'MusicBrainz', 'Artists': []}, {'Name': 'The Smile', 'ProviderIds': {'MusicBrainzArtist': '9055fca5-69bc-4d47-b569-ab2012a19565'}, 'ProductionYear': 2021, 'PremiereDate': '2021-05-22T00:00:00.0000000Z', 'SearchProviderName': 'MusicBrainz', 'Artists': []}, {'Name': 'radiohead 3', 'ProviderIds': {'MusicBrainzArtist': '3ecaa799-94ae-45cd-9ad1-bcabae4073e1'}, 'SearchProviderName': 'MusicBrainz', 'Artists': []}]; named_count: H=0 J=25]",
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True(+evidence) J=True(+evidence) (property; named properties compared across the two servers; bodies NOT diffed)",
       "verification_method": "property"
     },
     "POST /Items/RemoteSearch/Person": {
@@ -484,9 +484,9 @@
       "verification_method": "effect"
     },
     "POST /LiveTv/ChannelMappings": {
-      "classification": "flagged: write effect not observed on either server (likely corpus/setup)",
+      "classification": "flagged: Jellyfin read-back differed (verify: oracle setup or Ferrofin extra)",
       "deep_verified": false,
-      "note": "H=False J=False (effect; each server checked against its OWN read-back only; nothing compared across the two)",
+      "note": "H=True J=False (effect; each server checked against its OWN read-back only; nothing compared across the two)",
       "verification_method": "effect"
     },
     "POST /LiveTv/ListingProviders": {
