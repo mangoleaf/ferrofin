@@ -330,7 +330,8 @@ async fn ensure_startup_wizard_integrity(
         return Ok(());
     }
     tracing::warn!(
-        "the startup wizard is marked incomplete but a configured administrator already          exists; marking setup as completed to prevent the unauthenticated setup endpoints          from being reachable"
+        "the startup wizard is marked incomplete but a configured administrator already exists; \
+         marking setup as completed to prevent the unauthenticated setup endpoints from being reachable"
     );
     let mut updated = (*current).clone();
     updated.is_startup_wizard_completed = true;
