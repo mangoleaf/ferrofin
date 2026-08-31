@@ -1,19 +1,44 @@
 //! `ChannelsController` — internet/provider channels.
 //!
-//! Channels are contributed by channel *providers*, which in Jellyfin ship as
-//! plugins. Ferrofin has no built-in channel providers, so — exactly like a stock
-//! Jellyfin install with none registered — every channel query resolves to an
-//! empty result and there are no channel features to report. These handlers
-//! therefore return empty `QueryResult`s / `ChannelFeatures` directly.
+//! Channels are contributed by channel *providers* (`IChannel`), which in Jellyfin
+//! ship as .NET plugins. Neither the vendored 10.11.8 tree nor upstream master
+//! contains a single `IChannel` implementation, so on a stock server no `Channel`
+//! item can exist at all — and Ferrofin, which does not load .NET assemblies, is
+//! in the same state permanently.
 //!
-//! ponytail: no `ChannelManager` trait for an always-empty subsystem — add one
-//! only if channel providers are ever introduced.
+//! That splits this controller in two, and the split is *measured*, not assumed:
+//!
+//! - The COLLECTION routes (`/Channels`, `/Channels/Features`,
+//!   `/Channels/Items/Latest`) query for `Channel` items and legitimately find
+//!   none, so both servers answer `200` with an empty result.
+//! - The PER-CHANNEL routes (`/Channels/{channelId}/…`) do **not**. Upstream
+//!   resolves the id first — `ChannelManager.GetChannel(id)` is
+//!   `_libraryManager.GetItemById(id) as Channel`, which is `null` for every id
+//!   — and hands that `null` straight to
+//!   `ChannelManager.GetChannelProvider(channel)`, whose first statement is
+//!   `ArgumentNullException.ThrowIfNull(channel)`
+//!   (v10.11.8 `src/Jellyfin.LiveTv/Channels/ChannelManager.cs:1177`, master
+//!   `:1176` — byte-identical). `ExceptionMiddleware.GetStatusCode` maps
+//!   `ArgumentException => Status400BadRequest`, so **every** `channelId` is a
+//!   `400` on a stock server, on both trees.
+//!
+//! Ferrofin used to answer `200` here — an empty item list, and a fabricated
+//! `ChannelFeatures` echoing back whatever UUID was asked for. That told a client
+//! "this channel exists and is empty" for a resource that cannot exist, and the
+//! fabricated body was wrong on its own terms as well (`GetChannelFeaturesDto`
+//! sets `CanFilter = !features.MaxPageSize.HasValue`, i.e. `true` for a null page
+//! size, where `ChannelFeatures::default()` gives `false`). Both routes now
+//! reject, matching the C# on both trees. Measured on the parity pair
+//! 2026-08-30: before, F `200` vs J `400`; after, `400` on both.
+//!
+//! ponytail: no `ChannelManager` trait for a subsystem with no providers — add
+//! one only if channel providers are ever introduced.
 //!
 //! Ports `ChannelsController`:
 //! - `GET /Channels` — the user's channels (empty).
 //! - `GET /Channels/Features` — every channel's features (empty list).
-//! - `GET /Channels/{channelId}/Features` — one channel's features (default).
-//! - `GET /Channels/{channelId}/Items` — a channel's items (empty).
+//! - `GET /Channels/{channelId}/Features` — one channel's features (400: no provider).
+//! - `GET /Channels/{channelId}/Items` — a channel's items (400: no provider).
 //! - `GET /Channels/Items/Latest` — latest items across channels (empty).
 
 use axum::extract::Path;
@@ -25,6 +50,7 @@ use ferrofin_model::querying::QueryResult;
 use uuid::Uuid;
 
 use crate::auth::RequireAuth;
+use crate::error::ApiError;
 use crate::state::AppState;
 
 /// `GET /Channels` — the authenticated user's channels.
@@ -57,40 +83,61 @@ async fn get_all_channel_features(RequireAuth(_auth): RequireAuth) -> Json<Vec<C
 
 /// `GET /Channels/{channelId}/Features` — one channel's features.
 ///
-/// Port of `ChannelsController.GetChannelFeatures`. No provider backs the id, so
-/// a default feature set (carrying the requested id) is returned.
+/// Port of `ChannelsController.GetChannelFeatures` →
+/// `ChannelManager.GetChannelFeatures(Guid?)` (v10.11.8
+/// `src/Jellyfin.LiveTv/Channels/ChannelManager.cs:545-556`, master `:543-554`):
+/// `GetChannel(id)` is `null` with no `IChannel` provider registered, and
+/// `GetChannelProvider(null)` throws `ArgumentNullException` before any
+/// not-found check — `ExceptionMiddleware` maps that to `400`.
+///
+/// Nothing may be fabricated here: a feature set carrying the requested id would
+/// claim a channel exists that no provider backs.
 #[utoipa::path(
     get,
     path = "/Channels/{channelId}/Features",
     params(("channelId" = String, Path, description = "Channel id")),
-    responses((status = 200, description = "Channel features returned", body = ChannelFeatures)),
+    responses(
+        (status = 200, description = "Channel features returned", body = ChannelFeatures),
+        (status = 400, description = "No channel provider backs the id")
+    ),
     tag = "ferrofin"
 )]
 async fn get_channel_features(
     RequireAuth(_auth): RequireAuth,
     Path(channel_id): Path<Uuid>,
-) -> Json<ChannelFeatures> {
-    Json(ChannelFeatures {
-        id: channel_id,
-        ..ChannelFeatures::default()
-    })
+) -> Result<Json<ChannelFeatures>, ApiError> {
+    Err(ApiError::BadRequest(format!(
+        "no channel provider found for channel {channel_id}"
+    )))
 }
 
 /// `GET /Channels/{channelId}/Items` — a channel's items.
 ///
-/// Port of `ChannelsController.GetChannelItems`. No channels → empty.
+/// Port of `ChannelsController.GetChannelItems` →
+/// `ChannelManager.GetChannelItemsInternal` (v10.11.8
+/// `src/Jellyfin.LiveTv/Channels/ChannelManager.cs:691-697`), which resolves
+/// `GetChannel(query.ChannelIds[0])` and calls `GetChannelProvider(channel)`
+/// *before* it queries anything. With no `IChannel` provider that channel is
+/// `null`, so the same `ArgumentNullException.ThrowIfNull` fires and upstream
+/// answers `400` for every id. An empty `QueryResult` would assert the channel
+/// exists.
 #[utoipa::path(
     get,
     path = "/Channels/{channelId}/Items",
     params(("channelId" = String, Path, description = "Channel id")),
-    responses((status = 200, description = "Channel items returned (QueryResult<BaseItemDto>)")),
+    responses(
+        (status = 200, description = "Channel items returned (QueryResult<BaseItemDto>)"),
+        (status = 400, description = "No channel provider backs the id")
+    ),
     tag = "ferrofin"
 )]
 async fn get_channel_items(
     RequireAuth(_auth): RequireAuth,
-    Path(_channel_id): Path<Uuid>,
-) -> Json<QueryResult<BaseItemDto>> {
-    Json(QueryResult::default())
+    Path(channel_id): Path<Uuid>,
+) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
+    Err(ApiError::BadRequest(format!(
+        "no channel provider found for channel {channel_id}"
+    )))
 }
 
 /// `GET /Channels/Items/Latest` — latest items across all channels.

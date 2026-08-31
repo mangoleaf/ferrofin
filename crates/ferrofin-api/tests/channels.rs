@@ -177,3 +177,67 @@ async fn channels_route_returns_empty_not_501() {
     let (status, _body) = send(tasks, "GET", "/Channels").await;
     assert_eq!(status, StatusCode::OK);
 }
+
+#[tokio::test]
+async fn channel_features_for_an_unbacked_id_is_400() {
+    // Upstream: `ChannelManager.GetChannelFeatures(id)` -> `GetChannel(id)` is
+    // `_libraryManager.GetItemById(id) as Channel` -> null with no `IChannel`
+    // provider registered -> `GetChannelProvider(null)` ->
+    // `ArgumentNullException.ThrowIfNull(channel)` (v10.11.8 ChannelManager.cs:1177,
+    // master :1176) -> `ExceptionMiddleware` `ArgumentException => 400`.
+    let tasks = Arc::new(StubTasks::new(Vec::new()));
+    let (status, _body) = send(
+        tasks,
+        "GET",
+        "/Channels/11111111-1111-1111-1111-111111111111/Features",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn channel_features_never_fabricates_a_feature_set() {
+    // The regression this replaces: a 200 carrying a default `ChannelFeatures`
+    // that echoed the requested id back, asserting a channel no provider backs.
+    // The body must not parse as one — in particular it must not carry `Id`.
+    let tasks = Arc::new(StubTasks::new(Vec::new()));
+    let (status, body) = send(
+        tasks,
+        "GET",
+        "/Channels/00000000-0000-0000-0000-000000000000/Features",
+    )
+    .await;
+    assert_ne!(status, StatusCode::OK);
+    let parsed: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+    assert!(
+        parsed.get("Id").is_none() && parsed.get("MediaTypes").is_none(),
+        "error body still looks like a ChannelFeatures: {parsed}"
+    );
+}
+
+#[tokio::test]
+async fn channel_items_for_an_unbacked_id_is_400() {
+    // `ChannelManager.GetChannelItemsInternal` (v10.11.8 ChannelManager.cs:691-697)
+    // runs the same GetChannel/GetChannelProvider pair before it queries anything.
+    let tasks = Arc::new(StubTasks::new(Vec::new()));
+    let (status, _body) = send(
+        tasks,
+        "GET",
+        "/Channels/11111111-1111-1111-1111-111111111111/Items",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn the_collection_channel_routes_stay_200_empty() {
+    // The other half of the split: these query for `Channel` items and
+    // legitimately find none, so both servers answer 200 with an empty result.
+    // Measured identical on the parity pair, and must not follow the per-channel
+    // routes into a 4xx.
+    for uri in ["/Channels", "/Channels/Features", "/Channels/Items/Latest"] {
+        let tasks = Arc::new(StubTasks::new(Vec::new()));
+        let (status, _body) = send(tasks, "GET", uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+    }
+}

@@ -442,6 +442,22 @@ def resolve_fixtures(base, token, user):
         # scoped by path (see PATH_SCOPED) rather than put in `fx`, so filling
         # one cannot silently probe the other with a wrong id.
         "_livetv_channel": channel,
+        # The /Channels/ half of that split — same argument as `groupId` below.
+        # `ChannelsController` serves `IChannel` PROVIDER channels, and neither
+        # the v10.11.8 tree nor master contains a single `IChannel`
+        # implementation (`git grep -l "IChannel" -- "*.cs"` returns only the
+        # interface and its three consumers on both), so no `Channel` item can
+        # exist on either server and the response CANNOT depend on the value. A
+        # literal GUID is therefore the only possible seed and the right one:
+        # the breadth row then measures the 400/400 status parity
+        # (`GetChannel(id)` is null -> `GetChannelProvider(null)` ->
+        # `ArgumentNullException.ThrowIfNull` -> `ExceptionMiddleware`
+        # `ArgumentException => 400`) instead of skipping the op. It stays a
+        # NON-deep row here — sweep body-diffs only 200/200 — which is correct:
+        # there is no 200 body on either server, ever. Leaving it unseeded is
+        # what hid a live Ferrofin bug (a fabricated 200 `ChannelFeatures`
+        # echoing the requested id) behind a "requires-channel-plugin" label.
+        "_plugin_channel": "11111111-1111-1111-1111-111111111111",
         # `{groupId}` occurs in exactly ONE contract path, and
         # `LiveTvController.GetRecordingGroup` (v10.11.8) is `[Obsolete]` with
         # the body `return NotFound();` — no `RecordingGroup` lookup exists
@@ -523,6 +539,7 @@ QUERY_FILL = {
 # -> fixture key`: only a path under the prefix gets the value, so a name shared
 # by two unrelated id spaces cannot cross-contaminate.
 PATH_SCOPED = {("/LiveTv/", "channelId"): "_livetv_channel",
+               ("/Channels/", "channelId"): "_plugin_channel",
                ("/Plugins/", "version"): "_plugin_version"}
 
 
@@ -791,6 +808,11 @@ def selfcheck():
     # with an id from the wrong id space and call the result parity.
     assert build_url("/LiveTv/Channels/{channelId}", {"_livetv_channel": "CH"}) == ("/LiveTv/Channels/CH", None)
     assert build_url("/Channels/{channelId}/Items", {"_livetv_channel": "CH"})[0] is None
+    # …and the same in the other direction: the plugin-channel seed fills only
+    # under /Channels/, never a Live TV route.
+    assert build_url("/Channels/{channelId}/Items", {"_plugin_channel": "PC"}) == ("/Channels/PC/Items", None)
+    assert build_url("/Channels/{channelId}/Features", {"_plugin_channel": "PC"}) == ("/Channels/PC/Features", None)
+    assert build_url("/LiveTv/Channels/{channelId}", {"_plugin_channel": "PC"})[0] is None
     # The deep-diff verdict must be derived from what was actually compared.
     from parity_diff import diff_stats as ds
     empty = {"Items": [], "TotalRecordCount": 0, "StartIndex": 0}

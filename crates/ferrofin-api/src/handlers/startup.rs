@@ -274,7 +274,12 @@ async fn update_startup_user(
         .await?
         .ok_or_else(|| ApiError::NotFound("no first user".to_owned()))?;
 
-    if user.password.is_some() {
+    // `if (!string.IsNullOrEmpty(user.Password)) return Forbid();` — upstream
+    // security commit 62a5ded920. An EMPTY string is not a password: Jellyfin's
+    // own `DefaultAuthenticationProvider.ChangePassword` writes `null`, but an
+    // adopted or hand-edited DB can hold `''`, and `is_some()` alone would lock
+    // that account's wizard out where the C# proceeds.
+    if user.password.as_deref().is_some_and(|p| !p.is_empty()) {
         return Err(ApiError::Forbidden(
             "first user already has a password".to_owned(),
         ));

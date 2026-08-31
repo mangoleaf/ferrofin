@@ -196,6 +196,13 @@ JOURNEY_METHOD.update({op: verification.PROPERTY for op in (
     # `UpdateTimerAsync` takes four fields and discards the rest of the posted
     # body: the projection is those four plus "did the discarded ones survive".
     "POST /LiveTv/Timers/{timerId}",
+    # Two named invariants compared across the two servers — the first user's
+    # name, and whether the provisioned credentials still authenticate. NOT the
+    # status: Ferrofin answers 403 (upstream master's Forbid guard) where
+    # Jellyfin 10.11.8 answers 204, which is the `jellyfin-bug` row in
+    # classifications.json and is pinned in Rust unit tests instead. See
+    # `j_startup`.
+    "POST /Startup/User",
 )})
 JOURNEY_METHOD.update({op: verification.BODY_DIFF for op in (
     # The FIRST rows in this layer to earn the headline, and they earn it the way
@@ -234,6 +241,50 @@ def user_data(base, token, user, mid):
 
 # ---------------------------------------------------------------- journeys (per server → {op: effect_ok})
 
+def credentials_still_valid(base):
+    """Status of a fresh `POST /Users/AuthenticateByName` with the provisioned
+    credentials — the only way to prove a password write did not clobber them.
+
+    It MUST NOT reuse the harness's `DeviceId`: re-authenticating on a device
+    that already holds a session revokes that session's token on both servers,
+    and the run's own token is the one being revoked. Measured while writing
+    this: with `http()`'s fixed `Client="parity", DeviceId="parity"` header,
+    every request after this one 401'd — `POST /Startup/RemoteAccess`,
+    `POST /Startup/Complete` and the whole playlist-share journey went red on
+    both servers. A dedicated device id keeps the check to the one thing it is
+    asking about, and its session is logged out again so the probe leaves no
+    registration behind.
+    """
+    dev = 'Client="parity-reauth", Device="parity-reauth", DeviceId="parity-reauth", Version="1.0"'
+    req = urllib.request.Request(
+        f"{base}/Users/AuthenticateByName",
+        data=json.dumps({"Username": USER, "Pw": PASS}).encode(),
+        method="POST",
+        headers={"Content-Type": "application/json", "Authorization": f"MediaBrowser {dev}"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            st, raw = r.status, r.read()
+    except urllib.error.HTTPError as e:
+        return e.code
+    except (urllib.error.URLError, TimeoutError, ConnectionError):
+        return 0
+    try:
+        tok = json.loads(raw)["AccessToken"]
+    except (ValueError, KeyError):
+        return st
+    # Retire the session this probe just created, so a long-lived lab does not
+    # accumulate one device registration per journeys run.
+    logout = urllib.request.Request(
+        f"{base}/Sessions/Logout", data=b"", method="POST",
+        headers={"Content-Type": "application/json",
+                 "Authorization": f'MediaBrowser Token="{tok}", {dev}'})
+    try:
+        urllib.request.urlopen(logout, timeout=30).close()
+    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, ConnectionError):
+        pass
+    return st
+
+
 def j_startup(base, token, user, _m, _m2):
     """The first-run wizard endpoints. Setup is complete on both servers by the time journeys
     run, but the controller's policy is FirstTimeSetupOrElevated — an admin can drive it after
@@ -245,17 +296,38 @@ def j_startup(base, token, user, _m, _m2):
     st, _ = http("POST", f"{base}/Startup/Configuration", token, json.dumps(cfg))
     back = get_json(base, "/Startup/Configuration", token) or {}
     r["POST /Startup/Configuration"] = st < 300 and all(back.get(k) == v for k, v in cfg.items())
-    # Post-setup the first user already has a password, and the contract is 403 (the Forbid
-    # guard upstream added in v12, which Ferrofin ports). Jellyfin 10.11.8 predates it and
-    # silently re-sets the admin password instead — sending the provisioned credentials keeps
-    # that a no-op. Classified in classifications.json; this asserts the correct contract.
+    # Post-setup the first user already has a password, and the two servers answer this write
+    # DIFFERENTLY BY CONSTRUCTION: Ferrofin ports upstream master, whose `Forbid` guard is
+    # security commit 62a5ded920, and answers 403; Jellyfin 10.11.8 predates that commit and
+    # answers 204, silently re-setting the provisioned admin's password. That status delta is
+    # classified `jellyfin-bug` in classifications.json, with the C# for both trees.
+    #
+    # This row therefore may NOT assert a status. It used to assert `st == 403` on BOTH
+    # servers, which made the Jellyfin leg false by construction and pinned the row at
+    # H=True J=False forever — a permanently-red row wearing a hand-written "accepted" label
+    # instead of a measurement. What it asserts instead is the invariant the guard exists to
+    # protect and which BOTH trees agree on: the provisioned admin is not clobbered. Sending
+    # the harness's own credentials keeps Jellyfin's 204 a no-op, so the effect is checkable
+    # on both — the name is unchanged and the credentials still authenticate.
+    #
+    # The status itself is deliberately kept OUT of the `Same` evidence: 403 vs 204 legitimately
+    # differs, and putting it there would re-file a known upstream bug as "the two servers ended
+    # in different states". Ferrofin's 403 is pinned exactly, and against master rather than
+    # against a 10.11.8 container that does not contain the fix, by the unit tests in
+    # crates/ferrofin-api/tests/startup.rs (404/403/ordering/empty-column, transliterated from
+    # upstream's own StartupControllerTests.cs). `st in (204, 403)` here is that split, not a
+    # widened tolerance.
+    #
     # Jellyfin picks `Users.First()` from an unordered dictionary, so the call is only safe
     # while the admin is the ONLY user — a stray user from a failed cleanup would be the one
     # renamed/re-passworded instead. Guarded rather than assumed.
     if len(get_json(base, "/Users", token) or []) == 1:
         st, _ = http("POST", f"{base}/Startup/User", token, json.dumps({"Name": USER, "Password": PASS}))
         back = get_json(base, "/Startup/User", token) or {}
-        r["POST /Startup/User"] = st == 403 and back.get("Name") == USER
+        reauth = credentials_still_valid(base)
+        r["POST /Startup/User"] = Same(
+            st in (204, 403) and back.get("Name") == USER and reauth == 200,
+            {"FirstUserName": back.get("Name"), "CredentialsStillValid": reauth == 200})
     else:
         r["POST /Startup/User"] = False   # not attempted: more than one user on the instance
     st, _ = http("POST", f"{base}/Startup/RemoteAccess", token,
@@ -522,6 +594,22 @@ def j_playlist_share(base, token, user, mid, _m2):
         st, _ = http("DELETE", f"{base}/Playlists/{pid}/Users/{uid}", token)
         after = (get_json(base, f"/Playlists/{pid}/Users", token) or [])
         r["DELETE /Playlists/{playlistId}/Users/{userId}"] = st < 300 and not any(s.get("UserId") == uid for s in after)
+        # Second symptom of the same upstream defect, recorded rather than asserted.
+        # `PlaylistsController.RemoveUserFromPlaylist` specifies `share is null ->
+        # NotFound("User permissions not found")`, so a share the DELETE really removed
+        # must 404 on a repeat. Ferrofin does. Jellyfin's DELETE is a reference-equality
+        # no-op (`PlaylistManager.RemoveUserFromShares` re-fetches a DIFFERENT Playlist
+        # instance and calls `shares.Remove(share)` on a `PlaylistUserPermissions` with no
+        # equality override — v10.11.8 L641-648 / master L669-676, byte-identical), so the
+        # share survives and the repeat finds it again and answers 204 forever.
+        #
+        # Kept OUT of the row's boolean deliberately: folding it in would make the row
+        # ASSERT the divergence instead of measuring the shared invariant, and would let a
+        # future Ferrofin regression to a blind 204 pass by matching Jellyfin. The
+        # underscore prefix keeps it out of the op loop (it is evidence, not a contract op);
+        # the divergence itself is classified `jellyfin-bug` in classifications.json.
+        r["_note:playlist_share_repeat_delete_status"] = http(
+            "DELETE", f"{base}/Playlists/{pid}/Users/{uid}", token)[0]
         http("DELETE", f"{base}/Users/{uid}", token)   # cleanup
         http("DELETE", f"{base}/Items/{pid}", token)
     return r
@@ -2076,7 +2164,15 @@ def journeys(ferrofin_url, jellyfin_url):
                         "verification_method": None,
                         "note": f"H={h_ok} — no Jellyfin oracle, so no parity verdict "
                                 f"(Ferrofin-only run)"}
-    return rows, {k: v for k, v in h.items() if k.startswith("_")}
+    # The `_` namespace never becomes a row. `_error:<journey>` records a journey
+    # that blew up; `_note:<name>` records a measurement kept deliberately OUT of
+    # a row's assertion (see the repeat-DELETE evidence in `j_playlist_share`) —
+    # and a note is reported for BOTH servers, because its whole value is the
+    # side-by-side.
+    errors = {k: v for k, v in h.items() if k.startswith("_error")}
+    notes = {k[len("_note:"):]: {"ferrofin": h.get(k), "jellyfin": j.get(k)}
+             for k in sorted(set(h) | set(j)) if k.startswith("_note:")}
+    return rows, errors, notes
 
 
 def main():
@@ -2085,9 +2181,9 @@ def main():
         return
     ferrofin = os.environ.get("FERROFIN_URL", "http://localhost:18096")
     jellyfin = os.environ.get("JELLYFIN_URL")
-    rows, errors = journeys(ferrofin, jellyfin)
+    rows, errors, notes = journeys(ferrofin, jellyfin)
     out = {"generated_by": "suite/parity/journeys.py", "last_verified": os.environ.get("PARITY_STAMP", ""),
-           "errors": errors, "rows": rows}
+           "errors": errors, "notes": notes, "rows": rows}
     with open(os.path.join(ROOT, "suite/parity/journey-results.json"), "w") as f:
         json.dump(out, f, indent=2, sort_keys=True)
         f.write("\n")
@@ -2169,7 +2265,11 @@ def selfcheck():
         for line in src.splitlines():
             if 'r["' in line:
                 key = line.split('r["', 1)[1].split('"]', 1)[0]
-                declared.add(key)
+                # `_`-prefixed keys are the runner's own namespace (`_error:…`,
+                # `_note:…`): journeys() filters them out of `rows`, so they are
+                # evidence carried alongside the run and are NOT contract ops.
+                if not key.startswith("_"):
+                    declared.add(key)
         # …plus op keys carried in a data table rather than an `r["…"]` literal —
         # the nine remote-control rows are assigned in a loop, so scraping only
         # `r["` left them unvalidated against the spec AND unstamped.

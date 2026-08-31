@@ -605,8 +605,11 @@ recording_group_invariants.alias = "LiveTvRecordingGroup"
 # on both would compare a hit against a miss — worse than not measuring.
 #
 # What IS diffable, and what found four real defects, is the SHAPE each server
-# gives its OWN plugin. Each op below gets its OWN probe exercising its OWN
-# route: four ledger rows must be four measurements, not one claimed four times.
+# gives its OWN plugin, plus the id-INDEPENDENT rejection contract (an unknown
+# guid, an unparseable version, a version that misses, no credentials), which is
+# determined by the controller rather than by which plugins a server has. Each op
+# below gets its OWN probe exercising its OWN route: six ledger rows must be six
+# measurements, not one claimed six times.
 
 
 def plugin_seed(base, token):
@@ -740,6 +743,135 @@ def plugin_manifest_invariants(base, token, ctx):
 
 
 plugin_manifest_invariants.alias = "PluginsManifest"
+
+
+# ---------------------------------------------------- Plugins Enable / Disable
+#
+# Nothing exercised these two ops in ANY layer before this: sweep hands writes to
+# Layer 2, journeys.py contains no plugin journey at all, and the four probes
+# above cover Configuration/Manifest/Image only. Both rows sat on a hand-written
+# classification about a *different* op (the pre-restart window of
+# `POST /Packages/Installed/{name}`) while the real divergences went unmeasured.
+#
+# MUTATION HYGIENE — read this before editing either probe. On Jellyfin,
+# `PluginManager.ChangePluginState` (v10.11.8
+# Emby.Server.Implementations/Plugins/PluginManager.cs:513) early-returns
+# `true` when `plugin.Manifest.Status == state`, and that early return is the
+# ONLY path that reaches `ProcessAlternative`, whose last two lines are
+# `plugin.Manifest.Status = PluginStatus.Restart; plugin.Manifest.AutoUpdate =
+# false;` (:882, commented "This value is memory only"). So a NO-OP toggle —
+# enabling an already-Active plugin — permanently pins that plugin at `Restart`
+# in memory, poisoning `plugin_manifest_invariants`' `status_value` fact and
+# every later `GET /Plugins` diff, until the container restarts. Neither probe
+# below ever issues a toggle whose target equals the current status, and both
+# restore. A concurrent lane already left Jellyfin's AudioDB at `Restart` this
+# way; do not add an "idempotent toggle" fact here.
+#
+# WHAT IS AND IS NOT DIFFED. Every rejection fact is id-independent and agrees
+# exactly. The mutating leg's HTTP status does NOT agree, and it is included on
+# purpose — see the `jellyfin-bug` half of these rows in classifications.json.
+# Jellyfin answers 404 for a toggle that SUCCEEDS: its five plugins are bundled
+# in-assembly, so `LocalPlugin.Path` is a .dll FILE (`CreatePluginInstance`,
+# :541/:559), `SaveManifest` does `File.WriteAllText(Path.Combine(path,
+# "meta.json"))` and catches only `ArgumentException` (:364), the resulting
+# `DirectoryNotFoundException` escapes the action, and `ExceptionMiddleware`
+# maps it to 404 — after `ChangePluginState` has already flipped the status in
+# memory. Ferrofin answers 204 and is correct. Making that fact green by
+# dropping it would be the dishonest version of this row.
+
+
+def plugin_status(base, token, pid):
+    """The `Status` this server reports for `pid` in `GET /Plugins`, or None."""
+    return next((p.get("Status") for p in (token_get(base, "/Plugins", token)[1] or [])
+                 if p.get("Id") == pid), None)
+
+
+def plugin_toggle_facts(base, token, verb):
+    """The id-independent rejection facts for `POST /Plugins/{id}/{ver}/{verb}`.
+
+    `PluginsController` is `[Authorize(Policy = Policies.RequiresElevation)]` at
+    class level and binds `[FromRoute, Required] Version version`, then resolves
+    `_pluginManager.GetPlugin(pluginId, version)` and `NotFound()`s on a miss
+    (v10.11.8 PluginsController.cs:71 / :94, PluginManager.cs:293-311). Every
+    fact here is therefore determined by the CONTRACT, not by which plugins the
+    server happens to have — which is what makes them diffable across two servers
+    that share no plugin id.
+    """
+    pid, ver = plugin_seed(base, token)
+    facts = {"plugin_seed_present": bool(pid)}
+    facts["unknown_id"] = http(
+        "POST", base + f"/Plugins/{PROBE_PLUGIN_GUID}/1.0.0/{verb}", token, None)[0]
+    facts["anonymous"] = http(
+        "POST", base + f"/Plugins/{PROBE_PLUGIN_GUID}/1.0.0/{verb}", None, None)[0]
+    if not pid:
+        return facts, pid, ver
+    facts["malformed_version"] = http(
+        "POST", base + f"/Plugins/{pid}/notaversion/{verb}", token, None)[0]
+    facts["wrong_version"] = http(
+        "POST", base + f"/Plugins/{pid}/9.9.9.9/{verb}", token, None)[0]
+    # .NET's `Version` treats an absent component as -1, so `1.0` never equals
+    # `1.0.0` — the installed plugin's version with its last component dropped
+    # must miss. Ferrofin ports that rule (`plugin_at_version`).
+    short = ".".join(ver.split(".")[:-1])
+    if short and short != ver:
+        facts["short_version"] = http(
+            "POST", base + f"/Plugins/{pid}/{short}/{verb}", token, None)[0]
+    return facts, pid, ver
+
+
+def plugin_disable_invariants(base, token, ctx):
+    """`POST /Plugins/{pluginId}/{version}/Disable`.
+
+    The mutating leg drives Disable from `Active` (never a no-op) and restores
+    with one Enable. `status_after_disable` is the fact that matters and it
+    AGREES: both servers report `Disabled`, because Jellyfin's in-memory status
+    flip lands before the exception that costs it the 204. `disable_status` is
+    the one that diverges (F 204 / J 404) and is kept.
+    """
+    del ctx
+    facts, pid, ver = plugin_toggle_facts(base, token, "Disable")
+    if not pid:
+        return facts
+    before = plugin_status(base, token, pid)
+    facts["was_active_before"] = before == "Active"
+    if before != "Active":
+        return facts   # unknown starting state: measure nothing rather than guess
+    facts["disable_status"] = http(
+        "POST", base + f"/Plugins/{pid}/{ver}/Disable", token, None)[0]
+    facts["status_after_disable"] = plugin_status(base, token, pid)
+    http("POST", base + f"/Plugins/{pid}/{ver}/Enable", token, None)
+    facts["restored"] = plugin_status(base, token, pid) == before
+    return facts
+
+
+plugin_disable_invariants.alias = "PluginsDisable"
+
+
+def plugin_enable_invariants(base, token, ctx):
+    """`POST /Plugins/{pluginId}/{version}/Enable`.
+
+    Mirror of the Disable probe on its OWN route: Disable is the SETUP (so the
+    measured Enable is a real state change, not the `ProcessAlternative` trap),
+    Enable is the measurement, and the plugin ends where it started.
+    """
+    del ctx
+    facts, pid, ver = plugin_toggle_facts(base, token, "Enable")
+    if not pid:
+        return facts
+    before = plugin_status(base, token, pid)
+    facts["was_active_before"] = before == "Active"
+    if before != "Active":
+        return facts
+    http("POST", base + f"/Plugins/{pid}/{ver}/Disable", token, None)   # setup, not measured
+    facts["disabled_for_setup"] = plugin_status(base, token, pid) == "Disabled"
+    facts["enable_status"] = http(
+        "POST", base + f"/Plugins/{pid}/{ver}/Enable", token, None)[0]
+    facts["status_after_enable"] = plugin_status(base, token, pid)
+    facts["restored"] = plugin_status(base, token, pid) == before
+    return facts
+
+
+plugin_enable_invariants.alias = "PluginsEnable"
 
 
 def plugin_image_invariants(base, token, ctx):
@@ -1033,7 +1165,7 @@ READS = [
     # A movie seed cannot be body-diffed (Random order + a deliberately different
     # candidate algorithm) — verified by properties instead, see
     # `similar_invariants`.
-    # The four plugin ops. All four are stamped `property`, never `body-diff`:
+    # The six plugin ops. All six are stamped `property`, never `body-diff`:
     # no shared plugin id exists between a Rust server with compiled-in
     # extensions and a stock Jellyfin with five bundled .NET provider plugins,
     # so there is no shared subject to diff. What WOULD earn a body diff is the
@@ -1043,6 +1175,12 @@ READS = [
     invariant("POST /Plugins/{pluginId}/Configuration", plugin_configuration_write_invariants),
     invariant("POST /Plugins/{pluginId}/Manifest", plugin_manifest_invariants),
     invariant("GET /Plugins/{pluginId}/{version}/Image", plugin_image_invariants),
+    # The two state-toggle ops. Same rule as above — one probe per route, each
+    # exercising the route it is named for; the sibling verb only ever appears as
+    # setup or restore, never as the measurement. See the mutation-hygiene note
+    # above `plugin_status`.
+    invariant("POST /Plugins/{pluginId}/{version}/Enable", plugin_enable_invariants),
+    invariant("POST /Plugins/{pluginId}/{version}/Disable", plugin_disable_invariants),
     invariant("GET /Items/{itemId}/Similar", similar_invariants_for("Items")),
     item("GET /Items/{itemId}/Ancestors", "/Items/{i}/Ancestors?userId={u}"),
     item("GET /Items/{itemId}/PlaybackInfo", "/Items/{i}/PlaybackInfo?userId={u}"),
@@ -2072,7 +2210,8 @@ def selfcheck():
     # Naming them keeps a typo'd alias from silently colliding with a real one.
     assert set(aliases) <= set(SIMILAR_ALIASES) | {
         "LiveTvGuideInfo", "LiveTvRecordingGroup", "PluginsConfiguration",
-        "PluginsConfigurationWrite", "PluginsManifest", "PluginsImage"}, aliases
+        "PluginsConfigurationWrite", "PluginsManifest", "PluginsImage",
+        "PluginsEnable", "PluginsDisable"}, aliases
     # Every invariant row is stamped `property`, never the body-diff method the
     # ledger headline counts.
     assert all(ep["method"] == "property" for ep in READS if ep["kind"] == "invariant")
