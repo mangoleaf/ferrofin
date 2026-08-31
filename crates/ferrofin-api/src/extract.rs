@@ -295,11 +295,23 @@ where
 {
     type Rejection = ProblemDetails;
 
-    /// `[FromBody] T? body` semantics, measured against 10.11.8 on
-    /// `POST /Items/{id}/PlaybackInfo`: an absent body, an empty body and the
-    /// literal `null` all bind as `None` and the request is served; a body that
-    /// is present and malformed — `[]`, a syntax error, a member the DTO's own
-    /// types cannot take — is still a 400. Turning THAT into "no body supplied"
+    /// `[FromBody] T? body` semantics. Measured against 10.11.8 on
+    /// `POST /Items/{id}/PlaybackInfo`, all six spellings, both servers
+    /// (2026-08-30, item 28c3ad34d0306759137254e7c81d74e0):
+    ///
+    /// ```text
+    ///   absent body                    F=200 J=200
+    ///   empty body                     F=200 J=200
+    ///   literal null                   F=200 J=200
+    ///   array []                       F=400 J=400
+    ///   syntax error `{`               F=400 J=400
+    ///   {"MaxStreamingBitrate":"nope"} F=400 J=400
+    /// ```
+    ///
+    /// So: an absent body, an empty body and the literal `null` all bind as
+    /// `None` and the request is served; a body that is present and malformed —
+    /// `[]`, a syntax error, a member the DTO's own types cannot take — is
+    /// still a 400. Turning THAT into "no body supplied"
     /// is what axum's `Option<Json<T>>` did with a missing content type only,
     /// while a malformed one became a 422; neither matched.
     ///
