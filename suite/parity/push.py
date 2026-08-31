@@ -399,8 +399,20 @@ SOCKET_LIFECYCLE = frozenset({"ForceKeepAlive", "KeepAlive"})
 #: by `residue_report`, per server — nothing disappears.
 BACKGROUND_BROADCASTS = frozenset({"ScheduledTaskEnded"})
 
+#: How long `prove_library_changed` waits for the debounced push. Both
+#: servers default `LibraryUpdateDuration` to 30 s and each restarts its
+#: timer on its own last write, so this is that plus margin.
+LIBRARY_UPDATE_WAIT = 45
+
 #: Everything a leftover may be without invalidating the run's rows.
 UNATTRIBUTABLE = SOCKET_LIFECYCLE | BACKGROUND_BROADCASTS
+
+#: Message types this RUN proved both servers implement (see
+#: `prove_library_changed`). Empty until a proof succeeds, and never seeded from
+#: a literal: the whole point is that the allowance expires with the run that
+#: earned it. `sift` reads it too, because a frame landing inside a leg's
+#: collect window is the same frame as one landing between legs.
+PROVEN = set()
 
 
 def sift(msgs, label, residue):
@@ -413,14 +425,81 @@ def sift(msgs, label, residue):
     """
     kept = []
     for m in msgs:
-        if m.get("MessageType") in UNATTRIBUTABLE:
+        if m.get("MessageType") in UNATTRIBUTABLE or m.get("MessageType") in PROVEN:
             residue.append((label, msg_key(m)))
         else:
             kept.append(m)
     return kept
 
 
-def residue_report(residue):
+def prove_library_changed(pairs, sockets, residue):
+    """Make each server PROVE it pushes `LibraryChanged`, and only then agree to
+    ignore the stray ones.
+
+    Why this exists instead of a name in `BACKGROUND_BROADCASTS`. That set means
+    "no op here can cause this, so a leftover is timing" — which is only true if
+    BOTH servers actually implement the message. `LibraryChanged` was withdrawing
+    every row of this layer at j=1/h=0, and listing it would have converted a
+    push Ferrofin was not sending into 20 verified rows. But leaving it listed
+    once Ferrofin DOES send it would be equally wrong in the other direction:
+    the exclusion would then rest on a claim nobody re-checks, and a regression
+    that silenced the push would look exactly like a quiet run.
+
+    So the allowance is earned per run: edit an item on each server, wait out
+    `LibraryUpdateDuration`, and require the push on both. A server that stays
+    silent keeps `LibraryChanged` an error and this layer's rows stay withdrawn,
+    which is what an unported notifier deserves.
+
+    Returns `(proven, detail)`. Everything drained here still lands in `residue`.
+    """
+    mutated, seen = [], {}
+    for tag, p_ in pairs.items():
+        srv, sess = p_["srv"], p_["ctrl"]
+        _, listing = srv.http(
+            "GET", "/Items?includeItemTypes=Movie&recursive=true&limit=1"
+                   "&userId=%s" % sess["user_id"], sess)
+        items = (listing or {}).get("Items") or []
+        if not items:
+            return False, "%s: no Movie to edit, so the push could not be provoked" % tag
+        mid = items[0].get("Id")
+        _, dto = srv.http("GET", "/Items/%s" % mid, sess)
+        if not isinstance(dto, dict):
+            return False, "%s: could not read the item DTO to edit" % tag
+        before = list(dto.get("Tags") or [])
+        dto["Tags"] = before + ["parity-push-probe"]
+        srv.http("POST", "/Items/%s" % mid, sess, dto)
+        mutated.append((srv, sess, mid, dto, before))
+
+    # Both debounces are `LibraryUpdateDuration` (30 s by default on both
+    # servers), and each restarts on its own last write, so the wait is that
+    # plus enough margin for the fold and the socket write.
+    deadline = time.time() + LIBRARY_UPDATE_WAIT
+    while time.time() < deadline and len(seen) < len(pairs):
+        time.sleep(2)
+        for label, ws in sockets:
+            for m in ws.drain():
+                residue.append((label, msg_key(m)))
+                if msg_key(m).split("/", 1)[0] == "LibraryChanged":
+                    seen[label.split("/", 1)[0]] = True
+            for m in ws.drain_lifecycle():
+                residue.append((label, msg_key(m)))
+
+    # Put the corpus back the way it was found — every other layer diffs it.
+    for srv, sess, mid, dto, before in mutated:
+        dto["Tags"] = before
+        srv.http("POST", "/Items/%s" % mid, sess, dto)
+
+    missing = sorted({"h", "j"} - set(seen))
+    if missing:
+        return False, ("no `LibraryChanged` from %s within %ds of an item edit — "
+                       "the notifier is not pushing there, so its stray frames "
+                       "stay attributable and this layer's rows stay withdrawn"
+                       % ("/".join(missing), LIBRARY_UPDATE_WAIT))
+    PROVEN.add("LibraryChanged")
+    return True, "both servers pushed `LibraryChanged` after an item edit"
+
+
+def residue_report(residue, proven=frozenset()):
     """`(errors, observations)` for everything the settle windows drained.
 
     Two rules, both about never letting a frame disappear:
@@ -446,11 +525,11 @@ def residue_report(residue):
     for key, counts in sorted(per_server.items()):
         base = key.split("/", 1)[0]
         shown = f"{key}: " + ", ".join(f"{t}={n}" for t, n in sorted(counts.items()))
-        if base not in UNATTRIBUTABLE:
+        if base not in (UNATTRIBUTABLE | proven):
             errors.append(
                 f"a non-lifecycle message was drained by a settle window, so the "
                 f"leg after it was measured against an incomplete capture — {shown}")
-        elif base in BACKGROUND_BROADCASTS:
+        elif base in BACKGROUND_BROADCASTS or base in proven:
             observations.append(
                 f"BACKGROUND BROADCAST (not caused by any op this layer drives, so "
                 f"excluded from the compared sets and counted here instead) — {shown}. "
@@ -1067,6 +1146,8 @@ def playback_commands(pairs, gids, subs, allsock, residue, rows):
 
 def run(ferrofin_url, jellyfin_url):
     rows, errors, residue = {}, [], []
+    proven = frozenset()
+    observations_pre = []
     H, J = Server(ferrofin_url, "h"), Server(jellyfin_url, "j")
     stamp = uuid.uuid4().hex[:8]
     created = []            # (server, admin-session, user-id) to reap in `finally`
@@ -1083,6 +1164,17 @@ def run(ferrofin_url, jellyfin_url):
         h, j = pairs["h"], pairs["j"]
         allsock = [("h/ctrl", h["ws_ctrl"]), ("h/peer", h["ws_peer"]),
                    ("j/ctrl", j["ws_ctrl"]), ("j/peer", j["ws_peer"])]
+
+        # Earn the right to ignore stray `LibraryChanged` frames, before any row
+        # is measured. If either server fails to push one, the name is NOT
+        # excluded and this layer's rows withdraw exactly as they did when
+        # Ferrofin had no notifier at all.
+        ok, detail = prove_library_changed(pairs, allsock, residue)
+        if ok:
+            proven = frozenset({"LibraryChanged"})
+            observations_pre.append("PROVEN THIS RUN — " + detail)
+        else:
+            errors.append("LibraryChanged proof failed — " + detail)
 
         # -- the lab precondition GET /SyncPlay/List depends on -----------------
         # A SyncPlay group outlives the session that made it: a probe or a hand
@@ -1282,7 +1374,8 @@ def run(ferrofin_url, jellyfin_url):
                 srv.http("DELETE", f"/Users/{uid}", admin)
             except Exception as e:                           # noqa: BLE001
                 errors.append(f"could not delete {JOINER_USER} on {srv.base}: {e}")
-    res_errors, observations = residue_report(residue)
+    res_errors, observations = residue_report(residue, proven)
+    observations = observations_pre + observations
     withdraw_on_incomplete(rows, res_errors)
     return rows, errors + res_errors, observations
 
@@ -1483,6 +1576,28 @@ def selfcheck():
     assert not errs and obs and obs[0].startswith("COUNT DELTA"), (errs, obs)
     errs, obs = residue_report([("h/ctrl", "SyncPlayCommand/Stop")])
     assert errs and not obs and "incomplete capture" in errs[0], (errs, obs)
+    #     `LibraryChanged` is excluded ONLY when the run proved both servers push
+    #     it. Unproven it is an error that withdraws the greens -- which is what
+    #     an unported notifier must cost. Proving it must never be a constant.
+    unproven, _ = residue_report([("j/ctrl", "LibraryChanged")])
+    assert unproven and "incomplete capture" in unproven[0], unproven
+    errs2, obs2 = residue_report([("j/ctrl", "LibraryChanged")],
+                                 proven=frozenset({"LibraryChanged"}))
+    assert not errs2 and obs2 and "BACKGROUND BROADCAST" in obs2[0], (errs2, obs2)
+    #     ...and `sift` honours the same proof, so an in-window frame is treated
+    #     exactly like a between-legs one rather than compared as a verb's output.
+    PROVEN.add("LibraryChanged")
+    try:
+        assert sift([{"MessageType": "LibraryChanged", "Data": {}}], "h/ctrl", []) == [], \
+            "a proven broadcast must leave the compared set wherever it lands"
+    finally:
+        PROVEN.discard("LibraryChanged")
+    assert sift([{"MessageType": "LibraryChanged", "Data": {}}], "h/ctrl", []) != [], \
+        "unproven, it must stay in the compared set and be able to fail a row"
+    assert "LibraryChanged" not in UNATTRIBUTABLE, (
+        "the allowance must be earned per run by prove_library_changed, never "
+        "baked into the static set -- a regression that silenced the push would "
+        "otherwise look exactly like a quiet run")
     #     ...and a BACKGROUND broadcast (a scheduled task finishing on one server
     #     mid-leg) is taken out of the compared sets by `sift` and COUNTED here,
     #     never attributed to whichever verb was in flight — while a message no

@@ -266,12 +266,25 @@ impl Folded {
                 .cloned()
                 .collect()
         };
-        build(&keep(&self.added), &keep(&self.updated), &self.removed)
+        build(
+            &keep(&self.added),
+            &keep(&self.updated),
+            &self.removed,
+            Some(visible),
+        )
     }
 }
 
 /// Builds the wire payload from three already-deduped buckets.
-fn build(added: &[Changed], updated: &[Changed], removed: &[Changed]) -> LibraryUpdateInfo {
+///
+/// `user_libraries` is the set of libraries the recipient can see, when there is
+/// a recipient. It is what `CollectionFolders` is derived from — see below.
+fn build(
+    added: &[Changed],
+    updated: &[Changed],
+    removed: &[Changed],
+    user_libraries: Option<&HashSet<String>>,
+) -> LibraryUpdateInfo {
     let ids = |v: &[Changed]| -> Vec<String> {
         let mut seen = HashSet::new();
         v.iter()
@@ -286,21 +299,46 @@ fn build(added: &[Changed], updated: &[Changed], removed: &[Changed]) -> Library
             .filter(|p| seen.insert(p.clone()))
             .collect()
     };
-    // `CollectionFolders` is the set of libraries a client must re-read. C#
-    // derives it from the changed folders via `GetTopParentIds`; the top parent
-    // is already on every row here, so it is taken directly.
-    let mut seen = HashSet::new();
-    let collection_folders: Vec<String> = added
-        .iter()
-        .chain(removed)
-        .chain(updated)
-        .filter_map(|c| c.top_parent.clone())
-        .filter(|t| seen.insert(t.clone()))
-        .collect();
+    let folders_added_to = parents(added);
+    let folders_removed_from = parents(removed);
+
+    // `GetTopParentIds(newAndRemoved, allUserRootChildren)`, and it is NOT the
+    // changed items' own libraries. C# passes it `foldersAddedTo +
+    // foldersRemovedFrom` and, for each one, adds EVERY library the user can
+    // see, then distincts. So the field means "membership moved, re-read your
+    // libraries" -- all of them -- and a plain metadata edit, which moves
+    // nothing between folders, names NONE. Deriving it from each item's top
+    // parent instead made an edit name the edited item's library, which
+    // suite/parity/push.py caught as a diff at `Data.CollectionFolders[]`.
+    //
+    // ponytail: order is the visible-id order, not C#'s name-sorted root
+    // children. Only observable when folders actually change; sort by library
+    // name here if a client is ever seen to care.
+    let collection_folders: Vec<String> = match user_libraries {
+        Some(libs) if !folders_added_to.is_empty() || !folders_removed_from.is_empty() => {
+            let mut v: Vec<String> = libs.iter().cloned().collect();
+            v.sort();
+            v
+        }
+        Some(_) => Vec::new(),
+        // No recipient to scope to (no audience wired): fall back to the
+        // libraries the changed items belong to, which is the most a broadcast
+        // can honestly say.
+        None => {
+            let mut seen = HashSet::new();
+            added
+                .iter()
+                .chain(removed)
+                .chain(updated)
+                .filter_map(|c| c.top_parent.clone())
+                .filter(|t| seen.insert(t.clone()))
+                .collect()
+        }
+    };
 
     let mut info = LibraryUpdateInfo {
-        folders_added_to: parents(added),
-        folders_removed_from: parents(removed),
+        folders_added_to,
+        folders_removed_from,
         items_added: ids(added),
         items_removed: ids(removed),
         items_updated: ids(updated),
@@ -324,7 +362,7 @@ fn fold(pending: &Pending) -> Folded {
         .filter(|c| !added_ids.contains(&c.id))
         .cloned()
         .collect();
-    let info = build(&pending.added, &updated, &pending.removed);
+    let info = build(&pending.added, &updated, &pending.removed, None);
     Folded {
         added: pending.added.clone(),
         updated,
@@ -639,6 +677,56 @@ mod tests {
                     .to_string()
             ]
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_metadata_edit_names_no_collection_folder() {
+        // `GetTopParentIds` is fed foldersAddedTo + foldersRemovedFrom. An edit
+        // moves nothing between folders, so both are empty and C# names NO
+        // library. Deriving this from the item's own top parent instead was
+        // caught by suite/parity/push.py as a diff at Data.CollectionFolders[].
+        let (n, _events) = notifier(Duration::from_secs(30));
+        let (lib, alice) = (Uuid::new_v4(), Uuid::new_v4());
+        let audience = Arc::new(SplitAudience {
+            visible: vec![(alice, lib)],
+            delivered: Mutex::new(Vec::new()),
+        });
+        n.set_audience(Arc::clone(&audience) as Arc<dyn LibraryChangeAudience>);
+
+        let mut item = movie(Uuid::new_v4(), Uuid::new_v4(), lib);
+        item.parent_id = None; // an edit in place: no folder gained or lost a child
+        n.record_updated(std::slice::from_ref(&item));
+        tokio::time::sleep(Duration::from_secs(31)).await;
+
+        let delivered = audience.delivered.lock().expect("lock");
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].1.items_updated.len(), 1);
+        assert!(
+            delivered[0].1.collection_folders.is_empty(),
+            "an edit that moved nothing between folders names no library"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_added_item_names_every_library_the_user_can_see() {
+        // The other half of `GetTopParentIds`: once ANY folder gained or lost a
+        // child, C# names every one of the user's root children -- not just the
+        // library the item landed in.
+        let (n, _events) = notifier(Duration::from_secs(30));
+        let (lib_a, lib_b, alice) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let audience = Arc::new(SplitAudience {
+            visible: vec![(alice, lib_a), (alice, lib_b)],
+            delivered: Mutex::new(Vec::new()),
+        });
+        n.set_audience(Arc::clone(&audience) as Arc<dyn LibraryChangeAudience>);
+
+        n.record_added(&[movie(Uuid::new_v4(), Uuid::new_v4(), lib_a)]);
+        tokio::time::sleep(Duration::from_secs(31)).await;
+
+        let delivered = audience.delivered.lock().expect("lock");
+        let mut want = vec![lib_a.simple().to_string(), lib_b.simple().to_string()];
+        want.sort();
+        assert_eq!(delivered[0].1.collection_folders, want);
     }
 
     #[tokio::test(start_paused = true)]
