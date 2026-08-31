@@ -36,8 +36,33 @@ use tokio::sync::mpsc;
 
 use crate::state::AppState;
 
-/// The server keep-alive interval advertised to the client, in seconds.
+/// The server keep-alive interval advertised to the client, in seconds
+/// (C# `SessionWebSocketListener.WebSocketLostTimeout`). It is the value carried
+/// in the `ForceKeepAlive` payload AND the deadline the watchdog below measures
+/// silence against.
 const KEEPALIVE_SECS: u64 = 60;
+
+// The watchdog's two derived thresholds. Upstream stores them as FACTORS of
+// `WebSocketLostTimeout` (`IntervalFactor` 0.2f, `ForceKeepAliveFactor` 0.75f)
+// and multiplies at each use; here they are written out in seconds so the
+// arithmetic below stays in `f64` without casting a `u64` at every comparison.
+// The compile-time assertion keeps all three tied to the one timeout.
+const _: () = assert!(
+    KEEPALIVE_SECS == 60,
+    "the watchdog constants below assume 60 s"
+);
+
+/// How often the keep-alive watchdog looks at the socket — C#
+/// `SessionWebSocketListener.IntervalFactor` (0.2f) × `WebSocketLostTimeout`.
+const KEEPALIVE_WATCH_SECS: f64 = 12.0;
+
+/// How long a socket may stay silent before the watchdog prods it with another
+/// `ForceKeepAlive` — C# `ForceKeepAliveFactor` (0.75f) × `WebSocketLostTimeout`.
+const KEEPALIVE_FORCE_AFTER_SECS: f64 = 45.0;
+
+/// The silence after which a socket leaves the watchlist — C#
+/// `WebSocketLostTimeout` itself, as `f64` for the comparison.
+const KEEPALIVE_LOST_SECS: f64 = 60.0;
 
 /// How many server→client pushes may sit queued for one socket before the
 /// server gives up on that client.
@@ -444,91 +469,107 @@ async fn handle_socket(
     // Raised by the sink when the queue is full; the loop closes the socket.
     let overflowed = std::sync::Arc::new(tokio::sync::Notify::new());
     let registration = register_sink(&state, caller.as_ref().ok(), &tx, &overflowed);
-    match &caller {
-        Ok(_) => tracing::info!(
-            authenticated = registration.is_some(),
-            "websocket connected"
-        ),
-        Err(reason) => tracing::info!(
-            authenticated = false,
-            reason = reason.as_str(),
-            "websocket connected"
-        ),
-    }
+    log_connect(caller.as_ref(), registration.is_some());
     let caller = caller.ok();
 
-    let mut keepalive = tokio::time::interval(Duration::from_secs(KEEPALIVE_SECS));
+    // `SessionWebSocketListener.KeepAliveSockets` is a WATCHDOG, not a metronome:
+    // it wakes every `IntervalFactor * WebSocketLostTimeout` and only sends a
+    // `ForceKeepAlive` to a socket that has been SILENT for longer than
+    // `ForceKeepAliveFactor * WebSocketLostTimeout`, where "silent" is reset by
+    // the client's own `KeepAlive`. A socket past the full timeout leaves the
+    // watchlist (`RemoveWebSocket`) and is never prodded again — upstream does
+    // not close it either, which is the `// TODO: handle session relative to the
+    // lost webSocket` still standing at SessionWebSocketListener.cs:246.
+    //
+    // A fixed 60 s metronome — what this loop used to run — is neither: it kept
+    // prodding a socket the client was actively talking on, and its cadence
+    // could not match the oracle's on any live comparison.
+    let mut keepalive = tokio::time::interval(Duration::from_secs_f64(KEEPALIVE_WATCH_SECS));
     keepalive.tick().await; // consume the immediate first tick
+    // `IWebSocketConnection.LastKeepAliveDate`, seeded at registration
+    // (SessionWebSocketListener.cs:164).
+    let mut last_keep_alive = tokio::time::Instant::now();
+    let mut watched = true;
+
+    // The connect-time `ForceKeepAlive` (see `greet_with_keep_alive`). Guarded
+    // rather than unconditional: a peer that is already gone when the greeting
+    // is sent must still fall through to the teardown below.
+    let open = greet_with_keep_alive(&mut socket, &overflowed, caller.is_some()).await;
 
     // The dashboard's periodic streams, armed by *Start subscription messages
     // (each is `None` until subscribed). Only an authenticated socket may
     // subscribe — the streams answer as the socket's user.
     let mut streams = Streams::default();
 
-    loop {
-        tokio::select! {
-            frame = socket.recv() => match action_for(frame) {
-                Action::Pong(payload) => {
-                    if !send_frame(&mut socket, Message::Pong(payload), &overflowed).await {
+    if open {
+        loop {
+            tokio::select! {
+                frame = socket.recv() => match action_for(frame) {
+                    Action::Pong(payload) => {
+                        if !send_frame(&mut socket, Message::Pong(payload), &overflowed).await {
+                            break;
+                        }
+                    }
+                    Action::Stop => break,
+                    Action::Ignore => {}
+                    Action::Inbound(Inbound::KeepAlive) => {
+                        // Ack the client's ping. `WebSocketConnection.SendKeepAliveResponse`
+                        // (:227-232) stamps `LastKeepAliveDate` as it answers, which
+                        // is what stops the watchdog prodding a live client.
+                        last_keep_alive = tokio::time::Instant::now();
+                        let ack = Message::Text(keep_alive_ack().into());
+                        if !send_frame(&mut socket, ack, &overflowed).await {
+                            break;
+                        }
+                    }
+                    Action::Inbound(inbound) => {
+                        if caller.is_some() {
+                            streams.apply(inbound);
+                        }
+                    }
+                },
+                Some(push) = rx.recv() => {
+                    // A server→client message (SyncPlay command/update, …).
+                    if !send_frame(&mut socket, Message::Text(push.into()), &overflowed).await {
+                        break;
+                    }
+                },
+                () = overflowed.notified() => {
+                    warn_overflow();
+                    break;
+                },
+                Ok(()) = close_all.changed() => {
+                    say_goodbye(&mut socket, &mut rx, &overflowed).await;
+                    break;
+                },
+                _ = keepalive.tick(), if watched => {
+                    if !keep_alive_watchdog(
+                        &mut socket, &overflowed, last_keep_alive, &mut watched).await
+                    {
                         break;
                     }
                 }
-                Action::Stop => break,
-                Action::Ignore => {}
-                Action::Inbound(Inbound::KeepAlive) => {
-                    // Ack the client's ping (C# `SendKeepAliveResponse`).
-                    let ack = Message::Text(keep_alive_ack().into());
-                    if !send_frame(&mut socket, ack, &overflowed).await {
+                () = tick(&mut streams.sessions) => {
+                    if let Some(c) = caller.as_ref()
+                        && let Some(msg) = sessions_message(&state, c.user_id).await
+                        && !send_frame(&mut socket, Message::Text(msg.into()), &overflowed).await
+                    {
                         break;
                     }
                 }
-                Action::Inbound(inbound) => {
-                    if caller.is_some() {
-                        streams.apply(inbound);
+                () = tick(&mut streams.tasks) => {
+                    if let Some(msg) = tasks_message(&state).await
+                        && !send_frame(&mut socket, Message::Text(msg.into()), &overflowed).await
+                    {
+                        break;
                     }
                 }
-            },
-            Some(push) = rx.recv() => {
-                // A server→client message (SyncPlay command/update, …).
-                if !send_frame(&mut socket, Message::Text(push.into()), &overflowed).await {
-                    break;
-                }
-            },
-            () = overflowed.notified() => {
-                warn_overflow();
-                break;
-            },
-            Ok(()) = close_all.changed() => {
-                say_goodbye(&mut socket, &mut rx, &overflowed).await;
-                break;
-            },
-            _ = keepalive.tick() => {
-                // Jellyfin's `ForceKeepAlive`: tells the client the keep-alive interval.
-                let msg = Message::Text(force_keep_alive_message().into());
-                if !send_frame(&mut socket, msg, &overflowed).await {
-                    break;
-                }
-            }
-            () = tick(&mut streams.sessions) => {
-                if let Some(c) = caller.as_ref()
-                    && let Some(msg) = sessions_message(&state, c.user_id).await
-                    && !send_frame(&mut socket, Message::Text(msg.into()), &overflowed).await
-                {
-                    break;
-                }
-            }
-            () = tick(&mut streams.tasks) => {
-                if let Some(msg) = tasks_message(&state).await
-                    && !send_frame(&mut socket, Message::Text(msg.into()), &overflowed).await
-                {
-                    break;
-                }
-            }
-            () = tick(&mut streams.activity) => {
-                if let Some(msg) = activity_message(&state, &mut streams.activity_since).await
-                    && !send_frame(&mut socket, Message::Text(msg.into()), &overflowed).await
-                {
-                    break;
+                () = tick(&mut streams.activity) => {
+                    if let Some(msg) = activity_message(&state, &mut streams.activity_since).await
+                        && !send_frame(&mut socket, Message::Text(msg.into()), &overflowed).await
+                    {
+                        break;
+                    }
                 }
             }
         }
@@ -545,6 +586,103 @@ async fn handle_socket(
         elapsed_s = started.elapsed().as_secs(),
         "websocket disconnected"
     );
+}
+
+/// The one `websocket connected` line, which says whether the socket carries a
+/// session and — when it does not — why not.
+fn log_connect(caller: Result<&SocketCaller, &AnonymousReason>, registered: bool) {
+    match caller {
+        Ok(_) => tracing::info!(authenticated = registered, "websocket connected"),
+        Err(reason) => tracing::info!(
+            authenticated = false,
+            reason = reason.as_str(),
+            "websocket connected"
+        ),
+    }
+}
+
+/// The `ForceKeepAlive` `KeepAliveWebSocket` sends the moment a socket joins the
+/// watchlist (SessionWebSocketListener.cs:168-176), before the watchdog ever
+/// ticks — it is how the client learns the timeout it must answer within.
+///
+/// `ferrofin-core`'s listener port sends one, but that listener is not what
+/// serves this route, so on the wire Ferrofin's first frame arrived 48 s late.
+/// Measured against the oracle on one socket for 160 s: Jellyfin at
+/// `[0.2, 48.0, 96.0, 144.1]`, Ferrofin at `[48.0, 96.1, 144.1]` — the same
+/// cadence, one frame short, every run.
+///
+/// Only an authenticated socket is greeted, as upstream: `GetSession` runs
+/// before `KeepAliveWebSocket`, so a connection with no session never reaches
+/// the watchlist at all. Returns whether the socket is still usable.
+async fn greet_with_keep_alive(
+    socket: &mut WebSocket,
+    overflowed: &tokio::sync::Notify,
+    authenticated: bool,
+) -> bool {
+    if !authenticated {
+        return true;
+    }
+    send_frame(
+        socket,
+        Message::Text(force_keep_alive_message().into()),
+        overflowed,
+    )
+    .await
+}
+
+/// What one watchdog tick should do about a socket, by how long it has been
+/// silent — the pure half of `SessionWebSocketListener.KeepAliveSockets`'s
+/// `inactive` / `lost` partition (:210-224).
+#[derive(Debug, PartialEq, Eq)]
+enum KeepAlive {
+    /// The client spoke recently enough; say nothing.
+    Quiet,
+    /// `inactive` — silent past `ForceKeepAliveFactor * WebSocketLostTimeout`,
+    /// so prompt it with another `ForceKeepAlive`.
+    Prod,
+    /// `lost` — silent past the whole `WebSocketLostTimeout`. Upstream drops it
+    /// from the watchlist (`RemoveWebSocket`) and does NOT close it: the
+    /// `// TODO: handle session relative to the lost webSocket` at :246 stands.
+    Lost,
+}
+
+/// Classifies one watchdog tick. The two bands are half-open exactly as the C#
+/// writes them: `inactive` is `elapsed > force && elapsed < timeout`, `lost` is
+/// `elapsed >= timeout`, so a socket exactly at the timeout is lost, not prodded.
+fn keep_alive_action(silent_secs: f64) -> KeepAlive {
+    if silent_secs >= KEEPALIVE_LOST_SECS {
+        KeepAlive::Lost
+    } else if silent_secs > KEEPALIVE_FORCE_AFTER_SECS {
+        KeepAlive::Prod
+    } else {
+        KeepAlive::Quiet
+    }
+}
+
+/// One tick of `SessionWebSocketListener.KeepAliveSockets` for a single socket.
+/// Returns whether the socket loop should continue.
+async fn keep_alive_watchdog(
+    socket: &mut WebSocket,
+    overflowed: &tokio::sync::Notify,
+    last_keep_alive: tokio::time::Instant,
+    watched: &mut bool,
+) -> bool {
+    match keep_alive_action(last_keep_alive.elapsed().as_secs_f64()) {
+        KeepAlive::Quiet => true,
+        KeepAlive::Lost => {
+            *watched = false;
+            tracing::debug!("websocket keep-alive lost; no longer watched");
+            true
+        }
+        KeepAlive::Prod => {
+            send_frame(
+                socket,
+                Message::Text(force_keep_alive_message().into()),
+                overflowed,
+            )
+            .await
+        }
+    }
 }
 
 /// The armed periodic streams of one socket.
@@ -685,9 +823,9 @@ fn force_keep_alive_message() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Action, DEFAULT_STREAM_MILLIS, Inbound, KEEPALIVE_SECS, PUSH_QUEUE_DEPTH, action_for,
-        force_keep_alive_message, header_token, keep_alive_ack, parse_inbound, push_sink,
-        query_param,
+        Action, DEFAULT_STREAM_MILLIS, Inbound, KEEPALIVE_FORCE_AFTER_SECS, KEEPALIVE_LOST_SECS,
+        KEEPALIVE_SECS, KeepAlive, PUSH_QUEUE_DEPTH, action_for, force_keep_alive_message,
+        header_token, keep_alive_ack, keep_alive_action, parse_inbound, push_sink, query_param,
     };
     use axum::extract::ws::Message;
     use axum::http::HeaderMap;
@@ -953,5 +1091,29 @@ mod tests {
             ended.lock().expect("ended mutex").is_empty(),
             "the live session must not be ended"
         );
+    }
+
+    /// The watchdog's bands, against the C# factors of `WebSocketLostTimeout`.
+    /// A flat metronome — what this loop ran before — would answer `Prod` for
+    /// every one of these.
+    #[test]
+    fn the_keep_alive_watchdog_prods_only_a_silent_socket() {
+        // `IntervalFactor * WebSocketLostTimeout`: the watchdog wakes far more
+        // often than it speaks, so most ticks must be silent.
+        for quiet in [0.0, 1.0, 12.0, 24.0, 44.9, KEEPALIVE_FORCE_AFTER_SECS] {
+            assert_eq!(keep_alive_action(quiet), KeepAlive::Quiet, "{quiet}");
+        }
+        for prod in [45.1, 48.0, 59.9] {
+            assert_eq!(keep_alive_action(prod), KeepAlive::Prod, "{prod}");
+        }
+        // `elapsed >= WebSocketLostTimeout` is `lost`, not one last prod.
+        for lost in [KEEPALIVE_LOST_SECS, 60.1, 600.0] {
+            assert_eq!(keep_alive_action(lost), KeepAlive::Lost, "{lost}");
+        }
+        // ...and the bands are the C# factors of the one timeout the client is
+        // told about in the `ForceKeepAlive` payload.
+        assert_eq!(KEEPALIVE_SECS, 60);
+        assert!((KEEPALIVE_FORCE_AFTER_SECS - 60.0 * 0.75).abs() < f64::EPSILON);
+        assert!((KEEPALIVE_LOST_SECS - 60.0).abs() < f64::EPSILON);
     }
 }

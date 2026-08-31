@@ -63,6 +63,33 @@ fn ticks(count: i64) -> Duration {
     Duration::microseconds(count / 10)
 }
 
+/// A [`Duration`] as .NET ticks (100 ns units) — the inverse of [`ticks`].
+///
+/// `TimeSpan.Ticks` in the C# is the FULL 100 ns count, so every position this
+/// server derives from a clock difference has to be too. Rounding through
+/// `num_milliseconds()` quantises the result to a multiple of 10_000 ticks,
+/// which is visible on the wire next to a Jellyfin that emits the exact value
+/// (every Ferrofin `PositionTicks` ended in four zeroes; no Jellyfin one did).
+///
+/// `chrono` only fails to answer in nanoseconds beyond ~292 years, and in
+/// microseconds beyond ~292_000; both fallbacks are unreachable for a playback
+/// delta but are written out rather than saturating silently.
+fn duration_ticks(delta: Duration) -> i64 {
+    if let Some(ns) = delta.num_nanoseconds() {
+        ns / 100
+    } else if let Some(us) = delta.num_microseconds() {
+        us.saturating_mul(10)
+    } else {
+        delta.num_milliseconds().saturating_mul(TICKS_PER_MS)
+    }
+}
+
+/// `PlayQueueManager.NoPlayingItemIndex` — the sentinel `PlayingItemIndex` a
+/// queue carries when nothing is playing. It goes out on the wire as `-1`, and
+/// `AbstractGroupState.HandleRequest(RemoveFromPlaylistGroupRequest)` keys the
+/// group's drop to `Idle` on it (`!context.PlayQueue.IsItemPlaying()`).
+const NO_PLAYING_ITEM_INDEX: i32 = -1;
+
 /// The two server→client WebSocket message types SyncPlay uses.
 const MSG_COMMAND: &str = "SyncPlayCommand";
 const MSG_GROUP_UPDATE: &str = "SyncPlayGroupUpdate";
@@ -142,7 +169,14 @@ struct PlayQueue {
 impl PlayQueue {
     /// Replaces the queue with `item_ids`, assigning each a fresh server-side
     /// `PlaylistItemId`, and sets the playing item to `position`.
+    ///
+    /// `Group.SetPlayQueue` (Group.cs:503) calls `PlayQueue.Reset()` FIRST, and
+    /// `Reset` (PlayQueueManager.cs:352-361) clears shuffle and repeat back to
+    /// their defaults as well as the items — a new queue arrives unshuffled and
+    /// not repeating, which is not what "replace the items" alone would do.
     fn set(&mut self, item_ids: &[Uuid], position: i32) {
+        self.shuffle = GroupShuffleMode::default();
+        self.repeat = GroupRepeatMode::default();
         self.items = item_ids
             .iter()
             .map(|&item_id| SyncPlayQueueItem {
@@ -229,11 +263,56 @@ impl PlayQueue {
         }
     }
 
-    /// Removes the given playlist items, keeping the playing item where possible.
-    fn remove(&mut self, ids: &[Uuid]) {
-        let current = self.playing_item_id();
+    /// `PlayQueueManager.IsItemPlaying` — whether the queue points at an item.
+    fn is_item_playing(&self) -> bool {
+        self.playing_index != NO_PLAYING_ITEM_INDEX
+    }
+
+    /// Port of `PlayQueueManager.ClearPlaylist` (PlayQueueManager.cs:176-197).
+    ///
+    /// The playing item is KEPT unless `clear_playing_item` says otherwise, and
+    /// shuffle/repeat survive either way — `PlayQueue::default()` threw all three
+    /// away, so a `ClearPlaylist=true, ClearPlayingItem=false` request emptied a
+    /// Ferrofin queue that Jellyfin leaves one item long.
+    fn clear(&mut self, clear_playing_item: bool) {
+        let playing = self.current().copied();
+        self.items.clear();
+        match (clear_playing_item, playing) {
+            (false, Some(item)) => {
+                self.items.push(item);
+                self.playing_index = 0;
+            }
+            _ => self.playing_index = NO_PLAYING_ITEM_INDEX,
+        }
+    }
+
+    /// Port of `PlayQueueManager.RemoveFromPlaylist` (PlayQueueManager.cs:292-322):
+    /// removes the given playlist items and returns whether the PLAYING item was
+    /// one of them — which is what `AbstractGroupState` needs to decide whether
+    /// the group falls to `Idle`.
+    ///
+    /// When the playing item goes, upstream steps BACK one slot ("picking
+    /// previous item") and only falls forward to 0 if it was the first; an empty
+    /// remainder leaves no playing item at all.
+    fn remove(&mut self, ids: &[Uuid]) -> bool {
+        let Some(playing) = self.current().copied() else {
+            self.items.retain(|i| !ids.contains(&i.playlist_item_id));
+            return false;
+        };
         self.items.retain(|i| !ids.contains(&i.playlist_item_id));
-        self.reanchor(current);
+        if !ids.contains(&playing.playlist_item_id) {
+            self.reanchor(playing.playlist_item_id);
+            return false;
+        }
+        self.playing_index -= 1;
+        if self.playing_index < 0 {
+            self.playing_index = if self.items.is_empty() {
+                NO_PLAYING_ITEM_INDEX
+            } else {
+                0
+            };
+        }
+        true
     }
 
     /// Moves `playlist_item_id` to `new_index`.
@@ -246,24 +325,28 @@ impl PlayQueue {
             return;
         };
         let current = self.playing_item_id();
+        let item = self.items.remove(from);
+        // `Math.Clamp(newIndex, 0, playlist.Count)` on the list with the item
+        // already lifted out — the upper bound is `len`, not `len - 1`, so the
+        // last position is reachable.
         let to = usize::try_from(new_index)
             .unwrap_or(0)
-            .min(self.items.len().saturating_sub(1));
-        let item = self.items.remove(from);
+            .min(self.items.len());
         self.items.insert(to, item);
         self.reanchor(current);
     }
 
     /// Re-points `playing_index` at the item that had id `current` after a
-    /// mutation, clamped into range.
+    /// mutation — `PlayingItemIndex = playlist.IndexOf(playingItem)`, which
+    /// answers `-1` (nothing playing) when the item is gone. Clamping to `0`
+    /// instead silently started playing a different item.
     fn reanchor(&mut self, current: Uuid) {
         self.playing_index = self
             .items
             .iter()
             .position(|i| i.playlist_item_id == current)
             .and_then(|i| i32::try_from(i).ok())
-            .unwrap_or(0)
-            .min(self.max_index());
+            .unwrap_or(NO_PLAYING_ITEM_INDEX);
     }
 }
 
@@ -417,6 +500,13 @@ impl Group {
         }
     }
 
+    /// `Group.RestartCurrentItem` (Group.cs:601-605) — rewind to the head of the
+    /// item and restamp the group's clock.
+    fn restart_current_item(&mut self, now: DateTime<Utc>) {
+        self.position_ticks = 0;
+        self.last_activity = now;
+    }
+
     fn set_all_buffering(&mut self, buffering: bool) {
         for m in &mut self.members {
             m.is_buffering = buffering;
@@ -440,7 +530,7 @@ impl Group {
     /// SITE (only the `prevState` arms that came from `Playing` run it), never
     /// on the group's current state, so this helper does not second-guess it.
     fn advance_position(&mut self, now: DateTime<Utc>) {
-        let elapsed = (now - self.last_activity).num_milliseconds().max(0) * TICKS_PER_MS;
+        let elapsed = duration_ticks(now - self.last_activity).max(0);
         self.position_ticks += elapsed;
     }
 
@@ -479,8 +569,7 @@ impl Group {
         let is_playing = self.state == GroupStateType::Playing;
         let mut start_position_ticks = self.position_ticks;
         if is_playing {
-            start_position_ticks +=
-                (now - self.last_activity).num_milliseconds().max(0) * TICKS_PER_MS;
+            start_position_ticks += duration_ticks(now - self.last_activity).max(0);
         }
         let update = PlayQueueUpdate {
             reason,
@@ -511,6 +600,30 @@ impl Group {
             self.initial_state = Some(prev);
         }
         self.state = GroupStateType::Waiting;
+    }
+
+    /// The state a `WaitingGroupState` arm falls back to when the queue change
+    /// it was entered for cannot be applied.
+    ///
+    /// Upstream does NOT restore `prevState`. Every failed arm writes the same
+    /// switch (WaitingGroupState.cs:144-148 Play, :189-194 SetPlaylistItem,
+    /// :595-600 NextItem, :641-646 PreviousItem):
+    ///
+    /// ```text
+    /// prevState switch { Playing => Playing, Paused => Paused, _ => Idle }
+    /// ```
+    ///
+    /// so a group that was ALREADY `Waiting` when the request arrived falls
+    /// through to the default arm and drops to `Idle` — it does not go back to
+    /// waiting for a queue that no longer exists. Restoring `prev` verbatim left
+    /// Ferrofin in `Waiting` where Jellyfin was `Idle`, measured live on the
+    /// parity pair with `SetNewQueue {"PlayingQueue": []}` issued from `Waiting`.
+    fn restore_after_failed_queue_change(&mut self, prev: GroupStateType) {
+        self.set_state(match prev {
+            GroupStateType::Playing => GroupStateType::Playing,
+            GroupStateType::Paused => GroupStateType::Paused,
+            GroupStateType::Waiting | GroupStateType::Idle => GroupStateType::Idle,
+        });
     }
 
     /// Port of `IGroupStateContext.SetState` (Group.cs:382-386).
@@ -612,26 +725,13 @@ impl Group {
                 playlist_item_ids,
                 clear_playlist,
                 clear_playing_item,
-            } => {
-                if *clear_playlist {
-                    self.queue = PlayQueue::default();
-                    self.position_ticks = 0;
-                    let _ = clear_playing_item;
-                    let mut out = vec![Outbound::all(
-                        self.play_queue_env(PlayQueueUpdateReason::RemoveItems, now),
-                    )];
-                    // `AbstractGroupState.cs:86-94`: the Stop goes through
-                    // `IdleGroupState.HandleRequest` with `prevState = Type`, so
-                    // it obeys the same scope + `When` rules as every other Stop.
-                    out.extend(self.send_stop_command(prev, now));
-                    out
-                } else {
-                    self.queue.remove(playlist_item_ids);
-                    vec![Outbound::all(
-                        self.play_queue_env(PlayQueueUpdateReason::RemoveItems, now),
-                    )]
-                }
-            }
+            } => self.handle_remove_from_playlist(
+                prev,
+                playlist_item_ids,
+                *clear_playlist,
+                *clear_playing_item,
+                now,
+            ),
             PlaybackRequest::MovePlaylistItem {
                 playlist_item_id,
                 new_index,
@@ -642,6 +742,13 @@ impl Group {
                 )]
             }
             PlaybackRequest::Queue { item_ids, mode } => {
+                // `Group.AddToPlayQueue` (Group.cs:571-598) returns false on an
+                // empty list, and `AbstractGroupState.cs:114-132` broadcasts
+                // NOTHING when it does. (The other false arm — a member without
+                // access — is refused before the state machine runs.)
+                if item_ids.is_empty() {
+                    return Vec::new();
+                }
                 self.queue.enqueue(item_ids, *mode);
                 let reason = match mode {
                     GroupQueueMode::Queue => PlayQueueUpdateReason::Queue,
@@ -699,6 +806,50 @@ impl Group {
         }
     }
 
+    /// `POST /SyncPlay/RemoveFromPlaylist` — `AbstractGroupState.cs:69-95`.
+    ///
+    /// Two things it does that a blanket "wipe the queue and Stop" does not:
+    /// `ClearPlayingItem` decides whether the playing item survives the clear,
+    /// and the group only drops to `Idle` when the playing item was removed AND
+    /// nothing is playing afterwards. So `ClearPlaylist=true,
+    /// ClearPlayingItem=false` leaves a one-item queue still playing, and a
+    /// removal that misses the playing item never stops anybody.
+    fn handle_remove_from_playlist(
+        &mut self,
+        prev: GroupStateType,
+        playlist_item_ids: &[Uuid],
+        clear_playlist: bool,
+        clear_playing_item: bool,
+        now: DateTime<Utc>,
+    ) -> Vec<Outbound> {
+        let playing_item_removed = if clear_playlist {
+            self.queue.clear(clear_playing_item);
+            // `Group.ClearPlayQueue` (Group.cs:535-542) restarts the current
+            // item only when it was the one cleared.
+            if clear_playing_item {
+                self.restart_current_item(now);
+            }
+            clear_playing_item
+        } else {
+            let removed = self.queue.remove(playlist_item_ids);
+            // `Group.RemoveFromPlayQueue` (Group.cs:545-565).
+            if removed {
+                self.restart_current_item(now);
+            }
+            removed
+        };
+        let mut out = vec![Outbound::all(
+            self.play_queue_env(PlayQueueUpdateReason::RemoveItems, now),
+        )];
+        if playing_item_removed && !self.queue.is_item_playing() {
+            // The Stop goes through `IdleGroupState.HandleRequest` with
+            // `prevState = Type`, so it obeys the same scope + `When` rules as
+            // every other Stop.
+            out.extend(self.send_stop_command(prev, now));
+        }
+        out
+    }
+
     /// `POST /SyncPlay/SetNewQueue`. Every state delegates a `PlayGroupRequest`
     /// to `WaitingGroupState.HandleRequest` (WaitingGroupState.cs:127-162): the
     /// group WAITS for every member's Ready before playing. It does not start
@@ -714,12 +865,13 @@ impl Group {
         self.enter_waiting(prev);
         self.resume_playing = true;
         // `Group.SetPlayQueue` (Group.cs:489-512) refuses an empty queue or an
-        // out-of-range position; the state machine then returns to `prev` and
-        // broadcasts nothing (WaitingGroupState.cs:139-152).
+        // out-of-range position; the state machine then broadcasts nothing and
+        // settles per `restore_after_failed_queue_change` — which is NOT `prev`
+        // when `prev` was `Waiting` (WaitingGroupState.cs:139-152).
         let out_of_range =
             usize::try_from(position).map_or(true, |p| queue.is_empty() || p >= queue.len());
         if out_of_range {
-            self.set_state(prev);
+            self.restore_after_failed_queue_change(prev);
             return Vec::new();
         }
         self.queue.set(queue, position);
@@ -749,7 +901,7 @@ impl Group {
         self.position_ticks = 0;
         self.last_activity = now;
         if !found {
-            self.set_state(prev);
+            self.restore_after_failed_queue_change(prev);
             return Vec::new();
         }
         let out = vec![Outbound::all(
@@ -761,9 +913,10 @@ impl Group {
 
     /// `POST /SyncPlay/NextItem` / `PreviousItem` — every state delegates to
     /// `WaitingGroupState.cs:563-652`: the client's `PlaylistItemId` must be the
-    /// one actually playing (a stale duplicate request is dropped), the group
-    /// waits for fresh Ready events, and a queue that cannot move returns to the
-    /// state it came from.
+    /// one actually playing (a stale duplicate request is dropped, leaving the
+    /// group in the `Waiting` the delegation put it in), the group waits for
+    /// fresh Ready events, and a queue that cannot move settles per
+    /// [`Group::restore_after_failed_queue_change`].
     fn handle_queue_step(
         &mut self,
         prev: GroupStateType,
@@ -782,7 +935,7 @@ impl Group {
             self.queue.previous()
         };
         if !moved {
-            self.set_state(prev);
+            self.restore_after_failed_queue_change(prev);
             return Vec::new();
         }
         self.position_ticks = 0;
@@ -1039,7 +1192,7 @@ impl Group {
         }
         // WaitingGroupState.cs:420-446: the client's clock is trusted only inside
         // `TimeSyncOffset`, and only while it says it is actually playing.
-        let mut elapsed_ticks = (now - report.when).num_milliseconds() * TICKS_PER_MS;
+        let mut elapsed_ticks = duration_ticks(now - report.when);
         if elapsed_ticks.abs() > TIME_SYNC_OFFSET_MS * TICKS_PER_MS || !report.is_playing {
             elapsed_ticks = 0;
         }
@@ -1990,6 +2143,23 @@ mod tests {
         let data = &v["Data"]["Data"];
         let idx = usize::try_from(data["PlayingItemIndex"].as_i64().unwrap()).unwrap();
         Uuid::parse_str(data["Playlist"][idx]["PlaylistItemId"].as_str().unwrap()).unwrap()
+    }
+
+    /// Every `PlaylistItemId` in the last `PlayQueue` update, in queue order.
+    fn last_playlist(bus: &RecordingBus) -> Vec<Uuid> {
+        let body = bus
+            .bodies()
+            .into_iter()
+            .rev()
+            .find(|b| b.contains("\"Type\":\"PlayQueue\""))
+            .expect("a PlayQueue update was pushed");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        v["Data"]["Data"]["Playlist"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| Uuid::parse_str(i["PlaylistItemId"].as_str().unwrap()).unwrap())
+            .collect()
     }
 
     fn ready_at(pli: Uuid, position_ticks: i64, is_playing: bool) -> PlaybackRequest {
@@ -2979,6 +3149,302 @@ mod tests {
         assert_eq!(
             m.get_group(&a, info.group_id).await.unwrap().state,
             GroupStateType::Idle
+        );
+    }
+
+    /// `AbstractGroupState.cs:69-95` + `PlayQueueManager.ClearPlaylist`
+    /// (:176-197): `ClearPlayingItem=false` KEEPS the playing item, so nothing
+    /// was removed that was playing and the group never stops. Ferrofin used to
+    /// throw the whole `PlayQueue` away — shuffle and repeat with it — and Stop.
+    #[tokio::test]
+    async fn clearing_the_playlist_can_keep_the_playing_item() {
+        let (m, bus) = mgr();
+        let a = session("s1", "alice");
+        let info = m.new_group(&a, "g").await.unwrap();
+        m.handle_request(&a, play(3)).await.unwrap();
+        m.handle_request(
+            &a,
+            PlaybackRequest::SetShuffleMode {
+                mode: GroupShuffleMode::Shuffle,
+            },
+        )
+        .await
+        .unwrap();
+        let at = mark(&bus);
+
+        m.handle_request(
+            &a,
+            PlaybackRequest::RemoveFromPlaylist {
+                playlist_item_ids: vec![],
+                clear_playlist: true,
+                clear_playing_item: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        let (caller, _) = since(&bus, at);
+        assert_eq!(
+            caller.len(),
+            1,
+            "one RemoveItems update, no Stop: {caller:?}"
+        );
+        assert!(
+            caller[0].contains("\"Reason\":\"RemoveItems\""),
+            "{caller:?}"
+        );
+        // The playing item survived, still playing, and shuffle survived with it.
+        let v: serde_json::Value = serde_json::from_str(&caller[0]).unwrap();
+        let data = &v["Data"]["Data"];
+        assert_eq!(data["Playlist"].as_array().unwrap().len(), 1);
+        assert_eq!(data["PlayingItemIndex"], 0);
+        assert_eq!(data["ShuffleMode"], "Shuffle");
+        assert_eq!(
+            m.get_group(&a, info.group_id).await.unwrap().state,
+            GroupStateType::Waiting
+        );
+    }
+
+    /// `Group.SetPlayQueue` calls `PlayQueue.Reset()` before filling the queue,
+    /// and `Reset` (PlayQueueManager.cs:352-361) clears shuffle and repeat too —
+    /// a new queue arrives unshuffled and not repeating.
+    #[tokio::test]
+    async fn a_new_queue_resets_shuffle_and_repeat() {
+        let (m, bus) = mgr();
+        let a = session("s1", "alice");
+        m.new_group(&a, "g").await.unwrap();
+        m.handle_request(&a, play(2)).await.unwrap();
+        for r in [
+            PlaybackRequest::SetRepeatMode {
+                mode: GroupRepeatMode::RepeatAll,
+            },
+            PlaybackRequest::SetShuffleMode {
+                mode: GroupShuffleMode::Shuffle,
+            },
+        ] {
+            m.handle_request(&a, r).await.unwrap();
+        }
+        let at = mark(&bus);
+
+        m.handle_request(&a, play(2)).await.unwrap();
+
+        let (caller, _) = since(&bus, at);
+        let v: serde_json::Value = serde_json::from_str(&caller[0]).unwrap();
+        assert_eq!(v["Data"]["Data"]["ShuffleMode"], "Sorted", "{caller:?}");
+        assert_eq!(v["Data"]["Data"]["RepeatMode"], "RepeatNone", "{caller:?}");
+    }
+
+    /// The other half of the same condition: `playingItemRemoved` is false when
+    /// the removal misses the playing item, so no Stop is sent even though the
+    /// queue shrank.
+    #[tokio::test]
+    async fn removing_a_non_playing_item_never_stops_the_group() {
+        let (m, bus) = mgr();
+        let a = session("s1", "alice");
+        let info = m.new_group(&a, "g").await.unwrap();
+        m.handle_request(&a, play(3)).await.unwrap();
+        let playing = playing_item_id(&bus);
+        let other = last_playlist(&bus)
+            .into_iter()
+            .find(|id| *id != playing)
+            .expect("three items were queued");
+        let at = mark(&bus);
+
+        m.handle_request(
+            &a,
+            PlaybackRequest::RemoveFromPlaylist {
+                playlist_item_ids: vec![other],
+                clear_playlist: false,
+                clear_playing_item: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        let (caller, _) = since(&bus, at);
+        assert_eq!(caller.len(), 1, "update only, no Stop: {caller:?}");
+        assert_eq!(playing_item_id(&bus), playing, "playing item unchanged");
+        assert_ne!(
+            m.get_group(&a, info.group_id).await.unwrap().state,
+            GroupStateType::Idle
+        );
+    }
+
+    /// `PlayQueueManager.cs:303-312`: when the PLAYING item goes, upstream steps
+    /// BACK one slot; only an empty remainder leaves nothing playing, and that is
+    /// the single case that Stops the group.
+    #[tokio::test]
+    async fn removing_the_playing_item_steps_back_one_slot() {
+        let (m, bus) = mgr();
+        let a = session("s1", "alice");
+        let info = m.new_group(&a, "g").await.unwrap();
+        m.handle_request(&a, play(3)).await.unwrap();
+        let items = last_playlist(&bus);
+        // Point the queue at the middle item, then remove it.
+        m.handle_request(
+            &a,
+            PlaybackRequest::SetPlaylistItem {
+                playlist_item_id: items[1],
+            },
+        )
+        .await
+        .unwrap();
+        let at = mark(&bus);
+
+        m.handle_request(
+            &a,
+            PlaybackRequest::RemoveFromPlaylist {
+                playlist_item_ids: vec![items[1]],
+                clear_playlist: false,
+                clear_playing_item: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        let (caller, _) = since(&bus, at);
+        assert_eq!(caller.len(), 1, "update only, no Stop: {caller:?}");
+        assert_eq!(
+            playing_item_id(&bus),
+            items[0],
+            "stepped back, not to 0-by-luck"
+        );
+        assert_ne!(
+            m.get_group(&a, info.group_id).await.unwrap().state,
+            GroupStateType::Idle
+        );
+
+        // Emptying the queue is what finally stops it.
+        m.handle_request(
+            &a,
+            PlaybackRequest::RemoveFromPlaylist {
+                playlist_item_ids: vec![items[0], items[2]],
+                clear_playlist: false,
+                clear_playing_item: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            m.get_group(&a, info.group_id).await.unwrap().state,
+            GroupStateType::Idle
+        );
+    }
+
+    /// `Group.AddToPlayQueue` returns false on an empty list and
+    /// `AbstractGroupState.cs:114-132` broadcasts nothing when it does.
+    #[tokio::test]
+    async fn queueing_nothing_pushes_nothing() {
+        let (m, bus) = mgr();
+        let a = session("s1", "alice");
+        m.new_group(&a, "g").await.unwrap();
+        m.handle_request(&a, play(1)).await.unwrap();
+        let at = mark(&bus);
+
+        m.handle_request(
+            &a,
+            PlaybackRequest::Queue {
+                item_ids: vec![],
+                mode: GroupQueueMode::Queue,
+            },
+        )
+        .await
+        .unwrap();
+
+        let (caller, _) = since(&bus, at);
+        assert!(caller.is_empty(), "{caller:?}");
+    }
+
+    /// The `prevState switch` every failed `WaitingGroupState` arm writes
+    /// (:144-148, :189-194, :595-600, :641-646): `Waiting` is NOT restored, it
+    /// falls through the default arm to `Idle`. Ferrofin restored `prev`
+    /// verbatim and sat in `Waiting` where Jellyfin was `Idle` — measured live
+    /// on the parity pair before this fix.
+    #[tokio::test]
+    async fn a_queue_change_that_fails_while_waiting_drops_to_idle() {
+        let (m, bus) = mgr();
+        let a = session("s1", "alice");
+        let info = m.new_group(&a, "g").await.unwrap();
+        m.handle_request(&a, play(1)).await.unwrap(); // Idle -> Waiting
+        assert_eq!(
+            m.get_group(&a, info.group_id).await.unwrap().state,
+            GroupStateType::Waiting
+        );
+        let at = mark(&bus);
+
+        // An empty queue is refused by `Group.SetPlayQueue`.
+        m.handle_request(
+            &a,
+            PlaybackRequest::Play {
+                playing_queue: vec![],
+                playing_item_position: 0,
+                start_position_ticks: 0,
+            },
+        )
+        .await
+        .unwrap();
+
+        let (caller, _) = since(&bus, at);
+        assert!(
+            caller.is_empty(),
+            "the failed arm broadcasts nothing: {caller:?}"
+        );
+        assert_eq!(
+            m.get_group(&a, info.group_id).await.unwrap().state,
+            GroupStateType::Idle
+        );
+    }
+
+    /// ...while the two arms the switch DOES name are restored as they were.
+    #[tokio::test]
+    async fn a_queue_change_that_fails_while_playing_or_paused_is_restored() {
+        for pause_first in [false, true] {
+            let (m, bus) = mgr();
+            let a = session("s1", "alice");
+            let info = m.new_group(&a, "g").await.unwrap();
+            start_playing(&m, &bus, &[&a], 1).await;
+            let want = if pause_first {
+                m.handle_request(&a, PlaybackRequest::Pause).await.unwrap();
+                GroupStateType::Paused
+            } else {
+                GroupStateType::Playing
+            };
+            assert_eq!(m.get_group(&a, info.group_id).await.unwrap().state, want);
+
+            m.handle_request(
+                &a,
+                PlaybackRequest::SetPlaylistItem {
+                    playlist_item_id: Uuid::new_v4(), // not in the queue
+                },
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(
+                m.get_group(&a, info.group_id).await.unwrap().state,
+                want,
+                "pause_first={pause_first}"
+            );
+        }
+    }
+
+    /// `TimeSpan.Ticks` is the FULL 100 ns count. Rounding a clock delta through
+    /// milliseconds quantised every position Ferrofin emitted to a multiple of
+    /// 10_000 ticks, which is visible beside the oracle's exact values.
+    #[test]
+    fn a_clock_delta_keeps_full_tick_resolution() {
+        assert_eq!(
+            duration_ticks(Duration::nanoseconds(123_456_700)),
+            1_234_567
+        );
+        assert_eq!(duration_ticks(Duration::microseconds(1)), 10);
+        assert_eq!(duration_ticks(Duration::nanoseconds(99)), 0);
+        assert_eq!(duration_ticks(Duration::nanoseconds(-123_400)), -1_234);
+        // The two fallbacks are unreachable for a playback delta, but must not
+        // return nonsense if they ever are reached.
+        assert_eq!(
+            duration_ticks(Duration::days(365 * 400)),
+            365 * 400 * 864_000_000_000
         );
     }
 
