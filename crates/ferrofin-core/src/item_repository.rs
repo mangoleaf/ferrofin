@@ -1567,6 +1567,10 @@ async fn folder_preference(
 
 #[async_trait]
 impl ItemRepository for FerrofinItemRepository {
+    async fn visible_library_ids(&self, user: &UserEntity) -> Result<Vec<Uuid>, ServiceError> {
+        visible_views(&self.db, user).await
+    }
+
     async fn retrieve_item(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
         if id.is_nil() {
             return Err(ServiceError::invalid_input("item id can't be empty"));

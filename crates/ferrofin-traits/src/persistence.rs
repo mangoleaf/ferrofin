@@ -147,6 +147,17 @@ pub trait ItemRepository: Send + Sync {
     /// Retrieves a single item row by id, or `None` if it does not exist.
     async fn retrieve_item(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError>;
 
+    /// The library ids `user` is allowed to see — the collection folders and
+    /// views left after `BlockedMediaFolders`, `EnableAllFolders` and
+    /// `EnabledFolders` are applied.
+    ///
+    /// This is the per-user gate itself, not the unfiltered folder list that
+    /// `UserViewManager::get_user_views` returns (which leaves the filtering to
+    /// the query pipeline). Anything deciding what a user may be TOLD about —
+    /// as opposed to what a query returns — has to ask this, or it will treat
+    /// every library as visible to everybody.
+    async fn visible_library_ids(&self, user: &UserEntity) -> Result<Vec<Uuid>, ServiceError>;
+
     /// Returns the ids of every item whose metadata the user has **locked**
     /// (`IsLocked = 1`).
     ///

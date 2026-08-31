@@ -5114,6 +5114,15 @@ mod tests {
 
     #[async_trait]
     impl ferrofin_traits::persistence::ItemRepository for FakeItems {
+        async fn visible_library_ids(
+            &self,
+            _user: &ferrofin_db::entities::users::UserEntity,
+        ) -> Result<Vec<Uuid>, ferrofin_traits::ServiceError> {
+            // This fake exists for the provider tests; no test here asks what a
+            // user may see, and answering "nothing" is the safe wrong answer.
+            Ok(Vec::new())
+        }
+
         async fn retrieve_item(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
             let _ = self.seen.send(id);
             Ok(self.rows.get(&id).cloned())

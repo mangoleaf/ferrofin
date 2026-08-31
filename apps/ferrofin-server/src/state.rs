@@ -1520,7 +1520,8 @@ pub async fn build_app_state(
     // libraries they can actually see.
     change_notifier.set_audience(Arc::new(SessionLibraryAudience {
         sessions: Arc::clone(&sessions),
-        user_views: Arc::clone(&user_views),
+        users: Arc::clone(&users),
+        items: Arc::clone(&item_repository),
     }));
 
     // Forward domain events to client sessions over the WebSocket — the Rust
@@ -2054,14 +2055,19 @@ use uuid::Uuid;
 /// The per-user fan-out for `LibraryChanged` (`LibraryChangedNotifier`'s
 /// `ISessionManager` + `ILibraryManager` collaborators).
 ///
-/// "Which libraries can this user see" is answered by `UserViewManager` rather
-/// than the library manager, which also keeps this off an ownership ring: the
-/// library manager owns the notifier and the notifier owns this audience, so a
-/// strong handle back to the library would close the ring and leak both for the
-/// process lifetime.
+/// "Which libraries can this user see" is `ItemRepository::visible_library_ids`
+/// — the per-user gate itself. NOT `UserViewManager::get_user_views`, which
+/// returns every collection folder and leaves the filtering to the query
+/// pipeline: asking that one would have made this filter a no-op that still
+/// read like a filter.
+///
+/// Neither collaborator is on the library manager's ownership ring (library
+/// manager owns the notifier, notifier owns this audience), so a strong handle
+/// back would have closed the ring and leaked both for the process lifetime.
 struct SessionLibraryAudience {
     sessions: Arc<dyn ferrofin_traits::session::SessionManager>,
-    user_views: Arc<dyn ferrofin_traits::library::UserViewManager>,
+    users: Arc<dyn ferrofin_traits::library::UserManager>,
+    items: Arc<dyn ferrofin_traits::persistence::ItemRepository>,
 }
 
 #[async_trait::async_trait]
@@ -2085,13 +2091,12 @@ impl ferrofin_traits::events::LibraryChangeAudience for SessionLibraryAudience {
         &self,
         user_id: Uuid,
     ) -> Result<Vec<Uuid>, ferrofin_traits::error::ServiceError> {
-        Ok(self
-            .user_views
-            .get_user_views(user_id)
-            .await?
-            .iter()
-            .filter_map(|v| Uuid::parse_str(&v.id).ok())
-            .collect())
+        // A user that no longer exists gets told nothing, rather than
+        // everything.
+        let Some(user) = self.users.get_user_by_id(user_id).await? else {
+            return Ok(Vec::new());
+        };
+        self.items.visible_library_ids(&user).await
     }
 
     async fn deliver(
