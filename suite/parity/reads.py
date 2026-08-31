@@ -216,6 +216,19 @@ def lyric_visible(base, token, aid):
     return http("GET", f"{base}/Audio/{aid}/Lyrics", token)[0] == 200
 
 
+def seed_by_name_music_genre(base, token, ctx):
+    """`CreateItemByName<MusicGenre>` for a name only NON-music items carry, on
+    BOTH servers, so the `/MusicGenres` legs below compare the same universe.
+
+    This is a deliberate, named WRITE — `GET /MusicGenres/{name}` is
+    `CreateItemByName` upstream (`LibraryManager.cs:1289`), so both servers
+    materialize the row. Without it the movie-genre legs would depend on which
+    earlier probe happened to have created the row first, which is not a
+    measurement. Returns the status so a divergence is visible.
+    """
+    return http("GET", f"{base}/MusicGenres/{ctx['genre']}?userId={ctx['u']}", token)[0]
+
+
 def seed_lyrics(base, token, ctx):
     """Uploads one lyric per seed id and waits until each reads back.
 
@@ -636,7 +649,28 @@ READS = [
     user("GET /Artists/{itemId}/Similar", "/Artists/{artist_id}/Similar?userId={u}&limit=1000"),
     # by-name + shows (need the NFO metadata + shows fixture); {genre}/{studio}/{person} are
     # URL-encoded names shared across servers, {series} is the per-server first-series id.
-    user("GET /Genres/{genreName}", "/Genres/{genre}?userId={u}"),
+    # FOUR legs. `GenresController.GetGenre` has three behaviours, not one
+    # (v10.11.8 :159-208 and master, byte-identical apart from
+    # `.AddClientFields`): a plain name is `CreateItemByName`, a name carrying
+    # `BaseItem.SlugChar` ('-') is looked up through the `&` / `/` / `?`
+    # substitutions and creates NOTHING, and a miss returns a
+    # default-constructed `Genre` — the route cannot 404. A single-name leg saw
+    # only the first, which is how Ferrofin shipped a slug branch that minted a
+    # bogus genre for every hyphenated mis-spelling.
+    multi("GET /Genres/{genreName}", [
+        "/Genres/{genre}?userId={u}",
+        "/Genres/{genre_last}?userId={u}",
+        # The slug SUCCESS path: `R-B` must resolve the genre named `R&B`
+        # (added to suite/perf/gen-fixtures.sh; until the fixture is
+        # re-provisioned this leg is the MISS path on both servers, which is
+        # still an agreement worth asserting).
+        "/Genres/R-B?userId={u}",
+        # The slug MISS path — safe to repeat, because neither server creates
+        # on it. Before the port Ferrofin answered here with a freshly minted
+        # genre row (Name/Path/SortName present, LocationType FileSystem)
+        # against Jellyfin's all-zero DTO.
+        "/Genres/Diag-No-Such-F2?userId={u}",
+    ]),
     # TWO legs, and the second one is the point: a by-name Studio whose name is
     # also a GENRE name. `ItemCountService` restricts the `ItemValues` match to
     # the value type the kind owns (`ItemValueType.Studios` for a Studio,
@@ -646,11 +680,25 @@ READS = [
     # probed explicitly. This is also the body of a route the by-name lazy
     # create turned from a 404 into a 200, which is exactly when a status-only
     # check stops being enough.
+    # The third leg is the LAST shared studio by SortName, not the first: the
+    # single-name sample cannot stand in for the listing, and on this lab the
+    # pair diverged on exactly the studio `{studio}` never reaches.
     multi("GET /Studios/{name}", [
         "/Studios/{studio}?userId={u}",
         "/Studios/{genre}?userId={u}",
+        "/Studios/{studio_last}?userId={u}",
     ]),
-    user("GET /Persons/{name}", "/Persons/{person}?userId={u}"),
+    # `PersonsController.GetPerson` is the ONE person endpoint that builds
+    # `new DtoOptions()` (= all fields), where `GetPersons` builds
+    # `new DtoOptions { Fields = fields }` (= none) — so the deep-verified
+    # `GET /Persons` row is blind to the whole row body and only this one sees
+    # it. Two names, because `Person.GetPath` puts each under a first-letter
+    # subfolder (`/People/A/…`, `/People/B/…`) and one name exercises one
+    # branch of that.
+    multi("GET /Persons/{name}", [
+        "/Persons/{person}?userId={u}",
+        "/Persons/{person_last}?userId={u}",
+    ]),
     # A `Year` counts by `ProductionYear`, not through `ItemValues`
     # (`ItemCountService.cs:170-181`) — a distinct branch of the same by-name
     # count path, and unprobed until now: Ferrofin answered ChildCount 0 for
@@ -678,8 +726,34 @@ READS = [
         ("/MusicGenres?userId={u}&nameLessThan=Jb", with_item_order),
         ("/MusicGenres?userId={u}&includeItemTypes=Audio", with_item_order),
         ("/MusicGenres?userId={u}&includeItemTypes=Movie", with_item_order),
+        # NAME-ISOLATED legs. The unfiltered list legs above cannot be made to
+        # agree by any honest means: Jellyfin's `CreateItemByName` never assigns
+        # `PresentationUniqueKey` (`LibraryManager.cs:1289-1329` on master,
+        # `:1052-1092` on v10.11.8), so every lazily created by-name row lands
+        # with an EMPTY key and `GetItemValues`'s
+        # `.GroupBy(e => e.PresentationUniqueKey)` collapses all of them into one
+        # arbitrary representative — which one survives changes with the filter.
+        # Ferrofin writes a real `{Type}-{Name}` key and does not collapse.
+        # Narrowing to a single name takes the collapse out of the comparison
+        # while still comparing the row, its counts and the total: this is the
+        # honest way to earn depth here, NOT widening VOLATILE.
+        ("/MusicGenres?userId={u}&limit=100&nameStartsWith={musicgenre}", with_item_order),
+        ("/MusicGenres?userId={u}&limit=100&nameStartsWith={genre}", with_item_order),
+        ("/MusicGenres?userId={u}&limit=100&nameStartsWith={genre}&includeItemTypes=Movie",
+         with_item_order),
+    ], seed=seed_by_name_music_genre),
+    # The SAME slug branch as `GenresController.GetGenre`, but NOT the same
+    # fallback: `MusicGenresController.GetMusicGenre` keeps
+    # `if (item is null) return NotFound()` on both trees (v10.11.8 :164-167,
+    # master :165-168) where the genres controller has `item ??= new Genre()`.
+    # Both slug legs are therefore 404=404 agreements, and that asymmetry is
+    # exactly what these legs pin: a port that copied the genres fallback here
+    # answered 200 against Jellyfin's 404, and only the wire showed it.
+    multi("GET /MusicGenres/{genreName}", [
+        "/MusicGenres/{musicgenre}?userId={u}",
+        "/MusicGenres/R-B?userId={u}",
+        "/MusicGenres/Diag-No-Such-F2?userId={u}",
     ]),
-    user("GET /MusicGenres/{genreName}", "/MusicGenres/{musicgenre}?userId={u}"),
     # Instant mixes are shuffled: the diff aligns by Name, so the SET of tracks is what is
     # compared (with the whole fixture under `limit`, both sides hold every track).
     user("GET /Artists/InstantMix", "/Artists/InstantMix?id={artist_id}&userId={u}&limit=100"),
@@ -809,6 +883,19 @@ def reconcile_named(hc, jc):
         hc[key] = jc[key] = urllib.parse.quote(name)
         if id_key:
             hc[id_key], jc[id_key] = shared.get("Id") or "", j_by_name[name]
+    # A `{key}_last` seed too — the LAST shared name in the same order. A row
+    # probed with only `first_name` samples one end of the listing; on this lab
+    # the studios diverged on exactly the one the first-name leg never reaches.
+    # Falls back to the first shared name when only one is shared, so a leg is
+    # never left unformatted.
+    for key in NAMED_SEEDS:
+        h_items = hc["named_listings"].get(key) or []
+        j_names = {(i.get("Name") or "") for i in jc["named_listings"].get(key) or []}
+        shared = [i.get("Name") or "" for i in h_items if (i.get("Name") or "") in j_names]
+        if shared:
+            hc[f"{key}_last"] = jc[f"{key}_last"] = urllib.parse.quote(shared[-1])
+        else:
+            hc[f"{key}_last"] = jc[f"{key}_last"] = hc.get(key, "")
     return unshared
 
 
@@ -1007,6 +1094,16 @@ def run(ferrofin_url, jellyfin_url):
                         agg["mismatch"].append(
                             {"path": f"{leg['tmpl']} :: status", "j": js, "h": hs})
                         continue
+                    if hb is None and jb is None:
+                        # BOTH sides answered the same status with no JSON body
+                        # — e.g. the two servers agreeing on a 404, which is a
+                        # real agreement and the only assertion such a leg can
+                        # make. Counted clean, but it contributes NOTHING to
+                        # `compared`, so it cannot inflate a row's depth: the
+                        # row's `field(s) compared` still comes only from legs
+                        # that actually diffed a body.
+                        clean += 1
+                        continue
                     if hb is None or jb is None:
                         agg["mismatch"].append(
                             {"path": f"{leg['tmpl']} :: body",
@@ -1140,6 +1237,8 @@ def selfcheck():
            "channel": "CH", "album_id": "ALB", "movie": "MOV", "episode": "EP",
            "musicgenre_id": "MGID", "year": "Y", "named_listings": {},
            "lyric_lrc": "L1", "lyric_elrc": "L2", "lyric_txt": "L3"}
+    # `reconcile_named` adds a `{key}_last` for every NAMED_SEEDS key.
+    ctx.update({f"{k}_last": f"{k.upper()}L" for k in NAMED_SEEDS})
     # The context keys the self-check invents must be the ones resolve_named
     # actually produces, or this guard passes while the live run KeyErrors.
     import inspect
@@ -1199,6 +1298,19 @@ def selfcheck():
     assert any("/MusicGenres/{genre}/InstantMix" in t
                for t in legs["GET /MusicGenres/{name}/InstantMix"]), \
         legs["GET /MusicGenres/{name}/InstantMix"]
+    # The slug branch is the second and third behaviour of `GetGenre`; a leg
+    # carrying `BaseItem.SlugChar` must survive on both genre rows or the
+    # blind spot that let a hyphenated GET mint a bogus genre reopens.
+    for op in ("GET /Genres/{genreName}", "GET /MusicGenres/{genreName}"):
+        assert any("-" in t.rsplit("/", 1)[-1].split("?")[0] for t in legs[op]), legs[op]
+    # The name-isolated `/MusicGenres` legs: without them the row's only
+    # comparison is against Jellyfin's PresentationUniqueKey collapse, which no
+    # correct server can reproduce.
+    assert any("nameStartsWith={genre}" in t for t in legs["GET /MusicGenres"]), \
+        legs["GET /MusicGenres"]
+    # A last-name leg on the two rows whose fixture holds more than one name.
+    for op in ("GET /Studios/{name}", "GET /Persons/{name}", "GET /Genres/{genreName}"):
+        assert any("_last}" in t for t in legs[op]), legs[op]
     # Method derivation: two EMPTY result envelopes agreeing on their own zeros is
     # not the body-diff headline, and a pair that compared nothing at all is not a
     # verdict. Both are the shapes that silently inflated the count before.
@@ -1210,6 +1322,16 @@ def selfcheck():
     assert verification.read_method({"Items": [{"Name": "x"}], "TotalRecordCount": 1},
                                     {"Items": [{"Name": "x"}], "TotalRecordCount": 1},
                                     2) == verification.BODY_DIFF
+    # A leg where BOTH servers answer the same status with no JSON body (two
+    # 404s) is an agreement, not a mismatch — but it must not add depth. The
+    # branch is asserted here as a pair of facts rather than re-run live.
+    import inspect as _inspect
+    _multi_src = _inspect.getsource(run)
+    assert "if hb is None and jb is None:" in _multi_src, \
+        "the both-sides-non-JSON agreement branch is gone"
+    assert _multi_src.index("if hb is None and jb is None:") \
+        < _multi_src.index("if hb is None or jb is None:"), \
+        "the agreement branch must precede the one-sided-body mismatch branch"
     hf, jf = {"a": True, "b": True, "c": False}, {"a": True, "b": False, "c": False}
     bad = [k for k in sorted(set(hf) | set(jf))
            if hf.get(k) != jf.get(k) or hf.get(k) is False]

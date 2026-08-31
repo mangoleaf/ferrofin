@@ -102,10 +102,15 @@ async fn music_genre_row(
         return Ok(());
     };
     sqlx::query(
+        // `PresentationUniqueKey` for the same reason as the sibling by-name
+        // insert below: Jellyfin's scanner row carries `MusicGenre-Ambient`
+        // (read out of a real 10.11.8 database), this insert bypasses
+        // `upsert_item`, and the column is what `GetItemValues` groups on.
         r#"INSERT INTO "BaseItems"
-           ("Id","Type","Name","CleanName","SortName","IsFolder","IsInMixedFolder",
+           ("Id","Type","Name","CleanName","SortName","PresentationUniqueKey",
+            "IsFolder","IsInMixedFolder",
             "IsLocked","IsMovie","IsRepeat","IsSeries","IsVirtualItem")
-           SELECT ?1,?2,?3,?4,?5,0,0,0,0,0,0,0
+           SELECT ?1,?2,?3,?4,?5,?6,0,0,0,0,0,0,0
            WHERE NOT EXISTS (
                SELECT 1 FROM "BaseItems" WHERE "Type" = ?2 AND "CleanName" = ?4)"#,
     )
@@ -114,6 +119,14 @@ async fn music_genre_row(
     .bind(value)
     .bind(clean)
     .bind(ferrofin_util::sort_name::create_sort_name(value))
+    .bind(crate::kinds::presentation_unique_key(
+        BaseItemKind::MusicGenre,
+        id,
+        Some(value),
+        None,
+        None,
+        None,
+    ))
     .execute(&mut **tx)
     .await
     .map_err(db_err)?;
@@ -459,14 +472,21 @@ impl FerrofinItemPersistenceService {
         // A caller-supplied value always wins — that is what carries the
         // per-kind `CreateSortName` overrides (episode/season) the scanner
         // computes, which drive the client's play queue.
+        //
+        // The fallback goes through `kinds::sort_name_for`, not
+        // `create_sort_name` directly, because `CreateSortName` has a per-kind
+        // branch: `Person` overrides `EnableAlphaNumericSorting => false` and
+        // keeps its name verbatim. Deriving the generic key for a `Person` here
+        // lower-cased rows the people repository had written correctly.
+        let sort_kind = crate::item_type_lookup::kind_from_type_name(&item.type_);
         let sort_name = item.sort_name.clone().or_else(|| {
             let forced = item.forced_sort_name.as_deref().filter(|f| !f.is_empty());
             match forced {
                 Some(f) => Some(ferrofin_util::sort_name::forced_sort_key(f)),
-                None => item
-                    .name
-                    .as_deref()
-                    .map(ferrofin_util::sort_name::create_sort_name),
+                None => item.name.as_deref().map(|n| match sort_kind {
+                    Some(kind) => crate::kinds::sort_name_for(kind, n),
+                    None => ferrofin_util::sort_name::create_sort_name(n),
+                }),
             }
         });
         sqlx::query(sql)
@@ -1452,8 +1472,8 @@ fn scan_upsert_sql() -> &'static str {
 /// # Errors
 /// Returns [`ServiceError`] if the read or the write fails.
 pub async fn backfill_missing_sort_names(db: &Database) -> Result<usize, ServiceError> {
-    let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
-        r#"SELECT "Id", "Name", "ForcedSortName" FROM "BaseItems"
+    let rows: Vec<(String, String, Option<String>, String)> = sqlx::query_as(
+        r#"SELECT "Id", "Name", "ForcedSortName", "Type" FROM "BaseItems"
            WHERE "SortName" IS NULL AND "Name" IS NOT NULL AND "Name" <> ''
              AND "Type" <> 'PLACEHOLDER'"#,
     )
@@ -1465,10 +1485,17 @@ pub async fn backfill_missing_sort_names(db: &Database) -> Result<usize, Service
     }
 
     let mut tx = db.writer().begin().await.map_err(db_err)?;
-    for (id, name, forced) in &rows {
+    for (id, name, forced, type_name) in &rows {
+        // `Type` is selected so the per-kind `CreateSortName` branch applies:
+        // a `Person` keeps its name verbatim (`EnableAlphaNumericSorting =>
+        // false`). Backfilling the generic key here wrote the WRONG value into
+        // exactly the rows this function exists to repair.
         let sort_name = match forced.as_deref().filter(|f| !f.is_empty()) {
             Some(f) => ferrofin_util::sort_name::forced_sort_key(f),
-            None => ferrofin_util::sort_name::create_sort_name(name),
+            None => match crate::item_type_lookup::kind_from_type_name(type_name) {
+                Some(kind) => crate::kinds::sort_name_for(kind, name),
+                None => ferrofin_util::sort_name::create_sort_name(name),
+            },
         };
         sqlx::query(r#"UPDATE "BaseItems" SET "SortName" = ?1 WHERE "Id" = ?2"#)
             .bind(sort_name)
@@ -1870,6 +1897,43 @@ mod tests {
                 .expect("second run"),
             0,
             "the pass is a no-op once repaired"
+        );
+    }
+
+    /// The backfill applies the per-kind `CreateSortName` branch: `Person`
+    /// overrides `EnableAlphaNumericSorting => false` on both trees, so its key
+    /// is the name verbatim. Writing the generic lower-cased key here would
+    /// corrupt exactly the rows this pass exists to repair.
+    #[tokio::test]
+    async fn backfill_missing_sort_names_uses_the_person_rule_for_a_person() {
+        async fn read(db: &ferrofin_db::Database, id: Uuid) -> Option<String> {
+            sqlx::query_scalar(r#"SELECT "SortName" FROM "BaseItems" WHERE "Id" = ?1"#)
+                .bind(ferrofin_db::store::guid_to_db(id))
+                .fetch_one(db.pool())
+                .await
+                .expect("query")
+        }
+        let db = test_db().await;
+        let person = Uuid::from_u128(0xB101);
+        let movie = Uuid::from_u128(0xB102);
+        crate::test_support::seed_named_item(&db, person, BaseItemKind::Person, "The Rock").await;
+        crate::test_support::seed_named_item(&db, movie, BaseItemKind::Movie, "The Rock").await;
+        sqlx::query(r#"UPDATE "BaseItems" SET "SortName" = NULL"#)
+            .execute(db.writer())
+            .await
+            .expect("null them out");
+
+        assert_eq!(
+            super::backfill_missing_sort_names(&db)
+                .await
+                .expect("backfill"),
+            2
+        );
+        assert_eq!(read(&db, person).await.as_deref(), Some("The Rock"));
+        assert_eq!(
+            read(&db, movie).await.as_deref(),
+            Some("rock"),
+            "every other kind still gets the alphanumeric key"
         );
     }
 

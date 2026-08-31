@@ -556,7 +556,10 @@ impl FerrofinItemRepository {
     ) -> Result<i32, ServiceError> {
         let mut qb: QueryBuilder<Sqlite> =
             QueryBuilder::new(r#"SELECT COUNT(*) FROM "BaseItems" AS bi JOIN "#);
-        push_value_aggregate(&mut qb, scope);
+        // No per-kind counts here: this query only counts by-name rows, so the
+        // seven conditional sums would be computed and thrown away. The shared
+        // `scope` still guarantees the WHERE cannot drift from the page query.
+        push_value_aggregate(&mut qb, scope, &[]);
         push_by_name_join(&mut qb, return_type);
         append_by_name_filters(&mut qb, filter);
         let count: i64 = qb
@@ -582,8 +585,6 @@ impl FerrofinItemRepository {
         value_types: &[ItemValueType],
         return_type: BaseItemKind,
         filter: &InternalItemsQuery,
-        include_content_types: &[String],
-        exclude_content_types: &[String],
     ) -> Result<QueryResult<ItemWithCounts>, ServiceError> {
         // Every kind the six callers pass (`Genre`, `MusicGenre`, `Studio`,
         // `MusicArtist`) is in the lookup table. A kind that were not would
@@ -595,20 +596,20 @@ impl FerrofinItemRepository {
             .map(|t| i64::from(i32::from(*t)))
             .collect();
         // Content-item scoping. `GetItemValues` builds its inner query from
-        // `IncludeItemTypes` ALONE — the caller-forced list is Ferrofin's stand-in
-        // for upstream's `.Where(e => e.Type == returnType)` split between
-        // `/Genres` and `/MusicGenres`, so it is the FALLBACK when the caller
-        // named no kinds, never a union with them. Unioning made
-        // `?includeItemTypes=Movie` on `/MusicGenres` *widen* the aggregate back
-        // to music items instead of narrowing it to movies.
-        let mut content_type_names: Vec<String> = filter
+        // `IncludeItemTypes` ALONE (`BaseItemRepository.ByName.cs:154-168` on
+        // master, `BaseItemRepository.cs:1258-1275` on v10.11.8 — the two trees
+        // are structurally identical here). There is NO owner-kind restriction
+        // on either `GetGenres` or `GetMusicGenres`: both are
+        // `GetItemValues(filter, _getGenreValueTypes, <returnType>)` and differ
+        // only in the by-name row `Type` the outer `.Where(e => e.Type ==
+        // returnType)` selects. The owner-type split lives solely on the
+        // *Names* variants (`GetItemValueNames`, ByName.cs:120-141), which
+        // `get_genre_names`/`get_music_genre_names` still carry.
+        let content_type_names: Vec<String> = filter
             .include_item_types
             .iter()
             .filter_map(|k| stored_type_name(*k).map(str::to_owned))
             .collect();
-        if content_type_names.is_empty() {
-            content_type_names.extend(include_content_types.iter().cloned());
-        }
         let ancestors: Vec<String> = filter
             .ancestor_ids
             .iter()
@@ -624,21 +625,28 @@ impl FerrofinItemRepository {
             .unwrap_or_default();
 
         let want_total = filter.enable_total_record_count && filter.limit.is_some();
-        let mut qb: QueryBuilder<Sqlite> = if want_total {
-            QueryBuilder::new(
-                r#"SELECT bi.*, agg.cnt, COUNT(*) OVER() AS "total_count" FROM "BaseItems" AS bi JOIN "#,
-            )
-        } else {
-            QueryBuilder::new(r#"SELECT bi.*, agg.cnt FROM "BaseItems" AS bi JOIN "#)
-        };
+        // Master computes the per-kind counts only when the caller named item
+        // types (`if (filter.IncludeItemTypes.Length > 0)`, ByName.cs:249-268),
+        // so the aggregate carries the seven conditional sums only then — the
+        // by-name browse that asks for no counts pays nothing for them.
+        let count_types = per_kind_count_types(!content_type_names.is_empty());
+        let mut select = String::from(r"SELECT bi.*, agg.cnt");
+        for (alias, _) in &count_types {
+            select.push_str(", agg.");
+            select.push_str(alias);
+        }
+        if want_total {
+            select.push_str(r#", COUNT(*) OVER() AS "total_count""#);
+        }
+        select.push_str(r#" FROM "BaseItems" AS bi JOIN "#);
+        let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(select);
         let scope = ByNameScope {
             type_ints: &type_ints,
             content_type_names: &content_type_names,
-            exclude_content_types,
             ancestors: &ancestors,
             top_parents: &top_parents,
         };
-        push_value_aggregate(&mut qb, &scope);
+        push_value_aggregate(&mut qb, &scope, &count_types);
         push_by_name_join(&mut qb, return_type);
         append_by_name_filters(&mut qb, filter);
         // C# `GetItemValues` runs the same `ApplyOrder(query, filter, context)`
@@ -683,8 +691,24 @@ impl FerrofinItemRepository {
             .into_iter()
             .map(|r| ItemWithCounts {
                 item: r.item,
+                // Port of master's `BuildItemCountsByCleanName` (ByName.cs:277-330):
+                // one `ItemCounts` per `CleanName`, each field the number of
+                // in-scope content items of that kind carrying the value.
+                // v10.11.8 (BaseItemRepository.cs:1350-1390, comment "TODO: This
+                // is bad refactor!") instead hands EVERY row the same
+                // uncorrelated totals; master fixed it, so Ferrofin follows
+                // master. `ItemCount` and `ProgramCount` are left at the
+                // aggregate/zero because neither tree assigns them — see
+                // `by_name::project_query_result`.
                 counts: ferrofin_model::dto::ItemCounts {
                     item_count: i32::try_from(r.cnt).unwrap_or(i32::MAX),
+                    series_count: clamp_count(r.series_count),
+                    episode_count: clamp_count(r.episode_count),
+                    movie_count: clamp_count(r.movie_count),
+                    album_count: clamp_count(r.album_count),
+                    artist_count: clamp_count(r.artist_count),
+                    song_count: clamp_count(r.song_count),
+                    trailer_count: clamp_count(r.trailer_count),
                     ..Default::default()
                 },
             })
@@ -704,6 +728,54 @@ struct ByNameCountRow {
     cnt: i64,
     #[sqlx(default)]
     total_count: i64,
+    /// The seven per-kind counts of master's `BuildItemCountsByCleanName`.
+    /// `#[sqlx(default)]` because the aggregate emits them only when the
+    /// caller named item types — the browse that wants no counts does not
+    /// pay for seven conditional sums.
+    #[sqlx(default)]
+    series_count: i64,
+    #[sqlx(default)]
+    episode_count: i64,
+    #[sqlx(default)]
+    movie_count: i64,
+    #[sqlx(default)]
+    album_count: i64,
+    #[sqlx(default)]
+    artist_count: i64,
+    #[sqlx(default)]
+    song_count: i64,
+    #[sqlx(default)]
+    trailer_count: i64,
+}
+
+/// The `(column alias, stored type name)` pairs of master's per-kind by-name
+/// counts, or nothing when the caller named no item types.
+///
+/// Port of the seven `BaseItemKindNames[...]` locals master's
+/// `BuildItemCountsByCleanName` reads (`BaseItemRepository.ByName.cs:296-302`).
+/// A kind missing from the lookup table simply contributes no column, which
+/// leaves its count at the `0` default — the same answer as counting nothing.
+fn per_kind_count_types(wanted: bool) -> Vec<(&'static str, &'static str)> {
+    if !wanted {
+        return Vec::new();
+    }
+    [
+        ("series_count", BaseItemKind::Series),
+        ("episode_count", BaseItemKind::Episode),
+        ("movie_count", BaseItemKind::Movie),
+        ("album_count", BaseItemKind::MusicAlbum),
+        ("artist_count", BaseItemKind::MusicArtist),
+        ("song_count", BaseItemKind::Audio),
+        ("trailer_count", BaseItemKind::Trailer),
+    ]
+    .into_iter()
+    .filter_map(|(alias, kind)| stored_type_name(kind).map(|name| (alias, name)))
+    .collect()
+}
+
+/// Narrows one aggregate count to the `i32` the DTO field is.
+fn clamp_count(n: i64) -> i32 {
+    i32::try_from(n).unwrap_or(i32::MAX)
 }
 
 /// Pushes the value-count aggregate as a derived table `agg(cval, cnt)`: for
@@ -718,11 +790,14 @@ struct ByNameCountRow {
 /// is unique on the raw `Value`), and they are one genre to a client, so
 /// collapsing them here is also what stops a single by-name row being joined
 /// twice.
-fn push_value_aggregate<'a>(qb: &mut QueryBuilder<'a, Sqlite>, scope: &'a ByNameScope<'a>) {
+fn push_value_aggregate<'a>(
+    qb: &mut QueryBuilder<'a, Sqlite>,
+    scope: &'a ByNameScope<'a>,
+    count_types: &[(&'static str, &'static str)],
+) {
     let ByNameScope {
         type_ints,
         content_type_names,
-        exclude_content_types,
         ancestors,
         top_parents,
     } = scope;
@@ -735,8 +810,18 @@ fn push_value_aggregate<'a>(qb: &mut QueryBuilder<'a, Sqlite>, scope: &'a ByName
     // with the number of items sharing a genre/studio. Row-identical on the
     // bench library; the statement behind `/Studios` measures 0.407 ms → 0.366,
     // `/Items/Filters2` 0.566 → 0.490.
+    qb.push(r#"(SELECT iv."CleanValue" AS cval, COUNT(*) AS cnt"#);
+    // Master's per-`CleanName` counts, folded into the SAME group-by rather
+    // than run as a second dictionary query: `SUM(ci."Type" = ?)` is SQLite's
+    // spelling of `g.Where(x => x.Type == seriesTypeName).Sum(x => x.Count)`.
+    for (alias, type_name) in count_types {
+        qb.push(r#", SUM(ci."Type" = "#)
+            .push_bind((*type_name).to_owned())
+            .push(") AS ")
+            .push(*alias);
+    }
     qb.push(
-        r#"(SELECT iv."CleanValue" AS cval, COUNT(*) AS cnt
+        r#"
            FROM "ItemValues" iv
            JOIN "ItemValuesMap" ivm ON ivm."ItemValueId" = iv."ItemValueId"
            JOIN "BaseItems" ci ON ci."Id" = ivm."ItemId"
@@ -746,14 +831,6 @@ fn push_value_aggregate<'a>(qb: &mut QueryBuilder<'a, Sqlite>, scope: &'a ByName
     if !content_type_names.is_empty() {
         qb.push(" AND ");
         push_in_list(qb, r#"ci."Type""#, content_type_names);
-    }
-    if !exclude_content_types.is_empty() {
-        qb.push(r#" AND ci."Type" NOT IN ("#);
-        let mut sep = qb.separated(", ");
-        for n in *exclude_content_types {
-            sep.push_bind(n.clone());
-        }
-        qb.push(")");
     }
     if !ancestors.is_empty() {
         qb.push(r#" AND EXISTS (SELECT 1 FROM "AncestorIds" a WHERE a."ItemId" = ci."Id" AND "#);
@@ -781,10 +858,10 @@ fn push_value_aggregate<'a>(qb: &mut QueryBuilder<'a, Sqlite>, scope: &'a ByName
 struct ByNameScope<'a> {
     /// The `ItemValues.Type` numbers this tab aggregates.
     type_ints: &'a [i64],
-    /// Stored type names of the content items that may contribute.
+    /// Stored type names of the content items that may contribute — the
+    /// caller's `IncludeItemTypes` and nothing else, exactly as C# builds its
+    /// `innerQueryFilter`.
     content_type_names: &'a [String],
-    /// Stored type names that may not (music genres vs plain genres).
-    exclude_content_types: &'a [String],
     /// The browse's ancestor scope, if it is under a parent.
     ancestors: &'a [String],
     /// The user's libraries (`AddUserToQuery`), empty when unconfined.
@@ -1608,9 +1685,16 @@ impl ItemRepository for FerrofinItemRepository {
         &self,
         filter: &InternalItemsQuery,
     ) -> Result<QueryResult<ItemWithCounts>, ServiceError> {
-        // Plain genres exclude music items (those are the MusicGenres browse).
-        let music = self.item_type_lookup.music_genre_types();
-        self.item_values_with_counts(GENRE_TYPES, BaseItemKind::Genre, filter, &[], &music)
+        // `GetGenres` and `GetMusicGenres` are the SAME query over the same
+        // `ItemValueType`; only the by-name row kind returned differs (master
+        // `BaseItemRepository.ByName.cs:44-52`, v10.11.8
+        // `BaseItemRepository.cs:211-222`). Neither restricts which content
+        // items may contribute — the owner-kind split Ferrofin used to apply
+        // here was a compensation for a scanner mis-split that is itself fixed
+        // (a music owner materializes a `MusicGenre` row and nothing else,
+        // `item_persistence_service.rs`), and it made `/MusicGenres` drop every
+        // genre carried only by non-music items.
+        self.item_values_with_counts(GENRE_TYPES, BaseItemKind::Genre, filter)
             .await
     }
 
@@ -1618,9 +1702,7 @@ impl ItemRepository for FerrofinItemRepository {
         &self,
         filter: &InternalItemsQuery,
     ) -> Result<QueryResult<ItemWithCounts>, ServiceError> {
-        // Music genres come only from music items.
-        let music = self.item_type_lookup.music_genre_types();
-        self.item_values_with_counts(GENRE_TYPES, BaseItemKind::MusicGenre, filter, &music, &[])
+        self.item_values_with_counts(GENRE_TYPES, BaseItemKind::MusicGenre, filter)
             .await
     }
 
@@ -1628,7 +1710,7 @@ impl ItemRepository for FerrofinItemRepository {
         &self,
         filter: &InternalItemsQuery,
     ) -> Result<QueryResult<ItemWithCounts>, ServiceError> {
-        self.item_values_with_counts(STUDIO_TYPES, BaseItemKind::Studio, filter, &[], &[])
+        self.item_values_with_counts(STUDIO_TYPES, BaseItemKind::Studio, filter)
             .await
     }
 
@@ -1636,7 +1718,7 @@ impl ItemRepository for FerrofinItemRepository {
         &self,
         filter: &InternalItemsQuery,
     ) -> Result<QueryResult<ItemWithCounts>, ServiceError> {
-        self.item_values_with_counts(ARTIST_TYPES, BaseItemKind::MusicArtist, filter, &[], &[])
+        self.item_values_with_counts(ARTIST_TYPES, BaseItemKind::MusicArtist, filter)
             .await
     }
 
@@ -1644,28 +1726,16 @@ impl ItemRepository for FerrofinItemRepository {
         &self,
         filter: &InternalItemsQuery,
     ) -> Result<QueryResult<ItemWithCounts>, ServiceError> {
-        self.item_values_with_counts(
-            ALBUM_ARTIST_TYPES,
-            BaseItemKind::MusicArtist,
-            filter,
-            &[],
-            &[],
-        )
-        .await
+        self.item_values_with_counts(ALBUM_ARTIST_TYPES, BaseItemKind::MusicArtist, filter)
+            .await
     }
 
     async fn get_all_artists(
         &self,
         filter: &InternalItemsQuery,
     ) -> Result<QueryResult<ItemWithCounts>, ServiceError> {
-        self.item_values_with_counts(
-            ALL_ARTIST_TYPES,
-            BaseItemKind::MusicArtist,
-            filter,
-            &[],
-            &[],
-        )
-        .await
+        self.item_values_with_counts(ALL_ARTIST_TYPES, BaseItemKind::MusicArtist, filter)
+            .await
     }
 
     async fn get_music_genre_names(&self) -> Result<Vec<String>, ServiceError> {
@@ -4849,7 +4919,12 @@ mod tests {
             music.items[0].item.type_,
             stored_type_name(BaseItemKind::MusicGenre).expect("kind is known")
         );
-        // The plain genres browse excludes music items, so it stays empty.
+        // The plain genres browse stays empty — not because music items are
+        // excluded from the aggregate (upstream excludes nothing: both
+        // `GetGenres` and `GetMusicGenres` are the same `GetItemValues` call,
+        // `BaseItemRepository.ByName.cs:44-52`), but because a music owner
+        // materializes ONLY a `MusicGenre` row, so there is no `Genre` row of
+        // that name to join.
         assert!(
             repository
                 .get_genres(&InternalItemsQuery::default())
@@ -4857,6 +4932,124 @@ mod tests {
                 .expect("genres")
                 .items
                 .is_empty()
+        );
+    }
+
+    /// A `MusicGenre` row whose value is carried only by NON-music items still
+    /// lists on `/MusicGenres`.
+    ///
+    /// This is the shape a `GET /MusicGenres/Action` lazy create leaves behind
+    /// on a movie library: the `Action` value belongs to a Movie, and
+    /// `CreateItemByName<MusicGenre>` mints a `MusicGenre` row for it. Upstream
+    /// lists it, because `GetMusicGenres` restricts the *return kind* and never
+    /// the contributing items. Ferrofin used to pass the music types as an
+    /// `include_content_types` filter, which dropped the row entirely.
+    #[tokio::test]
+    async fn a_music_genre_row_lists_even_when_only_a_movie_carries_the_value() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let movie = Uuid::from_u128(0x9801);
+        let music_genre_row = Uuid::from_u128(0x9802);
+
+        seed_named_item(&db, movie, BaseItemKind::Movie, "An Action Film").await;
+        seed_item_genre(&db, movie, "Action").await;
+        // What `CreateItemByName<MusicGenre>("Action")` leaves behind.
+        seed_named_item(&db, music_genre_row, BaseItemKind::MusicGenre, "Action").await;
+        set_clean_name(&db, music_genre_row, "Action").await;
+
+        let music = repository
+            .get_music_genres(&InternalItemsQuery::default())
+            .await
+            .expect("music genres");
+        assert_eq!(
+            music.items.len(),
+            1,
+            "the MusicGenre row lists even though only a Movie carries the value"
+        );
+        assert_eq!(music.items[0].item.id, guid_to_db(music_genre_row));
+        // …and the plain Genre row for the same value still lists on /Genres.
+        let genres = repository
+            .get_genres(&InternalItemsQuery::default())
+            .await
+            .expect("genres");
+        assert_eq!(genres.items.len(), 1);
+        assert_eq!(genres.items[0].item.name.as_deref(), Some("Action"));
+    }
+
+    /// `includeItemTypes` fills the per-kind counts PER by-name row, master's
+    /// `BuildItemCountsByCleanName` (`BaseItemRepository.ByName.cs:277-330`).
+    ///
+    /// v10.11.8 instead hands every row the same uncorrelated totals
+    /// (`BaseItemRepository.cs:1350-1390`, whose own comment reads "TODO: This
+    /// is bad refactor!"), which is why a 10.11.8 oracle reports the same
+    /// `SongCount` for every genre. Ferrofin follows master.
+    #[tokio::test]
+    async fn per_kind_counts_are_computed_per_by_name_row() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let rock_song = Uuid::from_u128(0x9901);
+        let jazz_song = Uuid::from_u128(0x9902);
+        let jazz_album = Uuid::from_u128(0x9903);
+        let rock_movie = Uuid::from_u128(0x9904);
+
+        seed_named_item(&db, rock_song, BaseItemKind::Audio, "Rock Song").await;
+        seed_item_genre(&db, rock_song, "Rock").await;
+        seed_named_item(&db, jazz_song, BaseItemKind::Audio, "Jazz Song").await;
+        seed_item_genre(&db, jazz_song, "Jazz").await;
+        seed_named_item(&db, jazz_album, BaseItemKind::MusicAlbum, "Jazz Album").await;
+        seed_item_genre(&db, jazz_album, "Jazz").await;
+        // A movie carrying "Rock" — it must NOT be counted as a song.
+        seed_named_item(&db, rock_movie, BaseItemKind::Movie, "Rock The Film").await;
+        seed_item_genre(&db, rock_movie, "Rock").await;
+
+        let query = InternalItemsQuery {
+            include_item_types: vec![BaseItemKind::Audio, BaseItemKind::MusicAlbum],
+            ..InternalItemsQuery::default()
+        };
+        let music = repository
+            .get_music_genres(&query)
+            .await
+            .expect("music genres");
+        let by_name = |name: &str| {
+            music
+                .items
+                .iter()
+                .find(|i| i.item.name.as_deref() == Some(name))
+                .unwrap_or_else(|| panic!("{name} listed"))
+                .counts
+        };
+        assert_eq!(by_name("Rock").song_count, 1);
+        assert_eq!(by_name("Rock").album_count, 0);
+        assert_eq!(by_name("Rock").movie_count, 0, "movies were not requested");
+        assert_eq!(by_name("Jazz").song_count, 1);
+        assert_eq!(
+            by_name("Jazz").album_count,
+            1,
+            "per-CleanName, not one global total shared by every row"
+        );
+    }
+
+    /// With no `includeItemTypes` the per-kind counts stay zero, because
+    /// `GetItemValues` builds them only inside `if (filter.IncludeItemTypes
+    /// .Length > 0)` on both trees — and the API layer only projects them
+    /// then too.
+    #[tokio::test]
+    async fn per_kind_counts_are_not_computed_without_include_item_types() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let song = Uuid::from_u128(0x9A01);
+        seed_named_item(&db, song, BaseItemKind::Audio, "A Song").await;
+        seed_item_genre(&db, song, "Rock").await;
+
+        let music = repository
+            .get_music_genres(&InternalItemsQuery::default())
+            .await
+            .expect("music genres");
+        assert_eq!(music.items.len(), 1);
+        assert_eq!(music.items[0].counts.song_count, 0);
+        assert_eq!(
+            music.items[0].counts.item_count, 1,
+            "the value aggregate itself is unchanged"
         );
     }
 }

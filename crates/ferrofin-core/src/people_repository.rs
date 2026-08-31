@@ -37,7 +37,7 @@ use sqlx::QueryBuilder;
 /// person stored as `alice parity` instead of `Alice Parity` sorts and searches
 /// in a different place than Jellyfin puts it.
 fn person_sort_name(name: &str) -> String {
-    name.trim_start().to_owned()
+    crate::kinds::sort_name_for(BaseItemKind::Person, name)
 }
 use sqlx::Sqlite;
 use uuid::Uuid;
@@ -109,6 +109,20 @@ impl FerrofinPeopleRepository {
         item_type_lookup::person_item_id(mode, people_path, name).map(guid_to_db)
     }
 
+    /// The `Path` column of `name`'s `Person` row — `Person.GetPath(name)`,
+    /// `{PeoplePath}/{first alphanumeric}/{valid filename}`.
+    ///
+    /// Jellyfin writes it when it creates the row
+    /// (`LibraryManager.SavePeopleMetadataAsync`, v10.11.8 LibraryManager.cs:3105-3131
+    /// and master:3556-3592 — the two bodies diff empty), and `DtoService` emits
+    /// `Path` unconditionally, so a row without it is a `missing` field on
+    /// `GET /Persons/{name}`. [`None`] when the identity seam is unwired (unit
+    /// tests), which leaves the column NULL exactly as before.
+    fn person_metadata_path(&self, name: &str) -> Option<String> {
+        let (_, people_path) = self.identity.as_ref()?;
+        Some(item_type_lookup::person_path(people_path, name))
+    }
+
     /// Collapses one duplicate `Person` row onto `target` inside `tx`:
     /// ensures the target exists, copies still-empty enrichment columns,
     /// repoints user data + images (clashes keep the target's rows), and
@@ -117,6 +131,7 @@ impl FerrofinPeopleRepository {
         tx: &mut sqlx::Transaction<'_, Sqlite>,
         person_type: &str,
         name: &str,
+        path: Option<&str>,
         old_id: &str,
         target: &str,
         create_target: bool,
@@ -135,10 +150,10 @@ impl FerrofinPeopleRepository {
                 // diacritics removed, exactly as Jellyfin writes it. This
                 // insert bypasses `upsert_item`, so nothing else would set it.
                 r#"INSERT OR IGNORE INTO "BaseItems"
-                   ("Id","Type","Name","CleanName","SortName","PresentationUniqueKey",
+                   ("Id","Type","Name","CleanName","SortName","PresentationUniqueKey","Path",
                     "IsFolder","IsInMixedFolder",
                     "IsLocked","IsMovie","IsRepeat","IsSeries","IsVirtualItem")
-                   VALUES (?1,?2,?3,?4,?5,?6,0,0,0,0,0,0,0)"#,
+                   VALUES (?1,?2,?3,?4,?5,?6,?7,0,0,0,0,0,0,0)"#,
             )
             .bind(target)
             .bind(person_type)
@@ -153,6 +168,7 @@ impl FerrofinPeopleRepository {
                 None,
                 None,
             ))
+            .bind(path)
             .execute(&mut **tx)
             .await
             .map_err(db_err)?;
@@ -253,8 +269,17 @@ impl FerrofinPeopleRepository {
             // The target row must exist BEFORE any child rows repoint at it
             // (FK BaseItems.Id) — collapse_person_row handles the ordering.
             let create_target = seen_targets.insert(target.clone());
-            Self::collapse_person_row(&mut tx, person_type, name, &old_id, &target, create_target)
-                .await?;
+            let path = self.person_metadata_path(name);
+            Self::collapse_person_row(
+                &mut tx,
+                person_type,
+                name,
+                path.as_deref(),
+                &old_id,
+                &target,
+                create_target,
+            )
+            .await?;
             collapsed += 1;
         }
         sqlx::query(
@@ -268,7 +293,158 @@ impl FerrofinPeopleRepository {
         tx.commit().await.map_err(db_err)?;
         Ok(collapsed)
     }
+
+    /// Materializes the browsable `Person` item row for `name` at `item_id`.
+    ///
+    /// Port of the row C# `LibraryManager.SavePeopleMetadataAsync` creates
+    /// (v10.11.8 `LibraryManager.cs:3105-3131`; master's body at `:3556-3592`
+    /// diffs empty against it): `Path = Person.GetPath(name)`, the derived id,
+    /// and `PresentationUniqueKey = CreatePresentationUniqueKey()`.
+    ///
+    /// `SortName` is persisted rather than derived on read — it is what
+    /// `ORDER BY SortName` and `nameStartsWith` (which filters
+    /// `lower(SortName)`, faithfully to `ApplyNameFilters`) actually read — and
+    /// it uses the `Person` branch of `CreateSortName`, the verbatim name.
+    async fn insert_person_item(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        type_name: &str,
+        name: &str,
+        item_id: &str,
+    ) -> Result<(), ServiceError> {
+        sqlx::query(
+            r#"INSERT OR IGNORE INTO "BaseItems"
+               ("Id","Type","Name","CleanName","SortName","PresentationUniqueKey","Path",
+                "IsFolder","IsInMixedFolder",
+                "IsLocked","IsMovie","IsRepeat","IsSeries","IsVirtualItem")
+               VALUES (?1,?2,?3,?4,?5,?6,?7,0,0,0,0,0,0,0)"#,
+        )
+        .bind(item_id)
+        .bind(type_name)
+        .bind(name)
+        .bind(crate::text_util::get_clean_value(name))
+        .bind(person_sort_name(name))
+        .bind(crate::kinds::presentation_unique_key(
+            BaseItemKind::Person,
+            Uuid::parse_str(item_id).unwrap_or_default(),
+            Some(name),
+            None,
+            None,
+            None,
+        ))
+        .bind(self.person_metadata_path(name))
+        .execute(&mut **tx)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Repairs `Person` rows written before their columns were complete:
+    /// a NULL `Path`, a NULL `PresentationUniqueKey`, or a `SortName` that is
+    /// not the verbatim name.
+    ///
+    /// Ferrofin needs this and Jellyfin does not: C# recomputes `SortName`,
+    /// `PresentationUniqueKey` and `Path` on every `SaveItems`, so a row heals
+    /// itself on the next refresh, whereas both of Ferrofin's `Person` inserts
+    /// are `INSERT OR IGNORE` and nothing rewrites an existing row. Without
+    /// this pass, every install whose people were scanned before those columns
+    /// were written stays wrong forever, and an upgrade does not fix it.
+    ///
+    /// Idempotent, and a no-op on a database adopted from Jellyfin: Jellyfin
+    /// stores exactly `Name.TrimStart()` in `SortName`, `Person-{Name}` (with
+    /// diacritics removed) in `PresentationUniqueKey`, and the same
+    /// `{PeoplePath}/{A}/{Name}` in `Path`, so all three predicates are already
+    /// false there and the round trip is untouched. Returns the number of rows
+    /// rewritten.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ServiceError`] when the read or the rewrite fails.
+    pub async fn repair_person_items(&self) -> Result<usize, ServiceError> {
+        if self.identity.is_none() {
+            return Ok(0);
+        }
+        let Some(person_type) = stored_type_name(BaseItemKind::Person) else {
+            return Ok(0);
+        };
+        let rows: Vec<PersonRepairRow> = sqlx::query_as(
+            r#"SELECT "Id", "Name", "SortName", "Path", "PresentationUniqueKey"
+                   FROM "BaseItems" WHERE "Type" = ?1"#,
+        )
+        .bind(person_type)
+        .fetch_all(self.db.pool())
+        .await
+        .map_err(db_err)?;
+
+        let mut pending: Vec<(String, String, Option<String>, Option<String>)> = Vec::new();
+        for (id, name, sort_name, path, key) in rows {
+            let Some(name) = name.as_deref().map(str::trim).filter(|n| !n.is_empty()) else {
+                continue;
+            };
+            let want_sort = person_sort_name(name);
+            let want_path = self.person_metadata_path(name);
+            let want_key = Uuid::parse_str(&id).ok().map(|pid| {
+                crate::kinds::presentation_unique_key(
+                    BaseItemKind::Person,
+                    pid,
+                    Some(name),
+                    None,
+                    None,
+                    None,
+                )
+            });
+            let new_path = want_path.filter(|_| path.is_none());
+            let new_key = want_key.filter(|_| key.is_none());
+            if sort_name.as_deref() == Some(want_sort.as_str())
+                && new_path.is_none()
+                && new_key.is_none()
+            {
+                continue;
+            }
+            pending.push((id, want_sort, new_path, new_key));
+        }
+        if pending.is_empty() {
+            return Ok(0);
+        }
+
+        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        for (id, sort_name, path, key) in &pending {
+            sqlx::query(
+                r#"UPDATE "BaseItems"
+                   SET "SortName" = ?2,
+                       "Path" = COALESCE("Path", ?3),
+                       "PresentationUniqueKey" = COALESCE("PresentationUniqueKey", ?4)
+                   WHERE "Id" = ?1"#,
+            )
+            .bind(id)
+            .bind(sort_name)
+            .bind(path)
+            .bind(key)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        }
+        tx.commit().await.map_err(db_err)?;
+        for (_, _, path, _) in &pending {
+            if let Some(path) = path
+                && let Err(e) = tokio::fs::create_dir_all(path).await
+            {
+                tracing::debug!(%path, error = %e, "could not create person metadata directory");
+            }
+        }
+        Ok(pending.len())
+    }
 }
+
+/// One `Person` row as [`FerrofinPeopleRepository::repair_person_items`] reads
+/// it: `(Id, Name, SortName, Path, PresentationUniqueKey)`.
+type PersonRepairRow = (
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
 
 /// Dedupes credited people case-insensitively by `(name, person_type)`, matching
 /// the C# `DistinctBy(name.ToLower + "-" + type)` and preserving first-seen order
@@ -725,6 +901,10 @@ impl PeopleRepository for FerrofinPeopleRepository {
         people: &[PeopleEntity],
     ) -> Result<Vec<WrittenPerson>, ServiceError> {
         let deduped = dedupe_people(people);
+        // The metadata directories of the rows this call creates, made AFTER
+        // the commit — the same ordering `by_name_store::ensure` uses, so a
+        // filesystem failure can never be the reason a person lookup 404s.
+        let mut created_paths: Vec<Option<String>> = Vec::new();
         let mut tx = self.db.writer().begin().await.map_err(db_err)?;
 
         // Clear this item's credit rows first. Doing a write as the transaction's
@@ -794,23 +974,9 @@ impl PeopleRepository for FerrofinPeopleRepository {
             // identity seam is not wired (unit tests).
             let item_id = self.person_item_id(name).unwrap_or_else(|| id.clone());
             if let Some(type_name) = person_type_name {
-                let clean = crate::text_util::get_clean_value(name);
-                sqlx::query(
-                    // `SortName` persisted here for the same reason as above:
-                    // it is what `ORDER BY SortName` and `nameStartsWith` read.
-                    r#"INSERT OR IGNORE INTO "BaseItems"
-                       ("Id","Type","Name","CleanName","SortName","IsFolder","IsInMixedFolder",
-                        "IsLocked","IsMovie","IsRepeat","IsSeries","IsVirtualItem")
-                       VALUES (?1,?2,?3,?4,?5,0,0,0,0,0,0,0)"#,
-                )
-                .bind(&item_id)
-                .bind(type_name)
-                .bind(name)
-                .bind(&clean)
-                .bind(person_sort_name(name))
-                .execute(&mut *tx)
-                .await
-                .map_err(db_err)?;
+                self.insert_person_item(&mut tx, type_name, name, &item_id)
+                    .await?;
+                created_paths.push(self.person_metadata_path(name));
             }
 
             // Enrich (fetch a biography for) any person whose item has no overview
@@ -857,6 +1023,15 @@ impl PeopleRepository for FerrofinPeopleRepository {
         }
 
         tx.commit().await.map_err(db_err)?;
+        // `Directory.CreateDirectory(path)` — C# creates the person's metadata
+        // folder as part of writing the row (`SavePeopleMetadataAsync`), and a
+        // real 10.11.8 install has `/config/metadata/People/A/Alice Parity` on
+        // disk. Best-effort: the row is already committed and correct.
+        for path in created_paths.into_iter().flatten() {
+            if let Err(e) = tokio::fs::create_dir_all(&path).await {
+                tracing::debug!(%path, error = %e, "could not create person metadata directory");
+            }
+        }
         Ok(written)
     }
 
@@ -1092,6 +1267,101 @@ mod tests {
             .await
             .expect("peoples");
         assert_eq!(people_rows, 2, "credit rows stay per (name, type)");
+    }
+
+    /// The `Person` row carries the columns C# `SavePeopleMetadataAsync` sets:
+    /// `Path = Person.GetPath(name)` (the first-letter subfolder form) and
+    /// `PresentationUniqueKey = CreatePresentationUniqueKey()`. Ferrofin used
+    /// to leave both NULL, which is a `Path` missing from every
+    /// `GET /Persons/{name}` body.
+    #[tokio::test]
+    async fn a_person_row_carries_its_metadata_path_and_presentation_key() {
+        use crate::item_type_lookup::IdDerivation;
+
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let people_path = tmp.path().join("People").to_string_lossy().into_owned();
+        let repo = FerrofinPeopleRepository::new(db.clone()).with_identity(
+            IdDerivation::Jellyfin {
+                program_data_path: Some(tmp.path().to_string_lossy().into_owned()),
+            },
+            people_path.clone(),
+        );
+        let movie = Uuid::from_u128(0x71);
+        seed_item(&db, movie, BaseItemKind::Movie).await;
+        repo.update_people(movie, &[person("Alice Parity", "Actor")])
+            .await
+            .expect("credits");
+
+        let (path, key, sort): (Option<String>, Option<String>, Option<String>) = sqlx::query_as(
+            r#"SELECT "Path", "PresentationUniqueKey", "SortName" FROM "BaseItems"
+                   WHERE "Type" = 'MediaBrowser.Controller.Entities.Person'"#,
+        )
+        .fetch_one(db.pool())
+        .await
+        .expect("person row");
+        assert_eq!(
+            path.as_deref(),
+            Some(format!("{people_path}/A/Alice Parity").as_str())
+        );
+        assert_eq!(key.as_deref(), Some("Person-Alice Parity"));
+        assert_eq!(sort.as_deref(), Some("Alice Parity"));
+        // C# creates the directory as part of writing the row.
+        assert!(
+            std::path::Path::new(&format!("{people_path}/A/Alice Parity")).is_dir(),
+            "the person metadata directory is created"
+        );
+    }
+
+    /// A row written by an older build — lower-cased `SortName`, NULL `Path`,
+    /// NULL `PresentationUniqueKey` — is repaired at startup, and the repair is
+    /// idempotent (which is also what makes it a no-op on a database adopted
+    /// from Jellyfin, where all three already hold the right values).
+    #[tokio::test]
+    async fn repair_person_items_fixes_a_stale_row_and_then_does_nothing() {
+        use crate::item_type_lookup::{IdDerivation, person_item_id};
+        use crate::test_support::seed_named_item;
+
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let people_path = tmp.path().join("People").to_string_lossy().into_owned();
+        let mode = IdDerivation::Jellyfin {
+            program_data_path: Some(tmp.path().to_string_lossy().into_owned()),
+        };
+        let id = person_item_id(&mode, &people_path, "Alice Parity").expect("derived");
+        seed_named_item(&db, id, BaseItemKind::Person, "Alice Parity").await;
+        sqlx::query(
+            r#"UPDATE "BaseItems" SET "SortName" = 'alice parity',
+                 "Path" = NULL, "PresentationUniqueKey" = NULL WHERE "Id" = ?1"#,
+        )
+        .bind(guid_to_db(id))
+        .execute(db.writer())
+        .await
+        .expect("stale row");
+
+        let repo =
+            FerrofinPeopleRepository::new(db.clone()).with_identity(mode, people_path.clone());
+        assert_eq!(repo.repair_person_items().await.expect("repair"), 1);
+        let (path, key, sort): (Option<String>, Option<String>, Option<String>) = sqlx::query_as(
+            r#"SELECT "Path", "PresentationUniqueKey", "SortName" FROM "BaseItems"
+                   WHERE "Id" = ?1"#,
+        )
+        .bind(guid_to_db(id))
+        .fetch_one(db.pool())
+        .await
+        .expect("person row");
+        assert_eq!(sort.as_deref(), Some("Alice Parity"));
+        assert_eq!(
+            path.as_deref(),
+            Some(format!("{people_path}/A/Alice Parity").as_str())
+        );
+        assert_eq!(key.as_deref(), Some("Person-Alice Parity"));
+
+        assert_eq!(
+            repo.repair_person_items().await.expect("second pass"),
+            0,
+            "idempotent: a correct row is not rewritten"
+        );
     }
 
     #[tokio::test]

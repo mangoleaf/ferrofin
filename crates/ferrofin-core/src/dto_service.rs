@@ -421,6 +421,22 @@ fn is_live_tv_channel(kind: BaseItemKind) -> bool {
     matches!(kind, BaseItemKind::LiveTvChannel | BaseItemKind::TvChannel)
 }
 
+/// `BaseItem.LocationType` for a row's stored `Path`.
+///
+/// Port of v10.11.8 `MediaBrowser.Controller/Entities/BaseItem.cs:319-336`
+/// (master `:327-344`, identical) plus `ManagedFileSystem.IsPathFile`
+/// (`:526-535`): no path at all is `Virtual`, a path carrying a URI scheme
+/// other than `file://` is `Remote`, and everything else is `FileSystem`.
+fn location_type_of(path: Option<&str>) -> LocationType {
+    match path.filter(|p| !p.is_empty()) {
+        None => LocationType::Virtual,
+        Some(p) if p.contains("://") && !p.to_ascii_lowercase().starts_with("file://") => {
+            LocationType::Remote
+        }
+        Some(_) => LocationType::FileSystem,
+    }
+}
+
 /// Whether this kind is a Live TV programme (C# `item is LiveTvProgram`).
 fn is_live_tv_program(kind: BaseItemKind) -> bool {
     matches!(
@@ -1417,11 +1433,20 @@ impl FerrofinDtoService {
         } else if is_live_tv_channel(kind) {
             dto.location_type = Some(LocationType::Remote);
         } else {
-            dto.location_type = Some(if item.is_virtual_item {
-                LocationType::Virtual
-            } else {
-                LocationType::FileSystem
-            });
+            // Port of `BaseItem.LocationType` (v10.11.8 BaseItem.cs:319-336,
+            // master :327-344 — identical): it is derived from the **Path**,
+            // not from `IsVirtualItem`. An empty path is `Virtual`; a path
+            // carrying a scheme other than `file://` is `Remote`
+            // (`ManagedFileSystem.IsPathFile`, :526-535); anything else is
+            // `FileSystem`. Keying it on `IsVirtualItem` reported `FileSystem`
+            // for every pathless row — including the default-constructed
+            // by-name item `GenresController.GetGenre` answers a slug miss
+            // with, where Jellyfin says `Virtual`.
+            //
+            // The `SourceType == SourceType.Channel → Remote` arm is not
+            // reachable here: `SourceType` is not a `BaseItems` column, and a
+            // channel-sourced item is served by the Live TV arms above.
+            dto.location_type = Some(location_type_of(item.path.as_deref()));
         }
 
         dto.audio = item.audio.and_then(program_audio_from_disc);
@@ -2592,6 +2617,32 @@ impl FerrofinDtoService {
 
 #[cfg(test)]
 mod tests {
+    /// `BaseItem.LocationType` reads the PATH, not `IsVirtualItem`.
+    ///
+    /// Keying it on `IsVirtualItem` said `FileSystem` for every pathless row —
+    /// including the default-constructed `Genre` upstream answers a slug miss
+    /// with, where a live 10.11.8 returns `"LocationType": "Virtual"`.
+    #[test]
+    fn location_type_follows_the_path_the_way_base_item_does() {
+        use super::location_type_of;
+        use ferrofin_model::entities::LocationType;
+        assert_eq!(location_type_of(None), LocationType::Virtual);
+        assert_eq!(location_type_of(Some("")), LocationType::Virtual);
+        assert_eq!(
+            location_type_of(Some("/media/movies/A.mkv")),
+            LocationType::FileSystem
+        );
+        assert_eq!(
+            location_type_of(Some("file:///media/movies/A.mkv")),
+            LocationType::FileSystem,
+            "`file://` is still a file (ManagedFileSystem.IsPathFile)"
+        );
+        assert_eq!(
+            location_type_of(Some("http://tuner.local/stream.ts")),
+            LocationType::Remote
+        );
+    }
+
     use super::*;
 
     use chrono::{DateTime, TimeZone as _, Utc};

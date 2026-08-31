@@ -33,7 +33,7 @@ use uuid::Uuid;
 use crate::error::ProvidersError;
 use crate::library_options::{fetcher_names, image_fetcher_enabled, metadata_fetcher_enabled};
 use crate::tmdb::{TmdbClient, TmdbDetails, TmdbImage, TmdbKind};
-use ferrofin_db::entities::base_items::BaseItemEntity;
+use ferrofin_db::entities::base_items::{BaseItemEntity, item_values_of};
 
 /// A [`RemoteSearchProvider`] backed by TMDB (the "Identify" flow). One instance
 /// searches a single kind (movie or series), so it is registered once per kind.
@@ -1538,6 +1538,21 @@ impl LocalProviderManager {
         if let Some(store) = &self.image_store {
             entity.date_last_refreshed = Some(Utc::now());
             store.save_items(std::slice::from_ref(entity)).await?;
+            // Re-derive the by-name index from the row that was just written.
+            // C# does BOTH halves in one call — `BaseItemRepository.SaveItems`
+            // saves the row and then rewrites `ItemValues`/`ItemValuesMap` for
+            // it (v10.11.8 `BaseItemRepository.cs:674-735`, unchanged on
+            // master), and a refresh reaches it through
+            // `MetadataService.SaveItemAsync` → `UpdateToRepositoryAsync` →
+            // `LibraryManager.UpdateItemAsync`. Ferrofin's editor path
+            // (`LibraryManager::update_items`) already did this; this path did
+            // not, so a refresh that changed `Studios`/`Genres`/`Tags` left the
+            // by-name browses and their counts describing the OLD values —
+            // `/Studios/{name}` reporting a studio the item no longer carries,
+            // and reporting nothing for the one it now does.
+            if let Ok(id) = Uuid::parse_str(&entity.id) {
+                store.save_item_values(id, &item_values_of(entity)).await?;
+            }
         }
         Ok(())
     }
@@ -2400,6 +2415,10 @@ fn set_text(cur: &mut Option<String>, new: Option<&str>, replace: bool) {
 /// when empty, or overwritten when `replace` is set (the C# `FullRefresh`
 /// `ReplaceAllMetadata` behavior); a field TMDB did not return is left untouched.
 /// Mirrors the scanner's `apply_details` merge.
+// No per-kind `CreateSortName` branch here (the `Person` one in
+// `ferrofin-core`'s `kinds::sort_name_for`): the only caller is
+// `refresh_title`, whose `TmdbKind` is `Movie` or `Tv`, so a `Person` row
+// cannot reach this function.
 fn apply_tmdb_details(entity: &mut BaseItemEntity, details: &TmdbDetails, replace: bool) {
     // `ProviderUtils.MergeBaseItemData`: the name is replaced only on
     // `replaceData` (or when empty); the sort key follows the name
@@ -4904,6 +4923,10 @@ mod tests {
     /// A stored `(provider key, value)` id list.
     type IdPairs = Vec<(String, String)>;
 
+    /// One recorded `save_item_values` call: the item and its rewritten
+    /// `(ItemValueType discriminant, value)` index.
+    type RecordedItemValues = Vec<(Uuid, Vec<(i32, String)>)>;
+
     /// An [`ItemPersistenceService`] fake recording the writes a refresh makes
     /// (replaced id sets, upserted ids, saved rows) over a seeded id store.
     #[derive(Default)]
@@ -4912,6 +4935,7 @@ mod tests {
         replaced: std::sync::Mutex<Vec<(Uuid, IdPairs)>>,
         upserted: std::sync::Mutex<Vec<(Uuid, String, String)>>,
         saved: std::sync::Mutex<Vec<BaseItemEntity>>,
+        item_values: std::sync::Mutex<RecordedItemValues>,
     }
 
     #[async_trait]
@@ -4932,10 +4956,14 @@ mod tests {
         }
         async fn save_item_values(
             &self,
-            _item_id: Uuid,
-            _values: &[(i32, String)],
+            item_id: Uuid,
+            values: &[(i32, String)],
         ) -> Result<(), ServiceError> {
-            unimplemented!()
+            self.item_values
+                .lock()
+                .expect("lock")
+                .push((item_id, values.to_vec()));
+            Ok(())
         }
         async fn item_exists(&self, _id: Uuid) -> Result<bool, ServiceError> {
             unimplemented!()
@@ -5108,6 +5136,67 @@ mod tests {
         let upserted = store.upserted.lock().expect("lock");
         assert!(upserted.contains(&(item_id, "Tmdb".to_owned(), "603".to_owned())));
         assert!(upserted.contains(&(item_id, "Imdb".to_owned(), "tt0133093".to_owned())));
+    }
+
+    /// A refresh re-derives the by-name index from the row it just wrote.
+    ///
+    /// C# does both halves in one call: `BaseItemRepository.SaveItems` saves
+    /// the row and then rewrites `ItemValues`/`ItemValuesMap` for it (v10.11.8
+    /// `BaseItemRepository.cs:674-735`, unchanged on master). Ferrofin's
+    /// refresh path saved only the row, so a genre/studio a refresh replaced
+    /// left `/Genres`, `/Studios` and their counts describing the OLD value —
+    /// visible as a `/Studios/{name}` count that matches no item.
+    #[tokio::test]
+    async fn a_refresh_reindexes_the_rows_item_values() {
+        let server = crate::mock_http::MockServer::start(vec![(
+            "/movie/603",
+            r#"{"id":603,"title":"The Matrix","overview":"Neo.",
+                "genres":[{"id":878,"name":"Science Fiction"}],
+                "production_companies":[{"id":1,"name":"Village Roadshow"}]}"#
+                .to_owned(),
+        )])
+        .await;
+        let tmdb = Arc::new(crate::tmdb::TmdbClient::new().with_base_url(&server.base_url));
+        let store = Arc::new(RecordingStore::default());
+        let (item_id, mgr) = movie_manager("Matrix", tmdb, Arc::clone(&store));
+
+        let chosen = RemoteSearchResult {
+            name: Some("The Matrix".to_owned()),
+            provider_ids: Some(HashMap::from([("Tmdb".to_owned(), "603".to_owned())])),
+            ..RemoteSearchResult::default()
+        };
+        mgr.refresh_full_item(
+            item_id,
+            &MetadataRefreshOptions {
+                search_result: Some(chosen),
+                ..full_metadata_refresh()
+            },
+        )
+        .await
+        .expect("refresh");
+
+        let saved = store.saved.lock().expect("lock");
+        let written = saved.last().expect("a row was saved").clone();
+        drop(saved);
+        let reindexed = store.item_values.lock().expect("lock");
+        let (id, values) = reindexed.last().expect("the index was rewritten").clone();
+        assert_eq!(id, item_id);
+        assert_eq!(
+            values,
+            super::item_values_of(&written),
+            "the index is derived from the row that was just saved"
+        );
+        // The fetched genre and studio are what the by-name browses will now
+        // see — the whole point: before this, `/Genres` and `/Studios` kept
+        // answering from the pre-refresh values.
+        assert!(
+            values.contains(&(2, "Science Fiction".to_owned())),
+            "expected the fetched genre in the rewritten index, got {values:?}"
+        );
+        assert!(
+            values.contains(&(3, "Village Roadshow".to_owned())),
+            "expected the fetched studio in the rewritten index, got {values:?}"
+        );
     }
 
     #[tokio::test]

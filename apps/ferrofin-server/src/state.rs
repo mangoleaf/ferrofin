@@ -363,6 +363,20 @@ pub async fn build_app_state(
             tracing::warn!(%err, "person identity unification failed; person favorites may not round-trip");
         }
     }
+    // One-shot: rewrite `Person` rows missing their metadata `Path` /
+    // `PresentationUniqueKey`, or carrying the generic lower-cased sort key
+    // instead of the verbatim name Jellyfin sorts people by. C# recomputes all
+    // three on every save; Ferrofin's person inserts are `INSERT OR IGNORE`, so
+    // without this a row written by an older build stays wrong forever.
+    match people_repository_impl.repair_person_items().await {
+        Ok(0) => {}
+        Ok(repaired) => {
+            tracing::info!(repaired, "repaired person metadata paths and sort keys");
+        }
+        Err(err) => {
+            tracing::warn!(%err, "person metadata repair failed; person sort order and Path may diverge until the next scan");
+        }
+    }
     let people_repository: Arc<dyn ferrofin_traits::persistence::PeopleRepository> =
         people_repository_impl;
     let media_stream_repository: Arc<dyn ferrofin_traits::persistence::MediaStreamRepository> =

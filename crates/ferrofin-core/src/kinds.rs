@@ -167,6 +167,39 @@ pub fn is_item_by_name(kind: BaseItemKind) -> bool {
     )
 }
 
+/// Whether `CreateSortName` builds the alphanumeric sort key for this kind
+/// (C# `BaseItem.EnableAlphaNumericSorting`, `MediaBrowser.Controller/Entities/
+/// BaseItem.cs`).
+///
+/// `Person` is the ONLY override in either tree — `Person.cs:32` on v10.11.8,
+/// `Person.cs:33` on master, both `public override bool
+/// EnableAlphaNumericSorting => false` (`git grep EnableAlphaNumericSorting`
+/// returns BaseItem.cs and Person.cs and nothing else). It sends
+/// `CreateSortName` down its first branch, `return Name.TrimStart();` — the
+/// name verbatim, not the lower-cased, article-stripped, digit-padded key.
+#[must_use]
+pub fn enable_alpha_numeric_sorting(kind: BaseItemKind) -> bool {
+    kind != BaseItemKind::Person
+}
+
+/// The `SortName` C# would compute for a named item of this kind — the port of
+/// `BaseItem.CreateSortName()` including its
+/// [`enable_alpha_numeric_sorting`] branch.
+///
+/// One home for the rule, because three separate write paths
+/// (`upsert_item`'s fallback, `backfill_missing_sort_names`, and the people
+/// repository's inserts) each have to answer the same question, and a `Person`
+/// row that any one of them lower-cases stops matching where Jellyfin sorts and
+/// filters it.
+#[must_use]
+pub fn sort_name_for(kind: BaseItemKind, name: &str) -> String {
+    if enable_alpha_numeric_sorting(kind) {
+        ferrofin_util::sort_name::create_sort_name(name)
+    } else {
+        name.trim_start().to_owned()
+    }
+}
+
 /// Whether items of this kind can own media sources — the rows in
 /// `MediaStreamInfos`, `Chapters` and `TrickplayInfos`, and the alternate
 /// versions that point at them through `PrimaryVersionId`.

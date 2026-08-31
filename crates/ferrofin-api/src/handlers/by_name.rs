@@ -287,6 +287,56 @@ pub(crate) async fn project_item_rows(
     Ok(QueryResult::new(start_index, total, dtos))
 }
 
+/// `BaseItem.SlugChar` — `'-'`, `MediaBrowser.Controller/Entities/BaseItem.cs:98`
+/// (same line on v10.11.8 and master).
+const SLUG_CHAR: char = '-';
+
+/// Resolves a by-name route's `{name}` the way `GenresController.GetGenre` and
+/// `MusicGenresController.GetMusicGenre` do — the only two controllers in
+/// either tree that carry the slug branch (`git grep -l GetItemFromSlugName`).
+///
+/// A name WITHOUT the slug char goes through `LibraryManager.GetGenre`, which
+/// is `CreateItemByName<T>` and therefore materializes the row.
+///
+/// A name WITH it is a slug: upstream `GetItemFromSlugName<T>` runs three plain
+/// `GetItemList` lookups substituting `'-'` for `'&'`, then `'/'`, then `'?'`,
+/// and creates NOTHING. Creating here would mint a bogus genre for every
+/// hyphenated mis-spelling, which is exactly what Ferrofin used to do.
+///
+/// **One deliberate divergence**, kept per "don't port Jellyfin's bugs": a
+/// fourth lookup on the LITERAL name. Upstream never tries it, so upstream
+/// answers `/Genres/Sci-Fi` with the empty fallback even when a genre named
+/// exactly `Sci-Fi` exists — the name is simply unreachable there. Ferrofin
+/// reaches it. The divergence can only ever return a row upstream also has,
+/// never invent one, and it is recorded in
+/// `suite/parity/classifications.json`.
+///
+/// Returns [`None`] when nothing matches; the caller substitutes
+/// [`LibraryManager::empty_by_name_item`], which is upstream's `item ??= new
+/// Genre()`.
+///
+/// [`LibraryManager::empty_by_name_item`]: ferrofin_traits::library::LibraryManager::empty_by_name_item
+pub(crate) async fn resolve_by_name_or_slug(
+    state: &AppState,
+    kind: ferrofin_model::data::BaseItemKind,
+    name: &str,
+) -> Result<Option<ferrofin_db::entities::base_items::BaseItemEntity>, ApiError> {
+    if !name.contains(SLUG_CHAR) {
+        return Ok(state.library.get_named_item(kind, name).await?);
+    }
+    for candidate in [
+        name.replace(SLUG_CHAR, "&"),
+        name.replace(SLUG_CHAR, "/"),
+        name.replace(SLUG_CHAR, "?"),
+        name.to_owned(),
+    ] {
+        if let Some(item) = state.library.find_named_item(kind, &candidate).await? {
+            return Ok(Some(item));
+        }
+    }
+    Ok(None)
+}
+
 /// Projects a page of [`ItemWithCounts`] aggregates into a
 /// [`QueryResult<BaseItemDto>`], mirroring `RequestHelpers.CreateQueryResult`.
 ///

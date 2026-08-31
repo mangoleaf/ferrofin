@@ -65,11 +65,15 @@ link() { cp -l "$1" "$2" 2>/dev/null || cp "$1" "$2"; }
 # Deterministic NFO metadata so both servers scan identical genres/studios/people/year — makes the
 # by-name endpoints (Genres/Studios/Persons), Years, and similarity/search testable, and the diff
 # stays clean because both read the same files. Sets rotate to give real variety without randomness.
-GENRES=(Action Drama Comedy Thriller SciFi)
+# `R&B` is deliberately an ampersand name: `BaseItem.SlugChar` is '-', and
+# `GenresController.GetGenre` resolves `/Genres/R-B` by substituting it back
+# (`GetItemFromSlugName`, identical on v10.11.8 and master). Without a genre
+# whose real name carries `&`, the slug branch of that route is unprobeable.
+GENRES=(Action Drama Comedy Thriller SciFi "R&B")
 STUDIOS=("Parity Pictures" "Ferrofin Studios")
 ACTORS=("Alice Parity" "Bob Parity" "Carol Ferrofin")
 movie_nfo() { # $1=dir $2=title $3=index
-  local i=$3 g1="${GENRES[$((i % 5))]}" g2="${GENRES[$(((i+2) % 5))]}" st="${STUDIOS[$((i % 2))]}"
+  local i=$3 g1="${GENRES[$((i % 6))]}" g2="${GENRES[$(((i+2) % 6))]}" st="${STUDIOS[$((i % 2))]}"
   local a1="${ACTORS[$((i % 3))]}" a2="${ACTORS[$(((i+1) % 3))]}"
   # Movie 0001 carries a real IMDb id (remote fetchers stay off, so nothing is fetched for
   # it) — the opt-in remote-subtitle journey searches OpenSubtitles by that id on both.
@@ -77,7 +81,7 @@ movie_nfo() { # $1=dir $2=title $3=index
   [ "$i" -eq 1 ] && ids='<uniqueid type="imdb" default="true">tt0111161</uniqueid>'
   cat > "$1/movie.nfo" <<XML
 <?xml version="1.0" encoding="utf-8"?>
-<movie><title>$2</title><year>2020</year>$ids<genre>$g1</genre><genre>$g2</genre><studio>$st</studio><actor><name>$a1</name><role>Lead</role><type>Actor</type></actor><director>$a2</director></movie>
+<movie><title>$2</title><year>2020</year>$ids<genre>${g1//&/&amp;}</genre><genre>${g2//&/&amp;}</genre><studio>$st</studio><actor><name>$a1</name><role>Lead</role><type>Actor</type></actor><director>$a2</director></movie>
 XML
 }
 

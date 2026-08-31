@@ -6974,32 +6974,13 @@ fn assign_from_children(column: &mut Option<String>, values: &[String]) -> bool 
     true
 }
 
-/// Collects an item's genres/studios/tags as `(ItemValueType discriminant, value)`
-/// pairs for the `ItemValues` filter tables (Genre = 2, Studios = 3, Tags = 4).
-pub(crate) fn item_values_of(entity: &BaseItemEntity) -> Vec<(i32, String)> {
-    let split = |field: Option<&str>| -> Vec<String> {
-        field
-            .unwrap_or_default()
-            .split('|')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned)
-            .collect()
-    };
-    let mut out = Vec::new();
-    // Artist (0) / AlbumArtist (1) materialize browsable MusicArtist items and
-    // back the artist filters; genres (2), studios (3), tags (4) as before.
-    out.extend(split(entity.artists.as_deref()).into_iter().map(|a| (0, a)));
-    out.extend(
-        split(entity.album_artists.as_deref())
-            .into_iter()
-            .map(|a| (1, a)),
-    );
-    out.extend(split(entity.genres.as_deref()).into_iter().map(|g| (2, g)));
-    out.extend(split(entity.studios.as_deref()).into_iter().map(|s| (3, s)));
-    out.extend(split(entity.tags.as_deref()).into_iter().map(|t| (4, t)));
-    out
-}
+/// Collects an item's genres/studios/tags/artists as `(ItemValueType
+/// discriminant, value)` pairs for the `ItemValues` filter tables.
+///
+/// Re-exported from `ferrofin-db` so `ferrofin-providers` — which may not
+/// depend on `ferrofin-core` — can re-index an item it refreshed with exactly
+/// the same rule the scanner uses.
+pub(crate) use ferrofin_db::entities::base_items::item_values_of;
 
 /// Maps a probed [`ChapterInfo`](ferrofin_model::entities_media::ChapterInfo) to a
 /// persistable [`ChapterEntity`], numbered by its position in the file.
