@@ -11,8 +11,20 @@ use uuid::Uuid;
 
 use ferrofin_traits::error::ServiceError;
 
-use crate::projection::{ChannelRow, ChannelUserData};
+use crate::projection::{ChannelRow, ChannelUserData, ProgramRow};
 
+/// The columns a guide list read returns, joined to the owning channel for
+/// `ChannelName`. Held apart from the filters so the `WHERE`/`ORDER`/`LIMIT`
+/// builders can be shared with the total-record count.
+pub(crate) const PROGRAM_SELECT: &str = r#"SELECT p."Id",p."ChannelId",p."StartDate",p."EndDate",p."Title",p."EpisodeTitle",
+                      p."Overview",p."Genres",p."ProductionYear",p."OfficialRating",p."IsNew",
+                      p."IsRepeat",p."IsPremiere",p."IsMovie",p."IsSeries",p."IsNews",p."IsKids",
+                      p."IsSports",p."IsLive",p."ExternalId",p."ExternalSeriesId",
+                      p."SeasonNumber",p."EpisodeNumber",p."DateCreated",p."ShowId",
+                      c."Name" AS "ChannelName",c."Number" AS "ChannelNumber",
+                      c."ChannelType" AS "ChannelMediaKind"
+               FROM "FerrofinLiveTvPrograms" p
+               JOIN "FerrofinLiveTvChannels" c ON c."Id" = p."ChannelId""#;
 /// Every channel in the lineup, in stored (`SortIndex`) order, each carrying
 /// the guide-derived movie/series/kids flags `GuideManager.RefreshChannels`
 /// aggregates onto upstream channel items (`isMovie |= program.IsMovie; ...`,
@@ -23,7 +35,7 @@ use crate::projection::{ChannelRow, ChannelUserData};
 /// Fails when the database read fails.
 pub async fn channel_rows(db: &Database) -> Result<Vec<ChannelRow>, ServiceError> {
     sqlx::query_as(
-        r#"SELECT "Id","TvgId","Name","Number","ChannelType","DateCreated",
+        r#"SELECT "Id","TvgId","ExternalId","Name","Number","ChannelType","DateCreated",
                   EXISTS(SELECT 1 FROM "FerrofinLiveTvPrograms" p
                          WHERE p."ChannelId" = "FerrofinLiveTvChannels"."Id" AND p."IsMovie" = 1) AS "IsMovie",
                   EXISTS(SELECT 1 FROM "FerrofinLiveTvPrograms" p
@@ -46,7 +58,7 @@ pub async fn channel_rows(db: &Database) -> Result<Vec<ChannelRow>, ServiceError
 /// Fails when the database read fails.
 pub async fn channel_row(db: &Database, id: Uuid) -> Result<Option<ChannelRow>, ServiceError> {
     sqlx::query_as(
-        r#"SELECT "Id","TvgId","Name","Number","ChannelType","DateCreated",
+        r#"SELECT "Id","TvgId","ExternalId","Name","Number","ChannelType","DateCreated",
                   0 AS "IsMovie", 0 AS "IsSeries", 0 AS "IsKids"
            FROM "FerrofinLiveTvChannels" WHERE "Id" = ?1"#,
     )
@@ -54,6 +66,101 @@ pub async fn channel_row(db: &Database, id: Uuid) -> Result<Option<ChannelRow>, 
     .fetch_optional(db.pool())
     .await
     .map_err(db_err)
+}
+
+/// The channels among `ids`, keyed by their `Uuid`.
+///
+/// One query for a whole page: `AddChannelInfo` runs over every DTO the
+/// projection produced, and a per-DTO lookup would be an N+1 on the channel
+/// list. Ids that are not channels are simply absent from the map, which is
+/// how a mixed page (an ordinary `/Items` response) costs one query and
+/// changes nothing.
+///
+/// # Errors
+///
+/// Fails when the database read fails.
+pub async fn channel_rows_by_ids(
+    db: &Database,
+    ids: &[Uuid],
+) -> Result<std::collections::HashMap<Uuid, ChannelRow>, ServiceError> {
+    let mut out = std::collections::HashMap::new();
+    // One bind per id, so the page has to be chunked: a recursive `/Items` page
+    // can name thousands of items and a channel only has to be one of them for
+    // this lookup to run.
+    for chunk in ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+        let mut qb: sqlx::QueryBuilder<'_, sqlx::Sqlite> = sqlx::QueryBuilder::new(
+            r#"SELECT "Id","TvgId","ExternalId","Name","Number","ChannelType","DateCreated",
+                  0 AS "IsMovie", 0 AS "IsSeries", 0 AS "IsKids"
+           FROM "FerrofinLiveTvChannels" WHERE "Id" IN ("#,
+        );
+        let mut separated = qb.separated(", ");
+        for id in chunk {
+            separated.push_bind(guid_to_db(*id));
+        }
+        qb.push(")");
+        let rows: Vec<ChannelRow> = qb
+            .build_query_as()
+            .fetch_all(db.pool())
+            .await
+            .map_err(db_err)?;
+        out.extend(
+            rows.into_iter()
+                .filter_map(|row| Uuid::parse_str(&row.id).ok().map(|id| (id, row))),
+        );
+    }
+    Ok(out)
+}
+
+/// Every stored guide programme, channel-joined.
+///
+/// The mirror's source of truth: whatever `insert_programs` left in
+/// `FerrofinLiveTvPrograms` after the whole refresh is exactly upstream's
+/// `newProgramIdList` accumulated across every service.
+///
+/// # Errors
+///
+/// Fails when the database read fails.
+pub async fn program_rows(db: &Database) -> Result<Vec<ProgramRow>, ServiceError> {
+    sqlx::query_as(PROGRAM_SELECT)
+        .fetch_all(db.pool())
+        .await
+        .map_err(db_err)
+}
+
+/// The guide programmes among `ids`, keyed by their `Uuid`.
+///
+/// One query for a whole page, for the same reason [`channel_rows_by_ids`] is:
+/// the `DtoService` seam runs over every DTO on an `/Items` page and a per-DTO
+/// lookup would be an N+1. Ids that are not programmes are simply absent from
+/// the map, which is how a mixed page costs one query and changes nothing.
+///
+/// # Errors
+///
+/// Fails when the database read fails.
+pub async fn program_rows_by_ids(
+    db: &Database,
+    ids: &[Uuid],
+) -> Result<std::collections::HashMap<Uuid, ProgramRow>, ServiceError> {
+    let mut out = std::collections::HashMap::new();
+    for chunk in ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+        let mut qb: sqlx::QueryBuilder<'_, sqlx::Sqlite> = sqlx::QueryBuilder::new(PROGRAM_SELECT);
+        qb.push(r#" WHERE p."Id" IN ("#);
+        let mut separated = qb.separated(", ");
+        for id in chunk {
+            separated.push_bind(guid_to_db(*id));
+        }
+        qb.push(")");
+        let rows: Vec<ProgramRow> = qb
+            .build_query_as()
+            .fetch_all(db.pool())
+            .await
+            .map_err(db_err)?;
+        out.extend(
+            rows.into_iter()
+                .filter_map(|row| Uuid::parse_str(&row.id).ok().map(|id| (id, row))),
+        );
+    }
+    Ok(out)
 }
 
 /// The user's channel user-data rows, keyed by the stored channel id:
@@ -95,9 +202,12 @@ pub async fn channel_user_data(
 /// One channel of a tuner host's stored lineup, as the channel-mapping and
 /// guide-binding paths need it.
 ///
-/// The stored [`id`](Self::id) is Ferrofin's internal channel key; the external
-/// `ChannelInfo.Id` Jellyfin exposes is derived from the tuner URL and
-/// [`stream_url`](Self::stream_url) by [`crate::mapping::m3u_channel_id`].
+/// The stored [`id`](Self::id) is Ferrofin's internal channel key;
+/// [`external_id`](Self::external_id) is the `ChannelInfo.Id` the owning
+/// [`TunerHost`](crate::tuner_host::TunerHost) minted — `m3u_{md5}{md5}` for a
+/// playlist, `hdhr_{GuideNumber}` for an HDHomeRun. It is READ, never
+/// re-derived here: re-deriving it in the M3U shape would mislabel every
+/// HDHomeRun channel.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TunerLineupRow {
     /// The stored channel id (Ferrofin's internal key).
@@ -110,6 +220,49 @@ pub struct TunerLineupRow {
     pub number: String,
     /// The stream URL the channel plays from.
     pub stream_url: String,
+    /// The tuner host's `ChannelInfo.Id` for this channel.
+    pub external_id: String,
+}
+
+/// The user's channel user-data rows keyed by the stored channel id, in the
+/// shape `LiveTvManager.GetRecommendationScore` reads:
+/// `(Likes, IsFavorite, PlayCount)`.
+///
+/// Kept apart from [`channel_user_data`] because the recommendation score wants
+/// `Likes`/`PlayCount` and the filters want `Rating`; one query returning both
+/// shapes would make every favourite-filtered guide read pay for columns it
+/// throws away.
+///
+/// # Errors
+///
+/// Fails when the database read fails.
+pub async fn channel_recommendation_data(
+    db: &Database,
+    user_id: Uuid,
+) -> Result<std::collections::HashMap<String, (Option<bool>, bool, i32)>, ServiceError> {
+    let rows = sqlx::query(
+        r#"SELECT ud."ItemId", ud."Likes", ud."IsFavorite", ud."PlayCount"
+           FROM "UserData" ud
+           JOIN "FerrofinLiveTvChannels" c ON c."Id" = ud."ItemId"
+           WHERE ud."UserId" = ?1 AND ud."CustomDataKey" = lower(ud."ItemId")"#,
+    )
+    .bind(guid_to_db(user_id))
+    .fetch_all(db.pool())
+    .await
+    .map_err(db_err)?;
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            (
+                r.get::<String, _>("ItemId"),
+                (
+                    r.get::<Option<bool>, _>("Likes"),
+                    r.get::<bool, _>("IsFavorite"),
+                    r.get::<i32, _>("PlayCount"),
+                ),
+            )
+        })
+        .collect())
 }
 
 /// One tuner host's stored lineup, in playlist order.
@@ -127,7 +280,7 @@ pub async fn tuner_lineup(
     tuner_host_id: &str,
 ) -> Result<Vec<TunerLineupRow>, ServiceError> {
     let rows = sqlx::query(
-        r#"SELECT "Id","TvgId","Name","Number","StreamUrl" FROM "FerrofinLiveTvChannels"
+        r#"SELECT "Id","TvgId","Name","Number","StreamUrl","ExternalId" FROM "FerrofinLiveTvChannels"
            WHERE "TunerHostId" = ?1 COLLATE NOCASE ORDER BY "SortIndex", "Name""#,
     )
     .bind(tuner_host_id)
@@ -142,6 +295,7 @@ pub async fn tuner_lineup(
             name: r.get("Name"),
             number: r.get::<Option<String>, _>("Number").unwrap_or_default(),
             stream_url: r.get("StreamUrl"),
+            external_id: r.get("ExternalId"),
         })
         .collect())
 }
@@ -250,6 +404,29 @@ pub async fn existing_config_id(
         .map_err(db_err)
 }
 
+/// The tuner-facing external id of one channel, or `None` when the lineup does
+/// not hold it (or holds it empty, as a row written before migration 0023).
+///
+/// This is `SeriesTimerInfo.ChannelId`/`TimerInfo.ChannelId` upstream — the id
+/// the internal channel GUID was derived from, published on every timer DTO as
+/// `ExternalChannelId` (`LiveTvDtoService.cs:69`, `:137`).
+///
+/// # Errors
+///
+/// Fails when the read fails.
+pub async fn channel_external_id(
+    db: &Database,
+    channel_id: Uuid,
+) -> Result<Option<String>, ServiceError> {
+    let external: Option<String> =
+        sqlx::query_scalar(r#"SELECT "ExternalId" FROM "FerrofinLiveTvChannels" WHERE "Id" = ?1"#)
+            .bind(guid_to_db(channel_id))
+            .fetch_optional(db.pool())
+            .await
+            .map_err(db_err)?;
+    Ok(external.filter(|e| !e.is_empty()))
+}
+
 /// Whether any tuner host row exists.
 ///
 /// Backs the synchronous `has_tuner_hosts` flag the "Refresh Guide" task's
@@ -277,9 +454,10 @@ pub async fn tuner_hosts_exist(db: &Database) -> Result<bool, ServiceError> {
 pub async fn channel_stream_source(
     db: &Database,
     id: Uuid,
-) -> Result<Option<(String, String)>, ServiceError> {
+) -> Result<Option<(crate::tuner_host::StoredChannel, String)>, ServiceError> {
     let row = sqlx::query(
-        r#"SELECT "StreamUrl","TunerHostId" FROM "FerrofinLiveTvChannels" WHERE "Id" = ?1"#,
+        r#"SELECT "StreamUrl","TunerHostId","ExternalId","IsHd","VideoCodec","AudioCodec"
+           FROM "FerrofinLiveTvChannels" WHERE "Id" = ?1"#,
     )
     .bind(guid_to_db(id))
     .fetch_optional(db.pool())
@@ -287,7 +465,15 @@ pub async fn channel_stream_source(
     .map_err(db_err)?;
     Ok(row.map(|r| {
         (
-            r.get::<String, _>("StreamUrl"),
+            crate::tuner_host::StoredChannel {
+                external_id: r.get::<String, _>("ExternalId"),
+                path: r.get::<String, _>("StreamUrl"),
+                // `ChannelInfo.IsHD` is `bool?`: NULL is "the tuner did not
+                // say", which `HdHomerunHost.GetMediaSource` reads as `?? true`.
+                is_hd: r.get::<Option<i64>, _>("IsHd").map(|v| v != 0),
+                video_codec: r.get::<Option<String>, _>("VideoCodec"),
+                audio_codec: r.get::<Option<String>, _>("AudioCodec"),
+            },
             r.get::<String, _>("TunerHostId"),
         )
     }))
@@ -319,6 +505,42 @@ pub mod test_support {
         .await
         .map_err(db_err)?;
         Ok(())
+    }
+
+    /// The stored `BaseItems` channel-item rows as
+    /// `(Id, ParentId, TopParentId)`, id-ordered — what the guide refresh's
+    /// `BaseItems` mirror wrote.
+    pub async fn stored_channel_items(
+        db: &Database,
+    ) -> Result<Vec<(String, Option<String>, Option<String>)>, ServiceError> {
+        sqlx::query_as(
+            r#"SELECT "Id","ParentId","TopParentId" FROM "BaseItems"
+               WHERE "Type" = ?1 ORDER BY "Id""#,
+        )
+        .bind(crate::projection::CHANNEL_TYPE_NAME)
+        .fetch_all(db.pool())
+        .await
+        .map_err(db_err)
+    }
+
+    /// The stored `BaseItems` programme-item rows as
+    /// `(Id, ParentId, TopParentId, PresentationUniqueKey)`, id-ordered — what
+    /// the guide refresh's `BaseItems` mirror wrote.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the database read fails.
+    pub async fn stored_program_items(
+        db: &Database,
+    ) -> Result<Vec<(String, Option<String>, Option<String>, Option<String>)>, ServiceError> {
+        sqlx::query_as(
+            r#"SELECT "Id","ParentId","TopParentId","PresentationUniqueKey" FROM "BaseItems"
+               WHERE "Type" = ?1 ORDER BY "Id""#,
+        )
+        .bind(crate::projection::PROGRAM_TYPE_NAME)
+        .fetch_all(db.pool())
+        .await
+        .map_err(db_err)
     }
 
     /// Marks an item favourite for a user, the way the playstate path stores it.

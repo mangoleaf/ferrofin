@@ -24,6 +24,23 @@ pub trait SourceFetcher: Send + Sync {
     async fn fetch_bytes(&self, url: &str) -> Result<Vec<u8>, ServiceError> {
         self.fetch(url).await.map(String::into_bytes)
     }
+
+    /// Fetches `url` and returns `(status, body)` **without** failing on a
+    /// non-success status.
+    ///
+    /// The HDHomeRun host needs the code itself, not just success-or-not:
+    /// `HdHomerunHost.GetModelInfo` treats a **404** as "this is an HDHR4,
+    /// which has no `discover.json`" and answers with a synthetic model rather
+    /// than an error (v10.11.8 HdHomerunHost.cs:135-157), while every other
+    /// failure propagates. Flattening that to one error variant would turn a
+    /// perfectly good tuner into a broken one.
+    ///
+    /// The default reports `200` for whatever [`fetch`](Self::fetch) returns,
+    /// so a text-only fake keeps working; a fake that wants to exercise the
+    /// 404 branch overrides this.
+    async fn fetch_with_status(&self, url: &str) -> Result<(u16, String), ServiceError> {
+        self.fetch(url).await.map(|body| (200, body))
+    }
 }
 
 /// The `User-Agent` the real fetcher presents, mirroring the product header
@@ -92,6 +109,37 @@ impl SourceFetcher for ReqwestFetcher {
             tokio::fs::read_to_string(path)
                 .await
                 .map_err(|e| LiveTvError::io(format!("read {path}"), e).into())
+        }
+    }
+
+    async fn fetch_with_status(&self, url: &str) -> Result<(u16, String), ServiceError> {
+        if is_http(url) {
+            let resp = self
+                .client
+                .get(url)
+                .send()
+                .await
+                .map_err(|e| LiveTvError::http(format!("fetch {url}"), e))?;
+            let status = resp.status().as_u16();
+            let body = resp
+                .text()
+                .await
+                .map_err(|e| LiveTvError::http(format!("read {url}"), e))?;
+            Ok((status, body))
+        } else {
+            // A local path has no status; a missing file is the 404 analogue,
+            // which is exactly how the HDHR4 branch reads it.
+            match self.fetch(url).await {
+                Ok(body) => Ok((200, body)),
+                Err(e) => {
+                    let path = url.strip_prefix("file://").unwrap_or(url);
+                    if tokio::fs::try_exists(path).await.unwrap_or(false) {
+                        Err(e)
+                    } else {
+                        Ok((404, String::new()))
+                    }
+                }
+            }
         }
     }
 

@@ -30,13 +30,6 @@ pub const PROGRAM_TYPE_NAME: &str = "MediaBrowser.Controller.LiveTv.LiveTvProgra
 /// `"Recording"`, which is a timer-side concept.
 pub const RECORDING_TYPE_NAME: &str = "MediaBrowser.Controller.Entities.Video";
 
-/// The synthetic "Live TV" folder every channel parents to.
-///
-/// Upstream parents channels under `GetInternalLiveTvFolder()` — a real
-/// `BaseItems` folder row. Ferrofin has no such row, so a fixed id stands in;
-/// clients only echo `ParentId`, they never fetch it for a channel.
-pub const LIVE_TV_FOLDER_ID: Uuid = Uuid::from_u128(0x6c74_7666_6f6c_6465_725f_5f6e_735f_3031);
-
 /// One `FerrofinLiveTvChannels` row, as the query paths read it.
 #[derive(Debug, Clone, sqlx::FromRow)]
 #[sqlx(rename_all = "PascalCase")]
@@ -45,6 +38,11 @@ pub struct ChannelRow {
     pub id: String,
     /// The tuner `tvg-id` (empty when the M3U carried none).
     pub tvg_id: String,
+    /// The TUNER's own id for this entry (`hdhr_10.1`, `m3u_{md5}{md5}`) —
+    /// C# `ChannelInfo.Id`, which `GuideManager.GetChannel` stores as the
+    /// item's `ExternalId` and which the internal GUID is derived from.
+    #[sqlx(default)]
+    pub external_id: String,
     /// The display name.
     pub name: String,
     /// The channel number, if any.
@@ -68,7 +66,7 @@ pub struct ChannelRow {
 
 /// One `FerrofinLiveTvPrograms` row joined to its channel, as the query paths
 /// read it.
-#[derive(Debug, Clone, sqlx::FromRow)]
+#[derive(Debug, Clone, Default, sqlx::FromRow)]
 #[sqlx(rename_all = "PascalCase")]
 #[allow(clippy::struct_excessive_bools)] // the upstream ProgramInfo flags
 pub struct ProgramRow {
@@ -118,6 +116,8 @@ pub struct ProgramRow {
     pub episode_number: Option<i32>,
     /// When the programme row was first inserted.
     pub date_created: Option<String>,
+    /// The listing's showing-identity key (`ProgramInfo.ShowId`), if any.
+    pub show_id: Option<String>,
     /// The owning channel's name.
     pub channel_name: String,
     /// The owning channel's number, if any.
@@ -264,28 +264,108 @@ pub fn channel_sort_name(number: Option<&str>, name: &str) -> String {
 /// Port of `GuideManager.GetChannel`'s item shape: `LiveTvChannel` type, no
 /// path (the tuner URL is resolved at stream time, not stored on the item),
 /// the `CreateSortName` sort key, and the first-seen `DateCreated`.
+///
+/// `CleanName` and `PresentationUniqueKey` are deliberately left unset: the
+/// item store derives both at write time (C# `SaveItem` likewise stamps
+/// `CleanName = GetCleanValue(item.Name)` itself), so a value set here would be
+/// one nothing reads.
 #[must_use]
 pub fn channel_entity(
     row: &ChannelRow,
     parse_dt: fn(&str) -> Option<DateTime<Utc>>,
+    live_tv_view_id: Option<Uuid>,
 ) -> BaseItemEntity {
+    // `item.ParentId = parentFolderId` where the parent is
+    // `GetInternalLiveTvFolder()` — the Live TV `UserView` row. It is also the
+    // row's `TopParentId`, which is what puts a channel inside the recursive
+    // user universe (`scope_to_user_libraries` treats a Live TV view as
+    // standing for itself).
+    let parent = live_tv_view_id.map(db_guid);
     BaseItemEntity {
         id: row.id.clone(),
         type_: CHANNEL_TYPE_NAME.to_owned(),
         name: Some(row.name.clone()),
         media_type: Some(channel_media_type(&row.channel_type).to_owned()),
         sort_name: Some(channel_sort_name(row.number.as_deref(), &row.name)),
-        external_id: Some(if row.tvg_id.is_empty() {
-            row.name.clone()
-        } else {
+        // `ExternalId` is `channelInfo.Id` — the TUNER's id (`hdhr_10.1`), not
+        // the listing's `tvg-id` (v10.11.8 GuideManager.cs:425). It is what
+        // `GetInternalChannelId` hashed to mint this row's GUID, so the two
+        // must agree or a re-scan cannot recognise its own channel.
+        //
+        // No parity probe can catch this one: `ExternalId` is a `BaseItems`
+        // column that is not a `BaseItemDto` property in the vendored 10.11.8
+        // contract, so it never reaches the wire and the body diff can never
+        // see it. The unit test below is its only guard — do not delete it.
+        external_id: Some(if row.external_id.is_empty() {
             row.tvg_id.clone()
+        } else {
+            row.external_id.clone()
         }),
         external_service_id: Some("Emby".to_owned()),
+        // `LiveTvChannel.GetBlockUnratedType() => UnratedItem.LiveTvChannel`.
+        unrated_type: Some("LiveTvChannel".to_owned()),
         date_created: row.date_created.as_deref().and_then(parse_dt),
-        parent_id: Some(db_guid(LIVE_TV_FOLDER_ID)),
+        parent_id: parent.clone(),
+        top_parent_id: parent,
         is_folder: false,
         ..BaseItemEntity::default()
     }
+}
+
+/// Applies to an ALREADY-STORED channel item the bounded set of fields
+/// `GuideManager.GetChannel` assigns, returning the row to write back when one
+/// of them actually changed — the C#'s `forceUpdate` — and `None` when nothing
+/// did.
+///
+/// Upstream (v10.11.8 GuideManager.cs:375-468) loads the item from the database
+/// and assigns exactly `Tags`, `ParentId`, `ChannelType`, `ServiceName`,
+/// `ExternalId`, `Number`, `Name` and the primary image, then persists with
+/// `UpdateItemAsync` — so every OTHER property of the item survives a guide
+/// refresh, and the write happens at all only when `isNew || forceUpdate`.
+///
+/// Ferrofin's `save_items` is a full-column upsert, so that guarantee has to
+/// come from starting at the STORED row rather than at a fresh
+/// [`channel_entity`]. Starting at the fresh one is a silent 24-hourly revert:
+/// a channel item is a real item now, `POST /Items/{channelId}` writes
+/// `Overview`, `Genres`, `Tags`, `CustomRating`, `OfficialRating`, `IsLocked`
+/// and `Data` onto it, and the next `RefreshGuide` would put every one of them
+/// back to `NULL`.
+///
+/// `Number`/`ChannelType` are not `BaseItems` columns here — they reach the
+/// wire through `LiveTvManager::add_channel_info` from
+/// `FerrofinLiveTvChannels`, which the same refresh rewrites — and a channel
+/// row carries no image path, so those two upstream assignments have no column
+/// to land on.
+#[must_use]
+pub fn channel_item_update(
+    stored: &BaseItemEntity,
+    fresh: &BaseItemEntity,
+) -> Option<BaseItemEntity> {
+    let mut item = stored.clone();
+    item.type_.clone_from(&fresh.type_);
+    item.name.clone_from(&fresh.name);
+    item.media_type.clone_from(&fresh.media_type);
+    item.external_id.clone_from(&fresh.external_id);
+    item.external_service_id
+        .clone_from(&fresh.external_service_id);
+    item.unrated_type.clone_from(&fresh.unrated_type);
+    item.parent_id.clone_from(&fresh.parent_id);
+    item.top_parent_id.clone_from(&fresh.top_parent_id);
+    item.is_folder = fresh.is_folder;
+    // `SortName` is a lazy property upstream, not a stored assignment:
+    // `ForcedSortName` when the metadata editor set one, else
+    // `CreateSortName()` off Number/Name. Re-deriving it unconditionally would
+    // overwrite a user's forced sort key on every refresh.
+    if stored
+        .forced_sort_name
+        .as_deref()
+        .unwrap_or_default()
+        .is_empty()
+    {
+        item.sort_name.clone_from(&fresh.sort_name);
+    }
+    // `DateCreated` is stamped only on a NEW item, so the stored one stands.
+    (item != *stored).then_some(item)
 }
 
 /// One `FerrofinLiveTvRecordings` row, as the recording query paths read it.
@@ -404,10 +484,22 @@ pub fn recording_entity(
 /// `ParentId`, and `MediaType` left `"Unknown"` (the C# override is commented
 /// out upstream, so lists show `"Unknown"` until the `ChannelInfo` post-pass
 /// substitutes the channel's own type).
+///
+/// `live_tv_view_id` is the row's `TopParentId`, NOT its `ParentId`: upstream
+/// stores a programme with `CreateItems(newPrograms, currentChannel, …)`
+/// (GuideManager.cs:277) so the channel is the parent, while
+/// `BaseItemRepository` derives `TopParentId` from `item.TopParent?.Id` — the
+/// walk up through the channel to the Live TV `UserView`. That column is what
+/// puts a programme inside the recursive user universe (`scope_to_user_libraries`
+/// drops a NULL-`TopParentId` row from every unscoped user query), so without it
+/// `GET /Items?recursive=true&includeItemTypes=LiveTvProgram` is empty and
+/// `GET /Items/{programId}` is a 404 for an id `GET /LiveTv/Programs` just
+/// handed the client.
 #[must_use]
 pub fn program_entity(
     row: &ProgramRow,
     parse_dt: fn(&str) -> Option<DateTime<Utc>>,
+    live_tv_view_id: Option<Uuid>,
 ) -> BaseItemEntity {
     let start_date = parse_dt(&row.start_date);
     let end_date = row.end_date.as_deref().and_then(parse_dt);
@@ -450,9 +542,93 @@ pub fn program_entity(
         series_name: (is_series || row.episode_title.is_some()).then(|| row.title.clone()),
         media_type: Some("Unknown".to_owned()),
         date_created: row.date_created.as_deref().and_then(parse_dt),
+        show_id: row.show_id.clone(),
+        top_parent_id: live_tv_view_id.map(db_guid),
+        // `LiveTvProgram.GetBlockUnratedType() => UnratedItem.LiveTvProgram`
+        // (v10.11.8 MediaBrowser.Controller/LiveTv/LiveTvProgram.cs:210-213).
+        unrated_type: Some("LiveTvProgram".to_owned()),
+        // `LiveTvProgram`'s constructor sets `IsVirtualItem = true`
+        // (LiveTvProgram.cs:26-29): an airing has no file behind it. The column
+        // is load-bearing on the wire — `?locationTypes=FileSystem` returns no
+        // programmes on the oracle because of it.
+        is_virtual_item: true,
+        // `item.Width`/`item.Height` are non-nullable `int`s upstream, so a
+        // programme stores 0/0 unless the listing declares HD
+        // (`if (info.IsHD ?? false) { Width = 1280; Height = 720; }`,
+        // GuideManager.cs:566-570). `XmlTvListingsProvider.GetProgramInfo` never
+        // sets `IsHD`, so an XMLTV guide always takes the 0/0 branch; the DTO
+        // layer only projects a dimension greater than zero, so neither reaches
+        // the wire.
+        width: Some(0),
+        height: Some(0),
         is_folder: false,
         ..BaseItemEntity::default()
     }
+}
+
+/// Applies to an ALREADY-STORED programme item the bounded set of fields
+/// `GuideManager.GetProgram` assigns, returning the row to write back when one
+/// of them actually changed — the C#'s `isUpdated` — and `None` when nothing
+/// did.
+///
+/// The sibling of [`channel_item_update`], and for the same reason: upstream
+/// (v10.11.8 GuideManager.cs:473-640) LOADS the existing `LiveTvProgram` out of
+/// `existingPrograms` and assigns only the listing's own fields onto it, then
+/// persists through `UpdateItemsAsync`. Ferrofin's `save_items` is a full-column
+/// upsert that sets every column from `excluded.`, so rebuilding the row from
+/// [`program_entity`] and saving it would revert, on the guide timer, everything
+/// the metadata editor wrote onto a programme item — which is a real item now
+/// that `POST /Items/{programId}` can write to.
+///
+/// `ForcedSortName` is left alone and `SortName` re-derived only when no forced
+/// key is set, because upstream's `SortName` is a lazy property, not a stored
+/// assignment. `DateCreated` is stamped on a NEW item only.
+#[must_use]
+pub fn program_item_update(
+    stored: &BaseItemEntity,
+    fresh: &BaseItemEntity,
+) -> Option<BaseItemEntity> {
+    let mut item = stored.clone();
+    item.type_.clone_from(&fresh.type_);
+    item.name.clone_from(&fresh.name);
+    item.overview.clone_from(&fresh.overview);
+    item.episode_title.clone_from(&fresh.episode_title);
+    item.channel_id.clone_from(&fresh.channel_id);
+    item.parent_id.clone_from(&fresh.parent_id);
+    item.top_parent_id.clone_from(&fresh.top_parent_id);
+    item.start_date = fresh.start_date;
+    item.end_date = fresh.end_date;
+    item.run_time_ticks = fresh.run_time_ticks;
+    item.production_year = fresh.production_year;
+    item.index_number = fresh.index_number;
+    item.parent_index_number = fresh.parent_index_number;
+    item.premiere_date = fresh.premiere_date;
+    item.genres.clone_from(&fresh.genres);
+    item.tags.clone_from(&fresh.tags);
+    item.is_movie = fresh.is_movie;
+    item.is_series = fresh.is_series;
+    item.is_repeat = fresh.is_repeat;
+    item.official_rating.clone_from(&fresh.official_rating);
+    item.external_id.clone_from(&fresh.external_id);
+    item.external_series_id
+        .clone_from(&fresh.external_series_id);
+    item.series_name.clone_from(&fresh.series_name);
+    item.show_id.clone_from(&fresh.show_id);
+    item.media_type.clone_from(&fresh.media_type);
+    item.unrated_type.clone_from(&fresh.unrated_type);
+    item.is_virtual_item = fresh.is_virtual_item;
+    item.width = fresh.width;
+    item.height = fresh.height;
+    item.is_folder = fresh.is_folder;
+    if stored
+        .forced_sort_name
+        .as_deref()
+        .unwrap_or_default()
+        .is_empty()
+    {
+        item.sort_name.clone_from(&fresh.sort_name);
+    }
+    (item != *stored).then_some(item)
 }
 
 /// The flag-derived tag list, in `GuideManager.GetProgram`'s exact order.
@@ -565,6 +741,7 @@ mod tests {
             season_number: None,
             episode_number: None,
             date_created: None,
+            show_id: None,
             channel_name: String::new(),
             channel_number: None,
             channel_media_kind: "Tv".to_owned(),
@@ -601,11 +778,13 @@ mod tests {
             season_number: None,
             episode_number: None,
             date_created: None,
+            show_id: Some("a584069bf4e49f1dbb474bfb43129f3c".to_owned()),
             channel_name: "Parity One".to_owned(),
             channel_number: Some("1".to_owned()),
             channel_media_kind: "Tv".to_owned(),
         };
-        let entity = program_entity(&row, parse);
+        let view = Uuid::from_u128(0x2b2b_ca16_aacc_8a14_d53a_11bb_829e_afa5);
+        let entity = program_entity(&row, parse, Some(view));
         assert_eq!(entity.type_, PROGRAM_TYPE_NAME);
         assert_eq!(entity.run_time_ticks, Some(36_000_000_000));
         assert_eq!(entity.channel_id.as_deref(), Some(row.channel_id.as_str()));
@@ -614,13 +793,64 @@ mod tests {
         assert_eq!(entity.tags.as_deref(), Some("News"));
         assert_eq!(entity.media_type.as_deref(), Some("Unknown"));
         assert!(!entity.is_folder);
+        // The oracle row's shape: the channel is the PARENT, the Live TV view is
+        // the TOP parent — the column `scope_to_user_libraries` filters on, so
+        // it is what puts an airing in the recursive user universe.
+        assert_eq!(
+            entity.top_parent_id.as_deref(),
+            Some(db_guid(view).as_str())
+        );
+        assert_eq!(entity.unrated_type.as_deref(), Some("LiveTvProgram"));
+        assert!(entity.is_virtual_item);
+        assert_eq!(entity.width, Some(0));
+        assert_eq!(entity.height, Some(0));
+        assert_eq!(
+            entity.show_id.as_deref(),
+            Some("a584069bf4e49f1dbb474bfb43129f3c")
+        );
+    }
+
+    #[test]
+    fn a_guide_refresh_does_not_revert_an_edited_programme() {
+        // `GuideManager.GetProgram` (v10.11.8 GuideManager.cs:473-640) loads the
+        // stored `LiveTvProgram` and assigns only the listing's fields onto it,
+        // so anything the metadata editor put on the item survives the refresh.
+        // Rebuilding from `program_entity` + the full-column `save_items` upsert
+        // would revert every one of them on the guide timer.
+        let stored = BaseItemEntity {
+            id: "AAAAAAAA-0000-0000-0000-000000000001".to_owned(),
+            type_: PROGRAM_TYPE_NAME.to_owned(),
+            name: Some("News at Six".to_owned()),
+            custom_rating: Some("edited".to_owned()),
+            is_locked: true,
+            forced_sort_name: Some("zzz".to_owned()),
+            sort_name: Some("zzz".to_owned()),
+            ..BaseItemEntity::default()
+        };
+        let fresh = BaseItemEntity {
+            id: stored.id.clone(),
+            type_: PROGRAM_TYPE_NAME.to_owned(),
+            name: Some("News at Seven".to_owned()),
+            sort_name: Some("news at seven".to_owned()),
+            ..BaseItemEntity::default()
+        };
+        let merged = program_item_update(&stored, &fresh).expect("the name moved");
+        assert_eq!(merged.name.as_deref(), Some("News at Seven"));
+        assert_eq!(merged.custom_rating.as_deref(), Some("edited"));
+        assert!(merged.is_locked);
+        // A forced sort key is the user's, not the guide's.
+        assert_eq!(merged.sort_name.as_deref(), Some("zzz"));
+        // Nothing changed the second time round, so there is nothing to write.
+        assert!(program_item_update(&merged, &fresh).is_none());
     }
 
     #[test]
     fn channel_entity_has_no_path_and_the_emby_service_id() {
+        let view = Uuid::from_u128(0x2b2b_ca16_aacc_8a14_d53a_11bb_829e_afa5);
         let row = ChannelRow {
             id: "CCCCCCCC-0000-0000-0000-000000000003".to_owned(),
             tvg_id: "parity1".to_owned(),
+            external_id: "hdhr_10.1".to_owned(),
             name: "Parity One".to_owned(),
             number: Some("1".to_owned()),
             channel_type: "Tv".to_owned(),
@@ -629,16 +859,89 @@ mod tests {
             is_series: false,
             is_kids: false,
         };
-        let entity = channel_entity(&row, parse);
+        let entity = channel_entity(&row, parse, Some(view));
         assert_eq!(entity.type_, CHANNEL_TYPE_NAME);
         assert_eq!(entity.path, None); // upstream channel items carry no path
         assert_eq!(entity.media_type.as_deref(), Some("Video"));
         assert_eq!(entity.sort_name.as_deref(), Some("00001.0-Parity One"));
         assert_eq!(entity.external_service_id.as_deref(), Some("Emby"));
+        assert_eq!(entity.unrated_type.as_deref(), Some("LiveTvChannel"));
+        // `ExternalId` is the TUNER's id, which is what the GUID was hashed
+        // from — never the listing's tvg-id.
+        assert_eq!(entity.external_id.as_deref(), Some("hdhr_10.1"));
+        // ParentId == TopParentId == the Live TV UserView row.
+        assert_eq!(entity.parent_id.as_deref(), Some(db_guid(view).as_str()));
         assert_eq!(
-            entity.parent_id.as_deref(),
-            Some(db_guid(LIVE_TV_FOLDER_ID).as_str())
+            entity.top_parent_id.as_deref(),
+            Some(db_guid(view).as_str())
         );
+    }
+
+    /// A refresh assigns only the properties `GuideManager.GetChannel` assigns,
+    /// and writes at all only when one of them changed.
+    #[test]
+    fn a_channel_update_is_bounded_and_only_written_when_something_changed() {
+        let view = Uuid::from_u128(0x2b2b_ca16_aacc_8a14_d53a_11bb_829e_afa5);
+        let row = ChannelRow {
+            id: "CCCCCCCC-0000-0000-0000-000000000003".to_owned(),
+            tvg_id: "parity1".to_owned(),
+            external_id: "hdhr_10.1".to_owned(),
+            name: "Parity One".to_owned(),
+            number: Some("1".to_owned()),
+            channel_type: "Tv".to_owned(),
+            date_created: None,
+            is_movie: false,
+            is_series: false,
+            is_kids: false,
+        };
+        let fresh = channel_entity(&row, parse, Some(view));
+
+        // An unchanged lineup is not a write: the C# persists only on
+        // `isNew || forceUpdate`.
+        assert_eq!(channel_item_update(&fresh, &fresh), None);
+
+        // Everything the metadata editor owns survives the refresh…
+        let mut stored = fresh.clone();
+        stored.overview = Some("Edited".to_owned());
+        stored.genres = Some("News".to_owned());
+        stored.tags = Some("Favourite".to_owned());
+        stored.custom_rating = Some("PG".to_owned());
+        stored.official_rating = Some("TV-14".to_owned());
+        stored.is_locked = true;
+        stored.data = Some("{}".to_owned());
+        stored.date_created = Some(
+            DateTime::parse_from_rfc3339("2019-01-02T03:04:05Z")
+                .expect("date")
+                .with_timezone(&Utc),
+        );
+        // …and the edit alone is still not a reason to write.
+        assert_eq!(channel_item_update(&stored, &fresh), None);
+
+        // A renamed channel IS a write, and carries the edit through.
+        let renamed = ChannelRow {
+            name: "Parity One HD".to_owned(),
+            ..row.clone()
+        };
+        let fresh = channel_entity(&renamed, parse, Some(view));
+        let updated = channel_item_update(&stored, &fresh).expect("the rename is a write");
+        assert_eq!(updated.name.as_deref(), Some("Parity One HD"));
+        assert_eq!(updated.sort_name, fresh.sort_name);
+        assert_eq!(updated.overview.as_deref(), Some("Edited"));
+        assert_eq!(updated.genres.as_deref(), Some("News"));
+        assert_eq!(updated.tags.as_deref(), Some("Favourite"));
+        assert_eq!(updated.custom_rating.as_deref(), Some("PG"));
+        assert_eq!(updated.official_rating.as_deref(), Some("TV-14"));
+        assert!(updated.is_locked);
+        assert_eq!(updated.data.as_deref(), Some("{}"));
+        // `DateCreated` is stamped on a NEW item only.
+        assert_eq!(updated.date_created, stored.date_created);
+
+        // A user-forced sort key is not a property the refresh owns.
+        let mut forced = stored.clone();
+        forced.forced_sort_name = Some("zzz".to_owned());
+        forced.sort_name = Some("zzz".to_owned());
+        let updated = channel_item_update(&forced, &fresh).expect("the rename is still a write");
+        assert_eq!(updated.sort_name.as_deref(), Some("zzz"));
     }
 
     #[test]

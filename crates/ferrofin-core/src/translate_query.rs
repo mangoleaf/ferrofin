@@ -205,14 +205,37 @@ fn push_group_head(qb: &mut QueryBuilder<'_, Sqlite>) {
 
 /// Closes the subquery [`push_group_head`] opened.
 ///
-/// `COALESCE` because a row without a key groups with nothing but itself.
-/// Jellyfin always writes one (2 nulls in 40,610 on a real library) and so does
-/// Ferrofin wherever versions are merged
-/// (`ItemPersistenceService::set_primary_version_id`), but a row written before
-/// that has none, and a bare `GROUP BY` would fold every keyless row into a
-/// single result.
+/// A BARE `GROUP BY` on the column, as upstream's
+/// `dbQuery.GroupBy(e => e.PresentationUniqueKey)` translates to (v10.11.8
+/// Jellyfin.Server.Implementations/Item/BaseItemRepository.cs:417). SQLite
+/// groups NULLs together, so every keyless row collapses into ONE result — and
+/// on a real 10.11.8 that is not an accident: it is how the entire Live TV
+/// guide shows up as a single `Program` row on an unfiltered recursive page
+/// instead of as tens of thousands of airings. Measured on the parity oracle:
+/// 338 `LiveTvProgram` rows, all with a NULL key, and exactly one `Program` in
+/// the page.
+///
+/// This used to be `COALESCE(key, Id)`, justified by "Jellyfin always writes
+/// one (2 nulls in 40,610 on a real library)". The guide disproves that: the
+/// one kind upstream deliberately leaves keyless is the one the COALESCE was
+/// hiding, and the COALESCE put the whole guide on every user's home query.
+///
+/// **The bare `GROUP BY` is only safe while every other row carries a key, and
+/// that is a data invariant this statement cannot enforce.** Three Ferrofin
+/// write paths used to leave by-name rows keyless; they are fixed at the
+/// insert, and existing rows are repaired at boot — migration 0028 for the
+/// kinds whose key is their own id, and
+/// `ferrofin_db::presentation_key::backfill_by_name_presentation_keys` for the
+/// five whose key is `{Type}-{Name}`. The first attempt at that repair
+/// (migration 0027) was scoped `TopParentId IS NOT NULL` and therefore missed
+/// every by-name row, which is precisely where the keyless rows were: the lane
+/// pair measured `GET /Items?userId=…&ids=<three Person ids>` at ONE item
+/// against Jellyfin's three until 0028 landed. A new write path that skips the
+/// key reintroduces exactly that, and no query-shape test will see it — the
+/// guard is `presentation_key_backfill_rescues_a_grouped_query` plus the
+/// per-insert tests, not this comment.
 fn push_group_tail(qb: &mut QueryBuilder<'_, Sqlite>) {
-    qb.push(r#" GROUP BY COALESCE(bi."PresentationUniqueKey", bi."Id")))"#);
+    qb.push(r#" GROUP BY bi."PresentationUniqueKey"))"#);
 }
 
 /// Builds the "latest media" statement for a tvshows/music library — C#

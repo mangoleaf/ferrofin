@@ -213,6 +213,14 @@ impl Database {
             head,
             "database migrations applied"
         );
+        // The by-name half of migration 0028's backfill. It cannot live in the
+        // chain because a by-name row's key is `{Type}-{Name.RemoveDiacritics()}`
+        // and SQLite has no `RemoveDiacritics`; see
+        // `presentation_key::backfill_by_name_presentation_keys` for why a
+        // keyless by-name row is an item-loss bug and not a cosmetic one. The
+        // pass is indexed on `Type` and idempotent, so a repaired database pays
+        // one index range scan per boot.
+        crate::presentation_key::backfill_by_name_presentation_keys(&self.writer).await?;
         Ok(())
     }
 
@@ -483,6 +491,37 @@ impl Database {
             let sql = format!(
                 r#"SELECT "Id", "Data" FROM "BaseItems"
                    WHERE "Id" IN ({placeholders}) AND "Data" IS NOT NULL"#,
+            );
+            let mut query = sqlx::query_as::<_, (String, String)>(&sql);
+            for id in chunk {
+                query = query.bind(id);
+            }
+            out.extend(query.fetch_all(self.pool()).await?);
+        }
+        Ok(out)
+    }
+
+    /// The `Studios` column of the rows among `ids` that have one, keyed by the
+    /// id in its stored (uppercase, hyphenated) GUID form.
+    ///
+    /// One query for a page of episodes/seasons, whose `SeriesStudio` is
+    /// `series.Studios.FirstOrDefault()` (v10.11.8
+    /// Emby.Server.Implementations/Dto/DtoService.cs:1228-1234 and :1256-1262)
+    /// — a value that lives on the SERIES row, not on the item being projected.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub async fn item_studios(&self, ids: &[String]) -> Result<Vec<(String, String)>> {
+        let mut out = Vec::with_capacity(ids.len());
+        for chunk in ids.chunks(crate::BATCH_BIND_CHUNK) {
+            let placeholders = (1..=chunk.len())
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                r#"SELECT "Id", "Studios" FROM "BaseItems"
+                   WHERE "Id" IN ({placeholders}) AND "Studios" IS NOT NULL AND "Studios" <> ''"#,
             );
             let mut query = sqlx::query_as::<_, (String, String)>(&sql);
             for id in chunk {

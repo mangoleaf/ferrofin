@@ -36,11 +36,11 @@ use axum::http::{Request, StatusCode};
 use ferrofin_api::create_router;
 use ferrofin_api::state::AppState;
 use ferrofin_api::test_support::{
-    FakeActivity, FakeAdminUsers, FakeApiKeys, FakeAppHost, FakeClientEventLogger, FakeCollections,
-    FakeConfig, FakeDevices, FakeDisplayPreferences, FakeDto, FakeFileSystem, FakeLibrary,
-    FakeLocalization, FakeLyrics, FakeMediaSegments, FakeMediaSources, FakeMusic, FakePlaylists,
-    FakeProviders, FakeQuickConnect, FakeSearch, FakeSessions, FakeSimilarItems, FakeSubtitles,
-    FakeSystem, FakeTasks, FakeTrickplay, FakeTvSeries, FakeUserData, FakeUserViews, FakeUsers,
+    FakeActivity, FakeApiKeys, FakeAppHost, FakeClientEventLogger, FakeCollections, FakeConfig,
+    FakeDevices, FakeDisplayPreferences, FakeDto, FakeFileSystem, FakeLibrary, FakeLocalization,
+    FakeLyrics, FakeMediaSegments, FakeMediaSources, FakeMusic, FakePlaylists, FakeProviders,
+    FakeQuickConnect, FakeSearch, FakeSessions, FakeSimilarItems, FakeSubtitles, FakeSystem,
+    FakeTasks, FakeTrickplay, FakeTvSeries, FakeUserData, FakeUserViews, PolicyUsers,
     fake_user_entity,
 };
 use ferrofin_traits::error::ServiceError;
@@ -87,9 +87,9 @@ impl AuthorizationContext for UserAuth {
     }
 }
 
-/// An [`AppState`] whose caller is [`CALLER_ID`] and whose role comes from
-/// `users`: [`FakeUsers`] is an ordinary account, [`FakeAdminUsers`] an
-/// administrator.
+/// An [`AppState`] whose caller is [`CALLER_ID`] and whose policy comes from
+/// `users` — see [`caller_policy`], where `is_administrator` is the one field
+/// the cases below vary.
 fn state(users: Arc<dyn UserManager>) -> AppState {
     let auth = Arc::new(UserAuth(CALLER_ID));
     AppState::new(
@@ -134,6 +134,14 @@ fn state(users: Arc<dyn UserManager>) -> AppState {
 /// `501` — which is exactly what makes them usable here: the gate must fire
 /// before the seam is consulted, so the refused leg is `403` and the permitted
 /// legs are anything but.
+///
+/// Those two also sit behind a SECOND, independent gate that this table is not
+/// about: `LiveTvController` is `[Authorize(Policy = Policies.LiveTvAccess)]`
+/// (v10.11.8 `ApiServiceCollectionExtensions.cs:80`), so a caller without
+/// `EnableLiveTvAccess` is refused before `RequestHelpers.GetUserId` is
+/// reached. `caller_policy` below grants it — the permission's own allow/deny
+/// pair is owned by `live_tv_permissions.rs`, and asserting it here again would
+/// make this table's `403`s ambiguous about which rule produced them.
 const GATED: &[&str] = &[
     "/Channels?userId={user}",
     "/Channels/00000000-0000-0000-0000-0000000000c1/Items?userId={user}",
@@ -141,6 +149,24 @@ const GATED: &[&str] = &[
     "/LiveTv/Recordings/Folders?userId={user}",
     "/LiveTv/Recordings/00000000-0000-0000-0000-0000000000d1?userId={user}",
 ];
+
+/// The caller's policy: a stock account's Live TV and remote defaults
+/// (`UserEntityExtensions.cs:187`, `UserPolicy::default()`), with
+/// administrator set per case. Only the cross-user half of the rule varies
+/// between the tests below.
+fn caller_policy(admin: bool) -> ferrofin_model::users::UserPolicy {
+    ferrofin_model::users::UserPolicy {
+        is_administrator: admin,
+        enable_live_tv_access: true,
+        enable_remote_access: true,
+        ..ferrofin_model::users::UserPolicy::default()
+    }
+}
+
+/// A users manager answering [`caller_policy`].
+fn users(admin: bool) -> Arc<dyn UserManager> {
+    Arc::new(PolicyUsers(caller_policy(admin)))
+}
 
 async fn get(app: AppState, uri: &str) -> StatusCode {
     create_router(app)
@@ -162,7 +188,7 @@ async fn a_non_administrator_naming_another_user_is_refused() {
     for template in GATED {
         let uri = template.replace("{user}", &OTHER_ID.to_string());
         assert_eq!(
-            get(state(Arc::new(FakeUsers)), &uri).await,
+            get(state(users(false)), &uri).await,
             StatusCode::FORBIDDEN,
             "{uri}"
         );
@@ -174,7 +200,7 @@ async fn an_administrator_naming_another_user_is_served() {
     for template in GATED {
         let uri = template.replace("{user}", &OTHER_ID.to_string());
         assert_ne!(
-            get(state(Arc::new(FakeAdminUsers)), &uri).await,
+            get(state(users(true)), &uri).await,
             StatusCode::FORBIDDEN,
             "{uri}"
         );
@@ -186,7 +212,7 @@ async fn a_non_administrator_naming_their_own_id_is_served() {
     for template in GATED {
         let uri = template.replace("{user}", &CALLER_ID.to_string());
         assert_ne!(
-            get(state(Arc::new(FakeUsers)), &uri).await,
+            get(state(users(false)), &uri).await,
             StatusCode::FORBIDDEN,
             "{uri}"
         );
@@ -201,7 +227,7 @@ async fn an_all_zero_user_id_falls_back_to_the_caller() {
     for template in GATED {
         let uri = template.replace("{user}", &Uuid::nil().to_string());
         assert_ne!(
-            get(state(Arc::new(FakeUsers)), &uri).await,
+            get(state(users(false)), &uri).await,
             StatusCode::FORBIDDEN,
             "{uri}"
         );

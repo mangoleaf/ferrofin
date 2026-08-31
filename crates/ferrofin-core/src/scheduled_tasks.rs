@@ -1179,11 +1179,16 @@ impl ScheduledTask for RefreshLibraryTask {
         }]
     }
     async fn execute(&self, _progress: &TaskProgress) -> Result<(), ServiceError> {
-        // This runs inside a `scheduled_task` span already; tag the spawned scan
-        // as schedule-triggered so its own root trace records the origin.
-        self.library
-            .queue_library_scan_with_trigger("schedule")
-            .await
+        // AWAITS the scan, it does not queue it. Upstream's task body is
+        // `await ValidateMediaLibraryInternal(progress, ct)`
+        // (v10.11.8 `RefreshMediaLibraryTask.ExecuteAsync`:57-64), so the task
+        // stays `Running` for the whole scan. Queueing instead made this task
+        // report `Completed` in 0 ms with the scan still writing — the
+        // dashboard showed "Scan Media Library" idle while it ran, and
+        // `LastExecutionResult.EndTimeUtc` advanced before a single item had
+        // been re-read. `run_library_scan` tags the run `schedule` so its own
+        // root trace still records the origin.
+        self.library.run_library_scan().await
     }
 }
 

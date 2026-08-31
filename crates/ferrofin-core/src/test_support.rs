@@ -104,6 +104,14 @@ struct ItemRow<'a> {
     episode: Option<i64>,
     /// `Data` — Jellyfin's serialized-item JSON blob.
     data: Option<&'a str>,
+    /// `MediaType` — `"Video"` / `"Audio"`. `None` leaves the column NULL,
+    /// which is what every fixture that does not care about it gets.
+    media_type: Option<&'a str>,
+    /// `SeriesId` — the owning series, for a season or an episode.
+    series_id: Option<Uuid>,
+    /// `Studios` — the pipe-joined studio list a series carries, which is where
+    /// a season's/episode's `SeriesStudio` comes from.
+    studios: Option<&'a str>,
 }
 
 /// The one `BaseItems` insert every item fixture goes through.
@@ -140,13 +148,35 @@ async fn insert_base_item_raw_id(
     kind: BaseItemKind,
     row: &ItemRow<'_>,
 ) {
+    // `PresentationUniqueKey`, exactly as `save_items` derives it, because a
+    // seeded row that omits it is not a row a real server ever holds: the
+    // recursive user universe is queried with `GROUP BY PresentationUniqueKey`
+    // and SQLite groups NULLs TOGETHER, so two keyless fixtures collapse into
+    // one and the test measures a shape the product does not have. Upstream
+    // leaves the column NULL for exactly one kind, `LiveTvProgram` — the guide,
+    // whose airings are meant to collapse — so that kind keeps its NULL here.
+    let presentation_key = (kind != BaseItemKind::LiveTvProgram)
+        .then(|| Uuid::parse_str(raw_id).ok())
+        .flatten()
+        .map(|id| {
+            crate::kinds::presentation_unique_key(
+                kind,
+                id,
+                (!row.name.is_empty()).then_some(row.name),
+                None,
+                row.series_key,
+                row.episode,
+            )
+        });
     sqlx::query(
         r#"INSERT INTO "BaseItems"
            ("Id", "Type", "IsFolder", "IsInMixedFolder", "IsLocked", "IsMovie",
             "IsRepeat", "IsSeries", "IsVirtualItem", "Name", "ParentId",
             "TopParentId", "SeriesPresentationUniqueKey", "ParentIndexNumber",
-            "IndexNumber", "Data")
-           VALUES (?1, ?2, ?3, 0, 0, 0, 0, 0, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"#,
+            "IndexNumber", "Data", "MediaType", "PresentationUniqueKey",
+            "SeriesId", "Studios")
+           VALUES (?1, ?2, ?3, 0, 0, 0, 0, 0, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                   ?14, ?15)"#,
     )
     .bind(raw_id)
     .bind(type_name(kind))
@@ -163,6 +193,10 @@ async fn insert_base_item_raw_id(
     .bind(row.season)
     .bind(row.episode)
     .bind(row.data)
+    .bind(row.media_type)
+    .bind(presentation_key)
+    .bind(opt_guid_to_db(row.series_id))
+    .bind(row.studios)
     .execute(db.writer())
     .await
     .expect("insert item");
@@ -185,6 +219,45 @@ pub async fn seed_item_with_data(
         &ItemRow {
             name,
             data: Some(data),
+            ..ItemRow::default()
+        },
+    )
+    .await;
+}
+
+/// Inserts a `Series` row carrying a pipe-joined studio list — the source of
+/// its seasons'/episodes' `SeriesStudio`.
+pub async fn seed_series_with_studios(db: &Database, id: Uuid, name: &str, studios: &str) {
+    insert_base_item(
+        db,
+        id,
+        BaseItemKind::Series,
+        &ItemRow {
+            name,
+            is_folder: true,
+            studios: Some(studios),
+            ..ItemRow::default()
+        },
+    )
+    .await;
+}
+
+/// Inserts a `Season`/`Episode` row bound to `series`.
+pub async fn seed_item_of_series(
+    db: &Database,
+    id: Uuid,
+    kind: BaseItemKind,
+    name: &str,
+    series: Uuid,
+) {
+    insert_base_item(
+        db,
+        id,
+        kind,
+        &ItemRow {
+            name,
+            is_folder: kind == BaseItemKind::Season,
+            series_id: Some(series),
             ..ItemRow::default()
         },
     )
@@ -291,6 +364,25 @@ pub async fn items_at_path(db: &Database, path: &str) -> usize {
 /// Inserts a minimal `BaseItems` row of the given kind.
 pub async fn seed_item(db: &Database, id: Uuid, kind: BaseItemKind) {
     seed_named_item(db, id, kind, "").await;
+}
+
+/// Inserts an item whose `MediaType` is `"Video"`.
+///
+/// The column a real scan fills in and `seed_item` leaves NULL. Anything that
+/// branches on `BaseItem.MediaType` — the per-user
+/// `SupportsTranscoding`/`SupportsDirectStream` overwrite, for one — sees
+/// nothing without it.
+pub async fn seed_video_item(db: &Database, id: Uuid, kind: BaseItemKind) {
+    insert_base_item(
+        db,
+        id,
+        kind,
+        &ItemRow {
+            media_type: Some("Video"),
+            ..ItemRow::default()
+        },
+    )
+    .await;
 }
 
 /// Inserts a `BaseItems` row of the given kind with a name.

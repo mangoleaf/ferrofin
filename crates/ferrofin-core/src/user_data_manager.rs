@@ -953,6 +953,37 @@ impl UserDataManager for FerrofinUserDataManager {
         let has = |kind: i32| rows.iter().any(|(k, v)| *k == kind && *v);
         Ok(Some((has(10), has(11))))
     }
+
+    async fn get_playback_permissions(
+        &self,
+        user_id: Uuid,
+    ) -> Result<Option<ferrofin_traits::library::PlaybackPermissions>, ServiceError> {
+        // Kind 8 = EnableAudioPlaybackTranscoding, 9 =
+        // EnableVideoPlaybackTranscoding, 19 = EnablePlaybackRemuxing
+        // (`PermissionKind`). One indexed read for all three, because the
+        // overwrite reads all three on one request.
+        let rows: Vec<(i32, bool)> = sqlx::query_as(
+            r#"SELECT "Kind", "Value" FROM "Permissions"
+               WHERE "UserId" = ?1 AND "Kind" IN (8, 9, 19)"#,
+        )
+        .bind(guid_to_db(user_id))
+        .fetch_all(self.db.pool())
+        .await
+        .map_err(db_err)?;
+        if rows.is_empty() {
+            // No permission rows at all is "no policy known" — an unknown user
+            // id, whose sources upstream leaves untouched because `user` is
+            // null. Reporting three `false`s here would instead tell a client
+            // the item can neither be remuxed nor transcoded.
+            return Ok(None);
+        }
+        let has = |kind: i32| rows.iter().any(|(k, v)| *k == kind && *v);
+        Ok(Some(ferrofin_traits::library::PlaybackPermissions {
+            video_transcoding: has(9),
+            audio_transcoding: has(8),
+            remuxing: has(19),
+        }))
+    }
 }
 
 impl FerrofinUserDataManager {
@@ -1965,5 +1996,54 @@ mod tests {
             .await
             .expect("count");
         assert_eq!(rows, 1);
+    }
+
+    /// The three playback permissions the media-source manager overwrites
+    /// `SupportsTranscoding`/`SupportsDirectStream` from. A user id nobody
+    /// knows must answer `None` — "no policy", which leaves the source alone —
+    /// and never three `false`s, which would tell a client the item can be
+    /// neither remuxed nor transcoded.
+    #[tokio::test]
+    async fn playback_permissions_come_from_the_users_own_rows() {
+        use ferrofin_db::enums::PermissionKind;
+        use ferrofin_traits::library::UserManager as _;
+
+        let db = test_db().await;
+        let users = crate::user_manager::FerrofinUserManager::new(db.clone());
+        let user = users.create_user("erin").await.expect("create");
+        let id = Uuid::parse_str(&user.id).expect("uuid");
+        let mgr = FerrofinUserDataManager::new(db.clone(), config());
+
+        // `AddDefaultPermissions` grants all three.
+        let granted = mgr
+            .get_playback_permissions(id)
+            .await
+            .expect("read")
+            .expect("a known user has a policy");
+        assert!(granted.video_transcoding && granted.audio_transcoding && granted.remuxing);
+
+        crate::user_entity_ext::set_permission(
+            db.pool(),
+            &user.id,
+            PermissionKind::EnablePlaybackRemuxing,
+            false,
+        )
+        .await
+        .expect("revoke");
+        let revoked = mgr
+            .get_playback_permissions(id)
+            .await
+            .expect("read")
+            .expect("policy");
+        assert!(!revoked.remuxing, "only the revoked one flips");
+        assert!(revoked.video_transcoding && revoked.audio_transcoding);
+
+        assert!(
+            mgr.get_playback_permissions(Uuid::from_u128(0xdead))
+                .await
+                .expect("read")
+                .is_none(),
+            "an unknown user is 'no policy', not 'nothing permitted'"
+        );
     }
 }

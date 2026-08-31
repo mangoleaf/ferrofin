@@ -20,8 +20,8 @@ suite_require_fixtures
 
 echo ">> starting both servers"
 docker compose down -v >/dev/null 2>&1 || true
-if [ "${BENCH_SKIP_BUILD:-0}" = 1 ]; then docker compose up -d ferrofin jellyfin livetv-source
-else docker compose up -d --build ferrofin jellyfin livetv-source; fi
+if [ "${BENCH_SKIP_BUILD:-0}" = 1 ]; then docker compose up -d ferrofin jellyfin livetv-source hdhomerun-source
+else docker compose up -d --build ferrofin jellyfin livetv-source hdhomerun-source; fi
 trap 'docker compose down -v >/dev/null 2>&1 || true' EXIT
 
 # Host ports follow the compose file's overrides, so a worktree can run its own leg

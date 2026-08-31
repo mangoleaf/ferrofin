@@ -9,6 +9,17 @@
 //! child, which is what makes `GET /Items/{id}/Ancestors` climb past the
 //! library to the root and `GET /Items/Root` resolve a real row.
 //!
+//! `LibraryManager.CreateRootFolder()` also creates the **playlists** plugin
+//! folder at `{DataPath}/playlists`, but it parents that folder to the
+//! **`AggregateFolder`** (`folder.ParentId = rootFolder.Id`, then
+//! `rootFolder.AddVirtualChild(folder)`), not to this row — the user root only
+//! picks it up at read time, through
+//! `UserRootFolder.GetEligibleChildrenForRecursiveChildren`
+//! (`UserRootFolder.cs:96-102`). Ferrofin ports that split in
+//! [`crate::aggregate_folder::AggregateFolderStore`] (provisioning) and in
+//! [`crate::item_repository`]/[`crate::item_count_service`] (the read-time
+//! concat), so this store owns the `UserRootFolder` row and nothing else.
+//!
 //! Jellyfin renames the row from its directory name (`default`) to
 //! `Media Folders` on its first metadata refresh (`UserRootFolder.
 //! BeforeMetadataRefresh`); a 10.11.8 database carries that name, so the row
@@ -40,6 +51,18 @@ pub struct UserRootFolderStore {
     persistence: Arc<dyn ItemPersistenceService>,
     id_derivation: IdDerivation,
     path: PathBuf,
+    /// Memoizes the resolved id, so the whole provisioning pass runs **once**
+    /// per process — the port of C#'s `_userRootFolder` field, which
+    /// `GetUserRootFolder()` builds under a lock and then hands out forever.
+    ///
+    /// Load-bearing for latency, not just tidiness: `ensure()` is on the hot
+    /// path of `GET /Items/Root`, `GET /Library/MediaFolders`,
+    /// `GET /Library/VirtualFolders` and the scan, and a cold pass ends in a
+    /// writer statement. Re-running that per request is exactly what once
+    /// serialized `/Library/MediaFolders` to 1355 ms p50 (see the id-casing
+    /// note in `item_persistence_service`). Shared across clones via the
+    /// `Arc`, so every holder of the store settles it together.
+    resolved: Arc<tokio::sync::OnceCell<Uuid>>,
 }
 
 impl std::fmt::Debug for UserRootFolderStore {
@@ -63,6 +86,7 @@ impl UserRootFolderStore {
             persistence,
             id_derivation,
             path: default_user_views_path.into(),
+            resolved: Arc::new(tokio::sync::OnceCell::new()),
         }
     }
 
@@ -100,28 +124,37 @@ impl UserRootFolderStore {
         }
     }
 
-    /// Ensures the directory and the row exist, returning the row's id.
+    /// Ensures the directory and the row exist, returning the root row's id.
     ///
-    /// Idempotent and read-only once the row is there — an existence probe
-    /// on the pool, no writer traffic — so it is safe on every read that
-    /// needs the root (`Items/Root`, the virtual-folder listing, the scan).
+    /// Runs at most **once** per process: the result is memoized the way C#
+    /// caches `_userRootFolder`, so every later call is a field read with no
+    /// database traffic at all. That matters because this sits on the hot path
+    /// of `GET /Items/Root`, `GET /Library/MediaFolders`,
+    /// `GET /Library/VirtualFolders` and the scan.
     ///
     /// # Errors
     ///
-    /// Returns an error if the directory cannot be created or the row cannot
-    /// be written.
+    /// Returns an error if the directory cannot be created or a row cannot be
+    /// written. A failed pass is not cached, so the next call retries.
     pub async fn ensure(&self) -> Result<Uuid, ServiceError> {
-        let id = self.id();
-        if self.persistence.item_exists(id).await? {
-            return Ok(id);
-        }
-        tokio::fs::create_dir_all(&self.path)
+        self.resolved
+            .get_or_try_init(|| self.provision())
             .await
-            .map_err(|e| ServiceError::backend(format!("create user root directory: {e}")))?;
-        self.persistence
-            .save_items(std::slice::from_ref(&self.entity(id)))
-            .await?;
-        tracing::info!(item_id = %id, path = %self.path.display(), "created the user root folder");
+            .copied()
+    }
+
+    /// The one-shot body behind [`ensure`](Self::ensure).
+    async fn provision(&self) -> Result<Uuid, ServiceError> {
+        let id = self.id();
+        if !self.persistence.item_exists(id).await? {
+            tokio::fs::create_dir_all(&self.path)
+                .await
+                .map_err(|e| ServiceError::backend(format!("create user root directory: {e}")))?;
+            self.persistence
+                .save_items(std::slice::from_ref(&self.entity(id)))
+                .await?;
+            tracing::info!(item_id = %id, path = %self.path.display(), "created the user root folder");
+        }
         Ok(id)
     }
 }
@@ -135,13 +168,16 @@ mod tests {
 
     async fn store(tmp: &tempfile::TempDir) -> (ferrofin_db::Database, UserRootFolderStore) {
         let db = test_db().await;
+        (db.clone(), store_over(&db, tmp))
+    }
+
+    fn store_over(db: &ferrofin_db::Database, tmp: &tempfile::TempDir) -> UserRootFolderStore {
         let persistence: Arc<dyn ItemPersistenceService> =
             Arc::new(FerrofinItemPersistenceService::new(db.clone()));
         let mode = IdDerivation::Jellyfin {
             program_data_path: Some(tmp.path().to_string_lossy().into_owned()),
         };
-        let s = UserRootFolderStore::new(persistence, mode, tmp.path().join("root/default"));
-        (db, s)
+        UserRootFolderStore::new(persistence, mode, tmp.path().join("root/default"))
     }
 
     #[tokio::test]

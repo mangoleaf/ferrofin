@@ -119,36 +119,25 @@ pub fn presentation_unique_key(
         return Uuid::parse_str(primary)
             .map_or_else(|_| primary.to_owned(), |p| p.as_simple().to_string());
     }
-    // The by-name prefix is the CLR *type* name, not the stored CLR path — and
-    // `MusicArtist` is spelled `Artist` (`MusicArtist.cs:152`). Only these five
-    // kinds override the key; `Year` and everything else keep their own id,
-    // which is why the list is spelled out rather than derived from
-    // `is_item_by_name`.
-    let by_name_prefix = match kind {
-        BaseItemKind::Genre => Some("Genre"),
-        BaseItemKind::MusicGenre => Some("MusicGenre"),
-        BaseItemKind::Person => Some("Person"),
-        BaseItemKind::Studio => Some("Studio"),
-        BaseItemKind::MusicArtist => Some("Artist"),
-        _ => None,
-    };
-    match (kind, by_name_prefix) {
-        (BaseItemKind::Season, _) => match (series_key.filter(|k| !k.is_empty()), index_number) {
+    if kind == BaseItemKind::Season {
+        return match (series_key.filter(|k| !k.is_empty()), index_number) {
             (Some(series), Some(index)) => format!("{series}-{index:03}"),
             _ => own,
-        },
-        (_, Some(prefix)) => match name.filter(|n| !n.is_empty()) {
-            // Diacritics are removed and the case is kept, exactly as
-            // `GetUserDataKeys()[0]` builds it — a real 10.11.8 stores
-            // `Person-H. Jon Benjamin` and `Artist-Red Hot Chili Peppers`.
-            Some(name) => format!(
-                "{prefix}-{}",
-                ferrofin_util::string_extensions::remove_diacritics(name)
-            ),
-            None => own,
-        },
-        _ => own,
+        };
     }
+    // The by-name arm lives in `ferrofin_db::presentation_key` — the SAME
+    // function the boot-time repair calls, so a row this insert writes and a
+    // row the repair fixes cannot spell the key two different ways. (They did:
+    // migration 0027 backfilled the row's own id where this writes
+    // `Person-Bob Parity`.) Diacritics are removed and the case is kept,
+    // exactly as `GetUserDataKeys()[0]` builds it — a real 10.11.8 stores
+    // `Person-H. Jon Benjamin` and `Artist-Red Hot Chili Peppers`.
+    crate::item_type_lookup::stored_type_name(kind)
+        .zip(name.filter(|n| !n.is_empty()))
+        .and_then(|(type_name, name)| {
+            ferrofin_db::presentation_key::by_name_presentation_key(type_name, name)
+        })
+        .unwrap_or(own)
 }
 
 /// Whether this kind is an "item by name" — a genre, studio, year, person, or
@@ -219,10 +208,21 @@ pub fn supports_ancestors(kind: BaseItemKind) -> bool {
 ///
 /// Structural and by-name rows return `false` and the overrides say why:
 /// `Folder.CanDelete` refuses the root (`UserRootFolder.IsRoot`),
-/// `AggregateFolder`/`CollectionFolder`/`UserView`/`BasePluginFolder`
-/// (the playlists folder, under either of its two spellings) are hard `false`,
-/// and so are `Genre`/
-/// `MusicGenre`/`Studio`/`Year` (the `Person` row is metadata-only as well).
+/// `AggregateFolder`/`CollectionFolder`/`UserView`/`BasePluginFolder` are hard
+/// `false`, and so are `Genre`/`MusicGenre`/`Studio`/`Year` (the `Person` row
+/// is metadata-only as well).
+///
+/// The playlists folder is listed under **both** spellings on purpose.
+/// `BasePluginFolder.CanDelete() => false` (v10.11.8
+/// `MediaBrowser.Controller/Entities/BasePluginFolder.cs:24`) and
+/// `PlaylistsFolder : BasePluginFolder`, but the two names reach this table by
+/// different routes: `PlaylistsFolder` is what the row is *stored* as (the FQN
+/// `Emby.Server.Implementations.Playlists.PlaylistsFolder` a fresh or adopted
+/// 10.11.8 database carries), while `ManualPlaylistsFolder` is only
+/// `GetClientTypeName()` — and what an older Ferrofin wrote into the column.
+/// `DtoService` resolves `CanDelete` from the **stored** kind, so a table that
+/// knew only the client-facing spelling would report `CanDelete: true` on
+/// exactly the databases that spell it the upstream way.
 /// `MusicArtist.CanDelete` is `!IsAccessedByName`, i.e. only a physically
 /// parented artist folder is deletable — hence `has_parent`.
 ///
@@ -236,6 +236,7 @@ pub fn can_delete(kind: BaseItemKind, has_parent: bool) -> bool {
         | BaseItemKind::AggregateFolder
         | BaseItemKind::CollectionFolder
         | BaseItemKind::UserView
+        | BaseItemKind::BasePluginFolder
         | BaseItemKind::ManualPlaylistsFolder
         | BaseItemKind::PlaylistsFolder
         | BaseItemKind::Genre
@@ -761,6 +762,14 @@ mod tests {
             BaseItemKind::AggregateFolder,
             BaseItemKind::CollectionFolder,
             BaseItemKind::UserView,
+            BaseItemKind::BasePluginFolder,
+            // Both spellings of the plugin folder: `PlaylistsFolder` is the
+            // STORED type (`BasePluginFolder.CanDelete() => false`), and
+            // `ManualPlaylistsFolder` is `GetClientTypeName()` — which is what
+            // an older Ferrofin persisted. `has_parent` is `true` here because
+            // upstream really does parent this row, so the `MusicArtist` arm
+            // must not be what saves it.
+            BaseItemKind::PlaylistsFolder,
             BaseItemKind::ManualPlaylistsFolder,
             // …under BOTH spellings: 10.11.8 stores
             // `…Playlists.PlaylistsFolder` and only *renders* it as
@@ -893,6 +902,10 @@ mod tests {
             BaseItemKind::Season,
             BaseItemKind::BoxSet,
             BaseItemKind::Folder,
+            // Neither `BasePluginFolder` nor `PlaylistsFolder` overrides
+            // `SupportsPlayedStatus`, so both spellings keep `Folder`'s `true`
+            // — pinned so the stored-kind switch cannot silently move it.
+            BaseItemKind::PlaylistsFolder,
             BaseItemKind::ManualPlaylistsFolder,
         ] {
             assert!(supports_played_status(kind), "{kind:?}");

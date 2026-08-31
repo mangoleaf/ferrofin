@@ -101,6 +101,14 @@ pub struct FerrofinVirtualFolderManager {
     /// [`get_physical_paths`](VirtualFolderManager::get_physical_paths). `None`
     /// in unit tests keeps the manager library-only.
     playlists_path: Option<PathBuf>,
+    /// The shared `UserRootFolder` provisioner, injected by the composition
+    /// root so this manager settles the root **with** the other holders
+    /// instead of re-deriving it. [`UserRootFolderStore`] memoizes its pass in
+    /// an `Arc<OnceCell>` that survives cloning, so sharing the one instance
+    /// is what makes `GET /Library/VirtualFolders` stop paying a per-call
+    /// `item_exists` probe. `None` falls back to a private store built from
+    /// this manager's own fields — the shape unit tests use.
+    user_root: Option<UserRootFolderStore>,
 }
 
 impl std::fmt::Debug for FerrofinVirtualFolderManager {
@@ -129,6 +137,7 @@ impl FerrofinVirtualFolderManager {
             id_derivation: item_type_lookup::IdDerivation::LegacyLowercase,
             parented: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             playlists_path: None,
+            user_root: None,
         }
     }
 
@@ -167,6 +176,19 @@ impl FerrofinVirtualFolderManager {
         self
     }
 
+    /// Shares the composition root's one [`UserRootFolderStore`], so the root
+    /// row (and the playlists plugin folder it provisions) is resolved once
+    /// per process across every holder rather than once per manager.
+    ///
+    /// Without it this manager builds its own store on each call, which has a
+    /// cold `OnceCell` and therefore re-probes the root on every
+    /// `GET /Library/VirtualFolders`.
+    #[must_use]
+    pub fn with_user_root(mut self, store: UserRootFolderStore) -> Self {
+        self.user_root = Some(store);
+        self
+    }
+
     /// The deterministic `CollectionFolder` item id for a virtual-folder directory
     /// (`GetNewItemIdInternal` over the folder path) — both the created row's id
     /// and the value projected onto [`VirtualFolderInfo::item_id`]. Under the
@@ -180,11 +202,18 @@ impl FerrofinVirtualFolderManager {
         )
     }
 
-    /// The `UserRootFolder` provisioner over this manager's root, item store
-    /// and derivation mode — the parent every `CollectionFolder` row hangs off
-    /// (its directory is a child of `root/default/`, and so is its row). `None`
-    /// without an item store wired.
+    /// The `UserRootFolder` provisioner — the parent every `CollectionFolder`
+    /// row hangs off (its directory is a child of `root/default/`, and so is
+    /// its row).
+    ///
+    /// The shared store from the composition root when one was injected (see
+    /// [`with_user_root`](Self::with_user_root)); otherwise a private one over
+    /// this manager's root, item store and derivation mode. `None` without an
+    /// item store wired and no shared store.
     fn user_root(&self) -> Option<UserRootFolderStore> {
+        if let Some(shared) = &self.user_root {
+            return Some(shared.clone());
+        }
         let persistence = self.persistence.as_ref()?;
         Some(UserRootFolderStore::new(
             Arc::clone(persistence),
@@ -1182,6 +1211,60 @@ mod tests {
             .await
             .expect("count");
         assert_eq!(exists, 1, "the CollectionFolder row was re-created");
+    }
+
+    /// The composition root builds ONE [`UserRootFolderStore`] and shares it,
+    /// so the root (and the playlists plugin folder it provisions) is resolved
+    /// once per process instead of once per manager. Without the injection
+    /// this manager built a private store on every call — a cold `OnceCell`,
+    /// so `GET /Library/VirtualFolders` re-probed the root on every request.
+    ///
+    /// Discriminating by construction: the injected store is rooted at a
+    /// DIFFERENT directory than the manager's own `root`, so a private store
+    /// would derive a different `UserRootFolder` id and the library would be
+    /// parented to it instead.
+    #[tokio::test]
+    async fn an_injected_user_root_store_is_the_one_libraries_parent_to() {
+        use crate::test_support::fetch_item;
+        let (tmp, db, mgr) = manager_with_store().await;
+        let shared = crate::user_root_folder::UserRootFolderStore::new(
+            Arc::new(
+                crate::item_persistence_service::FerrofinItemPersistenceService::new(db.clone()),
+            ),
+            crate::item_type_lookup::IdDerivation::LegacyLowercase,
+            tmp.path().join("shared-root"),
+        );
+        assert_ne!(
+            shared.id(),
+            mgr.user_root().expect("store").id(),
+            "the fixture must separate the injected store from a private one"
+        );
+        // Settle it first: a shared store hands the memoized id to every later
+        // holder, which is the whole point of injecting it.
+        let root_id = shared.ensure().await.expect("ensure");
+        assert_eq!(root_id, shared.id());
+
+        let mgr = mgr.with_user_root(shared.clone());
+        let media = media_dir(&tmp, "movies");
+        mgr.add_virtual_folder(
+            "Movies",
+            Some(CollectionTypeOptions::movies),
+            &opts_with_paths(&[media]),
+        )
+        .await
+        .expect("add");
+        let item_id = mgr.get_virtual_folders().await.expect("get")[0]
+            .item_id
+            .clone()
+            .expect("ItemId");
+        let library = uuid::Uuid::parse_str(&item_id).expect("uuid");
+
+        assert_eq!(mgr.user_root().expect("store").id(), shared.id());
+        assert_eq!(
+            fetch_item(&db, library).await.parent_id.as_deref(),
+            Some(super::guid_to_db(shared.id()).as_str()),
+            "the library parents to the INJECTED root, not a privately built one"
+        );
     }
 
     #[tokio::test]

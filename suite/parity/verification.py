@@ -138,13 +138,44 @@ def is_empty_envelope(doc):
     reached the body-diff headline having compared six nested zeros, because the
     old test only ever looked at `doc["Items"]`.
 
+    Deliberately FALSE for a bare `[]`, which is not an envelope at all: a
+    QueryResult at least compares its own zeros, a bare list compares literally
+    nothing, and collapsing the two would make this predicate mean "compared
+    nothing" for one caller and "compared the zeros" for another.
+    `is_bare_empty_list` names that case, and `is_empty_result` is the union —
+    the wider test `read_method` uses, so the widening is visible at the call
+    site instead of hidden here.
+
     Diffing two of these compares the envelopes' own bookkeeping and no content at
     all, so the row is `empty-corpus`, never the headline.
     """
     if not isinstance(doc, (dict, list)):
         return False
+    if isinstance(doc, list) and not doc:
+        return False
     content, empties = _corpus_scan(doc)
     return empties > 0 and content == 0
+
+
+def is_bare_empty_list(doc):
+    """True for `[]` — the empty answer of the array-returning endpoints
+    (`POST /Items/RemoteSearch/{kind}` answers `[]` when no fetcher matched).
+
+    The most extreme empty there is: a diff of two of them performs ZERO leaf
+    comparisons, so it can never be evidence of agreement about anything but
+    the emptiness itself.
+    """
+    return isinstance(doc, list) and not doc
+
+
+def is_empty_result(doc):
+    """True for a response that carried no content, in EITHER wire shape.
+
+    Diffing two of these proves only that both handlers answered empty, so the
+    row is `empty-corpus` — never the headline, and never `deep_verified` on
+    the strength of a leaf count that is zero.
+    """
+    return is_empty_envelope(doc) or is_bare_empty_list(doc)
 
 
 def read_method(jbody, hbody, compared):
@@ -153,10 +184,27 @@ def read_method(jbody, hbody, compared):
     `compared` is the number of non-volatile leaf comparisons the diff actually
     performed (`parity_diff.diff_stats`). Returns None when the probe produced no
     evidence at all — the caller must then record the row untested, not verified.
+
+    The COMPARED test comes first, and the order is load-bearing. A bare
+    `[] vs []` walks zero leaves, and zero leaves compared is an absence of
+    evidence, not an agreement — there is no envelope there to restate its own
+    emptiness, so there is nothing a probe can be said to have checked. Such a
+    row is untested. Only a document that genuinely carried an empty envelope
+    (and so had its zeros compared) earns `empty-corpus`, which gen-ledger then
+    keeps out of the headline count.
+
+    Inverting these two lines silently promotes every both-empty bare list from
+    untested to verified — it did exactly that to POST /Items/RemoteSearch/Book
+    and /MusicVideo before this was restored.
+
+    Note what this does NOT do: an empty answer on one side and content on the
+    other is not an empty result, so it falls through to the leaf count and
+    the caller's diff buckets — a one-sided empty is a divergence, never an
+    agreement.
     """
     if not compared:
         return None
-    if is_empty_envelope(jbody) and is_empty_envelope(hbody):
+    if is_empty_result(jbody) and is_empty_result(hbody):
         return EMPTY_CORPUS
     return BODY_DIFF
 
@@ -213,9 +261,24 @@ def selfcheck():
     assert not is_empty_envelope({"Items": [], "Enabled": True})  # a real scalar alongside
     assert not is_empty_envelope({"Items": [], "TotalRecordCount": 3})  # count contradicts
     assert not is_empty_envelope({"A": {"Items": [], "TotalRecordCount": 0}, "B": 7})
+    # A bare list compares nothing at all, so it is NOT an empty envelope. The
+    # array endpoints' empty answer is classified by the separately-named
+    # `is_bare_empty_list`/`is_empty_result` pair, so the widening is visible in
+    # the call site rather than hidden in this predicate.
+    assert not is_empty_envelope([])
+    assert is_bare_empty_list([]) and not is_bare_empty_list([{"Name": "x"}])
+    assert is_empty_result([]) and is_empty_result({"Items": [], "TotalRecordCount": 0})
+    assert not is_empty_result([{"Name": "x"}])
     # A bare `[]` carries nothing AND compares nothing: read_method calls that
     # untested (no method) before the empty-corpus question is ever asked.
     assert read_method([], [], 0) is None
+    # …but only when BOTH sides are empty. One side empty is a DIVERGENCE, so it
+    # must not short-circuit to `empty-corpus`; it falls through to the leaf
+    # count, which for a one-sided empty is zero — untested, not verified. Both
+    # directions are asserted so the guard does not depend on which server
+    # happened to be the empty one.
+    assert read_method([], [{"Name": "x"}], 0) is None
+    assert read_method([{"Name": "x"}], [], 0) is None
 
     # no evidence is untested, not verified
     assert read_method({}, {}, 0) is None
@@ -240,7 +303,8 @@ def selfcheck():
     assert not bare_status_class((2, "m3u8", "application/x-mpegurl", ("#EXTM3U",)))
 
     print(f"ok: {len(VALID)} verification methods, headline={HEADLINE!r}, "
-          "nested-aware empty-envelope + evidence-based status-class detectors")
+          "nested-aware empty-envelope / bare-empty-list + "
+          "evidence-based status-class detectors")
 
 
 if __name__ == "__main__":

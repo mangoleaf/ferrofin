@@ -18,9 +18,9 @@ use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::dto::DayOfWeek;
 use ferrofin_model::dto::{BaseItemDto, MediaSourceInfo, NameIdPair, SortOrder};
 use ferrofin_model::live_tv::{
-    ChannelMappingOptionsDto, ChannelType, DayPattern, ItemSortBy, KeepUntil, ListingsProviderInfo,
-    LiveTvInfo, RecordingQuery, RecordingStatus, SeriesTimerInfoDto, TimerInfoDto, TimerQuery,
-    TunerChannelMapping, TunerHostInfo,
+    ChannelMappingOptionsDto, ChannelType, DayPattern, GuideInfo, ItemSortBy, KeepUntil,
+    ListingsProviderInfo, LiveTvInfo, RecordingQuery, RecordingStatus, SeriesTimerInfoDto,
+    TimerInfoDto, TimerQuery, TunerChannelMapping, TunerHostInfo,
 };
 use ferrofin_model::querying::QueryResult;
 
@@ -122,6 +122,19 @@ pub fn internal_series_timer_id(external_id: &str) -> String {
     )
     .simple()
     .to_string()
+}
+
+/// The internal id `LiveTvDtoService` derives for a recording timer with the
+/// given external id.
+///
+/// Port of `LiveTvDtoService.GetInternalTimerId` (v10.11.8
+/// `LiveTvDtoService.cs:410-415`). It is the same
+/// `(ServiceName + externalId + InternalVersionNumber).ToLowerInvariant().GetMD5()`
+/// derivation [`internal_series_timer_id`] uses — upstream keeps them as two
+/// methods because they are called from two different paths, and so do we.
+#[must_use]
+pub fn internal_timer_id(external_id: &str) -> String {
+    internal_series_timer_id(external_id)
 }
 
 /// The defaults a new timer starts from, before any programme is applied.
@@ -235,7 +248,36 @@ pub trait LiveTvManager: Send + Sync {
 
     /// Saves (adds or updates) a tuner host, returning the stored value with its
     /// assigned id.
+    ///
+    /// Fails with [`ServiceError::NotFound`] when no registered tuner backend
+    /// claims `info.Type` — `TunerHostManager.SaveTunerHost` (v10.11.8
+    /// TunerHostManager.cs:60-69) throws `ResourceNotFoundException` there.
     async fn save_tuner_host(&self, info: TunerHostInfo) -> Result<TunerHostInfo, ServiceError>;
+
+    /// The tuner-host kinds this server supports, ordered by display name.
+    ///
+    /// Port of `ITunerHostManager.GetTunerHostTypes` (v10.11.8
+    /// TunerHostManager.cs:52-58) — the projection of every registered,
+    /// supported `ITunerHost`. Synchronous because it reads a fixed collection,
+    /// not configuration.
+    fn tuner_host_types(&self) -> Vec<NameIdPair>;
+
+    /// Scans the network for tuner devices, giving each backend
+    /// `discovery_duration_ms` to answer.
+    ///
+    /// Port of `ITunerHostManager.DiscoverTuners(newDevicesOnly)` (v10.11.8
+    /// TunerHostManager.cs:102-121). An empty list is a legitimate answer — it
+    /// is what a network with no tuner on it looks like.
+    ///
+    /// `new_devices_only` is the controller's `?newDevicesOnly=` flag: when
+    /// set, a discovered device whose `DeviceId` is already on a configured
+    /// tuner host is dropped, so the dashboard's "Detect my devices" offers
+    /// only tuners that are not already added.
+    async fn discover_tuners(
+        &self,
+        discovery_duration_ms: u64,
+        new_devices_only: bool,
+    ) -> Result<Vec<TunerHostInfo>, ServiceError>;
 
     /// Deletes the tuner host with the given id (and its cached channels).
     async fn delete_tuner_host(&self, id: &str) -> Result<(), ServiceError>;
@@ -327,6 +369,21 @@ pub trait LiveTvManager: Send + Sync {
         options: &DtoOptions,
     ) -> Result<QueryResult<BaseItemDto>, ServiceError>;
 
+    /// Queries the "recommended"/"On Now" program list.
+    ///
+    /// Port of `LiveTvManager.GetRecommendedProgramsAsync`. The contract:
+    /// implementations delegate to [`Self::get_programs`] unless
+    /// `is_airing == Some(true)`, and otherwise force a StartDate-ascending
+    /// fetch of `max(limit * 4, 200)` rows, rank each start-date's airings by
+    /// the recommendation score (live, non-repeat series, and the caller's
+    /// channel likes/favourite/play count), take `limit`, and report the
+    /// fetched pool size as the total.
+    async fn get_recommended_programs(
+        &self,
+        query: &InternalItemsQuery,
+        options: &DtoOptions,
+    ) -> Result<QueryResult<BaseItemDto>, ServiceError>;
+
     /// Gets a single program by id, or `None` when it is unknown.
     ///
     /// Port of `LiveTvManager.GetProgram(id, ct, user)`. The contract:
@@ -361,9 +418,87 @@ pub trait LiveTvManager: Send + Sync {
     /// admin request must not hang on them.
     async fn refresh_guide(&self) -> Result<(), ServiceError>;
 
+    /// The guide's advertised date range.
+    ///
+    /// Port of `IGuideManager.GetGuideInfo`: `now .. now + GuideDays`, where
+    /// `GuideDays` is the dashboard's Live TV setting clamped to `1..=14`. It
+    /// lives on the manager rather than in the handler because it must be the
+    /// same day count the guide *ingest* window uses — advertising a range the
+    /// stored guide does not cover is how a client ends up scrolling into an
+    /// empty week.
+    async fn get_guide_info(&self) -> Result<GuideInfo, ServiceError>;
+
     /// Resolves a channel id to the tuner stream URL that plays it, or `None`
     /// when the channel is unknown.
     async fn get_channel_stream_url(&self, id: Uuid) -> Result<Option<String>, ServiceError>;
+
+    /// Stamps the Live-TV-only fields onto already-projected channel DTOs,
+    /// matching each by its own `Id`.
+    ///
+    /// Port of `ILiveTvManager.AddChannelInfo` (v10.11.8
+    /// src/Jellyfin.LiveTv/LiveTvManager.cs:954-1010): `Number`,
+    /// `ChannelNumber`, `ChannelType`, the `ExternalServiceId` provider id and
+    /// — when `options.add_current_program` — the airing `CurrentProgram`.
+    /// Upstream calls it from **`DtoService` itself** (Emby.Server.Implementations/
+    /// Dto/DtoService.cs:192 and :203, dispatching on `item is LiveTvChannel`),
+    /// which is why an ordinary `GET /Items/{id}` of a channel comes back with
+    /// its channel number: the post-pass is part of projecting a channel, not
+    /// part of the Live TV routes.
+    ///
+    /// Ids that are not channels are left untouched, so a mixed page is safe to
+    /// hand over whole.
+    ///
+    /// The default does nothing — the "no Live TV configured" state.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn add_channel_info(
+        &self,
+        dtos: &mut [BaseItemDto],
+        options: &DtoOptions,
+        user: Option<&UserEntity>,
+    ) -> Result<(), ServiceError> {
+        let _ = (dtos, options, user);
+        Ok(())
+    }
+
+    /// Stamps the Live-TV-only fields onto already-projected guide programme
+    /// DTOs, matching each by its own `Id`.
+    ///
+    /// Port of `ILiveTvManager.AddInfoToProgramDto` (v10.11.8
+    /// src/Jellyfin.LiveTv/LiveTvManager.cs:535-576): `StartDate`,
+    /// `EpisodeTitle` and the true-only airing flags always, the owning
+    /// channel's `ChannelName`/`MediaType`/`ChannelNumber` only when
+    /// `ItemFields.ChannelInfo` or `ItemFields.ChannelImage` was asked for, and
+    /// then the `AddRecordingInfo` pass that links an airing to the timer
+    /// recording it.
+    ///
+    /// The sibling of [`Self::add_channel_info`], and called from the same
+    /// place: `DtoService` buckets `item is LiveTvProgram` while projecting a
+    /// page and hands the bucket over (Emby.Server.Implementations/Dto/
+    /// DtoService.cs:168-192 and :201-207). That is why an ordinary
+    /// `GET /Items/{id}` of an airing comes back with its start date and
+    /// channel name — the post-pass belongs to projecting a programme, not to
+    /// the `/LiveTv/*` routes.
+    ///
+    /// Ids that are not programmes are left untouched, so a mixed page is safe
+    /// to hand over whole.
+    ///
+    /// The default does nothing — the "no Live TV configured" state.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn add_info_to_program_dto(
+        &self,
+        dtos: &mut [BaseItemDto],
+        options: &DtoOptions,
+        user: Option<&UserEntity>,
+    ) -> Result<(), ServiceError> {
+        let _ = (dtos, options, user);
+        Ok(())
+    }
 
     // ---- live streams ----------------------------------------------------
 
@@ -454,16 +589,24 @@ pub trait LiveTvManager: Send + Sync {
 
     // ---- DVR: series timers ----------------------------------------------
 
-    /// Lists the recurring (series) recording timers.
-    async fn get_series_timers(&self) -> Result<Vec<SeriesTimerInfoDto>, ServiceError>;
+    /// Lists the recurring (series) recording timers, in the query's order.
+    ///
+    /// Port of `LiveTvManager.GetSeriesTimers` (v10.11.8 LiveTvManager.cs:904-930):
+    /// `SortBy == "Priority"` orders by priority then name, anything else orders
+    /// by name alone.
+    async fn get_series_timers(
+        &self,
+        query: &ferrofin_model::live_tv::SeriesTimerQuery,
+    ) -> Result<Vec<SeriesTimerInfoDto>, ServiceError>;
 
     /// Gets a single series timer by id, or `None` when unknown.
     async fn get_series_timer(&self, id: &str) -> Result<Option<SeriesTimerInfoDto>, ServiceError>;
 
-    /// Creates (or replaces) a series timer, returning its id.
+    /// Creates a series timer, returning the id the server minted for it.
     async fn create_series_timer(&self, timer: SeriesTimerInfoDto) -> Result<String, ServiceError>;
 
-    /// Updates the series timer with the given id.
+    /// Updates the series timer with the given id, or does nothing when no such
+    /// timer exists (C# `UpdateSeriesTimerAsync`'s `if (instance is not null)`).
     async fn update_series_timer(
         &self,
         id: &str,
@@ -471,6 +614,9 @@ pub trait LiveTvManager: Send + Sync {
     ) -> Result<(), ServiceError>;
 
     /// Cancels (deletes) the series timer and its pending timers.
+    ///
+    /// Returns [`ServiceError::NotFound`] when no such series timer exists
+    /// (C# `LiveTvManager.CancelSeriesTimer`).
     async fn cancel_series_timer(&self, id: &str) -> Result<(), ServiceError>;
 
     /// The defaults a client seeds a new timer form with, for a programme or in
@@ -534,6 +680,27 @@ pub trait LiveTvManager: Send + Sync {
         timer_id: &str,
     ) -> Result<Option<String>, ServiceError> {
         let _ = timer_id;
+        Ok(None)
+    }
+
+    /// `BaseItem.MediaType` of a Live TV channel or DVR recording — `"Video"`,
+    /// `"Audio"`, or `None` when `id` is neither.
+    ///
+    /// The media-source manager needs it for the per-user
+    /// `SupportsTranscoding`/`SupportsDirectStream` overwrite
+    /// (`MediaSourceManager.GetPlaybackMediaSources`, v10.11.8
+    /// Emby.Server.Implementations/Library/MediaSourceManager.cs:204-217),
+    /// which branches on `item.MediaType`. Upstream reads it off the
+    /// `LiveTvChannel`/recording `BaseItem` it already has in hand; Ferrofin's
+    /// channels and recordings are not `BaseItems` rows, so the Live TV
+    /// manager answers for them. `LiveTvChannel.MediaType` is
+    /// `ChannelType == Radio ? Audio : Video`, and a recording inherits the
+    /// media type of the channel it was captured from.
+    ///
+    /// The default reports `None`, which leaves the source exactly as the
+    /// tuner built it — upstream's `user is null` behaviour.
+    async fn live_tv_media_type(&self, id: Uuid) -> Result<Option<String>, ServiceError> {
+        let _ = id;
         Ok(None)
     }
 

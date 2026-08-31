@@ -145,14 +145,7 @@ impl FerrofinPeopleRepository {
             .bind(name)
             .bind(&clean)
             .bind(person_sort_name(name))
-            .bind(crate::kinds::presentation_unique_key(
-                BaseItemKind::Person,
-                Uuid::parse_str(target).unwrap_or_default(),
-                Some(name),
-                None,
-                None,
-                None,
-            ))
+            .bind(person_presentation_key(target, name))
             .execute(&mut **tx)
             .await
             .map_err(db_err)?;
@@ -613,6 +606,54 @@ impl FerrofinPeopleRepository {
     }
 }
 
+/// The `INSERT OR IGNORE` that materializes the browsable Person item.
+///
+/// One row per name with the deterministic Jellyfin id (`Person.GetPath`-derived),
+/// shared by every credit type, so a favourite written against it reads back
+/// from every surface.
+///
+/// `SortName` is persisted rather than derived on read — it is what
+/// `ORDER BY SortName` and `nameStartsWith` read — and so is
+/// [`person_presentation_key`].
+fn person_item_insert<'a>(
+    item_id: &'a str,
+    type_name: &'a str,
+    name: &'a str,
+) -> sqlx::query::Query<'a, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'a>> {
+    sqlx::query(
+        r#"INSERT OR IGNORE INTO "BaseItems"
+           ("Id","Type","Name","CleanName","SortName","PresentationUniqueKey",
+            "IsFolder","IsInMixedFolder",
+            "IsLocked","IsMovie","IsRepeat","IsSeries","IsVirtualItem")
+           VALUES (?1,?2,?3,?4,?5,?6,0,0,0,0,0,0,0)"#,
+    )
+    .bind(item_id)
+    .bind(type_name)
+    .bind(name)
+    .bind(crate::text_util::get_clean_value(name))
+    .bind(person_sort_name(name))
+    .bind(person_presentation_key(item_id, name))
+}
+
+/// `Person-{Name}` — the `PresentationUniqueKey` a materialized Person row
+/// carries, exactly as `kinds::presentation_unique_key` builds it.
+///
+/// Both inserts that materialize a Person go through this. They produce the
+/// same row shape, and the scan-path one used to forget the column — so a
+/// person the scanner created was keyless where one the credit path created was
+/// not, and where a real 10.11.8 writes the key on both. The column is what
+/// `GROUP BY PresentationUniqueKey` reads, and SQLite groups NULLs together.
+fn person_presentation_key(item_id: &str, name: &str) -> String {
+    crate::kinds::presentation_unique_key(
+        BaseItemKind::Person,
+        Uuid::parse_str(item_id).unwrap_or_default(),
+        Some(name),
+        None,
+        None,
+        None,
+    )
+}
+
 #[async_trait]
 impl PeopleRepository for FerrofinPeopleRepository {
     async fn get_people(
@@ -794,23 +835,10 @@ impl PeopleRepository for FerrofinPeopleRepository {
             // identity seam is not wired (unit tests).
             let item_id = self.person_item_id(name).unwrap_or_else(|| id.clone());
             if let Some(type_name) = person_type_name {
-                let clean = crate::text_util::get_clean_value(name);
-                sqlx::query(
-                    // `SortName` persisted here for the same reason as above:
-                    // it is what `ORDER BY SortName` and `nameStartsWith` read.
-                    r#"INSERT OR IGNORE INTO "BaseItems"
-                       ("Id","Type","Name","CleanName","SortName","IsFolder","IsInMixedFolder",
-                        "IsLocked","IsMovie","IsRepeat","IsSeries","IsVirtualItem")
-                       VALUES (?1,?2,?3,?4,?5,0,0,0,0,0,0,0)"#,
-                )
-                .bind(&item_id)
-                .bind(type_name)
-                .bind(name)
-                .bind(&clean)
-                .bind(person_sort_name(name))
-                .execute(&mut *tx)
-                .await
-                .map_err(db_err)?;
+                person_item_insert(&item_id, type_name, name)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(db_err)?;
             }
 
             // Enrich (fetch a biography for) any person whose item has no overview

@@ -39,6 +39,7 @@ use uuid::Uuid;
 
 use crate::auth::{RequireAdmin, RequireAuth};
 use crate::error::ApiError;
+use crate::extract::JsonBody;
 use crate::handlers::image_upload::decode_base64;
 use crate::handlers::items::resolve_user_opt;
 use crate::handlers::queue_high_priority_refresh;
@@ -138,7 +139,7 @@ async fn upload_subtitle(
     State(state): State<AppState>,
     RequireAuth(_auth): RequireAuth,
     Path(item_id): Path<Uuid>,
-    Json(body): Json<UploadSubtitleDto>,
+    JsonBody(body): JsonBody<UploadSubtitleDto>,
 ) -> Result<StatusCode, ApiError> {
     require_item(&state, item_id).await?;
     let content = decode_base64(&body.data)

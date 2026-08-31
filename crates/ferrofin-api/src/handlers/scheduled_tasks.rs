@@ -26,6 +26,7 @@ use ferrofin_model::tasks::{TaskInfo, TaskTriggerInfo};
 
 use crate::auth::RequireAdmin;
 use crate::error::ApiError;
+use crate::extract::JsonSeqBody;
 use crate::state::AppState;
 
 /// Query parameters for `GET /ScheduledTasks` — the hidden/enabled filters.
@@ -176,7 +177,7 @@ async fn update_task_triggers(
     State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
     Path(task_id): Path<String>,
-    Json(triggers): Json<Vec<TaskTriggerInfo>>,
+    JsonSeqBody(triggers): JsonSeqBody<Vec<TaskTriggerInfo>>,
 ) -> Result<StatusCode, ApiError> {
     state.tasks.update_triggers(&task_id, &triggers).await?;
     Ok(StatusCode::NO_CONTENT)

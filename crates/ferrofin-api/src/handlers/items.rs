@@ -312,6 +312,14 @@ struct ItemsQuery {
     /// A single person name filter.
     #[serde(default)]
     person: Option<String>,
+    /// Comma-delimited [`LocationType`](ferrofin_model::entities::LocationType)
+    /// set to include. Drives `IsVirtualItem` — see
+    /// [`apply_location_types`](crate::handlers::query_parse::apply_location_types).
+    #[serde(default)]
+    location_types: Option<String>,
+    /// Comma-delimited `LocationType` set to exclude.
+    #[serde(default)]
+    exclude_location_types: Option<String>,
     /// Whether to compute the total record count (defaults `true`).
     #[serde(default)]
     enable_total_record_count: Option<bool>,
@@ -399,6 +407,14 @@ async fn get_items(
     // parent really is the user root (an ABSENT `parentId` is, per
     // `LibraryManager.GetParentItem(null, userId)`).
     internal.user_root_children = !internal.recursive && internal.item_ids.is_empty();
+    // `IsVirtualItem` is driven ONLY by these two parameters on this route
+    // (v10.11.8 Jellyfin.Api/Controllers/ItemsController.cs:437-447) — there is
+    // no `isVirtualItem` query parameter to set it directly.
+    crate::handlers::query_parse::apply_location_types(
+        &mut internal.is_virtual_item,
+        query.location_types.as_deref(),
+        query.exclude_location_types.as_deref(),
+    );
     // C# `ApplyFilters` translates the `filters` flag set onto the tri-state
     // fields, rejecting contradictory pairs with a `400`. Token parsing is
     // lenient + case-insensitive like ASP.NET's binder: jellyfin-web sends
@@ -900,6 +916,26 @@ pub(crate) fn parse_order_by(
         .collect()
 }
 
+/// Whether a parent row is itself a container of the requested kind, so the
+/// browse is a plain direct-children read and must NOT be re-rooted (C#
+/// `item is not BoxSet/Playlist`, plus the playlists library itself).
+///
+/// Takes the row's **stored** short type name. That is the trap this guards:
+/// 10.11.8 persists the playlists plugin folder as
+/// `Emby.Server.Implementations.Playlists.PlaylistsFolder`, while
+/// `ManualPlaylistsFolder` is only `PlaylistsFolder.GetClientTypeName()` — and
+/// the spelling an older Ferrofin wrote into the column. Both have to be
+/// recognised, or the Playlists-library browse jellyfin-web issues
+/// (`GET /Items?parentId=<playlistsFolder>&includeItemTypes=Playlist`) falls
+/// through to `linked_child_ancestor_ids` re-rooting on exactly the databases
+/// that spell it the upstream way.
+fn is_direct_children_browse(short_type_name: &str) -> bool {
+    matches!(
+        short_type_name,
+        "BoxSet" | "Playlist" | "PlaylistsFolder" | "ManualPlaylistsFolder"
+    )
+}
+
 /// Re-roots a BoxSet/Playlist-typed browse from a normal library parent onto a
 /// linked-child-ancestor constraint (port of `ItemsController.GetItems`'s
 /// `linkedChildAncestorIds` block).
@@ -933,7 +969,7 @@ async fn redirect_container_browse(
     // The parent is itself a container of the requested kind → a direct
     // children browse, no re-rooting (C# `item is not BoxSet/Playlist`).
     let short = parent.type_.rsplit('.').next().unwrap_or(&parent.type_);
-    if short == "BoxSet" || short == "Playlist" || short == "ManualPlaylistsFolder" {
+    if is_direct_children_browse(short) {
         return;
     }
     // A browse of the boxsets/playlists library itself keeps plain parent
@@ -1030,6 +1066,27 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
 mod tests {
     use super::*;
     use ferrofin_model::querying::ItemFields;
+
+    /// Both stored spellings of the playlists plugin folder are a direct-children
+    /// browse. `PlaylistsFolder` is the FQN 10.11.8 persists;
+    /// `ManualPlaylistsFolder` is `GetClientTypeName()`, which an older Ferrofin
+    /// wrote into the column. Recognising only the latter re-rooted the
+    /// Playlists-library browse on a fresh or adopted database.
+    #[test]
+    fn both_playlists_folder_spellings_are_a_direct_children_browse() {
+        for short in [
+            "BoxSet",
+            "Playlist",
+            "PlaylistsFolder",
+            "ManualPlaylistsFolder",
+        ] {
+            assert!(is_direct_children_browse(short), "{short}");
+        }
+        // An ordinary library parent is what the re-rooting exists for.
+        for short in ["CollectionFolder", "Folder", "UserRootFolder", "Series"] {
+            assert!(!is_direct_children_browse(short), "{short}");
+        }
+    }
 
     // GET /Items must honour the camelCase `fields` param (the OpenAPI contract's casing, what
     // jellyfin-web sends) and map it onto DtoOptions. Regression for the bug where the handler

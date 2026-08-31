@@ -70,4 +70,46 @@ impl MockServer {
     pub async fn always(body: &str) -> Self {
         Self::start(vec![("/", body.to_owned())]).await
     }
+
+    /// Like [`start`](Self::start) but each route also names the
+    /// `Content-Type` to answer with — needed by the artwork writer, whose
+    /// whole job is to believe the RESPONSE's media type rather than the URL's
+    /// suffix. An unmatched request gets `404`.
+    pub async fn start_typed(routes: Vec<(&'static str, &'static str, Vec<u8>)>) -> Self {
+        let routes = Arc::new(routes);
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock");
+        let port = listener.local_addr().expect("addr").port();
+        let handle = tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let routes = Arc::clone(&routes);
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 16 * 1024];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let path = req
+                        .lines()
+                        .next()
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .unwrap_or("");
+                    let mut resp = match routes.iter().find(|(k, _, _)| path.contains(k)) {
+                        Some((_, content_type, body)) => format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        )
+                        .into_bytes(),
+                        None => b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+                    };
+                    if let Some((_, _, body)) = routes.iter().find(|(k, _, _)| path.contains(k)) {
+                        resp.extend_from_slice(body);
+                    }
+                    let _ = sock.write_all(&resp).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        Self {
+            base_url: format!("http://127.0.0.1:{port}"),
+            handle,
+        }
+    }
 }

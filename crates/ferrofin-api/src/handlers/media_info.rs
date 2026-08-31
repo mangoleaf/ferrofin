@@ -24,6 +24,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
+use crate::extract::JsonBody;
 use crate::handlers::item_update::opt_i32;
 use crate::handlers::items::{effective_user_id, resolve_user, user_uuid};
 use crate::state::AppState;
@@ -626,9 +627,9 @@ async fn post_playback_info(
     RequireAuth(auth): RequireAuth,
     Path(item_id): Path<Uuid>,
     Query(query): Query<PlaybackInfoQuery>,
-    body: Option<Json<PlaybackInfoBody>>,
+    body: Option<JsonBody<PlaybackInfoBody>>,
 ) -> Result<Json<PlaybackInfoResponse>, ApiError> {
-    let body = body.map(|Json(b)| b).unwrap_or_default();
+    let body = body.map(|JsonBody(b)| b).unwrap_or_default();
     let stream_selection = StreamSelection {
         audio_stream_index: query.audio_stream_index.or(body.audio_stream_index),
         subtitle_stream_index: query.subtitle_stream_index.or(body.subtitle_stream_index),
@@ -791,9 +792,9 @@ async fn open_live_stream(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
     Query(query): Query<OpenLiveStreamQuery>,
-    body: Option<Json<OpenLiveStreamDto>>,
+    body: Option<JsonBody<OpenLiveStreamDto>>,
 ) -> Result<Json<LiveStreamResponse>, ApiError> {
-    let dto = body.map(|Json(dto)| dto).unwrap_or_default();
+    let dto = body.map(|JsonBody(dto)| dto).unwrap_or_default();
     // C# `userId ??= openLiveStreamDto?.UserId; userId =
     // RequestHelpers.GetUserId(User, userId)`: the query id wins over the body
     // id, and naming another user requires the administrator role. The resolved

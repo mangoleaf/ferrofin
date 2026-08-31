@@ -10,8 +10,14 @@
 //! rejected. Every mutating route (install/uninstall/repository-set/cancel/
 //! enable/disable/configuration-write) requires an administrator, porting
 //! Jellyfin's `RequiresElevation` policy; a WASM plugin's config JSON is
-//! handed straight to the guest, so config writes are guest input. Reads
-//! stay plain-auth.
+//! handed straight to the guest, so config writes are guest input. So do the
+//! READS: `PluginsController` carries `[Authorize(Policy =
+//! Policies.RequiresElevation)]` at CLASS level (v10.11.8
+//! Jellyfin.Api/Controllers/PluginsController.cs:25, byte-identical on master)
+//! with exactly one `[AllowAnonymous]` override, `GetPluginImage` (:221). A
+//! plugin's configuration holds its credentials — Ferrofin used to hand
+//! `{"ApiKey":…,"Username":…,"Password":…}` to any authenticated account,
+//! guest profiles included.
 //!
 //! - `GET /Plugins` — installed plugins
 //! - `GET|POST /Plugins/{id}/Configuration` — read/write a plugin's config
@@ -40,6 +46,7 @@ use uuid::Uuid;
 
 use crate::auth::{RequireAdmin, RequireAuth};
 use crate::error::ApiError;
+use crate::extract::JsonSeqBody;
 use crate::state::AppState;
 
 /// Ports Jellyfin's `RequiresElevation` policy for the plugin-mutating
@@ -77,7 +84,10 @@ async fn require_admin(
 /// so the framework parses before the action runs: a string that is not a
 /// `Version` is a model-binding failure (`400`), never a lookup miss. `Version`
 /// accepts **two to four** dot-separated non-negative `Int32`s, so `"10"` and
-/// `"notaversion"` both fail here exactly as they do upstream.
+/// `"notaversion"` both fail here exactly as they do upstream, and an absent
+/// component is `-1` — which is why a live 10.11.8 answers 404 for `10.11.8`
+/// against an installed `10.11.8.0` (v10.11.8
+/// Emby.Server.Implementations/Plugins/PluginManager.cs:293-311).
 fn parse_dotnet_version(raw: &str) -> Option<[i64; 4]> {
     let parts: Vec<&str> = raw.split('.').collect();
     if !(2..=4).contains(&parts.len()) {
@@ -112,7 +122,8 @@ async fn plugin_at_version(
     version: &str,
 ) -> Result<PluginDescriptor, ApiError> {
     let requested = parse_dotnet_version(version)
-        .ok_or_else(|| ApiError::BadRequest(format!("{version} is not a version")))?;
+        // The model binder's own wording, which is what a client reads.
+        .ok_or_else(|| ApiError::BadRequest(format!("The value '{version}' is not valid.")))?;
     let not_found = || ApiError::NotFound(format!("plugin {plugin_id} {version}"));
     let descriptor = state
         .plugins
@@ -153,13 +164,17 @@ fn to_plugin_info(d: PluginDescriptor) -> PluginInfo {
 #[utoipa::path(
     get,
     path = "/Plugins",
-    responses((status = 200, description = "Installed plugins returned", body = [PluginInfo])),
+    responses(
+        (status = 200, description = "Installed plugins returned", body = [PluginInfo]),
+        (status = 403, description = "Administrator access required")
+    ),
     tag = "ferrofin"
 )]
 async fn get_plugins(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAuth(auth): RequireAuth,
 ) -> Result<Json<Vec<PluginInfo>>, ApiError> {
+    require_admin(&state, &auth).await?;
     let mut plugins = state.plugins.list_plugins().await?;
     // `PluginsController.GetPlugins` is `_pluginManager.Plugins.OrderBy(p => p.Name)`
     // (v10.11.8 PluginsController.cs:55-57). Registration order is not the wire
@@ -180,15 +195,19 @@ async fn get_plugins(
     params(("pluginId" = String, Path, description = "Plugin id")),
     responses(
         (status = 200, description = "Configuration returned"),
+        (status = 403, description = "Administrator access required"),
         (status = 404, description = "Plugin not found")
     ),
     tag = "ferrofin"
 )]
 async fn get_plugin_configuration(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAuth(auth): RequireAuth,
     Path(plugin_id): Path<Uuid>,
 ) -> Result<Response, ApiError> {
+    // A plugin's configuration is where its credentials live; the C# gates this
+    // read at class level (PluginsController.cs:25).
+    require_admin(&state, &auth).await?;
     let bytes = state.plugins.get_plugin_configuration(plugin_id).await?;
     Ok(([(header::CONTENT_TYPE, "application/json")], bytes).into_response())
 }
@@ -233,7 +252,8 @@ async fn update_plugin_configuration(
     ),
     responses(
         (status = 204, description = "Plugin enabled"),
-        (status = 404, description = "Plugin not found")
+        (status = 400, description = "Version is not a valid version string"),
+        (status = 404, description = "Plugin or version not found")
     ),
     tag = "ferrofin"
 )]
@@ -258,7 +278,8 @@ async fn enable_plugin(
     ),
     responses(
         (status = 204, description = "Plugin disabled"),
-        (status = 404, description = "Plugin not found")
+        (status = 400, description = "Version is not a valid version string"),
+        (status = 404, description = "Plugin or version not found")
     ),
     tag = "ferrofin"
 )]
@@ -345,7 +366,8 @@ async fn uninstall_plugin_by_version(
     ),
     responses(
         (status = 200, description = "Image returned"),
-        (status = 404, description = "Plugin or image not found")
+        (status = 400, description = "Version is not a valid version string"),
+        (status = 404, description = "Plugin, version or image not found")
     ),
     tag = "ferrofin"
 )]
@@ -353,11 +375,21 @@ async fn get_plugin_image(
     State(state): State<AppState>,
     Path((plugin_id, version)): Path<(Uuid, String)>,
 ) -> Result<Response, ApiError> {
+    // No auth extractor: this is the ONE action upstream marks
+    // `[AllowAnonymous]` (v10.11.8 PluginsController.cs:221), against the
+    // controller's class-level `RequiresElevation`.
     plugin_at_version(&state, plugin_id, &version).await?;
     match state.plugins.plugin_image(plugin_id).await? {
-        Some(image) => {
-            Ok(([(header::CONTENT_TYPE, image.content_type)], image.data).into_response())
-        }
+        Some(image) => Ok((
+            [
+                (header::CONTENT_TYPE, image.content_type),
+                // `Response.Headers.ContentDisposition = "attachment"` before
+                // the `PhysicalFile(...)`, in both trees.
+                (header::CONTENT_DISPOSITION, "attachment".to_owned()),
+            ],
+            image.data,
+        )
+            .into_response()),
         None => Err(ApiError::NotFound(format!("image for plugin {plugin_id}"))),
     }
 }
@@ -371,22 +403,29 @@ async fn get_plugin_image(
     path = "/Plugins/{pluginId}/Manifest",
     params(("pluginId" = String, Path, description = "Plugin id")),
     responses(
-        (status = 200, description = "Manifest returned"),
+        (status = 200, description = "Manifest returned", body = PluginManifest),
+        (status = 403, description = "Administrator access required"),
         (status = 404, description = "Plugin not found")
     ),
     tag = "ferrofin"
 )]
 async fn get_plugin_manifest(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAuth(auth): RequireAuth,
     Path(plugin_id): Path<Uuid>,
 ) -> Result<Json<PluginManifest>, ApiError> {
+    require_admin(&state, &auth).await?;
     let Some(d) = state.plugins.get_plugin(plugin_id).await? else {
         return Err(ApiError::NotFound(format!("plugin {plugin_id}")));
     };
     // `PluginManifest` is the wire type upstream returns here, and it is the one
     // DTO in the API that is camelCase (every property carries an explicit
-    // `[JsonPropertyName]`), with `Id` spelled `guid`. See
+    // `[JsonPropertyName]`), with `Id` spelled `guid`. The vendored contract
+    // carries no `PluginManifest` schema component, which is why the Layer-1
+    // sweep could never see the shape — but
+    // `MediaBrowser.Common/Plugins/PluginManifest.cs` pins it exactly. Ferrofin
+    // used to hand-roll five PascalCase keys and a hyphenated `Id` here, which
+    // shares not one key with what a client reads. See
     // [`PluginManifest::manifestless`] for why the descriptive fields are empty:
     // a plugin with no `meta.json` on disk gets a dummy record carrying only
     // id/name/version/status, which is exactly Ferrofin's situation for every
@@ -428,7 +467,7 @@ async fn get_repositories(
 async fn set_repositories(
     State(state): State<AppState>,
     RequireAdmin(auth): RequireAdmin,
-    Json(repositories): Json<Vec<RepositoryInfo>>,
+    JsonSeqBody(repositories): JsonSeqBody<Vec<RepositoryInfo>>,
 ) -> Result<StatusCode, ApiError> {
     require_admin(&state, &auth).await?;
     state.plugins.set_repositories(repositories).await?;

@@ -33,6 +33,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
+use crate::extract::JsonBody;
 use crate::handlers::items::{resolve_user, user_uuid};
 use crate::handlers::session_ctx::{current_session, current_session_id, notify_user_data_changed};
 use crate::state::AppState;
@@ -200,7 +201,7 @@ async fn unmark_played_for_user(
 async fn report_playback_start(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Json(mut info): Json<PlaybackStartInfo>,
+    JsonBody(mut info): JsonBody<PlaybackStartInfo>,
 ) -> Result<StatusCode, ApiError> {
     info.play_method = validate_play_method(info.play_method);
     info.session_id = Some(current_session_id(&state, &auth).await?);
@@ -371,7 +372,7 @@ async fn log_playback_activity(
 async fn report_playback_progress(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Json(mut info): Json<PlaybackProgressInfo>,
+    JsonBody(mut info): JsonBody<PlaybackProgressInfo>,
 ) -> Result<StatusCode, ApiError> {
     info.play_method = validate_play_method(info.play_method);
     info.session_id = Some(current_session_id(&state, &auth).await?);
@@ -437,7 +438,7 @@ async fn ping_playback_session(
 async fn report_playback_stopped(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Json(mut info): Json<PlaybackStopInfo>,
+    JsonBody(mut info): JsonBody<PlaybackStopInfo>,
 ) -> Result<StatusCode, ApiError> {
     info.session_id = Some(current_session_id(&state, &auth).await?);
     // A stop report kills the session's live transcode and deletes its partial

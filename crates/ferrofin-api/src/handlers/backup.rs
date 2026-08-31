@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::auth::RequireAdmin;
 use crate::error::ApiError;
+use crate::extract::JsonBody;
 use crate::state::AppState;
 
 /// The SQLite database file name inside the data directory.
@@ -348,14 +349,14 @@ fn add_dir_to_zip<W: std::io::Write + std::io::Seek>(
 async fn create_backup(
     State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
-    body: Option<Json<BackupOptions>>,
+    body: Option<JsonBody<BackupOptions>>,
 ) -> Result<Json<BackupManifest>, ApiError> {
     let Ok(_permit) = BACKUP_IN_FLIGHT.try_acquire() else {
         return Err(ApiError::ServiceUnavailable(
             "a backup is already in progress".to_owned(),
         ));
     };
-    let options = body.map(|Json(b)| b).unwrap_or_default();
+    let options = body.map(|JsonBody(b)| b).unwrap_or_default();
     let roots = TreeRoots::from_paths(state.config.application_paths().as_ref());
     let dir = backups_dir(&state);
     let now = Utc::now();
@@ -464,10 +465,10 @@ fn write_backup(
 async fn restore_backup(
     State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
-    body: Option<Json<BackupRestoreRequest>>,
+    body: Option<JsonBody<BackupRestoreRequest>>,
 ) -> Result<axum::http::StatusCode, ApiError> {
     let name = body
-        .and_then(|Json(b)| b.archive_file_name)
+        .and_then(|JsonBody(b)| b.archive_file_name)
         .as_deref()
         .and_then(|p| Path::new(p).file_name().and_then(|n| n.to_str()))
         .filter(|n| !n.is_empty())

@@ -260,10 +260,20 @@ def provision_opensubtitles(base, target, token):
         raise SystemExit(f"{target}: opensubtitles configuration failed (status {st})")
 
 
+#: The fake HDHomeRun device the `hdhomerun-source` compose service runs. Both servers get
+#: a `hdhomerun` tuner host pointed here, so the SECOND tuner backend is exercised — and
+#: diffed — against one real device interface rather than against nothing.
+#:
+#: Overridable so a run against a PHYSICAL HDHomeRun can point at it instead; unset it to
+#: provision the M3U tuner alone.
+LIVETV_HDHR = os.environ.get("LIVETV_HDHR", "http://hdhomerun-source:8100")
+
+
 def provision_livetv(base, token):
-    """The Live TV fixture: one M3U tuner host + one XMLTV listings provider (both read
-    from the shared mount), then the guide refresh task, waited on until channels and
-    programmes are listed. No-op when the fixture is off (LIVETV_M3U unset)."""
+    """The Live TV fixture: an M3U tuner host, an HDHomeRun tuner host (the fake device on
+    the compose network) and one XMLTV listings provider, then the guide refresh task,
+    waited on until channels and programmes are listed. No-op when the fixture is off
+    (LIVETV_M3U unset)."""
     m3u, xmltv = os.environ.get("LIVETV_M3U"), os.environ.get("LIVETV_XMLTV")
     if not m3u or not xmltv:
         return
@@ -272,6 +282,23 @@ def provision_livetv(base, token):
                                "ImportFavoritesOnly": False, "AllowHWTranscoding": False}))
     if st >= 300:
         raise SystemExit(f"{base}: add tuner host failed {st}: {raw[:200]!r}")
+    if LIVETV_HDHR:
+        # `TunerHostManager.SaveTunerHost` runs the host's `Validate` before storing, so a
+        # non-2xx here means the device did not answer discover.json on ONE of the servers
+        # — which is a finding, not something to skip past.
+        st, raw = http("POST", base + "/LiveTv/TunerHosts", token,
+                       # `AllowHWTranscoding` is what opens
+                       # `GetChannelStreamMediaSources`' six-profile fan-out
+                       # (HdHomerunHost.cs:339-379) on a device whose
+                       # ModelNumber contains "hdtc" — the fake is an EXTEND, so
+                       # with it on BOTH servers emit heavy / internet540 /
+                       # internet480 / internet360 / internet240 / mobile /
+                       # native and every `GetMediaSource` arm is diffed. Off,
+                       # only `native` is, which is one arm of six.
+                       json.dumps({"Type": "hdhomerun", "Url": LIVETV_HDHR,
+                                   "ImportFavoritesOnly": False, "AllowHWTranscoding": True}))
+        if st >= 300:
+            raise SystemExit(f"{base}: add hdhomerun tuner host failed {st}: {raw[:200]!r}")
     st, raw = http("POST", base + "/LiveTv/ListingProviders?validateListings=false", token,
                    json.dumps({"Type": "xmltv", "Path": xmltv, "EnableAllTuners": True}))
     if st >= 300:
@@ -361,6 +388,37 @@ def resolve_fixtures(base, token, user):
     session = sessions[0]["Id"] if sessions else None
     logs = get_json(base, "/System/Logs", token) or []
     log_name = logs[0]["Name"] if logs and logs[0].get("Name") else None
+    # `GET /LiveTv/Channels/{channelId}` and `/LiveTv/Channels/{channelId}/...`
+    # were reported "unresolved path param" — the sweep never had a channel id to
+    # substitute, so a route with a real implementation behind it went unprobed.
+    # The Live TV fixture provisions the tuner, so the lineup is right there.
+    channels = get_json(base, f"/LiveTv/Channels?userId={user}&limit=1", token) or {}
+    channel = ((channels.get("Items") or [{}])[0]).get("Id")
+    # `{pluginId}`/`{version}` were reported "unresolved path param" on five
+    # plugin ops. The seed un-skips the TWO the breadth sweep actually fires —
+    # `GET /Plugins/{id}/Configuration` and `GET /Plugins/{id}/{version}/Image`.
+    # The other three (POST Configuration, POST Manifest, DELETE
+    # {id}/{version}) are non-GET and are stamped "write: not fired by the
+    # breadth sweep" further down regardless of the seed, which is the SAFE
+    # behaviour and not an oversight: a fired DELETE would uninstall a bundled
+    # plugin on the shared Jellyfin container. Their Layer-2 probes in reads.py
+    # own them.
+    #
+    # Each side is seeded from its OWN `GET /Plugins`, which is the same thing
+    # the `groupId` seed does above and for the same reason: the value only has
+    # to be a real one on the server being asked, and what the breadth row then
+    # measures is status parity — that both servers answer the same way for a
+    # plugin id that exists on them.
+    #
+    # The 200 BODY on these rows is out of reach by construction and must not be
+    # claimed: the two servers share no plugin id (Ferrofin ships compiled-in
+    # extensions and WASM components, stock Jellyfin ships five bundled .NET
+    # provider plugins), so no shared subject exists to body-diff. reads.py's
+    # `plugin_invariants` is what earns the verification, by holding each
+    # server's OWN answer to the same shape.
+    plugins = get_json(base, "/Plugins", token) or []
+    plugin = plugins[0].get("Id") if plugins else None
+    plugin_version = plugins[0].get("Version") if plugins else None
 
     def source_id(item_id):
         """The item's media source id from PlaybackInfo — what a client sends as
@@ -379,6 +437,37 @@ def resolve_fixtures(base, token, user):
         "SeasonId": season or any_item, "userId": user, "sessionId": session,
         "name": genre, "genreName": genre, "imageType": "Primary",
         "imageIndex": "0", "index": "0", "newIndex": "0", "routeIndex": "0",
+        # `channelId` is TWO different id spaces in this contract: a Live TV
+        # channel under /LiveTv/, and a plugin-channel under /Channels/. It is
+        # scoped by path (see PATH_SCOPED) rather than put in `fx`, so filling
+        # one cannot silently probe the other with a wrong id.
+        "_livetv_channel": channel,
+        # The /Channels/ half of that split — same argument as `groupId` below.
+        # `ChannelsController` serves `IChannel` PROVIDER channels, and neither
+        # the v10.11.8 tree nor master contains a single `IChannel`
+        # implementation (`git grep -l "IChannel" -- "*.cs"` returns only the
+        # interface and its three consumers on both), so no `Channel` item can
+        # exist on either server and the response CANNOT depend on the value. A
+        # literal GUID is therefore the only possible seed and the right one:
+        # the breadth row then measures the 400/400 status parity
+        # (`GetChannel(id)` is null -> `GetChannelProvider(null)` ->
+        # `ArgumentNullException.ThrowIfNull` -> `ExceptionMiddleware`
+        # `ArgumentException => 400`) instead of skipping the op. It stays a
+        # NON-deep row here — sweep body-diffs only 200/200 — which is correct:
+        # there is no 200 body on either server, ever. Leaving it unseeded is
+        # what hid a live Ferrofin bug (a fabricated 200 `ChannelFeatures`
+        # echoing the requested id) behind a "requires-channel-plugin" label.
+        "_plugin_channel": "11111111-1111-1111-1111-111111111111",
+        # `{groupId}` occurs in exactly ONE contract path, and
+        # `LiveTvController.GetRecordingGroup` (v10.11.8) is `[Obsolete]` with
+        # the body `return NotFound();` — no `RecordingGroup` lookup exists
+        # anywhere in the 10.11.8 tree, so the response cannot depend on the
+        # value. A literal GUID is therefore the only possible seed AND the
+        # right one: the breadth row then measures the 404/404 status parity
+        # instead of skipping the op. It stays a NON-deep row here (sweep
+        # body-diffs only 200/200); reads.py's `recording_group_invariants`
+        # is what earns the verification.
+        "groupId": "00000000-0000-0000-0000-000000000000",
         "year": "2020", "container": "mp4", "segmentContainer": "ts", "format": "ts",
         "routeFormat": "ts", "width": "400", "maxWidth": "400", "maxHeight": "400",
         "percentPlayed": "0", "unplayedCount": "0", "tag": "x", "language": "eng",
@@ -393,6 +482,13 @@ def resolve_fixtures(base, token, user):
         # this the probe was literally `GET /Packages/Action` — 404 on both
         # servers, scored status-conformant, and the lookup never exercised.
         "_package": first_package_name(base, token),
+        "pluginId": plugin,
+        # `{version}` occurs only under `/Plugins/`, and it must be the
+        # INSTALLED one: `PluginManager.GetPlugin(id, version)` matches with
+        # `Version.Equals` (v10.11.8 Emby.Server.Implementations/Plugins/
+        # PluginManager.cs:293-311), so any other string is a 404 and the row
+        # would measure the miss path instead of the hit path.
+        "_plugin_version": plugin_version,
     }
     return {k: v for k, v in fx.items() if v is not None}
 
@@ -479,8 +575,25 @@ QUERY_FILL = {
 }
 
 
+# Path params whose meaning depends on where they appear. `(path prefix, param)
+# -> fixture key`: only a path under the prefix gets the value, so a name shared
+# by two unrelated id spaces cannot cross-contaminate.
+PATH_SCOPED = {("/LiveTv/", "channelId"): "_livetv_channel",
+               ("/Channels/", "channelId"): "_plugin_channel",
+               ("/Plugins/", "version"): "_plugin_version"}
+
+
+def scoped_fixtures(path, fixtures):
+    """`fixtures` plus the path-scoped entries that apply to `path`."""
+    extra = {param: fixtures[key]
+             for (prefix, param), key in PATH_SCOPED.items()
+             if path.startswith(prefix) and fixtures.get(key)}
+    return {**fixtures, **extra} if extra else fixtures
+
+
 def build_url(path, fixtures):
     """Fill path params from one server's fixtures. Return (url, skip_reason_or_None)."""
+    fixtures = scoped_fixtures(path, fixtures)
     params = set(re.findall(r"{(\w+)}", path))
     missing = [p for p in params if p not in fixtures]
     if missing:
@@ -580,9 +693,17 @@ def sweep(ferrofin_url, jellyfin_url):
             if method not in METHODS:
                 continue
             opkey = f"{method.upper()} {path}"
-            if method not in ("get", "head"):   # writes are destructive/ordered → Layer-2 journeys
+            # Non-GET ops are ordered and often destructive, so the breadth sweep
+            # does not fire them; a Layer-2 probe owns each one. Which probe is
+            # the OP's business, not this stamp's: the RemoteSearch/<Kind> family
+            # is a POST-shaped SEARCH and lives in reads.py, everything that
+            # mutates lives in journeys.py. (The note used to say "deferred to
+            # Layer-2 journey", which named the wrong layer for those rows and
+            # asserted a state this project does not have — see CLAUDE.md.)
+            if method not in ("get", "head"):
                 results[opkey] = {"status_conformant": None, "schema_valid": None,
-                                  "note": "write: deferred to Layer-2 journey"}
+                                  "note": "write: not fired by the breadth sweep — "
+                                          "owned by a Layer-2 probe"}
                 continue
             fx_h = audio_fixtures(fixtures) if path.startswith("/Audio/") else fixtures
             fx_j = audio_fixtures(fixtures_j) if path.startswith("/Audio/") else fixtures_j
@@ -677,8 +798,19 @@ def selfcheck():
     fx = {"itemId": "abc", "userId": "u1"}
     url, skip = build_url("/Items/{itemId}", fx)
     assert url == "/Items/abc" and skip is None, (url, skip)
+    # `{pluginId}` used to be unresolvable, which skipped five plugin rows. It
+    # is seeded now, so the guard is the positive one: with a seed the URL
+    # builds, and WITHOUT one it still skips loudly rather than filling a blank.
+    url, skip = build_url("/Plugins/{pluginId}", {**fx, "pluginId": "abc123"})
+    assert url == "/Plugins/abc123" and skip is None, (url, skip)
     _, skip = build_url("/Plugins/{pluginId}", fx)
     assert skip and "pluginId" in skip
+    # …and `{version}` is path-scoped to /Plugins/, so it cannot leak into
+    # another route that happens to name a version.
+    scoped = scoped_fixtures("/Plugins/{pluginId}/{version}/Image",
+                             {**fx, "pluginId": "abc123", "_plugin_version": "1.0.0"})
+    url, skip = build_url("/Plugins/{pluginId}/{version}/Image", scoped)
+    assert url == "/Plugins/abc123/1.0.0/Image" and skip is None, (url, skip)
     # deep-diff field dedup collapses per-item [key] prefixes to one field each.
     df = dedup_fields({"missing": [{"path": "[Path=/a].Foo"}, {"path": "[Path=/b].Foo"}],
                        "extra": [], "mismatch": [{"path": "Bar"}]})
@@ -715,6 +847,17 @@ def selfcheck():
                             {"itemId": "m", "_album": "al"})["itemId"] == "m"
     # status-class comparison is by hundreds bucket.
     assert (200 // 100) == (204 // 100) and (404 // 100) != (500 // 100)
+    # A path-scoped param fills only inside its own path family. `channelId`
+    # names a Live TV channel under /LiveTv/ and a plugin channel under
+    # /Channels/; leaking the former into the latter would probe a real route
+    # with an id from the wrong id space and call the result parity.
+    assert build_url("/LiveTv/Channels/{channelId}", {"_livetv_channel": "CH"}) == ("/LiveTv/Channels/CH", None)
+    assert build_url("/Channels/{channelId}/Items", {"_livetv_channel": "CH"})[0] is None
+    # …and the same in the other direction: the plugin-channel seed fills only
+    # under /Channels/, never a Live TV route.
+    assert build_url("/Channels/{channelId}/Items", {"_plugin_channel": "PC"}) == ("/Channels/PC/Items", None)
+    assert build_url("/Channels/{channelId}/Features", {"_plugin_channel": "PC"}) == ("/Channels/PC/Features", None)
+    assert build_url("/LiveTv/Channels/{channelId}", {"_plugin_channel": "PC"})[0] is None
     # The deep-diff verdict must be derived from what was actually compared.
     from parity_diff import diff_stats as ds
     empty = {"Items": [], "TotalRecordCount": 0, "StartIndex": 0}
@@ -725,8 +868,8 @@ def selfcheck():
     assert ds(utc, {"RequestReceptionTime": "c", "ResponseTransmissionTime": "d"})[2] == 0
     assert verification.read_method(utc, utc, 0) is None
     assert verification.read_method({"A": 1}, {"A": 1}, 1) == verification.BODY_DIFF
-    print("ok: nullable, $ref, param-fill, skip, query-inject, required-fill, status-class, "
-          "verification-method derivation")
+    print("ok: nullable, $ref, param-fill, path-scoped params, skip, query-inject, "
+          "required-fill, status-class, verification-method derivation")
 
 
 def main():

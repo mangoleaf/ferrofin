@@ -14,6 +14,7 @@ pub mod database;
 pub mod entities;
 pub mod enums;
 pub mod error;
+pub mod presentation_key;
 pub mod sqlite_random;
 pub mod store;
 

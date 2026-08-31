@@ -16,7 +16,7 @@
 //! key an M3U tuner exposes as `tvg-id` — that is how guide data binds to tuner
 //! channels.
 
-use chrono::{DateTime, FixedOffset, TimeZone, Utc};
+use chrono::{DateTime, FixedOffset, TimeZone};
 use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
 
@@ -36,10 +36,20 @@ pub struct XmltvChannel {
 pub struct XmltvProgramme {
     /// The `channel` attribute — matches an [`XmltvChannel::id`].
     pub channel_id: String,
-    /// Airing start (parsed from the `start` attribute), UTC.
-    pub start: Option<DateTime<Utc>>,
-    /// Airing end (parsed from the `stop` attribute), UTC.
-    pub stop: Option<DateTime<Utc>>,
+    /// Airing start (parsed from the `start` attribute), keeping the offset the
+    /// file declared.
+    ///
+    /// Upstream's `XmlTvProgram.StartDate` is a `DateTimeOffset`, and
+    /// `XmlTvListingsProvider.GetProgramInfo` renders it with `{1:O}` into the
+    /// programme's external id (v10.11.8 XmlTvListingsProvider.cs:216) — which
+    /// `LiveTvDtoService.GetInternalProgramId` then hashes into the item GUID.
+    /// Normalising to UTC here would silently change every programme id for any
+    /// guide not published at `+0000`, so the source offset is load-bearing and
+    /// is kept.
+    pub start: Option<DateTime<FixedOffset>>,
+    /// Airing end (parsed from the `stop` attribute), keeping the offset the
+    /// file declared.
+    pub stop: Option<DateTime<FixedOffset>>,
     /// `<title>`.
     pub title: String,
     /// `<sub-title>` — the episode title, when present.
@@ -282,8 +292,11 @@ fn apply_end(
 
 /// Parses an XMLTV timestamp: `YYYYMMDDHHMMSS` optionally followed by a
 /// ` ±HHMM` offset. A missing offset is treated as UTC.
+///
+/// The declared offset is preserved rather than normalised away — see
+/// [`XmltvProgramme::start`] for why the programme's item GUID depends on it.
 #[must_use]
-pub fn parse_xmltv_time(raw: &str) -> Option<DateTime<Utc>> {
+pub fn parse_xmltv_time(raw: &str) -> Option<DateTime<FixedOffset>> {
     let raw = raw.trim();
     let (datetime, offset) = match raw.split_once(' ') {
         Some((dt, off)) => (dt, Some(off.trim())),
@@ -297,12 +310,7 @@ pub fn parse_xmltv_time(raw: &str) -> Option<DateTime<Utc>> {
         Some(o) => parse_offset(o)?,
         None => FixedOffset::east_opt(0)?,
     };
-    Some(
-        fixed
-            .from_local_datetime(&naive)
-            .single()?
-            .with_timezone(&Utc),
-    )
+    fixed.from_local_datetime(&naive).single()
 }
 
 /// Parses a `±HHMM` numeric timezone offset into a [`FixedOffset`].
@@ -436,8 +444,37 @@ mod tests {
         let p = &g.programmes[0];
         // 06:00 +0000 == 06:00 UTC.
         assert_eq!(p.start.unwrap().to_rfc3339(), "2026-07-25T06:00:00+00:00");
-        // 07:00 +0100 == 06:00 UTC.
-        assert_eq!(p.stop.unwrap().to_rfc3339(), "2026-07-25T06:00:00+00:00");
+        // 07:00 +0100 is the same instant, and the declared offset is KEPT
+        // rather than normalised away: upstream's `XmlTvProgram.StartDate` is a
+        // `DateTimeOffset` and its `{0:O}` rendering — offset included — is
+        // hashed into the programme's item GUID.
+        assert_eq!(p.stop.unwrap().to_rfc3339(), "2026-07-25T07:00:00+01:00");
+        assert_eq!(
+            p.stop.unwrap().with_timezone(&chrono::Utc).to_rfc3339(),
+            "2026-07-25T06:00:00+00:00"
+        );
+        assert_eq!(p.stop.unwrap().offset().local_minus_utc(), 3600);
+    }
+
+    /// The `{0:O}` rendering the programme id is built from keeps the source
+    /// offset, so an id derived from a `+0100` guide differs from one derived
+    /// from the same instant written as `+0000`. That is upstream's behaviour,
+    /// and normalising here would silently rewrite every such id.
+    #[test]
+    fn offset_survives_into_the_dotnet_round_trip_form() {
+        let plus_one = parse_xmltv_time("20260725070000 +0100").expect("parse");
+        let utc = parse_xmltv_time("20260725060000 +0000").expect("parse");
+        assert_eq!(plus_one, utc);
+        let render = |d: DateTime<FixedOffset>| {
+            format!(
+                "{}.{:07}{}",
+                d.format("%Y-%m-%dT%H:%M:%S"),
+                d.timestamp_subsec_nanos() / 100,
+                d.offset()
+            )
+        };
+        assert_eq!(render(plus_one), "2026-07-25T07:00:00.0000000+01:00");
+        assert_eq!(render(utc), "2026-07-25T06:00:00.0000000+00:00");
     }
 
     #[test]

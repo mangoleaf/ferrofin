@@ -703,9 +703,70 @@ pub trait LibraryManager: Send + Sync {
     async fn queue_library_scan_scoped(&self, _library_id: Uuid) -> Result<(), ServiceError> {
         self.queue_library_scan().await
     }
+
+    /// Runs a full library scan and returns only when it has FINISHED.
+    ///
+    /// The scheduled-task entry point, and the one place the difference from
+    /// `queue_library_scan` matters. Upstream's "Scan Media Library" task is
+    /// `await ValidateMediaLibraryInternal(progress, ct)`
+    /// (v10.11.8 `RefreshMediaLibraryTask.ExecuteAsync`), so the task stays
+    /// `Running` for the whole scan and its `LastExecutionResult` records the
+    /// real duration. A task that queued the scan and returned would report
+    /// itself finished in 0 ms with the scan still writing — which is what the
+    /// dashboard, and anything that waits on the task, would then believe.
+    ///
+    /// Defaults to the queueing form so implementations with no scanner need no
+    /// change; the real manager overrides it.
+    async fn run_library_scan(&self) -> Result<(), ServiceError> {
+        self.queue_library_scan().await
+    }
 }
 
 fn _assert_object_safe_library_manager(_: &dyn LibraryManager) {}
+
+/// The three playback permissions a user's policy imposes on a media source.
+///
+/// The inputs to `MediaSourceManager`'s per-user overwrite (v10.11.8
+/// Emby.Server.Implementations/Library/MediaSourceManager.cs:204-217): an
+/// AUDIO item's `SupportsTranscoding` becomes
+/// `EnableAudioPlaybackTranscoding`; a VIDEO item's becomes
+/// `EnableVideoPlaybackTranscoding`, and its `SupportsDirectStream` becomes
+/// `EnablePlaybackRemuxing`. Everything else (photos, books, unknown media)
+/// is left as the source built it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlaybackPermissions {
+    /// `PermissionKind.EnableVideoPlaybackTranscoding`.
+    pub video_transcoding: bool,
+    /// `PermissionKind.EnableAudioPlaybackTranscoding`.
+    pub audio_transcoding: bool,
+    /// `PermissionKind.EnablePlaybackRemuxing`.
+    pub remuxing: bool,
+}
+
+impl PlaybackPermissions {
+    /// Applies the overwrite to one media source, for an item of `media_type`.
+    ///
+    /// Port of the `if (user is not null)` block shared by
+    /// `GetStaticMediaSources` (:355-372) and `GetPlaybackMediaSources`
+    /// (:204-217) — the same three lines, on the static and the dynamic
+    /// sources respectively. `media_type` is `BaseItem.MediaType` ("Audio" /
+    /// "Video"); any other value is upstream's implicit `else`, which touches
+    /// nothing.
+    pub fn apply(
+        self,
+        media_type: Option<&str>,
+        source: &mut ferrofin_model::dto::MediaSourceInfo,
+    ) {
+        match media_type {
+            Some("Audio") => source.supports_transcoding = self.audio_transcoding,
+            Some("Video") => {
+                source.supports_transcoding = self.video_transcoding;
+                source.supports_direct_stream = self.remuxing;
+            }
+            _ => {}
+        }
+    }
+}
 
 /// Manages user accounts, authentication, and per-user policy/configuration.
 ///
@@ -1029,6 +1090,33 @@ pub trait UserDataManager: Send + Sync {
         let _ = user_id;
         Ok(None)
     }
+
+    /// The user's three PLAYBACK permissions.
+    ///
+    /// Backs `MediaSourceManager.GetStaticMediaSources` /
+    /// `GetPlaybackMediaSources`' per-user overwrite (v10.11.8
+    /// Emby.Server.Implementations/Library/MediaSourceManager.cs:355-372 and
+    /// :204-217), which re-sets `SupportsTranscoding` — and, for video,
+    /// `SupportsDirectStream` — from the user's policy AFTER the source has
+    /// been built.
+    ///
+    /// It sits beside [`Self::get_content_permissions`] for the same reason
+    /// that one does: both are a small bundle of `Permissions` rows read on one
+    /// request for one caller, and both belong with the per-user data rather
+    /// than in the manager that consumes them.
+    ///
+    /// `None` means "no policy known", and the caller must then leave the
+    /// source untouched — upstream's `if (user is not null)` path. It is
+    /// deliberately not three `false`s, which would tell a client the item can
+    /// be neither remuxed nor transcoded. The default returns it; the concrete
+    /// manager reads the `Permissions` rows.
+    async fn get_playback_permissions(
+        &self,
+        user_id: Uuid,
+    ) -> Result<Option<PlaybackPermissions>, ServiceError> {
+        let _ = user_id;
+        Ok(None)
+    }
 }
 
 fn _assert_object_safe_user_data_manager(_: &dyn UserDataManager) {}
@@ -1075,6 +1163,33 @@ pub trait UserViewManager: Send + Sync {
         query: &crate::options::LatestItemsQuery,
         options: &DtoOptions,
     ) -> Result<Vec<(Option<BaseItemEntity>, Vec<BaseItemEntity>)>, ServiceError>;
+
+    /// The id of the Live TV `UserView` row every Live TV channel item is
+    /// parented to, provisioning the view if it does not exist yet.
+    ///
+    /// Port of `LiveTvManager.GetInternalLiveTvFolder()` (v10.11.8
+    /// src/Jellyfin.LiveTv/LiveTvManager.cs:1258-1262), which is
+    /// `GetNamedView(name, CollectionType.livetv, name)` — and `GetNamedView`
+    /// (LibraryManager.cs:2856-2898) CREATES the folder and its row on first
+    /// read. `GuideManager.GetChannel` passes the result as every channel
+    /// item's `ParentId`, so the guide refresh needs it before it can store a
+    /// channel as an item.
+    ///
+    /// Unlike [`get_user_views`](Self::get_user_views) this has NO per-user
+    /// Live TV gate: upstream's `GetInternalLiveTvFolder` takes no user, and
+    /// the channel rows exist regardless of who may see them (visibility is
+    /// decided by the query scope, not by whether the row was written).
+    ///
+    /// The default returns `None` — a service with no item store behind it
+    /// cannot provision anything, and a caller must treat that as "no parent
+    /// known", never as an error.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn get_internal_live_tv_folder_id(&self) -> Result<Option<Uuid>, ServiceError> {
+        Ok(None)
+    }
 }
 
 fn _assert_object_safe_user_view_manager(_: &dyn UserViewManager) {}
@@ -1111,6 +1226,26 @@ pub trait MediaSourceManager: Send + Sync {
         Ok(map)
     }
 
+    /// The subset of `item_ids` that carry at least one LYRIC stream.
+    ///
+    /// Backs the DTO builder's `HasLyrics` (C# emits it on every `Audio` DTO,
+    /// outside the `ItemFields` system — DtoService.cs:308-311). The default
+    /// derives it from [`Self::get_media_streams_batch`]; the concrete manager
+    /// overrides it with a cheap ids-only query — same shape, and same reason
+    /// for the override, as [`Self::get_item_ids_with_subtitles`].
+    async fn get_item_ids_with_lyrics(&self, item_ids: &[Uuid]) -> Result<Vec<Uuid>, ServiceError> {
+        let map = self.get_media_streams_batch(item_ids).await?;
+        Ok(map
+            .into_iter()
+            .filter(|(_, streams)| {
+                streams
+                    .iter()
+                    .any(|s| s.stream_type == ferrofin_model::entities::MediaStreamType::Lyric)
+            })
+            .map(|(id, _)| id)
+            .collect())
+    }
+
     /// The subset of `item_ids` that carry at least one subtitle stream.
     ///
     /// Backs the DTO builder's `HasSubtitles` (C# emits it on every video DTO,
@@ -1129,25 +1264,6 @@ pub trait MediaSourceManager: Send + Sync {
                 streams
                     .iter()
                     .any(|s| s.stream_type == ferrofin_model::entities::MediaStreamType::Subtitle)
-            })
-            .map(|(id, _)| id)
-            .collect())
-    }
-
-    /// The subset of `item_ids` that carry at least one **lyric** stream.
-    ///
-    /// Backs the DTO builder's `HasLyrics`, which C# emits on every `Audio` DTO
-    /// outside the `ItemFields` system
-    /// (`DtoService.cs:308-311`). Same shape as
-    /// [`Self::get_item_ids_with_subtitles`], including the ids-only override.
-    async fn get_item_ids_with_lyrics(&self, item_ids: &[Uuid]) -> Result<Vec<Uuid>, ServiceError> {
-        let map = self.get_media_streams_batch(item_ids).await?;
-        Ok(map
-            .into_iter()
-            .filter(|(_, streams)| {
-                streams
-                    .iter()
-                    .any(|s| s.stream_type == ferrofin_model::entities::MediaStreamType::Lyric)
             })
             .map(|(id, _)| id)
             .collect())
@@ -1657,6 +1773,56 @@ mod tests {
         };
         assert_eq!(r.item_id, id);
         assert!((r.score - 0.5).abs() < f32::EPSILON);
+    }
+
+    /// The `if (user is not null)` block in
+    /// `MediaSourceManager.GetPlaybackMediaSources` (v10.11.8
+    /// Emby.Server.Implementations/Library/MediaSourceManager.cs:204-217):
+    /// audio takes only `EnableAudioPlaybackTranscoding`; video takes
+    /// `EnableVideoPlaybackTranscoding` AND `EnablePlaybackRemuxing`; anything
+    /// else is untouched. The overwrite is unconditional — it RAISES a flag the
+    /// source left false, which is exactly why an HDHomeRun source (Protocol
+    /// Udp, so the direct-stream validation cleared the flag) is still reported
+    /// direct-streamable by Jellyfin.
+    #[test]
+    fn playback_permissions_overwrite_follows_the_media_type() {
+        use crate::library::PlaybackPermissions;
+        use ferrofin_model::dto::MediaSourceInfo;
+        let perms = PlaybackPermissions {
+            video_transcoding: false,
+            audio_transcoding: true,
+            remuxing: true,
+        };
+        let cleared = || MediaSourceInfo {
+            supports_transcoding: false,
+            supports_direct_stream: false,
+            ..MediaSourceInfo::default()
+        };
+
+        let mut video = cleared();
+        perms.apply(Some("Video"), &mut video);
+        assert!(
+            !video.supports_transcoding,
+            "EnableVideoPlaybackTranscoding"
+        );
+        assert!(
+            video.supports_direct_stream,
+            "EnablePlaybackRemuxing RAISES a flag the protocol gate cleared"
+        );
+
+        let mut audio = cleared();
+        perms.apply(Some("Audio"), &mut audio);
+        assert!(audio.supports_transcoding, "EnableAudioPlaybackTranscoding");
+        assert!(
+            !audio.supports_direct_stream,
+            "the audio arm never touches SupportsDirectStream"
+        );
+
+        for media_type in [None, Some("Photo"), Some("Book"), Some("Unknown")] {
+            let mut other = cleared();
+            perms.apply(media_type, &mut other);
+            assert!(!other.supports_transcoding && !other.supports_direct_stream);
+        }
     }
 
     #[test]

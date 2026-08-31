@@ -6,10 +6,19 @@
 //! raw [`String`] and split it here, parsing enum tokens through their
 //! `serde::Deserialize` (PascalCase) impls so the accepted spellings match the
 //! vendored contract exactly.
+//!
+//! The same module also carries the JSON-*body* twin of those binders —
+//! [`de_comma_delimited`] / [`de_pipe_delimited`], a port of
+//! `JsonDelimitedCollectionConverter<T>` — for the request DTOs whose
+//! collection properties upstream decorates with the delimited converter
+//! factories (e.g. `GetProgramsDto`).
 
-use serde::Deserialize;
-use serde::de::IntoDeserializer;
+use std::fmt;
+use std::marker::PhantomData;
+
 use serde::de::value::{Error as ValueError, StrDeserializer};
+use serde::de::{self, DeserializeOwned, IntoDeserializer, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer};
 use uuid::Uuid;
 
 use crate::error::ApiError;
@@ -128,6 +137,173 @@ pub(crate) fn parse_pipe_strings(raw: Option<&str>) -> Vec<String> {
         .collect()
 }
 
+/// Deserializes a **comma**-delimited JSON collection field.
+///
+/// Port of `JsonDelimitedCollectionConverter<T>.Read` (v10.11.8
+/// `src/Jellyfin.Extensions/Json/Converters/JsonDelimitedCollectionConverter.cs`)
+/// as reached through `JsonCommaDelimitedCollectionConverterFactory`: when the
+/// JSON token is a **string** it is split on the delimiter with
+/// `StringSplitOptions.RemoveEmptyEntries`, each entry is `Trim()`ed and
+/// converted, and an entry that fails to convert is *silently dropped*
+/// (`catch (FormatException) { /* Ignore unconvertible inputs */ }`). Any other
+/// token falls through to a strict array deserialize.
+///
+/// Jellyfin decorates seven `GetProgramsDto` properties with this factory, so
+/// `{"ChannelIds":"<id>,<id>"}` is as valid as `{"ChannelIds":["<id>","<id>"]}`.
+pub(crate) fn de_comma_delimited<'de, D, T>(deserializer: D) -> Result<Option<Vec<T>>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: DeserializeOwned,
+{
+    deserializer.deserialize_option(DelimitedOption {
+        delimiter: ',',
+        marker: PhantomData,
+    })
+}
+
+/// Deserializes a **pipe**-delimited JSON collection field.
+///
+/// Same converter as [`de_comma_delimited`], reached through
+/// `JsonPipeDelimitedCollectionConverterFactory` — which upstream applies to
+/// `GetProgramsDto.Genres` only. Keeping the two apart matters: `"News,Sport"`
+/// is *one* genre here, exactly as upstream sees it.
+pub(crate) fn de_pipe_delimited<'de, D, T>(deserializer: D) -> Result<Option<Vec<T>>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: DeserializeOwned,
+{
+    deserializer.deserialize_option(DelimitedOption {
+        delimiter: '|',
+        marker: PhantomData,
+    })
+}
+
+/// The `Option` layer of the delimited-collection converters: `null` and a
+/// missing property both collapse to `None`, as upstream's nullable
+/// `IReadOnlyList<T>?` does.
+struct DelimitedOption<T> {
+    /// The character the string form is split on.
+    delimiter: char,
+    /// Ties the visitor to the element type without owning one.
+    marker: PhantomData<fn() -> T>,
+}
+
+impl<'de, T> Visitor<'de> for DelimitedOption<T>
+where
+    T: DeserializeOwned,
+{
+    type Value = Option<Vec<T>>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "an array, or a {:?}-delimited string, or null",
+            self.delimiter
+        )
+    }
+
+    fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_some<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        deserializer
+            .deserialize_any(DelimitedValue {
+                delimiter: self.delimiter,
+                marker: PhantomData,
+            })
+            .map(Some)
+    }
+}
+
+/// The value layer: the string arm splits leniently, the array arm stays strict.
+struct DelimitedValue<T> {
+    /// The character the string form is split on.
+    delimiter: char,
+    /// Ties the visitor to the element type without owning one.
+    marker: PhantomData<fn() -> T>,
+}
+
+impl<'de, T> Visitor<'de> for DelimitedValue<T>
+where
+    T: DeserializeOwned,
+{
+    type Value = Vec<T>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "an array or a {:?}-delimited string",
+            self.delimiter
+        )
+    }
+
+    fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+        // `Split(Delimiter, RemoveEmptyEntries)` + `Trim()` + convert, dropping
+        // whatever the `TypeConverter` refuses. `deserialize_enum_token_ci` is
+        // the same token parser the query-string path uses, so a spelling that
+        // binds on `GET /LiveTv/Programs` binds identically on the `POST` form;
+        // for `Guid` and `string` elements it degrades to a plain parse, which
+        // is what `GuidConverter`/`StringConverter` do upstream.
+        Ok(value
+            .split(self.delimiter)
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+            .filter_map(deserialize_enum_token_ci)
+            .collect())
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        // `JsonSerializer.Deserialize<T[]>` — strict: an unknown member errors.
+        let mut values = Vec::new();
+        while let Some(value) = seq.next_element::<T>()? {
+            values.push(value);
+        }
+        Ok(values)
+    }
+}
+
+/// Applies the `locationTypes` / `excludeLocationTypes` query parameters to a
+/// query's `IsVirtualItem`, exactly as `ItemsController.GetItems` does.
+///
+/// Port of v10.11.8 Jellyfin.Api/Controllers/ItemsController.cs:437-447:
+///
+/// ```text
+/// if (excludeLocationTypes.Any(t => t == LocationType.Virtual)) { query.IsVirtualItem = false; }
+/// if (locationTypes.Length > 0 && locationTypes.Length < 4)
+///     { query.IsVirtualItem = locationTypes.Contains(LocationType.Virtual); }
+/// ```
+///
+/// The `< 4` guard is upstream's: asking for ALL four location types is asking
+/// for no filter at all, so it must not collapse into
+/// `IsVirtualItem = Contains(Virtual)` and quietly become a virtual-only page.
+/// `LocationType` is the only thing either parameter can express here — the
+/// three non-`Virtual` values are indistinguishable in storage, and upstream
+/// reads them the same way.
+///
+/// Both parameters were unported, which is why
+/// `/Items?includeItemTypes=LiveTvProgram&locationTypes=FileSystem` returned the
+/// whole guide where Jellyfin returns nothing: an airing is `IsVirtualItem = 1`.
+pub(crate) fn apply_location_types(
+    is_virtual_item: &mut Option<bool>,
+    location_types: Option<&str>,
+    exclude_location_types: Option<&str>,
+) {
+    use ferrofin_model::entities::LocationType;
+    let excluded: Vec<LocationType> = parse_csv_enums_lenient(exclude_location_types);
+    if excluded.contains(&LocationType::Virtual) {
+        *is_virtual_item = Some(false);
+    }
+    let requested: Vec<LocationType> = parse_csv_enums_lenient(location_types);
+    if !requested.is_empty() && requested.len() < 4 {
+        *is_virtual_item = Some(requested.contains(&LocationType::Virtual));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{empty_as_none_uuid, parse_csv_uuids, parse_pipe_strings};
@@ -203,6 +379,95 @@ mod tests {
         assert!(parse_csv_uuids(Some("not-a-uuid")).is_err());
     }
 
+    /// A stand-in for a request DTO property carrying the *comma* factory.
+    #[derive(Debug, serde::Deserialize)]
+    struct CommaHolder {
+        #[serde(default, deserialize_with = "super::de_comma_delimited")]
+        ids: Option<Vec<Uuid>>,
+        #[serde(default, deserialize_with = "super::de_comma_delimited")]
+        kinds: Option<Vec<BaseItemKind>>,
+    }
+
+    /// A stand-in for a property carrying the *pipe* factory.
+    #[derive(Debug, serde::Deserialize)]
+    struct PipeHolder {
+        #[serde(default, deserialize_with = "super::de_pipe_delimited")]
+        genres: Option<Vec<String>>,
+    }
+
+    #[test]
+    fn delimited_json_accepts_both_the_string_and_the_array_form() {
+        let id = Uuid::from_u128(11);
+        let from_str: CommaHolder =
+            serde_json::from_str(&format!(r#"{{"ids":"{id},{id}","kinds":"Movie,Series"}}"#))
+                .expect("binds");
+        assert_eq!(from_str.ids, Some(vec![id, id]));
+        assert_eq!(
+            from_str.kinds,
+            Some(vec![BaseItemKind::Movie, BaseItemKind::Series])
+        );
+        let from_arr: CommaHolder = serde_json::from_str(&format!(
+            r#"{{"ids":["{id}","{id}"],"kinds":["Movie","Series"]}}"#
+        ))
+        .expect("binds");
+        assert_eq!(from_arr.ids, from_str.ids);
+        assert_eq!(from_arr.kinds, from_str.kinds);
+    }
+
+    #[test]
+    fn delimited_json_string_form_drops_unconvertible_entries() {
+        // `catch (FormatException) { /* Ignore unconvertible inputs */ }`.
+        let id = Uuid::from_u128(12);
+        let holder: CommaHolder =
+            serde_json::from_str(&format!(r#"{{"ids":"zzz,{id}","kinds":"Nope,Movie"}}"#))
+                .expect("binds");
+        assert_eq!(holder.ids, Some(vec![id]));
+        assert_eq!(holder.kinds, Some(vec![BaseItemKind::Movie]));
+        // Case-insensitively, exactly as the query-string binder does.
+        let cased: CommaHolder = serde_json::from_str(r#"{"kinds":"movie"}"#).expect("binds");
+        assert_eq!(cased.kinds, Some(vec![BaseItemKind::Movie]));
+    }
+
+    #[test]
+    fn delimited_json_string_form_removes_empty_entries_and_trims() {
+        let holder: CommaHolder =
+            serde_json::from_str(r#"{"kinds":" Movie , ,Series,"}"#).expect("binds");
+        assert_eq!(
+            holder.kinds,
+            Some(vec![BaseItemKind::Movie, BaseItemKind::Series])
+        );
+        let empty: CommaHolder = serde_json::from_str(r#"{"kinds":",,"}"#).expect("binds");
+        assert_eq!(empty.kinds, Some(Vec::new()));
+    }
+
+    #[test]
+    fn delimited_json_array_form_is_strict() {
+        // The array arm is `JsonSerializer.Deserialize<T[]>`, which errors.
+        assert!(serde_json::from_str::<CommaHolder>(r#"{"kinds":["Nope"]}"#).is_err());
+        assert!(serde_json::from_str::<CommaHolder>(r#"{"ids":["zzz"]}"#).is_err());
+    }
+
+    #[test]
+    fn delimited_json_null_and_absent_are_none() {
+        let absent: CommaHolder = serde_json::from_str("{}").expect("binds");
+        assert!(absent.ids.is_none() && absent.kinds.is_none());
+        let nulled: CommaHolder =
+            serde_json::from_str(r#"{"ids":null,"kinds":null}"#).expect("binds");
+        assert!(nulled.ids.is_none() && nulled.kinds.is_none());
+    }
+
+    #[test]
+    fn pipe_delimited_json_splits_on_the_pipe_only() {
+        let piped: PipeHolder = serde_json::from_str(r#"{"genres":"News|Sport"}"#).expect("binds");
+        assert_eq!(
+            piped.genres,
+            Some(vec!["News".to_owned(), "Sport".to_owned()])
+        );
+        // A comma is just a character in a genre name for the pipe converter.
+        let commas: PipeHolder = serde_json::from_str(r#"{"genres":"News,Sport"}"#).expect("binds");
+        assert_eq!(commas.genres, Some(vec!["News,Sport".to_owned()]));
+    }
+
     #[test]
     fn pipe_strings_split_and_trim() {
         assert_eq!(
@@ -210,5 +475,38 @@ mod tests {
             vec!["Action".to_owned(), "Sci-Fi".to_owned()]
         );
         assert!(parse_pipe_strings(None).is_empty());
+    }
+
+    /// `locationTypes`/`excludeLocationTypes` are the ONLY things that set
+    /// `IsVirtualItem` on `GET /Items` (v10.11.8
+    /// Jellyfin.Api/Controllers/ItemsController.cs:437-447). Both were unported,
+    /// which is why `?includeItemTypes=LiveTvProgram&locationTypes=FileSystem`
+    /// returned the whole guide where Jellyfin returns nothing — an airing is
+    /// `IsVirtualItem = 1`.
+    #[test]
+    fn location_types_drive_is_virtual_item() {
+        let apply = |loc: Option<&str>, excl: Option<&str>| {
+            let mut v = None;
+            super::apply_location_types(&mut v, loc, excl);
+            v
+        };
+        // Neither parameter: untouched.
+        assert_eq!(apply(None, None), None);
+        // `locationTypes=Virtual` asks for virtual items ONLY.
+        assert_eq!(apply(Some("Virtual"), None), Some(true));
+        // Any other subset asks for non-virtual ones.
+        assert_eq!(apply(Some("FileSystem"), None), Some(false));
+        assert_eq!(apply(Some("FileSystem,Remote,Offline"), None), Some(false));
+        // …but ALL FOUR is no filter at all — the `< 4` guard, which stops the
+        // "everything" request collapsing into a virtual-only page.
+        assert_eq!(apply(Some("FileSystem,Remote,Virtual,Offline"), None), None);
+        // `excludeLocationTypes` only reacts to Virtual.
+        assert_eq!(apply(None, Some("Virtual")), Some(false));
+        assert_eq!(apply(None, Some("Remote")), None);
+        // `locationTypes` is applied SECOND, so it wins over the exclusion —
+        // the order upstream evaluates them in.
+        assert_eq!(apply(Some("Virtual"), Some("Virtual")), Some(true));
+        // Unknown tokens are dropped by the lenient binder, not 400'd.
+        assert_eq!(apply(Some("Nonsense"), None), None);
     }
 }

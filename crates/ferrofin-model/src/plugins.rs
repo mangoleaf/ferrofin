@@ -69,6 +69,76 @@ pub struct PluginInfo {
     pub status: PluginStatus,
 }
 
+/// A plugin's manifest, as `POST /Plugins/{pluginId}/Manifest` returns it.
+///
+/// Port of `MediaBrowser.Common/Plugins/PluginManifest.cs` (v10.11.8;
+/// byte-identical on master).
+///
+/// **This DTO is camelCase on purpose — do not "fix" it to PascalCase for
+/// consistency with the rest of the API.** Every property upstream carries an
+/// explicit lowercase `[JsonPropertyName]`, which overrides the server's
+/// PascalCase naming policy, and the id is spelled `guid`, not `Id`. Both were
+/// verified against a live 10.11.8, which answers this route with
+/// `{"category":…,"guid":"b8715ed16c4745289ad3f72deb539cd4",…}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginManifest {
+    /// The plugin's category.
+    pub category: String,
+
+    /// The changelog text.
+    pub changelog: String,
+
+    /// The manifest's own description, which is NOT
+    /// [`PluginInfo::description`]: that one comes from `IPlugin.Description`,
+    /// this one from the on-disk manifest, and a bundled plugin leaves it empty.
+    pub description: String,
+
+    /// The plugin's unique id. Spelled `guid` on the wire
+    /// (`[JsonPropertyName("guid")] public Guid Id`), in the dashless `N` form
+    /// `JsonGuidConverter` writes.
+    #[schema(value_type = String, format = "uuid")]
+    #[serde(rename = "guid", with = "crate::json::guid")]
+    pub id: Uuid,
+
+    /// The plugin's name.
+    pub name: String,
+
+    /// An overview of the plugin.
+    pub overview: String,
+
+    /// The plugin's owner.
+    pub owner: String,
+
+    /// The compatibility version the plugin targets.
+    pub target_abi: String,
+
+    /// The manifest's timestamp — `DateTime.MinValue` when it carries none.
+    #[schema(value_type = String, format = "date-time")]
+    #[serde(with = "crate::json::datetime")]
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+
+    /// The plugin's version.
+    pub version: String,
+
+    /// The plugin's operational status.
+    pub status: PluginStatus,
+
+    /// Whether the plugin should update itself automatically.
+    pub auto_update: bool,
+
+    /// The bundled image's path, relative to the plugin folder.
+    ///
+    /// `DefaultIgnoreCondition = WhenWritingNull` drops the key when there is
+    /// no image, which is why it is absent from a bundled plugin's manifest.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_path: Option<String>,
+
+    /// The assemblies to load, relative to the plugin folder. Always empty
+    /// here: Ferrofin loads no .NET assemblies.
+    pub assemblies: Vec<String>,
+}
+
 /// Defines a plugin's web page.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
@@ -132,83 +202,24 @@ pub struct ConfigurationPageInfo {
     pub plugin_id: Option<Uuid>,
 }
 
-/// A plugin's manifest, as `POST /Plugins/{pluginId}/Manifest` returns it.
-///
-/// Port of `MediaBrowser.Common.Plugins.PluginManifest`. Every property there
-/// carries an explicit `[JsonPropertyName]` in **camelCase**, so this one type
-/// does not follow the API's PascalCase default — `guid`, `targetAbi`,
-/// `autoUpdate` and the rest are the names on the wire, and `Id` is spelled
-/// `guid`. Ferrofin used to answer this route with a five-field PascalCase
-/// projection of its own, which no client written against Jellyfin could read.
-///
-/// The values are the ones upstream fills in for a plugin that has **no
-/// `meta.json` on disk**: `PluginManager.CreatePluginInstance` builds a "dummy
-/// record" (v10.11.8 `PluginManager.cs:560-575`) setting only `Id`, `Name`,
-/// `Version` and `Status`, so the string fields stay at their constructor
-/// defaults (empty), `Assemblies` is empty, `Timestamp` is `DateTime.MinValue`
-/// and `AutoUpdate` keeps its `true` property initializer. That is exactly what
-/// a stock Jellyfin returns for its five in-tree provider plugins, and every
-/// Ferrofin plugin — compiled-in or staged WASM — is that same
-/// manifest-less shape.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct PluginManifest {
-    /// The plugin's category.
-    pub category: String,
-
-    /// The changelog information.
-    pub changelog: String,
-
-    /// The plugin's description.
-    pub description: String,
-
-    /// The plugin's globally unique identifier (C# `Id`, spelled `guid`).
-    #[schema(value_type = String, format = "uuid")]
-    #[serde(rename = "guid", with = "crate::json::guid")]
-    pub id: Uuid,
-
-    /// The plugin's name.
-    pub name: String,
-
-    /// An overview of the plugin.
-    pub overview: String,
-
-    /// The plugin's owner.
-    pub owner: String,
-
-    /// The compatibility version for the plugin.
-    #[serde(rename = "targetAbi")]
-    pub target_abi: String,
-
-    /// The manifest's timestamp (`DateTime.MinValue` for a manifest-less plugin).
-    pub timestamp: String,
-
-    /// The plugin's version number.
-    pub version: String,
-
-    /// The plugin's operational status.
-    pub status: PluginStatus,
-
-    /// Whether this plugin should automatically update.
-    #[serde(rename = "autoUpdate")]
-    pub auto_update: bool,
-
-    /// The plugin's image path, relative to its folder. Omitted when absent —
-    /// upstream serializes with `DefaultIgnoreCondition = WhenWritingNull`.
-    #[serde(rename = "imagePath", skip_serializing_if = "Option::is_none")]
-    pub image_path: Option<String>,
-
-    /// The assemblies that should be loaded (always empty here: Ferrofin has no
-    /// .NET assembly loading, by design — see `docs/EXTENSIONS.md`).
-    pub assemblies: Vec<String>,
-}
-
 impl PluginManifest {
     /// The manifest of a plugin with no `meta.json`, matching the C# dummy
     /// record `PluginManager.CreatePluginInstance` builds.
     ///
-    /// `DateTime.MinValue` serializes through Jellyfin's `JsonDateTimeConverter`
-    /// as `0001-01-01T00:00:00.0000000Z`; it is a constant here because a
-    /// manifest-less plugin has no timestamp to report.
+    /// `PluginManager.CreatePluginInstance` builds that dummy record (v10.11.8
+    /// `Emby.Server.Implementations/Plugins/PluginManager.cs:560-575`) setting
+    /// only `Id`, `Name`, `Version` and `Status`: the string fields keep their
+    /// constructor defaults (empty), `Assemblies` is empty, `Timestamp` is
+    /// `DateTime.MinValue` — which `JsonDateTimeConverter` writes as
+    /// `0001-01-01T00:00:00.0000000Z` — and `AutoUpdate` keeps its `true`
+    /// property initializer. That is what a stock Jellyfin returns for its five
+    /// in-tree provider plugins, and every Ferrofin plugin (compiled-in or
+    /// staged WASM) has that same manifest-less shape.
+    ///
+    /// Note that `description` stays empty here even though `GET /Plugins`
+    /// reports a real one for the same plugin: upstream sources
+    /// [`PluginInfo::description`] from `IPlugin.Description` and this one from
+    /// the on-disk manifest document. The two must not be merged.
     #[must_use]
     pub fn manifestless(id: Uuid, name: String, version: String, status: PluginStatus) -> Self {
         Self {
@@ -220,7 +231,7 @@ impl PluginManifest {
             overview: String::new(),
             owner: String::new(),
             target_abi: String::new(),
-            timestamp: "0001-01-01T00:00:00.0000000Z".to_owned(),
+            timestamp: crate::json::datetime::dotnet_min(),
             version,
             status,
             auto_update: true,

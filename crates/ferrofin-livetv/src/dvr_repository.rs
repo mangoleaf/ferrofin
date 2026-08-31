@@ -7,7 +7,7 @@
 use chrono::{DateTime, Utc};
 use ferrofin_db::Database;
 use ferrofin_db::store::{datetime_to_db, guid_to_db};
-use ferrofin_model::live_tv::{RecordingQuery, RecordingStatus, TimerInfoDto};
+use ferrofin_model::live_tv::{RecordingQuery, RecordingStatus, SeriesTimerInfoDto, TimerInfoDto};
 use sqlx::{QueryBuilder, Sqlite};
 use uuid::Uuid;
 
@@ -31,10 +31,27 @@ const RECORDING_SELECT: &str = r#"SELECT r."Id",r."ChannelId",r."TimerId",r."Ser
 /// Inserts or replaces one timer, storing the whole DTO as JSON so a `GET`
 /// round-trips exactly what was posted.
 ///
+/// `is_manual` is `TimerInfo.IsManual` — whether a person asked for this exact
+/// recording rather than a series timer scheduling it. It is STICKY-TRUE: an
+/// update raises the stored flag but never clears it (`MAX` in the `ON CONFLICT`
+/// clause below). That is exactly what upstream does with the field, because
+/// every assignment in `DefaultLiveTvService` writes `true` and none writes
+/// `false` — `:178` on a manual cancel, `:227` on reviving a cancelled timer by
+/// hand, `:255` on a manual create, `:302` when a series timer adopts an
+/// existing timer — and the one read-back (`:745`,
+/// `timer.IsManual = existingTimer.IsManual`) copies the stored value forward
+/// rather than resetting it. Writing it on INSERT only would silently drop
+/// every one of those four, which is what `persist_manual_timer` on an
+/// already-stored row means.
+///
 /// # Errors
 ///
 /// Fails when the write fails, or when the DTO cannot be serialized.
-pub async fn upsert_timer(db: &Database, timer: &TimerInfoDto) -> Result<String, ServiceError> {
+pub async fn upsert_timer(
+    db: &Database,
+    timer: &TimerInfoDto,
+    is_manual: bool,
+) -> Result<String, ServiceError> {
     let id = timer.base.id.clone().unwrap_or_default();
     let data = serde_json::to_string(timer).map_err(|e| {
         ServiceError::from(crate::error::LiveTvError::serialize("serialize timer", e))
@@ -42,13 +59,14 @@ pub async fn upsert_timer(db: &Database, timer: &TimerInfoDto) -> Result<String,
     sqlx::query(
         r#"INSERT INTO "FerrofinLiveTvTimers"
            ("Id","ChannelId","ProgramId","SeriesTimerId","Name","StartDate","EndDate","Status",
-            "PrePaddingSeconds","PostPaddingSeconds","Data")
-           VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
+            "PrePaddingSeconds","PostPaddingSeconds","Data","IsManual")
+           VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
            ON CONFLICT("Id") DO UPDATE SET
              "ChannelId"=excluded."ChannelId","ProgramId"=excluded."ProgramId",
              "SeriesTimerId"=excluded."SeriesTimerId","Name"=excluded."Name",
              "StartDate"=excluded."StartDate","EndDate"=excluded."EndDate",
-             "Status"=excluded."Status","Data"=excluded."Data""#,
+             "Status"=excluded."Status","Data"=excluded."Data",
+             "IsManual"=MAX("FerrofinLiveTvTimers"."IsManual",excluded."IsManual")"#,
     )
     .bind(&id)
     .bind(guid_to_db(timer.base.channel_id))
@@ -61,10 +79,107 @@ pub async fn upsert_timer(db: &Database, timer: &TimerInfoDto) -> Result<String,
     .bind(timer.base.pre_padding_seconds)
     .bind(timer.base.post_padding_seconds)
     .bind(&data)
+    .bind(i32::from(is_manual))
     .execute(db.writer())
     .await
     .map_err(db_err)?;
     Ok(id)
+}
+
+/// Whether the timer with this id was created by hand (`TimerInfo.IsManual`).
+///
+/// A timer that is not there is not manual — upstream reads the flag off a
+/// `TimerInfo` it already holds, so the question only arises for a row that
+/// exists.
+///
+/// # Errors
+///
+/// Fails when the read fails.
+pub async fn timer_is_manual(db: &Database, id: &str) -> Result<bool, ServiceError> {
+    let flag: Option<i64> =
+        sqlx::query_scalar(r#"SELECT "IsManual" FROM "FerrofinLiveTvTimers" WHERE "Id" = ?1"#)
+            .bind(id)
+            .fetch_optional(db.pool())
+            .await
+            .map_err(db_err)?;
+    Ok(flag.is_some_and(|f| f != 0))
+}
+
+/// One stored series timer's row: the published DTO JSON, the external id it was
+/// derived from, and the listings series id the fan-out queries with.
+///
+/// # Errors
+///
+/// Fails when the read fails.
+pub async fn series_timer_row(
+    db: &Database,
+    id: &str,
+) -> Result<Option<(SeriesTimerInfoDto, String, Option<String>)>, ServiceError> {
+    let row: Option<(String, String, Option<String>)> = sqlx::query_as(
+        r#"SELECT "Data","ExternalId","SeriesId" FROM "FerrofinLiveTvSeriesTimers"
+           WHERE "Id" = ?1"#,
+    )
+    .bind(id)
+    .fetch_optional(db.pool())
+    .await
+    .map_err(db_err)?;
+    Ok(row.and_then(|(data, external_id, series_id)| {
+        serde_json::from_str(&data)
+            .ok()
+            .map(|dto| (dto, external_id, series_id))
+    }))
+}
+
+/// Inserts or replaces one series timer, DTO and identity columns together.
+///
+/// # Errors
+///
+/// Fails when the write fails, or when the DTO cannot be serialized.
+pub async fn upsert_series_timer(
+    db: &Database,
+    timer: &SeriesTimerInfoDto,
+    external_id: &str,
+    series_id: Option<&str>,
+) -> Result<(), ServiceError> {
+    let data = serde_json::to_string(timer).map_err(|e| {
+        ServiceError::from(crate::error::LiveTvError::serialize("serialize timer", e))
+    })?;
+    sqlx::query(
+        r#"INSERT INTO "FerrofinLiveTvSeriesTimers"
+           ("Id","ChannelId","ProgramId","Name","Data","ExternalId","SeriesId")
+           VALUES (?1,?2,?3,?4,?5,?6,?7)
+           ON CONFLICT("Id") DO UPDATE SET
+             "ChannelId"=excluded."ChannelId","ProgramId"=excluded."ProgramId",
+             "Name"=excluded."Name","Data"=excluded."Data",
+             "ExternalId"=excluded."ExternalId","SeriesId"=excluded."SeriesId""#,
+    )
+    .bind(timer.base.id.clone().unwrap_or_default())
+    .bind(guid_to_db(timer.base.channel_id))
+    .bind(&timer.base.program_id)
+    .bind(timer.base.name.clone().unwrap_or_default())
+    .bind(&data)
+    .bind(external_id)
+    .bind(series_id)
+    .execute(db.writer())
+    .await
+    .map_err(db_err)?;
+    Ok(())
+}
+
+/// The ids of every timer a series timer scheduled.
+///
+/// # Errors
+///
+/// Fails when the read fails.
+pub async fn timer_ids_for_series(
+    db: &Database,
+    series_timer_id: &str,
+) -> Result<Vec<String>, ServiceError> {
+    sqlx::query_scalar(r#"SELECT "Id" FROM "FerrofinLiveTvTimers" WHERE "SeriesTimerId" = ?1"#)
+        .bind(series_timer_id)
+        .fetch_all(db.pool())
+        .await
+        .map_err(db_err)
 }
 
 /// The stored timer whose `ProgramId` or `ExternalProgramId` names this

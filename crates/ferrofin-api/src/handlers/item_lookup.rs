@@ -36,6 +36,7 @@ use uuid::Uuid;
 
 use crate::auth::{RequireAdmin, RequireAuth};
 use crate::error::ApiError;
+use crate::extract::JsonBody;
 use crate::state::AppState;
 
 /// `GET /Items/{itemId}/ExternalIdInfos` — the item's external-id descriptors.
@@ -209,7 +210,7 @@ macro_rules! remote_search_handler {
         async fn $fn_name(
             State(state): State<AppState>,
             _auth: $auth,
-            Json(query): Json<RemoteSearchQuery<$info>>,
+            JsonBody(query): JsonBody<RemoteSearchQuery<$info>>,
         ) -> Result<Json<Vec<RemoteSearchResult>>, ApiError> {
             let request = to_request(query, $kind);
             run_remote_search(&state, request).await
@@ -294,7 +295,7 @@ async fn apply_search_criteria(
     RequireAdmin(_auth): RequireAdmin,
     Path(item_id): Path<Uuid>,
     Query(query): Query<ApplyQuery>,
-    Json(search_result): Json<RemoteSearchResult>,
+    JsonBody(search_result): JsonBody<RemoteSearchResult>,
 ) -> Result<axum::http::StatusCode, ApiError> {
     let Some(item) = state.library.get_item_by_id(item_id).await? else {
         return Err(ApiError::NotFound(format!("item {item_id}")));
@@ -308,13 +309,16 @@ async fn apply_search_criteria(
 
     // Full metadata + image refresh, replacing everything (the C# builds
     // `FullRefresh` for both modes with `ReplaceAllMetadata = true`), bound to
-    // the chosen result (`SearchResult = searchResult`).
+    // the chosen result (`SearchResult = searchResult`), and — the flag only
+    // this endpoint sets — `RemoveOldMetadata = true`, so the previously
+    // identified record's fields do not survive under the new one.
     let options = MetadataRefreshOptions {
         metadata_refresh_mode: MetadataRefreshMode::FullRefresh,
         image_refresh_mode: MetadataRefreshMode::FullRefresh,
         replace_all_metadata: true,
         replace_all_images: query.replace_all_images,
         search_result: Some(search_result),
+        remove_old_metadata: true,
     };
     state.providers.refresh_full_item(item_id, &options).await?;
 

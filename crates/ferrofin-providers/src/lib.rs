@@ -15,6 +15,7 @@ pub mod container_types;
 pub mod error;
 pub mod external_ids;
 pub mod fanart;
+mod image_download;
 pub mod library_options;
 pub mod listenbrainz;
 pub mod local_images;

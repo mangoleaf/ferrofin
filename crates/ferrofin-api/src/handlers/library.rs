@@ -51,6 +51,7 @@ use uuid::Uuid;
 
 use crate::auth::{FirstTimeSetupOrAuth, RequireAdmin, RequireAuth};
 use crate::error::ApiError;
+use crate::extract::JsonBody;
 use crate::handlers::items::{resolve_user, user_uuid};
 use crate::handlers::query_parse::parse_csv_enums_lenient;
 use crate::handlers::streaming::serve_static_file;
@@ -681,7 +682,7 @@ async fn post_updated_movies(
 async fn post_updated_media(
     State(state): State<AppState>,
     RequireAuth(_auth): RequireAuth,
-    Json(dto): Json<MediaUpdateInfoDto>,
+    JsonBody(dto): JsonBody<MediaUpdateInfoDto>,
 ) -> Result<axum::http::StatusCode, ApiError> {
     let mut paths = Vec::with_capacity(dto.updates.len());
     for update in dto.updates {

@@ -35,6 +35,7 @@ use uuid::Uuid;
 
 use crate::auth::{RequireAdmin, RequireAuth};
 use crate::error::ApiError;
+use crate::extract::JsonBody;
 use crate::handlers::items::effective_user_id;
 use crate::handlers::query_parse::{parse_csv_enums_lenient, parse_csv_uuids};
 use crate::handlers::session_ctx::{current_session, current_session_id};
@@ -307,7 +308,7 @@ async fn send_full_general_command(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
     Path(session_id): Path<String>,
-    Json(mut command): Json<GeneralCommand>,
+    JsonBody(mut command): JsonBody<GeneralCommand>,
 ) -> Result<StatusCode, ApiError> {
     let controlling = current_session(&state, &auth).await?;
     command.controlling_user_id = controlling.user_id;
@@ -334,7 +335,7 @@ async fn send_message_command(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
     Path(session_id): Path<String>,
-    Json(mut command): Json<MessageCommand>,
+    JsonBody(mut command): JsonBody<MessageCommand>,
 ) -> Result<StatusCode, ApiError> {
     // C# defaults a blank header to "Message from Server".
     if command.header.as_deref().is_none_or(str::is_empty) {
@@ -472,7 +473,7 @@ async fn post_full_capabilities(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
     Query(query): Query<FullCapabilitiesQuery>,
-    Json(capabilities): Json<ClientCapabilitiesDto>,
+    JsonBody(capabilities): JsonBody<ClientCapabilitiesDto>,
 ) -> Result<StatusCode, ApiError> {
     let id = match query.id {
         Some(id) if !id.is_empty() => id,

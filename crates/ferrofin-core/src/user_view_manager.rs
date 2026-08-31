@@ -102,15 +102,24 @@ pub(crate) const PLAYLISTS_FOLDER_NAME: &str = "Playlists";
 #[derive(Clone)]
 pub struct FerrofinUserViewManager {
     items: Arc<dyn ItemRepository>,
-    /// The item store, set by the composition root. When present (together with a
-    /// [`playlists_path`](Self::playlists_path)), [`get_media_folders`] lazily
-    /// provisions the [`BaseItemKind::PlaylistsFolder`] row on first read —
+    /// The item store, set by the composition root. It provisions the Live TV
+    /// `UserView` row, and — together with a
+    /// [`playlists_path`](Self::playlists_path) — [`get_media_folders`] uses it
+    /// to lazily provision the [`BaseItemKind::PlaylistsFolder`] row on first
+    /// read —
     /// the same self-healing stance `FerrofinVirtualFolderManager` takes for a
-    /// library's `CollectionFolder`. `None` in unit tests keeps the manager
-    /// read-only.
+    /// library's `CollectionFolder`. The store memoizes, so this costs nothing
+    /// after the first call. `None` in unit tests.
     ///
     /// [`get_media_folders`]: UserViewManager::get_media_folders
     persistence: Option<Arc<dyn ItemPersistenceService>>,
+    /// The user-root provisioner. [`get_media_folders`] settles it on first
+    /// read so the `UserRootFolder` row this endpoint browses exists even on a
+    /// server that has never resolved `GET /Items/Root`. The store memoizes, so
+    /// this costs nothing after the first call. `None` in unit tests.
+    ///
+    /// [`get_media_folders`]: UserViewManager::get_media_folders
+    user_root: Option<crate::user_root_folder::UserRootFolderStore>,
     /// The on-disk playlists directory (`{data}/playlists`), the provisioned
     /// folder's `Path`. Only meaningful alongside [`persistence`](Self::persistence).
     playlists_path: Option<PathBuf>,
@@ -142,7 +151,7 @@ impl std::fmt::Debug for FerrofinUserViewManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FerrofinUserViewManager")
             .field("has_item_store", &self.persistence.is_some())
-            .field("playlists_path", &self.playlists_path)
+            .field("has_user_root", &self.user_root.is_some())
             .field("has_virtual_folders", &self.virtual_folders.is_some())
             .field("metadata_path", &self.metadata_path)
             .finish_non_exhaustive()
@@ -156,6 +165,7 @@ impl FerrofinUserViewManager {
         Self {
             items,
             persistence: None,
+            user_root: None,
             playlists_path: None,
             root_folder_path: None,
             id_derivation: item_type_lookup::IdDerivation::LegacyLowercase,
@@ -207,6 +217,14 @@ impl FerrofinUserViewManager {
         self
     }
 
+    /// Attaches the item store, so the Live TV `UserView` row can be
+    /// provisioned. Called once by the composition root.
+    #[must_use]
+    pub fn with_item_store(mut self, persistence: Arc<dyn ItemPersistenceService>) -> Self {
+        self.persistence = Some(persistence);
+        self
+    }
+
     /// Attaches the item store and the playlists directory so
     /// [`get_media_folders`](UserViewManager::get_media_folders) can lazily
     /// provision the `PlaylistsFolder` row (and create its directory) on
@@ -219,6 +237,16 @@ impl FerrofinUserViewManager {
     ) -> Self {
         self.persistence = Some(persistence);
         self.playlists_path = Some(playlists_path.into());
+        self
+    }
+
+    /// Attaches the user-root provisioner, so
+    /// [`get_media_folders`](UserViewManager::get_media_folders) settles the
+    /// root — and with it the playlists plugin folder it must list — on first
+    /// read. Called once by the composition root.
+    #[must_use]
+    pub fn with_user_root(mut self, store: crate::user_root_folder::UserRootFolderStore) -> Self {
+        self.user_root = Some(store);
         self
     }
 
@@ -371,9 +399,7 @@ impl FerrofinUserViewManager {
     /// the row on first read. Ferrofin only ever read such a row, so the view
     /// never existed and `/UserViews` served one fewer view than Jellyfin.
     async fn ensure_live_tv_view(&self, user_id: Uuid) -> Result<(), ServiceError> {
-        let (Some(persistence), Some(metadata_path), Some(db)) =
-            (&self.persistence, &self.metadata_path, &self.db)
-        else {
+        let Some(db) = &self.db else {
             return Ok(());
         };
         // The C# `GetEnabledUsers()` guard: a user without Live TV access never
@@ -383,12 +409,27 @@ impl FerrofinUserViewManager {
         {
             return Ok(());
         }
+        self.provision_live_tv_view().await.map(|_| ())
+    }
+
+    /// Provisions the Live TV `UserView` row (and its directory) if absent and
+    /// returns its id — the user-less half of [`Self::ensure_live_tv_view`].
+    ///
+    /// This is what `LiveTvManager.GetInternalLiveTvFolder()` does: it takes no
+    /// user, because the folder is the parent every channel ITEM is stored
+    /// under, and item rows exist whether or not a given user may see them.
+    /// `None` means the manager has no item store or metadata path wired.
+    async fn provision_live_tv_view(&self) -> Result<Option<Uuid>, ServiceError> {
+        let (Some(persistence), Some(metadata_path)) = (&self.persistence, &self.metadata_path)
+        else {
+            return Ok(None);
+        };
         let view_path = metadata_path.join("views").join("livetv");
         let Some(id) = self.live_tv_view_id(&view_path) else {
-            return Ok(());
+            return Ok(None);
         };
         if persistence.item_exists(id).await? {
-            return Ok(());
+            return Ok(Some(id));
         }
         // C# `Directory.CreateDirectory(path)` inside `GetNamedView`.
         tokio::fs::create_dir_all(&view_path)
@@ -422,7 +463,7 @@ impl FerrofinUserViewManager {
         persistence
             .save_items(std::slice::from_ref(&entity))
             .await?;
-        Ok(())
+        Ok(Some(id))
     }
 }
 
@@ -445,12 +486,21 @@ impl UserViewManager for FerrofinUserViewManager {
         self.without_disabled_live_tv(user_id, views).await
     }
 
+    async fn get_internal_live_tv_folder_id(&self) -> Result<Option<Uuid>, ServiceError> {
+        self.provision_live_tv_view().await
+    }
+
     async fn get_media_folders(&self, user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError> {
         // Jellyfin's LibraryController.GetMediaFolders returns
         // GetUserRootFolder().Children sorted by SortName — the library collection
-        // folders plus the auto-provisioned PlaylistsFolder. Provision the
-        // playlists folder on first read (lazy, self-healing), then project the
-        // user-root child kinds, name-sorted.
+        // folders plus the playlists plugin folder `CreateRootFolder()` parents
+        // to the `AggregateFolder`. Settle the user root on first read (lazy,
+        // self-healing, memoized by the store) and provision the playlists
+        // folder the same way, then project the user-root child kinds,
+        // name-sorted.
+        if let Some(root) = &self.user_root {
+            root.ensure().await?;
+        }
         self.ensure_playlists_folder().await?;
         let query = InternalItemsQuery {
             include_item_types: vec![
@@ -553,14 +603,61 @@ pub(crate) struct LatestParent {
     collection_type: Option<CollectionType>,
 }
 
+/// The `IHasCollectionType.CollectionType` of a latest-items parent row —
+/// the C# `switch (parent.CollectionType)` input.
+///
+/// - `CollectionFolder` carries the library's own configured type, looked up
+///   by id (`CollectionFolder.CollectionType`, CollectionFolder.cs:32);
+/// - the playlists plugin folder is the constant `playlists`
+///   (`PlaylistsFolder.CollectionType`, v10.11.8
+///   `Emby.Server.Implementations/Playlists/PlaylistsFolder.cs:29`) —
+///   recognised under BOTH spellings, since this classifies a **stored** row
+///   and 10.11.8 persists `…Playlists.PlaylistsFolder` while an older Ferrofin
+///   wrote the `GetClientTypeName()` name `ManualPlaylistsFolder`;
+/// - everything else reports `None`: a `UserView` (its `ViewType` is not
+///   persisted at this seam) and, deliberately, a bare `BasePluginFolder` —
+///   the abstract base declares `CollectionType => null`
+///   (BasePluginFolder.cs:14) and only `PlaylistsFolder` overrides it, so this
+///   arm must NOT be widened to the base class even though
+///   [`LatestParent::is_collection_folder`] does recognise it.
+///
+/// Lifted out of the `classify` closure so it can be pinned directly: getting
+/// it wrong loses `CollectionType::playlists` on a playlists parent, which is
+/// invisible until the media-type rules downstream quietly change.
+fn latest_parent_collection_type(
+    kind: Option<BaseItemKind>,
+    id: Uuid,
+    library_types: &HashMap<Uuid, Option<CollectionType>>,
+) -> Option<CollectionType> {
+    match kind {
+        Some(BaseItemKind::CollectionFolder) => library_types.get(&id).copied().flatten(),
+        Some(BaseItemKind::ManualPlaylistsFolder | BaseItemKind::PlaylistsFolder) => {
+            Some(CollectionType::playlists)
+        }
+        _ => None,
+    }
+}
+
 impl LatestParent {
     /// C# `parent is ICollectionFolder`: a library `CollectionFolder`, or the
-    /// plugin-folder line (`ManualPlaylistsFolder : BasePluginFolder :
-    /// ICollectionFolder`).
+    /// plugin-folder line (`PlaylistsFolder : BasePluginFolder :
+    /// ICollectionFolder`, v10.11.8
+    /// `MediaBrowser.Controller/Entities/BasePluginFolder.cs:12`).
+    ///
+    /// Both spellings, because this classifies a **stored** row: 10.11.8
+    /// persists the FQN `…Playlists.PlaylistsFolder`, while
+    /// `ManualPlaylistsFolder` is only `GetClientTypeName()` — the spelling an
+    /// older Ferrofin wrote. Missing either one drops the parent out of the
+    /// `top_parent_ids` branch below and loses `CollectionType::playlists`.
     fn is_collection_folder(&self) -> bool {
         matches!(
             self.kind,
-            Some(BaseItemKind::CollectionFolder | BaseItemKind::ManualPlaylistsFolder)
+            Some(
+                BaseItemKind::CollectionFolder
+                    | BaseItemKind::BasePluginFolder
+                    | BaseItemKind::ManualPlaylistsFolder
+                    | BaseItemKind::PlaylistsFolder
+            )
         )
     }
 
@@ -712,13 +809,7 @@ impl FerrofinUserViewManager {
         let classify = |row: &BaseItemEntity| -> Option<LatestParent> {
             let id = Uuid::parse_str(&row.id).ok()?;
             let kind = item_type_lookup::kind_from_type_name(&row.type_);
-            let collection_type = match kind {
-                Some(BaseItemKind::CollectionFolder) => {
-                    collection_types.get(&id).copied().flatten()
-                }
-                Some(BaseItemKind::ManualPlaylistsFolder) => Some(CollectionType::playlists),
-                _ => None,
-            };
+            let collection_type = latest_parent_collection_type(kind, id, &collection_types);
             Some(LatestParent {
                 id,
                 kind,
@@ -971,13 +1062,23 @@ mod tests {
         FerrofinUserViewManager::new(Arc::new(FerrofinItemRepository::new(db.clone(), lookup)))
     }
 
+    /// A manager that provisions the playlists folder, plus the user-root store
+    /// `get_media_folders` settles on the way in.
     fn manager_with_playlists(
         db: &Database,
+        root_path: impl Into<PathBuf>,
         playlists_path: impl Into<PathBuf>,
     ) -> FerrofinUserViewManager {
         let persistence: Arc<dyn ItemPersistenceService> =
             Arc::new(FerrofinItemPersistenceService::new(db.clone()));
-        manager(db).with_playlists_store(persistence, playlists_path)
+        let root = crate::user_root_folder::UserRootFolderStore::new(
+            Arc::clone(&persistence),
+            item_type_lookup::IdDerivation::LegacyLowercase,
+            root_path,
+        );
+        manager(db)
+            .with_playlists_store(persistence, playlists_path)
+            .with_user_root(root)
     }
 
     /// The Live TV view is served only while Live TV is available. An adopted
@@ -1875,6 +1976,84 @@ mod tests {
         }
     }
 
+    /// `PlaylistsFolder.CollectionType => playlists` (v10.11.8
+    /// `Emby.Server.Implementations/Playlists/PlaylistsFolder.cs:29`), under
+    /// the stored spelling and the `GetClientTypeName()` one alike — a
+    /// `CollectionFolder` reports its configured library type, and every other
+    /// kind reports `None`.
+    #[test]
+    fn a_playlists_parent_reports_the_playlists_collection_type() {
+        let library = Uuid::new_v4();
+        let playlists = Uuid::new_v4();
+        let types: HashMap<Uuid, Option<CollectionType>> =
+            [(library, Some(CollectionType::movies))]
+                .into_iter()
+                .collect();
+
+        for kind in [
+            BaseItemKind::PlaylistsFolder,
+            BaseItemKind::ManualPlaylistsFolder,
+        ] {
+            assert_eq!(
+                latest_parent_collection_type(Some(kind), playlists, &types),
+                Some(CollectionType::playlists),
+                "{kind:?}"
+            );
+        }
+        assert_eq!(
+            latest_parent_collection_type(Some(BaseItemKind::CollectionFolder), library, &types),
+            Some(CollectionType::movies),
+            "a library still reports its own configured type"
+        );
+        // `BasePluginFolder.CollectionType => null` (BasePluginFolder.cs:14):
+        // it is an `ICollectionFolder` WITHOUT a collection type, so the two
+        // predicates deliberately disagree on it.
+        assert_eq!(
+            latest_parent_collection_type(Some(BaseItemKind::BasePluginFolder), playlists, &types),
+            None
+        );
+        assert!(parent(BaseItemKind::BasePluginFolder, None).is_collection_folder());
+        assert_eq!(
+            latest_parent_collection_type(Some(BaseItemKind::UserView), playlists, &types),
+            None
+        );
+        assert_eq!(latest_parent_collection_type(None, playlists, &types), None);
+    }
+
+    /// `PlaylistsFolder : BasePluginFolder : ICollectionFolder` (v10.11.8
+    /// `MediaBrowser.Controller/Entities/BasePluginFolder.cs:12`), so a
+    /// playlists parent must classify as an `ICollectionFolder` — that is what
+    /// puts it on the `top_parent_ids` branch of
+    /// `LibraryManager.SetTopParentIdsOrAncestors` instead of the ancestor
+    /// closure.
+    ///
+    /// Pinned under BOTH spellings because this classifies a **stored** row:
+    /// 10.11.8 persists `…Playlists.PlaylistsFolder`, while
+    /// `ManualPlaylistsFolder` is only `GetClientTypeName()` and the spelling
+    /// an older Ferrofin wrote. Recognising just one of them silently moved
+    /// `GET /Items/Latest?parentId=<playlistsFolder>` onto the wrong branch.
+    #[test]
+    fn the_playlists_folder_classifies_as_a_collection_folder() {
+        for kind in [
+            BaseItemKind::PlaylistsFolder,
+            BaseItemKind::ManualPlaylistsFolder,
+            BaseItemKind::BasePluginFolder,
+            BaseItemKind::CollectionFolder,
+        ] {
+            assert!(
+                parent(kind, None).is_collection_folder(),
+                "{kind:?} is an ICollectionFolder"
+            );
+        }
+        // A `UserView` is the other branch, and an ordinary folder is neither
+        // — so the assertion above is not a predicate that says yes to
+        // everything.
+        assert!(!parent(BaseItemKind::UserView, None).is_collection_folder());
+        assert!(parent(BaseItemKind::UserView, None).is_user_view());
+        assert!(!parent(BaseItemKind::Folder, None).is_collection_folder());
+        assert!(!parent(BaseItemKind::Series, None).is_collection_folder());
+    }
+
     /// The `includeItemTypes` narrowing for grouped views: every `UserView`
     /// parent a movies (tvshows) library → `[Movie]` (`[Episode]`), which also
     /// empties the media types; a mixed set of views narrows nothing, and an
@@ -1943,7 +2122,8 @@ mod tests {
         let libraries = 2usize;
         let tmp = tempfile::tempdir().expect("tempdir");
         let playlists_path = tmp.path().join("data").join("playlists");
-        let mgr = manager_with_playlists(&db, &playlists_path);
+        let root_path = tmp.path().join("root").join("default");
+        let mgr = manager_with_playlists(&db, &root_path, &playlists_path);
 
         let folders = mgr
             .get_media_folders(Uuid::from_u128(9))
@@ -1956,6 +2136,9 @@ mod tests {
         let playlists = folders
             .iter()
             .find(|f| {
+                // Stored as `PlaylistsFolder` — 10.11.8 has no
+                // `ManualPlaylistsFolder` class, that name is only the folder's
+                // `GetClientTypeName()`, which `client_kind` applies on the way out.
                 f.type_ == "Emby.Server.Implementations.Playlists.PlaylistsFolder"
                     && f.name.as_deref() == Some("Playlists")
             })

@@ -50,6 +50,15 @@ use ferrofin_traits::persistence::{
 /// `00000000-0000-0000-0000-000000000001`).
 const PLACEHOLDER_ITEM_ID: Uuid = Uuid::from_u128(1);
 
+/// How often [`FerrofinLibraryManager::run_scan`] re-checks whether the scan it
+/// coalesced into has finished.
+///
+/// Only reached when a second scan request arrives while one is already
+/// running, so it costs one atomic load per tick and nothing at all on the
+/// common path. Small enough that "the task finished" is not visibly later than
+/// the scan itself; large enough not to spin.
+const SCAN_WAIT_POLL: std::time::Duration = std::time::Duration::from_millis(200);
+
 /// The concrete library manager.
 ///
 /// Holds cheaply-cloneable `Arc<dyn _>` handles to the four persistence traits it
@@ -759,6 +768,15 @@ impl LibraryManager for FerrofinLibraryManager {
         self.spawn_scan("api", ScanScope::Library(library_id));
         Ok(())
     }
+
+    async fn run_library_scan(&self) -> Result<(), ServiceError> {
+        // Boxed because the scan future is ~16 KB — a whole pass over the
+        // planner lives in it — and this is the one place it is awaited on a
+        // caller's stack instead of on a `tokio::spawn`ed task of its own
+        // (`clippy::large_futures`).
+        Box::pin(self.run_scan("schedule", ScanScope::Full)).await;
+        Ok(())
+    }
 }
 
 impl FerrofinLibraryManager {
@@ -769,71 +787,104 @@ impl FerrofinLibraryManager {
     /// `scope` restricts the scan to one library or to a set of changed paths;
     /// [`ScanScope::Full`] scans everything.
     fn spawn_scan(&self, trigger: &'static str, scope: ScanScope) {
-        let Some(scanner) = &self.scanner else {
-            tracing::debug!(trigger, "library scan queued (no scanner attached — no-op)");
+        let Some(work) = self.claim_scan(trigger, scope) else {
             return;
         };
-        // Coalesce: a full scan fetches remote metadata + artwork for every item,
-        // so it can run for minutes. The library-monitor webhooks report one path
-        // at a time (a Radarr/Sonarr batch = many calls) and `/Library/Refresh`
-        // can be double-clicked, so overlapping requests must fold into one scan.
-        // If a scan is already running, merge this request's scope into the
-        // pending rerun and return; the running task loops once more over the
-        // merged scope to pick up whatever changed mid-scan.
+        // Its own root span — a scan is a background unit of work, never parented
+        // under the request span. `.instrument()` carries it onto the spawned task.
+        tokio::spawn(work.instrument(tracing::info_span!("library_scan", trigger)));
+    }
+
+    /// The awaiting twin of [`spawn_scan`](Self::spawn_scan): runs the scan on
+    /// the CALLER's future and returns only once it has finished.
+    ///
+    /// Used by the "Scan Media Library" scheduled task, whose upstream
+    /// counterpart awaits the validation pass (`RefreshMediaLibraryTask
+    /// .ExecuteAsync` → `await ValidateMediaLibraryInternal`). When another scan
+    /// already owns the work this merges its scope into that scan's rerun — the
+    /// same coalescing as the spawning path — and then waits for the in-flight
+    /// flag to clear, so "the task finished" still means "the library is
+    /// scanned" and not merely "someone else is scanning".
+    async fn run_scan(&self, trigger: &'static str, scope: ScanScope) {
+        match self.claim_scan(trigger, scope) {
+            Some(work) => {
+                work.instrument(tracing::info_span!("library_scan", trigger))
+                    .await;
+            }
+            None => {
+                while self.scan_in_flight.load(Ordering::Acquire) {
+                    tokio::time::sleep(SCAN_WAIT_POLL).await;
+                }
+            }
+        }
+    }
+
+    /// Takes the single-scan claim and hands back the work to run, or `None`
+    /// when there is nothing for this caller to run — no scanner attached, or a
+    /// scan already in flight (in which case `scope` is merged into that scan's
+    /// queued rerun).
+    ///
+    /// Coalesce: a full scan fetches remote metadata + artwork for every item,
+    /// so it can run for minutes. The library-monitor webhooks report one path
+    /// at a time (a Radarr/Sonarr batch = many calls) and `/Library/Refresh`
+    /// can be double-clicked, so overlapping requests must fold into one scan.
+    fn claim_scan(
+        &self,
+        trigger: &'static str,
+        scope: ScanScope,
+    ) -> Option<impl std::future::Future<Output = ()> + Send + 'static> {
+        let Some(scanner) = &self.scanner else {
+            tracing::debug!(trigger, "library scan queued (no scanner attached — no-op)");
+            return None;
+        };
         if self.scan_in_flight.swap(true, Ordering::AcqRel) {
             scope.merge_into(&mut self.scan_pending.lock().expect("pending not poisoned"));
             tracing::debug!(
                 trigger,
                 "library scan already running; coalesced (rerun queued)"
             );
-            return;
+            return None;
         }
         let scanner = Arc::clone(scanner);
         let in_flight = Arc::clone(&self.scan_in_flight);
         let pending = Arc::clone(&self.scan_pending);
-        // Its own root span — a scan is a background unit of work, never parented
-        // under the request span. `.instrument()` carries it onto the spawned task.
-        let span = tracing::info_span!("library_scan", trigger);
-        tokio::spawn(
-            async move {
-                let started = std::time::Instant::now();
-                tracing::info!("library scan started");
-                let mut total_created = 0usize;
-                let mut scope = scope;
-                loop {
-                    let result = match scope {
-                        ScanScope::Full => scanner.scan(None).await,
-                        ScanScope::Library(id) => scanner.scan(Some(id)).await,
-                        ScanScope::Paths(ref paths) => scanner.scan_paths(paths).await,
-                    };
-                    match result {
-                        Ok(created) => {
-                            total_created += created;
-                            tracing::info!(created, "library scan pass complete");
-                        }
-                        // Logged exactly once, here, at the scan task's top level.
-                        Err(err) => tracing::error!(%err, "library scan failed"),
+        Some(async move {
+            let started = std::time::Instant::now();
+            tracing::info!("library scan started");
+            let mut total_created = 0usize;
+            let mut scope = scope;
+            loop {
+                let result = match scope {
+                    ScanScope::Full => scanner.scan(None).await,
+                    ScanScope::Library(id) => scanner.scan(Some(id)).await,
+                    ScanScope::Paths(ref paths) => scanner.scan_paths(paths).await,
+                };
+                match result {
+                    Ok(created) => {
+                        total_created += created;
+                        tracing::info!(created, "library scan pass complete");
                     }
-                    // A request that arrived during the scan queued a rerun over
-                    // its merged scope.
-                    match pending.lock().expect("pending not poisoned").take() {
-                        Some(next) => scope = next,
-                        None => break,
-                    }
+                    // Logged exactly once, here, at the scan task's top level.
+                    Err(err) => tracing::error!(%err, "library scan failed"),
                 }
-                in_flight.store(false, Ordering::Release);
-                tracing::info!(
-                    created = total_created,
-                    elapsed_ms = started.elapsed().as_millis(),
-                    "library scan complete"
-                );
-                // ponytail: a request landing in the gap between the pending take
-                // and clearing in_flight loses its rerun — harmless (the next webhook
-                // or a manual refresh re-triggers). Tighten only if webhook-driven
-                // scans start missing changes.
+                // A request that arrived during the scan queued a rerun over
+                // its merged scope.
+                match pending.lock().expect("pending not poisoned").take() {
+                    Some(next) => scope = next,
+                    None => break,
+                }
             }
-            .instrument(span),
-        );
+            in_flight.store(false, Ordering::Release);
+            tracing::info!(
+                created = total_created,
+                elapsed_ms = started.elapsed().as_millis(),
+                "library scan complete"
+            );
+            // ponytail: a request landing in the gap between the pending take
+            // and clearing in_flight loses its rerun — harmless (the next webhook
+            // or a manual refresh re-triggers). Tighten only if webhook-driven
+            // scans start missing changes.
+        })
     }
 }
 
@@ -905,6 +956,57 @@ mod tests {
             .find(|kv| kv.key.as_str() == "trigger")
             .map(|kv| kv.value.to_string());
         assert_eq!(trigger.as_deref(), Some("api"));
+    }
+
+    #[tokio::test]
+    async fn run_library_scan_returns_only_once_the_scan_has_finished() {
+        // Upstream's "Scan Media Library" task awaits the validation pass
+        // (`RefreshMediaLibraryTask.ExecuteAsync`:57-64), so the task is still
+        // `Running` while the library is being written. This asserts both
+        // halves of that: the owning caller returns with the in-flight claim
+        // released, and a caller that coalesced into someone else's scan waits
+        // for THAT scan rather than returning immediately.
+        use crate::file_system::FerrofinFileSystem;
+        use crate::library_scan::LibraryScanner;
+        use crate::virtual_folder_manager::FerrofinVirtualFolderManager;
+        use ferrofin_traits::library::VirtualFolderManager;
+
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+            FerrofinVirtualFolderManager::new(tmp.path().join("default"))
+                .with_item_store(persistence.clone()),
+        );
+        let scanner = Arc::new(LibraryScanner::new(
+            vf,
+            Arc::new(FerrofinFileSystem::new()),
+            persistence,
+        ));
+        let mgr = Arc::new(manager(&db).with_scanner(scanner));
+
+        mgr.run_library_scan().await.expect("scan runs");
+        assert!(
+            !mgr.scan_in_flight.load(Ordering::Acquire),
+            "the awaiting form must not return while its own scan is still claimed"
+        );
+
+        // Coalesced path: pretend another scan owns the claim, release it after
+        // a beat, and check the waiter observed the release instead of racing
+        // past it.
+        mgr.scan_in_flight.store(true, Ordering::Release);
+        let releaser = Arc::clone(&mgr);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            releaser.scan_in_flight.store(false, Ordering::Release);
+        });
+        let started = std::time::Instant::now();
+        mgr.run_library_scan().await.expect("scan runs");
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(100),
+            "a coalesced run must wait for the in-flight scan, not return at once"
+        );
+        assert!(!mgr.scan_in_flight.load(Ordering::Acquire));
     }
 
     #[tokio::test]

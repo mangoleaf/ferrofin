@@ -34,6 +34,7 @@ use uuid::Uuid;
 
 use crate::auth::FirstTimeSetupOrAuth;
 use crate::error::ApiError;
+use crate::extract::JsonBody;
 use crate::state::AppState;
 
 /// Restarts the library monitor so its watch set matches the just-mutated
@@ -158,7 +159,7 @@ async fn add_virtual_folder(
     State(state): State<AppState>,
     FirstTimeSetupOrAuth(_auth): FirstTimeSetupOrAuth,
     Query(query): Query<AddVirtualFolderQuery>,
-    body: Option<Json<AddVirtualFolderBody>>,
+    body: Option<JsonBody<AddVirtualFolderBody>>,
 ) -> Result<StatusCode, ApiError> {
     let name = query.name.unwrap_or_default();
     if name.trim().is_empty() {
@@ -168,7 +169,7 @@ async fn add_virtual_folder(
     }
 
     let mut options = body
-        .and_then(|Json(b)| b.library_options)
+        .and_then(|JsonBody(b)| b.library_options)
         .unwrap_or_default();
 
     // The query `paths` (comma-delimited) override the body's PathInfos, exactly
@@ -369,7 +370,7 @@ async fn add_media_path(
     State(state): State<AppState>,
     FirstTimeSetupOrAuth(_auth): FirstTimeSetupOrAuth,
     Query(query): Query<MediaPathQuery>,
-    Json(body): Json<MediaPathBody>,
+    JsonBody(body): JsonBody<MediaPathBody>,
 ) -> Result<StatusCode, ApiError> {
     let name = body.name.unwrap_or_default();
     if name.trim().is_empty() {
@@ -423,7 +424,7 @@ struct UpdateMediaPathBody {
 async fn update_media_path(
     State(state): State<AppState>,
     FirstTimeSetupOrAuth(_auth): FirstTimeSetupOrAuth,
-    Json(body): Json<UpdateMediaPathBody>,
+    JsonBody(body): JsonBody<UpdateMediaPathBody>,
 ) -> Result<StatusCode, ApiError> {
     let name = body.name.unwrap_or_default();
     if name.trim().is_empty() {
@@ -523,7 +524,7 @@ struct UpdateLibraryOptionsBody {
 async fn update_library_options(
     State(state): State<AppState>,
     FirstTimeSetupOrAuth(_auth): FirstTimeSetupOrAuth,
-    Json(body): Json<UpdateLibraryOptionsBody>,
+    JsonBody(body): JsonBody<UpdateLibraryOptionsBody>,
 ) -> Result<StatusCode, ApiError> {
     let options = body.library_options.unwrap_or_default();
     // No name: resolve the library by its CollectionFolder id (what jellyfin-web

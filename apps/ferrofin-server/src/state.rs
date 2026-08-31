@@ -671,19 +671,34 @@ pub async fn build_app_state(
     // the filesystem scanner the library manager runs on `queue_library_scan`.
     // Kept concrete so the library monitor can take it as its `WatchRootsSource`
     // (the roots of every library with realtime monitoring enabled).
-    // The playlists media folder lives at `{data}/playlists` (C#
-    // `ManualPlaylistsFolder`); the user-view seam provisions it lazily. Both
-    // seams need the path: the user-view manager creates the folder, and the
-    // virtual-folder manager reports it among the root's physical locations
-    // (`LibraryManager.CreateRootFolder` adds it as a virtual child of the
-    // root, so `GET /Library/PhysicalPaths` lists it).
+    // The playlists media folder lives at `{data}/playlists` (stored as
+    // `PlaylistsFolder`; `ManualPlaylistsFolder` is only its
+    // `GetClientTypeName()`). Both seams need the path: the user-root store
+    // provisions the folder, and the virtual-folder manager reports it among
+    // the root's physical locations (`LibraryManager.CreateRootFolder` adds it
+    // as a virtual child of the root, so `GET /Library/PhysicalPaths` lists
+    // it).
     let playlists_path = std::path::PathBuf::from(paths.data_path()).join("playlists");
+    // The `UserRootFolder` provisioner (`GetUserRootFolder()`): the row
+    // `Items/Root` resolves to and the parent of every library's
+    // `CollectionFolder`. The playlists plugin folder is NOT its child —
+    // `CreateRootFolder()` parents that to the `AggregateFolder`, which
+    // `aggregate_store.ensure()` above already did. Built FIRST and shared by
+    // every holder: the store memoizes its pass in an `Arc<OnceCell>` that
+    // survives cloning, so the virtual-folder, user-view and library managers
+    // settle the root together instead of each re-probing it per request.
+    let user_root_store = ferrofin_core::UserRootFolderStore::new(
+        Arc::clone(&item_persistence_service),
+        id_derivation.clone(),
+        paths.default_user_views_path(),
+    );
     let virtual_folders_impl = Arc::new(
         ferrofin_core::FerrofinVirtualFolderManager::new(paths.default_user_views_path())
             .with_item_store(Arc::clone(&item_persistence_service))
             .with_items(Arc::clone(&item_repository))
             .with_id_derivation(id_derivation.clone())
-            .with_playlists_path(playlists_path.clone()),
+            .with_playlists_path(playlists_path.clone())
+            .with_user_root(user_root_store.clone()),
     );
     let virtual_folders: Arc<dyn ferrofin_traits::library::VirtualFolderManager> =
         virtual_folders_impl.clone();
@@ -704,7 +719,11 @@ pub async fn build_app_state(
             .with_virtual_folders(Arc::clone(&virtual_folders)),
     );
     // Built after the virtual-folder manager: the refresh path reads the
-    // owning library's saved options through it (C# `BaseItemManager`).
+    // owning library's saved options through it (C# `BaseItemManager`). Two
+    // more things read it: the remote-image ("Choose Image") language filter
+    // resolves `LibraryOptions.PreferredMetadataLanguage` through it, and the
+    // remote-search path resolves the library's metadata downloaders. Nothing
+    // consumes `providers` before this point.
     let providers: Arc<dyn ferrofin_traits::providers::ProviderManager> = Arc::new(
         LocalProviderManager::new(Vec::new())
             .with_image_store(
@@ -727,7 +746,26 @@ pub async fn build_app_state(
             // The library-options gate for an on-demand refresh: without it a
             // `POST /Items/{id}/Refresh` ignores the library's metadata/image
             // fetcher checkboxes that the scan honours.
-            .with_virtual_folders(Arc::clone(&virtual_folders)),
+            .with_virtual_folders(Arc::clone(&virtual_folders))
+            // `BaseItem.GetPreferredMetadataLanguage()`'s two off-row tiers,
+            // which the remote-image language filter runs on. Read live rather
+            // than snapshotted so changing the setting takes effect without a
+            // restart.
+            .with_metadata_language(Arc::clone(&virtual_folders), {
+                let config_mgr = Arc::clone(&config_mgr);
+                Arc::new(move || {
+                    config_mgr
+                        .snapshot_shared()
+                        .preferred_metadata_language
+                        .clone()
+                })
+            })
+            // `SearchInfo.MetadataCountryCode`'s server-config fallback on the
+            // remote-search ("Identify") path.
+            .with_metadata_country({
+                let config_mgr = Arc::clone(&config_mgr);
+                Arc::new(move || config_mgr.snapshot_shared().metadata_country_code.clone())
+            }),
     );
 
     // The virtual-folder manager gives `/Items/Latest` each library's collection
@@ -739,10 +777,24 @@ pub async fn build_app_state(
             // The provisioned row's parent is the `AggregateFolder`, the way
             // `CreateRootFolder` parents it.
             .with_root_folder_path(paths.root_folder_path())
+            // Settles the `UserRootFolder` row on the first
+            // `GET /Library/MediaFolders`, memoized by the store.
+            .with_user_root(user_root_store.clone())
             .with_metadata_path(paths.internal_metadata_path())
             .with_id_derivation(id_derivation.clone())
             .with_virtual_folders(Arc::clone(&virtual_folders))
             .with_database(db.clone()),
+    );
+
+    // Close the Live TV <-> item-layer cycle: the guide refresh mirrors the
+    // channel lineup into `BaseItems` (C# `GuideManager.GetChannel` ->
+    // `LibraryManager.CreateItem`), parented to the Live TV `UserView` this
+    // manager provisions, so a channel resolves through the ordinary item
+    // routes and not just through `/LiveTv/Channels`.
+    live_tv_impl.set_item_store(
+        Arc::clone(&item_persistence_service),
+        Arc::clone(&item_repository),
+        Arc::clone(&user_views),
     );
     // Similar items: the local weighted-overlap scorer always runs; the remote
     // providers below run only for a library that ticked them in its
@@ -780,15 +832,6 @@ pub async fn build_app_state(
         Arc::clone(&item_persistence_service),
         id_derivation.clone(),
         paths.year_path(),
-    );
-    // The `UserRootFolder` provisioner (`GetUserRootFolder()`): the row
-    // `Items/Root` resolves to and the parent of every library's
-    // `CollectionFolder` (the virtual-folder manager builds its own over the
-    // same root + store, so both land on the one derived id).
-    let user_root_store = ferrofin_core::UserRootFolderStore::new(
-        Arc::clone(&item_persistence_service),
-        id_derivation.clone(),
-        paths.default_user_views_path(),
     );
     let mut scanner = ferrofin_core::LibraryScanner::new(
         Arc::clone(&virtual_folders),
@@ -983,6 +1026,10 @@ pub async fn build_app_state(
             Arc::clone(&providers),
         )
         .with_live_tv(Arc::clone(&live_tv))
+        // `GetPlaybackMediaSources`' per-user overwrite of
+        // `SupportsTranscoding`/`SupportsDirectStream` reads the requesting
+        // user's policy; without it the overwrite cannot run at all.
+        .with_user_data(Arc::clone(&user_data))
         .with_localization(Arc::clone(&localization)),
     );
 
@@ -1335,7 +1382,7 @@ pub async fn build_app_state(
         ));
 
     // ---- dto (consumes many of the above) ---------------------------------
-    let dto: Arc<dyn ferrofin_traits::dto::DtoService> = Arc::new(
+    let dto_impl = Arc::new(
         FerrofinDtoService::new(
             db.clone(),
             server_id.clone(),
@@ -1351,6 +1398,11 @@ pub async fn build_app_state(
         // Jellyfin's link providers use the plugin's configured server.
         .with_musicbrainz_server(&config.musicbrainz_base_url),
     );
+    // `DtoService` finishes a Live TV channel's DTO itself (C#
+    // `DtoService.LivetvManager.AddChannelInfo`), so it needs the Live TV
+    // manager — which needs the DTO service. Both sides are late-bound seams.
+    dto_impl.set_live_tv(Arc::clone(&live_tv));
+    let dto: Arc<dyn ferrofin_traits::dto::DtoService> = dto_impl;
     // Close the Live TV ↔ media-sources ↔ DTO cycle: the channel/programme
     // projections run through the same DTO service as every other item.
     live_tv_impl.set_dto(Arc::clone(&dto));

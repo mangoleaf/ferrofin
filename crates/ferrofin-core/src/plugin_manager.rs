@@ -1160,13 +1160,36 @@ impl PluginManager for FerrofinPluginManager {
         id: Uuid,
         config: Vec<u8>,
     ) -> Result<(), ServiceError> {
-        if self.find(id).is_none() {
+        let Some(plugin) = self.find(id) else {
             return Err(ServiceError::not_found(format!("plugin {id}")));
-        }
+        };
+        let defaults = plugin.default_config.clone();
         // Reject a non-JSON body so a corrupt write can't poison a later read.
-        serde_json::from_slice::<serde_json::Value>(&config)
+        let body = serde_json::from_slice::<serde_json::Value>(&config)
             .map_err(|_| ServiceError::invalid_input("plugin configuration must be valid JSON"))?;
-        Self::atomic_write(&self.config_path(id), &config)
+        match body {
+            // `if (configuration is not null) { configPlugin.UpdateConfiguration(…); }`
+            // (v10.11.8 Jellyfin.Api/Controllers/PluginsController.cs:186-201,
+            // unchanged on master): a `null` body is explicitly a NO-OP, and the
+            // action still answers 204. Ferrofin stored the literal `null`,
+            // after which `merge_config`'s non-object arm made the next GET
+            // answer the bare token `null` — an admin-reachable way to destroy a
+            // plugin's configuration AND to violate the contract's
+            // `BasePluginConfiguration` object shape.
+            serde_json::Value::Null => Ok(()),
+            serde_json::Value::Object(map) => {
+                let projected = project_config(&defaults, &map)?;
+                Self::atomic_write(&self.config_path(id), &projected)
+            }
+            // The C# deserializes into the plugin's own `ConfigurationType`, so
+            // an array or a scalar throws and the request fails. Jellyfin's
+            // handler lets that escape as a 500 "Error processing request."; a
+            // refused body is a 400 here, which is the accepted divergence
+            // already recorded for the malformed-body leg.
+            _ => Err(ServiceError::invalid_input(
+                "plugin configuration must be a JSON object",
+            )),
+        }
     }
 
     async fn plugin_image(&self, id: Uuid) -> Result<Option<PluginImage>, ServiceError> {
@@ -1411,24 +1434,115 @@ impl PluginManager for FerrofinPluginManager {
 
 /// Overlays a stored config's top-level keys onto the current defaults, so a
 /// config saved by an older plugin version still returns every field (missing
-/// keys keep their default). Falls back to the raw stored bytes if either side
-/// isn't a JSON object.
+/// keys keep their default).
+///
+/// A stored document that is not an object falls back to the DEFAULTS rather
+/// than to the raw bytes: this endpoint's contract is a
+/// `BasePluginConfiguration` object, and answering with whatever a corrupted
+/// file happens to hold would hand a client a shape its config type cannot
+/// bind. [`FerrofinPluginManager::set_plugin_configuration`] no longer writes a
+/// non-object, so this arm only covers a file damaged out of band.
+///
+/// The two sides are tested SEPARATELY, because only the stored side justifies
+/// discarding anything. A plugin registered with non-object DEFAULT bytes has
+/// no object to overlay onto — but the caller's saved configuration is not
+/// damaged and must survive, so it is returned as it is. Collapsing both cases
+/// into one `else` arm (which the original `let (Ok(Object), Ok(Object))`
+/// pattern did) threw away a perfectly valid stored config in favour of raw
+/// default bytes.
 fn merge_config(defaults: &[u8], stored: &[u8]) -> Vec<u8> {
-    let (Ok(serde_json::Value::Object(mut base)), Ok(serde_json::Value::Object(over))) = (
+    let parsed_stored = serde_json::from_slice::<serde_json::Value>(stored);
+    match (
         serde_json::from_slice::<serde_json::Value>(defaults),
-        serde_json::from_slice::<serde_json::Value>(stored),
-    ) else {
-        return stored.to_vec();
+        parsed_stored,
+    ) {
+        (Ok(serde_json::Value::Object(mut base)), Ok(serde_json::Value::Object(over))) => {
+            base.extend(over);
+            serde_json::to_vec(&serde_json::Value::Object(base)).unwrap_or_else(|_| stored.to_vec())
+        }
+        // The stored document IS a usable object; there is simply nothing to
+        // merge it onto.
+        (_, Ok(serde_json::Value::Object(_))) => stored.to_vec(),
+        // The stored document is missing, unparseable or not an object.
+        _ => defaults.to_vec(),
+    }
+}
+
+/// Projects a posted configuration object onto the plugin's own schema, the way
+/// `JsonSerializer.DeserializeAsync(Request.Body, configPlugin.ConfigurationType)`
+/// does (v10.11.8 Jellyfin.Api/Controllers/PluginsController.cs:194).
+///
+/// A typed deserialize has three consequences a raw byte-store does not, and all
+/// three were observable on the wire:
+///   * a key the configuration type does not declare is DROPPED — Ferrofin
+///     round-tripped `{"Bogus":"zzz"}` for ever;
+///   * a value of the wrong JSON kind THROWS — Ferrofin stored
+///     `{"Username":123}` and served an integer back to a plugin whose config
+///     type declares a string;
+///   * a key the body omits falls back to the C# property default rather than to
+///     whatever was stored, which is what the merge onto `defaults` gives.
+///
+/// The schema is the plugin's `default_config`. When a plugin declares none
+/// (`RegisteredPlugin::new`'s `{}`, and any WASM guest that ships no default
+/// document) there is no type to project onto, so the object is stored as it
+/// arrives — the pre-existing behaviour, kept deliberately rather than silently
+/// emptying a schemaless plugin's configuration.
+fn project_config(
+    defaults: &[u8],
+    body: &serde_json::Map<String, serde_json::Value>,
+) -> Result<Vec<u8>, ServiceError> {
+    let Ok(serde_json::Value::Object(schema)) =
+        serde_json::from_slice::<serde_json::Value>(defaults)
+    else {
+        return serde_json::to_vec(body)
+            .map_err(|e| ServiceError::backend(format!("serialize plugin config: {e}")));
     };
-    base.extend(over);
-    serde_json::to_vec(&serde_json::Value::Object(base)).unwrap_or_else(|_| stored.to_vec())
+    if schema.is_empty() {
+        return serde_json::to_vec(body)
+            .map_err(|e| ServiceError::backend(format!("serialize plugin config: {e}")));
+    }
+    let mut out = schema.clone();
+    for (key, value) in body {
+        let Some(slot) = out.get_mut(key) else {
+            continue; // unknown key: the deserializer drops it
+        };
+        if !same_json_kind(slot, value) {
+            return Err(ServiceError::invalid_input(format!(
+                "plugin configuration field {key} has the wrong type"
+            )));
+        }
+        *slot = value.clone();
+    }
+    serde_json::to_vec(&serde_json::Value::Object(out))
+        .map_err(|e| ServiceError::backend(format!("serialize plugin config: {e}")))
+}
+
+/// Whether `value` can bind to the field `slot` types.
+///
+/// One `Number` class, as .NET has: a `double RateLimit` accepts the integer
+/// `1` and an `int MaxCastMembers` accepts `15`, so the JSON distinction between
+/// integer and float is not one the C# deserializer draws. A `null` is accepted
+/// for any field — a nullable C# property takes it, and a non-nullable one falls
+/// back to its default rather than throwing.
+fn same_json_kind(slot: &serde_json::Value, value: &serde_json::Value) -> bool {
+    use serde_json::Value::{Array, Bool, Null, Number, Object, String as Str};
+    matches!(
+        (slot, value),
+        (_, Null)
+            | (Null, _)
+            | (Bool(_), Bool(_))
+            | (Number(_), Number(_))
+            | (Str(_), Str(_))
+            | (Array(_), Array(_))
+            | (Object(_), Object(_))
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         FerrofinPluginManager, RegisteredPlugin, abi_is_compatible, merge_config,
-        parse_dotnet_version,
+        parse_dotnet_version, project_config,
     };
     use ferrofin_model::updates::RepositoryInfo;
     use ferrofin_traits::error::ServiceError;
@@ -1444,9 +1558,60 @@ mod tests {
         assert_eq!(merged["A"], 9); // stored overrides default
         assert_eq!(merged["B"], true); // missing key filled from default
         assert_eq!(merged["C"], "x");
-        assert_eq!(merged["D"], "extra"); // stale extra key preserved
-        // Non-object stored falls back to raw stored bytes.
-        assert_eq!(merge_config(defaults, b"not json"), b"not json");
+        // A key outside the schema can only be in the file if it was written
+        // before `project_config` existed, or by hand; the merge still surfaces
+        // it rather than silently dropping a value the admin can see on disk.
+        assert_eq!(merged["D"], "extra");
+        // A file damaged out of band answers with the schema, not with the
+        // damage: the route's contract is a `BasePluginConfiguration` object.
+        assert_eq!(merge_config(defaults, b"not json"), defaults);
+        assert_eq!(merge_config(defaults, b"[1,2]"), defaults);
+        // But a plugin whose DEFAULTS are not an object has nothing to overlay
+        // onto — and that is no reason to discard a perfectly good stored
+        // configuration. (It used to: one `let (Ok(Object), Ok(Object))` pattern
+        // covered both sides, so a plugin registered with non-object default
+        // bytes served those raw bytes and silently lost the admin's saved
+        // values.)
+        assert_eq!(merge_config(b"[]", stored), stored);
+        assert_eq!(merge_config(b"not json either", stored), stored);
+    }
+
+    /// `POST /Plugins/{id}/Configuration` deserializes into the plugin's own
+    /// configuration TYPE (PluginsController.cs:194), which drops keys the type
+    /// does not declare and throws on a value of the wrong kind. Measured
+    /// against a live 10.11.8: posting `{"RateLimit":3,"Bogus":"zzz"}` to
+    /// MusicBrainz reads back without `Bogus`.
+    #[test]
+    fn a_config_write_is_projected_onto_the_plugin_schema() {
+        let defaults =
+            br#"{"Server":"https://musicbrainz.org","RateLimit":1,"ReplaceArtistName":false}"#;
+        let body = |json: &str| -> serde_json::Map<String, serde_json::Value> {
+            serde_json::from_str(json).unwrap()
+        };
+
+        let full = project_config(defaults, &body(r#"{"RateLimit":9}"#)).unwrap();
+        let full: serde_json::Value = serde_json::from_slice(&full).unwrap();
+        assert_eq!(full["RateLimit"], 9);
+        // An absent key falls back to the C# property default, not to whatever
+        // a previous write stored — the C# does a full replace.
+        assert_eq!(full["Server"], "https://musicbrainz.org");
+        assert_eq!(full["ReplaceArtistName"], false);
+
+        let dropped = project_config(defaults, &body(r#"{"RateLimit":3,"Bogus":"zzz"}"#)).unwrap();
+        let dropped: serde_json::Value = serde_json::from_slice(&dropped).unwrap();
+        assert!(dropped.get("Bogus").is_none());
+
+        // A `double` field takes an integer literal, as .NET does.
+        assert!(project_config(defaults, &body(r#"{"RateLimit":2.5}"#)).is_ok());
+        // …but a string where a number belongs is refused.
+        let err = project_config(defaults, &body(r#"{"RateLimit":"abc"}"#)).unwrap_err();
+        assert!(matches!(err, ServiceError::InvalidInput(_)), "{err:?}");
+
+        // A schemaless plugin has no type to project onto, so its object is
+        // stored as it arrives.
+        let raw = project_config(b"{}", &body(r#"{"Anything":[1,2]}"#)).unwrap();
+        let raw: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(raw["Anything"], serde_json::json!([1, 2]));
     }
 
     fn descriptor(id: Uuid, name: &str, enabled: bool) -> PluginDescriptor {

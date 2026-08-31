@@ -39,6 +39,7 @@ import sys
 from collections import Counter, defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import classification  # noqa: E402  — the closed set of classification categories
 import verification  # noqa: E402  — the closed set of verification methods
 
 METHODS = ("get", "post", "put", "delete", "patch", "head")
@@ -174,6 +175,12 @@ def build_rows(spec, real, overlay, curated, sweep, owners):
                 # (see "Verified with a recorded caveat") rather than living in
                 # a comment in the probe source.
                 "caveats": list(s.get("caveats") or ()),
+                # WHAT the divergence is, from the closed set in
+                # parity/classification.py. It picks the row's section and its
+                # tally; the prose does not. Only the curated overlay sets it —
+                # a live layer's own "flagged:" text is recognised by
+                # `classification.bucket` instead.
+                "category": s.get("category"),
                 "last_verified": s.get("last_verified") if s else None,
             })
     rows.sort(key=lambda r: (r["operation"].split(" ", 1)[1], r["operation"]))
@@ -198,29 +205,40 @@ def verified_by(r, method):
     return r["deep_verified"] is True and r.get("verification_method") == method
 
 
-def is_open_work(r):
-    """A named, NOT-accepted divergence — an open work item, not a settled decision.
+def bucket_of(r):
+    """The classification bucket a row renders in, or `None`.
 
-    These must never render under the "accepted — not a bug" heading: a reader
-    scanning that section would take a real gap for a closed question.
+    A row that is deep-verified carries its classification as a NOTE on its own
+    verified line (see `listing`) plus the "Verified WITH a recorded caveat"
+    section, not as a standing divergence — so it is in no bucket. That is
+    unchanged; what changed is that a row which is NOT verified is bucketed by
+    its declared `category` and never by prose-prefixing.
 
-    Nor is the item closed by a green verdict on the same op: a probe exercises
-    the path the fixture can reach, and the gap can live on a path it cannot —
-    an unported provider backend behind an op whose one CONFIGURED provider
-    diffs clean. The section therefore lists every open-work row and prints the
-    verdict beside it, instead of hiding the ones that happen to be green.
+    An OPEN-WORK row in particular must never render under the "accepted — not a
+    bug" heading: a reader scanning that section would take a real gap for a
+    closed question. Nor is such an item closed by a green verdict on the same
+    op — a probe exercises the path the fixture can reach, and the gap can live
+    on a path it cannot (an unported provider backend behind an op whose one
+    CONFIGURED provider diffs clean). Those rows therefore keep their
+    classification visible in the caveat section rather than vanishing.
     """
-    return r["classification"].startswith("open-work")
+    if r["deep_verified"] is True:
+        return None
+    return classification.bucket(r.get("category"), r["classification"])
 
 
-def is_flagged(r):
-    """Auto-generated detector text ("flagged: … (verify)") that NOBODY has reviewed.
+def in_bucket(r, name):
+    """Whether a row renders in exactly this bucket.
 
-    Rendering these under "accepted — not a bug" is the same defect as an unstamped
-    row in the deep count, pointed the other way: a detector's guess read as a
-    settled decision. They get their own section until a human classifies them.
+    The predicates this replaced were `is_open_work` / `is_flagged` /
+    `is_accepted`, and the last of them was defined as "has a classification and
+    is neither of the other two" — a DEFAULT into the section whose heading says
+    a human closed the question. That default swept an unreviewed detector flag,
+    an op no probe has ever run, and a measured lab-state artefact into the
+    accepted tally. A row now belongs to exactly one declared bucket, or to
+    none, and `check()` rejects a category that names no bucket.
     """
-    return r["classification"].startswith("flagged")
+    return bucket_of(r) == name
 
 
 def is_side_path(r):
@@ -241,22 +259,22 @@ def is_side_path(r):
     return r.get("classification_scope") == "side-path" and bool(r["classification"])
 
 
-def is_accepted(r):
-    return (r["classification"] and r["deep_verified"] is not True
-            and not is_open_work(r) and not is_flagged(r) and not is_side_path(r))
-
-
 def is_unexplained_failure(r):
     """A live probe returned FALSE and nothing on this page explains it.
 
     Until this existed, a `False` verdict on an op carrying ANY classification
     landed under "accepted — not a bug": a measured failure rendered as a
     settled decision. That is the exact masking shape this ledger exists to
-    prevent, so a failure now has to be either explained (accepted / open work /
-    a detector flag someone will triage) or listed here as unexplained.
+    prevent, so a failure now has to be either explained by a bucket that says
+    something about THIS row, or listed here as unexplained.
+
+    A `note` category is not such an explanation: `parity/classification.py`
+    says in its own words that a NOTE "claims nothing about this row on its
+    own". A red row carrying one is therefore still unexplained, and is listed
+    here as well as under its note.
     """
-    return (r["deep_verified"] is False and not is_accepted(r)
-            and not is_open_work(r) and not is_flagged(r))
+    return (r["deep_verified"] is False
+            and bucket_of(r) in (None, classification.NOTE))
 
 
 #: "N field(s) compared" / "N fields compared", however a layer phrases it.
@@ -293,11 +311,10 @@ def render_md(rows):
     deep = sum(1 for r in rows if is_headline(r))
     by_method = Counter(r["verification_method"] for r in rows if r["deep_verified"] is True)
     other = sum(n for m, n in by_method.items() if m != verification.HEADLINE)
-    accepted = sum(1 for r in rows if is_accepted(r))
-    openwork = sum(1 for r in rows if is_open_work(r))
+    buckets = Counter(b for b in (bucket_of(r) for r in rows) if b)
+    accepted = buckets[classification.SETTLED]
     sidepath = sum(1 for r in rows if is_side_path(r))
     failing = sum(1 for r in rows if is_unexplained_failure(r))
-    flagged = sum(1 for r in rows if is_flagged(r) and r["deep_verified"] is not True)
     untested = sum(1 for r in rows if r["deep_verified"] is None and not r["classification"])
     depth_counts = defaultdict(int)
     route_counts = defaultdict(int)
@@ -316,10 +333,13 @@ def render_md(rows):
     sv_run = sum(1 for r in rows if r["schema_valid"] is not None)
     layer1 = (f"Layer 1: {sc_yes}/{sc_run} status-conformant · {sv_yes}/{sv_run} schema-valid"
               if sc_run or sv_run else "status-conformance + schema-validation not yet run — Layer 1")
+    not_accepted = " · ".join(
+        f"{buckets[b]} {classification.BUCKETS[b][1].split(' (')[0].lower()}"
+        for b in classification.BUCKETS
+        if b != classification.SETTLED and buckets[b])
     out.append(f"**{deep}/{total} deep-verified · {other} verified another way · "
-               f"{accepted} classified-divergence · {openwork} open work · "
-               f"{failing} unexplained FAIL · {flagged} flagged (unreviewed) · "
-               f"{untested} untested**  \n_{layer1}_\n")
+               f"{accepted} accepted divergence · {not_accepted or 'nothing else classified'} · "
+               f"{failing} unexplained FAIL · {untested} untested**  \n_{layer1}_\n")
     out.append(f"_Plus {sidepath} recorded side-path divergence(s) — notes attached to ops "
                "whose own verdict covers a different path, counted nowhere above so they "
                "can neither flatter nor absorb it. Sections are not a partition: an "
@@ -356,9 +376,10 @@ def render_md(rows):
     out.append("## Ownership (core vs compiled-in extensions)\n")
     out.append("_Extensions must not dilute or flatter core's coverage number — "
                "each owner's deep-verified share stands alone._\n")
-    out.append("| owner | ops | deep-verified | verified another way | classified | open work "
-               "| flagged | untested |")
-    out.append("|---|---:|---:|---:|---:|---:|---:|---:|")
+    bucket_cols = list(classification.BUCKETS)
+    header = " | ".join(classification.BUCKETS[b][1].split(" (")[0].lower() for b in bucket_cols)
+    out.append(f"| owner | ops | deep-verified | verified another way | {header} | untested |")
+    out.append("|---|---:|---:|" + "---:|" * (len(bucket_cols) + 2))
     by_owner = defaultdict(list)
     for r in rows:
         by_owner[r["owner"]].append(r)
@@ -366,12 +387,10 @@ def render_md(rows):
         rs = by_owner[owner]
         d = sum(1 for r in rs if is_headline(r))
         o = sum(1 for r in rs if r["deep_verified"] is True and not is_headline(r))
-        c = sum(1 for r in rs if is_accepted(r))
-        w = sum(1 for r in rs if is_open_work(r))
-        fl = sum(1 for r in rs if is_flagged(r) and r["deep_verified"] is not True)
+        owned = Counter(b for b in (bucket_of(r) for r in rs) if b)
         u = sum(1 for r in rs if r["deep_verified"] is None and not r["classification"])
-        out.append(f"| {owner} | {len(rs)} | {d} ({100 * d // len(rs)}%) | {o} | {c} | {w} "
-                   f"| {fl} | {u} |")
+        cells = " | ".join(str(owned[b]) for b in bucket_cols)
+        out.append(f"| {owner} | {len(rs)} | {d} ({100 * d // len(rs)}%) | {o} | {cells} | {u} |")
     out.append("")
 
     def listing(method, show_evidence=False):
@@ -402,27 +421,19 @@ def render_md(rows):
                    "one: never counted in the deep-verified number._\n")
         listing(m)
 
-    out.append("## Classified divergence (accepted — not a bug)\n")
-    out.append("_Settled decisions. An item here is a question that has been closed._\n")
-    for r in rows:
-        if is_accepted(r):
-            out.append(f"- ⚠️ `{r['operation']}` — {r['classification']}")
-    out.append("")
-    out.append("## Open work (NOT accepted — a named divergence still to port)\n")
-    out.append("_These are real gaps with an owner and a path, kept OUT of the accepted "
-               "section: rendering an unfinished port under \"accepted\" is how a gap "
-               "quietly becomes a decision. Every one is listed, INCLUDING the ones whose "
-               "live verdict is green — a probe can only exercise what the fixture "
-               "configures, so a clean diff on the configured path does not close a gap "
-               "on an unconfigured one. The glyph is that row's verdict, not the item's "
-               "status._\n")
-    for r in rows:
-        if is_open_work(r):
-            vm = r["verification_method"]
-            glyph = (verification.METHODS[vm][0] if r["deep_verified"] is True and vm
-                     else mark_of(r))
-            out.append(f"- ⛏ {glyph} `{r['operation']}` — {r['classification']}")
-    out.append("")
+    # One section per bucket, in the order parity/classification.py declares
+    # them, so a reader can tell a closed question from an untested op from a
+    # named gap without opening a probe. Only the first heading claims a
+    # decision; the rest say in their own titles that they are not one.
+    for name, (glyph, heading, meaning) in classification.BUCKETS.items():
+        out.append(f"## {heading}\n")
+        out.append(f"_{meaning}_\n")
+        listed = [r for r in rows if in_bucket(r, name)]
+        for r in listed:
+            out.append(f"- {glyph} `{r['operation']}` — {r['classification']}")
+        if not listed:
+            out.append("_(none)_")
+        out.append("")
     out.append("## Recorded side-path divergence (the row's own verdict does not cover it)\n")
     out.append("_A real, evidenced difference on a path this op's verdict says nothing "
                "about — an error input the contract never sends, or a side effect the "
@@ -446,14 +457,6 @@ def render_md(rows):
         if is_unexplained_failure(r):
             note = f" — {r['classification']}" if r["classification"] not in ("", "ok") else ""
             out.append(f"- ❌ `{r['operation']}`{note}")
-    out.append("")
-    out.append("## Flagged by a detector — UNREVIEWED (not accepted, not verified)\n")
-    out.append("_A probe recorded a divergence and wrote its own text. Nobody has looked at "
-               "these yet: they are neither an accepted divergence nor a named work item. "
-               "They sat under \"accepted — not a bug\" until this section existed._\n")
-    for r in rows:
-        if is_flagged(r) and r["deep_verified"] is not True:
-            out.append(f"- 🔍 `{r['operation']}` — {r['classification']}")
     out.append("")
 
     # ---- green rows that still carry a divergence or a projection -----------
@@ -572,6 +575,9 @@ def build_curated():
         # cover, so the note may never stand in for a verdict). See
         # `is_side_path`.
         row["classification_scope"] = v.get("scope", "op")
+        # The category travels with the text it belongs to. Dropping it here is
+        # what left `category` a field nothing read.
+        row["category"] = v.get("category")
         row["last_verified"] = a_stamp
         curated[k] = row
     # NB the overlay above SPREADS onto the live row, so a live layer's
@@ -589,7 +595,7 @@ def _guards_fire():
     """
     base = {"operation": "GET /x", "deep_verified": True, "classification": "",
             "verification_method": None, "classification_scope": "op",
-            "caveats": []}
+            "caveats": [], "category": None}
     def rejected(row):
         try:
             check([{**base, **row}], {})
@@ -603,22 +609,41 @@ def _guards_fire():
     assert rejected({"deep_verified": None, "verification_method": "body-diff"}), \
         "a method with no verdict must be rejected"
     assert rejected({"deep_verified": None, "verification_method": None,
-                     "classification": "x", "classification_scope": "sort-of"}), \
+                     "classification": "x", "classification_scope": "sort-of",
+                     "category": "instance"}), \
         "a classification scope outside the closed set must be rejected"
     assert rejected({"deep_verified": None, "verification_method": None,
                      "classification": "", "classification_scope": "side-path"}), \
         "a side-path scope with no classification must be rejected"
+    # The classification guards, same shape: a category outside the closed set
+    # renders in NO section (a silent drop), and a curated row with prose but no
+    # category is the exact defect this replaced — it used to land in the
+    # accepted tally by saying nothing.
+    assert rejected({"verification_method": "body-diff", "category": "made-up"}), \
+        "an unknown classification category must be rejected"
+    try:
+        check([{**base, "verification_method": "body-diff"}],
+              {("get", "/x"): {"classification": "something", "category": None}})
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError("a curated row with no category must be rejected")
+    # …and the positive control: a declared category passes.
+    check([{**base, "verification_method": "body-diff", "category": "instance"}],
+          {("get", "/x"): {"classification": "instance: x", "category": "instance"}})
     # The masking channel, asserted as a PROPERTY rather than trusted: a
     # side-path note on a row whose live probe went False is an unexplained
-    # failure, never an accepted divergence.
+    # failure, and a `note` category is not an explanation of this row either.
     masked = {"operation": "GET /x", "deep_verified": False, "verification_method": "body-diff",
               "classification": "jellyfin-bug, error path only: …",
-              "classification_scope": "side-path"}
-    assert not is_accepted(masked), "a side-path note must never render as accepted"
+              "classification_scope": "side-path", "category": "verified"}
+    assert not in_bucket(masked, classification.SETTLED), \
+        "a side-path note must never render as accepted"
     assert is_unexplained_failure(masked), "a failure it does not explain must surface"
-    op_scoped = {**masked, "classification_scope": "op"}
-    assert is_accepted(op_scoped) and not is_unexplained_failure(op_scoped), \
-        "an op-scoped classification still explains its own row"
+    explained = {**masked, "classification_scope": "op", "category": "accepted-divergence"}
+    assert in_bucket(explained, classification.SETTLED) \
+        and not is_unexplained_failure(explained), \
+        "an op-scoped accepted classification still explains its own row"
 
 
 def check(rows, curated):
@@ -647,10 +672,6 @@ def check(rows, curated):
                if r["deep_verified"] is None and r["verification_method"]]
     assert not phantom, (f"{len(phantom)} row(s) declare a verification_method with no "
                          f"verdict — nothing was compared: {phantom[:10]}")
-    # An open work item, and an unreviewed detector flag, must never render under
-    # "accepted — not a bug" — that heading is a claim about a HUMAN decision.
-    assert not [r for r in rows if is_open_work(r) and is_accepted(r)]
-    assert not [r for r in rows if is_flagged(r) and is_accepted(r)]
     # `scope` is a closed set: a typo would silently fall back to "op" and let a
     # side-path note absorb a verdict again.
     bad_scope = [(r["operation"], r.get("classification_scope")) for r in rows
@@ -662,12 +683,31 @@ def check(rows, curated):
     assert not scoped_blank, f"side-path scope with no classification: {scoped_blank[:10]}"
     # And the masking channel itself: a note about a side path must never be
     # counted as this operation's accepted divergence.
-    assert not [r for r in rows if is_side_path(r) and is_accepted(r)]
+    assert not [r for r in rows
+                if is_side_path(r) and in_bucket(r, classification.SETTLED)]
     # A caveat is a claim about a row's evidence, so it must belong to a row
     # that HAS a verdict — a caveat on an untested row would read as "we
     # verified this, except…" about a probe that never ran.
     orphan = [r["operation"] for r in rows if r["caveats"] and r["deep_verified"] is None]
     assert not orphan, f"caveats on rows with no verdict: {orphan[:10]}"
+    # A row buckets in exactly one place, and only the `accepted` bucket claims
+    # a human closed the question. The guard is now structural — `bucket_of`
+    # returns ONE bucket — so what is left to check is that every curated
+    # category is one this ledger knows how to render. An unknown category used
+    # to be indistinguishable from an accepted divergence; now it renders
+    # nowhere, which is a silent DROP, so it must fail loudly instead.
+    unknown_cat = [(r["operation"], r["category"]) for r in rows
+                   if r.get("category") and r["category"] not in classification.VALID]
+    assert not unknown_cat, (f"classification category outside "
+                             f"{sorted(classification.VALID)}: {unknown_cat[:10]}")
+    # …and that a curated row declares one at all. Without this, a hand-added
+    # classifications.json entry with prose but no `category` buckets nowhere
+    # and vanishes from every section and every tally.
+    uncategorised = [op for op, v in curated.items()
+                     if v.get("classification") and not v.get("category")
+                     and not v["classification"].startswith(("flagged", "ok"))]
+    assert not uncategorised, (f"{len(uncategorised)} curated row(s) carry a classification "
+                               f"with no category: {uncategorised[:10]}")
     by = Counter(r["verification_method"] for r in rows if r["deep_verified"] is True)
     other = ", ".join(f"{n} {m}" for m, n in sorted(by.items(), key=lambda kv: kv[0] or "")
                       if m != verification.HEADLINE)

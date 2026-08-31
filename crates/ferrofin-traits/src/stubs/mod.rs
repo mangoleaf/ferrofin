@@ -31,7 +31,8 @@ pub use hls_stream::{
 pub use library_monitor::NoopLibraryMonitor;
 pub use live_tv::{
     LIVE_TV_SERVICE_NAME, LiveStreamFile, LiveTvChannelQuery, LiveTvManager,
-    TAIL_SEEK_AFTER_SECONDS, TAIL_SEEK_BYTES, filter_timers, new_timer_defaults,
+    TAIL_SEEK_AFTER_SECONDS, TAIL_SEEK_BYTES, filter_timers, internal_series_timer_id,
+    internal_timer_id, new_timer_defaults,
 };
 pub use lyrics::{LyricManager, LyricProvider, LyricResponse, RemoteLyricInfo};
 pub use sync_play::{PlaybackRequest, SyncPlayManager, SyncPlaySession};

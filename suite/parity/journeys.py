@@ -25,6 +25,7 @@ import os
 import sys
 import time
 import urllib.parse
+import uuid
 import urllib.request
 import urllib.error
 
@@ -32,14 +33,91 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from sweep import http, get_json, bring_up, container_read, ROOT, USER, PASS, CLIENT, opensubtitles_credentials   # reuse HTTP + provisioning
 import verification   # the closed set of verification methods
 
+class Same:
+    """A journey step whose effect held on this server AND whose `evidence` must equal
+    the other server's.
+
+    A plain bool only asserts per-server self-consistency: each server is checked
+    against what *it* was posted, so two servers that each faithfully round-trip
+    *different* values both pass. Returning `Same(ok, evidence)` instead makes the
+    runner compare the two servers' evidence as well, so the row is green only
+    when the write took AND both servers ended up in the same state.
+
+    `evidence` must be a value that is genuinely comparable across two independent
+    instances — a settings object, a flag, a count, a projected read-back, a
+    sha256 of served bytes. NEVER an id, a date, or anything per-instance.
+    """
+
+    __slots__ = ("ok", "evidence")
+
+    def __init__(self, ok, evidence):
+        self.ok = bool(ok)
+        self.evidence = evidence
+
+    def __bool__(self):
+        return self.ok
+
+    def __repr__(self):
+        return f"{self.ok}(+evidence)"
+
+
+def cross_server_ok(h_ok, j_ok):
+    """True unless BOTH sides returned `Same` and their evidence disagrees.
+
+    The whole cross-server rule, in one place, so the self-check exercises the code
+    the runner actually runs rather than a restatement of it."""
+    if isinstance(h_ok, Same) and isinstance(j_ok, Same):
+        return h_ok.evidence == j_ok.evidence
+    return True
+
+
+def evidence_diff(h, j):
+    """A short note naming where two evidence values differ: for dicts, the keys whose
+    values disagree (with both values); otherwise a repr pair.
+
+    RECURSES into a differing pair of dicts and names the inner keys instead of
+    printing both whole objects. Evidence that carries a projected read-back is
+    a dict of dicts, and the flat form rendered ~1.5 KB of identical fields to
+    say that three of them differed — a note nobody reads is a divergence
+    nobody sees."""
+    if isinstance(h, dict) and isinstance(j, dict):
+        bad = []
+        for k in sorted(set(h) | set(j)):
+            a, b = h.get(k), j.get(k)
+            if a == b:
+                continue
+            if isinstance(a, dict) and isinstance(b, dict):
+                bad.append(f"{k}{{{evidence_diff(a, b)}}}")
+            else:
+                bad.append(f"{k}: H={a!r} J={b!r}")
+        return "; ".join(bad) or "(no key differs)"
+    return f"H={h!r} J={j!r}"
+
+
+def earned_method(op, h_ok, j_ok):
+    """The method a row actually earned, which is never stronger than what ran.
+
+    A row may DECLARE `body-diff` only if it returned `Same` on BOTH servers —
+    i.e. something comparable really was compared across them. If it did not, the
+    claim is downgraded to `effect` here rather than being taken on trust: the
+    declaration is a promise, this is the check. (The blanket "journeys never
+    body-diff" rule this replaces was right about plain booleans and wrong about a
+    read-back that IS diffed against the other server's.)"""
+    declared = journey_method(op)
+    if declared == verification.BODY_DIFF and not (
+            isinstance(h_ok, Same) and isinstance(j_ok, Same)):
+        return verification.EFFECT
+    return declared
+
+
 # ---------------------------------------------------------------- how each row is verified
 #
-# This layer NEVER diffs a body. The write's own response is discarded (`st, _ =
-# http(...)`), the read-back pulls out one to three NAMED fields, and the two
-# servers are combined by AND-ing two independent booleans — no value from
-# Ferrofin is ever compared to the same value from Jellyfin. So no journey row
-# may claim the ledger's `body-diff` headline. Each op declares which weaker
-# thing it actually established:
+# Most of this layer never diffs a body. The write's own response is discarded
+# (`st, _ = http(...)`), the read-back pulls out one to three NAMED fields, and
+# the two servers are combined by AND-ing two independent booleans — no value
+# from Ferrofin is compared to the same value from Jellyfin. Such a row may not
+# claim the ledger's `body-diff` headline. Each op declares which thing it
+# actually established:
 #
 #   effect        a write was applied and its effect confirmed on that server's
 #                 own read-back (the favourite is set, the id is gone, the count
@@ -48,6 +126,18 @@ import verification   # the closed set of verification methods
 #                 back. A handler that 204s and ignores the request passes.
 #   property      a named property of a response body agreed (an MPEG-TS sync
 #                 signature, a non-empty search result) — no effect, no diff.
+#   body-diff     the read-back BODY itself — every field of the parsed DTO bar
+#                 a named, justified per-instance handful — diffed against the
+#                 other server's, which is what reads.py does. A named
+#                 PROJECTION, however wide, does not earn this: the test is
+#                 "start from the whole body and subtract", never "start from
+#                 nothing and add". Claimed today by exactly the two ops in the
+#                 BODY_DIFF block below (see SERIES_TIMER_PER_INSTANCE for the
+#                 subtraction and why each entry is in it); `selfcheck()` holds
+#                 that list to an explicit allowlist so a third claim takes a
+#                 deliberate edit, and `earned_method` independently downgrades
+#                 any declaring row that did not actually return `Same` on both
+#                 servers.
 #
 # `selfcheck()` asserts this table covers every op key the journeys declare, so a
 # new journey op cannot land in the ledger without saying how it was verified.
@@ -82,6 +172,16 @@ JOURNEY_METHOD = {op: verification.STATUS_CLASS for op in (
     "POST /Sessions/{sessionId}/Viewing",
 )}
 JOURNEY_METHOD.update({op: verification.PROPERTY for op in (
+    # The write's effect IS compared across the two servers, field for field —
+    # but on a NAMED PROJECTION of the read-back DTO, not on the body. The
+    # projection is `identified()`; read its docstring for exactly which fields
+    # are in it and which are not. It is `property` and not `body-diff` for one
+    # reason, stated plainly: `body-diff` means "every non-volatile field of the
+    # parsed body", and a hand-listed tuple is not that, however long the tuple
+    # gets. (It was recorded `body-diff` once. The projection had 16 entries,
+    # `MergeBaseItemData` under `replaceData` touches more, and the row's own
+    # docstring claimed "nothing here is dropped" — which was false.)
+    "POST /Items/RemoteSearch/Apply/{itemId}",
     # A container signature, not an effect: 200 + video/mp2t + a 0x47 sync byte at
     # 0 and 188. Wrong PIDs, wrong channel or a black feed all match.
     "GET /LiveTv/LiveStreamFiles/{streamId}/stream.{container}",
@@ -94,6 +194,27 @@ JOURNEY_METHOD.update({op: verification.PROPERTY for op in (
     # legitimately different on consecutive calls and only its shape and the
     # typed-lookup refusal are comparable. See `j_playlist_instant_mix`.
     "GET /Playlists/{itemId}/InstantMix",
+    # The write's effect IS compared across the two servers, but on derived
+    # properties (which ImageTags keys appeared, what media type the stored file is
+    # served as) — the stored bytes come from two different origins and cannot be
+    # diffed. See `j_remote_image_download`.
+    "POST /Items/{itemId}/RemoteImages/Download",
+    # A NAMED set of invariants, compared across the two servers: did exactly one
+    # row appear, is its id derived rather than posted, did the create schedule
+    # anything, does sortBy actually reorder. Counts and orderings, not a body.
+    "POST /LiveTv/SeriesTimers",
+    "DELETE /LiveTv/SeriesTimers/{timerId}",
+    # `UpdateTimerAsync` takes four fields and discards the rest of the posted
+    # body: the projection is those four plus "did the discarded ones survive".
+    "POST /LiveTv/Timers/{timerId}",
+    # Three named invariants carried across the two servers — the write's STATUS
+    # (Ferrofin 403 from upstream master's Forbid guard, Jellyfin 10.11.8 204),
+    # the first user's name, and whether the provisioned credentials still
+    # authenticate. The row asserts the refusal, so it is RED on the Jellyfin leg
+    # and stays red for as long as 10.11.8 lacks the guard: that is the
+    # `jellyfin-bug` row in classifications.json, not a gap in the probe. See
+    # `j_startup` for why the status is the only discriminator available here.
+    "POST /Startup/User",
 )})
 
 
@@ -194,7 +315,6 @@ JOURNEY_METHOD.update({op: verification.EFFECT for op in (
     "POST /Startup/Complete",
     "POST /Startup/Configuration",
     "POST /Startup/RemoteAccess",
-    "POST /Startup/User",
     "POST /System/Configuration",
     "POST /System/Configuration/Branding",
     "POST /System/Configuration/{key}",
@@ -213,6 +333,20 @@ JOURNEY_METHOD.update({op: verification.EFFECT for op in (
     "POST /Users/{userId}/Policy",
     "POST /Videos/MergeVersions",
     "POST /Videos/{itemId}/Subtitles",
+)})
+JOURNEY_METHOD.update({op: verification.BODY_DIFF for op in (
+    # The FIRST rows in this layer to earn the headline, and they earn it the way
+    # reads.py does: the evidence is the whole parsed `SeriesTimerInfoDto`, with
+    # exactly the four per-instance fields in SERIES_TIMER_PER_INSTANCE removed
+    # and nothing else — not a hand-listed projection that grows a field at a
+    # time. Two of those four are Id/ExternalId, and they are not waved through:
+    # `derives_its_id` re-derives the id from the C# formula on each server
+    # instead, which is a stronger check than comparing two random GUIDs could
+    # ever be. `earned_method` still downgrades either row to `effect` if the
+    # journey did not actually return `Same` on both servers.
+    "GET /LiveTv/SeriesTimers/{timerId}",
+    # Same body, read back after the update, plus the four whitelist invariants.
+    "POST /LiveTv/SeriesTimers/{timerId}",
 )})
 
 
@@ -244,6 +378,50 @@ def user_data(base, token, user, mid):
 
 # ---------------------------------------------------------------- journeys (per server → {op: effect_ok})
 
+def credentials_still_valid(base):
+    """Status of a fresh `POST /Users/AuthenticateByName` with the provisioned
+    credentials — the only way to prove a password write did not clobber them.
+
+    It MUST NOT reuse the harness's `DeviceId`: re-authenticating on a device
+    that already holds a session revokes that session's token on both servers,
+    and the run's own token is the one being revoked. Measured while writing
+    this: with `http()`'s fixed `Client="parity", DeviceId="parity"` header,
+    every request after this one 401'd — `POST /Startup/RemoteAccess`,
+    `POST /Startup/Complete` and the whole playlist-share journey went red on
+    both servers. A dedicated device id keeps the check to the one thing it is
+    asking about, and its session is logged out again so the probe leaves no
+    registration behind.
+    """
+    dev = 'Client="parity-reauth", Device="parity-reauth", DeviceId="parity-reauth", Version="1.0"'
+    req = urllib.request.Request(
+        f"{base}/Users/AuthenticateByName",
+        data=json.dumps({"Username": USER, "Pw": PASS}).encode(),
+        method="POST",
+        headers={"Content-Type": "application/json", "Authorization": f"MediaBrowser {dev}"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            st, raw = r.status, r.read()
+    except urllib.error.HTTPError as e:
+        return e.code
+    except (urllib.error.URLError, TimeoutError, ConnectionError):
+        return 0
+    try:
+        tok = json.loads(raw)["AccessToken"]
+    except (ValueError, KeyError):
+        return st
+    # Retire the session this probe just created, so a long-lived lab does not
+    # accumulate one device registration per journeys run.
+    logout = urllib.request.Request(
+        f"{base}/Sessions/Logout", data=b"", method="POST",
+        headers={"Content-Type": "application/json",
+                 "Authorization": f'MediaBrowser Token="{tok}", {dev}'})
+    try:
+        urllib.request.urlopen(logout, timeout=30).close()
+    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, ConnectionError):
+        pass
+    return st
+
+
 def j_startup(base, token, user, _m, _m2):
     """The first-run wizard endpoints. Setup is complete on both servers by the time journeys
     run, but the controller's policy is FirstTimeSetupOrElevated — an admin can drive it after
@@ -255,17 +433,58 @@ def j_startup(base, token, user, _m, _m2):
     st, _ = http("POST", f"{base}/Startup/Configuration", token, json.dumps(cfg))
     back = get_json(base, "/Startup/Configuration", token) or {}
     r["POST /Startup/Configuration"] = st < 300 and all(back.get(k) == v for k, v in cfg.items())
-    # Post-setup the first user already has a password, and the contract is 403 (the Forbid
-    # guard upstream added in v12, which Ferrofin ports). Jellyfin 10.11.8 predates it and
-    # silently re-sets the admin password instead — sending the provisioned credentials keeps
-    # that a no-op. Classified in classifications.json; this asserts the correct contract.
+    # Post-setup the first user already has a password, and the two servers answer this write
+    # DIFFERENTLY: Ferrofin ports upstream master, whose `Forbid` guard is security commit
+    # 62a5ded920, and REFUSES with 403; Jellyfin 10.11.8 predates that commit, performs the
+    # write, and silently re-sets the already-provisioned admin's password. That delta is
+    # classified `jellyfin-bug` in classifications.json, with the C# for both trees.
+    #
+    # WHAT THIS ROW ASSERTS, and why it is the refusal itself: a post-setup
+    # POST /Startup/User must be REFUSED. Ferrofin satisfies that, Jellyfin does not, so the
+    # row is RED — which is the correct terminal state for a jellyfin-bug row, exactly as
+    # `DELETE /Playlists/{playlistId}/Users/{userId}` is red in this same layer, and not a
+    # probe weakness.
+    #
+    # TWO WRONG VERSIONS OF THIS ROW, both recorded so neither is rediscovered as an idea:
+    #   * `st == 403` on both servers with NO evidence (the original). The status delta was
+    #     real, but it lived only in the boolean, so journey-results.json said "H=True
+    #     J=False" and named nothing. That is what let a hand-written "accepted" label stand
+    #     in for a measurement.
+    #   * `st in (204, 403)` plus "the admin was not clobbered" (batch F6's first attempt).
+    #     TRUE BY CONSTRUCTION: the payload is the harness's OWN credentials, so Jellyfin's
+    #     unguarded 204 re-sets the name to the name it already has and the password to the
+    #     password it already has. Measured on the F6 pair — Jellyfin, a server with NO guard
+    #     at all, returned evidence byte-identical to Ferrofin's and the row went GREEN. A
+    #     probe a guardless server passes cannot be evidence that the guard is present, and
+    #     it dropped the only Ferrofin-side discrimination the row had: a regression that
+    #     deleted the guard would have kept it green.
+    #
+    # WHY THE PAYLOAD IS STILL THE HARNESS'S OWN CREDENTIALS: not to make the assertion pass
+    # (it does not, on Jellyfin), but because Jellyfin ACTUALLY PERFORMS the write. Any other
+    # Name or Password renames the lab's admin or changes its password for every later probe
+    # on the pair, and StartupUserDto carries no third, harmless field. So "was the admin
+    # clobbered" cannot separate the two servers without damaging the lab, and it is kept
+    # only as a lab-safety invariant. The discriminator is the status, and the status is IN
+    # the `Same` evidence so the divergence is named in journey-results.json rather than
+    # living only in prose.
+    #
+    # Ferrofin's 403 is additionally pinned against MASTER — the only tree containing the fix,
+    # which no 10.11.8 container can witness — by the unit tests in
+    # crates/ferrofin-api/tests/startup.rs (404 / 403-with-ChangePassword-Times.Never /
+    # Forbid-before-BadRequest ordering / empty-Password-column), transliterated from
+    # upstream's own StartupControllerTests.cs.
+    #
     # Jellyfin picks `Users.First()` from an unordered dictionary, so the call is only safe
     # while the admin is the ONLY user — a stray user from a failed cleanup would be the one
     # renamed/re-passworded instead. Guarded rather than assumed.
     if len(get_json(base, "/Users", token) or []) == 1:
         st, _ = http("POST", f"{base}/Startup/User", token, json.dumps({"Name": USER, "Password": PASS}))
         back = get_json(base, "/Startup/User", token) or {}
-        r["POST /Startup/User"] = st == 403 and back.get("Name") == USER
+        reauth = credentials_still_valid(base)
+        r["POST /Startup/User"] = Same(
+            st == 403 and back.get("Name") == USER and reauth == 200,
+            {"Status": st, "FirstUserName": back.get("Name"),
+             "CredentialsStillValid": reauth == 200})
     else:
         r["POST /Startup/User"] = False   # not attempted: more than one user on the instance
     st, _ = http("POST", f"{base}/Startup/RemoteAccess", token,
@@ -646,6 +865,22 @@ def j_playlist_share(base, token, user, mid, _m2):
         st, _ = http("DELETE", f"{base}/Playlists/{pid}/Users/{uid}", token)
         after = (get_json(base, f"/Playlists/{pid}/Users", token) or [])
         r["DELETE /Playlists/{playlistId}/Users/{userId}"] = st < 300 and not any(s.get("UserId") == uid for s in after)
+        # Second symptom of the same upstream defect, recorded rather than asserted.
+        # `PlaylistsController.RemoveUserFromPlaylist` specifies `share is null ->
+        # NotFound("User permissions not found")`, so a share the DELETE really removed
+        # must 404 on a repeat. Ferrofin does. Jellyfin's DELETE is a reference-equality
+        # no-op (`PlaylistManager.RemoveUserFromShares` re-fetches a DIFFERENT Playlist
+        # instance and calls `shares.Remove(share)` on a `PlaylistUserPermissions` with no
+        # equality override — v10.11.8 L641-648 / master L669-676, byte-identical), so the
+        # share survives and the repeat finds it again and answers 204 forever.
+        #
+        # Kept OUT of the row's boolean deliberately: folding it in would make the row
+        # ASSERT the divergence instead of measuring the shared invariant, and would let a
+        # future Ferrofin regression to a blind 204 pass by matching Jellyfin. The
+        # underscore prefix keeps it out of the op loop (it is evidence, not a contract op);
+        # the divergence itself is classified `jellyfin-bug` in classifications.json.
+        r["_note:playlist_share_repeat_delete_status"] = http(
+            "DELETE", f"{base}/Playlists/{pid}/Users/{uid}", token)[0]
         http("DELETE", f"{base}/Users/{uid}", token)   # cleanup
         http("DELETE", f"{base}/Items/{pid}", token)
     return r
@@ -1434,10 +1669,48 @@ LIVETV_OPS = [
     "POST /LiveTv/TunerHosts", "POST /LiveTv/ListingProviders",
     "POST /LiveStreams/Open", "GET /LiveTv/LiveStreamFiles/{streamId}/stream.{container}",
     "POST /LiveStreams/Close", "GET /LiveTv/Programs/{programId}", "POST /LiveTv/Timers",
-    "GET /LiveTv/Timers/{timerId}", "GET /LiveTv/LiveRecordings/{recordingId}/stream",
+    "GET /LiveTv/Timers/{timerId}", "POST /LiveTv/Timers/{timerId}",
+    "GET /LiveTv/LiveRecordings/{recordingId}/stream",
     "GET /LiveTv/Recordings/{recordingId}", "DELETE /LiveTv/Timers/{timerId}",
     "DELETE /LiveTv/Recordings/{recordingId}",
 ]
+SERIES_TIMER_OPS = [
+    "POST /LiveTv/SeriesTimers", "GET /LiveTv/SeriesTimers/{timerId}",
+    "POST /LiveTv/SeriesTimers/{timerId}", "DELETE /LiveTv/SeriesTimers/{timerId}",
+]
+# The fields a series-timer body diff CANNOT carry across two independent
+# instances, and nothing else. Both servers mint the timer's external id as a
+# fresh `Guid.NewGuid()` per create (DefaultLiveTvService.cs:265) and publish its
+# MD5 as `Id` (LiveTvDtoService.cs:119) — so Id/ExternalId are random by
+# construction, and `derives_its_id` below checks the DERIVATION instead of
+# waving them through. `ServerId` is the instance's own SystemId.
+#
+# `ExternalChannelId` was in this tuple and has been PUT BACK IN THE DIFF. The
+# reason given for dropping it — "it embeds MD5(tuner URL), which differs
+# because the two servers reach the fixture tuner on different container hosts"
+# — was simply false, and measuring it said so: both servers' /System/Configuration/livetv
+# configure the m3u tuner with the identical `Url` "/media/synth/livetv/channels.m3u"
+# (a container-local PATH, not a host URL), both publish the same LiveTvChannel
+# guids, and a series timer created on each carries the same
+# `ExternalChannelId` = m3u_5581ab8b…26b. A field that agrees is a field the
+# diff must carry; excluding it hid nothing today and would have hidden a real
+# channel-identity divergence tomorrow.
+#
+# Everything else in the DTO — Name, Overview, ChannelId, ChannelName,
+# ExternalChannelId, ProgramId, ExternalProgramId, Days, DayPattern, the dates,
+# every padding/keep/record flag, ServiceName, Type, ImageTags — stays in the
+# diff. This is scoped to this probe on purpose: parity_diff.VOLATILE is global
+# and must not be widened for it.
+SERIES_TIMER_PER_INSTANCE = ("Id", "ExternalId", "ServerId")
+# How far ahead a programme must start before this journey will build a series
+# timer on it. "Has not started yet" is not enough: the journey runs the two
+# servers one after the other and takes tens of seconds per side, so a programme
+# three minutes out is New on the first server and already recording on the
+# second — measured, 2026-08-30 16:57Z, on the 17:00 airing: Ferrofin still had
+# a `New` child and Jellyfin had none, and the hand-cancel leg could not run
+# there. The fixture guide is HOURLY, so ten minutes costs at most one candidate
+# programme and buys a subject that cannot start mid-journey.
+SERIES_TIMER_MIN_LEAD_S = 600
 RECORDING_START_WAIT_S = 60   # the recorder opens the tuner stream + the Recordings folder refreshes
 RECORDING_POLL_S = 5
 STREAM_PREFIX_BYTES = 16384   # ~87 TS packets: enough for is_mpegts, cheap to pull
@@ -1464,6 +1737,78 @@ def is_mpegts(body):
 
 def mpegts_response(st, ct, body):
     return st == 200 and ct.split(";")[0].strip().lower() == "video/mp2t" and is_mpegts(body)
+
+
+def timer_update_leg(base, token, user, ch):
+    """`POST /LiveTv/Timers/{timerId}` on a timer of its own, for a programme that has
+    NOT started yet.
+
+    It cannot ride on the journey's main timer: that one records the programme airing
+    right now, so its recorder fires within a second of the create and
+    `DefaultLiveTvService.UpdateTimerAsync` (v10.11.8 DefaultLiveTvService.cs:342-363)
+    then refuses to touch it — "// Only update if not currently active". Measured on the
+    lab pair: the same leg was green on one run and red on the next with Jellyfin's
+    paddings unchanged, because its capture had started and Ferrofin's had not. Racing
+    the recorder is not a parity signal, so this leg brings its own quiet timer.
+
+    What it asserts is the C# whitelist: the FOUR padding fields are taken and the rest
+    of the posted body — Name, Priority, StartDate, and a Status=Cancelled that must not
+    cancel anything — is discarded. Plus: an id nothing matches must not MINT a timer.
+    Only the "no phantom" half of that is compared across the two servers; upstream's
+    intended answer there is `ResourceNotFoundException` (:346-349) but
+    `LiveTvDtoService.GetTimerInfo` dereferences a null series timer first
+    (LiveTvDtoService.cs:453-458), so Jellyfin really answers 500 where Ferrofin answers
+    404 — a Jellyfin bug, not a status to agree on."""
+    programs = (get_json(base, f"/LiveTv/Programs?channelIds={ch}&userId={user}", token)
+                or {}).get("Items") or []
+    now = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+    tid = None
+    # A programme a leftover series timer already scheduled is a 400 ("a scheduled
+    # recording already exists for this program") on both servers, so try a few.
+    for prog in [p for p in programs if (p.get("StartDate") or "") > now][:5]:
+        defaults = get_json(base, f"/LiveTv/Timers/Defaults?programId={prog['Id']}", token) or {}
+        st, _ = http("POST", f"{base}/LiveTv/Timers", token, json.dumps(defaults))
+        if st >= 300:
+            continue
+        timers = (get_json(base, f"/LiveTv/Timers?channelId={ch}", token) or {}).get("Items") or []
+        found = next((t for t in timers if t.get("ProgramId") == prog["Id"]), None)
+        if found:
+            tid = found.get("Id")
+            break
+    if not tid:
+        return False
+    try:
+        got = get_json(base, f"/LiveTv/Timers/{tid}", token) or {}
+        upd = dict(got)
+        upd.update(PrePaddingSeconds=300, PostPaddingSeconds=600,
+                   IsPrePaddingRequired=True, IsPostPaddingRequired=True,
+                   Name="parity-update-must-be-ignored", Priority=42,
+                   Status="Cancelled", StartDate="2027-01-01T00:00:00.0000000Z")
+        st, _ = http("POST", f"{base}/LiveTv/Timers/{tid}", token, json.dumps(upd))
+        back = get_json(base, f"/LiveTv/Timers/{tid}", token) or {}
+        # ExternalId is stripped from the ghost body on purpose: leave it in and
+        # Jellyfin resolves it to the REAL timer and updates that one instead.
+        ghost = "00000000000000000000000000009999"
+        ghost_body = {k: v for k, v in upd.items() if k not in ("Id", "ExternalId")}
+        http("POST", f"{base}/LiveTv/Timers/{ghost}", token,
+             json.dumps(dict(ghost_body, Id=ghost)))
+        return Same(st < 300, {
+            "PrePaddingSeconds": back.get("PrePaddingSeconds"),
+            "PostPaddingSeconds": back.get("PostPaddingSeconds"),
+            "IsPrePaddingRequired": back.get("IsPrePaddingRequired"),
+            "IsPostPaddingRequired": back.get("IsPostPaddingRequired"),
+            "NameUnchanged": back.get("Name") == got.get("Name"),
+            "PriorityUnchanged": back.get("Priority") == got.get("Priority"),
+            "StartDateUnchanged": back.get("StartDate") == got.get("StartDate"),
+            "StatusNotTheCancelledWePosted": back.get("Status") != "Cancelled",
+            # NOT "is 404": `get_json` answers None for any non-200 AND for a 200
+            # whose body is `null`, which is literally what Jellyfin returns here.
+            # All this establishes is that no timer exists to read — see the
+            # docstring for why the status itself is not a parity signal.
+            "UnknownIdHasNoTimerToRead": get_json(base, f"/LiveTv/Timers/{ghost}", token) in (None, {}),
+        })
+    finally:
+        http("DELETE", f"{base}/LiveTv/Timers/{tid}", token)
 
 
 def j_livetv(base, token, user, _m, _m2):
@@ -1536,7 +1881,9 @@ def j_livetv(base, token, user, _m, _m2):
     tid = timer.get("Id")
     rec = None
     try:
-        r["GET /LiveTv/Timers/{timerId}"] = (get_json(base, f"/LiveTv/Timers/{tid}", token) or {}).get("Id") == tid
+        got = get_json(base, f"/LiveTv/Timers/{tid}", token) or {}
+        r["GET /LiveTv/Timers/{timerId}"] = got.get("Id") == tid
+        r["POST /LiveTv/Timers/{timerId}"] = timer_update_leg(base, token, user, ch)
         for _ in range(RECORDING_START_WAIT_S // RECORDING_POLL_S):
             recs = (get_json(base, f"/LiveTv/Recordings?isInProgress=true&userId={user}", token)
                     or {}).get("Items") or []
@@ -1743,6 +2090,296 @@ def j_livetv_admin(base, token, user, _m, _m2):
     return r
 
 
+def dotnet_md5_guid_n(text):
+    """Jellyfin's `string.GetMD5().ToString("N")`: MD5 over UTF-16LE bytes, read back
+    as a .NET `Guid` (Data1/Data2/Data3 are little-endian) and printed without dashes.
+
+    This is `LiveTvDtoService.GetInternalSeriesTimerId` (v10.11.8 LiveTvDtoService.cs:417-421)
+    when fed `"Emby" + externalId + "4"` lowercased. Having it here is what lets the
+    journey assert that a server DERIVED its series-timer id rather than minting one —
+    the alternative would be to drop Id from the comparison and call that verified."""
+    import hashlib
+    d = hashlib.md5(text.encode("utf-16-le")).digest()
+    return (bytes([d[3], d[2], d[1], d[0], d[5], d[4], d[7], d[6]]) + d[8:]).hex()
+
+
+def derives_its_id(dto):
+    """True when this series timer's Id is the MD5 upstream derives from its ExternalId."""
+    ext = dto.get("ExternalId") or ""
+    return bool(ext) and dto.get("Id") == dotnet_md5_guid_n(("Emby" + ext + "4").lower())
+
+
+def series_timer_body(dto):
+    """The read-back DTO with exactly the per-instance fields dropped — see
+    SERIES_TIMER_PER_INSTANCE for why each one, and why nothing else is dropped."""
+    return {k: v for k, v in (dto or {}).items() if k not in SERIES_TIMER_PER_INSTANCE}
+
+
+def series_timer_ids(base, token, query=""):
+    items = (get_json(base, f"/LiveTv/SeriesTimers{query}", token) or {}).get("Items") or []
+    return [t.get("Id") for t in items]
+
+
+def children_of(base, token, series_timer_id):
+    """The timers a series timer has scheduled, as `GET /LiveTv/Timers` publishes them.
+
+    That view excludes `Completed` on both servers (`GetTimersAsync`, v10.11.8
+    DefaultLiveTvService.cs:392-403), so it is the right lens for "what is still
+    going to record" and the wrong one for "what rows exist" — which is exactly why
+    the Completed-child leak in `CancelSeriesTimerAsync` needed a unit test rather
+    than a journey leg."""
+    return [t for t in ((get_json(base, "/LiveTv/Timers", token) or {}).get("Items") or [])
+            if t.get("SeriesTimerId") == series_timer_id]
+
+
+def j_livetv_series_timers(base, token, user, _m, _m2):
+    """The series-timer lifecycle on the fixture tuner: pick two FUTURE programmes with
+    different titles from the guide, create a series timer from each programme's own
+    `Timers/Defaults` body, read one back, update it, delete it, and confirm it and the
+    timers it scheduled are gone — then clean the second one up too.
+
+    Three assertions here are the ones that were missing, and each catches a real bug:
+      * two creates from two different programmes leave TWO rows with DIFFERENT ids.
+        `Timers/Defaults` hands every programme the same constant Id and clients post
+        it straight back, so a server that honours it collapses every series timer
+        onto one row and silently destroys the previous one.
+      * the created Id is the MD5 the C# derives from a freshly minted ExternalId
+        (`derives_its_id`), not the posted one and not a random GUID in DB casing.
+      * creating a series timer SCHEDULES something: at least one timer carrying
+        SeriesTimerId. A series timer that records nothing passes every status check.
+      * editing the series timer does not RESURRECT a showing the user cancelled by
+        hand — the `IsManual` contract. Ferrofin wrote that flag on INSERT only, so
+        cancelling a child (always an UPDATE) never raised it and the next edit put
+        the showing back to New.
+      * the update keys on the BODY's id, not the route's, exactly as upstream does.
+
+    Every op starts False so an early exit (no channels, no future programmes) leaves a
+    flagged row, never a missing one."""
+    r = dict.fromkeys(SERIES_TIMER_OPS, False)
+    channels = (get_json(base, f"/LiveTv/Channels?userId={user}", token) or {}).get("Items") or []
+    if not channels:
+        return r
+    ch = channels[0]["Id"]
+    programs = (get_json(base, f"/LiveTv/Programs?channelIds={ch}&userId={user}", token)
+                or {}).get("Items") or []
+    # A programme that has already ended schedules nothing (`MinEndDate = UtcNow` in
+    # `GetTimersForSeries`), so the fan-out assertion would pass vacuously on it —
+    # and one that is airing RIGHT NOW is worse: its timer fires the moment the
+    # series timer is created, so the earliest showing races the recorder through
+    # New → InProgress → Completed while the journey is still reading. Only a
+    # programme SERIES_TIMER_MIN_LEAD_S out is a stable subject; see that constant
+    # for why "has not started yet" was not a wide enough margin.
+    now = time.strftime("%Y-%m-%dT%H:%M:%S",
+                        time.gmtime(time.time() + SERIES_TIMER_MIN_LEAD_S))
+    future = [p for p in programs if (p.get("StartDate") or "") > now]
+    picked, seen = [], set()
+    for p in future:                      # two DIFFERENT titles: two independent series
+        if p.get("Name") not in seen:
+            seen.add(p.get("Name"))
+            picked.append(p)
+        if len(picked) == 2:
+            break
+    if len(picked) < 2:
+        return r
+    created = []
+    try:
+        # --- create, twice, from two different programmes' defaults -------------------
+        create_ok, evidence = True, {}
+        for n, prog in enumerate(picked):
+            before = set(series_timer_ids(base, token))
+            defaults = get_json(base, f"/LiveTv/Timers/Defaults?programId={prog['Id']}", token) or {}
+            defaults["Priority"] = 3 + n * 5          # non-default: the create must DISCARD it
+            # …and a client-chosen Name, which the create must KEEP:
+            # `LiveTvDtoService.GetSeriesTimerInfo` binds `Name = dto.Name`
+            # (v10.11.8 LiveTvDtoService.cs:499) and neither
+            # `DefaultLiveTvService.CreateSeriesTimer` (:263-309) nor
+            # `UpdateSeriesTimerAsync`'s whitelist (:314-334) ever writes it, so
+            # create is the ONLY place a name can be set. The two names are also
+            # what makes the ordering legs below a real collation probe:
+            # `StringComparison.InvariantCulture` sorts "apple" before "Banana",
+            # code-point order sorts them the other way round.
+            defaults["Name"] = ("apple parity g5", "Banana parity g5")[n]
+            st, _ = http("POST", f"{base}/LiveTv/SeriesTimers", token, json.dumps(defaults))
+            fresh = [i for i in series_timer_ids(base, token) if i not in before]
+            created += fresh
+            dto = get_json(base, f"/LiveTv/SeriesTimers/{fresh[0]}", token) if fresh else {}
+            evidence[f"created{n}"] = {
+                "status_ok": st < 300,
+                "exactly_one_new_row": len(fresh) == 1,
+                "id_is_not_the_posted_defaults_id": bool(fresh) and fresh[0] != defaults.get("Id"),
+                "id_is_derived_from_external_id": derives_its_id(dto or {}),
+                "external_channel_id_set": bool((dto or {}).get("ExternalChannelId")),
+                "program_id": (dto or {}).get("ProgramId") == prog["Id"],
+                # `LiveTvManager.CreateSeriesTimer` overwrites the posted Priority
+                # with the standing defaults' ("// Set priority from default
+                # values", LiveTvManager.cs:1145-1147). The body above posted a
+                # non-default one, so a server that honours it fails here — and
+                # would then also make the sort leg below meaningless.
+                "posted_priority_discarded": (dto or {}).get("Priority") == 0,
+                "posted_name_kept": (dto or {}).get("Name") == defaults["Name"],
+            }
+            create_ok = create_ok and all(evidence[f"created{n}"].values())
+        evidence["two_distinct_ids"] = len(set(created)) == 2
+        create_ok = create_ok and evidence["two_distinct_ids"]
+        if len(created) < 2:
+            r["POST /LiveTv/SeriesTimers"] = Same(False, evidence)
+            return r
+        sid, other = created[0], created[1]
+        # …and the create SCHEDULED something: a series timer that records nothing
+        # passes every status check ever written, which is how this went unnoticed.
+        #
+        # The invariant compared is the shape upstream produces, not the raw count.
+        # Every airing of one title in this fixture hashes to the same `ShowId`
+        # (`XmlTvListingsProvider.cs:186-206` — no episode info, so it is MD5(title)),
+        # so `SearchForDuplicateShowIds` (DefaultLiveTvService.cs:681-707) records the
+        # EARLIEST showing and cancels the rest. The raw count is deliberately left out
+        # of the comparison: it is "future airings of this title at the instant the
+        # request landed", and the two servers are called seconds apart, so it moves by
+        # one across an hour boundary in the fixture's hourly guide. `>= 2` still gates
+        # that the fan-out really walked the guide rather than scheduling the one
+        # programme it was handed.
+        children = children_of(base, token, sid)
+        recordable = [t for t in children if t.get("Status") != "Cancelled"]
+        earliest = min(children, key=lambda t: t.get("StartDate") or "", default=None)
+        evidence["fan_out"] = {
+            "scheduled_more_than_one_showing": len(children) >= 2,
+            "exactly_one_showing_is_recordable": len(recordable) == 1,
+            "the_recordable_one_is_the_earliest":
+                bool(earliest) and earliest.get("Status") != "Cancelled",
+        }
+        create_ok = create_ok and all(evidence["fan_out"].values())
+        r["POST /LiveTv/SeriesTimers"] = Same(create_ok, evidence)
+
+        # --- read one back: the whole body, diffed against the other server ------------
+        dto = get_json(base, f"/LiveTv/SeriesTimers/{sid}", token) or {}
+        r["GET /LiveTv/SeriesTimers/{timerId}"] = Same(
+            dto.get("Id") == sid and derives_its_id(dto), series_timer_body(dto))
+
+        # --- update: the C# whitelist, and nothing else --------------------------------
+        ghost = "0000000000000000000000000000dead"
+        posted = dict(dto)
+        posted.update(PrePaddingSeconds=120, PostPaddingSeconds=240,
+                      IsPrePaddingRequired=True, Priority=7, KeepUpTo=3,
+                      Days=["Saturday", "Sunday"], DayPattern="Daily",
+                      Name="RENAMED", Overview="RENAMED")
+
+        # Before the edit: a person cancels the ONE showing this series timer was
+        # going to record. The edit below must not put it back. `CancelTimerAsync`
+        # cancels manually (v10.11.8 DefaultLiveTvService.cs:199-203), which flags the
+        # surviving row `IsManual` (:176-180); the next fan-out copies that flag onto
+        # the candidate (:745) and both arms that could revive it are guarded on it
+        # (`ShouldCancelTimerForSeriesTimer`'s first arm :646, and the
+        # `else if (!existingTimer.IsManual)` at :751). Ferrofin wrote `IsManual` on
+        # INSERT only, so cancelling a child — always an UPDATE, because a child keeps
+        # its SeriesTimerId and so is updated rather than deleted — never raised it.
+        # Measured on the pair before the fix: Jellyfin left the cancelled showing
+        # `Cancelled` and promoted the next one, Ferrofin set it back to `New` and
+        # would have recorded it. The create leg above has already established that
+        # `recordable` holds exactly one timer on both servers.
+        victim = recordable[0].get("Id") if len(recordable) == 1 else None
+        if victim:
+            http("DELETE", f"{base}/LiveTv/Timers/{victim}", token)
+
+        st, _ = http("POST", f"{base}/LiveTv/SeriesTimers/{sid}", token, json.dumps(posted))
+        updated = get_json(base, f"/LiveTv/SeriesTimers/{sid}", token) or {}
+
+        hand_cancel = {"ran": False, "recordable_children": len(recordable)}
+        if victim:
+            kids_after = children_of(base, token, sid)
+            same_showing = next((t for t in kids_after if t.get("Id") == victim), None)
+            hand_cancel = {
+                "ran": True,
+                "the_cancelled_showing_is_not_new_again":
+                    same_showing is not None and same_showing.get("Status") != "New",
+                "another_showing_took_its_place":
+                    any(t.get("Status") == "New" and t.get("Id") != victim
+                        for t in kids_after),
+            }
+
+        # The row is keyed on the BODY's id, not the route's: `LiveTvController`
+        # (v10.11.8 LiveTvController.cs:933-937) hands the manager the body alone and
+        # never reads `timerId`, and `UpdateSeriesTimerAsync` matches on `info.Id`
+        # (DefaultLiveTvService.cs:314). So a body carrying a FOREIGN id, posted to a
+        # perfectly valid route, must change nothing. This leg exists because Ferrofin
+        # used to fall back to the route id when the body id matched no row — strictly
+        # more lenient than upstream, and invisible to the ghost leg below (which
+        # misses on both ids at once and so cannot tell the two rules apart).
+        http("POST", f"{base}/LiveTv/SeriesTimers/{sid}", token,
+             json.dumps(dict(posted, Id=ghost, ExternalId="",
+                             PrePaddingSeconds=999, PostPaddingSeconds=888)))
+        after_foreign = get_json(base, f"/LiveTv/SeriesTimers/{sid}", token) or {}
+
+        # An id nothing matches must write nothing: no ghost row, no readable row after.
+        http("POST", f"{base}/LiveTv/SeriesTimers/{ghost}", token,
+             json.dumps(dict(posted, Id=ghost, ExternalId="")))
+
+        after = get_json(base, f"/LiveTv/SeriesTimers/{sid}", token) or {}
+        r["POST /LiveTv/SeriesTimers/{timerId}"] = Same(st < 300 and bool(after), {
+            "body": series_timer_body(after),
+            # Named here as well as inside the body so a failure says WHICH rule broke:
+            # the whitelist keeps Name/Overview, and DayPattern is recomputed from Days
+            # (`GetDayPattern`, LiveTvDtoService.cs:360-387) — [Sat,Sun] is Weekends even
+            # though the posted body said Daily.
+            "name_not_updatable": after.get("Name") == dto.get("Name"),
+            "overview_not_updatable": after.get("Overview") == dto.get("Overview"),
+            "day_pattern_recomputed": after.get("DayPattern") == "Weekends",
+            "foreign_body_id_changed_nothing":
+                series_timer_body(after_foreign) == series_timer_body(updated),
+            # Deliberately NOT named "is 404": `get_json` returns None for any
+            # non-200, and what this leg establishes is only "no row exists to
+            # read". The status itself is not compared here because upstream's is
+            # a Jellyfin bug — see `timer_update_leg`'s docstring.
+            "unknown_id_has_no_row_to_read":
+                get_json(base, f"/LiveTv/SeriesTimers/{ghost}", token) in (None, {}),
+            "hand_cancelled_showing_survives_the_edit": hand_cancel,
+        })
+
+        # --- sortBy is honoured, not silently dropped ---------------------------------
+        # This runs AFTER the update, which is the only way a series timer's Priority
+        # can move (create discards it): `sid` is now Priority 7 and `other` is still
+        # the default 0. Upstream's ASCENDING Priority arm is OrderByDescending(Priority)
+        # (LiveTvManager.cs:925-926) — the inversion is upstream's, ported verbatim — so
+        # the two orders are each other's reverse and both differ from the default
+        # name order. Names are compared, not ids, so this is cross-server evidence.
+        # Without distinct priorities the three lists would be identical and the leg
+        # would pass on a server that drops sortBy on the floor, which is the bug.
+        def order_of(query):
+            items = (get_json(base, f"/LiveTv/SeriesTimers{query}", token) or {}).get("Items") or []
+            return [t.get("Name") for t in items if t.get("Id") in (sid, other)]
+        r["POST /LiveTv/SeriesTimers"] = Same(create_ok, dict(
+            evidence,
+            order_default=order_of(""),
+            order_priority_asc=order_of("?sortBy=Priority"),
+            order_priority_desc=order_of("?sortBy=Priority&sortOrder=Descending"),
+            # The default (name) order, reversed: with the two posted names above
+            # this is the collation leg — a server comparing by Unicode scalar
+            # instead of CLDR root collation answers ["apple…", "Banana…"] here
+            # where upstream answers ["Banana…", "apple…"].
+            order_name_desc=order_of("?sortOrder=Descending")))
+
+        # --- delete: gone, its timers gone, and a second delete is not a silent 204 ----
+        st, _ = http("DELETE", f"{base}/LiveTv/SeriesTimers/{sid}", token)
+        again, _ = http("DELETE", f"{base}/LiveTv/SeriesTimers/{sid}", token)
+        left = children_of(base, token, sid)
+        r["DELETE /LiveTv/SeriesTimers/{timerId}"] = Same(st < 300, {
+            "gone_from_the_list": sid not in series_timer_ids(base, token),
+            # The literal status, not "get_json came back empty": `get_json`
+            # answers None for ANY non-200, so the old form let a 500 pass as a
+            # 404 and a regression from one to the other stayed green. Both
+            # servers really do answer 404 here (`LiveTvController.GetSeriesTimer`
+            # returns `NotFound()` on a null timer, v10.11.8 LiveTvController.cs:875-884),
+            # so the code is comparable and is compared.
+            "single_get_status": http("GET", f"{base}/LiveTv/SeriesTimers/{sid}", token)[0],
+            "its_timers_are_gone": len(left) == 0,
+            "second_delete_is_not_2xx": again >= 400,
+        })
+        created.remove(sid)
+    finally:
+        for leftover in created:
+            http("DELETE", f"{base}/LiveTv/SeriesTimers/{leftover}", token)
+    return r
+
+
 def j_remote_subtitles(base, token, user, mid, _m2):
     """Remote subtitles through OpenSubtitles — only when credentials are configured (see
     sweep.opensubtitles_credentials). The fixture's first movie carries a real IMDb id in
@@ -1781,6 +2418,322 @@ def j_remote_subtitles(base, token, user, mid, _m2):
         # (the fixture's own eng track is embedded, never external).
         if i not in before or lang == "eng":
             http("DELETE", f"{base}/Videos/{mid}/Subtitles/{i}", token)
+    return r
+
+
+# ---------------------------------------------------------------- Identify → Apply
+
+def http_headers(method, url, token=None, body=None):
+    """`sweep.http()` plus the response headers, keys lowercased.
+
+    Only the artwork journey needs them: what a stored image is SERVED as is the
+    observable half of "the download was typed from the response, not the URL",
+    and header casing differs between the two stacks (axum lowercases, Kestrel
+    does not), so the lookup must be case-insensitive."""
+    headers = {"Content-Type": "application/json"}
+    if token is not None:
+        headers["Authorization"] = f'MediaBrowser Token="{token}", {CLIENT}'
+    req = urllib.request.Request(url, data=(body.encode() if isinstance(body, str) else body),
+                                 method=method.upper(), headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return resp.status, resp.read(), {k.lower(): v for k, v in resp.headers.items()}
+    except urllib.error.HTTPError as e:
+        return e.code, e.read(), {k.lower(): v for k, v in e.headers.items()}
+    except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+        return 0, str(e).encode(), {}
+
+
+def movie_named(base, token, user, name):
+    """The movie whose Name is exactly `name`, or None.
+
+    Selection is BY NAME, never by sort position: the two servers do not hold the
+    same movie list (Jellyfin's DVR journey leaves recordings behind that sort into
+    the same range), so `limit=1&sortOrder=Descending` picks a DIFFERENT item on each
+    side and the cross-server comparison silently stops comparing the same thing."""
+    b = get_json(base, f"/Items?userId={user}&recursive=true&includeItemTypes=Movie"
+                       f"&searchTerm={urllib.parse.quote(name)}&limit=10", token)
+    return next((i["Id"] for i in (b or {}).get("Items", []) if i.get("Name") == name), None)
+
+
+#: The read-back fields `POST /Items/RemoteSearch/Apply/{itemId}` can change,
+#: derived from v10.11.8 `MetadataService.MergeBaseItemData` — every scalar it
+#: assigns under `replaceData: true`, plus the four the endpoint's own contract
+#: covers (`LockData`/`LockedFields`, and the ids the controller writes).
+#:
+#: This list is NOT the body. See `identified()` for what is left out and why the
+#: row is recorded `property`.
+IDENTIFY_READBACK = ("Name", "OriginalTitle", "ProductionYear", "PremiereDate", "ProviderIds",
+                     "Overview", "Genres", "Taglines", "CommunityRating", "OfficialRating",
+                     "RunTimeTicks", "LockData", "LockedFields",
+                     # …the rest of MergeBaseItemData's replaceData assignments,
+                     # which the first cut of this projection omitted — exactly
+                     # the fields a port could silently skip and no probe see.
+                     "EndDate", "IndexNumber", "ParentIndexNumber", "CustomRating",
+                     "CriticRating", "Tags", "ProductionLocations", "ForcedSortName",
+                     "PreferredMetadataLanguage", "PreferredMetadataCountryCode",
+                     "AlbumArtist", "AlbumArtists")
+
+
+def identified(dto):
+    """The item's post-Apply state, projected into a CROSS-SERVER comparable shape.
+
+    A PROJECTION, not a body — which is why the row is recorded `property` and not
+    the `body-diff` headline. Being explicit about both halves, because the
+    previous version of this docstring asserted "nothing here is dropped" and that
+    was not true:
+
+    COMPARED. Every field in `IDENTIFY_READBACK` (the whole of
+    `MergeBaseItemData`'s `replaceData` assignment list, MetadataService.cs
+    :1009-1176, plus `LockData`/`LockedFields`/`ProviderIds`), and four derived
+    values whose raw form is per-instance and for no other reason:
+      * `Studios` — the DTO entries carry each server's own GUID for the studio, so
+        the NAMES are compared, which is the whole of what a provider supplies.
+      * `People` — same GUID problem; the (Name, Type, Role) triples are compared,
+        so a cleared or re-ordered cast still fails. Upstream deliberately KEEPS
+        the cast here (`temp.People` is null, and `SaveItemAsync` skips a null
+        people list), so this is a guard against Ferrofin clearing it, not a
+        prediction that it will change.
+      * `RemoteTrailers` — the URLs are compared; the C# replaces the whole list
+        under `replaceData`.
+      * `ImageTags` — the tag is an md5 of path+mtime, so it differs between two
+        servers holding byte-identical artwork (measured). The KEY SET is
+        compared, so an image that appeared, vanished, or landed under the wrong
+        `ImageType` still fails. `BackdropImageTags` has the same tag problem, so
+        the COUNT is compared.
+
+    NOT COMPARED, and therefore not claimed: everything else the DTO carries —
+    `MediaSources`/`MediaStreams`/`Chapters`/`Trickplay`/`UserData`/`ExternalUrls`
+    and the rest. Those are the file's facts, not the merge's, they are owned by
+    the `GET /Items/{itemId}` row, and two of them (`MediaStreams[].BitRate`,
+    `MediaSources[].Bitrate`) carry a known open divergence that would pin this
+    row red for someone else's bug. A whole-body diff belongs in reads.py, which
+    has one.
+    """
+    out = {k: dto.get(k) for k in IDENTIFY_READBACK}
+    out["Studios"] = sorted(s.get("Name") for s in (dto.get("Studios") or []))
+    out["People"] = sorted((p.get("Name"), p.get("Type"), p.get("Role"))
+                           for p in (dto.get("People") or []))
+    out["RemoteTrailers"] = sorted(t.get("Url") for t in (dto.get("RemoteTrailers") or []))
+    out["ImageTags"] = sorted((dto.get("ImageTags") or {}).keys())
+    out["BackdropImageTags"] = len(dto.get("BackdropImageTags") or [])
+    return out
+
+
+#: How long to wait for a forced library scan to report itself finished. The
+#: fixture's 552 items take ~3 s on both stacks; the ceiling is generous so a
+#: loaded host produces a `scan_completed: False` row rather than a timeout.
+SCAN_WAIT_S = 300
+
+
+def scan_library_and_wait(base, token):
+    """Run the library scan to completion on `base`; True only if it really ran.
+
+    Driven through the `RefreshLibrary` SCHEDULED TASK, not `POST
+    /Library/Refresh`, because the task is the only library-scan trigger that
+    reports a completion signal on both stacks: `State` returns to `Idle` and
+    `LastExecutionResult.EndTimeUtc` advances past the value captured before the
+    start. `POST /Library/Refresh` is fire-and-forget on both, which is exactly
+    how a read-back taken "after" a scan can be taken before it.
+
+    Returns False on a timeout, on a missing task, or on a refused start — the
+    caller puts that in its evidence, so a scan that did not happen can never be
+    mistaken for a scan that changed nothing.
+    """
+    task = next((t for t in (get_json(base, "/ScheduledTasks", token) or [])
+                 if t.get("Key") == "RefreshLibrary"), None)
+    if not task:
+        return False
+    task_id, before = task["Id"], (task.get("LastExecutionResult") or {}).get("EndTimeUtc")
+    if http("POST", f"{base}/ScheduledTasks/Running/{task_id}", token, "")[0] >= 300:
+        return False
+    deadline = time.time() + SCAN_WAIT_S
+    while time.time() < deadline:
+        time.sleep(2)
+        now = get_json(base, f"/ScheduledTasks/{task_id}", token) or {}
+        end = (now.get("LastExecutionResult") or {}).get("EndTimeUtc")
+        if now.get("State") == "Idle" and end != before:
+            return True
+    return False
+
+
+def j_remote_search_apply(base, token, user, _m, _m2):
+    """`POST /Items/RemoteSearch/Apply/{itemId}` — the Identify dialog's "Apply".
+
+    A real mutation, so the row is earned on the READ-BACK — and the read-back is
+    compared against the OTHER server's, field for field, through `identified()`.
+    That is a NAMED PROJECTION of the DTO and not the DTO, so the row is recorded
+    `property`; `identified()`'s docstring lists what is in it and what is not.
+
+    Two legs, on movies no other journey touches (`Movie 0497`/`Movie 0496`, chosen by
+    name — see `movie_named`):
+
+      1. UNLOCKED. The fixture's Movies library has every "Metadata downloaders" and
+         "Image fetchers" box cleared (`LibraryOptions.TypeOptions[Movie]`), so no
+         remote fetcher may run: v10.11.8 `ProviderManager.CanRefreshMetadata` →
+         `BaseItemManager.IsMetadataFetcherEnabled` is an ALLOW-list, and an empty
+         `MetadataFetchers` disables everything. Two things must happen anyway. The
+         controller's own assignment — `item.ProviderIds = searchResult.ProviderIds`,
+         commented "Since the refresh process won't erase provider Ids, we need to set
+         this explicitly now" (`ItemLookupController.ApplySearchCriteria`) — and the
+         `RemoveOldMetadata` wipe: `MetadataService.RefreshWithProviders` skips
+         re-adding the item's own values, so merging the empty provider result under
+         `ReplaceAllMetadata` CLEARS every provider-supplied field. Ferrofin failed
+         this leg three ways in turn: it ignored the checkboxes and fetched TMDB; then,
+         once gated, it dropped the chosen ids too; and it never cleared the old
+         record's genres/studios/year.
+
+      2. LOCKED. `item.IsLocked` makes `RefreshWithProviders` return before the merge,
+         so the ids land and nothing else moves. Refusing the FETCH (right) and
+         refusing the ID ASSIGNMENT (wrong) are separable only on this leg.
+
+    …and then, for BOTH legs, the same read-back again after a library scan that
+    this journey forces and WAITS FOR (`scan_library_and_wait`). That third
+    observation is not decoration; it is the difference between a fact and a
+    coincidence. An earlier version of this row took its read-back immediately and
+    recorded it green, while the journeys suite's own `POST /Library/Refresh` was
+    mid-flight; seconds later Ferrofin's scan re-applied `movie.nfo` over the item
+    Apply had just cleared, and the row had certified a state that no longer
+    existed. Upstream cannot do that: `BaseNfoProvider.HasChanged` is
+    `nfoWriteTime - item.DateLastSaved > 1 minute`, so a sidecar older than the last
+    save reports no change, `MetadataService.GetProviders` returns an empty provider
+    list for the item, and the scan leaves it alone. Ferrofin's scan re-reads the
+    sidecar unconditionally, so `unlocked_after_scan` diverges — see the
+    `open-work (NOT accepted)` entry in classifications.json. Forcing the scan makes
+    that divergence a deterministic red instead of a race whose outcome depends on
+    when the suite happened to run.
+
+    Deliberately NOT probed: a leg with the downloaders TICKED. It would rewrite both
+    items from live TMDB, whose answer is not pinned in time, so the row would go red
+    on an upstream synopsis edit. The gate is what this row is for.
+    """
+    r = {}
+    unlocked = movie_named(base, token, user, "Movie 0497")
+    locked = movie_named(base, token, user, "Movie 0496")
+    if not (unlocked and locked):
+        return r
+
+    st, _ = http("POST", f"{base}/Items/RemoteSearch/Apply/{unlocked}?replaceAllImages=true",
+                 token, json.dumps({"Name": "The Matrix", "ProviderIds": {"Tmdb": "603"},
+                                    "ProductionYear": 1999,
+                                    "SearchProviderName": "TheMovieDb"}))
+    after_open = identified(q(base, f"/Items/{unlocked}", token, user) or {})
+
+    dto = q(base, f"/Items/{locked}", token, user) or {}
+    dto["LockData"] = True
+    lock_st, _ = http("POST", f"{base}/Items/{locked}", token, json.dumps(dto))
+    st2, _ = http("POST", f"{base}/Items/RemoteSearch/Apply/{locked}?replaceAllImages=true",
+                  token, json.dumps({"Name": "Inception", "ProviderIds": {"Tmdb": "27205"},
+                                     "ProductionYear": 2010,
+                                     "SearchProviderName": "TheMovieDb"}))
+    after_locked = identified(q(base, f"/Items/{locked}", token, user) or {})
+
+    # Durability. `scan_completed` is IN the evidence and in `ok`, so a scan that
+    # timed out or never started cannot pass as "the scan changed nothing".
+    scanned = scan_library_and_wait(base, token)
+    durable_open = identified(q(base, f"/Items/{unlocked}", token, user) or {})
+    durable_locked = identified(q(base, f"/Items/{locked}", token, user) or {})
+
+    ev = {"status": st, "locked_status": st2, "lock_accepted": lock_st < 300,
+          "unlocked": after_open, "locked": after_locked,
+          "scan_completed": scanned,
+          "unlocked_after_scan": durable_open, "locked_after_scan": durable_locked}
+    r["POST /Items/RemoteSearch/Apply/{itemId}"] = Same(
+        st == 204 and st2 == 204 and scanned
+        and (after_open.get("ProviderIds") or {}).get("Tmdb") == "603"
+        and (after_locked.get("ProviderIds") or {}).get("Tmdb") == "27205"
+        and after_locked.get("LockData") is True, ev)
+    return r
+
+
+def j_remote_image_download(base, token, user, _m, _m2):
+    """`POST /Items/{itemId}/RemoteImages/Download` — "Choose Image"'s download-by-URL.
+
+    Gated by admin elevation ONLY: v10.11.8 `RemoteImageController.DownloadRemoteImage`
+    carries `[Authorize(Policy = Policies.RequiresElevation)]` and consults no library
+    option, because `ProviderManager.SaveImage` is a raw GET of a caller-supplied URL,
+    not a provider call. Unlike Refresh and Identify, the absence of a "Metadata
+    downloaders"/"Image fetchers" check here is CORRECT; adding one would be the
+    divergence.
+
+    Each server downloads from ITSELF (`http://127.0.0.1:8096/...`, the in-container
+    listener) — the one source URL that is identical text on both sides and depends on
+    no other container. That is also why the row is `property` and not `body-diff`: the
+    two servers' stored bytes come from two different origins (each server's own
+    re-encode of its own poster), so they cannot be diffed against each other. What IS
+    compared across the two servers is the derived set below — statuses, which
+    `ImageTags` keys appeared, and the media type each stored file is SERVED as, which
+    is exactly what the two bugs this row exists for corrupted:
+
+      * the stored file used to be typed from the URL's SUFFIX ("ends with .png ? png :
+        jpeg"), so a PNG fetched from a URL carrying no `.png` was written as `.jpg`
+        and served as `image/jpeg`. C# reads `response.Content.Headers.ContentType` and
+        falls back to the URL PATH only when that is absent or
+        `application/octet-stream` (`ProviderManager.SaveImage`);
+      * and there was no `image/*` check at all, so a URL answering JSON was stored as
+        the item's artwork and served back as an image. C# throws
+        `Request returned '{contentType}' instead of an image type`.
+
+    Reaped at the end so a re-run, and every layer after it, sees the item unchanged.
+    """
+    r = {}
+    mid = movie_named(base, token, user, "Movie 0495")
+    if not mid:
+        return r
+    # The server fetches this itself, from inside its own container.
+    src = f"http://127.0.0.1:8096/Items/{mid}/Images/Primary"
+    before = sorted(((q(base, f"/Items/{mid}", token, user) or {}).get("ImageTags") or {}).keys())
+
+    def download(image_type, url):
+        st, _ = http("POST", f"{base}/Items/{mid}/RemoteImages/Download?type={image_type}"
+                             f"&imageUrl={urllib.parse.quote(url, safe='')}", token, "")
+        return st
+
+    # 1. happy path: a JPEG, from a URL with no extension at all.
+    logo_st = download("Logo", src)
+    # 2. the same picture re-encoded as PNG, again extensionless — the leg that used to
+    #    land as `.jpg` and be served `image/jpeg`.
+    thumb_st = download("Thumb", src + "?format=Png")
+    # 3. a URL that answers JSON: must be refused, and must leave no artwork behind.
+    art_st = download("Art", "http://127.0.0.1:8096/System/Info/Public")
+    # 4. the argument checks (`type` and `imageUrl` are both required).
+    no_type = http("POST", f"{base}/Items/{mid}/RemoteImages/Download"
+                           f"?imageUrl={urllib.parse.quote(src, safe='')}", token, "")[0]
+    no_url = http("POST", f"{base}/Items/{mid}/RemoteImages/Download?type=Logo", token, "")[0]
+    # 5. an unknown item is 404 — a RANDOM guid, never the degenerate
+    #    00000000-0000-0000-0000-000000000001, which makes Jellyfin 500 out of its own
+    #    repository (an artefact of that id, not of this endpoint).
+    unknown = http("POST", f"{base}/Items/{uuid.uuid4().hex}/RemoteImages/Download?type=Logo"
+                           f"&imageUrl={urllib.parse.quote(src, safe='')}", token, "")[0]
+
+    keys = sorted(((q(base, f"/Items/{mid}", token, user) or {}).get("ImageTags") or {}).keys())
+
+    def served(image_type):
+        st, _, headers = http_headers("GET", f"{base}/Items/{mid}/Images/{image_type}", token)
+        return st, (headers.get("content-type") or "").split(";")[0].strip().lower()
+
+    logo_served, logo_ct = served("Logo")
+    thumb_served, thumb_ct = served("Thumb")
+    art_served, _ = served("Art")
+
+    ev = {"logo_status": logo_st, "thumb_status": thumb_st, "art_status_class": art_st // 100,
+          "no_type_status": no_type, "no_url_status": no_url, "unknown_item_status": unknown,
+          "added_keys": sorted(set(keys) - set(before)),
+          "logo_served": logo_served, "logo_content_type": logo_ct,
+          "thumb_served": thumb_served, "thumb_content_type": thumb_ct,
+          "art_served": art_served}
+    r["POST /Items/{itemId}/RemoteImages/Download"] = Same(
+        logo_st == 204 and thumb_st == 204
+        and "Logo" in keys and "Thumb" in keys
+        # the refusal, and its consequence: no Art image exists afterwards
+        and art_st >= 400 and "Art" not in keys and art_served == 404
+        # …and the PNG kept its own type all the way through the store
+        and logo_ct == "image/jpeg" and thumb_ct == "image/png"
+        and no_type == 400 and no_url == 400 and unknown == 404, ev)
+
+    for image_type in ("Logo", "Thumb", "Art"):
+        if image_type in keys:
+            http("DELETE", f"{base}/Items/{mid}/Images/{image_type}", token)
     return r
 
 
@@ -1874,9 +2827,15 @@ JOURNEYS = [j_startup,   # first: see its docstring
             j_scheduled_run, j_playbackinfo_post, j_active_encodings, j_clientlog,
             j_authenticate, j_user_update, j_devices_delete, j_bulk_item_delete,
             j_subtitles_upload, j_lyrics, j_quickconnect, j_system_and_refresh,
-            j_forgot_password, j_backup, j_livetv, j_livetv_admin, j_remote_subtitles,
-            j_forgot_password, j_backup, j_livetv, j_remote_subtitles,
+            j_forgot_password, j_backup, j_livetv, j_livetv_series_timers,
+            # Mutates the tuner/listings configuration the Live TV reads depend
+            # on, so it runs after every other Live TV leg.
+            j_livetv_admin, j_remote_subtitles,
             j_activity_log,
+            j_remote_image_download,
+            # Destructive-ish: rewrites the metadata of two movies it owns outright
+            # (Movie 0497/0496, by name), and locks one of them.
+            j_remote_search_apply,
             # Destructive: merges/splits the shared movies, so it must run LAST so its
             # mutations can't corrupt the items other journeys read/refresh.
             j_merge_versions_controller]
@@ -1909,7 +2868,16 @@ def journeys(ferrofin_url, jellyfin_url):
         h_ok = h.get(op)
         j_ok = j.get(op)
         if jellyfin_url:
-            deep = bool(h_ok and j_ok)
+            agreed = cross_server_ok(h_ok, j_ok)
+            deep = bool(h_ok and j_ok) and agreed
+            method = earned_method(op, h_ok, j_ok)
+            if h_ok and j_ok and not agreed:
+                rows[op] = {"deep_verified": False,
+                            "classification": "flagged: the write took on both servers but "
+                                              "they ended in DIFFERENT states (verify)",
+                            "verification_method": method,
+                            "note": evidence_diff(h_ok.evidence, j_ok.evidence)}
+                continue
             if h_ok and not j_ok:
                 cls = "flagged: Jellyfin read-back differed (verify: oracle setup or Ferrofin extra)"
             elif not h_ok and j_ok:
@@ -1918,9 +2886,30 @@ def journeys(ferrofin_url, jellyfin_url):
                 cls = "flagged: write effect not observed on either server (likely corpus/setup)"
             else:
                 cls = "ok"
+            detail = {
+                verification.BODY_DIFF: "read-back bodies diffed against each other",
+                # `Same` rows compare a NAMED PROJECTION of each server's
+                # read-back against the other's; plain-bool rows compare nothing
+                # across servers at all. Saying "bodies not diffed" for both hid
+                # which of the two a row was.
+                verification.PROPERTY: ("named properties compared across the two servers; "
+                                        "bodies NOT diffed"),
+                verification.EFFECT: ("each server checked against its OWN read-back only; "
+                                      "nothing compared across the two"),
+                verification.STATUS_CLASS: "status only; nothing read back",
+            }.get(method, "bodies not diffed")
+            # A row that returned `Same` on both servers collected comparable
+            # evidence even when one leg's assertion failed, and that evidence is
+            # the only place the divergence is NAMED. Rendering it only in the
+            # `agreed is False` branch above threw it away for every mixed row —
+            # `POST /Startup/User` reported "H=True J=False" and said nothing
+            # about the 403-vs-204 that made it so.
+            ev = ""
+            if isinstance(h_ok, Same) and isinstance(j_ok, Same) and h_ok.evidence != j_ok.evidence:
+                ev = f" [evidence: {evidence_diff(h_ok.evidence, j_ok.evidence)}]"
             rows[op] = {"deep_verified": deep, "classification": cls,
-                        "verification_method": journey_method(op),
-                        "note": f"H={h_ok} J={j_ok} ({journey_method(op)}; bodies not diffed)"}
+                        "verification_method": method,
+                        "note": f"H={h_ok} J={j_ok} ({method}; {detail}){ev}"}
         else:
             # No oracle: the row rests on Ferrofin alone, which is not a parity
             # verdict at all — there is nothing to have agreed with. Recorded
@@ -1931,7 +2920,15 @@ def journeys(ferrofin_url, jellyfin_url):
                         "verification_method": None,
                         "note": f"H={h_ok} — no Jellyfin oracle, so no parity verdict "
                                 f"(Ferrofin-only run)"}
-    return rows, {k: v for k, v in h.items() if k.startswith("_")}
+    # The `_` namespace never becomes a row. `_error:<journey>` records a journey
+    # that blew up; `_note:<name>` records a measurement kept deliberately OUT of
+    # a row's assertion (see the repeat-DELETE evidence in `j_playlist_share`) —
+    # and a note is reported for BOTH servers, because its whole value is the
+    # side-by-side.
+    errors = {k: v for k, v in h.items() if k.startswith("_error")}
+    notes = {k[len("_note:"):]: {"ferrofin": h.get(k), "jellyfin": j.get(k)}
+             for k in sorted(set(h) | set(j)) if k.startswith("_note:")}
+    return rows, errors, notes
 
 
 def main():
@@ -1940,9 +2937,9 @@ def main():
         return
     ferrofin = os.environ.get("FERROFIN_URL", "http://localhost:18096")
     jellyfin = os.environ.get("JELLYFIN_URL")
-    rows, errors = journeys(ferrofin, jellyfin)
+    rows, errors, notes = journeys(ferrofin, jellyfin)
     out = {"generated_by": "suite/parity/journeys.py", "last_verified": os.environ.get("PARITY_STAMP", ""),
-           "errors": errors, "rows": rows}
+           "errors": errors, "notes": notes, "rows": rows}
     with open(os.path.join(ROOT, "suite/parity/journey-results.json"), "w") as f:
         json.dump(out, f, indent=2, sort_keys=True)
         f.write("\n")
@@ -1957,10 +2954,62 @@ def main():
 def selfcheck():
     # The combine logic: deep_verified only when the effect holds on BOTH servers.
     def combine(h_ok, j_ok):
-        return bool(h_ok and j_ok)
+        return bool(h_ok and j_ok) and cross_server_ok(h_ok, j_ok)
     assert combine(True, True) is True
     assert combine(True, False) is False   # Jellyfin disagrees → not verified
     assert combine(False, True) is False   # real Ferrofin gap → not verified
+    # …and for a `Same` step, only when both servers ended in the same state.
+    assert combine(Same(True, {"ProductionYear": 2020}), Same(True, {"ProductionYear": None})) is False
+    assert combine(Same(True, {"ProductionYear": None}), Same(True, {"ProductionYear": None})) is True
+    assert combine(Same(False, {"a": 1}), Same(True, {"a": 1})) is False
+    # …and the note names the INNER key, not the whole projection.
+    assert evidence_diff({"after": {"Year": 2020, "Name": "M"}},
+                         {"after": {"Year": None, "Name": "M"}}) \
+        == "after{Year: H=2020 J=None}"
+    assert evidence_diff({"a": 1}, {"a": 1}) == "(no key differs)"
+    # A MIXED row (one leg's assertion failed) still carries comparable evidence,
+    # and the runner must name it: `POST /Startup/User` is red BECAUSE the two
+    # servers' statuses differ, and a note that says only "H=True J=False" hides
+    # the very fact the row exists to record.
+    assert evidence_diff({"Status": 403, "FirstUserName": "bench"},
+                         {"Status": 204, "FirstUserName": "bench"}) \
+        == "Status: H=403 J=204"
+    # A row may only KEEP a declared body-diff when both sides really compared.
+    # Two rows declare it (the allowlist below pins which), but the guard itself is
+    # exercised on a SYNTHETIC declaration so it is tested even when the real
+    # claimants change: it must upgrade nothing and downgrade a plain-bool row.
+    diffed = "GET /System/Info"
+    assert diffed not in JOURNEY_METHOD
+    JOURNEY_METHOD[diffed] = verification.BODY_DIFF
+    try:
+        assert earned_method(diffed, Same(True, 1), Same(True, 1)) == verification.BODY_DIFF
+        assert earned_method(diffed, True, True) == verification.EFFECT
+        assert earned_method(diffed, Same(True, 1), True) == verification.EFFECT
+    finally:
+        del JOURNEY_METHOD[diffed]
+    # …and the ops that claim the headline are exactly the ones whose evidence is
+    # a whole parsed body minus a named per-instance list — not a hand-listed
+    # projection. This used to be a blanket "no journey op may claim body-diff";
+    # it is an allowlist now rather than a deletion, so adding a third one is a
+    # deliberate edit here and not a quiet upgrade at the call site.
+    assert {op for op, m in JOURNEY_METHOD.items() if m == verification.BODY_DIFF} == {
+        "GET /LiveTv/SeriesTimers/{timerId}", "POST /LiveTv/SeriesTimers/{timerId}"}
+    # The derivation helper is the reason Id/ExternalId may be left out of that
+    # body diff at all, so it is checked against the C# oracle here: the constant
+    # `GET /LiveTv/Timers/Defaults` publishes is GetInternalSeriesTimerId("").
+    assert dotnet_md5_guid_n("emby4") == "eb075d6a62e2edc6b764a304633d33c0"
+    assert derives_its_id({"ExternalId": "8279078f967a44c4a96656331ebc08d2",
+                           "Id": dotnet_md5_guid_n("emby8279078f967a44c4a96656331ebc08d24")})
+    assert not derives_its_id({"ExternalId": "", "Id": "eb075d6a62e2edc6b764a304633d33c0"})
+    assert not derives_its_id({"ExternalId": "abc", "Id": "abc"})
+    # …and the body projection drops exactly the three named per-instance fields,
+    # nothing else. `ExternalChannelId` is deliberately NOT among them: it was,
+    # on a rationale that measured false, and it is back in the diff.
+    assert series_timer_body({"Id": 1, "ExternalId": 2, "ServerId": 4,
+                              "ExternalChannelId": "m3u_abc",
+                              "Name": "n", "Priority": 0}) \
+        == {"ExternalChannelId": "m3u_abc", "Name": "n", "Priority": 0}
+    assert "ExternalChannelId" not in SERIES_TIMER_PER_INSTANCE
     # Every journey advertises only op keys that exist in the vendored spec.
     import glob
     spec = json.load(open(sorted(glob.glob(os.path.join(ROOT, "contracts/jellyfin-openapi-*.json")))[-1]))
@@ -1979,7 +3028,11 @@ def selfcheck():
         for line in src.splitlines():
             if 'r["' in line:
                 key = line.split('r["', 1)[1].split('"]', 1)[0]
-                declared.add(key)
+                # `_`-prefixed keys are the runner's own namespace (`_error:…`,
+                # `_note:…`): journeys() filters them out of `rows`, so they are
+                # evidence carried alongside the run and are NOT contract ops.
+                if not key.startswith("_"):
+                    declared.add(key)
         # …plus op keys carried in a data table rather than an `r["…"]` literal —
         # the nine remote-control rows are assigned in a loop, so scraping only
         # `r["` left them unvalidated against the spec AND unstamped.
@@ -1991,7 +3044,6 @@ def selfcheck():
     for k in declared:
         m = journey_method(k)
         assert m in verification.VALID, f"{k}: unknown verification method {m!r}"
-        assert m != verification.BODY_DIFF, f"{k}: journeys never diff a body"
     stale = sorted(k for k in JOURNEY_METHOD if k not in declared)
     assert not stale, f"JOURNEY_METHOD names ops no journey declares: {stale}"
     undeclared = sorted(k for k in declared if k not in JOURNEY_METHOD)

@@ -37,6 +37,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
+use crate::extract::JsonBody;
 use crate::handlers::items::effective_user_id;
 use crate::state::AppState;
 
@@ -263,7 +264,7 @@ async fn update_display_preferences(
     RequireAuth(auth): RequireAuth,
     Path(display_preferences_id): Path<String>,
     Query(params): Query<DisplayPreferencesParams>,
-    Json(mut dto): Json<DisplayPreferencesDto>,
+    JsonBody(mut dto): JsonBody<DisplayPreferencesDto>,
 ) -> Result<StatusCode, ApiError> {
     // C# `userId = RequestHelpers.GetUserId(User, userId)` — a named user other
     // than the caller requires the administrator role, else `403`.

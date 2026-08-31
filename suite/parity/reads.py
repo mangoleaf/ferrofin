@@ -17,12 +17,14 @@ Offline self-check:
   parity/reads.py --check
 """
 import collections
+import datetime
 import json
 import os
 import re
-import time
+import string
 import urllib.parse
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from sweep import http, get_json, bring_up          # noqa: E402
@@ -30,6 +32,13 @@ from parity_diff import diff_stats                  # noqa: E402
 import verification                                  # noqa: E402
 
 CORRELATE_LIMIT = 5   # item-scoped endpoints are exercised against this many Path-aligned items
+
+#: musicbrainz.org rate-limits at ~1 request/second per IP, and both containers
+#: plus this harness share the lab's egress address. A 503 comes back as an
+#: empty result list, so the MusicBrainz-backed `posted` legs are paced and
+#: retried rather than reported as a divergence (or, worse, as agreement).
+MB_PACE = 2.5
+MB_RETRIES = 4
 
 
 def token_get(base, path, token, method="GET"):
@@ -46,20 +55,62 @@ def token_get(base, path, token, method="GET"):
     except ValueError:
         return st, None
 
+def token_post(base, path, token, body):
+    """POST `body` as JSON; returns `(status, parsed body or None)`."""
+    st, raw = http("POST", base + path, token, json.dumps(body))
+    if st != 200 or not raw:
+        return st, None
+    try:
+        return st, json.loads(raw)
+    except ValueError:
+        return st, None
+
 # ---------------------------------------------------------------- endpoint set
 
 def plain(op, url):
     return {"op": op, "kind": "plain", "url": lambda c: url}
 
 
-def user(op, url):
+def user(op, url, project=None):
     # url may reference {u} (user id) plus resolved per-server context keys (genre/studio/person/
     # year/series/season). By-name values are URL-encoded and identical across servers (same NFO);
     # series/season ids are per-server (same title on both → clean diff).
-    return {"op": op, "kind": "user", "url": lambda c: url.format(**c)}
+    #
+    # `project(body, ctx)` narrows what is compared, and is allowed ONLY to
+    # translate a value that is genuinely per-instance into one that is not —
+    # never to drop a field. The one user is /LiveTv/Info's EnabledUsers, which
+    # is a list of raw user GUIDs; see there.
+    return {"op": op, "kind": "user", "url": lambda c: url.format(**c), "project": project}
 
 
-def item(op, tmpl, extra_seeds=()):
+def _extra_url(tmpl):
+    """One `extra` URL builder: `None` when the context has no seed for it.
+
+    An unseeded placeholder must NOT collapse the template into a different
+    URL. `{channel}` with no channels turns
+    `/Items/{channel}?userId={user}` into `/Items/?userId=...`, which answers
+    200 on BOTH servers with a full item list — the leg would then be counted
+    as tested-and-clean while comparing something that is not an item fetch at
+    all. Returning None makes the run SKIP it loudly instead (same guard the
+    channel-seeded fact in `recordings_group_invariants` already uses).
+
+    A key that is missing from the context entirely is still a KeyError, so the
+    self-check keeps catching a typo'd placeholder.
+    """
+    keys = [f for _, f, _, _ in string.Formatter().parse(tmpl) if f]
+
+    def url_of(c):
+        for k in keys:
+            if k not in c:
+                raise KeyError(k)
+        if any(not c[k] for k in keys):
+            return None
+        return tmpl.format(**c)
+
+    return url_of
+
+
+def item(op, tmpl, extra_seeds=(), extra=()):
     # tmpl contains {u} and {i}; filled per server (own user + own correlated item id).
     #
     # `extra_seeds` names additional per-server context keys to probe with the
@@ -68,8 +119,17 @@ def item(op, tmpl, extra_seeds=()):
     # is the only one that climbs to the `AggregateFolder` (a movie's stops at
     # the `UserRootFolder`), so without it the whole aggregate-root model is
     # untested by this layer.
-    return {"op": op, "kind": "item", "url": lambda c, i: tmpl.format(u=c["user"], i=i),
-            "extra_seeds": tuple(extra_seeds)}
+    #
+    # `extra` adds whole URLs that are NOT id-correlated pairs: each is formatted
+    # with that server's own context, so an id which both servers derive
+    # identically (a Live TV channel — `GetInternalChannelId` hashes only the
+    # tuner's own id) can be pinned on the same row. Both kinds are diffed and
+    # recorded exactly like a correlated pair, status divergence included; they
+    # are extra legs, never a replacement for the pairs.
+    return {"op": op, "kind": "item",
+            "url": lambda c, i: tmpl.format(u=c["user"], i=i),
+            "extra_seeds": tuple(extra_seeds),
+            "extra": [_extra_url(t) for t in extra]}
 
 
 def multi(op, legs, seed=None, reap=None, method="GET", caveats=None):
@@ -98,6 +158,116 @@ def multi(op, legs, seed=None, reap=None, method="GET", caveats=None):
                     "project": project})
     return {"op": op, "kind": "multi", "legs": out, "seed": seed, "reap": reap,
             "http_method": method, "caveats": list(caveats or ())}
+
+
+def post_leg(url, body, retry_empty=False, tag=None, requires=None):
+    """One leg of a [`posted`] row. `body(ctx)` builds the JSON for THAT server,
+    so a leg can carry the server's own item id.
+
+    `retry_empty` marks a leg whose emptiness would be a HARNESS artefact rather
+    than an answer — the MusicBrainz-backed searches, where musicbrainz.org
+    rate-limits at roughly one request per second per IP and answers 503, which
+    both servers turn into `[]`. Such a leg is retried until BOTH sides answer
+    non-empty, and if BOTH are still empty it is DROPPED from the row with a
+    note, because `[] vs []` compares nothing and must never be reported as
+    agreement. A leg whose correct answer IS `[]` (the fetcher-gate legs) must
+    leave this false.
+
+    Two deliberate non-behaviours of `retry_empty`, both of which used to
+    launder a Ferrofin failure into a green row:
+      * it never fires on a NON-200. `token_post` returns `(status, None)` for
+        anything but 200-with-JSON, and a falsy body is indistinguishable from
+        `[]`; the runner therefore settles the statuses FIRST, so a Ferrofin
+        500 against a Jellyfin 200 is a status mismatch, not a drop;
+      * it needs BOTH sides empty. One side empty and the other carrying hits,
+        after every retry, is a divergence — the rate limiter is shared, but it
+        does not answer for the server that did return data, and "one of them
+        found nothing" is exactly the shape a broken search has.
+
+    `tag`/`requires` pin a POSITIVE CONTROL to an assertion whose expected
+    answer is `[]`. A gate leg asserting "no fetcher may run" is satisfied
+    equally by a working gate and by a rate-limited provider; naming the
+    control's `tag` in the gated leg's `requires` makes the runner drop the
+    gate leg unless the control really did return content on both servers in
+    the same pass.
+    """
+    return {"url": url, "body": body, "retry_empty": retry_empty,
+            "tag": tag, "requires": requires}
+
+
+def post_leg_outcome(leg, hs, hb, js, jb, proven):
+    """What a `posted` leg's two responses mean, as ONE word, so the rule is
+    testable instead of being an `if`-ladder buried in the runner.
+
+    Order matters, and each step exists because the one below it used to swallow
+    a real result:
+
+      `uncontrolled`  the leg asserts `[]` (a fetcher gate) and its positive
+                      control did not return content in this pass, so the
+                      assertion is unattributable — drop it.
+      `status`        the two servers disagreed on the HTTP status. The loudest
+                      possible result. Settled BEFORE any emptiness test,
+                      because `token_post` reports a Ferrofin 500 as a falsy
+                      body and it would otherwise look like "the provider
+                      answered empty".
+      `unavailable`   both refused identically, or neither returned JSON. Not a
+                      divergence and not evidence: the leg compared nothing.
+      `rate-limited`  both answered 200 and BOTH came back empty on a leg whose
+                      emptiness is a harness artefact. Dropped with a note —
+                      `[] vs []` compares nothing and must never read as
+                      agreement. One side empty is NOT this: it falls through
+                      and diffs, which is a divergence.
+      `compare`       diff the two bodies.
+    """
+    if leg["requires"] and leg["requires"] not in proven:
+        return "uncontrolled"
+    if hs != js:
+        return "status"
+    if hs != 200 or hb is None or jb is None:
+        return "unavailable"
+    if leg["retry_empty"] and not hb and not jb:
+        return "rate-limited"
+    return "compare"
+
+
+def leaf_note(per_leg):
+    """The " (leaves A+B+C)" fragment a multi-leg row's note carries, or "" when
+    the caller kept no per-leg counts.
+
+    Spelled out leg by leg on purpose. A row whose legs are `[14, 5, 0]` has
+    three CLEAN legs and two legs of evidence; summing them to 19 and printing
+    "3/3 clean" invites the reader to divide, and the leg that compared nothing
+    is exactly the one — a fetcher gate asserting `[]` — whose silence must stay
+    visible. A row whose every leg compared something reads the same way, so
+    there is no special case to remember.
+    """
+    if not per_leg:
+        return ""
+    # The clause is only worth carrying when a zero sits NEXT TO real evidence —
+    # that is the case where a reader would otherwise credit the empty leg with
+    # a share of the total. A row whose every leg compared nothing already says
+    # so in `record`'s `empty-corpus` detail, and repeating it there just makes
+    # the note longer than the finding.
+    hidden_zero = 0 in per_leg and any(per_leg)
+    return (f" ({'+'.join(str(c) for c in per_leg)} leaves compared"
+            + ("; the 0 is a leg whose ASSERTION is emptiness)" if hidden_zero else ")"))
+
+
+def posted(op, legs):
+    """A POST-shaped READ folded into one ledger row.
+
+    The `RemoteSearch/<Kind>` family is POST by contract but a SEARCH by
+    behaviour — v10.11.8 `ItemLookupController` only calls
+    `IProviderManager.GetRemoteSearchResults` and returns `Ok`, so nothing is
+    mutated and there is no read-back. These rows live here, not in
+    `journeys.py`, precisely because there IS no write effect: both servers get
+    the byte-identical body and their two RESPONSES are deep-diffed, which is
+    the same claim every GET row makes. The method is derived by
+    `verification.read_method` from what the diff actually compared, so a family
+    with no provider on either side lands `empty-corpus` rather than borrowing
+    the headline.
+    """
+    return {"op": op, "kind": "posted", "legs": legs}
 
 
 def invariant(op, fn):
@@ -682,6 +852,482 @@ def packages_by_name_invariants(base, token, ctx):
     return facts
 
 
+def guide_info_invariants(base, token, ctx):
+    """The properties `GET /LiveTv/GuideInfo` must have on BOTH servers.
+
+    `GuideManager.GetGuideInfo` is `now .. now + GetGuideDays()`, so the two
+    endpoints of the window are a per-request instant and cannot be byte-equal
+    between two servers answering microseconds apart. Everything *else* about
+    the window can be, and is compared here: its LENGTH (the bug this row was
+    hiding — Ferrofin ignored `LiveTvOptions.GuideDays` and always answered 7
+    days where Jellyfin answers the configured value clamped to 1..14), its
+    now-relativity (an epoch/default window is the regression this route already
+    had once), and the .NET 7-fractional-digit wire format.
+
+    This is deliberately NOT a `parity_diff.VOLATILE` entry: denylisting
+    StartDate/EndDate would have swallowed the GuideDays divergence whole.
+    """
+    del ctx
+    facts = {}
+    before = datetime.datetime.now(datetime.timezone.utc)
+    st, b = token_get(base, "/LiveTv/GuideInfo", token)
+    after = datetime.datetime.now(datetime.timezone.utc)
+    facts["status_200"] = st == 200
+    if not isinstance(b, dict):
+        return facts
+    start_raw, end_raw = b.get("StartDate"), b.get("EndDate")
+    facts["has_both_bounds"] = bool(start_raw and end_raw)
+    if not facts["has_both_bounds"]:
+        return facts
+
+    def parse(v):
+        return datetime.datetime.fromisoformat(v.replace("Z", "+00:00"))
+
+    # `Utf8JsonWriter`'s `FFFFFFF` trims a fraction's trailing zeros, so the
+    # DIGIT COUNT is a property of the instant, not of the server — sampled 60
+    # times, Jellyfin emits 5, 6 and 7 digits and Ferrofin emits 6 and 7. Only
+    # the shape is comparable: UTC `Z`, no offset, never more than .NET tick
+    # precision.
+    wire = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,7})?Z$")
+
+    start, end = parse(start_raw), parse(end_raw)
+    # The exact instant is per-request; that it IS this request's instant is not.
+    facts["start_is_request_instant"] = (before - datetime.timedelta(seconds=120)
+                                         <= start
+                                         <= after + datetime.timedelta(seconds=120))
+    # The window length in whole seconds — identical on both servers or the row
+    # fails, which is what makes a 7-vs-14 day divergence visible.
+    facts["window_seconds"] = int((end - start).total_seconds())
+    facts["window_is_whole_days"] = facts["window_seconds"] % 86400 == 0
+    facts["start_wire_format"] = bool(wire.match(start_raw))
+    facts["end_wire_format"] = bool(wire.match(end_raw))
+    # Both bounds are stamped from ONE `UtcNow`, so their sub-second parts agree.
+    # `AddDays` cannot change them, and a window built from two separate reads
+    # would not survive this.
+    facts["bounds_share_subsecond"] = start.microsecond == end.microsecond
+    return facts
+
+
+guide_info_invariants.alias = "LiveTvGuideInfo"
+
+
+#: A groupId that resolves in no id space on either server. The value is
+#: arbitrary BY DESIGN — see `recording_group_invariants`.
+PROBE_GROUP_GUID = "f0f0f0f0-1111-2222-3333-444444444444"
+
+# A GUID no plugin can have on either server, for the miss paths.
+PROBE_PLUGIN_GUID = "11111111-1111-1111-1111-111111111111"
+
+
+def recording_group_invariants(base, token, ctx):
+    """`GET /LiveTv/Recordings/Groups/{groupId}` — an OBSOLETE endpoint whose
+    whole C# body is `return NotFound();`.
+
+    v10.11.8 `Jellyfin.Api/Controllers/LiveTvController.cs:955-966`:
+
+        [HttpGet("Recordings/Groups/{groupId}")]
+        [Authorize(Policy = Policies.LiveTvAccess)]
+        [Obsolete("This endpoint is obsolete.")]
+        public ActionResult<BaseItemDto> GetRecordingGroup([FromRoute, Required] Guid groupId)
+            => NotFound();
+
+    `git grep RecordingGroup v10.11.8 -- '*.cs'` returns only the two controller
+    signatures: there is no `LiveTvManager.GetRecordingGroups`, no group-id
+    derivation and no DTO anywhere in the 10.11.8 tree. The answer is therefore
+    groupId-INDEPENDENT, and no recording can ever make it 200 — which is why
+    this is a property row and not a body diff: there is no 200 body to diff,
+    ever, on either server.
+
+    What the facts actually claim, then, is the thing a lookup-that-happens-to-
+    miss would fail: that ids which DO resolve in other id spaces (a real Live
+    TV channel, a real recording — recordings exist on both servers now) are
+    still 404, that the policy gate is in front of the `NotFound`, and that a
+    malformed groupId is a route-binding 400 rather than the handler's 404.
+
+    Only statuses and a boolean go into the facts. The ids themselves are
+    per-server (each instance minted its own recording), so putting one in a
+    fact would be a guaranteed false red.
+    """
+    facts = {}
+
+    def status(group_id, tok=token):
+        return token_get(base, f"/LiveTv/Recordings/Groups/{group_id}", tok)[0]
+
+    facts["nil_guid"] = status("00000000-0000-0000-0000-000000000000")
+    facts["random_guid"] = status(PROBE_GROUP_GUID)
+    if ctx.get("channel"):
+        # A real id from a NEIGHBOURING id space: proof the handler never looks
+        # anything up, rather than looking in an empty table.
+        facts["live_channel_id_does_not_resolve"] = status(ctx["channel"])
+    recordings = (get_json(base, "/LiveTv/Recordings?limit=1", token) or {}).get("Items") or []
+    recording_id = recordings[0].get("Id") if recordings else ""
+    # Recorded as a fact so the leg above cannot silently degrade to "there was
+    # nothing to try": the old classification claimed this row needed a
+    # recording to exist, and this is where that claim is settled.
+    facts["recording_seed_present"] = bool(recording_id)
+    if recording_id:
+        facts["recording_id_does_not_resolve"] = status(recording_id)
+    # `Guid` route binding rejects before the handler runs: 400, not 404.
+    facts["malformed_groupid"] = status("notaguid")
+    # `Policies.LiveTvAccess` sits in front of the `NotFound`, so an anonymous
+    # caller must not be able to tell this route from any other.
+    facts["unauthenticated"] = status(PROBE_GROUP_GUID, None)
+    return facts
+
+
+recording_group_invariants.alias = "LiveTvRecordingGroup"
+
+
+# ------------------------------------------------------------ plugin identity
+#
+# The two servers share NO plugin id. Ferrofin registers compiled-in extensions
+# and staged WASM components; stock Jellyfin 10.11.8 registers five bundled .NET
+# provider plugins (TMDb b8715ed1…, MusicBrainz 8c95c4d2…, OMDb a628c0da…,
+# AudioDB a629c0da…, Studio Images 872a7849…). An id-correlated BODY diff is
+# therefore impossible on every `{pluginId}` route, and seeding one server's id
+# on both would compare a hit against a miss — worse than not measuring.
+#
+# What IS diffable, and what found four real defects, is the SHAPE each server
+# gives its OWN plugin, plus the id-INDEPENDENT rejection contract (an unknown
+# guid, an unparseable version, a version that misses, no credentials), which is
+# determined by the controller rather than by which plugins a server has. Each op
+# below gets its OWN probe exercising its OWN route: six ledger rows must be six
+# measurements, not one claimed six times.
+
+
+def plugin_seed(base, token):
+    """`(plugin id, version)` for a plugin THIS server has, or `("", "")`."""
+    plugins = token_get(base, "/Plugins", token)[1] or []
+    if not plugins:
+        return "", ""
+    pid = sorted(p["Id"] for p in plugins)[0]
+    return pid, next(p.get("Version") or "" for p in plugins if p["Id"] == pid)
+
+
+def plugin_configuration_invariants(base, token, ctx):
+    """`GET /Plugins/{pluginId}/Configuration`.
+
+    A plugin's configuration is where its API key, username and password live,
+    and `PluginsController` is `[Authorize(Policy = Policies.RequiresElevation)]`
+    at CLASS level with exactly one `[AllowAnonymous]` override, `GetPluginImage`
+    (v10.11.8 Jellyfin.Api/Controllers/PluginsController.cs:25 and :221).
+    """
+    del ctx
+    facts = {}
+    pid, _ = plugin_seed(base, token)
+    facts["plugin_seed_present"] = bool(pid)
+    if pid:
+        st, config = token_get(base, f"/Plugins/{pid}/Configuration", token)
+        facts["status"] = st
+        # The contract's `BasePluginConfiguration` is an OBJECT. Ferrofin used
+        # to store a posted `null` verbatim and serve the bare token back.
+        facts["is_object"] = isinstance(config, dict)
+    facts["unknown_id"] = token_get(
+        base, f"/Plugins/{PROBE_PLUGIN_GUID}/Configuration", token)[0]
+    facts["malformed_id"] = token_get(base, "/Plugins/notaguid/Configuration", token)[0]
+    facts["anonymous"] = token_get(
+        base, f"/Plugins/{PROBE_PLUGIN_GUID}/Configuration", None)[0]
+    facts["anonymous_list"] = token_get(base, "/Plugins", None)[0]
+    return facts
+
+
+plugin_configuration_invariants.alias = "PluginsConfiguration"
+
+
+def plugin_configuration_write_invariants(base, token, ctx):
+    """`POST /Plugins/{pluginId}/Configuration`.
+
+    Upstream deserializes the body into the plugin's own `ConfigurationType`
+    (v10.11.8 PluginsController.cs:186-201), which has three consequences a raw
+    byte-store does not have — and Ferrofin had none of them:
+
+      * `if (configuration is not null)` — a `null` body is a NO-OP that still
+        answers 204. Ferrofin stored the literal `null` and the next read
+        answered `null`, destroying the plugin's configuration from an
+        admin-reachable route.
+      * a key the type does not declare is DROPPED by the deserializer.
+      * the write is a full REPLACE: a key the body omits falls back to the C#
+        property default.
+
+    Every leg restores the snapshot it took, so the shared lab pair is left
+    exactly as it was found. The probe writes only values the server itself just
+    handed back, plus one deliberately-unknown key that must not survive.
+    """
+    del ctx
+    facts = {}
+    pid, _ = plugin_seed(base, token)
+    facts["plugin_seed_present"] = bool(pid)
+    facts["unknown_id"] = http("POST", base + f"/Plugins/{PROBE_PLUGIN_GUID}/Configuration",
+                               token, "{}")[0]
+    if not pid:
+        return facts
+    path = f"/Plugins/{pid}/Configuration"
+    snapshot = token_get(base, path, token)[1]
+    facts["snapshot_is_object"] = isinstance(snapshot, dict)
+    if not isinstance(snapshot, dict):
+        return facts
+
+    def post(body):
+        return http("POST", base + path, token, body)[0]
+
+    def read_back():
+        return token_get(base, path, token)[1]
+
+    # An identity write changes nothing.
+    facts["identity_write_status"] = post(json.dumps(snapshot))
+    facts["identity_write_is_a_noop"] = read_back() == snapshot
+    # A `null` body is a no-op that still answers 204.
+    facts["null_write_status"] = post("null")
+    facts["null_write_is_a_noop"] = read_back() == snapshot
+    # A key the plugin's configuration type does not declare is dropped.
+    probe_key = "FerrofinParityProbeUnknownKey"
+    facts["unknown_key_write_status"] = post(json.dumps({**snapshot, probe_key: "x"}))
+    facts["unknown_key_is_dropped"] = probe_key not in (read_back() or {})
+    # Restore, whatever the server did with the two writes above.
+    post(json.dumps(snapshot))
+    facts["restored"] = read_back() == snapshot
+    return facts
+
+
+plugin_configuration_write_invariants.alias = "PluginsConfigurationWrite"
+
+
+def plugin_manifest_invariants(base, token, ctx):
+    """`POST /Plugins/{pluginId}/Manifest`.
+
+    `MediaBrowser.Common/Plugins/PluginManifest.cs` gives every property an
+    explicit lowercase `[JsonPropertyName]`, so this one response is camelCase
+    against the server's PascalCase policy, and the id is spelled `guid` in the
+    dashless `N` form `JsonGuidConverter` writes. Ferrofin answered five
+    PascalCase keys and a hyphenated `Id` — not one key in common with what a
+    client reads.
+    """
+    del ctx
+    facts = {}
+    pid, _ = plugin_seed(base, token)
+    facts["plugin_seed_present"] = bool(pid)
+    if pid:
+        st, manifest = token_post(base, f"/Plugins/{pid}/Manifest", token, None)
+        manifest = manifest or {}
+        facts["status"] = st
+        facts["keys"] = ",".join(sorted(manifest))
+        facts["guid_dashless"] = "-" not in (manifest.get("guid") or "-")
+        facts["guid_matches_route"] = (
+            (manifest.get("guid") or "").replace("-", "").lower() == pid.replace("-", "").lower())
+        facts["auto_update_is_bool"] = isinstance(manifest.get("autoUpdate"), bool)
+        facts["assemblies_is_list"] = isinstance(manifest.get("assemblies"), list)
+        facts["status_value"] = manifest.get("status")
+        facts["timestamp"] = manifest.get("timestamp")
+    facts["unknown_id"] = token_post(
+        base, f"/Plugins/{PROBE_PLUGIN_GUID}/Manifest", token, None)[0]
+    facts["anonymous"] = token_post(
+        base, f"/Plugins/{PROBE_PLUGIN_GUID}/Manifest", None, None)[0]
+    return facts
+
+
+plugin_manifest_invariants.alias = "PluginsManifest"
+
+
+# ---------------------------------------------------- Plugins Enable / Disable
+#
+# Nothing exercised these two ops in ANY layer before this: sweep hands writes to
+# Layer 2, journeys.py contains no plugin journey at all, and the four probes
+# above cover Configuration/Manifest/Image only. Both rows sat on a hand-written
+# classification about a *different* op (the pre-restart window of
+# `POST /Packages/Installed/{name}`) while the real divergences went unmeasured.
+#
+# MUTATION HYGIENE — read this before editing either probe. On Jellyfin,
+# `PluginManager.ChangePluginState` (v10.11.8
+# Emby.Server.Implementations/Plugins/PluginManager.cs:513) early-returns
+# `true` when `plugin.Manifest.Status == state`, and that early return is the
+# ONLY path that reaches `ProcessAlternative`, whose last two lines are
+# `plugin.Manifest.Status = PluginStatus.Restart; plugin.Manifest.AutoUpdate =
+# false;` (:882, commented "This value is memory only"). So a NO-OP toggle —
+# enabling an already-Active plugin — permanently pins that plugin at `Restart`
+# in memory, poisoning `plugin_manifest_invariants`' `status_value` fact and
+# every later `GET /Plugins` diff, until the container restarts. Neither probe
+# below ever issues a toggle whose target equals the current status, and both
+# restore. A concurrent lane already left Jellyfin's AudioDB at `Restart` this
+# way; do not add an "idempotent toggle" fact here.
+#
+# WHAT IS AND IS NOT DIFFED. Every rejection fact is id-independent and agrees
+# exactly. The mutating leg's HTTP status does NOT agree, and it is included on
+# purpose — see the `jellyfin-bug` half of these rows in classifications.json.
+# Jellyfin answers 404 for a toggle that SUCCEEDS: its five plugins are bundled
+# in-assembly, so `LocalPlugin.Path` is a .dll FILE (`CreatePluginInstance`,
+# :541/:559), `SaveManifest` does `File.WriteAllText(Path.Combine(path,
+# "meta.json"))` and catches only `ArgumentException` (:364), the resulting
+# `DirectoryNotFoundException` escapes the action, and `ExceptionMiddleware`
+# maps it to 404 — after `ChangePluginState` has already flipped the status in
+# memory. Ferrofin answers 204 and is correct. Making that fact green by
+# dropping it would be the dishonest version of this row.
+
+
+def plugin_status(base, token, pid):
+    """The `Status` this server reports for `pid` in `GET /Plugins`, or None."""
+    return next((p.get("Status") for p in (token_get(base, "/Plugins", token)[1] or [])
+                 if p.get("Id") == pid), None)
+
+
+def restore_plugin_state(base, token, pid, ver, want):
+    """Put `pid` back to the `want` status ("Active"/"Disabled") it started in.
+
+    Called from a `finally`, because the mutate/restore pair is otherwise a real
+    poisoning hazard: an interrupt or a timed-out restore between the two calls
+    leaves the Jellyfin plugin Disabled in memory for the rest of the container's
+    life, which corrupts `plugin_manifest_invariants`' status_value and every
+    later GET /Plugins diff on this pair — the exact damage the mutation-hygiene
+    note at the top of this section exists to prevent. The `restored` fact makes
+    that visible after the fact; this prevents it.
+
+    It READS the status first and issues nothing when it already matches. That is
+    load-bearing, not an optimisation: on Jellyfin a toggle to the status the
+    plugin is already in early-returns from `ChangePluginState` into
+    `ProcessAlternative`, which pins the plugin at `Status = Restart` in memory
+    until the container restarts. A blind restore would be the poisoning it is
+    meant to undo.
+    """
+    if plugin_status(base, token, pid) == want:
+        return
+    verb = "Enable" if want == "Active" else "Disable"
+    http("POST", base + f"/Plugins/{pid}/{ver}/{verb}", token, None)
+
+
+def plugin_toggle_facts(base, token, verb):
+    """The id-independent rejection facts for `POST /Plugins/{id}/{ver}/{verb}`.
+
+    `PluginsController` is `[Authorize(Policy = Policies.RequiresElevation)]` at
+    class level and binds `[FromRoute, Required] Version version`, then resolves
+    `_pluginManager.GetPlugin(pluginId, version)` and `NotFound()`s on a miss
+    (v10.11.8 PluginsController.cs:71 / :94, PluginManager.cs:293-311). Every
+    fact here is therefore determined by the CONTRACT, not by which plugins the
+    server happens to have — which is what makes them diffable across two servers
+    that share no plugin id.
+    """
+    pid, ver = plugin_seed(base, token)
+    facts = {"plugin_seed_present": bool(pid)}
+    facts["unknown_id"] = http(
+        "POST", base + f"/Plugins/{PROBE_PLUGIN_GUID}/1.0.0/{verb}", token, None)[0]
+    facts["anonymous"] = http(
+        "POST", base + f"/Plugins/{PROBE_PLUGIN_GUID}/1.0.0/{verb}", None, None)[0]
+    if not pid:
+        return facts, pid, ver
+    facts["malformed_version"] = http(
+        "POST", base + f"/Plugins/{pid}/notaversion/{verb}", token, None)[0]
+    facts["wrong_version"] = http(
+        "POST", base + f"/Plugins/{pid}/9.9.9.9/{verb}", token, None)[0]
+    # .NET's `Version` treats an absent component as -1, so `1.0` never equals
+    # `1.0.0` — the installed plugin's version with its last component dropped
+    # must miss. Ferrofin ports that rule (`plugin_at_version`).
+    short = ".".join(ver.split(".")[:-1])
+    if short and short != ver:
+        facts["short_version"] = http(
+            "POST", base + f"/Plugins/{pid}/{short}/{verb}", token, None)[0]
+    return facts, pid, ver
+
+
+def plugin_disable_invariants(base, token, ctx):
+    """`POST /Plugins/{pluginId}/{version}/Disable`.
+
+    The mutating leg drives Disable from `Active` (never a no-op) and restores
+    with one Enable. `status_after_disable` is the fact that matters and it
+    AGREES: both servers report `Disabled`, because Jellyfin's in-memory status
+    flip lands before the exception that costs it the 204. `disable_status` is
+    the one that diverges (F 204 / J 404) and is kept.
+    """
+    del ctx
+    facts, pid, ver = plugin_toggle_facts(base, token, "Disable")
+    if not pid:
+        return facts
+    before = plugin_status(base, token, pid)
+    facts["was_active_before"] = before == "Active"
+    if before != "Active":
+        return facts   # unknown starting state: measure nothing rather than guess
+    try:
+        facts["disable_status"] = http(
+            "POST", base + f"/Plugins/{pid}/{ver}/Disable", token, None)[0]
+        facts["status_after_disable"] = plugin_status(base, token, pid)
+    finally:
+        restore_plugin_state(base, token, pid, ver, before)
+    facts["restored"] = plugin_status(base, token, pid) == before
+    return facts
+
+
+plugin_disable_invariants.alias = "PluginsDisable"
+
+
+def plugin_enable_invariants(base, token, ctx):
+    """`POST /Plugins/{pluginId}/{version}/Enable`.
+
+    Mirror of the Disable probe on its OWN route: Disable is the SETUP (so the
+    measured Enable is a real state change, not the `ProcessAlternative` trap),
+    Enable is the measurement, and the plugin ends where it started.
+    """
+    del ctx
+    facts, pid, ver = plugin_toggle_facts(base, token, "Enable")
+    if not pid:
+        return facts
+    before = plugin_status(base, token, pid)
+    facts["was_active_before"] = before == "Active"
+    if before != "Active":
+        return facts
+    try:
+        http("POST", base + f"/Plugins/{pid}/{ver}/Disable", token, None)   # setup, not measured
+        facts["disabled_for_setup"] = plugin_status(base, token, pid) == "Disabled"
+        facts["enable_status"] = http(
+            "POST", base + f"/Plugins/{pid}/{ver}/Enable", token, None)[0]
+        facts["status_after_enable"] = plugin_status(base, token, pid)
+    finally:
+        # The measured Enable is itself the restore, so this normally reads the
+        # status and issues nothing; it fires only when the run died between the
+        # setup Disable and the measurement.
+        restore_plugin_state(base, token, pid, ver, before)
+    facts["restored"] = plugin_status(base, token, pid) == before
+    return facts
+
+
+plugin_enable_invariants.alias = "PluginsEnable"
+
+
+def plugin_image_invariants(base, token, ctx):
+    """`GET /Plugins/{pluginId}/{version}/Image`.
+
+    The 200 body is out of reach on both servers by construction — no plugin on
+    either reports `HasImage`, and a shared image subject would need the SAME
+    external plugin installed on both, which needs the .NET assembly loading
+    Ferrofin does not have. The status paths are fully diffable, and they are
+    where the defect was: `{version}` is a `Version` bound by the model binder
+    and matched with `Version.Equals` (v10.11.8 Emby.Server.Implementations/
+    Plugins/PluginManager.cs:293-311), and Ferrofin discarded the segment
+    entirely — `notaversion` answered as if it were the installed version.
+
+    This is also the ONE action upstream marks `[AllowAnonymous]`
+    (PluginsController.cs:221), against the controller's class-level elevation.
+    """
+    del ctx
+    facts = {}
+    pid, version = plugin_seed(base, token)
+    facts["plugin_seed_present"] = bool(pid)
+    facts["version_seed_present"] = bool(version)
+    if pid and version:
+        facts["installed_version"] = token_get(
+            base, f"/Plugins/{pid}/{version}/Image", token)[0]
+        facts["wrong_version"] = token_get(
+            base, f"/Plugins/{pid}/9.9.9.9/Image", token)[0]
+        facts["malformed_version"] = token_get(
+            base, f"/Plugins/{pid}/notaversion/Image", token)[0]
+        # `[AllowAnonymous]`: the same answer without a token.
+        facts["anonymous_installed_version"] = token_get(
+            base, f"/Plugins/{pid}/{version}/Image", None)[0]
+    facts["unknown_id"] = token_get(
+        base, f"/Plugins/{PROBE_PLUGIN_GUID}/1.0.0/Image", token)[0]
+    facts["malformed_id"] = token_get(base, "/Plugins/notaguid/1.0.0/Image", token)[0]
+    return facts
+
+
+plugin_image_invariants.alias = "PluginsImage"
+
+
 def similar_invariants_for(alias):
     """The invariant probe bound to ONE alias.
 
@@ -963,6 +1609,16 @@ def trailers_invariants(base, token, ctx):
     # ships trailer extras (suite/perf/gen-fixtures.sh) so this must hold.
     facts["corpus_not_empty"] = len(items) > 0
     return facts
+def guide_window_body(ctx, body):
+    """`body` plus the `MinStartDate`/`MaxStartDate` window BOTH servers hold.
+
+    A no-op when `shared_guide_window` found no overlap to name — the leg then
+    runs unpinned and its diff says so, rather than the harness inventing a
+    window neither server covers.
+    """
+    if ctx.get("guide_from") and ctx.get("guide_to"):
+        return {**body, "MinStartDate": ctx["guide_from"], "MaxStartDate": ctx["guide_to"]}
+    return dict(body)
 
 
 READS = [
@@ -1022,8 +1678,15 @@ READS = [
     plain("GET /Sessions", "/Sessions"),
     user("GET /UserViews", "/UserViews?userId={u}"),
     user("GET /Library/MediaFolders", "/Library/MediaFolders"),
+    # `GET /Items/Root` takes NO item id — both servers resolve the same
+    # deterministic UserRootFolder — so sweep's single-item pass was already
+    # comparing like for like and its diff was honest. It lives here now so the
+    # ledger sources it from a full body diff rather than a Layer-1 spot check.
+    user("GET /Items/Root", "/Items/Root?userId={u}"),
     user("GET /Library/VirtualFolders", "/Library/VirtualFolders"),
-    # Three legs. The first two are order-checked (see `with_item_order`).
+    # SIX legs, because the recursive item universe is what this op is, and a
+    # Movie-only leg cannot see a whole kind going missing from it. The first
+    # two are order-checked (see `with_item_order`).
     #
     # Leg 2 is the `UserRootFolder` browse, and it is not a duplicate of
     # `GET /Items/Root`: C# `ItemsController.GetItems` answers it from
@@ -1044,6 +1707,84 @@ READS = [
         ("/Items?userId={u}&parentId={root}&sortBy=SortName&sortOrder=Descending&limit=2&startIndex=1",
          with_item_order),
         "/Items?userId={u}&recursive=true&includeItemTypes=Audio&limit=50&sortBy=SortName&fields=Path",
+        # The guide. Jellyfin stores every airing as a real `BaseItems` row
+        # parented to the channel and TOP-parented to the Live TV `UserView`
+        # (`CreateItems(newPrograms, currentChannel, …)`, v10.11.8
+        # src/Jellyfin.LiveTv/Guide/GuideManager.cs:277), so the recursive
+        # universe holds the whole guide. Ferrofin held none of it — measured
+        # F 0 / J 338 — while `/LiveTv/Programs` answered 338 on both, so the
+        # data was there and only the item rows were missing.
+        #
+        # PROJECTED, and this is the one leg on this row that is. Each server's
+        # guide is a ROLLING window anchored to its own last refresh
+        # (GuideManager.cs:215-231), and `/Items` — unlike `/LiveTv/Programs` —
+        # has NO `minStartDate`/`maxStartDate` to pin one with, so the two pages
+        # are index-aligned across two different windows and every airing's
+        # Name/StartDate/EndDate reads as a divergence the moment either server
+        # refreshes. That is per-instance refresh state, not a body difference.
+        # What the leg claims instead is exactly what it exists to claim: that
+        # the guide is REACHABLE through this route at all, in the same size and
+        # with the same DTO shape. The per-airing body IS fully diffed — by the
+        # `POST /LiveTv/Programs` legs inside the shared window, and by the
+        # `GET /Items/{itemId}` programme leg, which is seeded from inside that
+        # same window and so names the SAME airing on both servers.
+        ("/Items?userId={u}&recursive=true&includeItemTypes=LiveTvProgram"
+         "&limit=100000&sortBy=StartDate,SortName&enableTotalRecordCount=true",
+         lambda b: {"TotalRecordCount": b.get("TotalRecordCount"),
+                    "PageLength": len(b.get("Items") or []),
+                    "Types": sorted({i.get("Type") for i in (b.get("Items") or [])}),
+                    # The union of keys across the page: a field the mirror
+                    # failed to carry would drop out of it.
+                    "ItemKeys": sorted({k for i in (b.get("Items") or []) for k in i})}),
+        # …and the same page under `locationTypes=FileSystem`, which must be
+        # EMPTY on both. An airing has no file behind it, so
+        # `LiveTvProgram`'s constructor sets `IsVirtualItem = true` (v10.11.8
+        # MediaBrowser.Controller/LiveTv/LiveTvProgram.cs:26-29), and
+        # `ItemsController.GetItems` translates `locationTypes` onto
+        # `query.IsVirtualItem` (:437-447). Ferrofin ignored BOTH
+        # `locationTypes` and `excludeLocationTypes` entirely, so this leg
+        # answered with the whole guide where Jellyfin answers with nothing —
+        # a filter the client believes it applied and the server never did.
+        # This leg's assertion IS emptiness, so it is only meaningful next to
+        # the non-empty one above.
+        "/Items?userId={u}&recursive=true&includeItemTypes=LiveTvProgram"
+        "&locationTypes=FileSystem&limit=100000&enableTotalRecordCount=true",
+        # The unfiltered recursive page, projected to its TYPE CENSUS and total.
+        #
+        # The projection is not a narrowing of what is compared — every kind on
+        # this page is body-diffed by its own leg or its own row — it is the ONE
+        # thing no other leg can see: which kinds exist in the universe at all,
+        # and how the grouping collapses them. With a user and an EMPTY
+        # `includeItemTypes`, `EnableGroupByPresentationUniqueKey` is TRUE
+        # (Jellyfin.Server.Implementations/Item/BaseItemRepository.cs:1557-1589)
+        # and the query groups on `PresentationUniqueKey`. Only
+        # `MetadataService.UpdatePresentationUniqueKey` ever populates that
+        # column (MediaBrowser.Providers/Manager/MetadataService.cs:332-336) and
+        # the guide refresh calls `RefreshMetadata` on a CHANNEL only
+        # (GuideManager.cs:305) — so every airing's key is NULL, SQLite groups
+        # NULLs together, and the entire guide shows up here as exactly ONE
+        # `Program`. Verified in the oracle database: 4 channel rows carry their
+        # own id as the key, all 338 programme rows carry NULL. A mirror that
+        # minted a key per airing would move this census from 1 to 338 and put
+        # the whole guide on every user's home screen.
+        ("/Items?userId={u}&recursive=true&limit=100000&enableTotalRecordCount=true",
+         lambda b: {"TotalRecordCount": b.get("TotalRecordCount"),
+                    "TypeCensus": dict(sorted(collections.Counter(
+                        i.get("Type") for i in (b.get("Items") or [])).items()))}),
+    ], caveats=[
+        "The per-airing BODY on the LiveTvProgram leg — that leg compares only "
+        "TotalRecordCount, the page length, the Type set and the UNION of DTO "
+        "keys across the page. Each server's guide is a rolling window anchored "
+        "to its own last refresh (v10.11.8 GuideManager.cs:215-231) and `/Items` "
+        "has no minStartDate/maxStartDate to pin one with, so the two pages are "
+        "index-aligned across two different windows. Every field of a programme "
+        "IS diffed, by the `POST /LiveTv/Programs` legs inside the shared window "
+        "and by the `GET /Items/{itemId}` programme leg seeded from it.",
+        "The item bodies on the unfiltered recursive leg — it compares only "
+        "TotalRecordCount and the per-Type census, which is the one thing no "
+        "other leg can see (which kinds exist in the universe, and how "
+        "`EnableGroupByPresentationUniqueKey` collapses them). Every kind on "
+        "that page is body-diffed by its own leg or its own row.",
     ]),
     user("GET /Items/Latest", "/Items/Latest?userId={u}&limit=20&fields=Path"),
     user("GET /UserItems/Resume", "/UserItems/Resume?userId={u}&limit=12&fields=Path"),
@@ -1100,10 +1841,42 @@ READS = [
     user("GET /Movies/Recommendations", "/Movies/Recommendations?userId={u}"),
     user("GET /Search/Hints", "/Search/Hints?userId={u}&searchTerm=a&limit=20"),
     # item-scoped — correlated by Path, each server queried with its own id
-    item("GET /Items/{itemId}", "/Items/{i}?userId={u}&fields=Path,MediaSources,MediaStreams,Overview,Genres"),
+    # …plus a Live TV channel, which Jellyfin resolves through this very route
+    # because `GuideManager.GetChannel` stores every channel as a real
+    # `BaseItems` row parented to the Live TV view. The channel id is NOT
+    # correlated by Path — it does not need to be: `GetInternalChannelId` hashes
+    # the tuner's own id, so both servers mint the same GUID from the same
+    # lineup, and each side is asked for its own `{channel}` anyway.
+    # …and a guide programme, for the same reason and with the same identity
+    # argument: `LiveTvDtoService.GetInternalProgramId` hashes
+    # `{listingsProviderId}_{start:O}_{channelExternalId}`, all three of which
+    # both servers derive from the same XMLTV and the same M3U, so the GUID is
+    # the same on both (measured: 328 of 338 ids join exactly, the ten-row gap
+    # being the rolling guide window sliding between the two refreshes). The
+    # seed is picked inside the SHARED guide window so both sides name the same
+    # airing.
+    item("GET /Items/{itemId}", "/Items/{i}?userId={u}&fields=Path,MediaSources,MediaStreams,Overview,Genres",
+         extra=["/Items/{channel}?userId={user}&fields=Path,MediaSources,MediaStreams,Overview,Genres",
+                "/Items/{program}?userId={user}&fields=Path,MediaSources,MediaStreams,Overview,Genres"]),
     # A movie seed cannot be body-diffed (Random order + a deliberately different
     # candidate algorithm) — verified by properties instead, see
     # `similar_invariants`.
+    # The six plugin ops. All six are stamped `property`, never `body-diff`:
+    # no shared plugin id exists between a Rust server with compiled-in
+    # extensions and a stock Jellyfin with five bundled .NET provider plugins,
+    # so there is no shared subject to diff. What WOULD earn a body diff is the
+    # same plugin installed on both, which Jellyfin can only do with a .NET
+    # assembly — see the residual in classifications.json.
+    invariant("GET /Plugins/{pluginId}/Configuration", plugin_configuration_invariants),
+    invariant("POST /Plugins/{pluginId}/Configuration", plugin_configuration_write_invariants),
+    invariant("POST /Plugins/{pluginId}/Manifest", plugin_manifest_invariants),
+    invariant("GET /Plugins/{pluginId}/{version}/Image", plugin_image_invariants),
+    # The two state-toggle ops. Same rule as above — one probe per route, each
+    # exercising the route it is named for; the sibling verb only ever appears as
+    # setup or restore, never as the measurement. See the mutation-hygiene note
+    # above `plugin_status`.
+    invariant("POST /Plugins/{pluginId}/{version}/Enable", plugin_enable_invariants),
+    invariant("POST /Plugins/{pluginId}/{version}/Disable", plugin_disable_invariants),
     invariant("GET /Items/{itemId}/Similar", similar_invariants_for("Items")),
     # …plus the PLAYLISTS FOLDER, whose single ancestor is the `AggregateFolder`
     # `LibraryManager.CreateRootFolder()` parents it to (LibraryManager.cs:855-885).
@@ -1113,6 +1886,58 @@ READS = [
          extra_seeds=("playlists_folder",)),
     item("GET /Items/{itemId}/PlaybackInfo", "/Items/{i}/PlaybackInfo?userId={u}"),
     item("GET /Items/{itemId}/Images", "/Items/{i}/Images"),
+    # The Identify-dialog id fields, and the metadata editor that re-serves them.
+    # FANNED ACROSS KINDS ON PURPOSE: the descriptor list is chosen by
+    # `Supports(item)`, so a Movie-only probe (what sweep did) cannot see the
+    # Season/Episode/Audio arms — and the MusicBrainz block was ordered wrongly
+    # in exactly the Audio arm. Intra-provider ORDER is part of the response
+    # (`ProviderManager` sorts `OrderBy(ProviderName)`, which is STABLE), so the
+    # deep diff must stay order-sensitive here; do not relax it to a set compare.
+    multi("GET /Items/{itemId}/ExternalIdInfos", [
+        "/Items/{movie}/ExternalIdInfos",
+        "/Items/{series}/ExternalIdInfos",
+        "/Items/{season}/ExternalIdInfos",
+        "/Items/{episode}/ExternalIdInfos",
+        "/Items/{album_id}/ExternalIdInfos",
+        "/Items/{audio_id}/ExternalIdInfos",
+        "/Items/{person_id}/ExternalIdInfos",
+    ]),
+    multi("GET /Items/{itemId}/MetadataEditor", [
+        "/Items/{movie}/MetadataEditor",
+        "/Items/{series}/MetadataEditor",
+        "/Items/{season}/MetadataEditor",
+        "/Items/{episode}/MetadataEditor",
+        "/Items/{album_id}/MetadataEditor",
+        "/Items/{audio_id}/MetadataEditor",
+        "/Items/{person_id}/MetadataEditor",
+    ]),
+    # "Choose Image". Same reason for fanning: Ferrofin listed NO provider for a
+    # Season and only OMDb for an Episode, which a movie-only probe cannot show.
+    multi("GET /Items/{itemId}/RemoteImages/Providers", [
+        "/Items/{movie}/RemoteImages/Providers",
+        "/Items/{series}/RemoteImages/Providers",
+        "/Items/{season}/RemoteImages/Providers",
+        "/Items/{episode}/RemoteImages/Providers",
+        "/Items/{album_id}/RemoteImages/Providers",
+        "/Items/{audio_id}/RemoteImages/Providers",
+        "/Items/{person_id}/RemoteImages/Providers",
+    ]),
+    # The image candidates themselves. The unscoped leg is kept even though it
+    # cannot come back clean — Ferrofin ships fanart.tv and Jellyfin bakes an
+    # OMDb key, both recorded in classifications.json — because dropping it would
+    # leave the endpoint's real shape (TotalRecordCount, Providers) unchecked.
+    # The `providerName=TheMovieDb` legs are the strict ones: both servers run the
+    # same provider there, so those bodies must match field for field AND in
+    # order, which is what pins the preferred-language filter and
+    # `OrderByLanguageDescending`. Live TMDB, so a candidate list that changes
+    # upstream between the two calls shows here as noise, not a server bug.
+    multi("GET /Items/{itemId}/RemoteImages", [
+        "/Items/{movie}/RemoteImages",
+        "/Items/{movie}/RemoteImages?providerName=TheMovieDb",
+        "/Items/{movie}/RemoteImages?providerName=TheMovieDb&includeAllLanguages=true",
+        "/Items/{movie}/RemoteImages?providerName=TheMovieDb&type=Logo",
+        "/Items/{series}/RemoteImages?providerName=TheMovieDb",
+    ]),
     invariant("GET /Movies/{itemId}/Similar", similar_invariants_for("Movies")),
     invariant("GET /Trailers/{itemId}/Similar", similar_invariants_for("Trailers")),
     # The NON-movie seeds ARE diffable: upstream master serves Series/MusicAlbum/
@@ -1244,12 +2069,163 @@ READS = [
     user("GET /MusicGenres/InstantMix", "/MusicGenres/InstantMix?name={musicgenre}&userId={u}&limit=100"),
     # Live TV (needs the tuner fixture): channels are keyed by Name across servers; the
     # airing programmes by Name too (the guide is identical on both).
+    # Tuner DISCOVERY. `LiveTvController.DiscoverTuners([FromQuery] bool
+    # newDevicesOnly = false)` (v10.11.8 LiveTvController.cs:1146-1150) →
+    # `TunerHostManager.DiscoverTuners`, which UDP-broadcasts the 20-byte
+    # HDHomeRun discovery datagram, waits 3 s, and then — when the flag is set —
+    # drops every device whose `DeviceId` is already on a configured tuner host
+    # (TunerHostManager.cs:102-121).
+    #
+    # Both legs are needed and neither is redundant. The fake device
+    # (`suite/perf/hdhomerun-source.py`) answers the broadcast, so the `false`
+    # leg diffs a real discovered `TunerHostInfo` field for field; the fixture
+    # then CONFIGURES that same device, so the `true` leg must be empty on both
+    # — and it is only empty because the filter runs. Ferrofin's handler took no
+    # query parameter at all until this was measured: it answered the device to
+    # both spellings, where Jellyfin answers it to one. With a single leg that
+    # divergence is invisible.
+    #
+    # Two legs, ~3 s each per server, because the wait IS the protocol. The
+    # `/LiveTv/Tuners/Discvover` alias route is deliberately NOT a second row:
+    # it is the same handler behind a second path (the contract carries
+    # upstream's typo), so a Layer-2 row there would measure the router, which
+    # Layer 1 already does.
+    multi("GET /LiveTv/Tuners/Discover", [
+        "/LiveTv/Tuners/Discover?newDevicesOnly=false",
+        "/LiveTv/Tuners/Discover?newDevicesOnly=true",
+    ]),
     user("GET /LiveTv/Channels", "/LiveTv/Channels?userId={u}"),
     user("GET /LiveTv/Channels/{channelId}", "/LiveTv/Channels/{channel}?userId={u}"),
     user("GET /LiveTv/Programs", "/LiveTv/Programs?channelIds={channel}&isAiring=true&userId={u}"),
+    # The BODY form of the row above. `LiveTvController.GetPrograms([FromBody]
+    # GetProgramsDto)` (v10.11.8 LiveTvController.cs:654-695) builds the
+    # identical `InternalItemsQuery` as the query-string overload and calls the
+    # same `_liveTvManager.GetPrograms`, so an equivalent body must return the
+    # equivalent guide — on each server AND across the pair. It lives here and
+    # not in journeys.py for the `RemoteSearch` reason: nothing is mutated,
+    # there is no read-back, and `posted` settles both STATUSES before any body
+    # compare, which is what keeps a Ferrofin 422 against a Jellyfin 200 from
+    # being silently dropped instead of failing.
+    posted("POST /LiveTv/Programs", [
+        # 1. The body twin of the GET leg above — same filters, same answer.
+        post_leg("/LiveTv/Programs", lambda c: {
+            "ChannelIds": [c["channel"]], "IsAiring": True, "UserId": c["u"]}),
+        # 2. The whole guide inside the WINDOW BOTH SERVERS HOLD — every field of
+        #    every programme in it, unpaged. The window pin is not a narrowing of
+        #    what is compared: each server anchors its rolling ~7-day guide to
+        #    its OWN last refresh (`GuideManager.RefreshChannelsInternal` keeps
+        #    `[now - 1h, now - 1h + GuideDays)`), so an unpinned leg compares
+        #    Ferrofin's window against Jellyfin's and calls the offset a body
+        #    divergence. See `shared_guide_window`, which MEASURES the overlap
+        #    from the two servers' own answers rather than hard-coding one.
+        post_leg("/LiveTv/Programs", lambda c: guide_window_body(c, {"UserId": c["u"]})),
+        # 3. Paging, with the tie-break PINNED. `LiveTvManager.GetPrograms`
+        #    (LiveTvManager.cs:199-206) falls back to `OrderBy = [(StartDate,
+        #    Ascending)]` with NO secondary key, and the fixture holds two
+        #    programmes per StartDate. A page edge that cuts such a tie orders
+        #    differently even between Jellyfin's OWN paged and unpaged answers,
+        #    so a bare startIndex/limit leg would be permanently and
+        #    meaninglessly red. Naming the second key makes the page boundary a
+        #    real assertion again rather than a coin toss.
+        post_leg("/LiveTv/Programs", lambda c: guide_window_body(c, {
+            "UserId": c["u"], "StartIndex": 10, "Limit": 5,
+            "SortBy": ["StartDate", "SortName"],
+            "SortOrder": ["Ascending", "Ascending"]})),
+        # 4. The DTO options — `Fields`, image types and user data all reach
+        #    `GetProgramsDto.into_parts`'s `DtoOptions`. `Limit` cuts a
+        #    StartDate tie, so the second sort key is named here too.
+        post_leg("/LiveTv/Programs", lambda c: guide_window_body(c, {
+            "UserId": c["u"], "Limit": 5,
+            "SortBy": ["StartDate", "SortName"],
+            "SortOrder": ["Ascending", "Ascending"],
+            "Fields": ["ChannelInfo", "Overview", "Genres"],
+            "EnableImages": True, "ImageTypeLimit": 1,
+            "EnableImageTypes": ["Primary"], "EnableUserData": True})),
+        # 5-7. THE DELIMITED-STRING FORM. Seven `GetProgramsDto` properties carry
+        #    `JsonCommaDelimitedCollectionConverterFactory` upstream (`Genres`
+        #    carries the PIPE factory), so `"SortBy":"StartDate"` is as valid as
+        #    `["StartDate"]`, and an entry the `TypeConverter` refuses is
+        #    silently dropped rather than rejected
+        #    (JsonDelimitedCollectionConverter.Read). Ferrofin bound all seven as
+        #    plain arrays and answered 422 to every string form; these legs are
+        #    the regression pin for that fix, and leg 7 pins the DROP semantics
+        #    specifically — a strict parser would 400 where Jellyfin returns the
+        #    real channel's programmes.
+        #
+        #    These three are window-pinned as well: a leg that 422s on one side
+        #    fails on the STATUS before any body compare, so the pin cannot mask
+        #    the regression it exists to catch — it only stops the guide offset
+        #    from reporting a second, false divergence on top of it.
+        post_leg("/LiveTv/Programs", lambda c: guide_window_body(c, {
+            "ChannelIds": c["channel"], "SortBy": "StartDate,SortName",
+            "SortOrder": "Ascending,Ascending", "Fields": "Overview",
+            "EnableImageTypes": "Primary", "UserId": c["u"], "Limit": 5})),
+        post_leg("/LiveTv/Programs", lambda c: guide_window_body(c, {
+            "Genres": "News", "UserId": c["u"], "Limit": 5,
+            "SortBy": "StartDate,SortName", "SortOrder": "Ascending,Ascending"})),
+        post_leg("/LiveTv/Programs", lambda c: guide_window_body(c, {
+            "ChannelIds": "not-a-guid," + c["channel"],
+            "SortBy": "NotASort,StartDate,SortName",
+            "SortOrder": "Ascending,Ascending", "UserId": c["u"], "Limit": 5})),
+        # 8. `UserId` is NOT defaulted from the caller on the body form —
+        #    `body.UserId.IsNullOrEmpty() ? null : GetUserById(...)`, unlike the
+        #    query-string overload. An anonymous-user guide is a different DTO.
+        post_leg("/LiveTv/Programs", lambda c: guide_window_body(c, {
+            "Limit": 3, "SortBy": ["StartDate", "SortName"],
+            "SortOrder": ["Ascending", "Ascending"]})),
+        # 9-10. THE BINDER'S REJECTION STATUS. The array arm of
+        #    `JsonDelimitedCollectionConverter` stays strict, so
+        #    `{"SortBy":["NotASort"]}` is a body-binding FAILURE — and ASP.NET's
+        #    `[ApiController]` filter answers it 400 with ValidationProblemDetails
+        #    (v10.11.8 Jellyfin.Api/BaseJellyfinApiController.cs:12-18; nothing in
+        #    the tree replaces the default `InvalidModelStateResponseFactory`).
+        #    axum's `Json` rejection is 422 `text/plain`, so every body-taking
+        #    Ferrofin route diverged until `ferrofin-api`'s `JsonBody` extractor
+        #    replaced it. Leg 10 pins the OPPOSITE half of the same defect:
+        #    serde's derived impl binds a JSON sequence to a struct positionally,
+        #    so Ferrofin answered `[]` with 200 and the WHOLE guide where
+        #    System.Text.Json 400s — a malformed body silently accepted as a
+        #    valid one.
+        #
+        #    Only the STATUS is the assertion here, and that is deliberate:
+        #    `post_leg_outcome` settles `hs != js` BEFORE the 200 check, so a
+        #    Ferrofin 422-or-200 against a Jellyfin 400 fails this row as
+        #    `status`, and once both answer 400 the leg records as `unavailable`
+        #    and compares nothing. The `errors` dictionary is NOT diffed: its
+        #    keys and messages carry .NET type names
+        #    ("Jellyfin.Data.Enums.ItemSortBy") and its `traceId` is a
+        #    per-request ASP.NET activity id — neither is reproducible, and
+        #    neither belongs in parity_diff.VOLATILE.
+        post_leg("/LiveTv/Programs", lambda c: {"SortBy": ["NotASort"]}),
+        post_leg("/LiveTv/Programs", lambda c: []),
+    ]),
     user("GET /LiveTv/Programs/Recommended", "/LiveTv/Programs/Recommended?userId={u}&isAiring=true&limit=5"),
     user("GET /LiveTv/Timers/Defaults", "/LiveTv/Timers/Defaults"),
-    user("GET /LiveTv/Info", "/LiveTv/Info"),
+    # `EnabledUsers` is `user.Id.ToString("N")` for every user who may use Live
+    # TV (`LiveTvManager.GetLiveTvInfo`). The list's LENGTH and MEMBERSHIP are
+    # exactly what a regression in that filter — a dropped
+    # `EnableLiveTvAccess` check, a missing tuner-host guard — would change, so
+    # they must stay compared; only the GUID itself cannot match, because each
+    # server minted the `bench` account independently. Substituting each
+    # server's own id for that server's username keeps a wrong count, a missing
+    # user and a user who should have been filtered out all failing the diff.
+    # An `EnabledUsers` entry in parity_diff.VOLATILE would hide all three.
+    #
+    # The projection also SORTS, which is a second, separate narrowing and is
+    # called out here because the rest of this batch documents every one.
+    # `LiveTvManager.GetLiveTvInfo` (LiveTvManager.cs:1207-1210) emits
+    # `_userManager.Users.Where(IsLiveTvEnabled)` in store order, so ordering IS
+    # a signal upstream — but it is not a comparable one across two servers whose
+    # `bench` accounts were provisioned independently, in separate transactions,
+    # with independently minted GUIDs. Sorting discards only that incomparable
+    # signal: count, membership and duplicates all still fail the diff. Drop the
+    # `sorted()` the day the harness provisions users in a pinned order on both
+    # servers, and the row gets its ordering check back for free.
+    invariant("GET /LiveTv/GuideInfo", guide_info_invariants),
+    invariant("GET /LiveTv/Recordings/Groups/{groupId}", recording_group_invariants),
+    user("GET /LiveTv/Info", "/LiveTv/Info",
+         project=lambda b, c: {**b, "EnabledUsers": sorted(
+             c["users_by_id"].get(i, i) for i in (b.get("EnabledUsers") or []))}),
     user("GET /LiveTv/TunerHosts/Types", "/LiveTv/TunerHosts/Types"),
     # The tuner/listings administration reads. Both bodies are derived entirely
     # from the shared fixture (the M3U's names/numbers/stream URLs and the
@@ -1260,6 +2236,111 @@ READS = [
          "/LiveTv/ChannelMappingOptions?providerId={listings_provider}"),
     user("GET /LiveTv/ListingProviders/Lineups",
          "/LiveTv/ListingProviders/Lineups?id={listings_provider}"),
+
+    # ------------------------------------------------------------------ Identify
+    #
+    # `POST /Items/RemoteSearch/<Kind>` — POST by contract, a SEARCH by
+    # behaviour (see `posted`). Everything below is pinned by a PROVIDER ID, not
+    # by a name: musicbrainz.org returns 96 equal-score hits for "Abbey Road"
+    # and its page order is not stable request-to-request (measured), while the
+    # dedup in `ProviderManager.GetRemoteSearchResults` collapses them to
+    # whichever release came back first — so a name search's single result is
+    # nondeterministic on ONE server, let alone two. A lookup by id takes the
+    # `LookupRelease`/`LookupArtist` path and returns one stable document. That
+    # is why there is no `ProviderIds`/`PremiereDate` entry in
+    # parity_diff.VOLATILE for these rows: nothing here needs one.
+    #
+    # Needs outbound musicbrainz.org reachability from BOTH containers; with
+    # none, the `retry_empty` legs drop out and the row records "no comparable
+    # response" rather than passing vacuously.
+    posted("POST /Items/RemoteSearch/MusicAlbum", [
+        # 1. The deterministic lookup, AND the positive control for leg 3.
+        #    `MusicBrainzAlbumProvider.GetSearchResults` short-circuits on a
+        #    known release id, so both servers fetch the same single MB document
+        #    and every field must agree. It carries the SAME `ItemId` as the
+        #    gate leg with `IncludeDisabledProviders: True`, which is the
+        #    override C# checks first (`ProviderManager.GetRemoteSearchResults`
+        #    :801-830), so the only difference between this leg and leg 3 is the
+        #    gate itself — content here and `[]` there is attributable to the
+        #    checkbox and to nothing else. Without this pairing a musicbrainz.org
+        #    503 satisfies leg 3 exactly as well as a working gate does.
+        post_leg("/Items/RemoteSearch/MusicAlbum", lambda c: {
+            "ItemId": c["album_id"],
+            "SearchInfo": {"Name": "Abbey Road", "ProviderIds": {
+                "MusicBrainzAlbum": "6bb3793b-f991-378e-9bff-0bd3117f2298"}},
+            "IncludeDisabledProviders": True},
+            retry_empty=True, tag="mb-album-reachable"),
+        # 2. The dateless-release sentinel. MusicBrainz dates this release `""`;
+        #    MetaBrainz still builds a `PartialDate`, so C# emits
+        #    `PremiereDate: 0001-01-01T00:00:00.0000000Z` with NO `ProductionYear`
+        #    (`Date?.NearestDate` / `Date?.Year`). Ferrofin used to drop the field.
+        post_leg("/Items/RemoteSearch/MusicAlbum", lambda c: {
+            "SearchInfo": {"Name": "Abbey Road", "ProviderIds": {
+                "MusicBrainzAlbum": "372f7e64-08dd-3ffb-913a-f29e5fe2b9d5"}},
+            "IncludeDisabledProviders": True}, retry_empty=True),
+        # 3. The fetcher gate. The fixture's Music library has every "Metadata
+        #    downloaders" box cleared, so with an `ItemId` naming an album in it
+        #    and no `IncludeDisabledProviders` override, `CanRefreshMetadata` ->
+        #    `IsMetadataFetcherEnabled` lets NO fetcher run: `[]` on both. This
+        #    leg is the one that used to be red — Ferrofin ignored `ItemId`,
+        #    `IncludeDisabledProviders` and the library entirely. Its empty
+        #    answer is the ASSERTION, so it is never retried away — and for the
+        #    same reason it is only credited when leg 1 proved, in the same
+        #    pass, that the provider WOULD have answered.
+        post_leg("/Items/RemoteSearch/MusicAlbum", lambda c: {
+            "ItemId": c["album_id"],
+            "SearchInfo": {"Name": "Abbey Road", "ProviderIds": {
+                "MusicBrainzAlbum": "6bb3793b-f991-378e-9bff-0bd3117f2298"}},
+            "IncludeDisabledProviders": False}, requires="mb-album-reachable"),
+    ]),
+    posted("POST /Items/RemoteSearch/MusicArtist", [
+        # The artist lookup by `MusicBrainzArtist` id — `LookupArtist`, one
+        # stable document, carrying the life-span begin as PremiereDate. Same
+        # `ItemId` + `IncludeDisabledProviders: True` shape as the album row, so
+        # it is also the gate leg's positive control.
+        post_leg("/Items/RemoteSearch/MusicArtist", lambda c: {
+            "ItemId": c["artist_id"],
+            "SearchInfo": {"Name": "Radiohead", "ProviderIds": {
+                "MusicBrainzArtist": "a74b1b7f-71a5-4011-9441-d0b5e4122711"}},
+            "IncludeDisabledProviders": True},
+            retry_empty=True, tag="mb-artist-reachable"),
+        # …and the same fetcher gate, on this server's own `Artist 01`.
+        post_leg("/Items/RemoteSearch/MusicArtist", lambda c: {
+            "ItemId": c["artist_id"],
+            "SearchInfo": {"Name": "Radiohead", "ProviderIds": {
+                "MusicBrainzArtist": "a74b1b7f-71a5-4011-9441-d0b5e4122711"}},
+            "IncludeDisabledProviders": False}, requires="mb-artist-reachable"),
+    ]),
+    # MusicVideo and Book have NO remote search provider on either side, so both
+    # answer `[]` unconditionally and the row can only earn `empty-corpus` —
+    # `verification.read_method` derives that from the diff having compared zero
+    # leaves, so the row cannot borrow the body-diff headline. This is CORRECT,
+    # not a gap: `git grep -n "IRemoteMetadataProvider<" v10.11.8` lists AudioDb
+    # album/artist, MusicBrainz album/artist, Omdb episode/series/movie/trailer
+    # and Tmdb boxset/movie/person/episode/season/series, and no MusicVideo or
+    # Book arm anywhere — upstream's `MusicVideoMetadataService` and
+    # `BookMetadataService` are LOCAL services. Ferrofin registers nothing for
+    # either kind either, so the two empty sets have the same cause.
+    #
+    # The bodies are well-formed on purpose: v10.11.8 dereferences
+    # `searchInfo.SearchInfo.MetadataLanguage` with no null check
+    # (ProviderManager.cs, `GetRemoteSearchResults`) and answers 500 to a body
+    # with no `SearchInfo`, where Ferrofin defaults it and answers `200 []`.
+    # Probing that would flag the row for a Jellyfin defect no client provokes.
+    posted("POST /Items/RemoteSearch/MusicVideo", [
+        post_leg("/Items/RemoteSearch/MusicVideo", lambda c: {
+            "SearchInfo": {"Name": "Thriller", "Artists": ["Michael Jackson"],
+                           "Year": 1983, "MetadataLanguage": "en",
+                           "MetadataCountryCode": "US"},
+            "IncludeDisabledProviders": True}),
+    ]),
+    posted("POST /Items/RemoteSearch/Book", [
+        post_leg("/Items/RemoteSearch/Book", lambda c: {
+            "SearchInfo": {"Name": "Dune", "Year": 1965, "MetadataLanguage": "en",
+                           "MetadataCountryCode": "US", "ProviderIds": {}},
+            "IncludeDisabledProviders": True}),
+    ]),
+
     # resolvable-path-param GETs the breadth sweep couldn't fill (needs a real id).
     # The add-library options. `isNewLibrary` is a DIFFERENT answer, not a hint:
     # it decides which providers come pre-ticked, so both values are probed.
@@ -1411,11 +2492,21 @@ def resolve_named(base, token, user_id):
         return (names + [names[-1]] * n)[:n] if names else ["0"] * n
 
     years = first_years(3)
+    def users_by_id():
+        """`user GUID -> username` for this server.
+
+        The two servers create their accounts independently, so the same person
+        has a different GUID on each. Any body that carries a raw user id is
+        therefore undiffable as bytes but perfectly diffable as identity.
+        """
+        return {u["Id"]: u.get("Name") for u in (get_json(base, "/Users", token) or [])}
+
     artist = first_named("/Artists")
     lyric_ids = lyric_seed_ids(base, token, user_id)
     channels = (get_json(base, f"/LiveTv/Channels?userId={user_id}&limit=1", token) or {}).get("Items") or []
     listings_providers = (get_json(base, "/System/Configuration/livetv", token) or {}).get("ListingProviders") or []
     return {
+        "users_by_id": users_by_id(),
         "channel": channels[0]["Id"] if channels else "",
         # The `PlaylistsFolder` — the one seed whose ancestor chain reaches the
         # `AggregateFolder`.
@@ -1437,6 +2528,14 @@ def resolve_named(base, token, user_id):
         "album_id": first_id("MusicAlbum"),
         "movie": first_id("Movie"),
         "episode": first_id("Episode"),
+        # Path-derived, so these resolve to the SAME id on both servers (checked
+        # live: Movie/Series/Season/Episode/MusicAlbum/Audio and the Person all
+        # match byte-for-byte). That is what lets the kind-fanned rows below
+        # compare like for like instead of each server's own arbitrary first item
+        # — the "sweep single-item align" failure these probes exist to replace.
+        "season": first_id("Season"),
+        "audio_id": first_id("Audio"),
+        "person_id": first_named("/Persons").get("Id") or "",
         "task": first_task(),
         "device": first_device(),
         "artist": urllib.parse.quote(artist.get("Name") or ""),
@@ -1456,12 +2555,84 @@ def resolve_named(base, token, user_id):
     }
 
 
+def first_program_in_window(base, token, window):
+    """The id of the earliest airing inside `window`, or `""`.
+
+    Ordered by `StartDate,SortName` so a tie at the window edge resolves the
+    same way on both servers, exactly as the `/LiveTv/Programs` legs do.
+    """
+    url = "/LiveTv/Programs?limit=1&sortBy=StartDate,SortName&sortOrder=Ascending"
+    if window:
+        url += f"&minStartDate={window[0]}&maxStartDate={window[1]}"
+    items = (get_json(base, url, token) or {}).get("Items") or []
+    return items[0].get("Id") or "" if items else ""
+
+
+def shared_guide_window(bases_tokens):
+    """The `[MinStartDate, MaxStartDate)` BOTH servers' guides cover, as ISO-8601 Z.
+
+    Each server holds a ROLLING guide window anchored to its own last refresh:
+    `GuideManager.RefreshChannelsInternal` keeps `[now - 1h, now - 1h + GuideDays)`
+    and drops the rest (v10.11.8 GuideManager.cs:215-231). Two independent
+    instances therefore never hold the same window — a container restart moves
+    one of them by hours — so an UNPINNED programme leg compares Ferrofin's
+    window against Jellyfin's and reports the offset as a body divergence,
+    which it is not.
+
+    Pinning the window is the honest instrument here, and it is narrow: it is
+    the intersection of what the two servers actually hold, measured from their
+    own answers rather than hard-coded, so it shrinks when the servers disagree
+    instead of hiding the disagreement. What stays compared inside it is every
+    field of every programme. Guide-window ANCHORING itself is per-instance
+    refresh state owned by the guide-refresh and scheduled-task rows, not by
+    this op.
+
+    Returns `None` when either server holds no guide, so the caller can leave
+    the legs unpinned rather than invent a window.
+    """
+    edges = []
+    for base, token in bases_tokens:
+        lo = hi = None
+        for order, pick in (("Ascending", "lo"), ("Descending", "hi")):
+            body = get_json(base, "/LiveTv/Programs?limit=1&sortBy=StartDate"
+                                  f"&sortOrder={order}", token) or {}
+            items = body.get("Items") or []
+            if not items:
+                return None
+            if pick == "lo":
+                lo = items[0].get("StartDate")
+            else:
+                hi = items[0].get("StartDate")
+        if not lo or not hi:
+            return None
+        edges.append((lo, hi))
+    # ISO-8601 Z strings of one fixed shape sort lexicographically, which is
+    # exactly the comparison the intersection needs.
+    start, end = max(e[0] for e in edges), min(e[1] for e in edges)
+    return (start, end) if start < end else None
+
+
 def run(ferrofin_url, jellyfin_url):
     ht, hu = bring_up(ferrofin_url, "ferrofin")
     jt, ju = bring_up(jellyfin_url, "jellyfin")
     hc, jc = resolve_named(ferrofin_url, ht, hu), resolve_named(jellyfin_url, jt, ju)
     # `similar_invariants` holds each server to ITS OWN documented algorithm.
     hc["server"], jc["server"] = "ferrofin", "jellyfin"
+
+    # The guide window both servers hold, so the programme legs ask for the same
+    # airings on both rather than for each server's own rolling window.
+    window = shared_guide_window([(ferrofin_url, ht), (jellyfin_url, jt)])
+    if window is None:
+        print("  live tv guide window: one server holds no programmes; the POST "
+              "/LiveTv/Programs legs run UNPINNED", file=sys.stderr)
+    for ctx in (hc, jc):
+        ctx["guide_from"], ctx["guide_to"] = window or (None, None)
+    # The programme seed for the `GET /Items/{itemId}` extra leg, taken from
+    # INSIDE the shared window and ordered, so both servers name the same
+    # airing. `""` (no overlap, or no guide) makes the leg skip loudly rather
+    # than compare two different programmes — the same guard `{channel}` has.
+    for ctx, base, token in ((hc, ferrofin_url, ht), (jc, jellyfin_url, jt)):
+        ctx["program"] = first_program_in_window(base, token, window)
 
     pairs = correlate(path_id_map(ferrofin_url, ht, hu), path_id_map(jellyfin_url, jt, ju))
 
@@ -1481,8 +2652,10 @@ def run(ferrofin_url, jellyfin_url):
         """The honest method for an aggregate of diffed (jbody, hbody, compared) legs.
 
         None when no leg compared anything (untested); `empty-corpus` when every
-        leg that compared anything was two empty result envelopes agreeing on
-        their own zeros; `body-diff` as soon as one leg compared real content.
+        leg was two EMPTY results (an `Items: []` envelope agreeing on its own
+        zeros, or a bare `[]` agreeing on nothing at all — see
+        `verification.is_empty_result`); `body-diff` as soon as one leg compared
+        real content.
         """
         seen = [m for m in (verification.read_method(j, h, c) for j, h, c in legs)
                 if m is not None]
@@ -1499,11 +2672,15 @@ def run(ferrofin_url, jellyfin_url):
         rather than borrowing a claim it did not earn. `method=None` means the probe
         compared nothing at all — recorded untested, never verified.
 
-        `compared` is the number of leaf comparisons the diff actually performed,
-        carried into the note the way the sweep layer carries it. Without it the
-        page said "1/1 clean" for a row that compared 984 fields and for a row
-        that compared one, and a reader could not tell a thick body diff from a
-        thin one without opening this file.
+        `compared`, when given, is the PER-LEG count of non-volatile LEAF
+        comparisons the row actually performed, rendered leg by leg next to the
+        leg count. Per-leg and not a total, because the total is what hides the
+        problem: "3/3 clean" reads as three times the evidence when one of the
+        three legs asserted `[]` and compared nothing at all, and "3/3 clean, 19
+        leaves" still does. "3/3 legs clean (14+5+0 leaves compared)" cannot.
+        Without any count the page said "1/1 clean" for a row that compared 984
+        fields and for a row that compared one, and a reader could not tell a
+        thick body diff from a thin one without opening this file.
 
         `caveats` is what this row did NOT compare, in plain words. It rides on
         the row (not only in a comment in this file) so `gen-ledger.py` can print
@@ -1521,10 +2698,11 @@ def run(ferrofin_url, jellyfin_url):
                       verification.EMPTY_CORPUS: " (both result sets EMPTY; only the envelope"
                                                  " zeros compared — handler logic unexercised)",
                       }.get(method, "")
-            depth = f"; {compared} field(s) compared" if compared is not None else ""
+            leaves = leaf_note(compared)
             rows[op] = {"deep_verified": True, "classification": "ok",
                         "verification_method": method,
-                        "note": f"{clean}/{total} clean{depth}" + detail}
+                        "note": f"{clean}/{total} legs clean{leaves}" + detail
+                                + (f"; {note}" if note else "")}
             if caveats:
                 rows[op]["caveats"] = list(caveats)
         else:
@@ -1541,8 +2719,10 @@ def run(ferrofin_url, jellyfin_url):
             rows[op] = {"deep_verified": False,
                         "classification": "flagged: read diff vs Jellyfin (verify)",
                         "verification_method": method or verification.BODY_DIFF,
-                        "note": f"{clean}/{total} clean; mismatch:{len(buckets['mismatch'])} "
-                                f"missing:{len(buckets['missing'])} extra:{len(buckets['extra'])} | {sample}",
+                        "note": f"{clean}/{total} legs clean{leaf_note(compared)}; "
+                                f"mismatch:{len(buckets['mismatch'])} "
+                                f"missing:{len(buckets['missing'])} extra:{len(buckets['extra'])} | {sample}"
+                                + (f" | {note}" if note else ""),
                         "diffs": {
                             "missing": sorted(field_paths(buckets["missing"])),
                             "extra": sorted(field_paths(buckets["extra"])),
@@ -1568,7 +2748,7 @@ def run(ferrofin_url, jellyfin_url):
                     buckets["mismatch"].append({"path": key, "j": j, "h": h})
             n = sum(len(v) for v in buckets.values())
             record(ep["op"], 1 if n == 0 else 0, 1, buckets, ep["method"],
-                   compared=len(set(jf) | set(hf)))
+                   compared=[len(set(jf) | set(hf))])
         elif ep["kind"] == "multi":
             if ep.get("seed"):
                 hstat = ep["seed"](ferrofin_url, ht, hc)
@@ -1614,8 +2794,69 @@ def run(ferrofin_url, jellyfin_url):
                     ep["reap"](ferrofin_url, ht, hc)
                     ep["reap"](jellyfin_url, jt, jc)
             record(ep["op"], clean, tested, agg, agg_method(legs),
-                   compared=sum(c for _j, _h, c in legs),
+                   compared=[c for _j, _h, c in legs],
                    caveats=ep.get("caveats"))
+        elif ep["kind"] == "posted":
+            agg = {"mismatch": [], "missing": [], "extra": []}
+            legs = []
+            clean = tested = 0
+            dropped = []
+            unavailable = []
+            proven = set()          # tags whose control returned content on BOTH servers
+            for leg in ep["legs"]:
+                hs = js = 0
+                hb = jb = None
+                if not (leg["requires"] and leg["requires"] not in proven):
+                    # Both servers get the identical body, in the same run, back
+                    # to back, so an upstream provider sees one state.
+                    for _attempt in range(MB_RETRIES if leg["retry_empty"] else 1):
+                        hs, hb = token_post(ferrofin_url, leg["url"], ht, leg["body"](hc))
+                        time.sleep(MB_PACE)
+                        js, jb = token_post(jellyfin_url, leg["url"], jt, leg["body"](jc))
+                        # Retry while EITHER side is empty on a 200 — the
+                        # rate-limiter signature, which lands on ONE server as
+                        # often as on both (musicbrainz.org answers per request,
+                        # not per pass). Settle on both-non-empty; a non-200 is
+                        # a RESULT and is never retried. What leaves this loop is
+                        # then unambiguous: both empty is the limiter, one empty
+                        # after every retry is a persistent divergence and gets
+                        # diffed like anything else.
+                        if not leg["retry_empty"] or hs != 200 or js != 200 or (hb and jb):
+                            break
+                        time.sleep(MB_PACE)
+                outcome = post_leg_outcome(leg, hs, hb, js, jb, proven)
+                if outcome == "uncontrolled":
+                    dropped.append(f"{leg['url']} (gate assertion not credited: its positive "
+                                   f"control {leg['requires']!r} did not return content)")
+                    continue
+                if outcome == "status":
+                    tested += 1
+                    agg["mismatch"].append(
+                        {"path": f"{leg['url']} :: status", "j": js, "h": hs})
+                    continue
+                if outcome == "unavailable":
+                    unavailable.append(f"{leg['url']} (both HTTP {hs}, no JSON body)")
+                    continue
+                if outcome == "rate-limited":
+                    dropped.append(f"{leg['url']} (H={len(hb)} J={len(jb)}, both empty)")
+                    continue
+                tested += 1
+                n, b, compared = diff_stats(jb, hb)
+                legs.append((jb, hb, compared))
+                if n == 0:
+                    clean += 1
+                    if leg["tag"] and hb and jb:
+                        proven.add(leg["tag"])
+                for k in agg:
+                    agg[k].extend(b[k])
+            notes = []
+            if dropped:
+                notes.append("no comparable response on: " + "; ".join(dropped))
+            if unavailable:
+                notes.append("no body to compare on: " + "; ".join(unavailable))
+            record(ep["op"], clean, tested, agg, agg_method(legs),
+                   note="; ".join(notes) or None,
+                   compared=[c for _, _, c in legs])
         elif ep["kind"] in ("plain", "user"):
             path = ep["url"](hc if ep["kind"] == "user" else {})
             jpath = ep["url"](jc if ep["kind"] == "user" else {})
@@ -1628,9 +2869,11 @@ def run(ferrofin_url, jellyfin_url):
                 record(ep["op"], 0, 0, {"mismatch": [], "missing": [], "extra": []}, None,
                        note=f"no comparable response (H={hs} J={js})")
                 continue
+            if ep.get("project"):
+                hb, jb = ep["project"](hb, hc), ep["project"](jb, jc)
             n, buckets, compared = diff_stats(jb, hb)
             record(ep["op"], 1 if n == 0 else 0, 1, buckets,
-                   agg_method([(jb, hb, compared)]), compared=compared)
+                   agg_method([(jb, hb, compared)]), compared=[compared])
         else:  # item — aggregate over correlated pairs
             agg = {"mismatch": [], "missing": [], "extra": []}
             legs = []
@@ -1671,8 +2914,34 @@ def run(ferrofin_url, jellyfin_url):
                 else:
                     for k in agg:
                         agg[k].extend(b[k])
+            for url_of in ep.get("extra") or ():
+                hu, ju = url_of(hc), url_of(jc)
+                if hu is None or ju is None:
+                    # Unseeded on at least one server: skip rather than compare
+                    # a collapsed URL. `tested` does not move, so the row's
+                    # "n/m legs clean" note shows the leg did not run.
+                    print(f"    ! {ep['op']}: an extra leg has no seed on "
+                          f"{'ferrofin' if hu is None else 'jellyfin'}; skipped",
+                          file=sys.stderr)
+                    continue
+                hs, hb = token_get(ferrofin_url, hu, ht)
+                js, jb = token_get(jellyfin_url, ju, jt)
+                if hs != js:
+                    tested += 1
+                    agg["mismatch"].append({"path": f"[{hu}] :: status", "j": js, "h": hs})
+                    continue
+                if hb is None or jb is None:
+                    continue
+                tested += 1
+                n, b, compared = diff_stats(jb, hb)
+                legs.append((jb, hb, compared))
+                if n == 0:
+                    clean += 1
+                else:
+                    for k in agg:
+                        agg[k].extend(b[k])
             record(ep["op"], clean, tested, agg, agg_method(legs),
-                   compared=sum(c for _j, _h, c in legs))
+                   compared=[c for _j, _h, c in legs])
 
     return rows, len(pairs)
 
@@ -1763,17 +3032,41 @@ def selfcheck():
     # NB `http_method`, not `method`: an `invariant()` row already uses `method`
     # for its VERIFICATION method ("property"). Reusing that key here made every
     # invariant row look like it was probing with a verb called "property".
+    #
+    # Two kinds carry their verb intrinsically instead of declaring it, and each
+    # is checked on its own terms below rather than waved through:
+    #   * `posted` — the runner ALWAYS issues a POST for these, so the claim to
+    #     test is that the op key says POST too;
+    #   * `invariant` — the probe function issues its own requests, with whatever
+    #     verbs the invariant needs (a write row posts and then GETs the value
+    #     back), so no single verb on the row could describe it.
     mismatched = [ep["op"] for ep in READS
-                  if ep["op"].split(" ", 1)[0] != ep.get("http_method", "GET")]
+                  if ep["kind"] not in ("posted", "invariant")
+                  and ep["op"].split(" ", 1)[0] != ep.get("http_method", "GET")]
     assert not mismatched, f"row op verb != probe method: {mismatched}"
+    not_post = [ep["op"] for ep in READS
+                if ep["kind"] == "posted" and not ep["op"].startswith("POST ")]
+    assert not not_post, f"posted rows whose op key is not a POST: {not_post}"
+    # Every `posted` row's legs must be well-formed and buildable from a
+    # populated context, and only a leg whose empty answer would be an upstream
+    # artefact may set `retry_empty` — never a leg whose assertion IS `[]`.
+    posted_rows = [ep for ep in READS if ep["kind"] == "posted"]
+    assert posted_rows, "the posted mechanism has no rows"
     # every {placeholder} in a user() URL must be a key resolve_named() produces (guards the
     # {u} vs "user" KeyError). Format each with a fully-populated context; a KeyError fails here.
     ctx = {"user": "U", "u": "U", "genre": "G", "studio": "S", "person": "P", "series": "SE",
            "task": "T", "device": "D", "artist": "A", "artist_id": "AID", "musicgenre": "MG",
-           "channel": "CH", "album_id": "ALB", "movie": "MOV", "episode": "EP",
+           "channel": "CH", "program": "PRG", "album_id": "ALB", "movie": "MOV", "episode": "EP",
            "listings_provider": "LP", "playlists_folder": "PLF", "root": "ROOT",
            "lyric_lrc": "L1", "lyric_elrc": "L2", "lyric_txt": "L3",
-           "year1": "2020", "year2": "2021", "year3": "2022"}
+           "year1": "2020", "year2": "2021", "year3": "2022",
+           # The shared guide window `run` measures; `None` is the "no overlap
+           # to name" case, and the self-check must exercise it too.
+           "guide_from": None, "guide_to": None,
+           "season": "SEA", "audio_id": "AUD", "person_id": "PID",
+           # user GUID -> username, for the projections that translate a
+           # per-instance user id into a comparable identity.
+           "users_by_id": {"U": "bench"}}
     # The context keys the self-check invents must be the ones resolve_named
     # actually produces, or this guard passes while the live run KeyErrors.
     import inspect
@@ -1782,9 +3075,89 @@ def selfcheck():
     for ep in READS:
         if ep["kind"] == "user":
             ep["url"](ctx)  # raises KeyError if a placeholder has no context key
+        elif ep["kind"] == "item":
+            # The correlated template is formatted with an id at run time; the
+            # `extra` legs are formatted from the context alone, so a bad
+            # placeholder in one must fail HERE and not mid-run.
+            for url_of in ep.get("extra") or ():
+                assert url_of(ctx) is not None, f"{ep['op']}: extra leg unseeded in the self-check ctx"
+                # …and an EMPTY seed yields None (skip), never a collapsed URL
+                # that quietly compares a different endpoint.
+                blank = dict(ctx)
+                for k in list(blank):
+                    if k != "user" and isinstance(blank[k], str):
+                        blank[k] = ""
+                assert url_of(blank) is None, f"{ep['op']}: an unseeded extra leg must be skipped, not collapsed"
         elif ep["kind"] == "multi":
             for leg in ep["legs"]:
                 leg["url"](ctx)
+        elif ep["kind"] == "posted":
+            # The three assertions below are about the `RemoteSearch` family's body shape
+            # and its rate-limiter machinery, NOT about `posted` in general. Scoped to that
+            # family on purpose: applying them to every posted row made a Live TV row —
+            # which mutates nothing, is never rate-limited and has no `SearchInfo` — abort
+            # the whole self-test, so the layer could not run at all.
+            remote_search = ep["op"].startswith("POST /Items/RemoteSearch")
+            for leg in ep["legs"]:
+                body = leg["body"](ctx)
+                # A leg body is normally a DTO object. The two exceptions are
+                # the binder-rejection legs on POST /LiveTv/Programs, whose
+                # whole point is to post a body the model binder must REFUSE —
+                # a JSON sequence where the DTO is an object. Allowing a list
+                # here is not a loosened assertion: those legs assert a status,
+                # and a leg that could not post a malformed body could not
+                # assert anything about how a malformed body is answered.
+                assert isinstance(body, (dict, list)), \
+                    f"{ep['op']}: a leg body must be a JSON object or array"
+                if remote_search:
+                    assert "SearchInfo" in body, \
+                        f"{ep['op']}: a RemoteSearch body without SearchInfo makes Jellyfin 500"
+                    assert not (leg["retry_empty"] and not body["IncludeDisabledProviders"]), \
+                        (f"{ep['op']}: a GATED leg asserts `[]`; retrying it away would turn the "
+                         "assertion into an absence of evidence")
+                    assert body["IncludeDisabledProviders"] or leg["requires"], \
+                        (f"{ep['op']}: a GATED leg must name a positive control in `requires` — "
+                         "otherwise a rate-limited provider satisfies its `[]` exactly as well "
+                         "as a working gate does")
+                else:
+                    # `retry_empty` only ever means "a SHARED external rate limiter can make
+                    # both sides empty". Nothing outside RemoteSearch has one, so setting it
+                    # elsewhere would drop a real `[] vs []` divergence.
+                    assert not leg["retry_empty"], \
+                        (f"{ep['op']}: retry_empty models the MusicBrainz rate limiter; a row "
+                         "with no shared external provider must not set it")
+                json.dumps(body)
+        if ep["kind"] == "posted":
+            tags = {leg["tag"] for leg in ep["legs"] if leg["tag"]}
+            needed = {leg["requires"] for leg in ep["legs"] if leg["requires"]}
+            assert needed <= tags, \
+                f"{ep['op']}: `requires` names a control this row does not run: {needed - tags}"
+    # The `posted` leg-outcome rule, exercised on the exact shapes that used to
+    # be laundered into a green row.
+    control = {"retry_empty": True, "tag": "ctl", "requires": None}
+    gate = {"retry_empty": False, "tag": None, "requires": "ctl"}
+    plain_leg = {"retry_empty": True, "tag": None, "requires": None}
+    # A Ferrofin 5xx against a Jellyfin 200 is a STATUS divergence, never a drop.
+    assert post_leg_outcome(plain_leg, 500, None, 200, [{"Name": "x"}], set()) == "status"
+    assert post_leg_outcome(control, 503, None, 200, [{"Name": "x"}], set()) == "status"
+    # Both refused identically: no divergence, and no evidence either.
+    assert post_leg_outcome(plain_leg, 500, None, 500, None, set()) == "unavailable"
+    # Both 200-and-empty on a retry_empty leg is the shared rate limiter.
+    assert post_leg_outcome(plain_leg, 200, [], 200, [], set()) == "rate-limited"
+    # …but ONE side empty is a divergence, so it must reach the diff.
+    assert post_leg_outcome(plain_leg, 200, [], 200, [{"Name": "x"}], set()) == "compare"
+    assert post_leg_outcome(plain_leg, 200, [{"Name": "x"}], 200, [], set()) == "compare"
+    # A gate leg is only credited when its control returned content this pass.
+    assert post_leg_outcome(gate, 200, [], 200, [], set()) == "uncontrolled"
+    assert post_leg_outcome(gate, 200, [], 200, [], {"ctl"}) == "compare"
+    # …and a clean multi-leg row must SHOW the leg that compared nothing, rather
+    # than folding it into a total that reads as evidence.
+    assert leaf_note(None) == "" and leaf_note([]) == ""
+    assert leaf_note([14, 5, 0]) == (" (14+5+0 leaves compared; the 0 is a leg "
+                                     "whose ASSERTION is emptiness)")
+    assert leaf_note([14, 5]) == " (14+5 leaves compared)"
+    # An all-empty row does not repeat itself: `empty-corpus` already says it.
+    assert leaf_note([0]) == " (0 leaves compared)"
     # The invariant rows must carry a callable, and the diff-shaped folding of
     # its facts must flag both a disagreement AND a fact both servers fail.
     assert all(callable(ep["fn"]) for ep in READS if ep["kind"] == "invariant")
@@ -1800,12 +3173,33 @@ def selfcheck():
     aliases = [ep["fn"].alias for ep in READS
                if ep["kind"] == "invariant" and hasattr(ep["fn"], "alias")]
     assert len(aliases) == len(set(aliases)), f"invariant rows share an alias: {aliases}"
-    assert set(aliases) <= set(SIMILAR_ALIASES), aliases
+    # The allow-list is the `Similar` family plus each hand-written property row.
+    # Naming them keeps a typo'd alias from silently colliding with a real one.
+    assert set(aliases) <= set(SIMILAR_ALIASES) | {
+        "LiveTvGuideInfo", "LiveTvRecordingGroup", "PluginsConfiguration",
+        "PluginsConfigurationWrite", "PluginsManifest", "PluginsImage",
+        "PluginsEnable", "PluginsDisable"}, aliases
     inv_ops = [ep["op"] for ep in READS if ep["kind"] == "invariant"]
     assert len(inv_ops) == len(set(inv_ops)), inv_ops
     # Every invariant row is stamped `property`, never the body-diff method the
     # ledger headline counts.
     assert all(ep["method"] == "property" for ep in READS if ep["kind"] == "invariant")
+    # A projected user() row must be a real narrowing, not a body-eraser: the
+    # projection has to keep every key it was given (so it cannot make a
+    # divergence vanish by dropping a field) and has to actually change the
+    # per-instance value it exists to translate.
+    for ep in READS:
+        if ep["kind"] != "user" or not ep.get("project"):
+            continue
+        probe = {"Services": [{"Name": "Emby"}], "IsEnabled": True, "EnabledUsers": ["U"]}
+        out = ep["project"](probe, ctx)
+        assert set(out) == set(probe), f'{ep["op"]}: projection changed the key set'
+        assert out["EnabledUsers"] == ["bench"], f'{ep["op"]}: projection did not translate the id'
+        # A user the map does not know must survive as its raw id, so an
+        # unexpected extra account still shows up as a diff.
+        stray = ep["project"]({**probe, "EnabledUsers": ["U", "X"]}, ctx)
+        assert stray["EnabledUsers"] == ["X", "bench"], stray
+
     # A projected multi leg must project BOTH sides to the same key set, and
     # must not be able to project a body away to nothing.
     for ep in READS:

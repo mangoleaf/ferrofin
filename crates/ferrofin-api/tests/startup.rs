@@ -104,6 +104,12 @@ struct MemUsers {
     updated_policy: Mutex<Option<(Uuid, UserPolicy)>>,
     /// Records whether `delete_user` was called and for whom.
     deleted: Mutex<Option<Uuid>>,
+    /// The `Password` column the seeded first user reports. `None` (the default)
+    /// is a freshly bootstrapped admin: `insert_user` omits the column, so it is
+    /// SQL NULL, which is what makes the wizard's first write legal.
+    first_user_password: Option<String>,
+    /// When set, `get_first_user` reports that there is no first user at all.
+    no_first_user: bool,
 }
 
 /// The fixed two-user table shared by [`MemUsers`] and the assertions.
@@ -129,7 +135,14 @@ impl UserManager for MemUsers {
         Ok(mem_users().into_iter().find(|u| u.id == id.to_string()))
     }
     async fn get_first_user(&self) -> Result<Option<UserEntity>, ServiceError> {
-        Ok(Some(user_entity(BOB_ID, "bob", None)))
+        if self.no_first_user {
+            return Ok(None);
+        }
+        Ok(Some(user_entity(
+            BOB_ID,
+            "bob",
+            self.first_user_password.as_deref(),
+        )))
     }
     async fn get_user_by_name(&self, name: &str) -> Result<Option<UserEntity>, ServiceError> {
         Ok(mem_users().into_iter().find(|u| u.username == name))
@@ -666,4 +679,127 @@ async fn startup_user_get_and_set_password() {
     let (id, pw) = users.changed_password.lock().unwrap().clone().unwrap();
     assert_eq!(id, BOB_ID);
     assert_eq!(pw, "hunter2");
+}
+
+// ---------------------------------------------------------------------------
+// `POST /Startup/User` — the guard from upstream security commit 62a5ded920
+// ("Prevent unauthenticated re-run of the startup wizard on misconfiguration",
+// Shadowghost, 2026-07-17). Ferrofin tracks upstream MASTER here, so these three
+// cases are transliterated from master's own
+// `tests/Jellyfin.Api.Tests/Controllers/StartupControllerTests.cs`. Jellyfin
+// 10.11.8 predates the commit and answers 204 for all of them, silently
+// re-setting an already-provisioned admin's password — that is the divergence
+// recorded as `jellyfin-bug` in suite/parity/classifications.json, and it is why
+// the parity journey cannot be the oracle for this behaviour. These tests are.
+//
+// Do not relax any of them: 10.11.8's shape is the hole batch A1 closed on this
+// same controller, one layer deeper.
+
+/// Drives one `POST /Startup/User` against `users` and returns the status.
+async fn post_startup_user(users: Arc<MemUsers>, body: serde_json::Value) -> StatusCode {
+    let router = create_router(state(users, Arc::new(MemConfig::new(false))));
+    router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/Startup/User")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+}
+
+#[tokio::test]
+async fn startup_user_post_returns_404_when_no_first_user() {
+    // master: `var user = _userManager.GetFirstUser(); if (user is null) return NotFound();`
+    // (upstream `UpdateStartupUser_WhenNoUserExists_ReturnsNotFound`).
+    let users = Arc::new(MemUsers {
+        no_first_user: true,
+        ..MemUsers::default()
+    });
+    let status = post_startup_user(
+        users.clone(),
+        serde_json::json!({ "Name": "admin", "Password": "pw" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(users.changed_password.lock().unwrap().is_none());
+}
+
+#[tokio::test]
+async fn startup_user_post_forbidden_when_password_already_set() {
+    // master: `if (!string.IsNullOrEmpty(user.Password)) return Forbid();`
+    // Upstream's `UpdateStartupUser_WhenPasswordAlreadyConfigured_ReturnsForbidden`
+    // asserts `ForbidResult` AND `ChangePassword(..) Times.Never` — the status
+    // alone would not prove the write was skipped, which is the whole point of
+    // the guard.
+    let users = Arc::new(MemUsers {
+        first_user_password: Some("already-set-hash".to_owned()),
+        ..MemUsers::default()
+    });
+    let status = post_startup_user(
+        users.clone(),
+        serde_json::json!({ "Name": "attacker", "Password": "new-pw" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(
+        users.changed_password.lock().unwrap().is_none(),
+        "the wizard overwrote an already-provisioned account's password"
+    );
+}
+
+#[tokio::test]
+async fn startup_user_post_checks_forbid_before_the_empty_password_bad_request() {
+    // Ordering matters: master checks NotFound -> Forbid -> BadRequest. An
+    // implementation that validated the body first would leak, via a 400, that
+    // the wizard is still reachable for a provisioned account.
+    let provisioned = Arc::new(MemUsers {
+        first_user_password: Some("already-set-hash".to_owned()),
+        ..MemUsers::default()
+    });
+    assert_eq!(
+        post_startup_user(
+            provisioned,
+            serde_json::json!({ "Name": "bob", "Password": "   " })
+        )
+        .await,
+        StatusCode::FORBIDDEN
+    );
+
+    // …and with no password yet, the same body IS the BadRequest arm
+    // (`string.IsNullOrWhiteSpace(startupUserDto.Password)`).
+    let virgin = Arc::new(MemUsers::default());
+    assert_eq!(
+        post_startup_user(
+            virgin.clone(),
+            serde_json::json!({ "Name": "bob", "Password": "   " })
+        )
+        .await,
+        StatusCode::BAD_REQUEST
+    );
+    assert!(virgin.changed_password.lock().unwrap().is_none());
+}
+
+#[tokio::test]
+async fn startup_user_post_treats_an_empty_password_column_as_unset() {
+    // master guards on `!string.IsNullOrEmpty(user.Password)`, not on "is the
+    // column present". A `Password` of `''` — reachable through an adopted or
+    // hand-edited Jellyfin DB, never through `DefaultAuthenticationProvider`,
+    // which writes NULL — must still be able to run the wizard once.
+    let users = Arc::new(MemUsers {
+        first_user_password: Some(String::new()),
+        ..MemUsers::default()
+    });
+    let status = post_startup_user(
+        users.clone(),
+        serde_json::json!({ "Name": "bob", "Password": "hunter2" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (id, pw) = users.changed_password.lock().unwrap().clone().unwrap();
+    assert_eq!((id, pw.as_str()), (BOB_ID, "hunter2"));
 }

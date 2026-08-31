@@ -799,6 +799,22 @@ pub trait ItemCountService: Send + Sync {
         parent_ids: &[Uuid],
         user_id: Option<Uuid>,
     ) -> Result<HashMap<Uuid, i32>, ServiceError>;
+
+    /// How many LINKED children each of `parent_ids` has — C#
+    /// `Folder.LinkedChildren.Length`, the playlist-entry / merged-version edge
+    /// list, not the hierarchical `ParentId` children.
+    ///
+    /// Distinct from [`Self::get_child_count_batch`], which prefers linked
+    /// children but falls back to hierarchical ones and is only ever consulted
+    /// when the caller asked for the `ChildCount` field.
+    /// `DtoService.AttachUserSpecificInfo` needs the raw linked count for the
+    /// `MusicAlbum`/`Season`/`Playlist` shortcut, which runs with no field gate
+    /// at all (v10.11.8 Emby.Server.Implementations/Dto/DtoService.cs:472-486).
+    /// A parent with no linked children is absent from the map.
+    async fn get_linked_children_count_batch(
+        &self,
+        parent_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, i32>, ServiceError>;
 }
 
 fn _assert_object_safe_item_count_service(_: &dyn ItemCountService) {}
@@ -901,12 +917,17 @@ pub trait MediaStreamRepository: Send + Sync {
             .collect())
     }
 
-    /// The subset of `item_ids` with at least one **lyric** stream row.
+    /// The subset of `item_ids` with at least one LYRIC stream row.
     ///
-    /// Backs the DTO builder's `HasLyrics` (C# `DtoService`:
-    /// `if (item is Audio audio) dto.HasLyrics = audio.GetMediaStreams()
-    /// .Any(s => s.Type == MediaStreamType.Lyric);`). Same shape, and same
-    /// reason for an ids-only override, as [`Self::get_item_ids_with_subtitles`].
+    /// Backs the DTO builder's `HasLyrics`, which C# emits on every `Audio` DTO
+    /// outside the `ItemFields` system (`if (item is Audio audio)
+    /// dto.HasLyrics = audio.GetMediaStreams().Any(s => s.Type ==
+    /// MediaStreamType.Lyric);`, v10.11.8
+    /// Emby.Server.Implementations/Dto/DtoService.cs:308-311). The default
+    /// filters the full stream batch; the concrete repository overrides it with
+    /// an ids-only query so a music page does not materialize stream rows —
+    /// same shape, and same reason for the override, as
+    /// [`Self::get_item_ids_with_subtitles`].
     async fn get_item_ids_with_lyrics(&self, item_ids: &[Uuid]) -> Result<Vec<Uuid>, ServiceError> {
         let map = self.get_media_streams_batch(item_ids).await?;
         // Stored `StreamType` discriminant 5 = Lyric

@@ -110,6 +110,19 @@ mod tests {
 
     #[async_trait]
     impl LiveTvManager for FakeLiveTv {
+        async fn get_guide_info(&self) -> Result<ferrofin_model::live_tv::GuideInfo, ServiceError> {
+            unimplemented!("this fake is never asked for the guide window")
+        }
+        async fn get_recommended_programs(
+            &self,
+            _query: &ferrofin_traits::options::InternalItemsQuery,
+            _options: &ferrofin_traits::options::DtoOptions,
+        ) -> Result<
+            ferrofin_model::querying::QueryResult<ferrofin_model::dto::BaseItemDto>,
+            ServiceError,
+        > {
+            unimplemented!("this fake is never asked for recommended programs")
+        }
         fn has_tuner_hosts(&self) -> bool {
             self.tuners.load(Ordering::Relaxed)
         }
@@ -134,6 +147,16 @@ mod tests {
             &self,
             _info: ferrofin_model::live_tv::TunerHostInfo,
         ) -> Result<ferrofin_model::live_tv::TunerHostInfo, ServiceError> {
+            unimplemented!()
+        }
+        fn tuner_host_types(&self) -> Vec<ferrofin_model::dto::NameIdPair> {
+            unimplemented!()
+        }
+        async fn discover_tuners(
+            &self,
+            _discovery_duration_ms: u64,
+            _new_devices_only: bool,
+        ) -> Result<Vec<ferrofin_model::live_tv::TunerHostInfo>, ServiceError> {
             unimplemented!()
         }
         async fn delete_tuner_host(&self, _id: &str) -> Result<(), ServiceError> {
@@ -250,6 +273,7 @@ mod tests {
         }
         async fn get_series_timers(
             &self,
+            _query: &ferrofin_model::live_tv::SeriesTimerQuery,
         ) -> Result<Vec<ferrofin_model::live_tv::SeriesTimerInfoDto>, ServiceError> {
             unimplemented!()
         }

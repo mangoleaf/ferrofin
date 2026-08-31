@@ -63,6 +63,17 @@ impl CountriesLiveTv {
 
 #[async_trait]
 impl LiveTvManager for CountriesLiveTv {
+    async fn get_guide_info(&self) -> Result<ferrofin_model::live_tv::GuideInfo, ServiceError> {
+        unimplemented!("this fake is never asked for the guide window")
+    }
+    async fn get_recommended_programs(
+        &self,
+        _query: &ferrofin_traits::options::InternalItemsQuery,
+        _options: &ferrofin_traits::options::DtoOptions,
+    ) -> Result<ferrofin_model::querying::QueryResult<ferrofin_model::dto::BaseItemDto>, ServiceError>
+    {
+        unimplemented!("this fake is never asked for recommended programs")
+    }
     async fn get_schedules_direct_countries(&self) -> Result<Vec<u8>, ServiceError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.document
@@ -77,6 +88,16 @@ impl LiveTvManager for CountriesLiveTv {
         unreachable!()
     }
     async fn save_tuner_host(&self, _info: TunerHostInfo) -> Result<TunerHostInfo, ServiceError> {
+        unreachable!()
+    }
+    fn tuner_host_types(&self) -> Vec<ferrofin_model::dto::NameIdPair> {
+        unreachable!()
+    }
+    async fn discover_tuners(
+        &self,
+        _discovery_duration_ms: u64,
+        _new_devices_only: bool,
+    ) -> Result<Vec<TunerHostInfo>, ServiceError> {
         unreachable!()
     }
     async fn delete_tuner_host(&self, _id: &str) -> Result<(), ServiceError> {
@@ -171,7 +192,10 @@ impl LiveTvManager for CountriesLiveTv {
     async fn cancel_timer(&self, _id: &str) -> Result<(), ServiceError> {
         unreachable!()
     }
-    async fn get_series_timers(&self) -> Result<Vec<SeriesTimerInfoDto>, ServiceError> {
+    async fn get_series_timers(
+        &self,
+        _query: &ferrofin_model::live_tv::SeriesTimerQuery,
+    ) -> Result<Vec<SeriesTimerInfoDto>, ServiceError> {
         unreachable!()
     }
     async fn get_series_timer(

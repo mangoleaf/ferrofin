@@ -43,10 +43,14 @@ use ferrofin_traits::options::{DtoOptions, InternalItemsQuery};
 
 use ferrofin_traits::stubs::LiveTvChannelQuery;
 
-use crate::auth::{RequireAdmin, RequireAuth};
+use crate::auth::{RequireAdmin, RequireLiveTvAccess, RequireLiveTvManagement};
 use crate::error::ApiError;
+use crate::extract::JsonBody;
 use crate::handlers::items::{effective_user_id, resolve_user_opt};
-use crate::handlers::query_parse::{parse_csv_enums_lenient, parse_csv_uuids, parse_pipe_strings};
+use crate::handlers::query_parse::{
+    de_comma_delimited, de_pipe_delimited, parse_csv_enums_lenient, parse_csv_uuids,
+    parse_pipe_strings,
+};
 use crate::state::AppState;
 
 /// `GET /LiveTv/Info` — top-level Live TV status.
@@ -55,7 +59,7 @@ use crate::state::AppState;
 /// single M3U/XMLTV service once a tuner host exists), or disabled when none.
 async fn get_live_tv_info(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireLiveTvAccess(_auth): RequireLiveTvAccess,
 ) -> Result<Json<LiveTvInfo>, ApiError> {
     match state.live_tv.as_ref() {
         Some(m) => Ok(Json(m.get_live_tv_info().await?)),
@@ -63,24 +67,33 @@ async fn get_live_tv_info(
     }
 }
 
-/// Number of days of guide data the window spans, forward from now.
+/// Number of days of guide data the window spans when no Live TV manager is
+/// wired to read the configured value from.
 ///
-/// Mirrors Jellyfin's `LiveTvOptions.GuideDays` fallback (7). This is a
-/// candidate configuration value (valid range 1..=14); it is hardcoded here
-/// until Live TV options are surfaced in Ferrofin's config.
+/// Port of the `: 7` fallback in `GuideManager.GetGuideDays` (v10.11.8
+/// GuideManager.cs:161-168).
 const GUIDE_DAYS_DEFAULT: i64 = 7;
 
 /// `GET /LiveTv/GuideInfo` — the guide's date range.
 ///
-/// Port of `LiveTvController.GetGuideInfo`. Returns a now-relative window
-/// spanning [`GUIDE_DAYS_DEFAULT`] days forward from the current instant.
-async fn get_guide_info(RequireAuth(_auth): RequireAuth) -> Json<GuideInfo> {
+/// Port of `LiveTvController.GetGuideInfo` => `IGuideManager.GetGuideInfo`:
+/// `now .. now + GuideDays`, where `GuideDays` is the dashboard's Live TV
+/// setting clamped to `1..=14`. The day count comes from the manager, not from
+/// this handler, because the guide *ingest* window is computed from the same
+/// setting — a handler with its own constant would happily advertise a week of
+/// guide over a fortnight of stored airings, or the reverse.
+async fn get_guide_info(
+    State(state): State<AppState>,
+    RequireLiveTvAccess(_auth): RequireLiveTvAccess,
+) -> Result<Json<GuideInfo>, ApiError> {
+    if let Some(manager) = state.live_tv.as_ref() {
+        return Ok(Json(manager.get_guide_info().await?));
+    }
     let start = Utc::now();
-    let end = start + chrono::Duration::days(GUIDE_DAYS_DEFAULT);
-    Json(GuideInfo {
+    Ok(Json(GuideInfo {
         start_date: start,
-        end_date: end,
-    })
+        end_date: start + chrono::Duration::days(GUIDE_DAYS_DEFAULT),
+    }))
 }
 
 /// The query parameters honoured by `GET /LiveTv/Channels`.
@@ -147,7 +160,7 @@ struct ChannelsQuery {
 /// `addCurrentProgram=false`).
 async fn get_channels(
     State(state): State<AppState>,
-    RequireAuth(auth): RequireAuth,
+    RequireLiveTvAccess(auth): RequireLiveTvAccess,
     Query(query): Query<ChannelsQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     let Some(m) = state.live_tv.as_ref() else {
@@ -196,7 +209,7 @@ async fn get_channels(
 /// no known client requests a channel by the empty guid.
 async fn get_channel(
     State(state): State<AppState>,
-    RequireAuth(auth): RequireAuth,
+    RequireLiveTvAccess(auth): RequireLiveTvAccess,
     Path(channel_id): Path<Uuid>,
     Query(query): Query<UserIdQuery>,
 ) -> Result<Json<BaseItemDto>, ApiError> {
@@ -337,11 +350,19 @@ impl ProgramsQuery {
 /// Every array member is nullable in the vendored schema and upstream coalesces
 /// each to empty (`body.ChannelIds ?? []`), so they bind as `Option<Vec<_>>`
 /// and collapse the same way.
+///
+/// Seven of those members carry a delimited-collection converter upstream
+/// (`JsonCommaDelimitedCollectionConverterFactory`, or the *pipe* factory on
+/// `Genres`), so each also accepts the delimited-**string** spelling —
+/// `{"SortBy":"StartDate"}` as well as `{"SortBy":["StartDate"]}` — with
+/// unconvertible entries dropped rather than rejected. See
+/// [`de_comma_delimited`].
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(rename_all = "PascalCase", default)]
 #[allow(clippy::struct_excessive_bools)] // one field per contract property
 struct GetProgramsDto {
     /// The channels to return guide information for.
+    #[serde(deserialize_with = "de_comma_delimited")]
     channel_ids: Option<Vec<Uuid>>,
     /// The target user. Unlike the query-string form this does *not* fall back
     /// to the authenticated caller (upstream reads the body id only).
@@ -377,18 +398,24 @@ struct GetProgramsDto {
     /// The maximum number of records to return.
     limit: Option<i32>,
     /// The sort columns.
+    #[serde(deserialize_with = "de_comma_delimited")]
     sort_by: Option<Vec<ItemSortBy>>,
     /// The sort orders, paired positionally with `SortBy`.
+    #[serde(deserialize_with = "de_comma_delimited")]
     sort_order: Option<Vec<SortOrder>>,
-    /// The genre names to return guide information for.
+    /// The genre names to return guide information for. Upstream decorates
+    /// this one — and only this one — with the *pipe* converter factory.
+    #[serde(deserialize_with = "de_pipe_delimited")]
     genres: Option<Vec<String>>,
     /// The genre ids to return guide information for.
+    #[serde(deserialize_with = "de_comma_delimited")]
     genre_ids: Option<Vec<Uuid>>,
     /// Whether image information is included.
     enable_images: Option<bool>,
     /// The maximum number of images returned per image type.
     image_type_limit: Option<i32>,
     /// The image types to include.
+    #[serde(deserialize_with = "de_comma_delimited")]
     enable_image_types: Option<Vec<ImageType>>,
     /// Whether user data is included.
     enable_user_data: Option<bool>,
@@ -397,6 +424,7 @@ struct GetProgramsDto {
     /// Filter to the programmes of one library series.
     library_series_id: Option<Uuid>,
     /// Additional DTO fields.
+    #[serde(deserialize_with = "de_comma_delimited")]
     fields: Option<Vec<ItemFields>>,
     /// Whether the total record count is computed (schema default `true`).
     enable_total_record_count: Option<bool>,
@@ -661,7 +689,7 @@ fn parse_date_time(raw: &str) -> Option<DateTime<Utc>> {
 /// caller (C# `RequestHelpers.GetUserId`).
 async fn get_programs(
     State(state): State<AppState>,
-    RequireAuth(auth): RequireAuth,
+    RequireLiveTvAccess(auth): RequireLiveTvAccess,
     Query(query): Query<ProgramsQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     let user = resolve_user_opt(&state, &auth, query.user_id).await?;
@@ -677,8 +705,8 @@ async fn get_programs(
 /// back to the authenticated caller here.
 async fn post_programs(
     State(state): State<AppState>,
-    RequireAuth(auth): RequireAuth,
-    Json(body): Json<GetProgramsDto>,
+    RequireLiveTvAccess(auth): RequireLiveTvAccess,
+    JsonBody(body): JsonBody<GetProgramsDto>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     let user = match body.user_id.filter(|id| !id.is_nil()) {
         Some(id) => resolve_user_opt(&state, &auth, Some(id)).await?,
@@ -690,33 +718,21 @@ async fn post_programs(
 
 /// `GET /LiveTv/Programs/Recommended` — "On Now" / recommended programs.
 ///
-/// Port of `LiveTvController.GetRecommendedPrograms`. Upstream's
-/// `LiveTvManager.GetRecommendedProgramsAsync` is **not** merely a filtered
-/// program list:
-///
-/// - when `isAiring` is anything but `true` it *is* `GetPrograms` — the same
-///   query, so this handler takes the same path;
-/// - when `isAiring` is `true` it additionally re-orders the airing programmes
-///   by a per-user recommendation score (channel liked / favourited / play
-///   count, plus live and non-repeat bonuses), over-fetching
-///   `max(limit * 4, 200)` rows to rank within.
-///
-/// That score needs per-user *channel* user-data, which Ferrofin's
-/// [`LiveTvManager`] seam does not expose (no user-data method, and its M3U
-/// channels carry none), so the ranking step is an accepted divergence: airing
-/// programmes come back in start-date order — Jellyfin's own primary sort key —
-/// and the over-fetch is deliberately not done, since pulling four times the
-/// requested rows only to return them unranked would break `limit`. The filters
-/// themselves (`isAiring`, `hasAired`, the kind flags, `genreIds`, paging) are
-/// honoured.
+/// Port of `LiveTvController.GetRecommendedPrograms`. The filters are assembled
+/// exactly as for `GET /LiveTv/Programs`; the difference is entirely in the
+/// manager, whose `get_recommended_programs` ranks the airing branch by
+/// Jellyfin's per-user recommendation score (see
+/// [`LiveTvManager::get_recommended_programs`](ferrofin_traits::live_tv::LiveTvManager::get_recommended_programs)).
 async fn get_recommended_programs(
     State(state): State<AppState>,
-    RequireAuth(auth): RequireAuth,
+    RequireLiveTvAccess(auth): RequireLiveTvAccess,
     Query(query): Query<RecommendedProgramsQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     let user = resolve_user_opt(&state, &auth, query.user_id).await?;
     let (filters, options) = query.into_parts()?;
-    Ok(Json(query_programs(&state, user, filters, &options).await?))
+    Ok(Json(
+        query_programs_inner(&state, user, filters, &options, true).await?,
+    ))
 }
 
 /// `GET /LiveTv/Programs/{programId}` — a single programme.
@@ -726,7 +742,7 @@ async fn get_recommended_programs(
 /// unknown.
 async fn get_program(
     State(state): State<AppState>,
-    RequireAuth(auth): RequireAuth,
+    RequireLiveTvAccess(auth): RequireLiveTvAccess,
     Path(program_id): Path<Uuid>,
     Query(query): Query<UserIdQuery>,
 ) -> Result<Json<BaseItemDto>, ApiError> {
@@ -751,6 +767,22 @@ async fn query_programs(
     user: Option<UserEntity>,
     filters: ProgramFilters,
     options: &DtoOptions,
+) -> Result<QueryResult<BaseItemDto>, ApiError> {
+    query_programs_inner(state, user, filters, options, false).await
+}
+
+/// The shared body of `GET/POST /LiveTv/Programs` and
+/// `GET /LiveTv/Programs/Recommended`.
+///
+/// `recommended` picks which manager entry point the assembled query goes to:
+/// upstream's two controller actions build the identical `InternalItemsQuery`
+/// and differ only in calling `GetProgramsAsync` vs `GetRecommendedProgramsAsync`.
+async fn query_programs_inner(
+    state: &AppState,
+    user: Option<UserEntity>,
+    filters: ProgramFilters,
+    options: &DtoOptions,
+    recommended: bool,
 ) -> Result<QueryResult<BaseItemDto>, ApiError> {
     let Some(manager) = state.live_tv.as_ref() else {
         return Ok(QueryResult::default());
@@ -794,7 +826,11 @@ async fn query_programs(
             query.name = series.name;
         }
     }
-    Ok(manager.get_programs(&query, options).await?)
+    Ok(if recommended {
+        manager.get_recommended_programs(&query, options).await?
+    } else {
+        manager.get_programs(&query, options).await?
+    })
 }
 
 /// `POST /LiveTv/TunerHosts` — add (or update) an M3U tuner host.
@@ -806,7 +842,7 @@ async fn query_programs(
 async fn add_tuner_host(
     State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
-    Json(info): Json<TunerHostInfo>,
+    JsonBody(info): JsonBody<TunerHostInfo>,
 ) -> Result<Json<TunerHostInfo>, ApiError> {
     let m = live_tv(&state)?;
     let saved = m.save_tuner_host(info).await?;
@@ -835,7 +871,7 @@ async fn delete_tuner_host(
 async fn add_listing_provider(
     State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
-    Json(info): Json<ListingsProviderInfo>,
+    JsonBody(info): JsonBody<ListingsProviderInfo>,
 ) -> Result<Json<ListingsProviderInfo>, ApiError> {
     let m = live_tv(&state)?;
     let saved = m.save_listing_provider(info).await?;
@@ -974,7 +1010,7 @@ struct RecordingsQuery {
 /// how far through it is.
 async fn get_recordings(
     State(state): State<AppState>,
-    RequireAuth(auth): RequireAuth,
+    RequireLiveTvAccess(auth): RequireLiveTvAccess,
     Query(query): Query<RecordingsQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     let Some(manager) = state.live_tv.as_ref() else {
@@ -1035,7 +1071,7 @@ struct LiveTvUserQuery {
 /// must be one here.
 async fn get_recording(
     State(state): State<AppState>,
-    RequireAuth(auth): RequireAuth,
+    RequireLiveTvAccess(auth): RequireLiveTvAccess,
     Path(recording_id): Path<Uuid>,
     Query(query): Query<LiveTvUserQuery>,
 ) -> Result<Json<BaseItemDto>, ApiError> {
@@ -1050,7 +1086,7 @@ async fn get_recording(
 /// `DELETE /LiveTv/Recordings/{recordingId}` — delete a recording + its file.
 async fn delete_recording(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireLiveTvManagement(_auth): RequireLiveTvManagement,
     Path(recording_id): Path<Uuid>,
 ) -> Result<axum::http::StatusCode, ApiError> {
     live_tv(&state)?.delete_recording(recording_id).await?;
@@ -1059,12 +1095,13 @@ async fn delete_recording(
 
 /// `GET /LiveTv/Recordings/Folders` — recording folders (not modelled → empty).
 ///
-/// Empty either way, but the `userId` gate still runs: upstream applies
-/// `RequestHelpers.GetUserId` before it asks the manager for folders, so an
+/// Empty either way, but both gates still run: the route is
+/// `[Authorize(Policy = Policies.LiveTvAccess)]`, and upstream then applies
+/// `RequestHelpers.GetUserId` before it asks the manager for folders — so an
 /// unentitled caller gets a `403` rather than an empty `200`.
 async fn get_recording_folders(
     State(state): State<AppState>,
-    RequireAuth(auth): RequireAuth,
+    RequireLiveTvAccess(auth): RequireLiveTvAccess,
     Query(query): Query<LiveTvUserQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     effective_user_id(&state, &auth, query.user_id).await?;
@@ -1072,7 +1109,9 @@ async fn get_recording_folders(
 }
 
 /// `GET /LiveTv/Recordings/Groups` — recording groups (deprecated; empty).
-async fn get_recording_groups(RequireAuth(_auth): RequireAuth) -> Json<QueryResult<BaseItemDto>> {
+async fn get_recording_groups(
+    RequireLiveTvAccess(_auth): RequireLiveTvAccess,
+) -> Json<QueryResult<BaseItemDto>> {
     Json(QueryResult::default())
 }
 
@@ -1082,7 +1121,7 @@ async fn get_recording_groups(RequireAuth(_auth): RequireAuth) -> Json<QueryResu
 /// concept (the list endpoint returns empty), so no group is ever resolvable and
 /// this always reports `404` — the faithful outcome.
 async fn get_recording_group(
-    RequireAuth(_auth): RequireAuth,
+    RequireLiveTvAccess(_auth): RequireLiveTvAccess,
     Path(_group_id): Path<Uuid>,
 ) -> Result<Json<BaseItemDto>, ApiError> {
     Err(ApiError::NotFound("recording group".into()))
@@ -1340,7 +1379,7 @@ struct SetChannelMappingDto {
 async fn set_channel_mapping(
     State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
-    Json(dto): Json<SetChannelMappingDto>,
+    JsonBody(dto): JsonBody<SetChannelMappingDto>,
 ) -> Result<Json<TunerChannelMapping>, ApiError> {
     let m = live_tv(&state)?;
     let mapping = m
@@ -1357,7 +1396,9 @@ async fn set_channel_mapping(
 }
 
 /// `GET /LiveTv/Recordings/Series` — series recordings (deprecated; empty).
-async fn get_recordings_series(RequireAuth(_auth): RequireAuth) -> Json<QueryResult<BaseItemDto>> {
+async fn get_recordings_series(
+    RequireLiveTvAccess(_auth): RequireLiveTvAccess,
+) -> Json<QueryResult<BaseItemDto>> {
     Json(QueryResult::default())
 }
 
@@ -1383,7 +1424,7 @@ struct TimersQuery {
 /// scheduled filters, ordered by start date.
 async fn get_timers(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireLiveTvAccess(_auth): RequireLiveTvAccess,
     Query(query): Query<TimersQuery>,
 ) -> Result<Json<QueryResult<TimerInfoDto>>, ApiError> {
     let Some(manager) = state.live_tv.as_ref() else {
@@ -1404,7 +1445,7 @@ async fn get_timers(
 /// `GET /LiveTv/Timers/{timerId}` — a single timer (`404` if absent).
 async fn get_timer(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireLiveTvAccess(_auth): RequireLiveTvAccess,
     Path(timer_id): Path<String>,
 ) -> Result<Json<TimerInfoDto>, ApiError> {
     live_tv(&state)?
@@ -1417,8 +1458,8 @@ async fn get_timer(
 /// `POST /LiveTv/Timers` — create a recording timer.
 async fn create_timer(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
-    Json(timer): Json<TimerInfoDto>,
+    RequireLiveTvManagement(_auth): RequireLiveTvManagement,
+    JsonBody(timer): JsonBody<TimerInfoDto>,
 ) -> Result<axum::http::StatusCode, ApiError> {
     let program_id = timer.base.program_id.clone();
     let id = live_tv(&state)?.create_timer(timer).await?;
@@ -1456,9 +1497,9 @@ async fn notify_timer_event(
 /// `POST /LiveTv/Timers/{timerId}` — update a recording timer.
 async fn update_timer(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireLiveTvManagement(_auth): RequireLiveTvManagement,
     Path(timer_id): Path<String>,
-    Json(timer): Json<TimerInfoDto>,
+    JsonBody(timer): JsonBody<TimerInfoDto>,
 ) -> Result<axum::http::StatusCode, ApiError> {
     live_tv(&state)?.update_timer(&timer_id, timer).await?;
     Ok(axum::http::StatusCode::NO_CONTENT)
@@ -1467,7 +1508,7 @@ async fn update_timer(
 /// `DELETE /LiveTv/Timers/{timerId}` — cancel a recording timer.
 async fn cancel_timer(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireLiveTvManagement(_auth): RequireLiveTvManagement,
     Path(timer_id): Path<String>,
 ) -> Result<axum::http::StatusCode, ApiError> {
     live_tv(&state)?.cancel_timer(&timer_id).await?;
@@ -1501,7 +1542,7 @@ struct TimerDefaultsQuery {
 /// client posts straight back to create the timer.
 async fn get_default_timer(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireLiveTvAccess(_auth): RequireLiveTvAccess,
     Query(query): Query<TimerDefaultsQuery>,
 ) -> Result<Json<SeriesTimerInfoDto>, ApiError> {
     match state.live_tv.as_ref() {
@@ -1522,13 +1563,35 @@ async fn get_default_timer(
     }
 }
 
+/// The query `GET /LiveTv/SeriesTimers` binds.
+///
+/// Port of `LiveTvController.GetSeriesTimers`'s `[FromQuery] string? sortBy` +
+/// `[FromQuery] SortOrder? sortOrder` (v10.11.8 LiveTvController.cs:896-905),
+/// which it hands to `SeriesTimerQuery` with `SortOrder.Ascending` as the
+/// default.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct SeriesTimersQuery {
+    /// The field to sort on — only `Priority` is recognised upstream.
+    sort_by: Option<String>,
+    /// The sort direction.
+    sort_order: Option<ferrofin_model::dto::SortOrder>,
+}
+
 /// `GET /LiveTv/SeriesTimers` — recurring (series) timers.
 async fn get_series_timers(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireLiveTvAccess(_auth): RequireLiveTvAccess,
+    Query(query): Query<SeriesTimersQuery>,
 ) -> Result<Json<QueryResult<SeriesTimerInfoDto>>, ApiError> {
+    let query = ferrofin_model::live_tv::SeriesTimerQuery {
+        sort_by: query.sort_by,
+        sort_order: query.sort_order.unwrap_or_default(),
+    };
     match state.live_tv.as_ref() {
-        Some(m) => Ok(Json(QueryResult::from_items(m.get_series_timers().await?))),
+        Some(m) => Ok(Json(QueryResult::from_items(
+            m.get_series_timers(&query).await?,
+        ))),
         None => Ok(Json(QueryResult::default())),
     }
 }
@@ -1536,7 +1599,7 @@ async fn get_series_timers(
 /// `GET /LiveTv/SeriesTimers/{timerId}` — a single series timer (`404` if absent).
 async fn get_series_timer(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireLiveTvAccess(_auth): RequireLiveTvAccess,
     Path(timer_id): Path<String>,
 ) -> Result<Json<SeriesTimerInfoDto>, ApiError> {
     live_tv(&state)?
@@ -1549,8 +1612,8 @@ async fn get_series_timer(
 /// `POST /LiveTv/SeriesTimers` — create a series timer.
 async fn create_series_timer(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
-    Json(timer): Json<SeriesTimerInfoDto>,
+    RequireLiveTvManagement(_auth): RequireLiveTvManagement,
+    JsonBody(timer): JsonBody<SeriesTimerInfoDto>,
 ) -> Result<axum::http::StatusCode, ApiError> {
     let program_id = timer.base.program_id.clone();
     let id = live_tv(&state)?.create_series_timer(timer).await?;
@@ -1567,9 +1630,9 @@ async fn create_series_timer(
 /// `POST /LiveTv/SeriesTimers/{timerId}` — update a series timer.
 async fn update_series_timer(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireLiveTvManagement(_auth): RequireLiveTvManagement,
     Path(timer_id): Path<String>,
-    Json(timer): Json<SeriesTimerInfoDto>,
+    JsonBody(timer): JsonBody<SeriesTimerInfoDto>,
 ) -> Result<axum::http::StatusCode, ApiError> {
     live_tv(&state)?
         .update_series_timer(&timer_id, timer)
@@ -1580,7 +1643,7 @@ async fn update_series_timer(
 /// `DELETE /LiveTv/SeriesTimers/{timerId}` — cancel a series timer.
 async fn cancel_series_timer(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireLiveTvManagement(_auth): RequireLiveTvManagement,
     Path(timer_id): Path<String>,
 ) -> Result<axum::http::StatusCode, ApiError> {
     live_tv(&state)?.cancel_series_timer(&timer_id).await?;
@@ -1624,7 +1687,7 @@ async fn get_channel_mapping_options(
 
 /// `GET /LiveTv/ListingProviders/Default` — default listing-provider config.
 async fn get_default_listing_provider(
-    RequireAuth(_auth): RequireAuth,
+    RequireLiveTvAccess(_auth): RequireLiveTvAccess,
 ) -> Json<ListingsProviderInfo> {
     Json(ListingsProviderInfo::default())
 }
@@ -1654,20 +1717,13 @@ struct LineupsQuery {
 /// when the provider cannot be resolved, which is what the C#
 /// `ResourceNotFoundException` maps to.
 ///
-/// AUTHORIZATION GAP, recorded here rather than left to a review note: upstream
-/// is `[Authorize(Policy = Policies.LiveTvAccess)]` (LiveTvController.cs:1075
-/// @ v10.11.8), i.e. an authenticated user whose `EnableLiveTvAccess` permission
-/// is set — this checkout has no such extractor, so every Live TV READ route
-/// here (Info, Channels, Programs, Recordings, …) is `RequireAuth`, and this one
-/// matches its neighbours rather than inventing a second, inconsistent rule. The
-/// `UserPermissionRequirement` port that closes it for the whole surface lands
-/// with the Live TV policy work (upstream commit `2df565d`, not an ancestor of
-/// this branch); duplicating it here would collide with it at merge. Writes are
-/// unaffected: `Policies.RequiresElevation` is `RequireAdmin`, which the tuner
-/// and listings-provider mutations already use.
+/// `[Authorize(Policy = Policies.LiveTvAccess)]` upstream
+/// (`LiveTvController.cs:1075` @ v10.11.8), and [`RequireLiveTvAccess`] is the
+/// port of that policy — an earlier note here recorded the missing extractor as
+/// an open authorization gap; it is closed.
 async fn get_lineups(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireLiveTvAccess(_auth): RequireLiveTvAccess,
     Query(q): Query<LineupsQuery>,
 ) -> Result<Json<Vec<NameIdPair>>, ApiError> {
     Ok(Json(
@@ -1682,19 +1738,59 @@ async fn get_lineups(
     ))
 }
 
+/// How long each tuner backend is given to answer a discovery scan.
+///
+/// `TunerHostManager.TunerDiscoveryDurationMs` (v10.11.8
+/// TunerHostManager.cs:23) — the budget upstream gives `DiscoverDevices`, which
+/// for HDHomeRun is how long the UDP broadcast's replies are collected. Long
+/// enough for a device on the same segment to answer, short enough that a
+/// dashboard "Detect my devices" click is not a hang.
+const TUNER_DISCOVERY_DURATION_MS: u64 = 3000;
+
 /// `GET /LiveTv/TunerHosts/Types` — supported tuner-host types.
 ///
-/// Port of `LiveTvController.GetTunerHostTypes`. Ferrofin ships the M3U backend.
-async fn get_tuner_host_types(RequireAuth(_auth): RequireAuth) -> Json<Vec<NameIdPair>> {
-    Json(vec![NameIdPair {
-        name: Some("M3U Tuner".to_owned()),
-        id: Some("m3u".to_owned()),
-    }])
+/// Port of `LiveTvController.GetTunerHostTypes` over
+/// `ITunerHostManager.GetTunerHostTypes`: the projection of every registered,
+/// supported tuner backend, ordered by name. It is a fixed list, not a
+/// reachability probe — upstream advertises HDHomeRun whether or not a device
+/// is on the network, because `HdHomerunHost` never overrides
+/// `BaseTunerHost.IsSupported => true`.
+async fn get_tuner_host_types(
+    RequireLiveTvAccess(_auth): RequireLiveTvAccess,
+    State(state): State<AppState>,
+) -> Result<Json<Vec<NameIdPair>>, ApiError> {
+    Ok(Json(live_tv(&state)?.tuner_host_types()))
 }
 
-/// `GET /LiveTv/Tuners/Discover` — auto-discovered tuner devices (none → empty).
-async fn discover_tuners(RequireAdmin(_auth): RequireAdmin) -> Json<Vec<TunerHostInfo>> {
-    Json(Vec::new())
+/// The `?newDevicesOnly=` query both discovery routes bind.
+///
+/// `LiveTvController.DiscoverTuners([FromQuery] bool newDevicesOnly = false)`
+/// (v10.11.8 Jellyfin.Api/Controllers/LiveTvController.cs:1146-1150) — absent
+/// means `false`, i.e. report every reachable device.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct DiscoverTunersQuery {
+    /// Only report devices that are not already a configured tuner host.
+    new_devices_only: bool,
+}
+
+/// `GET /LiveTv/Tuners/Discover` — auto-discovered tuner devices.
+///
+/// Port of `LiveTvController.DiscoverTuners` over
+/// `ITunerHostManager.DiscoverTuners`: every backend scans for
+/// [`TUNER_DISCOVERY_DURATION_MS`], and `newDevicesOnly` drops the devices
+/// already configured (matched on `DeviceId`). An empty list is the honest
+/// answer on a network with no tuner on it.
+async fn discover_tuners(
+    RequireAdmin(_auth): RequireAdmin,
+    State(state): State<AppState>,
+    Query(query): Query<DiscoverTunersQuery>,
+) -> Result<Json<Vec<TunerHostInfo>>, ApiError> {
+    Ok(Json(
+        live_tv(&state)?
+            .discover_tuners(TUNER_DISCOVERY_DURATION_MS, query.new_devices_only)
+            .await?,
+    ))
 }
 
 /// Registers the Live TV surface onto `router`.
@@ -1784,8 +1880,8 @@ mod tests {
     use crate::test_support::fake_state;
 
     /// A `RequireAuth` for an authenticated (default) caller.
-    fn auth() -> RequireAuth {
-        RequireAuth(AuthorizationInfo::default())
+    fn auth() -> RequireLiveTvAccess {
+        RequireLiveTvAccess(AuthorizationInfo::default())
     }
 
     /// The elevated caller for the tuner/listing-provider routes, which are
@@ -1838,7 +1934,7 @@ mod tests {
             post_programs(
                 State(state.clone()),
                 auth(),
-                Json(GetProgramsDto::default())
+                JsonBody(GetProgramsDto::default())
             )
             .await
             .unwrap()
@@ -1866,7 +1962,7 @@ mod tests {
         let err = add_tuner_host(
             State(state.clone()),
             admin_auth(),
-            Json(TunerHostInfo::default()),
+            JsonBody(TunerHostInfo::default()),
         )
         .await
         .unwrap_err();
@@ -1882,9 +1978,79 @@ mod tests {
         assert_eq!(err.status(), axum::http::StatusCode::NOT_FOUND);
     }
 
+    /// The type list is the MANAGER's, projected — not a literal in the
+    /// handler. Ferrofin advertised only `m3u` while Jellyfin advertised
+    /// `hdhomerun` too, and the reason was exactly a literal here.
+    #[tokio::test]
+    async fn tuner_host_types_projects_the_managers_list() {
+        let state = fake_state().with_live_tv(std::sync::Arc::new(FakeLiveTv {
+            tuner_host_types: vec![
+                NameIdPair {
+                    name: Some("HD Homerun".to_owned()),
+                    id: Some("hdhomerun".to_owned()),
+                },
+                NameIdPair {
+                    name: Some("M3U Tuner".to_owned()),
+                    id: Some("m3u".to_owned()),
+                },
+            ],
+            ..FakeLiveTv::default()
+        }));
+        let types = get_tuner_host_types(auth(), State(state)).await.unwrap().0;
+        assert_eq!(
+            types
+                .iter()
+                .map(|p| p.id.clone().unwrap_or_default())
+                .collect::<Vec<_>>(),
+            ["hdhomerun", "m3u"]
+        );
+    }
+
+    /// Discovery reaches the manager, carrying upstream's 3000 ms budget, and
+    /// an empty answer stays a 200 rather than becoming an error.
+    #[tokio::test]
+    async fn discover_tuners_hands_the_manager_the_upstream_budget() {
+        let fake = std::sync::Arc::new(FakeLiveTv::default());
+        let state = fake_state().with_live_tv(fake.clone());
+        assert!(
+            discover_tuners(
+                admin_auth(),
+                State(state),
+                Query(DiscoverTunersQuery::default())
+            )
+            .await
+            .unwrap()
+            .0
+            .is_empty()
+        );
+        assert_eq!(
+            *fake.discovery_duration_ms.lock().expect("lock"),
+            Some(TUNER_DISCOVERY_DURATION_MS)
+        );
+        // `[FromQuery] bool newDevicesOnly = false` — an absent flag is false.
+        assert_eq!(*fake.discovery_new_only.lock().expect("lock"), Some(false));
+    }
+
+    /// `?newDevicesOnly=true` reaches the manager. Dropping it here is invisible
+    /// on an empty network and a live divergence on one with a tuner: upstream
+    /// filters the answer against the configured `DeviceId`s
+    /// (TunerHostManager.cs:102-121).
+    #[tokio::test]
+    async fn discover_tuners_forwards_new_devices_only() {
+        let fake = std::sync::Arc::new(FakeLiveTv::default());
+        let state = fake_state().with_live_tv(fake.clone());
+        let query: DiscoverTunersQuery =
+            serde_urlencoded::from_str("newDevicesOnly=true").expect("query");
+        let found = discover_tuners(admin_auth(), State(state), Query(query))
+            .await
+            .expect("discover");
+        assert!(found.0.is_empty());
+        assert_eq!(*fake.discovery_new_only.lock().expect("lock"), Some(true));
+    }
+
     #[tokio::test]
     async fn defaults_and_lists() {
-        let _ = get_guide_info(auth()).await;
+        let _ = get_guide_info(State(fake_state()), auth()).await;
         let _ = get_default_timer(
             State(fake_state()),
             auth(),
@@ -1892,8 +2058,35 @@ mod tests {
         )
         .await;
         let _ = get_default_listing_provider(auth()).await;
-        assert_eq!(get_tuner_host_types(auth()).await.0.len(), 1);
-        assert!(discover_tuners(admin_auth()).await.0.is_empty());
+        let smoke = fake_state().with_live_tv(std::sync::Arc::new(FakeLiveTv::default()));
+        assert!(
+            get_tuner_host_types(auth(), State(smoke.clone()))
+                .await
+                .expect("tuner host types")
+                .0
+                .is_empty(),
+            "the default fake advertises no tuner host types"
+        );
+        assert!(
+            discover_tuners(
+                admin_auth(),
+                State(smoke.clone()),
+                Query(DiscoverTunersQuery::default())
+            )
+            .await
+            .expect("discover")
+            .0
+            .is_empty()
+        );
+        // No listings provider is configured, and `ListingsManager.GetLineups`
+        // then throws `ResourceNotFoundException` — a 404, not an empty list.
+        assert_eq!(
+            get_lineups(State(smoke), auth(), Query(LineupsQuery::default()))
+                .await
+                .expect_err("no provider")
+                .status(),
+            axum::http::StatusCode::NOT_FOUND
+        );
         let state = fake_state();
         assert!(
             get_recordings(
@@ -1930,7 +2123,7 @@ mod tests {
             0
         );
         assert_eq!(
-            get_series_timers(State(state), auth())
+            get_series_timers(State(state), auth(), Query(SeriesTimersQuery::default()))
                 .await
                 .unwrap()
                 .0
@@ -1944,7 +2137,7 @@ mod tests {
     #[tokio::test]
     async fn guide_info_is_now_relative_seven_day_window() {
         let before = chrono::Utc::now();
-        let info = get_guide_info(auth()).await.0;
+        let info = get_guide_info(State(fake_state()), auth()).await.unwrap().0;
         let after = chrono::Utc::now();
         // Start is "now" (bracketed by the call), not the epoch/default.
         assert!(info.start_date >= before && info.start_date <= after);
@@ -2145,7 +2338,7 @@ mod tests {
         let map = set_channel_mapping(
             State(state),
             admin_auth(),
-            Json(SetChannelMappingDto {
+            JsonBody(SetChannelMappingDto {
                 provider_id: "p".into(),
                 tuner_channel_id: "t".into(),
                 provider_channel_id: "c".into(),
@@ -2170,6 +2363,8 @@ mod tests {
         /// The one open live stream, keyed by its unique id.
         live_stream: Option<(String, ferrofin_traits::stubs::LiveStreamFile)>,
         programs_query: std::sync::Mutex<Option<InternalItemsQuery>>,
+        /// How many times the *recommended* entry point was reached.
+        recommended_calls: std::sync::atomic::AtomicUsize,
         programs_options: std::sync::Mutex<Option<DtoOptions>>,
         channels_query: std::sync::Mutex<Option<LiveTvChannelQuery>>,
         channels_options: std::sync::Mutex<Option<DtoOptions>>,
@@ -2190,10 +2385,40 @@ mod tests {
         /// M3U/XMLTV source. A handler that awaited the refresh instead of
         /// queuing it could not answer at all.
         hang_refresh: bool,
+        /// The tuner-host types the manager reports, so a test can prove the
+        /// handler *projects the manager's list* rather than a literal.
+        tuner_host_types: Vec<NameIdPair>,
+        /// The discovery budget the handler passed down, if it was called.
+        discovery_duration_ms: std::sync::Mutex<Option<u64>>,
+        /// The `newDevicesOnly` flag the handler forwarded.
+        discovery_new_only: std::sync::Mutex<Option<bool>>,
     }
 
     #[async_trait::async_trait]
     impl ferrofin_traits::stubs::LiveTvManager for FakeLiveTv {
+        async fn get_guide_info(
+            &self,
+        ) -> Result<ferrofin_model::live_tv::GuideInfo, ferrofin_traits::error::ServiceError>
+        {
+            unimplemented!("this fake is never asked for the guide window")
+        }
+        /// Records into the same slot `get_programs` does, and counts the
+        /// call, so a test can assert both *what* the handler asked for and
+        /// *which* manager entry point it reached.
+        async fn get_recommended_programs(
+            &self,
+            query: &ferrofin_traits::options::InternalItemsQuery,
+            options: &ferrofin_traits::options::DtoOptions,
+        ) -> Result<
+            ferrofin_model::querying::QueryResult<ferrofin_model::dto::BaseItemDto>,
+            ferrofin_traits::error::ServiceError,
+        > {
+            self.recommended_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            *self.programs_query.lock().unwrap() = Some(query.clone());
+            *self.programs_options.lock().unwrap() = Some(options.clone());
+            Ok(QueryResult::from_items(vec![BaseItemDto::default()]))
+        }
         async fn get_listing_providers(
             &self,
         ) -> Result<Vec<ListingsProviderInfo>, ferrofin_traits::error::ServiceError> {
@@ -2303,6 +2528,18 @@ mod tests {
         ) -> Result<TunerHostInfo, ferrofin_traits::error::ServiceError> {
             unimplemented!()
         }
+        fn tuner_host_types(&self) -> Vec<NameIdPair> {
+            self.tuner_host_types.clone()
+        }
+        async fn discover_tuners(
+            &self,
+            discovery_duration_ms: u64,
+            new_devices_only: bool,
+        ) -> Result<Vec<TunerHostInfo>, ferrofin_traits::error::ServiceError> {
+            *self.discovery_duration_ms.lock().expect("lock") = Some(discovery_duration_ms);
+            *self.discovery_new_only.lock().expect("lock") = Some(new_devices_only);
+            Ok(Vec::new())
+        }
         async fn delete_tuner_host(
             &self,
             _id: &str,
@@ -2399,6 +2636,7 @@ mod tests {
         }
         async fn get_series_timers(
             &self,
+            _query: &ferrofin_model::live_tv::SeriesTimerQuery,
         ) -> Result<Vec<SeriesTimerInfoDto>, ferrofin_traits::error::ServiceError> {
             unimplemented!()
         }
@@ -2464,7 +2702,7 @@ mod tests {
         let mapping = set_channel_mapping(
             State(state),
             admin_auth(),
-            Json(SetChannelMappingDto {
+            JsonBody(SetChannelMappingDto {
                 provider_id: "prov1".into(),
                 tuner_channel_id: "10".into(),
                 provider_channel_id: "HBO".into(),
@@ -2505,7 +2743,7 @@ mod tests {
             add_listing_provider(
                 State(state),
                 admin_auth(),
-                Json(ListingsProviderInfo {
+                JsonBody(ListingsProviderInfo {
                     id: Some("prov1".to_owned()),
                     ..ListingsProviderInfo::default()
                 }),
@@ -2585,7 +2823,7 @@ mod tests {
         let err = set_channel_mapping(
             State(state),
             admin_auth(),
-            Json(SetChannelMappingDto {
+            JsonBody(SetChannelMappingDto {
                 provider_id: "missing".into(),
                 tuner_channel_id: "1".into(),
                 provider_channel_id: "2".into(),
@@ -2620,6 +2858,12 @@ mod tests {
         let _ = get_recommended_programs(State(state), auth(), query)
             .await
             .expect("ok");
+        assert_eq!(
+            fake.recommended_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "Recommended must reach the manager's ranked entry point, not GetPrograms"
+        );
         let recorded = fake.programs_query.lock().unwrap().clone();
         recorded.expect("the manager was called")
     }
@@ -2820,7 +3064,7 @@ mod tests {
 
         let fake = std::sync::Arc::new(FakeLiveTv::default());
         let state = fake_state().with_live_tv(fake.clone());
-        let _ = post_programs(State(state), auth(), Json(body))
+        let _ = post_programs(State(state), auth(), JsonBody(body))
             .await
             .expect("ok");
         let query = fake.programs_query.lock().unwrap().clone().expect("called");
@@ -2895,6 +3139,103 @@ mod tests {
         assert_eq!(options.image_type_limit, 1);
         assert!(!options.enable_user_data);
         assert!(options.enable_images);
+    }
+
+    /// Parses a `POST /LiveTv/Programs` body the way the handler's extractor
+    /// does, so the delimited-collection tests below exercise the real binding.
+    fn programs_body(json: &str) -> GetProgramsDto {
+        serde_json::from_str(json).expect("body binds")
+    }
+
+    #[test]
+    fn programs_body_accepts_comma_delimited_strings_and_arrays() {
+        // `GetProgramsDto.ChannelIds` carries
+        // `JsonCommaDelimitedCollectionConverterFactory` upstream, so the
+        // string form is as valid as the array form and must bind identically.
+        let one = Uuid::from_u128(1);
+        let two = Uuid::from_u128(2);
+        let from_string = programs_body(&format!(r#"{{"ChannelIds":"{one},{two}"}}"#));
+        assert_eq!(from_string.channel_ids, Some(vec![one, two]));
+        let from_array = programs_body(&format!(r#"{{"ChannelIds":["{one}","{two}"]}}"#));
+        assert_eq!(from_array.channel_ids, from_string.channel_ids);
+        // Whitespace around an entry is `Trim()`ed away upstream.
+        let spaced = programs_body(&format!(r#"{{"ChannelIds":" {one} , {two} "}}"#));
+        assert_eq!(spaced.channel_ids, Some(vec![one, two]));
+    }
+
+    #[test]
+    fn programs_body_drops_unconvertible_delimited_entries() {
+        // `catch (FormatException) { /* Ignore unconvertible inputs */ }` —
+        // a bad GUID or an unknown sort column is dropped, not a 400. Verified
+        // live against Jellyfin 10.11.8: `"ChannelIds":"not-a-guid,<real>"`
+        // returns 200 with only the real channel's programmes.
+        let real = Uuid::from_u128(3);
+        let body = programs_body(&format!(
+            r#"{{"ChannelIds":"not-a-guid,{real}","SortBy":"NotASort,StartDate"}}"#
+        ));
+        assert_eq!(body.channel_ids, Some(vec![real]));
+        assert_eq!(body.sort_by, Some(vec![ItemSortBy::StartDate]));
+    }
+
+    #[test]
+    fn programs_body_delimited_string_of_only_separators_is_empty() {
+        // `StringSplitOptions.RemoveEmptyEntries` leaves nothing, and an empty
+        // channel filter is *unfiltered* — Jellyfin answers the whole guide.
+        let body = programs_body(r#"{"ChannelIds":",,"}"#);
+        assert_eq!(body.channel_ids, Some(Vec::new()));
+        assert!(body.into_parts().0.channel_ids.is_empty());
+    }
+
+    #[test]
+    fn programs_body_genres_split_on_the_pipe_only() {
+        // `Genres` is the one property upstream gives the *pipe* factory. A
+        // comma is therefore an ordinary character inside a single genre name.
+        let piped = programs_body(r#"{"Genres":"News|Sport"}"#);
+        assert_eq!(
+            piped.genres,
+            Some(vec!["News".to_owned(), "Sport".to_owned()])
+        );
+        let commas = programs_body(r#"{"Genres":"News,Sport"}"#);
+        assert_eq!(commas.genres, Some(vec!["News,Sport".to_owned()]));
+    }
+
+    #[test]
+    fn programs_body_binds_every_delimited_property() {
+        let genre = Uuid::from_u128(4);
+        let body = programs_body(&format!(
+            r#"{{"SortOrder":"Descending","GenreIds":"{genre}",
+                 "EnableImageTypes":"Primary,Thumb","Fields":"ChannelInfo,Overview"}}"#
+        ));
+        assert_eq!(body.sort_order, Some(vec![SortOrder::Descending]));
+        assert_eq!(body.genre_ids, Some(vec![genre]));
+        assert_eq!(
+            body.enable_image_types,
+            Some(vec![ImageType::Primary, ImageType::Thumb])
+        );
+        assert_eq!(
+            body.fields,
+            Some(vec![ItemFields::ChannelInfo, ItemFields::Overview])
+        );
+    }
+
+    #[test]
+    fn programs_body_array_arm_stays_strict() {
+        // The non-string token falls through to `JsonSerializer.Deserialize<T[]>`,
+        // which is strict: Jellyfin answers 400 for `{"SortBy":["NotASort"]}`.
+        // Only the delimited-string form swallows a bad entry.
+        assert!(serde_json::from_str::<GetProgramsDto>(r#"{"SortBy":["NotASort"]}"#).is_err());
+        assert!(serde_json::from_str::<GetProgramsDto>(r#"{"ChannelIds":["nope"]}"#).is_err());
+    }
+
+    #[test]
+    fn programs_body_absent_and_null_collections_stay_none() {
+        let empty = programs_body("{}");
+        assert_eq!(empty.channel_ids, None);
+        assert_eq!(empty.genres, None);
+        let nulled = programs_body(r#"{"ChannelIds":null,"Genres":null,"Fields":null}"#);
+        assert_eq!(nulled.channel_ids, None);
+        assert_eq!(nulled.genres, None);
+        assert_eq!(nulled.fields, None);
     }
 
     #[tokio::test]

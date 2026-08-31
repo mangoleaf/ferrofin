@@ -24,6 +24,7 @@ use ferrofin_model::io::FileSystemEntryInfo;
 
 use crate::auth::FirstTimeSetupOrAuth;
 use crate::error::ApiError;
+use crate::extract::JsonBody;
 use crate::state::AppState;
 
 /// The leading marker of a UNC path (`\\server\share`).
@@ -112,7 +113,7 @@ async fn get_directory_contents(
 async fn validate_path(
     State(state): State<AppState>,
     _auth: FirstTimeSetupOrAuth,
-    Json(dto): Json<ValidatePathDto>,
+    JsonBody(dto): JsonBody<ValidatePathDto>,
 ) -> Result<StatusCode, ApiError> {
     let path = dto.path.unwrap_or_default();
     match dto.is_file {
