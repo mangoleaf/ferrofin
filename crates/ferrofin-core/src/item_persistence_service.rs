@@ -17,6 +17,7 @@ use async_trait::async_trait;
 use ferrofin_db::Database;
 use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_db::store::{datetime_to_db, guid_to_db, opt_datetime_to_db};
+use sqlx::{QueryBuilder, Sqlite};
 use uuid::Uuid;
 
 use ferrofin_traits::error::ServiceError;
@@ -1508,6 +1509,105 @@ pub async fn backfill_missing_sort_names(db: &Database) -> Result<usize, Service
     Ok(rows.len())
 }
 
+/// Fills in `BaseItems."PresentationUniqueKey"` for the by-name rows written
+/// before the write path derived it — run once at startup, cheap thereafter.
+///
+/// Why this exists at all: the by-name inserts are
+/// `INSERT ... WHERE NOT EXISTS` / `INSERT OR IGNORE`, so writing the column in
+/// the insert (as `music_genre_row` and `insert_named_item` now do) is INERT on
+/// every database that already holds the row. On this campaign's own lab that
+/// was every scanner-created music genre: `MusicGenre|Ambient`, `Jazz` and
+/// `Rock` still read back `PresentationUniqueKey NULL` after the fix shipped.
+/// The column is what `GetItemValues` GROUPs on, and SQLite groups all NULLs
+/// together, so a set of unkeyed by-name rows collapses to ONE representative
+/// — the whole tab silently loses names.
+///
+/// Upstream needs no such pass because it recomputes the key on every
+/// `SaveItems`: `MetadataService.BeforeSaveInternal`
+/// (`MediaBrowser.Providers/Manager/MetadataService.cs:332-338`, identical on
+/// v10.11.8 and master) assigns `item.CreatePresentationUniqueKey()` whenever
+/// it differs. A Jellyfin by-name row is unkeyed only until its first metadata
+/// refresh runs — `CreateItemByName` calls `CreateItem` and queues no refresh
+/// itself — which is why a live 10.11.8 shows a MIXTURE of keyed and unkeyed
+/// by-name rows. So the value written here is exactly the value Jellyfin's own
+/// next refresh of that row would write, which is what makes the pass safe on
+/// an adopted database: it moves a row forward to Jellyfin's settled state,
+/// never to a value Jellyfin would not produce.
+///
+/// Scoped to the four by-name kinds whose key is a pure function of the name
+/// (`Genre-…`, `MusicGenre-…`, `Studio-…`, `Artist-…` — see
+/// [`crate::kinds::presentation_unique_key`]). `Person` is deliberately absent:
+/// [`crate::people_repository::FerrofinPeopleRepository::repair_person_items`]
+/// already repairs that kind, together with the `Path` column and the metadata
+/// directory that only it knows how to build. Every other kind derives its key
+/// from an id or a parent chain, where NULL is not the same kind of damage and
+/// a blanket rewrite would be a guess.
+///
+/// Only NULL/empty keys are touched, so an already-keyed row — the whole of an
+/// adopted, refreshed Jellyfin database — is left byte-identical. Returns the
+/// number of rows repaired.
+///
+/// # Errors
+/// Returns [`ServiceError`] if the read or the write fails.
+pub async fn backfill_missing_presentation_keys(db: &Database) -> Result<usize, ServiceError> {
+    let kinds = [
+        BaseItemKind::Genre,
+        BaseItemKind::MusicGenre,
+        BaseItemKind::Studio,
+        BaseItemKind::MusicArtist,
+    ];
+    let type_names: Vec<&'static str> =
+        kinds.iter().copied().filter_map(stored_type_name).collect();
+    if type_names.is_empty() {
+        return Ok(0);
+    }
+    let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
+        r#"SELECT "Id", "Name", "Type" FROM "BaseItems"
+           WHERE coalesce("PresentationUniqueKey", '') = ''
+             AND "Name" IS NOT NULL AND "Name" <> '' AND "Type" IN ("#,
+    );
+    let mut sep = qb.separated(", ");
+    for t in &type_names {
+        sep.push_bind(*t);
+    }
+    qb.push(")");
+    let rows: Vec<(String, String, String)> = qb
+        .build_query_as()
+        .fetch_all(db.pool())
+        .await
+        .map_err(db_err)?;
+
+    let mut pending: Vec<(String, String)> = Vec::new();
+    for (id, name, type_name) in &rows {
+        let Some((kind, uuid)) =
+            crate::item_type_lookup::kind_from_type_name(type_name).zip(Uuid::parse_str(id).ok())
+        else {
+            continue;
+        };
+        pending.push((
+            id.clone(),
+            crate::kinds::presentation_unique_key(kind, uuid, Some(name), None, None, None),
+        ));
+    }
+    if pending.is_empty() {
+        return Ok(0);
+    }
+    let mut tx = db.writer().begin().await.map_err(db_err)?;
+    for (id, key) in &pending {
+        sqlx::query(
+            r#"UPDATE "BaseItems" SET "PresentationUniqueKey" = ?2
+               WHERE "Id" = ?1 AND coalesce("PresentationUniqueKey", '') = ''"#,
+        )
+        .bind(id)
+        .bind(key)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+    }
+    tx.commit().await.map_err(db_err)?;
+    Ok(pending.len())
+}
+
 /// The `PresentationUniqueKey` to store for `item`.
 ///
 /// Derived at write time for the same reason `CleanName` and `SortName` are:
@@ -1893,6 +1993,92 @@ mod tests {
 
         assert_eq!(
             super::backfill_missing_sort_names(&db)
+                .await
+                .expect("second run"),
+            0,
+            "the pass is a no-op once repaired"
+        );
+    }
+
+    /// The by-name key backfill: an unkeyed scanner-created row gets the key
+    /// upstream's next metadata refresh would give it, an already-keyed row is
+    /// left byte-identical, and a kind whose key is not name-derived is not
+    /// touched at all.
+    ///
+    /// This is the half the batch's first cut was missing: writing the key in
+    /// `music_genre_row`'s `INSERT ... WHERE NOT EXISTS` is INERT on every
+    /// database that already holds the row, and the campaign's own lab proved
+    /// it — `MusicGenre|Ambient`/`Jazz`/`Rock` still read back NULL after the
+    /// "fix" shipped.
+    #[tokio::test]
+    async fn backfill_missing_presentation_keys_repairs_only_unkeyed_by_name_rows() {
+        async fn key(db: &ferrofin_db::Database, id: Uuid) -> Option<String> {
+            sqlx::query_scalar(r#"SELECT "PresentationUniqueKey" FROM "BaseItems" WHERE "Id" = ?1"#)
+                .bind(ferrofin_db::store::guid_to_db(id))
+                .fetch_one(db.pool())
+                .await
+                .expect("query")
+        }
+        let db = test_db().await;
+        let unkeyed = Uuid::from_u128(0xB201);
+        let keyed = Uuid::from_u128(0xB202);
+        let artist = Uuid::from_u128(0xB203);
+        let movie = Uuid::from_u128(0xB204);
+        crate::test_support::seed_named_item(&db, unkeyed, BaseItemKind::MusicGenre, "Ambient")
+            .await;
+        crate::test_support::seed_named_item(&db, keyed, BaseItemKind::Genre, "Action").await;
+        crate::test_support::seed_named_item(&db, artist, BaseItemKind::MusicArtist, "Bjork").await;
+        crate::test_support::seed_named_item(&db, movie, BaseItemKind::Movie, "Heat").await;
+        // The unkeyed shapes are BOTH real: Ferrofin's inserts left NULL, and
+        // Jellyfin's lazily-created rows can carry ''.
+        sqlx::query(r#"UPDATE "BaseItems" SET "PresentationUniqueKey" = NULL WHERE "Id" = ?1"#)
+            .bind(ferrofin_db::store::guid_to_db(unkeyed))
+            .execute(db.writer())
+            .await
+            .expect("null key");
+        sqlx::query(r#"UPDATE "BaseItems" SET "PresentationUniqueKey" = '' WHERE "Id" = ?1"#)
+            .bind(ferrofin_db::store::guid_to_db(artist))
+            .execute(db.writer())
+            .await
+            .expect("empty key");
+        sqlx::query(
+            r#"UPDATE "BaseItems" SET "PresentationUniqueKey" = 'Genre-Action' WHERE "Id" = ?1"#,
+        )
+        .bind(ferrofin_db::store::guid_to_db(keyed))
+        .execute(db.writer())
+        .await
+        .expect("already keyed");
+        sqlx::query(r#"UPDATE "BaseItems" SET "PresentationUniqueKey" = NULL WHERE "Id" = ?1"#)
+            .bind(ferrofin_db::store::guid_to_db(movie))
+            .execute(db.writer())
+            .await
+            .expect("null movie key");
+
+        assert_eq!(
+            super::backfill_missing_presentation_keys(&db)
+                .await
+                .expect("backfill"),
+            2,
+            "only the two unkeyed BY-NAME rows"
+        );
+        assert_eq!(
+            key(&db, unkeyed).await.as_deref(),
+            Some("MusicGenre-Ambient")
+        );
+        // `MusicArtist` is spelled `Artist-` in the key (MusicArtist.cs:152).
+        assert_eq!(key(&db, artist).await.as_deref(), Some("Artist-Bjork"));
+        assert_eq!(
+            key(&db, keyed).await.as_deref(),
+            Some("Genre-Action"),
+            "an adopted, refreshed Jellyfin row comes through byte-identical"
+        );
+        assert_eq!(
+            key(&db, movie).await,
+            None,
+            "a Movie's key is derived from its id/primary version, not its name — not this pass's"
+        );
+        assert_eq!(
+            super::backfill_missing_presentation_keys(&db)
                 .await
                 .expect("second run"),
             0,

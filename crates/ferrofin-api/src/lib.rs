@@ -31,7 +31,7 @@ pub mod state;
 #[cfg(any(test, feature = "test-util"))]
 pub mod test_support;
 
-pub use error::ApiError;
+pub use error::{ApiError, ProblemStatus};
 pub use router::create_router;
 pub use state::{AppState, Inner};
 

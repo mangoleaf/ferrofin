@@ -287,8 +287,9 @@ pub(crate) async fn project_item_rows(
     Ok(QueryResult::new(start_index, total, dtos))
 }
 
-/// `BaseItem.SlugChar` — `'-'`, `MediaBrowser.Controller/Entities/BaseItem.cs:98`
-/// (same line on v10.11.8 and master).
+/// `BaseItem.SlugChar` — `'-'`,
+/// `MediaBrowser.Controller/Entities/BaseItem.cs:98` on v10.11.8, `:100` on
+/// master (the declaration is byte-identical; only its line moved).
 const SLUG_CHAR: char = '-';
 
 /// Resolves a by-name route's `{name}` the way `GenresController.GetGenre` and
@@ -303,13 +304,18 @@ const SLUG_CHAR: char = '-';
 /// and creates NOTHING. Creating here would mint a bogus genre for every
 /// hyphenated mis-spelling, which is exactly what Ferrofin used to do.
 ///
-/// **One deliberate divergence**, kept per "don't port Jellyfin's bugs": a
-/// fourth lookup on the LITERAL name. Upstream never tries it, so upstream
-/// answers `/Genres/Sci-Fi` with the empty fallback even when a genre named
-/// exactly `Sci-Fi` exists — the name is simply unreachable there. Ferrofin
-/// reaches it. The divergence can only ever return a row upstream also has,
-/// never invent one, and it is recorded in
-/// `suite/parity/classifications.json`.
+/// The three substitutions are the WHOLE list, deliberately. Upstream's
+/// consequence — that `/Genres/Sci-Fi` answers with the empty fallback even
+/// when a genre named exactly `Sci-Fi` exists, because a hyphen is only ever
+/// read as a slug — is real, and Ferrofin reproduces it. An earlier cut of this
+/// port added a fourth, non-creating lookup on the LITERAL name to reach that
+/// row. It was removed: a fourth candidate matches NEITHER tree (checked on
+/// both: `GetItemFromSlugName` is byte-identical on v10.11.8 and master and
+/// stops after `'?'`), and "Ferrofin matches neither tree" is the definition of
+/// the bug, not of a capability worth keeping — nothing shipped before this
+/// batch reached that row either, since the pre-existing behaviour here was the
+/// create-on-GET defect this batch removed. The upstream quirk itself is
+/// recorded, with the evidence, in `suite/parity/classifications.json`.
 ///
 /// Returns [`None`] when nothing matches; the caller substitutes
 /// [`LibraryManager::empty_by_name_item`], which is upstream's `item ??= new
@@ -328,7 +334,6 @@ pub(crate) async fn resolve_by_name_or_slug(
         name.replace(SLUG_CHAR, "&"),
         name.replace(SLUG_CHAR, "/"),
         name.replace(SLUG_CHAR, "?"),
-        name.to_owned(),
     ] {
         if let Some(item) = state.library.find_named_item(kind, &candidate).await? {
             return Ok(Some(item));

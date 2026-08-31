@@ -22,6 +22,7 @@ import os
 import re
 import time
 import urllib.parse
+import string
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -32,14 +33,51 @@ import verification                                  # noqa: E402
 CORRELATE_LIMIT = 5   # item-scoped endpoints are exercised against this many Path-aligned items
 
 
+def agg_method(legs, status_only=0):
+    """The honest method for an aggregate of diffed (jbody, hbody, compared) legs.
+
+    None when no leg compared anything and none even agreed on a status
+    (untested); `status-class` when the ONLY thing any leg established was
+    that both servers answered the same status with no body; `empty-corpus`
+    when every leg that compared anything was two empty result envelopes
+    agreeing on their own zeros; `body-diff` as soon as one leg compared
+    real content.
+
+    `status_only` is passed rather than inferred because a bodiless leg
+    leaves no (jbody, hbody) pair to inspect — and a row whose every leg is
+    bodiless must not be able to reach the headline by having had many of
+    them.
+    """
+    seen = [m for m in (verification.read_method(j, h, c) for j, h, c in legs)
+            if m is not None]
+    if not seen:
+        return verification.STATUS_CLASS if status_only else None
+    return (verification.BODY_DIFF if verification.BODY_DIFF in seen
+            else verification.EMPTY_CORPUS)
+
+
 def token_get(base, path, token):
+    """`(status, parsed_json_or_None)` — the 200-only view, for the row kinds
+    whose contract is "a body to diff, or no evidence at all"."""
+    st, body, _raw = token_probe(base, path, token)
+    return st, (body if st == 200 else None)
+
+
+def token_probe(base, path, token):
+    """`(status, parsed_json_or_None, raw)` for ANY status.
+
+    Separate from [`token_get`] because a non-200 still HAS a body and that body
+    is part of the wire contract. `token_get` throwing it away is what let a
+    404-vs-404 leg be scored clean while the two servers were in fact answering
+    with two different documents (Jellyfin an RFC 9110 ProblemDetails, Ferrofin
+    its own `{"error": …}`)."""
     st, raw = http("GET", base + path, token)
-    if st != 200 or not raw:
-        return st, None
+    if not raw:
+        return st, None, raw
     try:
-        return st, json.loads(raw)
+        return st, json.loads(raw), raw
     except ValueError:
-        return st, None
+        return st, None, raw
 
 # ---------------------------------------------------------------- endpoint set
 
@@ -78,9 +116,21 @@ def multi(op, legs, seed=None, reap=None):
     out = []
     for leg in legs:
         tmpl, project = leg if isinstance(leg, tuple) else (leg, None)
-        out.append({"tmpl": tmpl,
-                    "url": (lambda c, t=tmpl: t.format(**c)),
-                    "project": project})
+
+        def build(c, t=tmpl):
+            """The leg's URL, or None when a seed it needs resolved to nothing.
+
+            A leg is then SKIPPED, not substituted. The `{key}_last` seeds used
+            to fall back to `{key}` when only one name was shared, which turned
+            the extra leg into a byte-identical copy of the first one: no new
+            coverage, and double the row's published `field(s) compared`.
+            Skipping is honest; duplicating is not."""
+            for _lit, field, _spec, _conv in string.Formatter().parse(t):
+                if field and c.get(field) is None:
+                    return None
+            return t.format(**c)
+
+        out.append({"tmpl": tmpl, "url": build, "project": project})
     return {"op": op, "kind": "multi", "legs": out, "seed": seed, "reap": reap}
 
 
@@ -886,16 +936,19 @@ def reconcile_named(hc, jc):
     # A `{key}_last` seed too — the LAST shared name in the same order. A row
     # probed with only `first_name` samples one end of the listing; on this lab
     # the studios diverged on exactly the one the first-name leg never reaches.
-    # Falls back to the first shared name when only one is shared, so a leg is
-    # never left unformatted.
+    #
+    # When FEWER THAN TWO names are shared there is no distinct "last" name, and
+    # the seed is left None so `multi()` SKIPS the leg. It used to fall back to
+    # the first shared name, which made the extra leg a byte-identical copy of
+    # the first: the row then published double the `field(s) compared` — the
+    # depth number the ledger renders — for no additional coverage. A corpus
+    # that narrows to one shared name should shrink the evidence, not inflate it.
     for key in NAMED_SEEDS:
         h_items = hc["named_listings"].get(key) or []
         j_names = {(i.get("Name") or "") for i in jc["named_listings"].get(key) or []}
         shared = [i.get("Name") or "" for i in h_items if (i.get("Name") or "") in j_names]
-        if shared:
-            hc[f"{key}_last"] = jc[f"{key}_last"] = urllib.parse.quote(shared[-1])
-        else:
-            hc[f"{key}_last"] = jc[f"{key}_last"] = hc.get(key, "")
+        last = urllib.parse.quote(shared[-1]) if len(shared) >= 2 else None
+        hc[f"{key}_last"] = jc[f"{key}_last"] = last
     return unshared
 
 
@@ -988,20 +1041,6 @@ def run(ferrofin_url, jellyfin_url):
 
     rows = {}
 
-    def agg_method(legs):
-        """The honest method for an aggregate of diffed (jbody, hbody, compared) legs.
-
-        None when no leg compared anything (untested); `empty-corpus` when every
-        leg that compared anything was two empty result envelopes agreeing on
-        their own zeros; `body-diff` as soon as one leg compared real content.
-        """
-        seen = [m for m in (verification.read_method(j, h, c) for j, h, c in legs)
-                if m is not None]
-        if not seen:
-            return None
-        return (verification.BODY_DIFF if verification.BODY_DIFF in seen
-                else verification.EMPTY_CORPUS)
-
     def record(op, clean, total, buckets, method, note=None, compared=None):
         """`method` is HOW the row was verified, from `verification.METHODS`, and it
         is written into the results row. There is no default: gen-ledger.py counts
@@ -1080,11 +1119,19 @@ def run(ferrofin_url, jellyfin_url):
                           file=sys.stderr)
             agg = {"mismatch": [], "missing": [], "extra": []}
             legs = []
-            clean = tested = 0
+            clean = tested = status_only = 0
             try:
                 for leg in ep["legs"]:
-                    hs, hb = token_get(ferrofin_url, leg["url"](hc), ht)
-                    js, jb = token_get(jellyfin_url, leg["url"](jc), jt)
+                    hurl, jurl = leg["url"](hc), leg["url"](jc)
+                    if hurl is None or jurl is None:
+                        # An unseeded leg (see `reconcile_named`): not run, not
+                        # counted, and above all not silently duplicated onto
+                        # another leg's URL.
+                        print(f"  {ep['op']} leg skipped, unseeded: {leg['tmpl']}",
+                              file=sys.stderr)
+                        continue
+                    hs, hb, hraw = token_probe(ferrofin_url, hurl, ht)
+                    js, jb, jraw = token_probe(jellyfin_url, jurl, jt)
                     tested += 1
                     # A leg that does not answer 200-with-JSON on both sides is a
                     # RESULT, not a reason to skip: `continue`-ing here made a
@@ -1095,13 +1142,20 @@ def run(ferrofin_url, jellyfin_url):
                             {"path": f"{leg['tmpl']} :: status", "j": js, "h": hs})
                         continue
                     if hb is None and jb is None:
-                        # BOTH sides answered the same status with no JSON body
-                        # — e.g. the two servers agreeing on a 404, which is a
-                        # real agreement and the only assertion such a leg can
-                        # make. Counted clean, but it contributes NOTHING to
-                        # `compared`, so it cannot inflate a row's depth: the
-                        # row's `field(s) compared` still comes only from legs
-                        # that actually diffed a body.
+                        # Neither side sent a JSON body. If neither sent ANY
+                        # body, the status is genuinely all there is to compare
+                        # — recorded as `status-class` evidence, the weakest
+                        # verdict the ledger has, and NOT as a body diff. If a
+                        # body was sent that is not JSON, the bytes still have
+                        # to agree; two different opaque bodies behind the same
+                        # status are a divergence, not an agreement.
+                        if hraw or jraw:
+                            if (hraw or b"") != (jraw or b""):
+                                agg["mismatch"].append(
+                                    {"path": f"{leg['tmpl']} :: raw body",
+                                     "j": str(jraw)[:80], "h": str(hraw)[:80]})
+                                continue
+                        status_only += 1
                         clean += 1
                         continue
                     if hb is None or jb is None:
@@ -1112,6 +1166,11 @@ def run(ferrofin_url, jellyfin_url):
                         continue
                     if leg["project"]:
                         hb, jb = leg["project"](hb), leg["project"](jb)
+                    # NOTE: reached for a non-200 too. An error body is part of
+                    # the wire contract — Jellyfin answers a parameterless
+                    # `NotFound()` with an RFC 9110 ProblemDetails — so it is
+                    # diffed like any other body, `traceId` aside (VOLATILE:
+                    # per-request, cannot match across instances).
                     n, b, compared = diff_stats(jb, hb)
                     legs.append((jb, hb, compared))
                     if n == 0:
@@ -1124,7 +1183,7 @@ def run(ferrofin_url, jellyfin_url):
                 if ep.get("reap"):
                     ep["reap"](ferrofin_url, ht, hc)
                     ep["reap"](jellyfin_url, jt, jc)
-            record(ep["op"], clean, tested, agg, agg_method(legs),
+            record(ep["op"], clean, tested, agg, agg_method(legs, status_only),
                    compared=sum(c for _j, _h, c in legs))
         elif ep["kind"] in ("plain", "user"):
             path = ep["url"](hc if ep["kind"] == "user" else {})
@@ -1332,6 +1391,44 @@ def selfcheck():
     assert _multi_src.index("if hb is None and jb is None:") \
         < _multi_src.index("if hb is None or jb is None:"), \
         "the agreement branch must precede the one-sided-body mismatch branch"
+    # ...and it may only be reached when there is NO body at all. A non-200 that
+    # DOES carry a JSON body is diffed like any other body: `token_probe`, not
+    # `token_get`, is what the multi legs read with, because Jellyfin's error
+    # bodies are part of the wire (an RFC 9110 ProblemDetails for a
+    # parameterless `NotFound()`) and discarding them scored two different
+    # documents as one clean leg.
+    assert "token_probe(ferrofin_url, hurl, ht)" in _multi_src, \
+        "multi legs must read non-200 bodies, not discard them"
+    assert token_probe.__doc__ and "ANY status" in token_probe.__doc__
+    assert ":: raw body" in _multi_src, \
+        "two different non-JSON bodies behind the same status must be a mismatch"
+    # A row whose every leg was bodiless may NOT reach the body-diff headline:
+    # it earned `status-class`, the weakest verdict the ledger has.
+    assert agg_method([], status_only=2) == verification.STATUS_CLASS
+    assert agg_method([], status_only=0) is None
+    assert agg_method([({"A": 1}, {"A": 1}, 1)], status_only=3) == verification.BODY_DIFF
+    # `traceId` is VOLATILE (per-request), but nothing ELSE about a ProblemDetails
+    # is — a Ferrofin error body that is not upstream's must still diff red.
+    _pd = {"type": "https://tools.ietf.org/html/rfc9110#section-15.5.5",
+           "title": "Not Found", "status": 404, "traceId": "00-abc-def-00"}
+    assert diff_stats(_pd, {k: v for k, v in _pd.items() if k != "traceId"})[0] == 0, \
+        "traceId must be VOLATILE on both sides"
+    assert diff_stats(_pd, {"error": "not found: music genre R-B"})[0] > 0, \
+        "a different error document must not diff clean"
+    # An unseeded `{key}_last` SKIPS its leg rather than duplicating the first
+    # one — the depth number the ledger publishes must not be inflatable by a
+    # corpus that narrowed.
+    _one = {"named_listings": {k: [] for k in NAMED_SEEDS}}
+    _one["named_listings"]["genre"] = [{"Name": "Action", "Id": "H1"}]
+    _other = {"named_listings": {k: [] for k in NAMED_SEEDS}}
+    _other["named_listings"]["genre"] = [{"Name": "Action", "Id": "J1"}]
+    reconcile_named(_one, _other)
+    assert _one["genre"] == "Action" and _one["genre_last"] is None, _one
+    _leg = next(leg for leg in dict(
+        (ep["op"], ep["legs"]) for ep in READS if ep["kind"] == "multi"
+    )["GET /Genres/{genreName}"] if "{genre_last}" in leg["tmpl"])
+    assert _leg["url"]({**ctx, "genre_last": None}) is None, \
+        "an unseeded leg must be skipped, not formatted with None"
     hf, jf = {"a": True, "b": True, "c": False}, {"a": True, "b": False, "c": False}
     bad = [k for k in sorted(set(hf) | set(jf))
            if hf.get(k) != jf.get(k) or hf.get(k) is False]

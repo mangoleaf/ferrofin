@@ -18,7 +18,7 @@ use ferrofin_model::querying::QueryResult;
 use ferrofin_traits::options::DtoOptions;
 
 use crate::auth::RequireAuth;
-use crate::error::ApiError;
+use crate::error::{ApiError, ProblemStatus};
 use crate::handlers::by_name::{
     ByNameItemQuery, ByNameListQuery, project_query_result, resolve_by_name_or_slug,
 };
@@ -91,9 +91,16 @@ async fn get_music_genre(
     // MusicGenresController.cs:164-167, master :165-168), so a slug that
     // resolves nothing is a 404 here and a 200 there. Measured live against a
     // 10.11.8 container: `/MusicGenres/R-B` J=404.
+    //
+    // `NotFound()` takes NO argument on either tree, so ASP.NET fills the body
+    // from `ApiBehaviorOptions.ClientErrorMapping` — an RFC 9110
+    // `ProblemDetails`, not a message. `ApiError::Problem` is that body;
+    // `ApiError::NotFound` would have written Ferrofin's own `{"error": …}`
+    // shape, which is a real wire divergence the parity harness could not see
+    // while it discarded every non-200 body.
     let item = resolve_by_name_or_slug(&state, BaseItemKind::MusicGenre, &genre_name)
         .await?
-        .ok_or_else(|| ApiError::NotFound(format!("music genre {genre_name}")))?;
+        .ok_or(ApiError::Problem(ProblemStatus::NotFound))?;
     let options = DtoOptions::default();
     let dto = state
         .dto

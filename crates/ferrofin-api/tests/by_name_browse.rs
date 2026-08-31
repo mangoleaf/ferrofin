@@ -166,6 +166,7 @@ const ARTIST_ID: Uuid = Uuid::from_u128(0xAA03);
 const PERSON_ID: Uuid = Uuid::from_u128(0xAA04);
 const MUSIC_GENRE_ID: Uuid = Uuid::from_u128(0xAA05);
 const SLUG_GENRE_ID: Uuid = Uuid::from_u128(0xAA07);
+const LITERAL_HYPHEN_GENRE_ID: Uuid = Uuid::from_u128(0xAA08);
 const YEAR_ID: Uuid = Uuid::from_u128(0xAA06);
 
 fn one_aggregate(id: Uuid, name: &str) -> QueryResult<ItemWithCounts> {
@@ -255,6 +256,12 @@ impl LibraryManager for ByNameLibrary {
             // The slug-branch fixture: a genre whose real name carries the
             // character `BaseItem.SlugChar` stands in for on the wire.
             Some(BaseItemKind::Genre) if name == "R&B" => Some(named_entity(SLUG_GENRE_ID, "R&B")),
+            // A genre whose real name CONTAINS the slug char. Upstream can
+            // never reach it — `GetItemFromSlugName` only ever asks for the
+            // three substitutions — and neither may Ferrofin.
+            Some(BaseItemKind::Genre) if name == "Sci-Fi" => {
+                Some(named_entity(LITERAL_HYPHEN_GENRE_ID, "Sci-Fi"))
+            }
             Some(BaseItemKind::MusicGenre) if name == "Jazz" => {
                 Some(named_entity(MUSIC_GENRE_ID, "Jazz"))
             }
@@ -644,6 +651,26 @@ async fn genre_by_slug_name_resolves_through_the_ampersand_substitution() {
     let response = get("/Genres/R-B").await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(json_body(response).await["Name"], "R&B");
+}
+
+/// …and it tries EXACTLY three candidates. A name containing the slug char is
+/// read as a slug and nothing else, so a genre literally named `Sci-Fi` is
+/// unreachable — upstream's own consequence, verified byte-identical on
+/// v10.11.8 and master (`GetItemFromSlugName` substitutes `&`, `/`, `?` and
+/// returns). An earlier cut of this port added a fourth lookup on the literal
+/// name, which matched neither tree; this test is what stops it coming back.
+/// The fake resolves `Sci-Fi` when asked for it by that exact name, so a fourth
+/// candidate would return the row and fail the assertion.
+#[tokio::test]
+async fn a_hyphenated_name_is_only_ever_read_as_a_slug() {
+    let response = get("/Genres/Sci-Fi").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(
+        body["Id"], "00000000000000000000000000000000",
+        "upstream answers the empty Genre() here; reaching the literal row is a divergence"
+    );
+    assert!(body.get("Name").is_none());
 }
 
 /// …and the slug branch must never MATERIALIZE. Upstream's slug lookups are

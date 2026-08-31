@@ -554,14 +554,21 @@ impl FerrofinItemRepository {
         return_type: &str,
         filter: &InternalItemsQuery,
     ) -> Result<i32, ServiceError> {
+        // `representativeIds.Count()` (ByName.cs:229-232), not a row count:
+        // upstream counts the COLLAPSED set, so the total has to be the number
+        // of `PresentationUniqueKey` GROUPS the filtered rows form — the same
+        // grouping the page query applies. `COUNT(DISTINCT key)` would be
+        // wrong: it drops NULL keys entirely, and the whole point of the
+        // grouping is that the unkeyed rows form ONE group.
         let mut qb: QueryBuilder<Sqlite> =
-            QueryBuilder::new(r#"SELECT COUNT(*) FROM "BaseItems" AS bi JOIN "#);
+            QueryBuilder::new(r#"SELECT COUNT(*) FROM (SELECT 1 FROM "BaseItems" AS bi JOIN "#);
         // No per-kind counts here: this query only counts by-name rows, so the
         // seven conditional sums would be computed and thrown away. The shared
         // `scope` still guarantees the WHERE cannot drift from the page query.
         push_value_aggregate(&mut qb, scope, &[]);
         push_by_name_join(&mut qb, return_type);
         append_by_name_filters(&mut qb, filter);
+        qb.push(r#" GROUP BY bi."PresentationUniqueKey")"#);
         let count: i64 = qb
             .build_query_scalar()
             .fetch_one(self.db.pool())
@@ -626,19 +633,24 @@ impl FerrofinItemRepository {
 
         let want_total = filter.enable_total_record_count && filter.limit.is_some();
         // Master computes the per-kind counts only when the caller named item
-        // types (`if (filter.IncludeItemTypes.Length > 0)`, ByName.cs:249-268),
+        // types (`if (filter.IncludeItemTypes.Length > 0)`, ByName.cs:249),
         // so the aggregate carries the seven conditional sums only then — the
         // by-name browse that asks for no counts pays nothing for them.
         let count_types = per_kind_count_types(!content_type_names.is_empty());
-        let mut select = String::from(r"SELECT bi.*, agg.cnt");
+        // Two levels, because the representative collapse sits BETWEEN the
+        // filtered row set and the ordering/paging (see `push_representative_rank`).
+        // The outer level is where `COUNT(*) OVER()` belongs: run in the inner
+        // one it would count the rows BEFORE the collapse, i.e. report a total
+        // larger than the number of rows any amount of paging could ever return.
+        let mut select = String::from(r"SELECT bi.*");
+        if want_total {
+            select.push_str(r#", COUNT(*) OVER() AS "total_count""#);
+        }
+        select.push_str(r" FROM (SELECT bi.*, agg.cnt");
         for (alias, _) in &count_types {
             select.push_str(", agg.");
             select.push_str(alias);
         }
-        if want_total {
-            select.push_str(r#", COUNT(*) OVER() AS "total_count""#);
-        }
-        select.push_str(r#" FROM "BaseItems" AS bi JOIN "#);
         let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(select);
         let scope = ByNameScope {
             type_ints: &type_ints,
@@ -646,12 +658,21 @@ impl FerrofinItemRepository {
             ancestors: &ancestors,
             top_parents: &top_parents,
         };
+        push_representative_rank(&mut qb, return_type, &top_parents);
+        qb.push(r#" FROM "BaseItems" AS bi JOIN "#);
         push_value_aggregate(&mut qb, &scope, &count_types);
         push_by_name_join(&mut qb, return_type);
         append_by_name_filters(&mut qb, filter);
+        qb.push(r#") AS bi WHERE bi."rep_rank" = 1"#);
         // C# `GetItemValues` runs the same `ApplyOrder(query, filter, context)`
         // the main browse does, so the caller's `sortBy`/`sortOrder` apply and
         // the no-`sortBy` default is `OrderBy(e => e.SortName)` — not `Name`.
+        // It runs on the COLLAPSED set (`ApplyOrder` is applied to the query
+        // over `representativeIds`, ByName.cs:232-236), which is why it is
+        // pushed at this level and not inside the derived table. Every
+        // expression `append_order_by` emits is `bi."<column>"`, and the
+        // derived table is aliased `bi` and carries `bi.*`, so they still
+        // resolve.
         crate::translate_query::append_order_by(&mut qb, filter);
         if let Some(limit) = filter.limit {
             qb.push(" LIMIT ").push_bind(i64::from(limit));
@@ -691,10 +712,10 @@ impl FerrofinItemRepository {
             .into_iter()
             .map(|r| ItemWithCounts {
                 item: r.item,
-                // Port of master's `BuildItemCountsByCleanName` (ByName.cs:277-330):
+                // Port of master's `BuildItemCountsByCleanName` (ByName.cs:283-338):
                 // one `ItemCounts` per `CleanName`, each field the number of
                 // in-scope content items of that kind carrying the value.
-                // v10.11.8 (BaseItemRepository.cs:1350-1390, comment "TODO: This
+                // v10.11.8 (BaseItemRepository.cs:1368-1392, comment "TODO: This
                 // is bad refactor!") instead hands EVERY row the same
                 // uncorrelated totals; master fixed it, so Ferrofin follows
                 // master. `ItemCount` and `ProgramCount` are left at the
@@ -752,7 +773,7 @@ struct ByNameCountRow {
 /// counts, or nothing when the caller named no item types.
 ///
 /// Port of the seven `BaseItemKindNames[...]` locals master's
-/// `BuildItemCountsByCleanName` reads (`BaseItemRepository.ByName.cs:296-302`).
+/// `BuildItemCountsByCleanName` reads (`BaseItemRepository.ByName.cs:304-310`).
 /// A kind missing from the lookup table simply contributes no column, which
 /// leaves its count at the `0` default — the same answer as counting nothing.
 fn per_kind_count_types(wanted: bool) -> Vec<(&'static str, &'static str)> {
@@ -866,6 +887,63 @@ struct ByNameScope<'a> {
     ancestors: &'a [String],
     /// The user's libraries (`AddUserToQuery`), empty when unconfined.
     top_parents: &'a [String],
+}
+
+/// The representative-selection window — the port of `GetItemValues`'s
+/// `GroupBy(e => e.PresentationUniqueKey)` collapse.
+///
+/// Both trees perform it and neither has changed it in spirit:
+/// master `BaseItemRepository.ByName.cs:213-224` takes `g.Min(e => e.Id)`, and
+/// v10.11.8 `BaseItemRepository.cs:1313-1316` takes `g.FirstOrDefault().Id`.
+/// Ferrofin follows master, whose `Min(Id)` is deterministic where 10.11.8's
+/// `FirstOrDefault` is whatever the engine emitted first.
+///
+/// What the collapse is FOR, in upstream's own words at that site: rows that
+/// share a key are alternate versions of one thing, and "for MusicArtist,
+/// prefer the entity from a library the user can actually access, since the
+/// same artist can have a folder in multiple libraries". Without it a
+/// two-library server lists the same artist twice, and a merged film's
+/// alternate shows up beside its primary — so this is not a genre-tab detail.
+///
+/// Two things the SQL has to get right:
+///
+/// - `PARTITION BY` groups NULLs together, exactly as SQLite's `GROUP BY` and
+///   as EF translates `GroupBy` — so a set of by-name rows that never got a
+///   `PresentationUniqueKey` collapses to ONE row. That is faithful, and it is
+///   also why [`crate::item_persistence_service::backfill_missing_presentation_keys`]
+///   exists: reproducing upstream's collapse without also reproducing
+///   upstream's keys would silently delete names from the tab.
+/// - The window runs over the FILTERED row set (it is in the same SELECT as the
+///   join and the `WHERE`), which is what upstream does — it groups
+///   `masterQuery`, i.e. the inner query after `TranslateQuery` applied
+///   `outerQueryFilter`. Grouping over the unfiltered table instead would let a
+///   row excluded by `nameStartsWith` suppress the representative that was not.
+///
+/// `MIN(Id)` is expressed as `ROW_NUMBER() ... ORDER BY bi."Id"` so the chosen
+/// row's own columns come back with it; ids are stored as the uppercase
+/// hyphenated GUID text, so the ordering is the text ordering of that form.
+fn push_representative_rank(
+    qb: &mut QueryBuilder<'_, Sqlite>,
+    return_type: &str,
+    top_parents: &[String],
+) {
+    qb.push(r#", ROW_NUMBER() OVER (PARTITION BY bi."PresentationUniqueKey" ORDER BY "#);
+    // `isMusicArtist` arm (ByName.cs:215-222): an artist that exists in a
+    // library the caller can reach outranks the same artist's folder in one
+    // they cannot, and `Id` is only the tiebreaker. Upstream applies it
+    // unconditionally for MusicArtist; with no `TopParentIds` the `CASE` would
+    // be a constant, so it is omitted rather than emitted as dead SQL.
+    if return_type == stored_type_name(BaseItemKind::MusicArtist).unwrap_or("\u{0}")
+        && !top_parents.is_empty()
+    {
+        qb.push(r#"CASE WHEN bi."TopParentId" IN ("#);
+        let mut sep = qb.separated(", ");
+        for t in top_parents {
+            sep.push_bind(t.clone());
+        }
+        qb.push(") THEN 0 ELSE 1 END, ");
+    }
+    qb.push(r#"bi."Id") AS "rep_rank""#);
 }
 
 /// Joins the value aggregate to the by-name rows it describes.
@@ -4858,6 +4936,121 @@ mod tests {
         assert_eq!(genres.items[0].counts.item_count, 1);
     }
 
+    /// The representative collapse: two by-name rows that share a
+    /// `PresentationUniqueKey` are ONE row on the wire, and the survivor is the
+    /// lowest id.
+    ///
+    /// Ported from `GetItemValues`'s `GroupBy(e => e.PresentationUniqueKey)`,
+    /// which BOTH trees perform (master `BaseItemRepository.ByName.cs:213-224`
+    /// = `g.Min(e => e.Id)`; v10.11.8 `BaseItemRepository.cs:1313-1316` =
+    /// `g.FirstOrDefault()`). Ferrofin listed both rows, so a merged film's
+    /// alternate and a multi-library artist folder each showed up twice.
+    #[tokio::test]
+    async fn by_name_rows_sharing_a_presentation_key_collapse_to_the_lowest_id() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let movie = Uuid::from_u128(0x9A01);
+        let lo = Uuid::from_u128(0x9A02);
+        let hi = Uuid::from_u128(0x9A03);
+
+        seed_named_item(&db, movie, BaseItemKind::Movie, "A Drama Film").await;
+        seed_item_genre(&db, movie, "Drama").await;
+        sqlx::query(r#"DELETE FROM "BaseItems" WHERE "Type" LIKE '%Genre'"#)
+            .execute(db.writer())
+            .await
+            .expect("drop the scanner row");
+        for id in [lo, hi] {
+            seed_named_item(&db, id, BaseItemKind::Genre, "Drama").await;
+            set_clean_name(&db, id, "Drama").await;
+            sqlx::query(
+                r#"UPDATE "BaseItems" SET "PresentationUniqueKey" = 'Genre-Drama'
+                       WHERE "Id" = ?1"#,
+            )
+            .bind(guid_to_db(id))
+            .execute(db.writer())
+            .await
+            .expect("share the key");
+        }
+
+        let q = InternalItemsQuery {
+            enable_total_record_count: true,
+            limit: Some(50),
+            ..InternalItemsQuery::default()
+        };
+        let genres = repository.get_genres(&q).await.expect("genres");
+        assert_eq!(genres.items.len(), 1, "the two rows are one group");
+        assert_eq!(
+            genres.items[0].item.id,
+            guid_to_db(lo),
+            "Min(Id) is the representative"
+        );
+        assert_eq!(
+            genres.total_record_count, 1,
+            "the total counts GROUPS, not rows — otherwise paging promises rows it cannot serve"
+        );
+    }
+
+    /// …and rows with NO key collapse together, because that is what SQLite's
+    /// `GROUP BY` and EF's `GroupBy` both do with NULL — the very behaviour
+    /// that makes a live Jellyfin list four music genres where its database
+    /// holds eight.
+    ///
+    /// Reproducing it faithfully is only half the job: Ferrofin must also write
+    /// the keys upstream writes, or it reproduces the collapse WITHOUT the keys
+    /// that save most rows from it. That is
+    /// `backfill_missing_presentation_keys`, and this test is the reason it is
+    /// not optional.
+    #[tokio::test]
+    async fn unkeyed_by_name_rows_collapse_the_way_upstream_collapses_them() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let movie = Uuid::from_u128(0x9B01);
+        let other = Uuid::from_u128(0x9B02);
+        let drama = Uuid::from_u128(0x9B03);
+        let comedy = Uuid::from_u128(0x9B04);
+
+        seed_named_item(&db, movie, BaseItemKind::Movie, "A Drama Film").await;
+        seed_item_genre(&db, movie, "Drama").await;
+        seed_named_item(&db, other, BaseItemKind::Movie, "A Comedy Film").await;
+        seed_item_genre(&db, other, "Comedy").await;
+        sqlx::query(r#"DELETE FROM "BaseItems" WHERE "Type" LIKE '%Genre'"#)
+            .execute(db.writer())
+            .await
+            .expect("drop the scanner rows");
+        for (id, name) in [(drama, "Drama"), (comedy, "Comedy")] {
+            seed_named_item(&db, id, BaseItemKind::Genre, name).await;
+            set_clean_name(&db, id, name).await;
+            sqlx::query(r#"UPDATE "BaseItems" SET "PresentationUniqueKey" = NULL WHERE "Id" = ?1"#)
+                .bind(guid_to_db(id))
+                .execute(db.writer())
+                .await
+                .expect("unkey");
+        }
+
+        let genres = repository
+            .get_genres(&InternalItemsQuery::default())
+            .await
+            .expect("genres");
+        assert_eq!(
+            genres.items.len(),
+            1,
+            "two DIFFERENT unkeyed genres are one NULL group — upstream's own behaviour"
+        );
+
+        // …and once the keys are repaired, both names come back.
+        assert_eq!(
+            crate::item_persistence_service::backfill_missing_presentation_keys(&db)
+                .await
+                .expect("backfill"),
+            2
+        );
+        let genres = repository
+            .get_genres(&InternalItemsQuery::default())
+            .await
+            .expect("genres");
+        assert_eq!(genres.items.len(), 2, "keyed rows are their own groups");
+    }
+
     /// Matching by name alone is not enough — the row's *kind* is the other
     /// half of the C# filter.
     ///
@@ -4977,10 +5170,10 @@ mod tests {
     }
 
     /// `includeItemTypes` fills the per-kind counts PER by-name row, master's
-    /// `BuildItemCountsByCleanName` (`BaseItemRepository.ByName.cs:277-330`).
+    /// `BuildItemCountsByCleanName` (`BaseItemRepository.ByName.cs:283-338`).
     ///
     /// v10.11.8 instead hands every row the same uncorrelated totals
-    /// (`BaseItemRepository.cs:1350-1390`, whose own comment reads "TODO: This
+    /// (`BaseItemRepository.cs:1368-1392`, whose own comment reads "TODO: This
     /// is bad refactor!"), which is why a 10.11.8 oracle reports the same
     /// `SongCount` for every genre. Ferrofin follows master.
     #[tokio::test]

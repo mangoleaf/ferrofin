@@ -357,6 +357,18 @@ impl FerrofinPeopleRepository {
     /// false there and the round trip is untouched. Returns the number of rows
     /// rewritten.
     ///
+    /// A row carrying a non-empty `ForcedSortName` keeps its `SortName`
+    /// untouched. That column is the USER'S sort-title override, and C# derives
+    /// `SortName` from it instead of `CreateSortName`
+    /// (`BaseItem.cs:544` on master, `:536` on v10.11.8: `ModifySortChunks(ForcedSortName)
+    /// .ToLowerInvariant()`), so rewriting it to the verbatim name would both
+    /// destroy the override and — because the pass would never converge on it —
+    /// re-fire on every boot. Migration `0012_hermit_episode_sort_names.sql`
+    /// guards the same way (`coalesce("ForcedSortName", '') = ''`), as does
+    /// `upsert_item`; this pass is the third path over the same rule and must
+    /// not be the one that disagrees. Its `Path`/`PresentationUniqueKey` halves
+    /// still run for such a row: those are derived columns no user owns.
+    ///
     /// # Errors
     ///
     /// Returns a [`ServiceError`] when the read or the rewrite fails.
@@ -368,7 +380,8 @@ impl FerrofinPeopleRepository {
             return Ok(0);
         };
         let rows: Vec<PersonRepairRow> = sqlx::query_as(
-            r#"SELECT "Id", "Name", "SortName", "Path", "PresentationUniqueKey"
+            r#"SELECT "Id", "Name", "SortName", "Path", "PresentationUniqueKey",
+                      coalesce("ForcedSortName", '')
                    FROM "BaseItems" WHERE "Type" = ?1"#,
         )
         .bind(person_type)
@@ -376,8 +389,8 @@ impl FerrofinPeopleRepository {
         .await
         .map_err(db_err)?;
 
-        let mut pending: Vec<(String, String, Option<String>, Option<String>)> = Vec::new();
-        for (id, name, sort_name, path, key) in rows {
+        let mut pending: Vec<PersonRepairWrite> = Vec::new();
+        for (id, name, sort_name, path, key, forced) in rows {
             let Some(name) = name.as_deref().map(str::trim).filter(|n| !n.is_empty()) else {
                 continue;
             };
@@ -395,13 +408,16 @@ impl FerrofinPeopleRepository {
             });
             let new_path = want_path.filter(|_| path.is_none());
             let new_key = want_key.filter(|_| key.is_none());
-            if sort_name.as_deref() == Some(want_sort.as_str())
-                && new_path.is_none()
-                && new_key.is_none()
-            {
+            // `ForcedSortName` wins over the derived name — see the doc above.
+            let new_sort = forced
+                .trim()
+                .is_empty()
+                .then_some(want_sort)
+                .filter(|want| sort_name.as_deref() != Some(want.as_str()));
+            if new_sort.is_none() && new_path.is_none() && new_key.is_none() {
                 continue;
             }
-            pending.push((id, want_sort, new_path, new_key));
+            pending.push((id, new_sort, new_path, new_key));
         }
         if pending.is_empty() {
             return Ok(0);
@@ -411,7 +427,7 @@ impl FerrofinPeopleRepository {
         for (id, sort_name, path, key) in &pending {
             sqlx::query(
                 r#"UPDATE "BaseItems"
-                   SET "SortName" = ?2,
+                   SET "SortName" = COALESCE(?2, "SortName"),
                        "Path" = COALESCE("Path", ?3),
                        "PresentationUniqueKey" = COALESCE("PresentationUniqueKey", ?4)
                    WHERE "Id" = ?1"#,
@@ -436,14 +452,26 @@ impl FerrofinPeopleRepository {
     }
 }
 
+/// One rewrite [`FerrofinPeopleRepository::repair_person_items`] has decided on:
+/// `(Id, new SortName or None, new Path or None, new PresentationUniqueKey or
+/// None)`. Each column is `None` when the row's current value is already right
+/// — or, for `SortName`, when the row carries a `ForcedSortName` the pass must
+/// not touch.
+type PersonRepairWrite = (String, Option<String>, Option<String>, Option<String>);
+
 /// One `Person` row as [`FerrofinPeopleRepository::repair_person_items`] reads
-/// it: `(Id, Name, SortName, Path, PresentationUniqueKey)`.
+/// it: `(Id, Name, SortName, Path, PresentationUniqueKey, ForcedSortName)`.
+///
+/// `ForcedSortName` is coalesced to `''` in the SELECT, so an absent override
+/// and an empty one are the same value here — the one the pass must not
+/// overwrite is the non-empty one.
 type PersonRepairRow = (
     String,
     Option<String>,
     Option<String>,
     Option<String>,
     Option<String>,
+    String,
 );
 
 /// Dedupes credited people case-insensitively by `(name, person_type)`, matching
@@ -1361,6 +1389,70 @@ mod tests {
             repo.repair_person_items().await.expect("second pass"),
             0,
             "idempotent: a correct row is not rewritten"
+        );
+    }
+
+    /// …and it must NOT touch a row whose `SortName` came from the user's
+    /// `ForcedSortName`. That column is the sort-title override, and C# derives
+    /// `SortName` from it instead of `CreateSortName`
+    /// (`BaseItem.cs:544` on master, `:536` on v10.11.8), so a Jellyfin
+    /// database legitimately holds a `SortName` that is neither the verbatim
+    /// name nor anything this pass can compute. Rewriting it would destroy the
+    /// override AND make the pass re-fire on every boot, since the row could
+    /// never converge. Migration `0012` and `upsert_item` guard the same way.
+    #[tokio::test]
+    async fn repair_person_items_never_overwrites_a_forced_sort_name() {
+        use crate::item_type_lookup::{IdDerivation, person_item_id};
+        use crate::test_support::seed_named_item;
+
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let people_path = tmp.path().join("People").to_string_lossy().into_owned();
+        let mode = IdDerivation::Jellyfin {
+            program_data_path: Some(tmp.path().to_string_lossy().into_owned()),
+        };
+        let id = person_item_id(&mode, &people_path, "Alice Parity").expect("derived");
+        seed_named_item(&db, id, BaseItemKind::Person, "Alice Parity").await;
+        // The shape an adopted Jellyfin database has: an override, and the
+        // SortName Jellyfin derived from it — neither equal to the name.
+        sqlx::query(
+            r#"UPDATE "BaseItems" SET "ForcedSortName" = 'Parity, Alice',
+                 "SortName" = 'parity, alice',
+                 "Path" = NULL, "PresentationUniqueKey" = NULL WHERE "Id" = ?1"#,
+        )
+        .bind(guid_to_db(id))
+        .execute(db.writer())
+        .await
+        .expect("forced row");
+
+        let repo =
+            FerrofinPeopleRepository::new(db.clone()).with_identity(mode, people_path.clone());
+        // The row IS repaired — its Path and key are derived columns nobody
+        // owns — but the sort name survives untouched.
+        assert_eq!(repo.repair_person_items().await.expect("repair"), 1);
+        let (path, key, sort): (Option<String>, Option<String>, Option<String>) = sqlx::query_as(
+            r#"SELECT "Path", "PresentationUniqueKey", "SortName" FROM "BaseItems"
+                   WHERE "Id" = ?1"#,
+        )
+        .bind(guid_to_db(id))
+        .fetch_one(db.pool())
+        .await
+        .expect("person row");
+        assert_eq!(
+            sort.as_deref(),
+            Some("parity, alice"),
+            "the user's sort-title override must survive the repair"
+        );
+        assert!(
+            path.is_some() && key.is_some(),
+            "derived columns still filled"
+        );
+
+        // …and now it converges: nothing is left to do on the next boot.
+        assert_eq!(
+            repo.repair_person_items().await.expect("second pass"),
+            0,
+            "a forced-sort-name row must not re-fire the pass every startup"
         );
     }
 
