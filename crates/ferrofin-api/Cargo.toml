@@ -27,6 +27,9 @@ ferrofin-networking.workspace = true
 # The MD5 id-derivation helper (`GetMD5`) the display-preferences controller
 # uses to hash a non-Guid `displayPreferencesId` into a stable item id.
 ferrofin-common.workspace = true
+# `guid_extensions::parse_dotnet_guid` — the .NET `Guid.TryParse` format set
+# ASP.NET binds a `Guid?` query parameter with, which is not `Uuid::parse_str`'s.
+ferrofin-util.workspace = true
 # The manager traits return `ferrofin-db` entity types (`UserEntity`,
 # `BaseItemEntity`, …); the real handlers name them when projecting to DTOs, so
 # this is a plain (non-optional) dependency.

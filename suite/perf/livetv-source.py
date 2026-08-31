@@ -13,7 +13,8 @@ Runs inside the `livetv-source` compose service (python:3-alpine, stdlib only); 
 length comes from docker-compose.yml, next to where gen-fixtures.sh's 60 s is noted.
 
 It also serves two FIXED plugin-repository manifests at /manifest.json and
-/manifest-b.json. `GET /Packages` aggregates whatever the configured repositories
+/manifest-b.json, plus a deliberately POISONED one at /manifest-poison.json whose
+content changes on every request (see below). `GET /Packages` aggregates whatever the configured repositories
 publish, so diffing it against the live repo.jellyfin.org would make the row
 depend on upstream content that changes without notice; pointing BOTH servers at
 a manifest on this container instead makes the catalogue deterministic and
@@ -24,6 +25,7 @@ a version whose targetAbi is above 10.11.8, a version whose targetAbi does not
 parse, and one package listed by BOTH manifests so the same-guid merge runs.
 """
 import http.server
+import itertools
 import json
 import os
 import socketserver
@@ -108,7 +110,45 @@ MANIFEST_B = [
     },
 ]
 
-MANIFESTS = {"/manifest.json": MANIFEST_A, "/manifest-b.json": MANIFEST_B}
+# The DISABLED repository's manifest — a poison pill, not a dead URL.
+#
+# `GetAvailablePackages` skips a repository with `Enabled: false` BEFORE fetching
+# it (`if (repository.Enabled && repository.Url is not null)`). A dead URL cannot
+# test that: a server that ignored the flag would get an instant 404, warn, skip,
+# and produce a byte-identical catalogue — the leg would pass either way. This
+# path is served, and every response is DIFFERENT: the package identity carries a
+# per-request counter. So if either server fetches it the catalogues diverge (one
+# has an extra package, or both have one with different guids/names), and the
+# body diff goes red. If neither fetches it, nothing is added and the diff is
+# clean — which is the only outcome the flag permits.
+POISON_COUNTER = itertools.count(1)
+
+
+def poison_manifest():
+    n = next(POISON_COUNTER)
+    return [
+        {
+            "category": "Metadata",
+            # A fresh guid per request, so two servers that both fetched would
+            # still disagree with each other, not just with the expected list.
+            "guid": f"deadbeef-0000-0000-0000-{n:012d}",
+            "name": f"Parity Poison {n}",
+            "description": "A DISABLED repository must never be fetched.",
+            "overview": "If this appears in /Packages, repository.Enabled was ignored.",
+            "owner": "parity",
+            "versions": [
+                # targetAbi below the server version, so nothing else would drop it.
+                {"version": f"{n}.0.0.0", "targetAbi": "10.0.0.0", "changelog": "poison",
+                 "sourceUrl": "http://livetv-source:8000/poison.zip", "checksum": "ppp",
+                 "timestamp": "2025-01-01T00:00:00Z"},
+            ],
+        },
+    ]
+
+
+MANIFESTS = {"/manifest.json": lambda: MANIFEST_A,
+             "/manifest-b.json": lambda: MANIFEST_B,
+             "/manifest-poison.json": poison_manifest}
 
 
 class Broadcast(http.server.BaseHTTPRequestHandler):
@@ -118,7 +158,7 @@ class Broadcast(http.server.BaseHTTPRequestHandler):
     def do_GET(self):   # noqa: N802 — BaseHTTPRequestHandler's naming
         manifest = MANIFESTS.get(self.path.split("?")[0])
         if manifest is not None:
-            body = json.dumps(manifest).encode()
+            body = json.dumps(manifest()).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))

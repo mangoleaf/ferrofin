@@ -558,10 +558,14 @@ async fn plugin_route_strips_credentials_and_reserved_headers() {
 //
 // The C# is `FilterPackages(packages, name, assemblyGuid ?? default)`, whose two
 // predicates are ALTERNATIVES with the guid winning, over an `assemblyGuid` bound
-// by ASP.NET as a `Guid?` (N/D/B/P spellings all accepted, anything else a 400).
+// by ASP.NET as a `Guid?` — so the accepted spellings are exactly
+// `Guid.TryParse`'s (N/D/B/P/X, trimmed at both ends) and anything else is a 400.
 // Ferrofin used to AND them and string-compare the guid in its hyphenated
 // spelling — which never matched, because every guid Ferrofin serialises is
 // dashless. That is the exact shape jellyfin-web's plugin-detail page sends.
+// The format-set cases below are the handler's end of
+// `ferrofin_util::guid_extensions::parse_dotnet_guid`, whose own tests carry the
+// live 10.11.8 oracle statuses for each spelling.
 
 /// The dashless (`"N"`) spelling — the one Ferrofin itself emits from
 /// `/Plugins[].Id` and `/Packages[].guid`, and the one the dashboard echoes back.
@@ -646,4 +650,114 @@ async fn package_unknown_name_is_not_found() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// The braced (`"B"`), parenthesised (`"P"`) and hex-object (`"X"`) spellings,
+/// and a value padded with whitespace — all accepted by `Guid.TryParse`, so all
+/// accepted here. `P` and `X` were live divergences (400 here, 200 on the
+/// 10.11.8 oracle) until the binder stopped being `Uuid::parse_str`.
+#[tokio::test]
+async fn package_accepts_every_dotnet_guid_spelling() {
+    let id = known_id();
+    let hyphenated = id.hyphenated().to_string();
+    let bytes = id.as_bytes();
+    let hex_object = format!(
+        "{{0x{:08x},0x{:04x},0x{:04x},{{0x{:02x},0x{:02x},0x{:02x},0x{:02x},\
+0x{:02x},0x{:02x},0x{:02x},0x{:02x}}}}}",
+        u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+        u16::from_be_bytes([bytes[4], bytes[5]]),
+        u16::from_be_bytes([bytes[6], bytes[7]]),
+        bytes[8],
+        bytes[9],
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15],
+    );
+    for spelling in [
+        format!("{{{hyphenated}}}"),
+        format!("({hyphenated})"),
+        hex_object,
+        format!("  {hyphenated}  "),
+    ] {
+        let uri = format!(
+            "/Packages/Demo?assemblyGuid={}",
+            urlencoding_all(spelling.as_str())
+        );
+        let resp = router(Arc::new(RecordingPlugins::default()))
+            .oneshot(authed("GET", &uri, Body::empty()))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{spelling}");
+    }
+}
+
+/// `urn:uuid:` is the one spelling `Uuid::parse_str` takes and .NET does not —
+/// measured 200 here / 400 on the oracle before the binder was ported.
+#[tokio::test]
+async fn package_urn_guid_is_a_bad_request() {
+    let uri = format!("/Packages/Demo?assemblyGuid=urn%3Auuid%3A{}", known_id());
+    let resp = router(Arc::new(RecordingPlugins::default()))
+        .oneshot(authed("GET", &uri, Body::empty()))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+/// `POST /Packages/Installed/{name}` binds its `assemblyGuid` the same way, so
+/// it must take (and refuse) the same spellings. Both outcomes are a 400 with
+/// this fake — the trait default refuses runtime installs — so the discriminator
+/// is WHOSE 400 it is: model binding never reaches the manager.
+#[tokio::test]
+async fn install_binds_the_assembly_guid_the_same_way() {
+    let uri = format!(
+        "/Packages/Installed/Demo?assemblyGuid={}",
+        urlencoding_all(&format!("({})", known_id().hyphenated()))
+    );
+    let resp = router(Arc::new(RecordingPlugins::default()))
+        .oneshot(authed("POST", &uri, Body::empty()))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_string(resp).await;
+    assert!(
+        body.contains("runtime plugin installation is not available"),
+        "the P spelling must bind and reach the manager: {body}"
+    );
+
+    let resp = router(Arc::new(RecordingPlugins::default()))
+        .oneshot(authed(
+            "POST",
+            &format!(
+                "/Packages/Installed/Demo?assemblyGuid=urn%3Auuid%3A{}",
+                known_id()
+            ),
+            Body::empty(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_string(resp).await;
+    assert!(
+        body.contains("is not a valid GUID"),
+        "the URN spelling must be refused by binding, before the manager: {body}"
+    );
+}
+
+/// Percent-encodes every byte that is not an unreserved URI character, so a
+/// guid spelling full of braces, parentheses and commas survives the query
+/// string exactly as written.
+fn urlencoding_all(value: &str) -> String {
+    value
+        .bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+                char::from(b).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect()
 }

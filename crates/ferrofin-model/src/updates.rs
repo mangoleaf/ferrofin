@@ -115,15 +115,56 @@ impl VersionInfo {
     /// [`version`](Self::version), as the C# computed property does.
     ///
     /// `VersionInfo.Version`'s setter is `_version = SysVersion.Parse(value)` and
-    /// its getter is `_version.ToString()`, so the two are the same normalized
-    /// string; an entry with no version at all reports `SysVersion(0, 0, 0)`.
+    /// its getter is `_version.ToString()`, so **both** properties are the
+    /// round-tripped `System.Version` — `"1.00.0"` reaches the wire as `"1.0.0"`
+    /// on both. That normalization is applied here, to `version` as well as to
+    /// `version_number`, or a manifest with a padded component would diff.
+    /// An entry with no version at all reports `SysVersion(0, 0, 0)`.
+    ///
+    /// DELIBERATE DIVERGENCE on a version string that does not parse: upstream
+    /// throws out of the property setter during deserialization, and
+    /// `InstallationManager.GetPackages` catches only `JsonException`/`IOException`
+    /// /`UriFormatException`/`NotSupportedException`/`HttpRequestException` — a
+    /// `FormatException` from `SysVersion.Parse` escapes all five and takes
+    /// `GET /Packages` down with a `500`. Ferrofin keeps the entry with its
+    /// string as written instead. Porting the crash would be porting a bug.
     pub fn fill_version_number(&mut self) {
         if self.version.is_empty() {
             "0.0.0".clone_into(&mut self.version_number);
-        } else {
-            self.version_number.clone_from(&self.version);
+            return;
         }
+        if let Some(normalized) = normalize_system_version(&self.version) {
+            self.version = normalized;
+        }
+        self.version_number.clone_from(&self.version);
     }
+}
+
+/// `SysVersion.Parse(value).ToString()`: two to four dot-separated non-negative
+/// `Int32` components, re-rendered without padding and with exactly as many
+/// components as were given. `None` when the string is not a `System.Version`
+/// (upstream throws there; see [`VersionInfo::fill_version_number`]).
+fn normalize_system_version(value: &str) -> Option<String> {
+    let parts: Vec<&str> = value.split('.').collect();
+    if !(2..=4).contains(&parts.len()) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(parts.len());
+    for part in parts {
+        // `Version` parses each component with `int.TryParse(NumberStyles.Integer)`,
+        // which tolerates surrounding whitespace and a leading sign, then rejects
+        // a negative value.
+        let trimmed = part.trim();
+        let unsigned = trimmed.strip_prefix('+').unwrap_or(trimmed);
+        out.push(
+            unsigned
+                .parse::<i32>()
+                .ok()
+                .filter(|v| *v >= 0)?
+                .to_string(),
+        );
+    }
+    Some(out.join("."))
 }
 
 /// Information about a plugin package available from a repository.
@@ -343,5 +384,50 @@ mod tests {
         assert_eq!(json["Enabled"], true);
         let back: RepositoryInfo = serde_json::from_value(json).unwrap();
         assert_eq!(value, back);
+    }
+
+    #[test]
+    fn fill_version_number_round_trips_the_system_version() {
+        let cases = [
+            // (manifest value, wire `version` == wire `VersionNumber`)
+            ("1.0.0", "1.0.0"),
+            ("1.2.3.4", "1.2.3.4"),
+            ("10.11", "10.11"),
+            // `SysVersion.Parse("1.00.0").ToString()` drops the padding, and the
+            // component count is preserved.
+            ("1.00.0", "1.0.0"),
+            ("01.02", "1.2"),
+            ("1.0.0.00", "1.0.0.0"),
+        ];
+        for (raw, expected) in cases {
+            let mut v = VersionInfo {
+                version: raw.to_owned(),
+                ..VersionInfo::default()
+            };
+            v.fill_version_number();
+            assert_eq!(v.version, expected, "{raw}");
+            assert_eq!(v.version_number, expected, "{raw}");
+        }
+    }
+
+    #[test]
+    fn fill_version_number_defaults_and_keeps_unparseable_strings() {
+        let mut empty = VersionInfo::default();
+        empty.fill_version_number();
+        assert_eq!(empty.version, "");
+        assert_eq!(empty.version_number, "0.0.0");
+
+        // Upstream throws a `FormatException` out of the setter here, which
+        // `GetPackages` does not catch; Ferrofin keeps the entry as written.
+        for raw in ["1", "1.0.0-beta", "1.2.3.4.5", "-1.0", "", "x.y"] {
+            let mut v = VersionInfo {
+                version: raw.to_owned(),
+                ..VersionInfo::default()
+            };
+            v.fill_version_number();
+            assert_eq!(v.version, raw, "{raw}");
+            let expected = if raw.is_empty() { "0.0.0" } else { raw };
+            assert_eq!(v.version_number, expected, "{raw}");
+        }
     }
 }

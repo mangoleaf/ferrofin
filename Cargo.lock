@@ -1113,6 +1113,7 @@ dependencies = [
  "ferrofin-model",
  "ferrofin-networking",
  "ferrofin-traits",
+ "ferrofin-util",
  "flate2",
  "futures-core",
  "futures-util",

@@ -365,6 +365,20 @@ async fn get_packages(
     Ok(Json(state.plugins.list_packages().await?))
 }
 
+/// Binds an `assemblyGuid` query parameter the way ASP.NET binds a `Guid?`:
+/// absent or empty is `None`, a value is parsed with the .NET format set, and
+/// anything unparseable is a `400` before the action body ever runs.
+fn parse_assembly_guid(raw: Option<&str>) -> Result<Option<Uuid>, ApiError> {
+    match raw.filter(|g| !g.is_empty()) {
+        Some(raw) => Ok(Some(
+            ferrofin_util::guid_extensions::parse_dotnet_guid(raw).ok_or_else(|| {
+                ApiError::BadRequest(format!("assemblyGuid `{raw}` is not a valid GUID"))
+            })?,
+        )),
+        None => Ok(None),
+    }
+}
+
 /// `GET /Packages/{name}` — a package by name or assembly GUID.
 ///
 /// Port of `PackageController.GetPackageInfo`:
@@ -378,11 +392,15 @@ async fn get_packages(
 /// `FilterPackages` treats guid and name as **alternatives** and the guid wins,
 /// so a supplied `assemblyGuid` selects on its own; an all-zeros guid is
 /// `IsEmpty()` and falls through to the name. The guid is bound by ASP.NET as a
-/// `Guid?`, which accepts the N/D/B/P spellings alike and rejects anything else
-/// with a `400` — matched here by parsing it before the lookup rather than
-/// string-comparing it against one particular spelling. That comparison was a
-/// live bug: Ferrofin serialises every guid dashless, so the value the dashboard
-/// echoes back out of `/Plugins` never matched.
+/// `Guid?`, so its accepted spellings are exactly `Guid.TryParse`'s and anything
+/// else is a `400` from model binding — which is
+/// [`parse_dotnet_guid`](ferrofin_util::guid_extensions::parse_dotnet_guid), not
+/// `Uuid::parse_str`. The two are NOT the same set, measured live against the
+/// 10.11.8 oracle: `Uuid::parse_str` rejects the parenthesised `(guid)` and
+/// hex-object `{0x…}` spellings .NET takes, and accepts a `urn:uuid:` prefix
+/// .NET refuses. String-comparing one spelling was the original bug — Ferrofin
+/// serialises every guid dashless, so the value the dashboard echoes back out of
+/// `/Plugins` never matched.
 #[utoipa::path(
     get,
     path = "/Packages/{name}",
@@ -399,12 +417,7 @@ async fn get_package_info(
     Path(name): Path<String>,
     Query(query): Query<PackageInfoQuery>,
 ) -> Result<Json<PackageInfo>, ApiError> {
-    let assembly_guid = match query.assembly_guid.as_deref().filter(|g| !g.is_empty()) {
-        Some(raw) => Some(uuid::Uuid::parse_str(raw).map_err(|_| {
-            ApiError::BadRequest(format!("assemblyGuid `{raw}` is not a valid GUID"))
-        })?),
-        None => None,
-    };
+    let assembly_guid = parse_assembly_guid(query.assembly_guid.as_deref())?;
     let package = state
         .plugins
         .find_package(Some(name.as_str()), assembly_guid)
@@ -466,12 +479,7 @@ async fn install_package(
     Query(query): Query<InstallPackageQuery>,
 ) -> Result<StatusCode, ApiError> {
     require_admin(&state, &auth).await?;
-    let assembly_guid = match query.assembly_guid.as_deref().filter(|g| !g.is_empty()) {
-        Some(raw) => Some(uuid::Uuid::parse_str(raw).map_err(|_| {
-            ApiError::BadRequest(format!("assemblyGuid `{raw}` is not a valid GUID"))
-        })?),
-        None => None,
-    };
+    let assembly_guid = parse_assembly_guid(query.assembly_guid.as_deref())?;
     state
         .plugins
         .install_package(

@@ -65,7 +65,14 @@ async fn after_structure_change(state: &AppState, refresh_library: bool, scope: 
 }
 
 /// Resolves a just-mutated virtual folder's `CollectionFolder` id by name, for
-/// scoping the follow-up scan. Best-effort (`None` falls back to a full scan).
+/// scoping the follow-up scan.
+///
+/// Best-effort. `get_virtual_folders` mints the row (and its path-derived id)
+/// for every directory it enumerates, so a just-renamed library resolves; the
+/// `None` arm is reachable only when the directory does not project an id at all
+/// (it is not under the user-views root, or its name is not valid UTF-8). The
+/// caller must treat `None` as "unscoped", i.e. a FULL scan — see the note on
+/// [`rename_virtual_folder`].
 async fn library_id_by_name(state: &AppState, name: &str) -> Option<Uuid> {
     state
         .virtual_folders
@@ -281,19 +288,33 @@ async fn rename_virtual_folder(
         .rename_virtual_folder(&name, &new_name)
         .await?;
     // Deliberate divergence from `LibraryStructureController.RenameVirtualFolder`,
-    // which only refreshes when `refreshLibrary` is set. Ferrofin derives a
-    // library's item id from its directory path, so the rename necessarily
-    // re-keys the row: the manager deletes the row the vacated directory backed
-    // (upstream's `ValidateTopLibraryFolders` leg) and the new path mints a fresh
-    // one, which cascades the old row's children away. Upstream can skip the
-    // refresh because it keeps the stale row (and its children) until the next
-    // scan; here, skipping it would leave the renamed library empty. So the
-    // rescan is unconditional, and scoped to the renamed library.
+    // which runs `ValidateTopLibraryFolders(ct, removeRoot: true)` only when
+    // `refreshLibrary` is set and otherwise just delays 1 s and restarts the
+    // monitor. Ferrofin derives a library's item id from its directory path, so
+    // the rename necessarily re-keys the row: the manager deletes the row the
+    // vacated directory backed (upstream's `ValidateTopLibraryFolders` leg) and
+    // the new path mints a fresh one, which cascades the old row's children away.
+    // Upstream can skip the refresh because it keeps the stale row (and its
+    // children) until the next scan; here, skipping it would leave the renamed
+    // library empty. So the rescan is unconditional.
+    //
+    // It is scoped to the renamed library WHEN its id resolves, which is the
+    // normal case. If it does not, the fallback is a FULL library scan — more
+    // than upstream would queue for the same request, and on a large install a
+    // dashboard rename would then kick a whole pass. That arm is logged at WARN
+    // rather than left silent, because a full pass nobody asked for should be
+    // attributable.
     tracing::debug!(
         refresh_library = query.refresh_library,
         "renamed a library; rescanning it regardless, because its item id is derived from its path"
     );
     let scope = library_id_by_name(&state, &new_name).await;
+    if scope.is_none() {
+        tracing::warn!(
+            new_name,
+            "renamed library has no resolvable item id; falling back to a FULL library scan"
+        );
+    }
     after_structure_change(&state, true, scope).await;
     Ok(StatusCode::NO_CONTENT)
 }

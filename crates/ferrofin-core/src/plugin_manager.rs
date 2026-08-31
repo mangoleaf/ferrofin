@@ -27,6 +27,7 @@ use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::plugins::{
     PluginArtifactValidator, PluginDescriptor, PluginImage, PluginManager, PluginUpdateInfo,
 };
+use ferrofin_util::string_extensions::equals_ordinal_ignore_case;
 
 use crate::system_manager::LifecycleController;
 
@@ -803,7 +804,7 @@ fn filter_packages<'a>(
     let name = name?;
     packages
         .iter()
-        .find(|p| p.name.to_lowercase() == name.to_lowercase())
+        .find(|p| equals_ordinal_ignore_case(&p.name, name))
 }
 
 #[async_trait]
@@ -1241,9 +1242,12 @@ impl PluginManager for FerrofinPluginManager {
                 // first is taken": a second repository listing the same plugin
                 // merges its versions into the existing entry rather than adding a
                 // duplicate package.
+                // `FilterPackages(result, package.Name, package.Id)`: the guid
+                // wins when it is non-empty, and the name branch is
+                // `OrdinalIgnoreCase`, not a `ToLower()` comparison.
                 let existing = packages.iter_mut().find(|p| {
                     if package.id.is_nil() {
-                        p.name.to_lowercase() == package.name.to_lowercase()
+                        equals_ordinal_ignore_case(&p.name, &package.name)
                     } else {
                         p.id == package.id
                     }
@@ -1848,6 +1852,59 @@ mod tests {
             versions,
             ["2.0.0.0", "1.0.0.0"],
             "10.11.9.0 is above this server; an unparseable abi falls back to 0.0.0.1 and stays"
+        );
+    }
+
+    /// `if (repository.Enabled && repository.Url is not null)` — a disabled
+    /// repository is skipped BEFORE the fetch, not filtered out of the result.
+    ///
+    /// The assertion is that the disabled repository's server is never hit, which
+    /// a body comparison cannot make: a disabled repository whose URL merely 404s
+    /// produces exactly the same catalogue whether the flag is honoured or not.
+    #[tokio::test]
+    async fn a_disabled_repository_is_never_fetched() {
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&hits);
+        let (disabled_base, _stop_disabled) = raw_server(move |_| {
+            Box::new(move |_request| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                http_ok(
+                    "application/json",
+                    br#"[{"name":"Poison","guid":"44444444-4444-4444-4444-444444444444",
+                          "versions":[{"version":"9.0.0.0"}]}]"#,
+                )
+            })
+        });
+        let (enabled_base, _stop_enabled) = manifest_server(
+            r#"[{"name":"Kept","guid":"55555555-5555-5555-5555-555555555555","versions":[
+                   {"version":"1.0.0.0"}]}]"#
+                .to_owned(),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = catalog_manager(
+            &dir,
+            Vec::new(),
+            vec![
+                repo("Enabled", &format!("{enabled_base}/manifest.json")),
+                RepositoryInfo {
+                    name: Some("Disabled".to_owned()),
+                    url: Some(format!("{disabled_base}/manifest.json")),
+                    enabled: false,
+                },
+            ],
+            "10.11.8",
+        );
+
+        let packages = mgr.list_packages().await.expect("packages");
+        assert_eq!(
+            packages.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            ["Kept"],
+            "the disabled repository contributed a package: {packages:?}"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "the disabled repository's URL was requested"
         );
     }
 

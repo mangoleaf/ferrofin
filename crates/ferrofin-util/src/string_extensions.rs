@@ -209,6 +209,32 @@ pub fn get_clean_value(value: &str) -> String {
     remove_diacritics(value).to_lowercase()
 }
 
+/// `string.Equals(a, b, StringComparison.OrdinalIgnoreCase)`.
+///
+/// Not `a.to_lowercase() == b.to_lowercase()`: .NET's ordinal-ignore-case
+/// comparison applies the **simple** invariant uppercase mapping to each
+/// character, so a mapping that changes length (`ß` → `SS`) does not apply and
+/// characters that lowercase onto an ASCII letter under full Unicode rules —
+/// the Kelvin sign `K` (U+212A) lowercases to `k` in Rust — stay distinct. Lower
+/// casing both sides folds those together and would match strings .NET does not.
+#[must_use]
+pub fn equals_ordinal_ignore_case(left: &str, right: &str) -> bool {
+    left.chars()
+        .map(to_upper_invariant)
+        .eq(right.chars().map(to_upper_invariant))
+}
+
+/// `char.ToUpperInvariant` — the *simple* mapping, which by definition maps one
+/// character to one character. Rust's `char::to_uppercase` is the full mapping,
+/// so a character whose uppercase form is longer is left as it is.
+fn to_upper_invariant(c: char) -> char {
+    let mut upper = c.to_uppercase();
+    match (upper.next(), upper.next()) {
+        (Some(single), None) => single,
+        _ => c,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -346,5 +372,19 @@ mod tests {
     )]
     fn get_clean_value_normalizes(#[case] input: &str, #[case] expected: &str) {
         assert_eq!(expected, get_clean_value(input));
+    }
+
+    #[test]
+    fn ordinal_ignore_case_matches_dotnet() {
+        assert!(equals_ordinal_ignore_case("Bookshelf", "BOOKSHELF"));
+        assert!(equals_ordinal_ignore_case("", ""));
+        assert!(equals_ordinal_ignore_case("ÉCLAIR", "éclair"));
+        assert!(!equals_ordinal_ignore_case("Bookshelf", "Bookshelves"));
+        assert!(!equals_ordinal_ignore_case("a", "b"));
+        // The two cases a `to_lowercase()` comparison gets wrong: `ß` has no
+        // single-character uppercase, and the Kelvin sign is not `k`.
+        assert!(!equals_ordinal_ignore_case("straße", "STRASSE"));
+        assert!(!equals_ordinal_ignore_case("\u{212a}elvin", "kelvin"));
+        assert_eq!("\u{212a}".to_lowercase(), "k", "the trap this avoids");
     }
 }

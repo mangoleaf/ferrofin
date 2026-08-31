@@ -485,10 +485,19 @@ FIXTURE_REPOS = [
     {"Name": "Parity Fixture B", "Url": "http://livetv-source:8000/manifest-b.json",
      "Enabled": True},
     # A disabled repository must be skipped entirely
-    # (`if (repository.Enabled && repository.Url is not null)`); pointing it at a
-    # dead URL proves the skip happens BEFORE the fetch — if either server tried
-    # it, the row would stall rather than quietly pass.
-    {"Name": "Parity Fixture Disabled", "Url": "http://livetv-source:8000/nope.json",
+    # (`if (repository.Enabled && repository.Url is not null)`). This URL is
+    # SERVED, and serves something different on every request (see
+    # suite/perf/livetv-source.py's poison_manifest): a fetch by either server
+    # puts a package with a per-request guid into that server's catalogue and the
+    # body diff goes red, while the flag being honoured leaves both catalogues
+    # untouched. An unservable URL could not tell those apart — a 404 is instant,
+    # so a server that ignored the flag would warn, skip, and produce a
+    # byte-identical catalogue anyway. (The absolute form of the same assertion —
+    # that the disabled URL is never REQUESTED — is a hit-counted unit test,
+    # `plugin_manager::tests::a_disabled_repository_is_never_fetched`; a
+    # cross-server body diff cannot fail a behaviour both servers share.)
+    {"Name": "Parity Fixture Disabled",
+     "Url": "http://livetv-source:8000/manifest-poison.json",
      "Enabled": False},
 ]
 
@@ -534,6 +543,12 @@ def reap_package_repositories(base, token, ctx):
     return {"restore": st}
 
 
+def hex_object(guid):
+    """A dashless guid in .NET's `X` spelling: `{0xa,0xb,0xc,{0xd0,…,0xd7}}`."""
+    tail = ",".join(f"0x{guid[i:i + 2]}" for i in range(16, 32, 2))
+    return f"{{0x{guid[0:8]},0x{guid[8:12]},0x{guid[12:16]},{{{tail}}}}}"
+
+
 def packages_by_name_invariants(base, token, ctx):
     """Every branch of `InstallationManager.FilterPackages`, as booleans.
 
@@ -547,9 +562,12 @@ def packages_by_name_invariants(base, token, ctx):
         if (!id.IsEmpty())          … Where(x => x.Id.Equals(id));
         else if (name is not null)  … Where(x => x.Name.Equals(name, OrdinalIgnoreCase));
 
-    The guid is bound as `Guid?`, so the N/D/B spellings must all resolve and
+    The guid is bound as `Guid?`, so `Guid.TryParse`'s WHOLE format set must
+    resolve — N, D, B, P and X, with whitespace trimmed at both ends — and
     anything else must be a 400 from model binding. The N (dashless) spelling is
-    the one both servers emit and jellyfin-web echoes back.
+    the one both servers emit and jellyfin-web echoes back; `urn:uuid:` is the
+    one .NET refuses and `uuid::Uuid::parse_str` accepts, so it is asserted as a
+    400 rather than left out.
     """
     facts = {}
     st, catalog = token_get(base, "/Packages", token)
@@ -574,6 +592,20 @@ def packages_by_name_invariants(base, token, ctx):
     facts["guid_d_format_200"] = status(f"/Packages/{qn}?assemblyGuid={hyphenated}") == 200
     facts["guid_b_format_200"] = status(
         f"/Packages/{qn}?assemblyGuid=%7B{hyphenated}%7D") == 200
+    # The P ("(guid)") and X ("{0x…}") spellings and the whitespace trim are the
+    # rest of `Guid.TryParse`'s set, and `urn:uuid:` is the one spelling it
+    # REFUSES that Rust's `Uuid::parse_str` takes. Enumerating N/D/B and stopping
+    # is exactly where the two servers used to disagree, so the row went green
+    # over a live difference: `(guid)` was 400 here / 200 there, `urn:uuid:` 200
+    # here / 400 there, and `{0x…}` 400 here / 200 there.
+    facts["guid_p_format_200"] = status(
+        f"/Packages/{qn}?assemblyGuid=%28{hyphenated}%29") == 200
+    facts["guid_x_format_200"] = status(
+        f"/Packages/{qn}?assemblyGuid={urllib.parse.quote(hex_object(guid), safe='')}") == 200
+    facts["padded_guid_is_trimmed_200"] = status(
+        f"/Packages/{qn}?assemblyGuid=%20{hyphenated}%20") == 200
+    facts["urn_guid_is_400"] = status(
+        f"/Packages/{qn}?assemblyGuid=urn%3Auuid%3A{hyphenated}") == 400
     # `!id.IsEmpty()` short-circuits the name entirely, so a wrong name still
     # resolves the guid's package.
     st, body = token_get(base, f"/Packages/zzz-no-such-package?assemblyGuid={guid}", token)
