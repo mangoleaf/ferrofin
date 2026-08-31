@@ -158,45 +158,73 @@ pub(crate) struct UpdateItemRequest {
     album_artists: Option<Vec<NameGuidPair>>,
 }
 
-/// A JSON value that is either a number or a (possibly numeric) string — the shape
-/// the metadata editor emits for its number inputs.
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum NumOrStr {
-    Num(f64),
-    Str(String),
-}
-
-impl NumOrStr {
-    /// The numeric value, or `None` for an empty/unparseable string.
-    fn as_f64(&self) -> Option<f64> {
-        match self {
-            Self::Num(n) => Some(*n),
-            Self::Str(s) => {
-                let s = s.trim();
-                (!s.is_empty()).then(|| s.parse().ok()).flatten()
-            }
-        }
+/// Deserializes an optional `i32` that may arrive as a number, a numeric string,
+/// or an empty string (`""` → `None`).
+///
+/// The two halves are both ports, not conveniences. Reading a number out of a
+/// string is `JsonNumberHandling.AllowReadingFromString`, which
+/// `JsonDefaults.Options` sets for the whole API (v10.11.8
+/// src/Jellyfin.Extensions/Json/JsonDefaults.cs:33) — jellyfin-web's track
+/// pickers really do post `"AudioStreamIndex": "1"`. Reading `""` as a cleared
+/// field is `JsonNullableStructConverter<TStruct>.Read`, which returns `null`
+/// for an empty string before deserializing (JsonNullableStructConverter.cs:18).
+///
+/// Everything else is an ERROR, exactly as `Deserialize<int>` throws and the
+/// model binder answers `400`. Swallowing a string that is not a number into
+/// `None` was a real divergence: `{"MaxStreamingBitrate":"nope"}` on
+/// `POST /Items/{itemId}/PlaybackInfo` measured Ferrofin `200` against
+/// Jellyfin `400`.
+///
+/// # Errors
+///
+/// Fails when the value is a non-empty string that is not an integer, or a
+/// number that is not a 32-bit integer (`Deserialize<int>` rejects `3.0` too).
+pub(crate) fn opt_i32<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<i32>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Lenient {
+        Number(i32),
+        Text(String),
+        Null,
+    }
+    match Lenient::deserialize(d)? {
+        Lenient::Number(n) => Ok(Some(n)),
+        Lenient::Text(s) if s.trim().is_empty() => Ok(None),
+        Lenient::Text(s) => s
+            .trim()
+            .parse()
+            .map(Some)
+            .map_err(|_| serde::de::Error::custom(format!("expected an integer, got {s:?}"))),
+        Lenient::Null => Ok(None),
     }
 }
 
-/// Deserializes an optional `i32` that may arrive as a number, a numeric string,
-/// or an empty string (`""` → `None`).
-#[allow(clippy::cast_possible_truncation)]
-pub(crate) fn opt_i32<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<i32>, D::Error> {
-    Ok(Option::<NumOrStr>::deserialize(d)?
-        .as_ref()
-        .and_then(NumOrStr::as_f64)
-        .map(|n| n as i32))
-}
-
 /// Deserializes an optional `f32` that may arrive as a number or a numeric string.
-#[allow(clippy::cast_possible_truncation)]
+///
+/// The `f32` twin of [`opt_i32`], with the same two ports behind it and the
+/// same refusal to turn an unparseable string into a silent `None`.
+///
+/// # Errors
+///
+/// Fails when the value is a non-empty string that is not a number.
 fn opt_f32<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<f32>, D::Error> {
-    Ok(Option::<NumOrStr>::deserialize(d)?
-        .as_ref()
-        .and_then(NumOrStr::as_f64)
-        .map(|n| n as f32))
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Lenient {
+        Number(f32),
+        Text(String),
+        Null,
+    }
+    match Lenient::deserialize(d)? {
+        Lenient::Number(n) => Ok(Some(n)),
+        Lenient::Text(s) if s.trim().is_empty() => Ok(None),
+        Lenient::Text(s) => s
+            .trim()
+            .parse()
+            .map(Some)
+            .map_err(|_| serde::de::Error::custom(format!("expected a number, got {s:?}"))),
+        Lenient::Null => Ok(None),
+    }
 }
 
 /// Deserializes an optional timestamp the way Jellyfin reads one: a cleared
@@ -617,6 +645,64 @@ async fn get_metadata_editor(
 #[cfg(test)]
 mod tests {
     use super::{UpdateItemRequest, containing_folder_path, join_distinct, non_empty};
+
+    /// A string the number cannot be read from is a REFUSAL, not a silent
+    /// `None`.
+    ///
+    /// `JsonNumberHandling.AllowReadingFromString` reads `"2010"`; it does not
+    /// make `"nope"` null — `Deserialize<int>` throws and the model binder
+    /// answers 400. Measured on the parity pair before this fix:
+    /// `POST /Items/{itemId}/PlaybackInfo` with
+    /// `{"MaxStreamingBitrate":"nope"}` was Ferrofin 200 / Jellyfin 400,
+    /// because `opt_i32` swallowed the parse failure.
+    #[test]
+    fn a_number_that_is_not_a_number_is_refused_not_swallowed() {
+        let one = |body: &str| {
+            serde_json::from_str::<UpdateItemRequest>(&format!(
+                r#"{{"Id":"x","Type":"Movie","Name":"n",{body}}}"#
+            ))
+        };
+        // The two ported leniencies still hold.
+        assert_eq!(
+            one(r#""ProductionYear":"2010""#)
+                .expect("a numeric string reads")
+                .production_year,
+            Some(2010)
+        );
+        assert_eq!(
+            one(r#""ProductionYear":"""#)
+                .expect("an empty string is a cleared field")
+                .production_year,
+            None
+        );
+        assert_eq!(
+            one(r#""ProductionYear":null"#)
+                .expect("null is a cleared field")
+                .production_year,
+            None
+        );
+        assert_eq!(
+            one(r#""CommunityRating":"8.5""#)
+                .expect("a numeric string reads")
+                .community_rating,
+            Some(8.5)
+        );
+        // Everything else is an error, which the shared body binder turns into
+        // the 400 ValidationProblemDetails Jellyfin answers.
+        for body in [
+            r#""ProductionYear":"nope""#,
+            r#""ProductionYear":"20 10""#,
+            // `Deserialize<int>` rejects a fractional number too.
+            r#""ProductionYear":2010.5"#,
+            r#""IndexNumber":"one""#,
+            r#""CommunityRating":"great""#,
+        ] {
+            assert!(
+                one(body).is_err(),
+                "{body} must not bind: .NET throws and the binder answers 400"
+            );
+        }
+    }
 
     #[test]
     fn update_request_accepts_editor_string_numbers_and_empty_dates() {

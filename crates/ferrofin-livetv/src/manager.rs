@@ -18,6 +18,7 @@ use ferrofin_db::store::{datetime_to_db, guid_to_db, opt_datetime_to_db};
 use sqlx::{QueryBuilder, Row, Sqlite};
 use uuid::Uuid;
 
+use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::data::{BaseItemKind, MediaType};
 use ferrofin_model::dto::{BaseItemDto, MediaSourceInfo, MediaSourceType};
@@ -42,7 +43,8 @@ use crate::dvr::{ActiveRecording, RecorderKind, RecordingInput, TimerRecordingIn
 use crate::error::LiveTvError;
 use crate::fetch::SourceFetcher;
 use crate::projection::{
-    ChannelRow, ProgramRow as GuideProgramRow, channel_entity, program_entity, remove_fields,
+    ChannelRow, ProgramRow as GuideProgramRow, channel_entity, channel_item_update, program_entity,
+    remove_fields,
 };
 use crate::schedules_direct::SchedulesDirect;
 use crate::stream::{LiveStreamHandle, LiveStreamKind, TunerStreamSource};
@@ -715,23 +717,9 @@ impl FerrofinLiveTvManager {
         };
         let view_id = self.live_tv_view_id().await;
         let rows = crate::guide_repository::channel_rows(&self.db).await?;
-        let entities: Vec<_> = rows
-            .iter()
-            .map(|row| channel_entity(row, parse_dt, view_id))
-            .collect();
-        if !entities.is_empty() {
-            store.persistence.save_items(&entities).await?;
-        }
-        // `CleanDatabase`: the stored channel items the refreshed lineup no
-        // longer names. A lineup that came back empty because every tuner was
-        // unreachable must NOT wipe the channels — `BaseTunerHost.GetChannels`
-        // falls back to its cache rather than reporting none, and
-        // `replace_channels` is likewise never reached on a failed fetch.
-        if entities.is_empty() {
-            return Ok(());
-        }
-        let keep: std::collections::HashSet<String> =
-            entities.iter().map(|e| e.id.to_uppercase()).collect();
+        // The channel items already stored, read ONCE: the merge below needs
+        // them (the C# loads each item before assigning to it) and so does
+        // `CleanDatabase`.
         let stored = store
             .items
             .get_item_list(&InternalItemsQuery {
@@ -739,6 +727,45 @@ impl FerrofinLiveTvManager {
                 ..InternalItemsQuery::default()
             })
             .await?;
+        let by_id: std::collections::HashMap<String, &BaseItemEntity> = stored
+            .iter()
+            .map(|row| (row.id.to_uppercase(), row))
+            .collect();
+        let mut save: Vec<BaseItemEntity> = Vec::new();
+        for row in &rows {
+            let fresh = channel_entity(row, parse_dt, view_id);
+            match by_id.get(&fresh.id.to_uppercase()) {
+                // `isNew` — the item did not exist, so `CreateItem` stores it
+                // whole.
+                None => save.push(fresh),
+                // `forceUpdate` — the item exists, so only the fields the
+                // refresh owns are assigned onto the STORED row, and it is
+                // written back only if one of them actually changed. Writing
+                // `fresh` here instead would be a full-column upsert that
+                // reverts everything the metadata editor put on a channel.
+                Some(prev) => save.extend(channel_item_update(prev, &fresh)),
+            }
+        }
+        if !save.is_empty() {
+            store.persistence.save_items(&save).await?;
+        }
+        // `CleanDatabase(newChannelIdList, [BaseItemKind.LiveTvChannel], …)`
+        // (:145-148). The upstream guard is the `cleanDatabase` flag, which
+        // ONLY a thrown `RefreshChannelsInternal` clears (:130-134) — an
+        // empty-but-successful lineup still cleans, and takes every channel
+        // item with it. That is deliberate: it is how the last tuner's removal
+        // stops its channels haunting `GET /Items/{id}` and every recursive
+        // query for ever.
+        //
+        // Ferrofin has no empty-because-failed case to protect against.
+        // `refresh_guide` never reaches `replace_channels` on a failed lineup
+        // fetch, so the cached `FerrofinLiveTvChannels` rows survive and
+        // `channel_rows` still returns them — the same cache fallback
+        // `BaseTunerHost.GetChannels` performs upstream. An empty `rows` here
+        // therefore means the lineup is genuinely empty, which is precisely
+        // when the C# deletes.
+        let keep: std::collections::HashSet<String> =
+            rows.iter().map(|row| row.id.to_uppercase()).collect();
         let stale: Vec<Uuid> = stored
             .iter()
             .filter(|row| !keep.contains(&row.id.to_uppercase()))
@@ -5540,17 +5567,17 @@ mod tests {
             .expect("channel items")
     }
 
-    /// A guide refresh mirrors the lineup into `BaseItems` and removes the rows
-    /// that left it.
-    ///
-    /// Port of `GuideManager.GetChannel`'s `CreateItem`/`UpdateItemAsync`
-    /// (v10.11.8 GuideManager.cs:375-468) plus
-    /// `CleanDatabase(newChannelIdList, [BaseItemKind.LiveTvChannel], …)`
-    /// (:147). Without the first half `GET /Items/{channelId}` answers 404 for
-    /// an id `GET /LiveTv/Channels` just handed the client; without the second,
-    /// a removed tuner's channels haunt every recursive query for ever.
-    #[tokio::test]
-    async fn a_guide_refresh_stores_the_lineup_as_items_and_cleans_the_departed() {
+    /// The wiring a channel-item test needs: a manager with an item store, a
+    /// Live TV view row to parent to, and one M3U tuner in the lineup.
+    struct ChannelItemLab {
+        mgr: FerrofinLiveTvManager,
+        persistence: Arc<dyn ferrofin_traits::persistence::ItemPersistenceService>,
+        items: Arc<dyn ferrofin_traits::persistence::ItemRepository>,
+        view: Uuid,
+        tuner: TunerHostInfo,
+    }
+
+    async fn channel_item_lab() -> ChannelItemLab {
         let view = Uuid::from_u128(0x2b2b_ca16_aacc_8a14_d53a_11bb_829e_afa5);
         let mut sources = HashMap::new();
         sources.insert("http://tuner/playlist.m3u".to_owned(), M3U.to_owned());
@@ -5578,27 +5605,50 @@ mod tests {
             .expect("live tv view");
         mgr.set_item_store(
             Arc::clone(&persistence),
-            items,
+            Arc::clone(&items),
             Arc::new(FixedLiveTvView(view)),
         );
-        mgr.save_tuner_host(TunerHostInfo {
-            type_: Some("m3u".to_owned()),
-            url: Some("http://tuner/playlist.m3u".to_owned()),
-            ..TunerHostInfo::default()
-        })
-        .await
-        .expect("tuner");
+        let tuner = mgr
+            .save_tuner_host(TunerHostInfo {
+                type_: Some("m3u".to_owned()),
+                url: Some("http://tuner/playlist.m3u".to_owned()),
+                ..TunerHostInfo::default()
+            })
+            .await
+            .expect("tuner");
+        ChannelItemLab {
+            mgr,
+            persistence,
+            items,
+            view,
+            tuner,
+        }
+    }
+
+    /// A guide refresh mirrors the lineup into `BaseItems` and removes the rows
+    /// that left it.
+    ///
+    /// Port of `GuideManager.GetChannel`'s `CreateItem`/`UpdateItemAsync`
+    /// (v10.11.8 GuideManager.cs:375-468) plus
+    /// `CleanDatabase(newChannelIdList, [BaseItemKind.LiveTvChannel], …)`
+    /// (:147). Without the first half `GET /Items/{channelId}` answers 404 for
+    /// an id `GET /LiveTv/Channels` just handed the client; without the second,
+    /// a removed tuner's channels haunt every recursive query for ever.
+    #[tokio::test]
+    async fn a_guide_refresh_stores_the_lineup_as_items_and_cleans_the_departed() {
+        let lab = channel_item_lab().await;
+        let (mgr, persistence) = (&lab.mgr, &lab.persistence);
         mgr.refresh_guide().await.expect("refresh");
 
-        let lineup = channel_ids(&mgr).await;
+        let lineup = channel_ids(mgr).await;
         assert_eq!(lineup.len(), 2);
-        let stored = stored_channel_items(&mgr).await;
+        let stored = stored_channel_items(mgr).await;
         assert_eq!(
             stored.len(),
             2,
             "every channel in the lineup is an item row"
         );
-        let parent = ferrofin_db::store::guid_to_db(view);
+        let parent = ferrofin_db::store::guid_to_db(lab.view);
         for (id, parent_id, top_parent_id) in &stored {
             assert!(
                 lineup.contains(&Uuid::parse_str(id).expect("guid")),
@@ -5623,16 +5673,105 @@ mod tests {
             }])
             .await
             .expect("ghost");
-        assert_eq!(stored_channel_items(&mgr).await.len(), 3);
+        assert_eq!(stored_channel_items(mgr).await.len(), 3);
 
         mgr.refresh_guide().await.expect("second refresh");
-        let after = stored_channel_items(&mgr).await;
+        let after = stored_channel_items(mgr).await;
         assert_eq!(after.len(), 2, "the departed channel item was cleaned");
         assert!(
             !after
                 .iter()
                 .any(|(id, ..)| Uuid::parse_str(id).ok() == Some(ghost))
         );
+    }
+
+    /// A guide refresh assigns only the properties it owns, onto the item it
+    /// LOADED — everything else on a channel survives it.
+    ///
+    /// `GuideManager.GetChannel` (v10.11.8 GuideManager.cs:375-468) reads the
+    /// item back with `GetItemById`, assigns Tags/ParentId/ChannelType/
+    /// ServiceName/ExternalId/Number/Name onto it and persists with
+    /// `UpdateItemAsync`. A channel item is a REAL item now, so
+    /// `POST /Items/{channelId}` can write to it — and Ferrofin's `save_items`
+    /// is a full-column upsert, so mirroring a freshly built entity instead
+    /// would revert every edit at the next `RefreshGuide`, silently, on a 24h
+    /// timer.
+    #[tokio::test]
+    async fn a_guide_refresh_does_not_revert_an_edited_channel() {
+        let lab = channel_item_lab().await;
+        let (mgr, persistence, items) = (&lab.mgr, &lab.persistence, &lab.items);
+        mgr.refresh_guide().await.expect("refresh");
+        let edited = Uuid::parse_str(&stored_channel_items(mgr).await[0].0).expect("guid");
+
+        let mut row = channel_item(items, edited).await;
+        row.overview = Some("Written by the metadata editor".to_owned());
+        row.custom_rating = Some("PG".to_owned());
+        row.is_locked = true;
+        persistence.save_items(&[row]).await.expect("editor write");
+
+        mgr.refresh_guide().await.expect("second refresh");
+        let kept = channel_item(items, edited).await;
+        assert_eq!(
+            kept.overview.as_deref(),
+            Some("Written by the metadata editor"),
+            "a guide refresh must not revert an edited channel"
+        );
+        assert_eq!(kept.custom_rating.as_deref(), Some("PG"));
+        assert!(kept.is_locked);
+        // …and the fields the refresh DOES own are still the lineup's.
+        assert_eq!(
+            kept.parent_id.as_deref(),
+            Some(ferrofin_db::store::guid_to_db(lab.view).as_str())
+        );
+        assert_eq!(
+            kept.type_,
+            crate::projection::CHANNEL_TYPE_NAME,
+            "the refresh still owns the item's type"
+        );
+    }
+
+    /// `CleanDatabase` runs on an empty-but-successful lineup too.
+    ///
+    /// The upstream guard is the `cleanDatabase` flag, which ONLY a thrown
+    /// `RefreshChannelsInternal` clears (v10.11.8 GuideManager.cs:130-134,
+    /// :145-148) — never an empty lineup. Removing the last tuner cascades its
+    /// channels away, so the next refresh sees an empty lineup and must take
+    /// the channel items with it rather than leave them answering
+    /// `GET /Items/{id}` for ever. Ferrofin has no empty-because-failed case to
+    /// confuse this with: a failed lineup fetch never reaches
+    /// `replace_channels`, so the cached channel rows survive and the lineup
+    /// read back is NOT empty.
+    #[tokio::test]
+    async fn an_empty_lineup_cleans_every_channel_item() {
+        let lab = channel_item_lab().await;
+        let mgr = &lab.mgr;
+        mgr.refresh_guide().await.expect("refresh");
+        assert_eq!(stored_channel_items(mgr).await.len(), 2);
+
+        mgr.delete_tuner_host(lab.tuner.id.as_deref().expect("tuner id"))
+            .await
+            .expect("delete tuner");
+        mgr.refresh_guide().await.expect("second refresh");
+        assert!(
+            stored_channel_items(mgr).await.is_empty(),
+            "an empty lineup cleans every channel item"
+        );
+    }
+
+    /// One stored channel item, whole.
+    async fn channel_item(
+        items: &Arc<dyn ferrofin_traits::persistence::ItemRepository>,
+        id: Uuid,
+    ) -> BaseItemEntity {
+        items
+            .get_item_list(&InternalItemsQuery {
+                item_ids: vec![id],
+                ..InternalItemsQuery::default()
+            })
+            .await
+            .expect("item")
+            .pop()
+            .expect("the channel item")
     }
 
     /// The ids of the channels in the lineup, in order.

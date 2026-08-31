@@ -286,9 +286,14 @@ pub fn channel_entity(
         media_type: Some(channel_media_type(&row.channel_type).to_owned()),
         sort_name: Some(channel_sort_name(row.number.as_deref(), &row.name)),
         // `ExternalId` is `channelInfo.Id` — the TUNER's id (`hdhr_10.1`), not
-        // the listing's `tvg-id`. It is what `GetInternalChannelId` hashed to
-        // mint this row's GUID, so the two must agree or a re-scan cannot
-        // recognise its own channel.
+        // the listing's `tvg-id` (v10.11.8 GuideManager.cs:425). It is what
+        // `GetInternalChannelId` hashed to mint this row's GUID, so the two
+        // must agree or a re-scan cannot recognise its own channel.
+        //
+        // No parity probe can catch this one: `ExternalId` is a `BaseItems`
+        // column that is not a `BaseItemDto` property in the vendored 10.11.8
+        // contract, so it never reaches the wire and the body diff can never
+        // see it. The unit test below is its only guard — do not delete it.
         external_id: Some(if row.external_id.is_empty() {
             row.tvg_id.clone()
         } else {
@@ -303,6 +308,62 @@ pub fn channel_entity(
         is_folder: false,
         ..BaseItemEntity::default()
     }
+}
+
+/// Applies to an ALREADY-STORED channel item the bounded set of fields
+/// `GuideManager.GetChannel` assigns, returning the row to write back when one
+/// of them actually changed — the C#'s `forceUpdate` — and `None` when nothing
+/// did.
+///
+/// Upstream (v10.11.8 GuideManager.cs:375-468) loads the item from the database
+/// and assigns exactly `Tags`, `ParentId`, `ChannelType`, `ServiceName`,
+/// `ExternalId`, `Number`, `Name` and the primary image, then persists with
+/// `UpdateItemAsync` — so every OTHER property of the item survives a guide
+/// refresh, and the write happens at all only when `isNew || forceUpdate`.
+///
+/// Ferrofin's `save_items` is a full-column upsert, so that guarantee has to
+/// come from starting at the STORED row rather than at a fresh
+/// [`channel_entity`]. Starting at the fresh one is a silent 24-hourly revert:
+/// a channel item is a real item now, `POST /Items/{channelId}` writes
+/// `Overview`, `Genres`, `Tags`, `CustomRating`, `OfficialRating`, `IsLocked`
+/// and `Data` onto it, and the next `RefreshGuide` would put every one of them
+/// back to `NULL`.
+///
+/// `Number`/`ChannelType` are not `BaseItems` columns here — they reach the
+/// wire through `LiveTvManager::add_channel_info` from
+/// `FerrofinLiveTvChannels`, which the same refresh rewrites — and a channel
+/// row carries no image path, so those two upstream assignments have no column
+/// to land on.
+#[must_use]
+pub fn channel_item_update(
+    stored: &BaseItemEntity,
+    fresh: &BaseItemEntity,
+) -> Option<BaseItemEntity> {
+    let mut item = stored.clone();
+    item.type_.clone_from(&fresh.type_);
+    item.name.clone_from(&fresh.name);
+    item.media_type.clone_from(&fresh.media_type);
+    item.external_id.clone_from(&fresh.external_id);
+    item.external_service_id
+        .clone_from(&fresh.external_service_id);
+    item.unrated_type.clone_from(&fresh.unrated_type);
+    item.parent_id.clone_from(&fresh.parent_id);
+    item.top_parent_id.clone_from(&fresh.top_parent_id);
+    item.is_folder = fresh.is_folder;
+    // `SortName` is a lazy property upstream, not a stored assignment:
+    // `ForcedSortName` when the metadata editor set one, else
+    // `CreateSortName()` off Number/Name. Re-deriving it unconditionally would
+    // overwrite a user's forced sort key on every refresh.
+    if stored
+        .forced_sort_name
+        .as_deref()
+        .unwrap_or_default()
+        .is_empty()
+    {
+        item.sort_name.clone_from(&fresh.sort_name);
+    }
+    // `DateCreated` is stamped only on a NEW item, so the stored one stands.
+    (item != *stored).then_some(item)
 }
 
 /// One `FerrofinLiveTvRecordings` row, as the recording query paths read it.
@@ -664,6 +725,73 @@ mod tests {
             entity.top_parent_id.as_deref(),
             Some(db_guid(view).as_str())
         );
+    }
+
+    /// A refresh assigns only the properties `GuideManager.GetChannel` assigns,
+    /// and writes at all only when one of them changed.
+    #[test]
+    fn a_channel_update_is_bounded_and_only_written_when_something_changed() {
+        let view = Uuid::from_u128(0x2b2b_ca16_aacc_8a14_d53a_11bb_829e_afa5);
+        let row = ChannelRow {
+            id: "CCCCCCCC-0000-0000-0000-000000000003".to_owned(),
+            tvg_id: "parity1".to_owned(),
+            external_id: "hdhr_10.1".to_owned(),
+            name: "Parity One".to_owned(),
+            number: Some("1".to_owned()),
+            channel_type: "Tv".to_owned(),
+            date_created: None,
+            is_movie: false,
+            is_series: false,
+            is_kids: false,
+        };
+        let fresh = channel_entity(&row, parse, Some(view));
+
+        // An unchanged lineup is not a write: the C# persists only on
+        // `isNew || forceUpdate`.
+        assert_eq!(channel_item_update(&fresh, &fresh), None);
+
+        // Everything the metadata editor owns survives the refresh…
+        let mut stored = fresh.clone();
+        stored.overview = Some("Edited".to_owned());
+        stored.genres = Some("News".to_owned());
+        stored.tags = Some("Favourite".to_owned());
+        stored.custom_rating = Some("PG".to_owned());
+        stored.official_rating = Some("TV-14".to_owned());
+        stored.is_locked = true;
+        stored.data = Some("{}".to_owned());
+        stored.date_created = Some(
+            DateTime::parse_from_rfc3339("2019-01-02T03:04:05Z")
+                .expect("date")
+                .with_timezone(&Utc),
+        );
+        // …and the edit alone is still not a reason to write.
+        assert_eq!(channel_item_update(&stored, &fresh), None);
+
+        // A renamed channel IS a write, and carries the edit through.
+        let renamed = ChannelRow {
+            name: "Parity One HD".to_owned(),
+            ..row.clone()
+        };
+        let fresh = channel_entity(&renamed, parse, Some(view));
+        let updated = channel_item_update(&stored, &fresh).expect("the rename is a write");
+        assert_eq!(updated.name.as_deref(), Some("Parity One HD"));
+        assert_eq!(updated.sort_name, fresh.sort_name);
+        assert_eq!(updated.overview.as_deref(), Some("Edited"));
+        assert_eq!(updated.genres.as_deref(), Some("News"));
+        assert_eq!(updated.tags.as_deref(), Some("Favourite"));
+        assert_eq!(updated.custom_rating.as_deref(), Some("PG"));
+        assert_eq!(updated.official_rating.as_deref(), Some("TV-14"));
+        assert!(updated.is_locked);
+        assert_eq!(updated.data.as_deref(), Some("{}"));
+        // `DateCreated` is stamped on a NEW item only.
+        assert_eq!(updated.date_created, stored.date_created);
+
+        // A user-forced sort key is not a property the refresh owns.
+        let mut forced = stored.clone();
+        forced.forced_sort_name = Some("zzz".to_owned());
+        forced.sort_name = Some("zzz".to_owned());
+        let updated = channel_item_update(&forced, &fresh).expect("the rename is still a write");
+        assert_eq!(updated.sort_name.as_deref(), Some("zzz"));
     }
 
     #[test]

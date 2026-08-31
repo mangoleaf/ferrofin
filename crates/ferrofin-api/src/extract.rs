@@ -298,10 +298,18 @@ where
     /// `[FromBody] T? body` semantics, measured against 10.11.8 on
     /// `POST /Items/{id}/PlaybackInfo`: an absent body, an empty body and the
     /// literal `null` all bind as `None` and the request is served; a body that
-    /// is present and malformed — `[]`, a wrong-typed member, a syntax error —
-    /// is still a 400. Turning THAT into "no body supplied" is what axum's
-    /// `Option<Json<T>>` did with a missing content type only, while a
-    /// malformed one became a 422; neither matched.
+    /// is present and malformed — `[]`, a syntax error, a member the DTO's own
+    /// types cannot take — is still a 400. Turning THAT into "no body supplied"
+    /// is what axum's `Option<Json<T>>` did with a missing content type only,
+    /// while a malformed one became a 422; neither matched.
+    ///
+    /// "A member the DTO cannot take" is the extractor's half of the rule and
+    /// is only as strict as the DTO: this binder refuses what `T`'s
+    /// `Deserialize` refuses, so a field whose own deserializer is lenient
+    /// still binds. That is not hypothetical — `PlaybackInfoDto`'s numeric
+    /// fields used to swallow `{"MaxStreamingBitrate":"nope"}` into `None`
+    /// (Ferrofin 200 / Jellyfin 400) until `handlers::item_update::opt_i32` was
+    /// made to fail the way `Deserialize<int>` throws.
     async fn from_request(req: Request, state: &S) -> Result<Option<Self>, Self::Rejection> {
         let (json_content_type, bytes) = read_optional(req, state).await?;
         if bytes.iter().all(u8::is_ascii_whitespace) {

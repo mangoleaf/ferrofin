@@ -21,6 +21,7 @@ import datetime
 import json
 import os
 import re
+import string
 import urllib.parse
 import sys
 import time
@@ -77,6 +78,33 @@ def user(op, url, project=None):
     return {"op": op, "kind": "user", "url": lambda c: url.format(**c), "project": project}
 
 
+def _extra_url(tmpl):
+    """One `extra` URL builder: `None` when the context has no seed for it.
+
+    An unseeded placeholder must NOT collapse the template into a different
+    URL. `{channel}` with no channels turns
+    `/Items/{channel}?userId={user}` into `/Items/?userId=...`, which answers
+    200 on BOTH servers with a full item list — the leg would then be counted
+    as tested-and-clean while comparing something that is not an item fetch at
+    all. Returning None makes the run SKIP it loudly instead (same guard the
+    channel-seeded fact in `recordings_group_invariants` already uses).
+
+    A key that is missing from the context entirely is still a KeyError, so the
+    self-check keeps catching a typo'd placeholder.
+    """
+    keys = [f for _, f, _, _ in string.Formatter().parse(tmpl) if f]
+
+    def url_of(c):
+        for k in keys:
+            if k not in c:
+                raise KeyError(k)
+        if any(not c[k] for k in keys):
+            return None
+        return tmpl.format(**c)
+
+    return url_of
+
+
 def item(op, tmpl, extra=()):
     # tmpl contains {u} and {i}; filled per server (own user + own correlated item id).
     #
@@ -88,7 +116,7 @@ def item(op, tmpl, extra=()):
     # never a replacement for the pairs.
     return {"op": op, "kind": "item",
             "url": lambda c, i: tmpl.format(u=c["user"], i=i),
-            "extra": [(lambda c, t=t: t.format(**c)) for t in extra]}
+            "extra": [_extra_url(t) for t in extra]}
 
 
 def multi(op, legs):
@@ -1539,6 +1567,14 @@ def run(ferrofin_url, jellyfin_url):
                         agg[k].extend(b[k])
             for url_of in ep.get("extra") or ():
                 hu, ju = url_of(hc), url_of(jc)
+                if hu is None or ju is None:
+                    # Unseeded on at least one server: skip rather than compare
+                    # a collapsed URL. `tested` does not move, so the row's
+                    # "n/m legs clean" note shows the leg did not run.
+                    print(f"    ! {ep['op']}: an extra leg has no seed on "
+                          f"{'ferrofin' if hu is None else 'jellyfin'}; skipped",
+                          file=sys.stderr)
+                    continue
                 hs, hb = token_get(ferrofin_url, hu, ht)
                 js, jb = token_get(jellyfin_url, ju, jt)
                 if hs != js:
@@ -1652,7 +1688,14 @@ def selfcheck():
             # `extra` legs are formatted from the context alone, so a bad
             # placeholder in one must fail HERE and not mid-run.
             for url_of in ep.get("extra") or ():
-                url_of(ctx)
+                assert url_of(ctx) is not None, f"{ep['op']}: extra leg unseeded in the self-check ctx"
+                # …and an EMPTY seed yields None (skip), never a collapsed URL
+                # that quietly compares a different endpoint.
+                blank = dict(ctx)
+                for k in list(blank):
+                    if k != "user" and isinstance(blank[k], str):
+                        blank[k] = ""
+                assert url_of(blank) is None, f"{ep['op']}: an unseeded extra leg must be skipped, not collapsed"
         elif ep["kind"] == "multi":
             for leg in ep["legs"]:
                 leg["url"](ctx)
