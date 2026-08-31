@@ -42,14 +42,6 @@ VOLATILE = re.compile("^(" + "|".join([
     "StartupWizardCompleted", "CanSelfRestart",
     "TranscodingTempPath", "LogPath", "InternalMetadataPath", "ItemsByNamePath", "CachePath",
     "ProgramDataPath",
-    # `traceId` in an ASP.NET ProblemDetails error body: the W3C trace-context
-    # id of the ONE request that produced it (`00-<32 hex>-<16 hex>-00`), minted
-    # per request by the server that answered. Two independent instances cannot
-    # produce the same one, and the same instance cannot produce it twice — the
-    # textbook case this list is for. Scoped to that exact key; every other
-    # field of a ProblemDetails (`type`, `title`, `status`, `errors`) is still
-    # compared, which is what makes an error-body diff mean anything.
-    "traceId",
 ]) + ")$")
 
 ALIGN_KEYS = ("Path", "Name", "Id")
@@ -77,6 +69,27 @@ def _degenerate_key(k, jv, hv):
     """
     return k == "Key" and isinstance(jv, str) and isinstance(hv, str) \
         and bool(_GUID.match(jv)) and bool(_GUID.match(hv))
+
+
+def _per_request_value(k, jv, hv):
+    """`traceId` on an ASP.NET ProblemDetails: the value cannot match, the KEY must.
+
+    The W3C trace-context id (`00-<32 hex>-<16 hex>-00`) is minted per request by
+    the server that answered, so two independent instances can never produce the
+    same one — and the same instance cannot produce it twice.
+
+    But it does NOT belong in `VOLATILE`, because `diff` skips a volatile key
+    before it checks presence: a Ferrofin ProblemDetails that omitted `traceId`
+    ENTIRELY would have diffed clean, and every client that correlates a failed
+    request back to a server log would have lost it silently. Gated on
+    `k in j and k in h` at the call site, exactly like `_degenerate_key`, so the
+    key going missing on either side still lands in `missing`/`extra`.
+
+    Every other ProblemDetails field (`type`, `title`, `status`, `detail`,
+    `errors`) is compared normally, which is what makes an error-body diff mean
+    anything at all.
+    """
+    return k == "traceId" and isinstance(jv, str) and isinstance(hv, str)
 
 
 def _kind(x):
@@ -139,7 +152,9 @@ def diff(j, h, path, out, volatile=VOLATILE, stats=None):
         for k in set(j) | set(h):
             if volatile.match(k):
                 continue
-            if k in j and k in h and _degenerate_key(k, j[k], h[k]):
+            if k in j and k in h and (
+                _degenerate_key(k, j[k], h[k]) or _per_request_value(k, j[k], h[k])
+            ):
                 continue
             p = f"{path}.{k}" if path else k
             if k not in h:

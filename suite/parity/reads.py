@@ -3650,12 +3650,21 @@ def selfcheck():
     assert agg_method([], status_only=2) == verification.STATUS_CLASS
     assert agg_method([], status_only=0) is None
     assert agg_method([({"A": 1}, {"A": 1}, 1)], status_only=3) == verification.BODY_DIFF
-    # `traceId` is VOLATILE (per-request), but nothing ELSE about a ProblemDetails
-    # is — a Ferrofin error body that is not upstream's must still diff red.
+    # `traceId` on a ProblemDetails: the VALUE is per-request and cannot match,
+    # but the KEY must be there. It is deliberately NOT in VOLATILE — `diff`
+    # skips a volatile key BEFORE it checks presence, so a Ferrofin error body
+    # that omitted traceId entirely would have diffed clean and every client
+    # correlating a failure back to a server log would have lost it silently.
+    # Both directions are pinned here so the weaker rule cannot come back.
     _pd = {"type": "https://tools.ietf.org/html/rfc9110#section-15.5.5",
            "title": "Not Found", "status": 404, "traceId": "00-abc-def-00"}
-    assert diff_stats(_pd, {k: v for k, v in _pd.items() if k != "traceId"})[0] == 0, \
-        "traceId must be VOLATILE on both sides"
+    _pd_other = dict(_pd, traceId="00-999-888-00")
+    assert diff_stats(_pd, _pd_other)[0] == 0, \
+        "two different per-request traceId VALUES must not diff"
+    assert diff_stats(_pd, {k: v for k, v in _pd.items() if k != "traceId"})[0] > 0, \
+        "a MISSING traceId must diff red — presence is a contract property"
+    # …and nothing else about a ProblemDetails is suppressed.
+    assert diff_stats(_pd, dict(_pd, title="Bad Request"))[0] > 0
     assert diff_stats(_pd, {"error": "not found: music genre R-B"})[0] > 0, \
         "a different error document must not diff clean"
     # An unseeded `{key}_last` SKIPS its leg rather than duplicating the first

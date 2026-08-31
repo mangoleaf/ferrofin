@@ -358,6 +358,15 @@ impl ItemCountService for FerrofinItemCountService {
         // A `Year` counts by `ProductionYear`, not by a value name
         // (`ItemCountService.cs:170-181`); routing it through the clean-value
         // aggregate below answered 0 for every year that has content.
+        //
+        // A Year is not an `ItemValues` row either. The pinned 10.11.8
+        // `ItemValueType` enum is Artist=0, AlbumArtist=1, Genre=2, Studios=3,
+        // Tags=4, InheritedTags=6 — no Year — so the CleanName join further down
+        // matched nothing and every `/Years/{year}` reported `ChildCount: 0`.
+        // C# `DtoService.SetItemByNameInfo` counts a Year by the production-year
+        // column instead: `case BaseItemKind.Year when int.TryParse(dto.Name,
+        // NumberStyles.Integer, CultureInfo.InvariantCulture, out var year):
+        // query.Years = [year];`.
         if kind == BaseItemKind::Year {
             return self
                 .production_year_counts(rows, related_item_kinds, out)
@@ -369,20 +378,6 @@ impl ItemCountService for FerrofinItemCountService {
         let Some(value_types) = by_name_count_value_types(kind) else {
             return Ok(out);
         };
-
-        // A Year is not an `ItemValues` row either. The pinned 10.11.8
-        // `ItemValueType` enum is Artist=0, AlbumArtist=1, Genre=2, Studios=3,
-        // Tags=4, InheritedTags=6 — no Year — so the CleanName join below
-        // matched nothing and every `/Years/{year}` reported `ChildCount: 0`.
-        // C# `DtoService.SetItemByNameInfo` counts a Year by the production
-        // year column instead: `case BaseItemKind.Year when int.TryParse(dto.Name,
-        // NumberStyles.Integer, CultureInfo.InvariantCulture, out var year):
-        // query.Years = [year];`.
-        if kind == BaseItemKind::Year {
-            return self
-                .production_year_counts(rows, related_item_kinds, out)
-                .await;
-        }
 
         // Each row's CleanName rides along on the row the caller is already
         // projecting, so this path reads `ItemValues` and nothing else.
