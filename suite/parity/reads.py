@@ -19,6 +19,7 @@ Offline self-check:
 import collections
 import datetime
 import json
+import samples
 import os
 import re
 import string
@@ -3046,6 +3047,10 @@ def run(ferrofin_url, jellyfin_url):
                     # diffed like any other body, `traceId` aside (VOLATILE:
                     # per-request, cannot match across instances).
                     n, b, compared = diff_stats(jb, hb)
+                    # The curated probe's projected bodies beat the broad
+                    # sweep's for the same op — record last, win.
+                    samples.replace(leg["tmpl"], jb, hb, route=leg["tmpl"],
+                                    diff=b if n else None)
                     legs.append((jb, hb, compared))
                     if n == 0:
                         clean += 1
@@ -3232,6 +3237,7 @@ def main():
     print(f"wrote parity/reads-results.json — {len(rows)} read ops, {ok} deep-verified "
           f"(bodies diffed), {dict(other)} verified another way "
           f"(correlated {npairs} items by Path)")
+    samples.flush()
 
 
 def selfcheck():

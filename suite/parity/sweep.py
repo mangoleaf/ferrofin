@@ -697,6 +697,7 @@ def response_schema(op):
 # ---------------------------------------------------------------- deep diff (Layer-2 over all GET ops)
 
 from parity_diff import diff_stats  # noqa: E402
+import samples  # noqa: E402
 import verification  # noqa: E402
 
 
@@ -778,6 +779,11 @@ def sweep(ferrofin_url, jellyfin_url):
                     try:
                         jb, hb = json.loads(jraw), json.loads(hraw)
                         n, buckets, compared = diff_stats(jb, hb)
+                        # Keep the evidence. A verdict whose two bodies were
+                        # discarded cannot be audited, and a wrong one looks
+                        # exactly like a right one.
+                        samples.record(opkey, jb, hb, route=f"{method.upper()} {op}",
+                                       diff=buckets if n else None)
                         # HOW this row was verified, derived from what the diff
                         # actually walked — never assumed. `compared == 0` means the
                         # bodies were `[]`/`{}`/all-volatile and NOTHING was
@@ -929,6 +935,7 @@ def main():
     ferrofin = os.environ.get("FERROFIN_URL", "http://localhost:18096")
     jellyfin = os.environ.get("JELLYFIN_URL")   # optional oracle
     write_results(sweep(ferrofin, jellyfin))
+    samples.flush()
 
 
 if __name__ == "__main__":
