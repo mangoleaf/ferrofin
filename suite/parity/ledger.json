@@ -15,7 +15,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Albums/{itemId}/Similar",
@@ -42,7 +42,7 @@
       "depth": "REAL",
       "status_conformant": true,
       "schema_valid": true,
-      "note": "0/1 legs clean (38 leaves compared); mismatch:3 missing:0 extra:0 | Items[Name=Artist 02].RunTimeTicks(J=0 H=60000000); Items[Name=Artist 03].RunTimeTicks(J=0 H=60000000); Items[Name=Artist 01].RunTimeTicks(J=0 H=60000000)",
+      "note": "0/1 legs clean (38 leaves compared); mismatch:3 missing:0 extra:0 | Items[Name=Artist 01].RunTimeTicks(J=0 H=60000000); Items[Name=Artist 03].RunTimeTicks(J=0 H=60000000); Items[Name=Artist 02].RunTimeTicks(J=0 H=60000000)",
       "deep_verified": false,
       "verification_method": "body-diff",
       "classification": "jellyfin-bug (RunTimeTicks / CumulativeRunTimeTicks ONLY; every other leg of this row now diffs clean by measurement). `MusicArtistResolver` is PORTED (library_scan.rs::plan_music_node + is_music_artist, a port of v10.11.8 Emby.Server.Implementations/Library/Resolvers/Audio/MusicArtistResolver.cs:54-125), so an artist directory now resolves to a real MusicArtist row parented into the music library, on Jellyfin's OWN path-derived id (measured byte-identical on the fixture: Artist 01 = 0f39932400340734bea41ffc13aaddc4, Artist 02 = 2b3868bfaa266cc1d3cc4c3dd5d40800, Artist 03 = 697d2b7b6ec56d3cf7e87c2de748b0cd), with its albums re-parented onto it. That closed Path, CanDelete, RecursiveItemCount and the empty user-scoped MusicArtist universe.\n\nWHAT REMAINS, and why it is Jellyfin's bug and not Ferrofin's: with the artist resolved as a folder, `MetadataService.UpdateCumulativeRunTimeTicks` (MediaBrowser.Providers/Manager/MetadataService.cs:451) sums the RunTimeTicks of the non-folder children returned by `GetChildrenForMetadataUpdates`. For a MusicArtist that method is OVERRIDDEN \u2014 `ArtistMetadataService.GetChildrenForMetadataUpdates` (MediaBrowser.Providers/Music/ArtistMetadataService.cs:44-56) returns `item.IsAccessedByName ? item.GetTaggedItems(Recursive, IsFolder=false) : item.GetRecursiveChildren(i => i is IHasArtist && !i.IsFolder)`, NOT the base class's plain `folder.GetRecursiveChildren()` at MetadataService.cs:397-401. A folder-resolved artist takes the second arm, and `Audio : IHasArtist`, so the set is exactly the three tracks \u2014 the override strengthens the conclusion rather than changing it, and it is cited here because re-deriving the number from the base method lands on the wrong call. `MusicArtist.SupportsCumulativeRunTimeTicks => true` (MusicArtist.cs:38). 3 tracks x 20000000 = 60000000, which is what Ferrofin stores. The 10.11.8 oracle stores 0, and its OWN DateLastRefreshed timestamps show why \u2014 a first-scan ordering race, read out of this lab's /config/data/jellyfin.db:\n  MusicArtist 'Artist 01'   RunTimeTicks 0         DateLastRefreshed 2026-08-30 00:29:30.8359533\n  Audio       'Track 01'    RunTimeTicks 20000000                    2026-08-30 00:29:30.8815808\n  Audio       'Track 02'    RunTimeTicks 20000000                    2026-08-30 00:29:30.8973703\n  Audio       'Track 03'    RunTimeTicks 20000000                    2026-08-30 00:29:30.9096119\n  MusicAlbum  'Album 01'    RunTimeTicks 60000000                    2026-08-30 00:29:30.9187306\nThe artist refreshed 46 ms BEFORE its first track was probed, so it summed a set of NULLs. The album \u2014 identical code, `SupportsCumulativeRunTimeTicks` also true, refreshed after all three \u2014 got the right number. A rescan does not repair it either: `UpdateMetadataFromChildren` is gated on `isFullRefresh || currentUpdateType > None`. Matching Jellyfin here would mean reproducing a first-scan race on purpose.\n\nKept per 'don't port Jellyfin's bugs' (docs/ + the standing memory). OWNER CALL PENDING: ratify keeping 60000000, or direct that Ferrofin reproduce the race. The ledger renders this row under 'Awaiting owner ratification', NOT under 'accepted' \u2014 that bucket is a claim about a decision somebody made, and this one has not been made. Until ratified the row stays deep_verified=false against this oracle, honestly \u2014 the divergence is REAL and visible, not hidden. parity_diff.VOLATILE was NOT widened for RunTimeTicks and must not be.\n\nROW HISTORY, kept rather than dropped: before the port this row's bodies DIFFED CLEAN, and the old classification's warning ('DO NOT BANK THIS ROW') was right \u2014 the agreement was two different mechanisms landing on the same number. Ferrofin wrote RunTimeTicks 0 because its artist was a parentless by-name row with no recursive children and the faithful UpdateCumulativeRunTimeTicks summed nothing; Jellyfin wrote 0 because of the race above. The green was a coincidence and it is now a visible mismatch for the right reason. DE-DUPLICATION CHECK for this row specifically: it must return exactly 3 artists. A previous attempt at this port was rolled back because `push_by_name_join` joins on CleanName and the scanned row plus the by-name row each produced an entry, listing every artist twice. Measured 3, twice, after the fix.",
@@ -59,7 +59,7 @@
       "depth": "REAL",
       "status_conformant": true,
       "schema_valid": true,
-      "note": "0/1 legs clean (38 leaves compared); mismatch:3 missing:0 extra:0 | Items[Name=Artist 02].RunTimeTicks(J=0 H=60000000); Items[Name=Artist 03].RunTimeTicks(J=0 H=60000000); Items[Name=Artist 01].RunTimeTicks(J=0 H=60000000)",
+      "note": "0/1 legs clean (38 leaves compared); mismatch:3 missing:0 extra:0 | Items[Name=Artist 01].RunTimeTicks(J=0 H=60000000); Items[Name=Artist 03].RunTimeTicks(J=0 H=60000000); Items[Name=Artist 02].RunTimeTicks(J=0 H=60000000)",
       "deep_verified": false,
       "verification_method": "body-diff",
       "classification": "jellyfin-bug (RunTimeTicks / CumulativeRunTimeTicks ONLY; every other leg of this row now diffs clean by measurement). `MusicArtistResolver` is PORTED (library_scan.rs::plan_music_node + is_music_artist, a port of v10.11.8 Emby.Server.Implementations/Library/Resolvers/Audio/MusicArtistResolver.cs:54-125), so an artist directory now resolves to a real MusicArtist row parented into the music library, on Jellyfin's OWN path-derived id (measured byte-identical on the fixture: Artist 01 = 0f39932400340734bea41ffc13aaddc4, Artist 02 = 2b3868bfaa266cc1d3cc4c3dd5d40800, Artist 03 = 697d2b7b6ec56d3cf7e87c2de748b0cd), with its albums re-parented onto it. That closed Path, CanDelete, RecursiveItemCount and the empty user-scoped MusicArtist universe.\n\nWHAT REMAINS, and why it is Jellyfin's bug and not Ferrofin's: with the artist resolved as a folder, `MetadataService.UpdateCumulativeRunTimeTicks` (MediaBrowser.Providers/Manager/MetadataService.cs:451) sums the RunTimeTicks of the non-folder children returned by `GetChildrenForMetadataUpdates`. For a MusicArtist that method is OVERRIDDEN \u2014 `ArtistMetadataService.GetChildrenForMetadataUpdates` (MediaBrowser.Providers/Music/ArtistMetadataService.cs:44-56) returns `item.IsAccessedByName ? item.GetTaggedItems(Recursive, IsFolder=false) : item.GetRecursiveChildren(i => i is IHasArtist && !i.IsFolder)`, NOT the base class's plain `folder.GetRecursiveChildren()` at MetadataService.cs:397-401. A folder-resolved artist takes the second arm, and `Audio : IHasArtist`, so the set is exactly the three tracks \u2014 the override strengthens the conclusion rather than changing it, and it is cited here because re-deriving the number from the base method lands on the wrong call. `MusicArtist.SupportsCumulativeRunTimeTicks => true` (MusicArtist.cs:38). 3 tracks x 20000000 = 60000000, which is what Ferrofin stores. The 10.11.8 oracle stores 0, and its OWN DateLastRefreshed timestamps show why \u2014 a first-scan ordering race, read out of this lab's /config/data/jellyfin.db:\n  MusicArtist 'Artist 01'   RunTimeTicks 0         DateLastRefreshed 2026-08-30 00:29:30.8359533\n  Audio       'Track 01'    RunTimeTicks 20000000                    2026-08-30 00:29:30.8815808\n  Audio       'Track 02'    RunTimeTicks 20000000                    2026-08-30 00:29:30.8973703\n  Audio       'Track 03'    RunTimeTicks 20000000                    2026-08-30 00:29:30.9096119\n  MusicAlbum  'Album 01'    RunTimeTicks 60000000                    2026-08-30 00:29:30.9187306\nThe artist refreshed 46 ms BEFORE its first track was probed, so it summed a set of NULLs. The album \u2014 identical code, `SupportsCumulativeRunTimeTicks` also true, refreshed after all three \u2014 got the right number. A rescan does not repair it either: `UpdateMetadataFromChildren` is gated on `isFullRefresh || currentUpdateType > None`. Matching Jellyfin here would mean reproducing a first-scan race on purpose.\n\nKept per 'don't port Jellyfin's bugs' (docs/ + the standing memory). OWNER CALL PENDING: ratify keeping 60000000, or direct that Ferrofin reproduce the race. The ledger renders this row under 'Awaiting owner ratification', NOT under 'accepted' \u2014 that bucket is a claim about a decision somebody made, and this one has not been made. Until ratified the row stays deep_verified=false against this oracle, honestly \u2014 the divergence is REAL and visible, not hidden. parity_diff.VOLATILE was NOT widened for RunTimeTicks and must not be.\n\nROW HISTORY, kept rather than dropped: this row also diffed clean before the port, for the same coincidence recorded on `GET /Artists` (two mechanisms landing on 0) \u2014 the old classification said not to bank it and that was correct. It is now clean on every leaf but the ratified one, for the right reason.",
@@ -83,7 +83,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Artists/{itemId}/InstantMix",
@@ -100,7 +100,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Artists/{itemId}/Similar",
@@ -110,7 +110,7 @@
       "depth": "REAL",
       "status_conformant": true,
       "schema_valid": true,
-      "note": "0/1 legs clean (26 leaves compared); mismatch:2 missing:0 extra:0 | Items[Name=Artist 02].RunTimeTicks(J=0 H=60000000); Items[Name=Artist 03].RunTimeTicks(J=0 H=60000000)",
+      "note": "0/1 legs clean (26 leaves compared); mismatch:2 missing:0 extra:0 | Items[Name=Artist 03].RunTimeTicks(J=0 H=60000000); Items[Name=Artist 02].RunTimeTicks(J=0 H=60000000)",
       "deep_verified": false,
       "verification_method": "body-diff",
       "classification": "jellyfin-bug (RunTimeTicks / CumulativeRunTimeTicks ONLY; every other leg of this row now diffs clean by measurement). `MusicArtistResolver` is PORTED (library_scan.rs::plan_music_node + is_music_artist, a port of v10.11.8 Emby.Server.Implementations/Library/Resolvers/Audio/MusicArtistResolver.cs:54-125), so an artist directory now resolves to a real MusicArtist row parented into the music library, on Jellyfin's OWN path-derived id (measured byte-identical on the fixture: Artist 01 = 0f39932400340734bea41ffc13aaddc4, Artist 02 = 2b3868bfaa266cc1d3cc4c3dd5d40800, Artist 03 = 697d2b7b6ec56d3cf7e87c2de748b0cd), with its albums re-parented onto it. That closed Path, CanDelete, RecursiveItemCount and the empty user-scoped MusicArtist universe.\n\nWHAT REMAINS, and why it is Jellyfin's bug and not Ferrofin's: with the artist resolved as a folder, `MetadataService.UpdateCumulativeRunTimeTicks` (MediaBrowser.Providers/Manager/MetadataService.cs:451) sums the RunTimeTicks of the non-folder children returned by `GetChildrenForMetadataUpdates`. For a MusicArtist that method is OVERRIDDEN \u2014 `ArtistMetadataService.GetChildrenForMetadataUpdates` (MediaBrowser.Providers/Music/ArtistMetadataService.cs:44-56) returns `item.IsAccessedByName ? item.GetTaggedItems(Recursive, IsFolder=false) : item.GetRecursiveChildren(i => i is IHasArtist && !i.IsFolder)`, NOT the base class's plain `folder.GetRecursiveChildren()` at MetadataService.cs:397-401. A folder-resolved artist takes the second arm, and `Audio : IHasArtist`, so the set is exactly the three tracks \u2014 the override strengthens the conclusion rather than changing it, and it is cited here because re-deriving the number from the base method lands on the wrong call. `MusicArtist.SupportsCumulativeRunTimeTicks => true` (MusicArtist.cs:38). 3 tracks x 20000000 = 60000000, which is what Ferrofin stores. The 10.11.8 oracle stores 0, and its OWN DateLastRefreshed timestamps show why \u2014 a first-scan ordering race, read out of this lab's /config/data/jellyfin.db:\n  MusicArtist 'Artist 01'   RunTimeTicks 0         DateLastRefreshed 2026-08-30 00:29:30.8359533\n  Audio       'Track 01'    RunTimeTicks 20000000                    2026-08-30 00:29:30.8815808\n  Audio       'Track 02'    RunTimeTicks 20000000                    2026-08-30 00:29:30.8973703\n  Audio       'Track 03'    RunTimeTicks 20000000                    2026-08-30 00:29:30.9096119\n  MusicAlbum  'Album 01'    RunTimeTicks 60000000                    2026-08-30 00:29:30.9187306\nThe artist refreshed 46 ms BEFORE its first track was probed, so it summed a set of NULLs. The album \u2014 identical code, `SupportsCumulativeRunTimeTicks` also true, refreshed after all three \u2014 got the right number. A rescan does not repair it either: `UpdateMetadataFromChildren` is gated on `isFullRefresh || currentUpdateType > None`. Matching Jellyfin here would mean reproducing a first-scan race on purpose.\n\nKept per 'don't port Jellyfin's bugs' (docs/ + the standing memory). OWNER CALL PENDING: ratify keeping 60000000, or direct that Ferrofin reproduce the race. The ledger renders this row under 'Awaiting owner ratification', NOT under 'accepted' \u2014 that bucket is a claim about a decision somebody made, and this one has not been made. Until ratified the row stays deep_verified=false against this oracle, honestly \u2014 the divergence is REAL and visible, not hidden. parity_diff.VOLATILE was NOT widened for RunTimeTicks and must not be.\n\nWHAT THIS ROW CLOSED: Ferrofin returned 0 rows where Jellyfin returned 2. The scorer half was already right (`MusicArtistSimilarItemsProvider` is a flat InternalItemsQuery { Genres, Tags, IncludeItemTypes=[MusicArtist] } and an EMPTY Genres/Tags pair is not a predicate, so an untagged artist matches every other artist \u2014 covered by the `an_untagged_artist_seed_still_matches_every_other_artist` unit test). The blocker was the item UNIVERSE: no MusicArtist row survived `scope_to_user_libraries` (a faithful `AddUserToQuery`, TopParentId IS NOT NULL). That filter was NOT relaxed; the scanner was fixed. Both peers now return on both servers.\n\nORDERING \u2014 this row's own methodology guard rail, and it is LIVE now that the candidate pool is no longer empty: this endpoint's provider orders `Random` on BOTH servers (MusicArtistSimilarItemsProvider.cs:50 / v10.11.8 LibraryController.cs:801) and Ferrofin emits `Random` too. parity_diff aligns arrays by key, so the ORDER is not gateable by any probe \u2014 which means the reads leg MUST stay pinned at a limit above the candidate pool, or the two servers will draw different SUBSETS and the row will diff on membership for a reason that is not a bug. reads.py:636 pins limit=1000 (rationale at reads.py:608-623). Do not lower it, and do not 'fix' a future red on this row by narrowing the compare.",
@@ -127,7 +127,7 @@
       "depth": "REAL",
       "status_conformant": true,
       "schema_valid": true,
-      "note": "0/1 legs clean (34 leaves compared); mismatch:2 missing:0 extra:0 | RunTimeTicks(J=0 H=60000000); CumulativeRunTimeTicks(J=0 H=60000000)",
+      "note": "0/1 legs clean (34 leaves compared); mismatch:2 missing:0 extra:0 | CumulativeRunTimeTicks(J=0 H=60000000); RunTimeTicks(J=0 H=60000000)",
       "deep_verified": false,
       "verification_method": "body-diff",
       "classification": "jellyfin-bug (RunTimeTicks / CumulativeRunTimeTicks ONLY; every other leg of this row now diffs clean by measurement). `MusicArtistResolver` is PORTED (library_scan.rs::plan_music_node + is_music_artist, a port of v10.11.8 Emby.Server.Implementations/Library/Resolvers/Audio/MusicArtistResolver.cs:54-125), so an artist directory now resolves to a real MusicArtist row parented into the music library, on Jellyfin's OWN path-derived id (measured byte-identical on the fixture: Artist 01 = 0f39932400340734bea41ffc13aaddc4, Artist 02 = 2b3868bfaa266cc1d3cc4c3dd5d40800, Artist 03 = 697d2b7b6ec56d3cf7e87c2de748b0cd), with its albums re-parented onto it. That closed Path, CanDelete, RecursiveItemCount and the empty user-scoped MusicArtist universe.\n\nWHAT REMAINS, and why it is Jellyfin's bug and not Ferrofin's: with the artist resolved as a folder, `MetadataService.UpdateCumulativeRunTimeTicks` (MediaBrowser.Providers/Manager/MetadataService.cs:451) sums the RunTimeTicks of the non-folder children returned by `GetChildrenForMetadataUpdates`. For a MusicArtist that method is OVERRIDDEN \u2014 `ArtistMetadataService.GetChildrenForMetadataUpdates` (MediaBrowser.Providers/Music/ArtistMetadataService.cs:44-56) returns `item.IsAccessedByName ? item.GetTaggedItems(Recursive, IsFolder=false) : item.GetRecursiveChildren(i => i is IHasArtist && !i.IsFolder)`, NOT the base class's plain `folder.GetRecursiveChildren()` at MetadataService.cs:397-401. A folder-resolved artist takes the second arm, and `Audio : IHasArtist`, so the set is exactly the three tracks \u2014 the override strengthens the conclusion rather than changing it, and it is cited here because re-deriving the number from the base method lands on the wrong call. `MusicArtist.SupportsCumulativeRunTimeTicks => true` (MusicArtist.cs:38). 3 tracks x 20000000 = 60000000, which is what Ferrofin stores. The 10.11.8 oracle stores 0, and its OWN DateLastRefreshed timestamps show why \u2014 a first-scan ordering race, read out of this lab's /config/data/jellyfin.db:\n  MusicArtist 'Artist 01'   RunTimeTicks 0         DateLastRefreshed 2026-08-30 00:29:30.8359533\n  Audio       'Track 01'    RunTimeTicks 20000000                    2026-08-30 00:29:30.8815808\n  Audio       'Track 02'    RunTimeTicks 20000000                    2026-08-30 00:29:30.8973703\n  Audio       'Track 03'    RunTimeTicks 20000000                    2026-08-30 00:29:30.9096119\n  MusicAlbum  'Album 01'    RunTimeTicks 60000000                    2026-08-30 00:29:30.9187306\nThe artist refreshed 46 ms BEFORE its first track was probed, so it summed a set of NULLs. The album \u2014 identical code, `SupportsCumulativeRunTimeTicks` also true, refreshed after all three \u2014 got the right number. A rescan does not repair it either: `UpdateMetadataFromChildren` is gated on `isFullRefresh || currentUpdateType > None`. Matching Jellyfin here would mean reproducing a first-scan race on purpose.\n\nKept per 'don't port Jellyfin's bugs' (docs/ + the standing memory). OWNER CALL PENDING: ratify keeping 60000000, or direct that Ferrofin reproduce the race. The ledger renders this row under 'Awaiting owner ratification', NOT under 'accepted' \u2014 that bucket is a claim about a decision somebody made, and this one has not been made. Until ratified the row stays deep_verified=false against this oracle, honestly \u2014 the divergence is REAL and visible, not hidden. parity_diff.VOLATILE was NOT widened for RunTimeTicks and must not be.\n\nWHAT THIS ROW CLOSED, with the before-values: Path (J '/media/synth/music/Artist 01' vs H '/config/metadata/artists/Artist 01' \u2014 H's old value was the CORRECT path for the by-name row it actually had), CanDelete (J true, H false \u2014 kinds::can_delete is already a faithful !IsAccessedByName), and a missing RecursiveItemCount (J 3). All three measured equal now.\n\nTWO DIVERGENCES THIS ROW STILL CARRIES that the harness cannot see, recorded here so they are not mistaken for settled. Both are masked by parity_diff.VOLATILE, which was NOT widened for either \u2014 they were already in it. (1) ParentId: Jellyfin materializes a physical `Folder` row per media path and parents the artist to it (F 0 such rows vs J 9); Ferrofin parents to the CollectionFolder. The id derivation already reproduces exactly \u2014 md5_le('MediaBrowser.Controller.Entities.Folder' + '/media/synth/music') = f87561f1dd83cf1f019883e008f5f307, which is the id Jellyfin stores \u2014 so closing it is mechanical, but it changes the ancestor chain of every scanned item and needs its own measured change plus the perf gate. (2) UserData.Key: C# UserDataManager.cs:239-245 uses item.GetUserDataKeys()[0], so Jellyfin emits 'Artist-Artist 01' where Ferrofin emits the raw guid '0f399324-0034-0734-bea4-1ffc13aaddc4'. kinds.rs and user_data_keys.rs already COMPUTE the right keys; the gap is plumbing in user_data_manager.rs::empty_row / dto_service.rs::empty_user_data_dto, and it is server-wide, not artist-specific.",
@@ -151,7 +151,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "HEAD /Artists/{name}/Images/{imageType}/{imageIndex}",
@@ -168,7 +168,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "DELETE /Audio/{itemId}/Lyrics",
@@ -185,7 +185,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Audio/{itemId}/Lyrics",
@@ -202,7 +202,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /Audio/{itemId}/Lyrics",
@@ -219,7 +219,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Audio/{itemId}/RemoteSearch/Lyrics",
@@ -270,7 +270,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Audio/{itemId}/hls/{segmentId}/stream.mp3",
@@ -287,7 +287,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Audio/{itemId}/hls1/{playlistId}/{segmentId}.{container}",
@@ -304,7 +304,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Audio/{itemId}/main.m3u8",
@@ -321,7 +321,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Audio/{itemId}/master.m3u8",
@@ -338,7 +338,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "HEAD /Audio/{itemId}/master.m3u8",
@@ -355,7 +355,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Audio/{itemId}/stream",
@@ -372,7 +372,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "HEAD /Audio/{itemId}/stream",
@@ -389,7 +389,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Audio/{itemId}/stream.{container}",
@@ -406,7 +406,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "HEAD /Audio/{itemId}/stream.{container}",
@@ -423,7 +423,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Audio/{itemId}/universal",
@@ -457,7 +457,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Auth/Keys",
@@ -474,7 +474,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /Auth/Keys",
@@ -491,7 +491,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "DELETE /Auth/Keys/{key}",
@@ -508,7 +508,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Auth/PasswordResetProviders",
@@ -525,7 +525,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Auth/Providers",
@@ -542,7 +542,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Backup",
@@ -559,7 +559,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /Backup/Create",
@@ -576,7 +576,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Backup/Manifest",
@@ -593,7 +593,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /Backup/Restore",
@@ -610,7 +610,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Branding/Configuration",
@@ -627,7 +627,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Branding/Css",
@@ -644,7 +644,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Branding/Css.css",
@@ -661,7 +661,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "DELETE /Branding/Splashscreen",
@@ -678,7 +678,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Branding/Splashscreen",
@@ -695,7 +695,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /Branding/Splashscreen",
@@ -712,7 +712,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Channels",
@@ -814,7 +814,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /Collections",
@@ -831,7 +831,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "DELETE /Collections/{collectionId}/Items",
@@ -848,7 +848,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /Collections/{collectionId}/Items",
@@ -865,7 +865,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "DELETE /Devices",
@@ -882,7 +882,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Devices",
@@ -916,7 +916,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Devices/Options",
@@ -933,7 +933,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /Devices/Options",
@@ -950,7 +950,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /DisplayPreferences/{displayPreferencesId}",
@@ -1018,7 +1018,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Environment/Drives",
@@ -1069,7 +1069,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /Environment/ValidatePath",
@@ -1086,7 +1086,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Episode/{Id}/Timestamps",
@@ -1171,7 +1171,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /FileTransformation/RegisterTransformation",
@@ -1239,7 +1239,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "HEAD /Genres/{name}/Images/{imageType}",
@@ -1256,7 +1256,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Genres/{name}/Images/{imageType}/{imageIndex}",
@@ -1273,7 +1273,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "HEAD /Genres/{name}/Images/{imageType}/{imageIndex}",
@@ -1290,7 +1290,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /GetUtcTime",
@@ -1494,7 +1494,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Items",
@@ -1531,7 +1531,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Items/Filters",
@@ -1582,7 +1582,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /Items/RemoteSearch/Apply/{itemId}",
@@ -1667,7 +1667,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /Items/RemoteSearch/MusicArtist",
@@ -1677,8 +1677,8 @@
       "depth": "REAL",
       "status_conformant": null,
       "schema_valid": null,
-      "note": "H=True(+evidence) J=False(+evidence) (property; named properties compared across the two servers; bodies NOT diffed) [evidence: named: H=[{'Name': 'Amnesiac', 'ProviderIds': {'MusicBrainzArtist': '042914f7-8bfa-4b0d-9fa6-ee1b8feacbd5'}, 'ProductionYear': 2006, 'PremiereDate': '2006-01-01T00:00:00.0000000Z', 'SearchProviderName': 'MusicBrainz', 'Artists': []}, {'Name': 'Amnesiac', 'ProviderIds': {'MusicBrainzArtist': '2fe2bb15-8b74-4b5b-abb3-167d8c11954f'}, 'SearchProviderName': 'MusicBrainz', 'Artists': []}, {'Name': 'Amnesiac Quartet', 'ProviderIds': {'MusicBrainzArtist': '7615d0d9-9640-4749-a7f9-5e7c162ab5fa'}, 'SearchProviderName': 'MusicBrainz', 'Artists': []}, {'Name': 'An Evening of Radiohead', 'ProviderIds': {'MusicBrainzArtist': '1545e981-65ca-4123-9223-ae8efd72cf54'}, 'ProductionYear': 2024, 'PremiereDate': '2024-01-01T00:00:00.0000000Z', 'SearchProviderName': 'MusicBrainz', 'Artists': []}, {'Name': 'Android paranoid', 'ProviderIds': {'MusicBrainzArtist': '7a75f877-3cd7-432c-8349-b09e6a59f975'}, 'SearchProviderName': 'MusicBrainz', 'Artists': []}, {'Name': 'Colin Greenwood', 'ProviderIds': {'MusicBrainzArtist': 'f23074f4-2c06-477a-bf1d-12fa66e087ee'}, 'ProductionYear': 1969, 'PremiereDate': '1969-06-26T00:00:00.0000000Z', 'SearchProviderName': 'MusicBrainz', 'Artists': []}, {'Name': 'DJ Radiohead', 'ProviderIds': {'MusicBrainzArtist': '118b7a68-9249-4f5a-91f4-1fd046c07f8f'}, 'SearchProviderName': 'MusicBrainz', 'Artists': []}, {'Name': 'Ed O\u2019Brien', 'ProviderIds': {'MusicBrainzArtist': '309d9809-cf74-493a-b56b-1378258f20fd'}, 'ProductionYear': 1968, 'PremiereDate': '1968-04-15T00:00:00.0000000Z', 'SearchProviderName': 'MusicBrainz', 'Artists': []}, {'Name': 'Fake Plastic Radiohead', 'ProviderIds': {'MusicBrainzArtist': 'b21ab3cc-88ed-4d2b-bd01-6edb83c37900'}, 'ProductionYear': 2021, 'PremiereDate': '2021-09-25T00:00:00.0000000Z', 'SearchProviderName': 'MusicBrainz', 'Artists': []}, {'Name': 'Gazz', 'ProviderIds': {'MusicBrainzArtist': '93ccea0f-cc7e-4057-91b1-b5b8ae6f9a91'}, 'SearchProviderName': 'MusicBrainz', 'Artists': []}, {'Name': 'Goyimbwoods', 'ProviderIds': {'MusicBrainzArtist': '7acdf668-b20f-4f98-b740-584b6b24a10e'}, 'ProductionYear': 2018, 'PremiereDate': '2018-01-01T00:00:00.0000000Z', 'SearchProviderName': 'MusicBrainz', 'Artists': []}, {'Name': 'In Rainbows', 'ProviderIds': {'MusicBrainzArtist': 'a6606aaa-6027-4d6d-8bea-0e8ee816b8f1'}, 'SearchProviderName': 'MusicBrainz', 'Artists': []}, {'Name': 'Karma Police', 'ProviderIds': {'MusicBrainzArtist': 'eef663a4-72f1-4773-9a8d-f9254e555847'}, 'SearchProviderName': 'MusicBrainz', 'Artists': []}, {'Name': 'On a Friday', 'ProviderIds': {'MusicBrainzArtist': 'c74f4726-2671-4011-81b6-f70da905c05a'}, 'ProductionYear': 1985, 'PremiereDate': '1985-01-01T00:00:00.0000000Z', 'SearchProviderName': 'MusicBrainz', 'Artists': []}, {'Name': 'Paranoid', 'ProviderIds': {'MusicBrainzArtist': '3093e58d-57ce-4757-9919-bfa603ab9a64'}, 'SearchProviderName': 'MusicBrainz', 'Artists': []}, {'Name': 'Philip Selway', 'ProviderIds': {'MusicBrainzArtist': '4ab74d13-d1eb-4895-b874-6da5d8b1aac3'}, 'ProductionYear': 1967, 'PremiereDate': '1967-05-23T00:00:00.0000000Z', 'SearchProviderName': 'MusicBrainz', 'Artists': []}, {'Name': 'Plank', 'ProviderIds': {'MusicBrainzArtist': '827df643-4099-40e3-9ba1-8aebbf351cc1'}, 'SearchProviderName': 'MusicBrainz', 'Artists': []}, {'Name': 'RadiOK', 'ProviderIds': {'MusicBrainzArtist': 'eb2bf67f-5b28-4c2b-afd7-e6c5576aac9a'}, 'ProductionYear': 2019, 'PremiereDate': '2019-01-01T00:00:00.0000000Z', 'SearchProviderName': 'MusicBrainz', 'Artists': []}, {'Name': 'Radiohead', 'ProviderIds': {'MusicBrainzArtist': 'a74b1b7f-71a5-4011-9441-d0b5e4122711'}, 'ProductionYear': 1991, 'PremiereDate': '1991-01-01T00:00:00.0000000Z', 'SearchProviderName': 'MusicBrainz', 'Artists': []}, {'Name': 'Radiohead 2', 'ProviderIds': {'MusicBrainzArtist': '33bfaa56-037f-4f7d-9a0a-c2412c636e56'}, 'SearchProviderName': 'MusicBrainz', 'Artists': []}, {'Name': 'Radiohead Cover Brasil', 'ProviderIds': {'MusicBrainzArtist': 'e48fc8b3-e8ab-4dd4-9dc8-6b0f06ef07d6'}, 'SearchProviderName': 'MusicBrainz', 'Artists': []}, {'Name': 'Secret Society', 'ProviderIds': {'MusicBrainzArtist': 'b7ab4150-9830-4951-87ed-250ab2cea021'}, 'SearchProviderName': 'MusicBrainz', 'Artists': []}, {'Name': 'The Bends', 'ProviderIds': {'MusicBrainzArtist': 'b5ed1065-9be0-4214-af07-66d532e64fd2'}, 'SearchProviderName': 'MusicBrainz', 'Artists': []}, {'Name': 'The Smile', 'ProviderIds': {'MusicBrainzArtist': '9055fca5-69bc-4d47-b569-ab2012a19565'}, 'ProductionYear': 2021, 'PremiereDate': '2021-05-22T00:00:00.0000000Z', 'SearchProviderName': 'MusicBrainz', 'Artists': []}, {'Name': 'radiohead 3', 'ProviderIds': {'MusicBrainzArtist': '3ecaa799-94ae-45cd-9ad1-bcabae4073e1'}, 'SearchProviderName': 'MusicBrainz', 'Artists': []}] J=[]; named_count: H=25 J=0]",
-      "deep_verified": false,
+      "note": "H=True(+evidence) J=True(+evidence) (property; named properties compared across the two servers; bodies NOT diffed)",
+      "deep_verified": true,
       "verification_method": "property",
       "classification": "The library metadata-fetcher gate is now PORTED on this path: `LocalProviderManager::remote_search` resolves the `ItemId` reference item, reads ITS library's TypeOptions and drops every remote fetcher the \"Metadata downloaders\" list leaves unticked, honouring `IncludeDisabledProviders` as the short-circuit and the library's `MetadataFetcherOrder` for ordering \u2014 a port of MediaBrowser.Providers/Manager/ProviderManager.cs:787-830 -> :440-460 -> :462-491 -> MediaBrowser.Controller/BaseItemManager/BaseItemManager.cs:26-46. It only became REACHABLE for MusicArtist once `MusicArtistResolver` landed, because the gate resolves a library through `TopParentId` and an accessed-by-name artist has none. Measured live on the lab pair, both servers: scoped search with `ItemId` -> 200 with 0 results on BOTH (the fixture library ticks no MusicArtist fetcher; Ferrofin used to return 25), and `IncludeDisabledProviders=true` puts MusicBrainz back. The row also gained its first probe \u2014 `j_remote_search_identify` now sends `ItemId` and `IncludeDisabledProviders`, which no case did before, and resolves the artist id PER SERVER by Path so a server with no resolvable artist FAILS the row rather than skipping it. MEASUREMENT CAVEAT, not a divergence: MusicBrainz rate-limits both containers behind one egress IP and answers an over-rate query with an empty list, so the probe paces its legs 6 s apart and retries 5 times; if both servers still come back empty the row goes red with `named_count: 0` on both, which is the honest reading. The unscoped candidate list is compared whole, field for field, with ORDER normalised only \u2014 MusicBrainz returns tie-scored artists in an order two independent live queries do not agree on.\n\n--- ALSO ON THIS ROW (merged from main) ---\n\nopen-work (NOT accepted): the fetcher gate is ported and correct, but Ferrofin cannot RESOLVE a MusicArtist's library, so the gate is inert for that one kind. `LocalProviderManager::remote_search` now runs the C# `CanRefreshMetadata` chain (v10.11.8 ProviderManager.cs:801-830 -> :462-491 -> BaseItemManager.cs:26-46) and resolves the owning library through the reference item's `TopParentId`. Ferrofin's MusicArtist rows are materialized BY NAME out of `ItemValues` (library_scan.rs `item_values_of`, Artist=0/AlbumArtist=1), so they carry TopParentId='', ParentId='', Path=NULL and no `AncestorIds` row \u2014 verified directly in the lab DB for all three fixture artists. With no library resolvable the gate falls through permissive, so the GATED leg of the reads probe (ItemId=<own Artist>, IncludeDisabledProviders=false, against a Music library whose TypeOptions[MusicArtist].MetadataFetchers is []) answers with the MusicBrainz hit where Jellyfin answers []. Jellyfin's MusicArtist IS the artist DIRECTORY (measured: Path=/media/synth/music/Artist 01, ParentId=<Music library>), which is what makes `LibraryManager.GetCollectionFolders` (LibraryManager.cs:2262-2303) find the collection folder by path. The UNGATED leg of the same row diffs byte-identical, so the search itself is right; only the reference-item resolution is missing. Fix, in order of faithfulness: (1) give the materialized MusicArtist row its artist directory as `Path` (plus the owning library's TopParentId/ParentId) so the existing resolution works and `/Artists` stops serving Path:null \u2014 a library_scan change on the perf-gated path, needing its own batch and its own perf run; or (2) add a path-prefix fallback to `LocalProviderManager::library_options_for`, which only helps once (1) supplies the path. Same root cause as the separately observed `GET /Users/{userId}/Items?IncludeItemTypes=MusicArtist&Recursive=true` returning [] on Ferrofin and 3 on Jellyfin.",
       "classification_scope": "op",
@@ -1762,8 +1762,8 @@
       "depth": "REAL",
       "status_conformant": true,
       "schema_valid": true,
-      "note": "0/1 legs clean (21 leaves compared); mismatch:0 missing:0 extra:1 | ",
-      "deep_verified": false,
+      "note": "1/1 legs clean (22 leaves compared)",
+      "deep_verified": true,
       "verification_method": "body-diff",
       "classification": "lab-state (NOT a Ferrofin divergence, and NOT an accepted one \u2014 this row renders under \"Lab state\" and is counted there, never in the accepted tally). Re-measured 2026-08-31 on the lane pair: the body diffs 22 leaves and exactly ONE differs, `ChildCount` J=6 H=5. The whole of that difference is a `Recordings` CollectionFolder (`/config/root/default/Recordings`, id 79a2726d\u2026) that Jellyfin grew from an earlier DVR journey and this Ferrofin does not have; Ferrofin currently holds 0 recordings to Jellyfin's 12. On a freshly-wiped pair this row must come back clean, and if it does not it is a bug. PREVIOUS CLASSIFICATION, KEPT AS A RECORD BECAUSE IT WAS REAL AND IS NOW CLOSED: this row used to carry `accepted-divergence (structural: where the playlists plugin folder hangs)` \u2014 Ferrofin stored the playlists folder as a real DB child of the UserRootFolder where upstream parents it to the AggregateFolder (`LibraryManager.CreateRootFolder()`, v10.11.8 LibraryManager.cs:838-887, `folder.ParentId = rootFolder.Id`), which showed as the folder sorting INLINE by SortName instead of being appended last (`UserRootFolder.GetEligibleChildrenForRecursiveChildren` = `base.Children` + `list.AddRange(RootFolder.VirtualChildren)`, an APPEND, with `IsPreSorted => true`). That divergence was PORTED OUT by the AggregateFolder work, and the fix is measured, not assumed: on the pair today both servers list Playlists LAST, and the playlists folder's id and Path agree byte for byte (1071671e7bffa0532e930debee501d2e, /config/data/playlists). The old text also asserted \"the row's own body diffs CLEAN and this op stays deep-verified\", which was false while the row was red \u2014 that claim is what put a live red under the accepted heading, and it is the reason this row is now categorised by its measurement instead of by its story.",
       "classification_scope": "op",
@@ -1779,7 +1779,7 @@
       "depth": "REAL",
       "status_conformant": true,
       "schema_valid": true,
-      "note": "4/8 legs clean (108006+929+226+4868+101+104+218+3 leaves compared); mismatch:1572 missing:6306 extra:0 | Items[Path=/media/synth/movies/Movie 0266 (2020)/Movie 0266 (2020).mkv].MediaSources[Path=/media/synth/movies/Movie 0266 (2020)/Movie 0266 (2020).mkv].Bitrate(J=6253020 H=6061020); Items[Path=/media/synth/movies/Movie 0266 (2020)/Movie 0266 (2020).mkv].MediaSources[Path=/media/synth/movies/Movie 0266 (2020)/Movie 0266 (2020).mkv].MediaStreams[0].BitRate(J=6061020 H=5869020); Items[Path=/media/synth/movies/Movie 0266 (2020)/Movie 0266 (2020).mkv].MediaStreams[0].BitRate(J=6061020 H=5869020)",
+      "note": "4/8 legs clean (108006+929+226+4868+101+104+218+3 leaves compared); mismatch:1572 missing:6306 extra:0 | Items[Path=/media/synth/movies/Movie 0132 (2020)/Movie 0132 (2020).mkv].MediaStreams[0].BitRate(J=6061020 H=5869020); Items[Path=/media/synth/movies/Movie 0132 (2020)/Movie 0132 (2020).mkv].MediaSources[Path=/media/synth/movies/Movie 0132 (2020)/Movie 0132 (2020).mkv].MediaStreams[0].BitRate(J=6061020 H=5869020); Items[Path=/media/synth/movies/Movie 0132 (2020)/Movie 0132 (2020).mkv].MediaSources[Path=/media/synth/movies/Movie 0132 (2020)/Movie 0132 (2020).mkv].Bitrate(J=6253020 H=6061020)",
       "deep_verified": false,
       "verification_method": "body-diff",
       "classification": "open-work (NOT accepted). `SuggestionsController.GetSuggestions` (v10.11.8 Jellyfin.Api/Controllers/SuggestionsController.cs:78-96) is ONE recursive user query projected with ALL DtoOptions fields, and Ferrofin's handler is a line-for-line port \u2014 the handler was never the bug. Random PERMUTES but does not change the set, so at `limit >= |universe|` the answer is fully determined and the probe's seven full-limit legs body-diff it honestly; only the narrow startIndex leg is projected, and only onto what a Random page genuinely determines. The row was red for FIVE independent causes. THREE ARE FIXED HERE. (a) The item-universe gap on its biggest kind: LiveTvProgram was F 0 / J 338 and is now 338/338 (see `GET /Items`). (b) FOUR DTO fields the all-fields projection is supposed to carry and Ferrofin assigned NOWHERE \u2014 `RecursiveItemCount` and the folder `UserData.PlayedPercentage`/`Played` (`Folder.FillUserDataDtoValues`, v10.11.8 MediaBrowser.Controller/Entities/Folder.cs:1798-1838, whose two gates are DIFFERENT: the count is gated on its field alone and the played numbers on `SupportsPlayedStatus`, which is why a MusicAlbum carries the count and no percentage); `CumulativeRunTimeTicks` (Emby.Server.Implementations/Dto/DtoService.cs:492-495, the folder branch, not under EnableUserData); `HasLyrics`, unconditional on every Audio DTO and a plain bool \u2014 `false`, not an absent key (DtoService.cs:308-311); and `SeriesStudio` for both Episode and Season (:1228-1234 and :1256-1262), which is `series.Studios.FirstOrDefault()` and so lives on a row the projected item is not. (c) The `PresentationUniqueKey` grouping, which the LiveTvProgram mirror made visible: see `GET /Items`. STILL OPEN, both named: the MusicArtist/UserView/Live TV RECORDINGS half of the universe gap, and the BitRate offset \u2014 that last one is NOT a Ferrofin defect and is classified on its own row (`GET /Items/{itemId}`, jellyfin-bug: 10.11.8 reports more bitrate than the file physically contains, master's PR #16248 fixed it and Ferrofin ports the fixed form). The remaining Movie 0401/Inception and UserData.LastPlayedDate rows in the current results are LAB DRIFT from other batches' write journeys on this long-lived pair, not defects; they clear on a freshly wiped pair. Previous text kept for the record: open-work (NOT accepted). The old text ('Random, so the set is non-deterministic') was only half true and it hid two real divergences. Random here PERMUTES but does not change the set: `SuggestionsController` runs ONE query (`OrderBy = [(Random, Descending)]`, Recursive, mediaType/type, IsVirtualItem=false) and Ferrofin's handler is a line-for-line port, so at `limit >= |universe|` the answer is fully determined and parity_diff aligns Items by Path. The probe was the problem: `limit=10` sampled 10 of 552 at random and could never diff. It is now eight legs: seven pinned at a full limit (per type), where Random only permutes and the whole body IS diffed, plus one narrow startIndex/limit leg. That narrow leg is the one place a projection is applied \u2014 a page of 3 out of 500 Random-ordered rows draws a different triple per call on BOTH servers (measured: three consecutive calls, three different triples each side), so it compares StartIndex, TotalRecordCount and the page length only. Diffing its Items would pin this row red forever and destroy its ability to signal when the two real divergences below are fixed; the projection is scoped to that leg alone and nothing was added to parity_diff.VOLATILE. Two causes remain, BOTH owned by other rows and deliberately left visible here rather than filtered out of the probe: (1) ITEM UNIVERSE \u2014 Ferrofin's recursive user-root universe has no MusicArtist, Folder, TvChannel or UserView rows (F 552 vs J 561 unfiltered; per type F 0 vs J 3/3/2/1), the same parentless-by-name/TopParentId cause as GET /Artists/{itemId}/Similar; detector `/Items?userId=<u>&recursive=true&limit=100000`, which shows the identical 9-row delta, so it is not this handler's bug. (2) PER-ITEM DTO FIELDS \u2014 MediaSources[].Name/Bitrate, MediaStreams[].BitRate (a constant 192000 offset), LocalizedLanguage, Level/IsAVC/Width/Height: the same set already classified on GET /Items/{itemId} as independent-probe noise, inherited here because Suggestions returns full item DTOs. Narrowing the compare to hide either would be the dishonest green; the row stays red until they are fixed on their own rows. The multi-leg probe no longer skips a leg whose servers disagree on status: a status divergence (or a body that is not 200-with-JSON on both sides) is recorded as a mismatch, which is the whole point of keeping the type=MusicArtist and type=TvChannel legs. UNIVERSE GAP, re-measured 2026-08-29 and WIDER than first written: LiveTvProgram belongs on the missing-kind list too \u2014 `/Items?userId=<u>&recursive=true&includeItemTypes=LiveTvProgram` returns 338 rows on Jellyfin and 0 on Ferrofin, while `/LiveTv/Programs` returns the guide on both (F 19200, J 338). The knock-on is visible on a THIRD row: GET /Genres is red only because Jellyfin's genre list carries `News`, the XMLTV guide's programme genre, which Ferrofin's genre list cannot see for the same reason. One fix (give the by-name/programme rows a TopParentId so `scope_to_user_libraries` stops filtering them out) closes /Artists Similar, these Suggestions legs and the /Genres row together; it changes the recursive item universe server-wide, so it is its own change WITH the perf gate.\n\n--- ALSO ON THIS ROW (merged from worktree-dv-lane2) ---\n\nopen-work (NOT accepted) \u2014 but the MusicArtist half of this row is CLOSED. `MusicArtistResolver` is now ported, so `/Items/Suggestions?type=MusicArtist` returns the same 3 artists on both servers (measured twice: F 3 ['Artist 01','Artist 02','Artist 03'], J the same) where Ferrofin used to return 0, and the three `Items[Path=/media/synth/music/Artist NN] (whole item)` misses are gone. The artist rows now carry the RunTimeTicks divergence classified on `GET /Artists` (a Jellyfin first-scan race; 60000000 is correct). What is still open on this row belongs to OTHER causes and OTHER rows: the universe kinds Ferrofin does not materialize at all (physical Folder 0/9, TvChannel, UserView, LiveTvProgram), `SeriesStudio` on Episode, the MediaStreams/MediaSources bitrate offsets already classified on `GET /Items/{itemId}`, and the movie/playlist corpus asymmetry between the two long-lived instances. `RecursiveItemCount` and folder `UserData.PlayedPercentage` ARE now ported (dto_service.rs, a port of Folder.cs:1798-1836). Do NOT widen VOLATILE or drop a leg to hide any of the rest.\n\n--- previous text, retained ---\nopen-work (NOT accepted). The old text ('Random, so the set is non-deterministic') was only half true and it hid two real divergences. Random here PERMUTES but does not change the set: `SuggestionsController` runs ONE query (`OrderBy = [(Random, Descending)]`, Recursive, mediaType/type, IsVirtualItem=false) and Ferrofin's handler is a line-for-line port, so at `limit >= |universe|` the answer is fully determined and parity_diff aligns Items by Path. The probe was the problem: `limit=10` sampled 10 of 552 at random and could never diff. It is now eight legs: seven pinned at a full limit (per type), where Random only permutes and the whole body IS diffed, plus one narrow startIndex/limit leg. That narrow leg is the one place a projection is applied \u2014 a page of 3 out of 500 Random-ordered rows draws a different triple per call on BOTH servers (measured: three consecutive calls, three different triples each side), so it compares StartIndex, TotalRecordCount and the page length only. Diffing its Items would pin this row red forever and destroy its ability to signal when the two real divergences below are fixed; the projection is scoped to that leg alone and nothing was added to parity_diff.VOLATILE. Two causes remain, BOTH owned by other rows and deliberately left visible here rather than filtered out of the probe: (1) ITEM UNIVERSE \u2014 Ferrofin's recursive user-root universe has no MusicArtist, Folder, TvChannel or UserView rows (F 552 vs J 561 unfiltered; per type F 0 vs J 3/3/2/1), the same parentless-by-name/TopParentId cause as GET /Artists/{itemId}/Similar; detector `/Items?userId=<u>&recursive=true&limit=100000`, which shows the identical 9-row delta, so it is not this handler's bug. (2) PER-ITEM DTO FIELDS \u2014 MediaSources[].Name/Bitrate, MediaStreams[].BitRate (a constant 192000 offset), LocalizedLanguage, Level/IsAVC/Width/Height: the same set already classified on GET /Items/{itemId} as independent-probe noise, inherited here because Suggestions returns full item DTOs. Narrowing the compare to hide either would be the dishonest green; the row stays red until they are fixed on their own rows. The multi-leg probe no longer skips a leg whose servers disagree on status: a status divergence (or a body that is not 200-with-JSON on both sides) is recorded as a mismatch, which is the whole point of keeping the type=MusicArtist and type=TvChannel legs. UNIVERSE GAP, re-measured 2026-08-29 and WIDER than first written: LiveTvProgram belongs on the missing-kind list too \u2014 `/Items?userId=<u>&recursive=true&includeItemTypes=LiveTvProgram` returns 338 rows on Jellyfin and 0 on Ferrofin, while `/LiveTv/Programs` returns the guide on both (F 19200, J 338). The knock-on is visible on a THIRD row: GET /Genres is red only because Jellyfin's genre list carries `News`, the XMLTV guide's programme genre, which Ferrofin's genre list cannot see for the same reason. One fix (give the by-name/programme rows a TopParentId so `scope_to_user_libraries` stops filtering them out) closes /Artists Similar, these Suggestions legs and the /Genres row together; it changes the recursive item universe server-wide, so it is its own change WITH the perf gate.",
@@ -1805,7 +1805,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Items/{itemId}",
@@ -1815,7 +1815,7 @@
       "depth": "REAL",
       "status_conformant": true,
       "schema_valid": true,
-      "note": "2/7 legs clean (220+216+216+216+216+66+27 leaves compared); mismatch:15 missing:60 extra:0 | MediaSources[Path=/media/synth/movies/Movie 0001 (2020)/Movie 0001 (2020).mkv].Bitrate(J=6253020 H=6061020); MediaSources[Path=/media/synth/movies/Movie 0001 (2020)/Movie 0001 (2020).mkv].MediaStreams[0].BitRate(J=6061020 H=5869020); MediaStreams[0].BitRate(J=6061020 H=5869020)",
+      "note": "2/7 legs clean (220+216+216+216+216+66+27 leaves compared); mismatch:15 missing:60 extra:0 | MediaStreams[0].BitRate(J=6061020 H=5869020); MediaSources[Path=/media/synth/movies/Movie 0001 (2020)/Movie 0001 (2020).mkv].MediaStreams[0].BitRate(J=6061020 H=5869020); MediaSources[Path=/media/synth/movies/Movie 0001 (2020)/Movie 0001 (2020).mkv].Bitrate(J=6253020 H=6061020)",
       "deep_verified": false,
       "verification_method": "body-diff",
       "classification": "jellyfin-bug, on two independent fields \u2014 but see the NOT EXHAUSTIVE note at the end: these two arms do not account for every divergence on this row. (1) BITRATE. Ferrofin reports MediaStreams[video].BitRate as container-minus-other-streams and MediaSources[].Bitrate as the stream sum; Jellyfin 10.11.8 falls the video stream back to formatInfo.BitRate verbatim (v10.11.8 ProbeResultNormalizer.cs:978-987) and then InferTotalBitrate(true) (PRN.cs:259-264), which double-counts the audio. Measured on the fixture: the file is 775053 B / 1.023 s = 6,060,832 bps, so Jellyfin's MediaSources[].Bitrate of 6,253,020 exceeds what the file physically contains, while Ferrofin's 6,061,020 matches ffprobe's own format.bit_rate. Upstream fixed this itself in PR #16248 (master PRN.cs:979-991 comments that formatInfo.BitRate is the container, not the video bitrate) and Ferrofin ports the fixed form. (2) PROBE-DTO NULLABILITY (Level / IsAVC / Width / Height). Upstream MASTER declares all four nullable \u2014 MediaBrowser.MediaEncoding/Probing/MediaStreamInfo.cs:93 `public int? Width`, :107 `public int? Height`, :170 `public int? Level`, :233 `public bool? IsAvc` \u2014 so a stream for which ffprobe emits no such key keeps null. v10.11.8 declares the same four as non-nullable value types at the same file's :95 `public int Width`, :109 `public int Height`, :172 `public int Level`, :235 `public bool IsAvc`, so an absent key deserializes to the CLR default and 10.11.8 then emits `Level: 0` and `IsAVC: false` on EVERY stream \u2014 audio and subtitle included, where neither value is meaningful \u2014 plus `Width: 0`/`Height: 0` on a text subtitle. Ferrofin ports MASTER and is correct. MEASURED LIVE 2026-08-30 on the loop pair, GET /Items/{id}?fields=MediaSources,MediaStreams and POST /Items/{id}/PlaybackInfo, item d37ecb9d75b0c0a8e9ecb0a864ec670e (Movie 0001), after re-probing all 500 correlated movies on Ferrofin: video stream identical on both (Level 12, IsAVC true, 320x240); audio stream J=`Level:0, IsAVC:false` vs H=both keys ABSENT; subrip subtitle J=`Level:0, IsAVC:false, Width:0, Height:0` vs H=all four keys ABSENT. *** CORRECTION TO BATCH A3 (this entry supersedes it). A3 (commit e4f1b37) read the four fields off v10.11.8 only, called Ferrofin's nullable form a bug, and changed both the probing DTO and ProbeResultNormalizer to fabricate 0/false. That was a REGRESSION against the project rule that the WIRE CONTRACT is pinned to 10.11.8 while the BEHAVIOUR Ferrofin ports is upstream master, and it was reverted in batch M1 (probing/dtos.rs back to Option<i32>/Option<bool>; probe_result_normalizer.rs back to master's shape \u2014 Width/Height/Level in the shared initializer at master PRN.cs:702-714, IsAVC in the video arm only at master PRN.cs:794). The diff above is the expected consequence and is NOT a reason to change Ferrofin back, and NOT a reason to widen parity_diff.VOLATILE. A3's OTHER probing change is CORRECT and stands: codec_tag_string binds the plain JSON key (v10.11.8 MediaStreamInfo.cs:206), because the trailing-`?` typo is a master-only regression (master :204) that stops the key deserializing at all. *** OWNER CALL PENDING on the bitrate arithmetic: porting 10.11.8's instead would make this row body-diffable at the cost of being wrong. OPEN QUESTION, NOT AN AGENT DECISION \u2014 MediaStream.LocalizedLanguage: upstream master populates it for audio and subtitle streams (master ProbeResultNormalizer.cs:779 in the subtitle arm and the matching audio arm), but the vendored 10.11.8 OpenAPI declares MediaStream with `additionalProperties: false`, so emitting it makes every body carrying a language-tagged stream schema_valid:false. A3 withheld it from the wire; batch M1 deliberately left that as-is pending the owner's answer. The two halves are: master emits the field; the pinned contract forbids it. Whoever answers, record the decision here and either serialize the field or state why the contract wins. NOTE: the 'instance/probe-noise' text this row carried before A3 was DISPROVEN \u2014 running both containers' ffprobe binaries over the same file gives byte-identical JSON (7.1.4 vs 7.1.3-Jellyfin), and ffprobe emits no per-stream bit_rate at all. A3's other real fixes stand: MediaSources[].Name ports BaseItem.GetMediaSourceName (file stem, not item.Name), and the People[].Role read projection no longer NULLIFs the empty string C# always emits. LAB-STATE RECORD, so it is not lost (batch M1): the re-probe M1 needed in order to see the code change at all (the four values are PERSISTED at probe time, so a container rebuild alone changes nothing) also cleared a set of TMDB-scraped fields Ferrofin was carrying on the five correlated movies and Jellyfin was not. The pre-M1 run recorded them as Ferrofin extras \u2014 CommunityRating, OfficialRating, OriginalTitle, Overview, PremiereDate, ProviderIds.Tmdb, ExternalUrls[Name=TMDB], plus Taglines[] (J len 0, H len 1) and PrimaryImageAspectRatio. They did NOT come back on a second `metadataRefreshMode=FullRefresh&replaceAllMetadata=true`, and the reason is NOT that the remote fetch is unreachable \u2014 that claim was made without measuring and is false. TMDB IS reachable from the container (api.themoviedb.org answers HTTP 401). The FullRefresh was gated off BEFORE any HTTP call, by provider_manager.rs:967, on two conditions together: the item's is_locked=true (the same LockData divergence this row carries) and an empty MetadataFetchers list for that library. So the extras were one-time state from an earlier lab epoch AND the experiment that was supposed to reproduce them could not fire. TODO (NOT accepted): re-run with is_locked cleared and the library's metadata downloaders enabled, and either reproduce the extras \u2014 in which case the real question is why Jellyfin's fetch does not populate the same fields off the same `uniqueid type=imdb tt0111161` in the fixture movie.nfo \u2014 or confirm the fields are gone for good. *** NOT EXHAUSTIVE \u2014 the two arms above do not account for the whole row. Live on the pair 2026-08-30, GET /Items/{itemId} also carries: (a) BackdropImageTags J=len 7 H=len 0 \u2014 Ferrofin serves no backdrop tags for these movies where Jellyfin serves seven; this is UNRESOLVED and is NOT explained by either arm above, and it is not obviously lab state either, so it needs its own investigation before anyone calls this row understood; (b) UserData.LastPlayedDate differing by a few seconds, which is the probe's own playstate write landing at slightly different wall-clock times on the two servers; and (c) MediaStreams[0].BitRate, which IS arm (1) and is listed here only so a reader does not count it twice. Whoever next touches this row: (a) is the open one.",
@@ -1839,7 +1839,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Items/{itemId}/Ancestors",
@@ -1849,7 +1849,7 @@
       "depth": "REAL",
       "status_conformant": true,
       "schema_valid": true,
-      "note": "0/6 legs clean (42+42+42+42+42+22 leaves compared); mismatch:1 missing:0 extra:11 | [Path=/config/root].RecursiveItemCount(J=537 H=557)",
+      "note": "5/6 legs clean (44+44+44+44+44+23 leaves compared); mismatch:2 missing:0 extra:0 | [Path=/config/root].PrimaryImageAspectRatio(J=1.3333333333333333 H=1.0); [Path=/config/root].RecursiveItemCount(J=537 H=557)",
       "deep_verified": false,
       "verification_method": "body-diff",
       "classification": "open-work (NOT accepted): the two causes this row was flagged for are PORTED and verified live (2026-08-30, pair 18096/18097, measured twice, identical both passes). (1) The AggregateFolder root is modelled: LibraryManager.CreateRootFolder() (LibraryManager.cs:838-888) is ported in ferrofin-core/src/aggregate_folder.rs \u2014 the row at {program data}/root carrying Jellyfin's own derived id f27caa37-e514-2225-cced-ed48f6553502, the playlists folder re-parented onto it (folder.ParentId = rootFolder.Id) and stored under 10.11.8's real class name PlaylistsFolder (id 1071671e-7bff-a053-2e93-0debee501d2e, byte-for-byte Jellyfin's; the old ManualPlaylistsFolder spelling is only PlaylistsFolder.GetClientTypeName() and is now emitted as the DTO Type, never stored), and AddVirtualChild ported as the virtual-children concat in BOTH places it shows \u2014 the direct-children predicate (translate_query.rs) and the ChildCount prefetch (item_count_service.rs). GET /Items/{playlistsId}/Ancestors now answers [AggregateFolder root] on both servers, and a playlist's chain is [Playlists, root] on both, diffing clean over 42 fields. reads.py seeds this row with the playlists folder as well as the five movies, because a movie's chain stops at the UserRootFolder and never exercises the aggregate hop. (2) FolderImageProvider is ported (dynamic_images.rs, DynamicImageKind::Folder) behind the IsTopParent guard (BaseItem.cs:733-757), so the UserRootFolder's PrimaryImageAspectRatio is 1.7777777777777777 on BOTH servers and the playlists folder correctly has no image. It is CreateSingleImage \u2014 a File.Copy of the first descendant's Primary \u2014 not a collage: md5 on the live pair showed Jellyfin's root poster.png is byte-identical to the 'Movies (synth)' library tile. RecursiveItemCount came with it (Folder.cs:701-714 + 1805-1808, gated on SupportsUserDataFromChildren, which BasePluginFolder opts out of via ICollectionFolder). REMAINING on this long-lived drifted lab, all instance state rather than code, to be re-scored on the end-of-campaign fresh-pair sweep: ChildCount J=7 H=6 (the two containers hold different library SETS \u2014 Jellyfin carries ParityCRUD + Recordings, Ferrofin carries a 'Movies (synth) Renamed' rename ghost \u2014 and each server's ChildCount equals its own /Library/MediaFolders total, so the concat is right on both); RecursiveItemCount 541 vs 540 (different leaf universes: 506 movies on Jellyfin to 500 on Ferrofin); and PrimaryImageAspectRatio 1.3333 vs 0.6666 on the AggregateFolder only (both servers pick the same source row, 'Movie 0001', by the same query \u2014 Ferrofin's copy of it is a 2000x3000 poster an image-upload write journey left behind, Jellyfin's is the fixture's 320x240 on-disk poster; same rule, different bytes). Do NOT add PrimaryImageAspectRatio to VOLATILE: it is a real comparable value on every other row, and it is already equal on the UserRootFolder hop here. ADDED 2026-08-30 by the review-fix pass, on top of the above. (3) TranslateParentItem (LibraryController.cs:959-966) is now the C# search rather than a type exemption: it looks a hop under the aggregate up in the user root's children \u2014 BOTH groups of them, since GetChildren there is the concatenated set \u2014 matching on PhysicalLocations.Contains(item.Path). A CollectionFolder view contributes its library locations; a virtual child's BaseItem.PhysicalLocations is [Path] (BaseItem.cs:450-461), so the search matches such a folder against ITSELF and the walk continues through it. Same answer as the type list it replaces under 10.11.8's single AddVirtualChild call site, but it is the rule, not a special case \u2014 and a PATHLESS row now correctly ends the walk, because PhysicalLocations is empty for one. (4) A recursive browse of the aggregate is a browse with no PARENT, not one with no SCOPE: C# SetTopParentIdsOrAncestors (LibraryManager.cs:1673-1698) leaves AncestorIds = [aggregate] behind, and Ferrofin's early return dropped scoping altogether. Measured on the pair before the fix, /Items?parentId={aggregate}&recursive=true&includeItemTypes=Person was Ferrofin 3 / Jellyfin 0 \u2014 rows outside the physical root's closure leaking out. Ferrofin keeps a one-level AncestorIds table rather than a transitive closure, so binding the aggregate there would match nothing; the branch now takes exactly the scope the same query with no parent gets. Re-measured: Person 0/0, and the aggregate-recursive total is now identical to Ferrofin's own unparented total (554), where it was 583. (5) RecursiveItemCount is now counted by ONE rule for every folder on a page: the per-folder query was missing IsVirtualItem = 0 while the aggregate's whole-server variant carried it, and upstream sets IsVirtualItem = false in BOTH Folder.GetRecursiveChildCount (Folder.cs:701-714) and the UnplayedItemCount query (Folder.cs:1812-1824). Invisible on this fixture (0 virtual rows) and so unmeasurable here \u2014 stated as a code-level correction, not as a measured flip. (6) FolderImageProvider is NOT ported narrower than upstream, as it can look: it is an ICustomMetadataProvider<Folder>, and ProviderManager dispatches by _metadataProviders.OfType<IMetadataProvider<T>>() with T bound to the item's MetadataService type (ProviderManager.cs:440-459), an invariant generic \u2014 so Season/Series/BoxSet/Playlist/CollectionFolder/MusicAlbum/MusicArtist/PhotoAlbum/UserView, which all have an exact MetadataService of their own, never reach it. FolderMetadataService (T = Folder) only takes the Folder subclasses with no service: Folder, AggregateFolder, UserRootFolder and BasePluginFolder, and the last is excluded by IsTopParent. Confirmed live: 10.11.8 serves no ImageTags.Primary for any Series, Season, MusicAlbum, BoxSet or plain Folder on this fixture. The three residual field diffs above persist unchanged and are still instance state: re-measured twice on 2026-08-30 after these fixes, ChildCount J=7 H=6, RecursiveItemCount J=542 H=540, PrimaryImageAspectRatio 1.3333 vs 0.6666 on the AggregateFolder only.",
@@ -1873,7 +1873,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Items/{itemId}/CriticReviews",
@@ -1890,7 +1890,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Items/{itemId}/Download",
@@ -1907,7 +1907,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Items/{itemId}/ExternalIdInfos",
@@ -1941,7 +1941,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Items/{itemId}/Images",
@@ -1958,7 +1958,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "DELETE /Items/{itemId}/Images/{imageType}",
@@ -1975,7 +1975,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Items/{itemId}/Images/{imageType}",
@@ -1992,7 +1992,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "HEAD /Items/{itemId}/Images/{imageType}",
@@ -2009,7 +2009,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /Items/{itemId}/Images/{imageType}",
@@ -2026,7 +2026,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "DELETE /Items/{itemId}/Images/{imageType}/{imageIndex}",
@@ -2043,7 +2043,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Items/{itemId}/Images/{imageType}/{imageIndex}",
@@ -2060,7 +2060,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "HEAD /Items/{itemId}/Images/{imageType}/{imageIndex}",
@@ -2077,7 +2077,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /Items/{itemId}/Images/{imageType}/{imageIndex}",
@@ -2094,7 +2094,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /Items/{itemId}/Images/{imageType}/{imageIndex}/Index",
@@ -2111,7 +2111,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Items/{itemId}/Images/{imageType}/{imageIndex}/{tag}/{format}/{maxWidth}/{maxHeight}/{percentPlayed}/{unplayedCount}",
@@ -2128,7 +2128,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "HEAD /Items/{itemId}/Images/{imageType}/{imageIndex}/{tag}/{format}/{maxWidth}/{maxHeight}/{percentPlayed}/{unplayedCount}",
@@ -2145,7 +2145,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Items/{itemId}/InstantMix",
@@ -2162,7 +2162,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Items/{itemId}/Intros",
@@ -2179,7 +2179,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Items/{itemId}/LocalTrailers",
@@ -2223,7 +2223,7 @@
       "depth": "REAL",
       "status_conformant": true,
       "schema_valid": true,
-      "note": "0/5 legs clean (104+104+104+104+104 leaves compared); mismatch:10 missing:30 extra:0 | MediaSources[Path=/media/synth/movies/Movie 0001 (2020)/Movie 0001 (2020).mkv].Bitrate(J=6253020 H=6061020); MediaSources[Path=/media/synth/movies/Movie 0001 (2020)/Movie 0001 (2020).mkv].MediaStreams[0].BitRate(J=6061020 H=5869020); MediaSources[Path=/media/synth/movies/Movie 0002 (2020)/Movie 0002 (2020).mkv].Bitrate(J=6253020 H=6061020)",
+      "note": "0/5 legs clean (104+104+104+104+104 leaves compared); mismatch:10 missing:30 extra:0 | MediaSources[Path=/media/synth/movies/Movie 0001 (2020)/Movie 0001 (2020).mkv].MediaStreams[0].BitRate(J=6061020 H=5869020); MediaSources[Path=/media/synth/movies/Movie 0001 (2020)/Movie 0001 (2020).mkv].Bitrate(J=6253020 H=6061020); MediaSources[Path=/media/synth/movies/Movie 0002 (2020)/Movie 0002 (2020).mkv].MediaStreams[0].BitRate(J=6061020 H=5869020)",
       "deep_verified": false,
       "verification_method": "body-diff",
       "classification": "jellyfin-bug, on two independent fields \u2014 but see the NOT EXHAUSTIVE note at the end: these two arms do not account for every divergence on this row. (1) BITRATE. Ferrofin reports MediaStreams[video].BitRate as container-minus-other-streams and MediaSources[].Bitrate as the stream sum; Jellyfin 10.11.8 falls the video stream back to formatInfo.BitRate verbatim (v10.11.8 ProbeResultNormalizer.cs:978-987) and then InferTotalBitrate(true) (PRN.cs:259-264), which double-counts the audio. Measured on the fixture: the file is 775053 B / 1.023 s = 6,060,832 bps, so Jellyfin's MediaSources[].Bitrate of 6,253,020 exceeds what the file physically contains, while Ferrofin's 6,061,020 matches ffprobe's own format.bit_rate. Upstream fixed this itself in PR #16248 (master PRN.cs:979-991 comments that formatInfo.BitRate is the container, not the video bitrate) and Ferrofin ports the fixed form. (2) PROBE-DTO NULLABILITY (Level / IsAVC / Width / Height). Upstream MASTER declares all four nullable \u2014 MediaBrowser.MediaEncoding/Probing/MediaStreamInfo.cs:93 `public int? Width`, :107 `public int? Height`, :170 `public int? Level`, :233 `public bool? IsAvc` \u2014 so a stream for which ffprobe emits no such key keeps null. v10.11.8 declares the same four as non-nullable value types at the same file's :95 `public int Width`, :109 `public int Height`, :172 `public int Level`, :235 `public bool IsAvc`, so an absent key deserializes to the CLR default and 10.11.8 then emits `Level: 0` and `IsAVC: false` on EVERY stream \u2014 audio and subtitle included, where neither value is meaningful \u2014 plus `Width: 0`/`Height: 0` on a text subtitle. Ferrofin ports MASTER and is correct. MEASURED LIVE 2026-08-30 on the loop pair, GET /Items/{id}?fields=MediaSources,MediaStreams and POST /Items/{id}/PlaybackInfo, item d37ecb9d75b0c0a8e9ecb0a864ec670e (Movie 0001), after re-probing all 500 correlated movies on Ferrofin: video stream identical on both (Level 12, IsAVC true, 320x240); audio stream J=`Level:0, IsAVC:false` vs H=both keys ABSENT; subrip subtitle J=`Level:0, IsAVC:false, Width:0, Height:0` vs H=all four keys ABSENT. *** CORRECTION TO BATCH A3 (this entry supersedes it). A3 (commit e4f1b37) read the four fields off v10.11.8 only, called Ferrofin's nullable form a bug, and changed both the probing DTO and ProbeResultNormalizer to fabricate 0/false. That was a REGRESSION against the project rule that the WIRE CONTRACT is pinned to 10.11.8 while the BEHAVIOUR Ferrofin ports is upstream master, and it was reverted in batch M1 (probing/dtos.rs back to Option<i32>/Option<bool>; probe_result_normalizer.rs back to master's shape \u2014 Width/Height/Level in the shared initializer at master PRN.cs:702-714, IsAVC in the video arm only at master PRN.cs:794). The diff above is the expected consequence and is NOT a reason to change Ferrofin back, and NOT a reason to widen parity_diff.VOLATILE. A3's OTHER probing change is CORRECT and stands: codec_tag_string binds the plain JSON key (v10.11.8 MediaStreamInfo.cs:206), because the trailing-`?` typo is a master-only regression (master :204) that stops the key deserializing at all. *** OWNER CALL PENDING on the bitrate arithmetic: porting 10.11.8's instead would make this row body-diffable at the cost of being wrong. OPEN QUESTION, NOT AN AGENT DECISION \u2014 MediaStream.LocalizedLanguage: upstream master populates it for audio and subtitle streams (master ProbeResultNormalizer.cs:779 in the subtitle arm and the matching audio arm), but the vendored 10.11.8 OpenAPI declares MediaStream with `additionalProperties: false`, so emitting it makes every body carrying a language-tagged stream schema_valid:false. A3 withheld it from the wire; batch M1 deliberately left that as-is pending the owner's answer. The two halves are: master emits the field; the pinned contract forbids it. Whoever answers, record the decision here and either serialize the field or state why the contract wins. NOTE: the 'instance/probe-noise' text this row carried before A3 was DISPROVEN \u2014 running both containers' ffprobe binaries over the same file gives byte-identical JSON (7.1.4 vs 7.1.3-Jellyfin), and ffprobe emits no per-stream bit_rate at all. A3's other real fixes stand: MediaSources[].Name ports BaseItem.GetMediaSourceName (file stem, not item.Name), and the People[].Role read projection no longer NULLIFs the empty string C# always emits. Same root cause, same evidence and the same open question as GET /Items/{itemId}; the PlaybackInfo leg was measured in the same pass.",
@@ -2247,7 +2247,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /Items/{itemId}/Refresh",
@@ -2264,7 +2264,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Items/{itemId}/RemoteImages",
@@ -2274,7 +2274,7 @@
       "depth": "REAL",
       "status_conformant": true,
       "schema_valid": true,
-      "note": "0/5 legs clean (1177+1173+3486+65+2 leaves compared); mismatch:13 missing:0 extra:3 | Providers[](J=len 2 H=len 3); Providers[1](J=\"The Open Movie Database\" H=\"FanArt\"); TotalRecordCount(J=139 H=183)",
+      "note": "0/5 legs clean (1177+1173+3486+65+2 leaves compared); mismatch:13 missing:0 extra:3 | TotalRecordCount(J=139 H=183); Providers[](J=len 2 H=len 3); Providers[1](J=\"The Open Movie Database\" H=\"FanArt\")",
       "deep_verified": false,
       "verification_method": "body-diff",
       "classification": "accepted-divergence (provider lineup): two documented lineup facts, no server bug left. (1) `Providers` is built from `GetRemoteImageProviderInfo(item)` and narrowed ONLY by `type`, never by `providerName` (v10.11.8 RemoteImageController.cs:92-99) \u2014 so every leg, scoped or not, carries Ferrofin's extra `FanArt` entry (see `GET /Items/{itemId}/RemoteImages/Providers`). (2) On the UNSCOPED leg, fanart.tv adds its own images and Jellyfin's OMDb adds one Primary that Ferrofin cannot (upstream bakes an OMDb key at OmdbProvider.cs:257; Ferrofin's OMDb is inert without FERROFIN_OMDB_KEY \u2014 CLAUDE.md 'Current scope'). What this row now PROVES: on `providerName=TheMovieDb`, `Images` and `TotalRecordCount` are byte-identical INCLUDING ORDER on all four legs measured live on the A4 pair (default 138/138, includeAllLanguages=true 391/391, type=Logo 7/7, series 0/0). That is the fix this batch landed \u2014 Ferrofin was serving 497 images where 10.11.8 served 139, unfiltered and unsorted, because `ProviderManager.GetImages`' preferred-language filter and `OrderByLanguageDescending` were never ported (`RemoteImageQuery.include_all_languages` was read by nothing).",
@@ -2298,7 +2298,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Items/{itemId}/RemoteImages/Providers",
@@ -2400,7 +2400,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Items/{itemId}/ThemeSongs",
@@ -2417,7 +2417,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Items/{itemId}/ThemeVideos",
@@ -2434,7 +2434,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /Jellyfin.Plugin.OpenSubtitles/ValidateLoginInfo",
@@ -2485,7 +2485,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Library/MediaFolders",
@@ -2495,8 +2495,8 @@
       "depth": "REAL",
       "status_conformant": true,
       "schema_valid": true,
-      "note": "0/1 legs clean (66 leaves compared); mismatch:0 missing:0 extra:1 | ",
-      "deep_verified": false,
+      "note": "1/1 legs clean (67 leaves compared)",
+      "deep_verified": true,
       "verification_method": "body-diff",
       "classification": "open-work (NOT accepted) \u2014 measured 2026-08-31 on the lane pair, 66 leaves compared, and the row is RED for THREE distinct reasons that must not be folded together. (1) FIXED IN THIS BATCH, recorded so the defect cannot come back unnoticed: Ferrofin's auto-provisioned `Collections` library carried a NULL `CollectionType` where Jellyfin sends `boxsets`. 10.11.8 keeps that field in the row's `Data` blob and creates the library through `AddVirtualFolder(name, CollectionTypeOptions.boxsets, \u2026)` (v10.11.8 Emby.Server.Implementations/Collections/CollectionManager.cs:81-109); Ferrofin's `ensure_container` wrote no `Data` at all. Now written (only over an EMPTY `Data`, so an adopted database's `PhysicalLocationsList`/`PhysicalFolderIds` survive a swap-back), and re-measured live: the folder answers `boxsets` on `/Library/MediaFolders`, `/UserViews` and `/Items?parentId={root}`, the same as Jellyfin. (2) STILL OPEN \u2014 the Collections library's PATH and therefore its ID diverge, which is a real drop-in adoption hazard. Upstream's row is the virtual-folder shortcut `{RootFolderPath}/default/Collections`, so its id is `GetNewItemIdInternal(\"root\\\\default\\\\Collections\")` = 9d7ad6afe9afa2dab1a2f6e00ad28fa6; Ferrofin provisions `{data}/collections` directly and gets 6f929a39bd27711ce6208fb0aef66e5b. Both ids read off the live pair. Consequences, both measured: the library is absent from `GET /Library/VirtualFolders` on Ferrofin and present on Jellyfin, and `item_persistence_service::container_at` \u2014 which matches BY PATH \u2014 misses upstream's row on an adopted database and would provision a SECOND Collections library beside it. The code comment that used to justify the current path asserted Jellyfin derives its id from `%AppDataPath%/collections`; that is false and has been corrected in place. It IS true of the playlists folder, which agrees byte for byte on both servers (1071671e7bffa0532e930debee501d2e, /config/data/playlists). UN-DEFER PATH: provision the collections library through the same virtual-folder path the user libraries already use (shortcut dir + `.mblink` -> `{data}/collections`, registered so it lists in `GET /Library/VirtualFolders`), WITH a migration that re-parents the box sets hanging off the old id \u2014 the id change is why this is not a one-line edit \u2014 then re-measure `/Library/VirtualFolders`, `/Library/MediaFolders` and `/UserViews` against 18097 and re-run suite/roundtrip.sh. (3) STILL OPEN \u2014 `PrimaryImageAspectRatio` is absent on every Ferrofin library row and present on Jellyfin's (J=1.7777777777777777 on `Movies (synth)`). Not caused by this batch and not previously recorded here; the un-defer path is to compute the aspect ratio for the collection-folder image the way the item DTO path already does, and to add a leg that asserts it on a library row. (4) LAB STATE, not a divergence: Jellyfin additionally lists a `Recordings` library from an earlier DVR journey (see `GET /Items/Root`), which is the `TotalRecordCount` J=6 H=5.",
       "classification_scope": "op",
@@ -2553,7 +2553,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /Library/Refresh",
@@ -2570,7 +2570,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /Library/Series/Added",
@@ -2621,7 +2621,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Library/VirtualFolders",
@@ -2638,7 +2638,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /Library/VirtualFolders",
@@ -2655,7 +2655,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /Library/VirtualFolders/LibraryOptions",
@@ -2672,7 +2672,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /Library/VirtualFolders/Name",
@@ -2706,7 +2706,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /Library/VirtualFolders/Paths",
@@ -2723,7 +2723,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /Library/VirtualFolders/Paths/Update",
@@ -2740,7 +2740,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /LiveStreams/Close",
@@ -2757,7 +2757,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /LiveStreams/Open",
@@ -2825,7 +2825,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /LiveTv/Channels/{channelId}",
@@ -2842,7 +2842,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /LiveTv/GuideInfo",
@@ -2879,7 +2879,7 @@
         "\u2026and the substituted list is SORTED, so `EnabledUsers` ORDER is not compared either. Upstream emits `_userManager.Users.Where(IsLiveTvEnabled)` in store order (v10.11.8 LiveTvManager.cs:1207-1210), so order is a real upstream signal \u2014 it is dropped only because the two stores were populated in separate transactions. Pin the provisioning order on both servers and the `sorted()` can go, restoring the check."
       ],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "DELETE /LiveTv/ListingProviders",
@@ -2930,7 +2930,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /LiveTv/ListingProviders/Lineups",
@@ -2964,7 +2964,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /LiveTv/LiveRecordings/{recordingId}/stream",
@@ -2981,7 +2981,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /LiveTv/LiveStreamFiles/{streamId}/stream.{container}",
@@ -2998,7 +2998,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /LiveTv/Programs",
@@ -3015,7 +3015,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /LiveTv/Programs",
@@ -3049,7 +3049,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /LiveTv/Programs/{programId}",
@@ -3066,7 +3066,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /LiveTv/Recordings",
@@ -3083,7 +3083,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /LiveTv/Recordings/Folders",
@@ -3117,7 +3117,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /LiveTv/Recordings/Groups/{groupId}",
@@ -3151,7 +3151,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "DELETE /LiveTv/Recordings/{recordingId}",
@@ -3168,7 +3168,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /LiveTv/Recordings/{recordingId}",
@@ -3202,7 +3202,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /LiveTv/SeriesTimers",
@@ -3287,7 +3287,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /LiveTv/Timers",
@@ -3304,7 +3304,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /LiveTv/Timers/Defaults",
@@ -3338,7 +3338,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /LiveTv/Timers/{timerId}",
@@ -3355,7 +3355,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /LiveTv/Timers/{timerId}",
@@ -3406,7 +3406,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /LiveTv/TunerHosts/Types",
@@ -3440,7 +3440,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /LiveTv/Tuners/Discvover",
@@ -3457,7 +3457,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /LiveTv/Tuners/{tunerId}/Reset",
@@ -3491,7 +3491,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Localization/Cultures",
@@ -3508,7 +3508,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Localization/Options",
@@ -3525,7 +3525,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Localization/ParentalRatings",
@@ -3542,7 +3542,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /MediaSegments/{itemId}",
@@ -3559,7 +3559,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /MediaSegmentsApi",
@@ -3722,7 +3722,7 @@
       "depth": "REAL",
       "status_conformant": true,
       "schema_valid": true,
-      "note": "9/12 legs clean (26+26+20+26+14+14+20+47+17+8+8+17 leaves compared); mismatch:5 missing:0 extra:0 | Items[Name=Rock].SongCount(J=9 H=3); Items[Name=Ambient].SongCount(J=9 H=3); Items[Name=Jazz].SongCount(J=9 H=3)",
+      "note": "9/12 legs clean (26+26+20+26+14+14+20+47+17+8+8+17 leaves compared); mismatch:5 missing:0 extra:0 | Items[Name=Jazz].SongCount(J=9 H=3); Items[Name=Rock].SongCount(J=9 H=3); Items[Name=Ambient].SongCount(J=9 H=3)",
       "deep_verified": false,
       "verification_method": "body-diff",
       "classification": "open-work (NOT accepted) \u2014 the LIST shape was verified 2026-08-11 (QueryResult<BaseItemDto>, status + schema conformant, same by-name shape as /Genres), and that still holds. What a 2026-08-31 id-correlation measured on the lane pair is that the two servers give the SAME genre three different ids: F Ambient 1dcbb1e8\u2026, Jazz 5721323b\u2026, Rock f3bc3ad5\u2026; J Ambient 7566ee57\u2026, Jazz 2140463c\u2026, Rock 56fb6975\u2026. Person rows, by contrast, correlate exactly on both servers (Alice/Bob/Carol share ids), so this is MusicGenre's derivation specifically, not by-name ids in general. Cause, read in the code: `item_persistence_service::music_genre_row` derives the id with `derive_item_id(BaseItemKind::MusicGenre, value)` \u2014 the bare NAME, lowercased (`IdDerivation::LegacyLowercase`) \u2014 where upstream derives it from the metadata PATH: `GetItemByNameId<MusicGenre>(MusicGenre.GetPath(name))`, and `MusicGenre.GetPath` is `Path.Combine(ApplicationPaths.MusicGenrePath, GetValidFilename(name).Trim().TrimEnd('.'))` (v10.11.8 MediaBrowser.Controller/Entities/Audio/MusicGenre.cs:76-89). Ferrofin already has both halves of the correct derivation \u2014 `IdDerivation::Jellyfin { program_data_path }` and the `by_name_item_id`/`person_path` pattern the Person rows use. UN-DEFER PATH: route `music_genre_row` through the path-based derivation, then re-key the existing rows and their `ItemValuesMap`/`UserDatas` references in a migration \u2014 the re-key is the part that makes this a port of its own rather than a one-line change, and it is why it was not folded into the batch F4 reviewer-fix pass. Discovered while verifying that pass's `ids=`-scoped grouping fix, which is the query that made the id mismatch visible (F answers 3 of its own MusicGenre ids, J answers 0 for the same ids).\n\n--- ALSO ON THIS ROW (merged from worktree-dv-lane2) ---\n\nopen-work (NOT accepted) \u2014 SUPERSEDES the 2026-08-31 'jellyfin-bug' record, which was the wrong category and said so with the wrong evidence. That record folded upstream's `GroupBy(PresentationUniqueKey)` collapse under 'jellyfin-bug', which in this campaign means 'master already fixed it'. Master has NOT: master `BaseItemRepository.ByName.cs:213-224` still ships the collapse (`g.Min(e => e.Id)`, with a `TopParentIds`-preference arm for MusicArtist), and v10.11.8 `BaseItemRepository.cs:1313-1316` ships it as `g.FirstOrDefault()`. An upstream behaviour present in BOTH trees and absent from Ferrofin is an un-ported gap, so it has now been PORTED rather than labelled.\n\nWHAT F2 (as revised) FIXED \u2014 four things, all measured on the lane-2 pair:\n1. `get_genres` passed the music types as `exclude_content_types` and `get_music_genres` passed them as `include_content_types`, restricting which CONTENT items feed the aggregate. C# restricts neither: master ByName.cs:44-52 and v10.11.8 :211-222 are both `GetItemValues(filter, _getGenreValueTypes, <returnType>)`, whose inner query is built from `IncludeItemTypes` ALONE (ByName.cs:154-168); only the outer `.Where(e => e.Type == returnType)` differs. The owner-type split lives solely on the *Names* variants (`GetItemValueNames`, ByName.cs:120-141), which `get_genre_names`/`get_music_genre_names` still carry \u2014 that asymmetry IS the port. The compensation was paying for a scanner mis-split already fixed in da43f0a.\n2. `ItemCounts` were never computed (every per-kind count 0, matching neither tree). Ported MASTER's per-CleanName `BuildItemCountsByCleanName` (ByName.cs:283-338; the seven `BaseItemKindNames` locals it reads are at :304-310) as seven conditional `SUM(ci.\"Type\" = ?)` aggregates in the same GROUP BY, emitted only when the caller named item types (`if (filter.IncludeItemTypes.Length > 0)`, ByName.cs:249). `ItemCount`/`ProgramCount` stay 0 because neither tree assigns them.\n3. The representative collapse itself is now ported \u2014 `item_repository::push_representative_rank`, a `ROW_NUMBER() OVER (PARTITION BY bi.\"PresentationUniqueKey\" ORDER BY [MusicArtist TopParentId preference,] bi.\"Id\")` filtered to rank 1, run over the FILTERED row set exactly as upstream groups `masterQuery`, with the page total counting GROUPS (`representativeIds.Count()`, ByName.cs:229-232) instead of rows. Ferrofin followed master's deterministic `Min(Id)` over 10.11.8's `FirstOrDefault`. This is user-visible well beyond genres: upstream's own comment at that site says the grouping is what collapses alternate versions and a MusicArtist with a folder in more than one library.\n4. The `PresentationUniqueKey` half. The earlier record claimed 'music_genre_row now writes PresentationUniqueKey \u2026 Ferrofin writes a real {Type}-{Name} key on every one'. That was FALSE on the lab it cited: the insert is `INSERT ... WHERE NOT EXISTS`, so it never touches a row that already exists, and `MusicGenre|Ambient/Jazz/Rock` still read back NULL. Fixed properly with a startup repair, `item_persistence_service::backfill_missing_presentation_keys`, scoped to the four by-name kinds whose key is a pure function of the name. It logged `items=3` on the first boot after the change and nothing on the second, and the container's own DB now reads `MusicGenre-Ambient/-Jazz/-Rock`. Without it, porting item 3 would have COLLAPSED those three into one \u2014 reproducing upstream's collapse without reproducing upstream's keys.\n\nWHY THE ROW IS STILL RED (measured twice, 2026-08-31, after the ports above):\nH lists [Action, Ambient, Comedy, Drama, Jazz, Rock, SciFi, Thriller]; J lists [Action, Ambient, Jazz, Rock]. Two axes, and NEITHER is now an un-ported behaviour.\nAXIS 1 \u2014 Jellyfin's un-refreshed by-name keys. `CreateItemByName<T>` (master LibraryManager.cs:1289-1329 / v10.11.8 :1052-1092) constructs `new T { Name, Id, DateCreated, DateModified, Path }` and queues no refresh, so the row is written with a NULL `PresentationUniqueKey`; the key is assigned later by `MetadataService.BeforeSaveInternal` (MediaBrowser.Providers/Manager/MetadataService.cs:332-338, identical on both trees), i.e. on the row's FIRST metadata refresh. The lab's own jellyfin.db proves the mechanism exactly \u2014 every by-name row with a non-NULL DateLastRefreshed has a key and every row with a NULL one does not:\n  MusicGenre Ambient  key MusicGenre-Ambient  DateLastRefreshed 2026-08-30 00:29:31.807812\n  MusicGenre Jazz     key MusicGenre-Jazz     DateLastRefreshed 2026-08-30 00:29:31.8121208\n  MusicGenre Rock     key MusicGenre-Rock     DateLastRefreshed 2026-08-30 00:29:31.8180006\n  MusicGenre Action   key NULL                DateLastRefreshed NULL   (created 01:00:11 by a probe GET)\n  MusicGenre Comedy/Drama/SciFi/Thriller  key NULL, DateLastRefreshed NULL (created 02:20-02:21)\nSo Jellyfin's four unkeyed rows form ONE NULL group and surface as the single representative Action, while its three refreshed ones list individually. Ferrofin writes the key at creation and repairs any legacy row at startup, so it is permanently in the state Jellyfin reaches after a refresh. Reproducing J's list would mean deliberately withholding a column upstream itself fills in. On a freshly provisioned pair the probe-created rows do not exist, so this axis should not appear in the end-of-campaign sweep.\nAXIS 2 \u2014 the uncorrelated ItemCounts, a genuine jellyfin-bug that MASTER FIXED. J returns SongCount 9 for EVERY music genre and MovieCount 514 for Action, while BOTH databases hold exactly 3 Audio rows per music genre and 200 Movies carrying `action`. v10.11.8 BaseItemRepository.cs:1368-1392 hands every row the same `itemCountQuery.Count(...)` totals and comments 'TODO: This is bad refactor!'; master replaced it with the per-CleanName dictionary Ferrofin ported. Ferrofin returns each database's own truth. Following master here is the campaign rule, not a choice.\n\nNOT ACCEPTED, and nothing here is deferred: axis 1 needs no port (it is upstream transient state, with the mechanism and the evidence above) and axis 2 is master's fix. parity_diff.VOLATILE was not widened for either. deep_verified stays false, which is the honest state while the two listings genuinely differ.",
@@ -3746,7 +3746,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /MusicGenres/{genreName}",
@@ -3780,7 +3780,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "HEAD /MusicGenres/{name}/Images/{imageType}",
@@ -3797,7 +3797,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /MusicGenres/{name}/Images/{imageType}/{imageIndex}",
@@ -3814,7 +3814,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "HEAD /MusicGenres/{name}/Images/{imageType}/{imageIndex}",
@@ -3831,7 +3831,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /MusicGenres/{name}/InstantMix",
@@ -3848,7 +3848,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Packages",
@@ -3933,7 +3933,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Persons/{name}",
@@ -3967,7 +3967,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "HEAD /Persons/{name}/Images/{imageType}",
@@ -3984,7 +3984,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Persons/{name}/Images/{imageType}/{imageIndex}",
@@ -4001,7 +4001,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "HEAD /Persons/{name}/Images/{imageType}/{imageIndex}",
@@ -4018,7 +4018,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Playback/BitrateTest",
@@ -4035,7 +4035,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "DELETE /PlayingItems/{itemId}",
@@ -4052,7 +4052,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /PlayingItems/{itemId}",
@@ -4069,7 +4069,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /PlayingItems/{itemId}/Progress",
@@ -4086,7 +4086,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /Playlists",
@@ -4137,7 +4137,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /Playlists/{playlistId}",
@@ -4154,7 +4154,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "DELETE /Playlists/{playlistId}/Items",
@@ -4171,7 +4171,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Playlists/{playlistId}/Items",
@@ -4222,7 +4222,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Playlists/{playlistId}/Users",
@@ -4239,7 +4239,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "DELETE /Playlists/{playlistId}/Users/{userId}",
@@ -4273,7 +4273,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /Playlists/{playlistId}/Users/{userId}",
@@ -4290,7 +4290,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Plugins",
@@ -4511,7 +4511,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /QuickConnect/Enabled",
@@ -4528,7 +4528,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /QuickConnect/Initiate",
@@ -4545,7 +4545,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Repositories",
@@ -4630,7 +4630,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /ScheduledTasks/{taskId}",
@@ -4647,7 +4647,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /ScheduledTasks/{taskId}/Triggers",
@@ -4664,7 +4664,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Search/Hints",
@@ -4674,14 +4674,14 @@
       "depth": "REAL",
       "status_conformant": true,
       "schema_valid": null,
-      "note": "0/1 legs clean (149 leaves compared); mismatch:22 missing:6 extra:6 | SearchHints[10].Name(J=\"Artist 01\" H=\"Action\"); SearchHints[10].Type(J=\"Person\" H=\"Studio\"); SearchHints[11].Name(J=\"Artist 02\" H=\"Action\")",
+      "note": "0/1 legs clean (149 leaves compared); mismatch:22 missing:6 extra:6 | SearchHints[10].Name(J=\"Artist 01\" H=\"Action\"); SearchHints[10].Type(J=\"Person\" H=\"Genre\"); SearchHints[11].Name(J=\"Artist 02\" H=\"Action\")",
       "deep_verified": false,
       "verification_method": "body-diff",
       "classification": "flagged: read diff vs Jellyfin (verify)",
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Sessions",
@@ -4715,7 +4715,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /Sessions/Capabilities/Full",
@@ -4732,7 +4732,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /Sessions/Logout",
@@ -4749,7 +4749,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /Sessions/Playing",
@@ -4766,7 +4766,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /Sessions/Playing/Ping",
@@ -4783,7 +4783,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /Sessions/Playing/Progress",
@@ -4800,7 +4800,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /Sessions/Playing/Stopped",
@@ -4817,7 +4817,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /Sessions/Viewing",
@@ -4834,7 +4834,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /Sessions/{sessionId}/Command",
@@ -4851,7 +4851,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /Sessions/{sessionId}/Command/{command}",
@@ -4868,7 +4868,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /Sessions/{sessionId}/Message",
@@ -4885,7 +4885,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /Sessions/{sessionId}/Playing",
@@ -4902,7 +4902,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /Sessions/{sessionId}/Playing/{command}",
@@ -4919,7 +4919,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /Sessions/{sessionId}/System/{command}",
@@ -4936,7 +4936,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "DELETE /Sessions/{sessionId}/User/{userId}",
@@ -4953,7 +4953,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /Sessions/{sessionId}/User/{userId}",
@@ -4970,7 +4970,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /Sessions/{sessionId}/Viewing",
@@ -4987,7 +4987,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Shows/NextUp",
@@ -5021,7 +5021,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Shows/{itemId}/Similar",
@@ -5072,7 +5072,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /SkipButtonCss/InjectCss",
@@ -5123,7 +5123,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /Startup/Complete",
@@ -5140,7 +5140,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Startup/Configuration",
@@ -5157,7 +5157,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /Startup/Configuration",
@@ -5174,7 +5174,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Startup/FirstUser",
@@ -5191,7 +5191,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /Startup/RemoteAccess",
@@ -5208,7 +5208,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Startup/User",
@@ -5225,7 +5225,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /Startup/User",
@@ -5259,7 +5259,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Studios/{name}",
@@ -5293,7 +5293,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "HEAD /Studios/{name}/Images/{imageType}",
@@ -5310,7 +5310,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Studios/{name}/Images/{imageType}/{imageIndex}",
@@ -5327,7 +5327,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "HEAD /Studios/{name}/Images/{imageType}/{imageIndex}",
@@ -5344,7 +5344,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /SyncPlay/Buffering",
@@ -5354,7 +5354,7 @@
       "depth": "REAL",
       "status_conformant": null,
       "schema_valid": null,
-      "note": "buffer@idle Idle\u2192Idle; buffer@waiting/resume-armed Waiting\u2192Waiting; buffer@playing Playing\u2192Waiting; buffer@waiting/wrong-item Waiting\u2192Waiting; buffer@playing/ignored Playing\u2192Playing; buffer@paused Paused\u2192Waiting; buffer@waiting/resume-disarmed Waiting\u2192Waiting | buffer@idle/ctrl H/J 1/1; buffer@idle/peer H/J 0/0; buffer@waiting/resume-armed/ctrl H/J 1/1; buffer@waiting/resume-armed/peer H/J 1/1; buffer@playing/ctrl H/J 2/2; buffer@playing/peer H/J 1/1; buffer@waiting/wrong-item/ctrl H/J 1/1; buffer@waiting/wrong-item/peer H/J 0/0; buffer@playing/ignored/ctrl H/J 0/0; buffer@playing/ignored/peer H/J 0/0; buffer@paused/ctrl H/J 2/2; buffer@paused/peer H/J 1/1; buffer@waiting/resume-disarmed/ctrl H/J 2/2; buffer@waiting/resume-disarmed/peer H/J 1/1 | When\u2212EmittedAt: SyncPlayCommand/Stop H=-16.369s J=-16.367s; SyncPlayCommand/Pause H=+0.000s J=-0.000s; SyncPlayCommand/Pause H=-1.962s J=-1.962s; SyncPlayCommand/Pause H=-7.842s J=-7.843s | position (tolerance \u00b10.02s): PositionTicks H=133939304 J=133940495 \u0394=-0ms; PositionTicks H=9591515 J=9585264 \u0394=+1ms; StartPositionTicks H=133939304 J=133940495 \u0394=-0ms | 76 field(s) compared (pushed messages)",
+      "note": "buffer@idle Idle\u2192Idle; buffer@waiting/resume-armed Waiting\u2192Waiting; buffer@playing Playing\u2192Waiting; buffer@waiting/wrong-item Waiting\u2192Waiting; buffer@playing/ignored Playing\u2192Playing; buffer@paused Paused\u2192Waiting; buffer@waiting/resume-disarmed Waiting\u2192Waiting | buffer@idle/ctrl H/J 1/1; buffer@idle/peer H/J 0/0; buffer@waiting/resume-armed/ctrl H/J 1/1; buffer@waiting/resume-armed/peer H/J 1/1; buffer@playing/ctrl H/J 2/2; buffer@playing/peer H/J 1/1; buffer@waiting/wrong-item/ctrl H/J 1/1; buffer@waiting/wrong-item/peer H/J 0/0; buffer@playing/ignored/ctrl H/J 0/0; buffer@playing/ignored/peer H/J 0/0; buffer@paused/ctrl H/J 2/2; buffer@paused/peer H/J 1/1; buffer@waiting/resume-disarmed/ctrl H/J 2/2; buffer@waiting/resume-disarmed/peer H/J 1/1 | When\u2212EmittedAt: SyncPlayCommand/Stop H=-16.373s J=-16.372s; SyncPlayCommand/Pause H=+0.000s J=-0.000s; SyncPlayCommand/Pause H=-1.959s J=-1.959s; SyncPlayCommand/Pause H=-7.841s J=-7.842s | position (tolerance \u00b10.02s): PositionTicks H=133935582 J=133939338 \u0394=-0ms; PositionTicks H=9601132 J=9591274 \u0394=+1ms; StartPositionTicks H=133935582 J=133939338 \u0394=-0ms | 76 field(s) compared (pushed messages)",
       "deep_verified": true,
       "verification_method": "push-diff",
       "classification": "verified-by-push-probe: the response body carries no signal here \u2014 the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py).",
@@ -5371,7 +5371,7 @@
       "depth": "REAL",
       "status_conformant": null,
       "schema_valid": null,
-      "note": "H=204 J=204 | join/joiner H/J 2/2; join/member H/J 1/1 | When\u2212EmittedAt: SyncPlayCommand/Stop H=-2.716s J=-2.722s | 18 field(s) compared (pushed messages)",
+      "note": "H=204 J=204 | join/joiner H/J 2/2; join/member H/J 1/1 | When\u2212EmittedAt: SyncPlayCommand/Stop H=-2.715s J=-2.715s | 18 field(s) compared (pushed messages)",
       "deep_verified": true,
       "verification_method": "push-diff",
       "classification": "verified-by-push-probe: the response body carries no signal here \u2014 the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py).",
@@ -5412,7 +5412,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /SyncPlay/MovePlaylistItem",
@@ -5439,7 +5439,7 @@
       "depth": "REAL",
       "status_conformant": null,
       "schema_valid": null,
-      "note": "H=200 J=200 | new/creator H/J 2/2 | When\u2212EmittedAt: SyncPlayCommand/Stop H=+0.000s J=-0.002s | 17 field(s) compared (13 pushed + 4 body)",
+      "note": "H=200 J=200 | new/creator H/J 2/2 | When\u2212EmittedAt: SyncPlayCommand/Stop H=+0.000s J=-0.003s | 17 field(s) compared (13 pushed + 4 body)",
       "deep_verified": true,
       "verification_method": "push-diff",
       "classification": "verified-by-push-probe: the response body carries no signal here \u2014 the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py).",
@@ -5473,8 +5473,8 @@
       "depth": "REAL",
       "status_conformant": null,
       "schema_valid": null,
-      "note": "pause@idle Idle\u2192Idle; pause@playing Playing\u2192Paused; pause@playing/again Playing\u2192Paused; pause@paused Paused\u2192Paused; pause@playing/third Playing\u2192Paused; pause@playing/fourth Playing\u2192Paused; pause@playing/fifth Playing\u2192Paused; pause@waiting Waiting\u2192Waiting | pause@idle/ctrl H/J 1/1; pause@idle/peer H/J 0/0; pause@playing/ctrl H/J 2/2; pause@playing/peer H/J 2/2; pause@playing/again/ctrl H/J 2/2; pause@playing/again/peer H/J 2/2; pause@paused/ctrl H/J 1/1; pause@paused/peer H/J 0/0; pause@playing/third/ctrl H/J 2/2; pause@playing/third/peer H/J 2/2; pause@playing/fourth/ctrl H/J 2/2; pause@playing/fourth/peer H/J 2/2; pause@playing/fifth/ctrl H/J 2/2; pause@playing/fifth/peer H/J 2/2; pause@waiting/ctrl H/J 1/1; pause@waiting/peer H/J 1/1 | When\u2212EmittedAt: SyncPlayCommand/Stop H=-3.932s J=-3.928s; SyncPlayCommand/Pause H=+0.000s J=-0.000s; SyncPlayCommand/Pause H=+0.000s J=-0.000s; SyncPlayCommand/Pause H=+0.000s J=-0.000s; SyncPlayCommand/Pause H=+0.000s J=-0.000s; SyncPlayCommand/Pause H=-1.958s J=-1.958s; SyncPlayCommand/Pause H=+0.000s J=-0.000s; SyncPlayCommand/Pause H=+0.000s J=-0.000s; SyncPlayCommand/Pause H=+0.000s J=-0.000s; SyncPlayCommand/Pause H=+0.000s J=-0.000s; SyncPlayCommand/Pause H=+0.000s J=-0.000s; SyncPlayCommand/Pause H=+0.000s J=-0.000s | position (tolerance \u00b10.02s): PositionTicks H=11598535 J=11598524 \u0394=+0ms; PositionTicks H=21209347 J=21207379 \u0394=+0ms; PositionTicks H=9591515 J=9585264 \u0394=+1ms; PositionTicks H=9611229 J=9619417 \u0394=-1ms | pause@playing/again/ctrl[0] SyncPlayCommand/Pause: 1 diff(s) at ['Data.PositionTicks'] | pause@playing/again/peer[0] SyncPlayCommand/Pause: 1 diff(s) at ['Data.PositionTicks'] | pause@paused/ctrl[0] SyncPlayCommand/Pause: 1 diff(s) at ['Data.PositionTicks'] | 132 field(s) compared (pushed messages)",
-      "deep_verified": false,
+      "note": "pause@idle Idle\u2192Idle; pause@playing Playing\u2192Paused; pause@playing/again Playing\u2192Paused; pause@paused Paused\u2192Paused; pause@playing/third Playing\u2192Paused; pause@playing/fourth Playing\u2192Paused; pause@playing/fifth Playing\u2192Paused; pause@waiting Waiting\u2192Waiting | pause@idle/ctrl H/J 1/1; pause@idle/peer H/J 0/0; pause@playing/ctrl H/J 2/2; pause@playing/peer H/J 2/2; pause@playing/again/ctrl H/J 2/2; pause@playing/again/peer H/J 2/2; pause@paused/ctrl H/J 1/1; pause@paused/peer H/J 0/0; pause@playing/third/ctrl H/J 2/2; pause@playing/third/peer H/J 2/2; pause@playing/fourth/ctrl H/J 2/2; pause@playing/fourth/peer H/J 2/2; pause@playing/fifth/ctrl H/J 2/2; pause@playing/fifth/peer H/J 2/2; pause@waiting/ctrl H/J 1/1; pause@waiting/peer H/J 1/1 | When\u2212EmittedAt: SyncPlayCommand/Stop H=-3.936s J=-3.934s; SyncPlayCommand/Pause H=+0.000s J=-0.000s; SyncPlayCommand/Pause H=+0.000s J=-0.000s; SyncPlayCommand/Pause H=+0.000s J=-0.000s; SyncPlayCommand/Pause H=+0.000s J=-0.000s; SyncPlayCommand/Pause H=-1.961s J=-1.959s; SyncPlayCommand/Pause H=+0.000s J=-0.000s; SyncPlayCommand/Pause H=+0.000s J=-0.000s; SyncPlayCommand/Pause H=+0.000s J=-0.000s; SyncPlayCommand/Pause H=+0.000s J=-0.000s; SyncPlayCommand/Pause H=+0.000s J=-0.000s; SyncPlayCommand/Pause H=+0.000s J=-0.000s | position (tolerance \u00b10.02s): PositionTicks H=11588085 J=11587666 \u0394=+0ms; PositionTicks H=21193002 J=21189274 \u0394=+0ms; PositionTicks H=9599009 J=9603224 \u0394=-0ms; PositionTicks H=9601132 J=9591274 \u0394=+1ms; PositionTicks H=9622396 J=9619666 \u0394=+0ms | 132 field(s) compared (pushed messages)",
+      "deep_verified": true,
       "verification_method": "push-diff",
       "classification": "verified-by-push-probe: the response body carries no signal here \u2014 the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py).",
       "classification_scope": "op",
@@ -5541,8 +5541,8 @@
       "depth": "REAL",
       "status_conformant": null,
       "schema_valid": null,
-      "note": "ready@idle Idle\u2192Idle; ready@waiting/wrong-item Waiting\u2192Waiting; ready@waiting/first Waiting\u2192Waiting; ready@waiting/last Waiting\u2192Playing; ready@playing Playing\u2192Playing; ready@waiting/first-2 Waiting\u2192Waiting; ready@waiting/last-2 Waiting\u2192Playing; ready@paused Paused\u2192Paused; ready@waiting/first-3 Waiting\u2192Waiting; ready@waiting/last-3 Waiting\u2192Playing; ready@waiting/correcting Waiting\u2192Waiting | ready@idle/ctrl H/J 1/1; ready@idle/peer H/J 0/0; ready@waiting/wrong-item/ctrl H/J 0/0; ready@waiting/wrong-item/peer H/J 1/1; ready@waiting/first/ctrl H/J 1/1; ready@waiting/first/peer H/J 0/0; ready@waiting/last/ctrl H/J 2/2; ready@waiting/last/peer H/J 2/2; ready@playing/ctrl H/J 1/1; ready@playing/peer H/J 0/0; ready@waiting/first-2/ctrl H/J 1/1; ready@waiting/first-2/peer H/J 0/0; ready@waiting/last-2/ctrl H/J 2/2; ready@waiting/last-2/peer H/J 2/2; ready@paused/ctrl H/J 1/1; ready@paused/peer H/J 0/0; ready@waiting/first-3/ctrl H/J 1/1; ready@waiting/first-3/peer H/J 0/0; ready@waiting/last-3/ctrl H/J 2/2; ready@waiting/last-3/peer H/J 2/2; ready@waiting/correcting/ctrl H/J 2/2; ready@waiting/correcting/peer H/J 1/1 | When\u2212EmittedAt: SyncPlayCommand/Stop H=-21.086s J=-21.084s; SyncPlayCommand/Pause H=-1.204s J=-1.205s; SyncPlayCommand/Unpause H=+1.000s J=+1.000s; SyncPlayCommand/Unpause H=+1.000s J=+1.000s; SyncPlayCommand/Unpause H=-7.180s J=-7.180s; SyncPlayCommand/Pause H=-1.204s J=-1.205s; SyncPlayCommand/Unpause H=+1.000s J=+1.000s; SyncPlayCommand/Unpause H=+1.000s J=+1.000s; SyncPlayCommand/Pause H=-8.172s J=-8.172s; SyncPlayCommand/Pause H=-1.204s J=-1.206s; SyncPlayCommand/Unpause H=+1.000s J=+1.000s; SyncPlayCommand/Unpause H=+1.000s J=+1.000s; SyncPlayCommand/Seek H=-5.881s J=-5.881s | position (tolerance \u00b10.02s): PositionTicks H=9591515 J=9585264 \u0394=+1ms | ready@paused/ctrl[0] SyncPlayCommand/Pause: 1 diff(s) at ['Data.PositionTicks'] | 130 field(s) compared (pushed messages)",
-      "deep_verified": false,
+      "note": "ready@idle Idle\u2192Idle; ready@waiting/wrong-item Waiting\u2192Waiting; ready@waiting/first Waiting\u2192Waiting; ready@waiting/last Waiting\u2192Playing; ready@playing Playing\u2192Playing; ready@waiting/first-2 Waiting\u2192Waiting; ready@waiting/last-2 Waiting\u2192Playing; ready@paused Paused\u2192Paused; ready@waiting/first-3 Waiting\u2192Waiting; ready@waiting/last-3 Waiting\u2192Playing; ready@waiting/correcting Waiting\u2192Waiting | ready@idle/ctrl H/J 1/1; ready@idle/peer H/J 0/0; ready@waiting/wrong-item/ctrl H/J 0/0; ready@waiting/wrong-item/peer H/J 1/1; ready@waiting/first/ctrl H/J 1/1; ready@waiting/first/peer H/J 0/0; ready@waiting/last/ctrl H/J 2/2; ready@waiting/last/peer H/J 2/2; ready@playing/ctrl H/J 1/1; ready@playing/peer H/J 0/0; ready@waiting/first-2/ctrl H/J 1/1; ready@waiting/first-2/peer H/J 0/0; ready@waiting/last-2/ctrl H/J 2/2; ready@waiting/last-2/peer H/J 2/2; ready@paused/ctrl H/J 1/1; ready@paused/peer H/J 0/0; ready@waiting/first-3/ctrl H/J 1/1; ready@waiting/first-3/peer H/J 0/0; ready@waiting/last-3/ctrl H/J 2/2; ready@waiting/last-3/peer H/J 2/2; ready@waiting/correcting/ctrl H/J 2/2; ready@waiting/correcting/peer H/J 1/1 | When\u2212EmittedAt: SyncPlayCommand/Stop H=-21.090s J=-21.088s; SyncPlayCommand/Pause H=-1.205s J=-1.206s; SyncPlayCommand/Unpause H=+1.000s J=+1.000s; SyncPlayCommand/Unpause H=+1.000s J=+1.000s; SyncPlayCommand/Unpause H=-7.179s J=-7.179s; SyncPlayCommand/Pause H=-1.204s J=-1.205s; SyncPlayCommand/Unpause H=+1.000s J=+1.000s; SyncPlayCommand/Unpause H=+1.000s J=+1.000s; SyncPlayCommand/Pause H=-8.174s J=-8.174s; SyncPlayCommand/Pause H=-1.204s J=-1.205s; SyncPlayCommand/Unpause H=+1.000s J=+1.000s; SyncPlayCommand/Unpause H=+1.000s J=+1.000s; SyncPlayCommand/Seek H=-5.876s J=-5.876s | position (tolerance \u00b10.02s): PositionTicks H=9601132 J=9591274 \u0394=+1ms; PositionTicks H=9622396 J=9619666 \u0394=+0ms | 130 field(s) compared (pushed messages)",
+      "deep_verified": true,
       "verification_method": "push-diff",
       "classification": "verified-by-push-probe: the response body carries no signal here \u2014 the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py).",
       "classification_scope": "op",
@@ -5575,7 +5575,7 @@
       "depth": "REAL",
       "status_conformant": null,
       "schema_valid": null,
-      "note": "seek@idle Idle\u2192Idle; seek@waiting Waiting\u2192Waiting; seek@waiting/past-the-end Waiting\u2192Waiting; seek@playing Playing\u2192Waiting; seek@paused Paused\u2192Waiting | seek@idle/ctrl H/J 1/1; seek@idle/peer H/J 0/0; seek@waiting/ctrl H/J 2/2; seek@waiting/peer H/J 2/2; seek@waiting/past-the-end/ctrl H/J 2/2; seek@waiting/past-the-end/peer H/J 2/2; seek@playing/ctrl H/J 2/2; seek@playing/peer H/J 2/2; seek@paused/ctrl H/J 2/2; seek@paused/peer H/J 2/2 | When\u2212EmittedAt: SyncPlayCommand/Stop H=-10.148s J=-10.146s; SyncPlayCommand/Seek H=+0.000s J=-0.000s; SyncPlayCommand/Seek H=+0.000s J=-0.000s; SyncPlayCommand/Seek H=+0.000s J=-0.000s; SyncPlayCommand/Seek H=+0.000s J=-0.000s; SyncPlayCommand/Seek H=+0.000s J=-0.000s; SyncPlayCommand/Seek H=+0.000s J=-0.000s; SyncPlayCommand/Seek H=+0.000s J=-0.000s; SyncPlayCommand/Seek H=+0.000s J=-0.000s | position (tolerance \u00b10.02s): PositionTicks H=10230000 J=10230000 \u0394=+0ms; PositionTicks H=2000000 J=2000000 \u0394=+0ms; PositionTicks H=3000000 J=3000000 \u0394=+0ms; PositionTicks H=5000000 J=5000000 \u0394=+0ms | 94 field(s) compared (pushed messages)",
+      "note": "seek@idle Idle\u2192Idle; seek@waiting Waiting\u2192Waiting; seek@waiting/past-the-end Waiting\u2192Waiting; seek@playing Playing\u2192Waiting; seek@paused Paused\u2192Waiting | seek@idle/ctrl H/J 1/1; seek@idle/peer H/J 0/0; seek@waiting/ctrl H/J 2/2; seek@waiting/peer H/J 2/2; seek@waiting/past-the-end/ctrl H/J 2/2; seek@waiting/past-the-end/peer H/J 2/2; seek@playing/ctrl H/J 2/2; seek@playing/peer H/J 2/2; seek@paused/ctrl H/J 2/2; seek@paused/peer H/J 2/2 | When\u2212EmittedAt: SyncPlayCommand/Stop H=-10.155s J=-10.153s; SyncPlayCommand/Seek H=+0.000s J=-0.000s; SyncPlayCommand/Seek H=+0.000s J=-0.000s; SyncPlayCommand/Seek H=+0.000s J=-0.000s; SyncPlayCommand/Seek H=+0.000s J=-0.000s; SyncPlayCommand/Seek H=+0.000s J=-0.000s; SyncPlayCommand/Seek H=+0.000s J=-0.000s; SyncPlayCommand/Seek H=+0.000s J=-0.000s; SyncPlayCommand/Seek H=+0.000s J=-0.000s | position (tolerance \u00b10.02s): PositionTicks H=10230000 J=10230000 \u0394=+0ms; PositionTicks H=2000000 J=2000000 \u0394=+0ms; PositionTicks H=3000000 J=3000000 \u0394=+0ms; PositionTicks H=5000000 J=5000000 \u0394=+0ms | 94 field(s) compared (pushed messages)",
       "deep_verified": true,
       "verification_method": "push-diff",
       "classification": "verified-by-push-probe: the response body carries no signal here \u2014 the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py).",
@@ -5592,7 +5592,7 @@
       "depth": "REAL",
       "status_conformant": null,
       "schema_valid": null,
-      "note": "ignorewait@idle Idle\u2192Idle; ignorewait@paused Paused\u2192Paused; ignorewait@waiting Waiting\u2192Playing; ignorewait@playing Playing\u2192Playing | ignorewait@idle/ctrl H/J 0/0; ignorewait@idle/peer H/J 0/0; ignorewait@paused/ctrl H/J 0/0; ignorewait@paused/peer H/J 0/0; ignorewait@waiting/ctrl H/J 2/2; ignorewait@waiting/peer H/J 2/2; ignorewait@playing/ctrl H/J 0/0; ignorewait@playing/peer H/J 0/0 | When\u2212EmittedAt: SyncPlayCommand/Unpause H=+1.000s J=+1.000s; SyncPlayCommand/Unpause H=+1.000s J=+1.000s | position (tolerance \u00b10.02s): PositionTicks H=9591515 J=9585264 \u0394=+1ms | 22 field(s) compared (pushed messages)",
+      "note": "ignorewait@idle Idle\u2192Idle; ignorewait@paused Paused\u2192Paused; ignorewait@waiting Waiting\u2192Playing; ignorewait@playing Playing\u2192Playing | ignorewait@idle/ctrl H/J 0/0; ignorewait@idle/peer H/J 0/0; ignorewait@paused/ctrl H/J 0/0; ignorewait@paused/peer H/J 0/0; ignorewait@waiting/ctrl H/J 2/2; ignorewait@waiting/peer H/J 2/2; ignorewait@playing/ctrl H/J 0/0; ignorewait@playing/peer H/J 0/0 | When\u2212EmittedAt: SyncPlayCommand/Unpause H=+1.000s J=+1.000s; SyncPlayCommand/Unpause H=+1.000s J=+1.000s | position (tolerance \u00b10.02s): PositionTicks H=9601132 J=9591274 \u0394=+1ms | 22 field(s) compared (pushed messages)",
       "deep_verified": true,
       "verification_method": "push-diff",
       "classification": "verified-by-push-probe: the response body carries no signal here \u2014 the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py).",
@@ -5677,7 +5677,7 @@
       "depth": "REAL",
       "status_conformant": null,
       "schema_valid": null,
-      "note": "stop@waiting Waiting\u2192Idle; stop@idle Idle\u2192Idle; stop@paused Paused\u2192Idle; stop@playing/teardown Playing\u2192Idle | stop@waiting/ctrl H/J 1/1; stop@waiting/peer H/J 1/1; stop@idle/ctrl H/J 1/1; stop@idle/peer H/J 0/0; stop@paused/ctrl H/J 1/1; stop@paused/peer H/J 1/1; stop@playing/teardown/ctrl H/J 1/1; stop@playing/teardown/peer H/J 1/1 | When\u2212EmittedAt: SyncPlayCommand/Stop H=-1.972s J=-1.969s; SyncPlayCommand/Stop H=-1.972s J=-1.969s; SyncPlayCommand/Stop H=-33.523s J=-33.519s; SyncPlayCommand/Stop H=-1.958s J=-1.958s; SyncPlayCommand/Stop H=-1.958s J=-1.958s; SyncPlayCommand/Stop H=-7.174s J=-7.174s; SyncPlayCommand/Stop H=-7.174s J=-7.174s | position (tolerance \u00b10.02s): PositionTicks H=21209347 J=21207379 \u0394=+0ms; PositionTicks H=9591515 J=9585264 \u0394=+1ms | 42 field(s) compared (pushed messages)",
+      "note": "stop@waiting Waiting\u2192Idle; stop@idle Idle\u2192Idle; stop@paused Paused\u2192Idle; stop@playing/teardown Playing\u2192Idle | stop@waiting/ctrl H/J 1/1; stop@waiting/peer H/J 1/1; stop@idle/ctrl H/J 1/1; stop@idle/peer H/J 0/0; stop@paused/ctrl H/J 1/1; stop@paused/peer H/J 1/1; stop@playing/teardown/ctrl H/J 1/1; stop@playing/teardown/peer H/J 1/1 | When\u2212EmittedAt: SyncPlayCommand/Stop H=-1.971s J=-1.967s; SyncPlayCommand/Stop H=-1.971s J=-1.967s; SyncPlayCommand/Stop H=-33.526s J=-33.522s; SyncPlayCommand/Stop H=-1.959s J=-1.959s; SyncPlayCommand/Stop H=-1.959s J=-1.959s; SyncPlayCommand/Stop H=-7.175s J=-7.175s; SyncPlayCommand/Stop H=-7.175s J=-7.175s | position (tolerance \u00b10.02s): PositionTicks H=21193002 J=21189274 \u0394=+0ms; PositionTicks H=9601132 J=9591274 \u0394=+1ms | 42 field(s) compared (pushed messages)",
       "deep_verified": true,
       "verification_method": "push-diff",
       "classification": "verified-by-push-probe: the response body carries no signal here \u2014 the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py).",
@@ -5694,7 +5694,7 @@
       "depth": "REAL",
       "status_conformant": null,
       "schema_valid": null,
-      "note": "unpause@playing Playing\u2192Playing; unpause@waiting/forced Waiting\u2192Playing; unpause@waiting/forced-2 Waiting\u2192Playing; unpause@waiting/forced-3 Waiting\u2192Playing; unpause@idle Idle\u2192Waiting; unpause@waiting/arms-resume Waiting\u2192Waiting; unpause@waiting/forced-4 Waiting\u2192Playing; unpause@paused Paused\u2192Playing; unpause@idle/again Idle\u2192Waiting; unpause@waiting/arms-resume-2 Waiting\u2192Waiting | unpause@playing/ctrl H/J 1/1; unpause@playing/peer H/J 0/0; unpause@waiting/forced/ctrl H/J 2/2; unpause@waiting/forced/peer H/J 2/2; unpause@waiting/forced-2/ctrl H/J 2/2; unpause@waiting/forced-2/peer H/J 2/2; unpause@waiting/forced-3/ctrl H/J 2/2; unpause@waiting/forced-3/peer H/J 2/2; unpause@idle/ctrl H/J 1/1; unpause@idle/peer H/J 1/1; unpause@waiting/arms-resume/ctrl H/J 1/1; unpause@waiting/arms-resume/peer H/J 1/1; unpause@waiting/forced-4/ctrl H/J 2/2; unpause@waiting/forced-4/peer H/J 2/2; unpause@paused/ctrl H/J 2/2; unpause@paused/peer H/J 2/2; unpause@idle/again/ctrl H/J 1/1; unpause@idle/again/peer H/J 1/1; unpause@waiting/arms-resume-2/ctrl H/J 1/1; unpause@waiting/arms-resume-2/peer H/J 1/1 | When\u2212EmittedAt: SyncPlayCommand/Unpause H=-0.963s J=-0.965s; SyncPlayCommand/Unpause H=+1.000s J=+1.000s; SyncPlayCommand/Unpause H=+1.000s J=+1.000s; SyncPlayCommand/Unpause H=+1.000s J=+1.000s; SyncPlayCommand/Unpause H=+1.000s J=+1.000s; SyncPlayCommand/Unpause H=+1.000s J=+1.000s; SyncPlayCommand/Unpause H=+1.000s J=+1.000s; SyncPlayCommand/Unpause H=+1.000s J=+1.000s; SyncPlayCommand/Unpause H=+1.000s J=+1.000s; SyncPlayCommand/Unpause H=+1.000s J=+1.000s; SyncPlayCommand/Unpause H=+1.000s J=+1.000s | position (tolerance \u00b10.02s): PositionTicks H=10230000 J=10230000 \u0394=+0ms; PositionTicks H=11598535 J=11598524 \u0394=+0ms; PositionTicks H=2000000 J=2000000 \u0394=+0ms; PositionTicks H=3000000 J=3000000 \u0394=+0ms | 184 field(s) compared (pushed messages)",
+      "note": "unpause@playing Playing\u2192Playing; unpause@waiting/forced Waiting\u2192Playing; unpause@waiting/forced-2 Waiting\u2192Playing; unpause@waiting/forced-3 Waiting\u2192Playing; unpause@idle Idle\u2192Waiting; unpause@waiting/arms-resume Waiting\u2192Waiting; unpause@waiting/forced-4 Waiting\u2192Playing; unpause@paused Paused\u2192Playing; unpause@idle/again Idle\u2192Waiting; unpause@waiting/arms-resume-2 Waiting\u2192Waiting | unpause@playing/ctrl H/J 1/1; unpause@playing/peer H/J 0/0; unpause@waiting/forced/ctrl H/J 2/2; unpause@waiting/forced/peer H/J 2/2; unpause@waiting/forced-2/ctrl H/J 2/2; unpause@waiting/forced-2/peer H/J 2/2; unpause@waiting/forced-3/ctrl H/J 2/2; unpause@waiting/forced-3/peer H/J 2/2; unpause@idle/ctrl H/J 1/1; unpause@idle/peer H/J 1/1; unpause@waiting/arms-resume/ctrl H/J 1/1; unpause@waiting/arms-resume/peer H/J 1/1; unpause@waiting/forced-4/ctrl H/J 2/2; unpause@waiting/forced-4/peer H/J 2/2; unpause@paused/ctrl H/J 2/2; unpause@paused/peer H/J 2/2; unpause@idle/again/ctrl H/J 1/1; unpause@idle/again/peer H/J 1/1; unpause@waiting/arms-resume-2/ctrl H/J 1/1; unpause@waiting/arms-resume-2/peer H/J 1/1 | When\u2212EmittedAt: SyncPlayCommand/Unpause H=-0.960s J=-0.962s; SyncPlayCommand/Unpause H=+1.000s J=+1.000s; SyncPlayCommand/Unpause H=+1.000s J=+1.000s; SyncPlayCommand/Unpause H=+1.000s J=+1.000s; SyncPlayCommand/Unpause H=+1.000s J=+1.000s; SyncPlayCommand/Unpause H=+1.000s J=+1.000s; SyncPlayCommand/Unpause H=+1.000s J=+1.000s; SyncPlayCommand/Unpause H=+1.000s J=+1.000s; SyncPlayCommand/Unpause H=+1.000s J=+1.000s; SyncPlayCommand/Unpause H=+1.000s J=+1.000s; SyncPlayCommand/Unpause H=+1.000s J=+1.000s | position (tolerance \u00b10.02s): PositionTicks H=10230000 J=10230000 \u0394=+0ms; PositionTicks H=11588085 J=11587666 \u0394=+0ms; PositionTicks H=2000000 J=2000000 \u0394=+0ms; PositionTicks H=3000000 J=3000000 \u0394=+0ms | 184 field(s) compared (pushed messages)",
       "deep_verified": true,
       "verification_method": "push-diff",
       "classification": "verified-by-push-probe: the response body carries no signal here \u2014 the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py).",
@@ -5752,7 +5752,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /System/Configuration",
@@ -5769,7 +5769,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /System/Configuration/Branding",
@@ -5786,7 +5786,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /System/Configuration/MetadataOptions/Default",
@@ -5820,7 +5820,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /System/Configuration/{key}",
@@ -5837,7 +5837,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /System/Endpoint",
@@ -5854,7 +5854,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /System/Info",
@@ -5871,7 +5871,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /System/Info/Public",
@@ -5888,7 +5888,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /System/Info/Storage",
@@ -5939,7 +5939,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /System/Ping",
@@ -5973,7 +5973,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /System/Restart",
@@ -5990,7 +5990,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /System/Shutdown",
@@ -6007,7 +6007,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Tmdb/ClientConfiguration",
@@ -6024,7 +6024,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Trailers",
@@ -6075,7 +6075,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /UserFavoriteItems/{itemId}",
@@ -6092,7 +6092,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "DELETE /UserImage",
@@ -6109,7 +6109,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /UserImage",
@@ -6126,7 +6126,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "HEAD /UserImage",
@@ -6143,7 +6143,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /UserImage",
@@ -6160,7 +6160,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /UserItems/Resume",
@@ -6177,7 +6177,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "DELETE /UserItems/{itemId}/Rating",
@@ -6194,7 +6194,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /UserItems/{itemId}/Rating",
@@ -6211,7 +6211,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /UserItems/{itemId}/UserData",
@@ -6228,7 +6228,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /UserItems/{itemId}/UserData",
@@ -6245,7 +6245,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "DELETE /UserPlayedItems/{itemId}",
@@ -6262,7 +6262,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /UserPlayedItems/{itemId}",
@@ -6279,7 +6279,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /UserViews",
@@ -6289,8 +6289,8 @@
       "depth": "REAL",
       "status_conformant": true,
       "schema_valid": true,
-      "note": "0/1 legs clean (87 leaves compared); mismatch:0 missing:0 extra:1 | ",
-      "deep_verified": false,
+      "note": "1/1 legs clean (88 leaves compared)",
+      "deep_verified": true,
       "verification_method": "body-diff",
       "classification": "open-work (NOT accepted) \u2014 found 2026-08-30 by batch S1 while re-running the read layer, and recorded rather than left as an unreviewed detector flag. `POST /Library/VirtualFolders/Name` leaks a user view on Ferrofin: renaming a virtual folder and renaming it BACK leaves an orphan entry under the intermediate name in `GET /UserViews`. Measured on the lane-3 pair, same request sequence against both servers (`Music (synth)` -> `Music (synth) Tmp` -> `Music (synth)`, both legs 204 on both servers): Ferrofin's view list grew by one ('Music (synth) Tmp') and Jellyfin's was unchanged. It is not a cache \u2014 an earlier orphan ('Movies (synth) Renamed', left by the parity write layer's own rename journey) survived BOTH a container restart and a `POST /Library/Refresh`, while Jellyfin's equivalent transient view rows clear on restart. A user sees a phantom library in the sidebar. UN-DEFER PATH: make the rename path move the existing user-view row instead of creating a second one (C# `LibraryManager.RenameVirtualFolder` renames the folder on disk and the view follows it), add a journey leg that asserts the view COUNT is unchanged across a rename round-trip, and re-provision the lane pair (the two orphans above are on it now). ALSO ON THIS ROW \u2014 a SECOND open-work gap, measured 2026-08-31 on the lane pair and previously unrecorded anywhere: Ferrofin serves NO `Playlists` user view. Jellyfin answers 7 views to Ferrofin's 5; two of those are accounted for (`Recordings` is the lab-state library above), and the third is real. `UserViewManager.GetUserViews` (v10.11.8 Emby.Server.Implementations/Library/UserViewManager.cs:44-95) walks `GetUserRootFolder().GetChildren(user, true)`, and `UserView.IsUserSpecific(folder)` is TRUE for the playlists folder (UserView.cs:155-169: `collectionFolder.CollectionType == CollectionType.playlists`), so upstream materialises a PER-USER `UserView` for it via `GetNamedView(user, folder.Name, folder.Id, folderViewType, null)` \u2014 id = `GetNewItemId(\"38_namedview_\" + name + userIdN + parentIdN + viewType, typeof(UserView))` (LibraryManager.cs:2462-2496), Path `{InternalMetadataPath}/views/{idN}`, `Data` = `{\"ViewType\":\"playlists\",\"DisplayParentId\":<playlists folder>,\"UserId\":<user>}`. Read off the lab's 10.11.8: id 134ea3dcf722741c8892ad56d425dd3c, CollectionType `playlists`, ChildCount 6, with a Primary image. Ferrofin's `get_user_views` selects rows by KIND (`CollectionFolder` + `UserView`) and has no per-user named-view provisioning at all, so the view can never appear. UN-DEFER PATH, and it is three parts, not one \u2014 which is why it is a named work item and not a drive-by: (1) provision the row, reusing the `ensure_live_tv_view` shape in crates/ferrofin-core/src/user_view_manager.rs with the `38_namedview_` id key above; (2) SCOPE IT \u2014 `get_user_views` currently returns every `UserView` row to every user, so a per-user view added without a `Data.UserId` filter would leak one user's view into another's sidebar, a NEW divergence worse than the missing one; (3) the DTO must carry `ChildCount` and the Primary image, or the row swaps a missing view for a wrong one. Each part needs its own live re-measure against 18097.",
       "classification_scope": "op",
@@ -6313,7 +6313,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Users",
@@ -6330,7 +6330,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /Users",
@@ -6347,7 +6347,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /Users/AuthenticateByName",
@@ -6364,7 +6364,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /Users/AuthenticateWithQuickConnect",
@@ -6381,7 +6381,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /Users/Configuration",
@@ -6398,7 +6398,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /Users/ForgotPassword",
@@ -6415,7 +6415,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /Users/ForgotPassword/Pin",
@@ -6432,7 +6432,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Users/Me",
@@ -6449,7 +6449,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /Users/New",
@@ -6466,7 +6466,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /Users/Password",
@@ -6483,7 +6483,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Users/Public",
@@ -6517,7 +6517,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Users/{userId}",
@@ -6534,7 +6534,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /Users/{userId}/Policy",
@@ -6551,7 +6551,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "DELETE /Videos/ActiveEncodings",
@@ -6568,7 +6568,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /Videos/MergeVersions",
@@ -6585,7 +6585,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Videos/{itemId}/AdditionalParts",
@@ -6602,7 +6602,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "DELETE /Videos/{itemId}/AlternateSources",
@@ -6619,7 +6619,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "POST /Videos/{itemId}/Subtitles",
@@ -6636,7 +6636,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "DELETE /Videos/{itemId}/Subtitles/{index}",
@@ -6653,7 +6653,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Videos/{itemId}/Trickplay/{width}/tiles.m3u8",
@@ -6670,7 +6670,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Videos/{itemId}/Trickplay/{width}/{index}.jpg",
@@ -6687,7 +6687,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Videos/{itemId}/hls/{playlistId}/stream.m3u8",
@@ -6704,7 +6704,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Videos/{itemId}/hls/{playlistId}/{segmentId}.{segmentContainer}",
@@ -6721,7 +6721,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Videos/{itemId}/hls1/{playlistId}/{segmentId}.{container}",
@@ -6738,7 +6738,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Videos/{itemId}/live.m3u8",
@@ -6755,7 +6755,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Videos/{itemId}/main.m3u8",
@@ -6772,7 +6772,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Videos/{itemId}/master.m3u8",
@@ -6789,7 +6789,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "HEAD /Videos/{itemId}/master.m3u8",
@@ -6806,7 +6806,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Videos/{itemId}/stream",
@@ -6823,7 +6823,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "HEAD /Videos/{itemId}/stream",
@@ -6840,7 +6840,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Videos/{itemId}/stream.{container}",
@@ -6857,7 +6857,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "HEAD /Videos/{itemId}/stream.{container}",
@@ -6874,7 +6874,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Videos/{itemId}/{mediaSourceId}/Subtitles/{index}/subtitles.m3u8",
@@ -6891,7 +6891,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Videos/{routeItemId}/{routeMediaSourceId}/Subtitles/{routeIndex}/Stream.{routeFormat}",
@@ -6908,7 +6908,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Videos/{routeItemId}/{routeMediaSourceId}/Subtitles/{routeIndex}/{routeStartPositionTicks}/Stream.{routeFormat}",
@@ -6925,7 +6925,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Videos/{videoId}/{mediaSourceId}/Attachments/{index}",
@@ -6942,7 +6942,7 @@
       "classification_scope": "op",
       "caveats": [],
       "category": null,
-      "last_verified": "fc9c244 2026-09-01"
+      "last_verified": "fcb991a 2026-09-01"
     },
     {
       "operation": "GET /Years",

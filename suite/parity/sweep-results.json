@@ -1,6 +1,6 @@
 {
   "generated_by": "suite/parity/sweep.py",
-  "last_verified": "fc9c244 2026-09-01",
+  "last_verified": "fcb991a 2026-09-01",
   "rows": {
     "DELETE /Audio/{itemId}/Lyrics": {
       "note": "write: not fired by the breadth sweep \u2014 owned by a Layer-2 probe",
@@ -644,16 +644,8 @@
       "verification_method": "body-diff"
     },
     "GET /Items/Root": {
-      "classification": "flagged: read diff vs Jellyfin (sweep single-item align)",
-      "deep_verified": false,
-      "diffs": {
-        "extra": [
-          "PrimaryImageAspectRatio"
-        ],
-        "mismatch": [],
-        "missing": []
-      },
-      "note": "H=200 J=200",
+      "deep_verified": true,
+      "note": "H=200 J=200 | 22 field(s) compared",
       "schema_valid": true,
       "status_conformant": true,
       "verification_method": "body-diff"
@@ -8592,9 +8584,7 @@
       "classification": "flagged: read diff vs Jellyfin (sweep single-item align)",
       "deep_verified": false,
       "diffs": {
-        "extra": [
-          "PrimaryImageAspectRatio"
-        ],
+        "extra": [],
         "mismatch": [
           "ChildCount"
         ],
@@ -9067,16 +9057,8 @@
       "verification_method": "body-diff"
     },
     "GET /Library/MediaFolders": {
-      "classification": "flagged: read diff vs Jellyfin (sweep single-item align)",
-      "deep_verified": false,
-      "diffs": {
-        "extra": [
-          "Items[Path=/config/root/default/Movies (synth)].PrimaryImageAspectRatio"
-        ],
-        "mismatch": [],
-        "missing": []
-      },
-      "note": "H=200 J=200",
+      "deep_verified": true,
+      "note": "H=200 J=200 | 67 field(s) compared",
       "schema_valid": true,
       "status_conformant": true,
       "verification_method": "body-diff"
@@ -10292,16 +10274,8 @@
       "verification_method": "body-diff"
     },
     "GET /UserViews": {
-      "classification": "flagged: read diff vs Jellyfin (sweep single-item align)",
-      "deep_verified": false,
-      "diffs": {
-        "extra": [
-          "Items[Path=/config/root/default/Movies (synth)].PrimaryImageAspectRatio"
-        ],
-        "mismatch": [],
-        "missing": []
-      },
-      "note": "H=200 J=200",
+      "deep_verified": true,
+      "note": "H=200 J=200 | 88 field(s) compared",
       "schema_valid": true,
       "status_conformant": true,
       "verification_method": "body-diff"
