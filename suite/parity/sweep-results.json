@@ -1,6 +1,6 @@
 {
   "generated_by": "suite/parity/sweep.py",
-  "last_verified": "7f31cf1 2026-08-31",
+  "last_verified": "fc9c244 2026-09-01",
   "rows": {
     "DELETE /Audio/{itemId}/Lyrics": {
       "note": "write: not fired by the breadth sweep \u2014 owned by a Layer-2 probe",

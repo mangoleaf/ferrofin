@@ -1,7 +1,7 @@
 {
   "correlated_items": 5,
   "generated_by": "suite/parity/reads.py",
-  "last_verified": "7f31cf1 2026-08-31",
+  "last_verified": "fc9c244 2026-09-01",
   "rows": {
     "GET /Albums/{itemId}/Similar": {
       "classification": "ok",
@@ -21,7 +21,7 @@
         ],
         "missing": []
       },
-      "note": "0/1 legs clean (38 leaves compared); mismatch:3 missing:0 extra:0 | Items[Name=Artist 01].RunTimeTicks(J=0 H=60000000); Items[Name=Artist 02].RunTimeTicks(J=0 H=60000000); Items[Name=Artist 03].RunTimeTicks(J=0 H=60000000)",
+      "note": "0/1 legs clean (38 leaves compared); mismatch:3 missing:0 extra:0 | Items[Name=Artist 02].RunTimeTicks(J=0 H=60000000); Items[Name=Artist 03].RunTimeTicks(J=0 H=60000000); Items[Name=Artist 01].RunTimeTicks(J=0 H=60000000)",
       "verification_method": "body-diff"
     },
     "GET /Artists/AlbumArtists": {
@@ -36,7 +36,7 @@
         ],
         "missing": []
       },
-      "note": "0/1 legs clean (38 leaves compared); mismatch:3 missing:0 extra:0 | Items[Name=Artist 01].RunTimeTicks(J=0 H=60000000); Items[Name=Artist 02].RunTimeTicks(J=0 H=60000000); Items[Name=Artist 03].RunTimeTicks(J=0 H=60000000)",
+      "note": "0/1 legs clean (38 leaves compared); mismatch:3 missing:0 extra:0 | Items[Name=Artist 02].RunTimeTicks(J=0 H=60000000); Items[Name=Artist 03].RunTimeTicks(J=0 H=60000000); Items[Name=Artist 01].RunTimeTicks(J=0 H=60000000)",
       "verification_method": "body-diff"
     },
     "GET /Artists/InstantMix": {
@@ -56,7 +56,7 @@
         ],
         "missing": []
       },
-      "note": "0/1 legs clean (26 leaves compared); mismatch:2 missing:0 extra:0 | Items[Name=Artist 03].RunTimeTicks(J=0 H=60000000); Items[Name=Artist 02].RunTimeTicks(J=0 H=60000000)",
+      "note": "0/1 legs clean (26 leaves compared); mismatch:2 missing:0 extra:0 | Items[Name=Artist 02].RunTimeTicks(J=0 H=60000000); Items[Name=Artist 03].RunTimeTicks(J=0 H=60000000)",
       "verification_method": "body-diff"
     },
     "GET /Artists/{name}": {
@@ -8075,7 +8075,7 @@
           "Items[Path=/media/synth/tv/Series 08/Season 01/Series 08 S01E03.mkv].MediaStreams[2].Width"
         ]
       },
-      "note": "4/8 legs clean (108006+929+226+4868+101+104+218+3 leaves compared); mismatch:1572 missing:6306 extra:0 | Items[Path=/media/synth/movies/Movie 0026 (2020)/Movie 0026 (2020).mkv].MediaSources[Path=/media/synth/movies/Movie 0026 (2020)/Movie 0026 (2020).mkv].Bitrate(J=6253020 H=6061020); Items[Path=/media/synth/movies/Movie 0026 (2020)/Movie 0026 (2020).mkv].MediaSources[Path=/media/synth/movies/Movie 0026 (2020)/Movie 0026 (2020).mkv].MediaStreams[0].BitRate(J=6061020 H=5869020); Items[Path=/media/synth/movies/Movie 0026 (2020)/Movie 0026 (2020).mkv].MediaStreams[0].BitRate(J=6061020 H=5869020)",
+      "note": "4/8 legs clean (108006+929+226+4868+101+104+218+3 leaves compared); mismatch:1572 missing:6306 extra:0 | Items[Path=/media/synth/movies/Movie 0266 (2020)/Movie 0266 (2020).mkv].MediaSources[Path=/media/synth/movies/Movie 0266 (2020)/Movie 0266 (2020).mkv].Bitrate(J=6253020 H=6061020); Items[Path=/media/synth/movies/Movie 0266 (2020)/Movie 0266 (2020).mkv].MediaSources[Path=/media/synth/movies/Movie 0266 (2020)/Movie 0266 (2020).mkv].MediaStreams[0].BitRate(J=6061020 H=5869020); Items[Path=/media/synth/movies/Movie 0266 (2020)/Movie 0266 (2020).mkv].MediaStreams[0].BitRate(J=6061020 H=5869020)",
       "verification_method": "body-diff"
     },
     "GET /Items/{itemId}": {
@@ -8259,7 +8259,7 @@
         ],
         "missing": []
       },
-      "note": "0/5 legs clean (1177+1173+3486+65+2 leaves compared); mismatch:13 missing:0 extra:3 | Providers[](J=len 2 H=len 3); Providers[1](J=\"The Open Movie Database\" H=\"FanArt\"); Images[](J=len 139 H=len 183)",
+      "note": "0/5 legs clean (1177+1173+3486+65+2 leaves compared); mismatch:13 missing:0 extra:3 | Providers[](J=len 2 H=len 3); Providers[1](J=\"The Open Movie Database\" H=\"FanArt\"); TotalRecordCount(J=139 H=183)",
       "verification_method": "body-diff"
     },
     "GET /Items/{itemId}/RemoteImages/Providers": {
@@ -8432,7 +8432,7 @@
         ],
         "missing": []
       },
-      "note": "9/12 legs clean (26+26+20+26+14+14+20+47+17+8+8+17 leaves compared); mismatch:5 missing:0 extra:0 | Items[Name=Ambient].SongCount(J=9 H=3); Items[Name=Jazz].SongCount(J=9 H=3); Items[Name=Rock].SongCount(J=9 H=3)",
+      "note": "9/12 legs clean (26+26+20+26+14+14+20+47+17+8+8+17 leaves compared); mismatch:5 missing:0 extra:0 | Items[Name=Rock].SongCount(J=9 H=3); Items[Name=Ambient].SongCount(J=9 H=3); Items[Name=Jazz].SongCount(J=9 H=3)",
       "verification_method": "body-diff"
     },
     "GET /MusicGenres/InstantMix": {

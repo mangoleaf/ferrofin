@@ -1,7 +1,7 @@
 {
   "errors": [],
   "generated_by": "suite/parity/terminal.py",
-  "last_verified": "7f31cf1 2026-08-31",
+  "last_verified": "fc9c244 2026-09-01",
   "rows": {
     "POST /Backup/Restore": {
       "classification": "ok",
