@@ -1,7 +1,7 @@
 {
   "errors": {},
   "generated_by": "suite/parity/journeys.py",
-  "last_verified": "ce44a3e 2026-08-31",
+  "last_verified": "7f31cf1 2026-08-31",
   "notes": {
     "playlist_share_repeat_delete_status": {
       "ferrofin": 404,
@@ -484,9 +484,9 @@
       "verification_method": "effect"
     },
     "POST /LiveTv/ChannelMappings": {
-      "classification": "flagged: Jellyfin read-back differed (verify: oracle setup or Ferrofin extra)",
+      "classification": "flagged: write effect not observed on either server (likely corpus/setup)",
       "deep_verified": false,
-      "note": "H=True J=False (effect; each server checked against its OWN read-back only; nothing compared across the two)",
+      "note": "H=False J=False (effect; each server checked against its OWN read-back only; nothing compared across the two)",
       "verification_method": "effect"
     },
     "POST /LiveTv/ListingProviders": {

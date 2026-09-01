@@ -1,7 +1,7 @@
 {
   "correlated_items": 5,
   "generated_by": "suite/parity/reads.py",
-  "last_verified": "ce44a3e 2026-08-31",
+  "last_verified": "7f31cf1 2026-08-31",
   "rows": {
     "GET /Albums/{itemId}/Similar": {
       "classification": "ok",
@@ -56,7 +56,7 @@
         ],
         "missing": []
       },
-      "note": "0/1 legs clean (26 leaves compared); mismatch:2 missing:0 extra:0 | Items[Name=Artist 02].RunTimeTicks(J=0 H=60000000); Items[Name=Artist 03].RunTimeTicks(J=0 H=60000000)",
+      "note": "0/1 legs clean (26 leaves compared); mismatch:2 missing:0 extra:0 | Items[Name=Artist 03].RunTimeTicks(J=0 H=60000000); Items[Name=Artist 02].RunTimeTicks(J=0 H=60000000)",
       "verification_method": "body-diff"
     },
     "GET /Artists/{name}": {
@@ -172,9 +172,16 @@
       "verification_method": "body-diff"
     },
     "GET /Items/Root": {
-      "classification": "ok",
-      "deep_verified": true,
-      "note": "1/1 legs clean (22 leaves compared)",
+      "classification": "flagged: read diff vs Jellyfin (verify)",
+      "deep_verified": false,
+      "diffs": {
+        "extra": [
+          "PrimaryImageAspectRatio"
+        ],
+        "mismatch": [],
+        "missing": []
+      },
+      "note": "0/1 legs clean (21 leaves compared); mismatch:0 missing:0 extra:1 | ",
       "verification_method": "body-diff"
     },
     "GET /Items/Suggestions": {
@@ -8068,7 +8075,7 @@
           "Items[Path=/media/synth/tv/Series 08/Season 01/Series 08 S01E03.mkv].MediaStreams[2].Width"
         ]
       },
-      "note": "4/8 legs clean (108006+929+226+4868+101+104+218+3 leaves compared); mismatch:1572 missing:6306 extra:0 | Items[Path=/media/synth/movies/Movie 0038 (2020)/Movie 0038 (2020).mkv].MediaSources[Path=/media/synth/movies/Movie 0038 (2020)/Movie 0038 (2020).mkv].Bitrate(J=6253020 H=6061020); Items[Path=/media/synth/movies/Movie 0038 (2020)/Movie 0038 (2020).mkv].MediaSources[Path=/media/synth/movies/Movie 0038 (2020)/Movie 0038 (2020).mkv].MediaStreams[0].BitRate(J=6061020 H=5869020); Items[Path=/media/synth/movies/Movie 0038 (2020)/Movie 0038 (2020).mkv].MediaStreams[0].BitRate(J=6061020 H=5869020)",
+      "note": "4/8 legs clean (108006+929+226+4868+101+104+218+3 leaves compared); mismatch:1572 missing:6306 extra:0 | Items[Path=/media/synth/movies/Movie 0026 (2020)/Movie 0026 (2020).mkv].MediaSources[Path=/media/synth/movies/Movie 0026 (2020)/Movie 0026 (2020).mkv].Bitrate(J=6253020 H=6061020); Items[Path=/media/synth/movies/Movie 0026 (2020)/Movie 0026 (2020).mkv].MediaSources[Path=/media/synth/movies/Movie 0026 (2020)/Movie 0026 (2020).mkv].MediaStreams[0].BitRate(J=6061020 H=5869020); Items[Path=/media/synth/movies/Movie 0026 (2020)/Movie 0026 (2020).mkv].MediaStreams[0].BitRate(J=6061020 H=5869020)",
       "verification_method": "body-diff"
     },
     "GET /Items/{itemId}": {
@@ -8135,14 +8142,15 @@
       "classification": "flagged: read diff vs Jellyfin (verify)",
       "deep_verified": false,
       "diffs": {
-        "extra": [],
+        "extra": [
+          "PrimaryImageAspectRatio"
+        ],
         "mismatch": [
-          "PrimaryImageAspectRatio",
           "RecursiveItemCount"
         ],
         "missing": []
       },
-      "note": "5/6 legs clean (44+44+44+44+44+23 leaves compared); mismatch:2 missing:0 extra:0 | [Path=/config/root].PrimaryImageAspectRatio(J=1.3333333333333333 H=1.0); [Path=/config/root].RecursiveItemCount(J=537 H=557)",
+      "note": "0/6 legs clean (42+42+42+42+42+22 leaves compared); mismatch:1 missing:0 extra:11 | [Path=/config/root].RecursiveItemCount(J=537 H=557)",
       "verification_method": "body-diff"
     },
     "GET /Items/{itemId}/ExternalIdInfos": {
@@ -8251,7 +8259,7 @@
         ],
         "missing": []
       },
-      "note": "0/5 legs clean (1177+1173+3450+65+2 leaves compared); mismatch:13 missing:0 extra:3 | Images[](J=len 139 H=len 183); Images[138].ProviderName(J=\"The Open Movie Database\" H=\"FanArt\"); Images[138].Url(J=\"https://m.media-amazon.com/images/M/MV5BMDAyY2FhYjctNDc5OS00MDNlLThiMGUtY2UxYWV\u2026 H=\"https://assets.fanart.tv/fanart/the-shawshank-redemption-518530e5614ca.png\")",
+      "note": "0/5 legs clean (1177+1173+3486+65+2 leaves compared); mismatch:13 missing:0 extra:3 | Providers[](J=len 2 H=len 3); Providers[1](J=\"The Open Movie Database\" H=\"FanArt\"); Images[](J=len 139 H=len 183)",
       "verification_method": "body-diff"
     },
     "GET /Items/{itemId}/RemoteImages/Providers": {
@@ -8292,9 +8300,16 @@
       "verification_method": "body-diff"
     },
     "GET /Library/MediaFolders": {
-      "classification": "ok",
-      "deep_verified": true,
-      "note": "1/1 legs clean (67 leaves compared)",
+      "classification": "flagged: read diff vs Jellyfin (verify)",
+      "deep_verified": false,
+      "diffs": {
+        "extra": [
+          "Items[Path=/config/root/default/Movies (synth)].PrimaryImageAspectRatio"
+        ],
+        "mismatch": [],
+        "missing": []
+      },
+      "note": "0/1 legs clean (66 leaves compared); mismatch:0 missing:0 extra:1 | ",
       "verification_method": "body-diff"
     },
     "GET /Library/VirtualFolders": {
@@ -8417,7 +8432,7 @@
         ],
         "missing": []
       },
-      "note": "9/12 legs clean (26+26+20+26+14+14+20+47+17+8+8+17 leaves compared); mismatch:5 missing:0 extra:0 | Items[Name=Jazz].SongCount(J=9 H=3); Items[Name=Rock].SongCount(J=9 H=3); Items[Name=Ambient].SongCount(J=9 H=3)",
+      "note": "9/12 legs clean (26+26+20+26+14+14+20+47+17+8+8+17 leaves compared); mismatch:5 missing:0 extra:0 | Items[Name=Ambient].SongCount(J=9 H=3); Items[Name=Jazz].SongCount(J=9 H=3); Items[Name=Rock].SongCount(J=9 H=3)",
       "verification_method": "body-diff"
     },
     "GET /MusicGenres/InstantMix": {
@@ -8544,7 +8559,7 @@
           "SearchHints[16].RunTimeTicks"
         ]
       },
-      "note": "0/1 legs clean (149 leaves compared); mismatch:22 missing:6 extra:6 | SearchHints[10].Name(J=\"Artist 01\" H=\"Action\"); SearchHints[10].Type(J=\"Person\" H=\"Genre\"); SearchHints[11].Name(J=\"Artist 02\" H=\"Action\")",
+      "note": "0/1 legs clean (149 leaves compared); mismatch:22 missing:6 extra:6 | SearchHints[10].Name(J=\"Artist 01\" H=\"Action\"); SearchHints[10].Type(J=\"Person\" H=\"Studio\"); SearchHints[11].Name(J=\"Artist 02\" H=\"Action\")",
       "verification_method": "body-diff"
     },
     "GET /Sessions": {
@@ -8639,9 +8654,16 @@
       "verification_method": "empty-corpus"
     },
     "GET /UserViews": {
-      "classification": "ok",
-      "deep_verified": true,
-      "note": "1/1 legs clean (88 leaves compared)",
+      "classification": "flagged: read diff vs Jellyfin (verify)",
+      "deep_verified": false,
+      "diffs": {
+        "extra": [
+          "Items[Path=/config/root/default/Movies (synth)].PrimaryImageAspectRatio"
+        ],
+        "mismatch": [],
+        "missing": []
+      },
+      "note": "0/1 legs clean (87 leaves compared); mismatch:0 missing:0 extra:1 | ",
       "verification_method": "body-diff"
     },
     "GET /Users/Me": {
