@@ -1365,13 +1365,24 @@ mod tests {
         let restore = perms.clone();
         std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o555);
         std::fs::set_permissions(dir.path(), perms).expect("chmod");
+        // Running as root ignores the mode bits (CAP_DAC_OVERRIDE), so the
+        // unlink cannot be made to fail this way and the branch is unprovokable
+        // for this uid — probe whether the permission actually bites before
+        // asserting on it. CI runs as root and this assertion failed there while
+        // passing for every unprivileged developer.
+        let bites = std::fs::File::create(dir.path().join(".probe")).is_err();
         let denied = mgr.delete_lyrics(item_id).await;
         std::fs::set_permissions(dir.path(), restore).expect("restore");
-        assert!(denied.is_err(), "a failed unlink must not report success");
-        assert!(sidecar.is_file(), "the lyric is still there");
+        if bites {
+            assert!(denied.is_err(), "a failed unlink must not report success");
+            assert!(sidecar.is_file(), "the lyric is still there");
+        }
 
         // With the file gone there is nothing to delete, and that IS a success.
-        std::fs::remove_file(&sidecar).expect("rm");
+        // As root the delete above already removed it.
+        if sidecar.exists() {
+            std::fs::remove_file(&sidecar).expect("rm");
+        }
         mgr.delete_lyrics(item_id).await.expect("no-op delete");
     }
 
