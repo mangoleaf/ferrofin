@@ -48,6 +48,8 @@ DEFAULTS = {
     # login storm
     "BENCH_LOGIN_RATE": 10,
     "BENCH_LOGIN_DURATION_SECS": 15,
+    # merge tolerance: gaps allowed before a run is quarantined out of the trend
+    "MERGE_MAX_MISSING_LEGS": 5,
     # regression gate
     "PERF_GATE_FACTOR": 1.5,
     "PERF_GATE_SECONDS": 10,

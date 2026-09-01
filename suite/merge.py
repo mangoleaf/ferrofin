@@ -413,19 +413,39 @@ def main():
     cold = {tgt: load_json(SUITE / f"perf/results/raw/{tgt}-cold-requests.json", {})
             for tgt in ("ferrofin", "jellyfin")}
 
-    # A1: measure the full manifest or fail loud (no green record with holes).
-    # MERGE_ALLOW_INCOMPLETE=1 downgrades to a record stamped `incomplete` that
-    # is written but kept OUT of the trend file (needed for the legacy
-    # bench-data fallback, which predates the full endpoint set).
+    # A1: a vanished leg must never pass unnoticed — but it must not delete the
+    # run either. A full run measures ~280 legs; discarding all of them because
+    # one cold sentinel 500'd threw away two complete multi-hour runs and left
+    # the trend empty while the suite was working fine. The guard exists for the
+    # 2026-08 transcode path break, where an ENTIRE leg class silently produced
+    # zero rows — that is a break in kind, not one flaky window, and scale is
+    # what separates them.
+    #
+    # So: up to MERGE_MAX_MISSING_LEGS gaps, the record is written AND enters the
+    # trend, with every gap named in meta.incomplete and the affected rows marked
+    # `leg_missing` — loud and visible in the viewer, not silently green. Beyond
+    # that it is a path break: refuse, unless MERGE_ALLOW_INCOMPLETE=1 forces the
+    # old out-of-trend record for inspection.
     skipped, missing = manifest_check(v2op, perf, foot, cold)
+    max_missing = int(os.environ.get("MERGE_MAX_MISSING_LEGS")
+                      or CONFIG.get("MERGE_MAX_MISSING_LEGS", 5))
+    forced_out_of_trend = False
     if missing:
         print(f"!! manifest incomplete — {len(missing)} expected leg(s) produced no data:", file=sys.stderr)
         for m in missing:
             print(f"!!   {m}", file=sys.stderr)
         print("!! (deliberate? record it: SKIP_VARIANTS=name1,name2 — skipped legs are stamped into the record)", file=sys.stderr)
-        if os.environ.get("MERGE_ALLOW_INCOMPLETE") != "1":
-            print("!! refusing to write a run record (MERGE_ALLOW_INCOMPLETE=1 to write one stamped incomplete, excluded from the trend)", file=sys.stderr)
-            sys.exit(2)
+        if len(missing) > max_missing:
+            if os.environ.get("MERGE_ALLOW_INCOMPLETE") != "1":
+                print(f"!! {len(missing)} gaps exceeds MERGE_MAX_MISSING_LEGS ({max_missing}) — that is a "
+                      "broken leg, not a flaky window. Refusing to write a run record "
+                      "(MERGE_ALLOW_INCOMPLETE=1 to write one stamped incomplete, excluded from the trend).",
+                      file=sys.stderr)
+                sys.exit(2)
+            forced_out_of_trend = True
+        else:
+            print(f"!! within MERGE_MAX_MISSING_LEGS ({max_missing}) — recording the run with these "
+                  "gaps stamped in meta.incomplete; the other legs stand.", file=sys.stderr)
 
     operations, benched_ops, deep_ops = [], set(), set()
     for variant, p in perf.items():
@@ -661,10 +681,12 @@ def main():
 
     OUT.mkdir(parents=True, exist_ok=True)
 
-    # An incomplete record (MERGE_ALLOW_INCOMPLETE=1) is written for inspection
-    # under its own name but NEVER enters the trend file — a record with holes
-    # must not look like a point on the same curve as complete ones.
-    if missing:
+    # Only a run with MORE gaps than MERGE_MAX_MISSING_LEGS is quarantined here:
+    # written for inspection under its own name, never entering the trend, because
+    # a leg class that vanished wholesale is not a point on the same curve. A run
+    # with a handful of gaps DOES enter the trend, carrying meta.incomplete — the
+    # gaps are visible rather than fatal.
+    if forced_out_of_trend:
         # Numbered so successive incomplete runs of one SHA don't overwrite
         # each other's evidence (review carry-over, round 2).
         seq = 1

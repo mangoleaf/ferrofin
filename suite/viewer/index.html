@@ -111,7 +111,7 @@
 
   <h2>Trend <span class="muted" style="text-transform:none">(comparable median speedup + parity coverage; legacy greyed)</span></h2>
   <table id="trend"><thead><tr>
-    <th class="l">build</th><th class="l">when</th><th>comparable rows</th>
+    <th class="l">build</th><th class="l">when</th><th>measured</th><th>body-verified</th>
     <th>median speedup</th><th>win-rate</th><th>parity coverage</th><th class="l">tail losses</th>
   </tr></thead><tbody></tbody></table>
 
@@ -206,8 +206,14 @@ function statCards(h) {
     `<div class="stat"><div class="n" style="color:${color || "var(--fg)"}">${n}</div><div class="l">${l}</div></div>`;
   // Parity coverage leads (exact, deterministic); the ratio comes LAST and
   // labeled — it is the noisiest number on the page (review, round 1).
+  // A run may now enter the trend with a few legs missing (they are named in
+  // meta.incomplete). That must be VISIBLE here — the whole reason the record is
+  // allowed in is that the gap is disclosed rather than fatal.
+  const gaps = (RUN && RUN.meta && RUN.meta.incomplete) || [];
   return card(pct(h.parity_coverage), "parity coverage", "var(--accent)")
-    + card(h.comparable_rows, "comparable rows")
+    + card(h.measured_rows == null ? h.comparable_rows : h.measured_rows, "measured endpoints")
+    + card(h.comparable_rows, "of those, body-verified")
+    + (gaps.length ? card(gaps.length, "MISSING LEGS — " + gaps.join(", "), "var(--bad)") : "")
     + card(pct(h.win_rate), "win-rate (p50+p95+p99)", h.win_rate >= 0.5 ? "var(--good)" : "var(--bad)")
     + card((h.tail_losses || []).length, "tail losses", (h.tail_losses || []).length ? "var(--warn)" : "var(--good)")
     + card(h.median_speedup == null ? "—" : h.median_speedup + "×", "median speedup (noisy — see aggregate)",
@@ -291,6 +297,10 @@ function renderTrend() {
     const spd = h.median_speedup == null ? "—"
       : `<span class="${r.meta.legacy ? "" : (h.median_speedup >= 1 ? "good" : "bad")}">${h.median_speedup}×</span>`;
     return `<tr class="${cls}"><td class="l">${vlabel(r)}</td><td class="l">${r.meta.when || ""}</td>
+      <td>${h.measured_rows == null ? "—" : h.measured_rows}${
+        (r.meta.incomplete || []).length
+          ? ` <span class="bad" title="missing legs: ${(r.meta.incomplete || []).join(", ")}">⚠${(r.meta.incomplete || []).length}</span>`
+          : ""}</td>
       <td>${h.comparable_rows}</td><td>${spd}</td>
       <td>${pct(h.win_rate)}</td><td>${pct(h.parity_coverage)}</td>
       <td class="l muted">${(h.tail_losses || []).join(", ")}</td></tr>`;
