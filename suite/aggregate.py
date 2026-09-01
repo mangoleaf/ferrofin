@@ -104,6 +104,7 @@ def aggregate(runs):
     headline = {
         # The honest headline: exact and deterministic.
         "parity_coverage": heads[-1].get("parity_coverage"),
+        "measured_rows": dist([h.get("measured_rows") for h in heads]),
         "comparable_rows": dist([h.get("comparable_rows") for h in heads]),
         "win_rate": dist([h.get("win_rate") for h in heads]),
         # Distribution of paired per-endpoint speedups over always-comparable
@@ -138,7 +139,8 @@ def render_md(agg, sha):
     out.append(f"- **Jellyfin:** `{m.get('jellyfin_image')}` · **engine:** {m.get('engine')} "
                f"· **when:** {m.get('when')}")
     out.append(f"- **Parity coverage (exact): {h['parity_coverage']}** · "
-               f"comparable rows {fmt_dist(h['comparable_rows'])} · "
+               f"measured rows {fmt_dist(h.get('measured_rows'))} "
+               f"(body-verified {fmt_dist(h['comparable_rows'])}) · "
                f"win-rate {fmt_dist(h['win_rate'])}")
     out.append(f"- Paired speedup over always-comparable endpoints: **{fmt_dist(h['paired_speedup'])}** "
                f"(ratio of per-endpoint medians; spread is IQR across endpoints; "

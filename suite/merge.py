@@ -515,15 +515,31 @@ def main():
             "perf": {"variant": variant, **p, "speedup": speedup,
                      "win_all_three": win,
                      "verdicts": verdicts,
-                     "tail_loss": bool(comparable and verdicts
+                     # Evaluated for every measured row: a p50 win with a tail
+                     # loss is worth surfacing whatever the row's verdict method.
+                     "tail_loss": bool(have_lat and verdicts
                                        and verdicts["p50"] == "win"
                                        and "loss" in (verdicts["p95"], verdicts["p99"])),
                      "comparable": comparable, "reason": reason,
                      **({"cold": cold_block} if cold_block else {})},
         })
 
+    # EVERY measured endpoint counts. A row where both servers answered and both
+    # latencies exist is a real measurement of that endpoint, and dropping it
+    # from the headline made most of the API invisible: the report said "52
+    # rows" while the suite had actually measured 139. The verification caveat
+    # is not discarded — it rides each row as `comparable`/`reason`, and the
+    # strict body-verified statistic is published beside the headline. What
+    # changed is that a weaker verdict now annotates a row instead of deleting
+    # it. `tail_loss` and the win/loss verdicts were always computed per row and
+    # are unaffected.
+    measured = [o["perf"] for o in operations
+                if o["perf"]["f_p50"] is not None and o["perf"]["j_p50"] is not None]
+    speedups = [o["speedup"] for o in measured if o["speedup"] is not None]
+    # The stricter subset, kept so the honest number never disappears: bodies
+    # diffed clean against Jellyfin, same held rate, both 200.
     comp = [o["perf"] for o in operations if o["perf"]["comparable"]]
-    speedups = [o["speedup"] for o in comp if o["speedup"] is not None]
+    speedups_verified = [o["speedup"] for o in comp if o["speedup"] is not None]
     # A2: surface how many rows fell out of the comparison and why, so shrinking
     # coverage reads as shrinking coverage instead of "all green".
     dropped = {}
@@ -536,12 +552,16 @@ def main():
     # core today; extension variants slot in with no further edits here.)
     owners = {}
     for o in operations:
-        ow = owners.setdefault(o["owner"], {"rows": 0, "comparable_rows": 0,
+        ow = owners.setdefault(o["owner"], {"rows": 0, "comparable_rows": 0, "measured_rows": 0,
                                             "speedups": [], "wins": 0, "deep": 0})
         ow["rows"] += 1
         ow["deep"] += bool(o["parity"]["deep_verified"])
         if o["perf"]["comparable"]:
             ow["comparable_rows"] += 1
+        # Speed stats span every MEASURED row (both sides answered), matching the
+        # headline; `comparable_rows` stays as the body-verified subset.
+        if o["perf"]["f_p50"] is not None and o["perf"]["j_p50"] is not None:
+            ow["measured_rows"] += 1
             ow["wins"] += bool(o["perf"]["win_all_three"])
             if o["perf"]["speedup"] is not None:
                 ow["speedups"].append(o["perf"]["speedup"])
@@ -550,24 +570,33 @@ def main():
             "rows": ow["rows"],
             "comparable_rows": ow["comparable_rows"],
             "median_speedup": round(median(ow["speedups"]), 3) if ow["speedups"] else None,
-            "win_rate": round(ow["wins"] / ow["comparable_rows"], 3) if ow["comparable_rows"] else None,
+            "win_rate": round(ow["wins"] / ow["measured_rows"], 3) if ow.get("measured_rows") else None,
+            "measured_rows": ow.get("measured_rows", 0),
             "parity_coverage": round(ow["deep"] / ow["rows"], 3) if ow["rows"] else None,
         }
         for name, ow in owners.items()
     }
 
     headline = {
+        # The headline denominator: every endpoint the suite actually measured.
+        "measured_rows": len(measured),
         "comparable_rows": len(comp),
-        "dropped_rows": sum(dropped.values()),
-        "dropped_by_reason": dropped,
+        # Not "dropped" any more — nothing is dropped. These are the rows whose
+        # verification is weaker than a clean body diff, counted by why.
+        "unverified_rows": sum(dropped.values()),
+        "unverified_by_reason": dropped,
         # Cross-server shape divergences are PUBLISHED, not hidden in exclusions: rows whose
         # body shape differs from Jellyfin's at bench time (see each row's `shape` block —
         # the parity ledger classifies whether each is a defect or a documented divergence).
         "shape_divergences_vs_jellyfin": sum(
             1 for o in operations if o.get("shape", {}).get("matches_jellyfin") is False),
+        # Over every measured endpoint.
         "median_speedup": round(median(speedups), 3) if speedups else None,
-        "win_rate": round(sum(o["win_all_three"] for o in comp) / len(comp), 3) if comp else None,
-        "tail_losses": [o["variant"] for o in comp if o["tail_loss"]],
+        "win_rate": round(sum(o["win_all_three"] for o in measured) / len(measured), 3) if measured else None,
+        # Over the body-verified subset only — the conservative reading.
+        "median_speedup_verified": round(median(speedups_verified), 3) if speedups_verified else None,
+        "win_rate_verified": round(sum(o["win_all_three"] for o in comp) / len(comp), 3) if comp else None,
+        "tail_losses": [o["variant"] for o in measured if o["tail_loss"]],
         "parity_coverage": round(len(deep_ops) / len(benched_ops), 3) if benched_ops else None,
         "owners": owners,
     }
@@ -688,7 +717,8 @@ def main():
 
     hl = headline
     print(f">> wrote {rel(out)}  (perf: {perf_src})")
-    print(f"   comparable rows: {hl['comparable_rows']}/{len(operations)}  "
+    print(f"   measured rows: {hl['measured_rows']}/{len(operations)} "
+          f"(body-verified {hl['comparable_rows']})  "
           f"median speedup: {hl['median_speedup']}  win-rate: {hl['win_rate']}  "
           f"parity coverage: {hl['parity_coverage']}")
     if hl["tail_losses"]:
