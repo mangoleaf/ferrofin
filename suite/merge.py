@@ -628,13 +628,30 @@ def main():
     # fabricated point to the committed trend — observed, from a bats run.
     build = server_build()
     expect = sh("git", "describe", "--tags", "--always", "--dirty", "--abbrev=12")
+    stale_note = None
     if (build and expect
             and build.removesuffix("-dirty") != expect.removesuffix("-dirty")
             and not os.environ.get("MERGE_ALLOW_STALE_BUILD")):
-        sys.exit(f"merge: the raw artifacts were measured on build {build!r}, but the tree is "
-                 f"{expect!r}. Merging them would mint a trend point for code that was never "
-                 f"benchmarked. Re-run the perf leg, or set MERGE_ALLOW_STALE_BUILD=1 if you "
-                 f"deliberately want this record.")
+        # HEAD moving is NOT the question — in a shared repo it moves constantly
+        # during a 2-3 hour run (docs, the harness, the viewer). What invalidates
+        # a measurement is the code the BINARY is made of changing. A viewer
+        # JavaScript commit landing mid-run once blocked an otherwise complete
+        # run from ever being recorded, which is the failure this guard was
+        # supposed to prevent, not cause.
+        rev = build.removesuffix("-dirty").rsplit("-g", 1)[-1] if "-g" in build else build.removesuffix("-dirty")
+        BINARY_PATHS = ["crates", "apps", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml"]
+        changed = sh("git", "diff", "--name-only", f"{rev}..HEAD", "--", *BINARY_PATHS)
+        if changed is None:
+            sys.exit(f"merge: artifacts were measured on build {build!r}; the tree is {expect!r} and "
+                     f"that build's commit could not be resolved, so whether the binary changed is "
+                     f"unknowable. Re-run the perf leg, or set MERGE_ALLOW_STALE_BUILD=1.")
+        if changed.strip():
+            sys.exit(f"merge: the raw artifacts were measured on build {build!r}, but server code has "
+                     f"changed since ({', '.join(changed.split()[:4])}...). Merging them would mint a "
+                     f"trend point for code that was never benchmarked. Re-run the perf leg, or set "
+                     f"MERGE_ALLOW_STALE_BUILD=1 if you deliberately want this record.")
+        stale_note = f"measured at {build}; tree moved to {expect} with no server-code change"
+        print(f">> note: {stale_note}", file=sys.stderr)
     record = {
         "meta": {
             "ferrofin": sh("git", "describe", "--tags", "--always") or "dev",
@@ -661,6 +678,7 @@ def main():
             # /health/live during the perf leg (run.sh verified it against the
             # tree before measuring); None for records that predate the check.
             "server_build": server_build(),
+            **({"build_drift": stale_note} if stale_note else {}),
             # BENCH_ONLY keeps the other leg's PREVIOUS raw results, so the
             # two sides of such a record were not measured together;
             # BENCH_LEG_ORDER is publish's drift-cancelling alternation. Both
