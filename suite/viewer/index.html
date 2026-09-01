@@ -78,11 +78,11 @@
 </head>
 <body>
 <header>
-  <h1>Ferrofin ⇄ Jellyfin — suite <span class="sub">(parity × perf · speed shown for deep-verified ops only)</span></h1>
+  <h1>Ferrofin ⇄ Jellyfin — suite <span class="sub">(parity × perf · every measured endpoint counts; body-verified subset marked)</span></h1>
   <div class="controls">
     <label class="pick">Run<select id="run"></select></label>
     <label class="pick">Compare to<select id="base"><option value="">— none —</option></select></label>
-    <label class="pick chk"><input type="checkbox" id="compOnly" checked> comparable only</label>
+    <label class="pick chk"><input type="checkbox" id="compOnly"> body-verified only</label>
   </div>
   <div class="sub" id="subline">loading…</div>
   <div class="stats" id="stats"></div>
@@ -201,7 +201,7 @@ function frozenSetBanner(r, b) {
     this run ${med(r) ?? "—"}× (full-set headlines have different denominators).</div>`;
 }
 
-function statCards(h) {
+function statCards(h, meta) {
   const card = (n, l, color) =>
     `<div class="stat"><div class="n" style="color:${color || "var(--fg)"}">${n}</div><div class="l">${l}</div></div>`;
   // Parity coverage leads (exact, deterministic); the ratio comes LAST and
@@ -209,7 +209,7 @@ function statCards(h) {
   // A run may now enter the trend with a few legs missing (they are named in
   // meta.incomplete). That must be VISIBLE here — the whole reason the record is
   // allowed in is that the gap is disclosed rather than fatal.
-  const gaps = (RUN && RUN.meta && RUN.meta.incomplete) || [];
+  const gaps = (meta && meta.incomplete) || [];
   return card(pct(h.parity_coverage), "parity coverage", "var(--accent)")
     + card(h.measured_rows == null ? h.comparable_rows : h.measured_rows, "measured endpoints")
     + card(h.comparable_rows, "of those, body-verified")
@@ -231,7 +231,7 @@ function render() {
       ? `open-loop, sample-based windows ≤${m.load.duration_secs ?? "?"}s/endpoint`
       : m.load?.vus != null ? `${m.load.vus} VUs × ${m.load.duration}` : ""} ·
     ${m.cpus ?? "?"} cpus / ${m.mem ?? "?"}`;
-  stats.innerHTML = statCards(h);
+  stats.innerHTML = statCards(h, m);
   const fp = m.footprint;
   // Footprint cards: Ferrofin vs Jellyfin per metric, Ferrofin green when it wins.
   const fpCard = (label, hVal, jVal, hNum, jNum, hTitle, jTitle) => {
@@ -265,9 +265,10 @@ function render() {
   ops.tBodies[0].innerHTML = rows.map(o => {
     const p = o.perf, cls = m.legacy ? "legacyrow" : (p.comparable ? "" : "incomparable");
     const anyLoss = p.verdicts && Object.values(p.verdicts).includes("loss");
-    const verdict = p.win_all_three ? `<span class="pill win">win</span>`
-      : p.tail_loss ? `<span class="pill tail">tail loss</span>`
-      : p.comparable ? (anyLoss ? `<span class="pill loss">loss</span>` : `<span class="pill win">win</span>`) : "—";
+    const measured = p.f_p50 != null && p.j_p50 != null;
+    const verdict = p.tail_loss ? `<span class="pill tail">tail loss</span>`
+      : p.win_all_three ? `<span class="pill win">win</span>`
+      : measured ? (anyLoss ? `<span class="pill loss">loss</span>` : `<span class="pill win">win</span>`) : "—";
     const depth = o.parity.depth || "—";
     let delta = "—";
     if (b && baseP50[p.variant] != null && p.f_p50 != null && baseP50[p.variant] > 0) {
