@@ -82,32 +82,70 @@ echo ">> libraries: $LIBRARIES"
 suite_gen_fixtures
 suite_require_fixtures
 
-# Wait for container start -> the server can actually SERVE, return elapsed
-# seconds (cold-start metric). Gated on SUITE_READY_PATH, never
+# Time container start -> the server can actually SERVE, in seconds at 20ms
+# resolution (cold-start metric). Gated on SUITE_READY_PATH, never
 # /System/Info/Public: Jellyfin's SetupServer stub answers that one route while
 # the real app is still booting, so the old probe timed the stub and reported a
 # cold-start several times faster than the truth (see suite/lib.sh).
-coldstart() {  # $1=base url
+#
+# Measured on a RESTART of an already-provisioned server, never the first
+# boot: the first boot on a seeded snapshot includes one-time work that is not
+# cold start — Ferrofin's adopt-in-place migration of the Jellyfin database
+# (2026-09-02: a 215MB snapshot pushed the reported "cold start" from 0.5 to
+# 1.5 while a measured restart took 0.2s). The old 0.5s poll also quantized
+# every sub-500ms boot up to exactly "0.5".
+coldstart() {  # $1=service $2=base url
+  # -t 60: same graceful-stop rule as the H2 cold leg below — a 10s grace
+  # SIGKILLs Jellyfin mid-shutdown on a populated DB and poisons everything after.
+  docker compose stop -t 60 "$1" >/dev/null 2>&1 || echo "!! coldstart: compose stop failed" >&2
   local start now; start=$(date +%s.%N)
-  for _ in $(seq 1 120); do
-    curl -sf "$1$SUITE_READY_PATH" >/dev/null 2>&1 && { now=$(date +%s.%N); awk -v a="$start" -v b="$now" 'BEGIN{printf "%.1f", b-a}'; return; }
-    sleep 0.5
+  docker compose start "$1" >/dev/null 2>&1 || echo "!! coldstart: compose start failed" >&2
+  # Budget = the one restart-ready knob (BENCH_COLD_READY_TIMEOUT_SECS, default
+  # 120s — same knob cold_probe.py waits on), at 50 polls/second.
+  for _ in $(seq 1 $(( ${BENCH_COLD_READY_TIMEOUT_SECS:-120} * 50 ))); do
+    curl -sf "$2$SUITE_READY_PATH" >/dev/null 2>&1 && { now=$(date +%s.%N); awk -v a="$start" -v b="$now" 'BEGIN{printf "%.2f", b-a}'; return; }
+    sleep 0.02
   done
   echo "NaN"
 }
 
-# Sample the container's anonymous memory every 1s into a file (MiB), until told to stop.
+# Sample the container's anonymous memory into a file (MiB), until told to stop.
 # We read cgroup-v2 memory.stat `anon` (page-cache EXCLUDED) instead of `docker stats`
 # MemUsage: MemUsage counts file-backed page cache, and ffprobe reading the whole media
 # library during the scan drags GiBs of media into cache billed to the container — that
 # measured the kernel's cache of your files, not the server's working set. `anon` covers
 # all processes in the container cgroup (server threads + ffprobe children), cache-free.
+#
+# Sampled every 100ms from the HOST's cgroupfs view of the container (one file
+# read — no docker exec fork per sample). The old 1s `docker compose exec`
+# sampler aliased short allocation spikes: identical workloads recorded peaks
+# anywhere from 187 to 702 MiB across seven runs, which is a measurement
+# artifact, not a memory story. Falls back to the exec sampler at 1s when the
+# host cgroup path is unreadable (rootless docker, remote daemon).
 sample_rss() {  # $1=service $2=outfile
-  while :; do
-    docker compose exec -T "$1" cat /sys/fs/cgroup/memory.stat 2>/dev/null \
-      | anon_mib >> "$2" || true
-    sleep 1
-  done
+  local cid cgdir=""
+  cid=$(docker compose ps -q "$1" 2>/dev/null | head -1) || cid=""
+  if [ -n "$cid" ]; then
+    for d in "/sys/fs/cgroup/system.slice/docker-$cid.scope" \
+             "/sys/fs/cgroup/docker/$cid"; do
+      [ -r "$d/memory.stat" ] && { cgdir="$d"; break; }
+    done
+  fi
+  if [ -n "$cgdir" ]; then
+    while :; do
+      # 2>/dev/null FIRST: redirections apply left-to-right, and the failure
+      # mode is the shell's own `<` open erroring 10×/s if the container dies.
+      anon_mib 2>/dev/null < "$cgdir/memory.stat" >> "$2" || true
+      sleep 0.1
+    done
+  else
+    echo "!! sample_rss: host cgroupfs unreadable — falling back to 1s exec sampler (peak may alias)" >&2
+    while :; do
+      docker compose exec -T "$1" cat /sys/fs/cgroup/memory.stat 2>/dev/null \
+        | anon_mib >> "$2" || true
+      sleep 1
+    done
+  fi
 }
 
 bench() {  # $1=service $2=port $3=TARGET
@@ -133,7 +171,13 @@ bench() {  # $1=service $2=port $3=TARGET
   fi
   suite_assert_running_mounts_readonly
 
-  local cold; cold=$(coldstart "$base"); echo "   cold-start: ${cold}s"
+  # First boot (untimed): includes one-time provisioning — Ferrofin's
+  # adopt-in-place migration on a seeded snapshot, Jellyfin's own first-boot
+  # setup. The cold-start metric is the RESTART that follows. NOTE:
+  # suite_wait200's budget is 60s (lib.sh) — a snapshot whose migration
+  # exceeds that aborts the leg here; raise both budgets together if it does.
+  suite_wait200 "$base" "$target"
+  local cold; cold=$(coldstart "$svc" "$base"); echo "   cold-start: ${cold}s"
   echo "$cold" > "results/raw/$target-cold.txt"
   verify_build "$base" "$target"
 
@@ -276,7 +320,7 @@ ${TABLE}
 
 | Metric | Ferrofin | Jellyfin |
 |---|---|---|
-| Cold start (container → first 200) | ${H_COLD}s | ${J_COLD}s |
+| Cold start (restart → first 200) | ${H_COLD}s | ${J_COLD}s |
 | Peak anon memory (cache-excluded; scan + load, incl. ffprobe children) | ${H_RSS} MiB | ${J_RSS} MiB |
 | Items scanned | ${H_N} | ${J_N} |
 EOF

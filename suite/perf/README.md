@@ -51,8 +51,14 @@ every other row. The write rows dodge that by construction (rules enforced in `e
 
 Plus **footprint**, which is a bigger Rust-vs-.NET story than percentiles:
 
-- **Cold start** — container launch → the server can actually serve, measured as the
-  first `200` on `$SUITE_READY_PATH` (`/Users/Public`). Deliberately NOT
+- **Cold start** — a RESTART of the already-provisioned server → the first `200` on
+  `$SUITE_READY_PATH` (`/Users/Public`), polled at 20ms. The first boot is waited out
+  untimed first: on a seeded snapshot it includes one-time work that is not cold start
+  (Ferrofin's adopt-in-place migration of the Jellyfin DB — 2026-09-02, a 215MB
+  snapshot reported "1.5s" where a measured restart takes ~0.2s; the old 0.5s poll
+  also quantized every sub-500ms boot to exactly "0.5", which is what all pre-Sep-2026
+  records show). Records before this change measured first boot at 0.5s granularity —
+  not directly comparable. Deliberately NOT
   `/System/Info/Public`: Jellyfin's SetupServer stub answers that one route — and only
   that route — while the real app is still booting, so gating on it timed the stub and
   understated Jellyfin's cold start ~9× (measured: stub 200 at 0.31s, real server at
@@ -162,8 +168,13 @@ Mechanics (all enforced, not advisory):
   image discovery differs from Jellyfin's, that row may show a not-found path on one side rather
   than a real resize. It's flagged, not hidden.
 - **Cold start** includes container init (same for both), so read it as relative, not absolute.
-- **Peak RSS** is sampled at 1s granularity via `docker stats` — good enough for an order-of-
-  magnitude comparison, not a precise high-water mark.
+- **Peak RSS** is cgroup-v2 `memory.stat` `anon` (page cache excluded), sampled every 100ms
+  from the host's cgroupfs (where that path is unreadable — rootless docker, remote
+  daemon — it falls back to the old 1s exec sampler and says so on stderr) — a spike
+  shorter than the sample interval can still slip through, so treat it as a close
+  lower bound on the true high-water mark, not an exact one.
+  (The pre-Sep-2026 1s exec-based sampler aliased badly: identical workloads recorded
+  peaks from 187 to 702 MiB.)
 
 ## Running it
 
