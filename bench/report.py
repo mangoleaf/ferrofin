@@ -106,7 +106,9 @@ def mem_numbers(d):
     if "steady" in win and within(win["steady"]):
         out["steady"] = statistics.median(within(win["steady"])) / MIB
     if "interference" in rows[0]:
-        out["interference"] = max(float(r["interference"]) for r in rows)
+        inter = sorted(float(r["interference"]) for r in rows)
+        out["interference"] = inter[-1]
+        out["interference_p95"] = inter[int(0.95 * (len(inter) - 1))]
     if "swap" in rows[0]:
         out["swap_max"] = max(int(r["swap"]) for r in rows) / MIB
     return out
@@ -246,7 +248,9 @@ def main():
         peak.append(f"⚠ not comparable (loaded window missing or dropped iterations) · raw {cell}" if bad else cell)
     print("| peak under load | " + " | ".join(peak) + " |")
     print("| steady idle | " + " | ".join(agg([(m or {}).get("steady") for m in mems[k]], mib) for k, _ in servers) + " |")
-    print(f"| max interference on the server's cores (share of a {sample_ms} ms sample not spent by the container) | " + " | ".join(agg([(m or {}).get("interference") for m in mems[k]], lambda v: f"{v * 100:.0f}%") for k, _ in servers) + " |")
+    print(f"| interference on the server's cores, p95 / max of {sample_ms} ms samples (share not spent by the container) | "
+          + " | ".join(agg([(m or {}).get("interference_p95") for m in mems[k]], lambda v: f"{v * 100:.0f}%") + " / "
+                       + agg([(m or {}).get("interference") for m in mems[k]], lambda v: f"{v * 100:.0f}%") for k, _ in servers) + " |")
     print("| max swap | " + " | ".join(agg([(m or {}).get("swap_max") for m in mems[k]], mib) for k, _ in servers) + " |")
     print()
 
