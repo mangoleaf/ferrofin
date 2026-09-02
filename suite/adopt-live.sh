@@ -104,6 +104,10 @@ for f in jellyfin.db-wal jellyfin.db-shm device.txt collections playlists; do
   [ -e "$SRC/data/$f" ] && cp -a "$SRC/data/$f" "$DIR/data/"
 done
 [ "$WITH_METADATA" = 1 ] && cp -a "$SRC/metadata" "$DIR/metadata"
+# A pinned snapshot source (suite/test_data) is chmod'd read-only, and `cp -a`
+# preserves that — but this COPY must be writable: the checkpoint, the API-key
+# inject, and Ferrofin's adoption all write to it.
+chmod -R u+w "$DIR"
 sq 'PRAGMA wal_checkpoint(TRUNCATE);' >/dev/null
 [ "$(sq 'PRAGMA integrity_check;' | head -1)" = ok ] || { echo "the snapshot is not a consistent database (copied mid-write?)"; exit 1; }
 

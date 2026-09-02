@@ -37,3 +37,14 @@ suite/results/*.bak
 # Parity response samples: 4MB+ of regenerable evidence, rewritten every parity
 # run. Read it with suite/parity/show.py; it is an artifact, not source.
 suite/parity/samples.json
+
+# Pinned snapshot of the real Jellyfin instance used as suite test data
+# (both servers boot copies of it; Ferrofin adopts, Jellyfin reads natively).
+# ~10GB, and it contains real usernames and watch history — never committed,
+# never published. Refreshed deliberately via suite/snapshot-testdata.sh;
+# only the identifying MANIFEST.json is committed.
+suite/test_data/*
+!suite/test_data/MANIFEST.json
+# Interrupted snapshot-testdata.sh runs can strand staging/old siblings
+# (test_data.staging.<pid>, test_data.old.<pid>) full of the same private data.
+suite/test_data.*
