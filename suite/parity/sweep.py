@@ -355,17 +355,49 @@ def wait_for_scan(base, token):
 
 CTX_USER = {}
 
+def ensure_livetv(base, token):
+    """Provision the Live TV fixture exactly once. provision_livetv's tuner
+    POSTs are NOT idempotent (each call adds another tuner host), and the
+    already-provisioned early return in bring_up can run more than once per
+    docker cycle — channels>0 is the already-done signal (provision_livetv
+    itself waits until channels are listed before returning)."""
+    if not os.environ.get("LIVETV_M3U"):
+        return
+    b = get_json(base, "/LiveTv/Channels?limit=0", token)
+    if b is None:
+        # Fail LOUD, not open: treating a probe failure as "no channels" would
+        # re-run the non-idempotent tuner POSTs and duplicate the tuner host.
+        raise SystemExit(f"{base}: /LiveTv/Channels probe failed — cannot decide livetv provisioning")
+    if b.get("TotalRecordCount", 0) > 0:
+        return
+    provision_livetv(base, token)
+
+
 def bring_up(base, target):
     # Idempotent: if already provisioned (e.g. an earlier producer in the same docker cycle),
     # just connect — don't re-run the wizard (fails once setup is complete) or re-add libraries.
+    provisioned = False
     try:
         token, user = authenticate(base)
         CTX_USER[base] = user
         b = get_json(base, f"/Items?userId={user}&recursive=true&limit=0", token)
-        if b and b.get("TotalRecordCount", 0) > 0:
-            return token, user
+        provisioned = bool(b) and b.get("TotalRecordCount", 0) > 0
     except SystemExit:
         pass
+    if provisioned:
+        # Testdata mode always lands here (the seeded snapshot has items), so
+        # the Live TV fixture must be provisioned on THIS path or the whole
+        # LiveTv row family silently degrades to empty. OUTSIDE the try above:
+        # ensure_livetv fails loud via SystemExit, which the except would
+        # swallow and re-diagnose as a seeding problem.
+        if os.environ.get("BENCH_TESTDATA") == "1":
+            ensure_livetv(base, token)
+        return token, user
+    # Testdata mode NEVER provisions: reaching here means the seeded snapshot
+    # is not being served, and falling into wizard()+provision() against an
+    # empty server would fail minutes later pointing away from the real cause.
+    if os.environ.get("BENCH_TESTDATA") == "1":
+        raise SystemExit(f"{base}: testdata mode: server has no items — was the config volume seeded before start?")
     if target == "jellyfin":
         wizard(base)
     token, user = authenticate(base)

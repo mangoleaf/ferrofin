@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # One command to (re)generate the Ferrofin-vs-Jellyfin benchmark. Run this every release.
 #   ./run.sh
-# Requires: docker, docker compose, jq, python3 on the host, plus vegeta (pinned in
+# Requires: docker, docker compose, jq, python3, sqlite3 on the host, plus vegeta (pinned in
 # ./mise.toml — `mise install` here). ffmpeg only for gen-fixtures.sh.
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -51,7 +51,7 @@ verify_build() {  # $1=base url $2=target
   echo "   build verified: ${reported}"
 }
 
-mkdir -p results/raw fixtures/empty fixtures/media/movies fixtures/media/tv
+mkdir -p results/raw fixtures/media/movies fixtures/media/tv
 # Real-media check BEFORE the wipe below: aborting after it would destroy the
 # previous run's raw results, and `suite/run.sh merge` on them is the documented
 # recovery path. (The synthetic-fixture half runs after gen_fixtures.)
@@ -127,9 +127,9 @@ bench() {  # $1=service $2=port $3=TARGET
   # BENCH_SKIP_BUILD=1: use the existing ferrofin-bench:local image (e.g. one built
   # from a clean `git archive HEAD` while the working tree carries in-flight edits).
   if [ "${BENCH_SKIP_BUILD:-0}" = "1" ]; then
-    docker compose up -d "$svc"
+    suite_up_seeded "$svc"
   else
-    docker compose up -d --build "$svc"
+    suite_up_seeded --build "$svc"
   fi
   suite_assert_running_mounts_readonly
 

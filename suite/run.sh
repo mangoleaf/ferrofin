@@ -40,7 +40,7 @@ case "$stage" in
     suite_require_fixtures
     docker compose down -v >/dev/null 2>&1 || true
     rm -f results/raw/jellyfin-ctx.json   # fresh DB ⇒ saved tokens/ids are dead
-    docker compose up -d jellyfin
+    suite_up_seeded jellyfin
     suite_assert_running_mounts_readonly
     JPORT="${JELLYFIN_HOST_PORT:-18097}"
     suite_wait200 "http://localhost:$JPORT" jellyfin

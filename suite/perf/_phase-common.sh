@@ -19,7 +19,7 @@ bringup_scan() {
     docker compose down -v >/dev/null 2>&1 || true
     # A fresh DB invalidates any ctx.json from a prior run — stale ids would 404.
     rm -f "results/raw/$target-ctx.json"
-    if [ "${BENCH_SKIP_BUILD:-0}" = "1" ]; then docker compose up -d "$svc"; else docker compose up -d --build "$svc"; fi
+    if [ "${BENCH_SKIP_BUILD:-0}" = "1" ]; then suite_up_seeded "$svc"; else suite_up_seeded --build "$svc"; fi
     suite_assert_running_mounts_readonly
     up=0
     for _ in $(seq 1 120); do curl -sf "$base$SUITE_READY_PATH" >/dev/null 2>&1 && { up=1; break; }; sleep 1; done

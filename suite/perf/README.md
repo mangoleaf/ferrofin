@@ -20,7 +20,7 @@ vs C# actually differs):
 | `GET /UserViews` | home-screen view assembly |
 | `GET /Items` (Movie, SortName) | the library query + DTO hot path |
 | `GET /Items` (Movie, DateCreated desc) | the query planner under a different sort |
-| `GET /Items` (Episode) | episode-shaped DTOs + the Series/Season/Episode resolver (needs `REAL_TV_DIR`) |
+| `GET /Items` (Episode) | episode-shaped DTOs + the Series/Season/Episode resolver (the snapshot's TV libraries) |
 | `GET /Items/{id}` | single-item DTO build |
 | `GET /Items/{id}/Images/Primary` | image serve + resize (`ferrofin-drawing`) — see caveat |
 | `POST /Items/{id}/PlaybackInfo` | the hottest real-client POST: play-decision + MediaSource build |
@@ -136,11 +136,13 @@ Mechanics (all enforced, not advisory):
 
 ## Fairness (this is where benchmarks lie, so it's most of the harness)
 
-1. **Identical media, mounted read-only into both.** Point `REAL_MEDIA_DIR` at your own movies
-   (recommended — real files mean real probing and a meaningful transcode test). Both servers
-   scan the exact same directory. For query-scaling headroom you can also generate synthetic
-   padding (`FIXTURE_MOVIES`/`FIXTURE_SERIES`): `gen-fixtures.sh` hardlinks one tiny real A/V
-   clip to every synthetic path so ffprobe behaves identically on both.
+1. **Identical data, no media mounted.** With `BENCH_TESTDATA=1` (the default)
+   both servers boot copies of the pinned real-library snapshot (`suite/test_data/`,
+   see `suite/snapshot-testdata.sh`) — same items, same users, same metadata on
+   each side, and NO media directory is mounted into either container.
+   `REAL_MEDIA_DIR` is no longer supported (the suite refuses it). Synthetic
+   padding (`FIXTURE_MOVIES`/`FIXTURE_SERIES`) applies only to the legacy
+   synthetic mode; `gen-fixtures.sh` still generates the Live TV source files.
 2. **Equal item count is asserted.** Scan completion is detected by polling `GET /Items` until
    the total settles — a signal defined purely in terms of the shared API, so it's identical on
    both servers. The report records each server's actual scanned count and **flags a mismatch**:
@@ -172,8 +174,8 @@ fixture generation), and the pinned tools from `mise.toml` (`cd suite/perf && mi
 ```bash
 cd suite/perf
 cp .env.example .env
-#   set REAL_MEDIA_DIR to your movies dir (absolute path)
 #   set JELLYFIN_IMAGE to match your vendored spec version
+#   (test data comes from the pinned snapshot — see suite/snapshot-testdata.sh)
 ./run.sh
 ```
 

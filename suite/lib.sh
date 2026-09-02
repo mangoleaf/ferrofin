@@ -38,28 +38,30 @@ suite_load_env() {  # $1=env file (relative to suite/perf/), default .env
   for kv in ${preset+"${preset[@]}"}; do export "${kv?}"; done
 }
 
-# Fail NOW, with the path in hand, if the configured media is not there. Every
-# way of getting this wrong used to surface 3 minutes later as "scan never
-# started"/"container likely OOM'd", which sends the reader to look at memory
-# while the real answer is an empty directory.
-suite_require_media() {
-  local missing=0 p
-  for p in "${REAL_MEDIA_DIR:-}" "${REAL_TV_DIR:-}"; do
-    [ -z "$p" ] && continue
-    # EMPTY counts as missing, and that is the whole point: docker CREATES a
-    # bind-mount source that is not there, so a run with the template `.env`
-    # leaves a real, root-owned, empty `/path/to/your/movies` behind — and every
-    # later run then passes an existence check and scans nothing.
-    if [ ! -d "$p" ] || [ -z "$(ls -A "$p" 2>/dev/null)" ]; then
-      echo "media path is missing or empty: $p" >&2
-      echo "  (set REAL_MEDIA_DIR / REAL_TV_DIR in suite/perf/.env — a fresh" >&2
-      echo "   worktree gets .env.example, whose values are placeholders that" >&2
-      echo "   docker will happily create as empty directories)" >&2
-      missing=1
-    fi
-  done
-  [ "$missing" = 0 ] || exit 1
+# The suite mounts NO real media (plan §E2) — a leftover REAL_MEDIA_DIR /
+# REAL_TV_DIR in a stale .env would register libraries at nonexistent container
+# paths and fail minutes later with a misleading scan message. Refused by
+# suite_require_media, which every entry script runs BEFORE the results/raw
+# wipe: aborting after the wipe would destroy the previous run's raw results
+# (merge on them is the documented recovery path).
+suite_refuse_real_media_env() {
+  if [ -n "${REAL_MEDIA_DIR:-}" ] || [ -n "${REAL_TV_DIR:-}" ]; then
+    echo "REAL_MEDIA_DIR/REAL_TV_DIR are no longer supported: the suite mounts no real" >&2
+    echo "media (plan §E2). Remove them from suite/perf/.env and use BENCH_TESTDATA=1." >&2
+    exit 1
+  fi
 }
+# Enforced pre-wipe for the same reason as the refusal above: the snapshot's
+# media files are deliberately absent, so a transcode leg has nothing to serve,
+# and aborting later (in suite_build_libraries) would first destroy the
+# previous run's raw results.
+suite_refuse_transcode_in_testdata() {
+  if [ "${BENCH_TESTDATA:-0}" = 1 ] && [ "${RUN_TRANSCODE:-0}" = 1 ]; then
+    echo "RUN_TRANSCODE=1 is impossible with BENCH_TESTDATA=1 — the snapshot's media files are absent" >&2
+    exit 1
+  fi
+}
+suite_require_media() { suite_refuse_real_media_env; suite_refuse_transcode_in_testdata; }
 
 # The owner's irreplaceable data, protected UNCONDITIONALLY — not only when an
 # env var happens to point at it. Any bind mount that could reach under these
@@ -107,6 +109,14 @@ for name, svc in (cfg.get("services") or {}).items():
             or (v.get("type") == "bind" and any(touches(src, r) for r in roots))
         if is_media and not v.get("read_only"):
             bad.append(f"{name}: {src} -> {tgt} is NOT read-only")
+# A named volume can smuggle a bind via driver_opts (o: bind, device: <path>);
+# its service-level source is then just the volume name and the runtime mount
+# source is /var/lib/docker/volumes/…, so neither check above sees the device.
+# Refuse the construction outright if the device reaches protected media.
+for vname, vdef in (cfg.get("volumes") or {}).items():
+    dev = ((vdef or {}).get("driver_opts") or {}).get("device") or ""
+    if dev and any(touches(dev, r) for r in roots):
+        bad.append(f"volume {vname}: driver_opts.device {dev} reaches protected media")
 for b in bad:
     print(f"media mount check: {b}", file=sys.stderr)
 sys.exit(1 if bad else 0)
@@ -140,6 +150,7 @@ suite_assert_running_mounts_readonly() {
       local r
       for r in ${REAL_MEDIA_DIR:-} ${REAL_TV_DIR:-} ${TESTDATA_MEDIA_ROOTS:-} $SUITE_PROTECTED_MEDIA_ROOTS; do
         [ -n "$r" ] || continue
+        r=${r%/}   # a trailing slash on an env root must not break the subpath pattern
         case "$src" in "$r"|"$r"/*) is_media=1;; esac   # the root, or under it
         case "$r" in "$src"|"$src"/*) is_media=1;; esac # a parent of the root
       done
@@ -174,7 +185,7 @@ suite_require_fixtures() {
   [ -n "$(find fixtures/media -type f 2>/dev/null | head -1)" ] && return 0
   echo "synthetic fixtures are requested but generation produced no files under" >&2
   echo "  suite/perf/fixtures/media (check ffmpeg is installed and gen-fixtures.sh" >&2
-  echo "  ran, or point REAL_MEDIA_DIR at real media and set FIXTURE_*=0)" >&2
+  echo "  ran — or use BENCH_TESTDATA=1, which needs no synthetic video fixtures)" >&2
   exit 1
 }
 
@@ -196,18 +207,36 @@ suite_load_bench_conf() {
   done < <(grep -E '^[A-Z_]+=' "$conf")
 }
 
-# Build the docker-side library list from REAL_MEDIA_DIR/REAL_TV_DIR and/or synthetic padding,
-# then export LIBRARIES + EXPECTED_ITEMS + the passthrough vars every stage needs. Exits 1 if
-# no media is configured. Identical JSON drives provisioning on both servers.
+# Build the docker-side library list (testdata mode: none — the seeded
+# snapshot IS the library; synthetic mode: from the FIXTURE_* counts), then
+# export LIBRARIES + EXPECTED_ITEMS + the passthrough vars every stage needs.
+# Identical JSON drives provisioning on both servers.
 suite_build_libraries() {
+  suite_refuse_real_media_env
+  # Testdata mode (BENCH_TESTDATA=1, plan §E): the seeded snapshot IS the
+  # library — provisioning must add nothing and scan nothing. Adding a library
+  # or kicking a refresh would validate libraries whose media paths are
+  # deliberately absent, and what a scan does to path-less items is
+  # server-specific: the one way this mode could diverge the two datasets.
+  if [ "${BENCH_TESTDATA:-0}" = 1 ]; then
+    suite_refuse_transcode_in_testdata   # belt: entry scripts check pre-wipe via suite_require_media
+    # Live TV stays: registering an M3U tuner + XMLTV guide is additive (no
+    # library validation touches it) and the fixture lives on the synth mount.
+    if [ "${FIXTURE_LIVETV:-0}" -gt 0 ]; then
+      export LIVETV_M3U=/media/synth/livetv/channels.m3u LIVETV_XMLTV=/media/synth/livetv/guide.xml
+    else
+      export LIVETV_M3U="" LIVETV_XMLTV=""
+    fi
+    export LIBRARIES="[]" EXPECTED_ITEMS=0 \
+           BENCH_ADMIN_USER BENCH_ADMIN_PASSWORD JELLYFIN_IMAGE
+    return 0
+  fi
   local libs="[" sep=""
-  [ -n "${REAL_MEDIA_DIR:-}" ] && { libs="$libs${sep}{\"name\":\"Movies\",\"type\":\"movies\",\"path\":\"/media/movies-real\"}"; sep=","; }
-  [ -n "${REAL_TV_DIR:-}" ]    && { libs="$libs${sep}{\"name\":\"Shows\",\"type\":\"tvshows\",\"path\":\"/media/tv-real\"}"; sep=","; }
   [ "${FIXTURE_MOVIES:-0}" -gt 0 ] && { libs="$libs${sep}{\"name\":\"Movies (synth)\",\"type\":\"movies\",\"path\":\"/media/synth/movies\"}"; sep=","; }
   [ "${FIXTURE_SERIES:-0}" -gt 0 ] && { libs="$libs${sep}{\"name\":\"Shows (synth)\",\"type\":\"tvshows\",\"path\":\"/media/synth/tv\"}"; sep=","; }
   [ "${FIXTURE_ARTISTS:-0}" -gt 0 ] && { libs="$libs${sep}{\"name\":\"Music (synth)\",\"type\":\"music\",\"path\":\"/media/synth/music\"}"; sep=","; }
   libs="$libs]"
-  [ "$libs" = "[]" ] && { echo "No media: set REAL_MEDIA_DIR or FIXTURE_MOVIES>0 in the env file" >&2; exit 1; }
+  [ "$libs" = "[]" ] && { echo "No libraries: set FIXTURE_MOVIES>0 in the env file, or use BENCH_TESTDATA=1" >&2; exit 1; }
   # Live TV fixture: the M3U tuner + XMLTV guide both servers are provisioned with (paths on
   # the shared mount; the channel streams themselves come from the livetv-source sidecar).
   if [ "${FIXTURE_LIVETV:-0}" -gt 0 ]; then
@@ -216,12 +245,10 @@ suite_build_libraries() {
     export LIVETV_M3U="" LIVETV_XMLTV=""
   fi
 
-  # Real counts are unknown up front (naming resolvers diverge on real files); the scan waiter
-  # settles on a stable total instead. Synthetic count is exact and known.
-  if [ -n "${REAL_MEDIA_DIR:-}" ] || [ -n "${REAL_TV_DIR:-}" ]; then EXPECTED_ITEMS=0
-  else EXPECTED_ITEMS=$(( ${FIXTURE_MOVIES:-0} + ${FIXTURE_SERIES:-0} * ${FIXTURE_EPISODES_PER_SERIES:-0} )); fi
+  # Synthetic count is exact and known.
+  EXPECTED_ITEMS=$(( ${FIXTURE_MOVIES:-0} + ${FIXTURE_SERIES:-0} * ${FIXTURE_EPISODES_PER_SERIES:-0} ))
 
-  export LIBRARIES="$libs" EXPECTED_ITEMS REAL_MEDIA_DIR REAL_TV_DIR \
+  export LIBRARIES="$libs" EXPECTED_ITEMS \
          BENCH_ADMIN_USER BENCH_ADMIN_PASSWORD JELLYFIN_IMAGE
 }
 
@@ -299,4 +326,144 @@ suite_guard_no_probe() {
     echo "!! refusing probe: a measured load phase is active" >&2; return 1
   fi
   return 0
+}
+
+# ── Testdata mode (BENCH_TESTDATA=1, PLAN_SUITE_TRUSTWORTHY §E) ──────────────
+# The suite's data is a pinned, read-only snapshot of a real Jellyfin instance
+# at suite/test_data/ (see suite/snapshot-testdata.sh). Each server gets its
+# own writable COPY seeded into its compose config volume before it starts:
+# Jellyfin reads it natively, Ferrofin adopts it (adoption MUTATES the db,
+# which is why nothing may ever boot the pin itself). No media is mounted at
+# all — browse/query/user-data come from the db, images from metadata/.
+
+SUITE_TESTDATA_PIN=../test_data                     # relative to suite/perf/
+SUITE_TESTDATA_STAGE=../../target/bench-testdata-stage   # under target/: gitignored, same fs as the pin
+
+# Stage the pin once: hardlink the tree (cheap, same filesystem), REAL-copy the
+# database (a hardlinked db + sqlite UPDATE would write through into the pin),
+# strip what must not ride along, and reset the admin user's password to the
+# bench credentials so AuthenticateByName (a measured endpoint) works without
+# shipping real credentials anywhere. Re-staged only when the pin changes.
+suite_stage_testdata() {
+  # MANIFEST.json is tracked, the data is not — a fresh worktree/clone has the
+  # manifest and nothing else, so the guard must key on the database itself.
+  [ -f "$SUITE_TESTDATA_PIN/MANIFEST.json" ] && [ -f "$SUITE_TESTDATA_PIN/data/jellyfin.db" ] || {
+    echo "testdata pin missing or dataless: suite/test_data — run suite/snapshot-testdata.sh" >&2; exit 1; }
+  local stage="$SUITE_TESTDATA_STAGE"
+  if [ -f "$stage/MANIFEST.json" ] && cmp -s "$stage/MANIFEST.json" "$SUITE_TESTDATA_PIN/MANIFEST.json"; then
+    suite_export_testdata_user
+    # BENCH_ADMIN_PASSWORD may have changed since the stage was built; the
+    # reset is idempotent and only touches the stage db's own inode. If it
+    # fails (stage db missing/corrupt despite the manifest), fall through and
+    # rebuild the stage instead of wedging every subsequent run.
+    if suite_stage_set_password; then return 0; fi
+    echo ">> stage unusable (password reset failed) — restaging" >&2
+  fi
+  echo ">> staging testdata snapshot ($(command grep -o '"base_items": [0-9]*' "$SUITE_TESTDATA_PIN/MANIFEST.json" || true))"
+  # A stale stage can carry read-only dirs (interrupted run) that rm cannot
+  # descend — restore write bits on DIRECTORIES ONLY first: its files are
+  # hardlinks into the pin, and chmod on one writes through to the pin's
+  # shared inode. (Unlinking a read-only file needs only a writable parent.)
+  # Literal path, never a variable.
+  if [ -d ../../target/bench-testdata-stage ]; then
+    find ../../target/bench-testdata-stage -type d -exec chmod u+w {} +
+    rm -rf -- ../../target/bench-testdata-stage
+  fi
+  mkdir -p "$stage"
+  local entry base
+  while IFS= read -r entry; do
+    base=$(basename "$entry")
+    case "$base" in
+      # plugins/ would make Jellyfin load the real instance's plugins while
+      # FERROFIN_DISABLE_EXTENSIONS=1 muzzles Ferrofin's — strip it for BOTH.
+      # log/temp/transcodes are runtime junk; the db is real-copied below.
+      plugins|log|temp|transcodes|MANIFEST.json) continue;;
+    esac
+    cp -al "$entry" "$stage/" 2>/dev/null || {
+      # Cross-device fallback (target/ on another filesystem): the failed
+      # cp -al leaves a read-only directory skeleton plain cp -a cannot write
+      # into — free the DIRS (never file modes: hardlinks share the pin's
+      # inode), then copy for real. -f unlinks any half-made read-only file;
+      # either way a fresh inode, the pin untouched.
+      find "$stage/$(basename "$entry")" -type d -exec chmod u+w {} + 2>/dev/null || true
+      cp -af "$entry" "$stage/"
+    }
+  done < <(find "$SUITE_TESTDATA_PIN" -mindepth 1 -maxdepth 1)
+  # Directories came over read-only from the pin (cp -al copies dirs for real,
+  # hardlinks only files). Make DIRECTORIES writable — and ONLY directories:
+  # chmod on a hardlinked file writes through to the pin's shared inode and
+  # would strip the pin's own read-only protection.
+  find "$stage" -type d -exec chmod u+w {} +
+  rm -f -- "$stage/data/jellyfin.db"            # remove the HARDLINK before real-copying
+  cp -- "$SUITE_TESTDATA_PIN/data/jellyfin.db" "$stage/data/jellyfin.db"
+  chmod u+w -- "$stage/data/jellyfin.db"        # its own inode — safe to make writable
+  suite_export_testdata_user
+  suite_stage_set_password
+  cp -- "$SUITE_TESTDATA_PIN/MANIFEST.json" "$stage/MANIFEST.json"   # stamp LAST: an interrupted stage never matches
+}
+
+# Reset the bench user's password IN THE STAGE db (its own inode, never the
+# pin) to BENCH_ADMIN_PASSWORD — Jellyfin's own hash format, byte-compatible
+# with Ferrofin. Idempotent; also run on stage REUSE, since the configured
+# password may have changed since the stage was built.
+suite_stage_set_password() {
+  python3 - "$SUITE_TESTDATA_STAGE/data/jellyfin.db" "$BENCH_ADMIN_USER" "$BENCH_ADMIN_PASSWORD" <<'PY'
+import hashlib, secrets, sqlite3, sys
+db, user, pw = sys.argv[1:4]
+salt = secrets.token_bytes(16)                      # Jellyfin Constants: 128-bit salt
+h = hashlib.pbkdf2_hmac("sha512", pw.encode(), salt, 210000)  # DefaultIterations
+cur = sqlite3.connect(f"file:{db}?mode=rw", uri=True).cursor()  # missing db must FAIL, not be created
+cur.execute("UPDATE Users SET Password=? WHERE Username=?",
+            (f"$PBKDF2-SHA512$iterations=210000${salt.hex().upper()}${h.hex().upper()}", user))
+cur.connection.commit()
+sys.exit(0 if cur.rowcount == 1 else 1)
+PY
+}
+
+# The bench user is the snapshot's first user (its real admin) — exported so
+# benchlib's AuthenticateByName logs in as a user that actually exists there.
+suite_export_testdata_user() {
+  BENCH_ADMIN_USER=$(sqlite3 "file:$SUITE_TESTDATA_PIN/data/jellyfin.db?mode=ro&immutable=1" \
+                     "SELECT Username FROM Users ORDER BY rowid LIMIT 1")
+  [ -n "$BENCH_ADMIN_USER" ] || { echo "testdata pin has no users" >&2; exit 1; }
+  export BENCH_ADMIN_USER
+}
+
+# Fill one service's config volume from the stage. The volume must exist and
+# the container must NOT be running yet (compose create → seed → start).
+suite_seed_config_volume() {  # $1 = ferrofin|jellyfin
+  local vol="${COMPOSE_PROJECT_NAME:-ferrofin-bench}_$1-config"
+  local stage_abs; stage_abs=$(cd "$SUITE_TESTDATA_STAGE" && pwd)
+  docker run --rm -v "$vol":/config -v "$stage_abs":/src:ro alpine \
+    sh -c 'rm -rf /config/..?* /config/.[!.]* /config/* 2>/dev/null; cp -a /src/. /config/ && rm -f /config/MANIFEST.json && chmod -R u+w /config'
+}
+
+# The one bring-up entry: replaces bare `docker compose up -d` at every server
+# start site. Testdata mode seeds each server's config volume between create
+# and start; otherwise it is exactly the old `up`. Always follow with
+# suite_assert_running_mounts_readonly at the call site.
+suite_up_seeded() {  # usage: suite_up_seeded [--build] svc...
+  local build=""
+  [ "${1:-}" = "--build" ] && { build="--build"; shift; }
+  if [ "${BENCH_TESTDATA:-0}" = 1 ]; then
+    suite_stage_testdata
+    # Seed only volumes that do not exist yet: a surviving volume is KEPT data
+    # (BENCH_KEEP_DATA, a mid-sweep recreate) and re-seeding it would wipe the
+    # adopted state the caller deliberately preserved. (Existing is not proof
+    # of seeded — an interrupt between create and seed leaves an empty volume,
+    # which then fails loudly downstream as "serves no items".)
+    local proj="${COMPOSE_PROJECT_NAME:-ferrofin-bench}" svc seed=()
+    for svc in "$@"; do
+      case "$svc" in ferrofin|jellyfin)
+        docker volume inspect "${proj}_${svc}-config" >/dev/null 2>&1 || seed+=("$svc");;
+      esac
+    done
+    # shellcheck disable=SC2086
+    docker compose create $build "$@"
+    for svc in ${seed+"${seed[@]}"}; do suite_seed_config_volume "$svc"; done
+    docker compose start "$@"
+  else
+    # shellcheck disable=SC2086
+    docker compose up -d $build "$@"
+  fi
 }

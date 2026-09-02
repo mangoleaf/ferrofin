@@ -150,7 +150,7 @@ cat > "$STAGE/MANIFEST.json" <<JSON
   "base_items": $items,
   "users": $users,
   "taken": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-  "note": "Real library data — never commit, never publish. Refresh with suite/snapshot-testdata.sh --refresh"
+  "note": "Identifies the pin only. The snapshot DATA is never committed or published; refresh with suite/snapshot-testdata.sh --refresh"
 }
 JSON
 

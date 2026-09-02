@@ -49,8 +49,10 @@ services:
       # Lets the sweep surface the db_pool sampler (RUST_LOG=ferrofin_server=debug).
       RUST_LOG: ${BENCH_RUST_LOG:-info}
     volumes:
-      - ${REAL_MEDIA_DIR:-./fixtures/empty}:/media/movies-real:ro
-      - ${REAL_TV_DIR:-./fixtures/empty}:/media/tv-real:ro
+      # NO real media is mounted — the agreed invariant (plan §E2). The data
+      # comes from the seeded snapshot volume; /media/synth carries only
+      # generated fixtures (Live TV source files). suite_assert_media_readonly
+      # still guards any future mount edit.
       - ./fixtures/media:/media/synth:ro
       - ferrofin-config:/config
       # A counterpart to the jellyfin service's `jellyfin-cache:/cache` below.
@@ -71,8 +73,7 @@ services:
     mem_limit: ${BENCH_MEM}
     ports: ["${JELLYFIN_HOST_PORT:-18097}:8096"]
     volumes:
-      - ${REAL_MEDIA_DIR:-./fixtures/empty}:/media/movies-real:ro
-      - ${REAL_TV_DIR:-./fixtures/empty}:/media/tv-real:ro
+      # Mirrors the ferrofin service: no real media, ever.
       - ./fixtures/media:/media/synth:ro
       - jellyfin-config:/config
       - jellyfin-cache:/cache

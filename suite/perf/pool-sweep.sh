@@ -39,8 +39,8 @@ wait200() { for _ in $(seq 1 240); do curl -sf "$BASE$SUITE_READY_PATH" >/dev/nu
 echo ">> clean start (fresh volume — the one scan of the sweep)"
 docker compose down -v >/dev/null 2>&1 || true
 first_size=${POOL_SIZES%% *}
-if [ "${BENCH_SKIP_BUILD:-0}" = "1" ]; then FERROFIN_DB_POOL="$first_size" docker compose up -d ferrofin
-else FERROFIN_DB_POOL="$first_size" docker compose up -d --build ferrofin; fi
+if [ "${BENCH_SKIP_BUILD:-0}" = "1" ]; then FERROFIN_DB_POOL="$first_size" suite_up_seeded ferrofin
+else FERROFIN_DB_POOL="$first_size" suite_up_seeded --build ferrofin; fi
 suite_assert_running_mounts_readonly
 wait200
 echo ">> provision + scan (once)"

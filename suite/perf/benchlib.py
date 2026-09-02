@@ -285,7 +285,25 @@ def jellyfin_first_run_wizard(base, target):
 
 def bring_up(base, target):
     """Provision one server end-to-end and return its ready ctx
-    (token, userId, itemsFound, username/password for body templates)."""
+    (token, userId, itemsFound, username/password for body templates).
+
+    BENCH_TESTDATA=1 (PLAN_SUITE_TRUSTWORTHY §E): the config volume was seeded
+    with a copy of the pinned real-library snapshot before the server started —
+    wizard completed, users present, library already scanned by the real
+    instance, BENCH_ADMIN_USER's password reset to BENCH_ADMIN_PASSWORD at
+    stage time. Nothing to provision and nothing to scan: adding a library or
+    kicking a refresh here would scan libraries whose media paths are
+    deliberately absent, and what a validation pass does to path-less items is
+    server-specific — the one way this mode could diverge the two datasets."""
+    if os.environ.get("BENCH_TESTDATA") == "1":
+        ctx = authenticate(base, target)
+        ctx["username"], ctx["password"] = USER, PASS
+        ctx["itemsFound"] = item_count(base, ctx, "Movie,Episode")
+        if ctx["itemsFound"] <= 0:
+            raise RuntimeError(
+                f"[{target}] testdata mode: seeded snapshot serves no items — "
+                "was the config volume seeded before start?")
+        return ctx
     if target == "jellyfin":
         jellyfin_first_run_wizard(base, target)
     ctx = authenticate(base, target)

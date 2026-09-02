@@ -54,9 +54,9 @@ suite_build_libraries
 # silently-wrong-number case, and --rebaseline would enshrine it.
 suite_gen_fixtures
 suite_require_fixtures
-# …and refuse to start if that library does not exist on disk. Docker would
-# otherwise CREATE the missing mount point (root-owned, which then needs sudo to
-# clear), scan nothing, and report it as a memory problem.
+# …and refuse a stale env early: REAL_MEDIA_DIR is no longer supported (the
+# suite mounts no real media), and RUN_TRANSCODE=1 is impossible in testdata
+# mode — both abort here, before anything is wiped or started.
 suite_require_media
 suite_assert_media_readonly   # real media is never writable from the suite
 
