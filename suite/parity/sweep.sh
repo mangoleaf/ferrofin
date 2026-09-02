@@ -15,6 +15,7 @@ suite_load_env "$PARITY_ENV"
 suite_mint_device_id parity
 suite_build_libraries   # LIBRARIES is parsed by sweep.py
 suite_require_media
+suite_assert_media_readonly   # real media is never writable from the suite
 suite_gen_fixtures
 suite_require_fixtures
 
@@ -22,6 +23,7 @@ echo ">> starting both servers"
 docker compose down -v >/dev/null 2>&1 || true
 if [ "${BENCH_SKIP_BUILD:-0}" = 1 ]; then docker compose up -d ferrofin jellyfin livetv-source hdhomerun-source
 else docker compose up -d --build ferrofin jellyfin livetv-source hdhomerun-source; fi
+suite_assert_running_mounts_readonly
 trap 'docker compose down -v >/dev/null 2>&1 || true' EXIT
 
 # Host ports follow the compose file's overrides, so a worktree can run its own leg

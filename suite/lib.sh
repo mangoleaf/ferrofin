@@ -61,6 +61,106 @@ suite_require_media() {
   [ "$missing" = 0 ] || exit 1
 }
 
+# The owner's irreplaceable data, protected UNCONDITIONALLY — not only when an
+# env var happens to point at it. Any bind mount that could reach under these
+# (the root itself, a subpath, or a parent directory of one) must be read-only.
+SUITE_PROTECTED_MEDIA_ROOTS="/mnt/mangonas /mnt/nvme0/k3s"
+
+# HARD INVARIANT: the suite never writes to real media. Every host path mounted
+# into a server container under /media MUST be read-only, and this refuses to
+# start if one is not.
+#
+# It is not paranoia about the mount line alone. A server booted on a real
+# config directory carries that instance's library options, which may include
+# "save metadata/artwork into media folders" — a scan would then write .nfo and
+# image files next to the owner's media. `:ro` is what makes that attempt fail
+# harmlessly instead of mutating an irreplaceable library, so it may never be
+# optional and may never be quietly dropped by an edit.
+# Pre-flight, over the RESOLVED compose config, never the YAML text: the media
+# mounts here are `${REAL_MEDIA_DIR:-…}:/media/…` lines, and a text parse cannot
+# see through the interpolation (it read `${REAL_MEDIA_DIR` as the host source).
+# `docker compose config` resolves variables and normalises every volume to long
+# form, so this checks the mounts `up` would actually create. Keyed on both the
+# container path (/media…) and the real host roots, and it FAILS CLOSED: if the
+# config cannot be resolved, the run does not start.
+suite_assert_media_readonly() {
+  docker compose config --format json 2>/dev/null \
+    | MEDIA_ROOTS="${REAL_MEDIA_DIR:-} ${REAL_TV_DIR:-} ${TESTDATA_MEDIA_ROOTS:-} $SUITE_PROTECTED_MEDIA_ROOTS" python3 -c '
+import json, os, sys
+cfg = json.load(sys.stdin)
+# NOTE: roots are whitespace-split — a root containing spaces or glob chars
+# would mis-match. Fine for the real paths in use; do not add one with spaces.
+roots = [r.rstrip("/") for r in os.environ.get("MEDIA_ROOTS", "").split() if r]
+def touches(src, r):
+    # Either containment direction is media-reaching: a mount OF the root or a
+    # subpath, and a mount of a PARENT (e.g. /mnt/nvme0/k3s:/data, or / itself)
+    # through which the root is writable.
+    src = src.rstrip("/")   # "/" normalises to "", and "".startswith→parent-of-all
+    return src == r or src.startswith(r + "/") or r.startswith(src + "/")
+bad = []
+for name, svc in (cfg.get("services") or {}).items():
+    for v in svc.get("volumes") or []:
+        if not isinstance(v, dict):   # config emits long form; anything else is unresolvable
+            bad.append(f"{name}: unparsed volume entry {v!r}"); continue
+        src, tgt = v.get("source") or "", v.get("target") or ""
+        is_media = tgt == "/media" or tgt.startswith("/media/") \
+            or (v.get("type") == "bind" and any(touches(src, r) for r in roots))
+        if is_media and not v.get("read_only"):
+            bad.append(f"{name}: {src} -> {tgt} is NOT read-only")
+for b in bad:
+    print(f"media mount check: {b}", file=sys.stderr)
+sys.exit(1 if bad else 0)
+' || {
+    echo "" >&2
+    echo "REFUSING TO START. The suite must never be able to write to real media;" >&2
+    echo "every media mount has to be read-only (or docker compose config failed)." >&2
+    exit 1
+  }
+}
+
+# Post-start: assert against REALITY, not the compose text. Reads the running
+# containers' actual mounts and refuses if any media mount came up writable —
+# the compose file being right is not the same as the mount being right.
+suite_assert_running_mounts_readonly() {
+  local bad=0 cid cids name dest rw src mounts n=0
+  # Fail CLOSED, like the pre-flight: this runs right after an `up`, so an
+  # errored or empty listing means the guard cannot see what it must verify —
+  # never that everything is fine.
+  cids=$(docker compose ps -q) || cids=""
+  for cid in $cids; do
+    n=$((n + 1))
+    name=$(docker inspect -f '{{.Name}}' "$cid" 2>/dev/null) || name="$cid"
+    mounts=$(docker inspect -f '{{range .Mounts}}{{.Destination}}|{{.RW}}|{{.Source}}
+{{end}}' "$cid") || { echo "docker inspect $name failed; refusing" >&2; bad=1; continue; }
+    while IFS='|' read -r dest rw src; do
+      [ -n "$dest" ] || continue
+      local is_media=0
+      case "$dest" in /media*) is_media=1;; esac
+      case "$src" in /) is_media=1;; esac   # a bind of / reaches everything
+      local r
+      for r in ${REAL_MEDIA_DIR:-} ${REAL_TV_DIR:-} ${TESTDATA_MEDIA_ROOTS:-} $SUITE_PROTECTED_MEDIA_ROOTS; do
+        [ -n "$r" ] || continue
+        case "$src" in "$r"|"$r"/*) is_media=1;; esac   # the root, or under it
+        case "$r" in "$src"|"$src"/*) is_media=1;; esac # a parent of the root
+      done
+      [ "$is_media" = 1 ] || continue
+      if [ "$rw" = "true" ]; then
+        echo "!! $name has $src -> $dest mounted WRITABLE" >&2
+        bad=1
+      fi
+    done <<<"$mounts"
+  done
+  if [ "$n" -lt 1 ]; then
+    echo "REFUSING TO PROCEED: no running containers found to verify after up" >&2
+    bad=1
+  fi
+  if [ "$bad" != 0 ]; then
+    echo "REFUSING TO PROCEED: a running container can write to real media (or could not be verified)." >&2
+    docker compose down -v >/dev/null 2>&1 || true
+    exit 1
+  fi
+}
+
 # The synth half of the same guard, as a POSTcondition of suite_gen_fixtures —
 # before it, an empty fixtures/media is the normal fresh-worktree state, not an
 # error. Uses `find -type f`, not `ls -A`: run.sh pre-creates

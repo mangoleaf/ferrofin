@@ -20,6 +20,7 @@ bringup_scan() {
     # A fresh DB invalidates any ctx.json from a prior run — stale ids would 404.
     rm -f "results/raw/$target-ctx.json"
     if [ "${BENCH_SKIP_BUILD:-0}" = "1" ]; then docker compose up -d "$svc"; else docker compose up -d --build "$svc"; fi
+    suite_assert_running_mounts_readonly
     up=0
     for _ in $(seq 1 120); do curl -sf "$base$SUITE_READY_PATH" >/dev/null 2>&1 && { up=1; break; }; sleep 1; done
     if [ "$up" = 1 ] && python3 bootstrap.py --target "$target" --base "$base"; then return 0; fi

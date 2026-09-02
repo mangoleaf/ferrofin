@@ -41,6 +41,7 @@ docker compose down -v >/dev/null 2>&1 || true
 first_size=${POOL_SIZES%% *}
 if [ "${BENCH_SKIP_BUILD:-0}" = "1" ]; then FERROFIN_DB_POOL="$first_size" docker compose up -d ferrofin
 else FERROFIN_DB_POOL="$first_size" docker compose up -d --build ferrofin; fi
+suite_assert_running_mounts_readonly
 wait200
 echo ">> provision + scan (once)"
 python3 bootstrap.py --target ferrofin --base "$BASE"
@@ -50,6 +51,7 @@ for n in $POOL_SIZES; do
   # Recreate the container with the new env; the data volume (scanned library)
   # persists, so this is seconds, not a rescan.
   FERROFIN_DB_POOL="$n" docker compose up -d ferrofin
+  suite_assert_running_mounts_readonly
   wait200
   python3 pool_sweep.py --base "$BASE" --pool "$n" </dev/null
   # Keep the pool-sampler evidence for this size (acquisition-wait diagnosis).

@@ -56,6 +56,7 @@ mkdir -p results/raw fixtures/empty fixtures/media/movies fixtures/media/tv
 # previous run's raw results, and `suite/run.sh merge` on them is the documented
 # recovery path. (The synthetic-fixture half runs after gen_fixtures.)
 suite_require_media
+suite_assert_media_readonly   # real media is never writable from the suite
 
 # BENCH_ONLY=ferrofin|jellyfin re-runs one leg, keeping the other's raw results.
 # ctx files are exempt from the wipe: they are provisioning STATE, not results
@@ -130,6 +131,7 @@ bench() {  # $1=service $2=port $3=TARGET
   else
     docker compose up -d --build "$svc"
   fi
+  suite_assert_running_mounts_readonly
 
   local cold; cold=$(coldstart "$base"); echo "   cold-start: ${cold}s"
   echo "$cold" > "results/raw/$target-cold.txt"

@@ -58,6 +58,7 @@ suite_require_fixtures
 # otherwise CREATE the missing mount point (root-owned, which then needs sudo to
 # clear), scan nothing, and report it as a memory problem.
 suite_require_media
+suite_assert_media_readonly   # real media is never writable from the suite
 
 BASE="http://localhost:$FERROFIN_HOST_PORT"
 

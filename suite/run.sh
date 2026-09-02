@@ -35,11 +35,13 @@ case "$stage" in
     suite_mint_device_id calibrate
     suite_build_libraries
     suite_require_media
+    suite_assert_media_readonly
     suite_gen_fixtures
     suite_require_fixtures
     docker compose down -v >/dev/null 2>&1 || true
     rm -f results/raw/jellyfin-ctx.json   # fresh DB ⇒ saved tokens/ids are dead
     docker compose up -d jellyfin
+    suite_assert_running_mounts_readonly
     JPORT="${JELLYFIN_HOST_PORT:-18097}"
     suite_wait200 "http://localhost:$JPORT" jellyfin
     python3 compare.py --target jellyfin --base "http://localhost:$JPORT" --calibrate-rates
