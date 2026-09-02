@@ -78,7 +78,7 @@ def container_read(base, path):
 
 # ---------------------------------------------------------------- HTTP
 
-def http(method, url, token=None, body=None):
+def http(method, url, token=None, body=None, timeout=30):
     headers = {"Content-Type": "application/json"}
     if token is not None:
         headers["Authorization"] = f'MediaBrowser Token="{token}", {CLIENT}'
@@ -87,7 +87,7 @@ def http(method, url, token=None, body=None):
     data = body.encode() if isinstance(body, str) else body
     req = urllib.request.Request(url, data=data, method=method.upper(), headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=30) as r:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             raw = r.read()
             return r.status, raw
     except urllib.error.HTTPError as e:
@@ -399,7 +399,7 @@ def bring_up(base, target):
     # pointing away from the real cause.
     if os.environ.get("BENCH_TESTDATA") == "1":
         # Two very different causes land here and only one is about seeding —
-        # observed live: a journeys-triggered Jellyfin Backup/Create holds the
+        # observed live: a Jellyfin Backup/Create holds the
         # exclusive DB lock for HOURS on a 42k-item library, and every auth
         # attempt 500s ("database is locked") until it finishes.
         raise SystemExit(

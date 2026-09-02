@@ -287,7 +287,6 @@ JOURNEY_METHOD.update({op: verification.EFFECT for op in (
     "GET /Users/{userId}",
     "POST /Audio/{itemId}/Lyrics",
     "POST /Auth/Keys",
-    "POST /Backup/Create",
     "POST /ClientLog/Document",
     "POST /Collections",
     "POST /Collections/{collectionId}/Items",
@@ -3421,25 +3420,27 @@ def j_remote_search_identify(base, token, user, _m, _m2):
 
 
 def j_backup(base, token, user, _m, _m2):
-    """Backup create → manifest → list on the server's own data dir. The manifest must echo
-    the posted options, the Manifest route must read the same manifest back by the returned
-    path, and the listing must contain it. (Restore restarts the server: terminal.py.)"""
+    """Manifest + list against the PINNED backup — the Jellyfin-authored zip
+    seeded into each server's config volume with the snapshot (data/backups/).
+    Backup/Create is NOT exercised here: on a real-size library Jellyfin's
+    Database backup serializes every entity row-by-row while holding the
+    pessimistic exclusive DB lock — hours, with every concurrent request
+    500ing "database is locked" (measured 2026-09-01, plan §D0) — which
+    wedged every layer after journeys. The create op runs LAST of everything,
+    bounded, in terminal.py. The listing must contain the pinned artifact and
+    the Manifest route must read the same manifest back by its path — on BOTH
+    servers, which is the drop-in story itself: Ferrofin serving a backup
+    Jellyfin wrote."""
     r = {}
-    opts = {"Metadata": False, "Trickplay": False, "Subtitles": False, "Database": True}
-    st, raw = http("POST", f"{base}/Backup/Create", token, json.dumps(opts))
-    try:
-        created = json.loads(raw)
-    except ValueError:
-        created = {}
-    path = created.get("Path") or ""
-    r["POST /Backup/Create"] = (st == 200 and bool(path) and created.get("Options") == opts
-                                and bool(created.get("BackupEngineVersion"))
-                                and bool(created.get("DateCreated")))
-    if path:
-        manifest = get_json(base, "/Backup/Manifest?path=" + urllib.parse.quote(path), token) or {}
-        r["GET /Backup/Manifest"] = manifest == created
-        listed = get_json(base, "/Backup", token) or []
-        r["GET /Backup"] = any(m.get("Path") == path for m in listed)
+    listed = get_json(base, "/Backup", token) or []
+    pinned = next((m for m in listed if m.get("Path")), None)
+    r["GET /Backup"] = pinned is not None
+    if pinned:
+        manifest = get_json(
+            base, "/Backup/Manifest?path=" + urllib.parse.quote(pinned["Path"]), token) or {}
+        r["GET /Backup/Manifest"] = (manifest == pinned
+                                     and bool(manifest.get("BackupEngineVersion"))
+                                     and bool(manifest.get("DateCreated")))
     return r
 
 

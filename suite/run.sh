@@ -2,7 +2,9 @@
 # suite/run.sh — the one entry point for the merged parity + perf suite (Plan 6).
 #
 #   suite/run.sh calibrate  measure per-endpoint capacity on Jellyfin → suite/perf/rates.json
-#   suite/run.sh parity   both servers up   → sweep + reads + journeys + assets → ledger
+#   suite/run.sh parity   both servers up, NO media mounted → sweep + reads + journeys + push + terminal → ledger
+#   suite/run.sh streams  both servers up, real media READ-ONLY → assets + streams differentials → ledger
+#                         (the ONLY stage that mounts media; read-only probes only — see streams-stage.sh)
 #   suite/run.sh perf     one-at-a-time     → open-loop vegeta bench → per-endpoint latencies (+fingerprints)
 #   suite/run.sh all      parity, then perf, same build + same fixture → merged run record
 #   suite/run.sh publish  parity once, then BENCH_RUNS × (perf + merge) → agg-<sha> distributions
@@ -49,6 +51,7 @@ case "$stage" in
     echo ">> wrote suite/perf/rates.json — commit it (host/fixture-local, like the baseline)"
     ;;
   parity)  exec "$ROOT/suite/parity/sweep.sh" "$@" ;;
+  streams) exec "$ROOT/suite/parity/streams-stage.sh" "$@" ;;
   perf)    exec "$ROOT/suite/perf/run.sh" "$@" ;;
   push)
     # The Ferrofin-only SMOKE TEST for server→client pushes (remote control / cast

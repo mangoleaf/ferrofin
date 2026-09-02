@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
-"""Terminal phase: the three lifecycle ops that END the differential — runs LAST.
+"""Terminal phase: the lifecycle ops that END the differential — runs LAST.
 
-  POST /Backup/Restore   204; the server restarts and the backed-up state is live again
+  POST /Backup/Restore   204; the server restarts and the PINNED backup's state is live
   POST /System/Restart   204; the server goes away and comes back, in-process (the
                          container keeps running, as Jellyfin's Program.Main loop does)
   POST /System/Shutdown  204; the server goes away and stays away; the container exits
+  POST /Backup/Create    LAST of everything, after the pair is docker-restarted and
+                         bounded by CREATE_TIMEOUT_S: on a real-size library Jellyfin
+                         serializes every entity row-by-row under the pessimistic
+                         exclusive DB lock — hours, every concurrent request 500ing
+                         "database is locked" (measured 2026-09-01, plan §D0). A
+                         timeout is recorded as the measured outcome, never retried,
+                         and nothing runs after it on the same pair.
 
 None of these has a body to diff — their observable effect is the liveness timeline
 (reachable → unreachable → reachable, or → stays unreachable), a read-back after the
@@ -78,33 +85,41 @@ def disclaimer(base, token):
 
 
 def t_restore(base, token):
-    """Backup with a distinctive config value → overwrite it → Restore → the server restarts
-    and the backed-up value is live again."""
-    ok = branding(base, token, "parity-before")
-    st, raw = http("POST", f"{base}/Backup/Create", token, json.dumps({"Database": True}))
-    try:
-        path = json.loads(raw).get("Path") or ""
-    except ValueError:
-        path = ""
-    ok = ok and st == 200 and bool(path) and branding(base, token, "parity-after")
-    ok = ok and disclaimer(base, token) == "parity-after"
-    if not ok:
-        branding(base, token, "")
+    """Overwrite a config value → Restore from the PINNED backup (the
+    Jellyfin-authored zip seeded with the config volume) → the server restarts
+    and the overwrite is gone. Backup/Create is never called here — on a
+    real-size library it holds Jellyfin's exclusive DB lock for hours (plan
+    §D0); the create op runs LAST, in t_backup_create. The verdict anchors on
+    the overwrite being rolled back; `pre` rides in the note so drift between
+    the pre-state and the pin's own value is visible to a human."""
+    listed = get_json(base, "/Backup", token) or []
+    path = next((m.get("Path", "") for m in listed if m.get("Path")), "")
+    if not path:
+        return False, "no pinned backup listed (was the volume seeded with the backup pin?)"
+    before = disclaimer(base, token)
+    if not (branding(base, token, "parity-after") and disclaimer(base, token) == "parity-after"):
+        branding(base, token, before)
         return False, "setup failed"
     st, _ = http("POST", f"{base}/Backup/Restore", token,
                  json.dumps({"ArchiveFileName": os.path.basename(path)}))
     if st != 204:
-        branding(base, token, "")
+        branding(base, token, before)
         return False, f"restore status {st}"
     if not bounce_observed(base):
-        branding(base, token, "")
+        branding(base, token, before)
         return False, "no restart observed after restore"
     token = wait_auth(base)
     if token is None:
         return False, "server did not come back after the restore"
-    value = disclaimer(base, token)
-    branding(base, token, "")   # leave the config as the harness found it
-    return value == "parity-before", f"post-restore LoginDisclaimer={value!r}"
+    cfg = get_json(base, "/Branding/Configuration", token)
+    if cfg is None:
+        # A failed read-back must not score as a successful rollback — the pin's
+        # own disclaimer is legitimately null, so only the dict distinguishes
+        # "read failed" from "value is null".
+        return False, "post-restore branding read failed"
+    value = cfg.get("LoginDisclaimer")
+    # No cleanup write: the restore just reinstated the pin's own config wholesale.
+    return value != "parity-after", f"pre={before!r} post-restore={value!r}"
 
 
 def t_restart(base, token):
@@ -127,6 +142,32 @@ def t_shutdown(base, token):
         return False, "came back after shutdown"
     running = container_running(base)
     return running is not True, f"container running after shutdown: {running}"
+
+
+CREATE_TIMEOUT_S = int(os.environ.get("PARITY_BACKUP_CREATE_TIMEOUT_S", "120"))
+
+
+def t_backup_create(base, token):
+    """POST /Backup/Create with the journey's canonical Database-only options,
+    bounded by CREATE_TIMEOUT_S. Success = the create response carries the
+    manifest (path, echoed options, engine version, date). A timeout is the
+    measured outcome on a server that cannot complete the op on this corpus in
+    bounded time — recorded, not retried (see the module docstring)."""
+    opts = {"Metadata": False, "Trickplay": False, "Subtitles": False, "Database": True}
+    t0 = time.monotonic()
+    st, raw = http("POST", f"{base}/Backup/Create", token, json.dumps(opts),
+                   timeout=CREATE_TIMEOUT_S)
+    took = time.monotonic() - t0
+    if st == 0 and took >= CREATE_TIMEOUT_S - 1:
+        return False, (f"did not complete within {CREATE_TIMEOUT_S}s — holds the exclusive "
+                       "DB lock for the whole entity serialization (plan §D0)")
+    try:
+        created = json.loads(raw)
+    except ValueError:
+        created = {}
+    ok = (st == 200 and bool(created.get("Path")) and created.get("Options") == opts
+          and bool(created.get("BackupEngineVersion")) and bool(created.get("DateCreated")))
+    return ok, f"status {st} in {took:.1f}s"
 
 
 STEPS = [
@@ -153,28 +194,31 @@ def run_one(base, target):
     return out
 
 
+def classify(h_ok, j_ok):
+    if h_ok and j_ok:
+        return "ok"
+    if h_ok:
+        return "flagged: Jellyfin effect differed (verify: oracle setup or Ferrofin extra)"
+    if j_ok:
+        return "flagged: Ferrofin effect not observed (verify: real gap vs probe method)"
+    return "flagged: effect not observed on either server (likely harness/docker access)"
+
+
+def effect_row(h_pair, j_pair):
+    h_ok, h_note = h_pair
+    j_ok, j_note = j_pair
+    # These ops have no comparable body: the verdict is two independent effect
+    # observations AND-ed. So the row says `effect`, never the ledger's
+    # body-diff headline.
+    return {"deep_verified": bool(h_ok and j_ok), "classification": classify(h_ok, j_ok),
+            "verification_method": verification.EFFECT,
+            "note": f"H={h_ok} ({h_note}) J={j_ok} ({j_note}) "
+                    f"(effect verdict; no body exists to diff)"}
+
+
 def combine(h, j):
-    rows = {}
-    for op, _ in STEPS:
-        h_ok, h_note = h.get(op, (False, "not run"))
-        j_ok, j_note = j.get(op, (False, "not run"))
-        if h_ok and j_ok:
-            cls = "ok"
-        elif h_ok:
-            cls = "flagged: Jellyfin effect differed (verify: oracle setup or Ferrofin extra)"
-        elif j_ok:
-            cls = "flagged: Ferrofin effect not observed (verify: real gap vs probe method)"
-        else:
-            cls = "flagged: effect not observed on either server (likely harness/docker access)"
-        # All three ops answer 204 No Content: there is no body in existence to
-        # diff, and the two servers' responses are never compared with each other
-        # either — the verdict is two independent effect observations AND-ed. So
-        # the row says `effect`, never the ledger's body-diff headline.
-        rows[op] = {"deep_verified": bool(h_ok and j_ok), "classification": cls,
-                    "verification_method": verification.EFFECT,
-                    "note": f"H={h_ok} ({h_note}) J={j_ok} ({j_note}) "
-                            f"(effect verdict; no body exists to diff)"}
-    return rows
+    return {op: effect_row(h.get(op, (False, "not run")), j.get(op, (False, "not run")))
+            for op, _ in STEPS}
 
 
 def restart_pair(*bases):
@@ -203,6 +247,20 @@ def main():
         # Whatever happened, the pair is started again.
         restart_pair(ferrofin, jellyfin)
     rows = combine(h, j)
+    # LAST of everything: Backup/Create can wedge a server for the rest of its
+    # life (plan §D0), so nothing may run on the pair after it. Ferrofin first —
+    # a wedged Jellyfin cannot poison the Ferrofin observation.
+    hc = jc = (False, "server not authable after docker restart")
+    try:
+        tok = wait_auth(ferrofin)
+        if tok:
+            hc = t_backup_create(ferrofin, tok)
+        tok = wait_auth(jellyfin)
+        if tok:
+            jc = t_backup_create(jellyfin, tok)
+    except Exception as e:
+        error = error or f"backup-create: {type(e).__name__}: {e}"
+    rows["POST /Backup/Create"] = effect_row(hc, jc)
     out = {"generated_by": "suite/parity/terminal.py", "last_verified": os.environ.get("PARITY_STAMP", ""),
            "errors": [error] if error else [], "rows": rows}
     with open(os.path.join(ROOT, "suite/parity/terminal-results.json"), "w") as f:
@@ -216,9 +274,13 @@ def main():
 def selfcheck():
     import glob
     spec = json.load(open(sorted(glob.glob(os.path.join(ROOT, "contracts/jellyfin-openapi-*.json")))[-1]))
-    for op, _ in STEPS:
+    for op in [op for op, _ in STEPS] + ["POST /Backup/Create"]:
         method, path = op.split(" ", 1)
         assert method.lower() in spec["paths"].get(path, {}), op
+    # The create row rides the same effect-row shape as the STEPS rows.
+    row = effect_row((True, "status 200 in 1.2s"), (False, "did not complete within 120s"))
+    assert row["deep_verified"] is False and row["verification_method"] == verification.EFFECT
+    assert row["classification"].startswith("flagged: Jellyfin")
     rows = combine({"POST /System/Restart": (True, "x")}, {"POST /System/Restart": (False, "y")})
     assert rows["POST /System/Restart"]["deep_verified"] is False
     assert rows["POST /Backup/Restore"]["note"].startswith("H=False (not run)")
@@ -227,7 +289,7 @@ def selfcheck():
     # Every lifecycle row is an EFFECT verdict. 204 No Content has no body, so a
     # `body-diff` stamp here would be false on its face.
     assert all(r["verification_method"] == verification.EFFECT for r in rows.values())
-    print(f"ok: {len(STEPS)} lifecycle op-keys valid, combine logic, all rows stamped "
+    print(f"ok: {len(STEPS) + 1} lifecycle op-keys valid, combine logic, all rows stamped "
           f"{verification.EFFECT!r}")
 
 

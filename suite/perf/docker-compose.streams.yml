@@ -1,0 +1,29 @@
+# STREAMS-STAGE overlay — the ONLY compose invocation that may see real media.
+#
+# Used exclusively by suite/parity/streams-stage.sh via COMPOSE_FILE; the
+# default compose file mounts no media at all, so every other stage (sweep,
+# journeys, perf, pool-sweep) is physically incapable of touching the library.
+#
+# Every mount here is READ-ONLY, at the exact container path the pinned
+# snapshot's database references (verified against the live file tree
+# 2026-09-01) — and suite_assert_media_readonly + the post-start mount check
+# refuse the run if any of them ever comes up writable. The stage itself runs
+# only read-only probes (assets.py, streams.py); write-op probes live in the
+# media-less sweep stage and must never run against this overlay.
+services:
+  ferrofin:
+    volumes:
+      - ${STREAMS_HOT_MOVIES:?set in suite/perf/.env.streams}:/media/hot/Movies:ro
+      - ${STREAMS_HOT_TV:?set in suite/perf/.env.streams}:/media/hot/TV:ro
+      - ${STREAMS_COLD_MOVIES:?set in suite/perf/.env.streams}:/media/cold/Movies:ro
+      - ${STREAMS_COLD_TV:?set in suite/perf/.env.streams}:/media/cold/TV:ro
+      - ${STREAMS_COLD_MUSIC:?set in suite/perf/.env.streams}:/media/cold/Music:ro
+      - ${STREAMS_COLD_EDU:?set in suite/perf/.env.streams}:/media/cold/Educational:ro
+  jellyfin:
+    volumes:
+      - ${STREAMS_HOT_MOVIES:?set in suite/perf/.env.streams}:/media/hot/Movies:ro
+      - ${STREAMS_HOT_TV:?set in suite/perf/.env.streams}:/media/hot/TV:ro
+      - ${STREAMS_COLD_MOVIES:?set in suite/perf/.env.streams}:/media/cold/Movies:ro
+      - ${STREAMS_COLD_TV:?set in suite/perf/.env.streams}:/media/cold/TV:ro
+      - ${STREAMS_COLD_MUSIC:?set in suite/perf/.env.streams}:/media/cold/Music:ro
+      - ${STREAMS_COLD_EDU:?set in suite/perf/.env.streams}:/media/cold/Educational:ro

@@ -6,3 +6,5 @@ results/raw/
 bench-data.json
 
 results/*.log
+# Streams-stage host identity (real media paths) — like .env, never committed.
+.env.streams

@@ -42,10 +42,9 @@ echo ">> Layer-2 read depth (id-correlated)"
 python3 ../parity/reads.py
 echo ">> Layer-2 write journeys"
 python3 ../parity/journeys.py
-echo ">> Layer-3 binary/asset differential"
-python3 ../parity/assets.py
-echo ">> Layer-3 stream-signature differential (direct / HLS / subtitles / trickplay)"
-python3 ../parity/streams.py
+# Layer-3 (assets.py + streams.py) moved to suite/parity/streams-stage.sh — the
+# only stage allowed to mount real media (read-only). This stage's compose file
+# has no media mounts, which is what makes its write/delete journeys safe.
 echo ">> Layer-2 push differential (server->client WebSocket messages, both servers)"
 python3 ../parity/push.py
 echo ">> terminal phase: restore / restart / shutdown (ends the differential)"
