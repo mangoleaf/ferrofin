@@ -4,3 +4,8 @@ target/
 suite/
 data/
 .claude/
+# The RustCodeGraph index (2.4GB) made "load build context" take longer than
+# the compile; none of these feed the server build.
+.rcg/
+.port/
+brain/
