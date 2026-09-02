@@ -1,0 +1,126 @@
+# Benchmark methodology
+
+This directory produces the comparison table in the root README: Ferrofin against
+Jellyfin 10.11.8 (the vendored contract) and Jellyfin 12.0-rc7, on identical test data,
+on one host. Every number in that table has a one-sentence definition below, and every
+published number passed two checks the run itself performs:
+
+- **comparable** — the server returned the same status and record count as Jellyfin
+  10.11.8 and a field set that is a superset of its, for every request behind the number.
+  A server that returns fewer records, fewer fields, or an error would be "faster" for
+  free; such a cell prints `⚠ not comparable (reason)` (its raw number is kept for the
+  work list) instead of being published. A window in which k6 could not hold the arrival
+  rate, a Jellyfin-side failure, or a transcode with different parameters is flagged the
+  same way.
+- **reproducible** — across three full runs the min–max spread is within 15 % of the
+  median; a wider cell prints `not reproducible` and the measurement is fixed before the
+  number is used.
+
+## What is measured
+
+**Screens.** Load is expressed as *screens a user opens*, each being exactly the request
+set jellyfin-web 10.11.8 issues for it (sources cited in `screens.js`), fired concurrently
+as a browser does (six connections per host), then the first twelve poster images the
+cards would load:
+
+| screen | requests |
+|---|---|
+| home | `/Users/{u}/Views`, `/Users/{u}/Items/Resume` ×3 (video, audio, book), `/Shows/NextUp`, `/Users/{u}/Items/Latest` ×3 (one per library) |
+| movies | `/Users/{u}/Items` — a random page of 100, sorted by name (the library view) |
+| detail | `/Users/{u}/Items/{id}`, `/Items/{id}/Similar`, `SpecialFeatures`, `LocalTrailers` — a random movie from the first 500 by name |
+| series | `/Users/{u}/Items/{id}`, `/Shows/{id}/Seasons`, `/Shows/{id}/Episodes` (first season), `/Items/{id}/Similar` |
+| search | the global search set: `/Items` (all types, limit 800), `/Items` (videos), `/Persons`, `/Artists`, `/Items` (programs) |
+| playback | `POST /Items/{id}/PlaybackInfo` (direct-play profile), `Intros`, `MediaSegments`, `POST /Sessions/Playing`, `POST /Sessions/Playing/Stopped` |
+
+Screens are opened **open-loop** (k6 `constant-arrival-rate`): the next user never waits
+for the previous one, so slow responses do not throttle arrivals and the tails are real.
+The mix is home 3 : movies 2 : detail 2 : series 1 : search 1 : playback 1, in a fixed
+order with fixed picks, so every server receives the identical request sequence.
+Two levels are published: **unloaded** (1 screen/s) and **loaded** (5 screens/s — about
+24 API requests/s plus up to ~55 poster requests/s). Each window is 120 s after a 30 s
+warm-up at the same rate (different picks) that is discarded.
+
+## Definitions (one sentence each)
+
+- **Screen latency** — time from issuing a screen's first request to receiving its last
+  response, p50 / p95 / p99 over the window; **endpoint latency** — `http_req_duration`
+  per request name inside the screens; **err** — share of non-2xx/3xx or transport failures.
+- **Cold start** — milliseconds from the container process start (`docker inspect
+  .State.StartedAt`) to the first authenticated `200` on `GET /UserViews` (the home-screen
+  query), polled every 10 ms, on a *restart* of a server that had already booted this
+  data (the first boot includes Ferrofin's one-time adoption and Jellyfin 12's migration,
+  and is excluded); the median of 5 restarts is the run's number.
+- **HLS first segment** — milliseconds from `POST PlaybackInfo` (a device profile that
+  cannot direct-play the file: vp9/webm only, 2 Mbps cap on an 8 Mbps h264 source; no
+  subtitle) through `master.m3u8` and the variant playlist to the last byte of the first
+  segment; the median of 5 (fresh play session each, encoding killed afterwards) is the
+  run's number; if the servers chose different transcode parameters the cell says so.
+- **Direct-play TTFB** — milliseconds to the first byte of `GET /Videos/{id}/stream?static=true`
+  with `Range: bytes=0-1048575`; the median of 5 is the run's number.
+- **Peak memory** — the maximum of cgroup v2 `memory.stat anon` (heap and stacks of the
+  server and its ffmpeg children; page cache excluded) sampled every 100 ms during the
+  loaded window; **steady memory** — the median of the same over the 60 s idle after it.
+  Every server runs under an 8 GiB cgroup limit with swap disabled (`--memory-swap` =
+  `--memory`; the sampler records `memory.swap.current` to prove it stayed 0), which is
+  part of the definition (.NET sizes its GC heap from it).
+- **Parity** — `N / 412 operations deep-verified`: the number of contract operations whose
+  Ferrofin implementation was compared against the upstream Jellyfin C# (`v10.11.8`) for
+  behavioral equivalence, recorded as rows of `handlers::VERIFIED` in
+  `crates/ferrofin-api/src/handlers/mod.rs` and printed by
+  `cargo test -p ferrofin-api --test contract_superset verified_rows -- --nocapture`.
+  Runtime response comparison is supporting evidence for that work, never the number.
+
+## Test data
+
+Built once by `testdata/build.sh` (see `testdata/gen.py` for every constant):
+a seeded generator writes ~3,000 movies, 250 series (~7,500 episodes) and 800 albums
+(8,000 tracks) with Kodi-style NFO metadata (5,000 people, 30 genres, 200 studios,
+tmdb/imdb ids), locally drawn posters/fanart/logos, and five ffmpeg-generated template
+clips cloned under every name (real streams, no disk cost). It includes 40 multi-version
+movies, 50 HDR10 4K files, 300 multi-track files and one 3-minute 8 Mbps movie for the
+streaming numbers. **Jellyfin 10.11.8 itself scans it** with every remote fetcher off and
+is seeded over its own API (two users; 30 % of movies and 60 % of forty series played,
+5 % favorites, 60 resume positions, 200 ratings), then drained and stopped. The resulting
+config directory is what every server boots a fresh copy of; media is mounted read-only.
+
+## Accuracy controls
+
+- Each server runs alone, in a container pinned to dedicated cores (`SERVER_CPUS`,
+  default 8–15) with the load generator on other cores (`CLIENT_CPUS`, 16–19); the run
+  refuses to start unless those cores are ≥ 90 % idle, and records per 100 ms sample how
+  much of the server's cores was *not* spent by the container (the "interference" row —
+  other processes, plus the kernel's own network work for the server's traffic, which is
+  a few % under load).
+- Scheduled tasks are drained to idle plus a 30 s settle before every window (after
+  provisioning, after the cold-start restarts, before each load level, before TTFS), and
+  item counts are read after the first drain (startup tasks mutate libraries on boot).
+- Every virtual user shares one device id, so all load collapses into one server session
+  (a realism simplification, identical for every server; it does not affect comparability).
+- Every phase writes its file when it ends; `report.py` renders whatever exists and names
+  what is missing; any phase reruns alone (`--only`).
+- The scripts refuse the paths of the owner's real media and server config outright
+  (`/mnt/mangonas`, `/mnt/nvme0/k3s`); every server boots a fresh copy of the test data's
+  `config`, and `media` is bind-mounted read-only, always.
+
+## Instrument validations (done once, against known answers)
+
+| instrument | known answer | measured |
+|---|---|---|
+| memory sampler (`mem_sample.py`) | a container that allocates and touches exactly 512 MiB | 515.2 MiB anon (interpreter overhead ≈ 3 MiB), identical across 80 samples |
+| cold-start timer (`coldstart.py`) | a container that sleeps 3.000 s then starts `python -m http.server` | 3,158–3,188 ms over 5 restarts (≈ 160 ms is the interpreter's own startup); polling begins 143–172 ms after process start |
+| load client (`screens.js`) | a stub server answering every request after exactly 20 ms, at 5 screens/s | every endpoint p50 = 20 ms, p99 = 20–21 ms, max 21 ms — the client adds ≤ 1 ms |
+
+## Running it
+
+```bash
+docker build -t ferrofin:bench .                  # the commit under test
+docker pull jellyfin/jellyfin:10.11.8
+docker pull jellyfin/jellyfin:12.0-rc7
+bench/testdata/build.sh                           # once, ~20 min
+bench/run.sh                                      # one full run, ~40 min → bench/runs/<date>-<sha>/report.md
+python3 bench/report.py bench/runs/A bench/runs/B bench/runs/C   # the README table: medians + spread
+```
+
+Tunables are the variables at the top of `run.sh` (`WINDOW_S`, `RATE_LOADED`, …); pass
+`--only loaded` for a before/after on two builds. A shared host must be quiet: stop
+anything that would compete for the chosen cores before a release run.

@@ -3,3 +3,4 @@ media/
 config/
 cache/
 ids.json
+__pycache__/
