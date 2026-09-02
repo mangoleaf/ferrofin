@@ -1808,6 +1808,101 @@ mod tests {
         assert!(!path.with_extension("db.pre-ferrofin").exists());
     }
 
+    /// Counts foreign keys whose target table does not exist. 0009 shipped FK
+    /// targets under their pre-0007 names, which dangled on every adopted
+    /// database (fresh ones were rescued by 0007's rename rewriting the real
+    /// tables' FK texts) — the first Live TV channel INSERT then failed with
+    /// `no such table: main.LiveTvTunerHosts`. 0029 rebuilds the targets.
+    async fn dangling_fk_count(pool: &SqlitePool) -> i64 {
+        sqlx::query_scalar(
+            r#"SELECT count(*) FROM sqlite_master m, pragma_foreign_key_list(m.name) f
+               WHERE m.type = 'table'
+                 AND f."table" NOT IN (SELECT name FROM sqlite_master WHERE type = 'table')"#,
+        )
+        .fetch_one(pool)
+        .await
+        .expect("dangling fk audit")
+    }
+
+    #[tokio::test]
+    async fn adopted_database_accepts_live_tv_writes() {
+        // Found live by the parity suite on the pinned real snapshot: guide
+        // refresh died on the dangling channel→tuner FK. The write path below
+        // runs with foreign_keys=ON (the normal runtime pool), so it fails
+        // loudly if any Live TV FK target regresses to a name that is not there.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("jellyfin.db");
+        seed_jellyfin_fixture(&path, &JELLYFIN_10_11_8_MIGRATIONS).await;
+        let url = format!("sqlite://{}", path.display());
+        let db = Database::connect_sized(&url, Some(2))
+            .await
+            .expect("adoption succeeds");
+
+        assert_eq!(
+            dangling_fk_count(db.pool()).await,
+            0,
+            "no FK may dangle after adoption"
+        );
+
+        sqlx::query(
+            r#"INSERT INTO "FerrofinLiveTvTunerHosts" ("Id","Url","Type","Data")
+               VALUES ('t-fk','http://x','m3u','{}')"#,
+        )
+        .execute(db.pool())
+        .await
+        .expect("tuner insert");
+        sqlx::query(
+            r#"INSERT INTO "FerrofinLiveTvChannels" ("Id","TunerHostId","Name","StreamUrl")
+               VALUES ('c-fk','t-fk','Ch','http://s')"#,
+        )
+        .execute(db.pool())
+        .await
+        .expect("channel insert under FK enforcement");
+        sqlx::query(
+            r#"INSERT INTO "FerrofinLiveTvPrograms" ("Id","ChannelId","StartDate","Title")
+               VALUES ('p-fk','c-fk','2026-01-01T00:00:00Z','Prog')"#,
+        )
+        .execute(db.pool())
+        .await
+        .expect("program insert under FK enforcement");
+        // The cascade works through the CORRECT target: deleting the tuner
+        // clears its channel, and the channel its programme.
+        sqlx::query(r#"DELETE FROM "FerrofinLiveTvTunerHosts" WHERE "Id" = 't-fk'"#)
+            .execute(db.pool())
+            .await
+            .expect("tuner delete");
+        let left: i64 = sqlx::query_scalar(
+            r#"SELECT (SELECT count(*) FROM "FerrofinLiveTvChannels" WHERE "Id"='c-fk')
+                    + (SELECT count(*) FROM "FerrofinLiveTvPrograms" WHERE "Id"='p-fk')"#,
+        )
+        .fetch_one(db.pool())
+        .await
+        .expect("cascade audit");
+        assert_eq!(left, 0, "delete must cascade tuner → channel → programme");
+    }
+
+    #[tokio::test]
+    async fn fresh_database_has_no_dangling_foreign_keys() {
+        // connect_in_memory + run_migrations, NOT connect("sqlite::memory:"):
+        // the latter skips the migration block for in-memory URLs and would
+        // audit an empty schema — a vacuous pass. The table-count assertion
+        // keeps this test from ever going quietly vacuous again.
+        let db = Database::connect_in_memory()
+            .await
+            .expect("in-memory connect");
+        db.run_migrations().await.expect("migrations apply");
+        let tables: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM sqlite_master WHERE type = 'table'")
+                .fetch_one(db.pool())
+                .await
+                .expect("table count");
+        assert!(
+            tables > 20,
+            "audit must run against the migrated schema, not an empty db"
+        );
+        assert_eq!(dangling_fk_count(db.pool()).await, 0);
+    }
+
     #[tokio::test]
     async fn connect_file_roundtrips() {
         let dir = tempfile::tempdir().expect("tempdir");
