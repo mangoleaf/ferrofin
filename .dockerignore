@@ -10,3 +10,6 @@ data/
 .rcg/
 .port/
 brain/
+# benchmark test data and run output (bench/ code itself is tiny)
+bench/testdata/
+bench/runs/
