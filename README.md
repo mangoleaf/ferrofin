@@ -32,21 +32,21 @@ the server is Rust. Point Ferrofin at an existing Jellyfin database and it adopt
   to Jellyfin 10.11.8), same password hashes. Adopt an existing library with no re-scan; swap
   back to Jellyfin safely.
 - **Honest about what it is.** Every operation in the Jellyfin API contract is wired to a real
-  handler and cross-checked against a real Jellyfin server (see below) — not a demo with gaps
-  papered over by fake `200`s.
+  handler, developed by cross-checking responses against a real Jellyfin server — not a demo
+  with gaps papered over by fake `200`s.
 
 ## Benchmarks
 
-> **Deferred.** Ferrofin is dramatically lighter on memory and faster to cold-start than the
+> **Pending.** Ferrofin is dramatically lighter on memory and faster to cold-start than the
 > reference .NET server, but the "N× faster" throughput number swings widely run-to-run on
-> identical code, so publishing it as a headline would be dishonest. A freshly-rerun,
-> methodology-linked benchmark table lands here before the public release. The methodology
-> already lives at [`suite/README.md`](suite/README.md) and
-> [`suite/perf/README.md`](suite/perf/README.md).
+> identical code, so publishing it as a headline would be dishonest. A freshly-measured,
+> methodology-linked benchmark table lands here before the public release (the previous
+> harness was retired 2026-09-02; its replacement will publish its methodology alongside
+> the numbers).
 
-The one reproducible compatibility stat, meanwhile: the parity harness diffs Ferrofin's
-responses against a real `jellyfin/jellyfin:10.11.8` server across the whole API. **412/412
-operations are real handlers, 201 of them deep-verified byte-for-byte, 0 untested.**
+The compatibility story, meanwhile: **all 412 operations in the vendored Jellyfin OpenAPI
+contract are real handlers — no stubs** — and Ferrofin adopts (and round-trips) a real
+Jellyfin 10.11.8 database in place.
 
 ## Feature status
 
@@ -114,7 +114,7 @@ Jellyfin `jellyfin.db` (10.11.8) and on first boot it:
 The adoption is **two-way**: Ferrofin only adds its own tables in a collision-proof namespace
 and never rewrites Jellyfin's schema objects, so you can stop Ferrofin and start Jellyfin back
 on the same database. Existing native Ferrofin databases upgrade in place across releases the
-same way. The round-trip is covered by `suite/roundtrip.sh`.
+same way.
 
 ## Plugins: compiled-in extensions + sandboxed WASM
 

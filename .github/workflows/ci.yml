@@ -22,43 +22,8 @@ jobs:
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
           sudo docker image prune --all --force
           df -h /
-      # The "no silent omissions" gate: every operation in the vendored
-      # contract must be either measured by the benchmark
-      # (suite/registry.json) or skipped with a written reason
-      # (suite/coverage.py). Adding a path to the spec, or dropping a bench
-      # row, fails this until someone does one or the other.
-      #
-      # It was only reachable through `suite/run.bats`, which no workflow
-      # runs — so the property held by habit rather than by CI.
-      #
-      # Runs BEFORE the toolchain: pure Python, ~30 ms, no Rust, no Docker,
-      # no fixture. Placed after `cargo test --workspace` it would sit behind
-      # minutes of compilation to report a one-line bookkeeping miss.
-      - name: benchmark coverage (contract accounted for)
-        run: python3 suite/coverage.py
-
-      # The parity ledger's headline counts ONE method (body-diff: the response
-      # was itself diffed clean). --check rejects a row that carries a verdict
-      # without declaring which method earned it, a method outside the closed
-      # set, a method on a row with no verdict, and an open-work or unreviewed
-      # detector flag rendered as an accepted divergence. It ran nowhere until
-      # now, so the rule held only when a human remembered to type it — which is
-      # the same shape of defect the stamping exists to close.
-      #
-      # Pure Python, ~200 ms, no Rust, no Docker: sits with the coverage gate
-      # ahead of the toolchain rather than behind minutes of compilation.
-      - name: parity ledger (every verdict declares how it was verified)
-        run: python3 suite/parity/gen-ledger.py --check
-
-      # ...and the guard's own negative test: strip a method in a scratch copy and
-      # assert gen-ledger REFUSES and writes nothing. Scoped with --filter to the
-      # ledger tests: the rest of run.bats depends on host benchmark artifacts and
-      # is not what this step is signing up for.
-      - name: parity ledger guards fire (negative test)
-        run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq bats
-          bats --filter 'ledger|verification method' suite/run.bats
-
+      # NOTE: the benchmark/parity suite (v2) and its CI gates were retired on
+      # 2026-09-02 by owner decision; suite v3 will bring its own gates.
       - uses: dtolnay/rust-toolchain@1.97.0
         with:
           components: rustfmt, clippy
@@ -71,71 +36,6 @@ jobs:
         # the ferrofin:plugin WIT contract can't drift silently.
       - run: FERROFIN_WASM_GUEST_TESTS=1 cargo test --workspace
 
-
-  # Best-effort perf gate (plans 04/08): non-blocking (`continue-on-error`)
-  # because shared runners are noisy — the MANDATORY gate is the local
-  # `cd benchmark && ./perf-gate.sh` documented in CLAUDE.md. Fairness rule:
-  # a latency baseline is only comparable when measured in the SAME
-  # environment, so this job never uses the repo's committed baseline (that
-  # one belongs to the dev host). Instead it is self-contained: it captures a
-  # baseline from the PR's merge-base tree on this very runner, then gates the
-  # PR tree against it. Skips loudly (still green) on non-perf paths.
-  perf-gate:
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    if: github.event_name == 'pull_request'
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - name: skip unless perf-relevant paths changed
-        id: paths
-        shell: bash
-        run: |
-          base=$(git merge-base "origin/${{ github.base_ref }}" HEAD)
-          if git diff --name-only "$base" HEAD | grep -qE \
-            '^(crates/ferrofin-(core|db|api)/|suite/)'; then
-            echo "relevant=1" >> "$GITHUB_OUTPUT"
-          else
-            echo "perf-gate: no perf-relevant paths touched — skipping"
-            echo "relevant=0" >> "$GITHUB_OUTPUT"
-          fi
-      - name: install vegeta (+ k6 for pre-migration merge-bases) + ffmpeg
-        if: steps.paths.outputs.relevant == '1'
-        run: |
-          # vegeta drives the current suite (pinned to match suite/perf/mise.toml).
-          curl -sL https://github.com/tsenart/vegeta/releases/download/v12.12.0/vegeta_12.12.0_linux_amd64.tar.gz \
-            | sudo tar -xz -C /usr/local/bin vegeta
-          # k6 remains only for merge-base trees that predate the Python/vegeta
-          # suite — the baseline leg runs the BASE tree's own perf-gate.sh.
-          # Drop this block once the migration commit is in every merge-base.
-          # NOTE: while the merge-base is still k6-driven, its baseline was
-          # measured closed-loop and the PR leg open-loop — the comparison is
-          # methodology-crossed noise; the job is continue-on-error by design.
-          sudo gpg -k && sudo gpg --no-default-keyring \
-            --keyring /usr/share/keyrings/k6-archive-keyring.gpg \
-            --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69
-          echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main" \
-            | sudo tee /etc/apt/sources.list.d/k6.list
-          sudo apt-get update -qq && sudo apt-get install -y -qq k6 ffmpeg jq
-      - name: baseline from merge-base, then gate the PR tree
-        if: steps.paths.outputs.relevant == '1'
-        shell: bash
-        run: |
-          set -euo pipefail
-          # Perf leg dir: suite/perf today; the merge-base tree may predate the consolidation.
-          legdir() { if [ -d "$1/suite/perf" ]; then echo "$1/suite/perf"; else echo "$1/benchmark"; fi; }
-          # Synthetic-only fixture env, identical for both legs.
-          mk_env() { printf 'JELLYFIN_IMAGE=jellyfin/jellyfin:10.11.8\nBENCH_CPUS=2\nBENCH_MEM=3g\nREAL_MEDIA_DIR=\nREAL_TV_DIR=\nFIXTURE_MOVIES=300\nFIXTURE_SERIES=0\nFIXTURE_EPISODES_PER_SERIES=10\nBENCH_VUS=50\nBENCH_DURATION=30s\nBENCH_WARMUP_SECONDS=10\nBENCH_ADMIN_USER=bench\nBENCH_ADMIN_PASSWORD=benchpass123\nRUN_TRANSCODE=0\n' > "$(legdir "$1")/.env"; }
-          base=$(git merge-base "origin/${{ github.base_ref }}" HEAD)
-          git worktree add /tmp/base-tree "$base"
-          mk_env /tmp/base-tree
-          # Reuse the PR tree's generated fixtures for both legs (identical library).
-          (cd "$(legdir /tmp/base-tree)" && ln -sfn "$GITHUB_WORKSPACE/suite/perf/fixtures" fixtures || true)
-          (cd "$(legdir /tmp/base-tree)" && ./perf-gate.sh --rebaseline)
-          mk_env "$GITHUB_WORKSPACE"
-          cp /tmp/base-tree/suite/perf-baseline.json suite/perf-baseline.json
-          (cd suite/perf && ./perf-gate.sh)
 
   coverage:
     runs-on: ubuntu-latest

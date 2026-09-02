@@ -84,7 +84,7 @@ service layer in inheritance disguise. Trait signatures traffic in
 `query!` macros, so no `DATABASE_URL` at build time). The schema is pinned
 **byte-equal to a real Jellyfin 10.11.8 database** — that is what makes the
 drop-in adoption of an existing Jellyfin database possible (see the
-`schema_conformance` test and `suite/roundtrip.sh`). Ferrofin-own additions
+`schema_conformance` test). Ferrofin-own additions
 live in a collision-proof `Ferrofin*`/`FerrofinIX_*` namespace. Dynamic item
 queries (Jellyfin's `ItemsController` surface) are built with sqlx
 `QueryBuilder` in `ferrofin-core/src/translate_query.rs`.

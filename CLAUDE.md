@@ -87,7 +87,7 @@ contract is either ported faithfully or is an open work item to port now — nev
 no-op, a "faithful-empty" shrug, or an "out-of-scope"/"subsystem decision" label. This is
 a standing directive from the project owner (2026-08-22), and it is retroactive: any
 `deferred`/`deferred-hollow`/`deferred-remote-or-feature-gated`/"documented out-of-scope"
-wording you find in `suite/parity/classifications.json`, `brain/DEFERRED.md`, code comments,
+wording you find in `brain/DEFERRED.md`, code comments,
 or trait-default `Err("… is deferred")` bodies is **legacy debt to remove by porting the
 thing**, not a precedent to lean on.
 
@@ -136,7 +136,9 @@ Jellyfin-owned shape is **pinned byte-equal to a real Jellyfin 10.11.8 database*
 what makes drop-in adoption of an existing Jellyfin DB possible (point Ferrofin at it and it
 migrates in place; swapping back to Jellyfin is safe). Ferrofin-own tables/indexes live in a
 collision-proof `Ferrofin*`/`FerrofinIX_*` namespace. The `schema_conformance` test guards the
-pin; see `suite/roundtrip.sh` for the two-way swap test.
+pin. (The two-way swap test lived in the retired v2 suite — see the note under **Current
+scope**; `suite/roundtrip.sh` from git history is the ONE v2 piece acceptable to recover,
+as a reference for v3's replacement, since it tests the server rather than the harness.)
 
 ### Errors
 Libraries use per-crate `thiserror` enums; the binary uses `anyhow` at the top level.
@@ -235,21 +237,17 @@ runs it:
 FERROFIN_WASM_GUEST_TESTS=1 cargo test -p ferrofin-wasm --test wasm_hello_guest
 ```
 
-### Perf regression gate (mandatory for perf-touching changes)
-Body-diff correctness is not a latency signal — a 100× slowdown can land "green." Any
-change touching `ferrofin-core`, `ferrofin-db`, `ferrofin-api`, or the query/repository/DTO
-paths (`translate_query`, `item_repository`, `dto_service`) **must pass the perf gate**:
-
-```bash
-cd suite/perf && ./perf-gate.sh          # Ferrofin-only; fails if any sentinel endpoint
-                                        # exceeds 1.5× baseline on p50, p95, or p99
-```
-
-~5 min; compares Ferrofin to the `raw` section of `suite/perf-baseline.json` — the ONE
-baseline file, with `suite/gate.py` as the ONE comparator (also driven by
-`suite/run.sh gate` over the merged parity+perf record). Re-`./perf-gate.sh --rebaseline`
-at each release and after any *intended* perf change so only unintended slowdowns trip it.
-All three percentiles gate (tail regressions are what users feel). See `suite/README.md` + `suite/perf/README.md`.
+### Perf changes still need evidence (v2 suite retired; v3 pending)
+**The benchmark/parity suite (v2, formerly `suite/`) was scrapped by owner decision on
+2026-09-02** — it had grown into layered machinery that policed itself instead of answering
+questions, and a v3 will be built from scratch in a fresh session. Until v3 exists, there is
+no automated perf gate. That does NOT suspend the underlying rule: body-diff correctness is
+not a latency signal — a 100× slowdown can land "green." Any change touching
+`ferrofin-core`, `ferrofin-db`, `ferrofin-api`, or the query/repository/DTO paths
+(`translate_query`, `item_repository`, `dto_service`) must come with a measured
+before/after (e.g. hyperfine/curl timings against a locally run server on the same data),
+stated in the summary. Do not resurrect v2 pieces from git history to "run the gate";
+flag perf-sensitive changes to the owner instead.
 
 ### Green tests are necessary, not sufficient
 Several real bugs in this codebase passed their unit/integration tests and were caught only
@@ -263,20 +261,12 @@ the substance of what a handler actually does — don't rely on a green checkmar
 ## Current scope
 
 **All 412 operations in the vendored contract are wired to real handlers — 0 stubs, 0 `501`s.**
-The parity ledger (`suite/parity/LEDGER.md`) classifies every op `REAL`. Every ledger row
-declares HOW it was verified, from the closed set in `suite/parity/verification.py`, and
-**only `body-diff` — the response or a write's read-back itself diffed clean against Jellyfin
-10.11.8 — is counted in the deep-verified headline**. A row verified some weaker way (named
-`property`s agreed, a write's `effect` was confirmed, only the `status-class` matched, or both
-servers returned an `empty-corpus`) is real verification and is counted and rendered
-separately; it never joins the headline. A row with no method, or one outside the set, fails
-`gen-ledger.py --check` — there is no default, because a default is how a weak probe borrows a
-strong claim. That rule is enforced by machine, not by habit: `gen-ledger.py` VALIDATES BEFORE
-IT WRITES on every run (so the parity leg aborts rather than shipping an unstamped verdict),
-CI runs `--check` plus a negative test that the guard refuses, and `suite/viewer/` — the
-dashboard — counts `body-diff` only, exactly as `LEDGER.md` does. Read the counts off the
-ledger rather than quoting this paragraph, and regenerate it
-(`python3 suite/parity/gen-ledger.py`) after any parity run. Working end-to-end: authentication/users/QuickConnect,
+(The v2 parity ledger and its verification machinery were retired with the v2 suite on
+2026-09-02; verification tracking returns with suite v3. Owner's standing definition for v3:
+**"deep verified" means the Ferrofin implementation was compared against the upstream
+Jellyfin C# for behavioral equivalence** — runtime probes are supporting evidence, never a
+substitute, and a metric redefinition must never make completed verification work disappear.)
+Working end-to-end: authentication/users/QuickConnect,
 library scan + live filesystem watch, browse/query/DTO, images, sessions/playstate/remote
 control, WebSocket push, playlists/collections, direct play + live HLS transcode (subtitle
 burn-in, fMP4 HEVC/AV1), Live TV (M3U/XMLTV + DVR timers), SyncPlay, all 20 scheduled tasks,

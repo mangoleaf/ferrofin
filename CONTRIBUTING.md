@@ -42,13 +42,11 @@ cargo llvm-cov nextest -p <crate> --fail-under-lines 80 --summary-only
 Gate each crate on its own; don't pass multiple `-p` flags to one run (that
 checks the merged total and lets a weak crate hide behind a strong one).
 
-**Perf gate (for perf-touching changes).** Body-diff correctness is not a latency
+**Perf evidence (for perf-touching changes).** Body-diff correctness is not a latency
 signal — a large slowdown can land "green." Any change touching `ferrofin-core`,
-`ferrofin-db`, `ferrofin-api`, or the query/repository/DTO paths must pass:
-
-```bash
-cd suite/perf && ./perf-gate.sh   # fails if a sentinel endpoint exceeds 1.5× baseline (p50/p95/p99)
-```
+`ferrofin-db`, `ferrofin-api`, or the query/repository/DTO paths must include a measured
+before/after in the PR description (the automated perf gate is being rebuilt; until it
+returns, state your numbers and how you took them).
 
 > Green tests are necessary, not sufficient. When you touch a data, auth, or
 > stateful path, **run the binary and exercise it over real HTTP** — several

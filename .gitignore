@@ -30,21 +30,8 @@ __pycache__/
 # toolchain-island build dirs (root /target anchor does not reach them)
 examples/*/target/
 
-# Benchmark result backups — `runs.json` is the record; a `.bak` beside it
-# is a scratch copy of the same runs and must never be committed.
-suite/results/*.bak
-
-# Parity response samples: 4MB+ of regenerable evidence, rewritten every parity
-# run. Read it with suite/parity/show.py; it is an artifact, not source.
-suite/parity/samples.json
-
-# Pinned snapshot of the real Jellyfin instance used as suite test data
-# (both servers boot copies of it; Ferrofin adopts, Jellyfin reads natively).
-# ~10GB, and it contains real usernames and watch history — never committed,
-# never published. Refreshed deliberately via suite/snapshot-testdata.sh;
-# only the identifying MANIFEST.json is committed.
-suite/test_data/*
-!suite/test_data/MANIFEST.json
-# Interrupted snapshot-testdata.sh runs can strand staging/old siblings
-# (test_data.staging.<pid>, test_data.old.<pid>) full of the same private data.
-suite/test_data.*
+# The retired v2 benchmark suite lived at suite/ (removed 2026-09-02). Keep
+# its data patterns ignored so a stale checkout or a v3 that reuses the path
+# can never commit private snapshot data (real usernames + watch history).
+suite/
+suite.*/

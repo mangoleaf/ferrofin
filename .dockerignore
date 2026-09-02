@@ -1,4 +1,5 @@
-# Keep the docker build context small — suite/perf/Dockerfile.ferrofin uses the repo root.
+# Keep the docker build context small — the root Dockerfile builds from the repo root.
+# (suite/ stays ignored defensively: retired v2 data dirs may linger on old checkouts.)
 target/
 .git/
 suite/
