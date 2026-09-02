@@ -13,14 +13,16 @@ Reads, all at a single Ferrofin SHA:
 
 Writes suite/results/run-<sha>.json and upserts it into suite/results/runs.json (the trend the
 viewer reads). Fairness rules baked in (not left to the reader):
-  - a row is `comparable` only if the op is deep_verified BY A BODY DIFF (a
-    property-verified row does not qualify), both servers answered 200 for it, and
-    Ferrofin's body SHAPE matches the reviewed shape baseline — an UNREVIEWED change in
-    Ferrofin's own body is exactly "fast because the body went hollow" and excludes the row
-    until acked (MERGE_ACK_SHAPES=1 advances the baseline). Ferrofin-vs-Jellyfin shape is
-    published on the row as information but NEVER excludes: the parity ledger owns that
-    verdict per-op, and gating on it silently exiled every documented divergence forever;
-  - the headline median-speedup / win-rate are computed over comparable rows ONLY;
+  - a row is `comparable` when the MEASUREMENT is valid: both servers answered 200 at the
+    same held arrival rate, both latencies exist, and Ferrofin's body SHAPE matches the
+    reviewed shape baseline — an UNREVIEWED change in Ferrofin's own body is exactly "fast
+    because the body went hollow" and excludes the row until acked (MERGE_ACK_SHAPES=1
+    advances the baseline). Parity verification depth is the LEDGER's verdict (plan §A) —
+    it rides each row as parity.deep_verified but never excludes a valid measurement.
+    Ferrofin-vs-Jellyfin shape is published on the row as information but NEVER excludes:
+    the parity ledger owns that verdict per-op, and gating on it silently exiled every
+    documented divergence forever;
+  - the headline carries THREE median speedups — p50, p95, p99 (tails are what users feel);
   - a Ferrofin "win" requires beating Jellyfin on p50 AND p95 AND p99 — a p50 win with a tail loss
     is surfaced as a tail loss, never folded into "faster".
 """
@@ -447,39 +449,23 @@ def main():
             print(f"!! within MERGE_MAX_MISSING_LEGS ({max_missing}) — recording the run with these "
                   "gaps stamped in meta.incomplete; the other legs stand.", file=sys.stderr)
 
-    operations, benched_ops, deep_ops = [], set(), set()
+    operations = []
     for variant, p in perf.items():
         op, tag = v2op.get(variant, (None, None))
         if op is None:
             continue  # a benched name not in the registry — self-test would have caught new ones
         pr = par.get(op, {})
-        # The honesty gate is BODY-diffed parity, not merely a green ledger cell.
-        # Any row whose `verification_method` (parity/verification.py) is not
-        # "body-diff" had something WEAKER compared than its response — named
-        # properties, a write's effect, a status class, or two empty result sets
-        # — so the two servers may be returning genuinely different work, and a
-        # latency comparison of different work is not a comparison. An
-        # `empty-corpus` row is the sharpest case: both servers returned nothing,
-        # and timing two empty pages measures the harness. Those rows stay
-        # non-comparable here, exactly as they were before they had any verdict.
         # Write (non-GET) rows are fingerprint-exempt: fingerprint.py never captures
         # them (a probe would mutate state), so their honesty gate is the parity
         # WRITE JOURNEY's effect verdict plus the 100% expected-status check below.
         is_write = not op.startswith("GET ")
-        # No default. A row with no method never said what it compared, and the
-        # ledger's own --check now rejects it; admitting one here as "comparable
-        # work" would restore exactly the default this gate exists to distrust.
-        # A write can only ever be `effect` (no body diff exists for a 204), which
-        # is the documented gate for writes; a GET must be a real body diff. Every
-        # other method — property, status-class, empty-corpus — stays
-        # non-comparable, `empty-corpus` most sharply of all: both servers returned
-        # nothing, so timing them measures the harness, not the work.
+        # parity.deep_verified on each row = the op's STRONGEST-applicable check
+        # passed: a body diff for a GET, an effect verdict for a write (no body
+        # diff exists for a 204). The gate's parity-regression check reads it;
+        # it does not gate the perf comparison (plan §B).
         method = pr.get("verification_method")
         deep = bool(pr.get("deep_verified")) and (
             method == "body-diff" or (is_write and method == "effect"))
-        benched_ops.add(op)
-        if deep:
-            deep_ops.add(op)
         f_e = None if is_write else fp_entry(fp_h, variant, op)
         j_e = None if is_write else fp_entry(fp_j, variant, op)
         base_e = ((baseline or {}).get("variants") or {}).get(variant)
@@ -496,10 +482,15 @@ def main():
         # rate keys — None == None keeps them flowing through unchanged.
         same_rate = p.get("rate") == p.get("j_rate")
         rates_held = p.get("f_rate_held") is not False and p.get("j_rate_held") is not False
-        comparable = deep and both_ok and have_lat and not shape_reason and same_rate and rates_held
+        # MEASUREMENT validity only (plan §B): both sides 200, latencies present,
+        # same held arrival rate, body shape unchanged since review. Parity
+        # verification depth is the LEDGER's verdict — it rides each row as
+        # parity.deep_verified for the gate's regression check, but it no longer
+        # gates the perf comparison: a valid latency measurement of an op whose
+        # strongest possible check is `effect` is still a valid measurement.
+        comparable = both_ok and have_lat and not shape_reason and same_rate and rates_held
         reason = (None if comparable else
                   shape_reason if shape_reason else
-                  "not deep-verified" if not deep else
                   "200-rate < 100%" if not both_ok else
                   "measured at different arrival rates" if not same_rate else
                   "open-loop rate not held" if not rates_held else "missing latency")
@@ -508,6 +499,8 @@ def main():
         vlist = list(verdicts.values()) if verdicts else []
         win = vlist.count("win") == 3
         speedup = speedup_ratio(p["f_p50"], p["j_p50"])
+        speedup_p95 = speedup_ratio(p["f_p95"], p["j_p95"])
+        speedup_p99 = speedup_ratio(p["f_p99"], p["j_p99"])
         # H2: cold rows ride the same operation, as a separate labeled block —
         # WARM percentiles above are the headline; cold is published beside
         # them, never blended (fresh-process first-request latency).
@@ -533,6 +526,7 @@ def main():
             "parity": {"depth": pr.get("depth"), "deep_verified": deep,
                        "classification": pr.get("classification") or None},
             "perf": {"variant": variant, **p, "speedup": speedup,
+                     "speedup_p95": speedup_p95, "speedup_p99": speedup_p99,
                      "win_all_three": win,
                      "verdicts": verdicts,
                      # Evaluated for every measured row: a p50 win with a tail
@@ -547,19 +541,16 @@ def main():
     # EVERY measured endpoint counts. A row where both servers answered and both
     # latencies exist is a real measurement of that endpoint, and dropping it
     # from the headline made most of the API invisible: the report said "52
-    # rows" while the suite had actually measured 139. The verification caveat
-    # is not discarded — it rides each row as `comparable`/`reason`, and the
-    # strict body-verified statistic is published beside the headline. What
-    # changed is that a weaker verdict now annotates a row instead of deleting
-    # it. `tail_loss` and the win/loss verdicts were always computed per row and
+    # rows" while the suite had actually measured 139. Measurement-validity
+    # problems ride each row as `comparable`/`reason`; parity verification
+    # depth is the ledger's business and never shrinks this denominator.
+    # `tail_loss` and the win/loss verdicts were always computed per row and
     # are unaffected.
     measured = [o["perf"] for o in operations
                 if o["perf"]["f_p50"] is not None and o["perf"]["j_p50"] is not None]
     speedups = [o["speedup"] for o in measured if o["speedup"] is not None]
-    # The stricter subset, kept so the honest number never disappears: bodies
-    # diffed clean against Jellyfin, same held rate, both 200.
-    comp = [o["perf"] for o in operations if o["perf"]["comparable"]]
-    speedups_verified = [o["speedup"] for o in comp if o["speedup"] is not None]
+    speedups_p95 = [o["speedup_p95"] for o in measured if o.get("speedup_p95") is not None]
+    speedups_p99 = [o["speedup_p99"] for o in measured if o.get("speedup_p99") is not None]
     # A2: surface how many rows fell out of the comparison and why, so shrinking
     # coverage reads as shrinking coverage instead of "all green".
     dropped = {}
@@ -572,14 +563,11 @@ def main():
     # core today; extension variants slot in with no further edits here.)
     owners = {}
     for o in operations:
-        ow = owners.setdefault(o["owner"], {"rows": 0, "comparable_rows": 0, "measured_rows": 0,
-                                            "speedups": [], "wins": 0, "deep": 0})
+        ow = owners.setdefault(o["owner"], {"rows": 0, "measured_rows": 0,
+                                            "speedups": [], "wins": 0})
         ow["rows"] += 1
-        ow["deep"] += bool(o["parity"]["deep_verified"])
-        if o["perf"]["comparable"]:
-            ow["comparable_rows"] += 1
         # Speed stats span every MEASURED row (both sides answered), matching the
-        # headline; `comparable_rows` stays as the body-verified subset.
+        # headline.
         if o["perf"]["f_p50"] is not None and o["perf"]["j_p50"] is not None:
             ow["measured_rows"] += 1
             ow["wins"] += bool(o["perf"]["win_all_three"])
@@ -588,11 +576,9 @@ def main():
     owners = {
         name: {
             "rows": ow["rows"],
-            "comparable_rows": ow["comparable_rows"],
             "median_speedup": round(median(ow["speedups"]), 3) if ow["speedups"] else None,
             "win_rate": round(ow["wins"] / ow["measured_rows"], 3) if ow.get("measured_rows") else None,
             "measured_rows": ow.get("measured_rows", 0),
-            "parity_coverage": round(ow["deep"] / ow["rows"], 3) if ow["rows"] else None,
         }
         for name, ow in owners.items()
     }
@@ -600,24 +586,25 @@ def main():
     headline = {
         # The headline denominator: every endpoint the suite actually measured.
         "measured_rows": len(measured),
-        "comparable_rows": len(comp),
-        # Not "dropped" any more — nothing is dropped. These are the rows whose
-        # verification is weaker than a clean body diff, counted by why.
-        "unverified_rows": sum(dropped.values()),
-        "unverified_by_reason": dropped,
+        # Rows excluded for MEASUREMENT-validity reasons only (errors, rate
+        # mismatch, unreviewed shape change), counted by why. Parity
+        # verification depth is the ledger's business (LEDGER.md / plan §A) —
+        # it never annotates a perf row as "unverified" here.
+        "excluded_rows": sum(dropped.values()),
+        "excluded_by_reason": dropped,
         # Cross-server shape divergences are PUBLISHED, not hidden in exclusions: rows whose
         # body shape differs from Jellyfin's at bench time (see each row's `shape` block —
         # the parity ledger classifies whether each is a defect or a documented divergence).
         "shape_divergences_vs_jellyfin": sum(
             1 for o in operations if o.get("shape", {}).get("matches_jellyfin") is False),
-        # Over every measured endpoint.
+        # Three medians over every measured endpoint — tails are what users
+        # feel, so p95/p99 get equal billing (plan §B). `median_speedup` stays
+        # the p50 ratio for schema continuity with older records.
         "median_speedup": round(median(speedups), 3) if speedups else None,
+        "median_speedup_p95": round(median(speedups_p95), 3) if speedups_p95 else None,
+        "median_speedup_p99": round(median(speedups_p99), 3) if speedups_p99 else None,
         "win_rate": round(sum(o["win_all_three"] for o in measured) / len(measured), 3) if measured else None,
-        # Over the body-verified subset only — the conservative reading.
-        "median_speedup_verified": round(median(speedups_verified), 3) if speedups_verified else None,
-        "win_rate_verified": round(sum(o["win_all_three"] for o in comp) / len(comp), 3) if comp else None,
         "tail_losses": [o["variant"] for o in measured if o["tail_loss"]],
-        "parity_coverage": round(len(deep_ops) / len(benched_ops), 3) if benched_ops else None,
         "owners": owners,
     }
 
@@ -757,10 +744,9 @@ def main():
 
     hl = headline
     print(f">> wrote {rel(out)}  (perf: {perf_src})")
-    print(f"   measured rows: {hl['measured_rows']}/{len(operations)} "
-          f"(body-verified {hl['comparable_rows']})  "
-          f"median speedup: {hl['median_speedup']}  win-rate: {hl['win_rate']}  "
-          f"parity coverage: {hl['parity_coverage']}")
+    print(f"   measured rows: {hl['measured_rows']}/{len(operations)}  "
+          f"median speedup p50: {hl['median_speedup']}  p95: {hl['median_speedup_p95']}  "
+          f"p99: {hl['median_speedup_p99']}  win-rate: {hl['win_rate']}")
     if hl["tail_losses"]:
         print(f"   tail losses (p50 win, p95/p99 loss): {', '.join(hl['tail_losses'])}")
     if hl["shape_divergences_vs_jellyfin"]:

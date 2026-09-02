@@ -103,9 +103,7 @@ def aggregate(runs):
     paired_ties = sum(1 for ep in endpoints.values() if ep.get("paired_tie"))
     headline = {
         # The honest headline: exact and deterministic.
-        "parity_coverage": heads[-1].get("parity_coverage"),
         "measured_rows": dist([h.get("measured_rows") for h in heads]),
-        "comparable_rows": dist([h.get("comparable_rows") for h in heads]),
         "win_rate": dist([h.get("win_rate") for h in heads]),
         # Distribution of paired per-endpoint speedups over always-comparable
         # endpoints — the defensible single number, WITH its spread.
@@ -138,9 +136,7 @@ def render_md(agg, sha):
     out = [f"# Ferrofin vs Jellyfin — aggregate of {m['aggregated_runs']} runs @ `{m.get('ferrofin', sha)}`\n"]
     out.append(f"- **Jellyfin:** `{m.get('jellyfin_image')}` · **engine:** {m.get('engine')} "
                f"· **when:** {m.get('when')}")
-    out.append(f"- **Parity coverage (exact): {h['parity_coverage']}** · "
-               f"measured rows {fmt_dist(h.get('measured_rows'))} "
-               f"(body-verified {fmt_dist(h['comparable_rows'])}) · "
+    out.append(f"- measured rows {fmt_dist(h.get('measured_rows'))} · "
                f"win-rate {fmt_dist(h['win_rate'])}")
     out.append(f"- Paired speedup over always-comparable endpoints: **{fmt_dist(h['paired_speedup'])}** "
                f"(ratio of per-endpoint medians; spread is IQR across endpoints; "
@@ -230,7 +226,7 @@ def main():
     n = agg["meta"]["aggregated_runs"]
     h = agg["headline"]
     print(f">> wrote {out.name} + agg-{sha}.md ({n} runs aggregated)")
-    print(f"   parity {h['parity_coverage']} · paired speedup {fmt_dist(h['paired_speedup'])} "
+    print(f"   paired speedup {fmt_dist(h['paired_speedup'])} "
           f"· win-rate {fmt_dist(h['win_rate'])}")
     if n < 2:
         print("   NOTE: single run — IQRs are 0 by definition; a publishable record "

@@ -177,9 +177,10 @@ assert r['meta']['incomplete'], 'incomplete stamp missing'"
   [ "$status" -eq 0 ]
   run env OUTDIR="$OUTDIR" python3 -c "import json,glob,os; \
 r=json.load(open(sorted(glob.glob(os.environ['OUTDIR']+'/run-*.json'),key=os.path.getmtime)[-1])); \
-h=r['headline']; assert 'parity_coverage' in h and 'median_speedup' in h; \
-assert 'unverified_rows' in h and 'unverified_by_reason' in h; \
-assert 'measured_rows' in h and 'comparable_rows' in h; \
+h=r['headline']; assert 'median_speedup' in h; \
+assert 'median_speedup_p95' in h and 'median_speedup_p99' in h; \
+assert 'excluded_rows' in h and 'excluded_by_reason' in h; \
+assert 'measured_rows' in h and 'comparable_rows' not in h; \
 assert r['operations'], 'record has no operations'; \
 assert all('comparable' in o['perf'] for o in r['operations'])"
   [ "$status" -eq 0 ]

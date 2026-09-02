@@ -78,11 +78,11 @@
 </head>
 <body>
 <header>
-  <h1>Ferrofin ⇄ Jellyfin — suite <span class="sub">(parity × perf · every measured endpoint counts; body-verified subset marked)</span></h1>
+  <h1>Ferrofin ⇄ Jellyfin — suite <span class="sub">(parity × perf · every measured endpoint counts)</span></h1>
   <div class="controls">
     <label class="pick">Run<select id="run"></select></label>
     <label class="pick">Compare to<select id="base"><option value="">— none —</option></select></label>
-    <label class="pick chk"><input type="checkbox" id="compOnly"> body-verified only</label>
+    <label class="pick chk"><input type="checkbox" id="compOnly"> valid measurements only</label>
   </div>
   <div class="sub" id="subline">loading…</div>
   <div class="stats" id="stats"></div>
@@ -98,7 +98,7 @@
     <th>F p50</th><th>F p95</th><th>F p99</th><th>J p50</th><th>J p95</th><th>J p99</th>
     <th title="Fresh-process first-request latency (F / J, ms) — sentinels only; separate from warm, never blended">cold first F/J</th>
     <th title="Ferrofin p50 change vs the selected base run">Δ vs base</th>
-    <th>speedup</th><th>verdict</th><th class="l">note</th>
+    <th title="j/f ratio per percentile — >1 means Ferrofin faster">speedup p50/p95/p99</th><th>verdict</th><th class="l">note</th>
   </tr></thead><tbody></tbody></table>
 
   <h2 id="aggh" style="display:none">Aggregate <span class="muted" id="aggsub" style="text-transform:none"></span></h2>
@@ -109,10 +109,10 @@
     <th title="fresh-process first request, median±IQR across runs">cold F/J</th><th>n</th>
   </tr></thead><tbody></tbody></table>
 
-  <h2>Trend <span class="muted" style="text-transform:none">(comparable median speedup + parity coverage; legacy greyed)</span></h2>
+  <h2>Trend <span class="muted" style="text-transform:none">(median speedup over measured rows; legacy greyed)</span></h2>
   <table id="trend"><thead><tr>
-    <th class="l">build</th><th class="l">when</th><th>measured</th><th>body-verified</th>
-    <th>median speedup</th><th>win-rate</th><th>parity coverage</th><th class="l">tail losses</th>
+    <th class="l">build</th><th class="l">when</th><th>measured</th>
+    <th>median speedup p50/p95/p99</th><th>win-rate</th><th class="l">tail losses</th>
   </tr></thead><tbody></tbody></table>
 
   <h2>Full parity ledger <span class="muted" style="text-transform:none">(all contract operations, benched or not)</span></h2>
@@ -204,20 +204,21 @@ function frozenSetBanner(r, b) {
 function statCards(h, meta) {
   const card = (n, l, color) =>
     `<div class="stat"><div class="n" style="color:${color || "var(--fg)"}">${n}</div><div class="l">${l}</div></div>`;
-  // Parity coverage leads (exact, deterministic); the ratio comes LAST and
-  // labeled — it is the noisiest number on the page (review, round 1).
+  // Counts lead; the three speedup ratios come LAST, and the p50 one is
+  // labeled noisy — single-run ratios carry ≈30% run-to-run variance.
   // A run may now enter the trend with a few legs missing (they are named in
   // meta.incomplete). That must be VISIBLE here — the whole reason the record is
   // allowed in is that the gap is disclosed rather than fatal.
   const gaps = (meta && meta.incomplete) || [];
-  return card(pct(h.parity_coverage), "parity coverage", "var(--accent)")
-    + card(h.measured_rows == null ? h.comparable_rows : h.measured_rows, "measured endpoints")
-    + card(h.comparable_rows, "of those, body-verified")
+  const spdCard = (v, label) => card(v == null ? "—" : v + "×", label,
+                                     v == null ? "" : v >= 1 ? "var(--good)" : "var(--bad)");
+  return card(h.measured_rows == null ? h.comparable_rows : h.measured_rows, "measured endpoints")  // legacy records only carry comparable_rows
     + (gaps.length ? card(gaps.length, "MISSING LEGS — " + gaps.join(", "), "var(--bad)") : "")
     + card(pct(h.win_rate), "win-rate (p50+p95+p99)", h.win_rate >= 0.5 ? "var(--good)" : "var(--bad)")
     + card((h.tail_losses || []).length, "tail losses", (h.tail_losses || []).length ? "var(--warn)" : "var(--good)")
-    + card(h.median_speedup == null ? "—" : h.median_speedup + "×", "median speedup (noisy — see aggregate)",
-           h.median_speedup >= 1 ? "var(--good)" : "var(--bad)");
+    + spdCard(h.median_speedup, "median speedup p50 (noisy — see aggregate)")
+    + spdCard(h.median_speedup_p95, "median speedup p95")
+    + spdCard(h.median_speedup_p99, "median speedup p99");
 }
 
 function render() {
@@ -275,8 +276,8 @@ function render() {
       const d = (p.f_p50 - baseP50[p.variant]) / baseP50[p.variant] * 100;
       delta = `<span class="${d > 10 ? "bad" : d < -10 ? "good" : "muted"}">${d > 0 ? "+" : ""}${d.toFixed(0)}%</span>`;
     }
-    const spd = p.speedup == null ? "—"
-      : `<span class="${p.speedup >= 1 ? "good" : "bad"}">${p.speedup}×</span>`;
+    const spd1 = (v) => v == null ? "—" : `<span class="${v >= 1 ? "good" : "bad"}">${v}×</span>`;
+    const spd = `${spd1(p.speedup)} / ${spd1(p.speedup_p95)} / ${spd1(p.speedup_p99)}`;
     return `<tr class="${cls}">
       <td class="l">${opCell(o.op)}</td><td class="l"><code>${p.variant}</code>${o.owner && o.owner !== "core" ? " " + ownerBadge(o.owner) : ""}</td>
       <td class="l"><span class="pill d-${depth}">${depth}</span></td>
@@ -295,15 +296,16 @@ function render() {
 function renderTrend() {
   trend.tBodies[0].innerHTML = RUNS.slice().reverse().map(r => {
     const h = r.headline, cls = r.meta.legacy ? "legacyrow" : "";
-    const spd = h.median_speedup == null ? "—"
-      : `<span class="${r.meta.legacy ? "" : (h.median_speedup >= 1 ? "good" : "bad")}">${h.median_speedup}×</span>`;
+    const s1 = (v) => v == null ? "—"
+      : `<span class="${r.meta.legacy ? "" : (v >= 1 ? "good" : "bad")}">${v}×</span>`;
+    const spd = `${s1(h.median_speedup)} / ${s1(h.median_speedup_p95)} / ${s1(h.median_speedup_p99)}`;
     return `<tr class="${cls}"><td class="l">${vlabel(r)}</td><td class="l">${r.meta.when || ""}</td>
       <td>${h.measured_rows == null ? "—" : h.measured_rows}${
         (r.meta.incomplete || []).length
           ? ` <span class="bad" title="missing legs: ${(r.meta.incomplete || []).join(", ")}">⚠${(r.meta.incomplete || []).length}</span>`
           : ""}</td>
-      <td>${h.comparable_rows}</td><td>${spd}</td>
-      <td>${pct(h.win_rate)}</td><td>${pct(h.parity_coverage)}</td>
+      <td>${spd}</td>
+      <td>${pct(h.win_rate)}</td>
       <td class="l muted">${(h.tail_losses || []).join(", ")}</td></tr>`;
   }).join("");
 }
@@ -426,8 +428,8 @@ fetch("/suite/results/runs.json?t=" + Date.now()).then(r => r.json()).then(d => 
 });
 
 // C2: the publishable numbers are distributions (median±IQR over BENCH_RUNS
-// runs), led by parity coverage and paired per-endpoint speedups — the
-// single-run median-of-ratios stays out of the headline (≈30% run noise).
+// runs), led by paired per-endpoint speedups — the single-run
+// median-of-ratios stays out of the headline (≈30% run noise).
 const fd = (d) => d == null ? "—" : `${d.med}±${d.iqr}`;
 fetch("/suite/results/aggregates.json?t=" + Date.now()).then(r => r.json()).then(d => {
   const a = d.aggregates[d.aggregates.length - 1];
@@ -437,7 +439,7 @@ fetch("/suite/results/aggregates.json?t=" + Date.now()).then(r => r.json()).then
   document.getElementById("agg").style.display = "";
   document.getElementById("aggsub").textContent =
     `${m.ferrofin} · ${m.aggregated_runs} runs · latency median±IQR (ms) · ` +
-    `parity ${h.parity_coverage} · paired speedup ${fd(h.paired_speedup)} · win-rate ${fd(h.win_rate)}`;
+    `paired speedup ${fd(h.paired_speedup)} · win-rate ${fd(h.win_rate)}`;
   document.querySelector("#agg tbody").innerHTML = Object.entries(a.endpoints).map(([v, ep]) => `<tr>
     <td class="l"><code>${v}</code></td><td class="l">${ownerBadge(ep.owner)}</td>
     <td>${fd(ep.f_p50)}</td><td>${fd(ep.j_p50)}</td>
