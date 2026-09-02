@@ -691,14 +691,12 @@ pub const REAL_ROUTES: &[(&str, &str)] = &[
 /// extension** (`ferrofin-extensions`); core routes are everything in
 /// [`REAL_ROUTES`] not listed here.
 ///
-/// This is the machine-readable ownership manifest the benchmark/parity suite
-/// reads (`suite/parity/gen-ledger.py` parses this const the same way it
-/// parses `REAL_ROUTES`), so "how fast/complete is core Ferrofin" is
-/// separable from "how fast/complete is each extension" in every published
-/// record. Extension authors update ONE place: add the route here and to
-/// `REAL_ROUTES`; the compile-time assertion below catches an entry that
-/// drifts from (or never lands in) `REAL_ROUTES`, and the suite picks the
-/// ownership up with no further edits.
+/// This is the machine-readable ownership manifest, so "how complete is core
+/// Ferrofin" is separable from "how complete is each extension" (the parity
+/// printout in `tests/contract_superset.rs` reads it). Extension authors
+/// update ONE place: add the route here and to `REAL_ROUTES`; the compile-time
+/// assertion below catches an entry that drifts from (or never lands in)
+/// `REAL_ROUTES`.
 ///
 /// Paths are the contract-canonical forms, verbatim from `REAL_ROUTES`
 /// (e.g. `/MediaSegmentsApi/{segmentId}` canonicalizes to `{itemId}`).
@@ -746,6 +744,56 @@ pub const EXTENSION_ROUTES: &[(&str, &str, &str)] = &[
         "file-transformation",
     ),
 ];
+
+/// The upstream Jellyfin release every [`VERIFIED`] row was compared against —
+/// one fact for the whole record, so no row can carry a wrong tag or commit.
+pub const UPSTREAM_TAG: &str = "v10.11.8";
+/// The commit `UPSTREAM_TAG` resolves to in `github.com/jellyfin/jellyfin`.
+pub const UPSTREAM_COMMIT: &str = "2c62d40f0d";
+
+/// One contract operation whose Ferrofin implementation was compared against
+/// the upstream Jellyfin C# for behavioral equivalence — see [`VERIFIED`].
+#[derive(Debug)]
+pub struct Verified {
+    /// Lower-case HTTP method, exactly as in [`REAL_ROUTES`].
+    pub method: &'static str,
+    /// Contract path, exactly as in [`REAL_ROUTES`].
+    pub path: &'static str,
+    /// The C# file compared, relative to the upstream repository root —
+    /// `"Jellyfin.Api/Controllers/UserLibraryController.cs"`.
+    pub upstream_file: &'static str,
+    /// The controller method in that file — `"GetItem"`.
+    pub upstream_method: &'static str,
+    /// The Ferrofin code path compared (handler → core), for the next reader —
+    /// `"handlers/user_library.rs get_item → ferrofin-core dto_service.rs"`.
+    pub ferrofin: &'static str,
+    /// Date of the comparison, `YYYY-MM-DD`.
+    pub date: &'static str,
+    /// Accepted divergences, one sentence each. Owner-scope items (native .NET
+    /// plugin loading, SSDP, OMDb without a key) and Jellyfin bugs deliberately
+    /// not ported belong here; anything else is a gap to fix before the row is
+    /// written. An entry with divergences still counts as verified — the text
+    /// is the published statement of what is *not* done.
+    pub divergences: &'static [&'static str],
+}
+
+/// **The API-parity record.** One row per contract operation whose Ferrofin
+/// implementation has been compared against the upstream Jellyfin C#
+/// (`v10.11.8`) for behavioral equivalence: parameters honored and their
+/// defaults, filters, sort, paging, DTO field set and nullability, status
+/// codes, side effects, auth rules.
+///
+/// Rules, in full:
+/// - a row exists ⇔ the operation is deep-verified; there is no other state and
+///   no other published count (runtime probes are supporting evidence only);
+/// - rows are only ever added or amended — removing one is a visible deletion
+///   in review, and a benchmark-suite rewrite cannot touch this file;
+/// - `tests/contract_superset.rs` checks every row is a [`REAL_ROUTES`]
+///   operation with a well-formed `upstream_file`/`upstream_method`/`date`, and prints
+///   `N / 412 operations deep-verified` plus the per-controller table — that
+///   printout is the README parity section, it moves only when a row is
+///   written, and it reaches 100 % when the work is done.
+pub const VERIFIED: &[Verified] = &[];
 
 /// Compile-time `str` equality (`==` on `&str` isn't const).
 const fn str_eq(a: &str, b: &str) -> bool {
