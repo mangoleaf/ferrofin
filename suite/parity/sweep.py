@@ -394,10 +394,18 @@ def bring_up(base, target):
             ensure_livetv(base, token)
         return token, user
     # Testdata mode NEVER provisions: reaching here means the seeded snapshot
-    # is not being served, and falling into wizard()+provision() against an
-    # empty server would fail minutes later pointing away from the real cause.
+    # is not usable (not served, or the server is wedged mid-operation), and
+    # falling into wizard()+provision() against it would fail minutes later
+    # pointing away from the real cause.
     if os.environ.get("BENCH_TESTDATA") == "1":
-        raise SystemExit(f"{base}: testdata mode: server has no items — was the config volume seeded before start?")
+        # Two very different causes land here and only one is about seeding —
+        # observed live: a journeys-triggered Jellyfin Backup/Create holds the
+        # exclusive DB lock for HOURS on a 42k-item library, and every auth
+        # attempt 500s ("database is locked") until it finishes.
+        raise SystemExit(
+            f"{base}: testdata mode: cannot authenticate or count items. Either the config "
+            "volume was not seeded before start, or the server is wedged mid-operation "
+            "(e.g. Jellyfin's Backup/Create holds an exclusive DB lock — check its log).")
     if target == "jellyfin":
         wizard(base)
     token, user = authenticate(base)
