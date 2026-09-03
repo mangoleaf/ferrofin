@@ -177,6 +177,109 @@ pub fn set_data_field(data: Option<&str>, key: &str, value: &str) -> Option<Stri
     serde_json::to_string(&Value::Object(object)).ok()
 }
 
+/// The `Data` key a series' status lives under — C# `Series.Status`
+/// (`SeriesStatus?`), serialized by name (`"Status":"Ended"`) into the blob
+/// like every other non-column property (`BaseItemMapper.cs:234`).
+pub const SERIES_STATUS_KEY: &str = "Status";
+
+/// The `Data` key a series' air days live under — C# `Series.AirDays`
+/// (`DayOfWeek[]`, serialized by name: `"AirDays":["Monday"]`).
+pub const SERIES_AIR_DAYS_KEY: &str = "AirDays";
+
+/// The `Data` key a series' air time lives under — C# `Series.AirTime`
+/// (`"AirTime":"20:00"`).
+pub const SERIES_AIR_TIME_KEY: &str = "AirTime";
+
+/// The three `Series` properties that live only in the `Data` blob and come
+/// back out on the DTO (v12 DtoService.cs:1481-1483: `AirDays`, `AirTime`,
+/// `Status`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct SeriesFields {
+    /// `Series.AirDays` — `None` when the blob has no key; the DTO serves
+    /// `[]` for that, as an unset C# array does.
+    #[serde(rename = "AirDays")]
+    pub air_days: Option<Vec<ferrofin_model::dto::DayOfWeek>>,
+    /// `Series.AirTime`.
+    #[serde(rename = "AirTime")]
+    pub air_time: Option<String>,
+    /// `Series.Status` by name (`Continuing` / `Ended` / `Unreleased`).
+    #[serde(rename = "Status")]
+    pub status: Option<String>,
+}
+
+/// Reads a series' `AirDays`/`AirTime`/`Status` out of its `Data` column
+/// value in one pass. Deserializing into the narrow [`SeriesFields`] instead
+/// of [`parse_data`]'s full `Map` skips every other key without allocating
+/// for it — the blob is parsed once per Series row on every list page, so the
+/// cheap form matters.
+///
+/// A `NULL`/empty/malformed blob reads as all-`None`; so does a key that is
+/// JSON `null` or an empty string (an unset C# property).
+#[must_use]
+pub fn read_series_fields(data: Option<&str>) -> SeriesFields {
+    let Some(blob) = data.filter(|d| !d.is_empty()) else {
+        return SeriesFields::default();
+    };
+    let mut fields = serde_json::from_str::<SeriesFields>(blob).unwrap_or_default();
+    fields.air_time = fields.air_time.filter(|t| !t.is_empty());
+    fields.status = fields.status.filter(|s| !s.is_empty());
+    fields
+}
+
+/// Reads a series' stored status name (`Continuing` / `Ended` / `Unreleased`)
+/// from its `Data` column value — the value `DtoService` emits as `Status`
+/// (v12 DtoService.cs:1483: `dto.Status = series.Status?.ToString()`).
+#[must_use]
+pub fn read_series_status(data: Option<&str>) -> Option<String> {
+    if !data.is_some_and(|d| d.contains(SERIES_STATUS_KEY)) {
+        return None;
+    }
+    read_series_fields(data).status
+}
+
+/// Writes a series' status name into the `Data` column value when the blob
+/// carries none yet (the fill-if-empty rule every scan applier follows, so a
+/// local NFO's `<status>` outranks a provider's). Returns the new column text,
+/// or `None` when nothing changed.
+#[must_use]
+pub fn fill_series_status(data: Option<&str>, status: &str) -> Option<String> {
+    if read_series_status(data).is_some() {
+        return None;
+    }
+    set_data_field(data, SERIES_STATUS_KEY, status)
+}
+
+/// Writes a series' air days and air time into the `Data` column value —
+/// each only when the blob carries none yet (`SeriesMetadataService.MergeData`
+/// :156-168 fills `AirTime` when empty and `AirDays` when null or empty; the
+/// scan appliers take the fill-if-empty half, the refresh's replace pass is
+/// the provider manager's). Returns the new column text, or `None` when
+/// nothing changed.
+#[must_use]
+pub fn fill_series_air(
+    data: Option<&str>,
+    air_days: &[ferrofin_model::dto::DayOfWeek],
+    air_time: Option<&str>,
+) -> Option<String> {
+    let stored = read_series_fields(data);
+    let mut fields: Vec<(&str, Option<Value>)> = Vec::with_capacity(2);
+    if !air_days.is_empty()
+        && stored.air_days.as_ref().is_none_or(Vec::is_empty)
+        && let Ok(days) = serde_json::to_value(air_days)
+    {
+        fields.push((SERIES_AIR_DAYS_KEY, Some(days)));
+    }
+    if let Some(time) = air_time.filter(|t| !t.is_empty())
+        && stored.air_time.is_none()
+    {
+        fields.push((SERIES_AIR_TIME_KEY, Some(Value::String(time.to_owned()))));
+    }
+    if fields.is_empty() {
+        return None;
+    }
+    merge_data_fields(data, &fields)
+}
+
 /// The `Data` keys a photo's EXIF fields round-trip through, in the C# `Photo`
 /// property spelling — the same names Jellyfin serializes, so a database
 /// adopted in either direction keeps its photo metadata.
@@ -583,6 +686,88 @@ async fn import_container(
 mod tests {
     use super::*;
     use crate::test_support::{seed_item, seed_named_item, test_db};
+
+    /// `Status` is read out of the blob as Jellyfin writes it
+    /// (`"Status":"Ended"`), and only written when absent.
+    #[test]
+    fn series_status_round_trips_through_the_data_blob() {
+        assert_eq!(read_series_status(None), None);
+        assert_eq!(read_series_status(Some("")), None);
+        assert_eq!(read_series_status(Some("not json")), None);
+        assert_eq!(read_series_status(Some(r#"{"Status":null}"#)), None);
+        assert_eq!(read_series_status(Some(r#"{"Status":""}"#)), None);
+        assert_eq!(
+            read_series_status(Some(r#"{"AirDays":[],"Status":"Ended","IsHD":false}"#)).as_deref(),
+            Some("Ended")
+        );
+
+        let written = fill_series_status(Some(r#"{"AirDays":[]}"#), "Continuing").expect("written");
+        assert_eq!(
+            read_series_status(Some(&written)).as_deref(),
+            Some("Continuing")
+        );
+        assert!(written.contains(r#""AirDays":[]"#), "other keys survive");
+        // A NULL column grows a one-key blob.
+        assert_eq!(
+            fill_series_status(None, "Ended").as_deref(),
+            Some(r#"{"Status":"Ended"}"#)
+        );
+        // Fill-if-empty: a stored value is never replaced.
+        assert_eq!(fill_series_status(Some(&written), "Ended"), None);
+    }
+
+    /// `AirDays`/`AirTime` round-trip the same way, in the shape Jellyfin
+    /// serializes (`"AirDays":["Monday"]`, `"AirTime":"20:00"`), and one
+    /// parse yields all three series fields.
+    #[test]
+    fn series_air_days_and_time_round_trip_through_the_data_blob() {
+        use ferrofin_model::dto::DayOfWeek;
+        let fields = read_series_fields(Some(
+            r#"{"AirDays":["Monday","Friday"],"AirTime":"20:00","Status":"Ended","IsHD":false}"#,
+        ));
+        assert_eq!(
+            fields,
+            SeriesFields {
+                air_days: Some(vec![DayOfWeek::Monday, DayOfWeek::Friday]),
+                air_time: Some("20:00".to_owned()),
+                status: Some("Ended".to_owned()),
+            }
+        );
+        // Absent, null and empty all read as unset.
+        assert_eq!(read_series_fields(None), SeriesFields::default());
+        assert_eq!(
+            read_series_fields(Some(r#"{"AirDays":null,"AirTime":"","Status":null}"#)),
+            SeriesFields::default()
+        );
+        // The empty array Jellyfin always writes reads as "no days".
+        assert_eq!(
+            read_series_fields(Some(r#"{"AirDays":[]}"#)).air_days,
+            Some(Vec::new())
+        );
+
+        let written = fill_series_air(
+            Some(r#"{"AirDays":[]}"#),
+            &[DayOfWeek::Monday],
+            Some("20:00"),
+        )
+        .expect("written");
+        assert!(written.contains(r#""AirDays":["Monday"]"#), "{written}");
+        assert!(written.contains(r#""AirTime":"20:00""#), "{written}");
+        // Fill-if-empty per key: stored days stay, a missing time is filled.
+        let again = fill_series_air(Some(&written), &[DayOfWeek::Sunday], Some("21:00"));
+        assert_eq!(again, None);
+        let only_time = fill_series_air(
+            Some(r#"{"AirDays":["Monday"]}"#),
+            &[DayOfWeek::Sunday],
+            Some("21:00"),
+        )
+        .expect("time filled");
+        assert!(only_time.contains(r#""AirDays":["Monday"]"#));
+        assert!(only_time.contains(r#""AirTime":"21:00""#));
+        // Nothing to write ⇒ no rewrite.
+        assert_eq!(fill_series_air(None, &[], None), None);
+        assert_eq!(fill_series_air(None, &[], Some("")), None);
+    }
 
     /// Seeds a movie with an on-disk path so path-only links resolve.
     async fn seed_movie_with_path(db: &Database, id: Uuid, path: &str) {

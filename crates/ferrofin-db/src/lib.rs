@@ -18,7 +18,7 @@ pub mod presentation_key;
 pub mod sqlite_random;
 pub mod store;
 
-pub use database::Database;
+pub use database::{Database, ImageParentRow};
 
 /// How many ids one `IN (…)` query binds at a time: stays far below SQLite's
 /// conservative 999-host-variable floor (`SQLITE_MAX_VARIABLE_NUMBER` on old

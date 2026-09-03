@@ -6264,6 +6264,21 @@ fn apply_nfo(entity: &mut BaseItemEntity, n: &ferrofin_providers::xbmc::item::Nf
     merge_multi_value(&mut entity.genres, &n.genres);
     merge_multi_value(&mut entity.studios, &n.studios);
     merge_multi_value(&mut entity.tags, &n.tags);
+    // `<status>` (`SeriesNfoParser.cs:75-90`, via `TvParserHelpers.
+    // TryParseSeriesStatus`) — `Series.Status`, which lives in the `Data`
+    // blob (`"Status":"Ended"`) and comes back out as the DTO's `Status`.
+    if let Some(status) = n.status {
+        apply_series_status(entity, series_status_name(status));
+    }
+    // `<airs_dayofweek>` / `<airs_time>` (SeriesNfoParser.cs:63-74) —
+    // `Series.AirDays`/`AirTime`, the other two blob-only series properties.
+    if let Some(data) = crate::item_data::fill_series_air(
+        entity.data.as_deref(),
+        &n.air_days,
+        n.air_time.as_deref(),
+    ) {
+        entity.data = Some(data);
+    }
     // NFO `<trailer>` URLs join the same `Data.RemoteTrailers` array the TMDB
     // path writes (upstream keeps one merged list, deduped by URL).
     let trailers: Vec<(Option<String>, String)> = n
@@ -6272,6 +6287,32 @@ fn apply_nfo(entity: &mut BaseItemEntity, n: &ferrofin_providers::xbmc::item::Nf
         .map(|url| (None, url.clone()))
         .collect();
     if let Some(data) = crate::item_data::merge_remote_trailers(entity.data.as_deref(), &trailers) {
+        entity.data = Some(data);
+    }
+}
+
+/// The [`SeriesStatus`](ferrofin_model::entities::SeriesStatus) name as
+/// Jellyfin serializes it into the `Data` blob — `Enum.ToString()`, which is
+/// also the `Status` string `DtoService` emits.
+fn series_status_name(status: ferrofin_model::entities::SeriesStatus) -> &'static str {
+    use ferrofin_model::entities::SeriesStatus;
+    match status {
+        SeriesStatus::Continuing => "Continuing",
+        SeriesStatus::Ended => "Ended",
+        SeriesStatus::Unreleased => "Unreleased",
+    }
+}
+
+/// Writes a series' status into its `Data` blob when the row carries none
+/// yet — the fill-if-empty rule the sibling fields follow, so the first
+/// source in provider order (a local NFO) wins.
+///
+/// The status is a `Series` property (`Series.Status`, `SeriesStatus?`), and
+/// only the series sources ever produce one (`SeriesNfoParser`, the TMDB and
+/// TVDB series arms); on any other kind the key would simply be ignored by
+/// Jellyfin's deserializer, as every unknown key is.
+fn apply_series_status(entity: &mut BaseItemEntity, status: &str) {
+    if let Some(data) = crate::item_data::fill_series_status(entity.data.as_deref(), status) {
         entity.data = Some(data);
     }
 }
@@ -6310,6 +6351,17 @@ fn apply_details(entity: &mut BaseItemEntity, d: &TmdbDetails) {
     }
     if entity.premiere_date.is_none() {
         entity.premiere_date = d.premiere_date.as_deref().and_then(parse_ymd);
+    }
+    // `if (TvParserHelpers.TryParseSeriesStatus(seriesResult.Status, out var
+    // seriesStatus)) series.Status = seriesStatus;` (TmdbSeriesProvider.cs:
+    // 294-296) — TMDB's `Returning Series`/`Ended`/`Canceled`/… folded onto
+    // the three `SeriesStatus` values; an unrecognized name is dropped.
+    if let Some(status) = d
+        .status
+        .as_deref()
+        .and_then(ferrofin_providers::xbmc::xml_ext::try_parse_series_status)
+    {
+        apply_series_status(entity, series_status_name(status));
     }
     // Trailers live in the serialized `Data` blob — Jellyfin's only home for
     // them — so the client's Trailer button links out to YouTube like upstream.
@@ -6527,6 +6579,23 @@ fn apply_tvdb_series(entity: &mut BaseItemEntity, d: &ferrofin_providers::TvdbSe
     }
     if entity.end_date.is_none() {
         entity.end_date = d.end_date.as_deref().and_then(parse_ymd);
+    }
+    // The TVDB plugin's `TvdbSeriesProvider` folds `tvdbSeries.Status.Name`
+    // through the same `TryParseSeriesStatus` as the NFO and TMDB paths, and
+    // maps `airsDays`/`airsTime` onto `AirDays`/`AirTime`.
+    if let Some(status) = d
+        .status
+        .as_deref()
+        .and_then(ferrofin_providers::xbmc::xml_ext::try_parse_series_status)
+    {
+        apply_series_status(entity, series_status_name(status));
+    }
+    if let Some(data) = crate::item_data::fill_series_air(
+        entity.data.as_deref(),
+        &d.air_days,
+        d.air_time.as_deref(),
+    ) {
+        entity.data = Some(data);
     }
 }
 
@@ -7678,6 +7747,113 @@ mod tests {
         assert_eq!(e.genres.as_deref(), Some("Action|Drama"));
         assert_eq!(e.studios.as_deref(), Some("ACME"));
         assert_eq!(e.community_rating, Some(7.5));
+    }
+
+    /// `Series.Status` comes from `<status>` (SeriesNfoParser.cs:75-90), TMDB's
+    /// `status` (TmdbSeriesProvider.cs:294-296) and TVDB's `status.name`, all
+    /// through `TryParseSeriesStatus`, and lands in the `Data` blob as
+    /// `"Status":"Ended"` — the value `DtoService` emits as `Status`. Fill-if-
+    /// empty like the sibling fields: the NFO, applied first, wins.
+    #[test]
+    fn series_status_from_nfo_tmdb_and_tvdb_lands_in_the_data_blob() {
+        use ferrofin_db::entities::base_items::BaseItemEntity;
+        use ferrofin_model::entities::SeriesStatus;
+        use ferrofin_providers::TmdbDetails;
+        use ferrofin_providers::xbmc::item::{NfoBaseItem, NfoItemKind};
+
+        let mut n = NfoBaseItem::new(NfoItemKind::Series);
+        n.status = Some(SeriesStatus::Ended);
+        let mut e = BaseItemEntity {
+            data: Some(r#"{"DisplayOrder":"Aired"}"#.into()),
+            ..Default::default()
+        };
+        super::apply_nfo(&mut e, &n);
+        assert_eq!(
+            crate::item_data::read_series_status(e.data.as_deref()).as_deref(),
+            Some("Ended")
+        );
+        // The other keys survive the read-modify-write.
+        assert!(
+            e.data
+                .as_deref()
+                .unwrap()
+                .contains(r#""DisplayOrder":"Aired""#)
+        );
+
+        // TMDB's `Returning Series` folds onto `Continuing`, but does not
+        // replace the NFO's value.
+        let tmdb = TmdbDetails {
+            status: Some("Returning Series".into()),
+            ..TmdbDetails::default()
+        };
+        super::apply_details(&mut e, &tmdb);
+        assert_eq!(
+            crate::item_data::read_series_status(e.data.as_deref()).as_deref(),
+            Some("Ended")
+        );
+        let mut fresh = BaseItemEntity::default();
+        super::apply_details(&mut fresh, &tmdb);
+        assert_eq!(
+            crate::item_data::read_series_status(fresh.data.as_deref()).as_deref(),
+            Some("Continuing")
+        );
+        // A movie's `Released`, or any name the helper does not know, writes
+        // nothing at all.
+        let mut movie = BaseItemEntity::default();
+        super::apply_details(
+            &mut movie,
+            &TmdbDetails {
+                status: Some("Released".into()),
+                ..TmdbDetails::default()
+            },
+        );
+        assert_eq!(movie.data, None);
+
+        // TVDB: `Cancelled` → `Ended`, and `airsDays`/`airsTime` land too.
+        let mut tv = BaseItemEntity::default();
+        super::apply_tvdb_series(
+            &mut tv,
+            &ferrofin_providers::TvdbSeriesDetails {
+                status: Some("Cancelled".into()),
+                air_days: vec![ferrofin_model::dto::DayOfWeek::Sunday],
+                air_time: Some("21:00".into()),
+                ..ferrofin_providers::TvdbSeriesDetails::default()
+            },
+        );
+        let fields = crate::item_data::read_series_fields(tv.data.as_deref());
+        assert_eq!(fields.status.as_deref(), Some("Ended"));
+        assert_eq!(
+            fields.air_days.as_deref(),
+            Some(&[ferrofin_model::dto::DayOfWeek::Sunday][..])
+        );
+        assert_eq!(fields.air_time.as_deref(), Some("21:00"));
+
+        // NFO `<airs_dayofweek>`/`<airs_time>`, fill-if-empty like the status.
+        let mut n = NfoBaseItem::new(NfoItemKind::Series);
+        n.air_days = vec![ferrofin_model::dto::DayOfWeek::Monday];
+        n.air_time = Some("20:00".into());
+        let mut e = BaseItemEntity::default();
+        super::apply_nfo(&mut e, &n);
+        let fields = crate::item_data::read_series_fields(e.data.as_deref());
+        assert_eq!(
+            fields.air_days.as_deref(),
+            Some(&[ferrofin_model::dto::DayOfWeek::Monday][..])
+        );
+        assert_eq!(fields.air_time.as_deref(), Some("20:00"));
+        super::apply_tvdb_series(
+            &mut e,
+            &ferrofin_providers::TvdbSeriesDetails {
+                air_days: vec![ferrofin_model::dto::DayOfWeek::Sunday],
+                air_time: Some("21:00".into()),
+                ..ferrofin_providers::TvdbSeriesDetails::default()
+            },
+        );
+        let fields = crate::item_data::read_series_fields(e.data.as_deref());
+        assert_eq!(
+            fields.air_time.as_deref(),
+            Some("20:00"),
+            "the NFO's value stays"
+        );
     }
 
     // PhotoResolver.IsImageFile: the extension set, minus the artwork prefixes.
