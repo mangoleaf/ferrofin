@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # The comparison run (PLAN_BENCHMARK_V3 §5). For each server, alone on its cores:
 #   provision (fresh copy of the test data) → drain → counts → shape → cold start
-#   → unloaded window → loaded window (+ memory sampler) → steady window → TTFS.
+#   → unloaded / loaded / stress windows (+ memory sampler) → steady window → TTFS.
 # Every phase writes its file the moment it ends and fails on its own: a broken phase
 # is reported and the next one runs; report.py renders whatever exists.
 #
 #   run.sh [--testdata DIR] [--servers jellyfin,jellyfin12,ferrofin]
-#          [--only counts|shape|coldstart|unloaded|loaded|ttfs] [--rate N] [--out DIR]
+#          [--only counts|shape|coldstart|unloaded|loaded|stress|ttfs] [--rate N] [--out DIR]
 #
 # Requires: docker, k6, python3, jq; images jellyfin/jellyfin:10.11.8,
 # jellyfin/jellyfin:12.0-rc7 and ferrofin:bench (docker build -t ferrofin:bench .).
@@ -26,6 +26,21 @@ TTFS_REPS=${TTFS_REPS:-5}
 CORE_IDLE_MIN=${CORE_IDLE_MIN:-0.90}  # the server/client cores must be this idle before a run starts
 RATE_UNLOADED=${RATE_UNLOADED:-1}   # screens per second
 RATE_LOADED=${RATE_LOADED:-5}
+#: The third level exists to push the servers past a comfortable browse: 25 screens/s
+#: is ~120 API requests/s plus ~245 poster fetches/s. It is a fixed rate like the others
+#: rather than a ramp — finding one server's knee is a different question from comparing
+#: two servers doing the same work.
+#:
+#: Why 25 and not more: measured mean container CPU over the loaded window, as a share of
+#: the 8-core cpuset, was 1.03 cores for Jellyfin 12.0-rc7, 0.45 for 10.11.8 and 0.19 for
+#: Ferrofin. Scaled to 25 screens/s that is roughly 65 %, 28 % and 12 % of the box — so
+#: this is close to the highest fixed rate at which the SLOWEST server is still under
+#: saturation, which is what keeps the comparison fair. Raising it further stresses only
+#: Ferrofin (it would need ~150-200 screens/s to bend) while the oracle is already past
+#: its knee, and past that point the two columns are no longer measuring the same thing.
+#: Note k6's dropped-iteration flag guards the CLIENT, not the server, and at this rate
+#: it will not fire — it is not the safety net for choosing this number.
+RATE_STRESS=${RATE_STRESS:-25}
 export SERVER_CPUS=${SERVER_CPUS:-8-15}    # cpuset for the server under test
 export CLIENT_CPUS=${CLIENT_CPUS:-16-19}   # cpuset for k6 / the python clients / the sampler
 MEMORY=${MEMORY:-8g}                # cgroup limit, swap disabled (part of the memory number's definition)
@@ -33,7 +48,10 @@ MEMORY=${MEMORY:-8g}                # cgroup limit, swap disabled (part of the m
 TESTDATA=$PWD/bench/testdata; SERVERS=jellyfin,jellyfin12,ferrofin; ONLY=""; OUT=""
 while [ $# -gt 0 ]; do case "$1" in
   --testdata) TESTDATA=$2; shift 2;; --servers) SERVERS=$2; shift 2;; --only) ONLY=$2; shift 2;;
-  --rate) RATE_LOADED=$2; shift 2;; --out) OUT=$2; shift 2;; *) echo "unknown $1" >&2; exit 2;;
+  # --rate sets the LOADED level only; RATE_UNLOADED and RATE_STRESS are env vars.
+  --rate) RATE_LOADED=$2; shift 2;;
+  --out) OUT=$2; shift 2;;
+  *) echo "unknown $1" >&2; exit 2;;
 esac; done
 abs() { case "$1" in /*) echo "$1";; *) echo "$CALLER/$1";; esac; }   # user paths are relative to the caller's shell
 TESTDATA=$(realpath -m "$(abs "$TESTDATA")")
@@ -58,9 +76,11 @@ IDS=$TESTDATA/ids.json; U=$(jq -r .user "$IDS"); TOK=$(jq -r .token "$IDS")
 AUTH="Authorization: MediaBrowser Client=\"bench\", Device=\"bench\", DeviceId=\"bench-run\", Version=\"3\", Token=\"$TOK\""
 jq -n --arg sha "$SHA" --arg host "$(uname -srm)" --arg cpu "$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | xargs)" \
   --arg mem "$MEMORY" --arg cpus "$SERVER_CPUS" --arg k6 "$(k6 version | head -1)" --arg testdata "$(jq -c .counts "$IDS")" \
-  --argjson rate_unloaded "$RATE_UNLOADED" --argjson rate_loaded "$RATE_LOADED" --argjson window "$WINDOW_S" --argjson sample_ms "$MEM_SAMPLE_MS" \
+  --argjson rate_unloaded "$RATE_UNLOADED" --argjson rate_loaded "$RATE_LOADED" --argjson rate_stress "$RATE_STRESS" \
+  --argjson window "$WINDOW_S" --argjson sample_ms "$MEM_SAMPLE_MS" \
   '{sha:$sha, host:$host, cpu:$cpu, memory_limit:$mem, server_cpus:$cpus, k6:$k6, testdata_counts:($testdata|fromjson),
-    rate_unloaded:$rate_unloaded, rate_loaded:$rate_loaded, window_s:$window, mem_sample_ms:$sample_ms, date: (now|todate)}' > "$OUT/run.json"
+    rate_unloaded:$rate_unloaded, rate_loaded:$rate_loaded, rate_stress:$rate_stress,
+    window_s:$window, mem_sample_ms:$sample_ms, date: (now|todate)}' > "$OUT/run.json"
 
 api() {  # GET with the bench token; retries through a starting server's 503s/refusals
   local _; for _ in $(seq 1 120); do curl -sf -H "$AUTH" "$URL$1" && return 0; sleep 1; done
@@ -118,12 +138,16 @@ phase_coldstart() {
   taskset -c "$CLIENT_CPUS" python3 bench/coldstart.py "$CONTAINER" "$URL" "$IDS" "$D/coldstart.json" "$RESTARTS" "$POLL_MS" | sed 's/^/  /' || return 1
   wait_ready && drain
 }
-phase_load() {  # unloaded + loaded windows under one sampler (drained between), then the steady window
+phase_load() {  # every load level under one sampler (drained between), then the steady window
   taskset -c "$CLIENT_CPUS" python3 bench/mem_sample.py "$CONTAINER" "$D/mem.csv" "$MEM_SAMPLE_MS" "$SERVER_CPUS" &
   local sampler=$! w='{}' level rate seed t0 t1 rc=0
-  for level in unloaded loaded; do
+  for level in unloaded loaded stress; do
     want $level || continue
-    if [ $level = unloaded ]; then rate=$RATE_UNLOADED; seed=0; else rate=$RATE_LOADED; seed=500000; fi
+    case $level in
+      unloaded) rate=$RATE_UNLOADED; seed=0;;
+      loaded)   rate=$RATE_LOADED;   seed=500000;;
+      stress)   rate=$RATE_STRESS;   seed=250000;;
+    esac
     drain || rc=1
     echo "  $level: warm-up ${WARMUP_S}s @ $rate/s"
     k6run -e RATE="$rate" -e DURATION="${WARMUP_S}s" -e SEED=$((seed + 900000)) -e OUT="$D/k6-$level-warmup.json" >/dev/null || { echo "  warm-up failed" >&2; rc=1; }
@@ -133,6 +157,10 @@ phase_load() {  # unloaded + loaded windows under one sampler (drained between),
     t1=$(date +%s.%N)
     w=$(jq -c --arg l "$level" --argjson t0 "$t0" --argjson t1 "$t1" '. + {($l): {start:$t0, end:$t1}}' <<<"$w")
   done
+  # Drain before the steady window as well: it now follows the stress level, and an
+  # in-flight transcode or a scheduled task started under that load would otherwise be
+  # measured as idle memory.
+  drain || rc=1
   echo "  steady: idle ${STEADY_S}s"
   t0=$(date +%s.%N); sleep "$STEADY_S"; t1=$(date +%s.%N)
   jq -c --argjson t0 "$t0" --argjson t1 "$t1" '. + {steady: {start:$t0, end:$t1}}' <<<"$w" > "$D/windows.json"
@@ -166,7 +194,7 @@ run_server() {
   ! want counts || phase counts
   ! want shape || phase shape
   ! want coldstart || phase coldstart
-  { ! want unloaded && ! want loaded; } || phase load
+  { ! want unloaded && ! want loaded && ! want stress; } || phase load
   ! want ttfs || phase ttfs
   docker logs "$CONTAINER" > "$D/server.log" 2>&1 || true
   docker rm -f "$CONTAINER" >/dev/null; trap - EXIT

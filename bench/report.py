@@ -37,6 +37,24 @@ ORACLE = "jellyfin12"  # the source of truth (owner, 2026-09-02): Jellyfin 12 is
 ORACLE_LABEL = "Jellyfin 12.0-rc7"
 SERVERS = [("jellyfin12", "Jellyfin 12.0-rc7"), ("jellyfin", "Jellyfin 10.11.8"), ("ferrofin", "Ferrofin")]
 SCREENS = ["home", "movies", "detail", "series", "search", "playback"]
+#: The load levels a run may contain, lightest first. A run that skipped one (`--only`)
+#: has no entry for it in `windows.json`, and the renderers drop the level.
+LOAD_LEVELS = ("unloaded", "loaded", "stress")
+#: The levels "peak under load" is the peak *of*. `unloaded` is a screen a second — it is
+#: a control, not load, and a peak attributed to it would not mean what the row says.
+PEAK_LEVELS = ("loaded", "stress")
+
+
+def run_levels(d):
+    """The load levels this run dir actually executed, from its own `windows.json`.
+    A level that ran and then failed to produce a k6 file must still be reported as a
+    missing phase, so "did it run" cannot be inferred from the result file existing."""
+    win = load(os.path.join(d, "windows.json"))
+    if win is None:
+        # An interrupted run has no record of itself; fall back to what it produced, so
+        # a level whose result file is also missing is still named rather than dropped.
+        return {lvl for lvl in LOAD_LEVELS if os.path.isfile(os.path.join(d, f"k6-{lvl}.json"))}
+    return {lvl for lvl in LOAD_LEVELS if lvl in win}
 MIB = 2 ** 20
 TRANSCODE_NOISE = ("playsessionid", "apikey", "deviceid", "tag=", "api_key", "transcodereasons")
 
@@ -121,8 +139,12 @@ def mem_numbers(d):
         return [int(r["anon"]) for r in rows if w["start"] <= float(r["t"]) <= w["end"]]
 
     out = {}
-    if "loaded" in win and within(win["loaded"]):
-        out["peak"] = max(within(win["loaded"])) / MIB
+    # "Peak under load" is the peak across the run's load windows — with a stress level
+    # present that is where it lives, and naming one window would quietly report the
+    # second-heaviest number. `unloaded` is excluded: it is the control, not load.
+    under_load = [v for lvl in PEAK_LEVELS if lvl in win for v in within(win[lvl])]
+    if under_load:
+        out["peak"] = max(under_load) / MIB
     if "steady" in win and within(win["steady"]):
         out["steady"] = statistics.median(within(win["steady"])) / MIB
     if "interference" in rows[0]:
@@ -140,6 +162,9 @@ class Cell:
     missing); `flag` is the reason it is not publishable, if any."""
 
     def __init__(self, vals, fmt, flag=None, sub=None, unit="ms", context=False):
+        vals = list(vals)
+        #: how many runs were selected, whether or not each produced this number
+        self.runs = len(vals)
         self.vals = [v for v in vals if v is not None]
         self.fmt = fmt
         self.flag = flag
@@ -162,10 +187,14 @@ class Cell:
         return self.fmt(self.median) if self.vals else "—"
 
     def spread_text(self):
-        """`min–max over N runs`, or None when there is only one run to compare."""
+        """`min–max over N runs`, or None when there is only one run to compare.
+        Says `of M selected` when the cell is missing from some of them — a level added
+        later exists in one run and not another, and one value cannot satisfy a
+        reproducibility rule however many runs were asked for."""
         if len(self.vals) < 2:
-            return None
-        return f"{self.fmt(min(self.vals))}–{self.fmt(max(self.vals))} over {len(self.vals)} runs"
+            return f"1 of {self.runs} selected runs" if self.runs > len(self.vals) else None
+        seen = f"{len(self.vals)} runs" if self.runs == len(self.vals) else f"{len(self.vals)} of {self.runs} selected runs"
+        return f"{self.fmt(min(self.vals))}–{self.fmt(max(self.vals))} over {seen}"
 
     def parts(self):
         """This cell and, for a latency cell, its p95 and p99 — every number it prints,
@@ -198,7 +227,12 @@ class Cell:
                 if with_range:
                     txt += f" ({part.fmt(min(part.vals))}–{part.fmt(max(part.vals))})"
             out.append(txt)
-        return " / ".join(out)
+        txt = " / ".join(out)
+        if with_range and 0 < len(self.vals) < self.runs:
+            # One value cannot satisfy a reproducibility rule however many runs were
+            # asked for — say which, rather than let the number look agreed.
+            txt += f" [{len(self.vals)}/{self.runs} runs]"
+        return txt
 
     def spreads(self):
         """The per-number spreads, for the hover text."""
@@ -292,7 +326,8 @@ def md_cell(c, notes, source=None, oracle_cell=None):
 
 def build(runs):
     """Everything both renderers need, computed once from the run dirs."""
-    meta = load(os.path.join(runs[0], "run.json")) or {}
+    metas = [load(os.path.join(r, "run.json")) or {} for r in runs]
+    meta = metas[0]
     servers = [(k, label) for k, label in SERVERS if any(os.path.isdir(os.path.join(r, k)) for r in runs)]
     per = {k: [os.path.join(r, k) for r in runs] for k, _ in servers}
     shapes = {k: [load_shape(d) for d in ds] for k, ds in per.items()}
@@ -300,11 +335,15 @@ def build(runs):
     missing = []
     m = {"meta": meta, "runs": runs, "servers": servers, "levels": {}, "missing": missing}
 
-    for level in ("unloaded", "loaded"):
+    for level in LOAD_LEVELS:
         data = {k: [load(os.path.join(d, f"k6-{level}.json")) for d in ds] for k, ds in per.items()}
-        for k in per:
-            if any(x is None for x in data[k]):
-                missing.append(f"{k}: k6-{level}.json")
+        # `windows.json` says the level ran; a missing k6 file then means it failed,
+        # which has to be reported. Only a level no run executed disappears silently.
+        ran = any(level in run_levels(d) for ds in per.values() for d in ds)
+        for k, ds in per.items():
+            for d, x in zip(ds, data[k]):
+                if x is None and level in run_levels(d):
+                    missing.append(f"{k}: k6-{level}.json")
         names_of = defaultdict(set)
         for xs in data.values():
             for x in xs:
@@ -328,8 +367,15 @@ def build(runs):
         names = [n for scr in SCREENS for n in sorted(names_of[scr])] + (["image"] if "image" in names_of else [])
         endpoints = [(n, {k: latency_cell([x["endpoints"].get(n) if x else None for x in data[k]], flag(k, [n]))
                           for k, _ in servers}) for n in names]
-        m["levels"][level] = {"rate": meta.get("rate_" + level, "?"), "screens": screens, "endpoints": endpoints,
-                              "any_data": any(any(xs) for xs in data.values())}
+        # A level no run executed (an older run, or `--only`) is dropped rather than
+        # rendered as an empty section by whichever renderer forgets to check. A level
+        # that ran and failed keeps its (empty) section and its missing-phase entries.
+        if ran or any(any(xs) for xs in data.values()):
+            rates = {r["rate_" + level] for r in metas if r.get("rate_" + level) is not None}
+            rate = rates.pop() if len(rates) == 1 else ("?" if not rates else
+                                                        "/".join(str(x) for x in sorted(rates)))
+            m["levels"][level] = {"rate": rate, "screens": screens,
+                                  "endpoints": endpoints, "any_data": True}
 
     # time to first screen
     cold, hls, direct, turl = {}, {}, {}, {}
@@ -367,16 +413,25 @@ def build(runs):
     for k, x in mems.items():
         if any(v is None for v in x):
             missing.append(f"{k}: mem.csv/windows.json")
-    loaded = {k: [load(os.path.join(d, "k6-loaded.json")) for d in ds] for k, ds in per.items()}
+    # The gate asks the run what it ran, so a window that vanished still invalidates the
+    # peak computed from it — checking only the files that exist cannot fail.
+    windows = {k: [load(os.path.join(d, f"k6-{lvl}.json"))
+                   for d in ds for lvl in run_levels(d) if lvl in PEAK_LEVELS]
+               for k, ds in per.items()}
+    mixed = None if same_load_shape([d for ds in per.values() for d in ds]) else (
+        "runs measured different load levels, so this row mixes two definitions")
     peak = {}
-    for k, _ in servers:
-        bad = [x for x in loaded[k] if x is None or x.get("dropped_iterations")]
+    for k, ds in per.items():
+        bad = [x for x in windows[k] if x is None or x.get("dropped_iterations")]
         # the peak is only meaningful if the loaded window that produced it was the specified load
-        peak[k] = Cell([(x or {}).get("peak") for x in mems[k]], mib, "loaded window missing or dropped iterations" if bad else None, unit="MiB")
+        peak[k] = Cell([(x or {}).get("peak") for x in mems[k]], mib,
+                       mixed or ("a load window is missing or dropped iterations" if bad else None),
+                       unit="MiB")
     pct = lambda v: f"{v * 100:.0f}%"
     m["memory"] = [
         ("peak under load", peak),
-        ("steady idle", {k: Cell([(x or {}).get("steady") for x in mems[k]], mib, unit="MiB") for k, _ in servers}),
+        ("steady idle", {k: Cell([(x or {}).get("steady") for x in mems[k]], mib, mixed, unit="MiB")
+                         for k, _ in servers}),
         # interference and swap describe the host while that server ran, not the server
         ("interference on the server's cores, p95", {k: Cell([(x or {}).get("interference_p95") for x in mems[k]], pct, unit="%", context=True) for k, _ in servers}),
         ("interference, max single sample", {k: Cell([(x or {}).get("interference") for x in mems[k]], pct, unit="%", context=True) for k, _ in servers}),
@@ -414,7 +469,7 @@ def render_md(m):
     p(f"## Ferrofin vs Jellyfin — {len(m['runs'])} run(s), commit {meta.get('sha', '?')}, {meta.get('date', '')[:10]}")
     p(f"Host {meta.get('cpu', '?')} · server on cpus {meta.get('server_cpus', '?')} · {meta.get('memory_limit', '?')} limit · "
       f"test data {meta.get('testdata_counts', {})} · windows {meta.get('window_s', '?')} s · "
-      f"unloaded {meta.get('rate_unloaded', '?')} screens/s · loaded {meta.get('rate_loaded', '?')} screens/s")
+      + " · ".join(f"{lvl} {m['levels'][lvl]['rate']} screens/s" for lvl in LOAD_LEVELS if lvl in m["levels"]))
     p(f"Cells are the median across runs. A `~` after a number means its spread across runs exceeded "
       f"{SPREAD_MAX:.0%} of the median — that number is not reproducible, and its range follows. `⚠[n]` means "
       f"the server did different work than {ORACLE_LABEL} (status / record count / missing fields), so the "
@@ -581,6 +636,22 @@ def ratio_html(c, oracle_cell):
     return f"<span class='{cls}' title='{html.escape(title)}'>{html.escape(text)}</span>"
 
 
+def same_load_shape(dirs):
+    """Whether every run dir measured the same load levels. The memory rows are defined
+    by which windows ran — "peak under load" spans them and "steady idle" follows the
+    last — so a median taken across runs that ran different levels silently blends two
+    definitions of the row, which no other rule here would catch."""
+    return len({frozenset(run_levels(d)) for d in dirs}) <= 1
+
+
+def comparable_levels(m, base):
+    """Whether two run sets measured the same load levels. The memory rows change
+    meaning across that boundary — "peak under load" spans a heavier set of windows and
+    "steady idle" follows a different last window — so a delta between them would report
+    a definition change as a regression."""
+    return base is None or set(m["levels"]) == set(base["levels"])
+
+
 def delta_html(c, base):
     """Change against the same server in the baseline run; lower is better for every non-context
     number. Only when both numbers stand (a flagged cell is not a valid number to move from or to)."""
@@ -677,7 +748,9 @@ def render_html(m, base=None, picker=""):
     meta, servers = m["meta"], m["servers"]
     base_l = (base or {}).get("levels", {})
     base_ttfs = dict((base or {}).get("ttfs", []))
-    base_mem = dict((base or {}).get("memory", []))
+    # The memory rows mean different things either side of a change in which load levels
+    # ran, so a delta across that boundary would report a redefinition as a regression.
+    base_mem = dict((base or {}).get("memory", [])) if comparable_levels(m, base) else {}
     tc = meta.get("testdata_counts", {})
     title = f"Ferrofin Benchmark {meta.get('sha', '')}".strip()
     parts = ["<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'>",
@@ -707,8 +780,8 @@ def render_html(m, base=None, picker=""):
             if c.flag:
                 n = notes.add(c.flag, f"{lbl} · {name} (headline)")
                 extra += f"<sup class='fn'><a href='#n{n}'>{n}</a></sup>"
-            if len(c.vals) > 1:
-                rng = f"{sig3(min(c.vals))}–{sig3(max(c.vals))} over {len(c.vals)} runs"
+            rng = c.spread_text()
+            if rng:
                 if c.spread_ok():
                     why = f"<div class='tail' style='font-size:12px'>{rng}</div>"
                 else:
@@ -726,7 +799,12 @@ def render_html(m, base=None, picker=""):
         parts.append(table_html("screen", lv["screens"], servers, dict(bl.get("screens", [])), notes, f"{level} screens"))
         parts.append(f"<details><summary>Per endpoint, {level}</summary>{table_html('endpoint', lv['endpoints'], servers, dict(bl.get('endpoints', [])), notes, f'{level} endpoints')}</details>")
     parts.append("<h2>Time to first screen</h2>" + table_html("", m["ttfs"], servers, base_ttfs, notes, "time to first screen"))
-    parts.append(f"<h2>Memory — anon, cache excluded, {e(str(m['sample_ms']))} ms samples</h2>" + table_html("", m["memory"], servers, base_mem, notes, "memory"))
+    mem_note = "" if comparable_levels(m, base) else (
+        "<p class='lede'>The baseline ran different load levels, so no change is shown on the "
+        "memory rows: <em>peak under load</em> spans a different set of windows and "
+        "<em>steady idle</em> follows a different one, which would read as a regression.</p>")
+    parts.append(f"<h2>Memory — anon, cache excluded, {e(str(m['sample_ms']))} ms samples</h2>"
+                 + mem_note + table_html("", m["memory"], servers, base_mem, notes, "memory"))
     if m["work"]:
         parts.append(f"<h2>The work list — divergences from {ORACLE_LABEL}</h2><p class='lede'>From the shape pass (status, record count, field set) and the item counts. Each is a server fix or a recorded, accepted divergence.</p>")
         for k, items in m["work"].items():

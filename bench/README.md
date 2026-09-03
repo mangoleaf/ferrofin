@@ -37,9 +37,13 @@ Screens are opened **open-loop** (k6 `constant-arrival-rate`): the next user nev
 for the previous one, so slow responses do not throttle arrivals and the tails are real.
 The mix is home 3 : movies 2 : detail 2 : series 1 : search 1 : playback 1, in a fixed
 order with fixed picks, so every server receives the identical request sequence.
-Two levels are published: **unloaded** (1 screen/s) and **loaded** (5 screens/s — about
-24 API requests/s plus up to ~55 poster requests/s). Each window is 120 s after a 30 s
-warm-up at the same rate (different picks) that is discarded.
+Three levels are published: **unloaded** (1 screen/s), **loaded** (5 screens/s — about
+24 API requests/s plus up to ~55 poster requests/s) and **stress** (25 screens/s, five
+times that), which exists to push both servers past a comfortable browse. All three are
+fixed arrival rates rather than a ramp: finding one server's knee is a different question
+from comparing two servers doing the same work, and `RATE_STRESS` is the knob if neither
+bends. Each window is 120 s after a 30 s warm-up at the same rate (different picks) that
+is discarded, and a window in which k6 could not hold its rate is flagged, not published.
 
 ## Definitions (one sentence each)
 
@@ -59,8 +63,10 @@ warm-up at the same rate (different picks) that is discarded.
 - **Direct-play TTFB** — milliseconds to the first byte of `GET /Videos/{id}/stream?static=true`
   with `Range: bytes=0-1048575`; the median of 5 is the run's number.
 - **Peak memory** — the maximum of cgroup v2 `memory.stat anon` (heap and stacks of the
-  server and its ffmpeg children; page cache excluded) sampled every 100 ms during the
-  loaded window; **steady memory** — the median of the same over the 60 s idle after it.
+  server and its ffmpeg children; page cache excluded) sampled every 100 ms across the
+  loaded and stress windows — not the unloaded one, which is the control rather than
+  load; **steady memory** — the median of the same over the 60 s idle after them, which
+  the run drains into.
   Every server runs under an 8 GiB cgroup limit with swap disabled (`--memory-swap` =
   `--memory`; the sampler records `memory.swap.current` to prove it stayed 0), which is
   part of the definition (.NET sizes its GC heap from it).
@@ -123,7 +129,7 @@ docker build -t ferrofin:bench .                  # the commit under test
 docker pull jellyfin/jellyfin:10.11.8
 docker pull jellyfin/jellyfin:12.0-rc7
 bench/testdata/build.sh                           # once, ~20 min
-bench/run.sh                                      # one full run, ~40 min → bench/runs/<date>-<sha>/report.md
+bench/run.sh                                      # one full run, ~50 min → bench/runs/<date>-<sha>/report.md
 python3 bench/report.py bench/runs/A bench/runs/B bench/runs/C   # the README table: medians, markers, notes
 python3 bench/report.py --serve                   # the comparison viewer at http://127.0.0.1:8097/
 ```
