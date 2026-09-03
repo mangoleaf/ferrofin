@@ -41,7 +41,7 @@ async fn get_artists(
     Query(query): Query<ByNameListQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     let user = resolve_user(&state, &auth, query.user_id).await?;
-    let internal = query.base_query(Some(user.clone()));
+    let internal = query.base_query(Some(user.clone()))?;
     let result = state.library.get_artists(&internal).await?;
     let options = query.dto_options(query.enable_user_data);
     let projected = project_query_result(
@@ -71,7 +71,7 @@ async fn get_album_artists(
     Query(query): Query<ByNameListQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     let user = resolve_user(&state, &auth, query.user_id).await?;
-    let internal = query.base_query(Some(user.clone()));
+    let internal = query.base_query(Some(user.clone()))?;
     let result = state.library.get_album_artists(&internal).await?;
     let options = query.dto_options(query.enable_user_data);
     let projected = project_query_result(

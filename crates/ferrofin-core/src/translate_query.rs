@@ -12,14 +12,14 @@
 //! Faithfulness and scope. The scalar-column filters, type include/exclude,
 //! parent / ancestor / top-parent, provider-id presence, name/date/numeric
 //! ranges, `ItemValues` joins (genres, tags, studios, artists, album-artists,
-//! genre/studio ids), `UserData` predicates (favorite / played / liked), and the
-//! ordering table are ported directly. The deep recursive-descendant `EXISTS`
-//! folders (per-series played/resumable aggregation, box-set collapsing,
-//! chapter/subtitle folder roll-ups) are **not** expanded here — they need the
-//! `AncestorIds`/`FerrofinLinkedChildren` recursive CTEs that belong with the library
-//! manager (a later unit). Those filters are skipped rather than mistranslated;
-//! see the inline `// deferred:` notes. Everything ported matches the C#
-//! predicate exactly for non-folder items.
+//! genre/studio ids), `UserData` predicates (favorite / played / liked /
+//! resumable — the last with v12's Series/Season descendant roll-up), and the
+//! ordering table are ported directly. The remaining folder-descendant
+//! `EXISTS` roll-ups (the played filter's, the resolution and subtitle
+//! roll-ups) are open work items, each named at its predicate with the
+//! v12 reference; they take the `AncestorIds` walk `push_folders_with_leaf`
+//! already spells. Everything ported matches the C# predicate exactly for
+//! non-folder items.
 //!
 //! `Guid` columns are stored as UPPERCASE hyphenated `TEXT` and datetimes as
 //! `YYYY-MM-DD HH:MM:SS.fffffff` (Jellyfin's canonical storage formats), so
@@ -306,7 +306,8 @@ pub(crate) fn append_predicates<'a>(
     qb: &mut QueryBuilder<'a, Sqlite>,
     filter: &'a InternalItemsQuery,
 ) {
-    // --- resolution (own-row form; folder EXISTS roll-up is deferred) ---
+    // --- resolution (own-row form; the folder-descendant roll-up is an open
+    // work item, see `append_resolution_predicate`) ---
     if filter.is_hd.is_some() || filter.is_4k.is_some() {
         append_resolution_predicate(qb, filter);
     }
@@ -673,8 +674,12 @@ pub(crate) fn append_predicates<'a>(
     }
 }
 
-/// Appends the `IsHD` / `Is4K` own-resolution predicate (the non-folder branch of
-/// the C# resolution filter; the folder-descendant EXISTS roll-up is deferred).
+/// Appends the `IsHD` / `Is4K` own-resolution predicate — the non-folder branch
+/// of the C# resolution filter. v12 (`TranslateQuery.cs`, `IsHD`/`Is4K` with
+/// `VersionsMatchingDimension` and the folder-descendant `EXISTS` roll-up) also
+/// keeps a folder whose leaf descendant, or an alternate version, satisfies the
+/// bound; that half is an open work item: port it with the played/resumable
+/// descendant helpers (`push_folders_with_leaf`) once a browse needs it.
 fn append_resolution_predicate(qb: &mut QueryBuilder<'_, Sqlite>, filter: &InternalItemsQuery) {
     let standard_def = filter.is_hd == Some(false);
     let high_def = filter.is_hd == Some(true);
@@ -870,9 +875,9 @@ fn append_name_predicates(
 ///
 /// Ports of C# `TranslateQuery`'s `HasSubtitles` (`MediaStreams.Any(Subtitle)`),
 /// the `ExtraIds`-backed extra filters, and the `Data`-substring `VideoType` /
-/// `Video3DFormat` matches. The folder roll-up branches (a series "has
-/// subtitles" when any episode does) are deferred with the other
-/// series/box-set aggregation.
+/// `Video3DFormat` matches. The folder roll-up branch (v12
+/// `WhereItemOrDescendantMatches`: a series "has subtitles" when any episode
+/// does) is an open work item, to port with `push_folders_with_leaf`'s walk.
 fn append_media_attribute_predicates(
     qb: &mut QueryBuilder<'_, Sqlite>,
     filter: &InternalItemsQuery,
@@ -971,11 +976,13 @@ fn append_media_attribute_predicates(
 }
 
 /// Appends the `UserData`-backed predicates (favorite / favorite-or-liked / liked
-/// / played) as `EXISTS` sub-selects scoped to the query's user.
+/// / played / resumable) scoped to the query's user — the C# `TranslateQuery`
+/// blocks at `BaseItemRepository.TranslateQuery.cs:514-603` (v12).
 ///
-/// The played/resumable series-and-boxset aggregation branch is deferred (needs
-/// the library manager); this covers the direct per-item `UserData` predicates,
-/// which is the C# `else` branch for non-series/boxset queries.
+/// `IsPlayed` is the direct per-row rule (`UserData.Played` on the item
+/// itself); v12's `BuildIsPlayedFilter` (`:39-56`) additionally counts a
+/// folder as played once no leaf descendant is unplayed — an open work item
+/// for the played filter, tracked with the other folder roll-ups.
 fn append_user_data_predicates(qb: &mut QueryBuilder<'_, Sqlite>, filter: &InternalItemsQuery) {
     let Some(user_id) = filter.user_id() else {
         return;
@@ -997,14 +1004,189 @@ fn append_user_data_predicates(qb: &mut QueryBuilder<'_, Sqlite>, filter: &Inter
         push_user_data_exists(qb, &uid, r#"ud."Played" = 1"#, want);
     }
     if let Some(want) = filter.is_resumable {
-        // A resumable item is one with an in-progress user-data row
-        // (`PlaybackPositionTicks > 0`). C#
-        // `BaseItemRepository.TranslateQuery` also has a series-aggregation
-        // branch (a series is resumable when it has an in-progress or a
-        // partially-watched episode); that aggregation needs the series/episode
-        // walk and is deferred with the other series/box-set aggregation, so this
-        // covers the direct per-item case (C# `else` branch).
-        push_user_data_exists(qb, &uid, r#"ud."PlaybackPositionTicks" > 0"#, want);
+        push_resumable_predicate(qb, &uid, want);
+    }
+}
+
+/// The in-progress `UserData` rows of the user: `PlaybackPositionTicks > 0`
+/// (v12 `TranslateQuery.cs:558-559`, `inProgress`). Emitted as an
+/// uncorrelated `SELECT` so SQLite materializes the user's list once and
+/// drives the outer query through the `BaseItems` primary key — the IN form
+/// [`push_user_data_exists`] measures at 105× the correlated `EXISTS`.
+fn push_in_progress_ids(qb: &mut QueryBuilder<'_, Sqlite>, uid: &str) {
+    qb.push(r#"(SELECT ud."ItemId" FROM "UserData" ud WHERE ud."UserId" = "#)
+        .push_bind(uid.to_owned())
+        .push(r#" AND ud."PlaybackPositionTicks" > 0)"#);
+}
+
+/// `DescendantQueryHelper.IsCountableLeaf` (v12 `DescendantQueryHelper.cs:21-22`):
+/// real leaf media — neither a folder nor a virtual (missing / unaired) item —
+/// on the `l` alias.
+const COUNTABLE_LEAF: &str = r#"l."IsFolder" = 0 AND l."IsVirtualItem" = 0"#;
+
+/// [`COUNTABLE_LEAF`] as `GetAccessFilteredLeafItemsQuery(context, user)`
+/// (v12 `QueryBuilding.cs:669-679`) returns it without `includeOwnedItems`:
+/// `ApplyAccessFiltering` (`:459-476`) drops alternate versions and owned
+/// non-extras. (Its other two parts are no-ops for that call: `TopParentIds`
+/// is empty on the fresh `InternalItemsQuery(user)`, and parental
+/// restrictions are not a predicate Ferrofin's query layer carries.)
+const ACCESSIBLE_LEAF: &str = r#"l."IsFolder" = 0 AND l."IsVirtualItem" = 0
+    AND l."PrimaryVersionId" IS NULL
+    AND (l."OwnerId" IS NULL OR l."OwnerId" = '00000000-0000-0000-0000-000000000000'
+         OR l."ExtraType" IS NOT NULL)"#;
+
+/// Pushes `bi."Id" IN (<the folders with a leaf descendant in `leaf_set`>)`:
+/// the `AncestorIds` arm of v12 `BuildHasDescendantFilter`
+/// (`QueryBuilding.cs:685-698`), driven from the user's `UserData` rows that
+/// satisfy `ud_cond` rather than correlated per folder — the user's played /
+/// in-progress rows times their ancestors is a few hundred to a few thousand
+/// pairs, materialized once, where the per-folder walk costs every folder its
+/// descendants.
+///
+/// The `LinkedChildren` arm (`:695-697`) is not emitted: the only kinds this
+/// predicate is ever applied to are `Series` and `Season`
+/// (`_resumableFolderKinds`), and neither has linked children — the arm can
+/// never match for them.
+fn push_folders_with_leaf(
+    qb: &mut QueryBuilder<'_, Sqlite>,
+    uid: &str,
+    leaf_set: &str,
+    ud_cond: &str,
+) {
+    qb.push(format!(
+        r#"bi."Id" IN (SELECT a."ParentItemId" FROM "UserData" ud
+            JOIN "BaseItems" l ON l."Id" = ud."ItemId" AND {leaf_set}
+            JOIN "AncestorIds" a ON a."ItemId" = ud."ItemId"
+            WHERE ud."UserId" = "#
+    ))
+    .push_bind(uid.to_owned())
+    .push(format!(" AND {ud_cond})"));
+}
+
+/// Pushes the v12 `folderIsResumableFilter` minus its leading `IsFolder`
+/// (`TranslateQuery.cs:569-575`): the row is a `Series` or a `Season` and
+/// either a leaf descendant is in progress, or it has both a played and an
+/// unplayed leaf descendant (partially watched). No percentage threshold;
+/// `Played` does not exclude a leaf from the in-progress test.
+///
+/// Alternate versions keep their own progress, so they count towards the
+/// in-progress check ([`COUNTABLE_LEAF`], `includeOwnedItems: true`) but not
+/// towards the played/unplayed one ([`ACCESSIBLE_LEAF`]).
+fn push_folder_is_resumable(qb: &mut QueryBuilder<'_, Sqlite>, uid: &str) {
+    // `_resumableFolderKinds` (v12 `BaseItemRepository.cs:66-72`): "the only
+    // folder kinds whose children form a single viewing sequence, so playback
+    // progress on a child rolls up to them".
+    let kinds: Vec<String> = [BaseItemKind::Series, BaseItemKind::Season]
+        .into_iter()
+        .filter_map(|kind| stored_type_name(kind).map(str::to_owned))
+        .collect();
+    qb.push("(");
+    push_in_list(qb, r#"bi."Type""#, &kinds);
+    qb.push(" AND (");
+    push_folders_with_leaf(qb, uid, COUNTABLE_LEAF, r#"ud."PlaybackPositionTicks" > 0"#);
+    qb.push(" OR (");
+    push_folders_with_leaf(qb, uid, ACCESSIBLE_LEAF, r#"ud."Played" = 1"#);
+    // "Has an unplayed leaf descendant" is the one arm that cannot be driven
+    // from the user's rows (the leaf has none), so it walks the folder's
+    // descendants — evaluated only for the folders the played arm let through,
+    // and stopping at the first unplayed leaf. `CROSS JOIN` pins the walk to
+    // `IX_AncestorIds_ParentItemId` → the leaf's primary key: left to itself
+    // the planner starts from every leaf in the library
+    // (`IX_BaseItems_IsFolder_…`, `IsFolder=?`) and probes the closure per
+    // leaf per folder — 1.3 s for the unfiltered Resume count on the bench
+    // library, 2 ms pinned.
+    qb.push(
+        r#" AND EXISTS (SELECT 1 FROM "AncestorIds" a
+                CROSS JOIN "BaseItems" l ON l."Id" = a."ItemId"
+                WHERE a."ParentItemId" = bi."Id" AND "#,
+    )
+    .push(ACCESSIBLE_LEAF)
+    .push(
+        r#" AND NOT EXISTS (SELECT 1 FROM "UserData" ud
+                    WHERE ud."ItemId" = l."Id" AND ud."UserId" = "#,
+    )
+    .push_bind(uid.to_owned())
+    .push(r#" AND ud."Played" = 1)))))"#);
+}
+
+/// Appends the v12 `IsResumable` predicate
+/// (`BaseItemRepository.TranslateQuery.cs:552-603`).
+///
+/// A non-folder is resumable when it has an in-progress `UserData` row — per
+/// version: a resume query surfaces the version that was actually played,
+/// which may be an alternate, so each version is matched on its own progress
+/// rather than coalesced onto the primary. A `Series` or `Season` is resumable
+/// under [`push_folder_is_resumable`]. This is why v12 counts a partially
+/// watched show's seasons and the show itself among the resumable items, where
+/// 10.11.8 counted leaves only.
+///
+/// `want == true` additionally keeps, of several in-progress versions of one
+/// item, only the most recently played (`:586-602`) — id as the tiebreaker;
+/// `want == false` operates on primaries only (`:604-613`).
+fn push_resumable_predicate(qb: &mut QueryBuilder<'_, Sqlite>, uid: &str, want: bool) {
+    if want {
+        qb.push(r#" AND ((bi."IsFolder" = 0 AND bi."Id" IN "#);
+        push_in_progress_ids(qb, uid);
+        qb.push(r#") OR (bi."IsFolder" = 1 AND "#);
+        push_folder_is_resumable(qb, uid);
+        qb.push("))");
+        // "When several versions of the same item are in progress, keep only
+        // the most recently played one, use id as tiebreaker. Only in-progress
+        // siblings can eliminate a candidate: a version without progress has
+        // a NULL max LastPlayedDate, which is never greater and never ties.
+        // Restricting the sibling scan to the in-progress set keeps this
+        // bounded by the user's Continue Watching count instead of forcing a
+        // full BaseItems scan (COALESCE keys are non-indexable) per row. Items
+        // in no version group at all have no sibling that could eliminate
+        // them, so short-circuit the scan for those." (`:586-602`)
+        //
+        // The short-circuit is `FerrofinIX_BaseItems_PrimaryVersionId`'s one
+        // job — partial on `PrimaryVersionId IS NOT NULL`, exactly as v12's
+        // (`BaseItemConfiguration.cs:64-68`), so it can serve nothing else.
+        // `IS` is EF's `==` on two nullable dates (both NULL ties); `>` is
+        // plain (NULL never greater). `s."Id" < bi."Id"` is `Guid.CompareTo`:
+        // .NET compares the fields as unsigned in declaration order, which is
+        // the text order of the uppercase hyphenated form stored here.
+        qb.push(r#" AND (bi."IsFolder" = 1"#)
+            .push(r#" OR (bi."PrimaryVersionId" IS NULL AND NOT EXISTS (SELECT 1 FROM "BaseItems" x WHERE x."PrimaryVersionId" = bi."Id"))"#)
+            .push(r#" OR NOT EXISTS (SELECT 1 FROM "BaseItems" s WHERE s."Id" <> bi."Id" AND s."Id" IN "#);
+        push_in_progress_ids(qb, uid);
+        qb.push(r#" AND COALESCE(s."PrimaryVersionId", s."Id") = COALESCE(bi."PrimaryVersionId", bi."Id")"#);
+        // `inProgress.Where(u => u.ItemId == <alias>.Id).Max(u => u.LastPlayedDate)`.
+        let push_max_played = |qb: &mut QueryBuilder<'_, Sqlite>, alias: &str| {
+            qb.push(format!(
+                r#"(SELECT MAX(pu."LastPlayedDate") FROM "UserData" pu
+                    WHERE pu."ItemId" = {alias}."Id" AND pu."UserId" = "#
+            ))
+            .push_bind(uid.to_owned())
+            .push(r#" AND pu."PlaybackPositionTicks" > 0)"#);
+        };
+        qb.push(" AND (");
+        push_max_played(qb, "s");
+        qb.push(" > ");
+        push_max_played(qb, "bi");
+        qb.push(" OR (");
+        push_max_played(qb, "s");
+        qb.push(" IS ");
+        push_max_played(qb, "bi");
+        // Closes the tie arm, the date test, the sibling scan and the whole
+        // dedupe term.
+        qb.push(r#" AND s."Id" < bi."Id"))))"#);
+    } else {
+        // Not-resumable queries operate on primaries only: the id set is the
+        // in-progress versions' primaries (`:606-608`), and v12 has already
+        // dropped every alternate from the query (`:796-807`). Ferrofin's
+        // grouped browse keeps alternates for its collapse (see
+        // `append_predicates`), so the row's own primary is what is tested —
+        // an in-progress alternate must not resurface as its group's last
+        // representative.
+        qb.push(r#" AND ((bi."IsFolder" = 1 AND NOT "#);
+        push_folder_is_resumable(qb, uid);
+        qb.push(
+            r#") OR (bi."IsFolder" = 0 AND COALESCE(bi."PrimaryVersionId", bi."Id") NOT IN (SELECT COALESCE(x."PrimaryVersionId", x."Id") FROM "UserData" ud JOIN "BaseItems" x ON x."Id" = ud."ItemId" WHERE ud."UserId" = "#,
+        )
+        .push_bind(uid.to_owned())
+        .push(r#" AND ud."PlaybackPositionTicks" > 0)))"#);
     }
 }
 
@@ -1541,37 +1723,90 @@ fn push_order_expression(
     // fall through to SortName (matching the C# `(key, null)` arms).
     if let Some(user_id) = filter.user_id() {
         let uid = guid_to_db(user_id);
-        let correlated = match by {
-            // MAX over the item and its merged alternates (OrderMapper:
-            // `w.ItemId == e.Id || w.Item.PrimaryVersionId == e.Id`).
-            ItemSortBy::DatePlayed | ItemSortBy::SeriesDatePlayed => Some(r#""LastPlayedDate""#),
-            ItemSortBy::PlayCount => Some(r#""PlayCount""#),
-            ItemSortBy::IsPlayed | ItemSortBy::IsUnplayed => Some(r#""Played""#),
-            ItemSortBy::IsFavoriteOrLiked => Some(r#""IsFavorite""#),
-            _ => None,
-        };
-        if let Some(column) = correlated {
-            qb.push(format!(
-                r#"(SELECT MAX(oud.{column}) FROM "UserData" oud
-                    WHERE oud."UserId" = "#
-            ));
-            qb.push_bind(uid);
-            // The alternates arm navigates UserData.ItemId → BaseItems.Id (a
-            // PK lookup), exactly as upstream's `w.Item.PrimaryVersionId ==
-            // e.Id`. The inverted `IN (SELECT … WHERE PrimaryVersionId = …)`
-            // form re-scanned BaseItems per (row × userdata row): 97.5s for a
-            // 12-row Resume query on the live DB vs 33ms this way.
-            qb.push(
-                r#" AND (oud."ItemId" = bi."Id" OR EXISTS
-                    (SELECT 1 FROM "BaseItems" alt
-                     WHERE alt."Id" = oud."ItemId"
-                       AND alt."PrimaryVersionId" = bi."Id")))"#,
-            );
-            // IsUnplayed inverts the played flag (OrderMapper sorts `!IsPlayed`).
-            if by == ItemSortBy::IsUnplayed {
-                qb.push(" * -1");
+        match by {
+            // v12 `OrderMapper.cs:32-48`: "An item's played date is the newest
+            // of its own progress and that of its alternate versions, which
+            // track progress under their own ids. Matching both in one
+            // predicate ORs them together, which no index can serve: the
+            // user's whole UserData table gets scanned per sorted row. Two
+            // indexed lookups combined by MAX cost a seek each instead."
+            //
+            // The OR form measured 107 ms of a 109 ms Resume request here (60
+            // candidate rows × the user's ~5.4k rows). Two arms: the item's
+            // own row on `IX_UserData_ItemId_UserId_LastPlayedDate`, and its
+            // alternates' rows — `alt` first, on the partial
+            // `FerrofinIX_BaseItems_PrimaryVersionId`, then the same index
+            // by the alternate's id. `CROSS JOIN` pins that order: left to
+            // itself the planner re-drives the arm from `IX_UserData_UserId`
+            // and walks the user's rows per candidate again (300 ms).
+            //
+            // `SeriesDatePlayed` shares the arm: v12 orders it through a
+            // pre-aggregated join (`ApplySeriesDatePlayedOrder`) that is not
+            // ported here, and its correlated fallback (`OrderMapper.cs:75-84`)
+            // keys on `SeriesPresentationUniqueKey`, which is an open work
+            // item for the series-sorted browses.
+            ItemSortBy::DatePlayed | ItemSortBy::SeriesDatePlayed => {
+                qb.push(
+                    r#"(SELECT MAX(d."LastPlayedDate") FROM (
+                        SELECT oud."LastPlayedDate" FROM "UserData" oud
+                            WHERE oud."ItemId" = bi."Id" AND oud."UserId" = "#,
+                )
+                .push_bind(uid.clone())
+                .push(
+                    r#" UNION ALL
+                        SELECT oud."LastPlayedDate" FROM "BaseItems" alt
+                            CROSS JOIN "UserData" oud
+                                ON oud."ItemId" = alt."Id" AND oud."UserId" = "#,
+                )
+                .push_bind(uid)
+                .push(r#" WHERE alt."PrimaryVersionId" = bi."Id") AS d)"#);
+                return;
             }
-            return;
+            // `e.UserData.Where(f => f.UserId == user).OrderBy(f => f.CustomDataKey)
+            // .FirstOrDefault().<column>` (`OrderMapper.cs:57-61`): the item's
+            // own first row — alternates do not take part.
+            //
+            // Known divergence for `IsPlayed`/`IsUnplayed` WITH a user: v12
+            // never reaches this arm for those two keys, because `ApplyOrder`
+            // replaces them with `AsOrderKey(BuildIsPlayedFilter(...))`
+            // (`QueryBuilding.cs:327-336`) — the folder-aware predicate that
+            // counts a folder played once no leaf descendant is unplayed. Here
+            // a folder has no `UserData` row of its own and sorts on NULL,
+            // which orders ahead of `0`. Open work item, the same folder
+            // roll-up the `is_played` FILTER still owes
+            // (`append_user_data_predicates`): port `BuildIsPlayedFilter` over
+            // the descendant helper `push_resumable_predicate` already uses,
+            // then call it from both places and delete this arm's two keys.
+            // Reachable only via `sortBy=IsPlayed`/`IsUnplayed`.
+            ItemSortBy::PlayCount
+            | ItemSortBy::IsPlayed
+            | ItemSortBy::IsUnplayed
+            | ItemSortBy::IsFavoriteOrLiked => {
+                let column = match by {
+                    ItemSortBy::PlayCount => r#""PlayCount""#,
+                    ItemSortBy::IsFavoriteOrLiked => r#""IsFavorite""#,
+                    _ => r#""Played""#,
+                };
+                // `Select((bool?)f.IsFavorite).FirstOrDefault() ?? false`.
+                if by == ItemSortBy::IsFavoriteOrLiked {
+                    qb.push("COALESCE(");
+                }
+                qb.push(format!(
+                    r#"(SELECT oud.{column} FROM "UserData" oud
+                        WHERE oud."ItemId" = bi."Id" AND oud."UserId" = "#
+                ))
+                .push_bind(uid)
+                .push(r#" ORDER BY oud."CustomDataKey" LIMIT 1)"#);
+                if by == ItemSortBy::IsFavoriteOrLiked {
+                    qb.push(", 0)");
+                }
+                // IsUnplayed inverts the played flag (OrderMapper sorts `!IsPlayed`).
+                if by == ItemSortBy::IsUnplayed {
+                    qb.push(" * -1");
+                }
+                return;
+            }
+            _ => {}
         }
     }
     qb.push(order_column(by, filter.user_id().is_some()));
@@ -1617,7 +1852,9 @@ fn order_column(by: ItemSortBy, _has_user: bool) -> &'static str {
         ItemSortBy::IsFolder => r#"bi."IsFolder""#,
         ItemSortBy::OfficialRating => r#"bi."InheritedParentalRatingValue""#,
         ItemSortBy::SeriesSortName => r#"bi."SeriesName""#,
-        // Name/SortName and every deferred (join-backed) case: SortName.
+        // Name/SortName, and the join-backed keys (`Artist`, `AlbumArtist`,
+        // `Studio`: v12 orders by the first ItemValue of the type — an open work
+        // item) fall back to SortName.
         _ => r#"bi."SortName""#,
     }
 }
@@ -1671,7 +1908,7 @@ pub(crate) fn to_guid_strings(ids: &[Uuid]) -> Vec<String> {
 
 /// The stored `MediaType` name for a [`ferrofin_model::data::MediaType`]
 /// (C# `mediaType.ToString()`).
-fn media_type_name(media: ferrofin_model::data::MediaType) -> String {
+pub(crate) fn media_type_name(media: ferrofin_model::data::MediaType) -> String {
     format!("{media:?}")
 }
 

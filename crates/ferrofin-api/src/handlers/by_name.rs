@@ -101,6 +101,25 @@ pub(crate) struct ByNameListQuery {
     /// (Genres / `MusicGenres` hardcode `false` upstream).
     #[serde(default)]
     pub enable_user_data: Option<bool>,
+    /// Pipe-delimited genre names the by-name row itself must carry
+    /// (`ArtistsController` only; v12 `ByName.cs:191`).
+    #[serde(default)]
+    pub genres: Option<String>,
+    /// Comma-delimited genre item ids the by-name row must reference.
+    #[serde(default)]
+    pub genre_ids: Option<String>,
+    /// Pipe-delimited official ratings of the by-name row.
+    #[serde(default)]
+    pub official_ratings: Option<String>,
+    /// Pipe-delimited tags of the by-name row.
+    #[serde(default)]
+    pub tags: Option<String>,
+    /// Comma-delimited production years of the by-name row.
+    #[serde(default)]
+    pub years: Option<String>,
+    /// Comma-delimited studio item ids the by-name row must reference.
+    #[serde(default)]
+    pub studio_ids: Option<String>,
 }
 
 /// Builds the projection options a by-name browse hands to the DTO service.
@@ -160,24 +179,28 @@ impl ByNameListQuery {
     /// resolved user. The `parent_id` localizes the browse the way Jellyfin's
     /// `AncestorIds`/`ItemIds` split does (folders scope by ancestor, non-folders
     /// by item); here it always scopes by ancestor, the common case.
+    ///
+    /// # Errors
+    ///
+    /// A malformed id list or year list, or a contradictory `filters` pair, is
+    /// a `400` — ASP.NET's binder and C# `ApplyFilters` reject them the same way.
     pub(crate) fn base_query(
         &self,
         user: Option<UserEntity>,
-    ) -> ferrofin_traits::options::InternalItemsQuery {
+    ) -> Result<ferrofin_traits::options::InternalItemsQuery, ApiError> {
         let mut ancestor_ids = Vec::new();
         if let Some(parent) = self.parent_id {
             ancestor_ids.push(parent);
         }
-        // C# folds `filters ∋ IsFavorite` onto the tri-state when `isFavorite`
-        // is absent (ArtistsController/GenresController do this same dance).
+        // C# `query.ApplyFilters(filters)` runs after the explicit `isFavorite`
+        // is set, so a `filters ∋ IsFavorite` wins over `isFavorite=false`
+        // (`ArtistsController.cs:203`); the other flags land on their tri-states.
         let filters = crate::handlers::query_parse::parse_csv_enums_lenient::<
             ferrofin_model::querying::ItemFilter,
         >(self.filters.as_deref());
-        let is_favorite = self.is_favorite.or_else(|| {
-            filters
-                .contains(&ferrofin_model::querying::ItemFilter::IsFavorite)
-                .then_some(true)
-        });
+        let genre_ids = crate::handlers::query_parse::parse_csv_uuids(self.genre_ids.as_deref())?;
+        let studio_ids = crate::handlers::query_parse::parse_csv_uuids(self.studio_ids.as_deref())?;
+        let years = parse_csv_i32(self.years.as_deref())?;
         // Scope the aggregate to the requested kinds (C# sets IncludeItemTypes
         // on the inner query): the Movies "Genres" tab must list only genres
         // carried by movies, not by every item under the parent. Lenient parse,
@@ -192,9 +215,16 @@ impl ByNameListQuery {
         let media_types = crate::handlers::query_parse::parse_csv_enums_lenient::<
             ferrofin_model::data::MediaType,
         >(self.media_types.as_deref());
-        ferrofin_traits::options::InternalItemsQuery {
+        let mut query = ferrofin_traits::options::InternalItemsQuery {
             user,
-            is_favorite,
+            is_favorite: self.is_favorite,
+            // The repository computes per-kind counts only when `ItemCounts`
+            // is requested (v12 `ByName.cs:251`), and the controller adds it
+            // when a type filter is set — see [`Self::should_include_item_types`].
+            dto_options: DtoOptions {
+                fields: self.requested_fields(),
+                ..DtoOptions::default()
+            },
             include_item_types,
             exclude_item_types,
             media_types,
@@ -209,19 +239,70 @@ impl ByNameListQuery {
             name_starts_with_or_greater: self.name_starts_with_or_greater.clone(),
             name_starts_with: self.name_starts_with.clone(),
             name_less_than: self.name_less_than.clone(),
+            // The rest of C#'s `outerQueryFilter` (`ByName.cs:177-196`): the
+            // by-name row's own genres, tags, ratings, years and referenced
+            // studios/genres.
+            genres: crate::handlers::query_parse::parse_pipe_strings(self.genres.as_deref()),
+            genre_ids,
+            official_ratings: crate::handlers::query_parse::parse_pipe_strings(
+                self.official_ratings.as_deref(),
+            ),
+            tags: crate::handlers::query_parse::parse_pipe_strings(self.tags.as_deref()),
+            years,
+            studio_ids,
             ancestor_ids,
             enable_total_record_count: self.enable_total_record_count.unwrap_or(true),
             ..ferrofin_traits::options::InternalItemsQuery::default()
-        }
+        };
+        query
+            .apply_filters(&filters)
+            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+        Ok(query)
     }
 
-    /// Whether the caller asked to filter by item type, which — per Jellyfin —
-    /// means the aggregated child counts should be folded onto each DTO.
+    /// Whether the per-kind counts are folded onto each DTO — C#
+    /// `filter.DtoOptions.ContainsField(ItemFields.ItemCounts)` after the
+    /// controller's augmentation: "asking for a type filter has always
+    /// implied wanting that type's counts back" (v12 `ArtistsController.cs:129-133`
+    /// and its Genres/MusicGenres/Studios siblings), so a non-empty
+    /// `includeItemTypes` adds `ItemCounts` to the requested fields.
     pub(crate) fn should_include_item_types(&self) -> bool {
-        self.include_item_types
-            .as_deref()
-            .is_some_and(|s| !s.trim().is_empty())
+        self.requested_fields()
+            .contains(&ferrofin_model::querying::ItemFields::ItemCounts)
     }
+
+    /// The caller's `fields`, plus `ItemCounts` when `includeItemTypes` is
+    /// set — the field set the v12 by-name controllers hand the repository.
+    fn requested_fields(&self) -> Vec<ferrofin_model::querying::ItemFields> {
+        let mut fields: Vec<ferrofin_model::querying::ItemFields> =
+            crate::handlers::query_parse::parse_csv_enums_lenient(self.fields.as_deref());
+        let has_type_filter = self
+            .include_item_types
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty());
+        if has_type_filter && !fields.contains(&ferrofin_model::querying::ItemFields::ItemCounts) {
+            fields.push(ferrofin_model::querying::ItemFields::ItemCounts);
+        }
+        fields
+    }
+}
+
+/// Parses a comma-delimited list of `i32` values (Jellyfin's `years`). A
+/// malformed token is a `400` — stricter than v12's
+/// `CommaDelimitedCollectionModelBinder`, which logs and drops the token, and
+/// the same strictness as this crate's `parse_csv_uuids`.
+fn parse_csv_i32(raw: Option<&str>) -> Result<Vec<i32>, ApiError> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.parse::<i32>()
+                .map_err(|_| ApiError::BadRequest(format!("invalid integer {s:?}")))
+        })
+        .collect()
 }
 
 /// The single-item query parameters shared by every by-name `{name}` endpoint.
@@ -346,8 +427,9 @@ pub(crate) async fn resolve_by_name_or_slug(
 /// [`QueryResult<BaseItemDto>`], mirroring `RequestHelpers.CreateQueryResult`.
 ///
 /// Each aggregate's item row is projected through
-/// [`DtoService::get_item_by_name_dto`]; when `include_item_types` is set the
-/// aggregated counts are copied onto the DTO's count fields (`ChildCount`,
+/// [`DtoService::get_item_by_name_dto`]; when `include_item_types` — the
+/// caller's [`ByNameListQuery::should_include_item_types`] — is set, the
+/// per-kind counts are copied onto the DTO's count fields (`ChildCount`,
 /// `ProgramCount`, …) exactly as Jellyfin does.
 pub(crate) async fn project_query_result(
     state: &AppState,
@@ -372,14 +454,12 @@ pub(crate) async fn project_query_result(
         .get_base_item_dtos(&items, &options, user, None, true)
         .await?;
     if include_item_types {
+        // v12 `RequestHelpers.CreateQueryResult` (`RequestHelpers.cs:166-178`):
+        // the ten count fields, `ChildCount` being `ItemCounts.ItemCount`,
+        // which `BuildItemCountsByCleanName` sets to `TotalItemCount()`
+        // (`ByName.cs:399`) — 10.11.8 never assigned it and so always sent 0.
         for (dto, counts) in dtos.iter_mut().zip(counts.iter()) {
-            // NOT `counts.item_count`: C# `GetItemValues` never assigns
-            // `ItemCounts.ItemCount` (nor `ProgramCount`), so
-            // `RequestHelpers.SetItemCounts`'s `dto.ChildCount =
-            // counts.ItemCount` always writes the `0` default. Putting the
-            // per-value aggregate there instead reported a number upstream
-            // never sends, in a field jellyfin-web does not read.
-            dto.child_count = Some(0);
+            dto.child_count = Some(counts.item_count);
             dto.program_count = Some(counts.program_count);
             dto.series_count = Some(counts.series_count);
             dto.episode_count = Some(counts.episode_count);
@@ -388,6 +468,7 @@ pub(crate) async fn project_query_result(
             dto.album_count = Some(counts.album_count);
             dto.song_count = Some(counts.song_count);
             dto.artist_count = Some(counts.artist_count);
+            dto.music_video_count = Some(counts.music_video_count);
         }
     }
     Ok(QueryResult::new(start_index, total, dtos))
@@ -427,6 +508,85 @@ mod tests {
         assert!(!o.enable_user_data);
         assert_eq!(o.image_type_limit, 2);
         assert_eq!(o.image_types, vec![ImageType::Primary, ImageType::Thumb]);
+    }
+
+    /// v12 `ArtistsController.cs:129-133`: a type filter implies `ItemCounts`,
+    /// which is also what the repository's count gate reads off the query.
+    #[test]
+    fn a_type_filter_or_the_item_counts_field_requests_the_counts() {
+        let plain = ByNameListQuery::default();
+        assert!(!plain.should_include_item_types());
+        assert!(
+            !plain
+                .base_query(None)
+                .expect("query")
+                .dto_options
+                .contains_field(ItemFields::ItemCounts)
+        );
+
+        let typed = ByNameListQuery {
+            include_item_types: Some("Movie".to_owned()),
+            ..ByNameListQuery::default()
+        };
+        assert!(typed.should_include_item_types());
+        let fields = typed.base_query(None).expect("query").dto_options.fields;
+        assert_eq!(fields, vec![ItemFields::ItemCounts]);
+
+        let by_field = ByNameListQuery {
+            fields: Some("Overview,ItemCounts".to_owned()),
+            ..ByNameListQuery::default()
+        };
+        assert!(by_field.should_include_item_types());
+        // Not added twice when both are present.
+        let both = ByNameListQuery {
+            include_item_types: Some("Movie".to_owned()),
+            fields: Some("ItemCounts".to_owned()),
+            ..ByNameListQuery::default()
+        };
+        assert_eq!(both.requested_fields(), vec![ItemFields::ItemCounts]);
+    }
+
+    /// The C# `outerQueryFilter` fields reach the query, `filters` lands on
+    /// the tri-states (a contradictory pair is a `400`), and a malformed id
+    /// list is a `400`.
+    #[test]
+    fn outer_filter_parameters_reach_the_query() {
+        let query = ByNameListQuery {
+            filters: Some("IsPlayed,IsFavorite,Likes".to_owned()),
+            is_favorite: Some(false),
+            genres: Some("Rock|Jazz".to_owned()),
+            tags: Some("live".to_owned()),
+            official_ratings: Some("PG|R".to_owned()),
+            years: Some("1999, 2001".to_owned()),
+            genre_ids: Some("00000000-0000-0000-0000-000000000001".to_owned()),
+            studio_ids: Some("00000000000000000000000000000002".to_owned()),
+            ..ByNameListQuery::default()
+        };
+        let internal = query.base_query(None).expect("query");
+        assert_eq!(internal.is_played, Some(true));
+        assert_eq!(
+            internal.is_favorite,
+            Some(true),
+            "ApplyFilters runs after isFavorite"
+        );
+        assert_eq!(internal.is_liked, Some(true));
+        assert_eq!(internal.genres, vec!["Rock", "Jazz"]);
+        assert_eq!(internal.tags, vec!["live"]);
+        assert_eq!(internal.official_ratings, vec!["PG", "R"]);
+        assert_eq!(internal.years, vec![1999, 2001]);
+        assert_eq!(internal.genre_ids, vec![uuid::Uuid::from_u128(1)]);
+        assert_eq!(internal.studio_ids, vec![uuid::Uuid::from_u128(2)]);
+
+        let contradictory = ByNameListQuery {
+            filters: Some("IsPlayed,IsUnplayed".to_owned()),
+            ..ByNameListQuery::default()
+        };
+        assert!(contradictory.base_query(None).is_err());
+        let malformed = ByNameListQuery {
+            genre_ids: Some("not-a-guid".to_owned()),
+            ..ByNameListQuery::default()
+        };
+        assert!(malformed.base_query(None).is_err());
     }
 
     #[test]

@@ -3621,8 +3621,18 @@ impl LibraryScanner {
         ) else {
             return Ok(());
         };
+        // Only the studio rows are read below, so ask for no fields: the default
+        // query carries every `ItemFields`, and `ItemCounts` would run the
+        // per-kind count statements over every studio in the library and throw
+        // the answers away.
         let result = repo
-            .get_studios(&ferrofin_traits::options::InternalItemsQuery::default())
+            .get_studios(&ferrofin_traits::options::InternalItemsQuery {
+                dto_options: ferrofin_traits::options::DtoOptions {
+                    fields: Vec::new(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
             .await?;
         for row in result.items {
             let entity = row.item;

@@ -22,6 +22,7 @@ use ferrofin_db::entities::users::UserEntity;
 use ferrofin_db::enums::{ItemValueType, PermissionKind, PreferenceKind};
 use ferrofin_db::store::{datetime_to_db, guid_to_db};
 use ferrofin_model::data::{BaseItemKind, CollectionType};
+use ferrofin_model::dto::ItemCounts;
 use ferrofin_model::entities::ImageType;
 use ferrofin_model::entities::MediaStreamType;
 use ferrofin_model::querying::{QueryFiltersLegacy, QueryResult};
@@ -39,7 +40,7 @@ use crate::db_error::{db_err, media_stream_type_disc};
 use crate::item_type_lookup::stored_type_name;
 use crate::translate_query::{
     PLACEHOLDER_ID, QueryShape, append_predicates, build_latest_item_list_query, build_query,
-    non_blank, push_in_list, to_guid_strings,
+    media_type_name, non_blank, push_in_list, to_guid_strings,
 };
 use crate::user_entity_ext::{guid_preference, has_permission, live_tv_enabled_for};
 use sqlx::{FromRow, QueryBuilder, Row, Sqlite};
@@ -706,29 +707,29 @@ impl FerrofinItemRepository {
         query.fetch_all(self.db.pool()).await.map_err(db_err)
     }
 
-    /// Fallback total for by-name pagination when the page is empty (past the
-    /// last row). Accepts the SAME pre-computed vectors that the page query
-    /// built, so the filter shape can never drift.
+    /// Total for a by-name page that came back empty — `limit=0`, or an offset
+    /// past the last row — where the page query's window total has no row to
+    /// ride on. Accepts the SAME pre-computed scope the page query built, so
+    /// the filter shape can never drift.
     async fn count_by_name_total(
         &self,
         scope: &ByNameScope<'_>,
         return_type: &str,
         filter: &InternalItemsQuery,
+        outer: &InternalItemsQuery,
     ) -> Result<i32, ServiceError> {
-        // `representativeIds.Count()` (ByName.cs:229-232), not a row count:
+        // `representativeIds.Count` (ByName.cs:227-230), not a row count:
         // upstream counts the COLLAPSED set, so the total has to be the number
         // of `PresentationUniqueKey` GROUPS the filtered rows form — the same
         // grouping the page query applies. `COUNT(DISTINCT key)` would be
         // wrong: it drops NULL keys entirely, and the whole point of the
         // grouping is that the unkeyed rows form ONE group.
-        let mut qb: QueryBuilder<Sqlite> =
-            QueryBuilder::new(r#"SELECT COUNT(*) FROM (SELECT 1 FROM "BaseItems" AS bi JOIN "#);
-        // No per-kind counts here: this query only counts by-name rows, so the
-        // seven conditional sums would be computed and thrown away. The shared
-        // `scope` still guarantees the WHERE cannot drift from the page query.
-        push_value_aggregate(&mut qb, scope, &[]);
-        push_by_name_join(&mut qb, return_type);
-        append_by_name_filters(&mut qb, filter);
+        let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
+            r#"SELECT COUNT(*) FROM (SELECT 1 FROM "BaseItems" AS bi WHERE bi."Type" = "#,
+        );
+        qb.push_bind(return_type.to_owned());
+        push_value_exists(&mut qb, scope, InnerScope::Page);
+        append_by_name_filters(&mut qb, filter, outer);
         qb.push(r#" GROUP BY bi."PresentationUniqueKey")"#);
         let count: i64 = qb
             .build_query_scalar()
@@ -736,6 +737,198 @@ impl FerrofinItemRepository {
             .await
             .map_err(db_err)?;
         Ok(i32::try_from(count).unwrap_or(i32::MAX))
+    }
+
+    /// Port of v12 `BuildItemCountsByCleanName`
+    /// (`BaseItemRepository.ByName.cs:287-413`): one [`ItemCounts`] per
+    /// `CleanName` of the page, each field the number of in-scope content
+    /// items of that kind carrying the value.
+    ///
+    /// The scope is the browse's minus `IncludeItemTypes` — "the counts
+    /// describe everything the value is attached to, not only the types the
+    /// list was filtered down to" (`:299-300`) — and, exactly as upstream,
+    /// three statements rather than one: the raw per-`(value, type, series)`
+    /// counts, the series each value is written on, and the episodes under
+    /// those series. Each drives off an index; the single-statement form
+    /// left SQLite free to scan every episode in the library (`:422-423`).
+    async fn item_counts_by_clean_name(
+        &self,
+        scope: &ByNameScope<'_>,
+        value_types: &[ItemValueType],
+        clean_names: &[String],
+    ) -> Result<HashMap<String, ItemCounts>, ServiceError> {
+        let mut counts_by_clean_name = HashMap::new();
+        if clean_names.is_empty() {
+            return Ok(counts_by_clean_name);
+        }
+        let series_type = stored_type_name(BaseItemKind::Series).unwrap_or_default();
+        let episode_type = stored_type_name(BaseItemKind::Episode).unwrap_or_default();
+
+        // `rawCounts` (`:331-339`): grouped by `(CleanName, Type, SeriesId)`.
+        let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
+            r#"SELECT iv."CleanValue", ci."Type", ci."SeriesId", COUNT(*) FROM "#,
+        );
+        push_value_links(&mut qb, scope, clean_names);
+        push_content_scope(&mut qb, scope, InnerScope::Counts);
+        qb.push(r#" GROUP BY iv."CleanValue", ci."Type", ci."SeriesId""#);
+        let raw_counts: Vec<(String, String, Option<String>, i64)> = qb
+            .build_query_as()
+            .fetch_all(self.db.pool())
+            .await
+            .map_err(db_err)?;
+
+        // Only studios and genres pass down from a series to its episodes; an
+        // artist credit does not (`:341-342`).
+        let inherits_to_episodes = value_types
+            .iter()
+            .any(|t| matches!(t, ItemValueType::Studios | ItemValueType::Genre));
+        let tagged_episodes: Vec<(&str, Option<&str>, i64)> = raw_counts
+            .iter()
+            .filter(|(_, ty, _, _)| ty == episode_type)
+            .map(|(name, _, series, count)| (name.as_str(), series.as_deref(), *count))
+            .collect();
+        let episode_counts: HashMap<String, i64> = if inherits_to_episodes {
+            self.episode_counts_by_clean_name(scope, clean_names, &tagged_episodes)
+                .await?
+        } else {
+            let mut direct = HashMap::new();
+            for (name, _, count) in &tagged_episodes {
+                *direct.entry((*name).to_owned()).or_insert(0) += count;
+            }
+            direct
+        };
+
+        let kind_name = |kind: BaseItemKind| stored_type_name(kind).unwrap_or_default();
+        let (movie, album, artist, music_video, program, audio, trailer) = (
+            kind_name(BaseItemKind::Movie),
+            kind_name(BaseItemKind::MusicAlbum),
+            kind_name(BaseItemKind::MusicArtist),
+            kind_name(BaseItemKind::MusicVideo),
+            kind_name(BaseItemKind::LiveTvProgram),
+            kind_name(BaseItemKind::Audio),
+            kind_name(BaseItemKind::Trailer),
+        );
+        for (name, ty, _, count) in &raw_counts {
+            let counts: &mut ItemCounts = counts_by_clean_name
+                .entry(name.clone())
+                .or_insert_with(ItemCounts::default);
+            let count = clamp_count(*count);
+            let ty = ty.as_str();
+            if ty == series_type {
+                counts.series_count += count;
+            } else if ty == movie {
+                counts.movie_count += count;
+            } else if ty == album {
+                counts.album_count += count;
+            } else if ty == artist {
+                counts.artist_count += count;
+            } else if ty == music_video {
+                counts.music_video_count += count;
+            } else if ty == program {
+                counts.program_count += count;
+            } else if ty == audio {
+                counts.song_count += count;
+            } else if ty == trailer {
+                counts.trailer_count += count;
+            }
+        }
+        // Episodes are counted separately: the value is usually only written
+        // on the series (`:397-399`).
+        for (name, counts) in &mut counts_by_clean_name {
+            counts.episode_count = clamp_count(episode_counts.get(name).copied().unwrap_or(0));
+            counts.item_count = counts.total_item_count();
+        }
+        // A value carried by nothing but the episodes below a tagged series has
+        // no row of its own (`:403-410`).
+        for (name, episode_count) in episode_counts {
+            counts_by_clean_name
+                .entry(name)
+                .or_insert_with(|| ItemCounts {
+                    episode_count: clamp_count(episode_count),
+                    item_count: clamp_count(episode_count),
+                    ..ItemCounts::default()
+                });
+        }
+        Ok(counts_by_clean_name)
+    }
+
+    /// Port of v12 `BuildEpisodeCountsByCleanName`
+    /// (`BaseItemRepository.ByName.cs:415-464`): every in-scope episode under a
+    /// series that carries the value counts, plus the episodes that carry it
+    /// themselves under a series that does not.
+    async fn episode_counts_by_clean_name(
+        &self,
+        scope: &ByNameScope<'_>,
+        clean_names: &[String],
+        tagged_episodes: &[(&str, Option<&str>, i64)],
+    ) -> Result<HashMap<String, i64>, ServiceError> {
+        let series_type = stored_type_name(BaseItemKind::Series).unwrap_or_default();
+        let episode_type = stored_type_name(BaseItemKind::Episode).unwrap_or_default();
+
+        // `taggedSeries` (`:424-430`): the in-scope series each value is on.
+        let mut qb: QueryBuilder<Sqlite> =
+            QueryBuilder::new(r#"SELECT iv."CleanValue", ci."Id" FROM "#);
+        push_value_links(&mut qb, scope, clean_names);
+        qb.push(r#" AND ci."Type" = "#).push_bind(series_type);
+        push_content_scope(&mut qb, scope, InnerScope::Counts);
+        let tagged_series: Vec<(String, String)> = qb
+            .build_query_as()
+            .fetch_all(self.db.pool())
+            .await
+            .map_err(db_err)?;
+
+        // `episodesPerSeries` (`:432-440`): in-scope episodes per tagged series.
+        let mut series_ids: Vec<String> = tagged_series.iter().map(|(_, id)| id.clone()).collect();
+        series_ids.sort_unstable();
+        series_ids.dedup();
+        let episodes_per_series: HashMap<String, i64> = if series_ids.is_empty() {
+            HashMap::new()
+        } else {
+            let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
+                r#"SELECT ci."SeriesId", COUNT(*) FROM "BaseItems" ci WHERE ci."Type" = "#,
+            );
+            qb.push_bind(episode_type)
+                .push(r#" AND ci."SeriesId" IS NOT NULL AND "#);
+            push_in_list(&mut qb, r#"ci."SeriesId""#, &series_ids);
+            push_content_scope(&mut qb, scope, InnerScope::Counts);
+            qb.push(r#" GROUP BY ci."SeriesId""#);
+            qb.build_query_as::<(String, i64)>()
+                .fetch_all(self.db.pool())
+                .await
+                .map_err(db_err)?
+                .into_iter()
+                .collect()
+        };
+
+        let mut episode_counts: HashMap<String, i64> = HashMap::new();
+        let mut series_by_clean_name: HashMap<&str, std::collections::HashSet<&str>> =
+            HashMap::new();
+        for (name, series_id) in &tagged_series {
+            series_by_clean_name
+                .entry(name.as_str())
+                .or_default()
+                .insert(series_id.as_str());
+        }
+        for (name, series) in &series_by_clean_name {
+            let total: i64 = series
+                .iter()
+                .map(|id| episodes_per_series.get(*id).copied().unwrap_or(0))
+                .sum();
+            episode_counts.insert((*name).to_owned(), total);
+        }
+        // An episode that carries the value under a series that carries it too
+        // is already counted with its series (`:451-461`).
+        for (name, series_id, count) in tagged_episodes {
+            if let Some(series_id) = series_id
+                && series_by_clean_name
+                    .get(name)
+                    .is_some_and(|series| series.contains(series_id))
+            {
+                continue;
+            }
+            *episode_counts.entry((*name).to_owned()).or_insert(0) += count;
+        }
+        Ok(episode_counts)
     }
 
     /// Resolves the by-name items of `kind` to [`ItemWithCounts`], counting the
@@ -778,6 +971,17 @@ impl FerrofinItemRepository {
             .iter()
             .filter_map(|k| stored_type_name(*k).map(str::to_owned))
             .collect();
+        let exclude_type_names: Vec<String> = filter
+            .exclude_item_types
+            .iter()
+            .filter_map(|k| stored_type_name(*k).map(str::to_owned))
+            .collect();
+        let media_types: Vec<String> = filter
+            .media_types
+            .iter()
+            .copied()
+            .map(media_type_name)
+            .collect();
         let ancestors: Vec<String> = filter
             .ancestor_ids
             .iter()
@@ -792,12 +996,11 @@ impl FerrofinItemRepository {
             .map(|f| f.top_parent_ids.iter().copied().map(guid_to_db).collect())
             .unwrap_or_default();
 
-        let want_total = filter.enable_total_record_count && filter.limit.is_some();
-        // Master computes the per-kind counts only when the caller named item
-        // types (`if (filter.IncludeItemTypes.Length > 0)`, ByName.cs:249),
-        // so the aggregate carries the seven conditional sums only then — the
-        // by-name browse that asks for no counts pays nothing for them.
-        let count_types = per_kind_count_types(!content_type_names.is_empty());
+        // v12 assigns `TotalRecordCount = representativeIds.Count` whenever
+        // `EnableTotalRecordCount` (`ByName.cs:227-230`), with or without a
+        // `Limit`; 10.11.8's "no limit → no total" rule
+        // (`BaseItemRepository.cs:1255-1258` there) is gone.
+        let want_total = filter.enable_total_record_count;
         // Two levels, because the representative collapse sits BETWEEN the
         // filtered row set and the ordering/paging (see `push_representative_rank`).
         // The outer level is where `COUNT(*) OVER()` belongs: run in the inner
@@ -807,23 +1010,34 @@ impl FerrofinItemRepository {
         if want_total {
             select.push_str(r#", COUNT(*) OVER() AS "total_count""#);
         }
-        select.push_str(r" FROM (SELECT bi.*, agg.cnt");
-        for (alias, _) in &count_types {
-            select.push_str(", agg.");
-            select.push_str(alias);
-        }
+        select.push_str(r" FROM (SELECT bi.*");
         let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(select);
         let scope = ByNameScope {
+            filter,
             type_ints: &type_ints,
             content_type_names: &content_type_names,
+            exclude_type_names: &exclude_type_names,
+            media_types: &media_types,
             ancestors: &ancestors,
             top_parents: &top_parents,
         };
+        let outer = by_name_outer_filter(filter);
         push_representative_rank(&mut qb, return_type, &top_parents);
-        qb.push(r#" FROM "BaseItems" AS bi JOIN "#);
-        push_value_aggregate(&mut qb, &scope, &count_types);
-        push_by_name_join(&mut qb, return_type);
-        append_by_name_filters(&mut qb, filter);
+        // The C# outer filter is **two** clauses — `.Where(e => e.Type ==
+        // returnType)` and the `ItemValuesMap … .Any()` semijoin
+        // (`ByName.cs:166-175`). Both are load-bearing: `CleanName` is the
+        // only link on an adopted database (where `ItemValues.ItemValueId` is
+        // a synthetic guid matching no item), and `Type` is what keeps the
+        // answer to *this* browse — without it a Movie named "Drama" is
+        // returned by `/Genres` beside the real genre, and `/Genres` and
+        // `/MusicGenres`, which query the same `ItemValueType`, stop being
+        // distinguishable. It is also the leading column of
+        // `FerrofinIX_BaseItems_Type_CleanName`, so constraining it keeps this
+        // an index seek instead of a scan of every item.
+        qb.push(r#" FROM "BaseItems" AS bi WHERE bi."Type" = "#)
+            .push_bind(return_type.to_owned());
+        push_value_exists(&mut qb, &scope, InnerScope::Page);
+        append_by_name_filters(&mut qb, filter, &outer);
         qb.push(r#") AS bi WHERE bi."rep_rank" = 1"#);
         // C# `GetItemValues` runs the same `ApplyOrder(query, filter, context)`
         // the main browse does, so the caller's `sortBy`/`sortOrder` apply and
@@ -846,113 +1060,93 @@ impl FerrofinItemRepository {
         }
 
         let rows = qb
-            .build_query_as::<ByNameCountRow>()
+            .build_query_as::<ByNameRow>()
             .fetch_all(self.db.pool())
             .await
             .map_err(db_err)?;
 
-        // Total: C# `GetItemValues` forces EnableTotalRecordCount off when there is
-        // no Limit and then never assigns `TotalRecordCount` — a non-nullable int —
-        // so every unpaged (or count-disabled) by-name response carries
-        // `TotalRecordCount: 0` on the wire, even with a bare StartIndex. Match
-        // that exactly; the ledger's flagged /Genres//Studios read-diffs were this.
+        // The window total rides on the page's rows; a page with none (an
+        // offset past the end, or `limit=0` — jellyfin-web's "how many?"
+        // probe) still owes the collapsed count, which upstream has for free
+        // because it materializes `representativeIds` before paging.
         let start_index = filter.start_index.unwrap_or(0);
         let total = if want_total {
             match rows.first() {
                 Some(r) => i32::try_from(r.total_count).unwrap_or(i32::MAX),
-                None if start_index > 0 => {
-                    self.count_by_name_total(&scope, return_type, filter)
+                None => {
+                    self.count_by_name_total(&scope, return_type, filter, &outer)
                         .await?
                 }
-                None => 0,
             }
         } else {
             0
         };
+        let counts_by_clean_name = self.page_counts(&scope, value_types, filter, &rows).await?;
         let items: Vec<ItemWithCounts> = rows
             .into_iter()
             .map(|r| ItemWithCounts {
+                counts: r
+                    .item
+                    .clean_name
+                    .as_deref()
+                    .and_then(|name| counts_by_clean_name.get(name))
+                    .copied()
+                    .unwrap_or_default(),
                 item: r.item,
-                // Port of master's `BuildItemCountsByCleanName` (ByName.cs:283-338):
-                // one `ItemCounts` per `CleanName`, each field the number of
-                // in-scope content items of that kind carrying the value.
-                // v10.11.8 (BaseItemRepository.cs:1368-1392, comment "TODO: This
-                // is bad refactor!") instead hands EVERY row the same
-                // uncorrelated totals; master fixed it, so Ferrofin follows
-                // master. `ItemCount` and `ProgramCount` are left at the
-                // aggregate/zero because neither tree assigns them — see
-                // `by_name::project_query_result`.
-                counts: ferrofin_model::dto::ItemCounts {
-                    item_count: i32::try_from(r.cnt).unwrap_or(i32::MAX),
-                    series_count: clamp_count(r.series_count),
-                    episode_count: clamp_count(r.episode_count),
-                    movie_count: clamp_count(r.movie_count),
-                    album_count: clamp_count(r.album_count),
-                    artist_count: clamp_count(r.artist_count),
-                    song_count: clamp_count(r.song_count),
-                    trailer_count: clamp_count(r.trailer_count),
-                    ..Default::default()
-                },
             })
             .collect();
         Ok(QueryResult::new(Some(start_index), Some(total), items))
     }
+
+    /// The per-kind counts of a by-name page — only when `ItemCounts` is
+    /// requested (`ByName.cs:251`), and only for the page's names
+    /// (`:253-259`). v10.11.8 (`BaseItemRepository.cs:1368-1392`, comment
+    /// "TODO: This is bad refactor!") handed EVERY row the same uncorrelated
+    /// totals.
+    async fn page_counts(
+        &self,
+        scope: &ByNameScope<'_>,
+        value_types: &[ItemValueType],
+        filter: &InternalItemsQuery,
+        rows: &[ByNameRow],
+    ) -> Result<HashMap<String, ItemCounts>, ServiceError> {
+        if !filter
+            .dto_options
+            .contains_field(ferrofin_model::querying::ItemFields::ItemCounts)
+        {
+            return Ok(HashMap::new());
+        }
+        let mut page_clean_names: Vec<String> = rows
+            .iter()
+            .filter_map(|r| r.item.clean_name.clone())
+            .filter(|name| !name.is_empty())
+            .collect();
+        page_clean_names.sort_unstable();
+        page_clean_names.dedup();
+        // One bound parameter per name, and the page size is the caller's: a
+        // by-name browse with no `limit` would otherwise push the statement past
+        // SQLite's variable cap. Each name's counts are computed entirely within
+        // its own chunk (the grouping key is the name), so merging is exact.
+        let mut counts = HashMap::new();
+        for chunk in page_clean_names.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+            counts.extend(
+                self.item_counts_by_clean_name(scope, value_types, chunk)
+                    .await?,
+            );
+        }
+        Ok(counts)
+    }
 }
 
-/// A by-name row plus its in-scope item count, read from the joined by-name
-/// aggregate query (the `cnt` column is the aggregate's per-value `COUNT(*)`).
-/// `total_count` carries the `COUNT(*) OVER()` window-function total when the
-/// caller needs pagination metadata, avoiding a separate COUNT round-trip.
+/// A by-name page row. `total_count` carries the `COUNT(*) OVER()`
+/// window-function total when the caller needs pagination metadata, avoiding
+/// a separate COUNT round-trip.
 #[derive(sqlx::FromRow)]
-struct ByNameCountRow {
+struct ByNameRow {
     #[sqlx(flatten)]
     item: BaseItemEntity,
-    cnt: i64,
     #[sqlx(default)]
     total_count: i64,
-    /// The seven per-kind counts of master's `BuildItemCountsByCleanName`.
-    /// `#[sqlx(default)]` because the aggregate emits them only when the
-    /// caller named item types — the browse that wants no counts does not
-    /// pay for seven conditional sums.
-    #[sqlx(default)]
-    series_count: i64,
-    #[sqlx(default)]
-    episode_count: i64,
-    #[sqlx(default)]
-    movie_count: i64,
-    #[sqlx(default)]
-    album_count: i64,
-    #[sqlx(default)]
-    artist_count: i64,
-    #[sqlx(default)]
-    song_count: i64,
-    #[sqlx(default)]
-    trailer_count: i64,
-}
-
-/// The `(column alias, stored type name)` pairs of master's per-kind by-name
-/// counts, or nothing when the caller named no item types.
-///
-/// Port of the seven `BaseItemKindNames[...]` locals master's
-/// `BuildItemCountsByCleanName` reads (`BaseItemRepository.ByName.cs:304-310`).
-/// A kind missing from the lookup table simply contributes no column, which
-/// leaves its count at the `0` default — the same answer as counting nothing.
-fn per_kind_count_types(wanted: bool) -> Vec<(&'static str, &'static str)> {
-    if !wanted {
-        return Vec::new();
-    }
-    [
-        ("series_count", BaseItemKind::Series),
-        ("episode_count", BaseItemKind::Episode),
-        ("movie_count", BaseItemKind::Movie),
-        ("album_count", BaseItemKind::MusicAlbum),
-        ("artist_count", BaseItemKind::MusicArtist),
-        ("song_count", BaseItemKind::Audio),
-        ("trailer_count", BaseItemKind::Trailer),
-    ]
-    .into_iter()
-    .filter_map(|(alias, kind)| stored_type_name(kind).map(|name| (alias, name)))
-    .collect()
 }
 
 /// Narrows one aggregate count to the `i32` the DTO field is.
@@ -960,90 +1154,233 @@ fn clamp_count(n: i64) -> i32 {
     i32::try_from(n).unwrap_or(i32::MAX)
 }
 
-/// Pushes the value-count aggregate as a derived table `agg(cval, cnt)`: for
-/// each distinct `CleanValue` of one of `type_ints`, the count of in-scope
-/// content items that carry it, scoped by content-type include/exclude and the
-/// browse's `ancestors`. Shared by the page query and the total-count query so
-/// their WHERE stays identical (C# `GetItemValues` inner filter).
+/// Pushes the v12 by-name semijoin (`ByName.cs:168-175`): `AND EXISTS (…)` —
+/// the by-name row's `CleanName` is carried, as one of `type_ints`, by at
+/// least one content item inside the browse's scope.
 ///
-/// Grouped by `CleanValue`, not `ItemValueId`, because `CleanValue` is the key
-/// the by-name row is found by — see the `ON` clauses that consume this. Two
-/// `ItemValues` rows can differ only in capitalization (`IX_ItemValues_Type_Value`
-/// is unique on the raw `Value`), and they are one genre to a client, so
-/// collapsing them here is also what stops a single by-name row being joined
-/// twice.
-fn push_value_aggregate<'a>(
+/// Correlated on `bi."CleanName"` rather than joined to a `GROUP BY`
+/// aggregate, and for a measured reason: the aggregate shape ran the whole
+/// `ItemValuesMap` join for every value on the server before the by-name
+/// filter saw a row (296 artists × ~20k items ≈ 5.9 M probes, 927 ms for the
+/// search screen's `/Artists?searchTerm=`); the semijoin runs one indexed
+/// probe per surviving by-name row — `IX_ItemValues_Type_CleanValue` seeks
+/// `(Type, CleanValue)`, then the map's primary key and the content row's.
+/// Shared by the page query and the total-count query so their WHERE stays
+/// identical.
+fn push_value_exists<'a>(
     qb: &mut QueryBuilder<'a, Sqlite>,
     scope: &'a ByNameScope<'a>,
-    count_types: &[(&'static str, &'static str)],
+    inner: InnerScope,
 ) {
-    let ByNameScope {
-        type_ints,
-        content_type_names,
-        ancestors,
-        top_parents,
-    } = scope;
-    // `COUNT(*)`, not `COUNT(DISTINCT ivm."ItemId")`: `ItemValuesMap`'s primary
-    // key IS `("ItemValueId", "ItemId")`, so within one `GROUP BY
-    // iv."ItemValueId"` every `ItemId` is already distinct, and the `ci` join is
-    // 1:1 on `BaseItems`'s primary key so it cannot duplicate a map row either.
-    // The `DISTINCT` was therefore never able to remove a row — it only bought
-    // SQLite a `USE TEMP B-TREE FOR count(DISTINCT)` per group, whose cost grows
-    // with the number of items sharing a genre/studio. Row-identical on the
-    // bench library; the statement behind `/Studios` measures 0.407 ms → 0.366,
-    // `/Items/Filters2` 0.566 → 0.490.
-    qb.push(r#"(SELECT iv."CleanValue" AS cval, COUNT(*) AS cnt"#);
-    // Master's per-`CleanName` counts, folded into the SAME group-by rather
-    // than run as a second dictionary query: `SUM(ci."Type" = ?)` is SQLite's
-    // spelling of `g.Where(x => x.Type == seriesTypeName).Sum(x => x.Count)`.
-    for (alias, type_name) in count_types {
-        qb.push(r#", SUM(ci."Type" = "#)
-            .push_bind((*type_name).to_owned())
-            .push(") AS ")
-            .push(*alias);
-    }
     qb.push(
-        r#"
-           FROM "ItemValues" iv
+        r#" AND EXISTS (SELECT 1 FROM "ItemValues" iv
+           JOIN "ItemValuesMap" ivm ON ivm."ItemValueId" = iv."ItemValueId"
+           JOIN "BaseItems" ci ON ci."Id" = ivm."ItemId"
+           WHERE iv."CleanValue" = bi."CleanName" AND "#,
+    );
+    push_in_list(qb, r#"iv."Type""#, scope.type_ints);
+    push_content_scope(qb, scope, inner);
+    qb.push(")");
+}
+
+/// Pushes the `FROM` of a value-links statement (v12 `valueLinks`,
+/// `ByName.cs:314-317`): the `ItemValues` rows of `scope.type_ints` whose
+/// `CleanValue` is one of `clean_names`, joined to the content rows (`ci`)
+/// that carry them. Ends inside the `WHERE`, ready for more `AND` terms.
+fn push_value_links<'a>(
+    qb: &mut QueryBuilder<'a, Sqlite>,
+    scope: &'a ByNameScope<'a>,
+    clean_names: &'a [String],
+) {
+    qb.push(
+        r#""ItemValues" iv
            JOIN "ItemValuesMap" ivm ON ivm."ItemValueId" = iv."ItemValueId"
            JOIN "BaseItems" ci ON ci."Id" = ivm."ItemId"
            WHERE "#,
     );
-    push_in_list(qb, r#"iv."Type""#, type_ints);
-    if !content_type_names.is_empty() {
+    push_in_list(qb, r#"iv."Type""#, scope.type_ints);
+    qb.push(" AND ");
+    push_in_list(qb, r#"iv."CleanValue""#, clean_names);
+}
+
+/// Which of v12's two inner filters a content-row predicate set is.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InnerScope {
+    /// The `innerQueryFilter` behind the page and its total
+    /// (`ByName.cs:149-164`): kinds included and excluded, media types, the
+    /// ancestors / item ids / libraries, and the Live TV flags.
+    Page,
+    /// The `scopeQuery` behind the per-kind counts (`:301-311`): no included
+    /// kinds and no flags — "the counts describe everything the value is
+    /// attached to" — but the played state and the excluded ids.
+    Counts,
+}
+
+/// Pushes the content-row predicates of a by-name inner query onto the `ci`
+/// alias — the fields of the [`InnerScope`] asked for, each as
+/// `TranslateQuery` spells it for a browse, plus what `TranslateQuery` adds
+/// to any query that does not ask for owned items: no alternate versions, no
+/// owned non-extras (`TranslateQuery.cs:796-807`).
+#[allow(clippy::too_many_lines)] // one predicate per C# field, kept in the C# order
+fn push_content_scope<'a>(
+    qb: &mut QueryBuilder<'a, Sqlite>,
+    scope: &'a ByNameScope<'a>,
+    inner: InnerScope,
+) {
+    let ByNameScope {
+        filter,
+        content_type_names,
+        exclude_type_names,
+        media_types,
+        ancestors,
+        top_parents,
+        ..
+    } = scope;
+    // `+`: a plan pin, like the one on `TopParentId` below. Unpinned, the
+    // planner drives the semijoin from every content row of the kind
+    // (`FerrofinIX_BaseItems_Type_…`, `Type=?`) and probes the value per
+    // row — `/Artists?includeItemTypes=MusicAlbum` walks 800 albums per
+    // artist: 45 ms; pinned, it walks the artist's own map rows: 4 ms.
+    if inner == InnerScope::Page && !content_type_names.is_empty() {
         qb.push(" AND ");
-        push_in_list(qb, r#"ci."Type""#, content_type_names);
+        push_in_list(qb, r#"+ci."Type""#, content_type_names);
+    }
+    if !exclude_type_names.is_empty() {
+        qb.push(r#" AND ci."Type" NOT IN ("#);
+        let mut sep = qb.separated(", ");
+        for name in *exclude_type_names {
+            sep.push_bind(name.clone());
+        }
+        qb.push(")");
+    }
+    if !media_types.is_empty() {
+        qb.push(" AND ");
+        push_in_list(qb, r#"ci."MediaType""#, media_types);
     }
     if !ancestors.is_empty() {
         qb.push(r#" AND EXISTS (SELECT 1 FROM "AncestorIds" a WHERE a."ItemId" = ci."Id" AND "#);
         push_in_list(qb, r#"a."ParentItemId""#, ancestors);
         qb.push(")");
     }
+    if !filter.item_ids.is_empty() {
+        qb.push(" AND ");
+        push_in_list(qb, r#"ci."Id""#, &to_guid_strings(&filter.item_ids));
+    }
+    if inner == InnerScope::Page {
+        // The Live TV flags (`ByName.cs:159-163`), as `TranslateQuery` spells
+        // them for a browse: `IsMovie` is skipped when the kinds already say
+        // movie-ish (`append_predicates`), Sports/News/Kids are tag sugar.
+        if let Some(is_movie) = filter.is_movie {
+            let include_all_movie_types = is_movie
+                && (filter.include_item_types.is_empty()
+                    || filter.include_item_types.contains(&BaseItemKind::Movie)
+                    || filter.include_item_types.contains(&BaseItemKind::Trailer));
+            if !include_all_movie_types {
+                qb.push(r#" AND ci."IsMovie" = "#).push_bind(is_movie);
+            }
+        }
+        if let Some(is_series) = filter.is_series {
+            qb.push(r#" AND ci."IsSeries" = "#).push_bind(is_series);
+        }
+        for (flag, tag) in [
+            (filter.is_sports, "sports"),
+            (filter.is_news, "news"),
+            (filter.is_kids, "kids"),
+        ] {
+            let Some(want) = flag else { continue };
+            qb.push(if want {
+                " AND EXISTS "
+            } else {
+                " AND NOT EXISTS "
+            })
+            .push(
+                r#"(SELECT 1 FROM "ItemValuesMap" tm
+                    JOIN "ItemValues" tv ON tv."ItemValueId" = tm."ItemValueId"
+                    WHERE tm."ItemId" = ci."Id" AND tv."Type" = "#,
+            )
+            .push_bind(i64::from(i32::from(ItemValueType::Tags)))
+            .push(r#" AND tv."CleanValue" = "#)
+            .push_bind(tag.to_owned())
+            .push(")");
+        }
+        if let Some(airing) = filter.is_airing {
+            let now = datetime_to_db(chrono::Utc::now());
+            if airing {
+                qb.push(r#" AND ci."StartDate" <= "#)
+                    .push_bind(now.clone())
+                    .push(r#" AND ci."EndDate" >= "#)
+                    .push_bind(now);
+            } else {
+                qb.push(r#" AND ci."StartDate" > "#)
+                    .push_bind(now.clone())
+                    .push(r#" AND ci."EndDate" < "#)
+                    .push_bind(now);
+            }
+        }
+    } else {
+        if !filter.exclude_item_ids.is_empty() {
+            qb.push(r#" AND ci."Id" NOT IN ("#);
+            let mut sep = qb.separated(", ");
+            for id in to_guid_strings(&filter.exclude_item_ids) {
+                sep.push_bind(id);
+            }
+            qb.push(")");
+        }
+        // The played state of the content row (the direct per-row rule the
+        // browse uses — see `append_user_data_predicates`).
+        if let (Some(user_id), Some(want)) = (filter.user_id(), filter.is_played) {
+            qb.push(if want {
+                r#" AND ci."Id" IN "#
+            } else {
+                r#" AND ci."Id" NOT IN "#
+            })
+            .push(r#"(SELECT ud."ItemId" FROM "UserData" ud WHERE ud."UserId" = "#)
+            .push_bind(guid_to_db(user_id))
+            .push(r#" AND ud."Played" = 1)"#);
+        }
+    }
+    qb.push(
+        r#" AND ci."PrimaryVersionId" IS NULL
+            AND (ci."OwnerId" IS NULL OR ci."OwnerId" = '00000000-0000-0000-0000-000000000000'
+                 OR ci."ExtraType" IS NOT NULL)"#,
+    );
     // The user's libraries. Upstream reaches this through `TranslateQuery` on
     // the inner item query, which `AddUserToQuery` has already confined; here
     // the caller resolves the scope and passes it down. Without it the
     // by-name tabs aggregate over the WHOLE server, so a restricted account is
     // offered a genre or a studio that `/Items` will then refuse to return —
     // a filter list that lies about what is behind it.
+    //
+    // `+`: a plan pin. Without it the planner — which has no `sqlite_stat1`
+    // to tell it the four-value `IN` matches every item there is — takes
+    // `IX_BaseItems_TopParentId_Id` as a cheap seek and drives the join from
+    // `ci`, walking the whole library per value (the 927 ms above). Pinned,
+    // the predicate is a filter on the row the primary key already fetched.
     if !top_parents.is_empty() {
         qb.push(" AND ");
-        push_in_list(qb, r#"ci."TopParentId""#, top_parents);
+        push_in_list(qb, r#"+ci."TopParentId""#, top_parents);
     }
-    qb.push(r#" GROUP BY iv."CleanValue") AS agg"#);
 }
 
-/// The pre-computed vectors that shape a by-name aggregate.
+/// The pre-computed vectors that shape a by-name inner query.
 ///
-/// One struct so the page query and the paging-fallback count cannot drift
-/// apart: they take the SAME value, and a filter added to one is a filter in
-/// both.
+/// One struct so the page query, the paging-fallback count and the per-kind
+/// counts cannot drift apart: they take the SAME value, and a filter added to
+/// one is a filter in all of them.
 struct ByNameScope<'a> {
+    /// The browse's filter, for the fields that need no pre-computation
+    /// (item ids, the Live TV flags, the played state).
+    filter: &'a InternalItemsQuery,
     /// The `ItemValues.Type` numbers this tab aggregates.
     type_ints: &'a [i64],
     /// Stored type names of the content items that may contribute — the
     /// caller's `IncludeItemTypes` and nothing else, exactly as C# builds its
     /// `innerQueryFilter`.
     content_type_names: &'a [String],
+    /// Stored type names the content items must not be (`ExcludeItemTypes`).
+    exclude_type_names: &'a [String],
+    /// Stored `MediaType` names the content items are restricted to.
+    media_types: &'a [String],
     /// The browse's ancestor scope, if it is under a parent.
     ancestors: &'a [String],
     /// The user's libraries (`AddUserToQuery`), empty when unconfined.
@@ -1105,26 +1442,6 @@ fn push_representative_rank(
         qb.push(") THEN 0 ELSE 1 END, ");
     }
     qb.push(r#"bi."Id") AS "rep_rank""#);
-}
-
-/// Joins the value aggregate to the by-name rows it describes.
-///
-/// Port of the C# outer filter, which is **two** clauses —
-/// `.Where(e => e.Type == returnType).Where(e => itemValuesQuery.Contains(e.CleanName))`
-/// (`BaseItemRepository.GetItemValues`). Both are load-bearing:
-///
-/// - `CleanName` is the only link on an adopted database, where
-///   `ItemValues.ItemValueId` is a synthetic guid matching no item at all.
-/// - `Type` is what keeps the answer to *this* browse. Without it a Movie or an
-///   Episode named "Drama" is returned by `/Genres` beside the real genre, and
-///   `/Genres` and `/MusicGenres` — which query the same `ItemValueType` and
-///   differ only by return kind — stop being distinguishable. It is also the
-///   leading column of `FerrofinIX_BaseItems_Type_CleanName`, so constraining
-///   it keeps this an index seek instead of a scan of every item.
-fn push_by_name_join(qb: &mut QueryBuilder<'_, Sqlite>, return_type: &str) {
-    qb.push(r#" ON agg.cval = bi."CleanName" AND bi."Type" = "#)
-        .push_bind(return_type.to_owned())
-        .push(" WHERE 1 = 1");
 }
 
 /// The physical folders each of `ids` stands for, for those that are Jellyfin
@@ -1248,31 +1565,29 @@ impl<'r> FromRow<'r, sqlx::sqlite::SqliteRow> for PlaylistItemRow {
 /// Appends the caller's name filters against the by-name `bi` row (C#
 /// `TranslateQuery`'s name predicates on the outer query).
 ///
-/// - `SearchTerm` ports the C# two-branch shape: a term containing a wildcard
-///   character goes through `LIKE '%term%'` **unescaped** (client wildcards pass
-///   through, as upstream intends); a plain term is a literal contains-match.
-///   Deliberate divergence: the plain term is cleaned (`get_clean_value`) before
-///   matching `CleanName` — C# compares the raw lowered term against the cleaned
-///   column, which makes e.g. hyphenated searches miss; Ferrofin stays correct.
+/// - `SearchTerm` ports the C# two-branch shape (v12 `TranslateQuery.cs:250-265`):
+///   a term containing a wildcard character goes through `LIKE '%term%'`
+///   **unescaped** (client wildcards pass through, as upstream intends); a plain
+///   term is cleaned (`get_clean_value`, as v12's `GetCleanValue`) and matched
+///   as a literal contains on `CleanName`.
 /// - `NameStartsWith` is a prefix on the sort key. Deliberate divergence:
 ///   `COALESCE(SortName, Name)` because Ferrofin leaves by-name `SortName` NULL
 ///   (C# filters `SortName` alone, which would match nothing here).
-/// - `NameStartsWithOrGreater`/`NameLessThan` port C#'s **first-character**
-///   comparison (`SortName.FirstOrDefault() > x[0] || Name.FirstOrDefault() >
-///   x[0]`), not a full-string range: `substr(...,1,1)` on both columns, OR'd,
-///   binary collation — byte-identical to the C# char compare for ASCII.
-fn append_by_name_filters<'a>(qb: &mut QueryBuilder<'a, Sqlite>, filter: &'a InternalItemsQuery) {
+/// - `NameStartsWithOrGreater`/`NameLessThan` are full-string comparisons of
+///   `SortName` against the lowercased bound, as C# compares them.
+///
+/// Everything else in C#'s `outerQueryFilter` (`ByName.cs:177-196`) — played /
+/// favorite / liked / locked state, tags, official ratings, years, referenced
+/// studios and genres, excluded ids — is the same `TranslateQuery` a browse
+/// runs, so it runs through [`append_predicates`] over `outer`, the filter
+/// narrowed to exactly those fields (see [`by_name_outer_filter`]).
+fn append_by_name_filters<'a>(
+    qb: &mut QueryBuilder<'a, Sqlite>,
+    filter: &'a InternalItemsQuery,
+    outer: &'a InternalItemsQuery,
+) {
     let non_blank = |v: &'a Option<String>| v.as_deref().map(str::trim).filter(|s| !s.is_empty());
-    // Favorite state lives in the by-name item's own `UserData` row (C# joins
-    // `UserData` on the by-name item id) — same predicate the main browse uses.
-    if let (Some(user_id), Some(want)) = (filter.user_id(), filter.is_favorite) {
-        crate::translate_query::push_user_data_exists(
-            qb,
-            &guid_to_db(user_id),
-            r#"ud."IsFavorite" = 1"#,
-            want,
-        );
-    }
+    append_predicates(qb, outer);
     if let Some(term) = non_blank(&filter.search_term) {
         let lowered = term.to_lowercase();
         if lowered.contains(SEARCH_WILDCARD_TERMS) {
@@ -1304,6 +1619,35 @@ fn append_by_name_filters<'a>(qb: &mut QueryBuilder<'a, Sqlite>, filter: &'a Int
     if let Some(boundary) = non_blank(&filter.name_less_than) {
         qb.push(r#" AND bi."SortName" < "#)
             .push_bind(boundary.to_lowercase());
+    }
+}
+
+/// The C# `outerQueryFilter` (`ByName.cs:177-196`) minus the name filters
+/// [`append_by_name_filters`] spells itself: the predicates that apply to the
+/// by-name row — favorite state in its own `UserData` row (C# joins `UserData`
+/// on the by-name item id), its tags, ratings, years, referenced items.
+///
+/// A fresh query rather than the caller's, so that none of the inner-query
+/// fields (`IncludeItemTypes`, `MediaTypes`, `AncestorIds`, paging) reaches
+/// the by-name row: a genre is not a Movie, and `includeItemTypes=Movie`
+/// must narrow what carries it, not the genre row itself.
+fn by_name_outer_filter(filter: &InternalItemsQuery) -> InternalItemsQuery {
+    InternalItemsQuery {
+        user: filter.user.clone(),
+        is_played: filter.is_played,
+        is_favorite: filter.is_favorite,
+        is_favorite_or_liked: filter.is_favorite_or_liked,
+        is_liked: filter.is_liked,
+        is_locked: filter.is_locked,
+        tags: filter.tags.clone(),
+        official_ratings: filter.official_ratings.clone(),
+        studio_ids: filter.studio_ids.clone(),
+        genre_ids: filter.genre_ids.clone(),
+        genres: filter.genres.clone(),
+        years: filter.years.clone(),
+        name_contains: filter.name_contains.clone(),
+        exclude_item_ids: filter.exclude_item_ids.clone(),
+        ..InternalItemsQuery::default()
     }
 }
 
@@ -2251,10 +2595,19 @@ impl FerrofinItemRepository {
         // One entry per CLEANED value (upstream GetQueryFiltersLegacy groups by
         // CleanValue and keeps MIN(Value)), so "Sci-Fi"/"Sci-fi" case variants
         // collapse instead of doubling the filter dialog's list.
+        //
+        // `CROSS JOIN` pins the join order to iv → ivm → bi: the values of the
+        // type, their map rows by the map's primary key, the item by its own.
+        // Left to itself the planner — with no `sqlite_stat1` to tell it the
+        // user-scope `TopParentId IN (…)` matches every item there is — pairs
+        // every value with every item under the user's libraries and probes
+        // the map for each pair: 38 genres × 21k items ≈ 800k probes, 820 ms
+        // for the genre facet of `/Items/Filters` on the bench library; pinned,
+        // it is one probe per map row of the type.
         let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
             r#"SELECT MIN(iv."Value") FROM "ItemValues" AS iv
-               JOIN "ItemValuesMap" ivm ON ivm."ItemValueId" = iv."ItemValueId"
-               JOIN "BaseItems" AS bi ON bi."Id" = ivm."ItemId"
+               CROSS JOIN "ItemValuesMap" ivm ON ivm."ItemValueId" = iv."ItemValueId"
+               CROSS JOIN "BaseItems" AS bi ON bi."Id" = ivm."ItemId"
                WHERE iv."Type" = "#,
         );
         qb.push_bind(i64::from(i32::from(value_type)));
@@ -2289,9 +2642,10 @@ mod tests {
     use super::*;
     use crate::item_type_lookup::ItemTypeLookup;
     use crate::test_support::{
-        seed_child_item, seed_item, seed_item_genre, seed_item_with_data, seed_library_over,
-        seed_named_item, seed_top_parented_item, seed_user, seed_user_data,
-        seed_user_with_defaults, set_clean_name, test_db,
+        seed_child_item, seed_folder_item, seed_item, seed_item_genre, seed_item_of_series,
+        seed_item_value, seed_item_with_data, seed_library_over, seed_named_item,
+        seed_top_parented_item, seed_user, seed_user_data, seed_user_with_defaults, set_clean_name,
+        test_db,
     };
     use ferrofin_db::Database;
     use ferrofin_model::data::BaseItemKind;
@@ -3422,11 +3776,21 @@ mod tests {
         seed_named_item(&db, movie, BaseItemKind::Movie, "A Drama Film").await;
         seed_item_genre(&db, movie, "Drama").await;
 
+        // Counts are computed only when `ItemCounts` is requested
+        // (`ByName.cs:251`): a query with an explicit empty field set — what
+        // `/Items/Filters2` sends — pays nothing for them, and the default
+        // `DtoOptions` (every field, as C#'s parameterless constructor) has it.
         let genres = repository
-            .get_genres(&InternalItemsQuery::default())
+            .get_genres(&without_fields(InternalItemsQuery::default()))
             .await
             .expect("genres");
         assert_eq!(genres.items.len(), 1);
+        assert_eq!(genres.items[0].counts, ItemCounts::default());
+        let genres = repository
+            .get_genres(&InternalItemsQuery::default())
+            .await
+            .expect("genres with counts");
+        assert_eq!(genres.items[0].counts.movie_count, 1);
         assert_eq!(genres.items[0].counts.item_count, 1);
 
         // Studios / artists / album artists / all-artists resolve (empty here) and
@@ -3575,9 +3939,10 @@ mod tests {
         assert_eq!(paged.start_index, 1);
         assert_eq!(paged.total_record_count, 5);
 
-        // nameStartsWith is a prefix filter on the by-name row. Unpaged responses
-        // carry TotalRecordCount 0 — C# forces EnableTotalRecordCount off without
-        // a Limit and the non-nullable int is never assigned.
+        // nameStartsWith is a prefix filter on the by-name row. An unpaged
+        // response still carries the total: v12 assigns
+        // `representativeIds.Count` whenever `EnableTotalRecordCount`
+        // (`ByName.cs:227-230`) — 10.11.8's "no limit → no total" is gone.
         let starts = InternalItemsQuery {
             name_starts_with: Some("A".to_owned()),
             ..Default::default()
@@ -3585,7 +3950,7 @@ mod tests {
         let a = repository.get_genres(&starts).await.expect("starts");
         let a_names: Vec<_> = a.items.iter().filter_map(|i| i.item.name.clone()).collect();
         assert_eq!(a_names, vec!["Action", "Adventure"]);
-        assert_eq!(a.total_record_count, 0);
+        assert_eq!(a.total_record_count, 2);
 
         // nameLessThan is a FULL-STRING comparison of `SortName` against the
         // lowercased bound (C# `SortName.CompareTo(bound.ToLowerInvariant()) < 0`).
@@ -3644,13 +4009,14 @@ mod tests {
 
         // A plain searchTerm is a literal contains-match on CleanName, and the
         // count survives it.
-        let search = InternalItemsQuery {
+        let search = with_item_counts(InternalItemsQuery {
             search_term: Some("ram".to_owned()),
             ..Default::default()
-        };
+        });
         let s = repository.get_genres(&search).await.expect("search");
         assert_eq!(s.items.len(), 1);
         assert_eq!(s.items[0].item.name.as_deref(), Some("Drama"));
+        assert_eq!(s.items[0].counts.movie_count, 2);
         assert_eq!(s.items[0].counts.item_count, 2);
 
         // A searchTerm carrying a wildcard character routes through raw LIKE —
@@ -4425,6 +4791,348 @@ mod tests {
         assert_eq!(
             z.total_record_count, 0,
             "genuine empty is 0, not a stale count"
+        );
+    }
+
+    /// A query asking for exactly `ItemCounts` (the by-name controllers add
+    /// it whenever `includeItemTypes` is set).
+    fn with_item_counts(mut query: InternalItemsQuery) -> InternalItemsQuery {
+        query.dto_options.fields = vec![ferrofin_model::querying::ItemFields::ItemCounts];
+        query
+    }
+
+    /// A query with an explicit empty field set (`/Items/Filters2`'s shape).
+    fn without_fields(mut query: InternalItemsQuery) -> InternalItemsQuery {
+        query.dto_options.fields = Vec::new();
+        query
+    }
+
+    /// v12 `GetItemValues` assigns `TotalRecordCount = representativeIds.Count`
+    /// whenever `EnableTotalRecordCount` (`ByName.cs:227-230`), with or
+    /// without a `Limit` — `limit=0` is jellyfin-web's "how many?" probe, and
+    /// 10.11.8 answered it with 0.
+    #[tokio::test]
+    async fn by_name_total_is_the_collapsed_count_regardless_of_limit() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let movie = Uuid::from_u128(0xA0F5);
+        seed_named_item(&db, movie, BaseItemKind::Movie, "One").await;
+        for g in ["Action", "Adventure", "Comedy", "Drama", "Horror"] {
+            seed_item_genre(&db, movie, g).await;
+        }
+
+        let limit_zero = InternalItemsQuery {
+            limit: Some(0),
+            ..Default::default()
+        };
+        let r = repository.get_genres(&limit_zero).await.expect("limit 0");
+        assert!(r.items.is_empty());
+        assert_eq!(r.total_record_count, 5);
+
+        let no_limit = InternalItemsQuery::default();
+        let r = repository.get_genres(&no_limit).await.expect("no limit");
+        assert_eq!(r.items.len(), 5);
+        assert_eq!(r.total_record_count, 5);
+
+        let disabled = InternalItemsQuery {
+            enable_total_record_count: false,
+            ..Default::default()
+        };
+        let r = repository.get_genres(&disabled).await.expect("disabled");
+        assert_eq!(r.items.len(), 5);
+        assert_eq!(
+            r.total_record_count, 0,
+            "never assigned upstream → 0 on the wire"
+        );
+    }
+
+    /// Port of v12 `BuildItemCountsByCleanName` (`ByName.cs:287-464`): the
+    /// counts describe everything the value is attached to (not only the
+    /// `IncludeItemTypes` the list was narrowed to), `ItemCount` is their
+    /// sum, and — for studios and genres only — every episode under a tagged
+    /// series counts, while an episode tagged under an untagged series counts
+    /// once for itself.
+    #[tokio::test]
+    async fn by_name_counts_describe_everything_the_value_is_attached_to() {
+        let db = test_db().await;
+        let repository = repo(&db);
+
+        let movie = Uuid::from_u128(0xA301);
+        seed_named_item(&db, movie, BaseItemKind::Movie, "A Drama Film").await;
+        seed_item_genre(&db, movie, "Drama").await;
+        // A tagged series with three untagged episodes …
+        let tagged_series = Uuid::from_u128(0xA302);
+        seed_named_item(&db, tagged_series, BaseItemKind::Series, "Tagged Show").await;
+        seed_item_genre(&db, tagged_series, "Drama").await;
+        for n in 0..3u128 {
+            let ep = Uuid::from_u128(0xA310 + n);
+            seed_item_of_series(&db, ep, BaseItemKind::Episode, "Ep", tagged_series).await;
+        }
+        // … one of which is ALSO tagged itself (counted with its series, not twice) …
+        seed_item_genre(&db, Uuid::from_u128(0xA310), "Drama").await;
+        // … and an untagged series with one tagged episode (counts for itself).
+        let plain_series = Uuid::from_u128(0xA303);
+        seed_named_item(&db, plain_series, BaseItemKind::Series, "Plain Show").await;
+        let stray = Uuid::from_u128(0xA320);
+        seed_item_of_series(&db, stray, BaseItemKind::Episode, "Stray", plain_series).await;
+        seed_item_genre(&db, stray, "Drama").await;
+        // A song carrying the same genre: `SongCount`, and part of the total.
+        let song = Uuid::from_u128(0xA330);
+        seed_named_item(&db, song, BaseItemKind::Audio, "A Song").await;
+        seed_item_genre(&db, song, "Drama").await;
+
+        // Narrowed to movies: the list is the genres movies carry, but the
+        // counts are the whole picture (`ByName.cs:299-311`).
+        let movies_only = with_item_counts(InternalItemsQuery {
+            include_item_types: vec![BaseItemKind::Movie],
+            ..Default::default()
+        });
+        let got = repository.get_genres(&movies_only).await.expect("counts");
+        assert_eq!(got.items.len(), 1);
+        let counts = got.items[0].counts;
+        assert_eq!(counts.movie_count, 1);
+        assert_eq!(counts.series_count, 1);
+        assert_eq!(counts.song_count, 1);
+        assert_eq!(
+            counts.episode_count, 4,
+            "3 under the tagged series + the stray"
+        );
+        assert_eq!(counts.item_count, 7);
+
+        // An artist credit does not pass down to episodes (`:341-342`): the
+        // same shape under `AlbumArtist` (the value type that materializes a
+        // browsable `MusicArtist` row) counts only the directly tagged episodes.
+        seed_item_value(&db, tagged_series, ItemValueType::AlbumArtist, "Someone").await;
+        seed_item_value(
+            &db,
+            Uuid::from_u128(0xA310),
+            ItemValueType::AlbumArtist,
+            "Someone",
+        )
+        .await;
+        seed_item_value(&db, stray, ItemValueType::AlbumArtist, "Someone").await;
+        let artists = repository
+            .get_album_artists(&with_item_counts(InternalItemsQuery::default()))
+            .await
+            .expect("album artists");
+        assert_eq!(artists.items.len(), 1);
+        assert_eq!(artists.items[0].counts.series_count, 1);
+        assert_eq!(artists.items[0].counts.episode_count, 2);
+        assert_eq!(artists.items[0].counts.item_count, 3);
+    }
+
+    /// The two inner filters differ (`ByName.cs:149-164` vs `:301-311`): the
+    /// page's semijoin carries the Live TV flags (`IsMovie`, …) and the count
+    /// scope the played state and excluded ids.
+    #[tokio::test]
+    async fn by_name_inner_scopes_carry_the_flags_and_the_played_state() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let movie = Uuid::from_u128(0xA601);
+        let program = Uuid::from_u128(0xA602);
+        seed_named_item(&db, movie, BaseItemKind::Movie, "Film").await;
+        seed_named_item(&db, program, BaseItemKind::LiveTvProgram, "Airing").await;
+        sqlx::query(r#"UPDATE "BaseItems" SET "IsMovie" = 1 WHERE "Id" = ?1"#)
+            .bind(guid_to_db(program))
+            .execute(db.writer())
+            .await
+            .expect("flag the program");
+        seed_item_genre(&db, movie, "Drama").await;
+        seed_item_genre(&db, program, "News").await;
+        seed_library_over(&db, &[movie, program]).await;
+        let user = seed_user_with_defaults(&db, Uuid::from_u128(0xA610)).await;
+        seed_user_data(&db, Uuid::from_u128(0xA610), movie, true, None).await;
+
+        let names = |r: QueryResult<ItemWithCounts>| -> Vec<String> {
+            r.items.into_iter().filter_map(|i| i.item.name).collect()
+        };
+        // `IsMovie` with a Program-only kind filter reaches the content row;
+        // with no kind filter v12 skips the predicate (`include_all_movie_types`).
+        let programs = InternalItemsQuery {
+            user: Some(user.clone()),
+            include_item_types: vec![BaseItemKind::LiveTvProgram],
+            is_movie: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(
+            names(repository.get_genres(&programs).await.expect("programs")),
+            vec!["News"]
+        );
+        let unfiltered = InternalItemsQuery {
+            user: Some(user.clone()),
+            is_movie: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(
+            names(
+                repository
+                    .get_genres(&unfiltered)
+                    .await
+                    .expect("unfiltered")
+            ),
+            vec!["Drama", "News"]
+        );
+
+        // `IsPlayed` scopes the COUNTS (`scopeQuery`, `:310`), not the list.
+        let played = with_item_counts(InternalItemsQuery {
+            user: Some(user.clone()),
+            is_played: Some(false),
+            ..Default::default()
+        });
+        let got = repository.get_genres(&played).await.expect("played");
+        let drama = got
+            .items
+            .iter()
+            .find(|i| i.item.name.as_deref() == Some("Drama"))
+            .expect("the genre row is listed regardless");
+        assert_eq!(drama.counts.movie_count, 0, "the one carrier is played");
+        let news = got
+            .items
+            .iter()
+            .find(|i| i.item.name.as_deref() == Some("News"))
+            .expect("listed");
+        assert_eq!(news.counts.program_count, 1);
+        assert_eq!(news.counts.item_count, 1);
+    }
+
+    /// C#'s `outerQueryFilter` (`ByName.cs:177-196`) applies to the by-name
+    /// row itself — its own year, rating, tags and played state — never to
+    /// the content that carries the value.
+    #[tokio::test]
+    async fn by_name_outer_filters_apply_to_the_by_name_row() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let movie = Uuid::from_u128(0xA501);
+        seed_named_item(&db, movie, BaseItemKind::Movie, "Film").await;
+        sqlx::query(
+            r#"UPDATE "BaseItems" SET "ProductionYear" = 1999, "OfficialRating" = 'R' WHERE "Id" = ?1"#,
+        )
+        .bind(guid_to_db(movie))
+        .execute(db.writer())
+        .await
+        .expect("movie metadata");
+        for g in ["Action", "Drama"] {
+            seed_item_genre(&db, movie, g).await;
+        }
+        // Only the "Drama" genre ROW carries the year, the rating and a tag.
+        let drama: String = sqlx::query_scalar(
+            r#"SELECT "Id" FROM "BaseItems" WHERE "Name" = 'Drama' AND "Type" = 'MediaBrowser.Controller.Entities.Genre'"#,
+        )
+        .fetch_one(db.pool())
+        .await
+        .expect("genre row");
+        sqlx::query(
+            r#"UPDATE "BaseItems" SET "ProductionYear" = 2001, "OfficialRating" = 'PG' WHERE "Id" = ?1"#,
+        )
+        .bind(&drama)
+        .execute(db.writer())
+        .await
+        .expect("genre metadata");
+        let drama_id = Uuid::parse_str(&drama).expect("guid");
+        seed_item_value(&db, drama_id, ItemValueType::Tags, "featured").await;
+
+        let names = |r: QueryResult<ItemWithCounts>| -> Vec<String> {
+            r.items.into_iter().filter_map(|i| i.item.name).collect()
+        };
+        let by_year = InternalItemsQuery {
+            years: vec![2001],
+            ..Default::default()
+        };
+        assert_eq!(
+            names(repository.get_genres(&by_year).await.expect("years")),
+            vec!["Drama"]
+        );
+        let movie_year = InternalItemsQuery {
+            years: vec![1999],
+            ..Default::default()
+        };
+        assert!(
+            names(
+                repository
+                    .get_genres(&movie_year)
+                    .await
+                    .expect("movie year")
+            )
+            .is_empty(),
+            "the movie's year is not the genre's"
+        );
+        let by_rating = InternalItemsQuery {
+            official_ratings: vec!["PG".to_owned()],
+            ..Default::default()
+        };
+        assert_eq!(
+            names(repository.get_genres(&by_rating).await.expect("rating")),
+            vec!["Drama"]
+        );
+        let by_tag = InternalItemsQuery {
+            tags: vec!["featured".to_owned()],
+            ..Default::default()
+        };
+        assert_eq!(
+            names(repository.get_genres(&by_tag).await.expect("tag")),
+            vec!["Drama"]
+        );
+    }
+
+    /// The inner content query carries the caller's `ExcludeItemTypes` and
+    /// `MediaTypes` (`ByName.cs:151-153`) and, like every `TranslateQuery`
+    /// that does not ask for owned items, ignores alternate versions.
+    #[tokio::test]
+    async fn by_name_inner_query_honours_exclude_types_media_types_and_alternates() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let movie = Uuid::from_u128(0xA401);
+        seed_named_item(&db, movie, BaseItemKind::Movie, "Film").await;
+        seed_item_genre(&db, movie, "Action").await;
+        let series = Uuid::from_u128(0xA402);
+        seed_named_item(&db, series, BaseItemKind::Series, "Show").await;
+        seed_item_genre(&db, series, "Drama").await;
+        // A movie is `Video`; a series row carries `Unknown`, as Jellyfin writes it.
+        for (id, media) in [(movie, "Video"), (series, "Unknown")] {
+            sqlx::query(r#"UPDATE "BaseItems" SET "MediaType" = ?1 WHERE "Id" = ?2"#)
+                .bind(media)
+                .bind(guid_to_db(id))
+                .execute(db.writer())
+                .await
+                .expect("set media type");
+        }
+        // An alternate version is the only carrier of "Cut": it contributes
+        // nothing (`TranslateQuery.cs:796-807`).
+        let alternate = Uuid::from_u128(0xA403);
+        seed_named_item(&db, alternate, BaseItemKind::Movie, "Film 4K").await;
+        sqlx::query(r#"UPDATE "BaseItems" SET "PrimaryVersionId" = ?1 WHERE "Id" = ?2"#)
+            .bind(guid_to_db(movie))
+            .bind(guid_to_db(alternate))
+            .execute(db.writer())
+            .await
+            .expect("link alternate");
+        seed_item_genre(&db, alternate, "Cut").await;
+
+        let names = |r: QueryResult<ItemWithCounts>| -> Vec<String> {
+            r.items.into_iter().filter_map(|i| i.item.name).collect()
+        };
+        let all = repository
+            .get_genres(&InternalItemsQuery::default())
+            .await
+            .expect("all");
+        assert_eq!(names(all), vec!["Action", "Drama"]);
+
+        let no_movies = InternalItemsQuery {
+            exclude_item_types: vec![BaseItemKind::Movie],
+            ..Default::default()
+        };
+        assert_eq!(
+            names(repository.get_genres(&no_movies).await.expect("exclude")),
+            vec!["Drama"]
+        );
+
+        let video_only = InternalItemsQuery {
+            media_types: vec![ferrofin_model::data::MediaType::Video],
+            ..Default::default()
+        };
+        assert_eq!(
+            names(repository.get_genres(&video_only).await.expect("media")),
+            vec!["Action"]
         );
     }
 
@@ -5290,31 +5998,338 @@ mod tests {
 
         // BOTH carry progress. That is what makes this discriminating: with one
         // resumable row the grouping has nothing to collapse and the bug is
-        // invisible, which is exactly how it survived.
+        // invisible, which is exactly how it survived. The alternate was
+        // played more recently.
         let user = seed_user_with_defaults(&db, Uuid::from_u128(0x9C45)).await;
         for id in [primary, alternate] {
             set_playback_position(&db, id, &user.id, 42_000_000).await;
         }
+        let date_progress = |id: Uuid, date: &'static str| {
+            let db = db.clone();
+            async move {
+                sqlx::query(r#"UPDATE "UserData" SET "LastPlayedDate" = ?2 WHERE "ItemId" = ?1"#)
+                    .bind(guid_to_db(id))
+                    .bind(date)
+                    .execute(db.writer())
+                    .await
+                    .expect("date the progress");
+            }
+        };
+        let other = if alternate_id == primary {
+            alternate
+        } else {
+            primary
+        };
+        date_progress(other, "2026-01-01 00:00:00.0000000").await;
+        date_progress(alternate_id, "2026-01-02 00:00:00.0000000").await;
 
-        let resumed = repository
-            .get_item_list(&InternalItemsQuery {
-                user: Some(user),
-                recursive: true,
-                is_resumable: Some(true),
-                ..InternalItemsQuery::default()
-            })
-            .await
-            .expect("resume");
+        let query = InternalItemsQuery {
+            user: Some(user.clone()),
+            recursive: true,
+            is_resumable: Some(true),
+            ..InternalItemsQuery::default()
+        };
+        let resumed = repository.get_item_list(&query).await.expect("resume");
         let ids: Vec<String> = resumed.iter().map(|r| r.id.clone()).collect();
-        assert!(
-            ids.contains(&guid_to_db(alternate_id)),
-            "the played alternate must be surfaced, not collapsed onto the primary (got {ids:?})"
-        );
+        // v12 `TranslateQuery.cs:586-602`: "When several versions of the same
+        // item are in progress, keep only the most recently played one".
         assert_eq!(
-            ids.len(),
-            2,
-            "and both versions with progress are resumable"
+            ids,
+            vec![guid_to_db(alternate_id)],
+            "the played alternate must be surfaced, not collapsed onto the primary"
         );
+
+        // A tie on the date (both NULL here) falls to the lower id.
+        sqlx::query(r#"UPDATE "UserData" SET "LastPlayedDate" = NULL"#)
+            .execute(db.writer())
+            .await
+            .expect("clear dates");
+        let resumed = repository.get_item_list(&query).await.expect("resume");
+        let ids: Vec<String> = resumed.iter().map(|r| r.id.clone()).collect();
+        let lower = [primary, alternate]
+            .into_iter()
+            .map(guid_to_db)
+            .min()
+            .expect("two ids");
+        assert_eq!(ids, vec![lower]);
+
+        // `IsResumable = false` works on primaries: neither version is listed,
+        // the primary because a version of it is in progress.
+        let not_resumable = InternalItemsQuery {
+            is_resumable: Some(false),
+            ..query
+        };
+        let rest = repository
+            .get_item_list(&not_resumable)
+            .await
+            .expect("not resumable");
+        assert!(
+            rest.iter()
+                .all(|r| r.id != guid_to_db(primary) && r.id != guid_to_db(alternate)),
+            "an in-progress item is not in the not-resumable set (got {rest:?})"
+        );
+    }
+
+    /// v12 `OrderMapper.cs:32-48`: an item's played date is the newest of its
+    /// own progress and its alternate versions' — the second arm of the
+    /// `DatePlayed` ordering — while `PlayCount` / `IsPlayed` /
+    /// `IsFavoriteOrLiked` read the item's own first `UserData` row only
+    /// (`:57-61`).
+    #[tokio::test]
+    async fn date_played_spans_alternates_but_play_count_does_not() {
+        use ferrofin_model::dto::SortOrder;
+        use ferrofin_model::live_tv::ItemSortBy;
+
+        let db = test_db().await;
+        let repository = repo(&db);
+        let library = Uuid::from_u128(0x9F01);
+        let a = Uuid::from_u128(0x9F02);
+        let b = Uuid::from_u128(0x9F03);
+        let b_alt = Uuid::from_u128(0x9F04);
+        seed_named_item(&db, library, BaseItemKind::CollectionFolder, "Movies").await;
+        seed_top_parented_item(&db, a, BaseItemKind::Movie, "Alpha", library).await;
+        seed_top_parented_item(&db, b, BaseItemKind::Movie, "Beta", library).await;
+        seed_top_parented_item(&db, b_alt, BaseItemKind::Movie, "Beta 4K", library).await;
+        sqlx::query(r#"UPDATE "BaseItems" SET "PrimaryVersionId" = ?1 WHERE "Id" = ?2"#)
+            .bind(guid_to_db(b))
+            .bind(guid_to_db(b_alt))
+            .execute(db.writer())
+            .await
+            .expect("link alternate");
+        set_presentation_key(&db, a, "key-a").await;
+        set_presentation_key(&db, b, "key-b").await;
+        set_presentation_key(&db, b_alt, "key-b").await;
+        let user = seed_user_with_defaults(&db, Uuid::from_u128(0x9F05)).await;
+        // A: played once, in March. B: played once, in January — but its
+        // alternate was played nine times, in June.
+        for (item, count, date) in [
+            (a, 1_i64, "2026-03-01 00:00:00.0000000"),
+            (b, 1, "2026-01-01 00:00:00.0000000"),
+            (b_alt, 9, "2026-06-01 00:00:00.0000000"),
+        ] {
+            sqlx::query(
+                r#"INSERT INTO "UserData"
+                   ("ItemId", "UserId", "CustomDataKey", "IsFavorite", "LastPlayedDate",
+                    "PlayCount", "PlaybackPositionTicks", "Played")
+                   VALUES (?1, ?2, ?1, 0, ?3, ?4, 0, 1)"#,
+            )
+            .bind(guid_to_db(item))
+            .bind(&user.id)
+            .bind(date)
+            .bind(count)
+            .execute(db.writer())
+            .await
+            .expect("user data");
+        }
+
+        let names = |sort: ItemSortBy, user: UserEntity| {
+            let repository = &repository;
+            async move {
+                repository
+                    .get_item_list(&InternalItemsQuery {
+                        user: Some(user),
+                        recursive: true,
+                        include_item_types: vec![BaseItemKind::Movie],
+                        order_by: vec![(sort, SortOrder::Descending)],
+                        ..InternalItemsQuery::default()
+                    })
+                    .await
+                    .expect("sorted")
+                    .into_iter()
+                    .filter_map(|r| r.name)
+                    .collect::<Vec<_>>()
+            }
+        };
+        // The grouped browse lists the primaries; B's date is its alternate's.
+        assert_eq!(
+            names(ItemSortBy::DatePlayed, user.clone()).await,
+            vec!["Beta", "Alpha"]
+        );
+        // PlayCount reads B's own row (1), not the alternate's (9).
+        assert_eq!(
+            names(ItemSortBy::PlayCount, user.clone()).await,
+            vec!["Alpha", "Beta"]
+        );
+        // The other first-row keys build and run.
+        for sort in [
+            ItemSortBy::IsPlayed,
+            ItemSortBy::IsUnplayed,
+            ItemSortBy::IsFavoriteOrLiked,
+        ] {
+            assert_eq!(names(sort, user.clone()).await.len(), 2, "{sort:?}");
+        }
+    }
+
+    /// v12's `IsResumable` folder rule (`TranslateQuery.cs:562-575`,
+    /// `_resumableFolderKinds = [Series, Season]`): a series or season is
+    /// resumable when a leaf descendant is in progress, or when it has both a
+    /// played and an unplayed leaf descendant. No percentage threshold; a
+    /// box set is a container and never resumable.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one fixture tree, every arm of the rule asserted on it
+    async fn series_and_seasons_are_resumable_by_their_leaves() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let user = seed_user_with_defaults(&db, Uuid::from_u128(0x9E00)).await;
+        let uid = guid_to_db(Uuid::from_u128(0x9E00));
+
+        // Show A: S1 has one played and one unplayed episode → partially
+        // watched; S2 is untouched. Show B: one episode in progress. Show C:
+        // fully played. A box set links a played and an unplayed movie.
+        let show_a = Uuid::from_u128(0x9E01);
+        let a_s1 = Uuid::from_u128(0x9E02);
+        let a_s2 = Uuid::from_u128(0x9E03);
+        let a_s1e1 = Uuid::from_u128(0x9E04);
+        let a_s1e2 = Uuid::from_u128(0x9E05);
+        let a_s2e1 = Uuid::from_u128(0x9E06);
+        let show_b = Uuid::from_u128(0x9E11);
+        let b_s1 = Uuid::from_u128(0x9E12);
+        let b_s1e1 = Uuid::from_u128(0x9E13);
+        let show_c = Uuid::from_u128(0x9E21);
+        let c_s1 = Uuid::from_u128(0x9E22);
+        let c_s1e1 = Uuid::from_u128(0x9E23);
+        let box_set = Uuid::from_u128(0x9E31);
+        let played_movie = Uuid::from_u128(0x9E32);
+        let unplayed_movie = Uuid::from_u128(0x9E33);
+        for (id, name) in [(show_a, "A"), (show_b, "B"), (show_c, "C")] {
+            seed_folder_item(&db, id, BaseItemKind::Series, name, None).await;
+        }
+        for (id, series) in [
+            (a_s1, show_a),
+            (a_s2, show_a),
+            (b_s1, show_b),
+            (c_s1, show_c),
+        ] {
+            seed_item_of_series(&db, id, BaseItemKind::Season, "Season", series).await;
+        }
+        for (id, series) in [
+            (a_s1e1, show_a),
+            (a_s1e2, show_a),
+            (a_s2e1, show_a),
+            (b_s1e1, show_b),
+            (c_s1e1, show_c),
+        ] {
+            seed_item_of_series(&db, id, BaseItemKind::Episode, "Episode", series).await;
+        }
+        seed_folder_item(&db, box_set, BaseItemKind::BoxSet, "Set", None).await;
+        seed_named_item(&db, played_movie, BaseItemKind::Movie, "Played").await;
+        seed_named_item(&db, unplayed_movie, BaseItemKind::Movie, "Unplayed").await;
+        // An unscoped query as a user is confined to that user's libraries.
+        seed_library_over(
+            &db,
+            &[
+                show_a,
+                a_s1,
+                a_s2,
+                a_s1e1,
+                a_s1e2,
+                a_s2e1,
+                show_b,
+                b_s1,
+                b_s1e1,
+                show_c,
+                c_s1,
+                c_s1e1,
+                box_set,
+                played_movie,
+                unplayed_movie,
+            ],
+        )
+        .await;
+        // The ancestor closure — what `BuildHasDescendantFilter` walks.
+        for (item, parents) in [
+            (a_s1e1, vec![a_s1, show_a]),
+            (a_s1e2, vec![a_s1, show_a]),
+            (a_s2e1, vec![a_s2, show_a]),
+            (b_s1e1, vec![b_s1, show_b]),
+            (c_s1e1, vec![c_s1, show_c]),
+            (played_movie, vec![box_set]),
+            (unplayed_movie, vec![box_set]),
+        ] {
+            for parent in parents {
+                sqlx::query(
+                    r#"INSERT INTO "AncestorIds" ("ItemId", "ParentItemId") VALUES (?1, ?2)"#,
+                )
+                .bind(guid_to_db(item))
+                .bind(guid_to_db(parent))
+                .execute(db.writer())
+                .await
+                .expect("ancestor");
+            }
+        }
+        for (item, played, position) in [
+            (a_s1e1, true, 0),
+            (b_s1e1, false, 5_000),
+            (c_s1e1, true, 0),
+            (played_movie, true, 0),
+        ] {
+            sqlx::query(
+                r#"INSERT INTO "UserData"
+                   ("ItemId", "UserId", "CustomDataKey", "IsFavorite", "PlayCount",
+                    "PlaybackPositionTicks", "Played")
+                   VALUES (?1, ?2, ?1, 0, 1, ?3, ?4)"#,
+            )
+            .bind(guid_to_db(item))
+            .bind(&uid)
+            .bind(position)
+            .bind(played)
+            .execute(db.writer())
+            .await
+            .expect("user data");
+        }
+
+        let query = InternalItemsQuery {
+            user: Some(user),
+            recursive: true,
+            is_resumable: Some(true),
+            ..InternalItemsQuery::default()
+        };
+        let mut resumable: Vec<String> = repository
+            .get_item_list(&query)
+            .await
+            .expect("resumable")
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        resumable.sort();
+        let mut expected: Vec<String> = [show_a, a_s1, show_b, b_s1, b_s1e1]
+            .into_iter()
+            .map(guid_to_db)
+            .collect();
+        expected.sort();
+        assert_eq!(
+            resumable, expected,
+            "A + A/S1 (partially watched), B + B/S1 + the episode (in progress); \
+             not A/S2 (untouched), C (fully played) or the box set"
+        );
+
+        // The complement, on the same rows.
+        let not_resumable = InternalItemsQuery {
+            is_resumable: Some(false),
+            ..query
+        };
+        let rest: Vec<String> = repository
+            .get_item_list(&not_resumable)
+            .await
+            .expect("not resumable")
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        for id in [show_a, a_s1, show_b, b_s1, b_s1e1] {
+            assert!(!rest.contains(&guid_to_db(id)), "{id} is resumable");
+        }
+        for id in [
+            a_s2,
+            show_c,
+            c_s1,
+            box_set,
+            a_s1e1,
+            c_s1e1,
+            played_movie,
+            unplayed_movie,
+        ] {
+            assert!(rest.contains(&guid_to_db(id)), "{id} is not resumable");
+        }
     }
 
     /// The grouping *gate* — C# `EnableGroupByPresentationUniqueKey`, which
@@ -5816,13 +6831,16 @@ mod tests {
         assert_eq!(genres.items[0].item.name.as_deref(), Some("Action"));
     }
 
-    /// `includeItemTypes` fills the per-kind counts PER by-name row, master's
-    /// `BuildItemCountsByCleanName` (`BaseItemRepository.ByName.cs:283-338`).
+    /// The per-kind counts are PER by-name row, v12's
+    /// `BuildItemCountsByCleanName` (`BaseItemRepository.ByName.cs:287-413`),
+    /// and they describe everything the value is attached to — the scope
+    /// drops `IncludeItemTypes` (`:299-311`), so the music-genre tab narrowed
+    /// to songs and albums still reports the movie that carries "Rock".
     ///
     /// v10.11.8 instead hands every row the same uncorrelated totals
     /// (`BaseItemRepository.cs:1368-1392`, whose own comment reads "TODO: This
     /// is bad refactor!"), which is why a 10.11.8 oracle reports the same
-    /// `SongCount` for every genre. Ferrofin follows master.
+    /// `SongCount` for every genre.
     #[tokio::test]
     async fn per_kind_counts_are_computed_per_by_name_row() {
         let db = test_db().await;
@@ -5860,7 +6878,12 @@ mod tests {
         };
         assert_eq!(by_name("Rock").song_count, 1);
         assert_eq!(by_name("Rock").album_count, 0);
-        assert_eq!(by_name("Rock").movie_count, 0, "movies were not requested");
+        assert_eq!(
+            by_name("Rock").movie_count,
+            1,
+            "the counts describe everything the value is attached to"
+        );
+        assert_eq!(by_name("Rock").item_count, 2);
         assert_eq!(by_name("Jazz").song_count, 1);
         assert_eq!(
             by_name("Jazz").album_count,
@@ -5869,12 +6892,11 @@ mod tests {
         );
     }
 
-    /// With no `includeItemTypes` the per-kind counts stay zero, because
-    /// `GetItemValues` builds them only inside `if (filter.IncludeItemTypes
-    /// .Length > 0)` on both trees — and the API layer only projects them
-    /// then too.
+    /// Without `ItemCounts` among the requested fields the per-kind counts are
+    /// not computed at all (`ByName.cs:251`, `273-282`): every count stays at
+    /// its zero default, `ItemCount` included.
     #[tokio::test]
-    async fn per_kind_counts_are_not_computed_without_include_item_types() {
+    async fn per_kind_counts_are_not_computed_without_the_item_counts_field() {
         let db = test_db().await;
         let repository = repo(&db);
         let song = Uuid::from_u128(0x9A01);
@@ -5882,14 +6904,10 @@ mod tests {
         seed_item_genre(&db, song, "Rock").await;
 
         let music = repository
-            .get_music_genres(&InternalItemsQuery::default())
+            .get_music_genres(&without_fields(InternalItemsQuery::default()))
             .await
             .expect("music genres");
         assert_eq!(music.items.len(), 1);
-        assert_eq!(music.items[0].counts.song_count, 0);
-        assert_eq!(
-            music.items[0].counts.item_count, 1,
-            "the value aggregate itself is unchanged"
-        );
+        assert_eq!(music.items[0].counts, ItemCounts::default());
     }
 }
