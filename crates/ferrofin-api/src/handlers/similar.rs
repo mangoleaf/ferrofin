@@ -19,7 +19,7 @@ use axum::extract::{Path, Query, State};
 use axum::routing::get;
 use axum::{Json, Router};
 use ferrofin_model::dto::BaseItemDto;
-use ferrofin_model::querying::QueryResult;
+use ferrofin_model::querying::{ItemFields, QueryResult};
 use ferrofin_traits::options::DtoOptions;
 use uuid::Uuid;
 
@@ -99,11 +99,20 @@ async fn similar_items(
     let user = resolve_user_opt(state, auth, query.user_id).await?;
     let user_id = user.as_ref().and_then(|u| Uuid::parse_str(&u.id).ok());
     let exclude_artist_ids = parse_csv_uuids(query.exclude_artist_ids.as_deref())?;
-    let options = DtoOptions {
+    let mut options = DtoOptions {
         // Lenient: clients send deprecated ItemFields; Jellyfin drops unknowns.
         fields: parse_csv_enums_lenient(query.fields.as_deref()),
         ..DtoOptions::default()
     };
+    // `SimilarItemsManager.GetSimilarItemsAsync` forces `ProviderIds` into the
+    // options it is handed (v12 SimilarItemsManager.cs:108-112, "Ensure
+    // ProviderIds is included in DtoOptions for matching remote provider
+    // responses") and the controller then projects with that SAME mutated
+    // object (LibraryController.cs:835-849) — so every Similar row carries
+    // `ProviderIds`, whatever `fields` said.
+    if !options.contains_field(ItemFields::ProviderIds) {
+        options.fields.push(ItemFields::ProviderIds);
+    }
 
     // C# resolves the seed BEFORE any provider runs: a nil id is the documented
     // root-folder fallback (`itemId.IsEmpty() ? (user is null ? RootFolder :

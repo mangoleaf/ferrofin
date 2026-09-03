@@ -663,9 +663,14 @@ async fn get_latest_media(
         .get_base_item_dtos(&entities, &options, Some(&user), None, true)
         .await?;
     for (dto, count) in dtos.iter_mut().zip(child_counts) {
-        // `dto.ChildCount = childCount` on every row — 0 (serialized) for an
-        // ungrouped item, the fetched-children count for a collapsed container.
-        dto.child_count = Some(count);
+        // `if (childCounts[i] > 0) dtos[i].ChildCount = childCounts[i];`
+        // (v12 UserLibraryController.cs:592-598): only a collapsed container
+        // is restamped with its fetched-children count; an ungrouped item keeps
+        // whatever the DTO service gave it — usually nothing, so the key is
+        // absent rather than a serialized `0`.
+        if count > 0 {
+            dto.child_count = Some(count);
+        }
     }
     Ok(Json(dtos))
 }

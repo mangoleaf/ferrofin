@@ -1377,15 +1377,16 @@ async fn latest_collapses_series_with_two_episodes_into_series_with_child_count(
 }
 
 /// One new episode of a series is the episode itself (`Item2[0]`), not the
-/// series — `ChildCount` 0.
+/// series — and its `ChildCount` is left alone: v12 restamps only
+/// `if (childCounts[i] > 0)` (UserLibraryController.cs:592-598).
 #[tokio::test]
-async fn latest_returns_single_episode_itself_with_child_count_zero() {
+async fn latest_returns_single_episode_itself_without_child_count() {
     let views = LatestViews::new(vec![(Some(series()), vec![episode(EP1_ID)])]);
     let (status, _, dtos) = send_latest(&views, "/Items/Latest", false).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(dtos.len(), 1);
     assert_eq!(dtos[0].id, EP1_ID);
-    assert_eq!(dtos[0].child_count, Some(0));
+    assert_eq!(dtos[0].child_count, None);
 }
 
 /// `|| i.Item1 is MusicAlbum`: an album collapses even with one new track.
@@ -1399,10 +1400,12 @@ async fn latest_always_collapses_music_album_even_with_one_track() {
     assert_eq!(dtos[0].child_count, Some(1));
 }
 
-/// An ungrouped row carries `"ChildCount":0` on the wire — serialized, since
-/// `0` is not null (strict clients read it).
+/// An ungrouped row carries no `ChildCount` on the wire: 10.11.8 stamped
+/// `dto.ChildCount = childCount` (a serialized `0`) on every row, v12 only
+/// `if (childCounts[i] > 0)` (UserLibraryController.cs:592-598), so a movie
+/// row's key is absent.
 #[tokio::test]
-async fn latest_ungrouped_items_carry_child_count_zero() {
+async fn latest_ungrouped_items_carry_no_child_count() {
     let views = LatestViews::new(vec![(
         None,
         vec![item_entity(ITEM_ID, "Movie", BaseItemKind::Movie)],
@@ -1411,7 +1414,7 @@ async fn latest_ungrouped_items_carry_child_count_zero() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(dtos[0].id, ITEM_ID);
     let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
-    assert_eq!(json[0]["ChildCount"], serde_json::json!(0));
+    assert!(json[0].get("ChildCount").is_none(), "{}", json[0]);
 }
 
 /// The request's `groupItems`/`isPlayed`/`limit`/`parentId`/`includeItemTypes`

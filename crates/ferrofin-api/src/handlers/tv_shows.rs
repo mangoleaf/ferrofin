@@ -33,7 +33,7 @@ use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::dto::{BaseItemDto, SortOrder};
 use ferrofin_model::entities::ImageType;
 use ferrofin_model::live_tv::ItemSortBy;
-use ferrofin_model::querying::QueryResult;
+use ferrofin_model::querying::{ItemFields, QueryResult};
 use ferrofin_traits::options::{DtoOptions, InternalItemsQuery};
 use ferrofin_traits::tv::NextUpQuery;
 use uuid::Uuid;
@@ -624,7 +624,14 @@ async fn get_similar_shows(
     let user = resolve_user_opt(&state, &auth, query.user_id).await?;
     let user_id = user.as_ref().and_then(|u| Uuid::parse_str(&u.id).ok());
     let exclude_artist_ids = parse_csv_uuids(query.exclude_artist_ids.as_deref())?;
-    let options = build_dto_options(query.fields.as_deref(), None, None, None, None);
+    let mut options = build_dto_options(query.fields.as_deref(), None, None, None, None);
+    // `SimilarItemsManager.GetSimilarItemsAsync` forces `ProviderIds` into the
+    // options the controller then projects with (v12
+    // SimilarItemsManager.cs:108-112) — same as the five aliases in
+    // `handlers::similar`.
+    if !options.contains_field(ItemFields::ProviderIds) {
+        options.fields.push(ItemFields::ProviderIds);
+    }
 
     // Same C# seed resolution as the other five aliases: a nil id falls back to
     // the root folder, and an id that resolves to nothing is a `404`.

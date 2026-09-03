@@ -532,6 +532,46 @@ impl Database {
         Ok(out)
     }
 
+    /// How many alternate-version rows point at each of `primary_ids` through
+    /// `PrimaryVersionId`, keyed by the primary's id in its stored (uppercase,
+    /// hyphenated) GUID form. Primaries with no alternate are absent.
+    ///
+    /// The number behind a list page's `MediaSourceCount` (`linked + local +
+    /// 1`, `Video.GetMediaSourceCount`) when the page did not ask for the
+    /// sources themselves — a count over the partial `PrimaryVersionId` index
+    /// instead of the full rows the `MediaSources` field needs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub async fn alternate_version_counts(
+        &self,
+        primary_ids: &[String],
+    ) -> Result<Vec<(String, i64)>> {
+        let mut out = Vec::new();
+        for chunk in primary_ids.chunks(crate::BATCH_BIND_CHUNK) {
+            let placeholders = (1..=chunk.len())
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            // The seeded placeholder row is excluded exactly as the full-row
+            // read (`get_items_by_primary_version_batch`) excludes it.
+            let sql = format!(
+                r#"SELECT "PrimaryVersionId", COUNT(*) FROM "BaseItems"
+                   WHERE "PrimaryVersionId" IN ({placeholders}) AND "Id" <> ?{}
+                   GROUP BY "PrimaryVersionId""#,
+                chunk.len() + 1
+            );
+            let mut query = sqlx::query_as::<_, (String, i64)>(&sql);
+            for id in chunk {
+                query = query.bind(id);
+            }
+            query = query.bind(crate::PLACEHOLDER_ITEM_ID);
+            out.extend(query.fetch_all(self.pool()).await?);
+        }
+        Ok(out)
+    }
+
     /// Names the `PhotoAlbum` rows among `ids`, keyed by the id in its stored
     /// (uppercase, hyphenated) GUID form.
     ///

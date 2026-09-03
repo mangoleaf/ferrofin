@@ -155,6 +155,12 @@ struct Prefetched {
     /// the `MediaSources` field is requested), so a merged item reports its
     /// extra selectable sources without a per-item query.
     alternates: HashMap<Uuid, Vec<BaseItemEntity>>,
+    /// How many alternate versions each primary has (populated when either
+    /// the `MediaSources` or the `MediaSourceCount` field is requested; a
+    /// primary with none is absent). Keyed by the PRIMARY, which for a page
+    /// item that is itself an alternate is an off-page row — the count read
+    /// covers those primaries too, the full-row read above never does.
+    alternate_counts: HashMap<Uuid, usize>,
     /// The page's video item ids that carry a subtitle stream. Backs the
     /// unconditional `HasSubtitles` on video DTOs (C# emits it outside the
     /// `ItemFields` system) via one ids-only query per page.
@@ -1189,8 +1195,8 @@ impl FerrofinDtoService {
                 // kinds never enter it, a MusicArtist only when physically
                 // parented.
                 //
-                // Port of `Folder.FillUserDataDtoValues` (v10.11.8
-                // MediaBrowser.Controller/Entities/Folder.cs:1798-1838). Its
+                // Port of `Folder.FillUserDataDtoValues` (v12.0-rc7
+                // MediaBrowser.Controller/Entities/Folder.cs:1938-1990). Its
                 // ENTRY guard is `SupportsUserDataFromChildren` — false for
                 // every `ICollectionFolder` (which includes `BasePluginFolder`,
                 // so the playlists folder too), `UserView`, `UserRootFolder`
@@ -1206,19 +1212,19 @@ impl FerrofinDtoService {
                     && kinds::supports_user_data_from_children(kind)
                     && let Some(c) = prefetched.played_counts.get(&item_id).copied()
                 {
-                    // `Folder.FillUserDataDtoValues` (Folder.cs:1798) runs two
+                    // `Folder.FillUserDataDtoValues` (Folder.cs:1938) runs two
                     // INDEPENDENT gates behind `SupportsUserDataFromChildren`:
-                    // `RecursiveItemCount` on the FIELD alone (:1805) —
-                    // `GetRecursiveChildCount(user)` (Folder.cs:701-714:
-                    // recursive, non-folder, non-virtual, total record count,
-                    // i.e. the unplayed query minus `IsPlayed = false`, which is
-                    // exactly `total`) — and the unplayed count on
-                    // `SupportsPlayedStatus` (:1810). They are not the same set:
-                    // `MusicArtist.SupportsPlayedStatus` is false
-                    // (MusicArtist.cs:47), which is why Jellyfin's artist body
-                    // carries `RecursiveItemCount` and no `UnplayedItemCount`.
-                    // Both read the same recursive non-folder/non-virtual count
-                    // the prefetch already ran, so this costs no extra query.
+                    // `RecursiveItemCount` on the FIELD alone (:1974) —
+                    // `GetRecursiveChildCount(user)` (recursive, non-folder,
+                    // non-virtual, total record count, i.e. the unplayed query
+                    // minus `IsPlayed = false`, which is exactly `total`) — and
+                    // the unplayed count on `SupportsPlayedStatus` (:1979). They
+                    // are not the same set: `MusicArtist.SupportsPlayedStatus`
+                    // is false (MusicArtist.cs:47), which is why Jellyfin's
+                    // artist body carries `RecursiveItemCount` and no
+                    // `UnplayedItemCount`. Both read the same recursive
+                    // non-folder/non-virtual count the prefetch already ran, so
+                    // this costs no extra query.
                     if options.contains_field(ItemFields::RecursiveItemCount) {
                         dto.recursive_item_count = Some(c.total);
                     }
@@ -1228,18 +1234,21 @@ impl FerrofinDtoService {
                             .user_data
                             .get_or_insert_with(|| empty_user_data_dto(item_id));
                         ud.unplayed_item_count = Some(unplayed);
-                        // `if (itemDto?.RecursiveItemCount > 0)`
-                        // (Folder.cs:1828) — the folder's own played state is
-                        // derived from its children off the DTO FIELD, so a
-                        // caller that did not ask for `RecursiveItemCount`
-                        // degrades to the `unplayed == 0` arm, exactly as
-                        // upstream does.
-                        if let Some(total) = dto.recursive_item_count.filter(|t| *t > 0) {
-                            let pct = 100.0 - (f64::from(unplayed) / f64::from(total)) * 100.0;
-                            ud.played_percentage = Some(pct);
-                            ud.played = pct >= 100.0;
+                        // Folder.cs:1983-1990 — the played state is derived from
+                        // the COUNTS, with no field gate (10.11.8 keyed it off
+                        // the `RecursiveItemCount` DTO field, which is why a
+                        // seasons page without that field lost its
+                        // `PlayedPercentage`):
+                        //   if (totalCount > 0) {
+                        //     PlayedPercentage = playedCount / (double)totalCount * 100;
+                        //     Played = playedCount >= totalCount;
+                        //   } else { Played = true; }
+                        if c.total > 0 {
+                            ud.played_percentage =
+                                Some(f64::from(c.played) / f64::from(c.total) * 100.0);
+                            ud.played = c.played >= c.total;
                         } else {
-                            ud.played = unplayed == 0;
+                            ud.played = true;
                         }
                     }
                 }
@@ -1280,7 +1289,11 @@ impl FerrofinDtoService {
                 BaseItemKind::MusicAlbum | BaseItemKind::Season | BaseItemKind::Playlist
             )
         {
-            dto.child_count = dto.recursive_item_count;
+            // `if (dto.RecursiveItemCount > 0) dto.ChildCount = dto.RecursiveItemCount;`
+            // (v12 DtoService.cs:614-617) — a zero count does not become a
+            // `ChildCount: 0`; the linked-children half and the real count
+            // still get their turn.
+            dto.child_count = dto.recursive_item_count.filter(|count| *count > 0);
             if dto.child_count.is_none() && user.is_some() {
                 dto.child_count = prefetched
                     .linked_child_counts
@@ -1292,14 +1305,35 @@ impl FerrofinDtoService {
 
         // `if (options.ContainsField(ItemFields.CumulativeRunTimeTicks))
         //  { dto.CumulativeRunTimeTicks = item.RunTimeTicks; }`
-        // (Emby.Server.Implementations/Dto/DtoService.cs:492-495). It sits in
-        // the `item is Folder` branch and NOT under `EnableUserData`, so it is
-        // emitted for an anonymous caller too. The value is the folder's own
-        // stored runtime, which Ferrofin already had and simply never copied —
-        // measured: J's MusicAlbum returns CumulativeRunTimeTicks=60000000 next
-        // to the RunTimeTicks=60000000 Ferrofin was already reporting.
-        if item.is_folder && options.contains_field(ItemFields::CumulativeRunTimeTicks) {
+        // (v12 DtoService.cs:633-636). It sits in the `item.IsFolder` branch of
+        // `AttachUserSpecificInfo`, which `GetBaseItemDtoInternal` calls only
+        // `if (user is not null)` (:389-392) — so an anonymous caller never
+        // gets it, whatever the fields say. Not under `EnableUserData`, though.
+        // The value is the folder's own stored runtime — measured: J's
+        // MusicAlbum returns CumulativeRunTimeTicks=60000000 next to the
+        // RunTimeTicks=60000000.
+        // Both gates key on the runtime `IsFolder` (`folder_emits_counts`):
+        // a by-name Genre row is stored as a folder but is a plain `BaseItem`
+        // upstream, and never enters the branch.
+        let runtime_folder = user.is_some() && folder_emits_counts(item);
+        if runtime_folder && options.contains_field(ItemFields::CumulativeRunTimeTicks) {
             dto.cumulative_run_time_ticks = item.run_time_ticks;
+        }
+
+        // `if (options.ContainsField(ItemFields.DateLastMediaAdded))
+        //  { dto.DateLastMediaAdded = folder.DateLastMediaAdded; }` (v12
+        // DtoService.cs:638-641), in the same user-gated folder branch. The
+        // entity → domain mapper substitutes `DateTime.MinValue` for a NULL
+        // column (`BaseItemMapper.cs:200`: `entity.DateLastMediaAdded ??
+        // DateTime.SpecifyKind(DateTime.MinValue, DateTimeKind.Utc)`), so a
+        // folder that never had media added still carries
+        // `0001-01-01T00:00:00.0000000Z` — a user view, say — where copying the
+        // nullable column omitted the key.
+        if runtime_folder && options.contains_field(ItemFields::DateLastMediaAdded) {
+            dto.date_last_media_added = Some(
+                item.date_last_media_added
+                    .unwrap_or_else(ferrofin_model::json::datetime::dotnet_min),
+            );
         }
 
         // Media sources. Jellyfin only attaches these for `IHasMediaSources`
@@ -1438,18 +1472,9 @@ impl FerrofinDtoService {
             dto.date_created = item.date_created;
         }
 
-        // C# `DtoService` sets DateLastMediaAdded only for `Folder` items.
-        if options.contains_field(ItemFields::DateLastMediaAdded) && item.is_folder {
-            dto.date_last_media_added = item.date_last_media_added;
-        }
-
-        // `AttachUserSpecificInfo` (`DtoService.cs:594`), inside its
-        // `if (item.IsFolder)`: the cumulative ticks ARE the folder's own
-        // `RunTimeTicks` column — the sum is computed once at scan time
-        // (`MetadataService.UpdateCumulativeRunTimeTicks`), not per request.
-        if options.contains_field(ItemFields::CumulativeRunTimeTicks) && item.is_folder {
-            dto.cumulative_run_time_ticks = item.run_time_ticks;
-        }
+        // `DateLastMediaAdded` and `CumulativeRunTimeTicks` are set by the
+        // user-gated folder branch in `build_dto` (C# `AttachUserSpecificInfo`),
+        // not here: `AttachBasicFields` never touches either.
 
         if options.contains_field(ItemFields::Etag) {
             dto.etag = Some(compute_etag(item.date_last_saved));
@@ -1728,6 +1753,36 @@ impl FerrofinDtoService {
                 dto.has_subtitles = Some(true);
             }
 
+            // `MediaSourceCount` (v12 DtoService.cs:1319-1343): emitted only
+            // when the count `!= 1`. `Video.GetMediaSourceCount` is `linked +
+            // local + 1`, and an alternate version answers with its PRIMARY's
+            // count (Video.cs:255-280) — so a page item that IS an alternate
+            // reads the count prefetched under its primary's id.
+            //
+            // TODO(parity): the per-user arm (`GetAllVersions().Count(v =>
+            // v.Id == video.Id || v.IsVisibleStandalone(user))`, :1334-1337)
+            // drops versions the user's parental policy hides. Ferrofin's
+            // alternate reads are not user-filtered — neither here nor in the
+            // `MediaSources` block above — so a hidden version still counts
+            // and still lists. Un-defer path: filter the alternate rows
+            // through the user's parental-rating/tag visibility in one place
+            // (the alternates prefetch) so both readers agree.
+            if options.contains_field(ItemFields::MediaSourceCount) {
+                let primary_id = item
+                    .primary_version_id
+                    .as_deref()
+                    .and_then(|p| Uuid::parse_str(p).ok())
+                    .unwrap_or(item_id);
+                let alternates = prefetched
+                    .alternate_counts
+                    .get(&primary_id)
+                    .copied()
+                    .unwrap_or(0);
+                if alternates > 0 {
+                    dto.media_source_count = i32::try_from(alternates + 1).ok();
+                }
+            }
+
             if options.contains_field(ItemFields::Trickplay) {
                 // Jellyfin emits {} when requested but there is no manifest.
                 let manifest = take_or_clone(&mut prefetched.trickplay, &item_id, repeated)
@@ -1737,10 +1792,13 @@ impl FerrofinDtoService {
         }
 
         // Chapters — [] when requested but there are none (matches Jellyfin).
-        // C# assigns them only inside its `item is Video` branch, so every
-        // non-video kind (a folder, an album, a Live TV channel or programme)
-        // omits the key entirely.
-        if options.contains_field(ItemFields::Chapters) && kinds::is_video(kind) {
+        // v12 moved the assignment OUT of the `item is Video` block
+        // (DtoService.cs:1358-1361: `if (options.ContainsField(Chapters))
+        // dto.Chapters = _chapterManager.GetChapters(item.Id).ToList();`), so
+        // every kind carries the key — a folder, a series, a user view, a
+        // Live TV channel — as `[]`. Only media rows are asked for rows (the
+        // prefetch reads `media_ids`); everything else answers empty.
+        if options.contains_field(ItemFields::Chapters) {
             let mut chapters =
                 take_or_clone(&mut prefetched.chapters, &item_id, repeated).unwrap_or_default();
             // Each extracted chapter thumbnail needs its cache tag: clients gate
@@ -1862,6 +1920,15 @@ impl FerrofinDtoService {
                 .filter(|h| *h > 0)
         {
             dto.height = Some(height);
+        }
+
+        // `if (options.ContainsField(ItemFields.IsHD)) { if (item.IsHD)
+        //  dto.IsHD = true; }` (v12 DtoService.cs:1555-1562) — true-only, so
+        // the key is absent on an SD file. `BaseItem.IsHD => Height >= 720`
+        // (BaseItem.cs:404) for EVERY kind; a folder stores no height and is
+        // never HD.
+        if options.contains_field(ItemFields::IsHd) && item.height.is_some_and(|h| h >= 720) {
+            dto.is_hd = Some(true);
         }
 
         dto.channel_id = item
@@ -2482,14 +2549,59 @@ impl FerrofinDtoService {
         // Merged alternate versions (rows pointing at a page item via
         // `PrimaryVersionId`), so each item's extra selectable sources build
         // without a per-item query; their streams join the stream batch below.
-        let alternates =
-            if options.contains_field(ItemFields::MediaSources) && !media_ids.is_empty() {
-                self.media_sources
-                    .get_alternate_versions_batch(&media_ids)
-                    .await?
-            } else {
-                HashMap::new()
-            };
+        let want_sources = options.contains_field(ItemFields::MediaSources);
+        let alternates = if want_sources && !media_ids.is_empty() {
+            self.media_sources
+                .get_alternate_versions_batch(&media_ids)
+                .await?
+        } else {
+            HashMap::new()
+        };
+        // `MediaSourceCount` needs only HOW MANY versions each page video has:
+        // the full rows above when the page asked for the sources anyway,
+        // otherwise one count over the partial `PrimaryVersionId` index — the
+        // grid pages ask for the count without the sources, and reading every
+        // alternate's 72 columns to count them was measurable there. A page
+        // item that is itself an alternate counts its PRIMARY's versions
+        // (Video.cs:255-280), so those primaries are counted too; the full
+        // read never covers them.
+        let mut alternate_counts: HashMap<Uuid, usize> = alternates
+            .iter()
+            .map(|(primary, rows)| (*primary, rows.len()))
+            .collect();
+        if options.contains_field(ItemFields::MediaSourceCount) {
+            let mut count_ids: Vec<Uuid> = items
+                .iter()
+                .filter(|i| kinds::is_video(row_kind(i)))
+                .filter_map(|i| i.primary_version_id.as_deref())
+                .filter_map(|p| Uuid::parse_str(p).ok())
+                .collect();
+            if !want_sources {
+                count_ids.extend(
+                    items
+                        .iter()
+                        .filter(|i| kinds::is_video(row_kind(i)))
+                        .map(row_id),
+                );
+            }
+            count_ids.sort_unstable();
+            count_ids.dedup();
+            if !count_ids.is_empty() {
+                let stored: Vec<String> = count_ids.iter().copied().map(guid_to_db).collect();
+                for (primary, count) in self
+                    .db
+                    .alternate_version_counts(&stored)
+                    .await
+                    .map_err(|e| ServiceError::Backend(e.to_string()))?
+                {
+                    if let (Ok(primary), Ok(count)) =
+                        (Uuid::parse_str(&primary), usize::try_from(count))
+                    {
+                        alternate_counts.insert(primary, count);
+                    }
+                }
+            }
+        }
         // The heavy per-item relations, bulk-loaded once for the page when their
         // field is requested (an all-fields list DTO otherwise fans out a query
         // per item for each — costly on the 2-connection pool).
@@ -2908,6 +3020,7 @@ impl FerrofinDtoService {
             linked_child_counts,
             played_counts,
             alternates,
+            alternate_counts,
             has_subtitles,
             has_lyrics,
             content_permissions,
@@ -2989,9 +3102,9 @@ mod tests {
     use ferrofin_traits::dto::DtoService as _;
 
     use crate::test_support::{
-        fetch_item, fetch_item_opt, image_info, seed_child_item, seed_folder_item, seed_images,
-        seed_item_of_series, seed_item_with_data, seed_named_item, seed_provider_id,
-        seed_series_with_studios, seed_user, test_db,
+        fetch_item, fetch_item_opt, image_info, link_alternate_version, seed_child_item,
+        seed_folder_item, seed_images, seed_item_of_series, seed_item_with_data, seed_named_item,
+        seed_provider_id, seed_series_with_studios, seed_user, test_db,
     };
 
     // ---- Fakes for the injected siblings -------------------------------------
@@ -3342,16 +3455,104 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(narrow_dto.recursive_item_count, None);
-        // With no `RecursiveItemCount` on the DTO the C# takes its ELSE branch:
-        // `Played = (UnplayedItemCount ?? 0) == 0`, and no percentage.
+        // v12 (Folder.cs:1983-1990) derives the played state from the COUNTS,
+        // not from the `RecursiveItemCount` DTO field 10.11.8 keyed on — so
+        // the percentage survives a page that never asked for the count.
         let narrow_ud = narrow_dto.user_data.as_ref().unwrap();
-        assert_eq!(narrow_ud.played_percentage, None);
+        assert!((narrow_ud.played_percentage.unwrap() - 25.0).abs() < 1e-9);
         assert!(!narrow_ud.played);
     }
 
+    /// `Folder.FillUserDataDtoValues` (v12 Folder.cs:1983-1990):
+    /// `if (totalCount > 0) { PlayedPercentage = played / total * 100;
+    /// Played = played >= total; } else { Played = true; }` — a folder with
+    /// no countable leaf is "played", and a fully-played one says so through
+    /// the `>=` and not through a `pct >= 100.0` comparison.
+    #[tokio::test]
+    async fn folder_played_state_follows_the_counts_not_the_field() {
+        let db = test_db().await;
+        let season_id = Uuid::new_v4();
+        seed_folder_item(&db, season_id, BaseItemKind::Season, "Season 1", None).await;
+        let user = seed_user(&db, Uuid::new_v4()).await;
+        let season = fetch_item(&db, season_id).await;
+        let narrow = DtoOptions {
+            fields: vec![ItemFields::Path],
+            ..DtoOptions::default()
+        };
+
+        // 4 of 4 played: 100 %, `Played = 4 >= 4`.
+        let svc = service_with_counts(
+            db.clone(),
+            FakeCounts {
+                played: 4,
+                ..FakeCounts::default()
+            },
+        );
+        let dto = svc
+            .get_base_item_dto(&season, &narrow, Some(&user), None)
+            .await
+            .unwrap();
+        let ud = dto.user_data.as_ref().unwrap();
+        assert!((ud.played_percentage.unwrap() - 100.0).abs() < 1e-9);
+        assert!(ud.played);
+        assert_eq!(ud.unplayed_item_count, Some(0));
+
+        // No countable leaf at all: no percentage, and `Played = true`.
+        let svc = service_with_counts(
+            db,
+            FakeCounts {
+                total: 0,
+                played: 0,
+                ..FakeCounts::default()
+            },
+        );
+        let dto = svc
+            .get_base_item_dto(&season, &narrow, Some(&user), None)
+            .await
+            .unwrap();
+        let ud = dto.user_data.as_ref().unwrap();
+        assert_eq!(ud.played_percentage, None);
+        assert!(ud.played);
+        assert_eq!(ud.unplayed_item_count, Some(0));
+    }
+
+    /// `if (dto.RecursiveItemCount > 0) dto.ChildCount = dto.RecursiveItemCount;`
+    /// (v12 DtoService.cs:614-617): a zero recursive count is not a
+    /// `ChildCount: 0` — the shortcut falls through to the real
+    /// `GetChildCount`, which counts the folder's direct children.
+    #[tokio::test]
+    async fn child_count_shortcut_skips_a_zero_recursive_count() {
+        let db = test_db().await;
+        let season_id = Uuid::new_v4();
+        seed_folder_item(&db, season_id, BaseItemKind::Season, "Season 1", None).await;
+        let user = seed_user(&db, Uuid::new_v4()).await;
+        let season = fetch_item(&db, season_id).await;
+        let options = DtoOptions {
+            fields: vec![ItemFields::RecursiveItemCount, ItemFields::ChildCount],
+            ..DtoOptions::default()
+        };
+        // No leaf descendants at all, but `get_child_count_batch` (4 direct
+        // children in the fake) still answers.
+        let svc = service_with_counts(
+            db,
+            FakeCounts {
+                total: 0,
+                played: 0,
+                ..FakeCounts::default()
+            },
+        );
+        let dto = svc
+            .get_base_item_dto(&season, &options, Some(&user), None)
+            .await
+            .unwrap();
+        assert_eq!(dto.recursive_item_count, Some(0));
+        assert_eq!(dto.child_count, Some(4), "the real count, not the zero");
+    }
+
     /// `CumulativeRunTimeTicks` is the folder's own stored runtime, field-gated,
-    /// and NOT under `EnableUserData` — `DtoService.cs:492-495` sits in the
-    /// `item is Folder` branch. Ferrofin stored the value and never copied it.
+    /// and lives in `AttachUserSpecificInfo`'s `item.IsFolder` branch (v12
+    /// DtoService.cs:633-636) — which `GetBaseItemDtoInternal` calls only
+    /// `if (user is not null)` (:389). Not under `EnableUserData`, though.
     #[tokio::test]
     async fn a_folder_carries_its_cumulative_run_time_ticks() {
         let db = test_db().await;
@@ -3363,16 +3564,34 @@ mod tests {
         seed_named_item(&db, leaf_id, BaseItemKind::Movie, "A Movie").await;
         let mut leaf = fetch_item(&db, leaf_id).await;
         leaf.run_time_ticks = Some(60_000_000);
+        let user = seed_user(&db, Uuid::new_v4()).await;
         let svc = service(db);
 
         let dto = svc
-            .get_base_item_dto(&album, &DtoOptions::default(), None, None)
+            .get_base_item_dto(&album, &DtoOptions::default(), Some(&user), None)
             .await
             .unwrap();
         assert_eq!(dto.cumulative_run_time_ticks, Some(60_000_000));
+        // Still there with user data switched off — the gate is the USER, not
+        // `EnableUserData`.
+        let no_user_data = DtoOptions {
+            enable_user_data: false,
+            ..DtoOptions::default()
+        };
+        let dto = svc
+            .get_base_item_dto(&album, &no_user_data, Some(&user), None)
+            .await
+            .unwrap();
+        assert_eq!(dto.cumulative_run_time_ticks, Some(60_000_000));
+        // An anonymous caller never enters `AttachUserSpecificInfo`.
+        let anon_dto = svc
+            .get_base_item_dto(&album, &DtoOptions::default(), None, None)
+            .await
+            .unwrap();
+        assert_eq!(anon_dto.cumulative_run_time_ticks, None);
         // A leaf is not a folder, so it carries none however long it is.
         let leaf_dto = svc
-            .get_base_item_dto(&leaf, &DtoOptions::default(), None, None)
+            .get_base_item_dto(&leaf, &DtoOptions::default(), Some(&user), None)
             .await
             .unwrap();
         assert_eq!(leaf_dto.cumulative_run_time_ticks, None);
@@ -3382,10 +3601,234 @@ mod tests {
             ..DtoOptions::default()
         };
         let narrow_dto = svc
-            .get_base_item_dto(&album, &narrow, None, None)
+            .get_base_item_dto(&album, &narrow, Some(&user), None)
             .await
             .unwrap();
         assert_eq!(narrow_dto.cumulative_run_time_ticks, None);
+    }
+
+    /// `DateLastMediaAdded` (v12 DtoService.cs:638-641) sits in the same
+    /// user-gated folder branch, and the mapper substitutes `DateTime.MinValue`
+    /// for a NULL column (`BaseItemMapper.cs:200`) — so a view that never had
+    /// media added carries `0001-01-01T00:00:00Z`, never an absent key.
+    #[tokio::test]
+    async fn a_folder_carries_date_last_media_added_min_value_when_unset() {
+        let db = test_db().await;
+        let view_id = Uuid::new_v4();
+        seed_folder_item(&db, view_id, BaseItemKind::UserView, "Movies", None).await;
+        let mut view = fetch_item(&db, view_id).await;
+        let movie_id = Uuid::new_v4();
+        seed_named_item(&db, movie_id, BaseItemKind::Movie, "A Movie").await;
+        let movie = fetch_item(&db, movie_id).await;
+        let genre_id = Uuid::new_v4();
+        seed_folder_item(&db, genre_id, BaseItemKind::Genre, "Drama", None).await;
+        let genre = fetch_item(&db, genre_id).await;
+        let user = seed_user(&db, Uuid::new_v4()).await;
+        let svc = service(db);
+        let options = DtoOptions::default();
+
+        let dto = svc
+            .get_base_item_dto(&view, &options, Some(&user), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            dto.date_last_media_added,
+            Some(ferrofin_model::json::datetime::dotnet_min())
+        );
+        // A stored value is copied as is.
+        let stamped = Utc.with_ymd_and_hms(2024, 5, 6, 7, 8, 9).unwrap();
+        view.date_last_media_added = Some(stamped);
+        let dto = svc
+            .get_base_item_dto(&view, &options, Some(&user), None)
+            .await
+            .unwrap();
+        assert_eq!(dto.date_last_media_added, Some(stamped));
+        // Not under `EnableUserData`: the gate is the user.
+        let no_user_data = DtoOptions {
+            enable_user_data: false,
+            ..DtoOptions::default()
+        };
+        let dto = svc
+            .get_base_item_dto(&view, &no_user_data, Some(&user), None)
+            .await
+            .unwrap();
+        assert_eq!(dto.date_last_media_added, Some(stamped));
+        // User-gated, folder-only, and a by-name Genre row (stored as a folder,
+        // a plain `BaseItem` upstream) never enters the branch.
+        for (item, user) in [(&view, None), (&movie, Some(&user)), (&genre, Some(&user))] {
+            let dto = svc
+                .get_base_item_dto(item, &options, user, None)
+                .await
+                .unwrap();
+            assert_eq!(dto.date_last_media_added, None, "{:?}", item.name);
+        }
+    }
+
+    /// `if (options.ContainsField(IsHD) && item.IsHD) dto.IsHD = true;` (v12
+    /// DtoService.cs:1555-1562) with `BaseItem.IsHD => Height >= 720`
+    /// (BaseItem.cs:404): true-only, so an SD file omits the key.
+    #[tokio::test]
+    async fn is_hd_is_true_only_from_the_stored_height() {
+        let db = test_db().await;
+        let movie_id = Uuid::new_v4();
+        seed_named_item(&db, movie_id, BaseItemKind::Movie, "A Movie").await;
+        let mut movie = fetch_item(&db, movie_id).await;
+        let svc = service(db);
+
+        movie.height = Some(1080);
+        let dto = svc
+            .get_base_item_dto(&movie, &DtoOptions::default(), None, None)
+            .await
+            .unwrap();
+        assert_eq!(dto.is_hd, Some(true));
+        movie.height = Some(720);
+        let dto = svc
+            .get_base_item_dto(&movie, &DtoOptions::default(), None, None)
+            .await
+            .unwrap();
+        assert_eq!(dto.is_hd, Some(true), "720 is the threshold, inclusive");
+        movie.height = Some(576);
+        let dto = svc
+            .get_base_item_dto(&movie, &DtoOptions::default(), None, None)
+            .await
+            .unwrap();
+        assert_eq!(dto.is_hd, None);
+        // Field-gated.
+        movie.height = Some(1080);
+        let narrow = DtoOptions {
+            fields: vec![ItemFields::Path],
+            ..DtoOptions::default()
+        };
+        let dto = svc
+            .get_base_item_dto(&movie, &narrow, None, None)
+            .await
+            .unwrap();
+        assert_eq!(dto.is_hd, None);
+    }
+
+    /// `MediaSourceCount` (v12 DtoService.cs:1319-1343) is emitted only when
+    /// the count differs from one: `linked + local + 1`, and an alternate
+    /// version answers with its primary's count (Video.cs:255-280).
+    ///
+    /// Two alternate rows point at `movie_id` and at nothing else, so the
+    /// count can only be right when it is looked up under the PRIMARY's id —
+    /// for the alternate page item as much as for the movie.
+    #[tokio::test]
+    async fn media_source_count_is_emitted_only_for_multi_version_videos() {
+        let db = test_db().await;
+        let movie_id = Uuid::new_v4();
+        seed_named_item(&db, movie_id, BaseItemKind::Movie, "A Movie").await;
+        let single_id = Uuid::new_v4();
+        seed_named_item(&db, single_id, BaseItemKind::Movie, "Single Cut").await;
+        let audio_id = Uuid::new_v4();
+        seed_named_item(&db, audio_id, BaseItemKind::Audio, "Track 01").await;
+        let alt_ids = [Uuid::new_v4(), Uuid::new_v4()];
+        for (i, alt_id) in alt_ids.iter().enumerate() {
+            seed_named_item(&db, *alt_id, BaseItemKind::Video, &format!("Cut {i}")).await;
+            link_alternate_version(&db, *alt_id, movie_id).await;
+        }
+        let movie = fetch_item(&db, movie_id).await;
+        let single = fetch_item(&db, single_id).await;
+        let audio = fetch_item(&db, audio_id).await;
+        let alternate = fetch_item(&db, alt_ids[0]).await;
+        assert!(
+            alternate.primary_version_id.is_some(),
+            "fixture links the alternate"
+        );
+        // The fake reports no alternates at all, so a count that came from
+        // the `MediaSources` rows instead of the count read would be 1 → absent.
+        let svc = service_with_sources(
+            db.clone(),
+            FakeSources {
+                no_alternates: true,
+                ..FakeSources::default()
+            },
+        );
+        let count_only = DtoOptions {
+            fields: vec![ItemFields::MediaSourceCount],
+            ..DtoOptions::default()
+        };
+
+        let dtos = svc
+            .get_base_item_dtos(
+                &[movie.clone(), single.clone(), audio, alternate],
+                &count_only,
+                None,
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            dtos[0].media_source_count,
+            Some(3),
+            "primary + 2 alternates"
+        );
+        assert_eq!(
+            dtos[1].media_source_count, None,
+            "a single-version video says nothing"
+        );
+        assert_eq!(dtos[2].media_source_count, None, "songs always have one");
+        assert_eq!(
+            dtos[3].media_source_count,
+            Some(3),
+            "the alternate reads under its primary"
+        );
+        // Field-gated.
+        let dto = svc
+            .get_base_item_dto(&movie, &DtoOptions::with_all_fields(false), None, None)
+            .await
+            .unwrap();
+        assert_eq!(dto.media_source_count, None);
+
+        // With `MediaSources` requested too, the count comes from the rows the
+        // sources block already read — `FakeSources` hands every primary one
+        // alternate, so 2 — and no count read is needed for them.
+        let svc = service(db);
+        let both = DtoOptions {
+            fields: vec![ItemFields::MediaSourceCount, ItemFields::MediaSources],
+            ..DtoOptions::default()
+        };
+        let dto = svc
+            .get_base_item_dto(&movie, &both, None, None)
+            .await
+            .unwrap();
+        assert_eq!(dto.media_source_count, Some(2));
+        assert_eq!(dto.media_sources.as_ref().map(Vec::len), Some(2));
+    }
+
+    /// v12 assigns `Chapters` outside the `item is Video` block
+    /// (DtoService.cs:1358-1361), so a folder, a series or a user view carries
+    /// `[]` when the field is requested — 10.11.8 omitted the key there.
+    #[tokio::test]
+    async fn chapters_are_an_empty_array_on_every_non_video_kind() {
+        let db = test_db().await;
+        let series_id = Uuid::new_v4();
+        seed_folder_item(&db, series_id, BaseItemKind::Series, "Series 01", None).await;
+        let view_id = Uuid::new_v4();
+        seed_folder_item(&db, view_id, BaseItemKind::UserView, "Shows", None).await;
+        let audio_id = Uuid::new_v4();
+        seed_named_item(&db, audio_id, BaseItemKind::Audio, "Track 01").await;
+        let svc = service(db.clone());
+        for id in [series_id, view_id, audio_id] {
+            let item = fetch_item(&db, id).await;
+            let dto = svc
+                .get_base_item_dto(&item, &DtoOptions::default(), None, None)
+                .await
+                .unwrap();
+            assert_eq!(dto.chapters, Some(Vec::new()), "{:?}", item.name);
+        }
+        // Field-gated still.
+        let narrow = DtoOptions {
+            fields: vec![ItemFields::Path],
+            ..DtoOptions::default()
+        };
+        let series = fetch_item(&db, series_id).await;
+        let dto = svc
+            .get_base_item_dto(&series, &narrow, None, None)
+            .await
+            .unwrap();
+        assert_eq!(dto.chapters, None);
     }
 
     /// `HasLyrics` is emitted on every `Audio` DTO, `false` included.
@@ -3536,7 +3979,8 @@ mod tests {
         }
 
         // The field is opt-in: without `ItemFields::RecursiveItemCount` the
-        // count is absent, and `Played` falls back to the `unplayed == 0` arm.
+        // count is absent — but the played numbers come from the counts, not
+        // the field (v12 Folder.cs:1983-1990), so they stay.
         let mut narrow = DtoOptions::default();
         narrow
             .fields
@@ -3548,7 +3992,7 @@ mod tests {
         assert_eq!(narrow_dto.recursive_item_count, None);
         let narrow_ud = narrow_dto.user_data.as_ref().unwrap();
         assert_eq!(narrow_ud.unplayed_item_count, Some(3));
-        assert_eq!(narrow_ud.played_percentage, None);
+        assert!((narrow_ud.played_percentage.unwrap() - 25.0).abs() < 1e-9);
         assert!(!narrow_ud.played);
 
         // The batch (prefetched) path agrees with the single-item path.
@@ -3782,9 +4226,23 @@ mod tests {
     /// `> 0` test is "the default is an empty array, so we can't reliably use
     /// the count when it's empty" — and a fake that reported entries for every
     /// folder would hide the guard.
-    #[derive(Default)]
+    ///
+    /// `played`/`total` are the leaf-descendant counts every folder reports
+    /// (1 of 4 by default — one played, three unplayed).
     struct FakeCounts {
         linked: i32,
+        played: i32,
+        total: i32,
+    }
+
+    impl Default for FakeCounts {
+        fn default() -> Self {
+            Self {
+                linked: 0,
+                played: 1,
+                total: 4,
+            }
+        }
     }
 
     #[async_trait]
@@ -3848,15 +4306,16 @@ mod tests {
             _user: &UserEntity,
         ) -> Result<HashMap<Uuid, ferrofin_traits::persistence::PlayedAndTotal>, ServiceError>
         {
-            // Every folder reports 1 of 4 leaf descendants played → 3 unplayed.
+            // Every folder reports the same counts (1 of 4 leaf descendants
+            // played → 3 unplayed, by default).
             Ok(folder_ids
                 .iter()
                 .map(|&f| {
                     (
                         f,
                         ferrofin_traits::persistence::PlayedAndTotal {
-                            played: 1,
-                            total: 4,
+                            played: self.played,
+                            total: self.total,
                         },
                     )
                 })
@@ -3970,6 +4429,9 @@ mod tests {
         /// repository, so the lean (nothing-prefetched) path can be asserted
         /// in BOTH directions instead of only the positive one.
         with_lyrics: std::collections::HashSet<Uuid>,
+        /// When set, no primary has an alternate version — the single-version
+        /// shape `MediaSourceCount` stays silent on.
+        no_alternates: bool,
     }
 
     #[async_trait]
@@ -4072,6 +4534,9 @@ mod tests {
             primary_ids: &[Uuid],
         ) -> Result<HashMap<Uuid, Vec<BaseItemEntity>>, ServiceError> {
             // Every requested primary reports one canned alternate version.
+            if self.no_alternates {
+                return Ok(HashMap::new());
+            }
             Ok(primary_ids
                 .iter()
                 .map(|&id| {
@@ -4337,20 +4802,31 @@ mod tests {
         service_with(db, Arc::new(FakeLibrary::default()))
     }
 
-    /// [`service`] whose count service reports `linked` linked children for
-    /// every parent — the `Folder.LinkedChildren.Length` half of upstream's
-    /// ChildCount shortcut.
-    fn service_with_linked_children(db: Database, linked: i32) -> FerrofinDtoService {
+    /// [`service`] over a count service the caller shapes.
+    fn service_with_counts(db: Database, counts: FakeCounts) -> FerrofinDtoService {
         FerrofinDtoService::new(
             db,
             "server-1".into(),
             Arc::new(FakeLibrary::default()),
             Arc::new(FakeUserData),
-            Arc::new(FakeCounts { linked }),
+            Arc::new(counts),
             Arc::new(FakeImages),
             Arc::new(FakeSources::default()),
             Arc::new(FakeChapters),
             Arc::new(FakeTrickplay),
+        )
+    }
+
+    /// [`service`] whose count service reports `linked` linked children for
+    /// every parent — the `Folder.LinkedChildren.Length` half of upstream's
+    /// ChildCount shortcut.
+    fn service_with_linked_children(db: Database, linked: i32) -> FerrofinDtoService {
+        service_with_counts(
+            db,
+            FakeCounts {
+                linked,
+                ..FakeCounts::default()
+            },
         )
     }
 
@@ -4407,6 +4883,7 @@ mod tests {
         // Only a Series carries it — C# guards on `item is Series tmp`.
         assert_eq!(dtos[1].air_days, None);
     }
+
     /// `DisplayPreferencesId` keys display prefs by TYPE, not by item.
     ///
     /// Port of `BaseItem.DisplayPreferencesId` (v10.11.8
@@ -4778,10 +5255,10 @@ mod tests {
         assert_eq!(lean_dtos[2].has_lyrics, None);
     }
 
-    /// `DtoService.cs:594`, inside `AttachUserSpecificInfo`'s `if (item.IsFolder)`:
-    /// `CumulativeRunTimeTicks` IS the folder's own `RunTimeTicks` column (the
-    /// sum `MetadataService.UpdateCumulativeRunTimeTicks` wrote at scan time),
-    /// field-gated, and only for folders.
+    /// v12 DtoService.cs:633-636, inside `AttachUserSpecificInfo`'s
+    /// `if (item.IsFolder)`: `CumulativeRunTimeTicks` IS the folder's own
+    /// `RunTimeTicks` column (the sum `MetadataService.UpdateCumulativeRunTimeTicks`
+    /// wrote at scan time), field-gated, only for folders, and only for a user.
     #[tokio::test]
     async fn a_folder_dto_emits_cumulative_run_time_ticks_from_its_own_column() {
         let db = test_db().await;
@@ -4789,6 +5266,7 @@ mod tests {
         let track = Uuid::from_u128(0x5D02);
         seed_named_item(&db, album, BaseItemKind::MusicAlbum, "Album").await;
         seed_named_item(&db, track, BaseItemKind::Audio, "Track").await;
+        let user = seed_user(&db, Uuid::new_v4()).await;
         let svc = service_with_sources(db.clone(), FakeSources::default());
         let mut album_row = fetch_item(&db, album).await;
         album_row.is_folder = true;
@@ -4798,7 +5276,7 @@ mod tests {
         let items = vec![album_row, track_row];
 
         let dtos = svc
-            .get_base_item_dtos(&items, &DtoOptions::default(), None, None, true)
+            .get_base_item_dtos(&items, &DtoOptions::default(), Some(&user), None, true)
             .await
             .unwrap();
         assert_eq!(dtos[0].cumulative_run_time_ticks, Some(60_000_000));
@@ -4811,7 +5289,7 @@ mod tests {
         // Field-gated, unlike `RunTimeTicks`.
         let lean = DtoOptions::with_all_fields(false);
         let dtos = svc
-            .get_base_item_dtos(&items, &lean, None, None, true)
+            .get_base_item_dtos(&items, &lean, Some(&user), None, true)
             .await
             .unwrap();
         assert_eq!(dtos[0].cumulative_run_time_ticks, None);
@@ -6520,8 +6998,9 @@ mod tests {
         // The all-fields channel detail carries a present-and-empty stream list
         // (C# assigns `GetMediaStreams()` = [] for every IHasMediaSources).
         assert_eq!(dto.media_streams, Some(Vec::new()));
-        // C# only assigns Chapters for a `Video`; a channel omits the key.
-        assert_eq!(dto.chapters, None);
+        // v12 assigns Chapters for every kind (DtoService.cs:1358-1361); a
+        // channel owns none, so it carries `[]`.
+        assert_eq!(dto.chapters, Some(Vec::new()));
 
         let sources = dto.media_sources.expect("placeholder media source");
         assert_eq!(sources.len(), 1);
@@ -6580,7 +7059,11 @@ mod tests {
         assert_eq!(dto.media_type, MediaType::Unknown);
         assert_eq!(dto.media_sources, None);
         assert_eq!(dto.media_streams, None);
-        assert_eq!(dto.chapters, None, "a programme is not a Video");
+        assert_eq!(
+            dto.chapters,
+            Some(Vec::new()),
+            "v12 assigns Chapters for every kind; a programme owns none"
+        );
         assert_eq!(dto.channel_id, Some(channel));
         assert_eq!(dto.parent_id, Some(channel));
         assert_eq!(dto.run_time_ticks, Some(36_000_000_000));
