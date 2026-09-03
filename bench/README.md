@@ -119,7 +119,15 @@ docker pull jellyfin/jellyfin:12.0-rc7
 bench/testdata/build.sh                           # once, ~20 min
 bench/run.sh                                      # one full run, ~40 min → bench/runs/<date>-<sha>/report.md
 python3 bench/report.py bench/runs/A bench/runs/B bench/runs/C   # the README table: medians + spread
+python3 bench/report.py --serve                   # the comparison viewer at http://127.0.0.1:8097/
 ```
+
+The viewer lists every run under `bench/runs`; tick the runs to render (several =
+median + spread) and optionally a baseline. It shows the same cells as the markdown
+plus each cell's ratio to Jellyfin 10.11.8 and — with a baseline — each server's
+percentage change against an earlier run of itself (green = faster/smaller). The
+markdown keeps neither, so the README stays two columns side by side. Localhost only,
+stdlib only, no JavaScript.
 
 Tunables are the variables at the top of `run.sh` (`WINDOW_S`, `RATE_LOADED`, …); pass
 `--only loaded` for a before/after on two builds. A shared host must be quiet: stop

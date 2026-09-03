@@ -161,4 +161,4 @@ run_server() {
 
 for s in ${SERVERS//,/ }; do run_server "$s"; done
 python3 bench/report.py "$OUT" > "$OUT/report.md"
-echo "report: $OUT/report.md"
+echo "report: $OUT/report.md  —  compare in the browser: python3 bench/report.py --serve"
