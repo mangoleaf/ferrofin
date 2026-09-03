@@ -48,7 +48,7 @@ def load(path):
 
 def load_shape(d):
     """shape.log → {request name: {status set, counts, fields}} merged over the responses."""
-    out = defaultdict(lambda: {"status": set(), "count": set(), "fields": set(), "n": 0})
+    out = defaultdict(lambda: {"status": set(), "count": set(), "total": set(), "fields": set(), "n": 0})
     try:
         lines = open(os.path.join(d, "shape.log")).read().splitlines()
     except OSError:
@@ -63,6 +63,8 @@ def load_shape(d):
         s["n"] += 1
         if "count" in rec and rec["count"] is not None:
             s["count"].add(rec["count"])
+        if "total" in rec and rec["total"] is not None:
+            s["total"].add(rec["total"])
         s["fields"].update(rec.get("fields") or [])
     return out
 
@@ -93,7 +95,9 @@ def comparable(shape_srv, shape_oracle, names):
         if s["status"] != o["status"]:
             return f"{n}: status {sorted(s['status'])} vs {sorted(o['status'])}"
         if s["count"] != o["count"]:
-            return f"{n}: count {sorted(s['count'])} vs {sorted(o['count'])}"
+            return f"{n}: items {sorted(s['count'])} vs {sorted(o['count'])}"
+        if s["total"] != o["total"]:
+            return f"{n}: TotalRecordCount {sorted(s['total'])} vs {sorted(o['total'])}"
         missing = sorted(o["fields"] - s["fields"])
         if missing:
             more = f" (+{len(missing) - 3} more)" if len(missing) > 3 else ""

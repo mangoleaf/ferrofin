@@ -77,7 +77,10 @@ function record(name, res) {
         try { body = res.json(); } catch (e) { /* shape of a non-JSON body: status only */ }
         if (body !== null) {
             const f = new Set(); fieldSet(body, f, ''); s.fields = Array.from(f).sort();
-            s.count = Array.isArray(body) ? body.length : body.TotalRecordCount !== undefined ? body.TotalRecordCount : Array.isArray(body.Items) ? body.Items.length : undefined;
+            // count = items actually returned; total = the server's TotalRecordCount (which Jellyfin
+            // sets to 0 when the client passes EnableTotalRecordCount=false) — compared separately
+            s.count = Array.isArray(body) ? body.length : Array.isArray(body.Items) ? body.Items.length : undefined;
+            if (!Array.isArray(body) && body.TotalRecordCount !== undefined) s.total = body.TotalRecordCount;
         }
     } else { s.bytes = res.body ? res.body.length : 0; }
     // VU state is invisible to handleSummary; shape lines go out via the console log
