@@ -56,7 +56,41 @@ esac; done
 abs() { case "$1" in /*) echo "$1";; *) echo "$CALLER/$1";; esac; }   # user paths are relative to the caller's shell
 TESTDATA=$(realpath -m "$(abs "$TESTDATA")")
 SHA=$(git rev-parse --short HEAD 2>/dev/null || echo nogit)
-OUT=$(realpath -m "$(abs "${OUT:-$PWD/bench/runs/$(date +%Y%m%d-%H%M)-$SHA}")")
+
+# A run is named for the code it measured, so a run dir can be traced back to a build:
+#   on a tag            v0.42.1                 (and "v0.42.1 [2]", " [3]" … for repeats)
+#   ahead of a tag      v0.42.1-3-7e80268       (3 commits past the tag, at that sha)
+#   dirty working tree  …-dirty                 the tree had uncommitted changes when the
+#                                               run started, so the sha does not identify
+#                                               it; image.txt and run.json.sha record what
+#                                               actually ran
+#   no tags / no git    20260903-1412-7e80268   the date form, as before
+RUNS_DIR=$PWD/bench/runs
+run_name() {
+  local base n
+  if base=$(git describe --tags --exact-match 2>/dev/null); then
+    :
+  elif base=$(git describe --tags --long 2>/dev/null); then
+    # git prints tag-N-gSHA; the g is git's marker, not part of the sha.
+    base=$(sed -E 's/-([0-9]+)-g([0-9a-f]+)$/-\1-\2/' <<<"$base")
+  else
+    base="$(date +%Y%m%d-%H%M)-$SHA"
+  fi
+  [ -z "$(git status --porcelain 2>/dev/null)" ] || base="$base-dirty"
+  # Repeats are counted in brackets — " [2]", " [3]" — so a rerun never lands in a
+  # populated dir and the count cannot be misread as part of the version (v0.42.1-2,
+  # the second run, and v0.42.1-2-abc1234, two commits on, are otherwise a glance
+  # apart). The name therefore holds a space and brackets: quote it. On a dirty tree
+  # the counter only means "another run", not "the same code again" — two dirty trees
+  # are not the same tree.
+  n=1
+  local candidate="$base"
+  while [ -e "$RUNS_DIR/$candidate" ]; do
+    n=$((n + 1)); candidate="$base [$n]"
+  done
+  echo "$candidate"
+}
+OUT=$(realpath -m "$(abs "${OUT:-$RUNS_DIR/$(run_name)}")")
 for p in "$TESTDATA" "$OUT"; do case "$p" in /mnt/mangonas*|/mnt/nvme0/k3s*) echo "refusing to touch $p" >&2; exit 1;; esac; done
 
 die() { echo "run: $*" >&2; exit 1; }
@@ -74,11 +108,12 @@ awk -v i="$idle" -v m="$CORE_IDLE_MIN" -v c="$SERVER_CPUS,$CLIENT_CPUS" 'BEGIN {
 mkdir -p "$OUT"
 IDS=$TESTDATA/ids.json; U=$(jq -r .user "$IDS"); TOK=$(jq -r .token "$IDS")
 AUTH="Authorization: MediaBrowser Client=\"bench\", Device=\"bench\", DeviceId=\"bench-run\", Version=\"3\", Token=\"$TOK\""
-jq -n --arg sha "$SHA" --arg host "$(uname -srm)" --arg cpu "$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | xargs)" \
+DIRTY=$([ -z "$(git status --porcelain 2>/dev/null)" ] && echo false || echo true)
+jq -n --arg sha "$SHA" --arg name "$(basename "$OUT")" --argjson dirty "$DIRTY" --arg host "$(uname -srm)" --arg cpu "$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | xargs)" \
   --arg mem "$MEMORY" --arg cpus "$SERVER_CPUS" --arg k6 "$(k6 version | head -1)" --arg testdata "$(jq -c .counts "$IDS")" \
   --argjson rate_unloaded "$RATE_UNLOADED" --argjson rate_loaded "$RATE_LOADED" --argjson rate_stress "$RATE_STRESS" \
   --argjson window "$WINDOW_S" --argjson sample_ms "$MEM_SAMPLE_MS" \
-  '{sha:$sha, host:$host, cpu:$cpu, memory_limit:$mem, server_cpus:$cpus, k6:$k6, testdata_counts:($testdata|fromjson),
+  '{sha:$sha, name:$name, dirty:$dirty, host:$host, cpu:$cpu, memory_limit:$mem, server_cpus:$cpus, k6:$k6, testdata_counts:($testdata|fromjson),
     rate_unloaded:$rate_unloaded, rate_loaded:$rate_loaded, rate_stress:$rate_stress,
     window_s:$window, mem_sample_ms:$sample_ms, date: (now|todate)}' > "$OUT/run.json"
 

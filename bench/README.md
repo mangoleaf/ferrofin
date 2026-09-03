@@ -129,10 +129,19 @@ docker build -t ferrofin:bench .                  # the commit under test
 docker pull jellyfin/jellyfin:10.11.8
 docker pull jellyfin/jellyfin:12.0-rc7
 bench/testdata/build.sh                           # once, ~20 min
-bench/run.sh                                      # one full run, ~50 min → bench/runs/<date>-<sha>/report.md
+bench/run.sh                                      # one full run, ~50 min → bench/runs/<version>/report.md
 python3 bench/report.py bench/runs/A bench/runs/B bench/runs/C   # the README table: medians, markers, notes
 python3 bench/report.py --serve                   # the comparison viewer at http://127.0.0.1:8097/
 ```
+
+A run is named for the code it measured: `v0.42.1` on a tag, `v0.42.1-3-7e80268` when
+the branch is that many commits past the tag, and `-dirty` appended when the working
+tree had uncommitted changes at the start of the run, so the sha does not identify it
+(what actually ran is recorded in each server's `image.txt` and in `run.json`). Repeats of the same code are counted in brackets — `v0.42.1 [2]`,
+`v0.42.1-3-7e80268 [2]` — so the count can never be misread as part of the version.
+With no tags, or outside git, the name falls back to `20260903-1412-7e80268`. The
+resolved name and the dirty flag are also written into `run.json`, so they survive a
+renamed directory. `--out` overrides the whole thing.
 
 The viewer lists every run under `bench/runs`; tick the runs to render (several =
 median + spread) and optionally a baseline. Cells stay numeric in both renderers: the
