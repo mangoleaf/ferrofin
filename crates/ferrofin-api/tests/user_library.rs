@@ -1427,6 +1427,29 @@ async fn latest_ungrouped_items_carry_no_child_count() {
     assert!(json[0].get("ChildCount").is_none(), "{}", json[0]);
 }
 
+/// The shape v12's **music** branch produces: the manager returns the album
+/// ROW (not its tracks), so the tuple is `(null, [album])` and the album falls
+/// through the collapse test — `Item1 is MusicAlbum` never fires on a null
+/// `Item1` (UserLibraryController.cs:580). The album is therefore emitted as
+/// itself with `childCount` 0, and `if (childCounts[i] > 0)` (`:592-598`)
+/// leaves the key OFF the wire.
+///
+/// This is the one wire difference the branch makes: the same album used to
+/// arrive as a container carrying `ChildCount` = its new-track count.
+#[tokio::test]
+async fn latest_music_album_row_is_itself_and_carries_no_child_count() {
+    let views = LatestViews::new(vec![(None, vec![album()])]);
+    let (status, body, dtos) = send_latest(&views, "/Items/Latest", false).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(dtos.len(), 1);
+    assert_eq!(dtos[0].id, ALBUM_ID);
+    // The `MusicAlbum` collapse arm is guarded by `Item1 is not null`, so a
+    // null container skips it and no count is stamped. (The stub DTO service
+    // does not carry `Type` through, hence the assertion on the id.)
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    assert!(json[0].get("ChildCount").is_none(), "{}", json[0]);
+}
+
 /// The request's `groupItems`/`isPlayed`/`limit`/`parentId`/`includeItemTypes`
 /// reach the manager, the user rides along, and a `HidePlayedInLatest` user
 /// turns an unset `isPlayed` into `false`.

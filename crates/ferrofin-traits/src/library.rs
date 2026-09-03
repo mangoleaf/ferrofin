@@ -1225,12 +1225,14 @@ pub trait UserViewManager: Send + Sync {
     /// Port of `UserViewManager.GetLatestItems`: ONE query across every parent
     /// (the user's views minus `latest_item_excludes`, or the `parent_id`
     /// folder), ordered `DateCreated DESC, SortName DESC, ProductionYear DESC`
-    /// and over-fetched to `limit * 5` rows; a tvshows/music parent takes the
-    /// grouped-threshold query instead ([`ItemRepository::get_latest_item_list`]).
+    /// and over-fetched to `limit * 5` rows; a tvshows or music parent takes
+    /// its own per-collection-type query instead
+    /// ([`ItemRepository::get_latest_item_list`] — the grouped-threshold form
+    /// for tvshows, the newest albums for music).
     /// The rows are then bucketed by their `LatestItemsIndexContainer` (episode
     /// → series, track → music album, photo → photo album; folders and every
-    /// other kind stand alone) in first-seen order, stopping once `limit`
-    /// groups exist.
+    /// other kind — a `MusicAlbum` included — stand alone) in first-seen order,
+    /// stopping once `limit` groups exist.
     ///
     /// Each tuple is the C# `Tuple<BaseItem, List<BaseItem>>`: the container
     /// (`None` for an ungrouped row) and the rows that fell under it. Virtual

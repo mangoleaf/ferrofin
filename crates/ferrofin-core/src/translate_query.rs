@@ -238,28 +238,33 @@ fn push_group_tail(qb: &mut QueryBuilder<'_, Sqlite>) {
     qb.push(r#" GROUP BY bi."PresentationUniqueKey"))"#);
 }
 
-/// Builds the "latest media" statement for a tvshows/music library — C#
-/// `BaseItemRepository.GetLatestItemList`.
+/// Builds the "latest media" statement for a **tvshows** library — **v10.11.8**
+/// `BaseItemRepository.GetLatestItemList` (`BaseItemRepository.cs:328-369`).
 ///
 /// Upstream composes two translations of the **same** filter: a grouped
-/// subquery that takes the newest `MAX(DateCreated)` per series (`SeriesName`)
-/// or album (`Album`), keeps the top `filter.limit` groups, and uses the
-/// *smallest* of those maxima as a threshold; the main query then returns
-/// every row at or above that threshold, ordered by the caller's `order_by`
-/// and **unpaged** (upstream nulls `Limit` before `ApplyQueryPaging`, so only a
-/// `StartIndex` survives). That is what makes one query return whole groups —
-/// the caller groups the rows by container afterwards.
+/// subquery that takes the newest `MAX(DateCreated)` per series (`SeriesName`),
+/// keeps the top `filter.limit` groups, and uses the *smallest* of those maxima
+/// as a threshold; the main query then returns every row at or above that
+/// threshold, ordered by the caller's `order_by` and **unpaged** (upstream nulls
+/// `Limit` before `ApplyQueryPaging`, so only a `StartIndex` survives). That is
+/// what makes one query return whole groups — the caller groups the rows by
+/// container afterwards.
 ///
-/// `group_column` is the grouping expression (`bi."SeriesName"` /
-/// `bi."Album"`). Both translations share the predicate set, so the filter is
-/// appended twice; the inner `bi` alias shadows the outer inside the subquery,
-/// exactly as EF's nested query does.
+/// Both translations share the predicate set, so the filter is appended twice;
+/// the inner `bi` alias shadows the outer inside the subquery, exactly as EF's
+/// nested query does.
+///
+/// The **music** arm no longer uses this shape:
+/// [`build_latest_music_albums_query`] carries v12's rewritten one. This one
+/// stays on 10.11.8 deliberately — v12 replaced the tvshows arm too, with
+/// `GetLatestTvShowItems` (`Querying.cs:282+`, which picks a Season or Series
+/// container per group), and porting that is its own work item, not part of the
+/// music branch.
 #[must_use]
-pub(crate) fn build_latest_item_list_query<'a>(
-    filter: &'a InternalItemsQuery,
-    group_column: &'static str,
-) -> QueryBuilder<'a, Sqlite> {
-    let mut qb: QueryBuilder<'a, Sqlite> =
+pub(crate) fn build_latest_item_list_query(
+    filter: &InternalItemsQuery,
+) -> QueryBuilder<'_, Sqlite> {
+    let mut qb: QueryBuilder<'_, Sqlite> =
         QueryBuilder::new(r#"SELECT bi.* FROM "BaseItems" AS bi WHERE "#);
     // `GetLatestItemList` runs `ApplyGroupingFilter` over the main query too
     // (`BaseItemRepository.cs:363`), so "latest" collapses merged versions the
@@ -278,9 +283,10 @@ pub(crate) fn build_latest_item_list_query<'a>(
     qb.push(r#"SELECT MAX(bi."DateCreated") AS "m" FROM "BaseItems" AS bi WHERE bi."Id" <> "#);
     qb.push_bind(PLACEHOLDER_ID);
     append_predicates(&mut qb, filter);
-    qb.push(" GROUP BY ");
-    qb.push(group_column);
-    qb.push(r#" ORDER BY "m" DESC"#);
+    // `dbQuery.GroupBy(e => e.SeriesName)` — the one grouping key this shape
+    // ever had once the music arm moved to [`build_latest_music_albums_query`]
+    // (it used to take `bi."Album"` as a parameter).
+    qb.push(r#" GROUP BY bi."SeriesName" ORDER BY "m" DESC"#);
     if let Some(limit) = filter.limit {
         qb.push(" LIMIT ").push_bind(i64::from(limit));
     }
@@ -293,6 +299,90 @@ pub(crate) fn build_latest_item_list_query<'a>(
     // `filter.Limit = null` upstream — only a start index can page this query.
     if let Some(offset) = filter.start_index.filter(|o| *o > 0) {
         qb.push(" LIMIT -1 OFFSET ").push_bind(i64::from(offset));
+    }
+    qb
+}
+
+/// Builds the "latest media" statement for a **music** library — the music arm
+/// of v12 `BaseItemRepository.GetLatestItemList`
+/// (`Jellyfin.Server.Implementations/Item/BaseItemRepository.Querying.cs:147-180`).
+///
+/// v12 stopped asking "which albums contain the newest tracks" and asks "which
+/// albums are newest": the statement selects `MusicAlbum` rows directly. Two
+/// arms, exactly as upstream branches on `filter.TopParentIds`:
+///
+/// - **library-scoped** (`:150-157`) — `Type == MusicAlbum && !IsVirtualItem &&
+///   TopParentId.HasValue`, `WhereOneOrMany` on the top parent ids. No track is
+///   read at all: the caller's `baseQuery` (its media types, `IsPlayed`,
+///   `IsFolder` and the rest) is deliberately NOT applied, because those
+///   describe tracks and the album is what comes back;
+/// - **ancestor-scoped fallback** (`:159-167`) — albums that are the
+///   `AncestorIds` parent of a row the caller's own query matches. This arm DOES
+///   run the caller's track query, as its inner subquery. It has no
+///   `IsVirtualItem`/`TopParentId` test upstream, so it has none here.
+///
+/// The order is upstream's `OrderByDescending(DateCreated)
+/// .ThenByDescending(Id)` and the limit caps ALBUMS — the caller's `order_by`
+/// and `start_index` are both ignored, as they are in the C#.
+///
+/// `ApplyParentalRestrictions` (`:172`) is **not** ported, and upstream's
+/// comment above it (`:169-171`) says exactly what that costs: neither arm
+/// reads the album through the user's filters, so "a matching track does not
+/// make an album the user may not see visible" — that call is the only guard,
+/// and here the album comes back unguarded. This is not a gap this arm opened:
+/// Ferrofin's query layer carries no parental predicates anywhere (see
+/// [`ACCESSIBLE_LEAF`], which records the same absence on the leaf-access path,
+/// and the standing work item noted in `ferrofin-api` `handlers/mod.rs`). The
+/// one user scoping Ferrofin *does* have — `top_parent_ids` — is applied.
+///
+/// Upstream's closing `LoadLatestByIds` (`:180`) is folded in: it re-selects the
+/// same ids under the same `DateCreated DESC, Id DESC` purely to attach EF
+/// navigations, and `SELECT bi.*` already carries the whole row.
+#[must_use]
+pub(crate) fn build_latest_music_albums_query(
+    filter: &InternalItemsQuery,
+) -> QueryBuilder<'_, Sqlite> {
+    let album_type = stored_type_name(BaseItemKind::MusicAlbum).unwrap_or_default();
+    let mut qb: QueryBuilder<'_, Sqlite> =
+        QueryBuilder::new(r#"SELECT bi.* FROM "BaseItems" AS bi WHERE bi."Type" = "#);
+    qb.push_bind(album_type);
+    if filter.top_parent_ids.is_empty() {
+        // `lam` is an alias `append_predicates` never opens: the shadowed
+        // subquery below already uses `a` (the `ancestor_ids` EXISTS) and `la`
+        // (the `linked_child_ancestor_ids` join), and shadowing an alias the
+        // outer query still needs to reference is a correctness trap even
+        // where SQLite happens to resolve it inside-out.
+        qb.push(
+            r#" AND bi."Id" IN (SELECT lam."ParentItemId" FROM "AncestorIds" AS lam
+                WHERE lam."ItemId" IN (SELECT bi."Id" FROM "BaseItems" AS bi WHERE bi."Id" <> "#,
+        )
+        .push_bind(PLACEHOLDER_ID);
+        // `baseQuery`, which upstream builds with `PrepareItemQuery` +
+        // `TranslateQuery` only: no grouping filter, no ordering and no paging.
+        append_predicates(&mut qb, filter);
+        qb.push("))");
+    } else {
+        qb.push(r#" AND bi."IsVirtualItem" = 0 AND bi."TopParentId" IS NOT NULL AND "#);
+        push_in_list(
+            &mut qb,
+            r#"bi."TopParentId""#,
+            &to_guid_strings(&filter.top_parent_ids),
+        );
+    }
+    qb.push(r#" ORDER BY bi."DateCreated" DESC, bi."Id" DESC"#);
+    // `limit.HasValue ? orderedAlbums.Take(limit.Value) : orderedAlbums` — a
+    // `limit` of 0 really does mean no albums, as `Take(0)` does.
+    //
+    // The `max(0)` is deliberate HARDENING, not parity: upstream's `Take` stays
+    // deferred (it is `IQueryable`, kept that way so EF emits `WHERE Id IN
+    // (<subquery>)`), so a negative limit reaches SQLite there too and SQLite
+    // reads a negative `LIMIT` as *unbounded*. Answering a nonsense request with
+    // every album in the library is not worth reproducing. Unreachable today —
+    // both `/Items/Latest` forms clamp with `.max(0)` in the handler — and NOT
+    // mirrored into [`build_latest_item_list_query`], which would only move that
+    // statement further from both upstream and the generic path.
+    if let Some(limit) = filter.limit {
+        qb.push(" LIMIT ").push_bind(i64::from(limit).max(0));
     }
     qb
 }
@@ -1920,7 +2010,9 @@ pub(crate) fn non_blank(value: Option<&String>) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{QueryShape, build_latest_item_list_query, build_query};
+    use super::{
+        QueryShape, build_latest_item_list_query, build_latest_music_albums_query, build_query,
+    };
     use ferrofin_model::data::BaseItemKind;
     use ferrofin_model::dto::SortOrder;
     use ferrofin_model::live_tv::ItemSortBy;
@@ -1941,7 +2033,7 @@ mod tests {
             ],
             ..InternalItemsQuery::default()
         };
-        let qb = build_latest_item_list_query(&filter, r#"bi."SeriesName""#);
+        let qb = build_latest_item_list_query(&filter);
         let sql = qb.sql();
 
         assert!(
@@ -1974,13 +2066,77 @@ mod tests {
             start_index: Some(5),
             ..InternalItemsQuery::default()
         };
-        let qb = build_latest_item_list_query(&filter, r#"bi."Album""#);
+        let qb = build_latest_item_list_query(&filter);
         let sql = qb.sql();
         assert!(
-            sql.contains(r#"GROUP BY bi."Album" ORDER BY "m" DESC) AS g)"#),
+            sql.contains(r#"GROUP BY bi."SeriesName" ORDER BY "m" DESC) AS g)"#),
             "{sql}"
         );
         assert!(sql.ends_with(" LIMIT -1 OFFSET ?"), "{sql}");
+    }
+
+    /// v12's music arm, library-scoped: album rows by their own `TopParentId`,
+    /// `DateCreated DESC, Id DESC`, `LIMIT limit` — and NOT one predicate of
+    /// the caller's track query, whose `MediaTypes`/`IsFolder`/`order_by` are
+    /// all present on the filter and all ignored.
+    #[test]
+    fn latest_music_albums_query_reads_albums_by_top_parent() {
+        let filter = InternalItemsQuery {
+            media_types: vec![ferrofin_model::data::MediaType::Audio],
+            is_folder: Some(false),
+            is_virtual_item: Some(false),
+            limit: Some(16),
+            start_index: Some(5),
+            top_parent_ids: vec![uuid::Uuid::from_u128(1)],
+            order_by: vec![
+                (ItemSortBy::DateCreated, SortOrder::Descending),
+                (ItemSortBy::SortName, SortOrder::Descending),
+            ],
+            ..InternalItemsQuery::default()
+        };
+        let sql = build_latest_music_albums_query(&filter).into_sql();
+
+        assert_eq!(
+            sql,
+            concat!(
+                r#"SELECT bi.* FROM "BaseItems" AS bi WHERE bi."Type" = ?"#,
+                r#" AND bi."IsVirtualItem" = 0 AND bi."TopParentId" IS NOT NULL"#,
+                r#" AND bi."TopParentId" IN (?)"#,
+                r#" ORDER BY bi."DateCreated" DESC, bi."Id" DESC LIMIT ?"#,
+            ),
+            "the album query carries no track predicate, no caller ordering and no offset"
+        );
+    }
+
+    /// The ancestor-scoped fallback: no top parent ids, so the albums are the
+    /// `AncestorIds` parents of the rows the caller's own (unpaged, unordered)
+    /// query matches.
+    #[test]
+    fn latest_music_albums_query_falls_back_to_the_ancestor_closure() {
+        let filter = InternalItemsQuery {
+            include_item_types: vec![BaseItemKind::Audio],
+            limit: Some(16),
+            ancestor_ids: vec![uuid::Uuid::from_u128(2)],
+            ..InternalItemsQuery::default()
+        };
+        let sql = build_latest_music_albums_query(&filter).into_sql();
+
+        assert!(
+            sql.contains(r#"bi."Id" IN (SELECT lam."ParentItemId" FROM "AncestorIds" AS lam"#),
+            "{sql}"
+        );
+        assert!(
+            sql.contains(r#"bi."Type" IN"#),
+            "the caller's predicates select the matching rows: {sql}"
+        );
+        assert!(
+            !sql.contains(r#"bi."TopParentId" IS NOT NULL"#),
+            "the fallback has no top-parent test: {sql}"
+        );
+        assert!(
+            sql.ends_with(r#" ORDER BY bi."DateCreated" DESC, bi."Id" DESC LIMIT ?"#),
+            "{sql}"
+        );
     }
     /// The `ORDER BY …` tail of the statement `filter` translates to.
     fn order_by(filter: &InternalItemsQuery) -> String {

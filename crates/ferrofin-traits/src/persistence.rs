@@ -271,14 +271,29 @@ pub trait ItemRepository: Send + Sync {
     /// The "latest media" rows of a **tvshows or music** library — port of C#
     /// `BaseItemRepository.GetLatestItemList`.
     ///
-    /// One grouped-threshold statement: the filter's predicates are grouped by
-    /// `SeriesName` (tvshows) or `Album` (music), the newest `filter.limit`
-    /// groups' `MAX(DateCreated)` are taken, and every row at or above the
-    /// *smallest* of those maxima is returned in the filter's `order_by`,
-    /// unpaged — so `limit` caps groups, not rows, and the caller buckets the
-    /// rows by container afterwards. Any other collection type returns an
-    /// empty list (the C# early exit); the caller uses
-    /// [`get_item_list`](Self::get_item_list) for those.
+    /// The two types answer differently, and they track different upstream
+    /// versions — the music arm is v12's rewrite, the tvshows arm is still
+    /// 10.11.8's (v12 replaced that one too, with `GetLatestTvShowItems`;
+    /// porting it is its own work item):
+    ///
+    /// - **tvshows** (v10.11.8) — one grouped-threshold statement: the filter's predicates
+    ///   are grouped by `SeriesName`, the newest `filter.limit` groups'
+    ///   `MAX(DateCreated)` are taken, and every row at or above the *smallest*
+    ///   of those maxima is returned in the filter's `order_by`, unpaged — so
+    ///   `limit` caps groups, not rows, and the caller buckets the rows by
+    ///   container afterwards;
+    /// - **music** (v12) — the newest `filter.limit` `MusicAlbum` rows
+    ///   themselves, ordered `DateCreated DESC, Id DESC`, scoped by the filter's
+    ///   top parent ids — which reads no track at all — or, for an
+    ///   ancestor-scoped caller, to the albums above a row the filter matches,
+    ///   which is the one shape that still runs the caller's track query. The
+    ///   filter's `order_by` is not used, and the rows need no further grouping.
+    ///
+    /// Any other collection type returns an empty list and the caller uses
+    /// [`get_item_list`](Self::get_item_list) for it. Note that is wider than
+    /// the C# early exit, which also has `movies` and `unknown` arms — not
+    /// porting those two is an owner-scoped divergence, recorded where the
+    /// branch is taken (`ferrofin-core` `user_view_manager::items_for_latest_items`).
     async fn get_latest_item_list(
         &self,
         filter: &InternalItemsQuery,

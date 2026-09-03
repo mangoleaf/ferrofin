@@ -39,8 +39,9 @@ use crate::aggregate_folder::RootFolderIds;
 use crate::db_error::{db_err, media_stream_type_disc};
 use crate::item_type_lookup::stored_type_name;
 use crate::translate_query::{
-    PLACEHOLDER_ID, QueryShape, append_predicates, build_latest_item_list_query, build_query,
-    media_type_name, non_blank, push_in_list, to_guid_strings,
+    PLACEHOLDER_ID, QueryShape, append_predicates, build_latest_item_list_query,
+    build_latest_music_albums_query, build_query, media_type_name, non_blank, push_in_list,
+    to_guid_strings,
 };
 use crate::user_entity_ext::{guid_preference, has_permission, live_tv_enabled_for};
 use sqlx::{FromRow, QueryBuilder, Row, Sqlite};
@@ -2099,25 +2100,45 @@ impl ItemRepository for FerrofinItemRepository {
         filter: &InternalItemsQuery,
         collection_type: CollectionType,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        // C# `BaseItemRepository.GetLatestItemList`: only tvshows and music
-        // take the grouped path; every other collection type early-exits
-        // empty (the user-view manager sends those through `get_item_list`).
-        let group_column = match collection_type {
-            CollectionType::tvshows => r#"bi."SeriesName""#,
-            CollectionType::music => r#"bi."Album""#,
-            _ => return Ok(Vec::new()),
-        };
+        // Ferrofin implements two arms of `BaseItemRepository.GetLatestItemList`
+        // — music from v12 (`Querying.cs:147-180`) and tvshows still from
+        // 10.11.8 (`BaseItemRepository.cs:328-369`; v12 replaced that one too,
+        // with `GetLatestTvShowItems`). Every other collection type
+        // returns empty and the user-view manager sends it through
+        // `get_item_list`. That is WIDER than the C# early exit
+        // (`Querying.cs:112-116`, which only rejects types outside
+        // `{movies, tvshows, music, unknown}`): v12's `movies` and `unknown`
+        // arms are an owner-scoped divergence, recorded at the branch itself
+        // in `user_view_manager::items_for_latest_items`.
+        // Checked BEFORE `resolve_views` so the early exit costs no query.
+        if !matches!(
+            collection_type,
+            CollectionType::tvshows | CollectionType::music
+        ) {
+            return Ok(Vec::new());
+        }
         // This is the path jellyfin-web's per-library "Latest in …" rows take
         // (grouping is on by default for tvshows and music), so it needs the
         // same view translation as every other browse — without it, Latest for
         // a TV or Music library on an adopted database comes back empty.
         let resolved = self.resolve_views(filter).await?;
         let filter = resolved.as_ref().unwrap_or(filter);
-        // One statement: the newest `limit` groups' maxima set a DateCreated
-        // threshold, and every row at or above it comes back in the caller's
-        // order (`filter.limit` caps GROUPS, not rows — the outer query is
-        // unpaged). The caller's `order_by` rides through untouched.
-        let mut qb = build_latest_item_list_query(filter, group_column);
+        let mut qb = if collection_type == CollectionType::music {
+            // v12's music arm: the newest `limit` MusicAlbum rows themselves,
+            // one statement — which reads no track at all when the caller is
+            // library-scoped, and runs the caller's track query only as the
+            // ancestor fallback's inner subquery. The rows come back already
+            // "grouped" — an album carries no `LatestItemsIndexContainer`, so
+            // the caller's grouping pass is a no-op over them.
+            build_latest_music_albums_query(filter)
+        } else {
+            // tvshows, one statement: the newest `limit` groups' maxima set a
+            // DateCreated threshold, and every row at or above it comes back in
+            // the caller's order (`filter.limit` caps GROUPS, not rows — the
+            // outer query is unpaged). The caller's `order_by` rides through
+            // untouched.
+            build_latest_item_list_query(filter)
+        };
         qb.build_query_as::<BaseItemEntity>()
             .fetch_all(self.db.pool())
             .await
@@ -4459,9 +4480,12 @@ mod tests {
             .with_timezone(&Utc)
     }
 
-    /// The C# early exit: only `tvshows` and `music` take the grouped path —
-    /// `movies` (which the old port accepted) and `books` return nothing, the
-    /// user-view manager routes those through `get_item_list` instead.
+    /// Only `tvshows` and `music` take a dedicated path here; everything else
+    /// returns nothing and the user-view manager routes it through
+    /// `get_item_list`. `books` is the C# early exit; `movies` is NOT — v12
+    /// has a movies arm, deliberately not ported (the owner-scoped divergence
+    /// recorded in `user_view_manager::items_for_latest_items`), so this case
+    /// also pins that decision.
     #[tokio::test]
     async fn latest_item_list_is_empty_for_movies_and_books() {
         let db = test_db().await;
@@ -4547,9 +4571,9 @@ mod tests {
         )
         .await;
 
-        let filter = InternalItemsQuery {
+        let filter = |limit: i32| InternalItemsQuery {
             include_item_types: vec![BaseItemKind::Episode],
-            limit: Some(2),
+            limit: Some(limit),
             order_by: vec![
                 (
                     ferrofin_model::live_tv::ItemSortBy::DateCreated,
@@ -4562,78 +4586,259 @@ mod tests {
             ],
             ..InternalItemsQuery::default()
         };
+        let ids = |rows: Vec<BaseItemEntity>| -> Vec<Uuid> {
+            rows.iter()
+                .filter_map(|r| Uuid::parse_str(&r.id).ok())
+                .collect()
+        };
         let rows = repository
-            .get_latest_item_list(&filter, CollectionType::tvshows)
+            .get_latest_item_list(&filter(2), CollectionType::tvshows)
             .await
             .expect("latest tvshows");
-        let ids: Vec<Uuid> = rows
-            .iter()
-            .filter_map(|r| Uuid::parse_str(&r.id).ok())
-            .collect();
         // DateCreated DESC, then SortName DESC on the day-5 tie ("B e2" > "B e1").
-        assert_eq!(ids, vec![a_new, b_new, b_mid]);
+        assert_eq!(ids(rows), vec![a_new, b_new, b_mid]);
+
+        // No groups (`limit` 0) → `MIN` over nothing is NULL → `>= NULL` is
+        // never true → no rows. A "helpful" COALESCE on that threshold would
+        // turn "no groups" into "every row", and only a real statement against
+        // a real database catches it.
+        let none = repository
+            .get_latest_item_list(&filter(0), CollectionType::tvshows)
+            .await
+            .expect("latest tvshows, no groups");
+        assert!(none.is_empty(), "{:?}", ids(none));
     }
 
-    /// music groups by `Album`. The `limit` caps GROUPS: with `limit` 2 the
-    /// threshold is Album Y's maximum (day 6), so both of Album X's tracks (8,
-    /// 7) and Y's (6) come back while Album Z (day 4) is out. With `limit` 1
-    /// the threshold rises to X's own maximum and only the day-8 track
-    /// survives — the threshold is a row filter, not a group filter, exactly
-    /// as upstream's `DateCreated >= Min(MaxDateCreated)` behaves.
+    /// Seeds a `MusicAlbum` row the way the scanner writes one — the library it
+    /// belongs to in `TopParentId`, `IsFolder` set — plus one track under it, so
+    /// a test can tell "the newest albums" (what v12 answers) apart from
+    /// "the albums holding the newest tracks" (what 10.11.8 answered).
+    async fn seed_latest_album(
+        db: &Database,
+        id: Uuid,
+        name: &str,
+        top_parent: Option<Uuid>,
+        created: chrono::DateTime<Utc>,
+    ) {
+        let persistence =
+            crate::item_persistence_service::FerrofinItemPersistenceService::new(db.clone());
+        persistence
+            .save_items(&[BaseItemEntity {
+                id: guid_to_db(id),
+                type_: stored_type_name(BaseItemKind::MusicAlbum)
+                    .unwrap_or_default()
+                    .to_owned(),
+                name: Some(name.to_owned()),
+                sort_name: Some(name.to_owned()),
+                is_folder: true,
+                top_parent_id: top_parent.map(guid_to_db),
+                date_created: Some(created),
+                ..BaseItemEntity::default()
+            }])
+            .await
+            .expect("seed latest album");
+    }
+
+    /// The music library id the album tests scope to.
+    fn music_library() -> Uuid {
+        Uuid::from_u128(0xD2FF)
+    }
+
+    /// v12's music arm returns the newest ALBUMS, ordered `DateCreated DESC`,
+    /// and `limit` caps albums. The three albums here are seeded with tracks
+    /// whose dates run the OTHER way, which is exactly the case the 10.11.8
+    /// grouped-threshold query got right and v12 deliberately changed: the
+    /// answer follows the album rows, not the tracks.
+    #[rstest::rstest]
+    #[case(3, vec![0xD201, 0xD202, 0xD203])]
+    #[case(2, vec![0xD201, 0xD202])]
+    #[case(1, vec![0xD201])]
+    // `Take(0)` upstream — no albums, not "every album".
+    #[case(0, vec![])]
     #[tokio::test]
-    async fn latest_item_list_groups_by_album_for_music() {
+    async fn latest_item_list_returns_newest_albums_for_music(
+        #[case] limit: i32,
+        #[case] expected: Vec<u128>,
+    ) {
         let db = test_db().await;
         let repository = repo(&db);
-        let (x1, x2, y1, z1) = (
-            Uuid::from_u128(0xD201),
-            Uuid::from_u128(0xD202),
-            Uuid::from_u128(0xD203),
-            Uuid::from_u128(0xD204),
-        );
-        seed_latest_row(&db, x1, BaseItemKind::Audio, "X t1", "Album X", day(8)).await;
-        seed_latest_row(&db, x2, BaseItemKind::Audio, "X t2", "Album X", day(7)).await;
-        seed_latest_row(&db, y1, BaseItemKind::Audio, "Y t1", "Album Y", day(6)).await;
-        seed_latest_row(&db, z1, BaseItemKind::Audio, "Z t1", "Album Z", day(4)).await;
+        let library = music_library();
+        // Album X newest (day 8) … Album Z oldest (day 4).
+        for (id, name, created, track_day) in [
+            (0xD201_u128, "Album X", day(8), 4_u32),
+            (0xD202, "Album Y", day(6), 5),
+            (0xD203, "Album Z", day(4), 8),
+        ] {
+            seed_latest_album(&db, Uuid::from_u128(id), name, Some(library), created).await;
+            // A track whose own DateCreated contradicts its album's ordering.
+            seed_latest_row(
+                &db,
+                Uuid::from_u128(id + 0x1000),
+                BaseItemKind::Audio,
+                &format!("{name} t1"),
+                name,
+                day(track_day),
+            )
+            .await;
+        }
 
-        let filter = |limit: i32| InternalItemsQuery {
-            include_item_types: vec![BaseItemKind::Audio],
+        let filter = InternalItemsQuery {
+            include_item_types: vec![],
+            media_types: vec![ferrofin_model::data::MediaType::Audio],
+            is_folder: Some(false),
+            is_virtual_item: Some(false),
             limit: Some(limit),
+            top_parent_ids: vec![library],
             order_by: vec![(
                 ferrofin_model::live_tv::ItemSortBy::DateCreated,
                 ferrofin_model::dto::SortOrder::Descending,
             )],
             ..InternalItemsQuery::default()
         };
-        let ids = |rows: Vec<BaseItemEntity>| -> Vec<Uuid> {
-            rows.iter()
-                .filter_map(|r| Uuid::parse_str(&r.id).ok())
-                .collect()
-        };
-
-        let two = repository
-            .get_latest_item_list(&filter(2), CollectionType::music)
+        let rows = repository
+            .get_latest_item_list(&filter, CollectionType::music)
             .await
-            .expect("latest music, two groups");
-        assert_eq!(ids(two), vec![x1, x2, y1], "two newest albums, Z is out");
-
-        let one = repository
-            .get_latest_item_list(&filter(1), CollectionType::music)
-            .await
-            .expect("latest music, one group");
+            .expect("latest music albums");
+        let ids: Vec<Uuid> = rows
+            .iter()
+            .filter_map(|r| Uuid::parse_str(&r.id).ok())
+            .collect();
         assert_eq!(
-            ids(one),
-            vec![x1],
-            "the threshold is X's own max, so X's older track is below it"
+            ids,
+            expected
+                .into_iter()
+                .map(Uuid::from_u128)
+                .collect::<Vec<_>>(),
+            "the newest {limit} albums, in DateCreated order"
         );
+        assert!(
+            rows.iter()
+                .all(|r| r.type_.ends_with("MusicAlbum") && r.is_folder),
+            "the music arm returns album rows, not tracks"
+        );
+    }
 
-        // No groups (`limit` 0) → `MIN` over nothing is NULL → `>= NULL` is
-        // never true → no rows. A "helpful" COALESCE here would turn "no
-        // groups" into "every row".
-        let none = repository
-            .get_latest_item_list(&filter(0), CollectionType::music)
+    /// `Id DESC` is the tiebreaker on equal `DateCreated`
+    /// (`OrderByDescending(DateCreated).ThenByDescending(Id)`), and a virtual
+    /// album — an NFO-declared release with no files — never counts as new.
+    #[tokio::test]
+    async fn latest_music_albums_break_date_ties_by_id_and_skip_virtual_albums() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let library = music_library();
+        let (low, high) = (Uuid::from_u128(0xD211), Uuid::from_u128(0xD212));
+        seed_latest_album(&db, low, "Album low id", Some(library), day(5)).await;
+        seed_latest_album(&db, high, "Album high id", Some(library), day(5)).await;
+
+        // Same date, but virtual: excluded by `!album.IsVirtualItem`.
+        let virt = Uuid::from_u128(0xD213);
+        seed_latest_album(&db, virt, "Album virtual", Some(library), day(9)).await;
+        sqlx::query(r#"UPDATE "BaseItems" SET "IsVirtualItem" = 1 WHERE "Id" = ?1"#)
+            .bind(guid_to_db(virt))
+            .execute(db.writer())
             .await
-            .expect("latest music, no groups");
-        assert!(none.is_empty());
+            .expect("mark virtual");
+
+        // Same date again, but in another library: out of scope.
+        seed_latest_album(
+            &db,
+            Uuid::from_u128(0xD214),
+            "Album elsewhere",
+            Some(Uuid::from_u128(0xD2FE)),
+            day(9),
+        )
+        .await;
+
+        let rows = repository
+            .get_latest_item_list(
+                &InternalItemsQuery {
+                    limit: Some(10),
+                    top_parent_ids: vec![library],
+                    ..InternalItemsQuery::default()
+                },
+                CollectionType::music,
+            )
+            .await
+            .expect("latest music albums");
+        let ids: Vec<Uuid> = rows
+            .iter()
+            .filter_map(|r| Uuid::parse_str(&r.id).ok())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![high, low],
+            "the higher id wins the DateCreated tie"
+        );
+    }
+
+    /// A library with no albums answers empty rather than widening: the top
+    /// parent scope is a real predicate, not a hint.
+    #[tokio::test]
+    async fn latest_music_albums_are_empty_for_a_library_with_none() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        seed_latest_album(
+            &db,
+            Uuid::from_u128(0xD221),
+            "Album X",
+            Some(music_library()),
+            day(8),
+        )
+        .await;
+
+        let rows = repository
+            .get_latest_item_list(
+                &InternalItemsQuery {
+                    limit: Some(16),
+                    top_parent_ids: vec![Uuid::from_u128(0xD2FD)],
+                    ..InternalItemsQuery::default()
+                },
+                CollectionType::music,
+            )
+            .await
+            .expect("latest music albums");
+        assert!(rows.is_empty(), "another library's albums must not leak in");
+    }
+
+    /// The ancestor-scoped fallback (`Querying.cs:159-167`): with no top parent
+    /// ids the albums come from the `AncestorIds` parents of the rows the
+    /// caller's own query matches — so an artist-folder parent still answers
+    /// with albums.
+    #[tokio::test]
+    async fn latest_music_albums_fall_back_to_the_ancestor_closure() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let (album, other_album) = (Uuid::from_u128(0xD231), Uuid::from_u128(0xD232));
+        seed_latest_album(&db, album, "Album X", None, day(3)).await;
+        seed_latest_album(&db, other_album, "Album Y", None, day(9)).await;
+
+        // One track, under `album` only — `other_album` has no matching row and
+        // so must not come back despite its newer date.
+        let track = Uuid::from_u128(0xD233);
+        seed_latest_row(&db, track, BaseItemKind::Audio, "X t1", "Album X", day(1)).await;
+        sqlx::query(r#"INSERT INTO "AncestorIds" ("ItemId", "ParentItemId") VALUES (?1, ?2)"#)
+            .bind(guid_to_db(track))
+            .bind(guid_to_db(album))
+            .execute(db.writer())
+            .await
+            .expect("seed ancestor");
+
+        let rows = repository
+            .get_latest_item_list(
+                &InternalItemsQuery {
+                    limit: Some(16),
+                    ancestor_ids: vec![album],
+                    ..InternalItemsQuery::default()
+                },
+                CollectionType::music,
+            )
+            .await
+            .expect("latest music albums");
+        let ids: Vec<Uuid> = rows
+            .iter()
+            .filter_map(|r| Uuid::parse_str(&r.id).ok())
+            .collect();
+        assert_eq!(ids, vec![album], "only the album above a matching track");
     }
 
     #[tokio::test]

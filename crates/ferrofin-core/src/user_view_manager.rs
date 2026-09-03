@@ -844,9 +844,12 @@ impl FerrofinUserViewManager {
     }
 
     /// Port of `UserViewManager.GetItemsForLatestItems`: resolves the parents,
-    /// derives the type / media-type / played rules from them, and runs the
-    /// ONE query (plain, or the tvshows/music grouped-threshold form) that
-    /// feeds the grouping in [`get_latest_items`](UserViewManager::get_latest_items).
+    /// derives the type / media-type / played rules from them, and runs the ONE
+    /// query that feeds the grouping in
+    /// [`get_latest_items`](UserViewManager::get_latest_items) — the plain form,
+    /// or, for a grouped request whose first typed parent is a library of one of
+    /// the two short-circuited types, that type's own query (the
+    /// grouped-threshold statement for tvshows, the newest albums for music).
     async fn items_for_latest_items(
         &self,
         query: &LatestItemsQuery,
@@ -898,8 +901,38 @@ impl FerrofinUserViewManager {
         }
 
         if query.group_items {
-            // The first typed parent decides: a tvshows/music library takes the
-            // grouped-threshold query, with `limit` now capping GROUPS.
+            // The first typed parent decides (v12 `UserViewManager.cs:371-405`,
+            // `FirstOrDefault(type => type is not null)`): a tvshows or music
+            // library short-circuits into its own per-collection-type query,
+            // with `limit` now capping GROUPS (tvshows) or ALBUMS (music)
+            // rather than rows.
+            //
+            // Following that citation upward also reaches `Limit = limit * 2`
+            // (`:365`), which Ferrofin has NOT adopted — the plain path above
+            // still over-fetches 10.11.8's `limit * 5`
+            // ([`LATEST_OVER_FETCH_FACTOR`]). It cannot affect either
+            // short-circuit, both of which overwrite `limit` on the next line,
+            // so it is a live question only for the plain path: v12 returns
+            // fewer groups from a page of many small containers. Un-adopted,
+            // not decided.
+            //
+            // "First" is the parents' order, and with no `parentId` the parents
+            // are the user's whole view list — so on a server whose first view
+            // by `SortName` is a music library, the UNSCOPED `/Items/Latest`
+            // (the home row) is albums too, not just `ParentId=<music view>`.
+            // That is upstream's behaviour, not an artifact of this port.
+            //
+            // The movies and `null`-collection-type branches v12 added
+            // alongside them (`:394-404`) are deliberately NOT taken here, and
+            // that divergence is an owner decision to leave standing: the
+            // movies arm changes which movies a movies library answers with,
+            // and the `null` arm changes a MIXED library's answer for both
+            // movies and episodes. They are also not the same size of job —
+            // movies needs `GetLatestMovieItems` (`Querying.cs:233-256`) alone,
+            // while `null` (`:134-144`) needs that AND `GetLatestTvShowItems`
+            // (`:282+`), then their concat re-sorted `DateCreated DESC, Id
+            // DESC` and cut to `limit`. Either way the routing is one more arm
+            // on the match below.
             let collection_type = parents
                 .iter()
                 .filter(|p| p.is_collection_folder() || p.is_user_view())
@@ -1597,12 +1630,12 @@ mod tests {
             ],
         )
         .await;
-        // A music library lists Audio media only (the C# media-type switch),
-        // so the music video is reachable only through an explicit
-        // `includeItemTypes` — which also lifts the media-type rule and is how
-        // the "never groups" half of this test sees the row. The typed parent
-        // sends the request down the music grouped-threshold path.
-        let mgr = manager_with_folders(&db, vec![(MUSIC, Some(CollectionTypeOptions::music))]);
+        // No virtual-folder manager, so the parent has no collection type and
+        // the request takes the GENERIC path — the only one that still resolves
+        // index containers. A music-typed parent short-circuits into v12's
+        // album query instead (`latest_parent_music_library_returns_newest_albums`),
+        // which returns album rows and never groups anything.
+        let mgr = manager(&db);
 
         let groups = latest(
             &mgr,
@@ -1621,23 +1654,93 @@ mod tests {
                 (None, vec![mv]),
             ]
         );
+    }
 
-        // Without the explicit kinds the library's media type (Audio) applies
-        // and the music video is simply not "latest music". The grouped
-        // threshold also bites: the per-`Album` maxima are day 9 ("Loose")
-        // and day 8 ("Album"), so the day-7 track is below the smallest of
-        // them and the album collapses to its one newer track.
-        let groups = latest(
+    /// v12's music branch (`UserViewManager.cs:388-392` →
+    /// `BaseItemRepository.Querying.cs:147-180`): a music library answers with
+    /// the newest ALBUMS, ordered by the albums' own `DateCreated`, and `limit`
+    /// caps albums. The tracks' dates run the other way here, which is exactly
+    /// the answer 10.11.8 gave and v12 changed: nothing about a track can put
+    /// its album on the list, or keep it off.
+    ///
+    /// `GroupItems = false` still takes the generic path, where the library's
+    /// media type (`music` → `Audio`) applies and the music video is not
+    /// "latest music".
+    #[tokio::test]
+    async fn latest_parent_music_library_returns_newest_albums() {
+        let db = test_db().await;
+        seed_named_item(&db, MUSIC, BaseItemKind::CollectionFolder, "Music").await;
+        let (old_album, new_album) = (Uuid::from_u128(0x751), Uuid::from_u128(0x752));
+        let (t_new, t_old, mv) = (
+            Uuid::from_u128(0x761),
+            Uuid::from_u128(0x762),
+            Uuid::from_u128(0x763),
+        );
+        seed(
+            &db,
+            &[
+                Row::new(old_album, BaseItemKind::MusicAlbum, "Older", day(3), MUSIC),
+                Row::new(new_album, BaseItemKind::MusicAlbum, "Newer", day(6), MUSIC),
+                // The newest TRACK sits in the OLDEST album.
+                Row::new(t_new, BaseItemKind::Audio, "T new", day(9), MUSIC)
+                    .under(old_album)
+                    .on_album("Older"),
+                Row::new(t_old, BaseItemKind::Audio, "T old", day(1), MUSIC)
+                    .under(new_album)
+                    .on_album("Newer"),
+                Row::new(mv, BaseItemKind::MusicVideo, "MV", day(8), MUSIC).under(new_album),
+            ],
+        )
+        .await;
+        let mgr = manager_with_folders(&db, vec![(MUSIC, Some(CollectionTypeOptions::music))]);
+
+        let albums = latest(
             &mgr,
             LatestItemsQuery {
+                parent_id: Some(MUSIC),
                 limit: Some(20),
                 ..LatestItemsQuery::default()
             },
         )
         .await;
         assert_eq!(
-            shape(&groups),
-            vec![(None, vec![flat]), (Some(album), vec![t1])]
+            shape(&albums),
+            vec![(None, vec![new_album]), (None, vec![old_album])],
+            "the newest albums, ungrouped — an album has no index container"
+        );
+
+        // A limit of 1 yields one album. This is a smoke test, not the pin for
+        // "the SQL limit caps ALBUMS and is the caller's, un-over-fetched":
+        // `get_latest_items` breaks at `list.len() >= limit` regardless, so it
+        // would pass on a broken SQL limit too. The real pin is
+        // `item_repository::tests::latest_item_list_returns_newest_albums_for_music`,
+        // which reads the rows straight off the repository.
+        let one = latest(
+            &mgr,
+            LatestItemsQuery {
+                parent_id: Some(MUSIC),
+                limit: Some(1),
+                ..LatestItemsQuery::default()
+            },
+        )
+        .await;
+        assert_eq!(shape(&one), vec![(None, vec![new_album])]);
+
+        // Ungrouped, the generic path answers with the library's media type.
+        let tracks = latest(
+            &mgr,
+            LatestItemsQuery {
+                parent_id: Some(MUSIC),
+                group_items: false,
+                limit: Some(20),
+                ..LatestItemsQuery::default()
+            },
+        )
+        .await;
+        assert_eq!(
+            shape(&tracks),
+            vec![(None, vec![t_new]), (None, vec![t_old])],
+            "Audio only — the music video is not latest music"
         );
     }
 
@@ -1678,6 +1781,71 @@ mod tests {
         )
         .await;
         assert_eq!(shape(&groups), vec![(Some(album), vec![t1, t2])]);
+    }
+
+    /// The music branch fires on the parents' collection type and nothing else,
+    /// so a request scoped to a NON-music parent keeps the generic path even on
+    /// a server that does have a music library — and a stray `MusicAlbum` row
+    /// sitting in a movies library is a folder, which the generic query filters
+    /// out. The other half: a music library with no albums answers empty rather
+    /// than widening its top-parent scope.
+    #[tokio::test]
+    async fn latest_music_branch_needs_a_music_parent() {
+        let db = test_db().await;
+        seed_named_item(&db, MOVIES, BaseItemKind::CollectionFolder, "Movies").await;
+        seed_named_item(&db, MUSIC, BaseItemKind::CollectionFolder, "Music").await;
+        let (movie, stray_album) = (Uuid::from_u128(0x771), Uuid::from_u128(0x772));
+        seed(
+            &db,
+            &[
+                Row::new(movie, BaseItemKind::Movie, "Film", day(2), MOVIES),
+                Row::new(
+                    stray_album,
+                    BaseItemKind::MusicAlbum,
+                    "Stray",
+                    day(9),
+                    MOVIES,
+                ),
+            ],
+        )
+        .await;
+        let mgr = manager_with_folders(
+            &db,
+            vec![
+                (MOVIES, Some(CollectionTypeOptions::movies)),
+                (MUSIC, Some(CollectionTypeOptions::music)),
+            ],
+        );
+
+        let movies = latest(
+            &mgr,
+            LatestItemsQuery {
+                parent_id: Some(MOVIES),
+                limit: Some(20),
+                ..LatestItemsQuery::default()
+            },
+        )
+        .await;
+        assert_eq!(
+            shape(&movies),
+            vec![(None, vec![movie])],
+            "a movies parent still takes the generic path, folders excluded"
+        );
+
+        let empty = latest(
+            &mgr,
+            LatestItemsQuery {
+                parent_id: Some(MUSIC),
+                limit: Some(20),
+                ..LatestItemsQuery::default()
+            },
+        )
+        .await;
+        assert!(
+            empty.is_empty(),
+            "a music library with no albums answers empty: {empty:?}",
+            empty = shape(&empty)
+        );
     }
 
     /// `isPlayed` is a SQL predicate (it needs the user), not a post-filter
@@ -1729,12 +1897,18 @@ mod tests {
         // explicit parent only, as upstream).
         assert_eq!(shape(&unplayed), vec![(None, vec![fresh])]);
 
+        // `GroupItems = false` keeps a music parent on the generic path, which
+        // is where `isPlayed` would still be a predicate — and it is not:
+        // `latest_parents` cleared it on the explicit music parent, so the
+        // played track comes back. (With grouping on, v12's album query never
+        // reads a track's played state at all.)
         let music = latest(
             &mgr,
             LatestItemsQuery {
                 user: Some(user),
                 parent_id: Some(MUSIC),
                 is_played: Some(false),
+                group_items: false,
                 limit: Some(20),
                 ..LatestItemsQuery::default()
             },
