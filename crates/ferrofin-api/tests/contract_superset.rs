@@ -184,8 +184,8 @@ fn real_routes_have_no_duplicates() {
     );
 }
 
-/// `EXTENSION_ROUTES` (the core-vs-extension ownership manifest the benchmark
-/// suite reads) must be a duplicate-free set. Membership in `REAL_ROUTES` is
+/// `EXTENSION_ROUTES` (the core-vs-extension ownership manifest) must be a
+/// duplicate-free set. Membership in `REAL_ROUTES` is
 /// already a compile-time assertion next to the const; this guards the one
 /// property a `const fn` can't cheaply express.
 #[test]
@@ -202,5 +202,149 @@ fn extension_routes_have_no_duplicates() {
     assert!(
         dups.is_empty(),
         "EXTENSION_ROUTES contains duplicate (method, path) rows: {dups:?}"
+    );
+}
+
+/// The per-row well-formedness rules of a `VERIFIED` entry (everything except
+/// its membership in the route table). Empty = well-formed.
+fn row_problems(v: &ferrofin_api::handlers::Verified) -> Vec<String> {
+    let mut out = Vec::new();
+    let is_cs = std::path::Path::new(v.upstream_file)
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("cs"));
+    if !is_cs || v.upstream_file.contains(char::is_whitespace) {
+        out.push(format!(
+            "upstream_file must be a repo-relative `.cs` path, got {:?}",
+            v.upstream_file
+        ));
+    }
+    if v.upstream_method.is_empty() || v.upstream_method.contains(char::is_whitespace) {
+        out.push(format!(
+            "upstream_method must be one method name, got {:?}",
+            v.upstream_method
+        ));
+    }
+    if v.divergences.iter().any(|d| d.trim().is_empty()) {
+        out.push("empty divergence string".to_string());
+    }
+    let d = v.date.as_bytes();
+    let digits =
+        |r: std::ops::Range<usize>| d.get(r).is_some_and(|b| b.iter().all(u8::is_ascii_digit));
+    if d.len() != 10
+        || d[4] != b'-'
+        || d[7] != b'-'
+        || !digits(0..4)
+        || !digits(5..7)
+        || !digits(8..10)
+    {
+        out.push(format!("date must be YYYY-MM-DD, got {:?}", v.date));
+    }
+    if v.ferrofin.is_empty() {
+        out.push("ferrofin code path is empty".to_string());
+    }
+    out
+}
+
+/// **The API-parity record** (`handlers::VERIFIED`) is well-formed, and this
+/// test prints the parity section the README publishes:
+/// `N / <ops> operations deep-verified (K with recorded divergences)` plus the
+/// per-controller table (`--nocapture`). Every row must be a `REAL_ROUTES`
+/// operation (so a verified op is a served op), name the C# file and method it
+/// was compared against (the tag and commit are pinned once, as consts), and
+/// carry a `YYYY-MM-DD` date.
+/// The count moves only when a row is written; a suite rewrite cannot touch it.
+#[test]
+fn verified_rows_are_real_operations_and_print_the_parity_line() {
+    use std::collections::BTreeMap;
+
+    use ferrofin_api::handlers::{
+        EXTENSION_ROUTES, REAL_ROUTES, UPSTREAM_COMMIT, UPSTREAM_TAG, VERIFIED,
+    };
+
+    assert!(
+        UPSTREAM_TAG.starts_with('v'),
+        "UPSTREAM_TAG is a jellyfin release tag"
+    );
+    assert!(
+        UPSTREAM_COMMIT.len() >= 7 && UPSTREAM_COMMIT.chars().all(|c| c.is_ascii_hexdigit()),
+        "UPSTREAM_COMMIT must be a hex commit id"
+    );
+
+    let real: BTreeSet<(&str, &str)> = REAL_ROUTES.iter().copied().collect();
+    let mut seen = BTreeSet::new();
+    let mut problems = Vec::new();
+    for v in VERIFIED {
+        let key = (v.method, v.path);
+        if !seen.insert(key) {
+            problems.push(format!("{key:?}: duplicate row"));
+        }
+        if !real.contains(&key) {
+            problems.push(format!("{key:?}: not a REAL_ROUTES operation"));
+        }
+        problems.extend(row_problems(v).into_iter().map(|p| format!("{key:?}: {p}")));
+    }
+    assert!(
+        problems.is_empty(),
+        "VERIFIED rows are malformed:\n{}",
+        problems.join("\n")
+    );
+
+    // Per-controller table: controller = the operation's first OpenAPI tag.
+    let raw = include_str!("data/jellyfin-openapi-10.11.8.json");
+    let spec: serde_json::Value = serde_json::from_str(raw).expect("spec is valid JSON");
+    let mut per: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+    let verified: BTreeSet<(String, String)> = VERIFIED
+        .iter()
+        .map(|v| (v.method.to_string(), v.path.to_string()))
+        .collect();
+    let extension: BTreeSet<(&str, &str)> =
+        EXTENSION_ROUTES.iter().map(|(m, p, _)| (*m, *p)).collect();
+    let mut total = 0;
+    for (method, path) in spec_routes() {
+        let tag = spec["paths"][&path][&method]["tags"][0]
+            .as_str()
+            .unwrap_or("(untagged)")
+            .to_string();
+        let norm = normalize_contract_path(&path);
+        let e = per.entry(tag).or_insert((0, 0));
+        e.1 += 1;
+        total += 1;
+        if verified.contains(&(method.clone(), norm)) {
+            e.0 += 1;
+        }
+    }
+    assert_eq!(
+        per.values().map(|(v, _)| *v).sum::<usize>(),
+        VERIFIED.len(),
+        "every VERIFIED row must map to exactly one contract operation"
+    );
+    let with_div = VERIFIED
+        .iter()
+        .filter(|v| !v.divergences.is_empty())
+        .count();
+    let ext_verified = VERIFIED
+        .iter()
+        .filter(|v| extension.contains(&(v.method, v.path)))
+        .count();
+    println!(
+        "\n{} / {total} operations deep-verified against Jellyfin {UPSTREAM_TAG} ({UPSTREAM_COMMIT}) — {with_div} with recorded divergences; {ext_verified} owned by compiled-in extensions\n",
+        VERIFIED.len()
+    );
+    println!("| controller | verified / operations |\n|---|---|");
+    for (tag, (v, n)) in &per {
+        println!("| {tag} | {v} / {n} |");
+    }
+    for v in VERIFIED.iter().filter(|v| !v.divergences.is_empty()) {
+        println!(
+            "- {} {} — {}",
+            v.method.to_uppercase(),
+            v.path,
+            v.divergences.join("; ")
+        );
+    }
+    assert_eq!(
+        total,
+        VENDORED_ROUTES.len(),
+        "spec_routes and VENDORED_ROUTES disagree"
     );
 }

@@ -1,0 +1,6 @@
+# built test data (regenerate with build.sh)
+media/
+config/
+cache/
+ids.json
+__pycache__/
