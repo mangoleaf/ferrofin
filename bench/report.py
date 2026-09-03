@@ -178,10 +178,12 @@ class Cell:
         return not any(p.visibly_unstable() for p in self.parts())
 
     def visibly_unstable(self):
-        """Failed the spread rule *and* the runs disagree at the precision printed.
-        A 1 ms median that came out `1 ms` on every run is reproducible as published,
-        however wide the ratio between 0.6 and 1.4 looks; marking it `~` would be a
-        marker with nothing behind it, and at this scale that is most of them."""
+        """Failed the spread rule *and* the runs disagree at the precision printed —
+        a number that came out identical on every run as published is reproducible as
+        published, whatever the underlying ratio, and marking it would be a marker
+        with nothing behind it. The second clause suppresses nothing at three
+        significant figures (it did when everything printed as whole milliseconds);
+        it is the guard that keeps the marker honest if a formatter ever coarsens."""
         return not self.spread_ok() and self.fmt(min(self.vals)) != self.fmt(max(self.vals))
 
     def marked(self, with_range=False):
@@ -205,8 +207,28 @@ class Cell:
         return "; ".join(out)
 
 
-ms = lambda v: f"{v:.0f} ms"
-mib = lambda v: f"{v:.0f} MiB"
+def sig3(v):
+    """Three significant figures without an exponent: `0.71`, `5.31`, `19.3`, `171`,
+    `2960`. Fixed decimals cannot serve both ends of this report — most endpoint
+    numbers are under 10 ms and a good many under 1 ms, where printing `0` or `1`
+    lost the value and suppressed its speedup outright; while cold start is ~2,800 ms
+    and moves by tens between runs, where two decimals would be precision the
+    measurement does not have."""
+    if abs(v) >= 100:
+        return f"{v:.0f}"
+    if abs(v) >= 10:
+        return f"{v:.1f}"
+    return f"{v:.2f}"
+
+
+ms = lambda v: f"{sig3(v)} ms"
+mib = lambda v: f"{sig3(v)} MiB"
+#: A screen is timed with `Date.now()` in screens.js, so its *samples* are whole
+#: milliseconds. k6 interpolates its Trend percentiles, so the run files do hold
+#: fractional screen values — but that fraction comes from interpolating between
+#: 1 ms-quantised samples, not from measuring finer, so printing it would dress up
+#: the instrument's granularity. Screens need `performance.now()` and a re-run to
+#: earn decimals; until then they stay whole.
 n0 = lambda v: f"{v:.0f}"
 
 
@@ -241,11 +263,12 @@ class Notes:
         return bool(self.index)
 
 
-def latency_cell(per_run, flag):
-    """per_run: k6 summary entries (or None) for one screen/endpoint across runs."""
-    return Cell([x["p50"] if x else None for x in per_run], n0, flag, {
-        "p95": Cell([x["p95"] if x else None for x in per_run], n0),
-        "p99": Cell([x["p99"] if x else None for x in per_run], n0),
+def latency_cell(per_run, flag, fmt=sig3):
+    """per_run: k6 summary entries (or None) for one screen/endpoint across runs.
+    `fmt` is `n0` for screens, whose source data is whole milliseconds."""
+    return Cell([x["p50"] if x else None for x in per_run], fmt, flag, {
+        "p95": Cell([x["p95"] if x else None for x in per_run], fmt),
+        "p99": Cell([x["p99"] if x else None for x in per_run], fmt),
         "err": max(((1 - x["ok"]) * 100 for x in per_run if x and x.get("ok") is not None), default=0.0),
     })
 
@@ -258,7 +281,7 @@ def md_cell(c, notes, source=None, oracle_cell=None):
         return "—"
     txt = c.marked(with_range=True)
     if "p95" in c.sub:
-        txt += f" ({c.sub['err']:.1f}%)"
+        txt += f" ({c.sub['err']:.2f}%)"
     gain = speedup(c, oracle_cell)
     if gain:
         txt += f" — {gain}"
@@ -300,7 +323,7 @@ def build(runs):
         # a screen row is judged on its API requests; poster fetches ('image') show up in the
         # image endpoint row and in err%, and the list endpoints' ImageTags superset check
         # already proves the same posters exist on every server
-        screens = [(scr, {k: latency_cell([x["screens"].get(scr) if x else None for x in data[k]], flag(k, sorted(names_of[scr])))
+        screens = [(scr, {k: latency_cell([x["screens"].get(scr) if x else None for x in data[k]], flag(k, sorted(names_of[scr])), n0)
                           for k, _ in servers}) for scr in SCREENS]
         names = [n for scr in SCREENS for n in sorted(names_of[scr])] + (["image"] if "image" in names_of else [])
         endpoints = [(n, {k: latency_cell([x["endpoints"].get(n) if x else None for x in data[k]], flag(k, [n]))
@@ -677,7 +700,7 @@ def render_html(m, base=None, picker=""):
         stats = ""
         for k, lbl in servers:
             c = cells[k]
-            val = f"{c.median:.0f}" if c.median is not None else "—"
+            val = sig3(c.median) if c.median is not None else "—"
             unit = c.unit
             extra = ratio_html(c, cells.get(ORACLE) if k != ORACLE else None) + delta_html(c, (base_ttfs.get(name) or base_mem.get(name) or {}).get(k))
             why = ""
@@ -685,7 +708,7 @@ def render_html(m, base=None, picker=""):
                 n = notes.add(c.flag, f"{lbl} · {name} (headline)")
                 extra += f"<sup class='fn'><a href='#n{n}'>{n}</a></sup>"
             if len(c.vals) > 1:
-                rng = f"{min(c.vals):.0f}–{max(c.vals):.0f} over {len(c.vals)} runs"
+                rng = f"{sig3(min(c.vals))}–{sig3(max(c.vals))} over {len(c.vals)} runs"
                 if c.spread_ok():
                     why = f"<div class='tail' style='font-size:12px'>{rng}</div>"
                 else:
