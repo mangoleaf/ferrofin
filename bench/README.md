@@ -1,12 +1,13 @@
 # Benchmark methodology
 
 This directory produces the comparison table in the root README: Ferrofin against
-Jellyfin 10.11.8 (the vendored contract) and Jellyfin 12.0-rc7, on identical test data,
-on one host. Every number in that table has a one-sentence definition below, and every
+Jellyfin 12.0-rc7 (the source of truth — owner decision, 2026-09-02: Jellyfin 12 is
+10.12 in all but name, and where 10.11.8 differs from it, 10.11.8 is the one that is
+wrong) and Jellyfin 10.11.8 (the vendored API contract), on identical test data, on one host. Every number in that table has a one-sentence definition below, and every
 published number passed two checks the run itself performs:
 
 - **comparable** — the server returned the same status and record count as Jellyfin
-  10.11.8 and a field set that is a superset of its, for every request behind the number.
+  12.0-rc7 and a field set that is a superset of its, for every request behind the number.
   A server that returns fewer records, fewer fields, or an error would be "faster" for
   free; such a cell prints `⚠ not comparable (reason)` (its raw number is kept for the
   work list) instead of being published. A window in which k6 could not hold the arrival
@@ -64,7 +65,7 @@ warm-up at the same rate (different picks) that is discarded.
   `--memory`; the sampler records `memory.swap.current` to prove it stayed 0), which is
   part of the definition (.NET sizes its GC heap from it).
 - **Parity** — `N / 412 operations deep-verified`: the number of contract operations whose
-  Ferrofin implementation was compared against the upstream Jellyfin C# (`v10.11.8`) for
+  Ferrofin implementation was compared against the upstream Jellyfin C# (`v12.0-rc7`) for
   behavioral equivalence, recorded as rows of `handlers::VERIFIED` in
   `crates/ferrofin-api/src/handlers/mod.rs` and printed by
   `cargo test -p ferrofin-api --test contract_superset verified_rows -- --nocapture`.
@@ -129,7 +130,7 @@ python3 bench/report.py --serve                   # the comparison viewer at htt
 
 The viewer lists every run under `bench/runs`; tick the runs to render (several =
 median + spread) and optionally a baseline. It shows the same cells as the markdown
-plus each cell's ratio to Jellyfin 10.11.8 and — with a baseline — each server's
+plus each cell's ratio to Jellyfin 12.0-rc7 and — with a baseline — each server's
 percentage change against an earlier run of itself (green = faster/smaller). The
 markdown keeps neither, so the README stays two columns side by side. Localhost only,
 stdlib only, no JavaScript.

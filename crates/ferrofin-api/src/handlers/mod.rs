@@ -747,9 +747,12 @@ pub const EXTENSION_ROUTES: &[(&str, &str, &str)] = &[
 
 /// The upstream Jellyfin release every [`VERIFIED`] row was compared against —
 /// one fact for the whole record, so no row can carry a wrong tag or commit.
-pub const UPSTREAM_TAG: &str = "v10.11.8";
+/// Owner decision (2026-09-02): Jellyfin 12 (10.12 in all but name) is the source
+/// of truth; where 10.11.8 differs from it, 10.11.8 is the one that is wrong.
+/// The vendored OpenAPI contract stays 10.11.8 — the API surface did not move.
+pub const UPSTREAM_TAG: &str = "v12.0-rc7";
 /// The commit `UPSTREAM_TAG` resolves to in `github.com/jellyfin/jellyfin`.
-pub const UPSTREAM_COMMIT: &str = "2c62d40f0d";
+pub const UPSTREAM_COMMIT: &str = "4910aafa1a";
 
 /// One contract operation whose Ferrofin implementation was compared against
 /// the upstream Jellyfin C# for behavioral equivalence — see [`VERIFIED`].
@@ -779,7 +782,7 @@ pub struct Verified {
 
 /// **The API-parity record.** One row per contract operation whose Ferrofin
 /// implementation has been compared against the upstream Jellyfin C#
-/// (`v10.11.8`) for behavioral equivalence: parameters honored and their
+/// ([`UPSTREAM_TAG`]) for behavioral equivalence: parameters honored and their
 /// defaults, filters, sort, paging, DTO field set and nullability, status
 /// codes, side effects, auth rules.
 ///

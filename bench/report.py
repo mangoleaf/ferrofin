@@ -8,7 +8,7 @@
 One run dir: the numbers of that run. Several: each cell is `median (min–max)` across
 runs, and a cell whose spread exceeds SPREAD_MAX of its median prints "not reproducible".
 Two rules are applied per cell, both from files the run itself wrote:
-  comparable   — same status + record count as the oracle (Jellyfin 10.11.8) and a field
+  comparable   — same status + record count as the oracle (Jellyfin 12.0-rc7) and a field
                  set ⊇ the oracle's, for every request name behind the cell (shape.log);
   reproducible — spread within SPREAD_MAX across runs.
 Flagged cells keep their raw number (the work list) but are not publishable.
@@ -30,8 +30,9 @@ from collections import defaultdict
 
 SPREAD_MAX = 0.15
 DELTA_NOISE_PCT = 2  # a baseline change smaller than this is not coloured
-ORACLE = "jellyfin"
-SERVERS = [("jellyfin", "Jellyfin 10.11.8"), ("jellyfin12", "Jellyfin 12.0-rc7"), ("ferrofin", "Ferrofin")]
+ORACLE = "jellyfin12"  # the source of truth (owner, 2026-09-02): Jellyfin 12 is the newer code
+ORACLE_LABEL = "Jellyfin 12.0-rc7"
+SERVERS = [("jellyfin12", "Jellyfin 12.0-rc7"), ("jellyfin", "Jellyfin 10.11.8"), ("ferrofin", "Ferrofin")]
 SCREENS = ["home", "movies", "detail", "series", "search", "playback"]
 MIB = 2 ** 20
 TRANSCODE_NOISE = ("playsessionid", "apikey", "deviceid", "tag=", "api_key", "transcodereasons")
@@ -73,14 +74,14 @@ def oracle_failed(shape_oracle, names):
     for n in names:
         o = shape_oracle.get(n)
         if o and any(st >= 400 for st in o["status"]):
-            return f"Jellyfin failed {n} ({sorted(o['status'])})"
+            return f"{ORACLE_LABEL} failed {n} ({sorted(o['status'])})"
     return None
 
 
 def comparable(shape_srv, shape_oracle, names):
     """None if comparable, else the reason."""
     if shape_oracle is None:
-        return "no oracle run (Jellyfin 10.11.8 not in this run)"
+        return f"no oracle run ({ORACLE_LABEL} not in this run)"
     if shape_srv is None:
         return "no shape pass"
     for n in names:
@@ -88,7 +89,7 @@ def comparable(shape_srv, shape_oracle, names):
         if o is None or s is None:
             return f"{n}: missing"
         if any(st >= 400 for st in o["status"]):
-            return f"{n}: Jellyfin failed ({sorted(o['status'])})"
+            return f"{n}: {ORACLE_LABEL} failed ({sorted(o['status'])})"
         if s["status"] != o["status"]:
             return f"{n}: status {sorted(s['status'])} vs {sorted(o['status'])}"
         if s["count"] != o["count"]:
@@ -282,7 +283,7 @@ def build(runs):
         items = []
         for n in sorted(oracle_shape):
             r = comparable(shapes[k][0], oracle_shape, [n])
-            if r and "Jellyfin failed" not in r:  # the oracle's own failures are not this server's work
+            if r and " failed (" not in r:  # the oracle's own failures are not this server's work
                 items.append(r)
         if counts[k][0] and counts[ORACLE][0] and counts[k][0] != counts[ORACLE][0]:
             for n in counts[ORACLE][0]:
@@ -307,7 +308,7 @@ def render_md(m):
     p(f"Host {meta.get('cpu', '?')} · server on cpus {meta.get('server_cpus', '?')} · {meta.get('memory_limit', '?')} limit · "
       f"test data {meta.get('testdata_counts', {})} · windows {meta.get('window_s', '?')} s · "
       f"unloaded {meta.get('rate_unloaded', '?')} screens/s · loaded {meta.get('rate_loaded', '?')} screens/s")
-    p("Cells: median (min–max) across runs. `⚠ not comparable` = the server did different work than Jellyfin 10.11.8 "
+    p(f"Cells: median (min–max) across runs. `⚠ not comparable` = the server did different work than {ORACLE_LABEL} "
       "(status / record count / missing fields) — its raw number is shown for the work list but is not publishable; "
       "`not reproducible` = spread > 15 % of the median.\n")
     head = "| {} | " + " | ".join(f"{label} p50 / p95 / p99 (err)" for _, label in servers) + " |\n|" + "---|" * (len(servers) + 1)
@@ -330,14 +331,14 @@ def render_md(m):
     for name, cells in m["memory"]:
         p(f"| {name} | " + " | ".join(flagged(cells[k].text(), cells[k].flag) for k, _ in servers) + " |")
     if m["work"]:
-        p("\n### Response shape vs Jellyfin 10.11.8 (supporting evidence, not the parity number)\n")
+        p(f"\n### Response shape vs {ORACLE_LABEL} (supporting evidence, not the parity number)\n")
         for k, items in m["work"].items():
             p(f"**{k}**: {len(items)} divergence(s) across {m['work_total']} compared requests")
             for it in items:
                 p(f"- {it}")
             p("")
     if m["oracle_failures"]:
-        p("**Jellyfin 10.11.8 failed**: " + ", ".join(m["oracle_failures"]) + "\n")
+        p(f"**{ORACLE_LABEL} failed**: " + ", ".join(m["oracle_failures"]) + "\n")
     if m["missing"]:
         p("### Missing phases\n")
         for x in sorted(set(m["missing"])):
@@ -390,7 +391,7 @@ def ratio_html(c, oracle_cell):
     """Ratio to the oracle's number — only when both numbers stand (neither flagged, not a context row)."""
     if c.context or c.flag or oracle_cell is None or oracle_cell.flag or not c.median or not oracle_cell.median:
         return ""
-    return f"<span class='ratio' title='ratio to Jellyfin 10.11.8'>×{c.median / oracle_cell.median:.2f}</span>"
+    return f"<span class='ratio' title='ratio to {ORACLE_LABEL}'>×{c.median / oracle_cell.median:.2f}</span>"
 
 
 def delta_html(c, base):
@@ -442,8 +443,8 @@ def render_html(m, base=None, picker=""):
              f"<title>{e(title)}</title><style>{CSS}</style></head><body><main>{picker}",
              f"<h1>Ferrofin vs Jellyfin — {len(m['runs'])} run{'s' if len(m['runs']) != 1 else ''}, commit {e(meta.get('sha', '?'))}</h1>",
              "<p class='lede'>Every number is a median across the runs given (min–max shown when there are several). Amber cells are <em>not comparable</em>: "
-             "the server did different work than Jellyfin 10.11.8 — the number stays for the work list, not for the README. "
-             "×n is the ratio to Jellyfin 10.11.8; a coloured % is the change against the baseline run.</p>",
+             f"the server did different work than {ORACLE_LABEL} — the number stays for the work list, not for the README. "
+             f"×n is the ratio to {ORACLE_LABEL}; a coloured % is the change against the baseline run.</p>",
              f"<p class='meta'>{e(meta.get('date', '')[:16].replace('T', ' '))} UTC · {e(meta.get('cpu', '?'))} · server cores {e(str(meta.get('server_cpus', '?')))} · "
              f"{e(str(meta.get('memory_limit', '?')))} limit, no swap · test data {e(str(tc.get('movies', '?')))} movies / {e(str(tc.get('series', '?')))} series / {e(str(tc.get('episodes', '?')))} episodes · "
              f"windows {e(str(meta.get('window_s', '?')))} s · runs: {e(', '.join(os.path.basename(r.rstrip('/')) for r in m['runs']))}"
@@ -475,12 +476,12 @@ def render_html(m, base=None, picker=""):
     parts.append("<h2>Time to first screen</h2>" + table_html("", m["ttfs"], servers, base_ttfs))
     parts.append(f"<h2>Memory — anon, cache excluded, {e(str(m['sample_ms']))} ms samples</h2>" + table_html("", m["memory"], servers, base_mem))
     if m["work"]:
-        parts.append("<h2>The work list — divergences from Jellyfin 10.11.8</h2><p class='lede'>From the shape pass (status, record count, field set) and the item counts. Each is a server fix or a recorded, accepted divergence.</p>")
+        parts.append(f"<h2>The work list — divergences from {ORACLE_LABEL}</h2><p class='lede'>From the shape pass (status, record count, field set) and the item counts. Each is a server fix or a recorded, accepted divergence.</p>")
         for k, items in m["work"].items():
             lis = "".join(f"<li>{e(it)}</li>" for it in items)
             parts.append(f"<div class='work'><h3>{e(dict(servers)[k])} <span class='n'>{len(items)} divergence(s) across {m['work_total']} compared requests</span></h3><ul>{lis}</ul></div>")
     if m["oracle_failures"]:
-        parts.append("<p class='lede'><b>Jellyfin 10.11.8 failed</b>: " + e(", ".join(m["oracle_failures"])) + "</p>")
+        parts.append(f"<p class='lede'><b>{ORACLE_LABEL} failed</b>: " + e(", ".join(m["oracle_failures"])) + "</p>")
     if m["missing"]:
         parts.append("<h2>Missing phases</h2><ul>" + "".join(f"<li>{e(x)}</li>" for x in sorted(set(m["missing"]))) + "</ul>")
     parts.append("<p class='meta'>Methodology: bench/README.md · the raw file behind every cell lives in the run dir.</p></main></body></html>")
