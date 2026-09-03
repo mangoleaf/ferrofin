@@ -1,4 +1,4 @@
-//! `/Shows/NextUp` — the series-keys aggregate's join order, pinned.
+//! `/Shows/NextUp` — the series-keys aggregate's plan, pinned.
 //!
 //! This lives in `tests/` rather than beside the code because the SQL-boundary
 //! ratchet (`crates/ferrofin-db/tests/sql_boundary.rs`) counts `sqlx::query`
@@ -24,36 +24,50 @@ async fn plan(db: &Database, sql: &str, binds: usize) -> Vec<String> {
         .collect()
 }
 
-/// The aggregate must seed from `UserData`, never from `BaseItems`.
+/// The aggregate is driven from `BaseItems` through a `Type = ?` index and
+/// reaches `UserData` by `(UserId, ItemId)` on its covering index, with no
+/// join-order pin and no table scan.
 ///
-/// Left to itself SQLite drives this from
-/// `(Type, SeriesPresentationUniqueKey)` and then seeks `UserData` once per
-/// episode **in the library** — 1,997 seeks on the bench fixture, for a user
-/// with a single `UserData` row. Seeded from `UserData (UserId = ?)` the work
-/// scales with what the user has actually watched.
-///
-/// That one statement was 0.92 ms of the endpoint's 2.33 ms CPU per request,
-/// which is what pushed `/Shows/NextUp` past its 4-core budget at the
-/// benchmark's calibrated 1849 rps and collapsed p50 to 1.5-2 s.
+/// The planner takes the `(Type, SeriesPresentationUniqueKey, …)` index — its
+/// order serves the `GROUP BY` — and walks the episodes of the libraries in
+/// scope once, seeking the user's row for each: 6 ms for 7,490 episodes on
+/// the adopted bench database, 40 keys out. The `CROSS JOIN` this statement
+/// used to carry seeded from `UserData (UserId = ?)` instead and iterated the
+/// `TopParentId IN (…)` list once per `UserData` row — fine for one row
+/// against three parents, 5,044 × 1,975 ≈ 10 M probes and 1.4 s once the
+/// scope was every folder in the library and the user had a history. With the
+/// scope fixed to the library folders both orders are single-digit
+/// milliseconds; the v12 shape is kept because it is v12's, and this test
+/// pins that no pin crept back.
 #[tokio::test]
-async fn series_keys_seed_from_user_data_not_the_library() {
+async fn series_keys_are_index_driven_with_no_join_pin() {
     let db = Database::connect_in_memory().await.expect("connect");
     db.run_migrations().await.expect("migrations");
 
-    // Three `TopParentId` placeholders + type/user/placeholder/cutoff.
-    let sql = next_up_series_keys_sql(3);
-    let plan = plan(&db, &sql, 7).await;
+    // user/type/placeholder + three `TopParentId` placeholders + cutoff.
+    let sql = next_up_series_keys_sql(3, false);
+    assert!(!sql.contains("CROSS JOIN"), "no join-order pin: {sql}");
+    let steps = plan(&db, &sql, 7).await;
 
-    let first = plan.first().cloned().unwrap_or_default();
     assert!(
-        first.contains(" ud ") && first.contains("UserId=?"),
-        "the OUTERMOST loop must be UserData seeded on UserId, got: {plan:?}"
-    );
-    assert!(
-        !plan
+        steps
             .iter()
-            .any(|d| d.contains(" bi ") && d.contains("Type=?") && !d.contains("Id=?")),
-        "BaseItems must be reached by Id from the UserData row, never driven by \
-         Type — that walks every episode in the library: {plan:?}"
+            .any(|d| d.starts_with("SEARCH bi USING INDEX") && d.contains("Type=?")),
+        "BaseItems must be read through a Type-led index, got: {steps:?}"
     );
+    assert!(
+        steps
+            .iter()
+            .any(|d| d.contains(" ud ") && d.contains("UserId=? AND ItemId=?")),
+        "UserData must be reached by (UserId, ItemId) from the BaseItems row, got: {steps:?}"
+    );
+    assert!(
+        !steps.iter().any(|d| d.contains("SCAN")),
+        "no full scan of either table: {steps:?}"
+    );
+
+    // With a limit the statement carries one more bind and a LIMIT.
+    let limited = next_up_series_keys_sql(3, true);
+    assert!(limited.ends_with("LIMIT ?"), "bound LIMIT: {limited}");
+    plan(&db, &limited, 8).await;
 }

@@ -796,7 +796,34 @@ pub struct Verified {
 ///   `N / 412 operations deep-verified` plus the per-controller table — that
 ///   printout is the README parity section, it moves only when a row is
 ///   written, and it reaches 100 % when the work is done.
-pub const VERIFIED: &[Verified] = &[];
+pub const VERIFIED: &[Verified] = &[Verified {
+    method: "get",
+    path: "/Shows/NextUp",
+    upstream_file: "Jellyfin.Api/Controllers/TvShowsController.cs",
+    upstream_method: "GetNextUp",
+    ferrofin: "handlers/tv_shows.rs get_next_up → ferrofin-core tv_series_manager.rs \
+               (TVSeriesManager) → next_up_service.rs (NextUpService)",
+    date: "2026-09-02",
+    divergences: &[
+        "TVSeriesManager.GetPreferredVersion (continue in the alternate version the user \
+         has been watching, matched by media-source name) is not ported: the pick is always \
+         the primary episode row. Un-defer path: port v12's Video.GetMediaSourceName \
+         common-prefix naming in media_source_manager, then swap by name in \
+         tv_series_manager (see the TODO there).",
+        "Video.GetAllVersions also spans file-based local alternates \
+         (LinkedChildType.LocalAlternateVersion); Ferrofin's version model links alternates \
+         through PrimaryVersionId only, so the resumable check and the last-played date span \
+         that group.",
+        "parentId naming a non-view item: v12 routes it to AncestorIds, which the keys \
+         statement ignores, so the answer is always empty; Ferrofin scopes by TopParentId = \
+         that item (a physical library folder answers, anything else is empty as upstream). \
+         Jellyfin bug not ported.",
+        "ApplyAccessFiltering's parental-rating / blocked-tag row filter is not applied — \
+         no Ferrofin query path applies InternalItemsQuery.max_parental_rating / \
+         block_unrated_items / exclude_inherited_tags yet; NextUp inherits that \
+         cross-cutting gap (its alternate-version / owned-item exclusion is applied).",
+    ],
+}];
 
 /// Compile-time `str` equality (`==` on `&str` isn't const).
 const fn str_eq(a: &str, b: &str) -> bool {
