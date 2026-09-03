@@ -77,6 +77,18 @@ drain() {  # every scheduled task idle, then settle (before EVERY window)
   sleep "$SETTLE_S"
 }
 count() { api "$1" | jq -r 'if type=="array" then length else (.TotalRecordCount // (.Items|length)) end'; }
+disable_plugins() {  # core Ferrofin only: every compiled-in extension off, no WASM plugin loadable (owner rule)
+  local wasm; wasm=$(find "$1" -name '*.wasm' 2>/dev/null | head -1)
+  [ -z "$wasm" ] || die "$NAME: a WASM plugin is present in the config copy ($wasm) — the benchmark measures core Ferrofin only"
+  local id ver
+  while read -r id ver; do
+    curl -sf -X POST -H "$AUTH" "$URL/Plugins/$id/$ver/Disable" >/dev/null || die "$NAME: could not disable plugin $id $ver"
+  done < <(api "/Plugins" | jq -r '.[] | "\(.Id) \(.Version)"')
+  api "/Plugins" > "$D/plugins.json"
+  local on; on=$(jq -r '[.[] | select(.Status != "Disabled") | .Name] | join(", ")' "$D/plugins.json")
+  [ -z "$on" ] || die "$NAME: plugins still enabled after disabling: $on"
+  echo "  plugins: $(jq -r 'map(.Name) | join(", ")' "$D/plugins.json") — all disabled"
+}
 k6run() { taskset -c "$CLIENT_CPUS" k6 run --quiet -e URL="$URL" -e IDS="$IDS" "$@" bench/screens.js; }
 phase() { echo "  -- $1"; if ! "phase_$1"; then echo "  ✗ phase $1 failed for $NAME (see $D/server.log)" >&2; fi; }
 
@@ -148,6 +160,7 @@ run_server() {
     -p "127.0.0.1:$(port_of "$1"):8096" "${env[@]}" -v "$cfg:/config" -v "$cache:/cache" -v "$TESTDATA/media:/media:ro" \
     "$(image_of "$1")" >/dev/null
   wait_ready || die "$NAME did not start — see $D/server.log"
+  [ "$1" = ferrofin ] && disable_plugins "$cfg"
   drain || die "$NAME: could not read /ScheduledTasks"
   docker inspect -f '{{.Config.Image}} {{.Image}}' "$CONTAINER" > "$D/image.txt"
   ! want counts || phase counts

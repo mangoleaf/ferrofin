@@ -94,6 +94,11 @@ config directory is what every server boots a fresh copy of; media is mounted re
 - Scheduled tasks are drained to idle plus a 30 s settle before every window (after
   provisioning, after the cold-start restarts, before each load level, before TTFS), and
   item counts are read after the first drain (startup tasks mutate libraries on boot).
+- Ferrofin runs as **core Ferrofin**: after its provisioning boot the run disables every
+  plugin `GET /Plugins` lists (the compiled-in extensions and the remote-provider plugins,
+  which the test data already disables per library) and refuses to proceed if a WASM
+  plugin is present; the persisted flags survive the cold-start restarts and are recorded
+  in `plugins.json`. Jellyfin runs stock.
 - Every virtual user shares one device id, so all load collapses into one server session
   (a realism simplification, identical for every server; it does not affect comparability).
 - Every phase writes its file when it ends; `report.py` renders whatever exists and names
