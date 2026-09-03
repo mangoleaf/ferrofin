@@ -155,6 +155,12 @@ struct Prefetched {
     /// the `MediaSources` field is requested), so a merged item reports its
     /// extra selectable sources without a per-item query.
     alternates: HashMap<Uuid, Vec<BaseItemEntity>>,
+    /// How many alternate versions each primary has (populated when either
+    /// the `MediaSources` or the `MediaSourceCount` field is requested; a
+    /// primary with none is absent). Keyed by the PRIMARY, which for a page
+    /// item that is itself an alternate is an off-page row — the count read
+    /// covers those primaries too, the full-row read above never does.
+    alternate_counts: HashMap<Uuid, usize>,
     /// The page's video item ids that carry a subtitle stream. Backs the
     /// unconditional `HasSubtitles` on video DTOs (C# emits it outside the
     /// `ItemFields` system) via one ids-only query per page.
@@ -174,6 +180,13 @@ struct Prefetched {
     /// and then registers the resolved id under every raw spelling it saw, so
     /// `attach_people` looks up by `&str` instead of lowercasing per credit.
     person_ids_by_name: HashMap<String, Uuid>,
+    /// The page's image-display parents — every hop of the inherited-images
+    /// walk, plus the series/season/album rows the Episode/Season/Audio
+    /// blocks read whether or not images are enabled.
+    image_parents: ImageParentGraph,
+    /// Image rows per parent id in [`Self::image_parents`], read in the
+    /// page's one `BaseItemImageInfos` query.
+    parent_images: HashMap<Uuid, Vec<ItemImageInfo>>,
     /// Ids that some item on the page lists as a merged alternate version.
     /// Their `media_streams` entry is read again while projecting that OTHER
     /// item, so it must survive its own item's projection — see
@@ -631,6 +644,394 @@ fn extra_type_from_disc(disc: i32) -> Option<ExtraType> {
     })
 }
 
+// ---- Inherited / parent images: the rows the walk needs -------------------
+
+/// A row as the inherited-images walk sees it — the narrow projection of a
+/// parent (`Database::image_parent_rows`) or of a page item itself, so a
+/// parent that is also on the page resolves without a read.
+#[derive(Debug, Clone)]
+struct ImageParent {
+    /// The row's kind.
+    kind: BaseItemKind,
+    /// `ParentId`.
+    parent_id: Option<Uuid>,
+    /// `OwnerId` — `BaseItem.GetOwner()`.
+    owner_id: Option<Uuid>,
+    /// `SeriesId` — a season's display parent.
+    series_id: Option<Uuid>,
+    /// `SeasonId` — an episode's display parent.
+    season_id: Option<Uuid>,
+    /// `AlbumArtists.FirstOrDefault()` — the name a `MusicAlbum` resolves its
+    /// artist by when no `MusicArtist` folder is above it.
+    album_artist: Option<String>,
+    /// `Path` — what `GetCollectionFolders` matches the library on.
+    path: Option<String>,
+    /// `LUFS` — behind `AlbumNormalizationGain`.
+    lufs: Option<f64>,
+    /// `NormalizationGain` — behind `AlbumNormalizationGain`.
+    normalization_gain: Option<f64>,
+}
+
+/// Parses a stored id column, treating the nil GUID as absent (C#
+/// `Guid.Empty` → `GetItemById` is never called).
+fn stored_id(value: Option<&str>) -> Option<Uuid> {
+    value
+        .and_then(|s| Uuid::parse_str(s).ok())
+        .filter(|id| !id.is_nil())
+}
+
+impl ImageParent {
+    fn from_row(row: &ferrofin_db::ImageParentRow) -> Self {
+        Self {
+            kind: kind_from_type_name(&row.type_).unwrap_or(BaseItemKind::Folder),
+            parent_id: stored_id(row.parent_id.as_deref()),
+            owner_id: stored_id(row.owner_id.as_deref()),
+            series_id: stored_id(row.series_id.as_deref()),
+            season_id: stored_id(row.season_id.as_deref()),
+            album_artist: split_multi_str(row.album_artists.as_deref())
+                .next()
+                .map(str::to_owned),
+            path: row.path.clone(),
+            lufs: row.lufs,
+            normalization_gain: row.normalization_gain,
+        }
+    }
+
+    fn from_entity(item: &BaseItemEntity) -> Self {
+        Self {
+            kind: row_kind(item),
+            parent_id: stored_id(item.parent_id.as_deref()),
+            owner_id: stored_id(item.owner_id.as_deref()),
+            series_id: stored_id(item.series_id.as_deref()),
+            season_id: stored_id(item.season_id.as_deref()),
+            album_artist: split_multi_str(item.album_artists.as_deref())
+                .next()
+                .map(str::to_owned),
+            path: item.path.clone(),
+            lufs: item.lufs,
+            normalization_gain: item.normalization_gain,
+        }
+    }
+
+    /// A `CollectionFolder` reached through the `GetCollectionFolders`
+    /// fallback — never walked further (it does not inherit), so only its
+    /// kind and path matter.
+    fn collection_folder(path: Option<String>) -> Self {
+        Self {
+            kind: BaseItemKind::CollectionFolder,
+            parent_id: None,
+            owner_id: None,
+            series_id: None,
+            season_id: None,
+            album_artist: None,
+            path,
+            lufs: None,
+            normalization_gain: None,
+        }
+    }
+
+    /// `BaseItem.DisplayParentId` (`Episode.cs:65`, `Season.cs:43`,
+    /// `BaseItem.cs:564`).
+    fn display_parent_id(&self) -> Option<Uuid> {
+        match self.kind {
+            BaseItemKind::Episode => self.season_id,
+            BaseItemKind::Season => self.series_id,
+            _ => self.parent_id,
+        }
+    }
+
+    /// The ids `DisplayParent ?? GetOwner() ?? GetParent()` tries, in order.
+    fn candidates(&self) -> [Option<Uuid>; 3] {
+        [self.display_parent_id(), self.owner_id, self.parent_id]
+    }
+}
+
+/// A `CollectionFolder` as `LibraryManager.GetCollectionFoldersInternal`
+/// matches it: on its own `Path` or on the `PhysicalLocationsList` its `Data`
+/// blob carries (both `OrdinalIgnoreCase`).
+#[derive(Debug, Clone)]
+struct CollectionFolderLocations {
+    id: Uuid,
+    path: Option<String>,
+    physical_locations: Vec<String>,
+}
+
+impl CollectionFolderLocations {
+    fn matches(&self, path: &str) -> bool {
+        self.path
+            .as_deref()
+            .is_some_and(|p| p.eq_ignore_ascii_case(path))
+            || self
+                .physical_locations
+                .iter()
+                .any(|loc| loc.eq_ignore_ascii_case(path))
+    }
+}
+
+/// Everything the projection reads about a page's parents: the narrow rows,
+/// the per-item walk order, and the album a track belongs to.
+#[derive(Default)]
+struct ImageParentGraph {
+    /// Narrow rows of every hop (page items included, keyed by their own id).
+    rows: HashMap<Uuid, ImageParent>,
+    /// Per page item that inherits images: the parents
+    /// `DtoService.AddInheritedImages` would visit, in order — hop 0 first,
+    /// each next one `GetImageDisplayParent(previous)`, ending after the first
+    /// parent that does not `SupportsInheritedParentImages`.
+    chains: HashMap<Uuid, Vec<Uuid>>,
+    /// Per Audio page item: `Audio.AlbumEntity` (`FindParent<MusicAlbum>()`).
+    album_of_audio: HashMap<Uuid, Uuid>,
+    /// Per playlists `UserView` page item: its `DisplayParentId` row, when it
+    /// exists — the parent whose Primary image the view shows.
+    playlists_view_parent: HashMap<Uuid, Uuid>,
+    /// Every parent id whose images the projection reads.
+    image_ids: Vec<Uuid>,
+}
+
+/// The kinds `GetImageDisplayParent` never falls back to a collection folder
+/// for (`originalItem is not UserRootFolder/UserView/AggregateFolder/
+/// ICollectionFolder/Channel`, DtoService.cs:1594).
+fn never_falls_back_to_collection_folder(kind: BaseItemKind) -> bool {
+    matches!(
+        kind,
+        BaseItemKind::UserRootFolder
+            | BaseItemKind::UserView
+            | BaseItemKind::AggregateFolder
+            | BaseItemKind::CollectionFolder
+            | BaseItemKind::BasePluginFolder
+            | BaseItemKind::PlaylistsFolder
+            | BaseItemKind::ManualPlaylistsFolder
+            | BaseItemKind::Channel
+    )
+}
+
+/// The deepest ancestor chain the walk follows before giving up — real
+/// libraries are a handful of levels deep, and a `ParentId` cycle is data.
+const MAX_IMAGE_PARENT_DEPTH: usize = 8;
+
+impl ImageParentGraph {
+    /// `LibraryManager.GetCollectionFolders(item)` (:2757-2802): walk `item`
+    /// up through `GetParent()` (`GetOwner()` when there is none) until the
+    /// next parent is the `AggregateFolder`, then match the user-root
+    /// children on that top folder's path.
+    fn collection_folder_of(
+        &self,
+        original: Uuid,
+        folders: &[CollectionFolderLocations],
+    ) -> Option<Uuid> {
+        let mut item = original;
+        for _ in 0..MAX_IMAGE_PARENT_DEPTH {
+            let row = self.rows.get(&item)?;
+            match row.parent_id.filter(|p| self.rows.contains_key(p)) {
+                Some(parent)
+                    if self
+                        .rows
+                        .get(&parent)
+                        .is_some_and(|p| p.kind == BaseItemKind::AggregateFolder) =>
+                {
+                    break;
+                }
+                Some(parent) => item = parent,
+                None => match row.owner_id.filter(|o| self.rows.contains_key(o)) {
+                    Some(owner) => item = owner,
+                    None => break,
+                },
+            }
+        }
+        let path = self.rows.get(&item)?.path.as_deref()?;
+        folders.iter().find(|f| f.matches(path)).map(|f| f.id)
+    }
+
+    /// `DtoService.GetImageDisplayParent(currentItem, originalItem)`
+    /// (:1581-1600): a `MusicAlbum`'s artist first (a `MusicArtist` among its
+    /// parents, else the album artist by name), then `DisplayParent ??
+    /// GetOwner() ?? GetParent()` — each "exists" only when its row does —
+    /// and, with nothing found, the original item's collection folder.
+    ///
+    /// `folders` is `None` while the collection folders have not been read;
+    /// a walk that would need them reports so through `needs_folders`.
+    fn image_display_parent(
+        &self,
+        current: Uuid,
+        original: Uuid,
+        artist_ids_by_name: &HashMap<String, Uuid>,
+        folders: Option<&[CollectionFolderLocations]>,
+        needs_folders: &mut bool,
+    ) -> Option<Uuid> {
+        let row = self.rows.get(&current)?;
+        if row.kind == BaseItemKind::MusicAlbum {
+            // `GetParents()` — the whole ancestor chain — for a `MusicArtist`.
+            let mut parent = row.parent_id;
+            for _ in 0..MAX_IMAGE_PARENT_DEPTH {
+                let Some(id) = parent else { break };
+                let Some(p) = self.rows.get(&id) else { break };
+                if p.kind == BaseItemKind::MusicArtist {
+                    return Some(id);
+                }
+                parent = p.parent_id;
+            }
+            if let Some(artist) = row
+                .album_artist
+                .as_deref()
+                .and_then(|name| artist_ids_by_name.get(name))
+            {
+                return Some(*artist);
+            }
+        }
+        let parent = row
+            .candidates()
+            .into_iter()
+            .flatten()
+            .find(|id| self.rows.contains_key(id));
+        if parent.is_some() {
+            return parent;
+        }
+        let original_kind = self.rows.get(&original).map(|r| r.kind)?;
+        if never_falls_back_to_collection_folder(original_kind) {
+            return None;
+        }
+        if let Some(folders) = folders {
+            self.collection_folder_of(original, folders)
+        } else {
+            *needs_folders = true;
+            None
+        }
+    }
+
+    /// The walk of `AddInheritedImages` (:1655-1720) for one page item, as
+    /// the ordered parents it visits: `GetImageDisplayParent(item) ?? owner`
+    /// for the first hop, `GetImageDisplayParent(parent)` after each, and no
+    /// hop past a parent that does not `SupportsInheritedParentImages`.
+    fn chain_for(
+        &self,
+        root: Uuid,
+        owner: Option<Uuid>,
+        artist_ids_by_name: &HashMap<String, Uuid>,
+        folders: Option<&[CollectionFolderLocations]>,
+        needs_folders: &mut bool,
+    ) -> Vec<Uuid> {
+        let mut chain = Vec::new();
+        let mut current = root;
+        for hop in 0..MAX_IMAGE_PARENT_DEPTH {
+            let mut next = self.image_display_parent(
+                current,
+                root,
+                artist_ids_by_name,
+                folders,
+                needs_folders,
+            );
+            if hop == 0 {
+                next = next.or(owner.filter(|o| self.rows.contains_key(o)));
+            }
+            let Some(next) = next else { break };
+            chain.push(next);
+            if !self
+                .rows
+                .get(&next)
+                .is_some_and(|r| kinds::supports_inherited_parent_images(r.kind))
+            {
+                break;
+            }
+            current = next;
+        }
+        chain
+    }
+
+    /// The parents whose images the projection reads: every hop of every
+    /// chain, the series/season of every episode and season, the album of
+    /// every track, and the playlists view's display parent — deduplicated
+    /// and limited to rows that exist.
+    fn image_ids_for(&self, items: &[BaseItemEntity]) -> Vec<Uuid> {
+        let mut image_ids: Vec<Uuid> = self.chains.values().flatten().copied().collect();
+        for item in items {
+            let Some(row) = self.rows.get(&row_id(item)) else {
+                continue;
+            };
+            match row.kind {
+                BaseItemKind::Episode => {
+                    image_ids.extend(row.season_id);
+                    image_ids.extend(row.series_id);
+                }
+                BaseItemKind::Season => image_ids.extend(row.series_id),
+                _ => {}
+            }
+        }
+        image_ids.extend(self.album_of_audio.values().copied());
+        image_ids.extend(self.playlists_view_parent.values().copied());
+        image_ids.sort_unstable();
+        image_ids.dedup();
+        image_ids.retain(|id| self.rows.contains_key(id));
+        image_ids
+    }
+
+    /// `Audio.AlbumEntity` — `FindParent<MusicAlbum>()`: the first
+    /// `MusicAlbum` up the `ParentId` chain.
+    fn album_of(&self, audio: Uuid) -> Option<Uuid> {
+        let mut parent = self.rows.get(&audio)?.parent_id;
+        for _ in 0..MAX_IMAGE_PARENT_DEPTH {
+            let id = parent?;
+            let row = self.rows.get(&id)?;
+            if row.kind == BaseItemKind::MusicAlbum {
+                return Some(id);
+            }
+            parent = row.parent_id;
+        }
+        None
+    }
+
+    /// `Episode.Series` / `Season.Series`: the `SeriesId` row when it is a
+    /// series, else `FindParent<Series>()` up the parent chain.
+    fn series_of(&self, item: Uuid) -> Option<Uuid> {
+        self.typed_relative(item, |r| r.series_id, BaseItemKind::Series)
+    }
+
+    /// `Episode.Season`: the `SeasonId` row when it is a season, else
+    /// `FindParent<Season>()` up the parent chain.
+    fn season_of(&self, item: Uuid) -> Option<Uuid> {
+        self.typed_relative(item, |r| r.season_id, BaseItemKind::Season)
+    }
+
+    fn typed_relative(
+        &self,
+        item: Uuid,
+        stored: impl Fn(&ImageParent) -> Option<Uuid>,
+        kind: BaseItemKind,
+    ) -> Option<Uuid> {
+        let row = self.rows.get(&item)?;
+        if let Some(id) = stored(row)
+            && self.rows.get(&id).is_some_and(|r| r.kind == kind)
+        {
+            return Some(id);
+        }
+        let mut parent = row.parent_id;
+        for _ in 0..MAX_IMAGE_PARENT_DEPTH {
+            let id = parent?;
+            let p = self.rows.get(&id)?;
+            if p.kind == kind {
+                return Some(id);
+            }
+            parent = p.parent_id;
+        }
+        None
+    }
+}
+
+/// The `DisplayParentId` a `UserView` carries in its `Data` blob, when the
+/// view is the playlists view (`UserView { ViewType: CollectionType.playlists }`).
+fn playlists_view_display_parent(item: &BaseItemEntity) -> Option<Uuid> {
+    let blob = item.data.as_deref()?;
+    if !blob.contains("playlists") {
+        return None;
+    }
+    let data = crate::item_data::parse_data(Some(blob));
+    let is_playlists = crate::item_data::read_data_string(&data, "ViewType")
+        .is_some_and(|v| v.eq_ignore_ascii_case("playlists"));
+    if !is_playlists {
+        return None;
+    }
+    stored_id(crate::item_data::read_data_string(&data, "DisplayParentId").as_deref())
+}
+
 /// The concrete DTO-projection service.
 #[derive(Clone)]
 pub struct FerrofinDtoService {
@@ -767,6 +1168,271 @@ impl FerrofinDtoService {
         Ok(map)
     }
 
+    /// Hop by hop: reads the rows `wanted` names, then the parents of every
+    /// row that can itself inherit (a `Series`, `MusicArtist` or
+    /// `CollectionFolder` ends its chain; a plain `Folder`, `Season` or
+    /// `MusicAlbum` continues it — which also carries the
+    /// `FindParent<MusicAlbum>` and `MusicAlbum → MusicArtist` searches up the
+    /// tree). A wanted id with no row stays absent: every reader treats a
+    /// missing row as C#'s `GetItemById` returning null.
+    ///
+    /// With no walk to run (`walk_may_run` false — no Logo/Thumb limit) only
+    /// the `FindParent` searches need the chain, and those pass through plain
+    /// `Folder` rows alone: a track's album, an episode's season/series are
+    /// hop 0, and nothing above a `Season`/`MusicAlbum` is read.
+    async fn fetch_image_parent_rows(
+        &self,
+        graph: &mut ImageParentGraph,
+        mut wanted: Vec<Uuid>,
+        walk_may_run: bool,
+    ) -> Result<(), ServiceError> {
+        for _ in 0..MAX_IMAGE_PARENT_DEPTH {
+            wanted.sort_unstable();
+            wanted.dedup();
+            wanted.retain(|id| !graph.rows.contains_key(id));
+            if wanted.is_empty() {
+                break;
+            }
+            let stored: Vec<String> = wanted.iter().copied().map(guid_to_db).collect();
+            let fetched = self
+                .db
+                .image_parent_rows(&stored)
+                .await
+                .map_err(|e| ServiceError::Backend(e.to_string()))?;
+            let mut next: Vec<Uuid> = Vec::new();
+            for fetched_row in &fetched {
+                let Ok(id) = Uuid::parse_str(&fetched_row.id) else {
+                    continue;
+                };
+                let row = ImageParent::from_row(fetched_row);
+                let continues = kinds::supports_inherited_parent_images(row.kind)
+                    && (walk_may_run || row.kind == BaseItemKind::Folder);
+                if continues {
+                    next.extend(row.candidates().into_iter().flatten());
+                }
+                graph.rows.insert(id, row);
+            }
+            wanted = next;
+        }
+        Ok(())
+    }
+
+    /// `MusicAlbum.GetMusicArtist`'s by-name arm: the album artist of every
+    /// `MusicAlbum` in the graph resolved to its by-name `MusicArtist` row
+    /// (which joins the graph — it is a terminal hop, so nothing above it is
+    /// read), keyed by the name as stored on the album.
+    async fn resolve_album_artists(
+        &self,
+        graph: &mut ImageParentGraph,
+    ) -> Result<HashMap<String, Uuid>, ServiceError> {
+        let mut artist_names: Vec<String> = graph
+            .rows
+            .values()
+            .filter(|r| r.kind == BaseItemKind::MusicAlbum)
+            .filter_map(|r| r.album_artist.clone())
+            .collect();
+        artist_names.sort_unstable();
+        artist_names.dedup();
+        let mut artist_ids_by_name: HashMap<String, Uuid> = HashMap::new();
+        if artist_names.is_empty() {
+            return Ok(artist_ids_by_name);
+        }
+        let resolved = self
+            .library
+            .get_named_item_ids(BaseItemKind::MusicArtist, &artist_names)
+            .await?;
+        let artist_ids: Vec<String> = artist_names
+            .iter()
+            .zip(resolved)
+            .filter_map(|(name, id)| {
+                let id = id?;
+                artist_ids_by_name.insert(name.clone(), id);
+                Some(guid_to_db(id))
+            })
+            .collect();
+        if !artist_ids.is_empty() {
+            for fetched_row in self
+                .db
+                .image_parent_rows(&artist_ids)
+                .await
+                .map_err(|e| ServiceError::Backend(e.to_string()))?
+            {
+                if let Ok(id) = Uuid::parse_str(&fetched_row.id) {
+                    graph.rows.insert(id, ImageParent::from_row(&fetched_row));
+                }
+            }
+        }
+        Ok(artist_ids_by_name)
+    }
+
+    /// Every `CollectionFolder` with the locations it stands for — the
+    /// candidate set of `LibraryManager.GetCollectionFolders`.
+    /// Every `CollectionFolder` with the paths `GetCollectionFoldersInternal`
+    /// matches on. Read per page, and only when a walk runs out of parents
+    /// (`needs_folders`) — on an adopted Jellyfin DB that is the common shape,
+    /// so this is a handful of rows and JSON blobs on those pages. Measured
+    /// end-to-end it is noise (movies list 9.1 ms, an 800-item search 27.7 ms,
+    /// both under Jellyfin 12.0-rc7), so it is deliberately not cached: a cache
+    /// here would have to be invalidated on every library add/remove/rename,
+    /// and a stale one shows the wrong inherited images. If a profile ever puts
+    /// this on the critical path, cache it on the service behind the library
+    /// mutation hooks — not before.
+    async fn collection_folder_locations(
+        &self,
+    ) -> Result<Vec<CollectionFolderLocations>, ServiceError> {
+        let Some(type_name) =
+            crate::item_type_lookup::stored_type_name(BaseItemKind::CollectionFolder)
+        else {
+            return Ok(Vec::new());
+        };
+        Ok(self
+            .db
+            .rows_of_type(type_name)
+            .await
+            .map_err(|e| ServiceError::Backend(e.to_string()))?
+            .into_iter()
+            .filter_map(|(id, path, data)| {
+                let id = Uuid::parse_str(&id).ok()?;
+                let physical_locations = data
+                    .as_deref()
+                    .and_then(|d| serde_json::from_str::<serde_json::Value>(d).ok())
+                    .as_ref()
+                    .and_then(|v| v.get("PhysicalLocationsList"))
+                    .and_then(serde_json::Value::as_array)
+                    .map(|locations| {
+                        locations
+                            .iter()
+                            .filter_map(serde_json::Value::as_str)
+                            .map(str::to_owned)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                Some(CollectionFolderLocations {
+                    id,
+                    path,
+                    physical_locations,
+                })
+            })
+            .collect())
+    }
+
+    /// Reads everything the page's parent-image blocks need, in as few round
+    /// trips as the tree is deep: one narrow row read per hop of the walk
+    /// (the page's episodes share one series, so a hop is a handful of ids),
+    /// one by-name artist lookup when a `MusicAlbum` is on or above the page,
+    /// and the collection folders only when some walk ran out of parents.
+    ///
+    /// The image rows themselves are NOT read here — the caller folds
+    /// `image_ids` into the page's single `BaseItemImageInfos` read.
+    async fn load_image_parents(
+        &self,
+        items: &[BaseItemEntity],
+        options: &DtoOptions,
+        owner: Option<Uuid>,
+    ) -> Result<ImageParentGraph, ServiceError> {
+        let mut graph = ImageParentGraph::default();
+        // The loop of `AddInheritedImages` (:1655-1658) only starts on a
+        // missing Logo or Thumb with a positive limit: `parent` is null on
+        // entry, so `parent is Series` cannot start it, and Art is forced to
+        // 0. A backdrop-only request therefore never walks — which is why the
+        // walk is not read for it either. Whether the item's OWN tags already
+        // cover Logo/Thumb is only known after `attach_images`, so this is
+        // the superset; the walk itself decides.
+        let walk_may_run =
+            options.image_limit(ImageType::Logo) > 0 || options.image_limit(ImageType::Thumb) > 0;
+        let primary_limit = options.image_limit(ImageType::Primary) > 0;
+
+        let mut wanted: Vec<Uuid> = Vec::new();
+        let mut walk_roots: Vec<Uuid> = Vec::new();
+        let mut audio_roots: Vec<Uuid> = Vec::new();
+        for item in items {
+            let id = row_id(item);
+            let row = ImageParent::from_entity(item);
+            match row.kind {
+                // The stored ids first; the parent too, for the
+                // `FindParent<Season>()`/`FindParent<Series>()` fallbacks.
+                BaseItemKind::Episode => {
+                    wanted.extend(row.season_id);
+                    wanted.extend(row.series_id);
+                    wanted.extend(row.parent_id);
+                }
+                BaseItemKind::Season => {
+                    wanted.extend(row.series_id);
+                    wanted.extend(row.parent_id);
+                }
+                BaseItemKind::UserView if primary_limit => {
+                    if let Some(display_parent) = playlists_view_display_parent(item) {
+                        graph.playlists_view_parent.insert(id, display_parent);
+                        wanted.push(display_parent);
+                    }
+                }
+                kind if kinds::is_audio(kind) => {
+                    wanted.extend(row.parent_id);
+                    audio_roots.push(id);
+                }
+                _ => {}
+            }
+            if walk_may_run && kinds::supports_inherited_parent_images(row.kind) {
+                wanted.extend(row.candidates().into_iter().flatten());
+                wanted.extend(owner);
+                walk_roots.push(id);
+            }
+            graph.rows.insert(id, row);
+        }
+        if wanted.is_empty() {
+            return Ok(graph);
+        }
+
+        self.fetch_image_parent_rows(&mut graph, wanted, walk_may_run)
+            .await?;
+        // The album → artist hop exists only for the walk.
+        let artist_ids_by_name = if walk_may_run {
+            self.resolve_album_artists(&mut graph).await?
+        } else {
+            HashMap::new()
+        };
+
+        // The walks. A chain that runs out of parents consults the original
+        // item's collection folder; those rows are read once, only when some
+        // chain needs them, and the chains are then computed again.
+        let mut needs_folders = false;
+        let mut chains: HashMap<Uuid, Vec<Uuid>> = HashMap::with_capacity(walk_roots.len());
+        for root in &walk_roots {
+            let chain =
+                graph.chain_for(*root, owner, &artist_ids_by_name, None, &mut needs_folders);
+            chains.insert(*root, chain);
+        }
+        if needs_folders {
+            let folders = self.collection_folder_locations().await?;
+            for folder in &folders {
+                graph
+                    .rows
+                    .entry(folder.id)
+                    .or_insert_with(|| ImageParent::collection_folder(folder.path.clone()));
+            }
+            let mut unused = false;
+            for root in &walk_roots {
+                let chain = graph.chain_for(
+                    *root,
+                    owner,
+                    &artist_ids_by_name,
+                    Some(&folders),
+                    &mut unused,
+                );
+                chains.insert(*root, chain);
+            }
+        }
+        graph.chains = chains;
+        for audio in audio_roots {
+            if let Some(album) = graph.album_of(audio) {
+                graph.album_of_audio.insert(audio, album);
+            }
+        }
+
+        graph.image_ids = graph.image_ids_for(items);
+        Ok(graph)
+    }
+
     /// Resolves many `(value type, CLEAN value)` pairs to their `ItemValues` ids
     /// in one query — the page's studios/genres/artists — bucketed by type.
     /// Pairs with no row are simply absent.
@@ -817,14 +1483,20 @@ impl FerrofinDtoService {
         Ok(map)
     }
 
-    /// Computes the primary-image aspect ratio for a set of already-loaded image
-    /// rows, or `None` when there is no primary image.
-    async fn primary_aspect_ratio(&self, item_id: Uuid, images: &[ItemImageInfo]) -> Option<f64> {
+    /// `DtoService.GetPrimaryImageAspectRatio` (v12 :1745-1775) over a set of
+    /// already-loaded image rows: `None` when there is no primary image; the
+    /// kind's `GetDefaultPrimaryImageAspectRatio()` for a remote image or one
+    /// whose dimensions cannot be read (`Series` 2/3, `BaseItem` 0 — emitted
+    /// as `0`, as upstream does); else width / height.
+    async fn primary_aspect_ratio(
+        &self,
+        item_id: Uuid,
+        kind: BaseItemKind,
+        images: &[ItemImageInfo],
+    ) -> Option<f64> {
         let primary = images.iter().find(|i| i.image_type == ImageType::Primary)?;
         if !primary.is_local_file() {
-            // Remote images have no measurable local dimensions; the C# default
-            // (a domain-tree computation) is not available here.
-            return None;
+            return Some(kinds::default_primary_image_aspect_ratio(kind));
         }
         match self
             .image_processor
@@ -834,7 +1506,7 @@ impl FerrofinDtoService {
             Ok(dim) if dim.width > 0 && dim.height > 0 => {
                 Some(f64::from(dim.width) / f64::from(dim.height))
             }
-            _ => None,
+            _ => Some(kinds::default_primary_image_aspect_ratio(kind)),
         }
     }
 
@@ -1104,6 +1776,195 @@ impl FerrofinDtoService {
         // `ImageTags`) always see `{}`, not null.
     }
 
+    /// `DtoService.AddInheritedImages` (v12 :1615-1721), ported line for line
+    /// over the walk the prefetch resolved.
+    ///
+    /// The loop condition is upstream's exactly: it starts only on a missing
+    /// Logo or Thumb with a positive limit (`parent` is null on entry, so
+    /// `parent is Series` cannot start it), which is why a
+    /// `EnableImageTypes=Primary,Backdrop` browse never carries
+    /// `ParentBackdrop*` however many backdrops the series has; and it keeps
+    /// going through a `Series` parent whatever the tags say. `artLimit` is
+    /// forced to 0 ("For now. Emby apps are not using this").
+    #[allow(clippy::too_many_lines)] // one C# method, kept in its shape
+    async fn add_inherited_images(
+        &self,
+        dto: &mut BaseItemDto,
+        item_id: Uuid,
+        kind: BaseItemKind,
+        options: &DtoOptions,
+        prefetched: &Prefetched,
+    ) {
+        let graph = &prefetched.image_parents;
+        // `if (item is UserView { ViewType: playlists } && GetImageLimit(Primary)
+        //  > 0 && !DisplayParentId.IsEmpty())` (:1617-1630): the playlists view
+        // shows its display parent's Primary image in place of its own.
+        if kind == BaseItemKind::UserView
+            && let Some(display_parent) = graph.playlists_view_parent.get(&item_id)
+            && let Some(image) = prefetched
+                .parent_images
+                .get(display_parent)
+                .and_then(|images| images.iter().find(|i| i.image_type == ImageType::Primary))
+        {
+            if let Some(tags) = dto.image_tags.as_mut() {
+                tags.remove(&ImageType::Primary);
+            }
+            dto.parent_primary_image_item_id = Some(*display_parent);
+            dto.parent_primary_image_tag = self
+                .tag_and_fill_blur_hash(dto, *display_parent, image)
+                .await;
+        }
+
+        if !kinds::supports_inherited_parent_images(kind) {
+            return;
+        }
+
+        let logo_limit = options.image_limit(ImageType::Logo);
+        // `artLimit = 0;` — "For now. Emby apps are not using this" (:1643).
+        let art_limit = 0;
+        let thumb_limit = options.image_limit(ImageType::Thumb);
+        let backdrop_limit = options.image_limit(ImageType::Backdrop);
+        if logo_limit == 0 && art_limit == 0 && thumb_limit == 0 && backdrop_limit == 0 {
+            return;
+        }
+
+        // `var imageTags = dto.ImageTags;` — the item's OWN tags, captured
+        // once; parent tags never join it.
+        let has_own = |dto: &BaseItemDto, image_type: ImageType| {
+            dto.image_tags
+                .as_ref()
+                .is_some_and(|tags| tags.contains_key(&image_type))
+        };
+        let chain = graph.chains.get(&item_id).map_or(&[][..], Vec::as_slice);
+        let mut hop = 0;
+        let mut parent: Option<Uuid> = None;
+        let parent_is_series = |graph: &ImageParentGraph, parent: Option<Uuid>| {
+            parent.is_some_and(|p| {
+                graph
+                    .rows
+                    .get(&p)
+                    .is_some_and(|r| r.kind == BaseItemKind::Series)
+            })
+        };
+        while (!has_own(dto, ImageType::Logo) && logo_limit > 0)
+            || (!has_own(dto, ImageType::Art) && art_limit > 0)
+            || (!has_own(dto, ImageType::Thumb) && thumb_limit > 0)
+            || parent_is_series(graph, parent)
+        {
+            // `parent ??= isFirst ? GetImageDisplayParent(item, item) ?? owner
+            //  : parent;` — the chain already holds each hop's answer.
+            if parent.is_none() {
+                parent = chain.get(hop).copied();
+            }
+            let Some(parent_id) = parent else {
+                break;
+            };
+            let Some(parent_row) = graph.rows.get(&parent_id) else {
+                break;
+            };
+            let all_images = prefetched
+                .parent_images
+                .get(&parent_id)
+                .map_or(&[][..], Vec::as_slice);
+
+            if logo_limit > 0
+                && !has_own(dto, ImageType::Logo)
+                && dto.parent_logo_item_id.is_none()
+                && let Some(image) = all_images.iter().find(|i| i.image_type == ImageType::Logo)
+            {
+                dto.parent_logo_item_id = Some(parent_id);
+                dto.parent_logo_image_tag =
+                    self.tag_and_fill_blur_hash(dto, parent_id, image).await;
+            }
+
+            if art_limit > 0
+                && !has_own(dto, ImageType::Art)
+                && dto.parent_art_item_id.is_none()
+                && let Some(image) = all_images.iter().find(|i| i.image_type == ImageType::Art)
+            {
+                dto.parent_art_item_id = Some(parent_id);
+                dto.parent_art_image_tag = self.tag_and_fill_blur_hash(dto, parent_id, image).await;
+            }
+
+            // `(dto.ParentThumbItemId is null || parent is Series) && parent is
+            //  not ICollectionFolder && parent is not UserView` (:1690).
+            if thumb_limit > 0
+                && !has_own(dto, ImageType::Thumb)
+                && (dto.parent_thumb_item_id.is_none() || parent_row.kind == BaseItemKind::Series)
+                && !matches!(
+                    parent_row.kind,
+                    BaseItemKind::CollectionFolder
+                        | BaseItemKind::BasePluginFolder
+                        | BaseItemKind::PlaylistsFolder
+                        | BaseItemKind::ManualPlaylistsFolder
+                        | BaseItemKind::UserView
+                )
+                && let Some(image) = all_images.iter().find(|i| i.image_type == ImageType::Thumb)
+            {
+                dto.parent_thumb_item_id = Some(parent_id);
+                dto.parent_thumb_image_tag =
+                    self.tag_and_fill_blur_hash(dto, parent_id, image).await;
+            }
+
+            // Backdrops only when neither the item nor an earlier parent had
+            // any (:1701-1710), up to `backdropLimit` of them.
+            let own_backdrops = dto
+                .backdrop_image_tags
+                .as_ref()
+                .is_some_and(|tags| !tags.is_empty());
+            let parent_backdrops = dto
+                .parent_backdrop_image_tags
+                .as_ref()
+                .is_some_and(|tags| !tags.is_empty());
+            if backdrop_limit > 0 && !(own_backdrops || parent_backdrops) {
+                let backdrops: Vec<&ItemImageInfo> = all_images
+                    .iter()
+                    .filter(|i| i.image_type == ImageType::Backdrop)
+                    .take(usize::try_from(backdrop_limit).unwrap_or(usize::MAX))
+                    .collect();
+                if !backdrops.is_empty() {
+                    let mut tags = Vec::with_capacity(backdrops.len());
+                    for image in backdrops {
+                        if let Some(tag) = self.tag_and_fill_blur_hash(dto, parent_id, image).await
+                        {
+                            tags.push(tag);
+                        }
+                    }
+                    dto.parent_backdrop_item_id = Some(parent_id);
+                    dto.parent_backdrop_image_tags = Some(tags);
+                }
+            }
+
+            if !kinds::supports_inherited_parent_images(parent_row.kind) {
+                break;
+            }
+            // `parent = GetImageDisplayParent(parent, item);` — the next hop,
+            // or null, which the loop head turns into a break.
+            hop += 1;
+            parent = chain.get(hop).copied();
+            if parent.is_none() {
+                break;
+            }
+        }
+    }
+
+    /// `GetTagAndFillBlurhash(dto, parent, ImageType.Primary)` for a parent
+    /// row the prefetch read: its first Primary image's cache tag, with the
+    /// blurhash recorded on the way.
+    async fn parent_primary_tag(
+        &self,
+        dto: &mut BaseItemDto,
+        parent_id: Uuid,
+        prefetched: &Prefetched,
+    ) -> Option<String> {
+        let image = prefetched
+            .parent_images
+            .get(&parent_id)?
+            .iter()
+            .find(|i| i.image_type == ImageType::Primary)?;
+        self.tag_and_fill_blur_hash(dto, parent_id, image).await
+    }
+
     /// Builds the full DTO for one item row (port of `GetBaseItemDtoInternal` +
     /// `AttachBasicFields`), honoring every [`DtoOptions`] toggle.
     ///
@@ -1149,7 +2010,8 @@ impl FerrofinDtoService {
 
         // Primary-image aspect ratio.
         if options.contains_field(ItemFields::PrimaryImageAspectRatio) {
-            dto.primary_image_aspect_ratio = self.primary_aspect_ratio(item_id, &images).await;
+            dto.primary_image_aspect_ratio =
+                self.primary_aspect_ratio(item_id, kind, &images).await;
         }
 
         // Display-preferences id. `BaseItem.DisplayPreferencesId`
@@ -1189,8 +2051,8 @@ impl FerrofinDtoService {
                 // kinds never enter it, a MusicArtist only when physically
                 // parented.
                 //
-                // Port of `Folder.FillUserDataDtoValues` (v10.11.8
-                // MediaBrowser.Controller/Entities/Folder.cs:1798-1838). Its
+                // Port of `Folder.FillUserDataDtoValues` (v12.0-rc7
+                // MediaBrowser.Controller/Entities/Folder.cs:1938-1990). Its
                 // ENTRY guard is `SupportsUserDataFromChildren` — false for
                 // every `ICollectionFolder` (which includes `BasePluginFolder`,
                 // so the playlists folder too), `UserView`, `UserRootFolder`
@@ -1206,19 +2068,19 @@ impl FerrofinDtoService {
                     && kinds::supports_user_data_from_children(kind)
                     && let Some(c) = prefetched.played_counts.get(&item_id).copied()
                 {
-                    // `Folder.FillUserDataDtoValues` (Folder.cs:1798) runs two
+                    // `Folder.FillUserDataDtoValues` (Folder.cs:1938) runs two
                     // INDEPENDENT gates behind `SupportsUserDataFromChildren`:
-                    // `RecursiveItemCount` on the FIELD alone (:1805) —
-                    // `GetRecursiveChildCount(user)` (Folder.cs:701-714:
-                    // recursive, non-folder, non-virtual, total record count,
-                    // i.e. the unplayed query minus `IsPlayed = false`, which is
-                    // exactly `total`) — and the unplayed count on
-                    // `SupportsPlayedStatus` (:1810). They are not the same set:
-                    // `MusicArtist.SupportsPlayedStatus` is false
-                    // (MusicArtist.cs:47), which is why Jellyfin's artist body
-                    // carries `RecursiveItemCount` and no `UnplayedItemCount`.
-                    // Both read the same recursive non-folder/non-virtual count
-                    // the prefetch already ran, so this costs no extra query.
+                    // `RecursiveItemCount` on the FIELD alone (:1974) —
+                    // `GetRecursiveChildCount(user)` (recursive, non-folder,
+                    // non-virtual, total record count, i.e. the unplayed query
+                    // minus `IsPlayed = false`, which is exactly `total`) — and
+                    // the unplayed count on `SupportsPlayedStatus` (:1979). They
+                    // are not the same set: `MusicArtist.SupportsPlayedStatus`
+                    // is false (MusicArtist.cs:47), which is why Jellyfin's
+                    // artist body carries `RecursiveItemCount` and no
+                    // `UnplayedItemCount`. Both read the same recursive
+                    // non-folder/non-virtual count the prefetch already ran, so
+                    // this costs no extra query.
                     if options.contains_field(ItemFields::RecursiveItemCount) {
                         dto.recursive_item_count = Some(c.total);
                     }
@@ -1228,18 +2090,21 @@ impl FerrofinDtoService {
                             .user_data
                             .get_or_insert_with(|| empty_user_data_dto(item_id));
                         ud.unplayed_item_count = Some(unplayed);
-                        // `if (itemDto?.RecursiveItemCount > 0)`
-                        // (Folder.cs:1828) — the folder's own played state is
-                        // derived from its children off the DTO FIELD, so a
-                        // caller that did not ask for `RecursiveItemCount`
-                        // degrades to the `unplayed == 0` arm, exactly as
-                        // upstream does.
-                        if let Some(total) = dto.recursive_item_count.filter(|t| *t > 0) {
-                            let pct = 100.0 - (f64::from(unplayed) / f64::from(total)) * 100.0;
-                            ud.played_percentage = Some(pct);
-                            ud.played = pct >= 100.0;
+                        // Folder.cs:1983-1990 — the played state is derived from
+                        // the COUNTS, with no field gate (10.11.8 keyed it off
+                        // the `RecursiveItemCount` DTO field, which is why a
+                        // seasons page without that field lost its
+                        // `PlayedPercentage`):
+                        //   if (totalCount > 0) {
+                        //     PlayedPercentage = playedCount / (double)totalCount * 100;
+                        //     Played = playedCount >= totalCount;
+                        //   } else { Played = true; }
+                        if c.total > 0 {
+                            ud.played_percentage =
+                                Some(f64::from(c.played) / f64::from(c.total) * 100.0);
+                            ud.played = c.played >= c.total;
                         } else {
-                            ud.played = unplayed == 0;
+                            ud.played = true;
                         }
                     }
                 }
@@ -1280,7 +2145,11 @@ impl FerrofinDtoService {
                 BaseItemKind::MusicAlbum | BaseItemKind::Season | BaseItemKind::Playlist
             )
         {
-            dto.child_count = dto.recursive_item_count;
+            // `if (dto.RecursiveItemCount > 0) dto.ChildCount = dto.RecursiveItemCount;`
+            // (v12 DtoService.cs:614-617) — a zero count does not become a
+            // `ChildCount: 0`; the linked-children half and the real count
+            // still get their turn.
+            dto.child_count = dto.recursive_item_count.filter(|count| *count > 0);
             if dto.child_count.is_none() && user.is_some() {
                 dto.child_count = prefetched
                     .linked_child_counts
@@ -1292,14 +2161,35 @@ impl FerrofinDtoService {
 
         // `if (options.ContainsField(ItemFields.CumulativeRunTimeTicks))
         //  { dto.CumulativeRunTimeTicks = item.RunTimeTicks; }`
-        // (Emby.Server.Implementations/Dto/DtoService.cs:492-495). It sits in
-        // the `item is Folder` branch and NOT under `EnableUserData`, so it is
-        // emitted for an anonymous caller too. The value is the folder's own
-        // stored runtime, which Ferrofin already had and simply never copied —
-        // measured: J's MusicAlbum returns CumulativeRunTimeTicks=60000000 next
-        // to the RunTimeTicks=60000000 Ferrofin was already reporting.
-        if item.is_folder && options.contains_field(ItemFields::CumulativeRunTimeTicks) {
+        // (v12 DtoService.cs:633-636). It sits in the `item.IsFolder` branch of
+        // `AttachUserSpecificInfo`, which `GetBaseItemDtoInternal` calls only
+        // `if (user is not null)` (:389-392) — so an anonymous caller never
+        // gets it, whatever the fields say. Not under `EnableUserData`, though.
+        // The value is the folder's own stored runtime — measured: J's
+        // MusicAlbum returns CumulativeRunTimeTicks=60000000 next to the
+        // RunTimeTicks=60000000.
+        // Both gates key on the runtime `IsFolder` (`folder_emits_counts`):
+        // a by-name Genre row is stored as a folder but is a plain `BaseItem`
+        // upstream, and never enters the branch.
+        let runtime_folder = user.is_some() && folder_emits_counts(item);
+        if runtime_folder && options.contains_field(ItemFields::CumulativeRunTimeTicks) {
             dto.cumulative_run_time_ticks = item.run_time_ticks;
+        }
+
+        // `if (options.ContainsField(ItemFields.DateLastMediaAdded))
+        //  { dto.DateLastMediaAdded = folder.DateLastMediaAdded; }` (v12
+        // DtoService.cs:638-641), in the same user-gated folder branch. The
+        // entity → domain mapper substitutes `DateTime.MinValue` for a NULL
+        // column (`BaseItemMapper.cs:200`: `entity.DateLastMediaAdded ??
+        // DateTime.SpecifyKind(DateTime.MinValue, DateTimeKind.Utc)`), so a
+        // folder that never had media added still carries
+        // `0001-01-01T00:00:00.0000000Z` — a user view, say — where copying the
+        // nullable column omitted the key.
+        if runtime_folder && options.contains_field(ItemFields::DateLastMediaAdded) {
+            dto.date_last_media_added = Some(
+                item.date_last_media_added
+                    .unwrap_or_else(ferrofin_model::json::datetime::dotnet_min),
+            );
         }
 
         // Media sources. Jellyfin only attaches these for `IHasMediaSources`
@@ -1438,18 +2328,9 @@ impl FerrofinDtoService {
             dto.date_created = item.date_created;
         }
 
-        // C# `DtoService` sets DateLastMediaAdded only for `Folder` items.
-        if options.contains_field(ItemFields::DateLastMediaAdded) && item.is_folder {
-            dto.date_last_media_added = item.date_last_media_added;
-        }
-
-        // `AttachUserSpecificInfo` (`DtoService.cs:594`), inside its
-        // `if (item.IsFolder)`: the cumulative ticks ARE the folder's own
-        // `RunTimeTicks` column — the sum is computed once at scan time
-        // (`MetadataService.UpdateCumulativeRunTimeTicks`), not per request.
-        if options.contains_field(ItemFields::CumulativeRunTimeTicks) && item.is_folder {
-            dto.cumulative_run_time_ticks = item.run_time_ticks;
-        }
+        // `DateLastMediaAdded` and `CumulativeRunTimeTicks` are set by the
+        // user-gated folder branch in `build_dto` (C# `AttachUserSpecificInfo`),
+        // not here: `AttachBasicFields` never touches either.
 
         if options.contains_field(ItemFields::Etag) {
             dto.etag = Some(compute_etag(item.date_last_saved));
@@ -1527,8 +2408,12 @@ impl FerrofinDtoService {
             dto.tags = Some(split_multi(item.tags.as_deref()));
         }
 
-        // Images (single-type tags + backdrops).
+        // Images (single-type tags + backdrops), then the parents' images the
+        // item borrows (C# `AddInheritedImages`, called from
+        // `AttachBasicFields` right after `ParentId`).
         self.attach_images(dto, item_id, images, options).await;
+        self.add_inherited_images(dto, item_id, kind, options, prefetched)
+            .await;
 
         // Width/Height are the item's OWN stored dimensions — the video/photo
         // frame size on `BaseItem.Width`/`Height` (BaseItem.cs:405/407) — read
@@ -1686,17 +2571,28 @@ impl FerrofinDtoService {
         if kinds::is_audio(kind) {
             dto.album = item.album.clone();
             dto.extra_type = item.extra_type.and_then(extra_type_from_disc);
-            // A track's parent is its album row — jellyfin-web's now-playing
-            // bar and track lists link back through AlbumId. Upstream reads
-            // `Audio.AlbumEntity`, i.e. `FindParent<MusicAlbum>()`, so the id is
-            // only emitted when the parent really IS an album: an `AudioBook`
-            // hangs off its books library, and pointing AlbumId at a collection
-            // folder sends the client somewhere that is not an album.
-            if kind == BaseItemKind::Audio {
-                dto.album_id = item
-                    .parent_id
-                    .as_deref()
-                    .and_then(|p| Uuid::parse_str(p).ok());
+            // `var albumParent = audio.AlbumEntity;` — `FindParent<MusicAlbum>()`,
+            // the first MusicAlbum up the parent chain (v12 DtoService.cs:
+            // 1207-1222): `AlbumId`, the album's Primary tag (+ blurhash), and
+            // the album's normalization gain (LUFS first, −18 LUFS reference).
+            // `AudioBook : Audio` upstream, so it enters too — and finds no
+            // album above its books library, as upstream.
+            if let Some(album_id) = prefetched
+                .image_parents
+                .album_of_audio
+                .get(&item_id)
+                .copied()
+            {
+                dto.album_id = Some(album_id);
+                dto.album_primary_image_tag =
+                    self.parent_primary_tag(dto, album_id, prefetched).await;
+                if let Some(album) = prefetched.image_parents.rows.get(&album_id) {
+                    if let Some(lufs) = album.lufs.map(f64_to_f32) {
+                        dto.album_normalization_gain = Some(-18.0 - lufs);
+                    } else if let Some(gain) = album.normalization_gain.map(f64_to_f32) {
+                        dto.album_normalization_gain = Some(gain);
+                    }
+                }
             }
         }
 
@@ -1728,6 +2624,36 @@ impl FerrofinDtoService {
                 dto.has_subtitles = Some(true);
             }
 
+            // `MediaSourceCount` (v12 DtoService.cs:1319-1343): emitted only
+            // when the count `!= 1`. `Video.GetMediaSourceCount` is `linked +
+            // local + 1`, and an alternate version answers with its PRIMARY's
+            // count (Video.cs:255-280) — so a page item that IS an alternate
+            // reads the count prefetched under its primary's id.
+            //
+            // TODO(parity): the per-user arm (`GetAllVersions().Count(v =>
+            // v.Id == video.Id || v.IsVisibleStandalone(user))`, :1334-1337)
+            // drops versions the user's parental policy hides. Ferrofin's
+            // alternate reads are not user-filtered — neither here nor in the
+            // `MediaSources` block above — so a hidden version still counts
+            // and still lists. Un-defer path: filter the alternate rows
+            // through the user's parental-rating/tag visibility in one place
+            // (the alternates prefetch) so both readers agree.
+            if options.contains_field(ItemFields::MediaSourceCount) {
+                let primary_id = item
+                    .primary_version_id
+                    .as_deref()
+                    .and_then(|p| Uuid::parse_str(p).ok())
+                    .unwrap_or(item_id);
+                let alternates = prefetched
+                    .alternate_counts
+                    .get(&primary_id)
+                    .copied()
+                    .unwrap_or(0);
+                if alternates > 0 {
+                    dto.media_source_count = i32::try_from(alternates + 1).ok();
+                }
+            }
+
             if options.contains_field(ItemFields::Trickplay) {
                 // Jellyfin emits {} when requested but there is no manifest.
                 let manifest = take_or_clone(&mut prefetched.trickplay, &item_id, repeated)
@@ -1737,10 +2663,13 @@ impl FerrofinDtoService {
         }
 
         // Chapters — [] when requested but there are none (matches Jellyfin).
-        // C# assigns them only inside its `item is Video` branch, so every
-        // non-video kind (a folder, an album, a Live TV channel or programme)
-        // omits the key entirely.
-        if options.contains_field(ItemFields::Chapters) && kinds::is_video(kind) {
+        // v12 moved the assignment OUT of the `item is Video` block
+        // (DtoService.cs:1358-1361: `if (options.ContainsField(Chapters))
+        // dto.Chapters = _chapterManager.GetChapters(item.Id).ToList();`), so
+        // every kind carries the key — a folder, a series, a user view, a
+        // Live TV channel — as `[]`. Only media rows are asked for rows (the
+        // prefetch reads `media_ids`); everything else answers empty.
+        if options.contains_field(ItemFields::Chapters) {
             let mut chapters =
                 take_or_clone(&mut prefetched.chapters, &item_id, repeated).unwrap_or_default();
             // Each extracted chapter thumbnail needs its cache tag: clients gate
@@ -1805,6 +2734,56 @@ impl FerrofinDtoService {
                 .series_id
                 .as_deref()
                 .and_then(|s| Uuid::parse_str(s).ok());
+
+            // v12 DtoService.cs:1430-1464. "this block will add the series
+            // poster for episodes without a poster" — ungated by fields or
+            // `EnableImages`: `SeriesPrimaryImageTag` always, and the series'
+            // aspect ratio when the episode shows no Primary of its own
+            // (`dto.ImageTags is null || !ContainsKey(Primary)` — with images
+            // switched off `ImageTags` IS null, so the series ratio lands even
+            // on an episode that has a poster).
+            let graph = &prefetched.image_parents;
+            let episode_series = graph.series_of(item_id);
+            if let Some(series_id) = episode_series {
+                dto.series_primary_image_tag =
+                    self.parent_primary_tag(dto, series_id, prefetched).await;
+                if !dto
+                    .image_tags
+                    .as_ref()
+                    .is_some_and(|tags| tags.contains_key(&ImageType::Primary))
+                {
+                    dto.primary_image_aspect_ratio = self
+                        .primary_aspect_ratio(
+                            series_id,
+                            BaseItemKind::Series,
+                            prefetched
+                                .parent_images
+                                .get(&series_id)
+                                .map_or(&[][..], Vec::as_slice),
+                        )
+                        .await;
+                }
+            }
+            // `if (options.GetImageLimit(ImageType.Primary) > 0)`: the
+            // season's Primary as the parent poster, else the series' (:1447-1464).
+            if options.image_limit(ImageType::Primary) > 0 {
+                let season_tag = match graph.season_of(item_id) {
+                    Some(season_id) => self
+                        .parent_primary_tag(dto, season_id, prefetched)
+                        .await
+                        .map(|tag| (season_id, tag)),
+                    None => None,
+                };
+                if let Some((season_id, tag)) = season_tag {
+                    dto.parent_primary_image_item_id = Some(season_id);
+                    dto.parent_primary_image_tag = Some(tag);
+                } else if let (Some(series_id), Some(tag)) =
+                    (episode_series, dto.series_primary_image_tag.clone())
+                {
+                    dto.parent_primary_image_item_id = Some(series_id);
+                    dto.parent_primary_image_tag = Some(tag);
+                }
+            }
             Self::attach_series_studio(dto, item, options, prefetched);
         }
 
@@ -1816,6 +2795,29 @@ impl FerrofinDtoService {
                 .as_deref()
                 .and_then(|s| Uuid::parse_str(s).ok());
             Self::attach_series_studio(dto, item, options, prefetched);
+            // v12 DtoService.cs:1503-1516 — the series poster for seasons
+            // without a poster, same shape as the episode block, and no
+            // `ParentPrimaryImage*` for a season.
+            if let Some(series_id) = prefetched.image_parents.series_of(item_id) {
+                dto.series_primary_image_tag =
+                    self.parent_primary_tag(dto, series_id, prefetched).await;
+                if !dto
+                    .image_tags
+                    .as_ref()
+                    .is_some_and(|tags| tags.contains_key(&ImageType::Primary))
+                {
+                    dto.primary_image_aspect_ratio = self
+                        .primary_aspect_ratio(
+                            series_id,
+                            BaseItemKind::Series,
+                            prefetched
+                                .parent_images
+                                .get(&series_id)
+                                .map_or(&[][..], Vec::as_slice),
+                        )
+                        .await;
+                }
+            }
         }
 
         // Book extras — port of `DtoService.SetBookProperties`, which projects
@@ -1826,17 +2828,19 @@ impl FerrofinDtoService {
             dto.series_name = item.series_name.clone();
         }
 
-        // Series air days/time — C# v10.11.8 `DtoService.cs:1243-1244`
-        // (`dto.AirDays = series.AirDays; dto.AirTime = series.AirTime;`;
-        // master carries the same two lines at `DtoService.cs:1422-1423`).
-        // `Series.AirDays` is a runtime-only property (v10.11.8 `Series.cs:31`
-        // sets it to `Array.Empty<DayOfWeek>()` in the constructor and 10.11.8
-        // persists no `AirDays` column), so a DB-loaded series always serializes `[]` —
-        // never null. Ferrofin omitted the field entirely, which is the
-        // null-where-Jellyfin-sends-non-null shape strict clients crash on.
+        // `dto.AirDays = series.AirDays; dto.AirTime = series.AirTime;
+        //  dto.Status = series.Status?.ToString();` (v12 DtoService.cs:1481-1483).
+        // None of the three has a column: they live in the `Data` blob
+        // (`"AirDays":["Monday"]`, `"AirTime":"20:00"`, `"Status":"Ended"`),
+        // written by the NFO/TVDB/TMDB appliers and by Jellyfin itself on an
+        // adopted database. `AirDays` is a non-nullable array upstream
+        // (`Series.cs` initialises it empty), so a blob without the key still
+        // serializes `[]` — never null, the shape strict clients crash on.
         if kind == BaseItemKind::Series {
-            dto.air_days = Some(Vec::new());
-            dto.air_time = None; // no flat column at this layer, as upstream
+            let fields = crate::item_data::read_series_fields(item.data.as_deref());
+            dto.air_days = Some(fields.air_days.unwrap_or_default());
+            dto.air_time = fields.air_time;
+            dto.status = fields.status;
         }
 
         // Production locations.
@@ -1862,6 +2866,15 @@ impl FerrofinDtoService {
                 .filter(|h| *h > 0)
         {
             dto.height = Some(height);
+        }
+
+        // `if (options.ContainsField(ItemFields.IsHD)) { if (item.IsHD)
+        //  dto.IsHD = true; }` (v12 DtoService.cs:1555-1562) — true-only, so
+        // the key is absent on an SD file. `BaseItem.IsHD => Height >= 720`
+        // (BaseItem.cs:404) for EVERY kind; a folder stores no height and is
+        // never HD.
+        if options.contains_field(ItemFields::IsHd) && item.height.is_some_and(|h| h >= 720) {
+            dto.is_hd = Some(true);
         }
 
         dto.channel_id = item
@@ -2256,7 +3269,15 @@ impl ferrofin_traits::dto::DtoService for FerrofinDtoService {
         item_id: Uuid,
     ) -> Result<Option<f64>, ServiceError> {
         let images = self.load_images(item_id).await?;
-        Ok(self.primary_aspect_ratio(item_id, &images).await)
+        // The kind decides the fallback ratio for a remote/unreadable image
+        // (`GetDefaultPrimaryImageAspectRatio`); an item that no longer
+        // exists takes the `BaseItem` default of 0.
+        let kind = self
+            .library
+            .get_item_by_id(item_id)
+            .await?
+            .map_or(BaseItemKind::Folder, |row| row_kind(&row));
+        Ok(self.primary_aspect_ratio(item_id, kind, &images).await)
     }
 
     async fn get_base_item_dto(
@@ -2301,7 +3322,7 @@ impl ferrofin_traits::dto::DtoService for FerrofinDtoService {
         user: Option<&UserEntity>,
     ) -> Result<BaseItemDto, ServiceError> {
         let mut prefetched = self
-            .prefetch(std::slice::from_ref(item), options, user, false)
+            .prefetch(std::slice::from_ref(item), options, user, None, false)
             .await?;
         // Single-item page: the id cannot repeat, so every entry moves.
         let mut dto = self
@@ -2340,7 +3361,9 @@ impl FerrofinDtoService {
         // Visibility filtering needs the domain tree (`IsVisible`), which is not
         // ported at this layer; the caller is expected to have filtered the set,
         // so every input row is projected.
-        let mut prefetched = self.prefetch(items, options, user, retrieved_by_id).await?;
+        let mut prefetched = self
+            .prefetch(items, options, user, owner_id, retrieved_by_id)
+            .await?;
         // Ids the page lists more than once (a playlist may repeat a track).
         // Their prefetched entries are read once per occurrence, so they keep
         // cloning while every unique id moves its entry out — see `take_or_clone`.
@@ -2426,6 +3449,7 @@ impl FerrofinDtoService {
         items: &[BaseItemEntity],
         options: &DtoOptions,
         user: Option<&UserEntity>,
+        owner_id: Option<Uuid>,
         retrieved_by_id: bool,
     ) -> Result<Prefetched, ServiceError> {
         let ids: Vec<Uuid> = items.iter().map(row_id).collect();
@@ -2482,14 +3506,59 @@ impl FerrofinDtoService {
         // Merged alternate versions (rows pointing at a page item via
         // `PrimaryVersionId`), so each item's extra selectable sources build
         // without a per-item query; their streams join the stream batch below.
-        let alternates =
-            if options.contains_field(ItemFields::MediaSources) && !media_ids.is_empty() {
-                self.media_sources
-                    .get_alternate_versions_batch(&media_ids)
-                    .await?
-            } else {
-                HashMap::new()
-            };
+        let want_sources = options.contains_field(ItemFields::MediaSources);
+        let alternates = if want_sources && !media_ids.is_empty() {
+            self.media_sources
+                .get_alternate_versions_batch(&media_ids)
+                .await?
+        } else {
+            HashMap::new()
+        };
+        // `MediaSourceCount` needs only HOW MANY versions each page video has:
+        // the full rows above when the page asked for the sources anyway,
+        // otherwise one count over the partial `PrimaryVersionId` index — the
+        // grid pages ask for the count without the sources, and reading every
+        // alternate's 72 columns to count them was measurable there. A page
+        // item that is itself an alternate counts its PRIMARY's versions
+        // (Video.cs:255-280), so those primaries are counted too; the full
+        // read never covers them.
+        let mut alternate_counts: HashMap<Uuid, usize> = alternates
+            .iter()
+            .map(|(primary, rows)| (*primary, rows.len()))
+            .collect();
+        if options.contains_field(ItemFields::MediaSourceCount) {
+            let mut count_ids: Vec<Uuid> = items
+                .iter()
+                .filter(|i| kinds::is_video(row_kind(i)))
+                .filter_map(|i| i.primary_version_id.as_deref())
+                .filter_map(|p| Uuid::parse_str(p).ok())
+                .collect();
+            if !want_sources {
+                count_ids.extend(
+                    items
+                        .iter()
+                        .filter(|i| kinds::is_video(row_kind(i)))
+                        .map(row_id),
+                );
+            }
+            count_ids.sort_unstable();
+            count_ids.dedup();
+            if !count_ids.is_empty() {
+                let stored: Vec<String> = count_ids.iter().copied().map(guid_to_db).collect();
+                for (primary, count) in self
+                    .db
+                    .alternate_version_counts(&stored)
+                    .await
+                    .map_err(|e| ServiceError::Backend(e.to_string()))?
+                {
+                    if let (Ok(primary), Ok(count)) =
+                        (Uuid::parse_str(&primary), usize::try_from(count))
+                    {
+                        alternate_counts.insert(primary, count);
+                    }
+                }
+            }
+        }
         // The heavy per-item relations, bulk-loaded once for the page when their
         // field is requested (an all-fields list DTO otherwise fans out a query
         // per item for each — costly on the 2-connection pool).
@@ -2647,17 +3716,29 @@ impl FerrofinDtoService {
             (Vec::new(), HashMap::new())
         };
 
+        // The parents whose images the page borrows (C# `AddInheritedImages`
+        // and the Episode/Season/Audio parent blocks) — resolved before the
+        // image read so their rows ride in the same query.
+        let image_parents = self.load_image_parents(items, options, owner_id).await?;
+
         // The one image read: the page's own rows (when images are wanted) plus
-        // every credited person's row. `person_images` keeps its own copy of the
-        // cast entries because a page item drains its own entry as it projects.
+        // every credited person's row and every image-display parent.
+        // `person_images`/`parent_images` keep their own copies because a page
+        // item drains its own entry as it projects.
         let mut image_ids: Vec<Uuid> = if want_images { ids.clone() } else { Vec::new() };
         image_ids.extend(person_image_ids.iter().copied());
+        image_ids.extend(image_parents.image_ids.iter().copied());
         let fetched_images = if image_ids.is_empty() {
             HashMap::new()
         } else {
             self.load_images_batch(&image_ids).await?
         };
         let person_images: HashMap<Uuid, Vec<ItemImageInfo>> = person_image_ids
+            .iter()
+            .filter_map(|id| fetched_images.get(id).map(|rows| (*id, rows.clone())))
+            .collect();
+        let parent_images: HashMap<Uuid, Vec<ItemImageInfo>> = image_parents
+            .image_ids
             .iter()
             .filter_map(|id| fetched_images.get(id).map(|rows| (*id, rows.clone())))
             .collect();
@@ -2908,10 +3989,13 @@ impl FerrofinDtoService {
             linked_child_counts,
             played_counts,
             alternates,
+            alternate_counts,
             has_subtitles,
             has_lyrics,
             content_permissions,
             person_ids_by_name,
+            image_parents,
+            parent_images,
             alt_referenced,
         })
     }
@@ -2989,9 +4073,9 @@ mod tests {
     use ferrofin_traits::dto::DtoService as _;
 
     use crate::test_support::{
-        fetch_item, fetch_item_opt, image_info, seed_child_item, seed_folder_item, seed_images,
-        seed_item_of_series, seed_item_with_data, seed_named_item, seed_provider_id,
-        seed_series_with_studios, seed_user, test_db,
+        fetch_item, fetch_item_opt, image_info, link_alternate_version, save_item, seed_child_item,
+        seed_folder_item, seed_images, seed_item_of_series, seed_item_with_data, seed_named_item,
+        seed_provider_id, seed_series_with_studios, seed_user, test_db,
     };
 
     // ---- Fakes for the injected siblings -------------------------------------
@@ -3342,16 +4426,104 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(narrow_dto.recursive_item_count, None);
-        // With no `RecursiveItemCount` on the DTO the C# takes its ELSE branch:
-        // `Played = (UnplayedItemCount ?? 0) == 0`, and no percentage.
+        // v12 (Folder.cs:1983-1990) derives the played state from the COUNTS,
+        // not from the `RecursiveItemCount` DTO field 10.11.8 keyed on — so
+        // the percentage survives a page that never asked for the count.
         let narrow_ud = narrow_dto.user_data.as_ref().unwrap();
-        assert_eq!(narrow_ud.played_percentage, None);
+        assert!((narrow_ud.played_percentage.unwrap() - 25.0).abs() < 1e-9);
         assert!(!narrow_ud.played);
     }
 
+    /// `Folder.FillUserDataDtoValues` (v12 Folder.cs:1983-1990):
+    /// `if (totalCount > 0) { PlayedPercentage = played / total * 100;
+    /// Played = played >= total; } else { Played = true; }` — a folder with
+    /// no countable leaf is "played", and a fully-played one says so through
+    /// the `>=` and not through a `pct >= 100.0` comparison.
+    #[tokio::test]
+    async fn folder_played_state_follows_the_counts_not_the_field() {
+        let db = test_db().await;
+        let season_id = Uuid::new_v4();
+        seed_folder_item(&db, season_id, BaseItemKind::Season, "Season 1", None).await;
+        let user = seed_user(&db, Uuid::new_v4()).await;
+        let season = fetch_item(&db, season_id).await;
+        let narrow = DtoOptions {
+            fields: vec![ItemFields::Path],
+            ..DtoOptions::default()
+        };
+
+        // 4 of 4 played: 100 %, `Played = 4 >= 4`.
+        let svc = service_with_counts(
+            db.clone(),
+            FakeCounts {
+                played: 4,
+                ..FakeCounts::default()
+            },
+        );
+        let dto = svc
+            .get_base_item_dto(&season, &narrow, Some(&user), None)
+            .await
+            .unwrap();
+        let ud = dto.user_data.as_ref().unwrap();
+        assert!((ud.played_percentage.unwrap() - 100.0).abs() < 1e-9);
+        assert!(ud.played);
+        assert_eq!(ud.unplayed_item_count, Some(0));
+
+        // No countable leaf at all: no percentage, and `Played = true`.
+        let svc = service_with_counts(
+            db,
+            FakeCounts {
+                total: 0,
+                played: 0,
+                ..FakeCounts::default()
+            },
+        );
+        let dto = svc
+            .get_base_item_dto(&season, &narrow, Some(&user), None)
+            .await
+            .unwrap();
+        let ud = dto.user_data.as_ref().unwrap();
+        assert_eq!(ud.played_percentage, None);
+        assert!(ud.played);
+        assert_eq!(ud.unplayed_item_count, Some(0));
+    }
+
+    /// `if (dto.RecursiveItemCount > 0) dto.ChildCount = dto.RecursiveItemCount;`
+    /// (v12 DtoService.cs:614-617): a zero recursive count is not a
+    /// `ChildCount: 0` — the shortcut falls through to the real
+    /// `GetChildCount`, which counts the folder's direct children.
+    #[tokio::test]
+    async fn child_count_shortcut_skips_a_zero_recursive_count() {
+        let db = test_db().await;
+        let season_id = Uuid::new_v4();
+        seed_folder_item(&db, season_id, BaseItemKind::Season, "Season 1", None).await;
+        let user = seed_user(&db, Uuid::new_v4()).await;
+        let season = fetch_item(&db, season_id).await;
+        let options = DtoOptions {
+            fields: vec![ItemFields::RecursiveItemCount, ItemFields::ChildCount],
+            ..DtoOptions::default()
+        };
+        // No leaf descendants at all, but `get_child_count_batch` (4 direct
+        // children in the fake) still answers.
+        let svc = service_with_counts(
+            db,
+            FakeCounts {
+                total: 0,
+                played: 0,
+                ..FakeCounts::default()
+            },
+        );
+        let dto = svc
+            .get_base_item_dto(&season, &options, Some(&user), None)
+            .await
+            .unwrap();
+        assert_eq!(dto.recursive_item_count, Some(0));
+        assert_eq!(dto.child_count, Some(4), "the real count, not the zero");
+    }
+
     /// `CumulativeRunTimeTicks` is the folder's own stored runtime, field-gated,
-    /// and NOT under `EnableUserData` — `DtoService.cs:492-495` sits in the
-    /// `item is Folder` branch. Ferrofin stored the value and never copied it.
+    /// and lives in `AttachUserSpecificInfo`'s `item.IsFolder` branch (v12
+    /// DtoService.cs:633-636) — which `GetBaseItemDtoInternal` calls only
+    /// `if (user is not null)` (:389). Not under `EnableUserData`, though.
     #[tokio::test]
     async fn a_folder_carries_its_cumulative_run_time_ticks() {
         let db = test_db().await;
@@ -3363,16 +4535,34 @@ mod tests {
         seed_named_item(&db, leaf_id, BaseItemKind::Movie, "A Movie").await;
         let mut leaf = fetch_item(&db, leaf_id).await;
         leaf.run_time_ticks = Some(60_000_000);
+        let user = seed_user(&db, Uuid::new_v4()).await;
         let svc = service(db);
 
         let dto = svc
-            .get_base_item_dto(&album, &DtoOptions::default(), None, None)
+            .get_base_item_dto(&album, &DtoOptions::default(), Some(&user), None)
             .await
             .unwrap();
         assert_eq!(dto.cumulative_run_time_ticks, Some(60_000_000));
+        // Still there with user data switched off — the gate is the USER, not
+        // `EnableUserData`.
+        let no_user_data = DtoOptions {
+            enable_user_data: false,
+            ..DtoOptions::default()
+        };
+        let dto = svc
+            .get_base_item_dto(&album, &no_user_data, Some(&user), None)
+            .await
+            .unwrap();
+        assert_eq!(dto.cumulative_run_time_ticks, Some(60_000_000));
+        // An anonymous caller never enters `AttachUserSpecificInfo`.
+        let anon_dto = svc
+            .get_base_item_dto(&album, &DtoOptions::default(), None, None)
+            .await
+            .unwrap();
+        assert_eq!(anon_dto.cumulative_run_time_ticks, None);
         // A leaf is not a folder, so it carries none however long it is.
         let leaf_dto = svc
-            .get_base_item_dto(&leaf, &DtoOptions::default(), None, None)
+            .get_base_item_dto(&leaf, &DtoOptions::default(), Some(&user), None)
             .await
             .unwrap();
         assert_eq!(leaf_dto.cumulative_run_time_ticks, None);
@@ -3382,10 +4572,234 @@ mod tests {
             ..DtoOptions::default()
         };
         let narrow_dto = svc
-            .get_base_item_dto(&album, &narrow, None, None)
+            .get_base_item_dto(&album, &narrow, Some(&user), None)
             .await
             .unwrap();
         assert_eq!(narrow_dto.cumulative_run_time_ticks, None);
+    }
+
+    /// `DateLastMediaAdded` (v12 DtoService.cs:638-641) sits in the same
+    /// user-gated folder branch, and the mapper substitutes `DateTime.MinValue`
+    /// for a NULL column (`BaseItemMapper.cs:200`) — so a view that never had
+    /// media added carries `0001-01-01T00:00:00Z`, never an absent key.
+    #[tokio::test]
+    async fn a_folder_carries_date_last_media_added_min_value_when_unset() {
+        let db = test_db().await;
+        let view_id = Uuid::new_v4();
+        seed_folder_item(&db, view_id, BaseItemKind::UserView, "Movies", None).await;
+        let mut view = fetch_item(&db, view_id).await;
+        let movie_id = Uuid::new_v4();
+        seed_named_item(&db, movie_id, BaseItemKind::Movie, "A Movie").await;
+        let movie = fetch_item(&db, movie_id).await;
+        let genre_id = Uuid::new_v4();
+        seed_folder_item(&db, genre_id, BaseItemKind::Genre, "Drama", None).await;
+        let genre = fetch_item(&db, genre_id).await;
+        let user = seed_user(&db, Uuid::new_v4()).await;
+        let svc = service(db);
+        let options = DtoOptions::default();
+
+        let dto = svc
+            .get_base_item_dto(&view, &options, Some(&user), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            dto.date_last_media_added,
+            Some(ferrofin_model::json::datetime::dotnet_min())
+        );
+        // A stored value is copied as is.
+        let stamped = Utc.with_ymd_and_hms(2024, 5, 6, 7, 8, 9).unwrap();
+        view.date_last_media_added = Some(stamped);
+        let dto = svc
+            .get_base_item_dto(&view, &options, Some(&user), None)
+            .await
+            .unwrap();
+        assert_eq!(dto.date_last_media_added, Some(stamped));
+        // Not under `EnableUserData`: the gate is the user.
+        let no_user_data = DtoOptions {
+            enable_user_data: false,
+            ..DtoOptions::default()
+        };
+        let dto = svc
+            .get_base_item_dto(&view, &no_user_data, Some(&user), None)
+            .await
+            .unwrap();
+        assert_eq!(dto.date_last_media_added, Some(stamped));
+        // User-gated, folder-only, and a by-name Genre row (stored as a folder,
+        // a plain `BaseItem` upstream) never enters the branch.
+        for (item, user) in [(&view, None), (&movie, Some(&user)), (&genre, Some(&user))] {
+            let dto = svc
+                .get_base_item_dto(item, &options, user, None)
+                .await
+                .unwrap();
+            assert_eq!(dto.date_last_media_added, None, "{:?}", item.name);
+        }
+    }
+
+    /// `if (options.ContainsField(IsHD) && item.IsHD) dto.IsHD = true;` (v12
+    /// DtoService.cs:1555-1562) with `BaseItem.IsHD => Height >= 720`
+    /// (BaseItem.cs:404): true-only, so an SD file omits the key.
+    #[tokio::test]
+    async fn is_hd_is_true_only_from_the_stored_height() {
+        let db = test_db().await;
+        let movie_id = Uuid::new_v4();
+        seed_named_item(&db, movie_id, BaseItemKind::Movie, "A Movie").await;
+        let mut movie = fetch_item(&db, movie_id).await;
+        let svc = service(db);
+
+        movie.height = Some(1080);
+        let dto = svc
+            .get_base_item_dto(&movie, &DtoOptions::default(), None, None)
+            .await
+            .unwrap();
+        assert_eq!(dto.is_hd, Some(true));
+        movie.height = Some(720);
+        let dto = svc
+            .get_base_item_dto(&movie, &DtoOptions::default(), None, None)
+            .await
+            .unwrap();
+        assert_eq!(dto.is_hd, Some(true), "720 is the threshold, inclusive");
+        movie.height = Some(576);
+        let dto = svc
+            .get_base_item_dto(&movie, &DtoOptions::default(), None, None)
+            .await
+            .unwrap();
+        assert_eq!(dto.is_hd, None);
+        // Field-gated.
+        movie.height = Some(1080);
+        let narrow = DtoOptions {
+            fields: vec![ItemFields::Path],
+            ..DtoOptions::default()
+        };
+        let dto = svc
+            .get_base_item_dto(&movie, &narrow, None, None)
+            .await
+            .unwrap();
+        assert_eq!(dto.is_hd, None);
+    }
+
+    /// `MediaSourceCount` (v12 DtoService.cs:1319-1343) is emitted only when
+    /// the count differs from one: `linked + local + 1`, and an alternate
+    /// version answers with its primary's count (Video.cs:255-280).
+    ///
+    /// Two alternate rows point at `movie_id` and at nothing else, so the
+    /// count can only be right when it is looked up under the PRIMARY's id —
+    /// for the alternate page item as much as for the movie.
+    #[tokio::test]
+    async fn media_source_count_is_emitted_only_for_multi_version_videos() {
+        let db = test_db().await;
+        let movie_id = Uuid::new_v4();
+        seed_named_item(&db, movie_id, BaseItemKind::Movie, "A Movie").await;
+        let single_id = Uuid::new_v4();
+        seed_named_item(&db, single_id, BaseItemKind::Movie, "Single Cut").await;
+        let audio_id = Uuid::new_v4();
+        seed_named_item(&db, audio_id, BaseItemKind::Audio, "Track 01").await;
+        let alt_ids = [Uuid::new_v4(), Uuid::new_v4()];
+        for (i, alt_id) in alt_ids.iter().enumerate() {
+            seed_named_item(&db, *alt_id, BaseItemKind::Video, &format!("Cut {i}")).await;
+            link_alternate_version(&db, *alt_id, movie_id).await;
+        }
+        let movie = fetch_item(&db, movie_id).await;
+        let single = fetch_item(&db, single_id).await;
+        let audio = fetch_item(&db, audio_id).await;
+        let alternate = fetch_item(&db, alt_ids[0]).await;
+        assert!(
+            alternate.primary_version_id.is_some(),
+            "fixture links the alternate"
+        );
+        // The fake reports no alternates at all, so a count that came from
+        // the `MediaSources` rows instead of the count read would be 1 → absent.
+        let svc = service_with_sources(
+            db.clone(),
+            FakeSources {
+                no_alternates: true,
+                ..FakeSources::default()
+            },
+        );
+        let count_only = DtoOptions {
+            fields: vec![ItemFields::MediaSourceCount],
+            ..DtoOptions::default()
+        };
+
+        let dtos = svc
+            .get_base_item_dtos(
+                &[movie.clone(), single.clone(), audio, alternate],
+                &count_only,
+                None,
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            dtos[0].media_source_count,
+            Some(3),
+            "primary + 2 alternates"
+        );
+        assert_eq!(
+            dtos[1].media_source_count, None,
+            "a single-version video says nothing"
+        );
+        assert_eq!(dtos[2].media_source_count, None, "songs always have one");
+        assert_eq!(
+            dtos[3].media_source_count,
+            Some(3),
+            "the alternate reads under its primary"
+        );
+        // Field-gated.
+        let dto = svc
+            .get_base_item_dto(&movie, &DtoOptions::with_all_fields(false), None, None)
+            .await
+            .unwrap();
+        assert_eq!(dto.media_source_count, None);
+
+        // With `MediaSources` requested too, the count comes from the rows the
+        // sources block already read — `FakeSources` hands every primary one
+        // alternate, so 2 — and no count read is needed for them.
+        let svc = service(db);
+        let both = DtoOptions {
+            fields: vec![ItemFields::MediaSourceCount, ItemFields::MediaSources],
+            ..DtoOptions::default()
+        };
+        let dto = svc
+            .get_base_item_dto(&movie, &both, None, None)
+            .await
+            .unwrap();
+        assert_eq!(dto.media_source_count, Some(2));
+        assert_eq!(dto.media_sources.as_ref().map(Vec::len), Some(2));
+    }
+
+    /// v12 assigns `Chapters` outside the `item is Video` block
+    /// (DtoService.cs:1358-1361), so a folder, a series or a user view carries
+    /// `[]` when the field is requested — 10.11.8 omitted the key there.
+    #[tokio::test]
+    async fn chapters_are_an_empty_array_on_every_non_video_kind() {
+        let db = test_db().await;
+        let series_id = Uuid::new_v4();
+        seed_folder_item(&db, series_id, BaseItemKind::Series, "Series 01", None).await;
+        let view_id = Uuid::new_v4();
+        seed_folder_item(&db, view_id, BaseItemKind::UserView, "Shows", None).await;
+        let audio_id = Uuid::new_v4();
+        seed_named_item(&db, audio_id, BaseItemKind::Audio, "Track 01").await;
+        let svc = service(db.clone());
+        for id in [series_id, view_id, audio_id] {
+            let item = fetch_item(&db, id).await;
+            let dto = svc
+                .get_base_item_dto(&item, &DtoOptions::default(), None, None)
+                .await
+                .unwrap();
+            assert_eq!(dto.chapters, Some(Vec::new()), "{:?}", item.name);
+        }
+        // Field-gated still.
+        let narrow = DtoOptions {
+            fields: vec![ItemFields::Path],
+            ..DtoOptions::default()
+        };
+        let series = fetch_item(&db, series_id).await;
+        let dto = svc
+            .get_base_item_dto(&series, &narrow, None, None)
+            .await
+            .unwrap();
+        assert_eq!(dto.chapters, None);
     }
 
     /// `HasLyrics` is emitted on every `Audio` DTO, `false` included.
@@ -3536,7 +4950,8 @@ mod tests {
         }
 
         // The field is opt-in: without `ItemFields::RecursiveItemCount` the
-        // count is absent, and `Played` falls back to the `unplayed == 0` arm.
+        // count is absent — but the played numbers come from the counts, not
+        // the field (v12 Folder.cs:1983-1990), so they stay.
         let mut narrow = DtoOptions::default();
         narrow
             .fields
@@ -3548,7 +4963,7 @@ mod tests {
         assert_eq!(narrow_dto.recursive_item_count, None);
         let narrow_ud = narrow_dto.user_data.as_ref().unwrap();
         assert_eq!(narrow_ud.unplayed_item_count, Some(3));
-        assert_eq!(narrow_ud.played_percentage, None);
+        assert!((narrow_ud.played_percentage.unwrap() - 25.0).abs() < 1e-9);
         assert!(!narrow_ud.played);
 
         // The batch (prefetched) path agrees with the single-item path.
@@ -3782,9 +5197,23 @@ mod tests {
     /// `> 0` test is "the default is an empty array, so we can't reliably use
     /// the count when it's empty" — and a fake that reported entries for every
     /// folder would hide the guard.
-    #[derive(Default)]
+    ///
+    /// `played`/`total` are the leaf-descendant counts every folder reports
+    /// (1 of 4 by default — one played, three unplayed).
     struct FakeCounts {
         linked: i32,
+        played: i32,
+        total: i32,
+    }
+
+    impl Default for FakeCounts {
+        fn default() -> Self {
+            Self {
+                linked: 0,
+                played: 1,
+                total: 4,
+            }
+        }
     }
 
     #[async_trait]
@@ -3848,15 +5277,16 @@ mod tests {
             _user: &UserEntity,
         ) -> Result<HashMap<Uuid, ferrofin_traits::persistence::PlayedAndTotal>, ServiceError>
         {
-            // Every folder reports 1 of 4 leaf descendants played → 3 unplayed.
+            // Every folder reports the same counts (1 of 4 leaf descendants
+            // played → 3 unplayed, by default).
             Ok(folder_ids
                 .iter()
                 .map(|&f| {
                     (
                         f,
                         ferrofin_traits::persistence::PlayedAndTotal {
-                            played: 1,
-                            total: 4,
+                            played: self.played,
+                            total: self.total,
                         },
                     )
                 })
@@ -3970,6 +5400,9 @@ mod tests {
         /// repository, so the lean (nothing-prefetched) path can be asserted
         /// in BOTH directions instead of only the positive one.
         with_lyrics: std::collections::HashSet<Uuid>,
+        /// When set, no primary has an alternate version — the single-version
+        /// shape `MediaSourceCount` stays silent on.
+        no_alternates: bool,
     }
 
     #[async_trait]
@@ -4072,6 +5505,9 @@ mod tests {
             primary_ids: &[Uuid],
         ) -> Result<HashMap<Uuid, Vec<BaseItemEntity>>, ServiceError> {
             // Every requested primary reports one canned alternate version.
+            if self.no_alternates {
+                return Ok(HashMap::new());
+            }
             Ok(primary_ids
                 .iter()
                 .map(|&id| {
@@ -4337,20 +5773,31 @@ mod tests {
         service_with(db, Arc::new(FakeLibrary::default()))
     }
 
-    /// [`service`] whose count service reports `linked` linked children for
-    /// every parent — the `Folder.LinkedChildren.Length` half of upstream's
-    /// ChildCount shortcut.
-    fn service_with_linked_children(db: Database, linked: i32) -> FerrofinDtoService {
+    /// [`service`] over a count service the caller shapes.
+    fn service_with_counts(db: Database, counts: FakeCounts) -> FerrofinDtoService {
         FerrofinDtoService::new(
             db,
             "server-1".into(),
             Arc::new(FakeLibrary::default()),
             Arc::new(FakeUserData),
-            Arc::new(FakeCounts { linked }),
+            Arc::new(counts),
             Arc::new(FakeImages),
             Arc::new(FakeSources::default()),
             Arc::new(FakeChapters),
             Arc::new(FakeTrickplay),
+        )
+    }
+
+    /// [`service`] whose count service reports `linked` linked children for
+    /// every parent — the `Folder.LinkedChildren.Length` half of upstream's
+    /// ChildCount shortcut.
+    fn service_with_linked_children(db: Database, linked: i32) -> FerrofinDtoService {
+        service_with_counts(
+            db,
+            FakeCounts {
+                linked,
+                ..FakeCounts::default()
+            },
         )
     }
 
@@ -4407,6 +5854,563 @@ mod tests {
         // Only a Series carries it — C# guards on `item is Series tmp`.
         assert_eq!(dtos[1].air_days, None);
     }
+
+    /// `dto.Status = series.Status?.ToString()` (v12 DtoService.cs:1483), read
+    /// from the `Data` blob's `"Status"` — the only home the property has —
+    /// and only on a Series: a movie whose blob carries the key stays silent.
+    #[tokio::test]
+    async fn a_series_dto_carries_its_status_from_the_data_blob() {
+        let db = test_db().await;
+        let ended = Uuid::new_v4();
+        let unset = Uuid::new_v4();
+        let movie = Uuid::new_v4();
+        seed_item_with_data(
+            &db,
+            ended,
+            BaseItemKind::Series,
+            "Firefly",
+            r#"{"AirDays":["Friday"],"AirTime":"20:00","Status":"Ended"}"#,
+        )
+        .await;
+        seed_named_item(&db, unset, BaseItemKind::Series, "Unknown").await;
+        seed_item_with_data(
+            &db,
+            movie,
+            BaseItemKind::Movie,
+            "Serenity",
+            r#"{"Status":"Ended"}"#,
+        )
+        .await;
+        let svc = service(db.clone());
+        let rows = vec![
+            fetch_item(&db, ended).await,
+            fetch_item(&db, unset).await,
+            fetch_item(&db, movie).await,
+        ];
+        let dtos = svc
+            .get_base_item_dtos(&rows, &DtoOptions::with_all_fields(false), None, None, true)
+            .await
+            .unwrap();
+        assert_eq!(dtos[0].status.as_deref(), Some("Ended"));
+        assert_eq!(
+            dtos[0].air_days.as_deref(),
+            Some(&[ferrofin_model::dto::DayOfWeek::Friday][..])
+        );
+        assert_eq!(dtos[0].air_time.as_deref(), Some("20:00"));
+        assert_eq!(dtos[1].status, None);
+        assert_eq!(dtos[1].air_days.as_deref(), Some(&[][..]), "never null");
+        assert_eq!(dtos[1].air_time, None);
+        assert_eq!(dtos[2].status, None);
+        assert_eq!(dtos[2].air_days, None, "only a Series carries them");
+    }
+
+    // ---- Inherited / parent images (v12 DtoService.AddInheritedImages) -------
+
+    /// The exact test-data shape: an episode with no images, under a season
+    /// with `folder.jpg`, under a series with `poster.jpg` + `fanart.jpg`.
+    /// Seeds the three rows, links them, and returns (episode, season, series).
+    async fn seed_episode_tree(db: &Database) -> (BaseItemEntity, Uuid, Uuid) {
+        let series_id = Uuid::new_v4();
+        let season_id = Uuid::new_v4();
+        let episode_id = Uuid::new_v4();
+        seed_folder_item(db, series_id, BaseItemKind::Series, "The Cold Ocean", None).await;
+        seed_item_of_series(db, season_id, BaseItemKind::Season, "Season 1", series_id).await;
+        let mut season = fetch_item(db, season_id).await;
+        season.parent_id = Some(guid_to_db(series_id));
+        save_item(db, &season).await;
+        seed_item_of_series(
+            db,
+            episode_id,
+            BaseItemKind::Episode,
+            "Sour Secret",
+            series_id,
+        )
+        .await;
+        let mut episode = fetch_item(db, episode_id).await;
+        episode.parent_id = Some(guid_to_db(season_id));
+        episode.season_id = Some(guid_to_db(season_id));
+        save_item(db, &episode).await;
+        seed_images(
+            db,
+            series_id,
+            &[
+                image_info(
+                    ImageType::Primary,
+                    "/shows/poster.jpg",
+                    Some("series-primary"),
+                ),
+                image_info(
+                    ImageType::Backdrop,
+                    "/shows/fanart.jpg",
+                    Some("series-backdrop"),
+                ),
+            ],
+        )
+        .await;
+        seed_images(
+            db,
+            season_id,
+            &[image_info(
+                ImageType::Primary,
+                "/shows/Season 01/folder.jpg",
+                Some("season-primary"),
+            )],
+        )
+        .await;
+        (fetch_item(db, episode_id).await, season_id, series_id)
+    }
+
+    /// The page shape jellyfin-web asks for on the Episodes list —
+    /// `EnableImageTypes=Primary,Backdrop,Thumb` (a Thumb limit, so the walk
+    /// runs): the episode borrows the season's poster as its parent primary,
+    /// the series' poster as `SeriesPrimaryImageTag`, the series' backdrop as
+    /// its parent backdrop, and the series' aspect ratio.
+    #[tokio::test]
+    async fn an_episode_without_images_inherits_its_season_and_series_images() {
+        let db = test_db().await;
+        let (episode, season_id, series_id) = seed_episode_tree(&db).await;
+        let svc = service(db);
+        let options = DtoOptions {
+            fields: vec![ItemFields::PrimaryImageAspectRatio],
+            image_type_limit: 1,
+            image_types: vec![ImageType::Primary, ImageType::Backdrop, ImageType::Thumb],
+            ..DtoOptions::default()
+        };
+        let dto = svc
+            .get_base_item_dto(&episode, &options, None, None)
+            .await
+            .unwrap();
+        assert_eq!(dto.image_tags, Some(HashMap::new()), "no images of its own");
+        assert_eq!(dto.parent_primary_image_item_id, Some(season_id));
+        assert_eq!(
+            dto.parent_primary_image_tag.as_deref(),
+            Some("tag:/shows/Season 01/folder.jpg")
+        );
+        assert_eq!(
+            dto.series_primary_image_tag.as_deref(),
+            Some("tag:/shows/poster.jpg")
+        );
+        assert_eq!(dto.parent_backdrop_item_id, Some(series_id));
+        assert_eq!(
+            dto.parent_backdrop_image_tags.as_deref(),
+            Some(&["tag:/shows/fanart.jpg".to_owned()][..])
+        );
+        // The FakeImages dimension is 400×200.
+        assert!((dto.primary_image_aspect_ratio.unwrap() - 2.0).abs() < 1e-9);
+        // The blurhashes of the borrowed images ride along under their tags.
+        let hashes = dto.image_blur_hashes.as_ref().unwrap();
+        assert_eq!(
+            hashes[&ImageType::Primary]["tag:/shows/Season 01/folder.jpg"],
+            "season-primary"
+        );
+        assert_eq!(
+            hashes[&ImageType::Primary]["tag:/shows/poster.jpg"],
+            "series-primary"
+        );
+        assert_eq!(
+            hashes[&ImageType::Backdrop]["tag:/shows/fanart.jpg"],
+            "series-backdrop"
+        );
+        // Nothing has a Thumb or a Logo, so no parent thumb/logo either.
+        assert_eq!(dto.parent_thumb_item_id, None);
+        assert_eq!(dto.parent_logo_item_id, None);
+    }
+
+    /// The loop of `AddInheritedImages` starts only on a missing Logo or
+    /// Thumb with a positive limit (`parent` is null on entry, `artLimit` is
+    /// forced 0): with `EnableImageTypes=Primary,Backdrop` it never runs,
+    /// so no `ParentBackdrop*` — while the Episode block, which is not part
+    /// of the loop, still fills the series/season primaries. Ported verbatim.
+    #[tokio::test]
+    async fn a_primary_backdrop_only_request_never_walks_the_parents() {
+        let db = test_db().await;
+        let (episode, season_id, series_id) = seed_episode_tree(&db).await;
+        let svc = service(db);
+        let options = DtoOptions {
+            image_type_limit: 1,
+            image_types: vec![ImageType::Primary, ImageType::Backdrop],
+            ..DtoOptions::with_all_fields(false)
+        };
+        let dto = svc
+            .get_base_item_dto(&episode, &options, None, None)
+            .await
+            .unwrap();
+        assert_eq!(dto.parent_backdrop_item_id, None);
+        assert_eq!(dto.parent_backdrop_image_tags, None);
+        assert_eq!(dto.parent_primary_image_item_id, Some(season_id));
+        assert_eq!(
+            dto.series_primary_image_tag.as_deref(),
+            Some("tag:/shows/poster.jpg")
+        );
+        // The series' ratio is attached even though the field was never
+        // requested — the block is ungated (:1440-1443).
+        assert!((dto.primary_image_aspect_ratio.unwrap() - 2.0).abs() < 1e-9);
+        let _ = series_id;
+    }
+
+    /// `EnableImages=false`: every limit is 0, so `AddInheritedImages`
+    /// returns at once and no parent primary is set — but the Episode block
+    /// still stamps `SeriesPrimaryImageTag`, and because `dto.ImageTags` is
+    /// null the series' aspect ratio lands even on an episode that has a
+    /// poster of its own (the `ImageTags is null ||` quirk, :1440).
+    #[tokio::test]
+    async fn with_images_off_the_series_primary_tag_and_ratio_still_land() {
+        let db = test_db().await;
+        let (episode, _season_id, _series_id) = seed_episode_tree(&db).await;
+        seed_images(
+            &db,
+            row_id(&episode),
+            &[image_info(
+                ImageType::Primary,
+                "/shows/S01E01-thumb.jpg",
+                None,
+            )],
+        )
+        .await;
+        let svc = service(db);
+        let options = DtoOptions {
+            enable_images: false,
+            ..DtoOptions::default()
+        };
+        let dto = svc
+            .get_base_item_dto(&episode, &options, None, None)
+            .await
+            .unwrap();
+        assert_eq!(dto.image_tags, None);
+        assert_eq!(
+            dto.series_primary_image_tag.as_deref(),
+            Some("tag:/shows/poster.jpg")
+        );
+        assert_eq!(dto.parent_primary_image_item_id, None);
+        assert_eq!(dto.parent_backdrop_item_id, None);
+        assert!((dto.primary_image_aspect_ratio.unwrap() - 2.0).abs() < 1e-9);
+    }
+
+    /// A season borrows only the series' poster (`SeriesPrimaryImageTag` and
+    /// the ratio, :1503-1516) — no `ParentPrimaryImage*` — and, through the
+    /// walk, the series' backdrop.
+    #[tokio::test]
+    async fn a_season_inherits_the_series_poster_and_backdrop() {
+        let db = test_db().await;
+        let (episode, season_id, series_id) = seed_episode_tree(&db).await;
+        let _ = episode;
+        let season = fetch_item(&db, season_id).await;
+        let svc = service(db);
+        let options = DtoOptions {
+            image_types: vec![ImageType::Primary, ImageType::Backdrop, ImageType::Thumb],
+            ..DtoOptions::default()
+        };
+        let dto = svc
+            .get_base_item_dto(&season, &options, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            dto.image_tags
+                .as_ref()
+                .and_then(|t| t.get(&ImageType::Primary))
+                .map(String::as_str),
+            Some("tag:/shows/Season 01/folder.jpg"),
+            "its own poster"
+        );
+        assert_eq!(
+            dto.series_primary_image_tag.as_deref(),
+            Some("tag:/shows/poster.jpg")
+        );
+        assert_eq!(dto.parent_primary_image_item_id, None);
+        assert_eq!(dto.parent_backdrop_item_id, Some(series_id));
+        // Its own poster is there, so the season's OWN ratio stays.
+        assert!((dto.primary_image_aspect_ratio.unwrap() - 2.0).abs() < 1e-9);
+    }
+
+    /// Audio → MusicAlbum → MusicArtist (by album-artist name): `AlbumId`,
+    /// `AlbumPrimaryImageTag`, `AlbumNormalizationGain` from the album row
+    /// (:1207-1222), the album's Logo as the parent logo, and the artist's
+    /// backdrop as the parent backdrop — the artist does not inherit, so the
+    /// walk stops there.
+    #[tokio::test]
+    async fn a_track_inherits_from_its_album_and_then_the_album_artist() {
+        let db = test_db().await;
+        let artist_id = Uuid::new_v4();
+        let album_id = Uuid::new_v4();
+        let track_id = Uuid::new_v4();
+        seed_folder_item(
+            &db,
+            artist_id,
+            BaseItemKind::MusicArtist,
+            "Parity Band",
+            None,
+        )
+        .await;
+        seed_folder_item(&db, album_id, BaseItemKind::MusicAlbum, "First Album", None).await;
+        let mut album = fetch_item(&db, album_id).await;
+        album.album_artists = Some("Parity Band".to_owned());
+        album.lufs = Some(-14.0);
+        save_item(&db, &album).await;
+        seed_child_item(&db, track_id, BaseItemKind::Audio, "Track 01", album_id).await;
+        seed_images(
+            &db,
+            album_id,
+            &[
+                image_info(
+                    ImageType::Primary,
+                    "/music/album/cover.jpg",
+                    Some("album-primary"),
+                ),
+                image_info(ImageType::Logo, "/music/album/logo.png", None),
+            ],
+        )
+        .await;
+        seed_images(
+            &db,
+            artist_id,
+            &[image_info(
+                ImageType::Backdrop,
+                "/music/artist/fanart.jpg",
+                None,
+            )],
+        )
+        .await;
+        let artist = fetch_item(&db, artist_id).await;
+        let track = fetch_item(&db, track_id).await;
+        let svc = service_with(
+            db,
+            Arc::new(FakeLibrary {
+                named_items: vec![artist],
+                ..FakeLibrary::default()
+            }),
+        );
+        let dto = svc
+            .get_base_item_dto(&track, &DtoOptions::default(), None, None)
+            .await
+            .unwrap();
+        assert_eq!(dto.album_id, Some(album_id));
+        assert_eq!(
+            dto.album_primary_image_tag.as_deref(),
+            Some("tag:/music/album/cover.jpg")
+        );
+        assert!((dto.album_normalization_gain.unwrap() - (-18.0 + 14.0)).abs() < 1e-6);
+        assert_eq!(dto.parent_logo_item_id, Some(album_id));
+        assert_eq!(
+            dto.parent_logo_image_tag.as_deref(),
+            Some("tag:/music/album/logo.png")
+        );
+        assert_eq!(dto.parent_backdrop_item_id, Some(artist_id));
+        assert_eq!(
+            dto.image_blur_hashes.as_ref().unwrap()[&ImageType::Primary]["tag:/music/album/cover.jpg"],
+            "album-primary"
+        );
+    }
+
+    /// A movie's walk ends at its library: the `CollectionFolder` does not
+    /// inherit, its Thumb is guarded (`parent is not ICollectionFolder`,
+    /// :1690) but its Logo and Backdrop are not — and on a tree scanned by
+    /// Jellyfin (movie → physical `Folder` → `AggregateFolder`) the library
+    /// is reached through `GetCollectionFolders`' `PhysicalLocationsList`
+    /// match (:1594-1597).
+    #[tokio::test]
+    async fn a_movie_reaches_its_collection_folder_through_the_physical_root() {
+        let db = test_db().await;
+        let aggregate_id = Uuid::new_v4();
+        let physical_id = Uuid::new_v4();
+        let view_id = Uuid::new_v4();
+        let movie_id = Uuid::new_v4();
+        seed_folder_item(
+            &db,
+            aggregate_id,
+            BaseItemKind::AggregateFolder,
+            "root",
+            None,
+        )
+        .await;
+        seed_folder_item(
+            &db,
+            physical_id,
+            BaseItemKind::Folder,
+            "movies",
+            Some(aggregate_id),
+        )
+        .await;
+        let mut physical = fetch_item(&db, physical_id).await;
+        physical.path = Some("/media/movies".to_owned());
+        save_item(&db, &physical).await;
+        seed_item_with_data(
+            &db,
+            view_id,
+            BaseItemKind::CollectionFolder,
+            "Movies",
+            r#"{"PhysicalLocationsList":["/config/root/default/Movies","/media/movies"]}"#,
+        )
+        .await;
+        seed_child_item(
+            &db,
+            movie_id,
+            BaseItemKind::Movie,
+            "Burning Dance",
+            physical_id,
+        )
+        .await;
+        seed_images(
+            &db,
+            view_id,
+            &[
+                image_info(ImageType::Logo, "/views/movies/logo.png", None),
+                image_info(ImageType::Thumb, "/views/movies/thumb.jpg", None),
+                image_info(ImageType::Backdrop, "/views/movies/backdrop.jpg", None),
+            ],
+        )
+        .await;
+        let movie = fetch_item(&db, movie_id).await;
+        let svc = service(db);
+        let dto = svc
+            .get_base_item_dto(&movie, &DtoOptions::default(), None, None)
+            .await
+            .unwrap();
+        assert_eq!(dto.parent_logo_item_id, Some(view_id));
+        assert_eq!(dto.parent_backdrop_item_id, Some(view_id));
+        assert_eq!(
+            dto.parent_thumb_item_id, None,
+            "a collection folder's thumb is never inherited"
+        );
+    }
+
+    /// A `Series` does not inherit at all (`Series.cs:48`), whatever sits
+    /// above it — and neither does a by-name row.
+    #[tokio::test]
+    async fn a_series_and_a_genre_inherit_nothing() {
+        let db = test_db().await;
+        let view_id = Uuid::new_v4();
+        let series_id = Uuid::new_v4();
+        let genre_id = Uuid::new_v4();
+        seed_folder_item(&db, view_id, BaseItemKind::CollectionFolder, "Shows", None).await;
+        seed_folder_item(
+            &db,
+            series_id,
+            BaseItemKind::Series,
+            "Series",
+            Some(view_id),
+        )
+        .await;
+        seed_folder_item(&db, genre_id, BaseItemKind::Genre, "Drama", Some(view_id)).await;
+        seed_images(
+            &db,
+            view_id,
+            &[image_info(ImageType::Logo, "/views/shows/logo.png", None)],
+        )
+        .await;
+        let svc = service(db.clone());
+        for id in [series_id, genre_id] {
+            let item = fetch_item(&db, id).await;
+            let dto = svc
+                .get_base_item_dto(&item, &DtoOptions::default(), None, None)
+                .await
+                .unwrap();
+            assert_eq!(dto.parent_logo_item_id, None, "{:?}", item.name);
+        }
+    }
+
+    /// The playlists view shows its display parent's Primary image in place
+    /// of its own (:1617-1630).
+    #[tokio::test]
+    async fn the_playlists_view_shows_its_display_parents_primary() {
+        let db = test_db().await;
+        let folder_id = Uuid::new_v4();
+        let view_id = Uuid::new_v4();
+        seed_folder_item(
+            &db,
+            folder_id,
+            BaseItemKind::PlaylistsFolder,
+            "Playlists",
+            None,
+        )
+        .await;
+        seed_item_with_data(
+            &db,
+            view_id,
+            BaseItemKind::UserView,
+            "Playlists",
+            &format!(
+                r#"{{"ViewType":"playlists","DisplayParentId":"{}"}}"#,
+                folder_id.simple()
+            ),
+        )
+        .await;
+        seed_images(
+            &db,
+            folder_id,
+            &[image_info(
+                ImageType::Primary,
+                "/playlists/folder.jpg",
+                None,
+            )],
+        )
+        .await;
+        seed_images(
+            &db,
+            view_id,
+            &[image_info(ImageType::Primary, "/views/playlists.jpg", None)],
+        )
+        .await;
+        let view = fetch_item(&db, view_id).await;
+        let svc = service(db);
+        let dto = svc
+            .get_base_item_dto(&view, &DtoOptions::default(), None, None)
+            .await
+            .unwrap();
+        assert_eq!(dto.parent_primary_image_item_id, Some(folder_id));
+        assert_eq!(
+            dto.parent_primary_image_tag.as_deref(),
+            Some("tag:/playlists/folder.jpg")
+        );
+        assert!(
+            !dto.image_tags
+                .as_ref()
+                .unwrap()
+                .contains_key(&ImageType::Primary),
+            "its own Primary is removed"
+        );
+    }
+
+    /// `GetPrimaryImageAspectRatio` (:1745-1775) answers the kind's default
+    /// (`Series` 2/3, `BaseItem` 0) for a remote image or an unreadable one,
+    /// and null only when there is no primary at all.
+    #[tokio::test]
+    async fn primary_aspect_ratio_falls_back_to_the_kinds_default() {
+        let db = test_db().await;
+        let series_id = Uuid::new_v4();
+        let book_id = Uuid::new_v4();
+        seed_folder_item(&db, series_id, BaseItemKind::Series, "Remote", None).await;
+        seed_named_item(&db, book_id, BaseItemKind::Book, "Remote Book").await;
+        for id in [series_id, book_id] {
+            seed_images(
+                &db,
+                id,
+                &[image_info(
+                    ImageType::Primary,
+                    "https://img.example/poster.jpg",
+                    None,
+                )],
+            )
+            .await;
+        }
+        let svc = service(db.clone());
+        let options = DtoOptions {
+            fields: vec![ItemFields::PrimaryImageAspectRatio],
+            ..DtoOptions::default()
+        };
+        let series = fetch_item(&db, series_id).await;
+        let dto = svc
+            .get_base_item_dto(&series, &options, None, None)
+            .await
+            .unwrap();
+        assert!((dto.primary_image_aspect_ratio.unwrap() - 2.0 / 3.0).abs() < 1e-9);
+        let book = fetch_item(&db, book_id).await;
+        let dto = svc
+            .get_base_item_dto(&book, &options, None, None)
+            .await
+            .unwrap();
+        assert_eq!(dto.primary_image_aspect_ratio, Some(0.0));
+    }
+
     /// `DisplayPreferencesId` keys display prefs by TYPE, not by item.
     ///
     /// Port of `BaseItem.DisplayPreferencesId` (v10.11.8
@@ -4778,10 +6782,10 @@ mod tests {
         assert_eq!(lean_dtos[2].has_lyrics, None);
     }
 
-    /// `DtoService.cs:594`, inside `AttachUserSpecificInfo`'s `if (item.IsFolder)`:
-    /// `CumulativeRunTimeTicks` IS the folder's own `RunTimeTicks` column (the
-    /// sum `MetadataService.UpdateCumulativeRunTimeTicks` wrote at scan time),
-    /// field-gated, and only for folders.
+    /// v12 DtoService.cs:633-636, inside `AttachUserSpecificInfo`'s
+    /// `if (item.IsFolder)`: `CumulativeRunTimeTicks` IS the folder's own
+    /// `RunTimeTicks` column (the sum `MetadataService.UpdateCumulativeRunTimeTicks`
+    /// wrote at scan time), field-gated, only for folders, and only for a user.
     #[tokio::test]
     async fn a_folder_dto_emits_cumulative_run_time_ticks_from_its_own_column() {
         let db = test_db().await;
@@ -4789,6 +6793,7 @@ mod tests {
         let track = Uuid::from_u128(0x5D02);
         seed_named_item(&db, album, BaseItemKind::MusicAlbum, "Album").await;
         seed_named_item(&db, track, BaseItemKind::Audio, "Track").await;
+        let user = seed_user(&db, Uuid::new_v4()).await;
         let svc = service_with_sources(db.clone(), FakeSources::default());
         let mut album_row = fetch_item(&db, album).await;
         album_row.is_folder = true;
@@ -4798,7 +6803,7 @@ mod tests {
         let items = vec![album_row, track_row];
 
         let dtos = svc
-            .get_base_item_dtos(&items, &DtoOptions::default(), None, None, true)
+            .get_base_item_dtos(&items, &DtoOptions::default(), Some(&user), None, true)
             .await
             .unwrap();
         assert_eq!(dtos[0].cumulative_run_time_ticks, Some(60_000_000));
@@ -4811,7 +6816,7 @@ mod tests {
         // Field-gated, unlike `RunTimeTicks`.
         let lean = DtoOptions::with_all_fields(false);
         let dtos = svc
-            .get_base_item_dtos(&items, &lean, None, None, true)
+            .get_base_item_dtos(&items, &lean, Some(&user), None, true)
             .await
             .unwrap();
         assert_eq!(dtos[0].cumulative_run_time_ticks, None);
@@ -6433,6 +8438,10 @@ mod tests {
         let db = test_db().await;
         let library = Uuid::new_v4();
         let album = Uuid::new_v4();
+        // The parents are real rows: `FindParent<MusicAlbum>()` walks the
+        // stored chain and only a `MusicAlbum` row counts.
+        seed_folder_item(&db, library, BaseItemKind::CollectionFolder, "Books", None).await;
+        seed_folder_item(&db, album, BaseItemKind::MusicAlbum, "The Wall", None).await;
         let (book_id, audiobook_id, track_id) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
         seed_named_item(&db, book_id, BaseItemKind::Book, "A Study in Scarlet").await;
         seed_named_item(&db, audiobook_id, BaseItemKind::AudioBook, "The Hobbit").await;
@@ -6520,8 +8529,9 @@ mod tests {
         // The all-fields channel detail carries a present-and-empty stream list
         // (C# assigns `GetMediaStreams()` = [] for every IHasMediaSources).
         assert_eq!(dto.media_streams, Some(Vec::new()));
-        // C# only assigns Chapters for a `Video`; a channel omits the key.
-        assert_eq!(dto.chapters, None);
+        // v12 assigns Chapters for every kind (DtoService.cs:1358-1361); a
+        // channel owns none, so it carries `[]`.
+        assert_eq!(dto.chapters, Some(Vec::new()));
 
         let sources = dto.media_sources.expect("placeholder media source");
         assert_eq!(sources.len(), 1);
@@ -6580,7 +8590,11 @@ mod tests {
         assert_eq!(dto.media_type, MediaType::Unknown);
         assert_eq!(dto.media_sources, None);
         assert_eq!(dto.media_streams, None);
-        assert_eq!(dto.chapters, None, "a programme is not a Video");
+        assert_eq!(
+            dto.chapters,
+            Some(Vec::new()),
+            "v12 assigns Chapters for every kind; a programme owns none"
+        );
         assert_eq!(dto.channel_id, Some(channel));
         assert_eq!(dto.parent_id, Some(channel));
         assert_eq!(dto.run_time_ticks, Some(36_000_000_000));

@@ -455,6 +455,28 @@ pub async fn seed_episode(
     .await;
 }
 
+/// Writes an item row back through the real upsert — for a fixture that
+/// needs columns the seeders do not take (`SeasonId`, `AlbumArtists`, `LUFS`,
+/// `OwnerId`, …): `fetch_item`, set the fields, `save_item`.
+pub async fn save_item(db: &Database, row: &BaseItemEntity) {
+    persistence_over(db)
+        .save_items(std::slice::from_ref(row))
+        .await
+        .expect("save item");
+}
+
+/// Makes `alternate` a merged version of `primary` — the `PrimaryVersionId`
+/// link the alternate-version reads follow — through the real
+/// `set_primary_version_id` write path, so the stored form is exactly what
+/// the production writer produces.
+pub async fn link_alternate_version(db: &Database, alternate: Uuid, primary: Uuid) {
+    use ferrofin_traits::persistence::ItemPersistenceService as _;
+    persistence_over(db)
+        .set_primary_version_id(alternate, Some(primary))
+        .await
+        .expect("link the alternate to its primary");
+}
+
 /// Clears an episode's `IndexNumber`, so its position inside the season is only
 /// half-known — the shape that leaves the next-up sort key incomparable.
 pub async fn clear_index_number(db: &Database, id: Uuid) {

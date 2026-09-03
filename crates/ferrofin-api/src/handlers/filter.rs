@@ -21,7 +21,7 @@ use axum::{Json, Router};
 use ferrofin_model::data::{BaseItemKind, MediaType};
 use ferrofin_model::dto::NameGuidPair;
 use ferrofin_model::querying::{QueryFilters, QueryFiltersLegacy};
-use ferrofin_traits::options::InternalItemsQuery;
+use ferrofin_traits::options::{DtoOptions, InternalItemsQuery};
 use uuid::Uuid;
 
 use crate::auth::RequireAuth;
@@ -210,6 +210,15 @@ async fn get_query_filters(
     let base = InternalItemsQuery {
         user,
         include_item_types,
+        // `DtoOptions { Fields = [], EnableImages = false, EnableUserData =
+        // false }` (v12 `FilterController.cs:147-152`): no `ItemCounts`, so
+        // the by-name repository computes no per-kind counts for a facet list.
+        dto_options: DtoOptions {
+            fields: Vec::new(),
+            enable_images: false,
+            enable_user_data: false,
+            ..DtoOptions::default()
+        },
         is_airing: query.is_airing,
         is_movie: query.is_movie,
         is_sports: query.is_sports,

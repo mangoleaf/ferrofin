@@ -24,8 +24,9 @@ use axum::routing::get;
 use axum::{Json, Router};
 use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_db::entities::users::UserEntity;
+use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::dto::{BaseItemDto, ItemCounts};
-use ferrofin_model::querying::QueryResult;
+use ferrofin_model::querying::{ItemFields, QueryResult};
 use ferrofin_traits::options::{AuthorizationInfo, DeleteOptions, DtoOptions, InternalItemsQuery};
 use uuid::Uuid;
 
@@ -323,16 +324,51 @@ struct ItemsQuery {
     /// Whether to compute the total record count (defaults `true`).
     #[serde(default)]
     enable_total_record_count: Option<bool>,
+    /// Include image information in the output (C# default `true`).
+    #[serde(default)]
+    enable_images: Option<bool>,
+    /// Include user data (unset ⇒ the `DtoOptions` default, `true`).
+    #[serde(default)]
+    enable_user_data: Option<bool>,
+    /// The max number of images to return, per image type.
+    #[serde(default)]
+    image_type_limit: Option<i32>,
+    /// Comma-delimited [`ImageType`](ferrofin_model::entities::ImageType)s to
+    /// include. Empty ⇒ every type, as upstream.
+    #[serde(default)]
+    enable_image_types: Option<String>,
+}
+
+impl ItemsQuery {
+    /// `new DtoOptions { Fields = fields }.AddAdditionalDtoOptions(enableImages,
+    /// enableUserData, imageTypeLimit, enableImageTypes)` (v12
+    /// ItemsController.cs:283-284, DtoExtensions.cs:57-82).
+    ///
+    /// Lenient field parse: clients still send deprecated field names, which
+    /// Jellyfin drops rather than 400ing; absent ⇒ empty ⇒ the base DTO.
+    fn dto_options(&self) -> DtoOptions {
+        super::by_name::additional_dto_options(
+            self.fields.as_deref(),
+            self.enable_images,
+            self.enable_user_data,
+            self.image_type_limit,
+            self.enable_image_types.as_deref(),
+        )
+    }
 }
 
 /// `GET /Items` — a paged, filtered, user-scoped library query.
 ///
-/// Port of `ItemsController.GetItems`. The wide query is mapped onto
-/// [`InternalItemsQuery`]; the collection-type dispatch and search-provider
-/// ranking that need the un-ported `Folder` OOP tree are deferred, but every
-/// persistable filter is honoured. A non-recursive `parentId` browse of a
-/// box-set or playlist surfaces its manual `LinkedChildren` members (the SQL
-/// merge that mirrors C# `Folder.GetChildren`; see `translate_query`).
+/// Port of `ItemsController.GetItems` (v12 ItemsController.cs:83-350). The
+/// wide query is mapped onto [`InternalItemsQuery`] and every persistable
+/// filter is honoured by `translate_query`; the controller-side branches
+/// live here: the `UserRootFolder` children answer for a non-recursive,
+/// id-less request (`user_root_children`), the BoxSet/Playlist re-rooting
+/// (`redirect_container_browse`), `ApplyFilters`, `LocationTypes` →
+/// `IsVirtualItem`, the `AllowedTags` ⇒ `Tags` field rule, and
+/// `AddAdditionalDtoOptions`. A non-recursive `parentId` browse of a box-set
+/// or playlist surfaces its manual `LinkedChildren` members (the SQL merge
+/// that mirrors C# `Folder.GetChildren`; see `translate_query`).
 #[utoipa::path(
     get,
     path = "/Items",
@@ -432,13 +468,27 @@ async fn get_items(
     redirect_container_browse(&state, &mut internal).await;
 
     let result = state.library.query_items(&internal).await?;
-    // Honour the requested `Fields` (Path, Genres, …) — Jellyfin's GetItems builds its
-    // DtoOptions from them. Lenient parse: clients still send deprecated field names, which
-    // Jellyfin drops rather than 400ing. Absent ⇒ empty ⇒ the base DTO (matches Jellyfin).
-    let options = DtoOptions {
-        fields: parse_csv_enums_lenient(query.fields.as_deref()),
-        ..DtoOptions::default()
-    };
+    // The requested `Fields` plus the four image/user-data toggles (an
+    // `EnableImageTypes=Primary,Backdrop` browse must not answer with a
+    // `Logo` tag, and `ImageTypeLimit=1` caps the backdrops).
+    let mut options = query.dto_options();
+    // `if (user.GetPreference(AllowedTags).Length != 0 && !fields.Contains(Tags))
+    //  fields = [.. fields, Tags];` (v12 ItemsController.cs:276-281): a user
+    // whose policy whitelists tags always gets each row's `Tags`. The user
+    // DTO is served from the read-through cache, so this is no extra query
+    // on the common path.
+    if let Some(user) = internal.user.as_ref() {
+        let allowed_tags = state
+            .users
+            .get_user_dto(user, None)
+            .await?
+            .policy
+            .map(|p| p.allowed_tags)
+            .unwrap_or_default();
+        if !allowed_tags.is_empty() && !options.contains_field(ItemFields::Tags) {
+            options.fields.push(ItemFields::Tags);
+        }
+    }
     let dtos = state
         .dto
         .get_base_item_dtos(&result.items, &options, internal.user.as_ref(), None, true)
@@ -809,15 +859,123 @@ struct ResumeQuery {
     /// Whether to compute the total record count (defaults `true`).
     #[serde(default)]
     enable_total_record_count: Option<bool>,
+    /// Comma-delimited [`ItemFields`](ferrofin_model::querying::ItemFields) to
+    /// populate on each row. Absent/empty ⇒ the base DTO.
+    #[serde(default)]
+    fields: Option<String>,
+    /// Include image information in the output (C# default `true`).
+    #[serde(default)]
+    enable_images: Option<bool>,
+    /// Include user data (unset ⇒ the `DtoOptions` default, `true`).
+    #[serde(default)]
+    enable_user_data: Option<bool>,
+    /// The max number of images to return, per image type.
+    #[serde(default)]
+    image_type_limit: Option<i32>,
+    /// Comma-delimited [`ImageType`](ferrofin_model::entities::ImageType)s to
+    /// include. Empty ⇒ every type, as upstream.
+    #[serde(default)]
+    enable_image_types: Option<String>,
+    /// Whether to exclude the items the user's active sessions are playing
+    /// (C# default `false`).
+    #[serde(default)]
+    exclude_active_sessions: Option<bool>,
+}
+
+impl ResumeQuery {
+    /// `new DtoOptions { Fields = fields }.AddAdditionalDtoOptions(enableImages,
+    /// enableUserData, imageTypeLimit, enableImageTypes)` (v12
+    /// ItemsController.cs:947-949).
+    fn dto_options(&self) -> DtoOptions {
+        super::by_name::additional_dto_options(
+            self.fields.as_deref(),
+            self.enable_images,
+            self.enable_user_data,
+            self.image_type_limit,
+            self.enable_image_types.as_deref(),
+        )
+    }
+}
+
+/// The ids of everything the user's active sessions are playing, each
+/// expanded to every version of the video (v12 ItemsController.cs:963-976):
+///
+/// ```text
+/// _sessionManager.Sessions
+///     .Where(s => s.UserId.Equals(requestUserId) && s.NowPlayingItem is not null)
+///     .SelectMany(s => GetItemById(s.NowPlayingItem.Id) is Video video
+///         ? video.GetAllVersions().Select(v => v.Id) : [s.NowPlayingItem.Id])
+/// ```
+///
+/// `NowPlayingItem.Id` is the displayed/primary id, but the resume query
+/// surfaces the actually-played alternate version's own id, so an in-progress
+/// alternate must be excluded too. `GetAllVersions()` spans the whole group
+/// in both directions (Video.cs:845-884: the primary, its alternates, and —
+/// for an alternate — the primary's other alternates). Ferrofin's alternates
+/// hang off the primary through `PrimaryVersionId`, so each playing id is
+/// first lifted to its group's primary, and the group is the primaries plus
+/// every alternate under them.
+async fn active_session_item_ids(state: &AppState, user_id: Uuid) -> Result<Vec<Uuid>, ApiError> {
+    // `is_api_key: true` is the elevated view: C# reads the raw
+    // `_sessionManager.Sessions` list, so the caller-visibility gate and the
+    // two permission reads `GetSessions` would otherwise run are skipped, and
+    // the `s.UserId.Equals(requestUserId)` filter below is the controller's own.
+    let sessions = state
+        .sessions
+        .get_sessions(user_id, None, None, None, true)
+        .await?;
+    let mut playing: Vec<Uuid> = sessions
+        .iter()
+        .filter(|s| s.user_id == user_id)
+        .filter_map(|s| s.now_playing_item.as_ref())
+        .map(|item| item.id)
+        .collect();
+    playing.sort_unstable();
+    playing.dedup();
+    if playing.is_empty() {
+        return Ok(playing);
+    }
+    // Up: an alternate's group root is its primary.
+    let mut roots = playing.clone();
+    for id in &playing {
+        if let Some(primary) = state
+            .library
+            .get_item_by_id(*id)
+            .await?
+            .and_then(|row| row.primary_version_id)
+            .and_then(|p| Uuid::parse_str(&p).ok())
+            .filter(|p| !p.is_nil())
+        {
+            roots.push(primary);
+        }
+    }
+    roots.sort_unstable();
+    roots.dedup();
+    // Down: every alternate under those primaries.
+    let alternates = state
+        .media_sources
+        .get_alternate_versions_batch(&roots)
+        .await?;
+    let mut ids = roots;
+    ids.extend(
+        alternates
+            .values()
+            .flatten()
+            .filter_map(|alt| Uuid::parse_str(&alt.id).ok()),
+    );
+    ids.sort_unstable();
+    ids.dedup();
+    Ok(ids)
 }
 
 /// `GET /UserItems/Resume` — the user's resumable (in-progress) items.
 ///
-/// Port of `ItemsController.GetResumeItems`. The query is date-played-descending,
-/// resumable, non-virtual, recursive; the excluded-active-session and
-/// latest-item-exclude folder walks (which need the session list / the OOP child
-/// tree) are deferred, so this returns every in-progress item the flat query
-/// yields.
+/// Port of `ItemsController.GetResumeItems` (v12 ItemsController.cs:920-1005):
+/// date-played-descending, resumable, non-virtual, recursive, owned items
+/// included, box-set collapsing off. An unscoped request (`parentId` empty)
+/// with `LatestItemExcludes` set is confined to the user's remaining root
+/// folders through `AncestorIds`, and `excludeActiveSessions` drops whatever
+/// the user's sessions are currently playing (every version of it).
 #[utoipa::path(
     get,
     path = "/UserItems/Resume",
@@ -833,6 +991,59 @@ async fn get_resume_items(
     use ferrofin_model::live_tv::ItemSortBy;
 
     let user = resolve_user(&state, &auth, query.user_id).await?;
+    let user_id = user_uuid(&user)?;
+    let options = query.dto_options();
+
+    // `var excludeFolderIds = user.GetPreferenceValues<Guid>(LatestItemExcludes);
+    //  if (parentIdGuid.IsEmpty() && excludeFolderIds.Length > 0)
+    //      ancestorIds = GetUserRootFolder().GetChildren(user, true)
+    //          .Where(i => i is Folder).Where(i => !excludeFolderIds.Contains(i.Id))
+    //          .Select(i => i.Id).ToArray();` (:952-961)
+    let mut ancestor_ids: Vec<Uuid> = Vec::new();
+    if query.parent_id.is_none_or(|id| id.is_nil()) {
+        let exclude_folder_ids = state
+            .users
+            .get_user_dto(&user, None)
+            .await?
+            .configuration
+            .map(|c| c.latest_items_excludes)
+            .unwrap_or_default();
+        if !exclude_folder_ids.is_empty() {
+            // `GetUserRootFolder().GetChildren(user, true)` — the user-root
+            // children the USER can see (`Folder.IsVisible`: blocked-/enabled-
+            // folders), which is the repository's `user_root_children` branch
+            // (the same query `tv_series_manager` runs for NextUp's parents).
+            // `/Library/MediaFolders`' seam is the unfiltered list and would
+            // let a restricted user resume into a library they cannot see.
+            let children = state
+                .library
+                .query_items(&InternalItemsQuery {
+                    user: Some(user.clone()),
+                    user_root_children: true,
+                    include_item_types: vec![
+                        BaseItemKind::CollectionFolder,
+                        BaseItemKind::UserView,
+                        BaseItemKind::PlaylistsFolder,
+                        BaseItemKind::ManualPlaylistsFolder,
+                    ],
+                    ..InternalItemsQuery::default()
+                })
+                .await?
+                .items;
+            ancestor_ids = children
+                .iter()
+                .filter(|folder| folder.is_folder)
+                .filter_map(|folder| Uuid::parse_str(&folder.id).ok())
+                .filter(|id| !exclude_folder_ids.contains(id))
+                .collect();
+        }
+    }
+    let exclude_item_ids = if query.exclude_active_sessions.unwrap_or(false) {
+        active_session_item_ids(&state, user_id).await?
+    } else {
+        Vec::new()
+    };
+
     // The user row moves into the query and is borrowed back out for the DTO
     // projection below — `resolve_user` already cloned it off the auth context,
     // and a second full copy of every string on it buys nothing.
@@ -851,6 +1062,8 @@ async fn get_resume_items(
         exclude_item_types: parse_csv_enums_lenient(query.exclude_item_types.as_deref()),
         order_by: vec![(ItemSortBy::DatePlayed, SortOrder::Descending)],
         enable_total_record_count: query.enable_total_record_count.unwrap_or(true),
+        ancestor_ids,
+        exclude_item_ids,
         ..InternalItemsQuery::default()
     };
     if let Some(parent) = query.parent_id {
@@ -858,7 +1071,6 @@ async fn get_resume_items(
     }
 
     let result = state.library.query_items(&internal).await?;
-    let options = DtoOptions::with_all_fields(false);
     let dtos = state
         .dto
         .get_base_item_dtos(&result.items, &options, internal.user.as_ref(), None, true)
@@ -1065,7 +1277,6 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ferrofin_model::querying::ItemFields;
 
     /// Both stored spellings of the playlists plugin folder are a direct-children
     /// browse. `PlaylistsFolder` is the FQN 10.11.8 persists;
@@ -1097,19 +1308,61 @@ mod tests {
         let q: ItemsQuery =
             serde_urlencoded::from_str("recursive=true&fields=Path,Genres").expect("parses");
         assert_eq!(q.fields.as_deref(), Some("Path,Genres"));
-        let options = DtoOptions {
-            fields: parse_csv_enums_lenient(q.fields.as_deref()),
-            ..DtoOptions::default()
-        };
+        let options = q.dto_options();
         assert!(options.contains_field(ItemFields::Path));
         assert!(options.contains_field(ItemFields::Genres));
 
         // No `fields` ⇒ the base DTO (empty field set), matching Jellyfin's default GetItems.
         let base: ItemsQuery = serde_urlencoded::from_str("recursive=true").expect("parses");
-        let base_opts = DtoOptions {
-            fields: parse_csv_enums_lenient(base.fields.as_deref()),
-            ..DtoOptions::default()
-        };
+        let base_opts = base.dto_options();
         assert!(!base_opts.contains_field(ItemFields::Path));
+    }
+
+    /// `AddAdditionalDtoOptions(enableImages, enableUserData, imageTypeLimit,
+    /// enableImageTypes)` (v12 DtoExtensions.cs:57-82) on `GET /Items` and
+    /// `GET /UserItems/Resume`: the four toggles reach the projection, and the
+    /// defaults are upstream's (images on, every type, no limit, user data on).
+    #[test]
+    fn items_and_resume_queries_honour_the_image_and_user_data_toggles() {
+        use ferrofin_model::entities::ImageType;
+
+        let raw = "fields=PrimaryImageAspectRatio&imageTypeLimit=1&enableImageTypes=Primary,Backdrop&enableUserData=false&enableImages=true";
+        let items: ItemsQuery = serde_urlencoded::from_str(raw).expect("parses");
+        let resume: ResumeQuery = serde_urlencoded::from_str(raw).expect("parses");
+        for options in [items.dto_options(), resume.dto_options()] {
+            assert!(options.contains_field(ItemFields::PrimaryImageAspectRatio));
+            assert_eq!(options.image_type_limit, 1);
+            assert_eq!(
+                options.image_types,
+                [ImageType::Primary, ImageType::Backdrop]
+            );
+            assert!(!options.enable_user_data);
+            assert!(options.enable_images);
+            // `GetImageLimit(Logo)` is 0 for a type outside the list, so no
+            // `ImageTags.Logo` can come back on this browse.
+            assert_eq!(options.image_limit(ImageType::Logo), 0);
+            assert_eq!(options.image_limit(ImageType::Backdrop), 1);
+        }
+
+        // Defaults.
+        let items: ItemsQuery = serde_urlencoded::from_str("recursive=true").expect("parses");
+        let resume: ResumeQuery = serde_urlencoded::from_str("").expect("parses");
+        for options in [items.dto_options(), resume.dto_options()] {
+            assert!(options.enable_images);
+            assert!(options.enable_user_data);
+            assert_eq!(options.image_type_limit, i32::MAX);
+            assert!(options.image_limit(ImageType::Logo) > 0);
+            assert!(options.fields.is_empty(), "no fields ⇒ the base DTO");
+        }
+
+        // `enableImages=false` switches every tag off.
+        let items: ItemsQuery = serde_urlencoded::from_str("enableImages=false").expect("parses");
+        assert!(!items.dto_options().enable_images);
+        assert_eq!(items.dto_options().image_limit(ImageType::Primary), 0);
+
+        // `excludeActiveSessions` parses (default off).
+        let resume: ResumeQuery =
+            serde_urlencoded::from_str("excludeActiveSessions=true").expect("parses");
+        assert_eq!(resume.exclude_active_sessions, Some(true));
     }
 }

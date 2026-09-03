@@ -555,6 +555,16 @@ fn entity_to_dto(item: &BaseItemEntity) -> BaseItemDto {
     }
 }
 
+/// [`entity_to_dto`] plus an empty `Tags` list when the options carry the
+/// `Tags` field — so the `AllowedTags ⇒ Tags` rule is observable on the wire.
+fn entity_to_dto_with_fields(item: &BaseItemEntity, options: &DtoOptions) -> BaseItemDto {
+    let mut dto = entity_to_dto(item);
+    if options.contains_field(ferrofin_model::querying::ItemFields::Tags) {
+        dto.tags = Some(Vec::new());
+    }
+    dto
+}
+
 #[async_trait]
 impl DtoService for OkDto {
     async fn get_primary_image_aspect_ratio(
@@ -575,12 +585,15 @@ impl DtoService for OkDto {
     async fn get_base_item_dtos(
         &self,
         items: &[BaseItemEntity],
-        _options: &DtoOptions,
+        options: &DtoOptions,
         _user: Option<&UserEntity>,
         _owner_id: Option<Uuid>,
         _skip_visibility_check: bool,
     ) -> Result<Vec<BaseItemDto>, ServiceError> {
-        Ok(items.iter().map(entity_to_dto).collect())
+        Ok(items
+            .iter()
+            .map(|item| entity_to_dto_with_fields(item, options))
+            .collect())
     }
     async fn get_item_by_name_dto(
         &self,
@@ -649,10 +662,15 @@ fn ok_state(item_id: Uuid) -> AppState {
 
 /// [`ok_state`] over an explicit library fake.
 fn ok_state_with(library: OkLibrary) -> AppState {
+    ok_state_with_users(library, Arc::new(OkUsers))
+}
+
+/// [`ok_state_with`] over a caller-chosen [`UserManager`] (a policy, say).
+fn ok_state_with_users(library: OkLibrary, users: Arc<dyn UserManager>) -> AppState {
     let item_id = library.item_id;
     AppState::new(
         Arc::new(library),
-        Arc::new(OkUsers),
+        users,
         Arc::new(OkUserViews { item_id }),
         Arc::new(FakeUserData),
         Arc::new(FakeMediaSources),
@@ -1070,6 +1088,67 @@ async fn items_returns_query_result_of_base_item_dto() {
     assert_eq!(json["StartIndex"], 0);
     assert_eq!(json["Items"][0]["Id"], item_id.simple().to_string());
     assert_eq!(json["Items"][0]["Name"], "Test Item");
+}
+
+/// `if (user.GetPreference(AllowedTags).Length != 0 && !fields.Contains(Tags))
+///  fields = [.. fields, Tags];` (v12 ItemsController.cs:276-281): a user whose
+/// policy whitelists tags gets `Tags` on every `/Items` row without asking.
+#[tokio::test]
+async fn items_adds_the_tags_field_for_a_user_with_allowed_tags() {
+    use ferrofin_api::test_support::PolicyUsers;
+    use ferrofin_model::users::UserPolicy;
+
+    let item_id = Uuid::from_u128(0xABCD);
+    let library = || OkLibrary {
+        item_id,
+        adopted_tree: false,
+    };
+    let get = |state: AppState, uri: &'static str| async move {
+        let response = create_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header("X-Emby-Token", "valid")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        json_body(response).await
+    };
+    let whitelisted = || {
+        Arc::new(PolicyUsers(UserPolicy {
+            allowed_tags: vec!["kids".to_owned()],
+            ..UserPolicy::default()
+        })) as Arc<dyn UserManager>
+    };
+
+    // Whitelist ⇒ Tags, unasked.
+    let json = get(
+        ok_state_with_users(library(), whitelisted()),
+        "/Items?recursive=true",
+    )
+    .await;
+    assert_eq!(json["Items"][0]["Tags"], serde_json::json!([]));
+    // A policy with an empty whitelist ⇒ no Tags (the production shape, not
+    // a missing policy).
+    let json = get(
+        ok_state_with_users(
+            library(),
+            Arc::new(PolicyUsers(UserPolicy::default())) as Arc<dyn UserManager>,
+        ),
+        "/Items?recursive=true",
+    )
+    .await;
+    assert!(json["Items"][0].get("Tags").is_none(), "{json}");
+    // Asked for explicitly ⇒ still present.
+    let json = get(
+        ok_state_with_users(library(), whitelisted()),
+        "/Items?recursive=true&fields=Tags",
+    )
+    .await;
+    assert_eq!(json["Items"][0]["Tags"], serde_json::json!([]));
 }
 
 #[tokio::test]

@@ -18,10 +18,14 @@ pub mod presentation_key;
 pub mod sqlite_random;
 pub mod store;
 
-pub use database::Database;
+pub use database::{Database, ImageParentRow};
 
 /// How many ids one `IN (…)` query binds at a time: stays far below SQLite's
 /// conservative 999-host-variable floor (`SQLITE_MAX_VARIABLE_NUMBER` on old
 /// builds), so every batched lookup chunks its ids by this.
 pub const BATCH_BIND_CHUNK: usize = 500;
+
+/// The placeholder item row the initial migration seeds (C# `PlaceholderId`),
+/// in its stored GUID form; every real query excludes it.
+pub const PLACEHOLDER_ITEM_ID: &str = "00000000-0000-0000-0000-000000000001";
 pub use error::{DbError, Result};

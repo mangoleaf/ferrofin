@@ -89,6 +89,11 @@ pub struct TvdbSeriesDetails {
     pub runtime_minutes: Option<i32>,
     /// The series status name (e.g. `Continuing`, `Ended`).
     pub status: Option<String>,
+    /// The days the series airs (`airsDays`, the true flags in weekday order),
+    /// which the TVDB plugin maps onto `Series.AirDays`.
+    pub air_days: Vec<ferrofin_model::dto::DayOfWeek>,
+    /// The air time (`airsTime`, e.g. `20:00`) — `Series.AirTime`.
+    pub air_time: Option<String>,
     /// The URL slug (`TvdbSlug`).
     pub slug: Option<String>,
     /// Cross-provider ids resolved from `remoteIds`.
@@ -238,6 +243,10 @@ struct SeriesExtendedWire {
     last_aired: Option<String>,
     #[serde(alias = "averageRuntime")]
     average_runtime: Option<i32>,
+    #[serde(alias = "airsDays")]
+    airs_days: Option<AirsDaysWire>,
+    #[serde(alias = "airsTime")]
+    airs_time: Option<String>,
     status: Option<NamedWire>,
     genres: Option<Vec<NamedWire>>,
     #[serde(alias = "contentRatings")]
@@ -250,6 +259,46 @@ struct SeriesExtendedWire {
     original_network: Option<NamedWire>,
     characters: Option<Vec<CharacterWire>>,
     artworks: Option<Vec<ArtworkWire>>,
+}
+
+/// TVDB v4's `airsDays` object: one flag per weekday — the wire shape is
+/// seven booleans, so the bool-heavy-struct lint does not apply.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Default, Deserialize)]
+struct AirsDaysWire {
+    #[serde(default)]
+    sunday: bool,
+    #[serde(default)]
+    monday: bool,
+    #[serde(default)]
+    tuesday: bool,
+    #[serde(default)]
+    wednesday: bool,
+    #[serde(default)]
+    thursday: bool,
+    #[serde(default)]
+    friday: bool,
+    #[serde(default)]
+    saturday: bool,
+}
+
+impl AirsDaysWire {
+    /// The flagged days in weekday order (Sunday first, as `DayOfWeek`).
+    fn days(&self) -> Vec<ferrofin_model::dto::DayOfWeek> {
+        use ferrofin_model::dto::DayOfWeek;
+        [
+            (self.sunday, DayOfWeek::Sunday),
+            (self.monday, DayOfWeek::Monday),
+            (self.tuesday, DayOfWeek::Tuesday),
+            (self.wednesday, DayOfWeek::Wednesday),
+            (self.thursday, DayOfWeek::Thursday),
+            (self.friday, DayOfWeek::Friday),
+            (self.saturday, DayOfWeek::Saturday),
+        ]
+        .into_iter()
+        .filter_map(|(airs, day)| airs.then_some(day))
+        .collect()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -666,6 +715,12 @@ fn map_series(tvdb_id: i64, wire: SeriesExtendedWire, country_code: &str) -> Tvd
         studios,
         runtime_minutes: wire.average_runtime,
         status: wire.status.and_then(|s| s.name),
+        air_days: wire
+            .airs_days
+            .as_ref()
+            .map(AirsDaysWire::days)
+            .unwrap_or_default(),
+        air_time: wire.airs_time.filter(|t| !t.is_empty()),
         slug: wire.slug,
         imdb_id: find_remote("IMDB"),
         tmdb_id: find_remote("TheMovieDB.com"),
@@ -698,6 +753,8 @@ mod tests {
               "lastAired": "2019-05-19",
               "averageRuntime": 60,
               "status": { "name": "Ended" },
+              "airsDays": { "sunday": true, "monday": false, "friday": true },
+              "airsTime": "21:00",
               "genres": [ { "name": "Drama" }, { "name": "Fantasy" } ],
               "contentRatings": [
                 { "name": "TV-MA", "country": "usa" },
@@ -735,6 +792,14 @@ mod tests {
         assert_eq!(d.studios, vec!["HBO".to_owned()]);
         assert_eq!(d.runtime_minutes, Some(60));
         assert_eq!(d.status.as_deref(), Some("Ended"));
+        assert_eq!(
+            d.air_days,
+            [
+                ferrofin_model::dto::DayOfWeek::Sunday,
+                ferrofin_model::dto::DayOfWeek::Friday
+            ]
+        );
+        assert_eq!(d.air_time.as_deref(), Some("21:00"));
         assert_eq!(d.imdb_id.as_deref(), Some("tt0944947"));
         assert_eq!(d.tmdb_id.as_deref(), Some("1399"));
         // Blank-name character dropped; writer kept with the right kind.

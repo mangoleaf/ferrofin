@@ -2725,6 +2725,49 @@ fn apply_tmdb_details(entity: &mut BaseItemEntity, details: &TmdbDetails, replac
     {
         entity.premiere_date = Some(date);
     }
+    // `SeriesMetadataService.MergeData` (v12 :161-163): `if (replaceData ||
+    // !targetItem.Status.HasValue) targetItem.Status = sourceItem.Status;` —
+    // the TMDB name folded through `TryParseSeriesStatus`
+    // (`TmdbSeriesProvider.cs:294-296`) lands in the `Data` blob's `Status`.
+    // A result with no parsable status leaves the stored one alone even on
+    // `replace` — the split every sibling field uses here: this applier only
+    // writes what TMDB returned, and the "replace with an empty `temp`" wipe
+    // that upstream's `replaceData` implies is `clear_provider_supplied_metadata`.
+    if let Some(status) = details
+        .status
+        .as_deref()
+        .and_then(crate::xbmc::xml_ext::try_parse_series_status)
+        && let Some(data) = set_series_status(entity.data.as_deref(), status, replace)
+    {
+        entity.data = Some(data);
+    }
+}
+
+/// Writes `status` into the `Data` blob's `Status` key — always on `replace`,
+/// otherwise only when the blob has none. Returns the new column text, or
+/// `None` when nothing changed.
+///
+/// Mirrors `ferrofin_core::item_data::fill_series_status` in shape (parse,
+/// edit one key, re-serialise) but cannot call it: `ferrofin-core` depends on
+/// this crate, not the other way round.
+fn set_series_status(
+    data: Option<&str>,
+    status: ferrofin_model::entities::SeriesStatus,
+    replace: bool,
+) -> Option<String> {
+    let mut object: serde_json::Map<String, serde_json::Value> = data
+        .and_then(|d| serde_json::from_str(d).ok())
+        .unwrap_or_default();
+    let current = object
+        .get("Status")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty());
+    let name = format!("{status:?}");
+    if current == Some(name.as_str()) || (current.is_some() && !replace) {
+        return None;
+    }
+    object.insert("Status".to_owned(), serde_json::Value::String(name));
+    serde_json::to_string(&serde_json::Value::Object(object)).ok()
 }
 
 /// Clears every provider-supplied metadata field on `entity`, leaving only
@@ -2798,9 +2841,38 @@ fn clear_provider_supplied_metadata(entity: &mut BaseItemEntity) {
     if let Some(data) = clear_remote_trailers(entity.data.as_deref()) {
         entity.data = Some(data);
     }
+    // `SeriesMetadataService.MergeData` (:156-168) under `replaceData` sets
+    // `AirTime`, `Status` and `AirDays` from the (empty) source: null, null
+    // and an empty array — the three blob-only series properties.
+    if short_kind(entity) == "Series"
+        && let Some(data) = clear_series_fields(entity.data.as_deref())
+    {
+        entity.data = Some(data);
+    }
     if !probes_its_own_runtime(short_kind(entity)) {
         entity.run_time_ticks = None;
     }
+}
+
+/// Drops `Status` and `AirTime` from a series' `Data` column value and
+/// empties `AirDays`, returning the new column text — or `None` when the blob
+/// already had none of them, so the caller skips a pointless write.
+fn clear_series_fields(data: Option<&str>) -> Option<String> {
+    let mut object: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(data?).ok()?;
+    let had_status = object.remove("Status").is_some();
+    let had_time = object.remove("AirTime").is_some();
+    let had_days = object
+        .get("AirDays")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|days| !days.is_empty());
+    if had_days {
+        object.insert("AirDays".to_owned(), serde_json::Value::Array(Vec::new()));
+    }
+    if !(had_status || had_time || had_days) {
+        return None;
+    }
+    serde_json::to_string(&serde_json::Value::Object(object)).ok()
 }
 
 /// Drops the `RemoteTrailers` array from a `Data` column value, returning the
@@ -3333,7 +3405,7 @@ mod tests {
     use ferrofin_db::entities::base_items::BaseItemEntity;
     use ferrofin_model::configuration::MetadataOptions;
     use ferrofin_model::data::BaseItemKind;
-    use ferrofin_model::entities::ImageType;
+    use ferrofin_model::entities::{ImageType, SeriesStatus};
     use ferrofin_model::providers::{
         ExternalIdInfo, ItemLookupInfo, RemoteImageQuery, RemoteSearchResult,
     };
@@ -5022,6 +5094,71 @@ mod tests {
         apply_tmdb_details(&mut pinned, &details, true);
         assert_eq!(pinned.name.as_deref(), Some("Solaris"));
         assert_eq!(pinned.sort_name.as_deref(), Some("zzz"));
+    }
+
+    /// The refresh path writes `Series.Status` into the `Data` blob with the
+    /// same fill/replace split as the columns (`SeriesMetadataService.
+    /// MergeData` :161-163): filled when absent, overwritten on `replace`,
+    /// kept otherwise, and left alone when TMDB returned nothing parsable.
+    #[test]
+    fn apply_tmdb_details_writes_the_series_status_into_the_blob() {
+        let status = |entity: &BaseItemEntity| {
+            entity
+                .data
+                .as_deref()
+                .and_then(|d| serde_json::from_str::<serde_json::Value>(d).ok())
+                .and_then(|v| v.get("Status").and_then(|s| s.as_str()).map(str::to_owned))
+        };
+        let returning = TmdbDetails {
+            status: Some("Returning Series".to_owned()),
+            ..TmdbDetails::default()
+        };
+        let ended = TmdbDetails {
+            status: Some("Ended".to_owned()),
+            ..TmdbDetails::default()
+        };
+
+        // Filled when the blob has none, folding TMDB's name.
+        let mut series = BaseItemEntity {
+            data: Some(r#"{"DisplayOrder":"Aired"}"#.to_owned()),
+            ..BaseItemEntity::default()
+        };
+        apply_tmdb_details(&mut series, &returning, false);
+        assert_eq!(status(&series).as_deref(), Some("Continuing"));
+        assert!(
+            series
+                .data
+                .as_deref()
+                .unwrap()
+                .contains(r#""DisplayOrder":"Aired""#)
+        );
+        // Kept on a plain refresh, overwritten on replace.
+        apply_tmdb_details(&mut series, &ended, false);
+        assert_eq!(status(&series).as_deref(), Some("Continuing"));
+        apply_tmdb_details(&mut series, &ended, true);
+        assert_eq!(status(&series).as_deref(), Some("Ended"));
+        // The same value again is not a rewrite.
+        assert_eq!(
+            super::set_series_status(series.data.as_deref(), SeriesStatus::Ended, true),
+            None
+        );
+        // Nothing parsable (a movie's `Released`, or no status at all) leaves
+        // the stored value alone, replace or not.
+        apply_tmdb_details(
+            &mut series,
+            &TmdbDetails {
+                status: Some("Released".to_owned()),
+                ..TmdbDetails::default()
+            },
+            true,
+        );
+        assert_eq!(status(&series).as_deref(), Some("Ended"));
+        apply_tmdb_details(&mut series, &TmdbDetails::default(), true);
+        assert_eq!(status(&series).as_deref(), Some("Ended"));
+        // A NULL column grows the one key.
+        let mut fresh = BaseItemEntity::default();
+        apply_tmdb_details(&mut fresh, &ended, false);
+        assert_eq!(fresh.data.as_deref(), Some(r#"{"Status":"Ended"}"#));
     }
 
     /// The read-only descriptor queries return empty/default results (no store,
@@ -7214,6 +7351,25 @@ mod tests {
         book.run_time_ticks = Some(42);
         super::clear_provider_supplied_metadata(&mut book);
         assert_eq!(book.run_time_ticks, None);
+
+        // A series' blob-only properties: `SeriesMetadataService.MergeData`
+        // under `replaceData` sets Status/AirTime to null and AirDays to the
+        // empty array; every other key survives.
+        let mut series = row("TV.Series", "A Series");
+        series.data = Some(
+            r#"{"AirDays":["Monday"],"AirTime":"20:00","Status":"Ended","DisplayOrder":"Aired"}"#
+                .to_owned(),
+        );
+        super::clear_provider_supplied_metadata(&mut series);
+        let data = series.data.as_deref().unwrap();
+        assert!(!data.contains("Status"), "{data}");
+        assert!(!data.contains("AirTime"), "{data}");
+        assert!(data.contains(r#""AirDays":[]"#), "{data}");
+        assert!(data.contains(r#""DisplayOrder":"Aired""#), "{data}");
+        // A blob with none of them is left alone (no rewrite), and a movie's
+        // blob is never touched by the series clear.
+        assert_eq!(super::clear_series_fields(Some(r#"{"AirDays":[]}"#)), None);
+        assert_eq!(super::clear_series_fields(Some(r#"{"Keep":1}"#)), None);
 
         end_to_end_apply_persists_the_cleared_row(movie).await;
     }

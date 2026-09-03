@@ -88,6 +88,28 @@ pub struct MediaAttachmentQuery {
     pub index: Option<i32>,
 }
 
+/// The user-data facts `TVSeriesManager` reads through `IUserDataManager`
+/// while deciding one series' next-up pick, for one episode.
+///
+/// C# asks the user-data manager per episode (`DetermineNextEpisode`'s
+/// `Played` and `PlaybackPositionTicks` reads, `GetMostRecentlyPlayedVersion`'s
+/// `LastPlayedDate` read across the episode's versions). The Rust manager has
+/// no database of its own, so the next-up service answers those reads in the
+/// same batch that produced the rows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NextUpEpisodeUserData {
+    /// `UserItemData.Played` on the episode's own row.
+    pub played: bool,
+    /// The greatest `PlaybackPositionTicks` over the episode and every
+    /// alternate version of it (C# `Video.GetAllVersions()`): the value
+    /// `DetermineNextEpisode` inspects when resumable picks are excluded.
+    pub playback_position_ticks: i64,
+    /// The most recent `LastPlayedDate` over the episode and its versions
+    /// (C# `GetMostRecentlyPlayedVersion`), `None` when no version carries a
+    /// date.
+    pub last_played_date: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 /// Result of a batched next-up query for a single series.
 ///
 /// Port of `MediaBrowser.Controller.Persistence.NextUpEpisodeBatchResult`. Each
@@ -105,6 +127,10 @@ pub struct NextUpEpisodeBatchResult {
     pub last_watched_for_rewatching: Option<BaseItemEntity>,
     /// The next played episode, for rewatching mode.
     pub next_played_for_rewatching: Option<BaseItemEntity>,
+    /// The user-data facts for every row this result carries, keyed by the
+    /// row's stored id ([`BaseItemEntity::id`]). Not a C# field: it stands in
+    /// for the `IUserDataManager` reads the C# manager makes per episode.
+    pub user_data: HashMap<String, NextUpEpisodeUserData>,
 }
 
 /// The playlist-access columns a playlist read carries alongside its member
@@ -1292,7 +1318,10 @@ fn _assert_object_safe_item_type_lookup(_: &dyn ItemTypeLookup) {}
 
 #[cfg(test)]
 mod tests {
-    use super::{MediaAttachmentQuery, MediaStreamQuery, NextUpEpisodeBatchResult, PlayedAndTotal};
+    use super::{
+        MediaAttachmentQuery, MediaStreamQuery, NextUpEpisodeBatchResult, NextUpEpisodeUserData,
+        PlayedAndTotal,
+    };
 
     #[test]
     fn played_and_total_defaults_to_zero() {
@@ -1316,5 +1345,10 @@ mod tests {
         assert!(r.last_watched.is_none());
         assert!(r.next_up.is_none());
         assert!(r.specials.is_empty());
+        assert!(r.user_data.is_empty());
+        let ud = NextUpEpisodeUserData::default();
+        assert!(!ud.played);
+        assert_eq!(ud.playback_position_ticks, 0);
+        assert!(ud.last_played_date.is_none());
     }
 }

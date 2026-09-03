@@ -219,12 +219,78 @@ pub fn supports_theme_media(kind: BaseItemKind) -> bool {
     is_folder(kind) || is_video(kind)
 }
 
-/// Whether items of this kind inherit parent images
-/// (C# `BaseItem.SupportsInheritedParentImages`, `true` for `Folder` and
-/// `Video`).
+/// Whether items of this kind inherit parent images — the C#
+/// `BaseItem.SupportsInheritedParentImages` override table (v12.0-rc7):
+///
+/// - `true`: `Folder` (`Folder.cs:97`) and its subclasses unless overridden,
+///   `Video` (`Video.cs:60`) and `Audio` (`Audio.cs:52`) and theirs — so
+///   `Season` (`Season.cs:40`), `MusicAlbum` (`MusicAlbum.cs:45`), `Episode`
+///   (`Episode.cs:53`), plain folders, movies, trailers, music videos, tracks
+///   and audio books;
+/// - `false`: `Series` (`Series.cs:48`), `MusicArtist` (`MusicArtist.cs:36`),
+///   `CollectionFolder` (`:77`), `UserView` (`:62`), `UserRootFolder` (`:36`),
+///   `BoxSet` (`:33`), `Playlist` (`Playlist.cs:70`), `PlaylistsFolder`
+///   (`:27`), `PhotoAlbum` (`:17`), `Channel` (`Channel.cs:21`),
+///   `BasePluginFolder` (`:18`), and every plain `BaseItem` — the by-name
+///   kinds, `Book`, `Photo`, the Live TV kinds (`BaseItem.cs:796`).
+///
+/// This is the gate on `DtoService.AddInheritedImages` (:1632) and the stop
+/// rule of its walk (:1714): an Episode inherits from its Season, which
+/// inherits from its Series, which stops.
 #[must_use]
 pub fn supports_inherited_parent_images(kind: BaseItemKind) -> bool {
-    is_folder(kind) || is_video(kind)
+    if is_video(kind) || is_audio(kind) {
+        return true;
+    }
+    is_folder(kind)
+        && !matches!(
+            kind,
+            BaseItemKind::Series
+                | BaseItemKind::MusicArtist
+                | BaseItemKind::CollectionFolder
+                | BaseItemKind::UserView
+                | BaseItemKind::UserRootFolder
+                | BaseItemKind::BoxSet
+                | BaseItemKind::Playlist
+                | BaseItemKind::PlaylistsFolder
+                | BaseItemKind::ManualPlaylistsFolder
+                | BaseItemKind::PhotoAlbum
+                | BaseItemKind::Channel
+                | BaseItemKind::BasePluginFolder
+        )
+}
+
+/// `BaseItem.GetDefaultPrimaryImageAspectRatio()` — what `DtoService.
+/// GetPrimaryImageAspectRatio` answers when the primary image is not a local
+/// file or its dimensions cannot be read (v12 DtoService.cs:1745-1775). The
+/// base returns `0` (`BaseItem.cs:834`); the overrides are poster kinds at
+/// `2/3` (`Movie.cs:48`, `Series.cs:71`, `Season.cs:89`, `Trailer.cs:28`,
+/// `BoxSet.cs:77`, `Person.cs:59`, `Year.cs:46`), square kinds at `1`
+/// (`Audio.cs:80`, `MusicAlbum.cs:94`, `MusicArtist.cs:80`, `MusicGenre.cs:53`,
+/// `Genre.cs:50`, `Playlist.cs:116`), `Episode` and `Studio` at `16/9`
+/// (`Episode.cs:145`, `Studio.cs:49`), and `AudioBook` back to `0`
+/// (`AudioBook.cs:45`). `Photo` derives its own from the stored frame size
+/// (`Photo.cs:69-96`) and a Live TV programme from its service; both fall
+/// back to `0` here. The `SourceType == Channel` hacks are not reachable.
+#[must_use]
+pub fn default_primary_image_aspect_ratio(kind: BaseItemKind) -> f64 {
+    match kind {
+        BaseItemKind::Movie
+        | BaseItemKind::Series
+        | BaseItemKind::Season
+        | BaseItemKind::Trailer
+        | BaseItemKind::BoxSet
+        | BaseItemKind::Person
+        | BaseItemKind::Year => 2.0 / 3.0,
+        BaseItemKind::Audio
+        | BaseItemKind::MusicAlbum
+        | BaseItemKind::MusicArtist
+        | BaseItemKind::MusicGenre
+        | BaseItemKind::Genre
+        | BaseItemKind::Playlist => 1.0,
+        BaseItemKind::Episode | BaseItemKind::Studio => 16.0 / 9.0,
+        _ => 0.0,
+    }
 }
 
 /// Whether items of this kind participate in the ancestor closure
@@ -765,6 +831,60 @@ mod tests {
     fn folders_support_theme_media_but_not_people() {
         assert!(supports_theme_media(BaseItemKind::Series));
         assert!(!supports_people(BaseItemKind::Series));
+    }
+
+    /// The v12 `SupportsInheritedParentImages` override table, one case per
+    /// override the walk depends on: Episode → Season → Series(stop),
+    /// Audio → MusicAlbum → MusicArtist(stop), Movie → CollectionFolder(stop).
+    #[rstest]
+    #[case(BaseItemKind::Episode, true)]
+    #[case(BaseItemKind::Season, true)]
+    #[case(BaseItemKind::Series, false)]
+    #[case(BaseItemKind::Audio, true)]
+    #[case(BaseItemKind::AudioBook, true)]
+    #[case(BaseItemKind::MusicAlbum, true)]
+    #[case(BaseItemKind::MusicArtist, false)]
+    #[case(BaseItemKind::Movie, true)]
+    #[case(BaseItemKind::Folder, true)]
+    #[case(BaseItemKind::AggregateFolder, true)]
+    #[case(BaseItemKind::CollectionFolder, false)]
+    #[case(BaseItemKind::UserView, false)]
+    #[case(BaseItemKind::UserRootFolder, false)]
+    #[case(BaseItemKind::BoxSet, false)]
+    #[case(BaseItemKind::Playlist, false)]
+    #[case(BaseItemKind::PlaylistsFolder, false)]
+    #[case(BaseItemKind::PhotoAlbum, false)]
+    #[case(BaseItemKind::Channel, false)]
+    #[case(BaseItemKind::Person, false)]
+    #[case(BaseItemKind::Genre, false)]
+    #[case(BaseItemKind::Book, false)]
+    #[case(BaseItemKind::Photo, false)]
+    #[case(BaseItemKind::LiveTvChannel, false)]
+    fn inherited_parent_images_follow_the_override_table(
+        #[case] kind: BaseItemKind,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(supports_inherited_parent_images(kind), expected);
+    }
+
+    /// `GetDefaultPrimaryImageAspectRatio` overrides — what a remote or
+    /// unreadable primary image reports.
+    #[rstest]
+    #[case(BaseItemKind::Series, 2.0 / 3.0)]
+    #[case(BaseItemKind::Movie, 2.0 / 3.0)]
+    #[case(BaseItemKind::Season, 2.0 / 3.0)]
+    #[case(BaseItemKind::Episode, 16.0 / 9.0)]
+    #[case(BaseItemKind::MusicAlbum, 1.0)]
+    #[case(BaseItemKind::Audio, 1.0)]
+    #[case(BaseItemKind::Studio, 16.0 / 9.0)]
+    #[case(BaseItemKind::AudioBook, 0.0)]
+    #[case(BaseItemKind::Folder, 0.0)]
+    #[case(BaseItemKind::Book, 0.0)]
+    fn default_primary_image_aspect_ratio_follows_the_overrides(
+        #[case] kind: BaseItemKind,
+        #[case] expected: f64,
+    ) {
+        assert!((super::default_primary_image_aspect_ratio(kind) - expected).abs() < 1e-12);
     }
 
     #[test]

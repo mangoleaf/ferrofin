@@ -259,6 +259,11 @@ pub struct TmdbDetails {
     /// The poster's absolute URL — `TmdbClientManager.GetPosterUrl(PosterPath)`
     /// as the by-id Identify branch uses it.
     pub poster_url: Option<String>,
+    /// The series' TMDB status name (`Returning Series`, `Ended`, `Canceled`,
+    /// …) — what `TmdbSeriesProvider` folds onto `Series.Status` through
+    /// `TvParserHelpers.TryParseSeriesStatus`. Series only: a movie's
+    /// release status (`Released`) is not carried.
+    pub status: Option<String>,
 }
 
 /// One credited person from a title's `credits`.
@@ -374,6 +379,11 @@ struct DetailsResponse {
     release_date: Option<String>,
     #[serde(default)]
     first_air_date: Option<String>,
+    /// The series' production status (`Returning Series`, `Ended`,
+    /// `Canceled`, `In Production`, …); movies carry a release status here
+    /// (`Released`) that is ignored.
+    #[serde(default)]
+    status: Option<String>,
     #[serde(default)]
     poster_path: Option<String>,
     #[serde(default)]
@@ -1607,6 +1617,10 @@ impl TmdbClient {
                 .map(|id| id.to_string()),
             poster_url: non_empty(d.poster_path)
                 .map(|p| cfg.image_url(crate::plugin_config::TmdbImageKind::Poster, &p)),
+            status: match kind {
+                TmdbKind::Series => non_empty(d.status),
+                TmdbKind::Movie => None,
+            },
         })
     }
 

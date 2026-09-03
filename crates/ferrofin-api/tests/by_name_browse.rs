@@ -610,16 +610,26 @@ async fn genres_list_returns_query_result() {
 
 #[tokio::test]
 async fn genres_list_folds_counts_when_include_item_types_set() {
-    // `includeItemTypes` non-empty → the typed-count block is emitted. C#
-    // `GetItemValues` never assigns `ItemCounts.ItemCount`, and
-    // `RequestHelpers.SetItemCounts` copies that straight onto `ChildCount`, so
-    // upstream always reports `0` there — the per-value aggregate belongs in the
-    // typed counters, not in `ChildCount`.
+    // `includeItemTypes` non-empty → the controller adds `ItemCounts` to the
+    // fields and `RequestHelpers.CreateQueryResult` stamps the ten counts,
+    // `ChildCount` being `ItemCounts.ItemCount` (v12 `RequestHelpers.cs:166-178`;
+    // `BuildItemCountsByCleanName` sets it to `TotalItemCount()`).
     let response = get("/Genres?includeItemTypes=Movie").await;
     assert_eq!(response.status(), StatusCode::OK);
     let body = json_body(response).await;
-    assert_eq!(body["Items"][0]["ChildCount"], 0);
+    assert_eq!(body["Items"][0]["ChildCount"], 7);
     assert_eq!(body["Items"][0]["ProgramCount"], 0);
+    assert_eq!(body["Items"][0]["MusicVideoCount"], 0);
+
+    // …and `fields=ItemCounts` asks for the same thing without a type filter.
+    let response = get("/Genres?fields=ItemCounts").await;
+    let body = json_body(response).await;
+    assert_eq!(body["Items"][0]["ChildCount"], 7);
+
+    // Neither → no count fields at all.
+    let response = get("/Genres").await;
+    let body = json_body(response).await;
+    assert!(body["Items"][0].get("ChildCount").is_none());
 }
 
 #[tokio::test]

@@ -796,7 +796,193 @@ pub struct Verified {
 ///   `N / 412 operations deep-verified` plus the per-controller table — that
 ///   printout is the README parity section, it moves only when a row is
 ///   written, and it reaches 100 % when the work is done.
-pub const VERIFIED: &[Verified] = &[];
+pub const VERIFIED: &[Verified] = &[
+    Verified {
+        method: "get",
+        path: "/Shows/NextUp",
+        upstream_file: "Jellyfin.Api/Controllers/TvShowsController.cs",
+        upstream_method: "GetNextUp",
+        ferrofin: "handlers/tv_shows.rs get_next_up → ferrofin-core tv_series_manager.rs \
+               (TVSeriesManager) → next_up_service.rs (NextUpService)",
+        date: "2026-09-02",
+        divergences: &[
+            "TVSeriesManager.GetPreferredVersion (continue in the alternate version the user \
+         has been watching, matched by media-source name) is not ported: the pick is always \
+         the primary episode row. Un-defer path: port v12's Video.GetMediaSourceName \
+         common-prefix naming in media_source_manager, then swap by name in \
+         tv_series_manager (see the TODO there).",
+            "Video.GetAllVersions also spans file-based local alternates \
+         (LinkedChildType.LocalAlternateVersion); Ferrofin's version model links alternates \
+         through PrimaryVersionId only, so the resumable check and the last-played date span \
+         that group.",
+            "parentId naming a non-view item: v12 routes it to AncestorIds, which the keys \
+         statement ignores, so the answer is always empty; Ferrofin scopes by TopParentId = \
+         that item (a physical library folder answers, anything else is empty as upstream). \
+         Jellyfin bug not ported.",
+            "ApplyAccessFiltering's parental-rating / blocked-tag row filter is not applied — \
+         no Ferrofin query path applies InternalItemsQuery.max_parental_rating / \
+         block_unrated_items / exclude_inherited_tags yet; NextUp inherits that \
+         cross-cutting gap (its alternate-version / owned-item exclusion is applied).",
+        ],
+    },
+    Verified {
+        method: "get",
+        path: "/Artists",
+        upstream_file: "Jellyfin.Api/Controllers/ArtistsController.cs",
+        upstream_method: "GetArtists",
+        ferrofin: "handlers/artists.rs get_artists → handlers/by_name.rs (ByNameListQuery, \
+               project_query_result) → ferrofin-core item_repository.rs get_artists \
+               (item_values_with_counts, item_counts_by_clean_name)",
+        date: "2026-09-03",
+        divergences: BY_NAME_DIVERGENCES_ARTISTS,
+    },
+    Verified {
+        method: "get",
+        path: "/Artists/AlbumArtists",
+        upstream_file: "Jellyfin.Api/Controllers/ArtistsController.cs",
+        upstream_method: "GetAlbumArtists",
+        ferrofin: "handlers/artists.rs get_album_artists → handlers/by_name.rs → ferrofin-core \
+               item_repository.rs get_album_artists (item_values_with_counts)",
+        date: "2026-09-03",
+        divergences: BY_NAME_DIVERGENCES_ARTISTS,
+    },
+    Verified {
+        method: "get",
+        path: "/Genres",
+        upstream_file: "Jellyfin.Api/Controllers/GenresController.cs",
+        upstream_method: "GetGenres",
+        ferrofin: "handlers/genres.rs get_genres → handlers/by_name.rs → ferrofin-core \
+               item_repository.rs get_genres / get_music_genres (item_values_with_counts)",
+        date: "2026-09-03",
+        divergences: GENRES_DIVERGENCES,
+    },
+    Verified {
+        method: "get",
+        path: "/MusicGenres",
+        upstream_file: "Jellyfin.Api/Controllers/MusicGenresController.cs",
+        upstream_method: "GetMusicGenres",
+        ferrofin: "handlers/music_genres.rs get_music_genres → handlers/by_name.rs → \
+               ferrofin-core item_repository.rs get_music_genres (item_values_with_counts)",
+        date: "2026-09-03",
+        divergences: BY_NAME_DIVERGENCES_GENRES_STUDIOS,
+    },
+    Verified {
+        method: "get",
+        path: "/Studios",
+        upstream_file: "Jellyfin.Api/Controllers/StudiosController.cs",
+        upstream_method: "GetStudios",
+        ferrofin: "handlers/studios.rs get_studios → handlers/by_name.rs → ferrofin-core \
+               item_repository.rs get_studios (item_values_with_counts)",
+        date: "2026-09-03",
+        divergences: BY_NAME_DIVERGENCES_GENRES_STUDIOS,
+    },
+    Verified {
+        method: "get",
+        path: "/UserItems/Resume",
+        upstream_file: "Jellyfin.Api/Controllers/ItemsController.cs",
+        upstream_method: "GetResumeItems",
+        ferrofin: "handlers/items.rs get_resume_items → ferrofin-core item_repository.rs \
+               get_items → translate_query.rs (push_resumable_predicate, \
+               push_order_expression DatePlayed)",
+        date: "2026-09-03",
+        divergences: RESUME_DIVERGENCES,
+    },
+];
+
+/// What `/Artists` and `/Artists/AlbumArtists` do differently from v12's
+/// `ArtistsController` + `BaseItemRepository.GetItemValues`.
+const BY_NAME_DIVERGENCES_ARTISTS: &[&str] = &[
+    "`studios` (pipe-delimited names) is not honored: v12 resolves each name through \
+     LibraryManager.GetStudio — which CREATES the studio row on a GET — into StudioIds. \
+     `studioIds` is honored. Un-defer path: a non-creating name → id lookup in the \
+     handler (find_named_item), never the creating one.",
+    "A `parentId` that is not a folder: v12 puts it in ItemIds (the value is carried by \
+     that one item); Ferrofin scopes by AncestorIds in every case, so a non-folder parent \
+     answers with nothing.",
+    "/Artists is the performer (ItemValueType.Artist) tab, and its rows are the \
+     MusicArtist items that exist: Jellyfin's ArtistsValidator materializes a MusicArtist \
+     item for every artist name, Ferrofin's scanner only for album artists \
+     (item_persistence_service by_name_type_name), so a performer credited on tracks alone \
+     is listed by v12 and not here on a Ferrofin-scanned library (an adopted Jellyfin \
+     library has the rows). Un-defer path: materialize MusicArtist rows for \
+     Artist-typed values in save_item_values, sharing the AlbumArtist row by CleanName.",
+    "ApplyAccessFiltering's parental-rating / blocked-tag filter is not applied to the \
+     inner content query (the cross-cutting gap recorded on /Shows/NextUp); the \
+     alternate-version / owned-item exclusion is.",
+    "NameStartsWith matches COALESCE(SortName, Name) where v12 matches SortName alone \
+     (Ferrofin leaves by-name SortName NULL) — deliberate, recorded in \
+     append_by_name_filters.",
+    "A `userId` naming no user: v12's GetUserById returns null and the query runs with no \
+     user — unscoped, every library on the server; Ferrofin answers 404. Jellyfin bug not \
+     ported.",
+    "With `filters=IsPlayed`/`IsUnplayed` and counts requested, a listed row whose carriers \
+     are all on the other side of the played filter gets the ten count fields as 0 where v12 \
+     omits them (its `ItemCounts?` is null for a name the count scope never saw). \
+     Un-defer path: make `ItemWithCounts.counts` an `Option` in ferrofin-traits.",
+    "`minCommunityRating`, `person`, `personIds`, `personTypes` are accepted and ignored, \
+     exactly as v12 — GetItemValues copies none of them onto either filter.",
+];
+
+/// What `/Genres`, `/MusicGenres` and `/Studios` do differently from their v12
+/// controllers + `GetItemValues`. These controllers take a subset of the
+/// Artists parameters; Ferrofin's shared query struct accepts the superset.
+const BY_NAME_DIVERGENCES_GENRES_STUDIOS: &[&str] = &[
+    "A `userId` naming no user: v12's GetUserById returns null and the query runs with no \
+     user — unscoped, every library on the server; Ferrofin answers 404. Jellyfin bug not \
+     ported.",
+    "The shared query struct honors `filters`, `mediaTypes`, `genres`, `tags`, `years`, \
+     `officialRatings`, `genreIds`, `studioIds` — and, for /Studios, `sortBy`/`sortOrder` — \
+     which these v12 controllers do not declare (ASP.NET ignores them). A client sending \
+     one gets a narrowed or re-ordered list here and the full SortName-ordered list there.",
+    "A `parentId` that is not a folder: v12 puts it in ItemIds; Ferrofin scopes by \
+     AncestorIds in every case, so a non-folder parent answers with nothing.",
+    "ApplyAccessFiltering's parental-rating / blocked-tag filter is not applied to the \
+     inner content query (the cross-cutting gap recorded on /Shows/NextUp); the \
+     alternate-version / owned-item exclusion is.",
+    "NameStartsWith matches COALESCE(SortName, Name) where v12 matches SortName alone \
+     (Ferrofin leaves by-name SortName NULL) — deliberate, recorded in \
+     append_by_name_filters.",
+];
+
+/// `/Genres` on top of [`BY_NAME_DIVERGENCES_GENRES_STUDIOS`].
+const GENRES_DIVERGENCES: &[&str] = &[
+    "v12 answers /Genres?parentId=<music or musicvideos collection folder> from \
+     GetMusicGenres (MusicGenre rows, GenresController.cs:141-149); Ferrofin always \
+     answers from the Genre rows. Un-defer path: read the parent's CollectionType \
+     (collection_type_of) in handlers/genres.rs and branch as the controller does.",
+    "A `userId` naming no user: v12's GetUserById returns null and the query runs with no \
+     user — unscoped, every library on the server; Ferrofin answers 404. Jellyfin bug not \
+     ported.",
+    "The shared query struct honors `filters`, `mediaTypes`, `genres`, `tags`, `years`, \
+     `officialRatings`, `genreIds`, `studioIds`, which GenresController does not declare \
+     (ASP.NET ignores them). A client sending one gets a narrowed list here.",
+    "A `parentId` that is not a folder: v12 puts it in ItemIds; Ferrofin scopes by \
+     AncestorIds in every case, so a non-folder parent answers with nothing.",
+    "ApplyAccessFiltering's parental-rating / blocked-tag filter is not applied to the \
+     inner content query (the cross-cutting gap recorded on /Shows/NextUp); the \
+     alternate-version / owned-item exclusion is.",
+    "NameStartsWith matches COALESCE(SortName, Name) where v12 matches SortName alone \
+     (Ferrofin leaves by-name SortName NULL) — deliberate, recorded in \
+     append_by_name_filters.",
+];
+
+/// What `/UserItems/Resume` — and its legacy twin `/Users/{userId}/Items/Resume`,
+/// the same handler with the user from the route, which is hidden from the
+/// contract (`[ApiExplorerSettings(IgnoreApi = true)]`) and so has no row —
+/// does differently from v12's `ItemsController.GetResumeItems` +
+/// `TranslateQuery`'s `IsResumable` block.
+const RESUME_DIVERGENCES: &[&str] = &[
+    "Video.GetAllVersions also spans file-based local alternates \
+     (LinkedChildType.LocalAlternateVersion); Ferrofin links alternates through \
+     PrimaryVersionId only, so the per-version resumable test, the most-recently-played \
+     dedupe and the DatePlayed order span that group.",
+    "BuildHasDescendantFilter's LinkedChildren arm is not emitted: the only folder kinds \
+     the resumable rule applies to are Series and Season (_resumableFolderKinds), which \
+     never have linked children, so the arm can never match.",
+    "GetAccessFilteredLeafItemsQuery's parental-rating / blocked-tag filter on the leaf \
+     sets is not applied (the cross-cutting gap recorded on /Shows/NextUp); its \
+     owned-item / alternate-version rule is.",
+];
 
 /// Compile-time `str` equality (`==` on `&str` isn't const).
 const fn str_eq(a: &str, b: &str) -> bool {

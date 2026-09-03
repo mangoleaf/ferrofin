@@ -21,19 +21,29 @@ use ferrofin_api::test_support::{
     FakeSimilarItems, FakeSystem,
 };
 use ferrofin_db::entities::base_items::{BaseItemEntity, PeopleEntity};
+use ferrofin_db::entities::security::DeviceEntity;
 use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::dto::{
     BaseItemDto, SpecialViewOptionDto, UpdateUserItemDataDto, UserItemDataDto,
 };
+use ferrofin_model::dto::{MediaSourceInfo, SessionInfoDto};
+use ferrofin_model::entities_media::{MediaAttachment, MediaStream};
+use ferrofin_model::media_info::LiveStreamRequest;
 use ferrofin_model::querying::QueryResult;
+use ferrofin_model::session::{
+    ClientCapabilities, GeneralCommand, MessageCommand, PlayRequest, PlaybackProgressInfo,
+    PlaybackStartInfo, PlaybackStopInfo, PlaystateRequest, SessionMessageType, TranscodingInfo,
+};
 use ferrofin_traits::dto::DtoService;
 use ferrofin_traits::error::ServiceError;
+use ferrofin_traits::library::MediaSourceManager;
 use ferrofin_traits::library::{LibraryManager, UserDataManager, UserManager, UserViewManager};
 use ferrofin_traits::net::{AuthService, AuthorizationContext, RequestContext};
 use ferrofin_traits::options::{
     AuthorizationInfo, DeleteOptions, DtoOptions, InternalItemsQuery, InternalPeopleQuery,
 };
+use ferrofin_traits::session::{AuthenticationRequest, AuthenticationResultData, SessionManager};
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -1377,15 +1387,16 @@ async fn latest_collapses_series_with_two_episodes_into_series_with_child_count(
 }
 
 /// One new episode of a series is the episode itself (`Item2[0]`), not the
-/// series — `ChildCount` 0.
+/// series — and its `ChildCount` is left alone: v12 restamps only
+/// `if (childCounts[i] > 0)` (UserLibraryController.cs:592-598).
 #[tokio::test]
-async fn latest_returns_single_episode_itself_with_child_count_zero() {
+async fn latest_returns_single_episode_itself_without_child_count() {
     let views = LatestViews::new(vec![(Some(series()), vec![episode(EP1_ID)])]);
     let (status, _, dtos) = send_latest(&views, "/Items/Latest", false).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(dtos.len(), 1);
     assert_eq!(dtos[0].id, EP1_ID);
-    assert_eq!(dtos[0].child_count, Some(0));
+    assert_eq!(dtos[0].child_count, None);
 }
 
 /// `|| i.Item1 is MusicAlbum`: an album collapses even with one new track.
@@ -1399,10 +1410,12 @@ async fn latest_always_collapses_music_album_even_with_one_track() {
     assert_eq!(dtos[0].child_count, Some(1));
 }
 
-/// An ungrouped row carries `"ChildCount":0` on the wire — serialized, since
-/// `0` is not null (strict clients read it).
+/// An ungrouped row carries no `ChildCount` on the wire: 10.11.8 stamped
+/// `dto.ChildCount = childCount` (a serialized `0`) on every row, v12 only
+/// `if (childCounts[i] > 0)` (UserLibraryController.cs:592-598), so a movie
+/// row's key is absent.
 #[tokio::test]
-async fn latest_ungrouped_items_carry_child_count_zero() {
+async fn latest_ungrouped_items_carry_no_child_count() {
     let views = LatestViews::new(vec![(
         None,
         vec![item_entity(ITEM_ID, "Movie", BaseItemKind::Movie)],
@@ -1411,7 +1424,7 @@ async fn latest_ungrouped_items_carry_child_count_zero() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(dtos[0].id, ITEM_ID);
     let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
-    assert_eq!(json[0]["ChildCount"], serde_json::json!(0));
+    assert!(json[0].get("ChildCount").is_none(), "{}", json[0]);
 }
 
 /// The request's `groupItems`/`isPlayed`/`limit`/`parentId`/`includeItemTypes`
@@ -1511,4 +1524,577 @@ async fn latest_forwards_the_users_latest_item_excludes() {
         .clone()
         .expect("the manager was called");
     assert_eq!(q.latest_item_excludes, vec![excluded]);
+}
+
+// ---- GET /UserItems/Resume: the two v12 query inputs -----------------------
+
+/// The alternate version Alice's session is playing.
+const ALTERNATE_ID: Uuid = Uuid::from_u128(0xA17);
+/// Its primary — the group root `GetAllVersions()` spans from.
+const PRIMARY_ID: Uuid = Uuid::from_u128(0xA10);
+/// The primary's other alternate, which must be excluded too.
+const SIBLING_ID: Uuid = Uuid::from_u128(0xA18);
+/// What some other user's session plays — never excluded for Alice.
+const OTHER_USERS_ITEM_ID: Uuid = Uuid::from_u128(0x0BAD);
+/// Alice's visible root folders: two libraries and the playlists folder.
+const RESUME_MOVIES_ID: Uuid = Uuid::from_u128(0xF001);
+const RESUME_SHOWS_ID: Uuid = Uuid::from_u128(0xF002);
+const RESUME_PLAYLISTS_ID: Uuid = Uuid::from_u128(0xF003);
+
+/// A [`LibraryManager`] recording the resume `InternalItemsQuery`, answering
+/// the `user_root_children` query with Alice's root folders (plus a non-folder
+/// row the `i is Folder` filter must drop), and resolving the alternate to a
+/// row that names its primary.
+#[derive(Default)]
+struct RecordingResumeLibrary {
+    recorded: Mutex<Option<InternalItemsQuery>>,
+}
+
+#[async_trait]
+impl LibraryManager for RecordingResumeLibrary {
+    async fn get_item_by_id(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
+        if id == ALTERNATE_ID {
+            let mut row = item_entity(ALTERNATE_ID, "Movie - 1080p", BaseItemKind::Video);
+            row.primary_version_id = Some(PRIMARY_ID.to_string());
+            return Ok(Some(row));
+        }
+        Ok((id == ITEM_ID).then(|| item_entity(ITEM_ID, "Movie", BaseItemKind::Movie)))
+    }
+    async fn query_items(
+        &self,
+        query: &InternalItemsQuery,
+    ) -> Result<QueryResult<BaseItemEntity>, ServiceError> {
+        // The user-root children answer only for a USER-scoped query: the
+        // repository applies `Folder.IsVisible` only when `filter.user` is
+        // set, so a handler that dropped the user would get an empty list.
+        if query.user_root_children
+            && query
+                .user
+                .as_ref()
+                .is_some_and(|u| u.id == USER_ID.to_string())
+        {
+            let mut not_a_folder =
+                item_entity(Uuid::from_u128(0xF0FF), "Loose", BaseItemKind::Movie);
+            not_a_folder.is_folder = false;
+            let folder = |id, name, kind| {
+                let mut row = item_entity(id, name, kind);
+                row.is_folder = true;
+                row
+            };
+            return Ok(QueryResult::from_items(vec![
+                folder(RESUME_MOVIES_ID, "Movies", BaseItemKind::CollectionFolder),
+                folder(RESUME_SHOWS_ID, "Shows", BaseItemKind::CollectionFolder),
+                folder(
+                    RESUME_PLAYLISTS_ID,
+                    "Playlists",
+                    BaseItemKind::PlaylistsFolder,
+                ),
+                not_a_folder,
+            ]));
+        }
+        *self.recorded.lock().expect("lock") = Some(query.clone());
+        Ok(QueryResult::new(
+            Some(0),
+            Some(1),
+            vec![item_entity(ITEM_ID, "Movie", BaseItemKind::Movie)],
+        ))
+    }
+    async fn get_item_list(
+        &self,
+        _query: &InternalItemsQuery,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        unimplemented!()
+    }
+    async fn get_item_ids(&self, _q: &InternalItemsQuery) -> Result<Vec<Uuid>, ServiceError> {
+        unimplemented!()
+    }
+    async fn get_latest_item_list(
+        &self,
+        _q: &InternalItemsQuery,
+        _c: ferrofin_model::data::CollectionType,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        unimplemented!()
+    }
+    async fn create_items(
+        &self,
+        _items: &[BaseItemEntity],
+        _parent_id: Option<Uuid>,
+    ) -> Result<(), ServiceError> {
+        unimplemented!()
+    }
+    async fn update_items(
+        &self,
+        _items: &[BaseItemEntity],
+        _parent_id: Option<Uuid>,
+    ) -> Result<(), ServiceError> {
+        unimplemented!()
+    }
+    async fn delete_item(&self, _id: Uuid, _o: &DeleteOptions) -> Result<(), ServiceError> {
+        unimplemented!()
+    }
+    async fn get_people(
+        &self,
+        _q: &InternalPeopleQuery,
+    ) -> Result<Vec<PeopleEntity>, ServiceError> {
+        unimplemented!()
+    }
+    async fn get_people_names(
+        &self,
+        _q: &InternalPeopleQuery,
+    ) -> Result<Vec<String>, ServiceError> {
+        unimplemented!()
+    }
+    async fn get_count(&self, _q: &InternalItemsQuery) -> Result<i32, ServiceError> {
+        unimplemented!()
+    }
+    async fn get_item_counts(
+        &self,
+        _q: &InternalItemsQuery,
+    ) -> Result<ferrofin_model::dto::ItemCounts, ServiceError> {
+        unimplemented!()
+    }
+    async fn get_genres(
+        &self,
+        _q: &InternalItemsQuery,
+    ) -> Result<QueryResult<ferrofin_traits::persistence::ItemWithCounts>, ServiceError> {
+        unimplemented!()
+    }
+    async fn get_studios(
+        &self,
+        _q: &InternalItemsQuery,
+    ) -> Result<QueryResult<ferrofin_traits::persistence::ItemWithCounts>, ServiceError> {
+        unimplemented!()
+    }
+    async fn get_artists(
+        &self,
+        _q: &InternalItemsQuery,
+    ) -> Result<QueryResult<ferrofin_traits::persistence::ItemWithCounts>, ServiceError> {
+        unimplemented!()
+    }
+    async fn get_music_genres(
+        &self,
+        _q: &InternalItemsQuery,
+    ) -> Result<QueryResult<ferrofin_traits::persistence::ItemWithCounts>, ServiceError> {
+        unimplemented!()
+    }
+    async fn get_album_artists(
+        &self,
+        _q: &InternalItemsQuery,
+    ) -> Result<QueryResult<ferrofin_traits::persistence::ItemWithCounts>, ServiceError> {
+        unimplemented!()
+    }
+    async fn get_query_filters_legacy(
+        &self,
+        _q: &InternalItemsQuery,
+    ) -> Result<ferrofin_model::querying::QueryFiltersLegacy, ServiceError> {
+        unimplemented!()
+    }
+    async fn get_media_stream_languages(
+        &self,
+        _t: ferrofin_model::entities::MediaStreamType,
+        _q: &InternalItemsQuery,
+    ) -> Result<Vec<String>, ServiceError> {
+        unimplemented!()
+    }
+    async fn queue_library_scan(&self) -> Result<(), ServiceError> {
+        unimplemented!()
+    }
+}
+
+/// A [`SessionManager`] whose only live method is `get_sessions`.
+struct ResumeSessions;
+
+#[async_trait]
+impl SessionManager for ResumeSessions {
+    async fn log_session_activity(
+        &self,
+        _app_name: &str,
+        _app_version: &str,
+        _device_id: &str,
+        _device_name: &str,
+        _remote_endpoint: &str,
+        _user: &UserEntity,
+    ) -> Result<SessionInfoDto, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn update_device_name(
+        &self,
+        _session_id: &str,
+        _reported_device_name: &str,
+    ) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn on_playback_start(&self, _info: &PlaybackStartInfo) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn on_playback_progress(
+        &self,
+        _info: &PlaybackProgressInfo,
+        _is_automated: bool,
+    ) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn on_playback_stopped(&self, _info: &PlaybackStopInfo) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn report_session_ended(&self, _session_id: &str) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn send_general_command(
+        &self,
+        _controlling_session_id: &str,
+        _session_id: &str,
+        _command: &GeneralCommand,
+    ) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn send_message_command(
+        &self,
+        _controlling_session_id: &str,
+        _session_id: &str,
+        _command: &MessageCommand,
+    ) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn send_play_command(
+        &self,
+        _controlling_session_id: &str,
+        _session_id: &str,
+        _command: &PlayRequest,
+    ) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn send_playstate_command(
+        &self,
+        _controlling_session_id: &str,
+        _session_id: &str,
+        _command: &PlaystateRequest,
+    ) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn send_message_to_admin_sessions(
+        &self,
+        _message_type: SessionMessageType,
+        _data: &str,
+    ) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn send_message_to_user_sessions(
+        &self,
+        _user_ids: &[Uuid],
+        _message_type: SessionMessageType,
+        _data: &str,
+    ) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn send_message_to_user_device_sessions(
+        &self,
+        _device_id: &str,
+        _message_type: SessionMessageType,
+        _data: &str,
+    ) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn send_restart_required_notification(&self) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn add_additional_user(
+        &self,
+        _session_id: &str,
+        _user_id: Uuid,
+    ) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn remove_additional_user(
+        &self,
+        _session_id: &str,
+        _user_id: Uuid,
+    ) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn report_now_viewing_item(
+        &self,
+        _session_id: &str,
+        _item_id: &str,
+    ) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn authenticate_new_session(
+        &self,
+        _request: &AuthenticationRequest,
+    ) -> Result<AuthenticationResultData, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn authenticate_direct(
+        &self,
+        _request: &AuthenticationRequest,
+    ) -> Result<AuthenticationResultData, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn report_capabilities(
+        &self,
+        _session_id: &str,
+        _capabilities: &ClientCapabilities,
+    ) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn report_transcoding_info(
+        &self,
+        _device_id: &str,
+        _info: &TranscodingInfo,
+    ) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn clear_transcoding_info(&self, _device_id: &str) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn get_sessions(
+        &self,
+        _user_id: Uuid,
+        _device_id: Option<&str>,
+        _active_within_seconds: Option<i32>,
+        _controllable_user_to_check: Option<Uuid>,
+        _is_api_key: bool,
+    ) -> Result<Vec<SessionInfoDto>, ServiceError> {
+        // Alice's session plays the ALTERNATE version; another user's session
+        // plays something else and must be ignored.
+        let playing = |user_id: Uuid, item: Uuid| SessionInfoDto {
+            user_id,
+            now_playing_item: Some(BaseItemDto {
+                id: item,
+                ..BaseItemDto::default()
+            }),
+            ..SessionInfoDto::default()
+        };
+        Ok(vec![
+            playing(USER_ID, ALTERNATE_ID),
+            playing(Uuid::from_u128(0x0B0B), OTHER_USERS_ITEM_ID),
+        ])
+    }
+    async fn get_session_by_authentication_token(
+        &self,
+        _token: &str,
+        _device_id: &str,
+        _remote_endpoint: &str,
+    ) -> Result<SessionInfoDto, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn logout(&self, _access_token: &str) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn logout_device(&self, _device: &DeviceEntity) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn revoke_user_tokens(
+        &self,
+        _user_id: Uuid,
+        _current_access_token: &str,
+    ) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn close_live_stream_if_needed(
+        &self,
+        _live_stream_id: &str,
+        _session_or_play_session_id: &str,
+    ) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+}
+
+/// A [`MediaSourceManager`] whose only live method is the alternate-version
+/// batch: the primary has two alternates.
+struct ResumeMediaSources;
+
+#[async_trait]
+impl MediaSourceManager for ResumeMediaSources {
+    async fn get_media_streams(&self, _item_id: Uuid) -> Result<Vec<MediaStream>, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn get_media_attachments(
+        &self,
+        _item_id: Uuid,
+    ) -> Result<Vec<MediaAttachment>, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn get_playback_media_sources(
+        &self,
+        _item_id: Uuid,
+        _user_id: Uuid,
+        _allow_media_probe: bool,
+        _enable_path_substitution: bool,
+    ) -> Result<Vec<MediaSourceInfo>, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn get_static_media_sources(
+        &self,
+        _item_id: Uuid,
+        _enable_path_substitution: bool,
+        _user_id: Option<Uuid>,
+    ) -> Result<Vec<MediaSourceInfo>, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn open_live_stream(
+        &self,
+        _request: &LiveStreamRequest,
+    ) -> Result<MediaSourceInfo, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn get_live_stream(&self, _id: &str) -> Result<MediaSourceInfo, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn close_live_stream(&self, _id: &str) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn refresh_media_streams(&self, _item_id: uuid::Uuid) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn get_alternate_versions_batch(
+        &self,
+        primary_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, Vec<BaseItemEntity>>, ServiceError> {
+        // Only the primary has alternates: the playing one and its sibling.
+        Ok(primary_ids
+            .iter()
+            .filter(|id| **id == PRIMARY_ID)
+            .map(|id| {
+                (
+                    *id,
+                    vec![
+                        item_entity(ALTERNATE_ID, "Movie - 1080p", BaseItemKind::Video),
+                        item_entity(SIBLING_ID, "Movie - 720p", BaseItemKind::Video),
+                    ],
+                )
+            })
+            .collect())
+    }
+}
+
+/// Builds the Resume state: recording library, Alice's excludes, one playing
+/// session, and a two-alternate version group.
+fn resume_state(excludes: Vec<Uuid>) -> (AppState, Arc<RecordingResumeLibrary>) {
+    let library = Arc::new(RecordingResumeLibrary::default());
+    let state = AppState::new(
+        Arc::clone(&library) as Arc<dyn LibraryManager>,
+        Arc::new(OkUsers {
+            latest_item_excludes: excludes,
+        }),
+        Arc::new(StubUserViews),
+        Arc::new(RecordingUserData::default()),
+        Arc::new(ResumeMediaSources),
+        Arc::new(ResumeSessions),
+        Arc::new(FakeSystem),
+        Arc::new(FakeAppHost),
+        Arc::new(FakeConfig),
+        Arc::new(FakeProviders),
+        Arc::new(FakeMusic),
+        Arc::new(FakeSimilarItems),
+        Arc::new(FakeSearch),
+        Arc::new(LatestDto),
+        Arc::new(OkAuth { elevated: false }),
+        Arc::new(OkAuth { elevated: false }),
+        Arc::new(ferrofin_api::test_support::FakeQuickConnect),
+        Arc::new(ferrofin_api::test_support::FakePlaylists),
+        Arc::new(ferrofin_api::test_support::FakeCollections),
+        Arc::new(ferrofin_api::test_support::FakeTvSeries),
+        Arc::new(ferrofin_api::test_support::FakeSubtitles),
+        Arc::new(ferrofin_api::test_support::FakeLyrics),
+        Arc::new(ferrofin_api::test_support::FakeMediaSegments),
+        Arc::new(ferrofin_api::test_support::FakeTrickplay),
+        Arc::new(ferrofin_api::test_support::FakeDevices),
+        Arc::new(ferrofin_api::test_support::FakeClientEventLogger),
+        Arc::new(ferrofin_api::test_support::FakeApiKeys),
+        Arc::new(ferrofin_api::test_support::FakeLocalization),
+        Arc::new(ferrofin_api::test_support::FakeDisplayPreferences),
+        Arc::new(ferrofin_api::test_support::FakeActivity),
+        Arc::new(ferrofin_api::test_support::FakeFileSystem),
+        Arc::new(ferrofin_api::test_support::FakeTasks),
+    )
+    .with_virtual_folders(Arc::new(virtual_folders()));
+    (state, library)
+}
+
+async fn send_resume(
+    excludes: Vec<Uuid>,
+    uri: &str,
+) -> (StatusCode, Vec<u8>, Option<InternalItemsQuery>) {
+    let (state, library) = resume_state(excludes);
+    let response = create_router(state)
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(uri)
+                .header("Authorization", "Token abc")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body")
+        .to_vec();
+    let recorded = library.recorded.lock().expect("lock").clone();
+    (status, body, recorded)
+}
+
+/// v12 ItemsController.cs:952-961: an unscoped request by a user with
+/// `LatestItemExcludes` is confined to the user-root folders (`i is Folder`)
+/// the user can see, minus the excluded ones — and only then.
+#[tokio::test]
+async fn resume_confines_an_unscoped_request_to_the_users_remaining_root_folders() {
+    let (status, _, recorded) = send_resume(vec![RESUME_SHOWS_ID], "/UserItems/Resume").await;
+    assert_eq!(status, StatusCode::OK);
+    let query = recorded.expect("the resume query ran");
+    assert_eq!(
+        query.ancestor_ids,
+        vec![RESUME_MOVIES_ID, RESUME_PLAYLISTS_ID]
+    );
+    assert_eq!(query.is_resumable, Some(true));
+
+    // A scoped request (`parentId`) leaves AncestorIds alone…
+    let (_, _, recorded) = send_resume(
+        vec![RESUME_SHOWS_ID],
+        &format!("/UserItems/Resume?parentId={RESUME_MOVIES_ID}"),
+    )
+    .await;
+    let query = recorded.expect("ran");
+    assert!(query.ancestor_ids.is_empty());
+    assert_eq!(query.parent_id, RESUME_MOVIES_ID);
+    // …and so does a user with no excludes.
+    let (_, _, recorded) = send_resume(Vec::new(), "/UserItems/Resume").await;
+    assert!(recorded.expect("ran").ancestor_ids.is_empty());
+}
+
+/// v12 ItemsController.cs:963-976: `excludeActiveSessions` drops every
+/// version of what the user's own sessions are playing — the alternate that
+/// is playing, its primary, and the primary's other alternate — and nothing
+/// another user is playing.
+#[tokio::test]
+async fn resume_excludes_every_version_of_what_the_users_sessions_play() {
+    let (status, _, recorded) =
+        send_resume(Vec::new(), "/UserItems/Resume?excludeActiveSessions=true").await;
+    assert_eq!(status, StatusCode::OK);
+    let mut excluded = recorded.expect("ran").exclude_item_ids;
+    excluded.sort_unstable();
+    let mut expected = vec![ALTERNATE_ID, PRIMARY_ID, SIBLING_ID];
+    expected.sort_unstable();
+    assert_eq!(excluded, expected);
+
+    // Off by default.
+    let (_, _, recorded) = send_resume(Vec::new(), "/UserItems/Resume").await;
+    assert!(recorded.expect("ran").exclude_item_ids.is_empty());
+}
+
+/// `AddAdditionalDtoOptions` reaches the projection: `enableImages=false`
+/// strips the image tags the DTO fake otherwise emits.
+#[tokio::test]
+async fn resume_forwards_the_image_toggles_to_the_projection() {
+    let (status, body, _) = send_resume(Vec::new(), "/UserItems/Resume?enableImages=false").await;
+    assert_eq!(status, StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    assert!(json["Items"][0].get("ImageTags").is_none(), "{json}");
+    let (_, body, _) = send_resume(Vec::new(), "/UserItems/Resume").await;
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    assert!(json["Items"][0].get("ImageTags").is_some(), "{json}");
 }

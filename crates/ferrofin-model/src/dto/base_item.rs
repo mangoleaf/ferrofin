@@ -360,9 +360,12 @@ pub struct BaseItemDto {
     /// Gets or sets the parent thumb image tag.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_thumb_image_tag: Option<String>,
-    /// Gets or sets the parent primary image item id.
+    /// Gets or sets the parent primary image item id (`format: uuid` in the
+    /// contract; a `Guid?` upstream — `BaseItemDto.cs:554`).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub parent_primary_image_item_id: Option<String>,
+    #[schema(value_type = Option<String>, format = "uuid")]
+    #[serde(default, with = "crate::json::guid::option")]
+    pub parent_primary_image_item_id: Option<Uuid>,
     /// Gets or sets the parent primary image tag.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_primary_image_tag: Option<String>,

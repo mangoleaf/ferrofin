@@ -278,13 +278,18 @@ impl UserManager for OkUsers {
     }
 }
 
-/// A [`DtoService`] projecting each row to a minimal DTO carrying id + name.
+/// A [`DtoService`] projecting each row to a minimal DTO carrying id + name —
+/// plus an empty `ProviderIds` map when the options ask for that field, so a
+/// test can see which fields a handler projected with.
 struct OkDto;
 
-fn to_dto(item: &BaseItemEntity) -> BaseItemDto {
+fn to_dto(item: &BaseItemEntity, options: &DtoOptions) -> BaseItemDto {
     BaseItemDto {
         id: Uuid::parse_str(&item.id).unwrap_or_else(|_| Uuid::nil()),
         name: item.name.clone(),
+        provider_ids: options
+            .contains_field(ferrofin_model::querying::ItemFields::ProviderIds)
+            .then(std::collections::HashMap::new),
         ..BaseItemDto::default()
     }
 }
@@ -300,30 +305,30 @@ impl DtoService for OkDto {
     async fn get_base_item_dto(
         &self,
         item: &BaseItemEntity,
-        _options: &DtoOptions,
+        options: &DtoOptions,
         _user: Option<&UserEntity>,
         _owner_id: Option<Uuid>,
     ) -> Result<BaseItemDto, ServiceError> {
-        Ok(to_dto(item))
+        Ok(to_dto(item, options))
     }
     async fn get_base_item_dtos(
         &self,
         items: &[BaseItemEntity],
-        _options: &DtoOptions,
+        options: &DtoOptions,
         _user: Option<&UserEntity>,
         _owner_id: Option<Uuid>,
         _skip_visibility_check: bool,
     ) -> Result<Vec<BaseItemDto>, ServiceError> {
-        Ok(items.iter().map(to_dto).collect())
+        Ok(items.iter().map(|item| to_dto(item, options)).collect())
     }
     async fn get_item_by_name_dto(
         &self,
         item: &BaseItemEntity,
-        _options: &DtoOptions,
+        options: &DtoOptions,
         _tagged_item_ids: Option<&[Uuid]>,
         _user: Option<&UserEntity>,
     ) -> Result<BaseItemDto, ServiceError> {
-        Ok(to_dto(item))
+        Ok(to_dto(item, options))
     }
 }
 
@@ -671,4 +676,27 @@ async fn similar_shows_returns_items() {
     let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).expect("similar");
     assert_eq!(result.items.len(), 2);
     assert_eq!(result.items[0].name.as_deref(), Some("Similar A"));
+}
+
+/// `SimilarItemsManager.GetSimilarItemsAsync` forces `ProviderIds` into the
+/// `DtoOptions` the controller then projects with (v12
+/// SimilarItemsManager.cs:108-112, LibraryController.cs:835-849), so every
+/// Similar row carries the field even when `fields` never named it — on the
+/// `/Shows` route and on the `LibraryController` aliases alike.
+#[tokio::test]
+async fn similar_rows_always_carry_provider_ids() {
+    for path in [
+        format!("/Shows/{SERIES_ID}/Similar?fields=Overview"),
+        format!("/Items/{SERIES_ID}/Similar?fields=Overview"),
+        format!("/Movies/{SERIES_ID}/Similar"),
+    ] {
+        let (status, body) = get(&path).await;
+        assert_eq!(status, StatusCode::OK, "{path}");
+        let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).expect("similar");
+        assert!(
+            result.items.iter().all(|i| i.provider_ids.is_some()),
+            "{path}: {body:?}",
+            body = String::from_utf8_lossy(&body)
+        );
+    }
 }

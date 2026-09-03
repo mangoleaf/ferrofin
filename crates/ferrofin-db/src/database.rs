@@ -14,6 +14,39 @@ use crate::error::Result;
 /// this crate needs no live database or `DATABASE_URL`.
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
+/// A `BaseItems` row projected down to what the inherited-images walk and
+/// the Episode/Season/Audio parent blocks of the DTO service read off a
+/// parent: its kind, the three ids the walk follows, the album-artist name
+/// a `MusicAlbum` resolves its artist by, the path the collection-folder
+/// fallback matches on, and the two loudness columns behind
+/// `AlbumNormalizationGain`.
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+#[sqlx(rename_all = "PascalCase")]
+pub struct ImageParentRow {
+    /// The row's `Guid` primary key, hyphenated (`Id`).
+    pub id: String,
+    /// The stored CLR type name (`Type`).
+    #[sqlx(rename = "Type")]
+    pub type_: String,
+    /// `ParentId`, if any.
+    pub parent_id: Option<String>,
+    /// `OwnerId`, if any.
+    pub owner_id: Option<String>,
+    /// `SeriesId`, if any (a season's display parent).
+    pub series_id: Option<String>,
+    /// `SeasonId`, if any (an episode's display parent).
+    pub season_id: Option<String>,
+    /// The pipe-joined album artists (`AlbumArtists`), if any.
+    pub album_artists: Option<String>,
+    /// The on-disk path (`Path`), if any.
+    pub path: Option<String>,
+    /// The integrated loudness in LUFS (`LUFS`), if measured.
+    #[sqlx(rename = "LUFS")]
+    pub lufs: Option<f64>,
+    /// The stored normalization gain (`NormalizationGain`), if any.
+    pub normalization_gain: Option<f64>,
+}
+
 /// A handle to Ferrofin's SQLite database, wrapping two connection pools: a
 /// multi-connection **reader** pool ([`Database::pool`]) and a
 /// single-connection **writer** pool ([`Database::writer`]).
@@ -530,6 +563,103 @@ impl Database {
             out.extend(query.fetch_all(self.pool()).await?);
         }
         Ok(out)
+    }
+
+    /// How many alternate-version rows point at each of `primary_ids` through
+    /// `PrimaryVersionId`, keyed by the primary's id in its stored (uppercase,
+    /// hyphenated) GUID form. Primaries with no alternate are absent.
+    ///
+    /// The number behind a list page's `MediaSourceCount` (`linked + local +
+    /// 1`, `Video.GetMediaSourceCount`) when the page did not ask for the
+    /// sources themselves — a count over the partial `PrimaryVersionId` index
+    /// instead of the full rows the `MediaSources` field needs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub async fn alternate_version_counts(
+        &self,
+        primary_ids: &[String],
+    ) -> Result<Vec<(String, i64)>> {
+        let mut out = Vec::new();
+        for chunk in primary_ids.chunks(crate::BATCH_BIND_CHUNK) {
+            let placeholders = (1..=chunk.len())
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            // The seeded placeholder row is excluded exactly as the full-row
+            // read (`get_items_by_primary_version_batch`) excludes it.
+            let sql = format!(
+                r#"SELECT "PrimaryVersionId", COUNT(*) FROM "BaseItems"
+                   WHERE "PrimaryVersionId" IN ({placeholders}) AND "Id" <> ?{}
+                   GROUP BY "PrimaryVersionId""#,
+                chunk.len() + 1
+            );
+            let mut query = sqlx::query_as::<_, (String, i64)>(&sql);
+            for id in chunk {
+                query = query.bind(id);
+            }
+            query = query.bind(crate::PLACEHOLDER_ITEM_ID);
+            out.extend(query.fetch_all(self.pool()).await?);
+        }
+        Ok(out)
+    }
+
+    /// The [`ImageParentRow`] projection of each of `ids` that exists, keyed
+    /// by the id in its stored (uppercase, hyphenated) GUID form.
+    ///
+    /// One batched read per hop of the DTO service's inherited-images walk
+    /// (`DtoService.AddInheritedImages`), instead of a full 72-column row per
+    /// parent per item.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub async fn image_parent_rows(&self, ids: &[String]) -> Result<Vec<ImageParentRow>> {
+        let mut out = Vec::with_capacity(ids.len());
+        for chunk in ids.chunks(crate::BATCH_BIND_CHUNK) {
+            let placeholders = (1..=chunk.len())
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                r#"SELECT "Id", "Type", "ParentId", "OwnerId", "SeriesId", "SeasonId",
+                          "AlbumArtists", "Path", "LUFS", "NormalizationGain"
+                   FROM "BaseItems" WHERE "Id" IN ({placeholders})"#,
+            );
+            let mut query = sqlx::query_as::<_, ImageParentRow>(&sql);
+            for id in chunk {
+                query = query.bind(id);
+            }
+            out.extend(query.fetch_all(self.pool()).await?);
+        }
+        Ok(out)
+    }
+
+    /// Every row of the stored `type_name` (a CLR type name such as
+    /// `MediaBrowser.Controller.Entities.CollectionFolder`) as
+    /// `(Id, Path, Data)` — the candidate set of
+    /// `LibraryManager.GetCollectionFolders(item)` (the user root's children,
+    /// matched on `Path` or on the `PhysicalLocationsList` inside `Data`,
+    /// which the caller parses).
+    ///
+    /// An equality on `Type` so the `Type`-led indexes serve it: a `LIKE`
+    /// suffix match scans the whole table, and this read sits on every list
+    /// page whose image walk reaches a library root.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub async fn rows_of_type(
+        &self,
+        type_name: &str,
+    ) -> Result<Vec<(String, Option<String>, Option<String>)>> {
+        Ok(
+            sqlx::query_as(r#"SELECT "Id", "Path", "Data" FROM "BaseItems" WHERE "Type" = ?1"#)
+                .bind(type_name)
+                .fetch_all(self.pool())
+                .await?,
+        )
     }
 
     /// Names the `PhotoAlbum` rows among `ids`, keyed by the id in its stored
