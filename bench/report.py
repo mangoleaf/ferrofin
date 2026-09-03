@@ -5,17 +5,20 @@
     report.py RUN_DIR [RUN_DIR ...]          markdown on stdout (the README tables)
     report.py --serve [PORT] [RUNS_DIR]      the comparison viewer on http://127.0.0.1:PORT (default 8097, bench/runs)
 
-One run dir: the numbers of that run. Several: each cell is `median (min–max)` across
-runs, and a cell whose spread exceeds SPREAD_MAX of its median prints "not reproducible".
+One run dir: the numbers of that run. Several: each cell is the median across runs, and
+a number whose spread exceeds SPREAD_MAX of that median is marked `~` (not reproducible)
+with its range; a cell that did different work than the oracle is marked `⚠[n]` and the
+reason is printed once, numbered, under Notes.
 Two rules are applied per cell, both from files the run itself wrote:
   comparable   — same status + record count as the oracle (Jellyfin 12.0-rc7) and a field
                  set ⊇ the oracle's, for every request name behind the cell (shape.log);
   reproducible — spread within SPREAD_MAX across runs.
 Flagged cells keep their raw number (the work list) but are not publishable.
-The viewer lists every run dir, renders any selection of them (medians + spread) and
-adds two comparison aids the markdown deliberately omits: each cell's ratio to the
-oracle, and — with a baseline run chosen — each server's change against an earlier run
-of itself (the before/after of a code change). Missing phases are named.
+Both renderers print, per cell, how it compares with the oracle as `X.Y× faster`
+(memory says lighter), computed from the printed numbers so a reader can check it; the
+viewer adds, with a baseline run chosen, each server's change against an earlier run of
+itself (the before/after of a code change). A comparison drawn from a marked number is
+shown in amber italics rather than green. Missing phases are named.
 """
 
 import csv
@@ -153,20 +156,89 @@ class Cell:
             return True
         return (max(self.vals) - min(self.vals)) / self.median <= SPREAD_MAX
 
-    def text(self):
-        """`median (min–max)` with the reproducibility rule; the flag is rendered by the caller."""
-        if not self.vals:
-            return "—"
-        med = self.median
-        if len(self.vals) == 1:
-            return self.fmt(med)
-        cell = f"{self.fmt(med)} ({self.fmt(min(self.vals))}–{self.fmt(max(self.vals))})"
-        return cell if self.spread_ok() else f"not reproducible: {cell}"
+    def value(self):
+        """The published number — the median, and nothing else. A cell has to stay
+        scannable, so the spread and the verdicts are markers the renderers add."""
+        return self.fmt(self.median) if self.vals else "—"
+
+    def spread_text(self):
+        """`min–max over N runs`, or None when there is only one run to compare."""
+        if len(self.vals) < 2:
+            return None
+        return f"{self.fmt(min(self.vals))}–{self.fmt(max(self.vals))} over {len(self.vals)} runs"
+
+    def parts(self):
+        """This cell and, for a latency cell, its p95 and p99 — every number it prints,
+        each carrying its own spread verdict."""
+        extra = [self.sub[k] for k in ("p95", "p99") if k in self.sub]
+        return [self, *extra]
+
+    def reproducible(self):
+        """Every number this cell prints holds up run to run as printed."""
+        return not any(p.visibly_unstable() for p in self.parts())
+
+    def visibly_unstable(self):
+        """Failed the spread rule *and* the runs disagree at the precision printed.
+        A 1 ms median that came out `1 ms` on every run is reproducible as published,
+        however wide the ratio between 0.6 and 1.4 looks; marking it `~` would be a
+        marker with nothing behind it, and at this scale that is most of them."""
+        return not self.spread_ok() and self.fmt(min(self.vals)) != self.fmt(max(self.vals))
+
+    def marked(self, with_range=False):
+        """The numbers, each with `~` when that one is visibly unstable. `with_range`
+        appends that number's range — the markdown has no hover text, and a marker with
+        no quantity cannot tell a 16 % spread from a 300 % one."""
+        out = []
+        for part in self.parts():
+            txt = part.value()
+            if part.visibly_unstable():
+                txt += "~"
+                if with_range:
+                    txt += f" ({part.fmt(min(part.vals))}–{part.fmt(max(part.vals))})"
+            out.append(txt)
+        return " / ".join(out)
+
+    def spreads(self):
+        """The per-number spreads, for the hover text."""
+        labels = ("p50", "p95", "p99") if "p95" in self.sub else ("",)
+        out = [f"{lbl} {p.spread_text()}".strip() for lbl, p in zip(labels, self.parts()) if p.spread_text()]
+        return "; ".join(out)
 
 
 ms = lambda v: f"{v:.0f} ms"
 mib = lambda v: f"{v:.0f} MiB"
 n0 = lambda v: f"{v:.0f}"
+
+
+class Notes:
+    """Deduplicated, numbered explanations, each remembering every cell that points at
+    it. A comparability reason is long and repeats across rows and load levels, so the
+    cell carries a marker and the text is printed once at the end — with the list of
+    server/row/table it came from, because a reason with no "where" cannot be acted on."""
+
+    def __init__(self):
+        #: reason -> its 1-based number, in first-seen order (dicts keep insertion order)
+        self.index = {}
+        #: reason -> the cells that point at it, as `server · row (table)` strings
+        self.sources = {}
+
+    def add(self, text, source=None):
+        """The 1-based number for `text`, assigning one the first time it is seen and
+        recording `source` (a `server · row (table)` string) among its references."""
+        n = self.index.setdefault(text, len(self.index) + 1)
+        if source:
+            self.sources.setdefault(text, [])
+            if source not in self.sources[text]:
+                self.sources[text].append(source)
+        return n
+
+    @property
+    def items(self):
+        """`(number, reason, sources)` in numbered order."""
+        return [(n, text, self.sources.get(text, [])) for text, n in self.index.items()]
+
+    def __bool__(self):
+        return bool(self.index)
 
 
 def latency_cell(per_run, flag):
@@ -178,10 +250,21 @@ def latency_cell(per_run, flag):
     })
 
 
-def latency_text(c):
+def md_cell(c, notes, source=None, oracle_cell=None):
+    """`p50 / p95 / p99 (err) ⚠[n]` — the numbers, then markers: `~` on each number that
+    failed the spread rule (with its range, since markdown has no hover), and `⚠[n]`
+    pointing at the note saying why the cell is not comparable, hence not publishable."""
     if not c.vals:
         return "—"
-    return f"{c.text()} / {c.sub['p95'].text()} / {c.sub['p99'].text()} ms ({c.sub['err']:.1f}%)"
+    txt = c.marked(with_range=True)
+    if "p95" in c.sub:
+        txt += f" ({c.sub['err']:.1f}%)"
+    gain = speedup(c, oracle_cell)
+    if gain:
+        txt += f" — {gain}"
+    if c.flag:
+        txt += f" ⚠[{notes.add(c.flag, source)}]"
+    return txt
 
 
 def build(runs):
@@ -301,39 +384,48 @@ def build(runs):
 
 
 # ── markdown (the README tables) ────────────────────────────────────────────
-def flagged(text, flag):
-    return f"⚠ not comparable ({flag}) · raw {text}" if flag else text
-
-
 def render_md(m):
     meta, servers, out = m["meta"], m["servers"], []
+    notes = Notes()
     p = out.append
     p(f"## Ferrofin vs Jellyfin — {len(m['runs'])} run(s), commit {meta.get('sha', '?')}, {meta.get('date', '')[:10]}")
     p(f"Host {meta.get('cpu', '?')} · server on cpus {meta.get('server_cpus', '?')} · {meta.get('memory_limit', '?')} limit · "
       f"test data {meta.get('testdata_counts', {})} · windows {meta.get('window_s', '?')} s · "
       f"unloaded {meta.get('rate_unloaded', '?')} screens/s · loaded {meta.get('rate_loaded', '?')} screens/s")
-    p(f"Cells: median (min–max) across runs. `⚠ not comparable` = the server did different work than {ORACLE_LABEL} "
-      "(status / record count / missing fields) — its raw number is shown for the work list but is not publishable; "
-      "`not reproducible` = spread > 15 % of the median.\n")
-    head = "| {} | " + " | ".join(f"{label} p50 / p95 / p99 (err)" for _, label in servers) + " |\n|" + "---|" * (len(servers) + 1)
+    p(f"Cells are the median across runs. A `~` after a number means its spread across runs exceeded "
+      f"{SPREAD_MAX:.0%} of the median — that number is not reproducible, and its range follows. `⚠[n]` means "
+      f"the server did different work than {ORACLE_LABEL} (status / record count / missing fields), so the "
+      "number is not comparable: it is kept for the work list, not for publication, and note `n` says why. "
+      f"`X.Y× faster` compares the cell with {ORACLE_LABEL} on the same row. It is shown on marked cells "
+      "too — the note and the mark say the two servers did not do identical work, so read it as an "
+      "indication rather than a like-for-like result.\n")
+    head = "| {} | " + " | ".join(f"{label} p50 / p95 / p99 ms (err)" for _, label in servers) + " |\n|" + "---|" * (len(servers) + 1)
     for level, lv in m["levels"].items():
         p(f"### Latency — {level} ({lv['rate']} screens/s)\n")
         p(head.format("screen"))
         for name, cells in lv["screens"]:
-            p(f"| {name} | " + " | ".join(flagged(latency_text(cells[k]), cells[k].flag) for k, _ in servers) + " |")
+            p(f"| {name} | " + " | ".join(
+                md_cell(cells[k], notes, f"{lbl} · {name} ({level} screens)",
+                        cells.get(ORACLE) if k != ORACLE else None) for k, lbl in servers) + " |")
         p("")
         p(head.format("endpoint"))
         for name, cells in lv["endpoints"]:
-            p(f"| {name} | " + " | ".join(flagged(latency_text(cells[k]), cells[k].flag) for k, _ in servers) + " |")
+            p(f"| {name} | " + " | ".join(
+                md_cell(cells[k], notes, f"{lbl} · {name} ({level} endpoints)",
+                        cells.get(ORACLE) if k != ORACLE else None) for k, lbl in servers) + " |")
         p("")
     p("### Time to first screen\n")
     p("| | " + " | ".join(label for _, label in servers) + " |\n|" + "---|" * (len(servers) + 1))
     for name, cells in m["ttfs"]:
-        p(f"| {name} | " + " | ".join(flagged(cells[k].text(), cells[k].flag) for k, _ in servers) + " |")
+        p(f"| {name} | " + " | ".join(
+            md_cell(cells[k], notes, f"{lbl} · {name} (time to first screen)",
+                    cells.get(ORACLE) if k != ORACLE else None) for k, lbl in servers) + " |")
     p(f"\n### Memory (anon, cache excluded, {m['sample_ms']} ms samples)\n")
     p("| | " + " | ".join(label for _, label in servers) + " |\n|" + "---|" * (len(servers) + 1))
     for name, cells in m["memory"]:
-        p(f"| {name} | " + " | ".join(flagged(cells[k].text(), cells[k].flag) for k, _ in servers) + " |")
+        p(f"| {name} | " + " | ".join(
+            md_cell(cells[k], notes, f"{lbl} · {name} (memory)",
+                    cells.get(ORACLE) if k != ORACLE else None) for k, lbl in servers) + " |")
     if m["work"]:
         p(f"\n### Response shape vs {ORACLE_LABEL} (supporting evidence, not the parity number)\n")
         for k, items in m["work"].items():
@@ -347,6 +439,14 @@ def render_md(m):
         p("### Missing phases\n")
         for x in sorted(set(m["missing"])):
             p(f"- {x}")
+        p("")
+    if notes:
+        p("")
+        p("### Notes\n")
+        for n, text, sources in notes.items:
+            p(f"{n}. {text}")
+            if sources:
+                p(f"   — {'; '.join(sources)}")
     return "\n".join(out) + "\n"
 
 
@@ -369,7 +469,9 @@ h3{font:600 12.5px/1.2 system-ui,-apple-system,"Segoe UI",sans-serif;text-transf
 .stat .val{font:500 26px/1.15 ui-monospace,"SF Mono",Menlo,Consolas,monospace;font-variant-numeric:tabular-nums;margin-top:2px}
 .stat .unit{font-size:12px;color:var(--muted);margin-left:4px}
 .stat.ferrofin .val{color:var(--accent-ink)}
-.stat .ratio,.ratio{font:12px ui-monospace,"SF Mono",Menlo,Consolas,monospace;color:var(--muted);margin-left:6px}
+.stat .ratio,.ratio{font:12px ui-monospace,"SF Mono",Menlo,Consolas,monospace;color:var(--muted);margin-left:6px;white-space:nowrap}
+.ratio.win{color:var(--good);font-weight:600}
+.ratio.provisional,.delta.provisional{color:var(--flag);font-style:italic;font-weight:500}
 .delta{font:12px ui-monospace,"SF Mono",Menlo,Consolas,monospace;margin-left:6px}.delta.good{color:var(--good)}.delta.bad{color:var(--bad)}
 .why{font:12px/1.35 system-ui,-apple-system,"Segoe UI",sans-serif;color:var(--flag);white-space:normal;max-width:34ch;margin-top:3px}
 .legend{display:flex;flex-wrap:wrap;gap:18px;font-size:12.5px;color:var(--muted);margin:8px 0 14px}
@@ -381,62 +483,174 @@ thead th{font:600 11.5px/1.3 system-ui,-apple-system,"Segoe UI",sans-serif;text-
 thead th.ferrofin{color:var(--accent-ink)}
 tbody th{font-weight:500;white-space:nowrap}
 td.num{font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace;font-variant-numeric:tabular-nums;white-space:nowrap}
-.p50{font-weight:500}.tail{color:var(--muted)}.err{color:var(--err);font-size:12px;margin-left:6px}
+.p50{font-weight:500}.tail{color:var(--muted)}
+.err{color:var(--err);font-size:12px;margin-left:6px;font-weight:600}
 td.flagged{background:var(--flag-bg)}td.flagged .p50,td.flagged .tail{opacity:.7}
 details{margin-top:10px}summary{cursor:pointer;color:var(--accent-ink);font-size:13.5px}
 .work{background:var(--panel);border:1px solid var(--rule);border-radius:6px;padding:14px 18px;margin-top:12px}
 .work h3 .n{text-transform:none;letter-spacing:0;font-weight:400;color:var(--muted);margin-left:8px}
 .work ul{margin:0;padding-left:18px;font-size:13.5px}.work li{margin:3px 0}
 code{font:12.5px ui-monospace,"SF Mono",Menlo,Consolas,monospace}
+.mark{color:var(--flag);font-weight:700;cursor:help;margin-left:1px}
+td .p50.wobbly{text-decoration:underline dotted var(--flag) 1px;text-underline-offset:3px}
+sup.fn{margin-left:3px}sup.fn a{color:var(--flag);font-weight:600;text-decoration:none}
+ol.notes{font-size:13px;color:var(--muted);max-width:90ch;padding-left:22px}
+ol.notes li{margin:8px 0}ol.notes li:target{color:var(--ink);font-weight:500}
+ol.notes .src{font:12px ui-monospace,"SF Mono",Menlo,Consolas,monospace;color:var(--muted);opacity:.85;margin-top:2px}
 """
 
 
+def provisional(c, oracle_cell):
+    """Whether a comparison of these two cells is caveated — either side measured
+    different work than the other, so the number is informative but not like for like.
+    The cell keeps its amber ground and its note; the comparison is shown anyway,
+    because "how far apart are they" is still the question being asked."""
+    return bool(
+        c.flag
+        or not c.reproducible()
+        or (oracle_cell is not None and (oracle_cell.flag or not oracle_cell.reproducible()))
+    )
+
+
+def displayed(c):
+    """The cell's median as the page prints it — the number a reader can check a
+    multiple against. `None` when it rounds away to zero at that precision."""
+    if c.median is None:
+        return None
+    digits = "".join(ch for ch in c.fmt(c.median) if ch.isdigit() or ch == ".")
+    try:
+        return float(digits) or None
+    except ValueError:
+        return None
+
+
+def speedup(c, oracle_cell):
+    """`X.Y× faster` against the oracle, or None when there is nothing checkable to
+    compare (a context row, a missing median, or either side rounding to zero at the
+    printed precision — `13.7×` derived from `1 ms` vs `7 ms` is spurious). A raw ratio
+    like `×0.10` makes the reader do the division and invert it; this is the sentence
+    they were going to write anyway, computed from the printed numbers so it can be
+    checked by eye. Memory says lighter/heavier. A caveated comparison is still
+    returned — `provisional` decides how it is presented."""
+    if c.context or oracle_cell is None:
+        return None
+    mine, theirs = displayed(c), displayed(oracle_cell)
+    if not mine or not theirs:
+        return None
+    better, worse = ("lighter", "heavier") if c.unit == "MiB" else ("faster", "slower")
+    ratio = theirs / mine
+    if f"{ratio:.1f}" == "1.0":
+        return "about the same"
+    return f"{ratio:.1f}× {better}" if ratio > 1 else f"{1 / ratio:.1f}× {worse}"
+
+
 def ratio_html(c, oracle_cell):
-    """Ratio to the oracle's number — only when both numbers stand (neither flagged, not a context row)."""
-    if c.context or c.flag or oracle_cell is None or oracle_cell.flag or not c.median or not oracle_cell.median:
+    """The speedup against the oracle, for a table cell. A caveated one is muted rather
+    than green and says so on hover, so a win that is not like for like never reads as
+    a clean one."""
+    text = speedup(c, oracle_cell)
+    if not text:
         return ""
-    return f"<span class='ratio' title='ratio to {ORACLE_LABEL}'>×{c.median / oracle_cell.median:.2f}</span>"
+    caveat = provisional(c, oracle_cell)
+    won = "faster" in text or "lighter" in text
+    cls = "ratio provisional" if caveat else ("ratio win" if won else "ratio")
+    title = f"vs {ORACLE_LABEL}" + (" — not like for like, see the note" if caveat else "")
+    return f"<span class='{cls}' title='{html.escape(title)}'>{html.escape(text)}</span>"
 
 
 def delta_html(c, base):
     """Change against the same server in the baseline run; lower is better for every non-context
     number. Only when both numbers stand (a flagged cell is not a valid number to move from or to)."""
-    if c.context or c.flag or base is None or base.flag or not c.median or not base.median:
+    if c.context or base is None or not c.median or not base.median:
         return ""
     ch = (c.median - base.median) / base.median * 100
-    cls = "good" if ch < -DELTA_NOISE_PCT else "bad" if ch > DELTA_NOISE_PCT else ""
+    if c.flag or base.flag:
+        cls = "provisional"
+    else:
+        cls = "good" if ch < -DELTA_NOISE_PCT else "bad" if ch > DELTA_NOISE_PCT else ""
     return f"<span class='delta {cls}' title='vs baseline {base.fmt(base.median)}'>{ch:+.0f}%</span>"
 
 
-def td_html(c, oracle_cell, base):
+def td_html(c, oracle_cell, base, notes, source=None):
+    """One table cell: the numbers, then markers. The spread lands in the hover text
+    and the comparability reason in a numbered note, because inline they made a
+    three-server table unreadable."""
     if not c.vals:
         return "<td class='num'>—</td>"
     e = html.escape
-    if "p95" in c.sub:
-        body = f"<span class='p50'>{e(c.text())}</span> <span class='tail'>/ {e(c.sub['p95'].text())} / {e(c.sub['p99'].text())}</span>"
-        if c.sub["err"] > 0:
-            body += f" <span class='err'>{c.sub['err']:.2f}% err</span>"
-    else:
-        body = f"<span class='p50'>{e(c.text())}</span>"
+    def one(part, cls):
+        """One number, with `~` and its range on hover when it is visibly unstable."""
+        if not part.visibly_unstable():
+            return f"<span class='{cls}'>{e(part.value())}</span>"
+        rng = f"{part.fmt(min(part.vals))}–{part.fmt(max(part.vals))} over {len(part.vals)} runs"
+        return (f"<span class='{cls} wobbly' title='not reproducible: {e(rng)}'>{e(part.value())}"
+                f"<span class='mark'>~</span></span>")
+
+    parts = c.parts()
+    body = one(parts[0], "p50")
+    for part in parts[1:]:
+        body += " <span class='tail'>/</span> " + one(part, "tail")
+    if c.sub.get("err", 0) > 0:
+        body += f" <span class='err'>{c.sub['err']:.2f}% err</span>"
     body += ratio_html(c, oracle_cell) + delta_html(c, base)
+    cls = "num"
+    if not c.reproducible():
+        cls += " unstable"
     if c.flag:
-        return f"<td class='num flagged'>{body}<div class='why'>{e(c.flag)}</div></td>"
-    return f"<td class='num'>{body}</td>"
+        cls += " flagged"
+        n = notes.add(c.flag, source)
+        body += f"<sup class='fn'><a href='#n{n}'>{n}</a></sup>"
+    title = c.spreads()
+    attr = f" title='{e(title)}'" if title else ""
+    return f"<td class='{cls}'{attr}>{body}</td>"
 
 
-def table_html(first, rows, servers, base_rows):
+def notes_html(notes):
+    """The numbered reasons the cells point at, each with the cells that point at it."""
+    if not notes:
+        return ""
+    e = html.escape
+    lis = ""
+    for n, text, sources in notes.items:
+        src = f"<div class='src'>{e('; '.join(sources))}</div>" if sources else ""
+        lis += f"<li id='n{n}'>{e(text)}{src}</li>"
+    return f"<h2>Notes</h2><ol class='notes'>{lis}</ol>"
+
+
+def table_html(first, rows, servers, base_rows, notes, where=""):
     e = html.escape
     head = "".join(f"<th class='{k}'>{e(lbl)}</th>" for k, lbl in servers)
     body = []
     for name, cells in rows:
         bcells = base_rows.get(name, {}) if base_rows else {}
-        tds = "".join(td_html(cells[k], cells.get(ORACLE) if k != ORACLE else None, bcells.get(k)) for k, _ in servers)
+        tds = "".join(td_html(cells[k], cells.get(ORACLE) if k != ORACLE else None, bcells.get(k), notes,
+                              f"{lbl} · {name}" + (f" ({where})" if where else ""))
+                      for k, lbl in servers)
         body.append(f"<tr><th>{e(name)}</th>{tds}</tr>")
     return f"<div class='scroll'><table><thead><tr><th>{e(first)}</th>{head}</tr></thead><tbody>{''.join(body)}</tbody></table></div>"
 
 
+def prewalk_notes(m, notes):
+    """Assign the note numbers in the markdown's order before the page is built.
+    The viewer renders its headline tiles first, so without this the same reason is
+    note 2 in one output and note 14 in the other — and the two are read side by side."""
+    for level, lv in m["levels"].items():
+        for kind in ("screens", "endpoints"):
+            for name, cells in lv[kind]:
+                for k, lbl in m["servers"]:
+                    if cells[k].flag:
+                        notes.add(cells[k].flag, f"{lbl} · {name} ({level} {kind})")
+    for label, rows in (("time to first screen", m["ttfs"]), ("memory", m["memory"])):
+        for name, cells in rows:
+            for k, lbl in m["servers"]:
+                if cells[k].flag:
+                    notes.add(cells[k].flag, f"{lbl} · {name} ({label})")
+
+
 def render_html(m, base=None, picker=""):
     e = html.escape
+    notes = Notes()
+    prewalk_notes(m, notes)
     meta, servers = m["meta"], m["servers"]
     base_l = (base or {}).get("levels", {})
     base_ttfs = dict((base or {}).get("ttfs", []))
@@ -446,9 +660,13 @@ def render_html(m, base=None, picker=""):
     parts = ["<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'>",
              f"<title>{e(title)}</title><style>{CSS}</style></head><body><main>{picker}",
              f"<h1>Ferrofin vs Jellyfin — {len(m['runs'])} run{'s' if len(m['runs']) != 1 else ''}, commit {e(meta.get('sha', '?'))}</h1>",
-             "<p class='lede'>Every number is a median across the runs given (min–max shown when there are several). Amber cells are <em>not comparable</em>: "
-             f"the server did different work than {ORACLE_LABEL} — the number stays for the work list, not for the README. "
-             f"×n is the ratio to {ORACLE_LABEL}; a coloured % is the change against the baseline run.</p>",
+             "<p class='lede'>Every number is the median across the runs given. An amber cell is <em>not comparable</em>: "
+             f"the server did different work than {ORACLE_LABEL} — the number stays for the work list, not for the README, "
+             "and the superscript points at the reason under Notes. A <b>~</b> on a number means its spread across runs "
+             f"exceeded {SPREAD_MAX:.0%} of the median, so that number is not reproducible — hover the cell for the ranges. "
+             f"<b>X.Y× faster</b> compares the cell with {ORACLE_LABEL} on the same row (memory says lighter); "
+             "on an amber cell it is shown in amber italics, because the two servers did not do identical work. "
+             "A coloured % is the change against the baseline run.</p>",
              f"<p class='meta'>{e(meta.get('date', '')[:16].replace('T', ' '))} UTC · {e(meta.get('cpu', '?'))} · server cores {e(str(meta.get('server_cpus', '?')))} · "
              f"{e(str(meta.get('memory_limit', '?')))} limit, no swap · test data {e(str(tc.get('movies', '?')))} movies / {e(str(tc.get('series', '?')))} series / {e(str(tc.get('episodes', '?')))} episodes · "
              f"windows {e(str(meta.get('window_s', '?')))} s · runs: {e(', '.join(os.path.basename(r.rstrip('/')) for r in m['runs']))}"
@@ -462,10 +680,17 @@ def render_html(m, base=None, picker=""):
             val = f"{c.median:.0f}" if c.median is not None else "—"
             unit = c.unit
             extra = ratio_html(c, cells.get(ORACLE) if k != ORACLE else None) + delta_html(c, (base_ttfs.get(name) or base_mem.get(name) or {}).get(k))
-            why = f"<div class='why'>{e(c.flag)}</div>" if c.flag else ""
+            why = ""
+            if c.flag:
+                n = notes.add(c.flag, f"{lbl} · {name} (headline)")
+                extra += f"<sup class='fn'><a href='#n{n}'>{n}</a></sup>"
             if len(c.vals) > 1:
                 rng = f"{min(c.vals):.0f}–{max(c.vals):.0f} over {len(c.vals)} runs"
-                why += f"<div class='tail' style='font-size:12px'>{rng}</div>" if c.spread_ok() else f"<div class='why'>not reproducible: {rng}</div>"
+                if c.spread_ok():
+                    why = f"<div class='tail' style='font-size:12px'>{rng}</div>"
+                else:
+                    val += "<span class='mark' title='not reproducible'>~</span>"
+                    why = f"<div class='why'>{rng}</div>"
             stats += f"<div class='stat {k}'><div class='who'>{e(lbl)}</div><div class='val'>{val}<span class='unit'>{unit}</span>{extra}</div>{why}</div>"
         tiles.append(f"<section class='tile'><h3>{e(name)}</h3><div class='stats'>{stats}</div></section>")
     parts.append(f"<div class='tiles'>{''.join(tiles)}</div>")
@@ -473,12 +698,12 @@ def render_html(m, base=None, picker=""):
         if not lv["any_data"]:
             continue
         parts.append(f"<h2>Screens — {level}, {e(str(lv['rate']))} screens/s</h2>")
-        parts.append("<div class='legend'><span>p50 <span style='color:var(--muted)'>/ p95 / p99</span> ms per screen (all of its requests, concurrently)</span><span><span class='chip'></span>not comparable — reason under the number</span></div>")
+        parts.append("<div class='legend'><span>p50 <span style='color:var(--muted)'>/ p95 / p99</span> ms per screen (all of its requests, concurrently)</span><span><b>~</b> not reproducible across runs</span><span><span class='chip'></span>not comparable — superscript links to the reason</span></div>")
         bl = base_l.get(level, {})
-        parts.append(table_html("screen", lv["screens"], servers, dict(bl.get("screens", []))))
-        parts.append(f"<details><summary>Per endpoint, {level}</summary>{table_html('endpoint', lv['endpoints'], servers, dict(bl.get('endpoints', [])))}</details>")
-    parts.append("<h2>Time to first screen</h2>" + table_html("", m["ttfs"], servers, base_ttfs))
-    parts.append(f"<h2>Memory — anon, cache excluded, {e(str(m['sample_ms']))} ms samples</h2>" + table_html("", m["memory"], servers, base_mem))
+        parts.append(table_html("screen", lv["screens"], servers, dict(bl.get("screens", [])), notes, f"{level} screens"))
+        parts.append(f"<details><summary>Per endpoint, {level}</summary>{table_html('endpoint', lv['endpoints'], servers, dict(bl.get('endpoints', [])), notes, f'{level} endpoints')}</details>")
+    parts.append("<h2>Time to first screen</h2>" + table_html("", m["ttfs"], servers, base_ttfs, notes, "time to first screen"))
+    parts.append(f"<h2>Memory — anon, cache excluded, {e(str(m['sample_ms']))} ms samples</h2>" + table_html("", m["memory"], servers, base_mem, notes, "memory"))
     if m["work"]:
         parts.append(f"<h2>The work list — divergences from {ORACLE_LABEL}</h2><p class='lede'>From the shape pass (status, record count, field set) and the item counts. Each is a server fix or a recorded, accepted divergence.</p>")
         for k, items in m["work"].items():
@@ -488,6 +713,7 @@ def render_html(m, base=None, picker=""):
         parts.append(f"<p class='lede'><b>{ORACLE_LABEL} failed</b>: " + e(", ".join(m["oracle_failures"])) + "</p>")
     if m["missing"]:
         parts.append("<h2>Missing phases</h2><ul>" + "".join(f"<li>{e(x)}</li>" for x in sorted(set(m["missing"]))) + "</ul>")
+    parts.append(notes_html(notes))
     parts.append("<p class='meta'>Methodology: bench/README.md · the raw file behind every cell lives in the run dir.</p></main></body></html>")
     return "\n".join(parts)
 

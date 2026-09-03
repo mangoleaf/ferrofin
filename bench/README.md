@@ -9,13 +9,13 @@ published number passed two checks the run itself performs:
 - **comparable** — the server returned the same status and record count as Jellyfin
   12.0-rc7 and a field set that is a superset of its, for every request behind the number.
   A server that returns fewer records, fewer fields, or an error would be "faster" for
-  free; such a cell prints `⚠ not comparable (reason)` (its raw number is kept for the
-  work list) instead of being published. A window in which k6 could not hold the arrival
-  rate, a Jellyfin-side failure, or a transcode with different parameters is flagged the
-  same way.
+  free; such a cell is marked `⚠[n]` — the number stays for the work list rather than
+  being published, and note `n`, printed once at the end with every cell that points at
+  it, says what differed. A window in which k6 could not hold the arrival rate, a
+  Jellyfin-side failure, or a transcode with different parameters is flagged the same way.
 - **reproducible** — across three full runs the min–max spread is within 15 % of the
-  median; a wider cell prints `not reproducible` and the measurement is fixed before the
-  number is used.
+  median; a number that misses it is marked `~` (with its range in the markdown, and on
+  hover in the viewer) and the measurement is fixed before the number is used.
 
 ## What is measured
 
@@ -124,15 +124,17 @@ docker pull jellyfin/jellyfin:10.11.8
 docker pull jellyfin/jellyfin:12.0-rc7
 bench/testdata/build.sh                           # once, ~20 min
 bench/run.sh                                      # one full run, ~40 min → bench/runs/<date>-<sha>/report.md
-python3 bench/report.py bench/runs/A bench/runs/B bench/runs/C   # the README table: medians + spread
+python3 bench/report.py bench/runs/A bench/runs/B bench/runs/C   # the README table: medians, markers, notes
 python3 bench/report.py --serve                   # the comparison viewer at http://127.0.0.1:8097/
 ```
 
 The viewer lists every run under `bench/runs`; tick the runs to render (several =
-median + spread) and optionally a baseline. It shows the same cells as the markdown
-plus each cell's ratio to Jellyfin 12.0-rc7 and — with a baseline — each server's
-percentage change against an earlier run of itself (green = faster/smaller). The
-markdown keeps neither, so the README stays two columns side by side. Localhost only,
+median + spread) and optionally a baseline. Cells stay numeric in both renderers: the
+median, a `~` on any number that missed the spread rule, and `⚠[n]` pointing at a
+numbered note. Both also print each cell's speed against Jellyfin 12.0-rc7 as
+`X.Y× faster` (memory says lighter), shown only where both numbers stand; with a
+baseline the viewer adds each server's percentage change against an earlier run of
+itself (green = faster/smaller). Localhost only,
 stdlib only, no JavaScript.
 
 Tunables are the variables at the top of `run.sh` (`WINDOW_S`, `RATE_LOADED`, …); pass
