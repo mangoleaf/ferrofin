@@ -546,8 +546,13 @@ impl ItemCountService for FerrofinItemCountService {
         let totals = total_q.fetch_all(self.db.pool()).await.map_err(db_err)?;
 
         // Played subset: the same closure, joined to this user's played `UserData`.
+        // `CROSS JOIN` is the join-order pin, not a different join — see
+        // `folder_leaf_count_sql` for why the plain `JOIN` form drove from
+        // `UserData` instead of from this page's parents. It cost 9.9 ms on a
+        // 16-album `/Items/Latest` page and 55 ms on a 100-album one, against
+        // 0.1 and 1.0 pinned.
         let played_sql = grouped(
-            r#" JOIN "UserData" ud ON ud."ItemId" = a."ItemId""#,
+            r#" CROSS JOIN "UserData" ud ON ud."ItemId" = a."ItemId""#,
             r#" AND ud."UserId" = ? AND ud."Played" = 1"#,
         );
         // The `?` for UserId precedes the `ParentItemId` in-list, so bind it first.
@@ -750,6 +755,15 @@ impl FerrofinItemCountService {
         .fetch_one(self.db.pool())
         .await
         .map_err(db_err)?;
+        // TODO(P0.4 follow-up): this `COUNT(*)` over-counts. `UserData`'s key is
+        // `(ItemId, UserId, CustomDataKey)`, so a leaf can carry several rows for
+        // one user and the join multiplies — 4,031 against a true 1,574 on the
+        // adopted bench database, inflating the `AggregateFolder`'s
+        // `PlayedPercentage` ~2.6×. v12
+        // `ItemCountService.GetPlayedAndTotalCountFromQuery` (:610-624) is
+        // `UserData.Any(u => u.UserId == userId && u.Played)`, i.e.
+        // `COUNT(DISTINCT bi."Id")`. Fixed in its own commit, with its own
+        // before/after; not folded into the join-order pin below.
         let played: i64 = sqlx::query_scalar(
             r#"SELECT COUNT(*) FROM "BaseItems" bi
                JOIN "UserData" ud ON ud."ItemId" = bi."Id"
@@ -860,6 +874,51 @@ fn people_name_counts_sql(names: usize, types: usize) -> String {
 /// Measured on the bench library (9,862 items / 6,795 ancestor edges) for the
 /// 24-series page `/Items?includeItemTypes=Series`, alternating legs in
 /// process: 23.5 ms → 1.96 ms p50, rows identical.
+///
+/// The played subset (`extra_join`) must arrive as a `CROSS JOIN`, for the same
+/// reason and with the same effect. `ud."UserId" = ? AND ud."Played" = 1` is a
+/// driving term too: with a plain `JOIN`, SQLite seeds from
+/// `FerrofinIX_UserData_UserId_Played_ItemId (UserId=? AND Played=?)` — every
+/// PLAYED row the user owns, at ANY parent count, one included — and probes the
+/// closure per row per parent, O(the user's play history) rather than
+/// O(descendants of these parents), plus a temp b-tree for the `GROUP BY`.
+/// `CROSS JOIN` is SQLite's join-order pin: it forbids reordering and changes
+/// nothing else, so the plan becomes `AncestorIds (ParentItemId=?)` →
+/// `BaseItems (Id=?)` → that same Ferrofin index used the other way round,
+/// `(UserId=? AND Played=? AND ItemId=?)`, and the `GROUP BY` falls out of the
+/// driving index's order. The statement alone, on the adopted bench database
+/// (93,818 ancestor edges, 4,886 played rows), unpinned → pinned: one season
+/// 1.05 → 0.01 ms, the 16-album `/Items/Latest` page 9.86 → 0.10, a 24-series
+/// page 14.11 → 0.63, a 100-album page 55.05 → 0.99. End to end, with two
+/// servers interleaved request-for-request over 60 samples each: `/Items/Latest`
+/// for music 11.33 → 2.13 ms p50, a 100-album page 57.98 → 7.88, `/Artists`
+/// 58.98 → 11.57, a series' `/Seasons` 3.20 → 0.77; bodies byte-identical.
+///
+/// The `COUNT(DISTINCT a."ItemId")` is load-bearing for CORRECTNESS, not for
+/// the pin — do not delete it. (The pin needs nothing from it: a join's result
+/// set is order-independent, so the two orders agree either way.) `UserData`'s
+/// key is `(ItemId, UserId, CustomDataKey)`, so one `(item, user)` pair can
+/// carry several rows — 2,154 of them on that same adopted database — and the
+/// join multiplies: without the `DISTINCT` the shows folder counts 1,382 played
+/// leaves against a true 691, and movies 2,649 against 883. The `DISTINCT` is
+/// also exactly v12's rule:
+/// `ItemCountService.GetPlayedAndTotalCountFromQuery` (:610-624) counts an item
+/// played when `b.UserData.Any(u => u.UserId == userId && u.Played)` — ANY key
+/// row, not all of them.
+///
+/// The pin has a loss regime, and it is bounded. It wins whenever the parents'
+/// combined closure is smaller than the user's played-row count — every album /
+/// artist / season / series page — and loses in the mirror case: the three
+/// physical library folders (20,457 closure rows between them) measure 4.63 ms
+/// unpinned against 19.18 ms pinned. Those folders DO reach here: the page's
+/// folder list (`dto_service.rs`, the `get_played_and_total_count_batch` call
+/// site) drops `CollectionFolder`, `UserView` and the by-name kinds, but a plain
+/// `Folder` passes. What bounds the loss is the `total` arm: it is this
+/// same statement WITHOUT the `UserData` join, it always drives from
+/// `AncestorIds`, and on that page it costs 20.36 ms — already the same order.
+/// So the pinned played arm takes such a page from ~25 ms to ~40 ms, never from
+/// milliseconds to tens of them, while every page that does NOT hold a
+/// library-sized folder gets the 10-100× win above.
 ///
 /// Merged alternate versions (`PrimaryVersionId` set) are hidden duplicates of
 /// their primary — counting them inflated every series/season episode total
@@ -1003,6 +1062,7 @@ mod tests {
     };
     use ferrofin_db::Database;
     use ferrofin_db::entities::base_items::BaseItemEntity;
+    use rstest::rstest;
 
     fn svc(db: &Database) -> FerrofinItemCountService {
         FerrofinItemCountService::new(db.clone())
@@ -2312,14 +2372,14 @@ mod tests {
     /// a 24-series page), so the shape is pinned here: `AncestorIds` is the
     /// outermost loop and `BaseItems` is reached by id.
     ///
-    /// **Only the `total` arm discriminates.** `played` is driven by
-    /// `FerrofinIX_UserData_UserId_Played_ItemId (UserId=? AND Played=?)` under
-    /// both the `EXISTS` and the inner-join form, so `IsFolder` is never a
-    /// candidate driving term there and `bi` is reached by `Id=?` either way —
-    /// it passes against the unfixed SQL. It is kept as a smoke check that the
-    /// `UserData` variant still builds and still seeks, not as a regression
-    /// pin. Anyone re-verifying this test must delete the `total` case, not the
-    /// `played` one.
+    /// The `played` arm carries a second pin: its `UserData` join must be a
+    /// `CROSS JOIN`, so `AncestorIds` stays the OUTERMOST loop and `UserData`
+    /// is probed by `ItemId`. As a plain `JOIN`,
+    /// `ud."UserId" = ? AND ud."Played" = 1` is itself a driving term and
+    /// SQLite seeds from
+    /// `FerrofinIX_UserData_UserId_Played_ItemId (UserId=? AND Played=?)` —
+    /// every played row the user owns — which cost 9.9 ms on a 16-album page of
+    /// the adopted bench database against 0.1 ms pinned.
     #[tokio::test]
     async fn folder_leaf_counts_seek_from_the_ancestor_closure() {
         let db = test_db().await;
@@ -2328,7 +2388,7 @@ mod tests {
             ("total", "", "", 24),
             (
                 "played",
-                r#" JOIN "UserData" ud ON ud."ItemId" = a."ItemId""#,
+                r#" CROSS JOIN "UserData" ud ON ud."ItemId" = a."ItemId""#,
                 r#" AND ud."UserId" = ? AND ud."Played" = 1"#,
                 25,
             ),
@@ -2349,6 +2409,200 @@ mod tests {
                     .any(|s| s.starts_with("SEARCH bi") && s.contains("Id=?")),
                 "{label} count must reach BaseItems by id, got: {plan:?}"
             );
+            let Some(first) = plan
+                .iter()
+                .find(|s| s.starts_with("SEARCH") || s.starts_with("SCAN"))
+            else {
+                panic!("{label} count produced no driving loop: {plan:?}");
+            };
+            assert!(
+                first.contains(" a ") && first.contains("ParentItemId=?"),
+                "{label} count must be driven by AncestorIds (ParentItemId=?), got: {plan:?}"
+            );
         }
+    }
+
+    /// Adds a FURTHER `UserData` row for `(item, user)` under its own
+    /// `CustomDataKey`, the way an adopted Jellyfin database carries a row per
+    /// version key. [`seed_user_data`] always writes the key `item.to_string()`,
+    /// so this is the only way to build the multiplying shape.
+    async fn seed_extra_user_data_key(
+        db: &Database,
+        user: Uuid,
+        item: Uuid,
+        suffix: usize,
+        played: bool,
+    ) {
+        sqlx::query(
+            r#"INSERT INTO "UserData"
+               ("ItemId", "UserId", "CustomDataKey", "IsFavorite",
+                "PlayCount", "PlaybackPositionTicks", "Played")
+               VALUES (?1, ?2, ?3, 0, 0, 0, ?4)"#,
+        )
+        .bind(guid_to_db(item))
+        .bind(guid_to_db(user))
+        .bind(format!("{item}-version-{suffix}"))
+        .bind(i64::from(played))
+        .execute(db.writer())
+        .await
+        .expect("extra user data key");
+    }
+
+    /// Seeds `folders.len()` folders, the nth holding `played` played and
+    /// `unplayed` unplayed leaf children, all wired into the `AncestorIds`
+    /// closure for one user. Returns the folder ids in order plus the user.
+    ///
+    /// `extra_keys` adds that many FURTHER `UserData` rows per leaf under
+    /// distinct `CustomDataKey`s. That is not a contrivance: `UserData`'s key is
+    /// `(ItemId, UserId, CustomDataKey)` and an adopted Jellyfin database really
+    /// does carry a row per key (2,154 such `(item, user)` pairs on the bench
+    /// database), so the roll-up's `UserData` join multiplies and only the
+    /// `COUNT(DISTINCT …)` keeps the answer right.
+    async fn seed_played_roll_up(
+        db: &Database,
+        folders: &[(usize, usize)],
+        extra_keys: usize,
+    ) -> (Vec<Uuid>, UserEntity) {
+        let user_id = Uuid::from_u128(0x5EED_0001);
+        let user = seed_user(db, user_id).await;
+        let mut parents = Vec::with_capacity(folders.len());
+        let mut next = 0u128;
+        for (f, &(played, unplayed)) in folders.iter().enumerate() {
+            let parent = Uuid::from_u128(0x5EED_1000 + f as u128);
+            seed_item(db, parent, BaseItemKind::Folder).await;
+            for i in 0..(played + unplayed) {
+                next += 1;
+                let leaf = Uuid::from_u128(0x5EED_2000 + next);
+                seed_item(db, leaf, BaseItemKind::Movie).await;
+                sqlx::query(
+                    r#"INSERT INTO "AncestorIds" ("ItemId", "ParentItemId") VALUES (?1, ?2)"#,
+                )
+                .bind(guid_to_db(leaf))
+                .bind(guid_to_db(parent))
+                .execute(db.writer())
+                .await
+                .expect("ancestor");
+                seed_user_data(db, user_id, leaf, i < played, None).await;
+                for k in 0..extra_keys {
+                    seed_extra_user_data_key(db, user_id, leaf, k, i < played).await;
+                }
+            }
+            parents.push(parent);
+        }
+        (parents, user)
+    }
+
+    /// The roll-up's numbers, pinned per folder: the served batch must report
+    /// exactly the seeded played/total leaf counts. This is the correctness
+    /// oracle the `CROSS JOIN` plan pin must not move.
+    #[rstest]
+    #[case(&[(2, 1)], 0)]
+    #[case(&[(3, 0), (1, 4)], 0)]
+    #[case(&[(0, 2), (5, 5), (1, 0)], 0)]
+    #[case(&[(2, 1)], 1)]
+    #[case(&[(0, 2), (5, 5), (1, 0)], 2)]
+    #[tokio::test]
+    async fn played_roll_up_counts_every_folder_on_the_page(
+        #[case] folders: &[(usize, usize)],
+        #[case] extra_keys: usize,
+    ) {
+        let db = test_db().await;
+        let (parents, user) = seed_played_roll_up(&db, folders, extra_keys).await;
+
+        let counts = svc(&db)
+            .get_played_and_total_count_batch(&parents, &user)
+            .await
+            .expect("roll-up");
+
+        for (&parent, &(played, unplayed)) in parents.iter().zip(folders) {
+            let got = counts.get(&parent).copied().unwrap_or_default();
+            assert_eq!(
+                (got.played, got.total),
+                (
+                    i32::try_from(played).expect("small"),
+                    i32::try_from(played + unplayed).expect("small")
+                ),
+                "folder {parent} played/total"
+            );
+        }
+    }
+
+    /// A leaf is played when ANY of its `UserData` key rows is played — v12
+    /// `ItemCountService.GetPlayedAndTotalCountFromQuery` (:610-624),
+    /// `b.UserData.Any(u => u.UserId == userId && u.Played)`. Both mixed
+    /// orders count, and the `DISTINCT` still keeps the leaf from counting
+    /// twice.
+    #[tokio::test]
+    async fn a_leaf_is_played_when_any_of_its_user_data_keys_is() {
+        let db = test_db().await;
+        let user_id = Uuid::from_u128(0x5EED_0001);
+        let user = seed_user(&db, user_id).await;
+        let parent = Uuid::from_u128(0x5EED_1000);
+        seed_item(&db, parent, BaseItemKind::Folder).await;
+
+        // Three leaves: base row played + extra unplayed, base unplayed + extra
+        // played, and both unplayed. The first two are played, the third is not.
+        for (n, (base, extra)) in [(true, false), (false, true), (false, false)]
+            .into_iter()
+            .enumerate()
+        {
+            let leaf = Uuid::from_u128(0x5EED_2000 + n as u128);
+            seed_item(&db, leaf, BaseItemKind::Movie).await;
+            sqlx::query(r#"INSERT INTO "AncestorIds" ("ItemId", "ParentItemId") VALUES (?1, ?2)"#)
+                .bind(guid_to_db(leaf))
+                .bind(guid_to_db(parent))
+                .execute(db.writer())
+                .await
+                .expect("ancestor");
+            seed_user_data(&db, user_id, leaf, base, None).await;
+            seed_extra_user_data_key(&db, user_id, leaf, 0, extra).await;
+        }
+
+        let counts = svc(&db)
+            .get_played_and_total_count_batch(&[parent], &user)
+            .await
+            .expect("roll-up");
+        let got = counts.get(&parent).copied().unwrap_or_default();
+        assert_eq!((got.played, got.total), (2, 3));
+    }
+
+    /// Belt and braces: the pinned builder must still be the same query. A
+    /// join's result set is order-independent, so the two forms cannot disagree
+    /// on rows — what this guards is a future edit that changes the shape while
+    /// reaching for the plan, including under a multiplying `UserData` join.
+    #[rstest]
+    #[case(&[(2, 1)], 0)]
+    #[case(&[(3, 0), (1, 4)], 0)]
+    #[case(&[(0, 2), (5, 5), (1, 0)], 0)]
+    #[case(&[(2, 1)], 1)]
+    #[case(&[(3, 0), (1, 4)], 3)]
+    #[tokio::test]
+    async fn the_join_order_pin_does_not_change_the_rolled_up_rows(
+        #[case] folders: &[(usize, usize)],
+        #[case] extra_keys: usize,
+    ) {
+        let db = test_db().await;
+        let (parents, user) = seed_played_roll_up(&db, folders, extra_keys).await;
+        let ids: Vec<String> = parents.iter().copied().map(guid_to_db).collect();
+
+        let mut rows = Vec::new();
+        for join in [
+            r#" CROSS JOIN "UserData" ud ON ud."ItemId" = a."ItemId""#,
+            r#" JOIN "UserData" ud ON ud."ItemId" = a."ItemId""#,
+        ] {
+            let sql = folder_leaf_count_sql(
+                ids.len(),
+                join,
+                r#" AND ud."UserId" = ? AND ud."Played" = 1"#,
+            );
+            let mut q = sqlx::query_as::<_, (String, i64)>(&sql).bind(user.id.as_str());
+            for id in &ids {
+                q = q.bind(id.as_str());
+            }
+            let mut got = q.fetch_all(db.pool()).await.expect("roll-up");
+            got.sort();
+            rows.push(got);
+        }
+        assert_eq!(rows[0], rows[1], "the join-order pin changed the counts");
     }
 }
