@@ -111,10 +111,87 @@ jobs:
           build-args: |
             SERVICE_VERSION=${{ github.ref_name }}
 
-  # ── GitHub Release with git-cliff notes (final versions only) ──
+  # ── server binaries, one archive per target, attached to the Release ──
+  # Linux x86_64 and aarch64 are the supported set. macOS and Windows are
+  # experimental: they build and smoke-boot here (the owner has no such machine,
+  # so CI is the test environment) and a failure never blocks the release.
+  binaries:
+    if: github.event_name == 'push' && startsWith(github.ref_name, 'v')
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu }
+          - { os: ubuntu-latest,  target: aarch64-unknown-linux-gnu, cross: true }
+          - { os: macos-latest,   target: aarch64-apple-darwin,     experimental: true }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc,   experimental: true }
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.experimental == true }}
+    env:
+      # ferrofin-health's build.rs bakes this in as the reported version (the
+      # same override the Docker build uses), so a tarball reports the tag.
+      FERROFIN_GIT_DESCRIBE: ${{ github.ref_name }}
+      CARGO_PROFILE_RELEASE_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      # aarch64 Linux is cross-compiled with zig as the C toolchain (bundled
+      # SQLite and ring both need a C compiler for the target).
+      - if: matrix.cross
+        run: |
+          pip install cargo-zigbuild
+          cargo zigbuild --release -p ferrofin-server --target ${{ matrix.target }}
+      - if: ${{ !matrix.cross }}
+        run: cargo build --release -p ferrofin-server --target ${{ matrix.target }}
+      - name: smoke-boot the binary
+        if: ${{ !matrix.cross }}
+        shell: bash
+        run: |
+          set -eu
+          bin="target/${{ matrix.target }}/release/ferrofin-server"
+          [ -x "$bin" ] || bin="$bin.exe"
+          "$bin" --data-dir smoke-data --bind 127.0.0.1 --port 8096 > smoke.log 2>&1 &
+          pid=$!
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8096/System/Info/Public > info.json 2>/dev/null; then break; fi
+            sleep 1
+          done
+          kill "$pid" || true
+          cat info.json
+          grep -q "\"Version\":\"$GITHUB_REF_NAME\"" info.json || { echo "version mismatch"; cat smoke.log; exit 1; }
+      - name: package
+        shell: bash
+        run: |
+          set -eu
+          name="ferrofin-$GITHUB_REF_NAME-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp LICENSE README.md "dist/$name/"
+          case "${{ matrix.target }}" in
+            *windows*) cp "target/${{ matrix.target }}/release/ferrofin-server.exe" "dist/$name/"
+                       (cd dist && 7z a -bd "$name.zip" "$name" > /dev/null && sha256sum "$name.zip" > "$name.zip.sha256") ;;
+            *)         cp "target/${{ matrix.target }}/release/ferrofin-server" "dist/$name/"
+                       (cd dist && tar czf "$name.tar.gz" "$name" && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256") ;;
+          esac
+          rm -r "dist/$name"
+          ls -l dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ferrofin-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  # ── GitHub Release with git-cliff notes + the binaries (final versions only) ──
   github-release:
-    if: github.event_name == 'push' && startsWith(github.ref_name, 'v') && !contains(github.ref_name, '-rc.')
-    needs: [docker-image]
+    if: >-
+      !cancelled() && github.event_name == 'push' && startsWith(github.ref_name, 'v') &&
+      !contains(github.ref_name, '-rc.') &&
+      needs.docker-image.result == 'success' && needs.binaries.result == 'success'
+    needs: [docker-image, binaries]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -126,12 +203,17 @@ jobs:
           args: --current --strip header
         env:
           OUTPUT: release_notes.md
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: ferrofin-*
+          path: dist
+          merge-multiple: true
       - name: create the GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "$GITHUB_REF_NAME" --verify-tag \
-            --title "Ferrofin $GITHUB_REF_NAME" --notes-file release_notes.md
+            --title "Ferrofin $GITHUB_REF_NAME" --notes-file release_notes.md dist/*
 
   # ── Helm chart as an OCI artifact on GHCR ──
   #   install: helm install ferrofin oci://ghcr.io/<owner>/ferrofin/charts/ferrofin --version A.B.C
