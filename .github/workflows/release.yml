@@ -34,7 +34,7 @@ jobs:
     if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0 # full history + tags to derive the bump from commits
           token: ${{ secrets.RELEASE_TOKEN }}
@@ -66,7 +66,7 @@ jobs:
     env:
       HAVE_DOCKERHUB: ${{ secrets.DOCKERHUB_USERNAME != '' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: free runner disk (~25 GB of preinstalled toolchains)
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
@@ -133,7 +133,7 @@ jobs:
       FERROFIN_GIT_DESCRIBE: ${{ github.ref_name }}
       CARGO_PROFILE_RELEASE_DEBUG: "0"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.97.1
         with:
           targets: ${{ matrix.target }}
@@ -194,7 +194,7 @@ jobs:
     needs: [docker-image, binaries]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0 # git-cliff needs full history + tags
       - uses: orhun/git-cliff-action@v4
@@ -228,7 +228,7 @@ jobs:
     needs: [docker-image]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: package and push the chart
         env:
           GH_TOKEN: ${{ github.token }}
