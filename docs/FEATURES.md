@@ -63,7 +63,7 @@ Deep-verified against a real Jellyfin server:
 - **Sessions & playback** — sessions, playstate reporting, remote control, capabilities, and
   the **WebSocket push** messages clients rely on (`UserDataChanged`, session updates, …).
 - **Playlists & collections** — create/edit/reorder/share, membership, stored in Jellyfin's
-  `Data`-JSON shape so they survive a swap back to Jellyfin.
+  `Data`-JSON shape, the same source of truth Jellyfin itself reads.
 - **Playback delivery** — direct play, and **live HLS transcode** including subtitle burn-in
   and fMP4 HEVC/AV1.
 - **Hardware transcoding** — **NVENC, VAAPI and QSV**. Decode, scale, deinterlace, rotate,
@@ -155,7 +155,7 @@ Wired and working, with a documented limitation or lighter verification:
   ported and tested, but nothing calls them yet: Ferrofin creates collections and playlists as
   pathless database rows, and its scanner resolves no collection/playlist *folders*, so there
   is no on-disk file to read or write. Membership lives in `BaseItems."Data"` (Jellyfin's own
-  source of truth), which is what makes the drop-in round trip work.
+  source of truth), which is what makes in-place adoption of a Jellyfin database work.
 
 ## Not implemented (by design)
 

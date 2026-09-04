@@ -134,14 +134,17 @@ macros** — they require a live `DATABASE_URL` at build/CI time, which we delib
 The schema is an ordered migration chain (`crates/ferrofin-db/migrations/`) whose
 Jellyfin-owned shape is **pinned byte-equal to a real Jellyfin 10.11.8 database** — that is
 what makes drop-in adoption of an existing Jellyfin DB possible (point Ferrofin at it and it
-migrates in place; swapping back to Jellyfin is safe). Ferrofin-own tables/indexes live in a
-collision-proof `Ferrofin*`/`FerrofinIX_*` namespace. The `schema_conformance` test guards the
-pin. (The two-way swap test lived in the retired v2 suite and **has no replacement**:
-suite v3 exercises adoption — every server boots a disposable copy of a Jellyfin-scanned
-database, and Ferrofin migrates it in place — but nothing checks that Jellyfin still opens
-the database afterwards. `suite/roundtrip.sh` from git history is the ONE v2 piece
-acceptable to recover, as a reference for that replacement, since it tests the server
-rather than the harness.)
+migrates in place). Ferrofin-own tables/indexes live in a collision-proof
+`Ferrofin*`/`FerrofinIX_*` namespace. The `schema_conformance` test guards the pin.
+
+**Adoption is one-way, and every doc must say so.** The migration chain rebuilds several
+Jellyfin-owned tables (0007) and normalises stored values (GUID casing, presentation keys),
+so a database Ferrofin has migrated is not guaranteed to open under Jellyfin again. The
+adoption path copies the original to `jellyfin.db.pre-ferrofin` before touching it and logs
+the path; returning to Jellyfin means restoring that backup. Never describe the swap as
+two-way or round-trip in user-facing text. (Suite v3 exercises adoption — every server
+boots a disposable copy of a Jellyfin-scanned database and Ferrofin migrates it in place —
+but nothing checks that Jellyfin still opens the result, and nothing is expected to.)
 
 ### Errors
 Libraries use per-crate `thiserror` enums; the binary uses `anyhow` at the top level.

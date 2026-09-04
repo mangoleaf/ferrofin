@@ -26,9 +26,8 @@ strategy:
     maxUnavailable: 0
 
 image:
-  # -- Container image repository. Override per-environment; the placeholder is
-  # replaced by the published image location at the public release.
-  repository: registry.example.com/ferrofin
+  # -- Container image repository. Override if you mirror the image elsewhere.
+  repository: ghcr.io/mangoleaf/ferrofin
   # -- Image tag. Empty → chart appVersion.
   tag: ""
   # -- Image pull policy.

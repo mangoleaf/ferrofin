@@ -10,27 +10,905 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 
 ## [Unreleased]
 
+### Documentation
+- Documentation updates
+
+### Report
+- Report the run-to-run range, stop ruling on it
+
+## [0.42.3] - 2026-09-04
+
+### Counts
+- The whole-server played arm counts leaves, not user-data rows
+
+### Report
+- Make the headline tiles fit the window
+
+## [0.42.2] - 2026-09-03
+
+### Bench
+- A third load level, and the guards a third level needs
+- Name a run for the code it measured
+
+### Counts
+- Pin the played roll-up to drive from the page's parents
+
+## [0.42.1] - 2026-09-03
+
+### Bench
+- A report you can read — markers in the cells, reasons in notes
+- Report the precision the measurement actually has
+
+### Latest
+- Port v12's music branch — the newest albums, not the albums of the newest tracks
+
+## [0.42.0] - 2026-09-03
+
+### Bug Fixes
+- Every measured endpoint counts in the headline
+- A missing leg marks the run, it does not delete it
+- Repair the render and stop hiding measured endpoints
+- HEAD moving mid-run is not a stale build
+- Repoint the Live TV foreign keys 0009 left dangling on adopted databases
+- Name both causes when testdata bring-up cannot reach a server
+- Footprint metrics measure real numbers — restart-based cold start, 100ms host-cgroup RSS sampling
+- Scope to the user's libraries, port v12 DetermineNextEpisode — 1.29 s → 12 ms
+
+### Features
+- Keep both servers' responses beside every parity verdict
+- Refuse to run if real media is writable from any suite container
+- Pin a real Jellyfin snapshot as the suite's test data
+- Both servers run on seeded copies of the pinned snapshot
+- Pinned backup + a read-only streams stage — the two media rules
+- Three-percentile speedups; verification depth leaves the perf headline
+
+### Miscellaneous
+- Regenerated parity results and the v0.40.0-82 run record
+- Record the v0.41.0-3 run (130 measured, 1.94x, 1 leg missing)
+- Record the v0.41.0-6 run (136 measured, 1.795x, no missing legs)
+- Keep the code-graph index out of the docker build context
+- First snapshot-corpus record — recalibrated rates, run 240db12, acked shape baseline
+
+### Api
+- The parity record lives beside the route table
+- GET /Items and /UserItems/Resume take v12's DtoOptions and query inputs
+
+### Bench
+- Designed test data — generator, Jellyfin seeding, build
+- The comparison run, its instruments and the report
+- Report interference as p95 / max, not max alone
+- The comparison viewer — report.py --serve
+- Benchmark core Ferrofin — every plugin disabled, no WASM
+- Shape records items returned and TotalRecordCount separately
+
+### Dto
+- V12 parity for the small DTO fields (P1.1–P1.6, P1.9)
+- Port v12's inherited parent images and Series.Status
+
+## [0.41.0] - 2026-09-01
+
+### Bug Fixes
+- Align the lab data dirs and close the folder-DTO divergences
+- Pick the C# provider per kind, and 404 a seed that is not there
+- Order the flat providers Random, and stop calling a property probe deep-verified
+- Port the probe DTO, by-name and library-options divergences batch A3 found
+- Port image format negotiation, the refresh fetcher gate, and the music/search sort keys batch B2 found
+- Port the ?format= query binding arm and stop the asset layer borrowing the body-diff headline
+- Make every ledger row declare how it was verified, and stop defaulting into the headline
+- Restore merge.py's body-diff honesty gate, which the stamping commit dropped
+- Stop the deep-verified headline being borrowed by a nested empty envelope, a dashboard, or an unenforced rule
+- Save where Jellyfin saves, parse what Jellyfin parses
+- Port the real LrcParser decoder, and gate the writes on LyricManagement
+- Make tuner and listings-provider administration do the work
+- Queue the guide refresh instead of blocking on it, and stop a side-path note standing in for a verdict
+- Port the AggregateFolder root and its virtual-children concat
+- Port the /Items user-root branch, and make array order diffable
+- One repository store, a real package catalogue, no orphan views
+- Bind assemblyGuid the way ASP.NET binds a Guid?
+- Bind a blank assemblyGuid the way ASP.NET does
+- Rename the ferrofin volume after its mount point moved
+- Port the Years/InstantMix/dashboard-page behaviours the "out-of-scope" notes were hiding
+- Close the cross-user read, and port the plugin surface the "no shared id" notes were hiding
+- A non-admin could act as any other user through ?userId=
+- Close the last GetUserId site, and bind an empty guid the way ASP.NET does
+- Four "host-specific" rows were false labels hiding real bugs
+- The task Id is portable, and the ffmpeg logs belong in the log dir
+- The probe DTO tracks upstream master's nullability again
+- Correct the record M1 wrote, not just the code
+- Parent the playlists folder, and port the id/image lineups to 10.11.8
+- Teach every stored-kind switch the real PlaylistsFolder name
+- Derive channel/programme ids the way Jellyfin does, and bound the guide
+- Port the whole UserPermissionRequirement policy, not just its handler
+- Gate remote search on the library's downloaders, and stop typing artwork from the URL
+- Make the Identify Apply row say what it actually measured
+- A bare empty list is untested, not empty-corpus
+- The server mints a series timer's id, and the timer it schedules
+- A hand-cancelled showing stays cancelled, and cancelling a series takes its completed children
+- A tuner type is a lookup, a scan is a filter, and a source is the user's
+- A channel is a real item, a series timer keeps its name, and a refused body is a 400
+- A guide refresh owns a channel's lineup fields, not its item
+- An airing is a real item, and a keyless row is not a group
+- A keyless by-name row is item loss, not a grouping detail
+- A channel no provider backs is 400, and four labels were wrong
+- The Startup guard row asserts the guard, not a payload identity
+- Repair the series-timer fan-out probe and stop three reds rendering as settled
+- Port CreateItemByName, cumulative runtime ticks and the instant-mix dispatch
+- Resolve instant-mix genre names through CreateItemByName, and restrict by-name counts to their ItemValue type
+- Resolve LibraryOptions by parsed Uuid, not by id spelling
+- Write JPEG the way Skia does, and stop advertising ranges on trickplay tiles
+- Invalidate the image cache after the JPEG chroma change
+- Port the RemoteSearch "Identify" cascade faithfully
+- Pin a padded provider id the way int.Parse does
+- Route POST /Library/Refresh through the task registry
+- Port the group-state SessionJoined/SessionLeaving hooks; add a two-server push differential
+- Port WaitingGroupState's third ResumePlaying arm; make the push probe report what it drops
+- Port MusicArtistResolver; RecursiveItemCount; the remote-search fetcher gate
+- Port the remote-search provider ordering; loose artist audio
+- Port the per-state playback arms; drive them over the push differential
+- Port the WaitingGroupState fallback; widen the push probe to every state
+- A fresh play queue has nothing playing, not item 0
+- Port the slug branch, per-CleanName counts and the Person row columns
+- Port the PresentationUniqueKey collapse; guard ForcedSortName
+- A missing traceId must diff red, and drop the dead Year guard
+- Close the paths that let a wrong number look like a measurement
+- A side-path note never settles the row it hangs off
+- Filter LibraryChanged by what the user may actually see
+- Derive LibraryChanged CollectionFolders the way GetTopParentIds does
+- Stop delete_reports_a_failed_unlink failing when CI runs as root
+
+### Documentation
+- Record that Live TV channels 404 on GET /Items/{itemId}
+- Make the body-binder claim carry its measurement
+- Name the two unported IsMetadataFetcherEnabled arms
+
+### Features
+- A tuner is a kind, and HDHomeRun is one of them
+- Port LibraryChangedNotifier so item writes announce themselves
+
+### Miscellaneous
+- Record the v0.40.0 parity+perf run
+
+### Security
+- Join the wrapped warning string in ensure_startup_wizard_integrity
+
+### Testing
+- Cover the user-root branch's IsVisible arm
+- Probe the external-change webhooks; stop dropping ProviderIds on an item edit
+- Regenerate the ledger — push layer verifies 20/20
+
+## [0.40.0] - 2026-08-29
+
+### Bug Fixes
+- Write user data under the keys Jellyfin actually reads
+- Key the Peoples cover index on a collation, not on LOWER()
+- Anchor an interval on the last run, not on process start
+- Serve NetworkConfiguration under the contract's field names
+- Resolve jellyfin's virtual libraries, and find by-name rows by name and kind
+- Confine an unscoped query to the user's libraries, and give created items a container
+- Read an adopted Jellyfin database the way Jellyfin reads it
+- Stop folding eth and thorn, and keep the keys we cannot rebuild
+- Confine the counts and the by-name tabs to the user's libraries too
+- Confine the filter facets and /Years to the user's libraries
+- Resolve a UserView the way GetTopParentIdsForQuery does
+- Make the perf gate say what is actually wrong
+- Give a provisioned container the shape Jellyfin will recognise
+- A grouping view stands for the libraries grouped into it
+- Resume surfaces the version that was played, not the primary
+- Reduce memory usage of dev builds
+
+### Features
+- Import jellyfin's config xml when adopting a data directory
+- Enforce the network policy instead of only storing it
+- Import network.xml when adopting a Jellyfin data directory
+- Import Jellyfin's tuners and guide on adoption
+- Resolve the real client address behind a known proxy
+
+### Miscellaneous
+- Record the ferrofin-core -> ferrofin-networking edge in the lockfile
+
+### Testing
+- Cover KnownProxies and the forwarded-header walk
+
+## [0.39.1] - 2026-08-27
+
+### Bug Fixes
+- Scope Merge Versions' movie merging to one library
+
+## [0.39.0] - 2026-08-27
+
+### Bug Fixes
+- Stop the benchmark measuring Jellyfin's startup stub
+
+### Documentation
+- Scope hardware transcoding to NVENC, VAAPI and QSV
+
+### Features
+- Probe the full ffmpeg capability surface
+- Build the hardware device graphs and pick hardware encoders
+- Choose the hardware decoder and assemble the input line
+- Port the tonemapping paths and the shared filter fragments
+- Port the software filter chain and the filtergraph assembly
+- Port the NVENC/CUDA filter chain
+- Drive NVENC from the ported hardware matrix
+- Probe the VAAPI render node for its driver and Vulkan interop
+- Port the Intel iHD and limited VAAPI filter chains
+- Complete VAAPI -- AMD Vulkan chain, low-power params, wiring
+- Port the QSV gate and the Linux QSV filter chain
+- Complete QSV -- D3D11 chain, bitrate arms, wiring
+- Strip Dolby Vision and HDR10+ metadata on a stream copy
+- Report a starting transcode, and what hardware it runs on
+- Port the accelerated trickplay path, and fix -vsync on ffmpeg 8+
+- Run trickplay extraction on the GPU
+
+### Miscellaneous
+- Regenerate the parity ledger and record the latest benchmark runs
+
+### Performance
+- Drop the redundant DISTINCT from the by-name item count
+- Skip the browse row-count when the page already proves it
+
+### Testing
+- Stop the VAAPI device goldens depending on the test machine's GPU
+- The real-Jellyfin drop-in adoption harness
+
+## [0.38.0] - 2026-08-24
+
+### Testing
+- Stop the restart tests failing on a busy machine
+
+## [0.37.1] - 2026-08-23
+
+### Bug Fixes
+- Make scrubbing previews reachable by clients; honour the per-library gate
+- Stopping a scheduled task kills its ffmpeg child
+- Persist SortName on every write, and port CreateSortName faithfully
+- Gate POST /System/Restart behind local-access-or-elevation
+
+### Performance
+- Default the scan probe window to 8
+- Stop asking folders and by-name items for media sources
+- Take the playback-metrics writes off the request path
+
+## [0.37.0] - 2026-08-23
+
+### Bug Fixes
+- Derive Person ids from the case-normalized by-name key
+
+### Documentation
+- Retire the "deferred" classifications after the no-deferral sweep
+
+### Features
+- Port GetLocalizedString and re-stamp MediaStream.Localized* on read
+- Index external subtitle/audio sidecars at scan time
+
+### Performance
+- Stop memsetting 128 KiB per pushed WebSocket message
+- Stop re-decoding unchanged images on every rescan
+
+## [0.36.0] - 2026-08-23
+
+### Bug Fixes
+- GroupingOptions lists only grouping-eligible libraries
+- Subtitle writers match Jellyfin byte for byte
+- Media sources carry their attachments and the N-form id
+- Write guids and dates the way Jellyfin's JSON converters do
+- Accept the contract's videoBitRate/audioBitRate spellings on HLS routes
+- Port GetLatestItems — one query, grouped by index container
+- Persist the whole user policy; classify guide programmes
+- Stamp DateCreated/DateModified the way Jellyfin's resolver does
+- The liked threshold is 6.5, as UserItemData.MinLikeValue says
+- Hand the trickplay manager to the HLS chain
+- Match the segment container case-insensitively
+- Release the tuner when a transcode job dies
+- Release a tuner once per viewer, and only when the client is gone
+- Keep LastExecutionResult, and never lose a startup run
+- Build by-name DtoOptions from the request, as Jellyfin does
+- Give /Similar Jellyfin's phase-2 filter, seed guard and artist exclusion
+
+### Features
+- Port HlsCodecStringHelpers — the RFC 6381 CODECS strings
+- Port the tvshows/music grouped-threshold latest query
+- Port DynamicHlsHelper — the real master.m3u8
+- Project channels through the DTO service, as Jellyfin does
+- Project programmes through the DTO service, as Jellyfin does
+- The "Refresh Guide" scheduled task
+- Serve the live.m3u8 ffmpeg writes, as Jellyfin does
+- The real live-stream flow — open a tuner once, share it, close it
+- The DVR — timers that fire, recordings that play while recording
+- Transcode the live stream a client opened, not the channel again
+- The "Update Plugins" scheduled task
+- The "Refresh Channels" scheduled task
+- The core "Media Segment Scan" task, always registered
+- Port the remaining Identify / remote-image / lyric paths
+- Proxy the Schedules Direct country list as Jellyfin does
+- Materialize the UserRootFolder, Year items and by-name collages
+
+### Performance
+- Index the SortName ordering, and give it Jellyfin's tiebreaker
+
+### Refactor
+- One CreateSortName port for the scanner and the guide
+
+### Testing
+- Pin the canonical-id close and the sort-key re-derivation
+
+### Parity
+- Bring the misclassified not-testable ops under real test
+- Verify the host-side effects — password reset, backup, restart
+- Terminal phase — restore, restart, shutdown observed live
+- Fixtures and provisioning for music, subtitles, trickplay, Live TV
+- Verify subtitle delete and media attachments
+- Stream-signature layer for direct play, HLS, subtitles, trickplay
+- Live TV journey — live streams, timers, in-progress recordings
+- Opt-in remote-subtitle journey through OpenSubtitles
+- Regenerate the ledger with the new layers live
+
+### Style
+- Rustfmt the live-stream planner test
+
+## [0.35.0] - 2026-08-23
+
+### Bug Fixes
+- Project media folders without a user, as Jellyfin does
+- Honour the client's fields on playlist items
+- Stop exposing live access tokens in device listings
+- Never gate local sidecar artwork on the ImageFetchers list
+- Serve UserViews with Jellyfin's full default field set
+
+### CI/CD
+- Run the coverage gate before the Rust toolchain
+
+### Features
+- Shape honesty gate v2 — self-baseline excludes, Jellyfin diff publishes
+
+### Performance
+- Event-driven segment waits; gate the fMP4 init on segment 0
+
+### Testing
+- Assert the local-artwork regression via the repository seam
+
+## [0.34.0] - 2026-08-22
+
+### Bug Fixes
+- Stop re-provisioning the Playlists folder on every read
+
+### CI/CD
+- Enforce the benchmark-coverage gate
+
+### Features
+- Add the extension kill-switch the benchmark assumed existed
+
+### Performance
+- Compress at ASP.NET's level instead of the codec's default
+- Cut /Shows/NextUp CPU 6.5x — it was CPU-bound, not pool-bound
+
+## [0.33.3] - 2026-08-22
+
+### Bug Fixes
+- Correct provider parity defects found in review
+- One library read per similar-items request, and keep remotes out of recommendations
+- Correct EXIF, NFO and EPUB edge cases found in review
+- Close the remaining provider-parity gaps found in review
+- Resolve remote similar-item batches the way C# does
+- Persist the ids an NFO pins, and cap archive reads on bytes read
+- Complete the photo DTO and keep EXIF reads off async workers
+- Match upstream on book, playlist and OMDb lookup details
+- Resolve items by their recorded ids, and correct three misported details
+- Keep the presentation key in step with a merged version group
+- Hoist test const above statements for clippy
+
+### Documentation
+- State plainly that the container-XML and playlist-file ports are unwired
+
+### Miscellaneous
+- Cleanup
+
+### Performance
+- Scope the episode text read to the items the scan planned
+- Cache OMDb season listings, and finish the EXIF port
+- Only compress responses larger than one TCP segment
+
+## [0.33.2] - 2026-08-21
+
+### Bug Fixes
+- Default fsGroup 1000 so volume ownership self-heals on mount
+- Gate the rest of the RequiresElevation surface
+
+## [0.33.1] - 2026-08-21
+
+### Bug Fixes
+- Take backup work off the runtime, gate it, and serialize it
+
+### Performance
+- Stop reading the item row to serve an image that exists
+- Probe fpcalc concurrently instead of on the critical path
+- Resolve a page's cast without materializing 72-column rows
+- Keep exporter-only span fields out of the no-export path
+- Read the locked-item set once per scan, not once per item
+
+## [0.33.0] - 2026-08-20
+
+### Bug Fixes
+- Match C# ordering and null semantics in similar items
+- Translate a cast play request before pushing it
+- Enforce the SyncPlay access policy on every route
+- Gate SyncPlay groups on each member's library access
+- Expand linked-child containers, and drop the SyncPlay list N+1
+- Halve the reads in play translation, dedup, log denials
+- Never re-derive an item id from the row in play translation
+- Enforce Jellyfin's RequiresElevation policy
+
+### Documentation
+- Record how to profile the push paths, and what fails here
+
+### Testing
+- Make the push surface a first-class suite stage
+
+### Style
+- Formatting after the main merge
+
+## [0.32.0] - 2026-08-20
+
+### Bug Fixes
+- Give episodes their title and synopsis from TMDB
+- An episode's Cast & Crew comes back from TMDB
+- Let a completed credits fetch clear a stale cast
+- Make a failed frame extraction say why
+- A failed credits request is not an empty cast
+- Close the same credits hazard on the TVDB arm
+- Gate episode re-fetches on the stored row, not the planned one
+- Let TheTVDB report an episode miss, so TMDB gets a turn
+- Give up when every chapter extraction is failing
+- Only a real extraction resets the chapter failure streak
+- An image already on disk is not proof extraction works
+- A video that extracted before failing is both things
+- Parent photos to their own directory's album
+- Date folder-named audiobooks, correct books scan comments
+- Skip cue sheets and emit an empty book SeriesName
+- Resolve XML entities in XMLTV attribute values
+- Bound two collections that grew for the life of the process
+- Close three read-then-write races on the user and session paths
+
+### Features
+- External id descriptors and the item Links row
+- Full OMDb metadata, image and search provider
+- TMDB box-set metadata, artwork and identify
+- Scan photos and read their embedded EXIF
+- Album.nfo and artist.nfo readers and savers
+- Remote similarity providers (TMDB similar, ListenBrainz)
+- Scan books and read their embedded comic/EPUB metadata
+- Collection/playlist XML, playlist files, MusicBrainz depth
+- Scan books libraries into Book and AudioBook items
+
+### Miscellaneous
+- Drop dead cargo features and correct provider docs
+
+### Performance
+- Seek folder leaf counts from the ancestor closure
+
+### Revert
+- Drop the chapter failure-streak guard
+
+## [0.31.0] - 2026-08-20
+
+### Bug Fixes
+- Actually apply the program query filters in the manager
+- Stop degrading unparseable ids to the nil GUID
+- Rank search results in SQL, before the LIMIT
+- Scope socket unregistration to the socket that closed
+- End a session when its last socket closes
+
+### Features
+- Compress responses, as Jellyfin does
+
+### Performance
+- Let jemalloc return memory while the server is idle
+- Pipeline ffprobe during the library scan
+- Trim the scheduled-task scheduler's per-tick work
+- Skip the backtracking engine when a pattern provably cannot match
+
+## [0.30.3] - 2026-08-20
+
+### Bug Fixes
+- Close five races that real parallelism made reachable
+- Restore transcode keep-alives, honour SegmentLength, bound the log read
+
+### Documentation
+- Record what the fast loop cannot measure
+
+### Performance
+- Stop ORDER BY RANDOM() serializing on SQLite's global PRNG mutex
+- Cut cold start 3.1x by overlapping the external probes
+- Skip the user-data push read when nothing can receive it
+- Return the server configuration by Arc instead of by deep clone
+
+## [0.30.2] - 2026-08-20
+
+### Bug Fixes
+- Benchmark suite updates
+- Stop holding the session lock across WebSocket sends
+- Authenticate the hls1 segment routes, matching Jellyfin
+- Scope /Items/Filters2 by parent regardless of `recursive`
+- Stop slicing branding CSS with an index from its lowercased copy
+- Log the config read failures that rendered as "empty"
+- Make the two culture lists agree on their ordering
+- Keep an unset display preference null instead of ""
+- Apply the Live TV program query filters
+- Restore the SQL-boundary ratchet
+
+### Miscellaneous
+- Refresh ledger from a full sweep — 191/412 deep-verified
+- Drop the last of the old project name
+
+### Performance
+- Move prefetched relation rows into DTOs instead of cloning
+- Move an item's stream rows into the DTO at their last read
+- Move a stream row's text fields into the DTO instead of cloning
+- Collapse the NextUp episode projection into one query
+- Collapse the playlist-items read path
+- Push LIMIT/OFFSET into the /Persons query
+- Stop re-parsing and re-cloning on the authenticated request path
+- Bind borrowed names in the by-name count queries
+- Build the localization tables once
+- Stop recomputing DTO lookup keys per name per item
+- Stop buying the /Persons total with a second full pass
+- Stop blocking a tokio worker per image row
+- Remove SQLite's two global lock bottlenecks
+- Request SQLite's maximum mmap ceiling, and pin why it needs no tuning
+- Batch the /Devices listing out of its N+1
+- Batch the per-item user-data reads behind /Items/Latest
+- Force the join order on the suggestions aggregates
+
+### Refactor
+- Store the server configuration behind an Arc
+- Rename the Ferrofin-owned schema objects off the old project name
+
+### Testing
+- Cover the legacy-authorization gate
+- Pin the person-name key convention on both sides
+- Add suite/micro — a ~10s measurement loop
+
+## [0.30.1] - 2026-08-18
+
+### Bug Fixes
+- Address review findings — empty-page total, cycle guard, chunking
+- Bump library_manager SQL boundary ceiling for cycle test
+
+### Miscellaneous
+- Update performance gate baseline
+
+### Performance
+- Jemalloc + batch queries for saturation-family endpoints
+
+## [0.30.0] - 2026-08-17
+
+### Bug Fixes
+- An episode's Cast & Crew is the episode's, not the series'
+- An episode's Cast & Crew is the episode's, not the series'
+- Benchmark v2 — address review round 1 (blockers, ratio floor, pooling)
+- Benchmark v2 — address review round 2 (viewer subline, warmup call floor, ratio-floor tests)
+- Benchmark v2 — address review round 3 (vacuous test 11, ratio accounting totality)
+- Honor FERROFIN/JELLYFIN_HOST_PORT in the perf legs
+- Per-checkout compile-cache scope (CACHE_SCOPE) — shared cargo cache mounts cross-poisoned checkouts
+- Idempotent provisioning + ctx files exempt from the raw wipe
+- Scope the bench image tag like the compile cache
+- Cap calibrated rates at BENCH_RATE_MAX (2000/s)
+- Login storm runs LAST + failure taxonomy on partial rows
+- Graceful stop for cold-leg restarts — compose restart's 10s grace SIGKILLed Jellyfin into an unbootable DB
+- Cold probes wait out Jellyfin's post-restart 503 window, record it as ready_wait_ms
+- 0.5 review round 1 — sidecar escape, load-time name guard, caps become settings
+- 0.5 review round 2 — close the five low residuals
+
+### Build
+- Profiling profile — release speed with full debug info
+
+### Documentation
+- Profiling instructions — from benchmark row to root cause
+- Perf_event_mlock_kb sysctl for samply on many-threaded servers
+- Make the fetcher-enforcement upgrade note survive changelog regen
+
+### Features
+- Benchmark v2 phase A+B — fail-loud manifest + verified binary identity
+- Benchmark v2 phases I+G — single-language Python suite on vegeta, open-loop comparison legs
+- Benchmark v2 phase H — warm/cold protocol, cold as a first-class metric
+- Benchmark v2 phase E — core-vs-extension ownership, machine-readable
+- Benchmark v2 phase D — the noise floor is a first-class tie
+- Benchmark v2 phase C — publishable records are N-run distributions
+- Benchmark v2 phase F+G2 — fairness polish + the saturation knee
+- Scripted rate calibration — suite/run.sh calibrate
+- G4 — operator-tunable per-plugin state cap
+- G2 — the scoped write family (WIT 0.5.0)
+- G3 — embedded subtitle extraction
+- G1.1 — richer metadata-result (supplement-only, entity-backed)
+- G1.2 — named providers surface in library options
+- Remote-images (G1.3) + real per-library fetcher gating/ordering
+
+### Performance
+- Sample-count windows + scan reuse — publish drops from ~18-21h to ~4-6h
+- Drive user-data filters through the BaseItems PK, not a correlated EXISTS
+- /Persons dedup via one covering-index aggregate pass + SQL paging
+
+### Testing
+- Cover the 0.5 settings builders + provider-name guard
+
+### Results
+- First open-loop v2 run record (run-2e894f3)
+
+## [0.29.0] - 2026-08-16
+
+### Bug Fixes
+- Analysis-review fixes — drain deadlock, decode timeout, reserved keys
+- Analysis-review round 2 — the doc edits that never landed, and four real fixes
+
+### Documentation
+- Analysis-review round 3 — the four small landings
+
+### Features
+- ABI 0.4.0 — the generic media-analysis capability
+
+### Style
+- Hoist the PermissionsExt import (items-after-statements)
+
+## [0.28.1] - 2026-08-16
+
+### Bug Fixes
+- Run index.html transforms on the bare /web/ directory request
+
+## [0.28.0] - 2026-08-16
+
+### Bug Fixes
+- Fingerprint with ffmpeg's chromaprint muxer
+
+### Features
+- Rolling updates by default
+
+## [0.27.0] - 2026-08-16
+
+### Bug Fixes
+- Resolve a person filmography by item id, not just Peoples row id
+- Capability-review round 1 — token leak closed, coverage restored
+
+### Features
+- WIT 0.3.0 — plugin routes, web transforms, rich queries, KV state
+- 0.3.0 finishing pass — transform proof, wasm-hello demos, docs
+- Declared egress — plugin-shipped public-network allowlist
+
+### Testing
+- Dedupe test Config via Config::test_stub
+- 0.3.0 capability proof — KV caps, plugin routes end-to-end, uninstall state cleanup
+
+## [0.26.0] - 2026-08-14
+
+### Bug Fixes
+- Harden repository install per review
+- Close guid-squatting + provenance gaps from review round 2
+- Round-3 review — ledger at the source, file-drop squat door
+- Cap + time out repository fetches (round-4 review)
+- Settings-page hardening from review round 5
+- Round-8 minimal — id rule holds within the incoming batch
+
+### Features
+- Jellyfin-style repository install for WASM plugins
+- Plugin settings pages — config-pages export + synthesized fallback (ABI 0.2.0)
+- Round-7 hardening — disable disarms pages, immutable versions, DNS pin
+
+## [0.25.2] - 2026-08-14
+
+### Bug Fixes
+- Make credits detection survive a small /tmp, and visible when it fails
+
+## [0.25.1] - 2026-08-14
+
+### Bug Fixes
+- Cast device list, and chapter images after a scan
+
+## [0.25.0] - 2026-08-13
+
+### Bug Fixes
+- Harden the plugin host per external review
+- Untrack the perf-fixtures symlink, widen the private-IP deny, tidy the message
+- Deny http-fetch during load; cache the event enabled-flag
+- Serve chapter thumbnails — DTO tag + image route
+- Library tiles sample the right kinds, after artwork lands
+
+### CI/CD
+- Build the WASM example guest and gate ferrofin-wasm coverage
+
+### Documentation
+- Two-tier plugin architecture, sandbox security first
+- WASM plugin tier — sandbox model, authoring, knobs
+- The WASM capability surface after E2
+- Sweep the plugin story across CLAUDE.md, ARCHITECTURE, FEATURES, CONFIG, README
+- Spell out the WASM memory ceiling semantics and real cost
+- Confirm the 128 MiB per-plugin memory default
+
+### Features
+- Add the Tier-1b WASM plugin host (ferrofin-wasm)
+- Load WASM plugins at the composition root
+- Add the wasm-hello reference guest (toolchain island)
+- E2 capabilities — http-fetch, query-items, write-media-segments
+- E3 — WASM plugins as scan metadata sources (metadata-lookup)
+- Deny private/loopback http-fetch by default, per-plugin allowlist
+- Log session start/end and lockouts to the activity feed
+
+### Refactor
+- Fold provider-id merging into the dynamic metadata helper
+
+### Testing
+- Server-level HTTP test for WASM plugins; share the WAT fixture
+
+## [0.24.1] - 2026-08-13
+
+### Bug Fixes
+- Episodes sort by number, not title — restores the play queue
+
+## [0.24.0] - 2026-08-13
+
+### Bug Fixes
+- Kill the spinner class — index merged-version lookups, drop unknown enum tokens
+- Episode counts exclude merged alternate versions
+- Episode playback returns — startItemId id-casing, 3000x faster user-data sort, merged-version sources
+- Honor the folder year when matching a series on TVDB
+- Don't emit path-keyed MusicArtist rows
+
+### Documentation
+- Mark Live TV + DVR as not yet human-verified end-to-end
+
+### Features
+- Enforce the CollectionManagement policy on collection routes
+- Populate the dashboard activity log with system events
+- Download studio thumbs during the scan
+- Persist and serve RemoteTrailers
+- Album artwork from embedded cover art
+- Artist → album → track hierarchy in the music scan
+- Detect disc structures and record VideoType
+
+## [0.23.0] - 2026-08-13
+
+### Bug Fixes
+- Person favorites round-trip — one Person item per name, Jellyfin-derived ids
+- User-data sorts order for real — DatePlayed, PlayCount, Release fallback
+- Date Added and Parental Rating sorts get real data at scan time
+- Audio DTOs carry AlbumId; performer links prefer the browsable artist id
+
+### Features
+- The movie scan resolves extras into owned rows
+
+## [0.22.0] - 2026-08-13
+
+### Features
+- Library tiles get real artwork — post-scan CollectionFolder collage
+
+## [0.21.2] - 2026-08-13
+
+### Bug Fixes
+- FMP4 init serving never cancels the transcode start — fatal fragParsingError regression
+
+## [0.21.1] - 2026-08-13
+
+### Bug Fixes
+- Filter facets reach Jellyfin coverage — provider merging, clean-value dedup, edit re-indexing
+- Next Up returns — playback start stamps LastPlayedDate
+
+## [0.21.0] - 2026-08-13
+
+### Bug Fixes
+- Collections become visible — BoxSet browses re-root onto linked-child ancestors
+- Music libraries populate — scoped post-add scan, tag-derived track names
+
+### Features
+- Transcode and playback logs name the media, not just ids
+
+## [0.20.1] - 2026-08-13
+
+### Bug Fixes
+- Jellyfin-web parity sweep — filters, favorites, latest rows, legacy routes, DTO gaps
+- Transcode jobs die with their consumers; segment retries wait instead of killing
+- Provider episode titles replace the filename placeholder; SeriesName comes from the series row
+- Extract video frames into the temp dir, not beside the media
+
+### Miscellaneous
+- Fix cargo fmt issue
+
+### Testing
+- Cover the parity-sweep and transcode-lifecycle fixes
+
+## [0.20.0] - 2026-08-13
+
+### Bug Fixes
+- User metadata edits survive library scans (honor IsLocked)
+- Uploaded images survive the scan's artwork rewrite
+- Scope the episode merge key to the series row, not its name
+
+### Features
+- Log why a websocket session is anonymous
+
+### Miscellaneous
+- Remove legacy implementation-plan docs
+
+## [0.19.4] - 2026-08-12
+
+### Bug Fixes
+- Stop the library scan from clobbering columns it does not own
+- Merge/split write their link column instead of full stale rows
+
+### CI/CD
+- Free runner disk and strip debuginfo so jobs fit GitHub-hosted runners
+- Source homelab infra endpoints from CI/CD variables
+
+### Miscellaneous
+- Stop tracking .claude/ and .mcp.json (local agent tooling)
+
+## [0.19.3] - 2026-08-12
+
+### CI/CD
+- Make base-image builds resilient to github.com flakiness
+
+### Documentation
+- Phase 5 — README front door, feature matrix, extensions, config
+- Note the pre-publication history rewrite
+
+### Refactor
+- Rename Hermit → Ferrofin across the codebase
+
+## [0.19.2] - 2026-08-12
+
+### CI/CD
+- Skip unused Dockerfile stages under kaniko (fix release web rebuild)
+
+### Testing
+- Allowlist PlaySessionId in the no-lowercase-GUID invariant
+
+## [0.19.1] - 2026-08-12
+
+### Bug Fixes
+- Stop the 0007 rebuild from cascade-deleting all user data
+- Complete 0007's GUID-uppercase coverage (audit follow-up)
+
+### Testing
+- Verify + classify the 8 flagged ledger rows
+- Unit-test the extension crates and gate their coverage
+
+## [0.19.0] - 2026-08-12
+
+### Bug Fixes
+- Give episodes their cast — merge series regulars + surface roles
+- Detect BOM-less UTF-16 + restore the -sub_charenc hint
+
+### Documentation
+- Drop stale PORT_REPORT.md reference from contract-superset doc
+- Promote the knowledge base's load-bearing docs into public docs/
+
+### Features
+- Store GUIDs and datetimes in Jellyfin's exact text formats
+- Pin the schema to Jellyfin 10.11.8 — migration 0007 + code convergence
+- BaseItems.Data JSON is the playlist/collection source of truth
+- Adopt an existing Jellyfin 10.11.8 database in place
+
+### Miscellaneous
+- Release hygiene — community files, self-contained builds, de-identification
+
+### Testing
+- Schema-conformance gate + the drop-in round-trip test
+
+## [0.18.0] - 2026-08-10
+
+### Features
+- Live filesystem watching of library roots (inotify via notify)
+- Debounce filesystem changes behind LibraryMonitorDelay
+- Path-scoped ingest — resolve just the changed files
+
+## [0.17.0] - 2026-08-10
+
 ### Bug Fixes
 - Report CanUninstall=true so the dashboard shows the enable/disable toggle
 - Correct transcode.js fixture path after the suite/ reorg
-- Give episodes their cast — merge series regulars + surface roles
-- Detect BOM-less UTF-16 + restore the -sub_charenc hint
 
 ### Features
 - Accumulate benchmark reruns per SHA instead of overwriting
 - Prune items whose files were deleted from disk
 - Push UserDataChanged to the user's other devices
 - Send the WebSocket pushes Jellyfin clients rely on
-- Live filesystem watching of library roots (inotify via notify)
-- Debounce filesystem changes behind LibraryMonitorDelay
-- Path-scoped ingest — resolve just the changed files
-- Store GUIDs and datetimes in Jellyfin's exact text formats
-- Pin the schema to Jellyfin 10.11.8 — migration 0007 + code convergence
-- BaseItems.Data JSON is the playlist/collection source of truth
-- Adopt an existing Jellyfin 10.11.8 database in place
-
-### Testing
-- Schema-conformance gate + the drop-in round-trip test
 
 ## [0.16.0] - 2026-08-08
 
@@ -112,7 +990,7 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 - Guard get_playlist_items link order
 
 ### Bench
-- Clean release record v0.12.0 / 553252f (parity + perf)
+- Clean release record v0.12.0 / de2dc00 (parity + perf)
 
 ### Chart
 - Add de-identified values.example.yaml + maintenance skill
@@ -154,12 +1032,12 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 
 ### Features
 - Add OpenTelemetry-backed Prometheus /metrics endpoint
-- Add FERROFIN_ENABLE_METRICS bootstrap override
+- Add HERMIT_ENABLE_METRICS bootstrap override
 
 ### Miscellaneous
 - Add run-benchmark skill
 - Add missing crate dependency
-- Add secrecy crate dependency to ferrofin-providers and ferrofin-model
+- Add secrecy crate dependency to hermit-providers and hermit-model
 
 ### Performance
 - Serve user DTOs from the auth cache instead of 2-3 DB round-trips per request
@@ -170,7 +1048,7 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 
 ### Bench
 - Extend the surface to write paths — 4 POST variants + write-row comparability
-- Release suite record b41adc1 (parity + perf)
+- Release suite record 6d6f32f (parity + perf)
 
 ## [0.8.6] - 2026-08-04
 
@@ -202,7 +1080,7 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 
 ### Suite
 - First real seed data on the settled tree (plan 8 step 6)
-- Drop the stale cefe2f8 entry from runs.json too
+- Drop the stale 0157db4 entry from runs.json too
 - Carry HLS play-start TTFS into the merged record and viewer
 
 ### Viewer
@@ -221,7 +1099,7 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 
 ### Performance
 - One projection path — single item is a batch of one
-- Add Ferrofin-only p50/p95/p99 regression gate (plan 4)
+- Add Hermit-only p50/p95/p99 regression gate (plan 4)
 - Unify parity + benchmark into one cross-referenced suite
 - Split reader/writer pools; pool size becomes a config knob (auto = cores)
 - One comparator, one baseline — suite/gate.py absorbs perf-gate.mjs
@@ -327,7 +1205,7 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 - CLAUDE.md toolchain pin 1.97.0 -> 1.97.1 (match rust-toolchain.toml)
 
 ### Miscellaneous
-- Classify playstate-progress + playlist-share-delete as methodology (not Ferrofin bugs)
+- Classify playstate-progress + playlist-share-delete as methodology (not Hermit bugs)
 
 ### Performance
 - Use jellyfin-ffmpeg's tonemapx for software HDR tonemap
@@ -431,11 +1309,11 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 - Allow triggering create-release early, auto-cancel if tests fail
 
 ### Documentation
-- Fix env example to FERROFIN_LOG (the var Ferrofin reads)
+- Fix env example to HERMIT_LOG (the var Hermit reads)
 - Triage roadmap + per-op verdicts from the parity-triage workflow
 
 ### Features
-- Chart-managed env ConfigMap injected into Ferrofin
+- Chart-managed env ConfigMap injected into Hermit
 
 ### Miscellaneous
 - Refresh ledger after batch 1+2 fixes; denylist ETag (instance hash)
@@ -517,7 +1395,7 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 - Populate DTO field defaults + honour fields on /Items/Latest
 - Compute image dimensions + blurhash during the scan
 - Serve the full ISO-639 culture list
-- Bundle pinned jellyfin-web client at /usr/share/ferrofin/web
+- Bundle pinned jellyfin-web client at /usr/share/hermit/web
 
 ## [0.2.3] - 2026-08-01
 
@@ -618,7 +1496,7 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 - The client now fetches metadata, not just artwork
 
 ### Features
-- Scaffold ferrofin workspace + Wave 0 port
+- Scaffold hermit workspace + Wave 0 port
 - Port MediaBrowser.Model DTOs and enums
 - Wave 2
 - Port Jellyfin.Database schema + entities (sqlx + SQLite)
@@ -628,7 +1506,7 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 - Port Jellyfin.Api — contract-complete axum layer
 - Implement 236 endpoints for real (Wave 7b)
 - Real HLS transcode pipeline + more endpoints
-- Composition root — Ferrofin boots as a real server (Wave 8)
+- Composition root — Hermit boots as a real server (Wave 8)
 - Implement 31 of the 35 core-not-yet-wired routes
 - Serve a static web client at /web
 - Session WebSocket at /socket (fix "Connection Failure")
@@ -668,7 +1546,7 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 - Log playback to the dashboard activity feed
 - Enrich cast/crew with TMDB biography, birthday, birthplace
 - Rotten Tomatoes critic rating via OMDb
-- Plan + ferrofin-chromaprint pure intro/credits math
+- Plan + hermit-chromaprint pure intro/credits math
 - Intro Skipper — audio-fingerprint intro/credits detection
 - Implement four hollow functional gaps end-to-end
 - Dashboard settings page for plugins (Intro Skipper)
@@ -680,7 +1558,7 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 - Vendor real plugin web UIs; add the File Transformation extension
 - Enforce ownership, shares, and open-access for real
 - Real per-item metadata refresh, incl. seasons/episodes
-- Working Ferrofin-vs-Jellyfin harness, first run green
+- Working Hermit-vs-Jellyfin harness, first run green
 - The full Jellyfin dashboard task set + a real trigger scheduler
 - Real transcode TTFS — copy + forced-encode modes; fix 30s transcode start timeout
 - Honor the negotiated bitrate/resolution caps — downscale, -maxrate, HDR tonemap
@@ -688,11 +1566,10 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 - Bus-registered sockets are remote-controllable
 
 ### Miscellaneous
-- Cleanup commited .rcg/ files
 - Gitignore .rcg/
-- Lockfile for ferrofin-networking dependency
+- Lockfile for hermit-networking dependency
 - Fake MediaSourceManager impls + Cargo.lock for refresh_media_streams
-- Refresh Cargo.lock for ferrofin-providers tokio/tracing deps
+- Refresh Cargo.lock for hermit-providers tokio/tracing deps
 - Add hermitcodegraph server entry
 
 ### Performance

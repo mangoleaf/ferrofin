@@ -1,4 +1,8 @@
-# Ferrofin CI/CD — the canonical pipeline (GitLab is the source of truth).
+# Ferrofin CI/CD — the maintainer's INTERNAL pipeline (homelab GitLab).
+#
+# Public releases come from GitHub Actions (.github/workflows/); GitHub is the
+# source of truth for public versions and this file's tags are never pushed there.
+# It references only GitLab CI variables and is inert on GitHub.
 #
 # Stages:
 #   test    — fmt / clippy / unit tests, plus the per-crate 80% coverage gate.

@@ -27,7 +27,7 @@ jobs:
       # it needs a quiet machine, pinned cores and ~17 GB of generated test data, and a
       # number measured on a shared runner would be worse than no number. Contributors
       # run it themselves — see CONTRIBUTING.md.
-      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: dtolnay/rust-toolchain@1.97.1
         with:
           components: rustfmt, clippy
           # Builds the WASM example guest for the end-to-end plugin-host test.
@@ -49,7 +49,7 @@ jobs:
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
           sudo docker image prune --all --force
           df -h /
-      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: dtolnay/rust-toolchain@1.97.1
         with:
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2

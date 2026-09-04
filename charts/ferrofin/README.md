@@ -1,6 +1,6 @@
 # Ferrofin Helm chart
 
-Official chart for the [Ferrofin](https://example.com/ferrofin) media server — a Rust implementation of the Jellyfin server API.
+Official chart for the [Ferrofin](https://github.com/mangoleaf/ferrofin) media server — a Rust implementation of the Jellyfin server API.
 
 The value contract mirrors the common subset of the upstream
 [jellyfin-helm](https://github.com/jellyfin/jellyfin-helm) chart, so moving a Jellyfin
@@ -14,11 +14,13 @@ release to Ferrofin is near-zero churn. Two intentional differences:
 The chart is published as an OCI artifact next to the image:
 
 ```bash
-helm install ferrofin oci://<registry>/ferrofin/charts/ferrofin \
-  --version 0.1.0 -n ferrofin --create-namespace -f my-values.yaml
+helm install ferrofin oci://ghcr.io/mangoleaf/ferrofin/charts/ferrofin \
+  --version <chart-version> -n ferrofin --create-namespace -f my-values.yaml
 ```
 
-For a private registry, provide `imagePullSecrets` (a `docker-registry` secret) in your values.
+The chart version equals the Ferrofin release it ships (`v1.2.3` → chart `1.2.3`). The
+image is public on GHCR, so no pull secret is needed; if you mirror it into a private
+registry, set `image.repository` and `imagePullSecrets` in your values.
 
 ## Key values
 
@@ -38,7 +40,7 @@ For a private registry, provide `imagePullSecrets` (a `docker-registry` secret) 
 | `httpRoute.enabled` | `false` | Gateway API `HTTPRoute` (alternative to ingress) |
 | `networkPolicy.enabled` | `false` | Pod isolation (needs a policy-enforcing CNI) |
 | `serviceAccount.create` | `true` | Dedicated service account |
-| `metrics.serviceMonitor.enabled` | `false` | Off — Ferrofin exposes no `/metrics` yet |
+| `metrics.enabled` / `metrics.serviceMonitor.enabled` | `false` | Scrape Ferrofin's Prometheus `/metrics` endpoint via a `ServiceMonitor` |
 
 To expose Ferrofin on most clusters, enable ingress:
 

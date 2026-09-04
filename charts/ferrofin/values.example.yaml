@@ -13,19 +13,19 @@
 replicaCount: 1
 
 image:
-  # Your image location. The chart default points at the project's own registry;
-  # override it if you mirror the image somewhere else.
-  repository: registry.example.com/<org>/ferrofin
-  # Empty → the chart's appVersion. Pin a tag (e.g. "0.12.0") in production.
+  # The published image (public, no pull secret needed). Override it if you
+  # mirror the image somewhere else.
+  repository: ghcr.io/mangoleaf/ferrofin
+  # Empty → the chart's appVersion. Pin a tag (e.g. "v1.0.0") in production.
   tag: ""
   pullPolicy: IfNotPresent
 
-# Pull secret for a PRIVATE registry. Create it once in the release namespace:
+# Only needed if you mirror the image into a PRIVATE registry. Create the secret
+# once in the release namespace:
 #   kubectl create secret docker-registry <name> -n <namespace> \
-#     --docker-server=registry.example.com \
+#     --docker-server=<your-registry> \
 #     --docker-username=<user> --docker-password=<token>
-imagePullSecrets:
-  - name: <registry-pull-secret>
+imagePullSecrets: []
 
 # -----------------------------------------------------------------------------
 # GPU transcoding (NVIDIA). Omit this whole block for CPU-only transcoding.

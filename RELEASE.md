@@ -1,8 +1,13 @@
 # Releasing Ferrofin
 
-Ferrofin ships two artifacts from this repo: the **server image** and the official
-**Helm chart** (`charts/ferrofin/`). They are versioned **independently**. This is
-the operational checklist.
+Ferrofin ships three artifacts from this repo: the **server image**
+(`ghcr.io/mangoleaf/ferrofin`), the **Helm chart** (`oci://ghcr.io/mangoleaf/ferrofin/charts/ferrofin`)
+and **binary tarballs** attached to the GitHub Release. Image and chart are versioned
+**independently**. This is the operational checklist.
+
+**GitHub is the source of truth.** Public releases are cut by the `Release` workflow in
+`.github/workflows/release.yml`. The maintainer's homelab GitLab (`.gitlab-ci.yml`) runs
+an internal copy of the same pipeline; its tags are never pushed to GitHub.
 
 ## The versioning model
 
@@ -10,55 +15,60 @@ the operational checklist.
 version files: the release version is injected at build time — into the image
 via `SERVICE_VERSION` and into the chart via `helm package --version/--app-version`
 — so the committed `Cargo.toml`/`Chart.yaml` versions stay as dev placeholders.
-Never bump them for a release, and never push a hand-made tag: the manual
-`create-release` CI job derives the next version from the changelog and pushes
-the tag itself (override its choice with `FORCE_VERSION=vX.Y.Z` when needed).
+Never bump them for a release, and never push a hand-made tag: the workflow derives
+the next version from Conventional Commits since the last tag and pushes the tag
+itself (override its choice with the `force_version` input when needed).
 
 ## Tag scheme
 
 | Tag | Triggers | Notes |
 |---|---|---|
-| `vX.Y.Z` | image `:X.Y.Z` + `:latest`, release notes, chart publish | Final app release |
-| `vX.Y.Z-rc.N` | image `:X.Y.Z-rc.N` only | Pre-release; never moves `:latest` |
-| `chart-vA.B.C` | chart publish only | Chart-only fix (templates/values), no app change |
-| push to `main` | image `:{M.m.p}-{N}-{sha}` | Dev image between releases |
+| `vX.Y.Z` | image `:vX.Y.Z` + `:latest`, GitHub Release with notes + binaries, chart `X.Y.Z` | Final release |
+| `vX.Y.Z-rc.N` | image `:vX.Y.Z-rc.N` and binaries only | Pre-release; never moves `:latest`, no Release, no chart |
+| `chart-vA.B.C` | chart `A.B.C` only | Chart-only fix (templates/values), no app change |
 
-Pre-1.0 SemVer: **minor may break, patch is fixes.** Release tags are
-annotated (signed where the runner has a key).
+SemVer: **breaking → major, feature → minor, fix → patch.** Release tags are annotated.
+Note that `scripts/version.sh` never bumps to the next *major* on its own while the
+major is `0`; use `force_version` for that.
 
 ## Cutting an app release `vX.Y.Z`
 
-1. **Ensure `main` is green** — CI lint + tests + the per-crate coverage gate
-   must be passing on the commit you're releasing.
-2. **Run the manual `create-release` job** on that commit. It derives the next
-   version (or honors `FORCE_VERSION`), regenerates the git-cliff notes, and
-   pushes the annotated tag — it does **not** commit to `main`.
-3. Watch the pipeline: `build` → `release` (git-cliff notes) → `chart`
-   (OCI push). Verify the release object and the chart artifact exist.
+1. **Ensure `main` is green** — the `CI` workflow (lint, tests, per-crate coverage gate)
+   must have succeeded on the commit you are releasing; the workflow refuses otherwise.
+2. **Actions → Release → Run workflow** on `main`. Leave `force_version` empty to accept
+   the derived version, or set it to `vX.Y.Z`. The job pushes the annotated tag; it does
+   **not** commit to `main`.
+3. The tag push re-triggers the workflow: `docker-image` → `github-release` → `helm-chart`.
+   Watch it finish, then verify (below).
+
+The workflow needs the repository secret `RELEASE_TOKEN`: a fine-grained personal
+access token for this repository with **Contents: read and write**. Tags pushed with the
+default `GITHUB_TOKEN` do not trigger workflows, so without it the tag push publishes
+nothing.
 
 ## Cutting a release candidate `vX.Y.Z-rc.N`
 
-Run `create-release` with `FORCE_VERSION=vX.Y.Z-rc.N`. Only the image is built
-(`:X.Y.Z-rc.N`, no `:latest`, no release notes, no chart). Bump `N` for each
-respin — never re-point an existing rc tag.
+Run the workflow with `force_version = vX.Y.Z-rc.N`. Only the image and binaries are
+built (no `:latest`, no Release, no chart). Bump `N` for each respin — never re-point an
+existing rc tag.
 
 ## Cutting a chart-only release `chart-vA.B.C`
 
 For template/values fixes with no app change:
 
 1. `helm lint charts/ferrofin` and render-test with a real values file.
-2. Push the `chart-vA.B.C` tag (via `create-release` with
-   `FORCE_VERSION=chart-vA.B.C`). CI publishes the chart only, at version
-   `A.B.C`, leaving the app version untouched.
+2. Run the workflow with `force_version = chart-vA.B.C`. CI publishes the chart only, at
+   version `A.B.C`, leaving the app version untouched.
 
 ## Verifying a release
 
 ```bash
-docker pull  <registry>/ferrofin:X.Y.Z
-helm pull    oci://<registry>/ferrofin/charts/ferrofin --version A.B.C
+docker pull ghcr.io/mangoleaf/ferrofin:vX.Y.Z
+docker run --rm -p 8096:8096 ghcr.io/mangoleaf/ferrofin:vX.Y.Z &
+curl -s localhost:8096/System/Info/Public | jq .Version      # prints vX.Y.Z
+helm pull oci://ghcr.io/mangoleaf/ferrofin/charts/ferrofin --version X.Y.Z
+gh release view vX.Y.Z --json assets -q '.assets[].name'    # tarballs + checksums
 ```
-
-(Substitute the registry the release pipeline publishes to.)
 
 ## Not yet automated (do manually / add later)
 

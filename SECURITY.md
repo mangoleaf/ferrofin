@@ -20,6 +20,5 @@ data exposure as high priority.
 
 ## Supported versions
 
-Ferrofin is pre-1.0 and moves fast. Only the **latest released version** receives
-security fixes. Once maintenance branches (`release-x.y`) exist, this section will
-list the supported window.
+Only the **latest released version** receives security fixes. Once maintenance
+branches (`release-x.y`) exist, this section will list the supported window.

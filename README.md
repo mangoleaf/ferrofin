@@ -8,7 +8,7 @@
 [![Rust edition 2024](https://img.shields.io/badge/rust-edition%202024-orange.svg)](rust-toolchain.toml)
 [![API surface: 412/412 REAL](https://img.shields.io/badge/API%20surface-412%2F412%20REAL-brightgreen.svg)](docs/FEATURES.md)
 
-<!-- DECISION (Ken): add CI + release badges once the GitHub Actions run is green:
+<!-- TODO: uncomment once the GitHub Actions CI run is green and v1.0.0 exists:
 [![CI](https://github.com/mangoleaf/ferrofin/actions/workflows/ci.yml/badge.svg)](https://github.com/mangoleaf/ferrofin/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/mangoleaf/ferrofin)](https://github.com/mangoleaf/ferrofin/releases)
 -->
@@ -37,9 +37,6 @@ the server is Rust. Point Ferrofin at an existing Jellyfin database and it adopt
 - **What actually works?** → [Feature status](docs/FEATURES.md)
 - **Want to contribute?** → [CONTRIBUTING.md](CONTRIBUTING.md)
 
-<!-- DECISION (Ken): add a screenshot of jellyfin-web served by Ferrofin here (proof it drives
-     real clients). docs/images/ does not exist yet. -->
-
 ## Why Ferrofin
 
 - **Faster, and a fraction of the memory.** On the same machine and library, Ferrofin
@@ -60,8 +57,8 @@ the server is Rust. Point Ferrofin at an existing Jellyfin database and it adopt
 
 ## Benchmarks
 
-Ferrofin against **Jellyfin 12.0-rc7** and **Jellyfin 10.11.8**, measured 2026-09-04 on one
-machine (AMD Ryzen 9 9950X3D), each server alone in a container pinned to 8 cores with an
+Ferrofin `v0.42.3` against **Jellyfin 12.0-rc7** and **Jellyfin 10.11.8**, measured
+2026-09-04 on one machine (AMD Ryzen 9 9950X3D), each server alone in a container pinned to 8 cores with an
 8 GiB limit, over the same library of 3,001 movies, 250 series and 7,490 episodes. Every
 figure is the **median of three full runs**. No request failed on any server at any load
 level.
@@ -98,10 +95,6 @@ the harness and the one-sentence definition of every number are in
 [`bench/README.md`](bench/README.md). Run it yourself: it is a deliberate, local
 instrument, not a CI job.
 
-<!-- DECISION (Ken): these numbers are from commit c599f65 (v0.42.3 plus bench-only
-     changes). Either accept that for the v1.0.0 README or rerun `bench/run.sh` three
-     times at the release candidate and refresh both tables. -->
-
 ## Quickstart
 
 **Docker** (the release image bundles ffmpeg and the jellyfin-web client at `/web`):
@@ -113,10 +106,6 @@ docker run -d --name ferrofin \
   -v /path/to/media:/media:ro \
   ghcr.io/mangoleaf/ferrofin:latest
 ```
-
-<!-- DECISION (Ken): Docker Hub. release.yml also pushes docker.io/<DOCKERHUB_USERNAME>/ferrofin
-     when the DOCKERHUB_USERNAME / DOCKERHUB_TOKEN secrets exist. If you want Docker Hub to be
-     the advertised image, swap the line above and add the GHCR one as an alternative. -->
 
 **Helm** (the chart is published as an OCI artifact next to the image):
 

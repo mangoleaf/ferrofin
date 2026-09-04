@@ -6,10 +6,9 @@ type: application
 version: 0.2.0
 # Tracks the ferrofin release the chart is validated against (kept in step with Cargo.toml).
 appVersion: "0.2.0"
-# Placeholder until the public home exists (PLAN_OSS_RELEASE phases 4+7 set it).
-home: https://example.com/ferrofin
+home: https://github.com/mangoleaf/ferrofin
 sources:
-  - https://example.com/ferrofin
+  - https://github.com/mangoleaf/ferrofin
 keywords:
   - ferrofin
   - jellyfin
