@@ -200,8 +200,11 @@ fn disk_usage(path: &str) -> Option<(i64, i64)> {
     let block = i128::from(stat.f_frsize);
     let bytes =
         |blocks: u64| -> i64 { i64::try_from(i128::from(blocks) * block).unwrap_or(i64::MAX) };
-    let free = bytes(stat.f_bavail);
-    let total = bytes(stat.f_blocks);
+    // statvfs field widths differ per platform (u64 on Linux, u32 on macOS).
+    #[allow(clippy::useless_conversion)]
+    let free = bytes(u64::from(stat.f_bavail));
+    #[allow(clippy::useless_conversion)]
+    let total = bytes(u64::from(stat.f_blocks));
     Some((free, total.saturating_sub(free)))
 }
 

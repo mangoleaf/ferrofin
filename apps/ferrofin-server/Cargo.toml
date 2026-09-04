@@ -49,7 +49,6 @@ async-trait.workspace = true
 reqwest.workspace = true
 uuid.workspace = true
 anyhow.workspace = true
-tikv-jemallocator.workspace = true
 clap.workspace = true
 config.workspace = true
 serde.workspace = true
@@ -80,3 +79,8 @@ wat.workspace = true
 # `testing` unlocks the in-memory span exporter for the tracing→OTel bridge smoke test.
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 tracing-opentelemetry.workspace = true
+
+# jemalloc's configure script cannot build under MSVC; main.rs cfg-gates the
+# allocator the same way, so Windows falls back to the system allocator.
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator.workspace = true

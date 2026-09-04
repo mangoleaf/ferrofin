@@ -106,7 +106,9 @@ fn total_size(path: &str) -> u64 {
     if unsafe { libc::statvfs(c_path.as_ptr(), std::ptr::from_mut(&mut stat)) } != 0 {
         return 0;
     }
-    stat.f_blocks.saturating_mul(stat.f_frsize)
+    // statvfs field widths differ per platform (u64 on Linux, u32 on macOS).
+    #[allow(clippy::useless_conversion)]
+    u64::from(stat.f_blocks).saturating_mul(u64::from(stat.f_frsize))
 }
 
 /// Non-unix fallback: no `statvfs`, so the size filter cannot reject anything.
