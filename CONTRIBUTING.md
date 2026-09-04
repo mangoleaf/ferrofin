@@ -45,8 +45,18 @@ checks the merged total and lets a weak crate hide behind a strong one).
 **Perf evidence (for perf-touching changes).** Body-diff correctness is not a latency
 signal — a large slowdown can land "green." Any change touching `ferrofin-core`,
 `ferrofin-db`, `ferrofin-api`, or the query/repository/DTO paths must include a measured
-before/after in the PR description (the automated perf gate is being rebuilt; until it
-returns, state your numbers and how you took them).
+before/after in the PR description, with how you took it.
+
+The benchmark suite lives in [`bench/`](bench/README.md) and is the preferred source for
+those numbers: rebuild `ferrofin:bench`, run `bench/run.sh`, and compare with
+`python3 bench/report.py --serve`. `bench/run.sh --servers ferrofin --only loaded` on two
+builds is the cheap form of a before/after. It is deliberately **not** a CI gate, so nobody will run it for
+you — and budget for the setup: it needs `docker`, `k6`, `jq`, `taskset`, `curl` and
+`python3` (plus `ffmpeg` with libx264/libx265, `ffprobe` and Python `Pillow` for the test
+data), the two Jellyfin
+images must be pulled, the test data is generated locally and gitignored
+(`bench/testdata/build.sh`, ~20 min and ~17 GB), and a full run needs a quiet machine for
+about forty minutes. `bench/README.md` has the complete recipe.
 
 > Green tests are necessary, not sufficient. When you touch a data, auth, or
 > stateful path, **run the binary and exercise it over real HTTP** — several

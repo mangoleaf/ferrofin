@@ -23,7 +23,10 @@ jobs:
           sudo docker image prune --all --force
           df -h /
       # NOTE: the benchmark/parity suite (v2) and its CI gates were retired on
-      # 2026-09-02 by owner decision; suite v3 will bring its own gates.
+      # 2026-09-02 by owner decision. Suite v3 (bench/) deliberately does NOT run here:
+      # it needs a quiet machine, pinned cores and ~17 GB of generated test data, and a
+      # number measured on a shared runner would be worse than no number. Contributors
+      # run it themselves — see CONTRIBUTING.md.
       - uses: dtolnay/rust-toolchain@1.97.0
         with:
           components: rustfmt, clippy

@@ -136,9 +136,12 @@ Jellyfin-owned shape is **pinned byte-equal to a real Jellyfin 10.11.8 database*
 what makes drop-in adoption of an existing Jellyfin DB possible (point Ferrofin at it and it
 migrates in place; swapping back to Jellyfin is safe). Ferrofin-own tables/indexes live in a
 collision-proof `Ferrofin*`/`FerrofinIX_*` namespace. The `schema_conformance` test guards the
-pin. (The two-way swap test lived in the retired v2 suite — see the note under **Current
-scope**; `suite/roundtrip.sh` from git history is the ONE v2 piece acceptable to recover,
-as a reference for v3's replacement, since it tests the server rather than the harness.)
+pin. (The two-way swap test lived in the retired v2 suite and **has no replacement**:
+suite v3 exercises adoption — every server boots a disposable copy of a Jellyfin-scanned
+database, and Ferrofin migrates it in place — but nothing checks that Jellyfin still opens
+the database afterwards. `suite/roundtrip.sh` from git history is the ONE v2 piece
+acceptable to recover, as a reference for that replacement, since it tests the server
+rather than the harness.)
 
 ### Errors
 Libraries use per-crate `thiserror` enums; the binary uses `anyhow` at the top level.
@@ -237,17 +240,47 @@ runs it:
 FERROFIN_WASM_GUEST_TESTS=1 cargo test -p ferrofin-wasm --test wasm_hello_guest
 ```
 
-### Perf changes still need evidence (v2 suite retired; v3 pending)
-**The benchmark/parity suite (v2, formerly `suite/`) was scrapped by owner decision on
-2026-09-02** — it had grown into layered machinery that policed itself instead of answering
-questions, and a v3 will be built from scratch in a fresh session. Until v3 exists, there is
-no automated perf gate. That does NOT suspend the underlying rule: body-diff correctness is
-not a latency signal — a 100× slowdown can land "green." Any change touching
-`ferrofin-core`, `ferrofin-db`, `ferrofin-api`, or the query/repository/DTO paths
-(`translate_query`, `item_repository`, `dto_service`) must come with a measured
-before/after (e.g. hyperfine/curl timings against a locally run server on the same data),
-stated in the summary. Do not resurrect v2 pieces from git history to "run the gate";
-flag perf-sensitive changes to the owner instead.
+### Perf changes still need evidence — the v3 benchmark is in `bench/`
+**Suite v3 exists and is the tool to use** (v2, formerly `suite/`, was scrapped by owner
+decision on 2026-09-02 for policing itself instead of answering questions; do not
+resurrect it from git history). v3 answers four questions and nothing else:
+latency (screens and endpoints), time to first screen, memory, and API parity. Read
+[`bench/README.md`](bench/README.md) first — it defines every number in one sentence.
+
+```bash
+# needs docker, k6, jq, taskset, curl, python3 — plus ffmpeg (libx264 + libx265),
+# ffprobe and Python Pillow to build the test data
+docker pull jellyfin/jellyfin:10.11.8 && docker pull jellyfin/jellyfin:12.0-rc7
+bench/testdata/build.sh                          # once: ~20 min, ~17 GB (gitignored)
+docker build -t ferrofin:bench .                 # the commit under test — REBUILD IT
+bench/run.sh                                     # ~40 min → bench/runs/<tag>/report.md
+python3 bench/report.py --serve                  # compare runs at 127.0.0.1:8097
+```
+
+Things that will otherwise cost you a run: the harness only ever *inspects* the
+`ferrofin:bench` image, so a stale image silently measures old code under a run name that
+claims the current commit. `run.sh` refuses to start unless the server/client cores are
+90 % idle. A rerun of the same code lands in `<tag>-run2`, never on top of the first.
+Publishable numbers come from **three** runs — `report.py` takes the median and prints the
+range each cell spanned.
+
+`bench/` is NOT a CI gate and is not meant to become one; it is a measuring instrument you
+run deliberately — `bench/run.sh --servers ferrofin --only loaded` on two builds is the
+cheap form for a before/after, skipping both Jellyfins. So the standing rule is unchanged: body-diff correctness is not a
+latency signal — a 100× slowdown can land "green." Any change touching `ferrofin-core`,
+`ferrofin-db`, `ferrofin-api`, or the query/repository/DTO paths (`translate_query`,
+`item_repository`, `dto_service`) must come with a measured before/after stated in the
+summary — from `bench/` where the change is on a benchmarked path, else hyperfine/curl
+against a locally run server on the same data.
+
+**Never accept an index or a plan change from an isolated statement measurement** — a
+statement that gets faster alone routinely drags a hotter query onto the wrong index. Prefer
+`+col` / `CROSS JOIN` plan pins over new indexes (`item_repository.rs:1355,2622`;
+`item_count_service.rs:549,841,886`), and guard the plan with an `EXPLAIN QUERY PLAN` test —
+`item_count_service.rs:2386,2428,2835` and `crates/ferrofin-core/tests/item_repository.rs:941`
+pin a chosen plan; `crates/ferrofin-core/tests/next_up_query_plan.rs` pins the opposite, that
+a query stays *off* a `CROSS JOIN`. `ANALYZE` is deliberately unused and `sqlite_stat1`
+never exists.
 
 ### Green tests are necessary, not sufficient
 Several real bugs in this codebase passed their unit/integration tests and were caught only
@@ -261,15 +294,24 @@ the substance of what a handler actually does — don't rely on a green checkmar
 ## Current scope
 
 **All 412 operations in the vendored contract are wired to real handlers — 0 stubs, 0 `501`s.**
-(The v2 parity ledger and its verification machinery were retired with the v2 suite on
-2026-09-02; verification tracking returns with suite v3. Owner's standing definition for v3:
-**"deep verified" means the Ferrofin implementation was compared against the upstream
-Jellyfin C# for behavioral equivalence** — runtime probes are supporting evidence, never a
-substitute, and a metric redefinition must never make completed verification work disappear.)
+(Parity is tracked by `handlers::VERIFIED` beside `REAL_ROUTES`, validated and printed by
+`crates/ferrofin-api/tests/contract_superset.rs` against the vendored **10.11.8** contract —
+which is a different pin from the C# release named below, deliberately. The contract is the
+API real clients speak, and 12.0-rc7's own surface is smaller (364 operations to 10.11.8's 412 — it drops the
+DynamicHls family, `/MusicGenres`, `/CriticReviews` and more), so satisfying it would break
+clients. See `contracts/README.md`. The Jellyfin C# release each `VERIFIED` row was compared
+*against* is `UPSTREAM_TAG`/`UPSTREAM_COMMIT` in `handlers/mod.rs`, currently `v12.0-rc7`.
+Owner's standing definition: **"deep verified" means the
+Ferrofin implementation was compared against the upstream Jellyfin C# for behavioral
+equivalence** — runtime probes are supporting evidence, never a substitute, and a metric
+redefinition must never make completed verification work disappear. The benchmark's
+response-shape pass is one of those supporting probes, not the parity number.)
 Working end-to-end: authentication/users/QuickConnect,
 library scan + live filesystem watch, browse/query/DTO, images, sessions/playstate/remote
 control, WebSocket push, playlists/collections, direct play + live HLS transcode (subtitle
-burn-in, fMP4 HEVC/AV1), Live TV (M3U/XMLTV + DVR timers), SyncPlay, all 20 scheduled tasks,
+burn-in, fMP4 HEVC/AV1), Live TV (M3U/XMLTV + DVR timers), SyncPlay, 20 registered
+scheduled tasks (18 shown in a stock install — the two guide/channel refreshers hide
+themselves until a tuner exists),
 metrics/tracing, trickplay/chapters/lyrics/media segments, photo and book libraries
 (EXIF / `ComicInfo` / OPF), and backup/restore. See `docs/FEATURES.md` for the tiered
 status matrix.

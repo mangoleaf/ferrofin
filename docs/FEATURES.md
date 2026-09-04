@@ -6,8 +6,24 @@ Ferrofin implements the Jellyfin server API surface, not a subset of it. Every o
 faithfully an edge case matches Jellyfin.
 
 These tiers were last derived from the v2 parity ledger, retired with the v2 suite on
-2026-09-02 (recoverable from git history; suite v3 will regenerate verification tracking).
-Headline as of the last v2 run:
+2026-09-02 (recoverable from git history). Verification tracking now lives in the source:
+`handlers::VERIFIED` beside `REAL_ROUTES`, validated and printed by
+`crates/ferrofin-api/tests/contract_superset.rs`, where **"deep verified" means the
+Ferrofin implementation was compared against the upstream Jellyfin C# for behavioral
+equivalence** — the Jellyfin release each row was compared against is `UPSTREAM_TAG` /
+`UPSTREAM_COMMIT` in `crates/ferrofin-api/src/handlers/mod.rs`. That record is early:
+**7 of 412 operations** carry a row today, so the tiers below remain the honest picture and
+the `VERIFIED` count is the one that will replace them as it fills in.
+
+Separately, [`bench/`](../bench/README.md) compares response *shapes* against Jellyfin
+12.0-rc7 each run, on a generated library scanned by a real Jellyfin. That is supporting
+evidence, not the parity number — it covers 28 requests and only the fields those requests
+happen to exercise.
+
+Headline as of the last v2 run — note this table uses the **retired v2** definition of
+"deep-verified" (response + read-back diffed clean at runtime), which is a different and
+weaker bar than the C#-comparison definition above, and is why its count is so much larger
+than the 7 rows `VERIFIED` holds:
 
 | | ops | |
 |---|---:|---|
@@ -155,5 +171,7 @@ Precise about what's absent — this is what keeps the rest of the matrix credib
 
 ## Regenerating this
 
-`docs/FEATURES.md` is written by hand; per-operation verification tracking returns with
-suite v3. When adding or changing an operation, revisit the tiers above.
+`docs/FEATURES.md` is written by hand. Per-operation verification tracking is
+`handlers::VERIFIED` — add a row there when you have compared an operation against the
+upstream C#, and `contract_superset.rs` will check it maps to a real contract operation
+and print the count. When adding or changing an operation, revisit the tiers above.
