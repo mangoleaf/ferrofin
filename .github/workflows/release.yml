@@ -28,6 +28,7 @@ on:
 permissions:
   contents: write
   packages: write
+  actions: read # the create-release gate lists CI runs with `gh run list`
 
 jobs:
   # ── the manual gate: derive next version, tag, push (mirrors create-release) ──
