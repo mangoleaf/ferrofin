@@ -95,6 +95,19 @@ mod tests {
     }
 
     #[test]
+    fn opt_datetime_maps_through() {
+        assert_eq!(opt_datetime_to_db(None), None);
+        let instant = Utc
+            .with_ymd_and_hms(2026, 1, 2, 3, 4, 5)
+            .single()
+            .expect("valid instant");
+        assert_eq!(
+            opt_datetime_to_db(Some(instant)).as_deref(),
+            Some("2026-01-02 03:04:05.0000000")
+        );
+    }
+
+    #[test]
     fn stored_datetime_round_trips_through_sqlx_tolerant_decode() {
         // The written format must stay parseable by the `%F %T%.f` fallback
         // sqlx uses when decoding TEXT into chrono types.

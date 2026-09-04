@@ -1655,6 +1655,78 @@ mod tests {
         );
     }
 
+    /// The pre-0007 snapshot is the only way back from a bad rebuild, so a
+    /// snapshot that cannot be written must stop the open BEFORE the rebuild
+    /// runs — never "migrate anyway and hope". A directory squatting on the
+    /// backup's name makes the copy fail deterministically on every platform.
+    #[tokio::test]
+    async fn a_failed_pre_rebuild_snapshot_refuses_to_open_and_leaves_the_schema_alone() {
+        use sqlx::ConnectOptions as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ferrofin.db");
+        let url = seed_pre_0007_database(&path).await;
+        std::fs::create_dir(path.with_extension("db.pre-0007")).expect("squat on the backup");
+
+        let err = Database::connect_sized(&url, Some(1))
+            .await
+            .expect_err("an unwritable snapshot must refuse the open");
+        assert!(
+            matches!(&err, crate::DbError::Backup { path, .. } if path.ends_with("ferrofin.db.pre-0007")),
+            "unexpected error: {err}"
+        );
+
+        // Nothing past 0006 may have run: the refusal comes before `MIGRATOR.run`.
+        let mut conn = SqliteConnectOptions::from_str(&url)
+            .expect("options")
+            .connect()
+            .await
+            .expect("raw connect");
+        let at: i64 = sqlx::query_scalar(r#"SELECT MAX(version) FROM "_sqlx_migrations""#)
+            .fetch_one(&mut conn)
+            .await
+            .expect("version");
+        assert_eq!(at, 6, "the schema must be untouched after a refused open");
+        sqlx::Connection::close(conn).await.expect("close");
+    }
+
+    /// The seatbelt on the `foreign_keys = OFF` migration connection: a boot
+    /// that applies a migration and ends with dangling child rows must refuse
+    /// to open rather than serve a database whose integrity is already gone.
+    /// The dangling row is planted with enforcement off — the same state a
+    /// buggy rebuild would leave behind — and the rebuild carries it through.
+    #[tokio::test]
+    async fn dangling_child_rows_after_a_migration_refuse_the_open() {
+        use sqlx::ConnectOptions as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ferrofin.db");
+        let url = seed_pre_0007_database(&path).await;
+
+        let mut conn = SqliteConnectOptions::from_str(&url)
+            .expect("options")
+            .foreign_keys(false)
+            .connect()
+            .await
+            .expect("connect with enforcement off");
+        sqlx::query(
+            r#"INSERT INTO "Permissions" ("Id","Kind","RowVersion","Value","UserId")
+               VALUES (99,0,0,1,'ffffffff-ffff-ffff-ffff-ffffffffffff')"#,
+        )
+        .execute(&mut conn)
+        .await
+        .expect("plant a permission whose user does not exist");
+        sqlx::Connection::close(conn).await.expect("close");
+
+        let err = Database::connect_sized(&url, Some(1))
+            .await
+            .expect_err("a foreign-key violation after migrating must refuse the open");
+        assert!(
+            matches!(err, crate::DbError::MigrationIntegrity { violations: 1 }),
+            "unexpected error: {err}"
+        );
+    }
+
     #[test]
     fn cpu_max_parses_to_usable_cores() {
         assert_eq!(quota_cores_from_cpu_max("400000 100000"), Some(4)); // --cpus=4

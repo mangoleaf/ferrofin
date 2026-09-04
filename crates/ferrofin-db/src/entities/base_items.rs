@@ -575,3 +575,43 @@ pub fn item_values_of(entity: &BaseItemEntity) -> Vec<(i32, String)> {
     out.extend(split(entity.tags.as_deref()).into_iter().map(|t| (4, t)));
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{BaseItemEntity, item_values_of};
+
+    /// The five pipe-joined columns fan out into their `ItemValues` type
+    /// discriminants in C#'s order — artists, album artists, genres, studios,
+    /// tags — with each value trimmed and empty segments dropped, so a
+    /// trailing `|` or a doubled separator never materializes a nameless
+    /// by-name item.
+    #[test]
+    fn item_values_fan_out_per_type_and_drop_empty_segments() {
+        let entity = BaseItemEntity {
+            artists: Some("Nina Simone| Miles Davis |".to_owned()),
+            album_artists: Some("Nina Simone".to_owned()),
+            genres: Some("Jazz||Soul".to_owned()),
+            studios: Some("  ".to_owned()),
+            tags: None,
+            ..BaseItemEntity::default()
+        };
+        assert_eq!(
+            item_values_of(&entity),
+            vec![
+                (0, "Nina Simone".to_owned()),
+                (0, "Miles Davis".to_owned()),
+                (1, "Nina Simone".to_owned()),
+                (2, "Jazz".to_owned()),
+                (2, "Soul".to_owned()),
+            ]
+        );
+    }
+
+    /// A row with nothing to index yields nothing — the caller replaces the
+    /// item's `ItemValuesMap` rows with this list, so "no values" must be an
+    /// empty list rather than a placeholder entry.
+    #[test]
+    fn a_bare_row_has_no_item_values() {
+        assert!(item_values_of(&BaseItemEntity::default()).is_empty());
+    }
+}
