@@ -744,6 +744,28 @@ impl FerrofinItemCountService {
     /// Every non-folder, non-alternate row on the server, and this user's
     /// played subset — `GetRecursiveChildCount`/`GetUnplayedCount` for the
     /// physical root, whose descendants are everything.
+    ///
+    /// The played arm is [`WHOLE_SERVER_PLAYED_COUNT_SQL`]; read its doc for why
+    /// the count is `DISTINCT` and why the `UserData` join is the cheap form
+    /// here even though the sibling closure query wants an `EXISTS`.
+    ///
+    /// TODO: BOTH arms owe a placeholder filter. Migration `0001_initial`
+    /// (`:187-194`) inserts one `PLACEHOLDER` `BaseItems` row — "a placeholder
+    /// item for `UserData` that has been detached from its original item" —
+    /// which is `IsFolder = 0`, `IsVirtualItem = 0` and has no
+    /// `PrimaryVersionId`, so both statements below see it. v12 never counts it:
+    /// it reaches the `AggregateFolder`'s leaves through
+    /// `AncestorIds`/`LinkedChildren` (`ItemCountService.cs:495-530`) and the
+    /// placeholder is in neither. Measured on the adopted bench database, the
+    /// `total` arm serves 23,928 where the honest answer is 23,927 (the
+    /// placeholder is one of those rows and has zero `AncestorIds` rows). The
+    /// played arm is exposed the same way and for a sharper reason — that row
+    /// exists precisely to hold DETACHED `UserData`, so a detached row with
+    /// `Played = 1` would inflate it too; it reads clean on this database only
+    /// because none happens to be played. The fix is to exclude the placeholder
+    /// (`Type = 'PLACEHOLDER'`) from both arms, with its own before/after. Kept
+    /// out of the `DISTINCT` commit so that fix had a clean before/after; the
+    /// test const `UNSEEDED_LEAVES` pins the current behaviour meanwhile.
     async fn whole_server_leaf_counts(
         &self,
         user: &UserEntity,
@@ -755,25 +777,11 @@ impl FerrofinItemCountService {
         .fetch_one(self.db.pool())
         .await
         .map_err(db_err)?;
-        // TODO(P0.4 follow-up): this `COUNT(*)` over-counts. `UserData`'s key is
-        // `(ItemId, UserId, CustomDataKey)`, so a leaf can carry several rows for
-        // one user and the join multiplies — 4,031 against a true 1,574 on the
-        // adopted bench database, inflating the `AggregateFolder`'s
-        // `PlayedPercentage` ~2.6×. v12
-        // `ItemCountService.GetPlayedAndTotalCountFromQuery` (:610-624) is
-        // `UserData.Any(u => u.UserId == userId && u.Played)`, i.e.
-        // `COUNT(DISTINCT bi."Id")`. Fixed in its own commit, with its own
-        // before/after; not folded into the join-order pin below.
-        let played: i64 = sqlx::query_scalar(
-            r#"SELECT COUNT(*) FROM "BaseItems" bi
-               JOIN "UserData" ud ON ud."ItemId" = bi."Id"
-               WHERE bi."IsFolder" = 0 AND bi."PrimaryVersionId" IS NULL
-                 AND bi."IsVirtualItem" = 0 AND ud."UserId" = ?1 AND ud."Played" = 1"#,
-        )
-        .bind(user.id.as_str())
-        .fetch_one(self.db.pool())
-        .await
-        .map_err(db_err)?;
+        let played: i64 = sqlx::query_scalar(WHOLE_SERVER_PLAYED_COUNT_SQL)
+            .bind(user.id.as_str())
+            .fetch_one(self.db.pool())
+            .await
+            .map_err(db_err)?;
         Ok(PlayedAndTotal {
             played: i32::try_from(played).unwrap_or(i32::MAX),
             total: i32::try_from(total).unwrap_or(i32::MAX),
@@ -947,6 +955,50 @@ fn folder_leaf_count_sql(parents: usize, extra_join: &str, extra_where: &str) ->
     sql.push_str(r#") GROUP BY a."ParentItemId""#);
     sql
 }
+
+/// The whole-server played-leaf count — the `AggregateFolder`'s played arm,
+/// bound to one `UserId`. The sibling of [`folder_leaf_count_sql`] for the one
+/// parent whose descendants are everything, so it needs no ancestor closure.
+///
+/// The `COUNT(DISTINCT bi."Id")` is v12's rule and it is load-bearing.
+/// `ItemCountService.GetPlayedAndTotalCountFromQuery`
+/// (v12 `ItemCountService.cs:610-624`) projects ONE boolean PER ITEM —
+/// `query.Select(b => b.UserData!.Any(u => u.UserId == userId && u.Played))` —
+/// and counts the true ones, and `GetPlayedAndTotalCountBatch` (`:535-540`)
+/// spells the same thing out as
+/// `g.Where(x => x.Played).Select(x => x.Id).Distinct().Count()`. `UserData`'s
+/// primary key is `(ItemId, UserId, CustomDataKey)`, so one `(item, user)` pair
+/// can carry several rows — 2,154 such pairs on the adopted bench database —
+/// and a bare `COUNT(*)` over the join counts a leaf once per key row. It read
+/// 4,031 played leaves against a true 1,574 for the `bench` user (855 against
+/// 285 for `viewer`), out of 23,928 total.
+///
+/// It also restores an invariant the old form could break: the played
+/// predicates are a strict superset of the `total` arm's, so `played <= total`
+/// now always holds. Multiplied rows could push `played` ABOVE `total` and hand
+/// a caller a negative `total - played`.
+///
+/// `DISTINCT` and not `EXISTS`, which is the opposite of the choice
+/// [`folder_leaf_count_sql`] makes for its leaf test — because the driving side
+/// is the opposite too. There the closure is small and `BaseItems` is the
+/// library, so an `EXISTS` is what STOPS `IsFolder` from driving. Here there is
+/// no closure: an `EXISTS` form makes `bi."IsFolder" = 0` the only driving term,
+/// so SQLite walks every leaf row on the server and probes `UserData` per row
+/// (`SEARCH bi USING INDEX IX_BaseItems_IsFolder_… (IsFolder=?)` +
+/// `CORRELATED SCALAR SUBQUERY`), measured 15.9 ms against the join's 1.6 on the
+/// adopted bench database. The join keeps SQLite seeding from
+/// `FerrofinIX_UserData_UserId_Played_ItemId (UserId=? AND Played=?)` — only the
+/// rows this user actually played — and probing `BaseItems` by id, which is the
+/// same plan the un-`DISTINCT` version had; the `DISTINCT` adds one temp b-tree
+/// over those few thousand ids and 0.30 ms (`bench`) / 0.05 ms (`viewer`),
+/// against a `total` arm that already costs ~11 ms on the same call. No join
+/// order is pinned and no index is added: the planner already picks the played
+/// rows as the driving side, and `whole_server_leaf_counts_seek_from_the_user`
+/// pins that shape.
+const WHOLE_SERVER_PLAYED_COUNT_SQL: &str = r#"SELECT COUNT(DISTINCT bi."Id") FROM "BaseItems" bi
+   JOIN "UserData" ud ON ud."ItemId" = bi."Id"
+   WHERE bi."IsFolder" = 0 AND bi."PrimaryVersionId" IS NULL
+     AND bi."IsVirtualItem" = 0 AND ud."UserId" = ?1 AND ud."Played" = 1"#;
 
 /// The per-clean-value count aggregate for the `ItemValues`-backed by-name kinds
 /// (genre / music genre / studio / artist): `cleans` bound clean values,
@@ -2604,5 +2656,204 @@ mod tests {
             rows.push(got);
         }
         assert_eq!(rows[0], rows[1], "the join-order pin changed the counts");
+    }
+
+    /// Seeds an `AggregateFolder` and `leaves` movies directly under it, the
+    /// nth played for the returned user when `n < played`, each carrying
+    /// `extra_keys` FURTHER `UserData` rows under distinct `CustomDataKey`s.
+    ///
+    /// No `AncestorIds` rows: the whole-server arm counts every leaf on the
+    /// server by scope, not through the closure, which is exactly why it needs
+    /// its own oracle.
+    async fn seed_whole_server(
+        db: &Database,
+        played: usize,
+        unplayed: usize,
+        extra_keys: usize,
+    ) -> (RootFolderIds, UserEntity) {
+        use crate::test_support::seed_folder_item;
+        let user_id = Uuid::from_u128(0x5EED_0002);
+        let user = seed_user(db, user_id).await;
+        let aggregate = Uuid::from_u128(0xC002);
+        let user_root = Uuid::from_u128(0xC001);
+        seed_folder_item(db, aggregate, BaseItemKind::AggregateFolder, "root", None).await;
+        seed_folder_item(db, user_root, BaseItemKind::UserRootFolder, "MF", None).await;
+        for i in 0..(played + unplayed) {
+            let leaf = Uuid::from_u128(0xC100 + i as u128);
+            seed_item(db, leaf, BaseItemKind::Movie).await;
+            seed_user_data(db, user_id, leaf, i < played, None).await;
+            for k in 0..extra_keys {
+                seed_extra_user_data_key(db, user_id, leaf, k, i < played).await;
+            }
+        }
+        (
+            RootFolderIds {
+                user_root,
+                aggregate,
+            },
+            user,
+        )
+    }
+
+    /// Leaf rows the whole-server arm counts that nobody seeded: the single
+    /// `PLACEHOLDER` row migration `0001_initial` inserts ("a placeholder item
+    /// for `UserData` that has been detached from its original item"), which is
+    /// `IsFolder = 0`, `IsVirtualItem = 0` and has no `PrimaryVersionId`, so the
+    /// whole-server scope statement sees it.
+    ///
+    /// It is a divergence — v12 never counts that row — and it is an open work
+    /// item on BOTH whole-server arms, not just the `total` one. The TODO on
+    /// [`FerrofinItemCountService::whole_server_leaf_counts`] carries the
+    /// reasoning, the measurement and the un-fix path; this const only pins the
+    /// current behaviour so the played assertions below stay readable.
+    const UNSEEDED_LEAVES: i32 = 1;
+
+    /// The `AggregateFolder`'s played/total pair, pinned against duplicate
+    /// `UserData` key rows.
+    ///
+    /// v12 `ItemCountService.GetPlayedAndTotalCountFromQuery` (:610-624)
+    /// projects one boolean PER ITEM —
+    /// `b.UserData.Any(u => u.UserId == userId && u.Played)` — so a leaf with
+    /// four played key rows is ONE played leaf. A bare `COUNT(*)` over the
+    /// `UserData` join counted it four times: 4,031 played leaves against a true
+    /// 1,574 on the adopted bench database, out of 23,928. `extra_keys > 0` is
+    /// that exact shape.
+    #[rstest]
+    #[case(2, 1, 0)]
+    #[case(0, 3, 0)]
+    #[case(3, 0, 0)]
+    #[case(2, 1, 1)]
+    #[case(2, 1, 3)]
+    #[case(5, 5, 2)]
+    #[tokio::test]
+    async fn the_whole_server_counts_each_leaf_once_however_many_user_data_keys_it_has(
+        #[case] played: usize,
+        #[case] unplayed: usize,
+        #[case] extra_keys: usize,
+    ) {
+        let db = test_db().await;
+        let (roots, user) = seed_whole_server(&db, played, unplayed, extra_keys).await;
+
+        let counts = svc(&db)
+            .with_root_ids(roots)
+            .get_played_and_total_count_batch(&[roots.aggregate], &user)
+            .await
+            .expect("whole-server counts");
+
+        let got = counts.get(&roots.aggregate).copied().unwrap_or_default();
+        assert_eq!(
+            (got.played, got.total),
+            (
+                i32::try_from(played).expect("small"),
+                i32::try_from(played + unplayed).expect("small") + UNSEEDED_LEAVES
+            ),
+            "aggregate played/total with {extra_keys} extra UserData key rows per leaf"
+        );
+    }
+
+    /// A whole-server leaf is played when ANY of its `UserData` key rows is —
+    /// the same `UserData.Any(…)` rule [`a_leaf_is_played_when_any_of_its_user_data_keys_is`]
+    /// pins for the closure arm, asserted here for the `AggregateFolder` arm,
+    /// which is a different statement and so cannot inherit it.
+    ///
+    /// One leaf carries TWO played key rows, so this also fails against the old
+    /// `COUNT(*)` (which read 4 played leaves out of 4). Without that leaf it
+    /// would pin only the `Any` rule and pass under either form.
+    #[tokio::test]
+    async fn a_whole_server_leaf_is_played_when_any_of_its_user_data_keys_is() {
+        use crate::test_support::seed_folder_item;
+
+        let db = test_db().await;
+        let user_id = Uuid::from_u128(0x5EED_0002);
+        let user = seed_user(&db, user_id).await;
+        let aggregate = Uuid::from_u128(0xC002);
+        let user_root = Uuid::from_u128(0xC001);
+        seed_folder_item(&db, aggregate, BaseItemKind::AggregateFolder, "root", None).await;
+        seed_folder_item(&db, user_root, BaseItemKind::UserRootFolder, "MF", None).await;
+
+        // Base row played + extra unplayed, base unplayed + extra played, BOTH
+        // played, and both unplayed. The first three are played leaves, the
+        // fourth is not.
+        for (n, (base, extra)) in [(true, false), (false, true), (true, true), (false, false)]
+            .into_iter()
+            .enumerate()
+        {
+            let leaf = Uuid::from_u128(0xC100 + n as u128);
+            seed_item(&db, leaf, BaseItemKind::Movie).await;
+            seed_user_data(&db, user_id, leaf, base, None).await;
+            seed_extra_user_data_key(&db, user_id, leaf, 0, extra).await;
+        }
+
+        let counts = svc(&db)
+            .with_root_ids(RootFolderIds {
+                user_root,
+                aggregate,
+            })
+            .get_played_and_total_count_batch(&[aggregate], &user)
+            .await
+            .expect("whole-server counts");
+        let got = counts.get(&aggregate).copied().unwrap_or_default();
+        assert_eq!((got.played, got.total), (3, 4 + UNSEEDED_LEAVES));
+    }
+
+    /// Another user's played rows are not this user's played leaves — the
+    /// `UserId` bind is what makes the whole-server arm per-user, and a
+    /// `DISTINCT` over the wrong scope would hide its loss.
+    #[tokio::test]
+    async fn the_whole_server_played_arm_is_scoped_to_one_user() {
+        let db = test_db().await;
+        let (roots, _seeded_user) = seed_whole_server(&db, 2, 1, 2).await;
+        let other =
+            crate::test_support::seed_named_user(&db, Uuid::from_u128(0x5EED_0003), "other").await;
+
+        let counts = svc(&db)
+            .with_root_ids(roots)
+            .get_played_and_total_count_batch(&[roots.aggregate], &other)
+            .await
+            .expect("whole-server counts");
+
+        let got = counts.get(&roots.aggregate).copied().unwrap_or_default();
+        assert_eq!(
+            (got.played, got.total),
+            (0, 3 + UNSEEDED_LEAVES),
+            "the other user has played nothing, but the total is the server's"
+        );
+    }
+
+    /// The whole-server played arm must keep driving from the user's played
+    /// `UserData` rows, never from `BaseItems."IsFolder"`.
+    ///
+    /// This is the mirror of [`folder_leaf_counts_seek_from_the_ancestor_closure`]
+    /// and the reason the count is a `DISTINCT` over a join rather than an
+    /// `EXISTS`: with no ancestor closure to drive from, an `EXISTS` leaves
+    /// `IsFolder = 0` as the only driving term and SQLite walks every leaf row
+    /// on the server, probing `UserData` per row — 15.9 ms against 1.6 on the
+    /// adopted bench database. Driven from
+    /// `FerrofinIX_UserData_UserId_Played_ItemId (UserId=? AND Played=?)` it
+    /// touches only the rows this user played.
+    #[tokio::test]
+    async fn whole_server_leaf_counts_seek_from_the_user() {
+        let db = test_db().await;
+        let plan = query_plan(&db, WHOLE_SERVER_PLAYED_COUNT_SQL, 1).await;
+
+        assert!(
+            !plan.iter().any(|s| s.contains("IsFolder=?")),
+            "the whole-server played arm must not be driven by the IsFolder index, got: {plan:?}"
+        );
+        let Some(first) = plan
+            .iter()
+            .find(|s| s.starts_with("SEARCH") || s.starts_with("SCAN"))
+        else {
+            panic!("the whole-server played arm produced no driving loop: {plan:?}");
+        };
+        assert!(
+            first.contains(" ud ") && first.contains("UserId=?"),
+            "the whole-server played arm must be driven by UserData (UserId=?), got: {plan:?}"
+        );
+        assert!(
+            plan.iter()
+                .any(|s| s.starts_with("SEARCH bi") && s.contains("Id=?")),
+            "the whole-server played arm must reach BaseItems by id, got: {plan:?}"
+        );
     }
 }
