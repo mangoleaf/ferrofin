@@ -540,11 +540,46 @@ h2{font:600 20px/1.2 system-ui,-apple-system,"Segoe UI",sans-serif;margin:44px 0
 h3{font:600 12.5px/1.2 system-ui,-apple-system,"Segoe UI",sans-serif;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin:0 0 10px}
 .lede{color:var(--muted);max-width:70ch;margin:0 0 6px}
 .meta{font:12.5px/1.5 ui-monospace,"SF Mono",Menlo,Consolas,monospace;color:var(--muted)}
-.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px;margin-top:22px}
+/* Two tiles per row at most. The old auto-fit went to three across on a wide window and
+   held a 300px track floor on a narrow one, and either way the three server columns
+   inside a tile could not shrink — so the page itself scrolled sideways (559px of
+   content in a 320px viewport, 1245px in a 1200px one). */
+.tiles{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-top:22px}
+@media (max-width:700px){.tiles{grid-template-columns:1fr}}
 .tile{background:var(--panel);border:1px solid var(--rule);border-radius:6px;padding:16px 18px}
-.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+/* The columns re-flow (three, then two, then one) instead of being pinned to three, and
+   the floor is a real width rather than 0. Pinned at three, a narrow tile pushes the page
+   sideways; with a 0 floor the page fits, but only because a column shrinks under its own
+   text, which cannot wrap — the comparison is nowrap — and so paints over its neighbour.
+   150px clears the widest comparison ("about the same", 96.6px) and the widest value. */
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}
+/* A column carries a comparison only if it has one to make, and the range line beneath
+   wraps at some widths and not others, so all three differ in height. Subgrid puts the
+   label, the value and the range on the tile's own rows, which is what makes the three
+   range lines start level; bottom-pinning them only levelled the bottoms. `row-gap:0`
+   because a subgrid inherits its parent's gutter, and 12px of column gutter arriving as
+   vertical space would push the three rows apart. The range line comes in two classes —
+   `.tail` for a reproducible number's range, `.why` for an unreproducible one's — and a
+   tile can hold both, so they are levelled here too: subgrid lines up the boxes, but
+   `.why`'s own margin and line-height would still drop its glyphs 2px. */
+.stat{display:grid;grid-template-rows:subgrid;grid-row:span 3;row-gap:0}
+.stat .tail,.stat .why{margin-top:0;line-height:1.35}
 .stat .who{font-size:11.5px;color:var(--muted)}
-.stat .val{font:500 26px/1.15 ui-monospace,"SF Mono",Menlo,Consolas,monospace;font-variant-numeric:tabular-nums;margin-top:2px}
+.stat .val{font:500 24px/1.2 ui-monospace,"SF Mono",Menlo,Consolas,monospace;font-variant-numeric:tabular-nums;margin-top:2px}
+/* The comparison starts its own line rather than trailing the number, so the number
+   never has to share its line. A forced break, NOT display:block — the footnote marker
+   is emitted after the comparison, and a block box would strand that superscript on a
+   third line of its own, where an amber "13" reads as one more measured number. The
+   inherited nowrap stays. It is not load-bearing at any width this page reaches — the
+   comparison owns its own line, so it has the whole column — but `white-space:normal`
+   would split "about the same" once a column fell under ~100px (~113px where a footnote
+   marker follows it, since no whitespace separates the two), and the halves would be
+   held 28.8px apart by the value's line box, reading as two separate things. And the
+   marker is sized here, or it inherits `smaller` of the 24px value — 20px, larger than
+   the comparison it annotates and amber against a page of numbers. */
+.stat .val .ratio,.stat .val .delta{margin-left:0;font-size:11.5px}
+.stat .val .ratio::before,.stat .val .delta::before{content:"\\A";white-space:pre}
+.stat .val sup.fn{font-size:11.5px}
 .stat .unit{font-size:12px;color:var(--muted);margin-left:4px}
 .stat.ferrofin .val{color:var(--accent-ink)}
 .stat .ratio,.ratio{font:12px ui-monospace,"SF Mono",Menlo,Consolas,monospace;color:var(--muted);margin-left:6px;white-space:nowrap}
@@ -567,13 +602,13 @@ td.flagged{background:var(--flag-bg)}td.flagged .p50,td.flagged .tail{opacity:.7
 details{margin-top:10px}summary{cursor:pointer;color:var(--accent-ink);font-size:13.5px}
 .work{background:var(--panel);border:1px solid var(--rule);border-radius:6px;padding:14px 18px;margin-top:12px}
 .work h3 .n{text-transform:none;letter-spacing:0;font-weight:400;color:var(--muted);margin-left:8px}
-.work ul{margin:0;padding-left:18px;font-size:13.5px}.work li{margin:3px 0}
+.work ul{margin:0;padding-left:18px;font-size:13.5px}.work li{margin:3px 0;overflow-wrap:anywhere}
 code{font:12.5px ui-monospace,"SF Mono",Menlo,Consolas,monospace}
 .mark{color:var(--flag);font-weight:700;cursor:help;margin-left:1px}
 td .p50.wobbly{text-decoration:underline dotted var(--flag) 1px;text-underline-offset:3px}
 sup.fn{margin-left:3px}sup.fn a{color:var(--flag);font-weight:600;text-decoration:none}
 ol.notes{font-size:13px;color:var(--muted);max-width:90ch;padding-left:22px}
-ol.notes li{margin:8px 0}ol.notes li:target{color:var(--ink);font-weight:500}
+ol.notes li{margin:8px 0;overflow-wrap:anywhere}ol.notes li:target{color:var(--ink);font-weight:500}
 ol.notes .src{font:12px ui-monospace,"SF Mono",Menlo,Consolas,monospace;color:var(--muted);opacity:.85;margin-top:2px}
 """
 
