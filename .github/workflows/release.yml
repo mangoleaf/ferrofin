@@ -1,7 +1,8 @@
 name: Release
 
-# GitHub port of the GitLab release pipeline (.gitlab-ci.yml is canonical; the
-# release logic lives in scripts/version.sh + cliff.toml so both CIs share it).
+# The public release pipeline — GitHub is the source of truth for public
+# versions. .gitlab-ci.yml is the maintainer's internal copy; the release logic
+# lives in scripts/version.sh + cliff.toml so both share it.
 #
 # Tag scheme (see RELEASE.md):
 #   vX.Y.Z        → image :vX.Y.Z + :latest, GitHub Release, chart @ X.Y.Z
