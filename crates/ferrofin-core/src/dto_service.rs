@@ -805,9 +805,17 @@ fn never_falls_back_to_collection_folder(kind: BaseItemKind) -> bool {
     )
 }
 
-/// The deepest ancestor chain the walk follows before giving up — real
-/// libraries are a handful of levels deep, and a `ParentId` cycle is data.
-const MAX_IMAGE_PARENT_DEPTH: usize = 8;
+/// The deepest ancestor chain the walk follows before giving up.
+///
+/// Upstream has no such cap; this one exists because a `ParentId` cycle is
+/// data, not a bug we can rule out, and an uncapped walk would hang on one.
+/// The bound is generous rather than tight: the deepest chain in a real
+/// Jellyfin-scanned library measures 4 hops (track → album → artist → library),
+/// each hop is one already-batched query, and reaching the cap costs an item
+/// its inherited backdrop and logo with nothing on screen to explain why —
+/// so the failure is worth being far away from. `chain_for` logs when the cap
+/// is actually reached, which is the only way that silence gets broken.
+const MAX_IMAGE_PARENT_DEPTH: usize = 16;
 
 impl ImageParentGraph {
     /// `LibraryManager.GetCollectionFolders(item)` (:2757-2802): walk `item`
@@ -933,6 +941,15 @@ impl ImageParentGraph {
                 break;
             }
             current = next;
+        }
+        if chain.len() >= MAX_IMAGE_PARENT_DEPTH {
+            // Either a library nested deeper than any real one, or a ParentId
+            // cycle. Both lose inherited images silently otherwise.
+            tracing::warn!(
+                item_id = %root,
+                depth = MAX_IMAGE_PARENT_DEPTH,
+                "inherited-image walk hit its depth cap; parent images may be missing"
+            );
         }
         chain
     }

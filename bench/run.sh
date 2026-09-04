@@ -58,7 +58,7 @@ TESTDATA=$(realpath -m "$(abs "$TESTDATA")")
 SHA=$(git rev-parse --short HEAD 2>/dev/null || echo nogit)
 
 # A run is named for the code it measured, so a run dir can be traced back to a build:
-#   on a tag            v0.42.1                 (and "v0.42.1 [2]", " [3]" … for repeats)
+#   on a tag            v0.42.1                 (and v0.42.1-run2, -run3 … for repeats)
 #   ahead of a tag      v0.42.1-3-7e80268       (3 commits past the tag, at that sha)
 #   dirty working tree  …-dirty                 the tree had uncommitted changes when the
 #                                               run started, so the sha does not identify
@@ -77,16 +77,16 @@ run_name() {
     base="$(date +%Y%m%d-%H%M)-$SHA"
   fi
   [ -z "$(git status --porcelain 2>/dev/null)" ] || base="$base-dirty"
-  # Repeats are counted in brackets — " [2]", " [3]" — so a rerun never lands in a
-  # populated dir and the count cannot be misread as part of the version (v0.42.1-2,
-  # the second run, and v0.42.1-2-abc1234, two commits on, are otherwise a glance
-  # apart). The name therefore holds a space and brackets: quote it. On a dirty tree
+  # Repeats are counted as -run2, -run3 …, so a rerun never lands in a populated dir
+  # and the count cannot be misread as part of the version: a bare -2 reads as "two
+  # commits on" exactly as much as "the second run", and a word cannot. No spaces or
+  # glob characters, so the path needs no quoting on a command line. On a dirty tree
   # the counter only means "another run", not "the same code again" — two dirty trees
   # are not the same tree.
   n=1
   local candidate="$base"
   while [ -e "$RUNS_DIR/$candidate" ]; do
-    n=$((n + 1)); candidate="$base [$n]"
+    n=$((n + 1)); candidate="$base-run$n"
   done
   echo "$candidate"
 }

@@ -137,8 +137,9 @@ python3 bench/report.py --serve                   # the comparison viewer at htt
 A run is named for the code it measured: `v0.42.1` on a tag, `v0.42.1-3-7e80268` when
 the branch is that many commits past the tag, and `-dirty` appended when the working
 tree had uncommitted changes at the start of the run, so the sha does not identify it
-(what actually ran is recorded in each server's `image.txt` and in `run.json`). Repeats of the same code are counted in brackets — `v0.42.1 [2]`,
-`v0.42.1-3-7e80268 [2]` — so the count can never be misread as part of the version.
+(what actually ran is recorded in each server's `image.txt` and in `run.json`). Repeats of the same code are counted as `v0.42.1-run2`,
+`v0.42.1-3-7e80268-run2` — a word, so the count can never be misread as part of the
+version the way a bare `-2` could.
 With no tags, or outside git, the name falls back to `20260903-1412-7e80268`. The
 resolved name and the dirty flag are also written into `run.json`, so they survive a
 renamed directory. `--out` overrides the whole thing.
