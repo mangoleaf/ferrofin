@@ -112,6 +112,22 @@ jobs:
           tags: ${{ steps.tags.outputs.tags }}
           build-args: |
             SERVICE_VERSION=${{ github.ref_name }}
+      # Prove the pushed image boots and reports the tag (the registry is private
+      # until the public launch, so this is the only place that can pull it freely).
+      - name: boot the pushed image
+        run: |
+          set -eu
+          img="ghcr.io/$GITHUB_REPOSITORY:$GITHUB_REF_NAME"
+          docker pull "$img"
+          docker run -d --rm --name smoke -p 8096:8096 "$img"
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8096/health/live > live.json 2>/dev/null; then break; fi
+            sleep 1
+          done
+          cat live.json
+          grep -q "\"build\":\"$GITHUB_REF_NAME\"" live.json || { echo "version mismatch"; docker logs smoke; exit 1; }
+          curl -fsS -o /dev/null http://127.0.0.1:8096/web/ || { echo "/web not served"; docker logs smoke; exit 1; }
+          docker rm -f smoke
 
   # ── server binaries, one archive per target, attached to the Release ──
   # Linux x86_64 and aarch64 are the supported set. macOS and Windows are
@@ -160,12 +176,14 @@ jobs:
           "$bin" --data-dir smoke-data --bind 127.0.0.1 --port 8096 > smoke.log 2>&1 &
           pid=$!
           for _ in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:8096/System/Info/Public > info.json 2>/dev/null; then break; fi
+            if curl -fsS http://127.0.0.1:8096/health/live > live.json 2>/dev/null; then break; fi
             sleep 1
           done
           kill "$pid" || true
-          cat info.json
-          grep -q "\"Version\":\"$GITHUB_REF_NAME\"" info.json || { echo "version mismatch"; cat smoke.log; exit 1; }
+          cat live.json
+          # /System/Info/Public reports the Jellyfin API version (10.11.8) for client
+          # compatibility; Ferrofin's own build version is the `build` field of /health/live.
+          grep -q "\"build\":\"$GITHUB_REF_NAME\"" live.json || { echo "version mismatch"; cat smoke.log; exit 1; }
       - name: package
         shell: bash
         run: |
