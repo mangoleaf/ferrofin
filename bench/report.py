@@ -6,18 +6,24 @@
     report.py --serve [PORT] [RUNS_DIR]      the comparison viewer on http://127.0.0.1:PORT (default 8097, bench/runs)
 
 One run dir: the numbers of that run. Several: each cell is the median across runs, and
-a number whose spread exceeds SPREAD_MAX of that median is marked `~` (not reproducible)
-with its range; a cell that did different work than the oracle is marked `⚠[n]` and the
-reason is printed once, numbered, under Notes.
-Two rules are applied per cell, both from files the run itself wrote:
+where the runs disagreed at the precision published, the range they spanned; a cell that
+did different work than the oracle is marked `⚠[n]` and the reason is printed once,
+numbered, under Notes.
+One rule is applied per cell, from files the run itself wrote:
   comparable   — same status + record count as the oracle (Jellyfin 12.0-rc7) and a field
-                 set ⊇ the oracle's, for every request name behind the cell (shape.log);
-  reproducible — spread within SPREAD_MAX across runs.
+                 set ⊇ the oracle's, for every request name behind the cell (shape.log).
 Flagged cells keep their raw number (the work list) but are not publishable.
+The range is reported, never judged. A fixed 15 % band was tried as a reproducibility
+verdict and withdrawn (owner, 2026-09-04): it failed 57 of Ferrofin's 110 cells. Counting
+each failing number separately — a latency cell prints three — those 57 cells hold 80
+failures, and 69 of the 80 are p95 or p99, where a percentage of the median cannot tell
+run-to-run noise from a tail that is genuinely long. Nor was it a busy host: an idle trio
+(`quiet-1..3`) failed 41 of 76, and over every cell both trios produced it failed MORE
+often than the working one — 54 % against 45 %. Read the range and decide.
 Both renderers print, per cell, how it compares with the oracle as `X.Y× faster`
 (memory says lighter), computed from the printed numbers so a reader can check it; the
 viewer adds, with a baseline run chosen, each server's change against an earlier run of
-itself (the before/after of a code change). A comparison drawn from a marked number is
+itself (the before/after of a code change). A comparison drawn from a flagged number is
 shown in amber italics rather than green. Missing phases are named.
 """
 
@@ -31,7 +37,6 @@ import sys
 import urllib.parse
 from collections import defaultdict
 
-SPREAD_MAX = 0.15
 DELTA_NOISE_PCT = 2  # a baseline change smaller than this is not coloured
 ORACLE = "jellyfin12"  # the source of truth (owner, 2026-09-02): Jellyfin 12 is the newer code
 ORACLE_LABEL = "Jellyfin 12.0-rc7"
@@ -158,8 +163,9 @@ def mem_numbers(d):
 
 # ── the model: one Cell per (row, server) ───────────────────────────────────
 class Cell:
-    """A number across runs plus the rules' verdict. `vals` are per-run values (None =
-    missing); `flag` is the reason it is not publishable, if any."""
+    """A number across runs, the range they spanned, and the comparability verdict.
+    `vals` are per-run values (None = missing); `flag` is the reason it is not
+    publishable, if any."""
 
     def __init__(self, vals, fmt, flag=None, sub=None, unit="ms", context=False):
         vals = list(vals)
@@ -176,61 +182,48 @@ class Cell:
     def median(self):
         return statistics.median(self.vals) if self.vals else None
 
-    def spread_ok(self):
-        if len(self.vals) < 2 or not self.median:
-            return True
-        return (max(self.vals) - min(self.vals)) / self.median <= SPREAD_MAX
-
     def value(self):
         """The published number — the median, and nothing else. A cell has to stay
-        scannable, so the spread and the verdicts are markers the renderers add."""
+        scannable, so the range and the comparability flag are added by the renderers."""
         return self.fmt(self.median) if self.vals else "—"
 
     def spread_text(self):
-        """`min–max over N runs`, or None when there is only one run to compare.
-        Says `of M selected` when the cell is missing from some of them — a level added
-        later exists in one run and not another, and one value cannot satisfy a
-        reproducibility rule however many runs were asked for."""
+        """`min–max over N runs`, or None when there is no range to report — one run, or
+        runs that agreed at the precision published, where `174 ms–174 ms` would read as
+        a measurement rather than as agreement. Says `of M selected` when the cell is
+        missing from some of them: a level added later exists in one run and not another,
+        and one value is not the same evidence as several agreeing."""
+        coverage = f"{len(self.vals)} of {self.runs} selected runs" if self.runs > len(self.vals) else None
         if len(self.vals) < 2:
-            return f"1 of {self.runs} selected runs" if self.runs > len(self.vals) else None
-        seen = f"{len(self.vals)} runs" if self.runs == len(self.vals) else f"{len(self.vals)} of {self.runs} selected runs"
-        return f"{self.fmt(min(self.vals))}–{self.fmt(max(self.vals))} over {seen}"
+            # Including no values at all: a tile prints "—" and this line says how many
+            # of the selected runs produced nothing, which is the useful thing to know.
+            return coverage
+        lo, hi = self.fmt(min(self.vals)), self.fmt(max(self.vals))
+        if lo == hi:
+            return coverage
+        return f"{lo}–{hi} over {coverage or f'{len(self.vals)} runs'}"
 
     def parts(self):
         """This cell and, for a latency cell, its p95 and p99 — every number it prints,
-        each carrying its own spread verdict."""
+        each carrying its own range."""
         extra = [self.sub[k] for k in ("p95", "p99") if k in self.sub]
         return [self, *extra]
 
-    def reproducible(self):
-        """Every number this cell prints holds up run to run as printed."""
-        return not any(p.visibly_unstable() for p in self.parts())
-
-    def visibly_unstable(self):
-        """Failed the spread rule *and* the runs disagree at the precision printed —
-        a number that came out identical on every run as published is reproducible as
-        published, whatever the underlying ratio, and marking it would be a marker
-        with nothing behind it. The second clause suppresses nothing at three
-        significant figures (it did when everything printed as whole milliseconds);
-        it is the guard that keeps the marker honest if a formatter ever coarsens."""
-        return not self.spread_ok() and self.fmt(min(self.vals)) != self.fmt(max(self.vals))
-
-    def marked(self, with_range=False):
-        """The numbers, each with `~` when that one is visibly unstable. `with_range`
-        appends that number's range — the markdown has no hover text, and a marker with
-        no quantity cannot tell a 16 % spread from a 300 % one."""
+    def with_ranges(self):
+        """The numbers, each with the range its runs spanned where they disagree at the
+        precision printed — markdown has no hover text, so the range has to be in the
+        cell or it is not available at all. A number identical on every run as published
+        has nothing to add."""
         out = []
         for part in self.parts():
             txt = part.value()
-            if part.visibly_unstable():
-                txt += "~"
-                if with_range:
-                    txt += f" ({part.fmt(min(part.vals))}–{part.fmt(max(part.vals))})"
+            if len(part.vals) > 1 and part.fmt(min(part.vals)) != part.fmt(max(part.vals)):
+                txt += f" ({part.fmt(min(part.vals))}–{part.fmt(max(part.vals))})"
             out.append(txt)
         txt = " / ".join(out)
-        if with_range and 0 < len(self.vals) < self.runs:
-            # One value cannot satisfy a reproducibility rule however many runs were
-            # asked for — say which, rather than let the number look agreed.
+        if 0 < len(self.vals) < self.runs:
+            # A cell missing from some of the selected runs is not the same measurement
+            # as one present in all of them — say which, rather than let it look agreed.
             txt += f" [{len(self.vals)}/{self.runs} runs]"
         return txt
 
@@ -308,12 +301,12 @@ def latency_cell(per_run, flag, fmt=sig3):
 
 
 def md_cell(c, notes, source=None, oracle_cell=None):
-    """`p50 / p95 / p99 (err) ⚠[n]` — the numbers, then markers: `~` on each number that
-    failed the spread rule (with its range, since markdown has no hover), and `⚠[n]`
+    """`p50 / p95 / p99 (err) ⚠[n]` — the numbers, each with the range its runs spanned
+    where they disagreed (markdown has no hover, so it goes in the cell), and `⚠[n]`
     pointing at the note saying why the cell is not comparable, hence not publishable."""
     if not c.vals:
         return "—"
-    txt = c.marked(with_range=True)
+    txt = c.with_ranges()
     if "p95" in c.sub:
         txt += f" ({c.sub['err']:.2f}%)"
     gain = speedup(c, oracle_cell)
@@ -470,13 +463,13 @@ def render_md(m):
     p(f"Host {meta.get('cpu', '?')} · server on cpus {meta.get('server_cpus', '?')} · {meta.get('memory_limit', '?')} limit · "
       f"test data {meta.get('testdata_counts', {})} · windows {meta.get('window_s', '?')} s · "
       + " · ".join(f"{lvl} {m['levels'][lvl]['rate']} screens/s" for lvl in LOAD_LEVELS if lvl in m["levels"]))
-    p(f"Cells are the median across runs. A `~` after a number means its spread across runs exceeded "
-      f"{SPREAD_MAX:.0%} of the median — that number is not reproducible, and its range follows. `⚠[n]` means "
-      f"the server did different work than {ORACLE_LABEL} (status / record count / missing fields), so the "
-      "number is not comparable: it is kept for the work list, not for publication, and note `n` says why. "
-      f"`X.Y× faster` compares the cell with {ORACLE_LABEL} on the same row. It is shown on marked cells "
-      "too — the note and the mark say the two servers did not do identical work, so read it as an "
-      "indication rather than a like-for-like result.\n")
+    p("Cells are the median across runs"
+      + ("; where the runs disagreed, the range they spanned follows in brackets" if len(m["runs"]) > 1 else "")
+      + f". `⚠[n]` means the server did different work than {ORACLE_LABEL} (status / record count / "
+      "missing fields), so the number is not comparable: it is kept for the work list, not for publication, "
+      f"and note `n` says why. `X.Y× faster` compares the cell with {ORACLE_LABEL} on the same row. It is "
+      "shown on flagged cells too — the note says the two servers did not do identical work, so read it as "
+      "an indication rather than a like-for-like result.\n")
     head = "| {} | " + " | ".join(f"{label} p50 / p95 / p99 ms (err)" for _, label in servers) + " |\n|" + "---|" * (len(servers) + 1)
     for level, lv in m["levels"].items():
         p(f"### Latency — {level} ({lv['rate']} screens/s)\n")
@@ -558,12 +551,11 @@ h3{font:600 12.5px/1.2 system-ui,-apple-system,"Segoe UI",sans-serif;text-transf
    label, the value and the range on the tile's own rows, which is what makes the three
    range lines start level; bottom-pinning them only levelled the bottoms. `row-gap:0`
    because a subgrid inherits its parent's gutter, and 12px of column gutter arriving as
-   vertical space would push the three rows apart. The range line comes in two classes —
-   `.tail` for a reproducible number's range, `.why` for an unreproducible one's — and a
-   tile can hold both, so they are levelled here too: subgrid lines up the boxes, but
-   `.why`'s own margin and line-height would still drop its glyphs 2px. */
+   vertical space would push the three rows apart. The range line's leading is set here
+   too — 1.35 against the body's 1.55 — so it reads as a caption under the number rather
+   than as another line of body text. */
 .stat{display:grid;grid-template-rows:subgrid;grid-row:span 3;row-gap:0}
-.stat .tail,.stat .why{margin-top:0;line-height:1.35}
+.stat .tail{line-height:1.35}
 .stat .who{font-size:11.5px;color:var(--muted)}
 .stat .val{font:500 24px/1.2 ui-monospace,"SF Mono",Menlo,Consolas,monospace;font-variant-numeric:tabular-nums;margin-top:2px}
 /* The comparison starts its own line rather than trailing the number, so the number
@@ -586,7 +578,6 @@ h3{font:600 12.5px/1.2 system-ui,-apple-system,"Segoe UI",sans-serif;text-transf
 .ratio.win{color:var(--good);font-weight:600}
 .ratio.provisional,.delta.provisional{color:var(--flag);font-style:italic;font-weight:500}
 .delta{font:12px ui-monospace,"SF Mono",Menlo,Consolas,monospace;margin-left:6px}.delta.good{color:var(--good)}.delta.bad{color:var(--bad)}
-.why{font:12px/1.35 system-ui,-apple-system,"Segoe UI",sans-serif;color:var(--flag);white-space:normal;max-width:34ch;margin-top:3px}
 .legend{display:flex;flex-wrap:wrap;gap:18px;font-size:12.5px;color:var(--muted);margin:8px 0 14px}
 .legend .chip{display:inline-block;width:10px;height:10px;border-radius:2px;background:var(--flag-bg);border:1px solid var(--flag);vertical-align:-1px;margin-right:6px}
 .scroll{overflow-x:auto;background:var(--panel);border:1px solid var(--rule);border-radius:6px}
@@ -597,6 +588,7 @@ thead th.ferrofin{color:var(--accent-ink)}
 tbody th{font-weight:500;white-space:nowrap}
 td.num{font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace;font-variant-numeric:tabular-nums;white-space:nowrap}
 .p50{font-weight:500}.tail{color:var(--muted)}
+td.num.has-title{cursor:help}  /* only where the title actually says something */
 .err{color:var(--err);font-size:12px;margin-left:6px;font-weight:600}
 td.flagged{background:var(--flag-bg)}td.flagged .p50,td.flagged .tail{opacity:.7}
 details{margin-top:10px}summary{cursor:pointer;color:var(--accent-ink);font-size:13.5px}
@@ -604,8 +596,6 @@ details{margin-top:10px}summary{cursor:pointer;color:var(--accent-ink);font-size
 .work h3 .n{text-transform:none;letter-spacing:0;font-weight:400;color:var(--muted);margin-left:8px}
 .work ul{margin:0;padding-left:18px;font-size:13.5px}.work li{margin:3px 0;overflow-wrap:anywhere}
 code{font:12.5px ui-monospace,"SF Mono",Menlo,Consolas,monospace}
-.mark{color:var(--flag);font-weight:700;cursor:help;margin-left:1px}
-td .p50.wobbly{text-decoration:underline dotted var(--flag) 1px;text-underline-offset:3px}
 sup.fn{margin-left:3px}sup.fn a{color:var(--flag);font-weight:600;text-decoration:none}
 ol.notes{font-size:13px;color:var(--muted);max-width:90ch;padding-left:22px}
 ol.notes li{margin:8px 0;overflow-wrap:anywhere}ol.notes li:target{color:var(--ink);font-weight:500}
@@ -617,12 +607,12 @@ def provisional(c, oracle_cell):
     """Whether a comparison of these two cells is caveated — either side measured
     different work than the other, so the number is informative but not like for like.
     The cell keeps its amber ground and its note; the comparison is shown anyway,
-    because "how far apart are they" is still the question being asked."""
-    return bool(
-        c.flag
-        or not c.reproducible()
-        or (oracle_cell is not None and (oracle_cell.flag or not oracle_cell.reproducible()))
-    )
+    because "how far apart are they" is still the question being asked. Run-to-run
+    spread is not a caveat here: it is reported, not judged (see the module docstring).
+    Both places this comparison is drawn put the range in front of the reader — beneath
+    the number in a headline tile, on the cell's hover text in a table — so a wide spread
+    is there to be weighed without colouring the comparison."""
+    return bool(c.flag or (oracle_cell is not None and oracle_cell.flag))
 
 
 def displayed(c):
@@ -708,12 +698,9 @@ def td_html(c, oracle_cell, base, notes, source=None):
         return "<td class='num'>—</td>"
     e = html.escape
     def one(part, cls):
-        """One number, with `~` and its range on hover when it is visibly unstable."""
-        if not part.visibly_unstable():
-            return f"<span class='{cls}'>{e(part.value())}</span>"
-        rng = f"{part.fmt(min(part.vals))}–{part.fmt(max(part.vals))} over {len(part.vals)} runs"
-        return (f"<span class='{cls} wobbly' title='not reproducible: {e(rng)}'>{e(part.value())}"
-                f"<span class='mark'>~</span></span>")
+        """One number. The ranges live on the `<td>`'s own hover text, which labels all
+        three parts at once; a second title on the span would mask it with less."""
+        return f"<span class='{cls}'>{e(part.value())}</span>"
 
     parts = c.parts()
     body = one(parts[0], "p50")
@@ -723,13 +710,13 @@ def td_html(c, oracle_cell, base, notes, source=None):
         body += f" <span class='err'>{c.sub['err']:.2f}% err</span>"
     body += ratio_html(c, oracle_cell) + delta_html(c, base)
     cls = "num"
-    if not c.reproducible():
-        cls += " unstable"
     if c.flag:
         cls += " flagged"
         n = notes.add(c.flag, source)
         body += f"<sup class='fn'><a href='#n{n}'>{n}</a></sup>"
     title = c.spreads()
+    if title:
+        cls += " has-title"
     attr = f" title='{e(title)}'" if title else ""
     return f"<td class='{cls}'{attr}>{body}</td>"
 
@@ -791,10 +778,12 @@ def render_html(m, base=None, picker=""):
     parts = ["<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'>",
              f"<title>{e(title)}</title><style>{CSS}</style></head><body><main>{picker}",
              f"<h1>Ferrofin vs Jellyfin — {len(m['runs'])} run{'s' if len(m['runs']) != 1 else ''}, commit {e(meta.get('sha', '?'))}</h1>",
-             "<p class='lede'>Every number is the median across the runs given. An amber cell is <em>not comparable</em>: "
+             "<p class='lede'>Every number is the median across the runs given"
+             + (", and where those runs disagreed you can hover a cell for the range they spanned"
+                if len(m["runs"]) > 1 else "")
+             + ". An amber cell is <em>not comparable</em>: "
              f"the server did different work than {ORACLE_LABEL} — the number stays for the work list, not for the README, "
-             "and the superscript points at the reason under Notes. A <b>~</b> on a number means its spread across runs "
-             f"exceeded {SPREAD_MAX:.0%} of the median, so that number is not reproducible — hover the cell for the ranges. "
+             "and the superscript points at the reason under Notes. "
              f"<b>X.Y× faster</b> compares the cell with {ORACLE_LABEL} on the same row (memory says lighter); "
              "on an amber cell it is shown in amber italics, because the two servers did not do identical work. "
              "A coloured % is the change against the baseline run.</p>",
@@ -817,11 +806,7 @@ def render_html(m, base=None, picker=""):
                 extra += f"<sup class='fn'><a href='#n{n}'>{n}</a></sup>"
             rng = c.spread_text()
             if rng:
-                if c.spread_ok():
-                    why = f"<div class='tail' style='font-size:12px'>{rng}</div>"
-                else:
-                    val += "<span class='mark' title='not reproducible'>~</span>"
-                    why = f"<div class='why'>{rng}</div>"
+                why = f"<div class='tail' style='font-size:12px'>{rng}</div>"
             stats += f"<div class='stat {k}'><div class='who'>{e(lbl)}</div><div class='val'>{val}<span class='unit'>{unit}</span>{extra}</div>{why}</div>"
         tiles.append(f"<section class='tile'><h3>{e(name)}</h3><div class='stats'>{stats}</div></section>")
     parts.append(f"<div class='tiles'>{''.join(tiles)}</div>")
@@ -829,7 +814,7 @@ def render_html(m, base=None, picker=""):
         if not lv["any_data"]:
             continue
         parts.append(f"<h2>Screens — {level}, {e(str(lv['rate']))} screens/s</h2>")
-        parts.append("<div class='legend'><span>p50 <span style='color:var(--muted)'>/ p95 / p99</span> ms per screen (all of its requests, concurrently)</span><span><b>~</b> not reproducible across runs</span><span><span class='chip'></span>not comparable — superscript links to the reason</span></div>")
+        parts.append("<div class='legend'><span>p50 <span style='color:var(--muted)'>/ p95 / p99</span> ms per screen (all of its requests, concurrently)</span>" + ("<span>hover a number for the range its runs spanned</span>" if len(m["runs"]) > 1 else "") + "<span><span class='chip'></span>not comparable — superscript links to the reason</span></div>")
         bl = base_l.get(level, {})
         parts.append(table_html("screen", lv["screens"], servers, dict(bl.get("screens", [])), notes, f"{level} screens"))
         parts.append(f"<details><summary>Per endpoint, {level}</summary>{table_html('endpoint', lv['endpoints'], servers, dict(bl.get('endpoints', [])), notes, f'{level} endpoints')}</details>")
@@ -879,7 +864,7 @@ def picker_html(runs, selected, baseline):
     boxes = "".join(f"<label><input type='checkbox' name='run' value='{e(n)}'{' checked' if n in selected else ''}> {e(lbl)}</label>" for n, lbl in runs)
     opts = "<option value=''>— none —</option>" + "".join(f"<option value='{e(n)}'{' selected' if n == baseline else ''}>{e(n)}</option>" for n, _ in runs)
     return (f"<style>{PICKER_CSS}</style><form class='picker' method='get' action='/'><div class='row'>"
-            f"<div class='col'><h3>Runs to render (several = median + spread)</h3>{boxes or '<i>no runs yet</i>'}</div>"
+            f"<div class='col'><h3>Runs to render (several = median + ranges)</h3>{boxes or '<i>no runs yet</i>'}</div>"
             f"<div class='col'><h3>Baseline (change vs this run)</h3><select name='baseline'>{opts}</select><div style='margin-top:10px'><button type='submit'>Compare</button></div></div>"
             f"</div></form>")
 

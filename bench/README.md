@@ -4,7 +4,7 @@ This directory produces the comparison table in the root README: Ferrofin agains
 Jellyfin 12.0-rc7 (the source of truth — owner decision, 2026-09-02: Jellyfin 12 is
 10.12 in all but name, and where 10.11.8 differs from it, 10.11.8 is the one that is
 wrong) and Jellyfin 10.11.8 (the vendored API contract), on identical test data, on one host. Every number in that table has a one-sentence definition below, and every
-published number passed two checks the run itself performs:
+published number passed the one check the run itself performs:
 
 - **comparable** — the server returned the same status and record count as Jellyfin
   12.0-rc7 and a field set that is a superset of its, for every request behind the number.
@@ -13,9 +13,26 @@ published number passed two checks the run itself performs:
   being published, and note `n`, printed once at the end with every cell that points at
   it, says what differed. A window in which k6 could not hold the arrival rate, a
   Jellyfin-side failure, or a transcode with different parameters is flagged the same way.
-- **reproducible** — across three full runs the min–max spread is within 15 % of the
-  median; a number that misses it is marked `~` (with its range in the markdown, and on
-  hover in the viewer) and the measurement is fixed before the number is used.
+
+There is deliberately **no** second rule about run-to-run spread. Where the runs
+disagreed, the cell reports the range they spanned — in brackets in the markdown, beneath
+the number in the viewer's headline tiles, and on the cell's hover text in its tables —
+and the reader judges it. Where they agreed at the precision published, nothing is
+printed: agreement is the absence of a range, not a claim about one.
+
+A fixed 15 % band was tried as a **reproducible** verdict and withdrawn (owner,
+2026-09-04). It failed 57 of Ferrofin's 110 cells, and the failures sit almost entirely
+in the tails. Counting each failing number rather than each cell — a latency cell prints
+p50, p95 and p99 — those 57 cells hold 80 failures, of which **69 are p95 or p99** and
+only 11 are a median. A percentage of the median cannot tell a tail that moved because
+the host hiccuped from a tail that is honestly long, so the band was answering a question
+nobody had asked.
+
+It was not a busy-host artefact either. An idle trio (`quiet-1..3`) failed 41 of 76, and
+over every cell both trios produced it failed *more* often than the working trio did —
+54 % against 45 % (57 % against 46 % on the load levels alone). A wide range is still a
+reason not to publish a number; that is now a judgement made with the range in front of
+you rather than by a threshold.
 
 ## What is measured
 
@@ -145,8 +162,9 @@ resolved name and the dirty flag are also written into `run.json`, so they survi
 renamed directory. `--out` overrides the whole thing.
 
 The viewer lists every run under `bench/runs`; tick the runs to render (several =
-median + spread) and optionally a baseline. Cells stay numeric in both renderers: the
-median, a `~` on any number that missed the spread rule, and `⚠[n]` pointing at a
+median + ranges) and optionally a baseline. Cells stay numeric in both renderers: the
+median, the range its runs spanned (in brackets in the markdown; under the number in the
+viewer's tiles and on the cell's hover text in its tables), and `⚠[n]` pointing at a
 numbered note. Both also print each cell's speed against Jellyfin 12.0-rc7 as
 `X.Y× faster` (memory says lighter), shown only where both numbers stand; with a
 baseline the viewer adds each server's percentage change against an earlier run of
