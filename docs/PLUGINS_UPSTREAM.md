@@ -2,23 +2,24 @@
 
 One row per Jellyfin plugin ported into Ferrofin as a compiled-in extension
 (`crates/ferrofin-extensions/`). This is the single source of truth for *which
-upstream revision each port is based on*. The `sync-plugin-upstream` skill
-(`.claude/skills/sync-plugin-upstream/`) parses this file, fetches each clone,
-and ports behavioral deltas when upstream moves.
+upstream revision each port is based on*.
+
+Syncing with upstream: clone the upstream repo, `git log <ported rev>..HEAD`, port each
+behavioural change (or classify it as not-applicable / accepted divergence in the notes
+below), then bump **Ported rev** and the matching asset pin.
 
 Conventions:
-- **Clone** — local working copy under `~/dev/3rdparty/` (clone it if missing).
 - **Ported rev** — the upstream commit the Ferrofin implementation is faithful to.
   Bump it only after the delta is actually ported (or classified as
   not-applicable/accepted-divergence below).
 - Dashboard-asset pins live in `crates/ferrofin-extensions/build.rs`
   (`*_REPO`/`*_REV` consts) and must be kept equal to **Ported rev**.
 
-| Plugin | Upstream repo | Clone | Ported rev | Upstream version | Status |
-|---|---|---|---|---|---|
-| Intro Skipper | https://github.com/intro-skipper/intro-skipper | `~/dev/3rdparty/intro-skipper` | `db09359` | 10.11/prerelease | ported |
-| File Transformation | https://github.com/IAmParadox27/jellyfin-plugin-file-transformation | `~/dev/3rdparty/jellyfin-plugin-file-transformation` | `f4f01c3` | 2.5.10.0 | ported |
-| Merge Versions | https://github.com/danieladov/jellyfin-plugin-mergeversions | `~/dev/3rdparty/jellyfin-plugin-mergeversions` | `e6f58d6` | 12.0.0 | ported |
+| Plugin | Upstream repo | Ported rev | Upstream version | Status |
+|---|---|---|---|---|
+| Intro Skipper | https://github.com/intro-skipper/intro-skipper | `db09359` | 10.11/prerelease | ported |
+| File Transformation | https://github.com/IAmParadox27/jellyfin-plugin-file-transformation | `f4f01c3` | 2.5.10.0 | ported |
+| Merge Versions | https://github.com/danieladov/jellyfin-plugin-mergeversions | `e6f58d6` | 12.0.0 | ported |
 
 ## Per-plugin notes
 

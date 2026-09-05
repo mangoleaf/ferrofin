@@ -8,7 +8,7 @@
 //! **Not yet ported here:** the hardware-acceleration matrix
 //! (nvenc/qsv/vaapi/videotoolbox/rkmpp/amf), tonemapping/HDR filters, and
 //! hardware scale/filter chains — the work items of
-//! `brain/plans/PLAN_HWACCEL.md`, whose foundation (the probed environment and
+//! the hardware-transcoding roadmap, whose foundation (the probed environment and
 //! the version gates) already lives in [`hw`](super::hw). Where a software-path
 //! branch would consult one of those hardware helpers (e.g. the DOVI
 //! dynamic-metadata-removal check in `CanStreamCopyVideo`, which that plan's
@@ -243,7 +243,7 @@ impl<C: EncoderCapabilities> EncodingHelper<C> {
     /// fallback every encoder with no arm of its own takes — NVENC among them.
     /// The remaining per-vendor arms (the `h264_qsv` minimum-bitrate clamp and
     /// `-mbbrc`, and the vaapi/amf/videotoolbox rate-control shapes) are the
-    /// work items of `PLAN_HWACCEL.md` phases 4-7. Returns empty when no output
+    /// work items of the hardware-transcoding roadmap phases 4-7. Returns empty when no output
     /// bitrate is set.
     #[must_use]
     pub fn video_bitrate_param(&self, state: &EncodingJobInfo, video_codec: &str) -> String {
@@ -420,7 +420,7 @@ impl<C: EncoderCapabilities> EncodingHelper<C> {
     /// quality argument for `video_encoder`.
     ///
     /// Port of the **software slice** of `GetVideoQualityParam`. The hardware
-    /// low-power/i915-workaround preamble belongs to `PLAN_HWACCEL.md` phases
+    /// low-power/i915-workaround preamble belongs to the hardware-transcoding roadmap phases
     /// 4-5 — low-power covers vaapi and qsv, and the `-async_depth 1` i915
     /// workaround is qsv-only (it is inert when the
     /// hardware-acceleration type is `none`, i.e. the software path); the
@@ -496,7 +496,7 @@ impl<C: EncoderCapabilities> EncodingHelper<C> {
     /// Decides whether `video_stream` can be stream-copied (direct-play video).
     ///
     /// Port of `CanStreamCopyVideo`. The DOVI dynamic-metadata-removal branch
-    /// (which consults a hardware encoder capability that `PLAN_HWACCEL.md`
+    /// (which consults a hardware encoder capability that the hardware-transcoding roadmap
     /// phase 8 wires in) is handled
     /// conservatively: if a static-HDR stream is not directly range-compatible
     /// the copy is refused (matching the C# refuse-when-uncertain intent).
@@ -854,7 +854,7 @@ fn codec_specific_quality_args(
             // libx264 (and any other software encoder reaching here) accepts
             // the level as written. libx265 takes its level through
             // `-x265-params` only. The remaining per-vendor hardware remaps are
-            // the work items of `PLAN_HWACCEL.md` phases 4-7.
+            // the work items of the hardware-transcoding roadmap phases 4-7.
             let _ = write!(param, " -level {level}");
         }
     }
@@ -959,7 +959,7 @@ fn encoder_param(
         param.push_str(preset);
     }
     // The remaining hardware encoder branches (vaapi/qsv/amf/videotoolbox) are
-    // the per-vendor work items of `PLAN_HWACCEL.md` phases 4-7.
+    // the per-vendor work items of the hardware-transcoding roadmap phases 4-7.
 
     param
 }
@@ -1425,7 +1425,7 @@ fn profile_range_rotation_copy_ok(
 /// The video-range portion of the copy decision.
 ///
 /// Port of the range-type block of `CanStreamCopyVideo`; the DOVI
-/// dynamic-metadata-removal escape hatch (`PLAN_HWACCEL.md` phase 8) is
+/// dynamic-metadata-removal escape hatch (the hardware-transcoding roadmap phase 8) is
 /// replaced by a conservative refusal, matching the C# refuse-when-uncertain
 /// intent.
 fn range_type_copy_ok(video_stream: &MediaStream, requested: &[String]) -> bool {

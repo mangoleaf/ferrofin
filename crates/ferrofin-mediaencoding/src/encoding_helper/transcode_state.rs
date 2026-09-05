@@ -8,7 +8,7 @@
 //! hardware-acceleration matrix, HDR/tonemap plumbing, and session wiring; only
 //! the fields the *core software transcode + direct-play decision* touches are
 //! ported here. The rest arrive with the phases of
-//! `brain/plans/PLAN_HWACCEL.md` that need them.
+//! the hardware-transcoding roadmap that need them.
 //!
 //! Value types (`MediaStream`, `MediaSourceInfo`, codec/range/context enums) are
 //! **reused from `ferrofin-model`** rather than re-declared, per

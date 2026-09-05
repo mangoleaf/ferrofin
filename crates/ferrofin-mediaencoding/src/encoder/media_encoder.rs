@@ -8,7 +8,7 @@
 //! `GetExtraArguments` User-Agent/probe oracle.
 //!
 //! The hardware-acceleration matrix and HDR tonemapping are the work items of
-//! `brain/plans/PLAN_HWACCEL.md` (this unit gains its accelerated trickplay
+//! the hardware-transcoding roadmap (this unit gains its accelerated trickplay
 //! path in that plan's phase 9); Blu-ray (`BdInfo`) has no plan yet and belongs
 //! to disc-image playback rather than encoding. Every ffmpeg/ffprobe process
 //! spawn sits behind the [`Transcoder`] seam so unit tests inject a fake.
@@ -182,7 +182,7 @@ impl<T: Transcoder> MediaEncoderImpl<T> {
     /// offset.
     ///
     /// Two branches of the C# are missing here and are tracked separately: the
-    /// HDR tonemap branch belongs to `brain/plans/PLAN_HWACCEL.md` phase 2, and
+    /// HDR tonemap branch belongs to the hardware-transcoding roadmap phase 2, and
     /// `GetImageResolutionParameter` (the `ChapterImageResolution` setting →
     /// `-s WxH`) is not hardware work at all — it is open work item 4 in that
     /// plan's list, because the dashboard setting currently has no effect.

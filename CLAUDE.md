@@ -87,13 +87,13 @@ contract is either ported faithfully or is an open work item to port now — nev
 no-op, a "faithful-empty" shrug, or an "out-of-scope"/"subsystem decision" label. This is
 a standing directive from the project owner (2026-08-22), and it is retroactive: any
 `deferred`/`deferred-hollow`/`deferred-remote-or-feature-gated`/"documented out-of-scope"
-wording you find in `brain/DEFERRED.md`, code comments,
-or trait-default `Err("… is deferred")` bodies is **legacy debt to remove by porting the
-thing**, not a precedent to lean on.
+wording you find in older notes, code comments, or trait-default `Err("… is deferred")`
+bodies is **legacy debt to remove by porting the thing**, not a precedent to lean on.
 
 - When a parity note says *deferred*, first verify the real code state (the notes go stale —
   several were already ported when re-checked), then port whatever is actually missing from
-  the C# at `~/dev/3rdparty/jellyfin`, test it, and run it live.
+  the upstream C# (a checkout of github.com/jellyfin/jellyfin at `UPSTREAM_TAG`), test it,
+  and run it live.
 - The only accepted divergences are the ones listed under **Current scope** below (native .NET
   plugin loading, SSDP discovery, OMDb without a key). Adding to that list is the owner's call,
   never an agent's.

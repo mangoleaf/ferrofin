@@ -81,9 +81,24 @@ per-plugin list is in [`PLUGINS_UPSTREAM.md`](PLUGINS_UPSTREAM.md).
 
 ## Adding an extension
 
-The full workflow (trait seam → extension module → handlers → composition root → vendored
-page → tests) is documented for contributors and agents in the `plan-plugin-port` and
-`implement-plugin-port` skills under `.claude/skills/`.
+Porting a Jellyfin plugin as a compiled-in extension follows the shape of the three
+existing ones (`crates/ferrofin-extensions/src/`):
+
+1. **Map the upstream surface** — config model, scheduled tasks, API routes, settings page,
+   and which server internals it hooks. Decide up front which upstream behaviours are
+   Jellyfin-internal representation rather than API surface; those become documented
+   accepted divergences, not ports (see `docs/PLUGINS_UPSTREAM.md` for the pattern).
+2. **Trait seam** — any server capability the extension needs that is not already on a
+   `ferrofin-traits` trait gets one there, object-safe, implemented in `ferrofin-core`.
+3. **Extension module** — implement `Extension` in `ferrofin-extensions`; register tasks
+   and config; port tests from the upstream test suite where it has one.
+4. **Handlers** — thin routes in `ferrofin-api/src/handlers/`, registered in
+   `REAL_ROUTES`; the extension's enabled flag gates them (disabled → 404).
+5. **Composition root** — wire it in `apps/ferrofin-server`.
+6. **Vendored settings page** — pin the upstream asset revision in
+   `crates/ferrofin-extensions/build.rs` and record it in `docs/PLUGINS_UPSTREAM.md`.
+7. **Run it live** — boot the server, enable the plugin in the dashboard, exercise its
+   routes and tasks over real HTTP; green tests alone are not sufficient here.
 
 ## WASM plugins (Tier 1b)
 
@@ -335,10 +350,8 @@ never committed to this repo.
 
 **Contract stability:** the world is `0.x` and explicitly unstable until a few real
 third-party plugins exist; after that it freezes like the OpenAPI contract (additive
-evolution only). Planned capability growth (host-mediated HTTP, then a
-metadata-provider export) is tracked in `brain/plans/PLAN_PLUGIN_TIERS.md`
-phases E2–E3; read-only item queries and media-segment writes have since
-shipped.
+evolution only). The capability list above is what has shipped; proposals for new
+host capabilities are issues on this repository and land as additive WIT changes.
 
 ## Non-goals for the WASM tier
 

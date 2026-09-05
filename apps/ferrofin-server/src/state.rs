@@ -511,7 +511,7 @@ pub async fn build_app_state(
         &config.studios_repo_url,
     ));
     // Tier-1b: runtime-installed WASM plugins from `{data_dir}/plugins/*.wasm`
-    // (see brain/plans/PLAN_PLUGIN_TIERS.md). Loading compiles components —
+    // (see docs/EXTENSIONS.md). Loading compiles components —
     // CPU-heavy, so it runs on the blocking pool. A load failure degrades to
     // "no WASM plugins", never a failed boot; per-file failures are logged
     // and skipped inside the loader.

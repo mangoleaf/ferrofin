@@ -300,7 +300,7 @@ impl FfmpegCapabilities {
     /// the product version. Ferrofin reports `None` on macOS today, so the
     /// VideoToolbox H.264 Hi10P gate (`>= 14.6`) never opens and Hi10P falls
     /// back to software decoding. Closing that is a named work item of
-    /// `brain/plans/PLAN_HWACCEL.md` phase 6 (VideoToolbox).
+    /// the hardware-transcoding roadmap phase 6 (VideoToolbox).
     #[must_use]
     pub fn os_version(&self) -> Option<FfmpegVersion> {
         self.os_version

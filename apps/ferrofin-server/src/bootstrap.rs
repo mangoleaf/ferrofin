@@ -472,17 +472,17 @@ fn spawn_pool_sampler(db: &Database) {
 ///   stale. [`crate::vaapi_probe`] therefore probes them lazily, once per
 ///   device path, at the point of first VAAPI use. **That spawn has landed**;
 ///   what is still outstanding is wiring its result into the planner, which
-///   arrives with the VAAPI filter chains in `PLAN_HWACCEL.md` phase 4b. Until
+///   arrives with the VAAPI filter chains in the hardware-transcoding roadmap phase 4b. Until
 ///   then `is_vaapi_device_*` and `vaapi_vulkan_*` read `false` on the planning
 ///   path — moot for now, since VAAPI is gated out of the hardware path
 ///   entirely.
 /// - The VideoToolbox AV1-decode probe is not an ffmpeg spawn at all: upstream
-///   asks macOS directly through Objective-C. It belongs to `PLAN_HWACCEL.md`
+///   asks macOS directly through Objective-C. It belongs to the hardware-transcoding roadmap
 ///   phase 6, alongside reading the macOS release in [`read_os_version`].
 ///
 /// `SetFFmpegPath`'s `CheckSupportedRuntimeKey` (the transcode-throttle pause
 /// key) and `CheckSupportedProberOption` calls are outside the hardware matrix
-/// and are recorded as numbered work items in `brain/plans/PLAN_HWACCEL.md`.
+/// and are recorded as numbered work items in the hardware-transcoding roadmap.
 ///
 /// # Errors
 ///

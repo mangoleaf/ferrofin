@@ -1,5 +1,5 @@
 /// The Ferrofin WASM plugin contract — Tier 1b of the plugin architecture
-/// (see brain/plans/PLAN_PLUGIN_TIERS.md).
+/// (see docs/EXTENSIONS.md).
 ///
 /// STABILITY: this world is 0.x and UNSTABLE. It freezes (additive evolution
 /// only, like the vendored OpenAPI contract) once two or three real

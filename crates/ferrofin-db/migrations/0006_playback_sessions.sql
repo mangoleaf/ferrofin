@@ -1,4 +1,4 @@
--- Playback-decision metrics (brain/PLAN_PERFORMANCE.md, Track A).
+-- Playback-decision metrics.
 --
 -- One row per PlaybackInfo *decision*, keyed by the PlaySessionId the server
 -- mints in the PlaybackInfo response (the client threads it through every

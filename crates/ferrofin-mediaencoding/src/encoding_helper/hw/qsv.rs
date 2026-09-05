@@ -7,7 +7,7 @@
 //! on Windows on D3D11, and which of those is underneath decides the whole
 //! filter vocabulary — hence two chains rather than one with flags. The Windows
 //! variant (`GetIntelQsvDx11VidFiltersPrefered`) is the work item of
-//! `PLAN_HWACCEL.md` phase 5b.
+//! the hardware-transcoding roadmap phase 5b.
 //!
 //! Because QSV sits on VAAPI here, a job can arrive decoded by **either**, and
 //! the chain has to cope with both in the same pass:

@@ -1,6 +1,6 @@
 //! Host-level tests for the Tier-1b WASM plugin host, driven entirely by
 //! **inline WAT fixtures** compiled at test time via the `wat` crate — no
-//! `.wasm` binaries in the repo (artifact policy, PLAN_PLUGIN_TIERS.md).
+//! `.wasm` binaries in the repo (artifact policy, docs/EXTENSIONS.md).
 //!
 //! The fixture component implements the `ferrofin:plugin@0.2.0` world by
 //! hand at the canonical-ABI level. Its `run-task` export dispatches on the

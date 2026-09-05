@@ -4,7 +4,7 @@
 //! that the `PluginsController` / `PackageController` API surface needs, reduced
 //! to Ferrofin's Tier-1 model: plugins are Rust crates compiled into the server and
 //! registered at the composition root. There is no runtime assembly loading
-//! (that is Tier 2 — a WASM/`libloading` boundary, see `PLAN_FERROFIN_PLUGINS.md`),
+//! (that is Tier 2 — a WASM/`libloading` boundary, see `docs/EXTENSIONS.md`),
 //! `remove_plugin` and package installation ARE supported for runtime-installed
 //! WASM (Tier-1b) plugins: `install_package` downloads a repository package,
 //! verifies + validates it, and stages it for the next restart; compiled-in

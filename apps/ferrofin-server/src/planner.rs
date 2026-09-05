@@ -27,7 +27,7 @@
 //! *not* do is the full device-profile negotiation, the rest of the
 //! hardware-acceleration matrix (QSV/VAAPI/AMF), or subtitle provider fan-out
 //! (only stored/embedded burn-in). The hardware matrix is the work of
-//! `brain/plans/PLAN_HWACCEL.md`; the subtitle-provider fan-out is work item 5
+//! the hardware-transcoding roadmap; the subtitle-provider fan-out is work item 5
 //! in that plan's list.
 
 use std::path::PathBuf;
@@ -1070,7 +1070,7 @@ impl FerrofinStreamStatePlanner {
         let nvenc_video = video_encoder.ends_with("_nvenc");
         // Everything the ported hardware matrix reads about the job. The
         // render-node arguments are VAAPI/QSV territory and unused by the CUDA
-        // branch; `PLAN_HWACCEL.md` phase 4 resolves them from the encoding
+        // branch; the hardware-transcoding roadmap phase 4 resolves them from the encoding
         // options, which are not readable this early today.
         let caps = probed_caps;
         let requested = hw::decoder::RequestedSize {

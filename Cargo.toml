@@ -142,7 +142,7 @@ tracing-opentelemetry = "0.33"
 # so `Registry` + `TextEncoder` come from a direct dep (dedupes with the exporter's ^0.14).
 prometheus = { version = "0.14", default-features = false }
 
-# ── WASM plugin host (Tier 1b — see brain/plans/PLAN_PLUGIN_TIERS.md) ──
+# ── WASM plugin host (Tier 1b — see docs/EXTENSIONS.md) ──
 # Component-model runtime for sandboxed third-party plugins. Always compiled
 # in (decision 2026-08-07); MSRV 1.94 ≤ our pinned toolchain.
 wasmtime = "47"

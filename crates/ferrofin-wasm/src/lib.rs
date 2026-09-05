@@ -1,5 +1,5 @@
 //! The Tier-1b **WASM plugin host** — runtime-installable, sandboxed plugins
-//! for Ferrofin (see `brain/plans/PLAN_PLUGIN_TIERS.md`).
+//! for Ferrofin (see `docs/EXTENSIONS.md`).
 //!
 //! Users drop `ferrofin:plugin`-world components into `{data_dir}/plugins/`;
 //! at startup [`WasmPluginHost::load`] compiles and instantiates each one,
