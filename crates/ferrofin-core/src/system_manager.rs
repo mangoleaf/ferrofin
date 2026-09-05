@@ -688,6 +688,20 @@ mod tests {
         assert!(out[0].free_space > 0);
         assert_eq!(out[1].free_space, -1);
         assert!(out[2].free_space > 0);
-        assert_eq!(out[0], out[2]);
+        // The same path twice: identity fields and the filesystem total must agree.
+        // Free space itself is sampled twice and other tests write to the temp
+        // filesystem concurrently, so exact equality of the two samples is a race.
+        assert_eq!(
+            (&out[0].path, &out[0].resolved_path),
+            (&out[2].path, &out[2].resolved_path)
+        );
+        assert_eq!(
+            (&out[0].storage_type, &out[0].device_id),
+            (&out[2].storage_type, &out[2].device_id)
+        );
+        assert_eq!(
+            out[0].free_space + out[0].used_space,
+            out[2].free_space + out[2].used_space
+        );
     }
 }
