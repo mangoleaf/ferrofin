@@ -1,4 +1,8 @@
-# The reference Tier-1b WASM plugin — a `ferrofin:plugin` world guest.
+# The CONFORMANCE guest for the end-to-end host test (crates/ferrofin-wasm/tests/
+# wasm_hello_guest.rs): it binds the server's own WIT (../../crates/ferrofin-wasm/wit)
+# and implements every export, so CI compiles a real component against the contract
+# and the WIT cannot drift silently. It is a test fixture, not a starting point —
+# plugin authors should clone github.com/mangoleaf/ferrofin-plugin-template.
 #
 # This crate is a TOOLCHAIN ISLAND: it is excluded from the server workspace
 # (its own [workspace] table below) and carries its own rust-toolchain.toml

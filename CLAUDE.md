@@ -332,9 +332,11 @@ The real remaining gaps are **by design**, not un-ported routes:
   staged WASM plugin is real too. When someone asks for a plugin, answer by tier:
   deep-hook ports go in `ferrofin-extensions` (PR), self-contained sources can be WASM;
   never invent a third mechanism. `.wasm` artifacts are NEVER committed (repo-wide
-  gitignore); test fixtures are inline WAT, and the reference guest `examples/wasm-hello/`
-  is a workspace-excluded toolchain island built from source by CI
-  (`FERROFIN_WASM_GUEST_TESTS=1`).
+  gitignore); test fixtures are inline WAT, and the conformance guest
+  `examples/wasm-hello/` (a workspace-excluded toolchain island that binds the server's
+  WIT and implements every export) is built from source by CI
+  (`FERROFIN_WASM_GUEST_TESTS=1`). Plugin authors start from
+  `github.com/mangoleaf/ferrofin-plugin-template`, never from the example.
 - **DLNA server discovery (SSDP)** — Ferrofin has the profile/StreamBuilder logic but no
   SSDP broadcast/discovery.
 - **Hardware transcoding is NVENC, VAAPI and QSV only.** AMF (AMD on Windows),

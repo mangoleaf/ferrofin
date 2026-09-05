@@ -326,12 +326,12 @@ template**: [`ferrofin-plugin-template`](https://github.com/mangoleaf/ferrofin-p
 is a ready-to-build Rust skeleton with the toolchain, target, WIT bindings and a
 `build.sh` already wired, and its CI publishes a plugin-repository manifest
 (`https://mangoleaf.github.io/ferrofin-plugin-template/manifest.json`) you can point a
-server at to install it from the dashboard. The in-tree reference plugin is
-`examples/wasm-hello/` — a ~70-line Rust crate (`wit-bindgen` + `wasm32-wasip2`, its own
-toolchain island) that logs a config-driven greeting from a scheduled task and counts
-events. Build it with `cargo build --release --target wasm32-wasip2` inside that
-directory. `.wasm` artifacts are never committed to this repo; CI builds the example from
-source on every run so the WIT contract cannot drift silently.
+server at to install it from the dashboard. Separately, `examples/wasm-hello/` in this
+repo is the **conformance guest** for the end-to-end host test
+(`crates/ferrofin-wasm/tests/wasm_hello_guest.rs`): it binds the server's own WIT and
+implements every export, and CI compiles it from source on every run so the contract
+cannot drift silently. It is a test fixture, not a starting point. `.wasm` artifacts are
+never committed to this repo.
 
 **Contract stability:** the world is `0.x` and explicitly unstable until a few real
 third-party plugins exist; after that it freezes like the OpenAPI contract (additive
