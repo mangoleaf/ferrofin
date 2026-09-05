@@ -61,6 +61,11 @@ FROM ${WEB_IMAGE} AS web
 FROM rust:1.97.1-bookworm AS build
 WORKDIR /src
 COPY . .
+# .git is excluded from the build context, so bake the release version in from
+# the same SERVICE_VERSION build-arg CI already passes (empty for a local build,
+# which ferrofin-health's build.rs treats as unset → crate version fallback).
+ARG SERVICE_VERSION=
+ENV FERROFIN_GIT_DESCRIBE=${SERVICE_VERSION}
 RUN cargo build --release -p ferrofin-server
 
 # ── runtime ─────────────────────────────────────────────────────────────
