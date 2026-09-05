@@ -140,6 +140,36 @@ jobs:
           docker exec smoke ffmpeg -version | head -1 | tee ffmpeg.txt
           grep -qi jellyfin ffmpeg.txt || { echo "ffmpeg in the image is not jellyfin-ffmpeg"; exit 1; }
           docker rm -f smoke
+      # Upgrade smoke: a database created by the PREVIOUS release must open under
+      # this one. v1.0.0 shipped with a modified released migration and locked every
+      # existing install out; a fresh-database boot cannot see that, this can.
+      - name: upgrade a database from the previous release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          prev=$(gh release list --exclude-drafts --exclude-pre-releases --limit 1 --json tagName -q '.[0].tagName')
+          if [ -z "$prev" ]; then echo "no previous release to upgrade from"; exit 0; fi
+          img="ghcr.io/$GITHUB_REPOSITORY"
+          echo "previous release: $prev"
+          docker volume create upg >/dev/null
+          docker run -d --rm --name old -v upg:/data "$img:$prev"
+          for _ in $(seq 1 60); do
+            docker exec old curl -fsS http://127.0.0.1:8096/health/live >/dev/null 2>&1 && break; sleep 1
+          done
+          docker rm -f old
+          docker run -d --rm --name new -v upg:/data -p 8096:8096 "$img:$GITHUB_REF_NAME"
+          ok=
+          for _ in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:8096/health/live > up.json 2>/dev/null; then ok=1; break; fi
+            docker ps -q --filter name=new | grep -q . || break
+            sleep 1
+          done
+          if [ -z "$ok" ] || ! grep -q "\"build\":\"$GITHUB_REF_NAME\"" up.json; then
+            echo "the $GITHUB_REF_NAME image cannot open a $prev database"; docker logs new 2>&1 | tail -20; exit 1
+          fi
+          echo "upgrade $prev → $GITHUB_REF_NAME: ok"
+          docker rm -f new
 
   # ── server binaries, one archive per target, attached to the Release ──
   # Linux x86_64 and aarch64 are the supported set. macOS and Windows are
