@@ -6,7 +6,7 @@
 
 [![License: GPL-3.0-only](https://img.shields.io/badge/license-GPL--3.0--only-blue.svg)](LICENSE)
 [![Rust edition 2024](https://img.shields.io/badge/rust-edition%202024-orange.svg)](rust-toolchain.toml)
-[![API surface: 412/412](https://img.shields.io/badge/API%20surface-412%2F412%20REAL-brightgreen.svg)](docs/FEATURES.md)
+[![API surface: 412/412](https://img.shields.io/badge/API%20surface-412%2F412-brightgreen.svg)](docs/FEATURES.md)
 
 [![CI](https://github.com/mangoleaf/ferrofin/actions/workflows/ci.yml/badge.svg)](https://github.com/mangoleaf/ferrofin/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/mangoleaf/ferrofin)](https://github.com/mangoleaf/ferrofin/releases)
