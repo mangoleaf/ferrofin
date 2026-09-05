@@ -53,18 +53,17 @@ this is an "AI slop fork", and I understand the skepticism. I had a working serv
 days and could have released it then. Instead I spent the next six weeks using it as my home
 media server, testing features, fixing performance issues and bugs, reshaping the architecture, adding tests and
 gates, benchmarking, and closing the parity gap against Jellyfin. I fully intend to continue
-using Ferrofin personally and continue to improve it over time.
+using Ferrofin personally and to improve it over time.
 
 I will not claim 100% parity with Jellyfin or that Ferrofin is bug free. At ~360k lines of
 Rust there was more code than I could read, and the agents made questionable decisions at
-times without asking. The improvements over Jellyfin are real and the benchmarks back them
-up but there is still room for improvement.
+times without asking. The performance gains over Jellyfin have been verified and the benchmarks back them
+up, but there is still room for improvement.
 
-Up until this first public release I have worked on Ferrofin solo, and some features I cannot
-test reliably, for example Live TV/DVR against a real tuner as I do not own one. There are
-also a large number of settings that I could use more attention. If something does not behave
-the way Jellyfin does, an issue describing the current and expected behaviour is the most
-useful thing you can send. PRs are welcome too if anyone wants to get involved!
+Up until this first public release I have worked on Ferrofin solo. Most of my attention was on my 
+personal definition of the golden path. Areas that could use more attention include Live TV and the large number of settings.
+If something does not behave the way Jellyfin does, opening an issue describing the current and expected behaviour would be appreciated.
+PRs or plugin development are welcome too if anyone wants to get involved!
 
 ## Benchmarks
 
