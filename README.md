@@ -6,7 +6,7 @@
 
 [![License: GPL-3.0-only](https://img.shields.io/badge/license-GPL--3.0--only-blue.svg)](LICENSE)
 [![Rust edition 2024](https://img.shields.io/badge/rust-edition%202024-orange.svg)](rust-toolchain.toml)
-[![API surface: 412/412 REAL](https://img.shields.io/badge/API%20surface-412%2F412%20REAL-brightgreen.svg)](docs/FEATURES.md)
+[![API surface: 412/412](https://img.shields.io/badge/API%20surface-412%2F412%20REAL-brightgreen.svg)](docs/FEATURES.md)
 
 <!-- TODO: uncomment once the GitHub Actions CI run is green and v1.0.0 exists:
 [![CI](https://github.com/mangoleaf/ferrofin/actions/workflows/ci.yml/badge.svg)](https://github.com/mangoleaf/ferrofin/actions/workflows/ci.yml)
@@ -14,17 +14,6 @@
 -->
 
 </div>
-
-## A note from the author
-
-<!-- Ken: this section is yours. Replace this placeholder with your own words about what
-     Ferrofin is, where it stands today, and why you built it. Suggested shape, three short
-     paragraphs: (1) what it is in one breath, (2) current state and what you would and
-     would not run it for yet, (3) why you started it. Delete this comment when done. -->
-
-_(Author's notes go here.)_
-
----
 
 Ferrofin speaks the **same HTTP API** as [Jellyfin](https://github.com/jellyfin/jellyfin), so
 existing Jellyfin clients (the web UI and native TV/mobile apps such as Swiftfin, Findroid, and
@@ -51,9 +40,31 @@ the server is Rust. Point Ferrofin at an existing Jellyfin database and it adopt
   the server process. Ferrofin does not, and will not. Third-party plugins run as
   sandboxed WASM with no filesystem or network access of their own. This is the one place
   Ferrofin deliberately diverges from Jellyfin; see [Plugins](#plugins-the-one-deliberate-divergence).
-- **Every route is real.** All 412 operations in the Jellyfin API contract are wired to
+- **Every route ported** All 412 operations in the Jellyfin API contract are wired to
   working handlers, developed by cross-checking responses against a real Jellyfin server.
   No `501` stubs, no fake `200`s.
+
+## About this project
+
+Ferrofin began as a personal experiment in agentic engineering: a large Rust project taken from start to
+release with AI agents writing most of the code and me, a software engineer of 15+ years,
+steering the architecture, reviewing, and testing. I expect the first thing people will call
+this is an "AI slop fork", and I understand the skepticism. I had a working server after two
+days and could have released it then. Instead I spent the next six weeks using it as my home
+media server, testing features, fixing performance issues and bugs, reshaping the architecture, adding tests and
+gates, benchmarking, and closing the parity gap against Jellyfin. I fully intend to continue
+using Ferrofin personally and continue to improve it over time.
+
+I will not claim 100% parity with Jellyfin or that Ferrofin is bug free. At ~360k lines of
+Rust there was more code than I could read, and the agents made questionable decisions at
+times without asking. The improvements over Jellyfin are real and the benchmarks back them
+up but there is still room for improvement.
+
+Up until this first public release I have worked on Ferrofin solo, and some features I cannot
+test reliably, for example Live TV/DVR against a real tuner as I do not own one. There are
+also a large number of settings that I could use more attention. If something does not behave
+the way Jellyfin does, an issue describing the current and expected behaviour is the most
+useful thing you can send. PRs are welcome too if anyone wants to get involved!
 
 ## Benchmarks
 
