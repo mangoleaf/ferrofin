@@ -621,11 +621,15 @@ mod tests {
         );
         let total = i64::try_from(i128::from(stat.f_blocks) * i128::from(stat.f_frsize))
             .expect("total fits");
+        // `f_blocks` is stable; `f_bavail` is not — other tests write to the
+        // temp filesystem concurrently, so the two statvfs calls here and in
+        // the probe can legitimately disagree on free space. Assert the
+        // identity that matters (used includes the root reservation, so
+        // free + used is the whole filesystem) and sane bounds, not equality
+        // with a second, later sample.
         assert_eq!(info.free_space + info.used_space, total);
-        assert_eq!(
-            info.free_space,
-            i64::try_from(i128::from(stat.f_bavail) * i128::from(stat.f_frsize)).expect("free")
-        );
+        assert!(info.free_space >= 0 && info.used_space >= 0);
+        assert!(info.free_space <= total);
     }
 
     /// C# reports `DeviceId = driveInfo.Name`, and on Unix `DriveInfo.Name` is
