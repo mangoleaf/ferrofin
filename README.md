@@ -48,7 +48,7 @@ the server is Rust. Point Ferrofin at an existing Jellyfin database and it adopt
 
 Ferrofin began as a personal experiment in agentic engineering: a large Rust project taken from start to
 release with AI agents writing most of the code and me, a software engineer of 15+ years,
-steering the architecture, reviewing, and testing. I expect the first thing people will call
+steering the architecture, decisions, reviewing, and testing. I expect the first thing people will call
 this is an "AI slop fork", and I understand the skepticism. I had a working server after two
 days and could have released it then. Instead I spent the next six weeks using it as my home
 media server, testing features, fixing performance issues and bugs, reshaping the architecture, adding tests and
