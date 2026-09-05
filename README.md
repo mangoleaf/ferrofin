@@ -85,25 +85,7 @@ The screen rows are what a client actually does: each is the exact request set j
 | peak under load memory | 588 MiB | 548 MiB | **155 MiB** | **3.8× lighter** |
 | steady idle memory | 409 MiB | 356 MiB | **61.4 MiB** | **6.7× lighter** |
 
-```mermaid
-%%{init: {"themeVariables": {"xyChart": {"plotColorPalette": "#2E6E8E"}}}}%%
-xychart-beta horizontal
-  title "Times faster (memory: lighter) than Jellyfin 12.0-rc7 — p50, loaded"
-  x-axis ["home", "movies", "detail", "series", "search", "playback", "cold start", "direct-play TTFB", "peak memory", "idle memory"]
-  y-axis "× better" 0 --> 16
-  bar [3.4, 1.5, 10.9, 12.1, 2.7, 3.1, 15.8, 9.6, 3.8, 6.7]
-```
-
-Per endpoint, same level and runs (the full three-server table with p95/p99 is in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md)):
-
-```mermaid
-%%{init: {"themeVariables": {"xyChart": {"plotColorPalette": "#2E6E8E"}}}}%%
-xychart-beta horizontal
-  title "Per endpoint: times faster than Jellyfin 12.0-rc7 — p50, loaded"
-  x-axis ["home:latest-movies", "home:latest-music", "home:latest-shows", "home:nextup", "home:resume-audio", "home:resume-book", "home:resume-video", "home:views", "movies:items", "detail:item", "detail:local-trailers", "detail:similar", "detail:special-features", "series:episodes", "series:item", "series:seasons", "series:similar", "search:artists", "search:items", "search:persons", "search:programs", "search:videos", "playback:intros", "playback:playbackinfo", "playback:playing", "playback:segments", "playback:stopped", "image"]
-  y-axis "× faster" 0 --> 21
-  bar [1.5, 2.8, 2.0, 2.6, 3.8, 20.7, 3.8, 15.9, 1.1, 8.5, 11.3, 4.3, 11.0, 7.6, 8.1, 6.2, 5.6, 8.0, 2.5, 10.2, 20.3, 7.0, 1.8, 7.1, 2.1, 1.5, 7.8, 15.7]
-```
+Per endpoint, same level and runs, Ferrofin is faster than Jellyfin 12.0-rc7 on all 28 compared requests, from 1.1× (`movies:items`) to 20.7× (`home:resume-book`); the full three-server table with p95/p99 is in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
 
 ⚠ marks a row where the servers did not do identical work, so the multiple is an indication rather than a like-for-like result:
 

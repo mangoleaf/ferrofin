@@ -3,9 +3,9 @@
 (PLAN_BENCHMARK_V3 §7). stdlib only.
 
     report.py RUN_DIR [RUN_DIR ...]          markdown on stdout (the full tables, docs/BENCHMARKS.md style)
-    report.py --readme [README.md] RUN_DIR... the README "Benchmarks" section (headline table + Mermaid
-                                             speedup charts); with a README path, replaces the block between
-                                             the BEGIN/END GENERATED BENCHMARKS markers in place
+    report.py --readme [README.md] RUN_DIR... the README "Benchmarks" section (headline table + prose);
+                                             with a README path, replaces the block between the
+                                             BEGIN/END GENERATED BENCHMARKS markers in place
     report.py --serve [PORT] [RUNS_DIR]      the comparison viewer on http://127.0.0.1:PORT (default 8097, bench/runs)
 
 One run dir: the numbers of that run. Several: each cell is the median across runs, and
@@ -535,9 +535,7 @@ README_LEVEL = "loaded"
 #: of them are comparable. The interference/swap rows describe the run, not the server.
 README_TTFS = ("cold start (restart → home screen)", "direct-play TTFB (1 MiB range)")
 README_MEMORY = ("peak under load", "steady idle")
-#: x-axis labels for the headline chart — the table keeps the full row names.
-README_SHORT = {"cold start (restart → home screen)": "cold start", "direct-play TTFB (1 MiB range)": "direct-play TTFB",
-                "peak under load": "peak memory", "steady idle": "idle memory"}
+
 
 
 def _ratio(c, oracle_cell):
@@ -548,26 +546,10 @@ def _ratio(c, oracle_cell):
     return theirs / mine if mine and theirs else None
 
 
-def _mermaid_bars(title, labels, values, y_label):
-    """One single-series `xychart-beta` block. GitHub renders these natively in both
-    themes and Mermaid has no legend, which is why the README charts plot one series —
-    Ferrofin's multiple over the oracle — and leave absolute numbers to the table."""
-    top = max(values + [1.0])
-    top = float(int(top) + 1) if top == int(top) else float(int(top) + 1)
-    labs = ", ".join(f'"{l}"' for l in labels)
-    vals = ", ".join(f"{v:.1f}" for v in values)
-    horizontal = " horizontal"  # category labels never collide on the y axis
-    # The viewer's accent, so the README and the comparison page read as one instrument.
-    init = '%%{init: {"themeVariables": {"xyChart": {"plotColorPalette": "#2E6E8E"}}}}%%'
-    return (f"```mermaid\n{init}\nxychart-beta{horizontal}\n  title \"{title}\"\n  x-axis [{labs}]\n"
-            f"  y-axis \"{y_label}\" 0 --> {top:g}\n  bar [{vals}]\n```")
-
-
 def render_readme(m, run_dirs):
     """The README `## Benchmarks` body: setup sentence, the headline table with a
-    "Ferrofin vs oracle" column, two Mermaid speedup charts (screens + headline rows,
-    then every endpoint), the spread sentence computed from the runs, and the pointers to
-    the full tables. Wrapped in markers so `--readme README.md` can replace it in place;
+    "Ferrofin vs oracle" column, the per-endpoint range sentence, the spread sentence
+    computed from the runs, and the pointers to the full tables. Wrapped in markers so `--readme README.md` can replace it in place;
     everything inside the markers is generated — edit the prose here, not in the README."""
     meta, servers = m["meta"], m["servers"]
     lv = m["levels"].get(README_LEVEL)
@@ -596,7 +578,6 @@ def render_readme(m, run_dirs):
     # ── headline table ──
     p("| | " + " | ".join(f"**{lbl}**" if k == "ferrofin" else lbl for k, lbl in servers) + f" | Ferrofin vs {ORACLE_LABEL.split()[1]} |")
     p("|---|" + "---|" * (len(servers) + 1))
-    chart_labels, chart_values = [], []
 
     def row(name, cells, label_md, unit_suffix=""):
         cols = []
@@ -613,10 +594,6 @@ def render_readme(m, run_dirs):
             n = notes.add((f.flag or o.flag), f"{name}")
             mark = f" ⚠[{n}]"
         p(f"| {label_md} | " + " | ".join(cols) + f" | **{sp}**{mark} |")
-        r = _ratio(f, o)
-        if r:
-            chart_labels.append(README_SHORT.get(name, name))
-            chart_values.append(r)
 
     for name, cells in lv["screens"]:
         row(name, cells, f"**{name}** screen")
@@ -627,20 +604,13 @@ def render_readme(m, run_dirs):
         if name in README_MEMORY:
             row(name, cells, f"{name} memory")
     p("")
-    p(_mermaid_bars(f"Times faster (memory: lighter) than {ORACLE_LABEL} — p50, {README_LEVEL}",
-                    chart_labels, chart_values, "× better"))
-    p("")
-    # ── endpoints chart ──
-    ep_labels, ep_values = [], []
-    for name, cells in lv["endpoints"]:
-        r = _ratio(cells["ferrofin"], cells.get(ORACLE))
-        if r:
-            ep_labels.append(name)
-            ep_values.append(r)
-    p(f"Per endpoint, same level and runs (the full three-server table with p95/p99 is in "
-      f"[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md)):\n")
-    p(_mermaid_bars(f"Per endpoint: times faster than {ORACLE_LABEL} — p50, {README_LEVEL}", ep_labels, ep_values, "× faster"))
-    p("")
+    eps = [(name, _ratio(cells["ferrofin"], cells.get(ORACLE))) for name, cells in lv["endpoints"]]
+    eps = [(n, r) for n, r in eps if r]
+    if eps:
+        lo, hi = min(eps, key=lambda x: x[1]), max(eps, key=lambda x: x[1])
+        p(f"Per endpoint, same level and runs, Ferrofin is faster than {ORACLE_LABEL} on all {len(eps)} "
+          f"compared requests, from {lo[1]:.1f}× (`{lo[0]}`) to {hi[1]:.1f}× (`{hi[0]}`); the full three-server "
+          f"table with p95/p99 is in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).\n")
     # ── notes on marked rows ──
     if notes:
         p("⚠ marks a row where the servers did not do identical work, so the multiple is an indication rather "
