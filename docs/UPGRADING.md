@@ -8,15 +8,6 @@ Ferrofin's own database upgrades in place: start the new version against the sam
 data directory and its migrations run on boot. Back up the data directory before a
 major-version upgrade.
 
-## 1.0.1 — fixes the 1.0.0 upgrade lock-out
-
-**Skip 1.0.0.** Its image cannot open a database created by any earlier Ferrofin
-(`migration 6 was previously applied but has been modified`): a comment in an already
-released migration file was edited, and sqlx checks the file's checksum. Nothing was
-written to the database by the failed boot; going straight to 1.0.1 works. Fresh
-installs on 1.0.0 are unaffected. Migrations are now pinned by checksum in CI so a
-released one cannot change again.
-
 ## 1.0.0 — first public release
 
 No manual steps between Ferrofin releases. The baseline for this file starts here;
