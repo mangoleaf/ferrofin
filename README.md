@@ -67,8 +67,8 @@ PRs or plugin development are welcome too if anyone wants to get involved!
 ## Benchmarks
 
 <!-- BEGIN GENERATED BENCHMARKS — do not edit by hand. Regenerate with:
-     python3 bench/report.py --readme README.md bench/runs/v0.42.3 bench/runs/v0.42.3-run2 bench/runs/v0.42.3-run3 -->
-Ferrofin `v0.42.3` against **Jellyfin 12.0-rc7** and **Jellyfin 10.11.8**, measured 2026-09-04 on one machine (AMD Ryzen 9 9950X3D), each server alone in a container pinned to 8 dedicated cores with an 8 GiB limit and no swap, over the same library of 3,001 movies, 250 series and 7,490 episodes. Every figure is the **median of 3 full runs**. No request failed on any server at any load level.
+     python3 bench/report.py --readme README.md bench/runs/v1.0.0 bench/runs/v1.0.0-run2 bench/runs/v1.0.0-run3 -->
+Ferrofin `v1.0.0` against **Jellyfin 12.0-rc7** and **Jellyfin 10.11.8**, measured 2026-09-04 on one machine (AMD Ryzen 9 9950X3D), each server alone in a container pinned to 8 dedicated cores with an 8 GiB limit and no swap, over the same library of 3,001 movies, 250 series and 7,490 episodes. Every figure is the **median of 3 full runs**. No request failed on any server at any load level.
 
 The screen rows are what a client actually does: each is the exact request set jellyfin-web issues for that screen, replayed at 5 screens per second (the "loaded" level). Latency reads **p50 / p95 / p99 in milliseconds**; the last column compares p50 with Jellyfin 12.0-rc7.
 

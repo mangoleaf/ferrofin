@@ -7,7 +7,7 @@ servers did not do identical work. The harness and its methodology are in
 
 ## Setup
 
-Measured on 2026-09-04 at commit `c599f65`, against **Jellyfin 12.0-rc7** and **Jellyfin
+Measured on 2026-09-04 at `v1.0.0` (the server code is unchanged since the measured build; only docs and CI moved), against **Jellyfin 12.0-rc7** and **Jellyfin
 10.11.8** on the same machine, the same library and the same cgroup limits: an AMD Ryzen 9
 9950X3D, each server alone in a container pinned to 8 dedicated cores with an 8 GiB limit
 and swap disabled, over 3,001 movies / 250 series / 7,490 episodes. Every latency, memory
