@@ -321,7 +321,12 @@ through the `on-event` export via a bounded per-plugin queue
 (`FERROFIN_WASM_EVENT_QUEUE_CAPACITY`, default 256) — a slow guest loses events rather
 than slowing the server; the database, not the event stream, is the source of truth.
 
-Authoring: any language that targets the WASM component model. The reference plugin is
+Authoring: any language that targets the WASM component model. **Start from the
+template**: [`ferrofin-plugin-template`](https://github.com/mangoleaf/ferrofin-plugin-template)
+is a ready-to-build Rust skeleton with the toolchain, target, WIT bindings and a
+`build.sh` already wired, and its CI publishes a plugin-repository manifest
+(`https://mangoleaf.github.io/ferrofin-plugin-template/manifest.json`) you can point a
+server at to install it from the dashboard. The in-tree reference plugin is
 `examples/wasm-hello/` — a ~70-line Rust crate (`wit-bindgen` + `wasm32-wasip2`, its own
 toolchain island) that logs a config-driven greeting from a scheduled task and counts
 events. Build it with `cargo build --release --target wasm32-wasip2` inside that

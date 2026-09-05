@@ -200,8 +200,11 @@ system carries: file access, raw sockets, and the run-anything blast radius.
 
 Rust has no stable ABI, so a .NET-style native loader was never on the table, but that is
 not why the design is this way. Ferrofin will not load untrusted native code into the
-server process. Details, the capability list, and how to write a plugin are in
-**[`docs/EXTENSIONS.md`](docs/EXTENSIONS.md)**.
+server process. Details and the capability list are in
+**[`docs/EXTENSIONS.md`](docs/EXTENSIONS.md)**. To write one, clone
+[`ferrofin-plugin-template`](https://github.com/mangoleaf/ferrofin-plugin-template): the
+toolchain, target and contract bindings are already wired, and its CI publishes a plugin
+repository you can add to a server to install it from the dashboard.
 
 ## Feature status
 
