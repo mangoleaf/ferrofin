@@ -127,6 +127,10 @@ jobs:
           cat live.json
           grep -q "\"build\":\"$GITHUB_REF_NAME\"" live.json || { echo "version mismatch"; docker logs smoke; exit 1; }
           curl -fsS -o /dev/null http://127.0.0.1:8096/web/ || { echo "/web not served"; docker logs smoke; exit 1; }
+          # The bundled ffmpeg must be Jellyfin's fork (tonemapx, chromaprint, its
+          # libx264), never Debian's — owner rule.
+          docker exec smoke ffmpeg -version | head -1 | tee ffmpeg.txt
+          grep -qi jellyfin ffmpeg.txt || { echo "ffmpeg in the image is not jellyfin-ffmpeg"; exit 1; }
           docker rm -f smoke
 
   # ── server binaries, one archive per target, attached to the Release ──
