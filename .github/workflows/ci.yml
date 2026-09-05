@@ -55,24 +55,26 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-llvm-cov
       - uses: taiki-e/install-action@nextest
-      # 80% line-coverage gate, enforced per-crate via the allowlist (`.port/`).
+      # 80% line-coverage gate, enforced per-crate over every crate in crates/.
       # ffmpeg is only needed by the env-gated integration tests; unit/parity tests avoid it.
-      - name: coverage gate (ported crates)
+      - name: coverage gate (per crate)
         shell: bash
         run: |
           set -euo pipefail
           # Gate EACH crate independently: `-p a -p b --fail-under-lines` checks the
           # MERGED total, which lets a sub-80% crate hide behind a stronger sibling.
           # Line coverage only — branch coverage (-Z coverage-options=branch) is nightly-only; we pin stable.
+          # ferrofin-traits is exempt (trait definitions; the bodies live in ferrofin-core —
+          # see CLAUDE.md), as is apps/ferrofin-server (the composition root).
           fail=0
-          while read -r crate; do
-            [ -z "$crate" ] && continue
-            case "$crate" in \#*) continue ;; esac
+          for dir in crates/*/; do
+            crate=$(basename "$dir")
+            [ "$crate" = ferrofin-traits ] && continue
             echo "── coverage: $crate ──"
             # `-p X` still instruments X's workspace deps, so their (uncovered) source
             # lands in the TOTAL the gate compares against. Exclude every sibling.
-            others=$(ls crates | grep -v "^$crate\$" | paste -sd'|')
+            others=$(basename -a crates/*/ | grep -v "^$crate\$" | paste -sd'|')
             cargo llvm-cov nextest -p "$crate" --fail-under-lines 80 --summary-only \
               --ignore-filename-regex "(crates/($others)|apps)/" || fail=1
-          done < .port/gated-crates.txt
+          done
           exit $fail

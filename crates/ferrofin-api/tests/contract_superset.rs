@@ -3,7 +3,7 @@
 //!
 //! A real client (Wolphin) must never receive a `404` on a path the contract
 //! declares. This test reads the authoritative spec straight from
-//! `tests/data/jellyfin-openapi-10.11.8.json` and asserts:
+//! `contracts/jellyfin-openapi-10.11.8.json` and asserts:
 //!
 //! 1. **Generator fidelity** — every `(method, path)` in the JSON spec is present
 //!    in the crate's embedded [`ferrofin_api::VENDORED_ROUTES`] table, so the
@@ -28,7 +28,7 @@ use tower::ServiceExt;
 /// Parses the vendored spec into a sorted set of `(method, path)` pairs, exactly
 /// as the spec declares them (method lowercased, path verbatim).
 fn spec_routes() -> BTreeSet<(String, String)> {
-    let raw = include_str!("data/jellyfin-openapi-10.11.8.json");
+    let raw = include_str!("../../../contracts/jellyfin-openapi-10.11.8.json");
     let spec: serde_json::Value = serde_json::from_str(raw).expect("spec is valid JSON");
     let paths = spec
         .get("paths")
@@ -290,7 +290,7 @@ fn verified_rows_are_real_operations_and_print_the_parity_line() {
     );
 
     // Per-controller table: controller = the operation's first OpenAPI tag.
-    let raw = include_str!("data/jellyfin-openapi-10.11.8.json");
+    let raw = include_str!("../../../contracts/jellyfin-openapi-10.11.8.json");
     let spec: serde_json::Value = serde_json::from_str(raw).expect("spec is valid JSON");
     let mut per: BTreeMap<String, (usize, usize)> = BTreeMap::new();
     let verified: BTreeSet<(String, String)> = VERIFIED

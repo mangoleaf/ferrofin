@@ -1,5 +1,5 @@
 //! The vendored Jellyfin 10.11.8 route table — the authoritative client
-//! contract. GENERATED from `tests/data/jellyfin-openapi-10.11.8.json`; do not
+//! contract. GENERATED from `contracts/jellyfin-openapi-10.11.8.json`; do not
 //! edit by hand. Each entry is a `(method, path)` pair exactly as it appears in
 //! the spec (Jellyfin `{param}` placeholders preserved verbatim). The router and
 //! the contract-superset test both consume this table.

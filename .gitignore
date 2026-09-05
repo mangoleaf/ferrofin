@@ -1,8 +1,6 @@
 /target
 **/*.rs.bk
 *.pdb
-# per-crate PortJob agent scratch — only the coverage-gate allowlist is tracked
-/.port/*/
 # local media/data used for manual First-Light testing
 /data
 *.db

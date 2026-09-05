@@ -8,7 +8,6 @@ data/
 # The RustCodeGraph index (2.4GB) made "load build context" take longer than
 # the compile; none of these feed the server build.
 .rcg/
-.port/
 brain/
 # benchmark test data and run output (bench/ code itself is tiny)
 bench/testdata/

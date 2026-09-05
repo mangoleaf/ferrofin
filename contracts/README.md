@@ -1,27 +1,36 @@
 # Contracts
 
-Vendored, pinned copies of the **Jellyfin OpenAPI spec** — the authoritative HTTP contract
-that TV clients (Wolphin, Swiftfin, Findroid) depend on. `ferrofin-api` is built to satisfy
-this surface, and a Wave 7 CI test diffs `ferrofin-api`'s generated spec against it (Ferrofin
-must be a superset; drift fails CI).
+The vendored **Jellyfin OpenAPI spec** — the HTTP contract Ferrofin implements and the
+one real clients (jellyfin-web, Swiftfin, Findroid, Wolphin, …) are built against.
 
 ## `jellyfin-openapi-10.11.8.json`
 
-- **Source:** pulled live from the homelab Jellyfin (`kubectl -n jellyfin`, `GET /api-docs/openapi.json`)
-  on 2026-07-22. OpenAPI 3.0.1, 337 paths, 2.1 MB.
-- **How Jellyfin produces it:** Swashbuckle.AspNetCore generates it at runtime from the
-  controllers — it is NOT a static file in the source repo. (Upstream CI regenerates it by
-  running the `OpenApiSpecTests` integration test.) We captured it from the running server
-  instead, needing zero .NET toolchain on the host.
+- **What:** the spec a running Jellyfin **10.11.8** serves at `/api-docs/openapi.json`
+  (OpenAPI 3.0.1, 337 paths, 412 operations). Jellyfin generates it at runtime with
+  Swashbuckle, so it is captured from a live server rather than taken from the source tree.
+- **Captured:** 2026-07-22.
+- **Used by:**
+  - `crates/ferrofin-api/tests/contract_superset.rs` — the hard gate: every path in the
+    spec must be a registered route (an unported one answers `501`, never `404`), the
+    registered table must not contain paths outside the spec, and a live probe checks
+    nothing 404s.
+  - `crates/ferrofin-api/src/contract_routes.rs` — generated from this file.
+  - `apps/ferrofin-server` — embeds it and serves it at `/api-docs/openapi.json`.
+  - DTO work in `ferrofin-model`: `jq '.components.schemas.<Type>' contracts/jellyfin-openapi-10.11.8.json`
+    is the oracle for field names, casing and nullability.
 
-### Version note (important)
+## Why 10.11.8 and not 12.0
 
-- **This spec = Jellyfin 10.11.8** (the released version running in the homelab — the exact
-  API the real TV client talks to).
-- **The source clone being ported = v12.0.0** (a dev snapshot at `~/dev/3rdparty/jellyfin`).
+Two different pins, both deliberate. The **contract** is 10.11.8 because that is the API
+the clients speak; 12.0-rc7's surface is smaller (364 operations — it drops the
+`DynamicHls` family, `/MusicGenres`, `/CriticReviews` and more), so implementing it
+instead would break clients. The **C# that behaviour is ported from** is `v12.0-rc7`
+(`UPSTREAM_TAG` in `crates/ferrofin-api/src/handlers/mod.rs`) because it is the fixed,
+corrected version of 10.11's logic. Where the two disagree on shape, the contract wins.
 
-This is intentional: the goal is client compatibility, so the contract to satisfy is the API
-the **client** uses (10.11.8), not the dev snapshot's. The v12 source is only what we
-transliterate *from*. Any endpoint drift between v12 controllers and the 10.11.8 surface is
-caught by the Wave 7 contract-diff gate and reconciled then. If we later target a different
-client version, drop its spec here and repin.
+## Re-pinning
+
+To target a different client version: capture its `/api-docs/openapi.json`, drop it here
+under the versioned name, update the `include_str!` paths above and the pins in
+`CLAUDE.md`, regenerate `contract_routes.rs`, and let `contract_superset` tell you what
+moved.

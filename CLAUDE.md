@@ -16,9 +16,9 @@ repository. Read it before making changes.
 
 **Clients depend on Jellyfin's API surface, not its code.** So the contract Ferrofin must
 honor is the **HTTP API**, captured as a vendored OpenAPI spec
-(`contracts/jellyfin-openapi-*.json`, also embedded at
-`crates/ferrofin-api/tests/data/`). Everything else is an implementation detail we are free
-to design idiomatically in Rust.
+(`contracts/jellyfin-openapi-*.json`, the single copy — the api tests and the server
+`include_str!` it). Everything else is an implementation detail we are free to design
+idiomatically in Rust.
 
 Consequences you must respect:
 
