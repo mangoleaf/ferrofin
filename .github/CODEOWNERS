@@ -1,0 +1,4 @@
+# Workflow files run with repository credentials; every change to them needs the
+# maintainer's eyes before it merges (see docs and SECURITY.md).
+/.github/workflows/ @mangoleaf
+/.github/CODEOWNERS @mangoleaf

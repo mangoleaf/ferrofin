@@ -1,0 +1,25 @@
+name: zizmor
+
+# Static security analysis of the workflows themselves (pull_request_target
+# misuse, template injection, unpinned actions, credential persistence, cache
+# poisoning). Findings land in the Security tab as code-scanning alerts and the
+# job fails on anything at or above its default severity, so a PR that weakens a
+# workflow is blocked before a human has to spot it.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions: {}
+
+jobs:
+  zizmor:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write # upload-sarif into code scanning
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: zizmorcore/zizmor-action@70fb788f84895a7701f5643d103d587e460b5c99 # v0.6.3
