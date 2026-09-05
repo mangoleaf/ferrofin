@@ -8,10 +8,8 @@
 [![Rust edition 2024](https://img.shields.io/badge/rust-edition%202024-orange.svg)](rust-toolchain.toml)
 [![API surface: 412/412](https://img.shields.io/badge/API%20surface-412%2F412%20REAL-brightgreen.svg)](docs/FEATURES.md)
 
-<!-- TODO: uncomment once the GitHub Actions CI run is green and v1.0.0 exists:
 [![CI](https://github.com/mangoleaf/ferrofin/actions/workflows/ci.yml/badge.svg)](https://github.com/mangoleaf/ferrofin/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/mangoleaf/ferrofin)](https://github.com/mangoleaf/ferrofin/releases)
--->
 
 </div>
 
@@ -33,7 +31,8 @@ the server is Rust. Point Ferrofin at an existing Jellyfin database and it adopt
   faster**, and sits at **61 MiB idle against 409 MiB** (6.7× lighter), with peak memory
   under load 3.8× lower. Numbers, method and caveats are in [Benchmarks](#benchmarks).
 - **One binary, no runtime.** A single `ferrofin-server` executable plus ffmpeg. No .NET
-  runtime, no JIT warm-up.
+  runtime, no JIT warm-up. The Docker image bundles both jellyfin-ffmpeg and the jellyfin-web
+  client, so `docker run` gives you the whole server, web UI included.
 - **Drop-in compatible.** Same API contract, same on-disk database format (pinned to
   Jellyfin 10.11.8), same password hashes. Adopt an existing library with no re-scan.
 - **Plugins cannot own your server.** Jellyfin loads plugins as full-trust .NET code inside
@@ -67,43 +66,54 @@ PRs or plugin development are welcome too if anyone wants to get involved!
 
 ## Benchmarks
 
-Ferrofin `v0.42.3` against **Jellyfin 12.0-rc7** and **Jellyfin 10.11.8**, measured
-2026-09-04 on one machine (AMD Ryzen 9 9950X3D), each server alone in a container pinned to 8 cores with an
-8 GiB limit, over the same library of 3,001 movies, 250 series and 7,490 episodes. Every
-figure is the **median of three full runs**. No request failed on any server at any load
-level.
+<!-- BEGIN GENERATED BENCHMARKS — do not edit by hand. Regenerate with:
+     python3 bench/report.py --readme README.md bench/runs/v0.42.3 bench/runs/v0.42.3-run2 bench/runs/v0.42.3-run3 -->
+Ferrofin `v0.42.3` against **Jellyfin 12.0-rc7** and **Jellyfin 10.11.8**, measured 2026-09-04 on one machine (AMD Ryzen 9 9950X3D), each server alone in a container pinned to 8 dedicated cores with an 8 GiB limit and no swap, over the same library of 3,001 movies, 250 series and 7,490 episodes. Every figure is the **median of 3 full runs**. No request failed on any server at any load level.
 
-The screen rows are what a client actually does: each is the exact request set
-jellyfin-web issues for that screen, replayed at five screens per second (the "loaded"
-level: a measured 24 API requests and 48–49 poster fetches per second). Latency reads
-**p50 / p95 / p99 in milliseconds**; the comparison column is p50 against 12.0-rc7.
+The screen rows are what a client actually does: each is the exact request set jellyfin-web issues for that screen, replayed at 5 screens per second (the "loaded" level). Latency reads **p50 / p95 / p99 in milliseconds**; the last column compares p50 with Jellyfin 12.0-rc7.
 
 | | Jellyfin 12.0-rc7 | Jellyfin 10.11.8 | **Ferrofin** | Ferrofin vs 12.0-rc7 |
 |---|---|---|---|---|
 | **home** screen | 44 / 51 / 57 | 64 / 73 / 77 | **13 / 16 / 19** | **3.4× faster** |
 | **movies** screen | 38 / 43 / 47 | 24 / 28 / 31 | **25 / 30 / 32** | **1.5× faster** |
-| **detail** screen | 98 / 161 / 165 | 20 / 29 / 33 | **9 / 12 / 13** | **10.9× faster** ⚠ |
+| **detail** screen | 98 / 161 / 165 | 20 / 29 / 33 | **9 / 12 / 13** | **10.9× faster** ⚠[1] |
 | **series** screen | 97 / 101 / 224 | 18 / 21 / 27 | **8 / 10 / 11** | **12.1× faster** |
 | **search** screen | 70 / 234 / 255 | 98 / 121 / 184 | **26 / 36 / 42** | **2.7× faster** |
-| **playback** screen | 31 / 37 / 55 | 5 / 20 / 33 | **10 / 13 / 45** | **3.1× faster** ⚠ |
+| **playback** screen | 31 / 37 / 55 | 5 / 20 / 33 | **10 / 13 / 45** | **3.1× faster** ⚠[2] |
 | cold start (restart → home screen) | 2746 ms | 2162 ms | **174 ms** | **15.8× faster** |
-| direct-play time to first byte | 4.61 ms | 1.01 ms | **0.48 ms** | **9.6× faster** |
-| peak memory under load | 588 MiB | 548 MiB | **155 MiB** | **3.8× lighter** |
-| steady idle memory | 409 MiB | 356 MiB | **61 MiB** | **6.7× lighter** |
+| direct-play TTFB (1 MiB range) | 4.61 ms | 1.01 ms | **0.48 ms** | **9.6× faster** |
+| peak under load memory | 588 MiB | 548 MiB | **155 MiB** | **3.8× lighter** |
+| steady idle memory | 409 MiB | 356 MiB | **61.4 MiB** | **6.7× lighter** |
 
-⚠ On the two marked rows Ferrofin (like Jellyfin 10.11.8, which it targets) omits two
-fields that 12.0 added to `MediaStreams`, so the servers did not do byte-identical work
-there; read those multipliers as an indication. The one Jellyfin-side surprise is worth
-saying out loud: 10.11.8 is *faster* than 12.0-rc7 on most rows, and slower on home and
-search, so "vs 12.0-rc7" is not always the flattering comparison.
+```mermaid
+%%{init: {"themeVariables": {"xyChart": {"plotColorPalette": "#2E6E8E"}}}}%%
+xychart-beta horizontal
+  title "Times faster (memory: lighter) than Jellyfin 12.0-rc7 — p50, loaded"
+  x-axis ["home", "movies", "detail", "series", "search", "playback", "cold start", "direct-play TTFB", "peak memory", "idle memory"]
+  y-axis "× better" 0 --> 16
+  bar [3.4, 1.5, 10.9, 12.1, 2.7, 3.1, 15.8, 9.6, 3.8, 6.7]
+```
 
-How to read the spread: the medians were steady across the three runs (3 of 102 moved by
-more than 15 %), the p95/p99 tails and the memory figures wander more, so treat the p50s
-as the numbers and the tails as shape. The per-endpoint breakdown, run-to-run ranges, and
-every place the servers did different work are in **[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md)**;
-the harness and the one-sentence definition of every number are in
-[`bench/README.md`](bench/README.md). Run it yourself: it is a deliberate, local
-instrument, not a CI job.
+Per endpoint, same level and runs (the full three-server table with p95/p99 is in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md)):
+
+```mermaid
+%%{init: {"themeVariables": {"xyChart": {"plotColorPalette": "#2E6E8E"}}}}%%
+xychart-beta horizontal
+  title "Per endpoint: times faster than Jellyfin 12.0-rc7 — p50, loaded"
+  x-axis ["home:latest-movies", "home:latest-music", "home:latest-shows", "home:nextup", "home:resume-audio", "home:resume-book", "home:resume-video", "home:views", "movies:items", "detail:item", "detail:local-trailers", "detail:similar", "detail:special-features", "series:episodes", "series:item", "series:seasons", "series:similar", "search:artists", "search:items", "search:persons", "search:programs", "search:videos", "playback:intros", "playback:playbackinfo", "playback:playing", "playback:segments", "playback:stopped", "image"]
+  y-axis "× faster" 0 --> 21
+  bar [1.5, 2.8, 2.0, 2.6, 3.8, 20.7, 3.8, 15.9, 1.1, 8.5, 11.3, 4.3, 11.0, 7.6, 8.1, 6.2, 5.6, 8.0, 2.5, 10.2, 20.3, 7.0, 1.8, 7.1, 2.1, 1.5, 7.8, 15.7]
+```
+
+⚠ marks a row where the servers did not do identical work, so the multiple is an indication rather than a like-for-like result:
+
+1. detail: detail:item: missing MediaSources[].MediaStreams[].IsOriginal, MediaSources[].MediaStreams[].LocalizedOriginal, MediaStreams[].IsOriginal (+1 more)
+2. playback: playback:playbackinfo: missing MediaSources[].MediaStreams[].IsOriginal, MediaSources[].MediaStreams[].LocalizedOriginal
+
+Ferrofin implements the Jellyfin 10.11.8 contract, so a field that 12.0 added and 10.11.8 lacks shows up here as missing on both of them; the row is still Ferrofin's own work for everything else in it.
+
+How steady are these numbers? Across the 3 runs, 3 of the 102 medians in the loaded-level tables moved by more than 15 % of their value, against 68 of the 204 p95/p99 tails, so read the p50s as the numbers and the tails as shape. Run-to-run ranges for every cell, and every place the servers did different work, are in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md); the harness and the one-sentence definition of each number are in [`bench/README.md`](bench/README.md). It is a deliberate, local instrument, not a CI job.
+<!-- END GENERATED BENCHMARKS -->
 
 ## Quickstart
 

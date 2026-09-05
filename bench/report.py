@@ -2,7 +2,10 @@
 """Render a run (or several) as the README tables, or as an HTML page for comparing
 (PLAN_BENCHMARK_V3 §7). stdlib only.
 
-    report.py RUN_DIR [RUN_DIR ...]          markdown on stdout (the README tables)
+    report.py RUN_DIR [RUN_DIR ...]          markdown on stdout (the full tables, docs/BENCHMARKS.md style)
+    report.py --readme [README.md] RUN_DIR... the README "Benchmarks" section (headline table + Mermaid
+                                             speedup charts); with a README path, replaces the block between
+                                             the BEGIN/END GENERATED BENCHMARKS markers in place
     report.py --serve [PORT] [RUNS_DIR]      the comparison viewer on http://127.0.0.1:PORT (default 8097, bench/runs)
 
 One run dir: the numbers of that run. Several: each cell is the median across runs, and
@@ -521,6 +524,170 @@ def render_md(m):
     return "\n".join(out) + "\n"
 
 
+# ── README section (headline table + Mermaid charts) ────────────────────────
+README_BEGIN = "<!-- BEGIN GENERATED BENCHMARKS"
+README_END = "<!-- END GENERATED BENCHMARKS -->"
+#: The level the README quotes: five screens a second is the closest of the three to
+#: ordinary use (unloaded is a control, stress exists to find the knee).
+README_LEVEL = "loaded"
+#: The time-to-first-screen and memory rows the README headlines, by row name. HLS is
+#: excluded on purpose: the three servers pick different transcode parameters, so no two
+#: of them are comparable. The interference/swap rows describe the run, not the server.
+README_TTFS = ("cold start (restart → home screen)", "direct-play TTFB (1 MiB range)")
+README_MEMORY = ("peak under load", "steady idle")
+#: x-axis labels for the headline chart — the table keeps the full row names.
+README_SHORT = {"cold start (restart → home screen)": "cold start", "direct-play TTFB (1 MiB range)": "direct-play TTFB",
+                "peak under load": "peak memory", "steady idle": "idle memory"}
+
+
+def _ratio(c, oracle_cell):
+    """theirs/mine as a float, or None — the number behind `speedup()`'s sentence."""
+    if c is None or oracle_cell is None or c.context:
+        return None
+    mine, theirs = displayed(c), displayed(oracle_cell)
+    return theirs / mine if mine and theirs else None
+
+
+def _mermaid_bars(title, labels, values, y_label):
+    """One single-series `xychart-beta` block. GitHub renders these natively in both
+    themes and Mermaid has no legend, which is why the README charts plot one series —
+    Ferrofin's multiple over the oracle — and leave absolute numbers to the table."""
+    top = max(values + [1.0])
+    top = float(int(top) + 1) if top == int(top) else float(int(top) + 1)
+    labs = ", ".join(f'"{l}"' for l in labels)
+    vals = ", ".join(f"{v:.1f}" for v in values)
+    horizontal = " horizontal"  # category labels never collide on the y axis
+    # The viewer's accent, so the README and the comparison page read as one instrument.
+    init = '%%{init: {"themeVariables": {"xyChart": {"plotColorPalette": "#2E6E8E"}}}}%%'
+    return (f"```mermaid\n{init}\nxychart-beta{horizontal}\n  title \"{title}\"\n  x-axis [{labs}]\n"
+            f"  y-axis \"{y_label}\" 0 --> {top:g}\n  bar [{vals}]\n```")
+
+
+def render_readme(m, run_dirs):
+    """The README `## Benchmarks` body: setup sentence, the headline table with a
+    "Ferrofin vs oracle" column, two Mermaid speedup charts (screens + headline rows,
+    then every endpoint), the spread sentence computed from the runs, and the pointers to
+    the full tables. Wrapped in markers so `--readme README.md` can replace it in place;
+    everything inside the markers is generated — edit the prose here, not in the README."""
+    meta, servers = m["meta"], m["servers"]
+    lv = m["levels"].get(README_LEVEL)
+    if not lv:
+        sys.exit(f"the runs have no '{README_LEVEL}' level; the README section needs it")
+    tc = meta.get("testdata_counts", {})
+    tag = meta.get("name") or os.path.basename(run_dirs[0].rstrip("/"))
+    nruns = len(m["runs"])
+    notes = Notes()
+    out = []
+    p = out.append
+    cmd = "python3 bench/report.py --readme README.md " + " ".join(f"bench/runs/{os.path.basename(r.rstrip('/'))}" for r in run_dirs)
+    p(f"{README_BEGIN} — do not edit by hand. Regenerate with:\n     {cmd} -->")
+    cpus = str(meta.get("server_cpus", ""))
+    ncores = sum(int(b) - int(a) + 1 if "-" in part else 1 for part in cpus.split(",") if part for a, b in [part.split("-")] ) if cpus and all(x.replace("-", "").isdigit() for x in cpus.split(",")) else "?"
+    limit = str(meta.get("memory_limit", "?")).replace("g", " GiB")
+    article = "an" if limit[:1] in "8aeiou" else "a"
+    p(f"Ferrofin `{tag}` against **{servers[0][1]}** and **{servers[1][1]}**, measured {meta.get('date', '')[:10]} "
+      f"on one machine ({meta.get('cpu', '?').replace(' 16-Core Processor', '')}), each server alone in a container pinned to "
+      f"{ncores} dedicated cores with {article} {limit} limit and no swap, over the same library of "
+      f"{tc.get('movies', '?'):,} movies, {tc.get('series', '?'):,} series and {tc.get('episodes', '?'):,} episodes. "
+      f"Every figure is the **median of {nruns} full run{'s' if nruns != 1 else ''}**. No request failed on any server at any load level.\n")
+    p(f"The screen rows are what a client actually does: each is the exact request set jellyfin-web issues for that "
+      f"screen, replayed at {lv['rate']} screens per second (the \"{README_LEVEL}\" level). Latency reads "
+      f"**p50 / p95 / p99 in milliseconds**; the last column compares p50 with {ORACLE_LABEL}.\n")
+    # ── headline table ──
+    p("| | " + " | ".join(f"**{lbl}**" if k == "ferrofin" else lbl for k, lbl in servers) + f" | Ferrofin vs {ORACLE_LABEL.split()[1]} |")
+    p("|---|" + "---|" * (len(servers) + 1))
+    chart_labels, chart_values = [], []
+
+    def row(name, cells, label_md, unit_suffix=""):
+        cols = []
+        for k, _ in servers:
+            c = cells[k]
+            # `value()` already carries the unit for single-number cells; latency
+            # cells print p50 / p95 / p99 with the unit named in the intro sentence.
+            txt = " / ".join(part.value() for part in c.parts()) if "p95" in c.sub else c.value()
+            cols.append(f"**{txt}**" if k == "ferrofin" else txt)
+        f, o = cells["ferrofin"], cells.get(ORACLE)
+        sp = speedup(f, o) or "—"
+        mark = ""
+        if provisional(f, o):
+            n = notes.add((f.flag or o.flag), f"{name}")
+            mark = f" ⚠[{n}]"
+        p(f"| {label_md} | " + " | ".join(cols) + f" | **{sp}**{mark} |")
+        r = _ratio(f, o)
+        if r:
+            chart_labels.append(README_SHORT.get(name, name))
+            chart_values.append(r)
+
+    for name, cells in lv["screens"]:
+        row(name, cells, f"**{name}** screen")
+    for name, cells in m["ttfs"]:
+        if name in README_TTFS:
+            row(name, cells, name)
+    for name, cells in m["memory"]:
+        if name in README_MEMORY:
+            row(name, cells, f"{name} memory")
+    p("")
+    p(_mermaid_bars(f"Times faster (memory: lighter) than {ORACLE_LABEL} — p50, {README_LEVEL}",
+                    chart_labels, chart_values, "× better"))
+    p("")
+    # ── endpoints chart ──
+    ep_labels, ep_values = [], []
+    for name, cells in lv["endpoints"]:
+        r = _ratio(cells["ferrofin"], cells.get(ORACLE))
+        if r:
+            ep_labels.append(name)
+            ep_values.append(r)
+    p(f"Per endpoint, same level and runs (the full three-server table with p95/p99 is in "
+      f"[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md)):\n")
+    p(_mermaid_bars(f"Per endpoint: times faster than {ORACLE_LABEL} — p50, {README_LEVEL}", ep_labels, ep_values, "× faster"))
+    p("")
+    # ── notes on marked rows ──
+    if notes:
+        p("⚠ marks a row where the servers did not do identical work, so the multiple is an indication rather "
+          "than a like-for-like result:\n")
+        for n, text, sources in notes.items:
+            p(f"{n}. {', '.join(sources)}: {text}")
+        p("")
+        p(f"Ferrofin implements the Jellyfin 10.11.8 contract, so a field that 12.0 added and 10.11.8 lacks shows "
+          f"up here as missing on both of them; the row is still Ferrofin's own work for everything else in it.\n")
+    # ── spread sentence, computed ──
+    def moved(part):
+        return len(part.vals) > 1 and part.median and (max(part.vals) - min(part.vals)) > 0.15 * part.median
+    p50s = tails = p50_moved = tail_moved = 0
+    for _, cells in lv["screens"] + lv["endpoints"]:
+        for k, _ in servers:
+            parts = cells[k].parts()
+            if not parts or parts[0].median is None:
+                continue
+            p50s += 1
+            p50_moved += moved(parts[0])
+            for part in parts[1:]:
+                tails += 1
+                tail_moved += moved(part)
+    if nruns > 1:
+        p(f"How steady are these numbers? Across the {nruns} runs, {p50_moved} of the {p50s} medians in the "
+          f"{README_LEVEL}-level tables moved by more than 15 % of their value, against {tail_moved} of the {tails} "
+          f"p95/p99 tails, so read the p50s as the numbers and the tails as shape. Run-to-run ranges for every cell, "
+          f"and every place the servers did different work, are in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md); "
+          f"the harness and the one-sentence definition of each number are in [`bench/README.md`](bench/README.md). "
+          f"It is a deliberate, local instrument, not a CI job.")
+    p(README_END)
+    return "\n".join(out) + "\n"
+
+
+def inject_readme(path, section):
+    """Replace the block between the GENERATED BENCHMARKS markers in `path` with
+    `section` (which carries its own markers). Refuses to guess when they are absent."""
+    text = open(path, encoding="utf-8").read()
+    i, j = text.find(README_BEGIN), text.find(README_END)
+    if i < 0 or j < 0:
+        sys.exit(f"{path} has no {README_BEGIN} … {README_END} block to replace")
+    j += len(README_END)
+    if text[j:j + 1] == "\n":
+        j += 1
+    open(path, "w", encoding="utf-8").write(text[:i] + section + text[j:])
+
+
 # ── html (the comparison page) ──────────────────────────────────────────────
 CSS = """
 :root{--bg:#F5F6F8;--panel:#FFFFFF;--ink:#1A1E24;--muted:#5B636E;--rule:#D8DCE2;--rule-soft:#E9ECF0;--accent:#2E6E8E;--accent-ink:#1F4E66;--flag:#9A6A12;--flag-bg:#FBF3E2;--err:#A83A2E;--good:#2E7D4F;--bad:#A83A2E}
@@ -921,6 +1088,23 @@ def main():
         if not os.path.isdir(runs_dir):
             sys.exit(f"{runs_dir} is not a directory")
         serve(port, runs_dir)
+        return
+    if args and args[0] == "--readme":
+        target = None
+        rest = args[1:]
+        if rest and rest[0].lower().endswith(".md"):
+            target, rest = rest[0], rest[1:]
+        if not rest:
+            sys.exit(__doc__)
+        for r in rest:
+            if not os.path.isfile(os.path.join(r, "run.json")):
+                sys.exit(f"{r} is not a run dir (no run.json)")
+        section = render_readme(build(rest), rest)
+        if target:
+            inject_readme(target, section)
+            sys.stderr.write(f"replaced the generated benchmarks block in {target}\n")
+        else:
+            sys.stdout.write(section)
         return
     if not args or any(a.startswith("--") for a in args):
         sys.exit(__doc__)

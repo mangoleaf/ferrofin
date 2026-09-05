@@ -8,10 +8,60 @@ The format follows [Keep a Changelog](https://keepachangelog.com) and
 Upgrades needing a manual step or with a non-obvious behavior change are
 called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 
-## [Unreleased]
+## [1.0.0] - 2026-09-05
+
+### CI/CD
+- Harden the workflows — SHA pins, least privilege, zizmor gate, CODEOWNERS
+
+### Documentation
+- Observability section — JSON logs, Prometheus metrics, OTLP traces
+- Point plugin authors at ferrofin-plugin-template and its manifest
+- Examples/wasm-hello is the WIT conformance fixture, the template is for authors
+- Reset to the 1.0.0 baseline; drop the pre-release fetcher note
+- Remove references to private plans, local skills and personal paths
+- About update
+
+### Miscellaneous
+- Single vendored spec copy, drop the .port allowlist
+- Small readme.md update
+
+### Testing
+- Stop racing statvfs against parallel tests in the fs-probe check
+
+## [0.42.7] - 2026-09-05
+
+### CI/CD
+- Move to the Node 24 majors of the artifact and docker actions
+
+## [0.42.6] - 2026-09-05
+
+### Bug Fixes
+- Bake the release tag into the binary's build version
+
+### CI/CD
+- Assert the image ships jellyfin-ffmpeg
+
+## [0.42.5] - 2026-09-04
+
+### Bug Fixes
+- Compile on macOS and Windows targets
+
+### CI/CD
+- Check /health/live for the build tag, and boot the pushed image
+
+## [0.42.4] - 2026-09-04
+
+### CI/CD
+- Build and attach server binaries to the GitHub Release
+- Use actions/checkout@v5 (Node 20 runtime deprecation warning)
+- Header says GitHub is canonical, not GitLab
+- Grant actions:read so the green-CI gate can list runs
 
 ### Documentation
 - Documentation updates
+
+### Testing
+- Cover the Database query helpers, backup and integrity paths
 
 ### Report
 - Report the run-to-run range, stop ruling on it

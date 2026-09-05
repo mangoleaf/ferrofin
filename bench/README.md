@@ -152,7 +152,9 @@ docker pull jellyfin/jellyfin:10.11.8
 docker pull jellyfin/jellyfin:12.0-rc7
 bench/testdata/build.sh                           # once, ~20 min
 bench/run.sh                                      # one full run, ~40 min → bench/runs/<version>/report.md
-python3 bench/report.py bench/runs/A bench/runs/B bench/runs/C   # the README table: medians, markers, notes
+python3 bench/report.py bench/runs/A bench/runs/B bench/runs/C   # the full tables: medians, markers, notes
+python3 bench/report.py --readme README.md bench/runs/A bench/runs/B bench/runs/C
+                                                  # rewrites the README "Benchmarks" block (table + Mermaid charts)
 python3 bench/report.py --serve                   # the comparison viewer at http://127.0.0.1:8097/
 ```
 
