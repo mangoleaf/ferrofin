@@ -222,6 +222,24 @@ by default and gated per library exactly as in Jellyfin; OMDb needs an API key.
 The tiered matrix with verification depth per area is
 **[`docs/FEATURES.md`](docs/FEATURES.md)**.
 
+## Observability
+
+Ferrofin is built to be run under a modern monitoring stack, not tailed in a terminal.
+
+- **Structured JSON logs** on stdout by default, one event per line with a level, target
+  and typed fields (`item_id`, `user_id`, `task`, …). Set `FERROFIN_LOG_FORMAT=text` for
+  the human-readable form when running interactively; `FERROFIN_LOG` takes the usual
+  `RUST_LOG` filter syntax.
+- **Prometheus metrics** at `/metrics` when `FERROFIN_ENABLE_METRICS=true`, using
+  Jellyfin's own metric names (`http_*`, `process_*`) so existing dashboards keep
+  working. Two ready-made Grafana dashboards and a scrape config are in
+  [`contrib/metrics/`](contrib/metrics/).
+- **OpenTelemetry traces** over OTLP: set `OTEL_EXPORTER_OTLP_ENDPOINT` and every request,
+  library scan, transcode and scheduled task becomes a span. Off unless that variable is
+  set; sampling is the storage knob.
+
+Conventions for each are in [`docs/conventions/`](docs/conventions/).
+
 ## Architecture
 
 A Rust workspace of about twenty crates, edition 2024. The load-bearing idea: clients
