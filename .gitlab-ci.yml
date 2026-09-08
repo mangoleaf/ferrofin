@@ -22,7 +22,9 @@
 #   vX.Y.Z        → image :X.Y.Z + :latest, GitLab Release, chart @ X.Y.Z
 #   vX.Y.Z-rc.N   → image :X.Y.Z-rc.N only (never :latest, no release, no chart)
 #   chart-vA.B.C  → chart only @ A.B.C
-#   main commit   → dev image {M.m.p}-{N}-{sha12} when build-relevant paths change
+#   main commit   → dev image v{M.m.p}-{N}-{sha12} when build-relevant paths change
+#   merge request → dev image v{M.m.p}-{branch-slug}-{N}-{sha12}, MANUAL (play
+#                   docker-image in the MR pipeline) — for homelab testing before merge
 #
 # Portability: release logic is intentionally plain shell so a future move to
 # GitHub Actions / Docker Hub is a matter of re-wiring triggers, not rewriting.
@@ -386,14 +388,27 @@ image-version:
         - Cargo.toml
         - Cargo.lock
         - Dockerfile
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+        - crates/**/*
+        - apps/**/*
+        - Cargo.toml
+        - Cargo.lock
+        - Dockerfile
 
 # ---------------------------------------------------------------------------
 # build — server image (kaniko, no Docker daemon: the homelab runner is in k3s).
-# Builds on a release tag AND on a build-worthy main commit (dev image); the
-# version + :latest decision come from image-version's dotenv.
+# Builds on a release tag AND on a build-worthy main commit (dev image), and on
+# demand (manual) in a merge-request pipeline so a branch can be tested in the
+# homelab before it merges; the version + :latest decision come from
+# image-version's dotenv. `needs` makes that the only dependency, so the build
+# (or the MR's Play button) is available as soon as the version is known rather
+# than after lint + coverage — a dev image is a test artifact, not a release,
+# and release tags are only ever cut from commits that already passed both.
 # ---------------------------------------------------------------------------
 docker-image:
   stage: build
+  needs: [image-version]
   image:
     name: gcr.io/kaniko-project/executor:debug
     entrypoint: [""]
@@ -440,6 +455,15 @@ docker-image:
         - Cargo.toml
         - Cargo.lock
         - Dockerfile
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+        - crates/**/*
+        - apps/**/*
+        - Cargo.toml
+        - Cargo.lock
+        - Dockerfile
+      when: manual
+      allow_failure: true   # a non-clicked button must not leave the MR pipeline "blocked"
 
 # ---------------------------------------------------------------------------
 # release — GitLab Release with git-cliff notes (final versions only)

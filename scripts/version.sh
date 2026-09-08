@@ -14,9 +14,11 @@
 #           (CI_COMMIT_TAG set) that's the tag verbatim, e.g. v0.5.2 (keeps the
 #           leading v to match the git tag); otherwise a dev version
 #           v{Major}.{Minor}.{Patch}-{N}-{sha12}, where N counts commits since the
-#           latest tag that touched build-relevant paths.
+#           latest tag that touched build-relevant paths. On a merge-request
+#           pipeline (CI_COMMIT_REF_SLUG set to a non-default branch) the branch
+#           slug is inserted: v{M}.{m}.{p}-{slug}-{N}-{sha12}.
 #
-# Reads only git state + the CI_COMMIT_TAG / FORCE_VERSION env vars, so it runs
+# Reads only git state + the CI_COMMIT_TAG / FORCE_VERSION / CI_COMMIT_REF_SLUG env vars, so it runs
 # identically in CI and in a bats test against a throwaway repo.
 set -euo pipefail
 
@@ -89,7 +91,15 @@ image_version() {
   fi
   count=$(git rev-list --count "$range" -- "${BUILD_PATHS[@]}")
   sha=$(git rev-parse --short=12 HEAD)
-  printf '%s-%s-%s\n' "$base" "$count" "$sha"
+  # Off the default branch (a merge-request pipeline) the branch slug goes in
+  # the middle so a homelab test image is recognisable at a glance:
+  #   v1.0.0-feat-foo-3-abc123def456   vs main's   v1.0.0-3-abc123def456
+  local slug=${CI_COMMIT_REF_SLUG:-}
+  if [ -n "$slug" ] && [ "$slug" != "${CI_DEFAULT_BRANCH:-main}" ]; then
+    printf '%s-%s-%s-%s\n' "$base" "$slug" "$count" "$sha"
+  else
+    printf '%s-%s-%s\n' "$base" "$count" "$sha"
+  fi
 }
 
 main() {
