@@ -15,8 +15,8 @@ ARG WEB_IMAGE=web-build
 ARG RUNTIME_IMAGE=runtime-build
 
 # ── jellyfin-web, built from source (skipped when CI passes WEB_IMAGE) ──
-ARG JELLYFIN_WEB_VERSION=10.11.8
-FROM node:20-bookworm AS web-source
+ARG JELLYFIN_WEB_VERSION=12.0
+FROM node:24-trixie AS web-source
 ARG JELLYFIN_WEB_VERSION
 # webpack's production build is memory-hungry; give Node headroom.
 ENV NODE_OPTIONS=--max-old-space-size=4096
@@ -38,18 +38,18 @@ COPY --from=web-source /web/dist /dist
 # jellyfin-ffmpeg over Debian's ffmpeg: SIMD single-pass tonemapping and a
 # current libx264 — the difference on 4K HDR transcode start times. It is also
 # built --enable-chromaprint, which is what the intro skipper fingerprints
-# with; bookworm's libchromaprint-tools (fpcalc 1.5.1, a 2020 release) is
+# with; trixie's libchromaprint-tools (fpcalc 1.5.1, a 2020 release) is
 # deliberately NOT installed — it aborts any window that decodes to
 # end-of-stream, which is every credits window.
-FROM debian:bookworm-slim AS runtime-build
+FROM debian:trixie-slim AS runtime-build
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl gnupg \
  && curl -fsSL https://repo.jellyfin.org/jellyfin_team.gpg.key \
       | gpg --dearmor -o /usr/share/keyrings/jellyfin.gpg \
- && echo "deb [signed-by=/usr/share/keyrings/jellyfin.gpg] https://repo.jellyfin.org/debian bookworm main" \
+ && echo "deb [signed-by=/usr/share/keyrings/jellyfin.gpg] https://repo.jellyfin.org/debian trixie main" \
       > /etc/apt/sources.list.d/jellyfin.list \
  && apt-get update \
- && apt-get install -y --no-install-recommends jellyfin-ffmpeg7 \
+ && apt-get install -y --no-install-recommends jellyfin-ffmpeg8 \
  && ln -s /usr/lib/jellyfin-ffmpeg/ffmpeg /usr/local/bin/ffmpeg \
  && ln -s /usr/lib/jellyfin-ffmpeg/ffprobe /usr/local/bin/ffprobe \
  && rm -rf /var/lib/apt/lists/*
@@ -58,7 +58,7 @@ RUN apt-get update \
 FROM ${WEB_IMAGE} AS web
 
 # ── server binary ───────────────────────────────────────────────────────
-FROM rust:1.97.1-bookworm AS build
+FROM rust:1.97.1-trixie AS build
 WORKDIR /src
 COPY . .
 # .git is excluded from the build context, so bake the release version in from
