@@ -3,7 +3,7 @@
 # pushed by the `ci-image` job to $CI_REGISTRY_IMAGE/ci:rust-1.97.1 whenever this
 # file changes; lint/coverage use it as their `image:`. Keep this in step with
 # rust-toolchain.toml; bump the tag (ci:rust-<version>) whenever the toolchain moves.
-FROM rust:1.97.1-bookworm
+FROM rust:1.97.1-trixie
 
 # rustfmt + clippy (lint) and llvm-tools-preview (coverage instrumentation).
 # wasm32-wasip2 builds the WASM example plugin (crates/ferrofin-wasm's

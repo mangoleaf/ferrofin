@@ -6,8 +6,8 @@
 #
 # The final image is FROM scratch and carries only /dist (the built static
 # client), so it's a tiny COPY source (~tens of MB, no node/toolchain).
-ARG JELLYFIN_WEB_VERSION=10.11.8
-FROM node:20-bookworm AS build
+ARG JELLYFIN_WEB_VERSION=12.0
+FROM node:24-trixie AS build
 ARG JELLYFIN_WEB_VERSION
 # webpack's production build is memory-hungry; give Node headroom so CI doesn't OOM.
 ENV NODE_OPTIONS=--max-old-space-size=4096

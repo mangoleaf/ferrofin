@@ -299,8 +299,20 @@ async fn manager_start_ffmpeg_ts_waits_for_first_segment_then_completes() {
     let segs = count_ext(&out_dir, "ts");
     assert!(segs >= 2, "expected >=2 .ts segments, got {segs}");
 
-    // The stderr log captured ffmpeg output (has the command header).
-    let log = std::fs::read_to_string(out_dir.join("out.log")).expect("read log");
+    // The stderr log captured ffmpeg output (has the command header). It is
+    // named like Jellyfin's (`FFmpeg.Transcode-<stamp>_<source>_<id>.log`)
+    // inside `log_dir`, which `start_req` points at `out_dir`.
+    let log_file = std::fs::read_dir(&out_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .find(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("FFmpeg.Transcode-"))
+        })
+        .expect("FFmpeg.Transcode-*.log in out_dir");
+    let log = std::fs::read_to_string(&log_file).expect("read log");
     assert!(log.contains("ffmpeg"), "log missing command header");
 }
 

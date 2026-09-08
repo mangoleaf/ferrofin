@@ -33,7 +33,7 @@ stages: [test, tag, build, release, chart]
 # Pinned jellyfin-web version — single source of truth. web-image builds
 # ci:web-$JELLYFIN_WEB_VERSION; the service image pulls it via WEB_IMAGE.
 variables:
-  JELLYFIN_WEB_VERSION: "10.11.8"
+  JELLYFIN_WEB_VERSION: "12.0"
 
 # ---------------------------------------------------------------------------
 # request-release — the manual release GATE. It has NO needs and lives in .pre,
@@ -127,7 +127,8 @@ create-release:
 # ci-image — the Rust CI base image (toolchain + rustfmt/clippy/nextest/llvm-cov),
 # built with kaniko and pushed to $CI_REGISTRY_IMAGE/ci:rust-1.97.1. The lint and
 # coverage jobs use it as their `image:` so they don't reinstall tools every run.
-# Rebuilds automatically when ci/Dockerfile changes on main; force a rebuild
+# Rebuilds automatically when ci/Dockerfile changes, on main or on the merge-request
+# pipeline that proposes the change; force a rebuild
 # otherwise by running a pipeline with REBUILD_CI_IMAGE set. Lives in .pre so it
 # publishes before the test stage.
 #
@@ -158,14 +159,18 @@ ci-image:
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
       changes:
         - ci/Dockerfile
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+        - ci/Dockerfile
     - if: '$REBUILD_CI_IMAGE'   # force a rebuild: run a pipeline with this var set
 
 # ---------------------------------------------------------------------------
 # web-image — prebuilds jellyfin-web (ci/web.Dockerfile) once and pushes it to
 # ci:web-$JELLYFIN_WEB_VERSION, so the service image build never runs npm/webpack
 # (it COPY --from=s this). Rebuilds when ci/web.Dockerfile changes or on demand
-# via REBUILD_WEB_IMAGE. Bumping JELLYFIN_WEB_VERSION → run once with
-# REBUILD_WEB_IMAGE=1 to publish the new ci:web-<ver> tag. Lives in .pre.
+# via REBUILD_WEB_IMAGE. Bumping JELLYFIN_WEB_VERSION rebuilds it too (the tag
+# is keyed on it), on main and on the merge-request pipeline that proposes the
+# bump, so an MR can build the service image against its own web. Lives in .pre.
 # ---------------------------------------------------------------------------
 web-image:
   stage: .pre
@@ -190,14 +195,20 @@ web-image:
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
       changes:
         - ci/web.Dockerfile
+        - .gitlab-ci.yml   # JELLYFIN_WEB_VERSION (the tag) lives here
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+        - ci/web.Dockerfile
+        - .gitlab-ci.yml
     - if: '$REBUILD_WEB_IMAGE'   # force a rebuild: run a pipeline with this var set
 
 # ---------------------------------------------------------------------------
-# runtime-image — prebuilds the debian-slim + jellyfin-ffmpeg7 runtime base
-# (ci/runtime.Dockerfile) once and pushes it to ci:runtime-bookworm-ffmpeg7, so
+# runtime-image — prebuilds the debian-slim + jellyfin-ffmpeg8 runtime base
+# (ci/runtime.Dockerfile) once and pushes it to ci:runtime-trixie-ffmpeg8, so
 # the service image build never re-runs the ~150-package apt install (it just
-# `FROM`s this via RUNTIME_IMAGE). Rebuilds when ci/runtime.Dockerfile changes or
-# on demand via REBUILD_RUNTIME_IMAGE. Lives in .pre.
+# `FROM`s this via RUNTIME_IMAGE). Rebuilds when ci/runtime.Dockerfile or the tag
+# here changes — on main and on the merge-request pipeline proposing the change —
+# or on demand via REBUILD_RUNTIME_IMAGE. Lives in .pre.
 # ---------------------------------------------------------------------------
 runtime-image:
   stage: .pre
@@ -205,7 +216,7 @@ runtime-image:
     name: gcr.io/kaniko-project/executor:debug
     entrypoint: [""]
   variables:
-    RUNTIME_IMAGE: $CI_REGISTRY_IMAGE/ci:runtime-bookworm-ffmpeg7
+    RUNTIME_IMAGE: $CI_REGISTRY_IMAGE/ci:runtime-trixie-ffmpeg8
   before_script:
     - mkdir -p /kaniko/.docker
     - AUTH="$(printf "%s:%s" "$CI_REGISTRY_USER" "$CI_REGISTRY_PASSWORD" | base64 | tr -d '\n')"
@@ -221,6 +232,11 @@ runtime-image:
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
       changes:
         - ci/runtime.Dockerfile
+        - .gitlab-ci.yml   # the ci:runtime-<distro>-<ffmpeg> tag lives here
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+        - ci/runtime.Dockerfile
+        - .gitlab-ci.yml
     - if: '$REBUILD_RUNTIME_IMAGE'   # force a rebuild: run a pipeline with this var set
 
 # ---------------------------------------------------------------------------
@@ -408,7 +424,15 @@ image-version:
 # ---------------------------------------------------------------------------
 docker-image:
   stage: build
-  needs: [image-version]
+  needs:
+    - job: image-version
+    # `needs` bypasses stage ordering, so wait for the base images whenever this
+    # pipeline is publishing them (a Dockerfile or version change, or a REBUILD_*
+    # var); ignored on runs where they are skipped.
+    - job: web-image
+      optional: true
+    - job: runtime-image
+      optional: true
   image:
     name: gcr.io/kaniko-project/executor:debug
     entrypoint: [""]
@@ -442,7 +466,7 @@ docker-image:
       --dockerfile "$CI_PROJECT_DIR/Dockerfile"
       --build-arg SERVICE_VERSION="$IMAGE_VERSION"
       --build-arg WEB_IMAGE="$CI_REGISTRY_IMAGE/ci:web-$JELLYFIN_WEB_VERSION"
-      --build-arg RUNTIME_IMAGE="$CI_REGISTRY_IMAGE/ci:runtime-bookworm-ffmpeg7"
+      --build-arg RUNTIME_IMAGE="$CI_REGISTRY_IMAGE/ci:runtime-trixie-ffmpeg8"
       --skip-unused-stages=true
       $DESTS
       --push-retry 5
