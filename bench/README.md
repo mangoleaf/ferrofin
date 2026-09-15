@@ -1,13 +1,13 @@
 # Benchmark methodology
 
 This directory produces the comparison table in the root README: Ferrofin against
-Jellyfin 12.0-rc7 (the source of truth — owner decision, 2026-09-02: Jellyfin 12 is
-10.12 in all but name, and where 10.11.8 differs from it, 10.11.8 is the one that is
-wrong) and Jellyfin 10.11.8 (the vendored API contract), on identical test data, on one host. Every number in that table has a one-sentence definition below, and every
+Jellyfin 12.0.0 (the reference for future runs) and Jellyfin 10.11.8 (the vendored API
+contract), on identical test data, on one host. Archived runs retain their recorded
+12.0-rc7 labels and measurements. Every number in that table has a one-sentence definition below, and every
 published number passed the one check the run itself performs:
 
 - **comparable** — the server returned the same status and record count as Jellyfin
-  12.0-rc7 and a field set that is a superset of its, for every request behind the number.
+  12 and a field set that is a superset of its, for every request behind the number.
   A server that returns fewer records, fewer fields, or an error would be "faster" for
   free; such a cell is marked `⚠[n]` — the number stays for the work list rather than
   being published, and note `n`, printed once at the end with every cell that points at
@@ -105,7 +105,9 @@ movies, 50 HDR10 4K files, 300 multi-track files and one 3-minute 8 Mbps movie f
 streaming numbers. **Jellyfin 10.11.8 itself scans it** with every remote fetcher off and
 is seeded over its own API (two users; 30 % of movies and 60 % of forty series played,
 5 % favorites, 60 resume positions, 200 ratings), then drained and stopped. The resulting
-config directory is what every server boots a fresh copy of; media is mounted read-only.
+config directory is what Jellyfin 10.11.8 and Ferrofin boot a fresh copy of. Jellyfin
+12 boots a copy of the separately prepared config described below. Ferrofin adoption
+stays inside the run; media is mounted read-only for every server.
 
 ## Accuracy controls
 
@@ -154,22 +156,40 @@ numbers with a flag in full reports; flagged cells and their ratios are withheld
 the generated root README. Historical logs retain their original, limited shape evidence.
 Their timing repetition count defaults to the original five unless recorded explicitly.
 
-Needs `docker`, `k6`, `jq`, `taskset` and `python3` on PATH — `run.sh` checks for all five
-and refuses to start without them — plus `curl`, which it uses but does not check for.
+Needs `docker`, `k6`, `jq`, `taskset`, `python3`, `curl` and `sha256sum` on PATH;
+`run.sh` checks for them before starting.
 Building the test data additionally needs `ffmpeg` (with libx264 and libx265), `ffprobe`
 and Python `Pillow`.
 
 ```bash
 docker build -t ferrofin:bench .                  # the commit under test
 docker pull jellyfin/jellyfin:10.11.8
-docker pull jellyfin/jellyfin:12.0-rc7
-bench/testdata/build.sh                           # once, ~20 min
+docker pull "$(cat bench/testdata/jellyfin12-image.txt)"  # immutable Jellyfin 12.0 image
+bench/testdata/build.sh                           # source fixture, once, ~20 min
+bench/testdata/build.sh --prepare-jellyfin12        # once per source fixture / pinned image
 bench/run.sh                                      # one full run, ~40 min → bench/runs/<version>/report.md
 python3 bench/report.py bench/runs/A bench/runs/B bench/runs/C   # the full tables: medians, markers, notes
 python3 bench/report.py --readme README.md bench/runs/A bench/runs/B bench/runs/C
                                                   # rewrites the README "Benchmarks" block (headline table + prose)
 python3 bench/report.py --serve                   # the comparison viewer at http://127.0.0.1:8097/
 ```
+
+Jellyfin preparation copies the stopped 10.11.8 config into `testdata/jellyfin12/`,
+boots the pinned image, explicitly requests a full library scan, and waits for that
+scan's last-execution end time to advance with a successful result. An initial Idle
+state does not count as completion. It verifies movie, series, episode, album and
+track counts, all 40 multi-version groups, and the fixture's selected item IDs,
+then drains tasks and stops the server. `PREPARE_TIMEOUT_S` (default 1800) bounds each
+task-drain/scan wait; preparation is outside measured windows. The output directory
+must not already exist, so a failed preparation cannot silently become a ready fixture.
+
+`preparation.json` records the image ID, source database and ID-file hashes, server
+version, scan result, counts and preparation elapsed time. Runs reject a preparation
+whose source, IDs or image no longer match, and copy its config for each run. The
+source 10.11.8 config and prepared 12 config remain stopped and unchanged. Each run
+also records `/System/Info/Public` in `system-info.json`; all report labels use that
+version, falling back to `image.txt` for archived runs. RC7 and stable runs cannot be
+pooled. Preparation logs and validation evidence stay beside the prepared config.
 
 A run is named for the code it measured: `v0.42.1` on a tag, `v0.42.1-3-7e80268` when
 the branch is that many commits past the tag, and `-dirty` appended when the working
@@ -185,12 +205,14 @@ The viewer lists every run under `bench/runs`; tick the runs to render (several 
 median + ranges) and optionally a baseline. Cells stay numeric in both renderers: the
 median, the range its runs spanned (in brackets in the markdown; under the number in the
 viewer's tiles and on the cell's hover text in its tables), and `⚠[n]` pointing at a
-numbered note. Both also print each cell's speed against Jellyfin 12.0-rc7 as
+numbered note. Both also print each cell's speed against the recorded Jellyfin 12 reference as
 `X.Y× faster` (memory says lighter), shown only where both numbers stand; with a
 baseline the viewer adds each server's percentage change against an earlier run of
 itself (green = faster/smaller). Localhost only,
 stdlib only, no JavaScript.
 
 Tunables are the variables at the top of `run.sh` (`WINDOW_S`, `RATE_LOADED`, …); pass
-`--only loaded` for a before/after on two builds. A shared host must be quiet: stop
+`--only loaded` for a before/after on two builds, or a comma list such as
+`--only counts,shape,unloaded,loaded`. Unknown or empty list entries are rejected.
+The default still selects all phases and all three servers. A shared host must be quiet: stop
 anything that would compete for the chosen cores before a release run.

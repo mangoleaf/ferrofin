@@ -11,6 +11,7 @@ and the persisted bench token that run.sh, screens.js and ttfs.py use.
 """
 
 import json
+import os
 import random
 import sys
 import time
@@ -27,9 +28,11 @@ TICK = 10_000_000  # ticks per second
 
 
 class Api:
-    def __init__(self, url):
+    def __init__(self, url, timeout=600, attempts=120):
         self.url = url.rstrip("/")
         self.token = None
+        self.timeout = timeout
+        self.attempts = attempts
 
     def call(self, method, path, body=None, **q):
         q = {k: v for k, v in q.items() if v is not None}
@@ -39,16 +42,16 @@ class Api:
         req.add_header("Authorization", AUTH + (f', Token="{self.token}"' if self.token else ""))
         if data is not None:
             req.add_header("Content-Type", "application/json")
-        for attempt in range(120):
+        for attempt in range(self.attempts):
             try:
-                with urllib.request.urlopen(req, timeout=600) as r:
+                with urllib.request.urlopen(req, timeout=self.timeout) as r:
                     raw = r.read()
                     return json.loads(raw) if raw.strip() else None
             except urllib.error.HTTPError as e:
-                if e.code != 503:  # 503 = still starting up
+                if e.code != 503 or attempt + 1 == self.attempts:  # 503 = still starting up
                     raise
                 time.sleep(1)
-        raise RuntimeError(f"{method} {path}: 503 for 120s")
+        raise RuntimeError(f"{method} {path}: 503 after {self.attempts} attempts")
 
     def get(self, path, **q):
         return self.call("GET", path, **q)
@@ -60,10 +63,13 @@ class Api:
 def wait_ready(api, secs=300):
     for _ in range(secs * 2):
         try:
-            api.get("/System/Info/Public")
-            return
+            # Jellyfin 12's temporary setup server also returns HTTP 200, but
+            # camelCase JSON; wait for the actual API's PascalCase response.
+            if api.get("/System/Info/Public").get("Version"):
+                return
         except (urllib.error.URLError, ConnectionError, OSError):
-            time.sleep(0.5)
+            pass
+        time.sleep(0.5)
     sys.exit("server never became ready")
 
 
@@ -81,6 +87,76 @@ def drain(api, settle=30, label=""):
         print(f"  {label}waiting for {busy} ({int(time.time() - t0)}s)", flush=True)
         time.sleep(10)
     time.sleep(settle)
+
+
+def refresh_and_wait(api, timeout):
+    """The refresh POST is asynchronous: Idle alone does not prove a scan ran."""
+    tasks = [t for t in api.get("/ScheduledTasks") if t.get("Key") == "RefreshLibrary"]
+    if len(tasks) != 1:
+        raise RuntimeError("expected one RefreshLibrary task")
+    task = tasks[0]
+    if task.get("State") != "Idle":
+        raise RuntimeError("library scan already active; drain before requesting a scan")
+    before = (task.get("LastExecutionResult") or {}).get("EndTimeUtc", "")
+    api.post("/Library/Refresh")
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        task = api.get(f"/ScheduledTasks/{task['Id']}")
+        result = task.get("LastExecutionResult") or {}
+        if result.get("EndTimeUtc", "") > before:
+            if result.get("Status") != "Completed":
+                raise RuntimeError(f"library scan failed: {result.get('Status')}")
+            if task.get("State") == "Idle":
+                return result
+        time.sleep(2)
+    raise RuntimeError("library scan did not complete before its deadline")
+
+
+def prepare_jellyfin12(url, ids_path, summary_path, out):
+    """Verify one disposable upgraded config; build.sh stops it before marking ready."""
+    with open(ids_path) as f:
+        ids = json.load(f)
+    with open(summary_path) as f:
+        summary = json.load(f)
+    api = Api(url, timeout=10, attempts=1)
+    wait_ready(api)
+    api.token = ids["token"]
+    info = api.get("/System/Info/Public")
+    if info.get("Version") != "12.0.0":
+        raise RuntimeError(f"expected Jellyfin 12.0.0, got {info.get('Version')}")
+    timeout = int(os.environ.get("PREPARE_TIMEOUT_S", "1800"))
+    deadline = time.monotonic() + timeout
+    while running_tasks(api):
+        if time.monotonic() >= deadline:
+            raise RuntimeError("startup tasks did not drain before preparation deadline")
+        time.sleep(2)
+    print("requesting post-upgrade library scan", flush=True)
+    scan = refresh_and_wait(api, timeout)
+    counts = {}
+    for key, item_type in (("movies", "Movie"), ("series", "Series"), ("episodes", "Episode"),
+                           ("albums", "MusicAlbum"), ("tracks", "Audio")):
+        counts[key] = api.get("/Items", userId=ids["user"], recursive="true",
+                              includeItemTypes=item_type, limit=0)["TotalRecordCount"]
+        if counts[key] != summary[key]:
+            raise RuntimeError(f"{key}: expected {summary[key]}, got {counts[key]} after scan")
+    movies = api.get("/Items", userId=ids["user"], recursive="true", includeItemTypes="Movie",
+                     fields="MediaSources", limit=100000)["Items"]
+    versions = sum(len(m.get("MediaSources", [])) > 1 for m in movies)
+    if versions != summary["case_multi_version"]:
+        raise RuntimeError(f"multi-version groups: expected {summary['case_multi_version']}, got {versions}")
+    for key in ("movie", "hdr_movie", "stream", "series", "season", "episode"):
+        item = api.get(f"/Users/{ids['user']}/Items/{ids[key]}")
+        if item.get("Id", "").replace("-", "") != ids[key].replace("-", ""):
+            raise RuntimeError(f"selected {key} no longer resolves to its fixture ID")
+    deadline = time.monotonic() + timeout
+    while running_tasks(api):
+        if time.monotonic() >= deadline:
+            raise RuntimeError("tasks did not drain after preparation")
+        time.sleep(2)
+    result = {"system_info": info, "scan": scan, "counts": counts, "multi_version_groups": versions}
+    with open(out, "w") as f:
+        json.dump(result, f, indent=2)
+    print(json.dumps({"version": info["Version"], "counts": counts, "multi_version_groups": versions}), flush=True)
 
 
 def main():
@@ -162,4 +238,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] == "--prepare-jellyfin12":
+        prepare_jellyfin12(*sys.argv[2:])
+    else:
+        main()

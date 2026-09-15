@@ -6,10 +6,10 @@
 # is reported and the next one runs; report.py renders whatever exists.
 #
 #   run.sh [--testdata DIR] [--servers jellyfin,jellyfin12,ferrofin]
-#          [--only counts|shape|coldstart|unloaded|loaded|stress|ttfs] [--rate N] [--out DIR]
+#          [--only counts,shape,coldstart,unloaded,loaded,stress,ttfs] [--rate N] [--out DIR]
 #
 # Requires: docker, k6, python3, jq; images jellyfin/jellyfin:10.11.8,
-# jellyfin/jellyfin:12.0-rc7 and ferrofin:bench (docker build -t ferrofin:bench .).
+# the pinned Jellyfin 12.0.0 image and ferrofin:bench (docker build -t ferrofin:bench .).
 set -euo pipefail
 CALLER=$PWD
 cd "$(dirname "$0")/.."
@@ -47,12 +47,25 @@ MEMORY=${MEMORY:-8g}                # cgroup limit, swap disabled (part of the m
 
 TESTDATA=$PWD/bench/testdata; SERVERS=jellyfin,jellyfin12,ferrofin; ONLY=""; OUT=""
 while [ $# -gt 0 ]; do case "$1" in
-  --testdata) TESTDATA=$2; shift 2;; --servers) SERVERS=$2; shift 2;; --only) ONLY=$2; shift 2;;
+  --testdata) TESTDATA=$2; shift 2;; --servers) SERVERS=$2; shift 2;;
+  --only) ONLY=${2:-}; [ -n "$ONLY" ] || { echo "--only requires a phase or comma list" >&2; exit 2; }; shift 2;;
   # --rate sets the LOADED level only; RATE_UNLOADED and RATE_STRESS are env vars.
   --rate) RATE_LOADED=$2; shift 2;;
   --out) OUT=$2; shift 2;;
   *) echo "unknown $1" >&2; exit 2;;
 esac; done
+# Reject bad selections before any fixture access or Docker command.
+for selection in "$ONLY" "$SERVERS"; do
+  [[ "$selection" != *[[:space:]]* ]] || { echo "selections must be comma-separated without whitespace" >&2; exit 2; }
+  case "$selection" in ,*|*,|*,,*) echo "invalid empty selection in $selection" >&2; exit 2;; esac
+done
+[ -n "$SERVERS" ] || { echo "--servers cannot be empty" >&2; exit 2; }
+for phase in ${ONLY//,/ }; do
+  case "$phase" in counts|shape|coldstart|unloaded|loaded|stress|ttfs) ;; *) echo "unknown phase $phase" >&2; exit 2;; esac
+done
+for server in ${SERVERS//,/ }; do
+  case "$server" in jellyfin|jellyfin12|ferrofin) ;; *) echo "unknown server $server" >&2; exit 2;; esac
+done
 abs() { case "$1" in /*) echo "$1";; *) echo "$CALLER/$1";; esac; }   # user paths are relative to the caller's shell
 TESTDATA=$(realpath -m "$(abs "$TESTDATA")")
 SHA=$(git rev-parse --short HEAD 2>/dev/null || echo nogit)
@@ -94,14 +107,25 @@ OUT=$(realpath -m "$(abs "${OUT:-$RUNS_DIR/$(run_name)}")")
 for p in "$TESTDATA" "$OUT"; do case "$p" in /mnt/mangonas*|/mnt/nvme0/k3s*) echo "refusing to touch $p" >&2; exit 1;; esac; done
 
 die() { echo "run: $*" >&2; exit 1; }
-image_of() { case "$1" in jellyfin) echo jellyfin/jellyfin:10.11.8;; jellyfin12) echo jellyfin/jellyfin:12.0-rc7;; ferrofin) echo ferrofin:bench;; *) die "unknown server $1";; esac; }
+image_of() { case "$1" in jellyfin) echo jellyfin/jellyfin:10.11.8;; jellyfin12) cat bench/testdata/jellyfin12-image.txt;; ferrofin) echo ferrofin:bench;; *) die "unknown server $1";; esac; }
 port_of() { case "$1" in jellyfin) echo 18101;; jellyfin12) echo 18102;; ferrofin) echo 18103;; esac; }
-want() { [ -z "$ONLY" ] || [ "$ONLY" = "$1" ]; }
+want() { [ -z "$ONLY" ] || [[ ",$ONLY," == *",$1,"* ]]; }
 
 # ── preflight ──────────────────────────────────────────────────────────────
 [ -f "$TESTDATA/ids.json" ] || die "no $TESTDATA/ids.json — build the test data first (bench/testdata/build.sh)"
-for t in docker k6 python3 jq taskset; do command -v $t >/dev/null || die "$t not installed"; done
+for t in docker k6 python3 jq taskset curl sha256sum; do command -v $t >/dev/null || die "$t not installed"; done
 for s in ${SERVERS//,/ }; do docker image inspect "$(image_of "$s")" >/dev/null 2>&1 || die "image $(image_of "$s") missing"; done
+if [[ ",$SERVERS," == *,jellyfin12,* ]]; then
+  prep=$TESTDATA/jellyfin12/preparation.json
+  [ -f "$prep" ] || die "prepare Jellyfin 12.0.0 first: bench/testdata/build.sh --prepare-jellyfin12 '$TESTDATA'"
+  expected_image=$(docker image inspect -f '{{.Id}}' "$(image_of jellyfin12)")
+  expected_source=$(sha256sum "$TESTDATA/config/data/jellyfin.db" | cut -d' ' -f1)
+  expected_ids=$(sha256sum "$TESTDATA/ids.json" | cut -d' ' -f1)
+  jq -e --arg image "$expected_image" --arg source "$expected_source" --arg ids "$expected_ids" \
+    '.image_id == $image and .source_db_sha256 == $source and .ids_sha256 == $ids and .validation.system_info.Version == "12.0.0"' \
+    "$prep" >/dev/null || die "Jellyfin 12 preparation does not match this image/source fixture"
+fi
+echo "servers: $SERVERS; selected phases: ${ONLY:-all}; warm-up ${WARMUP_S}s; windows ${WINDOW_S}s"
 [ -z "$(docker ps -aq --filter name=^bench-)" ] || die "a bench-* container exists (docker rm -f it first)"
 idle=$(python3 bench/mem_sample.py --check "$SERVER_CPUS,$CLIENT_CPUS")
 awk -v i="$idle" -v m="$CORE_IDLE_MIN" -v c="$SERVER_CPUS,$CLIENT_CPUS" 'BEGIN { if (i < m) { printf "cores %s are only %.0f%% idle (need %.0f%%) — something else is using them\n", c, i*100, m*100; exit 1 } }' || exit 1
@@ -121,7 +145,9 @@ api() {  # GET with the bench token; retries through a starting server's 503s/re
   local _; for _ in $(seq 1 120); do curl -sf -H "$AUTH" "$URL$1" && return 0; sleep 1; done
   echo "run: $NAME: GET $1 kept failing" >&2; return 1
 }
-wait_ready() { local _; for _ in $(seq 1 600); do curl -sf "$URL/System/Info/Public" >/dev/null 2>&1 && return; sleep 1; done; echo "run: $NAME never became ready" >&2; return 1; }
+# The temporary Jellyfin 12 setup server returns 200 with camelCase JSON. Require
+# the real API response before recording its version or issuing authenticated calls.
+wait_ready() { local _; for _ in $(seq 1 600); do curl -sf "$URL/System/Info/Public" 2>/dev/null | jq -e '.Version | strings | length > 0' >/dev/null 2>&1 && return; sleep 1; done; echo "run: $NAME never became ready" >&2; return 1; }
 drain() {  # every scheduled task idle, then settle (before EVERY window)
   local t0=$SECONDS busy
   while :; do
@@ -214,7 +240,12 @@ run_server() {
   [ -e "$cfg" ] && die "$cfg exists — a run dir is never reused"
   mkdir -p "$D"
   # provision: fresh copy of the test data; media read-only, no flag removes it
-  cp -r --reflink=auto "$TESTDATA/config" "$cfg"; mkdir -p "$cache"
+  local source=$TESTDATA/config
+  if [ "$1" = jellyfin12 ]; then
+    source=$TESTDATA/jellyfin12/config
+    cp "$TESTDATA/jellyfin12/preparation.json" "$D/preparation.json"
+  fi
+  cp -r --reflink=auto "$source" "$cfg"; mkdir -p "$cache"
   local env=(); [ "$1" = ferrofin ] && env=(-e FERROFIN_DATA_DIR=/config -e FERROFIN_CACHE_DIR=/cache)
   # the server log is the one diagnostic a failed phase needs: always captured, on any exit
   trap 'docker logs "$CONTAINER" > "$D/server.log" 2>&1 || true; docker rm -f "$CONTAINER" >/dev/null 2>&1 || true' EXIT
@@ -223,6 +254,10 @@ run_server() {
     -p "127.0.0.1:$(port_of "$1"):8096" "${env[@]}" -v "$cfg:/config" -v "$cache:/cache" -v "$TESTDATA/media:/media:ro" \
     "$(image_of "$1")" >/dev/null
   wait_ready || die "$NAME did not start — see $D/server.log"
+  api "/System/Info/Public" > "$D/system-info.json"
+  if [ "$1" = jellyfin12 ]; then
+    [ "$(jq -r .Version "$D/system-info.json")" = 12.0.0 ] || die "expected Jellyfin 12.0.0"
+  fi
   [ "$1" = ferrofin ] && disable_plugins "$cfg"
   drain || die "$NAME: could not read /ScheduledTasks"
   docker inspect -f '{{.Config.Image}} {{.Image}}' "$CONTAINER" > "$D/image.txt"

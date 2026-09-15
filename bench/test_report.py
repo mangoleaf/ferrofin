@@ -3,10 +3,14 @@ import copy
 import json
 from pathlib import Path
 import shutil
+import subprocess
 import tempfile
 import unittest
+from unittest.mock import Mock, patch
+import urllib.error
 
 import report
+from testdata import seed
 
 
 class ReportTests(unittest.TestCase):
@@ -270,12 +274,102 @@ class ReportTests(unittest.TestCase):
         self.edit(self.a / 'ferrofin/k6-loaded.json', lambda x: x['screens']['home'].pop('p99'))
         self.assertNotIn('faster', self.row(self.readme()))
 
+    def test_version_labels_follow_each_run_in_every_renderer(self):
+        old = self.build(self.a)
+        self.write(self.b / 'jellyfin12/system-info.json', {'Version': '12.0.0'})
+        new = self.build(self.b)
+        for render in (report.render_md, report.render_html,
+                       lambda m: report.render_readme(m, m['runs'])):
+            with self.subTest(renderer=render):
+                self.assertIn('Jellyfin 12.0.0', render(new))
+                self.assertNotIn('12.0-rc7', render(new))
+                self.assertIn('Jellyfin 12.0-rc7', render(old))
+                self.assertNotIn('Jellyfin 12.0.0', render(old))
+
+    def test_digest_without_version_is_not_labelled_stable(self):
+        d = self.a / 'jellyfin12'
+        (d / 'image.txt').write_text('jellyfin/jellyfin@sha256:abc sha256:def')
+        self.assertEqual(report.server_label(d, 'jellyfin12'), 'Jellyfin (version unknown)')
+
+    def test_reported_version_mismatch_refuses_aggregation(self):
+        self.write(self.a / 'jellyfin12/system-info.json', {'Version': '12.0.0'})
+        with self.assertRaisesRegex(ValueError, 'jellyfin12 reported version'):
+            self.build(self.a, self.b)
+
     def test_missing_memory_repetition_withholds_headline(self):
         (self.b / 'ferrofin/mem.csv').unlink()
         m = self.build(self.a, self.b)
         for name, cells in m['memory']:
             if name in report.README_MEMORY:
                 self.assertIsNotNone(cells['ferrofin'].flag)
+
+
+class PreparationTests(unittest.TestCase):
+    def task(self, state='Idle', end='2026-09-14T01:00:00Z', status='Completed'):
+        return {'Id': 'scan', 'Key': 'RefreshLibrary', 'State': state,
+                'LastExecutionResult': {'EndTimeUtc': end, 'Status': status}}
+
+    @patch.object(seed.time, 'sleep')
+    def test_scan_waits_past_initial_idle_for_new_completion(self, sleep):
+        done = self.task(end='2026-09-15T01:00:00Z')
+        api = Mock()
+        api.get.side_effect = [[self.task()], self.task(), self.task('Running'), done]
+        self.assertEqual(seed.refresh_and_wait(api, 30), done['LastExecutionResult'])
+        api.post.assert_called_once_with('/Library/Refresh')
+        self.assertEqual(api.get.call_count, 4)
+        self.assertEqual(sleep.call_count, 2)
+
+    def test_failed_scan_is_not_ready(self):
+        api = Mock()
+        api.get.side_effect = [[self.task()], self.task(end='2026-09-15T01:00:00Z', status='Failed')]
+        with self.assertRaisesRegex(RuntimeError, 'scan failed'):
+            seed.refresh_and_wait(api, 30)
+
+    @patch.object(seed.time, 'sleep')
+    @patch.object(seed.time, 'monotonic', side_effect=[0, 1, 31])
+    def test_stale_idle_times_out(self, monotonic, sleep):
+        api = Mock()
+        api.get.side_effect = [[self.task()], self.task()]
+        with self.assertRaisesRegex(RuntimeError, 'deadline'):
+            seed.refresh_and_wait(api, 30)
+
+    def test_already_running_scan_is_not_adopted(self):
+        api = Mock()
+        api.get.return_value = [self.task('Running')]
+        with self.assertRaisesRegex(RuntimeError, 'already active'):
+            seed.refresh_and_wait(api, 30)
+        api.post.assert_not_called()
+
+    @patch.object(seed.time, 'sleep')
+    @patch.object(seed.urllib.request, 'urlopen')
+    def test_startup_503_remains_retryable(self, urlopen, sleep):
+        urlopen.side_effect = urllib.error.HTTPError('http://localhost', 503, 'starting', {}, None)
+        self.addCleanup(urlopen.side_effect.close)
+        api = seed.Api('http://localhost', attempts=1)
+        with self.assertRaises(urllib.error.HTTPError):
+            api.get('/System/Info/Public')
+        with patch.object(api, 'get', side_effect=[urlopen.side_effect, {'Version': '12.0.0'}]):
+            seed.wait_ready(api, secs=1)
+        sleep.assert_called_once_with(0.5)
+
+    @patch.object(seed.time, 'sleep')
+    def test_setup_server_200_is_not_api_readiness(self, sleep):
+        api = Mock()
+        api.get.side_effect = [{'version': '12.0.0'}, {'Version': '12.0.0'}]
+        seed.wait_ready(api, secs=1)
+        self.assertEqual(api.get.call_count, 2)
+        sleep.assert_called_once_with(0.5)
+
+    def test_invalid_selections_fail_before_fixture_or_docker_access(self):
+        script = Path(__file__).parent / 'run.sh'
+        for flag, value in (('--only', ''), ('--only', 'loaded,bogus'), ('--only', 'loaded,,shape'),
+                            ('--only', 'loaded shape'), ('--only', ',counts'),
+                            ('--servers', ''), ('--servers', 'jellyfin12,unknown')):
+            with self.subTest(flag=flag, value=value):
+                result = subprocess.run(['bash', str(script), flag, value],
+                                        capture_output=True, text=True)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertNotIn('build the test data', result.stderr)
 
 
 if __name__ == '__main__':

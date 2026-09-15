@@ -13,7 +13,7 @@ where the runs disagreed at the precision published, the range they spanned; a c
 did different work than the oracle is marked `⚠[n]` and the reason is printed once,
 numbered, under Notes.
 One rule is applied per cell, from files the run itself wrote:
-  comparable   — same status + record count as the oracle (Jellyfin 12.0-rc7) and a field
+  comparable   — same status + record count as the recorded Jellyfin 12 oracle and a field
                  set ⊇ the oracle's, for every request name behind the cell (shape.log).
 Flagged cells keep their raw number (the work list) but are not publishable.
 The range is reported, never judged. A fixed 15 % band was tried as a reproducibility
@@ -43,8 +43,8 @@ from collections import defaultdict
 
 DELTA_NOISE_PCT = 2  # a baseline change smaller than this is not coloured
 ORACLE = "jellyfin12"  # the source of truth (owner, 2026-09-02): Jellyfin 12 is the newer code
-ORACLE_LABEL = "Jellyfin 12.0-rc7"
-SERVERS = [("jellyfin12", "Jellyfin 12.0-rc7"), ("jellyfin", "Jellyfin 10.11.8"), ("ferrofin", "Ferrofin")]
+ORACLE_LABEL = "Jellyfin reference"
+SERVERS = [("jellyfin12", "Jellyfin 12"), ("jellyfin", "Jellyfin 10.11"), ("ferrofin", "Ferrofin")]
 SCREENS = ["home", "movies", "detail", "series", "search", "playback"]
 #: The load levels a run may contain, lightest first. A run that skipped one (`--only`)
 #: has no entry for it in `windows.json`, and the renderers drop the level.
@@ -111,7 +111,7 @@ def load_shape(d):
     return out
 
 
-def oracle_failed(shape_oracle, names):
+def oracle_failed(shape_oracle, names, oracle_label=ORACLE_LABEL):
     """The oracle's own verdict: a status >= 400 on any request behind the row."""
     if shape_oracle is None:
         return "no shape pass"  # the oracle ran but its shape phase did not
@@ -120,16 +120,16 @@ def oracle_failed(shape_oracle, names):
         if not o:
             return f"{n}: missing"
         if any(not isinstance(st, int) or not 200 <= st < 400 for st in o["status"]):
-            return f"{ORACLE_LABEL} failed {n} ({sorted(o['status'], key=str)})"
+            return f"{oracle_label} failed {n} ({sorted(o['status'], key=str)})"
         if n == "image" and any(r.get("bytes") == 0 for rs in o.get("samples", {}).values() for r in rs):
             return f"{n}: empty oracle response"
     return None
 
 
-def comparable(shape_srv, shape_oracle, names):
+def comparable(shape_srv, shape_oracle, names, oracle_label=ORACLE_LABEL):
     """None if comparable, else the reason."""
     if shape_oracle is None:
-        return f"no oracle run ({ORACLE_LABEL} not in this run)"
+        return f"no oracle run ({oracle_label} not in this run)"
     if shape_srv is None:
         return "no shape pass"
     for n in names:
@@ -137,7 +137,7 @@ def comparable(shape_srv, shape_oracle, names):
         if o is None or s is None:
             return f"{n}: missing"
         if any(not isinstance(st, int) or not 200 <= st < 400 for st in o["status"]):
-            return f"{n}: {ORACLE_LABEL} failed ({sorted(o['status'], key=str)})"
+            return f"{n}: {oracle_label} failed ({sorted(o['status'], key=str)})"
         if s["status"] != o["status"]:
             return f"{n}: status {sorted(s['status'], key=str)} vs {sorted(o['status'], key=str)}"
         if s["count"] != o["count"]:
@@ -392,6 +392,20 @@ def image_id(d):
         return None
 
 
+def server_label(d, server):
+    if server == "ferrofin":
+        return "Ferrofin"
+    info = load(os.path.join(d, "system-info.json")) or {}
+    if info.get("Version"):
+        return f"Jellyfin {info['Version']}"
+    # Archived image.txt starts with repository:tag, followed by the image ID.
+    identity = image_id(d)
+    ref = identity.split()[0] if identity else ""
+    if "@" not in ref and ":" in ref.rsplit("/", 1)[-1] and not ref.startswith("sha256:"):
+        return "Jellyfin " + ref.rsplit(":", 1)[-1]
+    return "Jellyfin (version unknown)"
+
+
 def incompatible(runs, compare_builds=False):
     metas = [load(os.path.join(r, "run.json")) or {} for r in runs]
     issues = [key for key in CONDITIONS
@@ -406,6 +420,8 @@ def incompatible(runs, compare_builds=False):
             issues.append(f"{k} load levels")
         if not (compare_builds and k == "ferrofin") and len({image_id(d) for d in present}) > 1:
             issues.append(f"{k} image")
+        if k != "ferrofin" and len({server_label(d, k) for d in present}) > 1:
+            issues.append(f"{k} reported version")
         for lvl in LOAD_LEVELS:
             xs = [load(os.path.join(d, f"k6-{lvl}.json")) for d in present]
             for field in ("rate", "duration"):
@@ -454,13 +470,15 @@ def build(runs):
         raise ValueError("incompatible runs: " + ", ".join(problems))
     metas = [load(os.path.join(r, "run.json")) or {} for r in runs]
     meta = metas[0]
-    servers = [(k, label) for k, label in SERVERS if any(os.path.isdir(os.path.join(r, k)) for r in runs)]
+    servers = [(k, server_label(next(os.path.join(r, k) for r in runs if os.path.isdir(os.path.join(r, k))), k))
+               for k, _ in SERVERS if any(os.path.isdir(os.path.join(r, k)) for r in runs)]
+    oracle_label = dict(servers).get(ORACLE, ORACLE_LABEL)
     per = {k: [os.path.join(r, k) for r in runs] for k, _ in servers}
     shapes = {k: [load_shape(d) for d in ds] for k, ds in per.items()}
     oracle_shapes = shapes.get(ORACLE, [None] * len(runs))
     counts = {k: [load(os.path.join(d, "counts.json")) for d in ds] for k, ds in per.items()}
     missing = []
-    m = {"meta": meta, "runs": runs, "servers": servers, "levels": {}, "missing": missing, "load_problems": []}
+    m = {"meta": meta, "runs": runs, "servers": servers, "levels": {}, "missing": missing, "load_problems": [], "oracle_label": oracle_label}
 
     for level in LOAD_LEVELS:
         data = {k: [load(os.path.join(d, f"k6-{level}.json")) for d in ds] for k, ds in per.items()}
@@ -481,8 +499,8 @@ def build(runs):
             problems = []
             for i, x in enumerate(data[k]):
                 problems.append(window_problem(x))
-                problems.append(oracle_failed(oracle_shapes[i], names) if k == ORACLE else
-                                comparable(shapes[k][i], oracle_shapes[i], names))
+                problems.append(oracle_failed(oracle_shapes[i], names, oracle_label) if k == ORACLE else
+                                comparable(shapes[k][i], oracle_shapes[i], names, oracle_label))
                 if not counts[k][i]:
                     problems.append("missing counts.json")
                 if k != ORACLE:
@@ -589,7 +607,7 @@ def build(runs):
         items = set()
         for i, oracle in enumerate(oracle_shapes):
             for n in sorted(oracle or {}):
-                problem = comparable(shapes[k][i], oracle, [n])
+                problem = comparable(shapes[k][i], oracle, [n], oracle_label)
                 if problem:
                     items.add(problem)
             a, b = counts[k][i], counts.get(ORACLE, [None] * len(runs))[i]
@@ -602,7 +620,7 @@ def build(runs):
         work[k] = sorted(items)
     m["work"] = work
     all_names = set().union(*(set(x or {}) for x in oracle_shapes))
-    m["oracle_failures"] = sorted(n for n in all_names if any(oracle_failed(x, [n]) for x in oracle_shapes))
+    m["oracle_failures"] = sorted(n for n in all_names if any(oracle_failed(x, [n], oracle_label) for x in oracle_shapes))
     m["work_total"] = len(all_names) - len(m["oracle_failures"])
 
     return m
@@ -610,6 +628,7 @@ def build(runs):
 
 # ── markdown (the README tables) ────────────────────────────────────────────
 def render_md(m):
+    oracle_label = m["oracle_label"]
     meta, servers, out = m["meta"], m["servers"], []
     notes = Notes()
     p = out.append
@@ -619,9 +638,9 @@ def render_md(m):
       + " · ".join(f"{lvl} {m['levels'][lvl]['rate']} screens/s" for lvl in LOAD_LEVELS if lvl in m["levels"]))
     p("Cells are the median across runs"
       + ("; where the runs disagreed, the range they spanned follows in brackets" if len(m["runs"]) > 1 else "")
-      + f". `⚠[n]` means the server did different work than {ORACLE_LABEL} (status / record count / "
+      + f". `⚠[n]` means the server did different work than {oracle_label} (status / record count / "
       "missing fields), so the number is not comparable: it is kept for the work list, not for publication, "
-      f"and note `n` says why. `X.Y× faster` compares the cell with {ORACLE_LABEL} on the same row. It is "
+      f"and note `n` says why. `X.Y× faster` compares the cell with {oracle_label} on the same row. It is "
       "shown on flagged cells too — the note says the two servers did not do identical work, so read it as "
       "an indication rather than a like-for-like result.\n")
     head = "| {} | " + " | ".join(f"{label} p50 / p95 / p99 ms (err)" for _, label in servers) + " |\n|" + "---|" * (len(servers) + 1)
@@ -652,14 +671,14 @@ def render_md(m):
             md_cell(cells[k], notes, f"{lbl} · {name} (memory)",
                     cells.get(ORACLE) if k != ORACLE else None) for k, lbl in servers) + " |")
     if m["work"]:
-        p(f"\n### Response shape vs {ORACLE_LABEL} (supporting evidence, not the parity number)\n")
+        p(f"\n### Response shape vs {oracle_label} (supporting evidence, not the parity number)\n")
         for k, items in m["work"].items():
             p(f"**{k}**: {len(items)} divergence(s) across {m['work_total']} compared requests")
             for it in items:
                 p(f"- {it}")
             p("")
     if m["oracle_failures"]:
-        p(f"**{ORACLE_LABEL} failed**: " + ", ".join(m["oracle_failures"]) + "\n")
+        p(f"**{oracle_label} failed**: " + ", ".join(m["oracle_failures"]) + "\n")
     if m["missing"]:
         p("### Missing phases\n")
         for x in sorted(set(m["missing"])):
@@ -702,6 +721,7 @@ def render_readme(m, run_dirs):
     "Ferrofin vs oracle" column, the per-endpoint range sentence, the spread sentence
     computed from the runs, and the pointers to the full tables. Wrapped in markers so `--readme README.md` can replace it in place;
     everything inside the markers is generated — edit the prose here, not in the README."""
+    oracle_label = m["oracle_label"]
     meta, servers = m["meta"], m["servers"]
     if "ferrofin" not in dict(servers):
         raise ValueError("README comparison requires Ferrofin")
@@ -738,9 +758,9 @@ def render_readme(m, run_dirs):
     p(f"The screen rows are scripted HTTP transactions based on jellyfin-web 10.11.8, "
       f"replayed at {lv['rate']} screens per second (the \"{README_LEVEL}\" level). They include "
       "API and poster requests, not browser rendering. Latency reads "
-      f"**p50 / p95 / p99 in milliseconds**; the last column compares p50 with {ORACLE_LABEL}.\n")
+      f"**p50 / p95 / p99 in milliseconds**; the last column compares p50 with {oracle_label}.\n")
     # ── headline table ──
-    p("| | " + " | ".join(f"**{lbl}**" if k == "ferrofin" else lbl for k, lbl in servers) + f" | Ferrofin vs {ORACLE_LABEL.split()[1]} |")
+    p("| | " + " | ".join(f"**{lbl}**" if k == "ferrofin" else lbl for k, lbl in servers) + f" | Ferrofin vs {oracle_label.split()[1]} |")
     p("|---|" + "---|" * (len(servers) + 1))
 
     def row(name, cells, label_md, unit_suffix=""):
@@ -773,7 +793,7 @@ def render_readme(m, run_dirs):
         wins = sum(r > 1 and f"{r:.1f}" != "1.0" for _, r in eps)
         losses = len(eps) - wins - ties
         p(f"Among {len(eps)} comparable endpoint measurements at this level, Ferrofin is faster on "
-          f"{wins}, about the same on {ties}, and slower on {losses} against {ORACLE_LABEL}. "
+          f"{wins}, about the same on {ties}, and slower on {losses} against {oracle_label}. "
           "Flagged or missing endpoints are excluded from these counts. The full tables are in "
           "[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).\n")
     else:
@@ -948,7 +968,7 @@ def speedup(c, oracle_cell):
     return f"{ratio:.1f}× {better}" if ratio > 1 else f"{1 / ratio:.1f}× {worse}"
 
 
-def ratio_html(c, oracle_cell):
+def ratio_html(c, oracle_cell, oracle_label=ORACLE_LABEL):
     """The speedup against the oracle, for a table cell. A caveated one is muted rather
     than green and says so on hover, so a win that is not like for like never reads as
     a clean one."""
@@ -958,7 +978,7 @@ def ratio_html(c, oracle_cell):
     caveat = provisional(c, oracle_cell)
     won = "faster" in text or "lighter" in text
     cls = "ratio provisional" if caveat else ("ratio win" if won else "ratio")
-    title = f"vs {ORACLE_LABEL}" + (" — not like for like, see the note" if caveat else "")
+    title = f"vs {oracle_label}" + (" — not like for like, see the note" if caveat else "")
     return f"<span class='{cls}' title='{html.escape(title)}'>{html.escape(text)}</span>"
 
 
@@ -991,7 +1011,7 @@ def delta_html(c, base):
     return f"<span class='delta {cls}' title='vs baseline {base.fmt(base.median)}'>{ch:+.0f}%</span>"
 
 
-def td_html(c, oracle_cell, base, notes, source=None):
+def td_html(c, oracle_cell, base, notes, source=None, oracle_label=ORACLE_LABEL):
     """One table cell: the numbers, then markers. The spread lands in the hover text
     and the comparability reason in a numbered note, because inline they made a
     three-server table unreadable."""
@@ -1009,7 +1029,7 @@ def td_html(c, oracle_cell, base, notes, source=None):
         body += " <span class='tail'>/</span> " + one(part, "tail")
     if c.sub.get("err", 0) > 0:
         body += f" <span class='err'>{c.sub['err']:.2f}% err</span>"
-    body += ratio_html(c, oracle_cell) + delta_html(c, base)
+    body += ratio_html(c, oracle_cell, oracle_label) + delta_html(c, base)
     cls = "num"
     if c.flag:
         cls += " flagged"
@@ -1041,7 +1061,8 @@ def table_html(first, rows, servers, base_rows, notes, where=""):
     for name, cells in rows:
         bcells = base_rows.get(name, {}) if base_rows else {}
         tds = "".join(td_html(cells[k], cells.get(ORACLE) if k != ORACLE else None, bcells.get(k), notes,
-                              f"{lbl} · {name}" + (f" ({where})" if where else ""))
+                              f"{lbl} · {name}" + (f" ({where})" if where else ""),
+                              oracle_label=dict(servers).get(ORACLE, ORACLE_LABEL))
                       for k, lbl in servers)
         body.append(f"<tr><th>{e(name)}</th>{tds}</tr>")
     return f"<div class='scroll'><table><thead><tr><th>{e(first)}</th>{head}</tr></thead><tbody>{''.join(body)}</tbody></table></div>"
@@ -1065,6 +1086,7 @@ def prewalk_notes(m, notes):
 
 
 def render_html(m, base=None, picker=""):
+    oracle_label = m["oracle_label"]
     if base and not comparable_levels(m, base):
         raise ValueError("incompatible baseline conditions or oracle build")
     e = html.escape
@@ -1085,9 +1107,9 @@ def render_html(m, base=None, picker=""):
              + (", and where those runs disagreed you can hover a cell for the range they spanned"
                 if len(m["runs"]) > 1 else "")
              + ". An amber cell is <em>not comparable</em>: "
-             f"the server did different work than {ORACLE_LABEL} — the number stays for the work list, not for the README, "
+             f"the server did different work than {oracle_label} — the number stays for the work list, not for the README, "
              "and the superscript points at the reason under Notes. "
-             f"<b>X.Y× faster</b> compares the cell with {ORACLE_LABEL} on the same row (memory says lighter); "
+             f"<b>X.Y× faster</b> compares the cell with {oracle_label} on the same row (memory says lighter); "
              "on an amber cell it is shown in amber italics, because the two servers did not do identical work. "
              "A coloured % is the change against the baseline run.</p>",
              f"<p class='meta'>{e(meta.get('date', '')[:16].replace('T', ' '))} UTC · {e(meta.get('cpu', '?'))} · server cores {e(str(meta.get('server_cpus', '?')))} · "
@@ -1102,7 +1124,7 @@ def render_html(m, base=None, picker=""):
             c = cells[k]
             val = sig3(c.median) if c.median is not None else "—"
             unit = c.unit
-            extra = ratio_html(c, cells.get(ORACLE) if k != ORACLE else None) + delta_html(c, (base_ttfs.get(name) or base_mem.get(name) or {}).get(k))
+            extra = ratio_html(c, cells.get(ORACLE) if k != ORACLE else None, oracle_label) + delta_html(c, (base_ttfs.get(name) or base_mem.get(name) or {}).get(k))
             why = ""
             if c.flag:
                 n = notes.add(c.flag, f"{lbl} · {name} (headline)")
@@ -1129,12 +1151,12 @@ def render_html(m, base=None, picker=""):
     parts.append(f"<h2>Memory — anon, cache excluded, {e(str(m['sample_ms']))} ms samples</h2>"
                  + mem_note + table_html("", m["memory"], servers, base_mem, notes, "memory"))
     if m["work"]:
-        parts.append(f"<h2>The work list — divergences from {ORACLE_LABEL}</h2><p class='lede'>From the shape pass (status, record count, field set) and the item counts. Each is a server fix or a recorded, accepted divergence.</p>")
+        parts.append(f"<h2>The work list — divergences from {oracle_label}</h2><p class='lede'>From the shape pass (status, record count, field set) and the item counts. Each is a server fix or a recorded, accepted divergence.</p>")
         for k, items in m["work"].items():
             lis = "".join(f"<li>{e(it)}</li>" for it in items)
             parts.append(f"<div class='work'><h3>{e(dict(servers)[k])} <span class='n'>{len(items)} divergence(s) across {m['work_total']} compared requests</span></h3><ul>{lis}</ul></div>")
     if m["oracle_failures"]:
-        parts.append(f"<p class='lede'><b>{ORACLE_LABEL} failed</b>: " + e(", ".join(m["oracle_failures"])) + "</p>")
+        parts.append(f"<p class='lede'><b>{oracle_label} failed</b>: " + e(", ".join(m["oracle_failures"])) + "</p>")
     if m["missing"]:
         parts.append("<h2>Missing phases</h2><ul>" + "".join(f"<li>{e(x)}</li>" for x in sorted(set(m["missing"]))) + "</ul>")
     parts.append(notes_html(notes))
