@@ -335,8 +335,65 @@ pub struct MusicBrainzClient {
     /// `ReplaceArtistName`).
     plugin: crate::plugin_config::ConfigSource,
     user_agent: String,
-    /// Timestamp of the last request, for the rate limit.
-    last_request: Mutex<Option<Instant>>,
+    /// Request pacing and server-directed cooldown, shared by all callers.
+    rate: Mutex<RequestRate>,
+}
+
+/// State shared by album, artist and interactive lookups on this client.
+#[derive(Default)]
+struct RequestRate {
+    next: Option<Instant>,
+    failures: u32,
+}
+
+impl RequestRate {
+    fn postpone(&mut self, delay: Duration) {
+        // Bound untrusted numeric headers to a representable monotonic deadline.
+        let deadline = Instant::now() + delay.min(Duration::from_secs(u64::from(u32::MAX)));
+        self.next = Some(self.next.map_or(deadline, |next| next.max(deadline)));
+    }
+
+    fn failed(&mut self, server_delay: Duration) -> Duration {
+        self.failures = self.failures.saturating_add(1);
+        let backoff =
+            Duration::from_secs((2_u64 << self.failures.min(6).saturating_sub(1)).min(60));
+        // Positive jitter avoids synchronizing clients without shortening Retry-After.
+        let jitter = Duration::from_millis(u64::from(uuid::Uuid::new_v4().as_bytes()[0]));
+        let delay = backoff.max(server_delay).saturating_add(jitter);
+        self.postpone(delay);
+        delay
+    }
+}
+
+/// Honor Retry-After (seconds or HTTP date), plus MusicBrainz's epoch reset
+/// when the advertised quota is exhausted. Date avoids client/server clock skew.
+fn server_delay(
+    headers: &reqwest::header::HeaderMap,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Duration {
+    let value = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    let now = value("date")
+        .and_then(|v| chrono::DateTime::parse_from_rfc2822(v).ok())
+        .map_or(now, |date| date.with_timezone(&chrono::Utc));
+    let until = |date: chrono::DateTime<chrono::Utc>| (date - now).to_std().unwrap_or_default();
+    let retry = value("retry-after")
+        .and_then(|v| {
+            v.parse::<u64>().ok().map(Duration::from_secs).or_else(|| {
+                chrono::DateTime::parse_from_rfc2822(v)
+                    .ok()
+                    .map(|date| until(date.with_timezone(&chrono::Utc)))
+            })
+        })
+        .unwrap_or_default();
+    let reset = if value("x-ratelimit-remaining").and_then(|v| v.parse::<u64>().ok()) == Some(0) {
+        value("x-ratelimit-reset")
+            .and_then(|v| v.parse::<i64>().ok())
+            .and_then(|v| chrono::DateTime::from_timestamp(v, 0))
+            .map_or(Duration::ZERO, until)
+    } else {
+        Duration::ZERO
+    };
+    retry.max(reset)
 }
 
 impl std::fmt::Debug for MusicBrainzClient {
@@ -359,8 +416,8 @@ impl MusicBrainzClient {
             configured_base_url: (!base.is_empty()).then(|| base.to_owned()),
             plugin: crate::plugin_config::ConfigSource::new(),
             // MB requires contact info; the project URL satisfies the policy.
-            user_agent: format!("Ferrofin/{version} ( https://github.com/ )"),
-            last_request: Mutex::new(None),
+            user_agent: format!("Ferrofin/{version} ( https://github.com/mangoleaf/ferrofin )"),
+            rate: Mutex::new(RequestRate::default()),
         }
     }
 
@@ -393,19 +450,6 @@ impl MusicBrainzClient {
         cfg.normalized()
     }
 
-    /// Blocks until at least `interval` has elapsed since the previous request,
-    /// then records now — the ≤1 req/sec throttle, whose period is the
-    /// plugin's `RateLimit` (seconds between requests).
-    async fn throttle(&self, interval: std::time::Duration) {
-        let mut last = self.last_request.lock().await;
-        if let Some(prev) = *last
-            && let Some(wait) = interval.checked_sub(prev.elapsed())
-        {
-            tokio::time::sleep(wait).await;
-        }
-        *last = Some(Instant::now());
-    }
-
     /// `RateLimit` seconds as a `Duration`.
     ///
     /// A negative or non-finite value (only reachable by hand-editing
@@ -414,58 +458,111 @@ impl MusicBrainzClient {
     /// published MusicBrainz policy floor. Falling back to *zero* there would
     /// turn a typo into an unthrottled crawl of a public service.
     fn interval(rate_limit: f64) -> Duration {
-        if rate_limit.is_finite() && rate_limit > 0.0 {
-            Duration::from_secs_f64(rate_limit)
+        if rate_limit > 0.0 {
+            Duration::try_from_secs_f64(rate_limit)
+                .unwrap_or(MIN_INTERVAL)
+                .min(Duration::from_secs(u64::from(u32::MAX)))
         } else {
             MIN_INTERVAL
         }
     }
 
-    /// GETs `path?{query}&fmt=json` as an authenticated (User-Agent) MB call,
-    /// returning the parsed body or `None` on any failure. Throttled.
-    ///
-    /// Every failure is LOGGED before it is swallowed. musicbrainz.org
-    /// rate-limits at roughly one request per second per IP and answers `503`
-    /// when it is exceeded; returning a silent `None` makes that
-    /// indistinguishable from "no such release" in the Identify dialog. C#
-    /// surfaces the same failures — `ProviderManager` catches the MetaBrainz
-    /// `HttpError` and logs `Provider {ProviderName} failed to retrieve search
-    /// results` (v10.11.8 `MediaBrowser.Providers/Manager/ProviderManager.cs`).
+    fn request_interval(server: &str, rate_limit: f64) -> Duration {
+        let interval = Self::interval(rate_limit);
+        let official = reqwest::Url::parse(server).ok().is_some_and(|url| {
+            url.host_str()
+                .is_some_and(|host| host == "musicbrainz.org" || host.ends_with(".musicbrainz.org"))
+        });
+        if official {
+            interval.max(MIN_INTERVAL)
+        } else {
+            interval
+        }
+    }
+
+    /// A bounded retry loop. The shared gate covers the response as well as
+    /// dispatch, so concurrent callers cannot miss a newly received cooldown.
+    /// Cooldowns survive exhausted retries and cancelled callers.
     async fn get<T: for<'de> Deserialize<'de>>(
         &self,
         path: &str,
         query: &[(&str, String)],
     ) -> Option<T> {
         let cfg = self.settings().await;
-        self.throttle(Self::interval(cfg.rate_limit)).await;
-        let mut q: Vec<(&str, String)> = vec![("fmt", "json".to_owned())];
+        let interval = Self::request_interval(&cfg.server, cfg.rate_limit);
+        let mut q = vec![("fmt", "json".to_owned())];
         q.extend(query.iter().cloned());
-        let resp = match self
-            .http
-            .get(format!("{}{path}", cfg.server))
-            .header(reqwest::header::USER_AGENT, &self.user_agent)
-            .query(&q)
-            .send()
-            .await
-        {
-            Ok(resp) => resp,
-            Err(error) => {
-                tracing::warn!(%path, %error, "MusicBrainz request failed");
-                return None;
+        for attempt in 1..=4 {
+            let mut rate = self.rate.lock().await;
+            if let Some(next) = rate.next {
+                // Do not tie up a scan for a long server-directed cooldown.
+                // Keep the deadline for subsequent calls instead.
+                if next.saturating_duration_since(Instant::now()) > Duration::from_mins(1) {
+                    tracing::debug!(%path, "MusicBrainz cooldown active; skipping lookup");
+                    return None;
+                }
+                tokio::time::sleep_until(next).await;
             }
-        };
-        let status = resp.status();
-        if !status.is_success() {
-            tracing::warn!(%path, %status, "MusicBrainz request rejected");
-            return None;
-        }
-        match resp.json().await {
-            Ok(body) => Some(body),
-            Err(error) => {
-                tracing::warn!(%path, %error, "MusicBrainz response could not be parsed");
-                None
+            // Reserve before awaiting I/O, including when this future is cancelled.
+            rate.next = Some(Instant::now() + interval);
+            let response = self
+                .http
+                .get(format!("{}{path}", cfg.server))
+                .header(reqwest::header::USER_AGENT, &self.user_agent)
+                .query(&q)
+                .timeout(Duration::from_secs(20))
+                .send()
+                .await;
+            match response {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let headers = resp.headers();
+                    let retryable = matches!(status.as_u16(), 408 | 429 | 500 | 502 | 503 | 504);
+                    let server_delay = server_delay(headers, chrono::Utc::now());
+                    if retryable {
+                        let delay = rate.failed(server_delay);
+                        if rate.failures == 1 {
+                            tracing::warn!(%status, rate_limit_zone = ?headers.get("x-ratelimit-zone"), "MusicBrainz unavailable; entering backoff");
+                        }
+                        tracing::debug!(%path, %status, attempt, delay_ms = delay.as_millis(),
+                            rate_limit_zone = ?headers.get("x-ratelimit-zone"),
+                            "MusicBrainz request rejected; backing off");
+                    } else {
+                        if rate.failures > 0 && status.is_success() {
+                            tracing::info!("MusicBrainz requests recovered");
+                        }
+                        rate.failures = 0;
+                        rate.postpone(interval.max(server_delay));
+                    }
+                    if status.is_success() {
+                        return match resp.json().await {
+                            Ok(body) => Some(body),
+                            Err(error) => {
+                                tracing::debug!(%path, error = %error.without_url(), "MusicBrainz response could not be parsed");
+                                None
+                            }
+                        };
+                    }
+                    if !retryable {
+                        tracing::debug!(%path, %status, "MusicBrainz request rejected");
+                        return None;
+                    }
+                }
+                Err(error) => {
+                    if !error.is_timeout() && !error.is_connect() && !error.is_request() {
+                        tracing::debug!(%path, error = %error.without_url(), "MusicBrainz request failed");
+                        return None;
+                    }
+                    rate.failed(Duration::ZERO);
+                    if rate.failures == 1 {
+                        tracing::warn!("MusicBrainz connection failed; entering backoff");
+                    }
+                    tracing::debug!(%path, attempt, error = %error.without_url(), "MusicBrainz request failed; backing off");
+                }
             }
         }
+        tracing::debug!(%path, "MusicBrainz retries exhausted");
+        None
     }
 
     /// Resolves an artist's `MusicBrainzArtist` id by name, or `None`. Port of
@@ -731,6 +828,140 @@ fn lucene_escape(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn cooldown_headers_and_backoff() {
+        use reqwest::header::HeaderMap;
+        let now = chrono::DateTime::from_timestamp(1_789_491_890, 0).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("retry-after", "0".parse().unwrap());
+        let mut rate = RequestRate::default();
+        assert!(rate.failed(server_delay(&headers, now)) >= Duration::from_secs(2));
+        assert!(rate.failed(Duration::ZERO) >= Duration::from_secs(4));
+        for _ in 0..20 {
+            rate.failed(Duration::ZERO);
+        }
+        assert!(rate.failed(Duration::ZERO) < Duration::from_secs(61));
+        headers.insert("retry-after", "120".parse().unwrap());
+        assert_eq!(server_delay(&headers, now), Duration::from_mins(2));
+        headers.insert(
+            "retry-after",
+            "Tue, 15 Sep 2026 17:05:00 GMT".parse().unwrap(),
+        );
+        headers.insert("date", "Tue, 15 Sep 2026 17:04:50 GMT".parse().unwrap());
+        assert_eq!(server_delay(&headers, now), Duration::from_secs(10));
+        headers.insert("retry-after", "invalid".parse().unwrap());
+        headers.insert("x-ratelimit-remaining", "0".parse().unwrap());
+        headers.insert("x-ratelimit-reset", "1789491900".parse().unwrap());
+        assert_eq!(server_delay(&headers, now), Duration::from_secs(10));
+        headers.insert("x-ratelimit-remaining", "14".parse().unwrap());
+        assert_eq!(server_delay(&headers, now), Duration::ZERO);
+        assert_eq!(MusicBrainzClient::interval(f64::MAX), MIN_INTERVAL);
+        assert_eq!(MusicBrainzClient::interval(f64::NAN), MIN_INTERVAL);
+        for url in [
+            "https://musicbrainz.org",
+            "http://MUSICBRAINZ.ORG:80/",
+            "https://www.musicbrainz.org",
+        ] {
+            assert_eq!(MusicBrainzClient::request_interval(url, 0.01), MIN_INTERVAL);
+        }
+        assert_eq!(
+            MusicBrainzClient::request_interval("http://localhost", 0.1),
+            Duration::from_millis(100)
+        );
+    }
+
+    // Real HTTP exercises the entire request/retry path, including headers and
+    // concurrent calls, without sending test traffic to MusicBrainz.
+    async fn scripted_server(
+        responses: Vec<(u16, &'static str)>,
+    ) -> (String, tokio::task::JoinHandle<Vec<Instant>>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let mut times = Vec::new();
+            for (status, headers) in responses {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut buf = [0; 1024];
+                    let n = stream.read(&mut buf).await.unwrap();
+                    assert!(n > 0);
+                    request.extend_from_slice(&buf[..n]);
+                    if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                assert!(
+                    String::from_utf8_lossy(&request)
+                        .contains("https://github.com/mangoleaf/ferrofin")
+                );
+                times.push(Instant::now());
+                let body = r#"{"artists":[{"id":"found"}]}"#;
+                let response = format!(
+                    "HTTP/1.1 {status} Test\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+            times
+        });
+        (url, task)
+    }
+
+    #[tokio::test]
+    async fn retries_and_concurrent_lookups_share_cooldown() {
+        let (url, task) =
+            scripted_server(vec![(503, "Retry-After: 3\r\n"), (200, ""), (200, "")]).await;
+        let client = MusicBrainzClient::new(&url, "test");
+        let (a, b) = tokio::join!(client.search_artist("a"), client.search_artist("b"));
+        assert_eq!(a.as_deref(), Some("found"));
+        assert_eq!(b.as_deref(), Some("found"));
+        let times = task.await.unwrap();
+        assert!(times[1] - times[0] >= Duration::from_secs(3));
+        assert!(times[2] - times[1] >= MIN_INTERVAL);
+    }
+
+    #[tokio::test]
+    async fn exhausted_retries_preserve_backoff() {
+        let (url, task) = scripted_server(vec![(503, "Retry-After: 0\r\n"); 4]).await;
+        let client = MusicBrainzClient::new(&url, "test");
+        assert!(client.search_artist("a").await.is_none());
+        let times = task.await.unwrap();
+        for (i, pair) in times.windows(2).enumerate() {
+            assert!(pair[1] - pair[0] >= Duration::from_secs(2 << i));
+        }
+        let rate = client.rate.lock().await;
+        assert_eq!(rate.failures, 4);
+        assert!(
+            rate.next.unwrap().saturating_duration_since(Instant::now()) > Duration::from_secs(15)
+        );
+    }
+
+    #[tokio::test]
+    async fn long_cooldown_skips_following_items_and_permanent_errors_do_not_retry() {
+        let (url, task) = scripted_server(vec![(429, "Retry-After: 120\r\n")]).await;
+        let client = MusicBrainzClient::new(&url, "test");
+        assert!(client.search_artist("a").await.is_none());
+        assert!(client.search_artist("b").await.is_none());
+        assert_eq!(task.await.unwrap().len(), 1);
+        let (url, task) = scripted_server(vec![(400, "")]).await;
+        let client = MusicBrainzClient::new(&url, "test");
+        assert!(client.search_artist("a").await.is_none());
+        assert_eq!(client.rate.lock().await.failures, 0);
+        assert_eq!(task.await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn successful_response_with_exhausted_quota_delays_next_lookup() {
+        let (url, task) = scripted_server(vec![(200, "Retry-After: 2\r\n"), (200, "")]).await;
+        let client = MusicBrainzClient::new(&url, "test");
+        assert!(client.search_artist("a").await.is_some());
+        assert!(client.search_artist("b").await.is_some());
+        let times = task.await.unwrap();
+        assert!(times[1] - times[0] >= Duration::from_secs(2));
+    }
 
     #[test]
     fn partial_dates_default_the_missing_parts_to_the_first() {
