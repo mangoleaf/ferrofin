@@ -1,0 +1,282 @@
+"""Reporter correctness only: python3 -m unittest discover -s bench -p test_report.py."""
+import copy
+import json
+from pathlib import Path
+import shutil
+import tempfile
+import unittest
+
+import report
+
+
+class ReportTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.a = self.make_run('a')
+        self.b = self.make_run('b')
+
+    def write(self, path, value):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(value))
+
+    def edit(self, path, change):
+        value = json.loads(path.read_text())
+        change(value)
+        self.write(path, value)
+
+    def make_run(self, name):
+        root = self.root / name
+        self.write(root / 'run.json', {
+            'name': name, 'sha': 'abc', 'date': '2026-09-04', 'cpu': 'test',
+            'host': 'test', 'memory_limit': '8g', 'server_cpus': '0,2-3',
+            'rate_loaded': 5, 'window_s': 120, 'k6': 'test',
+            'testdata_counts': {'movies': 100, 'series': 10, 'episodes': 100},
+        })
+        for server, _ in report.SERVERS:
+            d = root / server
+            d.mkdir()
+            tag = {'jellyfin12': 'jellyfin/jellyfin:12.0-rc7',
+                   'jellyfin': 'jellyfin/jellyfin:10.11.8', 'ferrofin': 'ferrofin:bench'}[server]
+            (d / 'image.txt').write_text(f'{tag} sha256:{server}')
+            value = {'count': 60, 'p50': 10 if server == 'ferrofin' else 20,
+                     'p95': 30, 'p99': 40, 'max': 50, 'ok': 1}
+            endpoints = {f'{s}:items': copy.deepcopy(value) for s in report.SCREENS}
+            endpoints['image'] = copy.deepcopy(value)
+            self.write(d / 'k6-loaded.json', {
+                'iterations': 600, 'requests': 700, 'dropped_iterations': 0,
+                'rate': '5', 'duration': '120s',
+                'screens': {s: copy.deepcopy(value) for s in report.SCREENS},
+                'endpoints': endpoints,
+            })
+            self.write(d / 'counts.json', {'movies': 100})
+            records = [{'shape': n, 'url': f'http://{server}/{n}', 'status': 200,
+                        'count': 1, 'fields': ['.Items', '.Items[].Id'], 'bytes': 100}
+                       for n in endpoints]
+            self.shapes(d, records)
+            self.write(d / 'coldstart.json', {'runs': [{'home_ms': 100} for _ in range(5)]})
+            self.write(d / 'ttfs.json', {
+                'hls': [{'ttfs_ms': 100, 'transcoding_url': '/master.m3u8?VideoCodec=h264'} for _ in range(5)],
+                'direct': [{'ttfb_ms': 1, 'status': 206} for _ in range(5)],
+            })
+            self.write(d / 'windows.json', {'loaded': {'start': 1, 'end': 2}, 'steady': {'start': 3, 'end': 4}})
+            (d / 'mem.csv').write_text('t,anon,file,current,swap\n1,1048576,0,1048576,0\n2,2097152,0,2097152,0\n3,1048576,0,1048576,0\n4,1048576,0,1048576,0\n')
+        return root
+
+    def shapes(self, directory, records):
+        (directory / 'shape.log').write_text('\n'.join(json.dumps({'msg': json.dumps(r)}) for r in records))
+
+    def build(self, *runs):
+        return report.build([str(r) for r in runs or (self.a,)])
+
+    def home(self, model, server='ferrofin'):
+        return dict(model['levels']['loaded']['screens'])['home'][server]
+
+    def readme(self, model=None):
+        model = model or self.build()
+        return report.render_readme(model, model['runs'])
+
+    def row(self, text, label='home'):
+        return next(line for line in text.splitlines() if line.startswith(f'| **{label}**'))
+
+    def test_clean_report_and_optional_servers(self):
+        m = self.build(self.a, self.b)
+        self.assertIsNone(self.home(m).flag)
+        self.assertIn('faster on 7', self.readme(m))
+        self.assertIn('3 logical CPUs', self.readme(m))
+        self.assertIn('12.0-rc7', report.render_md(m))
+        self.assertIn('No measured request failed', self.readme(m))
+        self.assertNotIn('full runs', self.readme(m))
+        self.assertIn('<html', report.render_html(m))
+
+    def test_later_missing_shape_and_selection_order(self):
+        (self.b / 'ferrofin/shape.log').unlink()
+        forward, reverse = self.build(self.a, self.b), self.build(self.b, self.a)
+        self.assertIn('no shape pass', self.home(forward).flag)
+        self.assertEqual(self.home(forward).flag, self.home(reverse).flag)
+        self.assertNotIn('faster', self.row(self.readme(forward)))
+
+    def test_http_failures_invalidate_measured_window(self):
+        self.edit(self.a / 'ferrofin/k6-loaded.json', lambda x: x['screens']['home'].update(ok=0.5))
+        m = self.build()
+        self.assertIn('failed', self.home(m).flag)
+        self.assertNotIn('No measured request failed', self.readme(m))
+        self.assertNotIn('faster', self.row(self.readme(m)))
+
+    def test_oracle_http_failure_invalidates_comparison(self):
+        self.edit(self.b / 'jellyfin12/k6-loaded.json', lambda x: x['endpoints']['home:items'].update(ok=0))
+        m = self.build(self.a, self.b)
+        self.assertIn('failed', self.home(m).flag)
+        self.assertIn('failed', self.home(m, 'jellyfin12').flag)
+
+    def test_slower_and_tied_candidates_do_not_claim_wins(self):
+        for latency, sentence in [(20, 'about the same on 7'), (25, 'slower on 7')]:
+            with self.subTest(latency=latency):
+                def update(x):
+                    for group in ('screens', 'endpoints'):
+                        for v in x[group].values():
+                            v['p50'] = latency
+                self.edit(self.a / 'ferrofin/k6-loaded.json', update)
+                self.assertIn(sentence, self.readme())
+                self.assertNotIn('faster on 7', self.readme())
+
+    def test_mixed_conditions_and_images_are_rejected(self):
+        original = json.loads((self.b / 'run.json').read_text())
+        for key, value in [('rate_loaded', 50), ('window_s', 5), ('memory_limit', '1g'),
+                           ('server_cpus', '4-7'), ('ids_sha256', 'changed'), ('screens_sha256', 'changed')]:
+            with self.subTest(key=key):
+                self.write(self.b / 'run.json', {**original, key: value})
+                with self.assertRaisesRegex(ValueError, key):
+                    self.build(self.a, self.b)
+        self.write(self.b / 'run.json', original)
+        (self.b / 'jellyfin12/image.txt').write_text('jellyfin/jellyfin:12.0 sha256:different')
+        with self.assertRaisesRegex(ValueError, 'jellyfin12 image'):
+            self.build(self.a, self.b)
+
+    def test_actual_window_conditions_are_checked(self):
+        self.edit(self.b / 'ferrofin/k6-loaded.json', lambda x: x.update(rate='50'))
+        with self.assertRaisesRegex(ValueError, 'loaded rate'):
+            self.build(self.a, self.b)
+
+    def test_baseline_allows_candidate_build_only(self):
+        (self.b / 'ferrofin/image.txt').write_text('ferrofin:bench sha256:next')
+        self.assertTrue(report.comparable_levels(self.build(self.a), self.build(self.b)))
+        self.assertIn('<html', report.render_html(self.build(self.a), self.build(self.b)))
+        with self.assertRaisesRegex(ValueError, 'ferrofin image'):
+            self.build(self.a, self.b)
+        self.edit(self.b / 'run.json', lambda x: x.update(window_s=10))
+        with self.assertRaisesRegex(ValueError, 'baseline'):
+            report.render_html(self.build(self.a), self.build(self.b))
+
+    def test_failed_and_truncated_timing_repetitions(self):
+        self.edit(self.b / 'ferrofin/coldstart.json', lambda x: x['runs'][1].update(home_ms=None))
+        self.edit(self.b / 'ferrofin/ttfs.json', lambda x: x.update(direct=x['direct'][:1]))
+        m = self.build(self.a, self.b)
+        for name, cells in m['ttfs']:
+            if name in report.README_TTFS:
+                self.assertIn('successful repetitions', cells['ferrofin'].flag)
+                self.assertIsNotNone(cells['ferrofin'].median)
+
+    def test_known_nondefault_repetition_count(self):
+        self.edit(self.a / 'run.json', lambda x: x.update(restarts=1))
+        self.edit(self.a / 'ferrofin/coldstart.json', lambda x: x.update(runs=x['runs'][:1]))
+        self.assertIsNone(dict(self.build()['ttfs'])[report.README_TTFS[0]]['ferrofin'].flag)
+
+    def test_swapped_counts_between_request_keys_fail(self):
+        for server, counts in [('jellyfin12', [1, 2]), ('ferrofin', [2, 1])]:
+            self.shapes(self.a / server, [{'shape': 'movies:items', 'url': f'http://{server}/Items?page={i}',
+                                         'status': 200, 'count': count, 'fields': ['.Items']}
+                                        for i, count in enumerate(counts)])
+        self.assertIsNotNone(report.comparable(report.load_shape(self.a / 'ferrofin'),
+                                              report.load_shape(self.a / 'jellyfin12'), ['movies:items']))
+
+    def test_image_byte_sizes_do_not_flag_cells(self):
+        for server, size in [('jellyfin12', 100), ('ferrofin', 200)]:
+            path = self.a / server / 'shape.log'
+            records = [json.loads(json.loads(line)['msg']) for line in path.read_text().splitlines()]
+            for r in records:
+                if r['shape'] == 'image':
+                    r['bytes'] = size
+            self.shapes(path.parent, records)
+        m = self.build()
+        self.assertIsNone(dict(m['levels']['loaded']['endpoints'])['image']['ferrofin'].flag)
+        self.assertIn('faster', self.row(self.readme(m)))
+
+    def test_third_server_caveat_withholds_its_cell(self):
+        path = self.a / 'jellyfin/shape.log'
+        records = [json.loads(json.loads(line)['msg']) for line in path.read_text().splitlines()]
+        records[0]['fields'] = []
+        self.shapes(path.parent, records)
+        m = self.build()
+        self.assertIsNotNone(self.home(m, 'jellyfin').flag)
+        row = self.row(self.readme(m))
+        self.assertIn('— ⚠', row)
+        self.assertIn('faster', row)  # FF/oracle still valid
+
+    def test_missing_counts_and_later_inventory_difference(self):
+        self.edit(self.b / 'ferrofin/counts.json', lambda x: x.update(movies=1))
+        m = self.build(self.a, self.b)
+        self.assertIn('inventory', self.home(m).flag)
+        self.assertTrue(any('count movies' in x for x in m['work']['ferrofin']))
+        (self.b / 'ferrofin/counts.json').unlink()
+        self.assertIn('missing counts', self.home(self.build(self.a, self.b)).flag)
+
+    def test_transport_failure_in_oracle_shape(self):
+        self.shapes(self.a / 'jellyfin12', [{'shape': 'home:items', 'url': '/home:items', 'status': 0}])
+        self.assertIsNotNone(self.home(self.build()).flag)
+
+    def test_invalid_quantile_cannot_be_published(self):
+        self.edit(self.a / 'ferrofin/k6-loaded.json', lambda x: x['screens']['home'].update(p50=float('nan')))
+        m = self.build()
+        self.assertIsNotNone(self.home(m).flag)
+        self.assertNotIn('nan', self.row(self.readme(m)))
+
+    def test_missing_timing_file_is_flagged(self):
+        (self.b / 'ferrofin/coldstart.json').unlink()
+        c = dict(self.build(self.a, self.b)['ttfs'])[report.README_TTFS[0]]['ferrofin']
+        self.assertIsNotNone(c.flag)
+        self.assertEqual(c.runs, 2)
+        self.assertEqual(len(c.vals), 1)
+
+    def test_two_servers_and_single_server_render(self):
+        shutil.rmtree(self.a / 'jellyfin')
+        self.assertNotIn('**Jellyfin 10.11.8**', self.readme())
+        self.assertIn('**Jellyfin 12.0-rc7**', self.readme())
+        shutil.rmtree(self.a / 'jellyfin12')
+        text = self.readme()
+        self.assertIn('no Jellyfin reference selected', text)
+        self.assertNotIn('faster', self.row(text))
+
+    def test_dropped_and_aborted_work_withholds_resource_comparisons(self):
+        for key in ('dropped_iterations', 'aborted_iterations'):
+            with self.subTest(key=key):
+                self.edit(self.a / 'ferrofin/k6-loaded.json', lambda x: x.update({key: 1}))
+                m = self.build()
+                self.assertIsNotNone(self.home(m).flag)
+                for name, cells in m['memory']:
+                    if name in report.README_MEMORY:
+                        self.assertIsNotNone(cells['ferrofin'].flag)
+                self.edit(self.a / 'ferrofin/k6-loaded.json', lambda x: x.update({key: 0}))
+
+    def test_missing_window_is_incomplete_not_zero_errors(self):
+        (self.b / 'ferrofin/k6-loaded.json').unlink()
+        m = self.build(self.a, self.b)
+        self.assertIn('missing load window', self.home(m).flag)
+        self.assertNotIn('No measured request failed', self.readme(m))
+
+    def test_later_oracle_timing_failure_withholds_ratio(self):
+        self.edit(self.b / 'jellyfin12/coldstart.json', lambda x: x['runs'][0].update(home_ms=None))
+        text = self.readme(self.build(self.a, self.b))
+        line = next(x for x in text.splitlines() if x.startswith('| cold start'))
+        self.assertIn('— ⚠', line)
+        self.assertNotIn('faster', line)
+
+    def test_empty_image_is_not_accepted(self):
+        for server in ('ferrofin', 'jellyfin12'):
+            with self.subTest(server=server):
+                path = self.a / server / 'shape.log'
+                original = path.read_text()
+                records = [json.loads(json.loads(line)['msg']) for line in original.splitlines()]
+                for r in records:
+                    if r['shape'] == 'image':
+                        r['bytes'] = 0
+                self.shapes(path.parent, records)
+                c = dict(self.build()['levels']['loaded']['endpoints'])['image'][server]
+                self.assertIsNotNone(c.flag)
+                path.write_text(original)
+
+    def test_missing_tail_withholds_entire_headline_cell(self):
+        self.edit(self.a / 'ferrofin/k6-loaded.json', lambda x: x['screens']['home'].pop('p99'))
+        self.assertNotIn('faster', self.row(self.readme()))
+
+    def test_missing_memory_repetition_withholds_headline(self):
+        (self.b / 'ferrofin/mem.csv').unlink()
+        m = self.build(self.a, self.b)
+        for name, cells in m['memory']:
+            if name in report.README_MEMORY:
+                self.assertIsNotNone(cells['ferrofin'].flag)
+
+
+if __name__ == '__main__':
+    unittest.main()

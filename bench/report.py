@@ -34,6 +34,7 @@ import csv
 import html
 import http.server
 import json
+import math
 import os
 import statistics
 import sys
@@ -70,22 +71,26 @@ TRANSCODE_NOISE = ("playsessionid", "apikey", "deviceid", "tag=", "api_key", "tr
 # ── loading ─────────────────────────────────────────────────────────────────
 def load(path):
     try:
-        return json.load(open(path))
+        with open(path) as f:
+            return json.load(f)
     except (OSError, ValueError):
         return None
 
 
 def load_shape(d):
-    """shape.log → {request name: {status set, counts, fields}} merged over the responses."""
-    out = defaultdict(lambda: {"status": set(), "count": set(), "total": set(), "fields": set(), "n": 0})
+    """Load legacy shape summaries and retain individual request observations."""
+    out = defaultdict(lambda: {"status": set(), "count": set(), "total": set(), "fields": set(), "n": 0, "samples": {}})
     try:
-        lines = open(os.path.join(d, "shape.log")).read().splitlines()
+        with open(os.path.join(d, "shape.log")) as f:
+            lines = f.read().splitlines()
     except OSError:
         return None
     for line in lines:
         try:
             rec = json.loads(json.loads(line)["msg"])
         except (ValueError, KeyError, TypeError):
+            continue
+        if not isinstance(rec, dict) or not isinstance(rec.get("shape"), str):
             continue
         s = out[rec["shape"]]
         s["status"].add(rec.get("status"))
@@ -95,6 +100,14 @@ def load_shape(d):
         if "total" in rec and rec["total"] is not None:
             s["total"].add(rec["total"])
         s["fields"].update(rec.get("fields") or [])
+        # Preserve request identity instead of accepting counts swapped between URLs.
+        # Old NextUp URLs used wall-clock cutoffs; retain their historical shape check
+        # without claiming that these legacy inputs were identical.
+        u = urllib.parse.urlsplit(rec.get("url", ""))
+        query = [(k, v) for k, v in urllib.parse.parse_qsl(u.query)
+                 if k.lower() not in {"apikey", "api_key", "playsessionid", "tag", "nextupdatecutoff"}]
+        key = rec.get("key") or (u.path, tuple(sorted(query)))
+        s["samples"].setdefault(key, []).append(rec)
     return out
 
 
@@ -104,8 +117,12 @@ def oracle_failed(shape_oracle, names):
         return "no shape pass"  # the oracle ran but its shape phase did not
     for n in names:
         o = shape_oracle.get(n)
-        if o and any(st >= 400 for st in o["status"]):
-            return f"{ORACLE_LABEL} failed {n} ({sorted(o['status'])})"
+        if not o:
+            return f"{n}: missing"
+        if any(not isinstance(st, int) or not 200 <= st < 400 for st in o["status"]):
+            return f"{ORACLE_LABEL} failed {n} ({sorted(o['status'], key=str)})"
+        if n == "image" and any(r.get("bytes") == 0 for rs in o.get("samples", {}).values() for r in rs):
+            return f"{n}: empty oracle response"
     return None
 
 
@@ -119,10 +136,10 @@ def comparable(shape_srv, shape_oracle, names):
         o, s = shape_oracle.get(n), shape_srv.get(n)
         if o is None or s is None:
             return f"{n}: missing"
-        if any(st >= 400 for st in o["status"]):
-            return f"{n}: {ORACLE_LABEL} failed ({sorted(o['status'])})"
+        if any(not isinstance(st, int) or not 200 <= st < 400 for st in o["status"]):
+            return f"{n}: {ORACLE_LABEL} failed ({sorted(o['status'], key=str)})"
         if s["status"] != o["status"]:
-            return f"{n}: status {sorted(s['status'])} vs {sorted(o['status'])}"
+            return f"{n}: status {sorted(s['status'], key=str)} vs {sorted(o['status'], key=str)}"
         if s["count"] != o["count"]:
             return f"{n}: items {sorted(s['count'])} vs {sorted(o['count'])}"
         if s["total"] != o["total"]:
@@ -131,13 +148,30 @@ def comparable(shape_srv, shape_oracle, names):
         if missing:
             more = f" (+{len(missing) - 3} more)" if len(missing) > 3 else ""
             return f"{n}: missing {', '.join(m.lstrip('.') for m in missing[:3])}{more}"
+        if s.get("samples") is not None and o.get("samples") is not None:
+            if s["samples"].keys() != o["samples"].keys():
+                return f"{n}: request picks differ"
+            for key, expected in o["samples"].items():
+                actual = s["samples"][key]
+                if len(actual) != len(expected):
+                    return f"{n}: request count differs"
+                for a, b in zip(actual, expected):
+                    for field in ("status", "count", "total", "content_type", "ids", "types"):
+                        if a.get(field) != b.get(field):
+                            return f"{n}: {field} differs for a request pick"
+                    if set(b.get("fields") or []) - set(a.get("fields") or []):
+                        return f"{n}: missing fields for a request pick"
+                    # Encoding sizes vary legitimately. Only an empty image is invalid.
+                    if n == "image" and (a.get("bytes", 1) <= 0 or b.get("bytes", 1) <= 0):
+                        return f"{n}: empty response"
     return None
 
 
 def mem_numbers(d):
     win = load(os.path.join(d, "windows.json"))
     try:
-        rows = list(csv.DictReader(open(os.path.join(d, "mem.csv"))))
+        with open(os.path.join(d, "mem.csv")) as f:
+            rows = list(csv.DictReader(f))
     except OSError:
         return None
     if not win or not rows:
@@ -174,9 +208,9 @@ class Cell:
         vals = list(vals)
         #: how many runs were selected, whether or not each produced this number
         self.runs = len(vals)
-        self.vals = [v for v in vals if v is not None]
+        self.vals = [v for v in vals if number(v)]
         self.fmt = fmt
-        self.flag = flag
+        self.flag = flag or ("missing or invalid samples in selected runs" if len(self.vals) != self.runs else None)
         self.sub = sub or {}  # extra per-run series, e.g. p95/p99/err for latency
         self.unit = unit
         self.context = context  # describes the run's conditions, not the server: no ratio, no delta
@@ -293,14 +327,105 @@ class Notes:
         return bool(self.index)
 
 
+def number(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0
+
+
+def reasons(*values):
+    return "; ".join(sorted({v for v in values if v})) or None
+
+
+def latency_problem(x):
+    if not x or not number(x.get("count")) or x["count"] <= 0:
+        return "missing request samples"
+    if not number(x.get("ok")) or x["ok"] > 1:
+        return "missing or invalid request success rate"
+    if x["ok"] < 1:
+        return "measured requests failed"
+    if any(not number(x.get(q)) for q in ("p50", "p95", "p99")):
+        return "missing or invalid latency"
+    if not x["p50"] <= x["p95"] <= x["p99"]:
+        return "invalid latency quantiles"
+    return None
+
+
+def window_problem(x):
+    if not x:
+        return "missing load window"
+    if not number(x.get("iterations")) or x["iterations"] <= 0:
+        return "missing completed iterations"
+    for key in ("dropped_iterations", "aborted_iterations"):
+        if x.get(key):
+            return f"invalid window: {key}={x[key]}"
+    for group in ("screens", "endpoints"):
+        if not x.get(group):
+            return f"missing {group} samples"
+        for value in x[group].values():
+            problem = latency_problem(value)
+            if problem:
+                return problem
+    return None
+
+
 def latency_cell(per_run, flag, fmt=sig3):
-    """per_run: k6 summary entries (or None) for one screen/endpoint across runs.
-    `fmt` is `n0` for screens, whose source data is whole milliseconds."""
-    return Cell([x["p50"] if x else None for x in per_run], fmt, flag, {
-        "p95": Cell([x["p95"] if x else None for x in per_run], fmt),
-        "p99": Cell([x["p99"] if x else None for x in per_run], fmt),
-        "err": max(((1 - x["ok"]) * 100 for x in per_run if x and x.get("ok") is not None), default=0.0),
+    flag = reasons(flag, *(latency_problem(x) for x in per_run))
+    return Cell([x.get("p50") if x else None for x in per_run], fmt, flag, {
+        "p95": Cell([x.get("p95") if x else None for x in per_run], fmt),
+        "p99": Cell([x.get("p99") if x else None for x in per_run], fmt),
+        "err": max(((1 - x["ok"]) * 100 for x in per_run if x and number(x.get("ok")) and x["ok"] <= 1), default=0.0),
     })
+
+
+# Missing legacy fields may agree with other legacy runs, but not with known values.
+CONDITIONS = ("host", "cpu", "memory_limit", "server_cpus", "client_cpus", "k6",
+              "window_s", "mem_sample_ms", "rate_unloaded", "rate_loaded", "rate_stress",
+              "warmup_s", "settle_s", "steady_s", "restarts", "ttfs_reps",
+              "ids_sha256", "screens_sha256", "seed", "slots", "shape_vus", "pools",
+              "testdata_counts")
+
+
+def image_id(d):
+    try:
+        with open(os.path.join(d, "image.txt")) as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def incompatible(runs, compare_builds=False):
+    metas = [load(os.path.join(r, "run.json")) or {} for r in runs]
+    issues = [key for key in CONDITIONS
+              if len({json.dumps(m.get(key), sort_keys=True) for m in metas}) > 1]
+    for k, _ in SERVERS:
+        ds = [os.path.join(r, k) for r in runs]
+        present = [d for d in ds if os.path.isdir(d)]
+        if not present:
+            continue
+        # A missing server is incomplete evidence, not a different build.
+        if len({frozenset(run_levels(d)) for d in present}) > 1:
+            issues.append(f"{k} load levels")
+        if not (compare_builds and k == "ferrofin") and len({image_id(d) for d in present}) > 1:
+            issues.append(f"{k} image")
+        for lvl in LOAD_LEVELS:
+            xs = [load(os.path.join(d, f"k6-{lvl}.json")) for d in present]
+            for field in ("rate", "duration"):
+                values = {str(x.get(field)) for x in xs if x}
+                if len(values) > 1:
+                    issues.append(f"{k} {lvl} {field}")
+    return sorted(set(issues))
+
+
+def timing_cell(documents, group, metric, metas, repeat_key):
+    vals, problems = [], []
+    for doc, meta in zip(documents, metas):
+        reps = (doc or {}).get(group, [])
+        # Archived v3 runs used five repetitions but did not persist the setting.
+        expected = (doc or {}).get("reps", meta.get(repeat_key, 5))
+        good = [r[metric] for r in reps if number(r.get(metric)) and not r.get("error")]
+        vals.append(statistics.median(good) if good else None)
+        if len(reps) != expected or len(good) != expected:
+            problems.append(f"{group}: {len(good)}/{expected} successful repetitions")
+    return Cell(vals, ms, reasons(*problems))
 
 
 def md_cell(c, notes, source=None, oracle_cell=None):
@@ -322,14 +447,20 @@ def md_cell(c, notes, source=None, oracle_cell=None):
 
 def build(runs):
     """Everything both renderers need, computed once from the run dirs."""
+    if not runs:
+        raise ValueError("no selected runs")
+    problems = incompatible(runs)
+    if problems:
+        raise ValueError("incompatible runs: " + ", ".join(problems))
     metas = [load(os.path.join(r, "run.json")) or {} for r in runs]
     meta = metas[0]
     servers = [(k, label) for k, label in SERVERS if any(os.path.isdir(os.path.join(r, k)) for r in runs)]
     per = {k: [os.path.join(r, k) for r in runs] for k, _ in servers}
     shapes = {k: [load_shape(d) for d in ds] for k, ds in per.items()}
-    oracle_shape = shapes[ORACLE][0] if ORACLE in shapes else None
+    oracle_shapes = shapes.get(ORACLE, [None] * len(runs))
+    counts = {k: [load(os.path.join(d, "counts.json")) for d in ds] for k, ds in per.items()}
     missing = []
-    m = {"meta": meta, "runs": runs, "servers": servers, "levels": {}, "missing": missing}
+    m = {"meta": meta, "runs": runs, "servers": servers, "levels": {}, "missing": missing, "load_problems": []}
 
     for level in LOAD_LEVELS:
         data = {k: [load(os.path.join(d, f"k6-{level}.json")) for d in ds] for k, ds in per.items()}
@@ -346,18 +477,31 @@ def build(runs):
                 if x:
                     for n in x["endpoints"]:
                         names_of[n.split(":")[0]].add(n)
-        dropped = {k: sum((x or {}).get("dropped_iterations", 0) for x in data[k]) for k in data}
-
         def flag(k, names):
-            if dropped.get(k):
-                return f"invalid window: k6 dropped {dropped[k]} iterations"
-            if k == ORACLE:
-                return oracle_failed(oracle_shape, names)
-            return comparable(shapes[k][0], oracle_shape, names)
+            problems = []
+            for i, x in enumerate(data[k]):
+                problems.append(window_problem(x))
+                problems.append(oracle_failed(oracle_shapes[i], names) if k == ORACLE else
+                                comparable(shapes[k][i], oracle_shapes[i], names))
+                if not counts[k][i]:
+                    problems.append("missing counts.json")
+                if k != ORACLE:
+                    problems.append(window_problem(data.get(ORACLE, [None] * len(runs))[i]))
+                    oracle_counts = counts.get(ORACLE, [None] * len(runs))[i]
+                    if not oracle_counts:
+                        problems.append("missing oracle counts.json")
+                    elif counts[k][i]:
+                        # Resume/latest are independent query diagnostics; static library
+                        # inventory changes affect every selection drawn from that library.
+                        changed = sorted(n for n in set(counts[k][i]) | set(oracle_counts)
+                                         if n not in {"resume", "nextup", "latest"}
+                                         and counts[k][i].get(n) != oracle_counts.get(n))
+                        if changed:
+                            problems.append("inventory counts differ: " + ", ".join(changed))
+            return reasons(*problems)
 
-        # a screen row is judged on its API requests; poster fetches ('image') show up in the
-        # image endpoint row and in err%, and the list endpoints' ImageTags superset check
-        # already proves the same posters exist on every server
+        # Legacy logs do not associate poster observations with a screen. Keep their
+        # image verdict separate; the bounded-slot producer will supply that identity.
         screens = [(scr, {k: latency_cell([x["screens"].get(scr) if x else None for x in data[k]], flag(k, sorted(names_of[scr])), n0)
                           for k, _ in servers}) for scr in SCREENS]
         names = [n for scr in SCREENS for n in sorted(names_of[scr])] + (["image"] if "image" in names_of else [])
@@ -370,6 +514,10 @@ def build(runs):
             rates = {r["rate_" + level] for r in metas if r.get("rate_" + level) is not None}
             rate = rates.pop() if len(rates) == 1 else ("?" if not rates else
                                                         "/".join(str(x) for x in sorted(rates)))
+            for k, xs in data.items():
+                for i, x in enumerate(xs):
+                    if problem := window_problem(x):
+                        m["load_problems"].append(f"{os.path.basename(runs[i])}/{k}/{level}: {problem}")
             m["levels"][level] = {"rate": rate, "screens": screens,
                                   "endpoints": endpoints, "any_data": True}
 
@@ -379,15 +527,12 @@ def build(runs):
         cs = [load(os.path.join(d, "coldstart.json")) for d in ds]
         if any(c is None for c in cs):
             missing.append(f"{k}: coldstart.json")
-        cold[k] = Cell([statistics.median([r["home_ms"] for r in c["runs"] if r["home_ms"]]) if c and any(r["home_ms"] for r in c["runs"]) else None for c in cs], ms)
+        cold[k] = timing_cell(cs, "runs", "home_ms", metas, "restarts")
         ts = [load(os.path.join(d, "ttfs.json")) for d in ds]
         if any(t is None for t in ts):
             missing.append(f"{k}: ttfs.json")
-        errs = [h["error"] for t in ts if t for h in t["hls"] if "error" in h]
-        # fewer successful reps than specified is different work, so failures flag the cell
-        hls[k] = Cell([statistics.median([h["ttfs_ms"] for h in t["hls"] if "ttfs_ms" in h]) if t and any("ttfs_ms" in h for h in t["hls"]) else None for t in ts], ms,
-                      f"{len(errs)} rep(s) failed: {errs[0][:60]}" if errs else None)
-        direct[k] = Cell([statistics.median([h["ttfb_ms"] for h in t["direct"] if "ttfb_ms" in h]) if t and any("ttfb_ms" in h for h in t["direct"]) else None for t in ts], ms)
+        hls[k] = timing_cell(ts, "hls", "ttfs_ms", metas, "ttfs_reps")
+        direct[k] = timing_cell(ts, "direct", "ttfb_ms", metas, "ttfs_reps")
         for t in ts:
             for h in (t or {}).get("hls", []):
                 if h.get("transcoding_url"):
@@ -416,17 +561,18 @@ def build(runs):
                for k, ds in per.items()}
     mixed = None if same_load_shape([d for ds in per.values() for d in ds]) else (
         "runs measured different load levels, so this row mixes two definitions")
-    peak = {}
+    peak, memory_flags = {}, {}
     for k, ds in per.items():
-        bad = [x for x in windows[k] if x is None or x.get("dropped_iterations")]
+        bad = [window_problem(x) for x in windows[k] if window_problem(x)]
+        memory_flags[k] = reasons(mixed, *bad)
         # the peak is only meaningful if the loaded window that produced it was the specified load
         peak[k] = Cell([(x or {}).get("peak") for x in mems[k]], mib,
-                       mixed or ("a load window is missing or dropped iterations" if bad else None),
+                       memory_flags[k],
                        unit="MiB")
     pct = lambda v: f"{v * 100:.0f}%"
     m["memory"] = [
         ("peak under load", peak),
-        ("steady idle", {k: Cell([(x or {}).get("steady") for x in mems[k]], mib, mixed, unit="MiB")
+        ("steady idle", {k: Cell([(x or {}).get("steady") for x in mems[k]], mib, memory_flags[k], unit="MiB")
                          for k, _ in servers}),
         # interference and swap describe the host while that server ran, not the server
         ("interference on the server's cores, p95", {k: Cell([(x or {}).get("interference_p95") for x in mems[k]], pct, unit="%", context=True) for k, _ in servers}),
@@ -435,25 +581,30 @@ def build(runs):
     ]
     m["sample_ms"] = meta.get("mem_sample_ms", "?")
 
-    # the work list: every divergence from the oracle, per server
-    counts = {k: [load(os.path.join(d, "counts.json")) for d in ds] for k, ds in per.items()}
+    # Retain divergences from every repetition, with deterministic de-duplication.
     work = {}
     for k, _ in servers:
-        if k == ORACLE or not shapes[k][0] or not oracle_shape:
+        if k == ORACLE:
             continue
-        items = []
-        for n in sorted(oracle_shape):
-            r = comparable(shapes[k][0], oracle_shape, [n])
-            if r and " failed (" not in r:  # the oracle's own failures are not this server's work
-                items.append(r)
-        if counts[k][0] and counts[ORACLE][0] and counts[k][0] != counts[ORACLE][0]:
-            for n in counts[ORACLE][0]:
-                if counts[k][0].get(n) != counts[ORACLE][0].get(n):
-                    items.append(f"count {n}: {counts[k][0].get(n)} vs {counts[ORACLE][0].get(n)}")
-        work[k] = items
+        items = set()
+        for i, oracle in enumerate(oracle_shapes):
+            for n in sorted(oracle or {}):
+                problem = comparable(shapes[k][i], oracle, [n])
+                if problem:
+                    items.add(problem)
+            a, b = counts[k][i], counts.get(ORACLE, [None] * len(runs))[i]
+            if not a or not b:
+                items.add("missing counts.json")
+            else:
+                for n in sorted(set(a) | set(b)):
+                    if a.get(n) != b.get(n):
+                        items.add(f"count {n}: {a.get(n)} vs {b.get(n)}")
+        work[k] = sorted(items)
     m["work"] = work
-    m["oracle_failures"] = [n for n in sorted(oracle_shape or {}) if oracle_failed(oracle_shape, [n])]
-    m["work_total"] = len(oracle_shape or {}) - len(m["oracle_failures"])
+    all_names = set().union(*(set(x or {}) for x in oracle_shapes))
+    m["oracle_failures"] = sorted(n for n in all_names if any(oracle_failed(x, [n]) for x in oracle_shapes))
+    m["work_total"] = len(all_names) - len(m["oracle_failures"])
+
     return m
 
 
@@ -540,7 +691,7 @@ README_MEMORY = ("peak under load", "steady idle")
 
 def _ratio(c, oracle_cell):
     """theirs/mine as a float, or None — the number behind `speedup()`'s sentence."""
-    if c is None or oracle_cell is None or c.context:
+    if c is None or oracle_cell is None or c.context or c.flag or oracle_cell.flag:
         return None
     mine, theirs = displayed(c), displayed(oracle_cell)
     return theirs / mine if mine and theirs else None
@@ -552,6 +703,8 @@ def render_readme(m, run_dirs):
     computed from the runs, and the pointers to the full tables. Wrapped in markers so `--readme README.md` can replace it in place;
     everything inside the markers is generated — edit the prose here, not in the README."""
     meta, servers = m["meta"], m["servers"]
+    if "ferrofin" not in dict(servers):
+        raise ValueError("README comparison requires Ferrofin")
     lv = m["levels"].get(README_LEVEL)
     if not lv:
         sys.exit(f"the runs have no '{README_LEVEL}' level; the README section needs it")
@@ -564,16 +717,27 @@ def render_readme(m, run_dirs):
     cmd = "python3 bench/report.py --readme README.md " + " ".join(f"bench/runs/{os.path.basename(r.rstrip('/'))}" for r in run_dirs)
     p(f"{README_BEGIN} — do not edit by hand. Regenerate with:\n     {cmd} -->")
     cpus = str(meta.get("server_cpus", ""))
-    ncores = sum(int(b) - int(a) + 1 if "-" in part else 1 for part in cpus.split(",") if part for a, b in [part.split("-")] ) if cpus and all(x.replace("-", "").isdigit() for x in cpus.split(",")) else "?"
+    try:
+        ncores = sum(int(part.split("-")[-1]) - int(part.split("-")[0]) + 1 for part in cpus.split(","))
+    except ValueError:
+        ncores = "?"
     limit = str(meta.get("memory_limit", "?")).replace("g", " GiB")
     article = "an" if limit[:1] in "8aeiou" else "a"
-    p(f"Ferrofin `{tag}` against **{servers[0][1]}** and **{servers[1][1]}**, measured {meta.get('date', '')[:10]} "
+    opponents = " and ".join(f"**{label}**" for k, label in servers if k != "ferrofin")
+    comparison = f" against {opponents}" if opponents else " (no Jellyfin reference selected)"
+    p(f"Ferrofin `{tag}`{comparison}, measured {meta.get('date', '')[:10]} "
       f"on one machine ({meta.get('cpu', '?').replace(' 16-Core Processor', '')}), each server alone in a container pinned to "
-      f"{ncores} dedicated cores with {article} {limit} limit and no swap, over the same library of "
-      f"{tc.get('movies', '?'):,} movies, {tc.get('series', '?'):,} series and {tc.get('episodes', '?'):,} episodes. "
-      f"Every figure is the **median of {nruns} full run{'s' if nruns != 1 else ''}**. No request failed on any server at any load level.\n")
-    p(f"The screen rows are what a client actually does: each is the exact request set jellyfin-web issues for that "
-      f"screen, replayed at {lv['rate']} screens per second (the \"{README_LEVEL}\" level). Latency reads "
+      f"{ncores} logical CPUs with {article} {limit} limit, over a fixture of "
+      f"{tc.get('movies', '?')} movies, {tc.get('series', '?')} series and {tc.get('episodes', '?')} episodes. "
+      f"Published figures are medians across {nruns} selected run{'s' if nruns != 1 else ''}; "
+      "incomplete or non-comparable cells are withheld.")
+    if m.get("load_problems"):
+        p("Measured load windows contain failures or incomplete evidence; see the full report.\n")
+    else:
+        p("No measured request failed in the recorded load windows (" + ", ".join(m["levels"]) + ").\n")
+    p(f"The screen rows are scripted HTTP transactions based on jellyfin-web 10.11.8, "
+      f"replayed at {lv['rate']} screens per second (the \"{README_LEVEL}\" level). They include "
+      "API and poster requests, not browser rendering. Latency reads "
       f"**p50 / p95 / p99 in milliseconds**; the last column compares p50 with {ORACLE_LABEL}.\n")
     # ── headline table ──
     p("| | " + " | ".join(f"**{lbl}**" if k == "ferrofin" else lbl for k, lbl in servers) + f" | Ferrofin vs {ORACLE_LABEL.split()[1]} |")
@@ -581,19 +745,17 @@ def render_readme(m, run_dirs):
 
     def row(name, cells, label_md, unit_suffix=""):
         cols = []
-        for k, _ in servers:
+        for k, label in servers:
             c = cells[k]
-            # `value()` already carries the unit for single-number cells; latency
-            # cells print p50 / p95 / p99 with the unit named in the intro sentence.
-            txt = " / ".join(part.value() for part in c.parts()) if "p95" in c.sub else c.value()
+            if c.flag or not c.vals:
+                reason = c.flag or "missing measurement"
+                txt = f"— ⚠[{notes.add(reason, f'{label}: {name}')}]"
+            else:
+                txt = " / ".join(part.value() for part in c.parts()) if "p95" in c.sub else c.value()
             cols.append(f"**{txt}**" if k == "ferrofin" else txt)
         f, o = cells["ferrofin"], cells.get(ORACLE)
-        sp = speedup(f, o) or "—"
-        mark = ""
-        if provisional(f, o):
-            n = notes.add((f.flag or o.flag), f"{name}")
-            mark = f" ⚠[{n}]"
-        p(f"| {label_md} | " + " | ".join(cols) + f" | **{sp}**{mark} |")
+        sp = speedup(f, o) if _ratio(f, o) is not None else None
+        p(f"| {label_md} | " + " | ".join(cols) + f" | **{sp or '—'}** |")
 
     for name, cells in lv["screens"]:
         row(name, cells, f"**{name}** screen")
@@ -607,19 +769,21 @@ def render_readme(m, run_dirs):
     eps = [(name, _ratio(cells["ferrofin"], cells.get(ORACLE))) for name, cells in lv["endpoints"]]
     eps = [(n, r) for n, r in eps if r]
     if eps:
-        lo, hi = min(eps, key=lambda x: x[1]), max(eps, key=lambda x: x[1])
-        p(f"Per endpoint, same level and runs, Ferrofin is faster than {ORACLE_LABEL} on all {len(eps)} "
-          f"compared requests, from {lo[1]:.1f}× (`{lo[0]}`) to {hi[1]:.1f}× (`{hi[0]}`); the full three-server "
-          f"table with p95/p99 is in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).\n")
-    # ── notes on marked rows ──
+        ties = sum(f"{r:.1f}" == "1.0" for _, r in eps)
+        wins = sum(r > 1 and f"{r:.1f}" != "1.0" for _, r in eps)
+        losses = len(eps) - wins - ties
+        p(f"Among {len(eps)} comparable endpoint measurements at this level, Ferrofin is faster on "
+          f"{wins}, about the same on {ties}, and slower on {losses} against {ORACLE_LABEL}. "
+          "Flagged or missing endpoints are excluded from these counts. The full tables are in "
+          "[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).\n")
+    else:
+        p("No endpoint speed comparisons have complete, comparable evidence in this selection.\n")
     if notes:
-        p("⚠ marks a row where the servers did not do identical work, so the multiple is an indication rather "
-          "than a like-for-like result:\n")
+        p("⚠ marks a withheld cell: its evidence is incomplete or the servers did different work. "
+          "Raw diagnostic numbers remain in the full report.\n")
         for n, text, sources in notes.items:
             p(f"{n}. {', '.join(sources)}: {text}")
         p("")
-        p(f"Ferrofin implements the Jellyfin 10.11.8 contract, so a field that 12.0 added and 10.11.8 lacks shows "
-          f"up here as missing on both of them; the row is still Ferrofin's own work for everything else in it.\n")
     # ── spread sentence, computed ──
     def moved(part):
         return len(part.vals) > 1 and part.median and (max(part.vals) - min(part.vals)) > 0.15 * part.median
@@ -811,7 +975,7 @@ def comparable_levels(m, base):
     meaning across that boundary — "peak under load" spans a heavier set of windows and
     "steady idle" follows a different last window — so a delta between them would report
     a definition change as a regression."""
-    return base is None or set(m["levels"]) == set(base["levels"])
+    return base is None or not incompatible(m["runs"] + base["runs"], compare_builds=True)
 
 
 def delta_html(c, base):
@@ -901,6 +1065,8 @@ def prewalk_notes(m, notes):
 
 
 def render_html(m, base=None, picker=""):
+    if base and not comparable_levels(m, base):
+        raise ValueError("incompatible baseline conditions or oracle build")
     e = html.escape
     notes = Notes()
     prewalk_notes(m, notes)
@@ -1028,7 +1194,7 @@ def serve(port, runs_dir):
                 else:
                     body = f"<!doctype html><html lang='en'><head><meta charset='utf-8'><title>Ferrofin Benchmark</title><style>{CSS}</style></head><body><main><h1>Ferrofin benchmark runs</h1>{picker}</main></body></html>"
             except Exception as ex:  # a run still being written, or a malformed file: say which, keep the picker
-                status = 500
+                status = 400 if isinstance(ex, ValueError) else 500
                 body = (f"<!doctype html><html lang='en'><head><meta charset='utf-8'><title>Ferrofin Benchmark</title><style>{CSS}</style></head><body><main>"
                         f"<h1>Could not render {html.escape(', '.join(sel))}</h1><p class='lede'>{html.escape(type(ex).__name__)}: {html.escape(str(ex))} — "
                         f"a run that is still in progress renders once it finishes.</p>{picker}</main></body></html>")
@@ -1085,4 +1251,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except ValueError as error:
+        sys.exit(str(error))

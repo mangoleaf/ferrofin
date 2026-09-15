@@ -141,6 +141,19 @@ config directory is what every server boots a fresh copy of; media is mounted re
 
 ## Running it
 
+The reporter has a fast correctness check, also run in CI:
+
+```sh
+python3 -m unittest discover -s bench -p test_report.py
+```
+
+It uses self-contained fixtures and does not start servers or measure performance.
+The reporter checks every selected repetition and refuses to combine recorded workloads
+or builds that differ. Missing observations and failed repetitions retain their diagnostic
+numbers with a flag in full reports; flagged cells and their ratios are withheld from
+the generated root README. Historical logs retain their original, limited shape evidence.
+Their timing repetition count defaults to the original five unless recorded explicitly.
+
 Needs `docker`, `k6`, `jq`, `taskset` and `python3` on PATH — `run.sh` checks for all five
 and refuses to start without them — plus `curl`, which it uses but does not check for.
 Building the test data additionally needs `ffmpeg` (with libx264 and libx265), `ffprobe`
