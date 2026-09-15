@@ -3719,11 +3719,15 @@ impl LibraryScanner {
         let dest = dir.join(format!("{stem}.jpg"));
         if !dest.exists() {
             let index = i32::try_from(index).ok();
-            let Ok(extracted) = encoder.extract_audio_image(path, index).await else {
-                return Vec::new();
+            let extracted = match encoder.extract_audio_image(path, index).await {
+                Ok(extracted) => extracted,
+                Err(err) => {
+                    tracing::warn!(%err, item = %item_id, "failed to extract embedded cover art");
+                    return Vec::new();
+                }
             };
-            // ffmpeg writes next to the media file; move it into the metadata
-            // dir so the user's library stays untouched.
+            // Copy the temporary extraction into permanent item metadata,
+            // alongside the artwork for movies and TV, then clean up the temp file.
             if let Err(err) = std::fs::create_dir_all(&dir)
                 .and_then(|()| std::fs::copy(&extracted, &dest).map(|_| ()))
             {
