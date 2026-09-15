@@ -40,6 +40,7 @@ const NOT_AVAILABLE: &str = "N/A";
 #[derive(Debug)]
 pub struct OmdbClient {
     http: reqwest::Client,
+    limiter: crate::rate_limit::RateLimiter,
     api_key: SecretString,
     base_url: String,
     /// Season listings already fetched, keyed by `(series id, season)`.
@@ -83,6 +84,7 @@ impl OmdbClient {
     pub fn new(api_key: &str) -> Self {
         Self {
             http: reqwest::Client::new(),
+            limiter: crate::rate_limit::RateLimiter::new("omdb"),
             api_key: SecretString::from(api_key.trim()),
             base_url: API_BASE.to_owned(),
             seasons: Arc::default(),
@@ -284,25 +286,9 @@ impl OmdbClient {
         for (key, value) in params {
             request = request.query(&[(key, value)]);
         }
-        let resp = match request.send().await {
-            Ok(resp) => resp,
-            // `without_url()` strips the query string — the URL carries the API key.
-            Err(e) => {
-                tracing::warn!(provider = "omdb", imdb_id, error = %e.without_url(), "omdb request failed");
-                return None;
-            }
-        };
-        if !resp.status().is_success() {
-            tracing::warn!(provider = "omdb", imdb_id, status = %resp.status(), "omdb returned non-success");
-            return None;
-        }
-        match resp.json::<T>().await {
-            Ok(body) => Some(body),
-            Err(e) => {
-                tracing::warn!(provider = "omdb", imdb_id, error = %e.without_url(), "omdb body did not parse");
-                None
-            }
-        }
+        // OMDb has no configured fixed request interval. Server quota headers
+        // and transient failures still apply a shared cooldown across lookups.
+        self.limiter.get_json(request, Duration::ZERO).await
     }
 }
 
