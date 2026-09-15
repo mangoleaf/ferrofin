@@ -256,6 +256,7 @@ latency (screens and endpoints), time to first screen, memory, and API parity. R
 docker pull jellyfin/jellyfin:10.11.8
 docker pull "$(cat bench/testdata/jellyfin12-image.txt)"
 bench/testdata/build.sh                          # source fixture, once: ~20 min, ~17 GB (gitignored)
+bench/testdata/build.sh --export-pools             # existing fixtures only; fresh builds already include pools
 bench/testdata/build.sh --prepare-jellyfin12       # upgrade a copy, scan and verify, once
 docker build -t ferrofin:bench .                 # the commit under test — REBUILD IT
 bench/run.sh                                     # ~40 min → bench/runs/<tag>/report.md

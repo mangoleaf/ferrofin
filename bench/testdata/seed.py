@@ -159,6 +159,41 @@ def prepare_jellyfin12(url, ids_path, summary_path, out):
     print(json.dumps({"version": info["Version"], "counts": counts, "multi_version_groups": versions}), flush=True)
 
 
+def export_pools(api, ids):
+    """Read the fixed source fixture once; never select pools from a measured server."""
+    query = dict(Recursive="true", SortBy="SortName", SortOrder="Ascending")
+    movies = api.get(f"/Users/{ids['user']}/Items", **query, IncludeItemTypes="Movie",
+                     Limit=500, ParentId=ids["movies_view"])
+    series = api.get(f"/Users/{ids['user']}/Items", **query, IncludeItemTypes="Series",
+                     Limit=100, ParentId=ids["shows_view"])
+    terms = sorted({w for m in movies["Items"] for w in m["Name"].split(" ")
+                    if len(w) > 3 and w != "The"})[:40]
+    pools = {"movies": [m["Id"] for m in movies["Items"]],
+             "series": [m["Id"] for m in series["Items"]], "terms": terms,
+             "movieCount": movies["TotalRecordCount"],
+             "nextUpCutoff": "2025-09-01T00:00:00.000Z"}
+    if not all(pools[k] for k in ("movies", "series", "terms", "movieCount")):
+        raise RuntimeError("source fixture returned empty pools")
+    return pools
+
+
+def export_existing_pools(url, ids_path):
+    with open(ids_path) as f:
+        ids = json.load(f)
+    api = Api(url, timeout=10, attempts=1)
+    wait_ready(api)
+    api.token = ids["token"]
+    if api.get("/System/Info/Public").get("Version") != "10.11.8":
+        raise RuntimeError("pool export requires the source Jellyfin 10.11.8 fixture")
+    drain(api)
+    ids["pools"] = export_pools(api, ids)
+    # Atomic replacement leaves the old fixture IDs intact if export fails.
+    with open(ids_path + ".tmp", "w") as f:
+        json.dump(ids, f, indent=2)
+    os.replace(ids_path + ".tmp", ids_path)
+    print("exported source pools: " + json.dumps({k: len(ids["pools"][k]) for k in ("movies", "series", "terms")}))
+
+
 def main():
     url, out = sys.argv[1], sys.argv[2]
     api = Api(url)
@@ -233,6 +268,7 @@ def main():
            "series": ser["Id"], "season": season["Id"], "episode": episode["Id"],
            "stream": stream["Id"], "stream_source": stream["MediaSources"][0]["Id"],
            "counts": {"movies": len(movies), "series": len(series), "episodes": len(episodes), "hdr": len(hdr)}}
+    ids["pools"] = export_pools(api, ids)
     json.dump(ids, open(out, "w"), indent=2)
     print(json.dumps(ids["counts"]))
 
@@ -240,5 +276,7 @@ def main():
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "--prepare-jellyfin12":
         prepare_jellyfin12(*sys.argv[2:])
+    elif len(sys.argv) > 1 and sys.argv[1] == "--export-pools":
+        export_existing_pools(*sys.argv[2:])
     else:
         main()

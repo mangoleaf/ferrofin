@@ -7,7 +7,10 @@ contract), on identical test data, on one host. Archived runs retain their recor
 published number passed the one check the run itself performs:
 
 - **comparable** — the server returned the same status and record count as Jellyfin
-  12 and a field set that is a superset of its, for every request behind the number.
+  12, matching content type, counts, ordered item IDs and per-item field types for
+  every validated request key; extra object fields are allowed. Required image requests
+  must have matching keys/types and successful, non-empty responses. Image byte sizes
+  are recorded as diagnostics and never compared for equivalence.
   A server that returns fewer records, fewer fields, or an error would be "faster" for
   free; such a cell is marked `⚠[n]` — the number stays for the work list rather than
   being published, and note `n`, printed once at the end with every cell that points at
@@ -53,7 +56,8 @@ cards would load:
 Screens are opened **open-loop** (k6 `constant-arrival-rate`): the next user never waits
 for the previous one, so slow responses do not throttle arrivals and the tails are real.
 The mix is home 3 : movies 2 : detail 2 : series 1 : search 1 : playback 1, in a fixed
-order with fixed picks, so every server receives the identical request sequence.
+order with shared primary picks. Response-dependent image and episode picks are
+recorded and checked; differing selections flag the affected screen.
 Three levels are published: **unloaded** (1 screen/s), **loaded** (5 screens/s — about
 24 API requests/s plus up to ~55 poster requests/s) and **stress** (25 screens/s, five
 times that), which exists to push both servers past a comfortable browse. All three are
@@ -66,7 +70,9 @@ is discarded, and a window in which k6 could not hold its rate is flagged, not p
 
 - **Screen latency** — time from issuing a screen's first request to receiving its last
   response, p50 / p95 / p99 over the window; **endpoint latency** — `http_req_duration`
-  per request name inside the screens; **err** — share of non-2xx/3xx or transport failures.
+  per request name inside the screens; **err** — share of non-2xx/transport failures,
+  invalid image responses, or missing playback/episode dependencies (legacy runs
+  checked non-2xx/3xx and transport failures only).
 - **Cold start** — milliseconds from the container process start (`docker inspect
   .State.StartedAt`) to the first authenticated `200` on `GET /UserViews` (the home-screen
   query), polled every 10 ms, on a *restart* of a server that had already booted this
@@ -109,6 +115,50 @@ config directory is what Jellyfin 10.11.8 and Ferrofin boot a fresh copy of. Jel
 12 boots a copy of the separately prepared config described below. Ferrofin adoption
 stays inside the run; media is mounted read-only for every server.
 
+## Shared picks and bounded validation
+
+The seeder writes `pools` into `ids.json`: ordered movie/series IDs, search terms, the
+movie count, and a fixed NextUp cutoff. Existing fixtures can export these without
+regenerating media or reseeding users:
+
+```bash
+bench/testdata/build.sh --export-pools
+# Move an existing testdata/jellyfin12 preparation aside, then:
+bench/testdata/build.sh --prepare-jellyfin12
+```
+
+Export boots a disposable 10.11.8 source copy and atomically updates only `ids.json`.
+The changed ID-file hash invalidates an earlier Jellyfin 12 preparation. Runs refuse
+missing pools; measured servers never supply their own fallback picks. The final partial
+movie page is included using `ceil(movieCount / 100)`.
+
+`SLOTS` defaults to 600 and must be a positive multiple of ten. Each iteration uses
+`slot = iterationInTest % SLOTS`, the fixed ten-screen mix, and `lcg(slot + 1 + SEED)`.
+All measured levels share `SEED` (default 0); warm-up uses `SEED + 900000`. The one
+untimed shape pass uses ten VUs and exactly `SLOTS` shared iterations, with scenario-wide
+indices so each slot runs once. Iteration 601 wraps to slot 0. This is a warm-cache
+workload, identified as revision 4 in the raw data; it cannot be pooled with the old
+per-level-seed workload.
+
+Shape records identify each request by slot, scoped name, occurrence, method, path/query
+and stable request body. Image cache tags and runtime authentication/session IDs are
+excluded from keys. Counts, ordered IDs (including duplicates), nested array lengths and
+per-item field types are checked per response; no cross-item field union or arbitrary
+value diff is used. Each image belongs to its screen, and binary byte lengths detect
+empty bodies. Different nonzero JPEG sizes remain valid, unflagged diagnostics.
+
+Timed iterations emit one compact selection record after recording screen latency,
+without a full structural comparison. The reporter checks observed keys and request
+counts against that server's validated slot, including every dependent image and episode
+request. Missing, extra or changed requests fail eligibility. Logging still consumes client
+resources; a dropped iteration remains a failure. Raw logs are kept per phase for review.
+
+`run.json` records the non-secret pools, IDs/script SHA-256 hashes, seeds, slot count and
+shape VU count. Reports show measured shape duration and distinct-pick coverage, plus
+image response bytes per measured level as diagnostics. Missing historical evidence is
+not upgraded to bounded coverage. The 600-slot validation uses a sample of the fixture;
+it is not all-endpoint coverage or a deep-parity score.
+
 ## Accuracy controls
 
 - Each server runs alone, in a container pinned to dedicated cores (`SERVER_CPUS`,
@@ -126,7 +176,9 @@ stays inside the run; media is mounted read-only for every server.
   plugin is present; the persisted flags survive the cold-start restarts and are recorded
   in `plugins.json`. Jellyfin runs stock.
 - Every virtual user shares one device id, so all load collapses into one server session
-  (a realism simplification, identical for every server; it does not affect comparability).
+  (a realism simplification). Playback runs during shape, warm-up and measured phases;
+  it can change later home/resume/image selections. These changes are flagged, without
+  an implicit state reset or a claim of value parity under concurrent mutations.
 - Every phase writes its file when it ends; `report.py` renders whatever exists and names
   what is missing; any phase reruns alone (`--only`).
 - The scripts refuse the paths of the owner's real media and server config outright

@@ -296,6 +296,38 @@ class ReportTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'jellyfin12 reported version'):
             self.build(self.a, self.b)
 
+    def test_required_image_failure_withholds_its_screen(self):
+        for server, _ in report.SERVERS:
+            d = self.a / server
+            records = [json.loads(json.loads(line)['msg']) for line in (d/'shape.log').read_text().splitlines()]
+            for rec in records:
+                if rec['shape'] == 'image':
+                    rec.update(shape='home:image', key='poster', bytes=100, content_type='image/jpeg')
+            self.shapes(d, records)
+        self.assertIsNone(self.home(self.build()).flag)
+        d = self.a/'ferrofin'
+        records = [json.loads(json.loads(line)['msg']) for line in (d/'shape.log').read_text().splitlines()]
+        for rec in records:
+            if rec['shape'] == 'home:image':
+                rec['bytes'] = 200
+        self.shapes(d, records)
+        self.assertIsNone(self.home(self.build()).flag)
+        for rec in records:
+            if rec['shape'] == 'home:image':
+                rec['bytes'] = 0
+        self.shapes(d, records)
+        model = self.build()
+        self.assertIn('empty', self.home(model).flag)
+        self.assertNotIn('faster', self.row(self.readme(model)))
+
+    def test_workload_hashes_and_seeds_cannot_be_mixed(self):
+        for field in ('workload', 'ids_sha256', 'screens_sha256', 'seed', 'warmup_seed', 'slots', 'pools'):
+            with self.subTest(field=field):
+                self.edit(self.a/'run.json', lambda m: m.update({field: 4}))
+                with self.assertRaisesRegex(ValueError, field):
+                    self.build(self.a, self.b)
+                self.edit(self.a/'run.json', lambda m: m.pop(field))
+
     def test_missing_memory_repetition_withholds_headline(self):
         (self.b / 'ferrofin/mem.csv').unlink()
         m = self.build(self.a, self.b)
@@ -370,6 +402,139 @@ class PreparationTests(unittest.TestCase):
                                         capture_output=True, text=True)
                 self.assertEqual(result.returncode, 2, result.stderr)
                 self.assertNotIn('build the test data', result.stderr)
+
+
+
+class BoundedEvidenceTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.meta = {'workload': 4, 'slots': 10, 'seed': 0, 'shape_vus': 10}
+        self.records = []
+        self.responses = []
+        for i in range(10):
+            key = json.dumps([i, 'home:image', 0, 'GET', '/Items/a/Images/Primary', {}])
+            self.records.append({'selection': i, 'iteration': i, 'screen': 'home', 'keys': [key], 'ok': True})
+            self.responses.append({'shape': 'home:image', 'slot': i, 'key': key,
+                                   'status': 200, 'content_type': 'image/jpeg', 'bytes': 100})
+        self.summary = {**self.meta, 'iterations': 10, 'requests': 10, 'elapsed_ms': 20}
+        (self.root/'shape-summary.json').write_text(json.dumps(self.summary))
+        self.save()
+
+    def save(self):
+        self.log(self.root/'shape.log', self.records + self.responses)
+
+    def log(self, path, records):
+        path.write_text('\n'.join(json.dumps({'msg': json.dumps(r)}) for r in records))
+
+    def evidence(self):
+        return report.shape_evidence(self.root, self.meta, report.load_shape(self.root))
+
+    def test_shape_slots_are_complete_once_across_vus(self):
+        self.records.reverse()  # completion order across VUs is irrelevant
+        self.responses.reverse()
+        self.save()
+        problem, index, coverage = self.evidence()
+        self.assertIsNone(problem)
+        self.assertEqual(set(index), set(range(10)))
+        self.assertEqual(coverage['distinct_requests'], 1)
+
+    def test_missing_or_duplicated_slot_fails(self):
+        self.records[-1] = self.records[0]
+        self.save()
+        self.assertIn('missing or duplicated', self.evidence()[0])
+
+    def test_missing_image_response_fails_coverage(self):
+        self.responses.pop()
+        self.save()
+        self.assertIn('request evidence', self.evidence()[0])
+
+    def test_changed_seed_fails(self):
+        self.meta['seed'] = 9
+        self.assertIn('seed', self.evidence()[0])
+
+    def test_601st_iteration_wraps_to_validated_slot(self):
+        # Ten-slot fixture exercises the same modulo rule cheaply over 601 iterations.
+        _, expected, _ = self.evidence()
+        measured = [{**copy.deepcopy(expected[i % 10]), 'iteration': i} for i in range(601)]
+        path = self.root/'selections.log'
+        self.log(path, measured)
+        summary = {'iterations': 601, 'requests': 601}
+        self.assertEqual(report.selection_problems(path, summary, expected, 10), {})
+        measured[-1]['keys'] = []
+        self.log(path, measured)
+        summary['requests'] -= 1
+        self.assertIn('selections differ', report.selection_problems(path, summary, expected, 10)['home'])
+
+    def test_missing_timed_evidence_cannot_pass(self):
+        _, expected, _ = self.evidence()
+        problems = report.selection_problems(self.root/'absent.log', self.summary, expected, 10)
+        self.assertIn('incomplete', problems['home'])
+
+    def test_measured_seed_must_match_shape_seed(self):
+        _, expected, _ = self.evidence()
+        path = self.root/'selections.log'
+        self.log(path, self.records)
+        problems = report.selection_problems(path, {**self.summary, 'seed': 99}, expected, 10, self.meta)
+        self.assertIn('seed', problems['home'])
+
+    def test_failed_dependency_fails_screen(self):
+        _, expected, _ = self.evidence()
+        self.records[0]['ok'] = False
+        path = self.root/'selections.log'
+        self.log(path, self.records)
+        self.assertIn('dependent request', report.selection_problems(path, self.summary, expected, 10)['home'])
+
+    def test_image_bytes_are_diagnostic_but_type_and_empty_body_fail(self):
+        original = report.load_shape(self.root)
+        self.responses[0]['bytes'] = 200
+        self.save()
+        self.assertIsNone(report.comparable(report.load_shape(self.root), original, ['home:image']))
+        self.responses[0]['content_type'] = 'text/html'
+        self.save()
+        self.assertIn('content_type', report.comparable(report.load_shape(self.root), original, ['home:image']))
+        self.responses[0]['content_type'] = 'image/jpeg'
+        self.responses[0]['bytes'] = 0
+        self.save()
+        self.assertIn('empty', report.comparable(report.load_shape(self.root), original, ['home:image']))
+        self.assertIn('empty', report.oracle_failed(report.load_shape(self.root), ['home:image']))
+
+    def test_request_key_includes_each_image_occurrence(self):
+        original = report.load_shape(self.root)
+        self.responses.pop()
+        self.save()
+        self.assertIn('picks differ', report.comparable(report.load_shape(self.root), original, ['home:image']))
+
+    def test_both_servers_invalid_json_is_still_a_failure(self):
+        self.log(self.root/'shape.log', [{'shape': 'home:items', 'key': 'key', 'status': 200,
+                                        'content_type': 'application/json', 'invalid_json': True}])
+        shape = report.load_shape(self.root)
+        self.assertIsNotNone(report.comparable(shape, shape, ['home:items']))
+
+    def test_ordered_ids_and_per_item_types_preserve_duplicates(self):
+        response = {'shape': 'movies:items', 'key': 'pick', 'status': 200, 'count': 2,
+                    'ids': ['a', 'a'], 'types': {'$.Items[0].Name': 'string', '$.Items[1].Name': 'string'}}
+        self.log(self.root/'shape.log', [response])
+        original = report.load_shape(self.root)
+        response['ids'] = ['a', 'b']
+        self.log(self.root/'shape.log', [response])
+        self.assertIn('ids differs', report.comparable(report.load_shape(self.root), original, ['movies:items']))
+        response['ids'] = ['a', 'a']
+        response['types']['$.Items[1].Name'] = 'null'
+        self.log(self.root/'shape.log', [response])
+        self.assertIn('per-item', report.comparable(report.load_shape(self.root), original, ['movies:items']))
+
+    def test_pool_export_uses_source_ids_and_fixed_cutoff(self):
+        api = Mock()
+        api.get.side_effect = [{'Items': [{'Id': 'm', 'Name': 'The Shared Movie'}], 'TotalRecordCount': 101},
+                               {'Items': [{'Id': 's'}]}]
+        pools = seed.export_pools(api, {'user': 'u', 'movies_view': 'm', 'shows_view': 's'})
+        self.assertEqual(pools['movies'], ['m'])
+        self.assertEqual(pools['series'], ['s'])
+        self.assertEqual(pools['movieCount'], 101)
+        self.assertEqual(pools['terms'], ['Movie', 'Shared'])
+        self.assertEqual(pools['nextUpCutoff'], '2025-09-01T00:00:00.000Z')
 
 
 if __name__ == '__main__':

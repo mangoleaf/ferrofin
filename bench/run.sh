@@ -19,6 +19,11 @@ WARMUP_S=${WARMUP_S:-30}        # discarded seconds at the same rate before each
 WINDOW_S=${WINDOW_S:-120}       # measured seconds per load level
 SETTLE_S=${SETTLE_S:-30}        # idle after scheduled tasks report idle, before any window
 STEADY_S=${STEADY_S:-60}        # idle after load; steady memory = median over this window
+# Shared bounded picks; the discarded warm-up uses a separate seed.
+SLOTS=${SLOTS:-600}
+SEED=${SEED:-0}
+SHAPE_VUS=10
+WARMUP_SEED=$((SEED + 900000))
 MEM_SAMPLE_MS=${MEM_SAMPLE_MS:-100}
 POLL_MS=${POLL_MS:-10}          # cold-start readiness poll
 RESTARTS=${RESTARTS:-5}
@@ -54,6 +59,7 @@ while [ $# -gt 0 ]; do case "$1" in
   --out) OUT=$2; shift 2;;
   *) echo "unknown $1" >&2; exit 2;;
 esac; done
+[[ "$SLOTS" =~ ^[1-9][0-9]*$ ]] && (( SLOTS % 10 == 0 )) || { echo "SLOTS must be a positive multiple of ten" >&2; exit 2; }
 # Reject bad selections before any fixture access or Docker command.
 for selection in "$ONLY" "$SERVERS"; do
   [[ "$selection" != *[[:space:]]* ]] || { echo "selections must be comma-separated without whitespace" >&2; exit 2; }
@@ -114,6 +120,7 @@ want() { [ -z "$ONLY" ] || [[ ",$ONLY," == *",$1,"* ]]; }
 # ── preflight ──────────────────────────────────────────────────────────────
 [ -f "$TESTDATA/ids.json" ] || die "no $TESTDATA/ids.json — build the test data first (bench/testdata/build.sh)"
 for t in docker k6 python3 jq taskset curl sha256sum; do command -v $t >/dev/null || die "$t not installed"; done
+jq -e '.pools | (.movies|length)>0 and (.series|length)>0 and (.terms|length)>0 and (.movieCount>0) and (.nextUpCutoff|type=="string")' "$TESTDATA/ids.json" >/dev/null || die "fixture pools missing; run bench/testdata/build.sh --export-pools"
 for s in ${SERVERS//,/ }; do docker image inspect "$(image_of "$s")" >/dev/null 2>&1 || die "image $(image_of "$s") missing"; done
 if [[ ",$SERVERS," == *,jellyfin12,* ]]; then
   prep=$TESTDATA/jellyfin12/preparation.json
@@ -137,7 +144,9 @@ jq -n --arg sha "$SHA" --arg name "$(basename "$OUT")" --argjson dirty "$DIRTY" 
   --arg mem "$MEMORY" --arg cpus "$SERVER_CPUS" --arg k6 "$(k6 version | head -1)" --arg testdata "$(jq -c .counts "$IDS")" \
   --argjson rate_unloaded "$RATE_UNLOADED" --argjson rate_loaded "$RATE_LOADED" --argjson rate_stress "$RATE_STRESS" \
   --argjson window "$WINDOW_S" --argjson sample_ms "$MEM_SAMPLE_MS" \
-  '{sha:$sha, name:$name, dirty:$dirty, host:$host, cpu:$cpu, memory_limit:$mem, server_cpus:$cpus, k6:$k6, testdata_counts:($testdata|fromjson),
+  --arg ids_sha "$(sha256sum "$IDS" | cut -d' ' -f1)" --arg script_sha "$(sha256sum bench/screens.js | cut -d' ' -f1)" \
+  --argjson pools "$(jq -c .pools "$IDS")" --argjson warmup_s "$WARMUP_S" --argjson settle_s "$SETTLE_S" --argjson steady_s "$STEADY_S" --arg client_cpus "$CLIENT_CPUS" --argjson slots "$SLOTS" --argjson seed "$SEED" --argjson warmup_seed "$WARMUP_SEED" --argjson shape_vus "$SHAPE_VUS" \
+  '{workload:4, warmup_s:$warmup_s, settle_s:$settle_s, steady_s:$steady_s, client_cpus:$client_cpus, ids_sha256:$ids_sha, screens_sha256:$script_sha, pools:$pools, slots:$slots, seed:$seed, warmup_seed:$warmup_seed, shape_vus:$shape_vus, sha:$sha, name:$name, dirty:$dirty, host:$host, cpu:$cpu, memory_limit:$mem, server_cpus:$cpus, k6:$k6, testdata_counts:($testdata|fromjson),
     rate_unloaded:$rate_unloaded, rate_loaded:$rate_loaded, rate_stress:$rate_stress,
     window_s:$window, mem_sample_ms:$sample_ms, date: (now|todate)}' > "$OUT/run.json"
 
@@ -170,7 +179,7 @@ disable_plugins() {  # core Ferrofin only: every compiled-in extension off, no W
   [ -z "$on" ] || die "$NAME: plugins still enabled after disabling: $on"
   echo "  plugins: $(jq -r 'map(.Name) | join(", ")' "$D/plugins.json") — all disabled"
 }
-k6run() { taskset -c "$CLIENT_CPUS" k6 run --quiet -e URL="$URL" -e IDS="$IDS" "$@" bench/screens.js; }
+k6run() { taskset -c "$CLIENT_CPUS" k6 run --quiet --log-format json -e SLOTS="$SLOTS" -e URL="$URL" -e IDS="$IDS" "$@" bench/screens.js; }
 phase() { echo "  -- $1"; if ! "phase_$1"; then echo "  ✗ phase $1 failed for $NAME (see $D/server.log)" >&2; fi; }
 
 phase_counts() {
@@ -192,8 +201,9 @@ phase_counts() {
 }
 phase_shape() {
   taskset -c "$CLIENT_CPUS" k6 run --quiet --log-format json --console-output "$D/shape.log" \
-    -e URL="$URL" -e IDS="$IDS" -e SHAPE=1 -e OUT="$D/shape-summary.json" bench/screens.js >/dev/null || return 1
-  echo "  shape: $(wc -l < "$D/shape.log") responses"
+    -e URL="$URL" -e IDS="$IDS" -e SHAPE=1 -e SEED="$SEED" -e SLOTS="$SLOTS" -e OUT="$D/shape-summary.json" bench/screens.js >/dev/null || return 1
+  echo "  shape: $(jq -r '.iterations|tostring' "$D/shape-summary.json") slots; $(jq -r '.elapsed_ms/1000' "$D/shape-summary.json") seconds"
+  python3 bench/report.py --shape-coverage "$D"
 }
 phase_coldstart() {
   taskset -c "$CLIENT_CPUS" python3 bench/coldstart.py "$CONTAINER" "$URL" "$IDS" "$D/coldstart.json" "$RESTARTS" "$POLL_MS" | sed 's/^/  /' || return 1
@@ -201,20 +211,20 @@ phase_coldstart() {
 }
 phase_load() {  # every load level under one sampler (drained between), then the steady window
   taskset -c "$CLIENT_CPUS" python3 bench/mem_sample.py "$CONTAINER" "$D/mem.csv" "$MEM_SAMPLE_MS" "$SERVER_CPUS" &
-  local sampler=$! w='{}' level rate seed t0 t1 rc=0
+  local sampler=$! w='{}' level rate t0 t1 rc=0
   for level in unloaded loaded stress; do
     want $level || continue
     case $level in
-      unloaded) rate=$RATE_UNLOADED; seed=0;;
-      loaded)   rate=$RATE_LOADED;   seed=500000;;
-      stress)   rate=$RATE_STRESS;   seed=250000;;
+      unloaded) rate=$RATE_UNLOADED;;
+      loaded)   rate=$RATE_LOADED;;
+      stress)   rate=$RATE_STRESS;;
     esac
     drain || rc=1
     echo "  $level: warm-up ${WARMUP_S}s @ $rate/s"
-    k6run -e RATE="$rate" -e DURATION="${WARMUP_S}s" -e SEED=$((seed + 900000)) -e OUT="$D/k6-$level-warmup.json" >/dev/null || { echo "  warm-up failed" >&2; rc=1; }
+    k6run -e RATE="$rate" -e DURATION="${WARMUP_S}s" --console-output "$D/selections-$level-warmup.log" -e SEED="$WARMUP_SEED" -e OUT="$D/k6-$level-warmup.json" >/dev/null || { echo "  warm-up failed" >&2; rc=1; }
     echo "  $level: window ${WINDOW_S}s @ $rate/s"
     t0=$(date +%s.%N)
-    k6run -e RATE="$rate" -e DURATION="${WINDOW_S}s" -e SEED=$seed -e OUT="$D/k6-$level.json" | sed 's/^/    /' || { echo "  window failed" >&2; rc=1; }
+    k6run -e RATE="$rate" -e DURATION="${WINDOW_S}s" --console-output "$D/selections-$level.log" -e SEED="$SEED" -e OUT="$D/k6-$level.json" | sed 's/^/    /' || { echo "  window failed" >&2; rc=1; }
     t1=$(date +%s.%N)
     w=$(jq -c --arg l "$level" --argjson t0 "$t0" --argjson t1 "$t1" '. + {($l): {start:$t0, end:$t1}}' <<<"$w")
   done

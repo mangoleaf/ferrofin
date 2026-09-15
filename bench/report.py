@@ -39,7 +39,7 @@ import os
 import statistics
 import sys
 import urllib.parse
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 DELTA_NOISE_PCT = 2  # a baseline change smaller than this is not coloured
 ORACLE = "jellyfin12"  # the source of truth (owner, 2026-09-02): Jellyfin 12 is the newer code
@@ -108,7 +108,85 @@ def load_shape(d):
                  if k.lower() not in {"apikey", "api_key", "playsessionid", "tag", "nextupdatecutoff"}]
         key = rec.get("key") or (u.path, tuple(sorted(query)))
         s["samples"].setdefault(key, []).append(rec)
+    # Retain the historical aggregate image row, while each screen owns its images.
+    for name, observations in list(out.items()):
+        if name.endswith(":image"):
+            aggregate = out["image"]
+            for field in ("status", "count", "total", "fields"):
+                aggregate[field].update(observations[field])
+            aggregate["n"] += observations["n"]
+            aggregate["samples"].update(observations["samples"])
     return out
+
+
+def selection_records(path):
+    records = []
+    try:
+        with open(path) as f:
+            for line in f:
+                try:
+                    rec = json.loads(json.loads(line)["msg"])
+                    if isinstance(rec, dict) and "selection" in rec:
+                        records.append(rec)
+                except (ValueError, KeyError, TypeError):
+                    continue
+    except OSError:
+        pass
+    return records
+
+
+def shape_evidence(d, meta, shape):
+    """Validate bounded coverage once per run, outside the per-cell render loop."""
+    summary = load(os.path.join(d, "shape-summary.json")) or {}
+    records = selection_records(os.path.join(d, "shape.log"))
+    slots = meta.get("slots")
+    if not isinstance(slots, int) or slots <= 0 or slots % 10:
+        return "invalid slot count", {}, {}
+    if any(summary.get(k) != meta.get(k) for k in ("workload", "slots", "seed", "shape_vus")):
+        return "shape workload/seed/slots differ from run metadata", {}, {}
+    if len(records) != slots or summary.get("iterations") != slots:
+        return "shape slot coverage incomplete", {}, {}
+    if sorted(r.get("iteration", -1) for r in records) != list(range(slots)) or any(r.get("selection") != r.get("iteration") for r in records):
+        return "shape slots missing or duplicated", {}, {}
+    expected = Counter(key for r in records for key in r.get("keys", []))
+    actual = Counter(key for name, obs in (shape or {}).items() if name != "image"
+                     for key, samples in obs["samples"].items() for _ in samples)
+    if expected != actual or any(n != 1 for n in actual.values()) or sum(actual.values()) != summary.get("requests"):
+        return "shape request evidence missing or duplicated", {}, {}
+    index = {r["selection"]: r for r in records}
+    distinct = {json.dumps(json.loads(key)[3:], sort_keys=True) for key in expected}
+    picks = defaultdict(set)
+    for key in expected:
+        _, name, _, _, path, _ = json.loads(key)
+        if name in {"detail:item", "playback:playbackinfo", "series:item", "movies:items", "search:items"}:
+            picks[name].add(path)
+    coverage = {"distinct_picks": {name: len(paths) for name, paths in sorted(picks.items())}, "slots": slots, "requests": sum(actual.values()), "distinct_requests": len(distinct),
+                "elapsed_s": (summary.get("elapsed_ms") or 0) / 1000}
+    return None, index, coverage
+
+
+def selection_problems(path, summary, expected, slots, meta=None):
+    records = selection_records(path)
+    if meta and summary and any(summary.get(k) != meta.get(k) for k in ("workload", "slots", "seed")):
+        return {s: "measured workload/seed/slots differ from validation" for s in SCREENS}
+    if not summary or len(records) != summary.get("iterations") or not records:
+        return {s: "measured selection evidence incomplete" for s in SCREENS}
+    if sorted(r.get("iteration", -1) for r in records) != list(range(len(records))):
+        return {s: "measured iterations missing or duplicated" for s in SCREENS}
+    if sum(len(r.get("keys", [])) for r in records) != summary.get("requests"):
+        return {s: "measured request counts differ from selection evidence" for s in SCREENS}
+    problems = {}
+    for r in records:
+        scr = r.get("screen")
+        slot = r.get("selection")
+        validation = expected.get(slot)
+        if slot != r["iteration"] % slots or not validation or validation.get("screen") != scr:
+            return {s: "measured slot was not validated" for s in SCREENS}
+        if not r.get("ok") or not validation.get("ok"):
+            problems[scr] = "dependent request or screen failed"
+        elif r.get("keys") != validation.get("keys"):
+            problems[scr] = "measured request selections differ from validated slot"
+    return problems
 
 
 def oracle_failed(shape_oracle, names, oracle_label=ORACLE_LABEL):
@@ -121,7 +199,12 @@ def oracle_failed(shape_oracle, names, oracle_label=ORACLE_LABEL):
             return f"{n}: missing"
         if any(not isinstance(st, int) or not 200 <= st < 400 for st in o["status"]):
             return f"{oracle_label} failed {n} ({sorted(o['status'], key=str)})"
-        if n == "image" and any(r.get("bytes") == 0 for rs in o.get("samples", {}).values() for r in rs):
+        if any(r.get("key") and "json" in r.get("content_type", "") and not isinstance(r.get("types"), dict)
+               for rs in o["samples"].values() for r in rs):
+            return f"{n}: missing per-item shape evidence"
+        if any(r.get("invalid_json") for rs in o["samples"].values() for r in rs):
+            return f"{n}: invalid JSON response"
+        if (n == "image" or n.endswith(":image")) and any(r.get("bytes") == 0 for rs in o.get("samples", {}).values() for r in rs):
             return f"{n}: empty oracle response"
     return None
 
@@ -132,6 +215,8 @@ def comparable(shape_srv, shape_oracle, names, oracle_label=ORACLE_LABEL):
         return f"no oracle run ({oracle_label} not in this run)"
     if shape_srv is None:
         return "no shape pass"
+    if problem := oracle_failed(shape_oracle, names, oracle_label):
+        return problem
     for n in names:
         o, s = shape_oracle.get(n), shape_srv.get(n)
         if o is None or s is None:
@@ -156,13 +241,15 @@ def comparable(shape_srv, shape_oracle, names, oracle_label=ORACLE_LABEL):
                 if len(actual) != len(expected):
                     return f"{n}: request count differs"
                 for a, b in zip(actual, expected):
-                    for field in ("status", "count", "total", "content_type", "ids", "types"):
+                    for field in ("status", "count", "total", "content_type", "ids", "invalid_json"):
                         if a.get(field) != b.get(field):
                             return f"{n}: {field} differs for a request pick"
+                    if any(a.get("types", {}).get(path) != kind for path, kind in b.get("types", {}).items()):
+                        return f"{n}: per-item fields/types differ for a request pick"
                     if set(b.get("fields") or []) - set(a.get("fields") or []):
                         return f"{n}: missing fields for a request pick"
                     # Encoding sizes vary legitimately. Only an empty image is invalid.
-                    if n == "image" and (a.get("bytes", 1) <= 0 or b.get("bytes", 1) <= 0):
+                    if (n == "image" or n.endswith(":image")) and (a.get("bytes", 1) <= 0 or b.get("bytes", 1) <= 0):
                         return f"{n}: empty response"
     return None
 
@@ -380,7 +467,7 @@ def latency_cell(per_run, flag, fmt=sig3):
 CONDITIONS = ("host", "cpu", "memory_limit", "server_cpus", "client_cpus", "k6",
               "window_s", "mem_sample_ms", "rate_unloaded", "rate_loaded", "rate_stress",
               "warmup_s", "settle_s", "steady_s", "restarts", "ttfs_reps",
-              "ids_sha256", "screens_sha256", "seed", "slots", "shape_vus", "pools",
+              "ids_sha256", "screens_sha256", "seed", "warmup_seed", "slots", "shape_vus", "pools", "workload",
               "testdata_counts")
 
 
@@ -480,6 +567,9 @@ def build(runs):
     missing = []
     m = {"meta": meta, "runs": runs, "servers": servers, "levels": {}, "missing": missing, "load_problems": [], "oracle_label": oracle_label}
 
+    evidence = {k: [shape_evidence(d, metas[i], shapes[k][i]) if metas[i].get("workload") == 4 else (None, {}, {})
+                    for i, d in enumerate(ds)] for k, ds in per.items()}
+    m["coverage"] = {k: [e[2] or {"unavailable": e[0] or "legacy workload"} for e in es] for k, es in evidence.items()}
     for level in LOAD_LEVELS:
         data = {k: [load(os.path.join(d, f"k6-{level}.json")) for d in ds] for k, ds in per.items()}
         # `windows.json` says the level ran; a missing k6 file then means it failed,
@@ -495,10 +585,27 @@ def build(runs):
                 if x:
                     for n in x["endpoints"]:
                         names_of[n.split(":")[0]].add(n)
+        observed = {k: [selection_problems(os.path.join(d, f"selections-{level}.log"), data[k][i], evidence[k][i][1], metas[i].get("slots"), metas[i])
+                        if metas[i].get("workload") == 4 and not evidence[k][i][0] else {}
+                        for i, d in enumerate(ds)] for k, ds in per.items()}
+        for xs in shapes.values():
+            for shape in xs:
+                for name in shape or {}:
+                    names_of[name.split(":")[0]].add(name)
         def flag(k, names):
             problems = []
             for i, x in enumerate(data[k]):
                 problems.append(window_problem(x))
+                for server in {k, ORACLE} & evidence.keys():
+                    problems.append(evidence[server][i][0])
+                    for name in names:
+                        scr = name.split(":")[0]
+                        problems.append(observed[server][i].get(scr))
+                        if scr == "image":
+                            problems.extend(observed[server][i].values())
+                    for rec in evidence[server][i][1].values():
+                        if not rec.get("ok") and any(n.startswith(rec.get("screen", "") + ":") or n == "image" for n in names):
+                            problems.append("shape dependency failed")
                 problems.append(oracle_failed(oracle_shapes[i], names, oracle_label) if k == ORACLE else
                                 comparable(shapes[k][i], oracle_shapes[i], names, oracle_label))
                 if not counts[k][i]:
@@ -537,7 +644,8 @@ def build(runs):
                     if problem := window_problem(x):
                         m["load_problems"].append(f"{os.path.basename(runs[i])}/{k}/{level}: {problem}")
             m["levels"][level] = {"rate": rate, "screens": screens,
-                                  "endpoints": endpoints, "any_data": True}
+                                  "endpoints": endpoints, "any_data": True,
+                                  "image_bytes": {k: [x.get("image_bytes") if x else None for x in xs] for k, xs in data.items()}}
 
     # time to first screen
     cold, hls, direct, turl = {}, {}, {}, {}
@@ -658,6 +766,9 @@ def render_md(m):
                 md_cell(cells[k], notes, f"{lbl} · {name} ({level} endpoints)",
                         cells.get(ORACLE) if k != ORACLE else None) for k, lbl in servers) + " |")
         p("")
+        p("Image response bytes (diagnostic, per run): " + "; ".join(f"{label}: {lv['image_bytes'][k]}" for k, label in servers) + "\n")
+    for k, coverage in m["coverage"].items():
+        p(f"Shape coverage — {dict(servers)[k]}: `{json.dumps(coverage)}`\n")
     p("### Time to first screen\n")
     p("| | " + " | ".join(label for _, label in servers) + " |\n|" + "---|" * (len(servers) + 1))
     for name, cells in m["ttfs"]:
@@ -1143,11 +1254,13 @@ def render_html(m, base=None, picker=""):
         bl = base_l.get(level, {})
         parts.append(table_html("screen", lv["screens"], servers, dict(bl.get("screens", [])), notes, f"{level} screens"))
         parts.append(f"<details><summary>Per endpoint, {level}</summary>{table_html('endpoint', lv['endpoints'], servers, dict(bl.get('endpoints', [])), notes, f'{level} endpoints')}</details>")
+        parts.append("<p>Image response bytes (diagnostic, per run): " + e("; ".join(f"{label}: {lv['image_bytes'][k]}" for k, label in servers)) + "</p>")
     parts.append("<h2>Time to first screen</h2>" + table_html("", m["ttfs"], servers, base_ttfs, notes, "time to first screen"))
     mem_note = "" if comparable_levels(m, base) else (
         "<p class='lede'>The baseline ran different load levels, so no change is shown on the "
         "memory rows: <em>peak under load</em> spans a different set of windows and "
         "<em>steady idle</em> follows a different one, which would read as a regression.</p>")
+    parts.append("<p>Shape coverage: " + e(json.dumps(m["coverage"])) + "</p>")
     parts.append(f"<h2>Memory — anon, cache excluded, {e(str(m['sample_ms']))} ms samples</h2>"
                  + mem_note + table_html("", m["memory"], servers, base_mem, notes, "memory"))
     if m["work"]:
@@ -1240,6 +1353,14 @@ def serve(port, runs_dir):
 
 def main():
     args = sys.argv[1:]
+    if args and args[0] == "--shape-coverage":
+        d = args[1]
+        summary = load(os.path.join(d, "shape-summary.json")) or {}
+        problem, _, coverage = shape_evidence(d, summary, load_shape(d))
+        if problem:
+            raise ValueError(problem)
+        print("  coverage: " + json.dumps(coverage))
+        return
     if args and args[0] == "--serve":
         port = int(args[1]) if len(args) > 1 and args[1].isdigit() else 8097
         runs_dir = args[2] if len(args) > 2 else (args[1] if len(args) > 1 and not args[1].isdigit() else os.path.join(os.path.dirname(os.path.abspath(__file__)), "runs"))
