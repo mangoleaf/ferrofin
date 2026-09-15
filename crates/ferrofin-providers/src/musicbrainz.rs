@@ -469,7 +469,7 @@ impl MusicBrainzClient {
 
     fn request_interval(server: &str, rate_limit: f64) -> Duration {
         let interval = Self::interval(rate_limit);
-        let official = reqwest::Url::parse(server).ok().is_some_and(|url| {
+        let official = reqwest::Url::parse(server).is_ok_and(|url| {
             url.host_str()
                 .is_some_and(|host| host == "musicbrainz.org" || host.ends_with(".musicbrainz.org"))
         });
