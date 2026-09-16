@@ -1475,7 +1475,7 @@ def main():
             raise ValueError(problem)
         print("  coverage: " + json.dumps(coverage))
         shape = load_shape(d)
-        if problem := oracle_failed(shape, list(shape or {})):
+        if problem := oracle_failed(shape, list(shape or {}), os.path.basename(os.path.normpath(d))):
             raise ValueError(problem)
         if any(not r.get("ok") for r in selection_records(os.path.join(d, "shape.log"))):
             raise ValueError("shape dependency failed")

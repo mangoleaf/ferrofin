@@ -588,6 +588,45 @@ class InstrumentTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
 
+    def test_sampler_preserves_distinct_observations_in_one_millisecond(self):
+        for name, value in {'memory.stat': 'anon 100\nfile 0\n',
+                            'memory.current': '100', 'memory.swap.current': '0'}.items():
+            (self.root/name).write_text(value)
+        output = self.root/'mem.csv'
+        timestamps = [1789519227.7521, 1789519227.7523]
+        handlers = {}
+        sleeps = []
+
+        def sleep(_):
+            sleeps.append(True)
+            if len(sleeps) == 2:
+                handlers[mem_sample.signal.SIGTERM](None, None)
+
+        with patch.object(mem_sample.sys, 'argv', ['sampler', 'container', str(output), '100', '0']), \
+             patch.object(mem_sample, 'cgroup_dir', return_value=str(self.root)), \
+             patch.object(mem_sample, 'container_cpu_usec', side_effect=[0, 100, 200]), \
+             patch.object(mem_sample, 'cpu_times', return_value=(0, 100)), \
+             patch.object(mem_sample.signal, 'signal', side_effect=lambda sig, fn: handlers.update({sig: fn})), \
+             patch.object(mem_sample.time, 'time', side_effect=timestamps), \
+             patch.object(mem_sample.time, 'sleep', side_effect=sleep):
+            mem_sample.main()
+        recorded = [float(row.split(',')[0]) for row in output.read_text().splitlines()[1:]]
+        self.assertEqual(recorded, timestamps)
+        (self.root/'windows.json').write_text(json.dumps({'loaded': {'start': timestamps[0], 'end': timestamps[1]}}))
+        evidence = report.resource_windows(self.root, {'resource_schema': 1})['loaded']
+        self.assertNotIn('error', evidence)
+        self.assertAlmostEqual(evidence['cpu_seconds'], .0001)
+
+    def test_shape_cli_names_the_server_whose_response_failed(self):
+        shape = {'home:image': {'status': {0, 200}}}
+        with patch.object(report.sys, 'argv', ['report', '--shape-coverage', str(self.root/'ferrofin')]), \
+             patch.object(report, 'load', return_value={}), \
+             patch.object(report, 'load_shape', return_value=shape), \
+             patch.object(report, 'shape_evidence', return_value=(None, None, {})), \
+             patch('builtins.print'):
+            with self.assertRaisesRegex(ValueError, 'ferrofin failed home:image'):
+                report.main()
+
     def resource(self, times=(0, 0.1, 0.2, 0.3, 0.4), counter=True):
         (self.root/'windows.json').write_text(json.dumps({'loaded': {'start': .05, 'end': .35}}))
         (self.root/'mem.csv').write_text('t,anon' + (',cpu_usec' if counter else '') + '\n' +

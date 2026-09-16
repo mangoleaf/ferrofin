@@ -219,7 +219,9 @@ its bounded default HTTP request timeout, with the outer client limit above. A d
 finish its last bounded HTTP call before reporting timeout. Fixture task drain/export
 uses `PREPARE_TIMEOUT_S` (1800 by default). No global cleanup or host changes occur.
 
-The sampler saves `cpu_usec` beside its interval utilization fields. Reports show actual
+The sampler saves `cpu_usec` beside its interval utilization fields. Sample timestamps
+retain sub-millisecond precision so catch-up observations do not collide through rounding.
+Reports show actual
 observation boundaries, sample count and largest gap. CPU seconds use the two bracketing
 raw counters; they are not reconstructed from rounded utilization for archived runs.
 Unbracketed windows, excessive gaps, counter resets or failed sampler exit flag resource

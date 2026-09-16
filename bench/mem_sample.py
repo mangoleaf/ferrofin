@@ -112,10 +112,10 @@ def main():
         pc = container_cpu_usec(d)
         while not stop:
             try:
-                stat = dict(line.split() for line in open(f"{d}/memory.stat"))
-                cur = open(f"{d}/memory.current").read().strip()
+                stat = dict(line.split() for line in Path(d, "memory.stat").read_text().splitlines())
+                cur = Path(d, "memory.current").read_text().strip()
                 try:
-                    swap = open(f"{d}/memory.swap.current").read().strip()
+                    swap = Path(d, "memory.swap.current").read_text().strip()
                 except OSError:
                     swap = "0"
                 cc = container_cpu_usec(d)
@@ -128,8 +128,10 @@ def main():
             cores_busy = (b - pb) / dt_j
             container_cpu = (cc - pc) / 1e6 * hz / dt_j
             pb, pt, pc = b, t, cc
-            load1 = open("/proc/loadavg").read().split()[0]
-            f.write(f"{time.time():.3f},{stat['anon']},{stat['file']},{cur},{cores_busy:.3f},{container_cpu:.3f},{max(0.0, cores_busy - container_cpu):.3f},{swap},{load1},{cc}\n")
+            load1 = Path("/proc/loadavg").read_text().split()[0]
+            # Catch-up observations can share a millisecond. Keep clock precision
+            # so rounding cannot manufacture nonmonotonic resource evidence.
+            f.write(f"{time.time():.9f},{stat['anon']},{stat['file']},{cur},{cores_busy:.3f},{container_cpu:.3f},{max(0.0, cores_busy - container_cpu):.3f},{swap},{load1},{cc}\n")
             f.flush()
             nxt += interval
             time.sleep(max(0.0, nxt - time.monotonic()))
