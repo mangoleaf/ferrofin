@@ -61,7 +61,8 @@ class Api:
 
 
 def wait_ready(api, secs=300):
-    for _ in range(secs * 2):
+    deadline = time.monotonic() + secs
+    while time.monotonic() < deadline:
         try:
             # Jellyfin 12's temporary setup server also returns HTTP 200, but
             # camelCase JSON; wait for the actual API's PascalCase response.
@@ -80,7 +81,10 @@ def running_tasks(api):
 def drain(api, settle=30, label=""):
     """Every scheduled task idle, then a settle margin — the run.sh rule applied at build."""
     t0 = time.time()
+    deadline = time.monotonic() + int(os.environ.get("PREPARE_TIMEOUT_S", "1800"))
     while True:
+        if time.monotonic() >= deadline:
+            raise RuntimeError("fixture tasks did not drain before deadline")
         busy = running_tasks(api)
         if not busy:
             break

@@ -251,8 +251,8 @@ latency (screens and endpoints), time to first screen, memory, and API parity. R
 [`bench/README.md`](bench/README.md) first — it defines every number in one sentence.
 
 ```bash
-# needs docker, k6, jq, taskset, curl, python3 — plus ffmpeg (libx264 + libx265),
-# ffprobe and Python Pillow to build the test data
+# needs docker, k6, jq, taskset, curl, python3, sha256sum, timeout, setsid; ffprobe for TTFS
+# plus ffmpeg (libx264 + libx265) and Python Pillow to build the test data
 docker pull jellyfin/jellyfin:10.11.8
 docker pull "$(cat bench/testdata/jellyfin12-image.txt)"
 bench/testdata/build.sh                          # source fixture, once: ~20 min, ~17 GB (gitignored)
@@ -266,7 +266,7 @@ python3 bench/report.py --serve                  # compare runs at 127.0.0.1:809
 Things that will otherwise cost you a run: the harness only ever *inspects* the
 `ferrofin:bench` image, so a stale image silently measures old code under a run name that
 claims the current commit. `run.sh` refuses to start unless the server/client cores are
-90 % idle. A rerun of the same code lands in `<tag>-run2`, never on top of the first.
+90 % idle including their SMT siblings, and rejects shared physical cores. A rerun of the same code lands in `<tag>-run2`, never on top of the first.
 Publishable numbers come from **three** runs — `report.py` takes the median and prints the
 range each cell spanned.
 

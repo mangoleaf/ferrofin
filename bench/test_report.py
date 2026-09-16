@@ -10,6 +10,9 @@ from unittest.mock import Mock, patch
 import urllib.error
 
 import report
+import coldstart
+import mem_sample
+import ttfs
 from testdata import seed
 
 
@@ -328,6 +331,47 @@ class ReportTests(unittest.TestCase):
                     self.build(self.a, self.b)
                 self.edit(self.a/'run.json', lambda m: m.pop(field))
 
+    def with_phases(self):
+        self.edit(self.a/'run.json', lambda m: m.update(phase_schema=1))
+        for server, _ in report.SERVERS:
+            self.write(self.a/server/'phases.json', {n: {'status':'completed'} for n in
+                ('startup','startup-drain','shape','drain-loaded','warmup-loaded','loaded','sampler','steady','coldstart','ttfs')})
+
+    def test_failed_warmup_or_interrupted_window_flags_latency(self):
+        self.with_phases()
+        for name, status in (('warmup-loaded','failed'),('loaded','running')):
+            self.edit(self.a/'ferrofin/phases.json', lambda p: p[name].update(status=status))
+            self.assertIn(name,self.home(self.build()).flag)
+            self.edit(self.a/'ferrofin/phases.json', lambda p: p[name].update(status='completed'))
+
+    def test_skipped_selected_window_stays_identifiable(self):
+        self.with_phases()
+        self.write(self.a/'ferrofin/windows.json', {})
+        (self.a/'ferrofin/k6-loaded.json').unlink()
+        self.edit(self.a/'ferrofin/phases.json', lambda p: p['loaded'].update(status='skipped',reason='warm-up failed'))
+        self.assertIn('loaded',report.run_levels(self.a/'ferrofin'))
+        self.assertIn('skipped',self.home(self.build()).flag)
+
+    def test_failed_sampler_preserves_valid_latency(self):
+        self.with_phases()
+        self.edit(self.a/'ferrofin/phases.json', lambda p: p['sampler'].update(status='failed'))
+        model=self.build()
+        self.assertIsNone(self.home(model).flag)
+        self.assertIn('sampler', dict(model['memory'])['peak under load']['ferrofin'].flag)
+
+    def test_earlier_transcode_repetition_is_compared(self):
+        self.edit(self.a/'ferrofin/ttfs.json', lambda t: t['hls'][1].update(transcoding_url='/master.m3u8?VideoCodec=hevc'))
+        model=self.build()
+        cell=dict(model['ttfs'])['HLS first segment (forced transcode)']['ferrofin']
+        self.assertIn('parameters differ',cell.flag)
+
+    def test_stream_probe_failure_in_later_run_is_not_ignored(self):
+        self.edit(self.b/'run.json', lambda m:m.update(streaming_validation=1))
+        self.edit(self.a/'run.json', lambda m:m.update(streaming_validation=1))
+        model=self.build(self.a,self.b)
+        cell=dict(model['ttfs'])['HLS first segment (forced transcode)']['ferrofin']
+        self.assertIn('validation evidence',cell.flag)
+
     def test_missing_memory_repetition_withholds_headline(self):
         (self.b / 'ferrofin/mem.csv').unlink()
         m = self.build(self.a, self.b)
@@ -535,6 +579,134 @@ class BoundedEvidenceTests(unittest.TestCase):
         self.assertEqual(pools['movieCount'], 101)
         self.assertEqual(pools['terms'], ['Movie', 'Shared'])
         self.assertEqual(pools['nextUpCutoff'], '2025-09-01T00:00:00.000Z')
+
+
+
+class InstrumentTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+
+    def resource(self, times=(0, 0.1, 0.2, 0.3, 0.4), counter=True):
+        (self.root/'windows.json').write_text(json.dumps({'loaded': {'start': .05, 'end': .35}}))
+        (self.root/'mem.csv').write_text('t,anon' + (',cpu_usec' if counter else '') + '\n' +
+            '\n'.join(f'{t},100' + (f',{int(t*2000000)}' if counter else '') for t in times))
+        return report.resource_windows(self.root, {'resource_schema': 1, 'mem_sample_ms': 100})['loaded']
+
+    def test_cpu_uses_raw_counter_at_documented_brackets(self):
+        row = self.resource()
+        self.assertNotIn('error', row)
+        self.assertAlmostEqual(row['cpu_seconds'], .8)
+        self.assertEqual(row['observed_start'], 0)
+        self.assertEqual(row['observed_end'], .4)
+        self.assertEqual(row['samples'], 5)
+
+    def test_started_window_without_boundaries_fails_resources(self):
+        (self.root/'phases.json').write_text(json.dumps({'loaded':{'status':'completed','start':1}}))
+        self.assertIn('missing resource window',report.resource_windows(self.root, {'resource_schema':1})['loaded']['error'])
+
+    def test_stopped_sampler_cannot_cover_window(self):
+        self.assertIn('error', self.resource(times=(0, .1, .2)))
+
+    def test_large_gap_and_missing_counter_fail(self):
+        self.assertIn('bracket', self.resource(times=(0, .1, 1))['error'])
+        self.assertIn('counter', self.resource(counter=False)['error'])
+
+    def test_internal_sample_gap_fails_even_with_close_brackets(self):
+        self.resource(times=(0, .1, .9, 1))
+        (self.root/'windows.json').write_text(json.dumps({'loaded':{'start':.05,'end':.95}}))
+        self.assertIn('gap',report.resource_windows(self.root, {'resource_schema':1})['loaded']['error'])
+
+    def test_raw_cpu_counter_cannot_go_backwards(self):
+        self.resource()
+        (self.root/'mem.csv').write_text('t,anon,cpu_usec\n0,100,800\n0.1,100,600\n0.4,100,900\n')
+        row = report.resource_windows(self.root, {'resource_schema': 1})['loaded']
+        self.assertIn('decreased', row['error'])
+
+    def test_smt_shared_physical_core_is_rejected(self):
+        for cpu, siblings in ((0, '0,2'), (2, '0,2'), (1, '1,3'), (3, '1,3')):
+            p=self.root/f'cpu{cpu}/topology'
+            p.mkdir(parents=True)
+            (p/'thread_siblings_list').write_text(siblings)
+        with self.assertRaisesRegex(ValueError, 'physical cores'):
+            mem_sample.topology('0', '2', self.root)
+        with self.assertRaisesRegex(ValueError, 'overlap'):
+            mem_sample.topology('0', '0', self.root)
+        self.assertEqual(mem_sample.topology('0','1',self.root)['checked_cpus'], [0,1,2,3])
+
+    def test_range_validation_rejects_ignored_truncated_or_wrong_range(self):
+        ttfs.validate_range(206, 'bytes 0-1048575/2000000', 1048576)
+        for status, header, count in ((200,'bytes 0-1048575/2000000',1048576),
+                (206,'bytes 0-1048575/2000000',10), (206,'bytes 1-1048576/2000000',1048576),
+                (206,None,1048576), (206,'bytes 0-1048575/1',1048576)):
+            with self.subTest(status=status,header=header,count=count), self.assertRaises(ValueError):
+                ttfs.validate_range(status, header, count)
+
+    @patch.object(ttfs.subprocess, 'check_output')
+    def test_segment_probe_requires_streams_and_positive_duration(self, probe):
+        probe.return_value = json.dumps({'streams':[{'codec_type':'video','codec_name':'h264'},
+            {'codec_type':'audio','codec_name':'aac'}], 'format':{'duration':'3.2','format_name':'mpegts'}}).encode()
+        self.assertEqual(ttfs.probe_segment(b'body')['duration_s'],3.2)
+        probe.return_value = b'{"streams": [], "format":{"duration":"0"}}'
+        with self.assertRaisesRegex(ValueError,'duration'):
+            ttfs.probe_segment(b'body')
+        with self.assertRaisesRegex(ValueError,'empty'):
+            ttfs.probe_segment(b'')
+
+    def test_eof_before_first_byte_has_no_successful_ttfb(self):
+        import io
+        class Response(io.BytesIO):
+            status=206
+            headers={'Content-Range':'bytes 0-1048575/2000000'}
+        ids=self.root/'ids.json'
+        ids.write_text(json.dumps({'stream':'a','stream_source':'b','user':'u','token':'test'}))
+        out=self.root/'ttfs.json'
+        def response(req, **kwargs):
+            return Response(b'{"MediaSources":[{}]}' if req.method=='POST' else b'')
+        with (patch.object(ttfs.urllib.request, 'urlopen', side_effect=response),
+              patch.object(ttfs.time, 'sleep'), patch('builtins.print'),
+              patch.object(ttfs.sys, 'argv', ['ttfs.py','http://localhost',str(ids),str(out),'1'])):
+            self.assertEqual(ttfs.main(),1)
+        result=json.loads(out.read_text())
+        self.assertIn('EOF',result['direct'][0]['error'])
+        self.assertNotIn('ttfb_ms',result['direct'][0])
+
+    def test_start_failure_stops_and_joins_poller(self):
+        import threading
+        finished=threading.Event()
+        def command(args, **kwargs):
+            if args[1]=='start':
+                raise subprocess.TimeoutExpired(args,1)
+        def poll(url, headers, timeout_s, poll_s, stop, started):
+            started.set()
+            stop.wait(2)
+            finished.set()
+        with (patch.object(coldstart.subprocess, 'run', side_effect=command),
+              patch.object(coldstart, 'poll', side_effect=poll)):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                coldstart.restart('owned','http://localhost',{},.01)
+        self.assertTrue(finished.is_set())
+
+    def test_restart_poller_is_running_before_start_and_joined(self):
+        import threading
+        events=[]
+        release=threading.Event()
+        def command(args, **kwargs):
+            events.append(args[1])
+            if args[1]=='start':
+                self.assertIn('poll',events)
+                release.set()
+        def poll(url, headers, timeout_s, poll_s, stop, started):
+            events.append('poll'); started.set()
+            release.wait(1)
+            return 103.2
+        with patch.object(coldstart.subprocess,'run',side_effect=command), \
+             patch.object(coldstart,'poll',side_effect=poll), \
+             patch.object(coldstart,'started_at',return_value=100):
+            result=coldstart.restart('owned','http://localhost',{},.01)
+        self.assertEqual(events,['stop','poll','start'])
+        self.assertAlmostEqual(result['home_ms'],3200)
 
 
 if __name__ == '__main__':

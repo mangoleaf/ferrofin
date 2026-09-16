@@ -36,6 +36,7 @@ import http.server
 import json
 import math
 import os
+import re
 import statistics
 import sys
 import urllib.parse
@@ -59,11 +60,12 @@ def run_levels(d):
     A level that ran and then failed to produce a k6 file must still be reported as a
     missing phase, so "did it run" cannot be inferred from the result file existing."""
     win = load(os.path.join(d, "windows.json"))
+    selected = {lvl for lvl in LOAD_LEVELS if lvl in (load(os.path.join(d, "phases.json")) or {})}
     if win is None:
         # An interrupted run has no record of itself; fall back to what it produced, so
         # a level whose result file is also missing is still named rather than dropped.
-        return {lvl for lvl in LOAD_LEVELS if os.path.isfile(os.path.join(d, f"k6-{lvl}.json"))}
-    return {lvl for lvl in LOAD_LEVELS if lvl in win}
+        return selected | {lvl for lvl in LOAD_LEVELS if os.path.isfile(os.path.join(d, f"k6-{lvl}.json"))}
+    return selected | {lvl for lvl in LOAD_LEVELS if lvl in win}
 MIB = 2 ** 20
 TRANSCODE_NOISE = ("playsessionid", "apikey", "deviceid", "tag=", "api_key", "transcodereasons")
 
@@ -251,6 +253,83 @@ def comparable(shape_srv, shape_oracle, names, oracle_label=ORACLE_LABEL):
                     # Encoding sizes vary legitimately. Only an empty image is invalid.
                     if (n == "image" or n.endswith(":image")) and (a.get("bytes", 1) <= 0 or b.get("bytes", 1) <= 0):
                         return f"{n}: empty response"
+    return None
+
+
+def phase_problem(d, meta, required):
+    if not meta.get("phase_schema"):
+        return None
+    phases = load(os.path.join(d, "phases.json")) or {}
+    return reasons(*(f"{name}: {phases.get(name, {}).get('status', 'missing')} ({phases.get(name, {}).get('reason', '')})"
+                     for name in required if phases.get(name, {}).get("status") != "completed"))
+
+
+def resource_windows(d, meta):
+    windows = load(os.path.join(d, "windows.json")) or {}
+    try:
+        with open(os.path.join(d, "mem.csv")) as f:
+            rows = list(csv.DictReader(f))
+        times = [float(r["t"]) for r in rows]
+    except (OSError, ValueError, KeyError):
+        rows, times = [], []
+    interval = meta.get("mem_sample_ms", 100) / 1000
+    bracket = meta.get("sample_bracket_intervals", 2) * interval
+    gap_limit = meta.get("sample_gap_intervals", 5) * interval
+    out = {}
+    for name, w in windows.items():
+        rec = {"samples": 0, "cpu_seconds": None}
+        try:
+            if not times or any(b <= a for a, b in zip(times, times[1:])):
+                raise ValueError("missing or nonmonotonic samples")
+            if not any(t <= w["start"] for t in times) or not any(t >= w["end"] for t in times):
+                raise ValueError("sampler does not bracket window")
+            lo = max(i for i, t in enumerate(times) if t <= w["start"])
+            hi = min(i for i, t in enumerate(times) if t >= w["end"])
+            section = rows[lo:hi+1]
+            rec.update(samples=len(section), observed_start=times[lo], observed_end=times[hi],
+                       max_gap_s=max((b-a for a, b in zip(times[lo:hi], times[lo+1:hi+1])), default=0))
+            if hi <= lo or w["end"] <= w["start"]:
+                raise ValueError("invalid observation window")
+            if w["start"] - times[lo] > bracket or times[hi] - w["end"] > bracket:
+                raise ValueError("sample bracket exceeds tolerance")
+            if rec["max_gap_s"] > gap_limit:
+                raise ValueError("sample gap exceeds tolerance")
+            if "cpu_usec" in rows[0]:
+                counters = [int(r["cpu_usec"]) for r in section]
+                if any(b < a for a, b in zip(counters, counters[1:])):
+                    raise ValueError("cumulative CPU counter decreased")
+                rec["cpu_seconds"] = (counters[-1] - counters[0]) / 1e6
+            elif meta.get("resource_schema"):
+                raise ValueError("missing cumulative CPU counter")
+        except (ValueError, KeyError, TypeError) as e:
+            rec["error"] = str(e) or "missing boundary samples"
+        out[name] = rec
+    phases = load(os.path.join(d, "phases.json")) or {}
+    for name in (*LOAD_LEVELS, "steady"):
+        if phases.get(name, {}).get("start") and name not in out:
+            out[name] = {"error": "missing resource window", "samples": 0, "cpu_seconds": None}
+    return out
+
+
+def transcode_parameters(rep):
+    return sorted((k.lower(), v.lower()) for k, v in urllib.parse.parse_qsl(urllib.parse.urlsplit(rep.get("transcoding_url", "")).query)
+                  if k.lower() not in {"playsessionid", "apikey", "api_key", "deviceid", "tag", "transcodereasons"})
+
+
+def streaming_problem(doc, meta, group):
+    if not meta.get("streaming_validation"):
+        return None
+    if not doc or doc.get("validation") != 1:
+        return "missing streaming validation evidence"
+    for rep in doc.get(group, []):
+        if group == "direct":
+            match = re.fullmatch(r"bytes 0-1048575/(\d+)", rep.get("content_range", "") or "")
+            if rep.get("status") != 206 or rep.get("bytes") != 1048576 or not match or int(match[1]) <= 1048575:
+                return "direct range status/header/byte count invalid"
+        else:
+            output = rep.get("output") or {}
+            if not number(output.get("duration_s")) or output["duration_s"] <= 0 or not output.get("streams"):
+                return "missing or invalid first-segment probe"
     return None
 
 
@@ -468,7 +547,9 @@ CONDITIONS = ("host", "cpu", "memory_limit", "server_cpus", "client_cpus", "k6",
               "window_s", "mem_sample_ms", "rate_unloaded", "rate_loaded", "rate_stress",
               "warmup_s", "settle_s", "steady_s", "restarts", "ttfs_reps",
               "ids_sha256", "screens_sha256", "seed", "warmup_seed", "slots", "shape_vus", "pools", "workload",
-              "testdata_counts")
+              "testdata_counts", "core_idle_min", "phase_schema", "resource_schema", "streaming_validation", "topology",
+              "sample_bracket_intervals", "sample_gap_intervals", "ready_timeout_s", "drain_timeout_s",
+              "http_timeout_s", "stream_http_timeout_s", "phase_timeout_s", "cleanup_timeout_s")
 
 
 def image_id(d):
@@ -574,7 +655,7 @@ def build(runs):
         data = {k: [load(os.path.join(d, f"k6-{level}.json")) for d in ds] for k, ds in per.items()}
         # `windows.json` says the level ran; a missing k6 file then means it failed,
         # which has to be reported. Only a level no run executed disappears silently.
-        ran = any(level in run_levels(d) for ds in per.values() for d in ds)
+        ran = any(level in run_levels(d) or level in (load(os.path.join(d, "phases.json")) or {}) for ds in per.values() for d in ds)
         for k, ds in per.items():
             for d, x in zip(ds, data[k]):
                 if x is None and level in run_levels(d):
@@ -596,6 +677,8 @@ def build(runs):
             problems = []
             for i, x in enumerate(data[k]):
                 problems.append(window_problem(x))
+                for server in {k, ORACLE} & per.keys():
+                    problems.append(phase_problem(per[server][i], metas[i], ["startup", "startup-drain", "shape", f"drain-{level}", f"warmup-{level}", level]))
                 for server in {k, ORACLE} & evidence.keys():
                     problems.append(evidence[server][i][0])
                     for name in names:
@@ -648,7 +731,7 @@ def build(runs):
                                   "image_bytes": {k: [x.get("image_bytes") if x else None for x in xs] for k, xs in data.items()}}
 
     # time to first screen
-    cold, hls, direct, turl = {}, {}, {}, {}
+    cold, hls, direct, streams = {}, {}, {}, {}
     for k, ds in per.items():
         cs = [load(os.path.join(d, "coldstart.json")) for d in ds]
         if any(c is None for c in cs):
@@ -659,22 +742,31 @@ def build(runs):
             missing.append(f"{k}: ttfs.json")
         hls[k] = timing_cell(ts, "hls", "ttfs_ms", metas, "ttfs_reps")
         direct[k] = timing_cell(ts, "direct", "ttfb_ms", metas, "ttfs_reps")
-        for t in ts:
-            for h in (t or {}).get("hls", []):
-                if h.get("transcoding_url"):
-                    # ffmpeg-relevant parameters only: session/auth/tag identify the request and
-                    # TranscodeReasons is informational (it differs between versions without changing an ffmpeg argument)
-                    turl[k] = sorted(p.lower() for p in h["transcoding_url"].split("?")[-1].split("&")
-                                     if p and not p.lower().startswith(TRANSCODE_NOISE))
-                    break
-    if ORACLE in turl:
-        for k in turl:
-            if k != ORACLE and turl[k] != turl[ORACLE]:
-                diff = sorted(set(turl[k]) ^ set(turl[ORACLE]))
-                reason = f"transcode parameters differ: {', '.join(diff)[:200]}"
-                hls[k].flag = f"{hls[k].flag}; {reason}" if hls[k].flag else reason
-    m["ttfs"] = [("cold start (restart → home screen)", cold), ("HLS first segment (forced transcode)", hls), ("direct-play TTFB (1 MiB range)", direct)]
+        streams[k] = ts
+        for group, cell, phase_name in (("runs", cold[k], "coldstart"), ("hls", hls[k], "ttfs"), ("direct", direct[k], "ttfs")):
+            for i, d in enumerate(ds):
+                cell.flag = reasons(cell.flag, phase_problem(d, metas[i], ["startup", "startup-drain", phase_name]))
+                if group != "runs":
+                    cell.flag = reasons(cell.flag, streaming_problem(ts[i], metas[i], group))
+    if ORACLE in streams:
+        for k, docs in streams.items():
+            for i, doc in enumerate(docs):
+                reps = (doc or {}).get("hls", [])
+                expected = (streams[ORACLE][i] or {}).get("hls", [])
+                for j, rep in enumerate(reps):
+                    if j >= len(expected):
+                        hls[k].flag = reasons(hls[k].flag, "missing oracle transcode repetition")
+                        continue
+                    if transcode_parameters(rep) != transcode_parameters(expected[j]):
+                        hls[k].flag = reasons(hls[k].flag, f"transcode parameters differ (run {i+1}, rep {j+1})")
+                    if metas[i].get("streaming_validation") and rep.get("output") != expected[j].get("output"):
+                        hls[k].flag = reasons(hls[k].flag, f"first-segment properties differ (run {i+1}, rep {j+1})")
+                    if reps and (transcode_parameters(rep) != transcode_parameters(reps[0]) or rep.get("output") != reps[0].get("output")):
+                        hls[k].flag = reasons(hls[k].flag, "transcode work differs between repetitions")
+    m["ttfs"] = [("cold start (restart → authenticated views; host caches retained)", cold), ("HLS first segment (forced transcode)", hls), ("direct-play TTFB (1 MiB range)", direct)]
 
+    m["phases"] = {k: [load(os.path.join(d, "phases.json")) for d in ds] for k, ds in per.items()}
+    m["resources"] = {k: [resource_windows(d, metas[i]) for i, d in enumerate(ds)] for k, ds in per.items()}
     # memory
     mems = {k: [mem_numbers(d) for d in ds] for k, ds in per.items()}
     for k, x in mems.items():
@@ -690,7 +782,9 @@ def build(runs):
     peak, memory_flags = {}, {}
     for k, ds in per.items():
         bad = [window_problem(x) for x in windows[k] if window_problem(x)]
-        memory_flags[k] = reasons(mixed, *bad)
+        resource_bad = [phase_problem(d, metas[i], ["startup", "startup-drain", "sampler"]) for i, d in enumerate(ds)]
+        resource_bad += [r.get("error") for i, windows in enumerate(m["resources"][k]) if metas[i].get("resource_schema") for r in windows.values()]
+        memory_flags[k] = reasons(mixed, *bad, *resource_bad)
         # the peak is only meaningful if the loaded window that produced it was the specified load
         peak[k] = Cell([(x or {}).get("peak") for x in mems[k]], mib,
                        memory_flags[k],
@@ -769,6 +863,13 @@ def render_md(m):
         p("Image response bytes (diagnostic, per run): " + "; ".join(f"{label}: {lv['image_bytes'][k]}" for k, label in servers) + "\n")
     for k, coverage in m["coverage"].items():
         p(f"Shape coverage — {dict(servers)[k]}: `{json.dumps(coverage)}`\n")
+    p("### CPU and sample coverage — invocation and idle windows\n")
+    p("CPU seconds use cumulative counters at the reported bracketing samples; load includes setup/teardown and harness overhead, and steady is post-load idle. Missing historical counters remain unavailable.\n")
+    for k, windows in m["resources"].items():
+        p(f"**{dict(servers)[k]}**: `{json.dumps(windows)}`\n")
+    p("### Phase outcomes\n")
+    for k, phases in m["phases"].items():
+        p(f"**{dict(servers)[k]}**: `{json.dumps(phases)}`\n")
     p("### Time to first screen\n")
     p("| | " + " | ".join(label for _, label in servers) + " |\n|" + "---|" * (len(servers) + 1))
     for name, cells in m["ttfs"]:
@@ -814,7 +915,7 @@ README_LEVEL = "loaded"
 #: The time-to-first-screen and memory rows the README headlines, by row name. HLS is
 #: excluded on purpose: the three servers pick different transcode parameters, so no two
 #: of them are comparable. The interference/swap rows describe the run, not the server.
-README_TTFS = ("cold start (restart → home screen)", "direct-play TTFB (1 MiB range)")
+README_TTFS = ("cold start (restart → authenticated views; host caches retained)", "direct-play TTFB (1 MiB range)")
 README_MEMORY = ("peak under load", "steady idle")
 
 
@@ -1255,6 +1356,8 @@ def render_html(m, base=None, picker=""):
         parts.append(table_html("screen", lv["screens"], servers, dict(bl.get("screens", [])), notes, f"{level} screens"))
         parts.append(f"<details><summary>Per endpoint, {level}</summary>{table_html('endpoint', lv['endpoints'], servers, dict(bl.get('endpoints', [])), notes, f'{level} endpoints')}</details>")
         parts.append("<p>Image response bytes (diagnostic, per run): " + e("; ".join(f"{label}: {lv['image_bytes'][k]}" for k, label in servers)) + "</p>")
+    parts.append("<h2>CPU and sample coverage — invocation and idle windows</h2><p>Cumulative counter differences use the reported bracketing samples; load includes setup/teardown and harness overhead, and steady is post-load idle. Historical counters are unavailable.</p><pre>" + e(json.dumps(m["resources"], indent=2)) + "</pre>")
+    parts.append("<h2>Phase outcomes</h2><pre>" + e(json.dumps(m["phases"], indent=2)) + "</pre>")
     parts.append("<h2>Time to first screen</h2>" + table_html("", m["ttfs"], servers, base_ttfs, notes, "time to first screen"))
     mem_note = "" if comparable_levels(m, base) else (
         "<p class='lede'>The baseline ran different load levels, so no change is shown on the "
@@ -1353,6 +1456,17 @@ def serve(port, runs_dir):
 
 def main():
     args = sys.argv[1:]
+    if args and args[0] == "--resource-check":
+        d = args[1]
+        windows = resource_windows(d, load(os.path.join(os.path.dirname(d), "run.json")) or {})
+        print("  resources: " + json.dumps(windows))
+        if not windows or any(r.get("error") for r in windows.values()):
+            raise ValueError("resource coverage incomplete")
+        return
+    if args and args[0] == "--window-check":
+        if problem := window_problem(load(args[1])):
+            raise ValueError(problem)
+        return
     if args and args[0] == "--shape-coverage":
         d = args[1]
         summary = load(os.path.join(d, "shape-summary.json")) or {}
@@ -1360,6 +1474,11 @@ def main():
         if problem:
             raise ValueError(problem)
         print("  coverage: " + json.dumps(coverage))
+        shape = load_shape(d)
+        if problem := oracle_failed(shape, list(shape or {})):
+            raise ValueError(problem)
+        if any(not r.get("ok") for r in selection_records(os.path.join(d, "shape.log"))):
+            raise ValueError("shape dependency failed")
         return
     if args and args[0] == "--serve":
         port = int(args[1]) if len(args) > 1 and args[1].isdigit() else 8097

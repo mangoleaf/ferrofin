@@ -3,8 +3,8 @@
 This directory produces the comparison table in the root README: Ferrofin against
 Jellyfin 12.0.0 (the reference for future runs) and Jellyfin 10.11.8 (the vendored API
 contract), on identical test data, on one host. Archived runs retain their recorded
-12.0-rc7 labels and measurements. Every number in that table has a one-sentence definition below, and every
-published number passed the one check the run itself performs:
+12.0-rc7 labels and measurements. Every number has a definition below. New published results must pass the
+comparability, phase and resource checks described here:
 
 - **comparable** — the server returned the same status and record count as Jellyfin
   12, matching content type, counts, ordered item IDs and per-item field types for
@@ -76,15 +76,20 @@ is discarded, and a window in which k6 could not hold its rate is flagged, not p
 - **Cold start** — milliseconds from the container process start (`docker inspect
   .State.StartedAt`) to the first authenticated `200` on `GET /UserViews` (the home-screen
   query), polled every 10 ms, on a *restart* of a server that had already booted this
-  data (the first boot includes Ferrofin's one-time adoption and Jellyfin 12's migration,
-  and is excluded); the median of 5 restarts is the run's number.
+  data, with host caches retained; stop completes before the poller starts, and polling
+  begins before `docker start`; stop duration and first provisioning/adoption are excluded,
+  and the median of 5 restarts is the run's number, not full-screen rendering.
 - **HLS first segment** — milliseconds from `POST PlaybackInfo` (a device profile that
   cannot direct-play the file: vp9/webm only, 2 Mbps cap on an 8 Mbps h264 source; no
   subtitle) through `master.m3u8` and the variant playlist to the last byte of the first
   segment; the median of 5 (fresh play session each, encoding killed afterwards) is the
-  run's number; if the servers chose different transcode parameters the cell says so.
+  run's number; `ffprobe` checks the received segment after the timer stops, recording
+  codecs, dimensions, audio properties and duration; every repetition's selected
+  parameters and output properties are compared, with differences flagged.
 - **Direct-play TTFB** — milliseconds to the first byte of `GET /Videos/{id}/stream?static=true`
-  with `Range: bytes=0-1048575`; the median of 5 is the run's number.
+  with `Range: bytes=0-1048575`; the median of 5 is the run's number, eligible only
+  with HTTP 206, the expected Content-Range and exactly 1,048,576 received bytes;
+  EOF before the first byte is failure.
 - **Peak memory** — the maximum of cgroup v2 `memory.stat anon` (heap and stacks of the
   server and its ffmpeg children; page cache excluded) sampled every 100 ms across the
   loaded and stress windows — not the unloaded one, which is the control rather than
@@ -93,6 +98,9 @@ is discarded, and a window in which k6 could not hold its rate is flagged, not p
   Every server runs under an 8 GiB cgroup limit with swap disabled (`--memory-swap` =
   `--memory`; the sampler records `memory.swap.current` to prove it stayed 0), which is
   part of the definition (.NET sizes its GC heap from it).
+- **CPU seconds** — change in the raw cgroup `usage_usec` counter between the
+  bracketing samples, divided by one million, for the server and its children; load
+  windows include k6 setup/teardown and harness overhead, and steady is post-load idle.
 - **Parity** — `N / 412 operations deep-verified`: the number of contract operations whose
   Ferrofin implementation was compared against the upstream Jellyfin C# (`v12.0-rc7`) for
   behavioral equivalence, recorded as rows of `handlers::VERIFIED` in
@@ -163,10 +171,11 @@ it is not all-endpoint coverage or a deep-parity score.
 
 - Each server runs alone, in a container pinned to dedicated cores (`SERVER_CPUS`,
   default 8–15) with the load generator on other cores (`CLIENT_CPUS`, 16–19); the run
-  refuses to start unless those cores are ≥ 90 % idle, and records per 100 ms sample how
-  much of the server's cores was *not* spent by the container (the "interference" row —
-  other processes, plus the kernel's own network work for the server's traffic, which is
-  a few % under load).
+  rejects overlap or shared physical cores, checks their SMT siblings too, and refuses
+  to start unless the expanded set is ≥ 90 % idle. Checked CPU IDs and the observed
+  idle fraction are recorded. Affinity does not reserve those CPUs. The existing
+  "interference" row is the difference between observed busy time and container CPU
+  time on the server CPUs; it does not establish what caused a slowdown.
 - Scheduled tasks are drained to idle plus a 30 s settle before every window (after
   provisioning, after the cold-start restarts, before each load level, before TTFS), and
   item counts are read after the first drain (startup tasks mutate libraries on boot).
@@ -179,18 +188,52 @@ it is not all-endpoint coverage or a deep-parity score.
   (a realism simplification). Playback runs during shape, warm-up and measured phases;
   it can change later home/resume/image selections. These changes are flagged, without
   an implicit state reset or a claim of value parity under concurrent mutations.
-- Every phase writes its file when it ends; `report.py` renders whatever exists and names
-  what is missing; any phase reruns alone (`--only`).
+- `phases.json` records selected phases and prerequisites as pending, running, completed,
+  failed or skipped, with timestamps and reasons. Failed startup stops that server;
+  failed drain or warm-up skips its dependent load window. Independent selected phases
+  can still produce diagnostics, and any failed required work makes the runner exit
+  nonzero. Interruption leaves unfinished work identifiable and stops owned clients,
+  sampler and container. Results are retained; an existing run directory is refused.
 - The scripts refuse the paths of the owner's real media and server config outright
   (`/mnt/mangonas`, `/mnt/nvme0/k3s`); every server boots a fresh copy of the test data's
   `config`, and `media` is bind-mounted read-only, always.
+
+## Timeouts and resource evidence
+
+The limits are explicit environment tunables at the top of `run.sh`:
+
+| setting | default | scope |
+|---|---:|---|
+| `READY_TIMEOUT_S` | 300 | server readiness / restart start command |
+| `DRAIN_TIMEOUT_S` | 300 | scheduled-task drain |
+| `HTTP_TIMEOUT_S` | 10 | runner API requests, Docker inspection and ffprobe |
+| `STREAM_HTTP_TIMEOUT_S` | 120 | each streaming HTTP request |
+| `PHASE_TIMEOUT_S` | 600 | each k6 or Python measurement client invocation |
+| `CLEANUP_TIMEOUT_S` | 30 | client/sampler termination and owned container removal |
+| `SAMPLE_BRACKET_INTERVALS` | 2 | maximum distance from a window boundary to its bracketing sample |
+| `SAMPLE_GAP_INTERVALS` | 5 | maximum gap within that sample span |
+
+These settings are recorded and checked before aggregation. Client process groups receive
+TERM, then KILL if needed; container cleanup uses the ID created by this run. k6 retains
+its bounded default HTTP request timeout, with the outer client limit above. A drain can
+finish its last bounded HTTP call before reporting timeout. Fixture task drain/export
+uses `PREPARE_TIMEOUT_S` (1800 by default). No global cleanup or host changes occur.
+
+The sampler saves `cpu_usec` beside its interval utilization fields. Reports show actual
+observation boundaries, sample count and largest gap. CPU seconds use the two bracketing
+raw counters; they are not reconstructed from rounded utilization for archived runs.
+Unbracketed windows, excessive gaps, counter resets or failed sampler exit flag resource
+results. These checks do not erase otherwise valid latency. No number represents memory
+allocated by an individual request. A successful first-segment probe is limited output
+validation, not full decoding or sustained playback evidence.
 
 ## Instrument validations (done once, against known answers)
 
 | instrument | known answer | measured |
 |---|---|---|
 | memory sampler (`mem_sample.py`) | a container that allocates and touches exactly 512 MiB | 515.2 MiB anon (interpreter overhead ≈ 3 MiB), identical across 80 samples |
-| cold-start timer (`coldstart.py`) | a container that sleeps 3.000 s then starts `python -m http.server` | 3,158–3,188 ms over 5 restarts (≈ 160 ms is the interpreter's own startup); polling begins 143–172 ms after process start |
+| restart timer (`coldstart.py`) | a container sleeps 3.000 s before serving authenticated-view probes | 3,162–3,168 ms over 3 restarts; polling was active 55–58 ms before process start; Python startup accounts for the additional time |
+| cumulative CPU (`mem_sample.py`) | a process burns 2.000 CPU seconds | 2.021 cgroup CPU seconds across 23 bracketing samples, including container command overhead |
 | load client (`screens.js`) | a stub server answering every request after exactly 20 ms, at 5 screens/s | every endpoint p50 = 20 ms, p99 = 20–21 ms, max 21 ms — the client adds ≤ 1 ms |
 
 ## Running it
@@ -208,8 +251,8 @@ numbers with a flag in full reports; flagged cells and their ratios are withheld
 the generated root README. Historical logs retain their original, limited shape evidence.
 Their timing repetition count defaults to the original five unless recorded explicitly.
 
-Needs `docker`, `k6`, `jq`, `taskset`, `python3`, `curl` and `sha256sum` on PATH;
-`run.sh` checks for them before starting.
+Needs `docker`, `k6`, `jq`, `taskset`, `python3`, `curl`, `sha256sum`, `timeout` and
+`setsid` on PATH, plus `ffprobe` when selecting TTFS; `run.sh` checks before starting.
 Building the test data additionally needs `ffmpeg` (with libx264 and libx265), `ffprobe`
 and Python `Pillow`.
 
@@ -268,3 +311,7 @@ Tunables are the variables at the top of `run.sh` (`WINDOW_S`, `RATE_LOADED`, �
 `--only counts,shape,unloaded,loaded`. Unknown or empty list entries are rejected.
 The default still selects all phases and all three servers. A shared host must be quiet: stop
 anything that would compete for the chosen cores before a release run.
+
+For repeated comparisons, rotate order explicitly, for example
+`--servers jellyfin12,ferrofin` followed by `--servers ferrofin,jellyfin12`.
+Use the same phase selection and settings; affinity alone does not make a busy host quiet.
