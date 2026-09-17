@@ -18,6 +18,7 @@
 //! via `GET /api/get/{id}`. Every request sends a descriptive `User-Agent`, as
 //! lrclib.net asks of API consumers.
 
+use crate::rate_limit::{LimitedRequest as _, RateLimiter};
 use async_trait::async_trait;
 use ferrofin_model::lyrics::{LyricMetadata, LyricSearchRequest};
 use ferrofin_traits::error::ServiceError;
@@ -204,6 +205,7 @@ fn fuzzy_query(
 pub struct LrcLibProvider {
     /// The shared HTTP client.
     http: reqwest::Client,
+    limiter: RateLimiter,
     /// The search behavior (strict vs. fuzzy, field exclusions).
     config: LrcLibConfig,
     /// The API base URL (overridable for tests).
@@ -237,6 +239,7 @@ impl LrcLibProvider {
     pub fn with_config(config: LrcLibConfig) -> Self {
         Self {
             http: reqwest::Client::new(),
+            limiter: RateLimiter::new("lrclib"),
             config,
             base_url: BASE_URL.to_owned(),
         }
@@ -261,7 +264,7 @@ impl LrcLibProvider {
             .get(format!("{}{path}", self.base_url))
             .query(query)
             .header(reqwest::header::USER_AGENT, USER_AGENT)
-            .send()
+            .send_limited(&self.limiter)
             .await;
         let response = match result {
             Ok(r) => r,

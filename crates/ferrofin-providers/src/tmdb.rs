@@ -10,6 +10,7 @@
 //! then fetches full metadata (overview, tagline, genres, studios, rating,
 //! certification, premiere date, and cast + key crew) alongside the artwork.
 
+use crate::rate_limit::{LimitedRequest as _, RateLimiter};
 use ferrofin_model::entities::ImageType;
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
@@ -846,6 +847,7 @@ pub struct TmdbCollection {
 #[derive(Debug)]
 pub struct TmdbClient {
     http: reqwest::Client,
+    limiter: RateLimiter,
     /// The key to use when the TMDb settings page names none: Jellyfin's
     /// built-in project key, or one the operator passed to
     /// [`with_api_key`](TmdbClient::with_api_key).
@@ -869,6 +871,7 @@ impl TmdbClient {
     pub fn new() -> Self {
         Self {
             http: reqwest::Client::new(),
+            limiter: RateLimiter::new("tmdb"),
             api_key: SecretString::from(DEFAULT_API_KEY),
             base_url: API_BASE.to_owned(),
             plugin: crate::plugin_config::ConfigSource::new(),
@@ -880,6 +883,7 @@ impl TmdbClient {
     pub fn with_api_key(key: String) -> Self {
         Self {
             http: reqwest::Client::new(),
+            limiter: RateLimiter::new("tmdb"),
             api_key: SecretString::from(if key.is_empty() {
                 DEFAULT_API_KEY.to_owned()
             } else {
@@ -955,11 +959,11 @@ impl TmdbClient {
         }
 
         tracing::debug!(provider = "tmdb", query = name, ?year, "tmdb image search");
-        let resp = match req.send().await {
+        let resp = match req.send_limited(&self.limiter).await {
             Ok(resp) => resp,
-            // `without_url()` strips the query string — the URL carries the API key.
+            // The limiter strips URLs from transport errors to protect API keys.
             Err(e) => {
-                tracing::warn!(provider = "tmdb", error = %e.without_url(), "tmdb request failed");
+                tracing::warn!(provider = "tmdb", error = %e, "tmdb request failed");
                 return Vec::new();
             }
         };
@@ -1014,7 +1018,7 @@ impl TmdbClient {
         if let Some(y) = year {
             req = req.query(&[("first_air_date_year", y.to_string())]);
         }
-        let resp = req.send().await.ok()?;
+        let resp = req.send_limited(&self.limiter).await.ok()?;
         if !resp.status().is_success() {
             return None;
         }
@@ -1059,7 +1063,7 @@ impl TmdbClient {
             .http
             .get(url)
             .query(&[("api_key", key)])
-            .send()
+            .send_limited(&self.limiter)
             .await
             .ok()?;
         if !resp.status().is_success() {
@@ -1090,7 +1094,10 @@ impl TmdbClient {
             .http
             .get(format!("{}/search/collection", self.base_url))
             .query(&[("api_key", key), ("query", name)]);
-        let Ok(resp) = with_language(req, language).send().await else {
+        let Ok(resp) = with_language(req, language)
+            .send_limited(&self.limiter)
+            .await
+        else {
             return Vec::new();
         };
         if !resp.status().is_success() {
@@ -1126,7 +1133,10 @@ impl TmdbClient {
             .http
             .get(format!("{}/collection/{tmdb_id}", self.base_url))
             .query(&[("api_key", key), ("append_to_response", "images")]);
-        let resp = with_language(req, language).send().await.ok()?;
+        let resp = with_language(req, language)
+            .send_limited(&self.limiter)
+            .await
+            .ok()?;
         if !resp.status().is_success() {
             return None;
         }
@@ -1190,7 +1200,7 @@ impl TmdbClient {
             req = req.query(&[(year_param, y.to_string())]);
         }
         req = with_language(req, language);
-        let Ok(resp) = req.send().await else {
+        let Ok(resp) = req.send_limited(&self.limiter).await else {
             return Vec::new();
         };
         if !resp.status().is_success() {
@@ -1227,7 +1237,7 @@ impl TmdbClient {
             .http
             .get(format!("{}/{path}/{tmdb_id}/similar", self.base_url))
             .query(&[("api_key", key), ("page", &page.max(1).to_string())])
-            .send()
+            .send_limited(&self.limiter)
             .await
         else {
             return (Vec::new(), 0);
@@ -1262,7 +1272,7 @@ impl TmdbClient {
             .http
             .get(format!("{}/{path}/{tmdb_id}/images", self.base_url))
             .query(&[("api_key", key)])
-            .send()
+            .send_limited(&self.limiter)
             .await
         else {
             return Vec::new();
@@ -1349,7 +1359,7 @@ impl TmdbClient {
             .http
             .get(url)
             .query(&[("api_key", cfg.api_key(self.api_key.expose_secret()))])
-            .send()
+            .send_limited(&self.limiter)
             .await
         else {
             return Vec::new();
@@ -1413,7 +1423,7 @@ impl TmdbClient {
             .http
             .get(url)
             .query(&[("api_key", key)])
-            .send()
+            .send_limited(&self.limiter)
             .await
             .ok()?;
         if !resp.status().is_success() {
@@ -1510,7 +1520,10 @@ impl TmdbClient {
             .http
             .get(format!("{}/find/{external_id}", self.base_url))
             .query(&[("api_key", key), ("external_source", source)]);
-        let resp = with_language(req, language).send().await.ok()?;
+        let resp = with_language(req, language)
+            .send_limited(&self.limiter)
+            .await
+            .ok()?;
         if !resp.status().is_success() {
             return None;
         }
@@ -1571,7 +1584,10 @@ impl TmdbClient {
             .http
             .get(format!("{}/{path}/{tmdb_id}", self.base_url))
             .query(&[("api_key", key), ("append_to_response", append)]);
-        let resp = with_language(req, language).send().await.ok()?;
+        let resp = with_language(req, language)
+            .send_limited(&self.limiter)
+            .await
+            .ok()?;
         if !resp.status().is_success() {
             return None;
         }
@@ -1645,7 +1661,7 @@ impl TmdbClient {
             // on every TMDb search upstream (`TmdbClientManager.cs:396,424,467`);
             // the API's own default is `false`, which is also the plugin's.
             .query(&[("include_adult", cfg.include_adult.to_string())])
-            .send()
+            .send_limited(&self.limiter)
             .await
         else {
             return Vec::new();
@@ -1691,7 +1707,10 @@ impl TmdbClient {
                 ("api_key", key),
                 ("append_to_response", "images,external_ids"),
             ]);
-        let resp = with_language(req, language).send().await.ok()?;
+        let resp = with_language(req, language)
+            .send_limited(&self.limiter)
+            .await
+            .ok()?;
         if !resp.status().is_success() {
             return None;
         }
@@ -1722,7 +1741,7 @@ impl TmdbClient {
             .http
             .get(format!("{}/person/{tmdb_id}", self.base_url))
             .query(&[("api_key", key)])
-            .send()
+            .send_limited(&self.limiter)
             .await
             .ok()?;
         if !resp.status().is_success() {
@@ -1747,7 +1766,7 @@ impl TmdbClient {
 
     /// Downloads an image URL's bytes, or `None` on any failure.
     pub async fn download(&self, url: &str) -> Option<Vec<u8>> {
-        let resp = self.http.get(url).send().await.ok()?;
+        let resp = crate::image_download::send(&self.http, url).await.ok()?;
         if !resp.status().is_success() {
             return None;
         }

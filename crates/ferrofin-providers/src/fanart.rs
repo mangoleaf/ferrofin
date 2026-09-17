@@ -15,6 +15,7 @@
 //! by community likes. The `music` leg (artist by MusicBrainz artist id, album
 //! by album-artist id + release-group id) is served the same way.
 
+use crate::rate_limit::{LimitedRequest as _, RateLimiter};
 use ferrofin_model::entities::ImageType;
 use serde::Deserialize;
 
@@ -119,6 +120,7 @@ struct FanartAlbum {
 #[derive(Debug, Clone)]
 pub struct FanartClient {
     http: reqwest::Client,
+    limiter: RateLimiter,
     /// Optional user personal key (`client_key`), raising limits/freshness.
     personal_key: Option<String>,
     /// The preferred artwork language for the ordering (Ferrofin has no per-item
@@ -143,6 +145,7 @@ impl FanartClient {
     pub fn new(personal_key: Option<String>) -> Self {
         Self {
             http: reqwest::Client::new(),
+            limiter: RateLimiter::new("fanart"),
             personal_key: personal_key.filter(|k| !k.is_empty()),
             language: "en".to_owned(),
             base_url: API_BASE.to_owned(),
@@ -169,7 +172,12 @@ impl FanartClient {
 
     /// GETs and parses a fanart response, or `None` on any failure (best-effort).
     async fn fetch<T: for<'de> Deserialize<'de>>(&self, media_type: &str, id: &str) -> Option<T> {
-        let resp = self.http.get(self.url(media_type, id)).send().await.ok()?;
+        let resp = self
+            .http
+            .get(self.url(media_type, id))
+            .send_limited(&self.limiter)
+            .await
+            .ok()?;
         if !resp.status().is_success() {
             return None;
         }

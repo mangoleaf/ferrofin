@@ -32,6 +32,11 @@ impl MockServer {
     /// first `(path_substring, body)` route whose substring the request path
     /// contains; unmatched requests get `{}`.
     pub async fn start(routes: Vec<(&'static str, String)>) -> Self {
+        Self::with_headers(routes, "").await
+    }
+
+    /// Like start, but attach quota headers to each successful response.
+    pub async fn with_headers(routes: Vec<(&'static str, String)>, headers: &'static str) -> Self {
         let routes = Arc::new(routes);
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock");
         let port = listener.local_addr().expect("addr").port();
@@ -52,7 +57,7 @@ impl MockServer {
                         .find(|(k, _)| path.contains(k))
                         .map_or_else(|| "{}".to_owned(), |(_, v)| v.clone());
                     let resp = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        "HTTP/1.1 200 OK\r\n{headers}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                         body.len()
                     );
                     let _ = sock.write_all(resp.as_bytes()).await;

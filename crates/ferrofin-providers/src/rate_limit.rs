@@ -3,7 +3,8 @@
 //! Create one limiter per provider quota (usually API host/account), and clone
 //! it for callers sharing that quota. Clones share state; unrelated instances
 //! are independent. Callers supply their own request headers, credentials and
-//! minimum interval. Only replayable GET requests are accepted.
+//! minimum interval. Only replayable GET requests are retried; other methods
+//! are sent once while sharing quota/cooldown tracking.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -48,22 +49,47 @@ impl RateLimiter {
         interval: Duration,
     ) -> Option<reqwest::Response> {
         let (http, request) = request.build_split();
-        let request = match request {
-            Ok(request) if request.method() == reqwest::Method::GET => request,
-            Ok(_) => {
-                tracing::debug!(
-                    provider = self.provider,
-                    "Only GET requests may be retried by the provider limiter"
-                );
-                return None;
-            }
-            Err(error) => {
-                tracing::debug!(provider = self.provider, error = %error.without_url(), "Provider request could not be built");
-                return None;
-            }
+        let request = request.ok()?;
+        if request.method() != reqwest::Method::GET {
+            return None;
+        }
+        self.execute(http, request, interval)
+            .await
+            .ok()
+            .filter(|response| response.status().is_success())
+    }
+
+    /// Send a provider request. GETs receive bounded retries; other methods are
+    /// dispatched only once, but still observe and respect the shared cooldown.
+    /// HTTP errors are returned intact so callers can interpret API responses.
+    ///
+    /// # Errors
+    /// Returns an error for transport/build failures, a non-replayable GET, or
+    /// a retained cooldown longer than one minute.
+    pub async fn send_request(
+        &self,
+        request: reqwest::RequestBuilder,
+        interval: Duration,
+    ) -> Result<reqwest::Response, RequestError> {
+        let (http, request) = request.build_split();
+        let request = request.map_err(|error| RequestError::Http(error.without_url()))?;
+        self.execute(http, request, interval).await
+    }
+
+    async fn execute(
+        &self,
+        http: reqwest::Client,
+        request: reqwest::Request,
+        interval: Duration,
+    ) -> Result<reqwest::Response, RequestError> {
+        let attempts = if request.method() == reqwest::Method::GET {
+            4
+        } else {
+            1
         };
+        let mut original = Some(request);
         let interval = interval.min(Duration::from_secs(u64::from(u32::MAX)));
-        for attempt in 1..=4 {
+        for attempt in 1..=attempts {
             let mut rate = self.state.lock().await;
             let quota_delay = rate.quota_delay();
             rate.postpone(quota_delay);
@@ -75,14 +101,21 @@ impl RateLimiter {
                         provider = self.provider,
                         "Metadata provider cooldown active; skipping lookup"
                     );
-                    return None;
+                    return Err(RequestError::Cooldown);
                 }
                 tokio::time::sleep_until(next).await;
             }
             // Reserve before awaiting I/O, including when this future is cancelled.
             rate.consume_quota();
             rate.next = Some(Instant::now() + interval.max(rate.adaptive_interval()));
-            let mut attempt_request = request.try_clone()?;
+            let mut attempt_request = if attempts == 1 {
+                original.take().ok_or(RequestError::NotReplayable)?
+            } else {
+                original
+                    .as_ref()
+                    .and_then(reqwest::Request::try_clone)
+                    .ok_or(RequestError::NotReplayable)?
+            };
             attempt_request
                 .timeout_mut()
                 .get_or_insert(Duration::from_secs(20));
@@ -113,18 +146,21 @@ impl RateLimiter {
                         let delay = interval.max(server_delay).max(rate.adaptive_interval());
                         rate.postpone(delay);
                     }
-                    if status.is_success() {
-                        return Some(resp);
+                    if status.is_success() || attempt == attempts {
+                        return Ok(resp);
                     }
                     if !retryable {
                         tracing::debug!(provider = self.provider, %status, "Metadata provider request rejected");
-                        return None;
+                        return Ok(resp);
                     }
                 }
                 Err(error) => {
                     if !error.is_timeout() && !error.is_connect() && !error.is_request() {
-                        tracing::debug!(provider = self.provider, error = %error.without_url(), "Metadata provider request failed");
-                        return None;
+                        tracing::debug!(
+                            provider = self.provider,
+                            "Metadata provider request failed"
+                        );
+                        return Err(RequestError::Http(error.without_url()));
                     }
                     rate.failed(Duration::ZERO);
                     if rate.failures == 1 {
@@ -133,15 +169,18 @@ impl RateLimiter {
                             "Metadata provider connection failed; entering backoff"
                         );
                     }
-                    tracing::debug!(provider = self.provider, attempt, error = %error.without_url(), "Metadata provider request failed; backing off");
+                    tracing::debug!(
+                        provider = self.provider,
+                        attempt,
+                        "Metadata provider request failed; backing off"
+                    );
+                    if attempt == attempts {
+                        return Err(RequestError::Http(error.without_url()));
+                    }
                 }
             }
         }
-        tracing::debug!(
-            provider = self.provider,
-            "Metadata provider retries exhausted"
-        );
-        None
+        Err(RequestError::NotReplayable)
     }
     /// Executes a paced GET and decodes its successful response as JSON.
     /// Parse failures return `None`; transport retries are handled by [`Self::send_get`].
@@ -158,6 +197,31 @@ impl RateLimiter {
                 None
             }
         }
+    }
+}
+
+/// A request failed before a usable HTTP response was received.
+#[derive(Debug, thiserror::Error)]
+pub enum RequestError {
+    /// Transport/build errors never expose request URLs containing credentials.
+    #[error("provider HTTP request failed: {0}")]
+    Http(reqwest::Error),
+    /// Preserve long cooldowns without blocking the scan indefinitely.
+    #[error("provider cooldown is active")]
+    Cooldown,
+    /// The request body cannot be duplicated for a safe retry.
+    #[error("provider request cannot be replayed")]
+    NotReplayable,
+}
+
+/// Apply a provider's quota without imposing a fixed request interval.
+pub(crate) trait LimitedRequest {
+    async fn send_limited(self, limiter: &RateLimiter) -> Result<reqwest::Response, RequestError>;
+}
+
+impl LimitedRequest for reqwest::RequestBuilder {
+    async fn send_limited(self, limiter: &RateLimiter) -> Result<reqwest::Response, RequestError> {
+        limiter.send_request(self, Duration::ZERO).await
     }
 }
 
@@ -201,22 +265,23 @@ impl RequestRate {
         headers: &reqwest::header::HeaderMap,
         now: chrono::DateTime<chrono::Utc>,
     ) {
-        let remaining = header_number(headers, "x-ratelimit-remaining");
-        let reset = header_number(headers, "x-ratelimit-reset")
+        let remaining = header_number(headers, "x-ratelimit-remaining")
+            .or_else(|| header_number(headers, "ratelimit-remaining"));
+        let relative = header_number(headers, "x-ratelimit-reset-in")
+            .or_else(|| header_number(headers, "ratelimit-reset"))
+            .map(Duration::from_secs);
+        let absolute = header_number(headers, "x-ratelimit-reset")
             .and_then(|v| i64::try_from(v).ok())
-            .and_then(|v| chrono::DateTime::from_timestamp(v, 0));
-        if let (Some(remaining), Some(reset)) = (remaining, reset) {
-            let now = server_now(headers, now);
-            // HTTP Date and reset epochs have whole-second precision. A second
-            // of slack avoids dispatching into the last partial reset second.
-            if let Ok(window) = (reset - now).to_std() {
-                self.quota = Some(Quota {
-                    remaining,
-                    reset: Instant::now()
-                        + window.min(Duration::from_secs(u64::from(u32::MAX)))
-                        + Duration::from_secs(1),
-                });
-            }
+            .and_then(|v| chrono::DateTime::from_timestamp(v, 0))
+            .and_then(|reset| (reset - server_now(headers, now)).to_std().ok());
+        if let (Some(remaining), Some(window)) = (remaining, relative.or(absolute)) {
+            // A second of slack covers integer header precision at the boundary.
+            self.quota = Some(Quota {
+                remaining,
+                reset: Instant::now()
+                    + window.min(Duration::from_secs(u64::from(u32::MAX)))
+                    + Duration::from_secs(1),
+            });
         }
     }
 
@@ -385,6 +450,61 @@ mod tests {
         assert!(a.is_some() && b.is_some());
         let times = task.await.unwrap();
         assert!(times[1] - times[0] >= Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn headerless_success_has_no_fixed_pacing() {
+        let (url, task) = scripted_server(vec![(200, ""), (200, "")]).await;
+        let limiter = RateLimiter::new("headerless");
+        for _ in 0..2 {
+            assert!(
+                reqwest::Client::new()
+                    .get(&url)
+                    .send_limited(&limiter)
+                    .await
+                    .is_ok()
+            );
+            let state = limiter.state.lock().await;
+            assert!(state.next.unwrap() <= Instant::now());
+            assert!(state.quota.is_none());
+            assert_eq!(state.adaptive_interval(), Duration::ZERO);
+        }
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn post_is_not_retried_but_retains_server_cooldown() {
+        let (url, task) = scripted_server(vec![(429, "Retry-After: 120\r\n")]).await;
+        let limiter = RateLimiter::new("post-test");
+        let http = reqwest::Client::new();
+        let response = limiter
+            .send_request(http.post(&url).body("payload"), Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 429);
+        assert_eq!(task.await.unwrap().len(), 1);
+        assert!(matches!(
+            limiter.send_request(http.get(&url), Duration::ZERO).await,
+            Err(RequestError::Cooldown)
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn relative_quota_headers_and_invalid_values() {
+        for (remaining, reset) in [
+            ("x-ratelimit-remaining", "x-ratelimit-reset-in"),
+            ("ratelimit-remaining", "ratelimit-reset"),
+        ] {
+            let mut rate = RequestRate::default();
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(remaining, "2".parse().unwrap());
+            headers.insert(reset, "9".parse().unwrap());
+            rate.observe_quota(&headers, chrono::Utc::now());
+            assert_eq!(rate.quota_delay(), Duration::from_secs(5));
+            headers.insert(reset, "invalid".parse().unwrap());
+            rate.observe_quota(&headers, chrono::Utc::now());
+            assert_eq!(rate.quota_delay(), Duration::from_secs(5));
+        }
     }
 
     #[test]
