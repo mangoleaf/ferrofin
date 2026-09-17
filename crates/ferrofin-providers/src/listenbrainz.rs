@@ -3,9 +3,9 @@
 //!
 //! The Labs API answers "which artists are similar to this one" from aggregated
 //! listening sessions, keyed by MusicBrainz artist id. Requests use server quota
-//! headers when available, with no fixed delay for the Labs endpoint.
+//! headers when available, with a one-second minimum for the public Labs server.
 
-use crate::rate_limit::{LimitedRequest as _, RateLimiter};
+use crate::rate_limit::RateLimiter;
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -70,6 +70,9 @@ pub struct ListenBrainzConfig {
     pub labs_server: String,
     /// The similarity algorithm to request.
     pub algorithm: SimilarityAlgorithm,
+    /// Minimum request spacing in seconds; defaults to one. The public Labs
+    /// server always retains at least one second, even without quota headers.
+    pub rate_limit_seconds: f64,
     /// How many days a result may be cached; `0` disables caching.
     pub cache_days: i64,
 }
@@ -79,6 +82,7 @@ impl Default for ListenBrainzConfig {
         Self {
             labs_server: DEFAULT_LABS_SERVER.to_owned(),
             algorithm: SimilarityAlgorithm::default(),
+            rate_limit_seconds: 1.0,
             cache_days: DEFAULT_CACHE_DAYS,
         }
     }
@@ -94,6 +98,20 @@ impl ListenBrainzConfig {
             DEFAULT_LABS_SERVER
         } else {
             server
+        }
+    }
+
+    fn request_interval(&self) -> Duration {
+        let interval = Duration::try_from_secs_f64(self.rate_limit_seconds)
+            .unwrap_or(Duration::from_secs(1))
+            .min(Duration::from_secs(u64::from(u32::MAX)));
+        if reqwest::Url::parse(self.server()).is_ok_and(|url| {
+            url.host_str()
+                .is_some_and(|host| host.eq_ignore_ascii_case("labs.api.listenbrainz.org"))
+        }) {
+            interval.max(Duration::from_secs(1))
+        } else {
+            interval
         }
     }
 }
@@ -143,14 +161,13 @@ impl ListenBrainzClient {
             return Vec::new();
         }
         let url = format!("{}/similar-artists/json", self.config.server());
+        let request = self.http.get(&url).query(&[
+            ("artist_mbids", mbid),
+            ("algorithm", self.config.algorithm.as_api_string()),
+        ]);
         let resp = match self
-            .http
-            .get(&url)
-            .query(&[
-                ("artist_mbids", mbid),
-                ("algorithm", self.config.algorithm.as_api_string()),
-            ])
-            .send_limited(&self.limiter)
+            .limiter
+            .send_request(request, self.config.request_interval())
             .await
         {
             Ok(resp) => resp,
@@ -264,19 +281,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn labs_uses_headers_without_a_fixed_interval() {
+    async fn labs_retains_default_spacing_without_headers_and_honors_quota() {
         let body = r#"[{"artist_mbid":"other","score":1}]"#;
         let open = MockServer::always(body).await;
         let client = ListenBrainzClient::new(ListenBrainzConfig {
             labs_server: open.base_url.clone(),
             ..ListenBrainzConfig::default()
         });
-        tokio::time::timeout(Duration::from_millis(800), async {
-            assert_eq!(client.similar_artists("seed").await, ["other"]);
-            assert_eq!(client.similar_artists("seed").await, ["other"]);
-        })
-        .await
-        .expect("headerless Labs calls must not have a one-second delay");
+        let started = tokio::time::Instant::now();
+        assert_eq!(client.similar_artists("seed").await, ["other"]);
+        assert_eq!(client.clone().similar_artists("seed").await, ["other"]);
+        assert!(
+            started.elapsed() >= Duration::from_secs(1),
+            "clones must share the one-second pacing gate without response headers"
+        );
         let limited = MockServer::with_headers(
             vec![("/", body.to_owned())],
             "X-RateLimit-Remaining: 0\r\nX-RateLimit-Reset-In: 120\r\n",
@@ -288,6 +306,23 @@ mod tests {
         });
         assert_eq!(client.similar_artists("seed").await, ["other"]);
         assert!(client.similar_artists("seed").await.is_empty());
+    }
+
+    #[test]
+    fn public_labs_minimum_cannot_be_disabled() {
+        for value in [0.0, 0.1, -1.0, f64::NAN, f64::INFINITY] {
+            let config = ListenBrainzConfig {
+                rate_limit_seconds: value,
+                ..Default::default()
+            };
+            assert_eq!(config.request_interval(), Duration::from_secs(1));
+        }
+        let mirror = ListenBrainzConfig {
+            labs_server: "https://labs.example.org".to_owned(),
+            rate_limit_seconds: 0.0,
+            ..Default::default()
+        };
+        assert_eq!(mirror.request_interval(), Duration::ZERO);
     }
 
     #[tokio::test]

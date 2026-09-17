@@ -43,7 +43,7 @@ fallback timeout is 20 seconds per attempt.
 
 ## Header-driven pacing
 
-All newly integrated providers use zero fixed spacing. A successful response
+Providers other than MusicBrainz and ListenBrainz Labs use zero fixed spacing. A successful response
 without quota headers introduces no timed throttle. An unexpired quota learned
 from an earlier response still applies if subsequent responses omit headers.
 Failures still activate bounded retries and adaptive backoff, even without
@@ -57,11 +57,12 @@ A live successful MusicBrainz response checked during this change included
 `X-RateLimit-Limit`, `X-RateLimit-Remaining`, and `X-RateLimit-Reset`.
 
 A successful request to the actual ListenBrainz Labs `/similar-artists/json`
-endpoint returned no quota headers. Its inherited fixed one-second delay and
-unused interval setting were removed. The separate main ListenBrainz API
-advertises quota headers and a one-call-per-second policy; those main-API docs
-alone do not establish what the Labs endpoint returns. Labs still honors quota
-headers if they appear later.
+endpoint returned no quota headers. Labs therefore retains Jellyfin's conservative
+one-second default/minimum for the public server, in addition to header-aware
+pacing and failure backoff. Its request interval is configurable for mirrors;
+the public server cannot be configured below one second. A missing quota header
+does not disable this provider-specific minimum. The separate main ListenBrainz
+API documents both quota headers and a one-call-per-second policy.
 
 Sources: [MusicBrainz policy](https://musicbrainz.org/doc/MusicBrainz_API/Rate_Limiting)
 and [main ListenBrainz API policy](https://listenbrainz.readthedocs.io/en/latest/users/api/index.html).
