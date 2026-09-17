@@ -78,6 +78,7 @@ create-release:
     - job: request-release
     - job: lint
     - job: coverage
+    - job: benchmark-report
   image: alpine/git:latest        # has git + busybox awk/grep/sed; NO git-cliff
   variables:
     GIT_DEPTH: "0"   # need full history + tags to derive the bump from commits
@@ -305,6 +306,17 @@ sccache-creds:
 # ---------------------------------------------------------------------------
 # test
 # ---------------------------------------------------------------------------
+benchmark-report:
+  stage: test
+  image: python:3.13-slim
+  script:
+    # Reporter correctness only; never run performance measurements on shared CI.
+    - python3 -m unittest discover -s bench -p test_report.py
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+(-rc\.\d+)?$/'
+
 lint:
   stage: test
   image: $CI_REGISTRY_IMAGE/ci:rust-1.98.1   # toolchain + nextest/llvm-cov baked in

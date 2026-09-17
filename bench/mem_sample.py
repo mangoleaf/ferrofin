@@ -16,10 +16,14 @@ Columns per sample (interval = one row):
                   server's traffic (a few % under load is that, not a neighbour)
   swap     bytes — memory.swap.current (must stay 0: run.sh sets --memory-swap = --memory)
   load1    host 1-min loadavg
+  cpu_usec cumulative cgroup CPU microseconds (server and its children)
 Runs until SIGTERM/SIGINT. `--check CPUSET` prints the idle fraction of those cores
 over one second and exits (the preflight in run.sh).
 """
 
+import json
+import os
+from pathlib import Path
 import signal
 import subprocess
 import sys
@@ -34,12 +38,25 @@ def cpuset_list(spec):
     return out
 
 
+def topology(server, client, root="/sys/devices/system/cpu"):
+    server, client = set(cpuset_list(server)), set(cpuset_list(client))
+    if not server or not client or server & client:
+        raise ValueError("server/client CPU sets overlap or are empty")
+    def siblings(cores):
+        return set().union(*(set(cpuset_list((Path(root)/f"cpu{c}/topology/thread_siblings_list").read_text().strip())) for c in cores))
+    a, b = siblings(server), siblings(client)
+    if a & b:
+        raise ValueError("server/client CPU sets share physical cores (SMT siblings)")
+    return {"server_cpus": sorted(server), "client_cpus": sorted(client),
+            "checked_cpus": sorted(a | b)}
+
+
 def cpu_times(cores):
     """(busy, total) jiffies summed over the given cores."""
     busy = total = 0
     for line in open("/proc/stat"):
         if line.startswith("cpu") and line[3:4].isdigit() and int(line.split()[0][3:]) in cores:
-            v = [int(x) for x in line.split()[1:]]
+            v = [int(x) for x in line.split()[1:9]]  # guest time is already included in user/nice
             idle = v[3] + v[4]  # idle + iowait
             total += sum(v)
             busy += sum(v) - idle
@@ -47,7 +64,7 @@ def cpu_times(cores):
 
 
 def cgroup_dir(container):
-    cid = subprocess.check_output(["docker", "inspect", "-f", "{{.Id}}", container], text=True).strip()
+    cid = subprocess.check_output(["docker", "inspect", "-f", "{{.Id}}", container], text=True, timeout=float(os.environ.get("HTTP_TIMEOUT_S", "10"))).strip()
     for d in (f"/sys/fs/cgroup/system.slice/docker-{cid}.scope", f"/sys/fs/cgroup/docker/{cid}"):
         try:
             open(f"{d}/memory.stat").close()
@@ -61,10 +78,13 @@ def container_cpu_usec(d):
     for line in open(f"{d}/cpu.stat"):
         if line.startswith("usage_usec"):
             return int(line.split()[1])
-    return 0
+    raise ValueError("cpu.stat has no usage_usec counter")
 
 
 def main():
+    if sys.argv[1] == "--topology":
+        print(json.dumps(topology(sys.argv[2], sys.argv[3])))
+        return
     if sys.argv[1] == "--check":
         cores = cpuset_list(sys.argv[2])
         b0, t0 = cpu_times(cores)
@@ -75,7 +95,7 @@ def main():
     container, out = sys.argv[1], sys.argv[2]
     interval = int(sys.argv[3]) / 1000 if len(sys.argv) > 3 else 0.1
     cores = cpuset_list(sys.argv[4]) if len(sys.argv) > 4 else list(range(64))
-    hz = 100  # USER_HZ (jiffies per second) on Linux
+    hz = os.sysconf("SC_CLK_TCK")
     d = cgroup_dir(container)
     stop = False
 
@@ -86,28 +106,32 @@ def main():
     signal.signal(signal.SIGTERM, on_sig)
     signal.signal(signal.SIGINT, on_sig)
     with open(out, "w") as f:
-        f.write("t,anon,file,current,cores_busy,container_cpu,interference,swap,load1\n")
+        f.write("t,anon,file,current,cores_busy,container_cpu,interference,swap,load1,cpu_usec\n")
         nxt = time.monotonic()
         pb, pt = cpu_times(cores)
         pc = container_cpu_usec(d)
         while not stop:
             try:
-                stat = dict(line.split() for line in open(f"{d}/memory.stat"))
-                cur = open(f"{d}/memory.current").read().strip()
+                stat = dict(line.split() for line in Path(d, "memory.stat").read_text().splitlines())
+                cur = Path(d, "memory.current").read_text().strip()
                 try:
-                    swap = open(f"{d}/memory.swap.current").read().strip()
+                    swap = Path(d, "memory.swap.current").read_text().strip()
                 except OSError:
                     swap = "0"
                 cc = container_cpu_usec(d)
             except OSError:
-                break  # container gone
+                if stop:
+                    break
+                raise  # unexpected container loss is a failed sampler
             b, t = cpu_times(cores)
             dt_j = max(1, t - pt)
             cores_busy = (b - pb) / dt_j
             container_cpu = (cc - pc) / 1e6 * hz / dt_j
             pb, pt, pc = b, t, cc
-            load1 = open("/proc/loadavg").read().split()[0]
-            f.write(f"{time.time():.3f},{stat['anon']},{stat['file']},{cur},{cores_busy:.3f},{container_cpu:.3f},{max(0.0, cores_busy - container_cpu):.3f},{swap},{load1}\n")
+            load1 = Path("/proc/loadavg").read_text().split()[0]
+            # Catch-up observations can share a millisecond. Keep clock precision
+            # so rounding cannot manufacture nonmonotonic resource evidence.
+            f.write(f"{time.time():.9f},{stat['anon']},{stat['file']},{cur},{cores_busy:.3f},{container_cpu:.3f},{max(0.0, cores_busy - container_cpu):.3f},{swap},{load1},{cc}\n")
             f.flush()
             nxt += interval
             time.sleep(max(0.0, nxt - time.monotonic()))
