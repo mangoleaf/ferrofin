@@ -41,6 +41,7 @@ import statistics
 import sys
 import urllib.parse
 from collections import Counter, defaultdict
+from datetime import datetime, timezone
 
 DELTA_NOISE_PCT = 2  # a baseline change smaller than this is not coloured
 ORACLE = "jellyfin12"  # the source of truth (owner, 2026-09-02): Jellyfin 12 is the newer code
@@ -547,7 +548,7 @@ CONDITIONS = ("host", "cpu", "memory_limit", "server_cpus", "client_cpus", "k6",
               "window_s", "mem_sample_ms", "rate_unloaded", "rate_loaded", "rate_stress",
               "warmup_s", "settle_s", "steady_s", "restarts", "ttfs_reps",
               "ids_sha256", "screens_sha256", "seed", "warmup_seed", "slots", "shape_vus", "pools", "workload",
-              "testdata_counts", "core_idle_min", "phase_schema", "resource_schema", "streaming_validation", "topology",
+              "testdata_counts", "background_policy", "core_idle_min", "phase_schema", "resource_schema", "streaming_validation", "topology",
               "sample_bracket_intervals", "sample_gap_intervals", "ready_timeout_s", "drain_timeout_s",
               "http_timeout_s", "stream_http_timeout_s", "phase_timeout_s", "cleanup_timeout_s")
 
@@ -691,21 +692,10 @@ def build(runs):
                             problems.append("shape dependency failed")
                 problems.append(oracle_failed(oracle_shapes[i], names, oracle_label) if k == ORACLE else
                                 comparable(shapes[k][i], oracle_shapes[i], names, oracle_label))
-                if not counts[k][i]:
-                    problems.append("missing counts.json")
                 if k != ORACLE:
                     problems.append(window_problem(data.get(ORACLE, [None] * len(runs))[i]))
-                    oracle_counts = counts.get(ORACLE, [None] * len(runs))[i]
-                    if not oracle_counts:
-                        problems.append("missing oracle counts.json")
-                    elif counts[k][i]:
-                        # Resume/latest are independent query diagnostics; static library
-                        # inventory changes affect every selection drawn from that library.
-                        changed = sorted(n for n in set(counts[k][i]) | set(oracle_counts)
-                                         if n not in {"resume", "nextup", "latest"}
-                                         and counts[k][i].get(n) != oracle_counts.get(n))
-                        if changed:
-                            problems.append("inventory counts differ: " + ", ".join(changed))
+                # Inventory is diagnostic only. Request-level counts and shapes above
+                # determine whether a latency cell represents comparable work.
             return reasons(*problems)
 
         # Legacy logs do not associate poster observations with a screen. Keep their
@@ -828,6 +818,41 @@ def build(runs):
     return m
 
 
+def cpu_tables(m):
+    """Keep each repetition and its resource validity visible, including missing data."""
+    cpu, coverage = [], []
+    for i, _ in enumerate(m["runs"]):
+        for window in (*LOAD_LEVELS, "steady"):
+            records = {k: m["resources"][k][i].get(window, {}) for k, _ in m["servers"]}
+            if not any(records.values()):
+                continue
+            label = f"{window} · run {i + 1}"
+            values, details = {}, {}
+            for k, _ in m["servers"]:
+                r = records[k]
+                phases = m["phases"][k][i] or {}
+                failures = [f"{name}: {phases[name]['status']} ({phases[name].get('reason') or 'no reason recorded'})"
+                            for name in ("startup", "startup-drain", "sampler", window)
+                            if name in phases and phases[name].get("status") != "completed"]
+                problem = reasons(r.get("error"), *failures)
+                seconds = r.get("cpu_seconds")
+                values[k] = (f"{seconds:.3f}" if number(seconds) else "unavailable") + (" ⚠" if problem else "")
+                start, end = r.get("observed_start"), r.get("observed_end")
+                stamp = lambda t: datetime.fromtimestamp(t, timezone.utc).isoformat(timespec="milliseconds") if number(t) else "unavailable"
+                details[k] = {
+                    "Observed duration (s)": f"{end-start:.3f}" if number(start) and number(end) else "unavailable",
+                    "Samples": str(r.get("samples", 0)),
+                    "Largest gap (ms)": f"{r['max_gap_s']*1000:.3f}" if number(r.get("max_gap_s")) else "unavailable",
+                    "Observed start (UTC)": stamp(start),
+                    "Observed end (UTC)": stamp(end),
+                    "CPU evidence": "⚠ " + problem if problem else ("available" if number(seconds) else "unavailable — no cumulative CPU counters"),
+                }
+            cpu.append((label, values))
+            for metric in next(iter(details.values())):
+                coverage.append((f"{label} · {metric}", {k: d[metric] for k, d in details.items()}))
+    return [("CPU consumption (CPU-seconds)", cpu), ("CPU sample coverage", coverage)]
+
+
 # ── markdown (the README tables) ────────────────────────────────────────────
 def render_md(m):
     oracle_label = m["oracle_label"]
@@ -865,8 +890,14 @@ def render_md(m):
         p(f"Shape coverage — {dict(servers)[k]}: `{json.dumps(coverage)}`\n")
     p("### CPU and sample coverage — invocation and idle windows\n")
     p("CPU seconds use cumulative counters at the reported bracketing samples; load includes setup/teardown and harness overhead, and steady is post-load idle. Missing historical counters remain unavailable.\n")
-    for k, windows in m["resources"].items():
-        p(f"**{dict(servers)[k]}**: `{json.dumps(windows)}`\n")
+    p("Each row retains its individual run; these are diagnostic observations, not speedup claims. See the latency/work flags for differences in executed work.\n")
+    for title, rows in cpu_tables(m):
+        p(f"#### {title}\n")
+        p("| Window / metric | " + " | ".join(label for _, label in servers) + " |\n|" + "---|" * (len(servers) + 1))
+        for label, cells in rows:
+            escape = lambda value: str(value).replace("|", "\\|").replace("\n", " ")
+            p("| " + escape(label) + " | " + " | ".join(escape(cells[k]) for k, _ in servers) + " |")
+        p("")
     p("### Phase outcomes\n")
     for k, phases in m["phases"].items():
         p(f"**{dict(servers)[k]}**: `{json.dumps(phases)}`\n")
@@ -1356,7 +1387,12 @@ def render_html(m, base=None, picker=""):
         parts.append(table_html("screen", lv["screens"], servers, dict(bl.get("screens", [])), notes, f"{level} screens"))
         parts.append(f"<details><summary>Per endpoint, {level}</summary>{table_html('endpoint', lv['endpoints'], servers, dict(bl.get('endpoints', [])), notes, f'{level} endpoints')}</details>")
         parts.append("<p>Image response bytes (diagnostic, per run): " + e("; ".join(f"{label}: {lv['image_bytes'][k]}" for k, label in servers)) + "</p>")
-    parts.append("<h2>CPU and sample coverage — invocation and idle windows</h2><p>Cumulative counter differences use the reported bracketing samples; load includes setup/teardown and harness overhead, and steady is post-load idle. Historical counters are unavailable.</p><pre>" + e(json.dumps(m["resources"], indent=2)) + "</pre>")
+    parts.append("<h2>CPU and sample coverage — invocation and idle windows</h2><p>Cumulative counter differences use the reported bracketing samples; load includes setup/teardown and harness overhead, and steady is post-load idle. Missing historical counters remain unavailable. Each row retains its individual run; these are diagnostic observations, not speedup claims. See latency/work flags for differences in executed work.</p>")
+    for title, rows in cpu_tables(m):
+        head = "".join(f"<th>{e(label)}</th>" for _, label in servers)
+        body = "".join("<tr><th>" + e(label) + "</th>" + "".join(
+            f"<td class='num{' flagged' if '⚠' in cells[k] else ''}'>{e(cells[k])}</td>" for k, _ in servers) + "</tr>" for label, cells in rows)
+        parts.append(f"<h3>{e(title)}</h3><div class='scroll'><table><thead><tr><th>Window / metric</th>{head}</tr></thead><tbody>{body}</tbody></table></div>")
     parts.append("<h2>Phase outcomes</h2><pre>" + e(json.dumps(m["phases"], indent=2)) + "</pre>")
     parts.append("<h2>Time to first screen</h2>" + table_html("", m["ttfs"], servers, base_ttfs, notes, "time to first screen"))
     mem_note = "" if comparable_levels(m, base) else (

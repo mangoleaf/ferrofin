@@ -1,6 +1,7 @@
 """Reporter correctness only: python3 -m unittest discover -s bench -p test_report.py."""
 import copy
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -87,6 +88,42 @@ class ReportTests(unittest.TestCase):
     def row(self, text, label='home'):
         return next(line for line in text.splitlines() if line.startswith(f'| **{label}**'))
 
+    def test_cpu_tables_compare_servers_and_preserve_every_repetition(self):
+        model = self.build(self.a, self.b)
+        for n, (server, _) in enumerate(model['servers']):
+            model['resources'][server] = [
+                {'loaded': {'cpu_seconds': n + i + .25, 'samples': 1202,
+                            'observed_start': 1000, 'observed_end': 1120,
+                            'max_gap_s': .101}}
+                for i in range(2)]
+        rows = dict(report.cpu_tables(model)[0][1])
+        self.assertEqual(rows['loaded · run 1']['jellyfin12'], '0.250')
+        self.assertEqual(rows['loaded · run 2']['ferrofin'], '3.250')
+        for rendered in (report.render_md(model), report.render_html(model)):
+            section = rendered.split('CPU and sample coverage — invocation and idle windows', 1)[1].split('Phase outcomes', 1)[0]
+            for expected in ('CPU consumption (CPU-seconds)', 'loaded · run 2', '3.250',
+                             'Samples', '1202', '101.000', '120.000', 'Observed start (UTC)', '10.11.8'):
+                self.assertIn(expected, section)
+            self.assertNotIn('cpu_seconds', section)
+            self.assertNotIn('<pre>', section)
+
+    def test_cpu_table_retains_failed_sampler_and_escapes_reason(self):
+        model = self.build()
+        model['resources']['ferrofin'] = [{'loaded': {'cpu_seconds': 0.0, 'samples': 2}}]
+        model['phases']['ferrofin'] = [{'sampler': {'status': 'failed', 'reason': '<lost>|exit'}}]
+        rows = dict(report.cpu_tables(model)[0][1])
+        self.assertEqual(rows['loaded · run 1']['ferrofin'], '0.000 ⚠')
+        self.assertIn('&lt;lost&gt;|exit', report.render_html(model))
+        self.assertIn('<lost>\\|exit', report.render_md(model))
+
+    def test_cpu_table_does_not_invent_missing_historical_counters(self):
+        model = self.build()
+        for server, _ in model['servers']:
+            model['resources'][server] = [{'loaded': {'cpu_seconds': None, 'samples': 2}}]
+        rows = dict(report.cpu_tables(model)[0][1])
+        self.assertEqual(set(rows['loaded · run 1'].values()), {'unavailable'})
+        self.assertIn('unavailable — no cumulative CPU counters', report.render_html(model))
+
     def test_clean_report_and_optional_servers(self):
         m = self.build(self.a, self.b)
         self.assertIsNone(self.home(m).flag)
@@ -131,7 +168,7 @@ class ReportTests(unittest.TestCase):
     def test_mixed_conditions_and_images_are_rejected(self):
         original = json.loads((self.b / 'run.json').read_text())
         for key, value in [('rate_loaded', 50), ('window_s', 5), ('memory_limit', '1g'),
-                           ('server_cpus', '4-7'), ('ids_sha256', 'changed'), ('screens_sha256', 'changed')]:
+                           ('server_cpus', '4-7'), ('ids_sha256', 'changed'), ('screens_sha256', 'changed'), ('background_policy', 1)]:
             with self.subTest(key=key):
                 self.write(self.b / 'run.json', {**original, key: value})
                 with self.assertRaisesRegex(ValueError, key):
@@ -201,13 +238,34 @@ class ReportTests(unittest.TestCase):
         self.assertIn('— ⚠', row)
         self.assertIn('faster', row)  # FF/oracle still valid
 
-    def test_missing_counts_and_later_inventory_difference(self):
-        self.edit(self.b / 'ferrofin/counts.json', lambda x: x.update(movies=1))
+    def test_inventory_differences_remain_diagnostic_across_repetitions(self):
+        self.edit(self.b / 'ferrofin/counts.json', lambda x: x.update(movies=1, persons=5000))
+        self.edit(self.b / 'jellyfin12/counts.json', lambda x: x.update(persons=5158))
         m = self.build(self.a, self.b)
-        self.assertIn('inventory', self.home(m).flag)
+        for kind in ('screens', 'endpoints'):
+            for _, cells in m['levels']['loaded'][kind]:
+                self.assertIsNone(cells['ferrofin'].flag)
         self.assertTrue(any('count movies' in x for x in m['work']['ferrofin']))
-        (self.b / 'ferrofin/counts.json').unlink()
-        self.assertIn('missing counts', self.home(self.build(self.a, self.b)).flag)
+        self.assertTrue(any('count persons' in x for x in m['work']['ferrofin']))
+        self.assertIn('faster', self.row(self.readme(m)))
+
+    def test_missing_inventory_stays_visible_without_flagging_latency(self):
+        for server in ('ferrofin', 'jellyfin12'):
+            (self.b / server / 'counts.json').unlink()
+        m = self.build(self.a, self.b)
+        self.assertIsNone(self.home(m).flag)
+        self.assertIsNone(self.home(m, 'jellyfin12').flag)
+        self.assertIn('missing counts.json', m['work']['ferrofin'])
+
+    def test_actual_response_counts_still_flag_affected_latency(self):
+        path = self.b / 'ferrofin/shape.log'
+        records = [json.loads(json.loads(line)['msg']) for line in path.read_text().splitlines()]
+        next(r for r in records if r['shape'] == 'home:items')['count'] = 2
+        self.shapes(path.parent, records)
+        m = self.build(self.a, self.b)
+        self.assertIsNotNone(self.home(m).flag)
+        self.assertIsNone(dict(m['levels']['loaded']['screens'])['movies']['ferrofin'].flag)
+        self.assertIn('— ⚠', self.row(self.readme(m)))
 
     def test_transport_failure_in_oracle_shape(self):
         self.shapes(self.a / 'jellyfin12', [{'shape': 'home:items', 'url': '/home:items', 'status': 0}])
@@ -435,6 +493,15 @@ class PreparationTests(unittest.TestCase):
         seed.wait_ready(api, secs=1)
         self.assertEqual(api.get.call_count, 2)
         sleep.assert_called_once_with(0.5)
+
+    def test_invalid_shape_vus_fail_before_fixture_or_docker_access(self):
+        script = Path(__file__).parent / 'run.sh'
+        for value in ('0', '-1', '1.5', 'no'):
+            with self.subTest(value=value):
+                result = subprocess.run(['bash', str(script), '--only', 'shape'],
+                                        env=dict(os.environ, SHAPE_VUS=value), capture_output=True, text=True)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn('SHAPE_VUS must be a positive integer', result.stderr)
 
     def test_invalid_selections_fail_before_fixture_or_docker_access(self):
         script = Path(__file__).parent / 'run.sh'

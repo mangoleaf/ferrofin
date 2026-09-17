@@ -270,9 +270,14 @@ claims the current commit. `run.sh` refuses to start unless the server/client co
 Publishable numbers come from **three** runs — `report.py` takes the median and prints the
 range each cell spanned.
 
-`bench/` is NOT a CI gate and is not meant to become one; it is a measuring instrument you
+Benchmark performance is NOT a CI gate and is not meant to become one; it is a measuring instrument you
 run deliberately — `bench/run.sh --servers ferrofin --only loaded` on two builds is the
-cheap form for a before/after, skipping both Jellyfins. So the standing rule is unchanged: body-diff correctness is not a
+cheap form for a before/after, skipping both Jellyfins. The fast stdlib reporter
+correctness tests (`bench/test_report.py`) do run in CI and gate releases; they do not
+start servers or impose performance thresholds. The benchmark reference is stable
+Jellyfin **12.0.0**, requested by the owner in the approved benchmark improvement plan,
+and pinned by digest in `bench/testdata/jellyfin12-image.txt`. This does not change the
+source-verification `UPSTREAM_TAG` recorded below. So the standing rule is unchanged: body-diff correctness is not a
 latency signal — a 100× slowdown can land "green." Any change touching `ferrofin-core`,
 `ferrofin-db`, `ferrofin-api`, or the query/repository/DTO paths (`translate_query`,
 `item_repository`, `dto_service`) must come with a measured before/after stated in the

@@ -3,7 +3,10 @@
 This directory produces the comparison table in the root README: Ferrofin against
 Jellyfin 12.0.0 (the reference for future runs) and Jellyfin 10.11.8 (the vendored API
 contract), on identical test data, on one host. Archived runs retain their recorded
-12.0-rc7 labels and measurements. Every number has a definition below. New published results must pass the
+12.0-rc7 labels and raw measurements. Re-rendering archived results applies the current
+validation rules: previously published cells can become flagged (including archived
+Ferrofin detail/playback responses missing `IsOriginal`/`LocalizedOriginal`). Review
+an unpublished preview before replacing any published table. Every number has a definition below. New published results must pass the
 comparability, phase and resource checks described here:
 
 - **comparable** — the server returned the same status and record count as Jellyfin
@@ -17,25 +20,23 @@ comparability, phase and resource checks described here:
   it, says what differed. A window in which k6 could not hold the arrival rate, a
   Jellyfin-side failure, or a transcode with different parameters is flagged the same way.
 
+Inventory totals (including person counts) are diagnostics in the work list, not latency
+gates. Missing inventory evidence is also reported there. Actual request/response counts,
+shapes, selections and failures still determine the affected latency cells' comparability.
+
 There is deliberately **no** second rule about run-to-run spread. Where the runs
 disagreed, the cell reports the range they spanned — in brackets in the markdown, beneath
 the number in the viewer's headline tiles, and on the cell's hover text in its tables —
 and the reader judges it. Where they agreed at the precision published, nothing is
 printed: agreement is the absence of a range, not a claim about one.
 
-A fixed 15 % band was tried as a **reproducible** verdict and withdrawn (owner,
-2026-09-04). It failed 57 of Ferrofin's 110 cells, and the failures sit almost entirely
-in the tails. Counting each failing number rather than each cell — a latency cell prints
-p50, p95 and p99 — those 57 cells hold 80 failures, of which **69 are p95 or p99** and
-only 11 are a median. A percentage of the median cannot tell a tail that moved because
-the host hiccuped from a tail that is honestly long, so the band was answering a question
-nobody had asked.
+The owner withdrew the fixed 15% spread gate on 2026-09-04: tail variation was not a
+reliable pass/fail test. Reports retain ranges for review instead.
 
-It was not a busy-host artefact either. An idle trio (`quiet-1..3`) failed 41 of 76, and
-over every cell both trios produced it failed *more* often than the working trio did —
-54 % against 45 % (57 % against 46 % on the load levels alone). A wide range is still a
-reason not to publish a number; that is now a judgement made with the range in front of
-you rather than by a threshold.
+The owner requested stable 12.0.0 for future benchmarks in the approved plan. This benchmark
+reference is separate from the C# source-parity pin in `handlers/mod.rs`. On 2026-09-16
+the owner also requested plugin checks and background scan suppression; the isolation
+policy below implements that request on disposable configurations.
 
 ## What is measured
 
@@ -126,7 +127,8 @@ stays inside the run; media is mounted read-only for every server.
 ## Shared picks and bounded validation
 
 The seeder writes `pools` into `ids.json`: ordered movie/series IDs, search terms, the
-movie count, and a fixed NextUp cutoff. Existing fixtures can export these without
+movie count, and a fixed NextUp cutoff. The cutoff is fixed fixture input (not the current date), recorded in `ids.json` and
+covered by its hash; regenerating it changes the workload. Existing fixtures can export these without
 regenerating media or reseeding users:
 
 ```bash
@@ -143,8 +145,11 @@ movie page is included using `ceil(movieCount / 100)`.
 `SLOTS` defaults to 600 and must be a positive multiple of ten. Each iteration uses
 `slot = iterationInTest % SLOTS`, the fixed ten-screen mix, and `lcg(slot + 1 + SEED)`.
 All measured levels share `SEED` (default 0); warm-up uses `SEED + 900000`. The one
-untimed shape pass uses ten VUs and exactly `SLOTS` shared iterations, with scenario-wide
-indices so each slot runs once. Iteration 601 wraps to slot 0. This is a warm-cache
+untimed shape pass uses `SHAPE_VUS` (default **1**) and exactly `SLOTS` shared iterations, with scenario-wide
+indices so each slot runs once. Serial validation avoids concurrent cold-cache poster
+encodes across screens; the server race is tracked in [IMAGE_CACHE_RACE.md](IMAGE_CACHE_RACE.md).
+Setting `SHAPE_VUS` above one is an explicit concurrency experiment, not the default.
+Iteration 601 wraps to slot 0. This is a warm-cache
 workload, identified as revision 4 in the raw data; it cannot be pooled with the old
 per-level-seed workload.
 
@@ -176,14 +181,25 @@ it is not all-endpoint coverage or a deep-parity score.
   idle fraction are recorded. Affinity does not reserve those CPUs. The existing
   "interference" row is the difference between observed busy time and container CPU
   time on the server CPUs; it does not establish what caused a slowdown.
-- Scheduled tasks are drained to idle plus a 30 s settle before every window (after
-  provisioning, after the cold-start restarts, before each load level, before TTFS), and
-  item counts are read after the first drain (startup tasks mutate libraries on boot).
-- Ferrofin runs as **core Ferrofin**: after its provisioning boot the run disables every
-  plugin `GET /Plugins` lists (the compiled-in extensions and the remote-provider plugins,
-  which the test data already disables per library) and refuses to proceed if a WASM
-  plugin is present; the persisted flags survive the cold-start restarts and are recorded
-  in `plugins.json`. Jellyfin runs stock.
+- Automatic scheduled-task triggers are cleared on each disposable server configuration,
+  including library scans and startup/maintenance triggers. Real-time library monitoring
+  is set off before boot; automatic metadata refresh and metadata/image fetchers must
+  already be off in every fixture library or the run fails. The runner restarts once
+  outside timing to apply plugin unloads and verify persisted settings. Initial provisioning
+  work can run before these settings take effect; it is outside measured phases.
+- Before each drain, the runner verifies that triggers remain empty, library monitoring/
+  fetchers remain off, and plugin states still satisfy the policy. Tasks drain to idle
+  plus a 30 s settle before measurements. Fixture creation and the explicit Jellyfin 12
+  preparation scan remain enabled outside benchmark runs.
+- Ferrofin runs as **core Ferrofin**, with every plugin/compiled-in extension disabled;
+  WASM files in the disposable config are rejected. Installed Jellyfin plugins are also
+  disabled. Jellyfin's non-uninstallable bundled providers (AudioDB, MusicBrainz, OMDb,
+  Studio Images, TMDb, and ListenBrainz Similarity Provider in 12.0.0) remain loaded and report `Active`: their disable endpoint fails
+  when it tries to write a manifest inside `MediaBrowser.Providers.dll`. Their library
+  fetchers are disabled instead; this is not a claim that those assemblies are unloaded.
+  `plugins-before.json`, `plugins.json`, `tasks-before.json`, `tasks.json` and `libraries.json`
+  record the policy evidence. `background_policy: 1` prevents aggregation with older runs
+  that left automatic schedules and stock Jellyfin plugin settings unchanged.
 - Every virtual user shares one device id, so all load collapses into one server session
   (a realism simplification). Playback runs during shape, warm-up and measured phases;
   it can change later home/resume/image selections. These changes are flagged, without
@@ -221,8 +237,9 @@ uses `PREPARE_TIMEOUT_S` (1800 by default). No global cleanup or host changes oc
 
 The sampler saves `cpu_usec` beside its interval utilization fields. Sample timestamps
 retain sub-millisecond precision so catch-up observations do not collide through rounding.
-Reports show actual
-observation boundaries, sample count and largest gap. CPU seconds use the two bracketing
+Reports compare CPU-seconds side by side for each server and repetition. A separate
+coverage table shows observed duration, UTC boundaries, sample count, largest gap and
+CPU evidence validity; missing historical counters remain unavailable. CPU seconds use the two bracketing
 raw counters; they are not reconstructed from rounded utilization for archived runs.
 Unbracketed windows, excessive gaps, counter resets or failed sampler exit flag resource
 results. These checks do not erase otherwise valid latency. No number represents memory

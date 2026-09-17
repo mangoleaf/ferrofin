@@ -22,7 +22,7 @@ STEADY_S=${STEADY_S:-60}        # idle after load; steady memory = median over t
 # Shared bounded picks; the discarded warm-up uses a separate seed.
 SLOTS=${SLOTS:-600}
 SEED=${SEED:-0}
-SHAPE_VUS=10
+SHAPE_VUS=${SHAPE_VUS:-1}  # serial validation avoids overlapping cold-cache poster encodes
 WARMUP_SEED=$((SEED + 900000))
 MEM_SAMPLE_MS=${MEM_SAMPLE_MS:-100}
 POLL_MS=${POLL_MS:-10}          # cold-start readiness poll
@@ -68,7 +68,7 @@ while [ $# -gt 0 ]; do case "$1" in
   *) echo "unknown $1" >&2; exit 2;;
 esac; done
 [[ "$SLOTS" =~ ^[1-9][0-9]*$ ]] && (( SLOTS % 10 == 0 )) || { echo "SLOTS must be a positive multiple of ten" >&2; exit 2; }
-for tunable in READY_TIMEOUT_S DRAIN_TIMEOUT_S HTTP_TIMEOUT_S STREAM_HTTP_TIMEOUT_S PHASE_TIMEOUT_S CLEANUP_TIMEOUT_S MEM_SAMPLE_MS SAMPLE_BRACKET_INTERVALS SAMPLE_GAP_INTERVALS RESTARTS TTFS_REPS; do
+for tunable in SHAPE_VUS READY_TIMEOUT_S DRAIN_TIMEOUT_S HTTP_TIMEOUT_S STREAM_HTTP_TIMEOUT_S PHASE_TIMEOUT_S CLEANUP_TIMEOUT_S MEM_SAMPLE_MS SAMPLE_BRACKET_INTERVALS SAMPLE_GAP_INTERVALS RESTARTS TTFS_REPS; do
   [[ "${!tunable}" =~ ^[1-9][0-9]*$ ]] || { echo "$tunable must be a positive integer" >&2; exit 2; }
 done
 # Reject bad selections before any fixture access or Docker command.
@@ -165,7 +165,7 @@ jq -n --arg sha "$SHA" --arg name "$(basename "$OUT")" --argjson dirty "$DIRTY" 
   --argjson window "$WINDOW_S" --argjson sample_ms "$MEM_SAMPLE_MS" \
   --arg ids_sha "$(sha256sum "$IDS" | cut -d' ' -f1)" --arg script_sha "$(sha256sum bench/screens.js | cut -d' ' -f1)" \
   --argjson pools "$(jq -c .pools "$IDS")" --argjson warmup_s "$WARMUP_S" --argjson settle_s "$SETTLE_S" --argjson steady_s "$STEADY_S" --arg client_cpus "$CLIENT_CPUS" --argjson slots "$SLOTS" --argjson seed "$SEED" --argjson warmup_seed "$WARMUP_SEED" --argjson shape_vus "$SHAPE_VUS" \
-  '{preflight_idle:$idle, core_idle_min:$idle_min, phase_schema:1, resource_schema:1, streaming_validation:1, topology:$topology, sample_bracket_intervals:$bracket, sample_gap_intervals:$gap, ready_timeout_s:$ready, drain_timeout_s:$drain, http_timeout_s:$http, stream_http_timeout_s:$stream_http, phase_timeout_s:$phase, cleanup_timeout_s:$cleanup, restarts:$restarts, ttfs_reps:$ttfs_reps, workload:4, warmup_s:$warmup_s, settle_s:$settle_s, steady_s:$steady_s, client_cpus:$client_cpus, ids_sha256:$ids_sha, screens_sha256:$script_sha, pools:$pools, slots:$slots, seed:$seed, warmup_seed:$warmup_seed, shape_vus:$shape_vus, sha:$sha, name:$name, dirty:$dirty, host:$host, cpu:$cpu, memory_limit:$mem, server_cpus:$cpus, k6:$k6, testdata_counts:($testdata|fromjson),
+  '{background_policy:1, preflight_idle:$idle, core_idle_min:$idle_min, phase_schema:1, resource_schema:1, streaming_validation:1, topology:$topology, sample_bracket_intervals:$bracket, sample_gap_intervals:$gap, ready_timeout_s:$ready, drain_timeout_s:$drain, http_timeout_s:$http, stream_http_timeout_s:$stream_http, phase_timeout_s:$phase, cleanup_timeout_s:$cleanup, restarts:$restarts, ttfs_reps:$ttfs_reps, workload:4, warmup_s:$warmup_s, settle_s:$settle_s, steady_s:$steady_s, client_cpus:$client_cpus, ids_sha256:$ids_sha, screens_sha256:$script_sha, pools:$pools, slots:$slots, seed:$seed, warmup_seed:$warmup_seed, shape_vus:$shape_vus, sha:$sha, name:$name, dirty:$dirty, host:$host, cpu:$cpu, memory_limit:$mem, server_cpus:$cpus, k6:$k6, testdata_counts:($testdata|fromjson),
     rate_unloaded:$rate_unloaded, rate_loaded:$rate_loaded, rate_stress:$rate_stress,
     window_s:$window, mem_sample_ms:$sample_ms, date: (now|todate)}' > "$OUT/run.json"
 
@@ -179,6 +179,7 @@ wait_ready() {
   FAIL_REASON="readiness timed out"; return 1
 }
 drain() {
+  verify_isolation || return 1
   local deadline=$((SECONDS + DRAIN_TIMEOUT_S)) busy
   while (( SECONDS < deadline )); do
     busy=$(api "/ScheduledTasks" | jq -er 'if type != "array" then error("invalid tasks") else [.[] | select(.State != "Idle") | .Name] | join(",") end') || { FAIL_REASON="cannot read scheduled tasks"; return 1; }
@@ -188,17 +189,38 @@ drain() {
   FAIL_REASON="scheduled tasks did not drain before deadline"; return 1
 }
 count() { api "$1" | jq -r 'if type=="array" then length else (.TotalRecordCount // (.Items|length)) end'; }
-disable_plugins() {  # core Ferrofin only: every compiled-in extension off, no WASM plugin loadable (owner rule)
+disable_plugins() {  # installed Jellyfin plugins / all Ferrofin plugins off; no WASM
   local wasm; wasm=$(find "$1" -name '*.wasm' 2>/dev/null | head -1)
   [ -z "$wasm" ] || die "$NAME: a WASM plugin is present in the config copy ($wasm) — the benchmark measures core Ferrofin only"
+  api "/Plugins" > "$D/plugins-before.json" || die "$NAME: cannot enumerate plugins"
+  jq -e 'type == "array"' "$D/plugins-before.json" >/dev/null || die "invalid plugins response"
   local id ver
   while read -r id ver; do
     curl -sf --max-time "$HTTP_TIMEOUT_S" -X POST -H "$AUTH" "$URL/Plugins/$id/$ver/Disable" >/dev/null || die "$NAME: could not disable plugin $id $ver"
-  done < <(api "/Plugins" | jq -r '.[] | "\(.Id) \(.Version)"')
+  done < <(jq -r --arg server "$NAME" '.[] | select($server == "ferrofin" or .CanUninstall != false) | "\(.Id) \(.Version)"' "$D/plugins-before.json")
   api "/Plugins" > "$D/plugins.json"
-  local on; on=$(jq -r '[.[] | select(.Status != "Disabled") | .Name] | join(", ")' "$D/plugins.json")
+  local on; on=$(jq -r --arg server "$NAME" '[.[] | select(.Status != "Disabled" and ($server == "ferrofin" or .CanUninstall != false)) | .Name] | join(", ")' "$D/plugins.json")
   [ -z "$on" ] || die "$NAME: plugins still enabled after disabling: $on"
-  echo "  plugins: $(jq -r 'map(.Name) | join(", ")' "$D/plugins.json") — all disabled"
+  echo "  plugins: $(jq -r 'map(.Name) | join(", ")' "$D/plugins.json") — plugin policy applied for $NAME"
+}
+# Persist empty schedules before the provisioning restart, including startup triggers.
+# This also suppresses automatic metadata/image/plugin maintenance during measurements.
+disable_schedules() {
+  api "/ScheduledTasks" > "$D/tasks-before.json" || return 1
+  jq -e 'type == "array" and length > 0' "$D/tasks-before.json" >/dev/null || return 1
+  local id
+  while read -r id; do
+    curl -sf --max-time "$HTTP_TIMEOUT_S" -X POST -H "$AUTH" -H 'Content-Type: application/json' \
+      --data '[]' "$URL/ScheduledTasks/$id/Triggers" >/dev/null || return 1
+  done < <(jq -r '.[].Id' "$D/tasks-before.json")
+}
+verify_isolation() {
+  api "/Plugins" > "$D/plugins.json" &&
+    jq -e --arg server "$NAME" 'type == "array" and all(.[]; .Status == "Disabled" or ($server != "ferrofin" and .CanUninstall == false))' "$D/plugins.json" >/dev/null || { FAIL_REASON="plugins not disabled"; return 1; }
+  api "/ScheduledTasks" > "$D/tasks.json" &&
+    jq -e 'type == "array" and length > 0 and all(.[]; .Triggers == [])' "$D/tasks.json" >/dev/null || { FAIL_REASON="automatic task triggers remain enabled"; return 1; }
+  api "/Library/VirtualFolders" > "$D/libraries.json" &&
+    jq -e 'type == "array" and length > 0 and all(.[]; .LibraryOptions | .EnableRealtimeMonitor == false and .AutomaticRefreshIntervalDays == 0 and (.TypeOptions | length > 0 and all(.[]; .MetadataFetchers == [] and .ImageFetchers == [])))' "$D/libraries.json" >/dev/null || { FAIL_REASON="library monitoring/automatic refresh/fetchers not disabled"; return 1; }
 }
 # A client gets its own process group, so interruption/timeout also stops descendants.
 client() {
@@ -220,7 +242,7 @@ client() {
 k6run() {
   local arg output="" validation
   for arg in "$@"; do case "$arg" in OUT=*) output=${arg#OUT=};; esac; done
-  client taskset -c "$CLIENT_CPUS" k6 run --quiet --log-format json -e SLOTS="$SLOTS" -e URL="$URL" -e IDS="$IDS" "$@" bench/screens.js || return $?
+  client taskset -c "$CLIENT_CPUS" k6 run --quiet --log-format json -e SLOTS="$SLOTS" -e SHAPE_VUS="$SHAPE_VUS" -e URL="$URL" -e IDS="$IDS" "$@" bench/screens.js || return $?
   validation=$(python3 bench/report.py --window-check "$output" 2>&1) || { FAIL_REASON="$validation"; echo "$validation" >&2; return 1; }
 }
 state() {
@@ -298,7 +320,7 @@ phase_counts() {
 phase_shape() {
   local validation
   client taskset -c "$CLIENT_CPUS" k6 run --quiet --log-format json --console-output "$D/shape.log" \
-    -e URL="$URL" -e IDS="$IDS" -e SHAPE=1 -e SEED="$SEED" -e SLOTS="$SLOTS" -e OUT="$D/shape-summary.json" bench/screens.js >/dev/null || return 1
+    -e URL="$URL" -e IDS="$IDS" -e SHAPE=1 -e SHAPE_VUS="$SHAPE_VUS" -e SEED="$SEED" -e SLOTS="$SLOTS" -e OUT="$D/shape-summary.json" bench/screens.js >/dev/null || return 1
   echo "  shape: $(jq -r '.iterations|tostring' "$D/shape-summary.json") slots; $(jq -r '.elapsed_ms/1000' "$D/shape-summary.json") seconds"
   validation=$(python3 bench/report.py --shape-coverage "$D" 2>&1) || { FAIL_REASON="$validation"; echo "$validation" >&2; return 1; }
   echo "$validation"
@@ -373,6 +395,21 @@ run_server() {
     cp "$TESTDATA/jellyfin12/preparation.json" "$D/preparation.json"
   fi
   cp -r --reflink=auto "$source" "$cfg"; mkdir -p "$cache"
+  # Change only the disposable copy, before either server starts its filesystem watcher.
+  python3 - "$cfg" <<'PY_ISOLATION'
+import pathlib, sys, xml.etree.ElementTree as ET
+files = list(pathlib.Path(sys.argv[1]).glob("root/default/*/options.xml"))
+if not files:
+    raise SystemExit("no library options found in benchmark config")
+for path in files:
+    tree = ET.parse(path)
+    root = tree.getroot()
+    node = root.find("EnableRealtimeMonitor")
+    if node is None:
+        node = ET.SubElement(root, "EnableRealtimeMonitor")
+    node.text = "false"
+    tree.write(path, encoding="utf-8", xml_declaration=True)
+PY_ISOLATION
   local env=(); [ "$1" = ferrofin ] && env=(-e FERROFIN_DATA_DIR=/config -e FERROFIN_CACHE_DIR=/cache)
   # the server log is the one diagnostic a failed phase needs: always captured, on any exit
   timeout --kill-after=2 "$READY_TIMEOUT_S" docker run -d --cidfile "$D/container.cid" --name "$CONTAINER" --user "$(id -u):$(id -g)" --cpuset-cpus "$SERVER_CPUS" \
@@ -384,7 +421,13 @@ run_server() {
   if [ "$1" = jellyfin12 ]; then
     [ "$(jq -r .Version "$D/system-info.json")" = 12.0.0 ] || die "expected Jellyfin 12.0.0"
   fi
-  [ "$1" = ferrofin ] && disable_plugins "$cfg"
+  disable_plugins "$cfg"
+  disable_schedules || die "$NAME: could not disable automatic tasks"
+  # Jellyfin unloads disabled plugin assemblies only on restart. Do this outside timing.
+  docker_cmd stop --time "$CLEANUP_TIMEOUT_S" "$CONTAINER" >/dev/null
+  docker_cmd start "$CONTAINER" >/dev/null
+  wait_ready || die "$NAME: isolation restart failed"
+  verify_isolation || die "$NAME: $FAIL_REASON"
   state startup completed; CURRENT_PHASE=""
   phase startup-drain drain || exit 1
   docker_cmd inspect -f '{{.Config.Image}} {{.Image}}' "$CONTAINER" > "$D/image.txt"
