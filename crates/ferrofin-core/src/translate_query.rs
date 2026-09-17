@@ -149,7 +149,13 @@ pub fn build_query<'a>(
     filter: &'a InternalItemsQuery,
     shape: QueryShape,
 ) -> QueryBuilder<'a, Sqlite> {
+    let page_movie_keys = shape == QueryShape::FullRows && pages_movie_keys(filter);
     let projection = match shape {
+        QueryShape::FullRows if page_movie_keys => {
+            r#"WITH movie_page AS MATERIALIZED (
+                SELECT bi."Id", bi."SortName", bi."Name", bi."ProductionYear"
+                FROM "BaseItems" AS bi WHERE "#
+        }
         QueryShape::FullRows => r#"SELECT bi.* FROM "BaseItems" AS bi WHERE "#,
         QueryShape::IdsOnly => r#"SELECT bi."Id" FROM "BaseItems" AS bi WHERE "#,
         QueryShape::IdAndCleanName => {
@@ -187,7 +193,42 @@ pub fn build_query<'a>(
         }
     }
 
+    if page_movie_keys {
+        // Keep the page as the outer loop: at most LIMIT full rows are read.
+        // The final sort sees only the page, and preserves its input order for
+        // ties, just as the original full-row sort did. No extra ID tiebreaker.
+        qb.push(
+            r#") SELECT bi.* FROM movie_page
+                CROSS JOIN "BaseItems" AS bi ON bi."Id" = movie_page."Id"
+                ORDER BY movie_page."SortName" ASC, movie_page."Name" ASC"#,
+        );
+        if filter.order_by.len() == 2 {
+            qb.push(r#", movie_page."ProductionYear" ASC"#);
+        }
+    }
+
     qb
+}
+
+/// A grouped movie grid currently sorts full rows (including metadata blobs)
+/// before discarding OFFSET rows. Sort only keys, then hydrate the final page.
+/// Keep other orderings on their existing plans: search, random and user-data
+/// sorts need other expressions, and ungrouped index walks have different tie
+/// behavior. The shared builder still applies every predicate BEFORE grouping.
+fn pages_movie_keys(filter: &InternalItemsQuery) -> bool {
+    filter.limit.is_some_and(|limit| limit > 0)
+        && filter.include_item_types == [BaseItemKind::Movie]
+        && group_by_presentation_unique_key(filter)
+        && non_blank(filter.search_term.as_ref()).is_none()
+        && filter.virtual_child_parent_id.is_none()
+        && matches!(
+            filter.order_by.as_slice(),
+            [(ItemSortBy::SortName, SortOrder::Ascending)]
+                | [
+                    (ItemSortBy::SortName, SortOrder::Ascending),
+                    (ItemSortBy::ProductionYear, SortOrder::Ascending)
+                ]
+        )
 }
 
 /// Opens the grouped-representative subquery: everything up to (but not

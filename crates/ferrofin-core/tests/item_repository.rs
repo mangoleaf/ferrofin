@@ -133,6 +133,281 @@ async fn plan(db: &Database, sql: &str) -> String {
         .join(" | ")
 }
 
+/// Execute the old full-row projection using the unchanged ID-query builder.
+/// This keeps the oracle's predicates, grouping, ordering and binds identical.
+async fn movie_page_before_hydration_change(
+    db: &Database,
+    filter: &InternalItemsQuery,
+) -> Vec<BaseItemEntity> {
+    use ferrofin_core::translate_query::{QueryShape, build_query};
+    use sqlx::Execute as _;
+
+    let mut builder = build_query(filter, QueryShape::IdsOnly);
+    let mut query = builder.build();
+    let sql = query
+        .sql()
+        .replacen(r#"SELECT bi."Id" FROM"#, "SELECT bi.* FROM", 1);
+    let args = query.take_arguments().expect("arguments").expect("binds");
+    sqlx::query_as_with(&sql, args)
+        .fetch_all(db.pool())
+        .await
+        .expect("original movie page")
+}
+
+async fn movie_page_fixture() -> (Database, InternalItemsQuery) {
+    let db = fresh_db().await;
+    let persist = FerrofinItemPersistenceService::new(db.clone());
+    let user = seed_user_who_sees_everything(&db, Uuid::from_u128(0xB00)).await;
+    let library = Uuid::from_u128(0xB01);
+    let other_library = Uuid::from_u128(0xB02);
+    let mut rows = vec![
+        item(library, BaseItemKind::CollectionFolder, "Movies"),
+        item(other_library, BaseItemKind::CollectionFolder, "Other"),
+    ];
+    // Insert in reverse ID order. Equal names, years and NULL sort keys must
+    // keep the original sort's tie order, even at a page boundary.
+    for n in (1_u128..=24).rev() {
+        let mut row = item(Uuid::from_u128(0xC00 + n), BaseItemKind::Movie, "Same");
+        row.sort_name = (n > 4).then(|| "same".to_owned());
+        row.production_year = (n % 3 != 0).then_some(if n % 2 == 0 { 2000 } else { 2001 });
+        if n % 5 == 0 {
+            row.name = Some("Another name with the same sort key".to_owned());
+        }
+        row.presentation_unique_key = Some(format!("movie-{n}"));
+        row.top_parent_id = Some(library.to_string().to_uppercase());
+        row.overview = Some(format!("Full payload for {n}: {}", "x".repeat(4096)));
+        if n == 24 {
+            row.top_parent_id = Some(other_library.to_string().to_uppercase());
+        }
+        rows.push(row);
+    }
+    // A primary and alternate share a key. The default browse hides the
+    // alternate behind its same-library primary. With owned items explicitly
+    // included, a year filter can leave only the alternate eligible, exercising
+    // filtering before representative selection.
+    let mut alternate = rows.last().expect("movie 1").clone();
+    alternate.id = Uuid::from_u128(0xD00).to_string();
+    alternate.primary_version_id = Some(Uuid::from_u128(0xC01).to_string().to_uppercase());
+    alternate.production_year = Some(1999);
+    rows.push(alternate);
+    for row in &mut rows {
+        row.id = row.id.to_uppercase();
+    }
+    persist.save_items(&rows).await.expect("save");
+    // The writer fills missing sort names; reproduce nullable adopted rows
+    // explicitly so the regression exercises SQL's NULL ordering too.
+    sqlx::query(r#"UPDATE "BaseItems" SET "SortName" = NULL WHERE "Id" <= ? AND "Type" = ?"#)
+        .bind(Uuid::from_u128(0xC04).to_string().to_uppercase())
+        .bind(type_name(BaseItemKind::Movie))
+        .execute(db.writer())
+        .await
+        .expect("nullable sort keys");
+
+    let base = InternalItemsQuery {
+        user: Some(user),
+        recursive: true,
+        top_parent_ids: vec![library],
+        include_item_types: vec![BaseItemKind::Movie],
+        order_by: vec![
+            (ItemSortBy::SortName, SortOrder::Ascending),
+            (ItemSortBy::ProductionYear, SortOrder::Ascending),
+        ],
+        enable_total_record_count: true,
+        ..Default::default()
+    };
+    (db, base)
+}
+
+#[tokio::test]
+async fn movie_page_hydration_preserves_versions_filters_ties_and_totals() {
+    let (db, base) = movie_page_fixture().await;
+    let repository = repo(&db);
+    for (years, include_owned_items) in [
+        (vec![], false),
+        (vec![], true),
+        (vec![1999], false),
+        (vec![1999], true),
+        (vec![2000], false),
+        (vec![2099], false),
+    ] {
+        let unpaged = InternalItemsQuery {
+            years,
+            include_owned_items,
+            ..base.clone()
+        };
+        let all = movie_page_before_hydration_change(&db, &unpaged).await;
+        if unpaged.years.is_empty() {
+            assert_eq!(
+                all.len(),
+                23,
+                "collapse alternate and exclude other library"
+            );
+            assert!(!all.iter().any(|row| row.primary_version_id.is_some()));
+        } else if unpaged.years == [1999] {
+            // Filtering out the primary by year does not make its alternate
+            // visible under the 12.1 rule: the primary still exists in this
+            // library. Explicit inclusion bypasses that visibility predicate.
+            assert_eq!(all.len(), usize::from(include_owned_items));
+            if include_owned_items {
+                assert_eq!(all[0].id, Uuid::from_u128(0xD00).to_string().to_uppercase());
+                assert!(all[0].primary_version_id.is_some());
+            }
+        }
+        for limit in [0, 1, 5, 100, -1] {
+            for offset in [0, 1, 5, 20, 23, 99] {
+                let filter = InternalItemsQuery {
+                    limit: Some(limit),
+                    start_index: Some(offset),
+                    ..unpaged.clone()
+                };
+                let expected = movie_page_before_hydration_change(&db, &filter).await;
+                let actual = repository.get_items(&filter).await.expect("page");
+                assert_eq!(actual.items, expected, "limit={limit}, offset={offset}");
+                assert_eq!(
+                    actual.total_record_count,
+                    i32::try_from(all.len()).expect("count")
+                );
+                assert_eq!(actual.start_index, offset);
+            }
+        }
+    }
+    let by_name = InternalItemsQuery {
+        order_by: vec![(ItemSortBy::SortName, SortOrder::Ascending)],
+        limit: Some(5),
+        start_index: Some(3),
+        ..base
+    };
+    assert_eq!(
+        repository
+            .get_items(&by_name)
+            .await
+            .expect("name page")
+            .items,
+        movie_page_before_hydration_change(&db, &by_name).await,
+    );
+}
+
+#[tokio::test]
+async fn movie_page_hydration_plan_materializes_keys_before_primary_key_fetches() {
+    use ferrofin_core::translate_query::{QueryShape, build_query};
+    use sqlx::{Execute as _, Row as _};
+
+    let db = fresh_db().await;
+    let user = seed_user_who_sees_everything(&db, Uuid::from_u128(0xB00)).await;
+    let filter = InternalItemsQuery {
+        user: Some(user),
+        include_item_types: vec![BaseItemKind::Movie],
+        limit: Some(100),
+        start_index: Some(1500),
+        order_by: vec![
+            (ItemSortBy::SortName, SortOrder::Ascending),
+            (ItemSortBy::ProductionYear, SortOrder::Ascending),
+        ],
+        ..Default::default()
+    };
+    let mut builder = build_query(&filter, QueryShape::FullRows);
+    let mut query = builder.build();
+    let sql = format!("EXPLAIN QUERY PLAN {}", query.sql());
+    let args = query.take_arguments().expect("arguments").expect("binds");
+    let plan = sqlx::query_with(&sql, args)
+        .fetch_all(db.pool())
+        .await
+        .expect("explain")
+        .iter()
+        .map(|row| row.get::<String, _>("detail"))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    assert!(plan.contains("MATERIALIZE movie_page"), "{plan}");
+    let hydration = plan
+        .split("SCAN movie_page")
+        .nth(1)
+        .expect("page drives hydration");
+    assert!(
+        hydration.contains("SEARCH bi USING INDEX sqlite_autoindex_BaseItems_1 (Id=?)"),
+        "{plan}"
+    );
+    assert!(
+        !hydration.contains("SCAN bi"),
+        "must not scan full library: {plan}"
+    );
+}
+
+#[tokio::test]
+async fn movie_page_hydration_leaves_other_query_plans_unchanged() {
+    use ferrofin_core::translate_query::{QueryShape, build_query};
+
+    let db = fresh_db().await;
+    let user = seed_user_who_sees_everything(&db, Uuid::from_u128(0xB00)).await;
+    let filter = InternalItemsQuery {
+        user: Some(user),
+        include_item_types: vec![BaseItemKind::Movie],
+        limit: Some(100),
+        order_by: vec![(ItemSortBy::SortName, SortOrder::Ascending)],
+        ..Default::default()
+    };
+    for other in vec![
+        InternalItemsQuery {
+            search_term: Some("Movie".to_owned()),
+            ..filter.clone()
+        },
+        InternalItemsQuery {
+            include_item_types: vec![BaseItemKind::Series],
+            ..filter.clone()
+        },
+        InternalItemsQuery {
+            user: None,
+            ..filter.clone()
+        },
+        InternalItemsQuery {
+            group_by_presentation_unique_key: false,
+            ..filter.clone()
+        },
+        InternalItemsQuery {
+            limit: None,
+            ..filter.clone()
+        },
+        InternalItemsQuery {
+            limit: Some(0),
+            ..filter.clone()
+        },
+        InternalItemsQuery {
+            limit: Some(-1),
+            ..filter.clone()
+        },
+        InternalItemsQuery {
+            order_by: vec![(ItemSortBy::SortName, SortOrder::Descending)],
+            ..filter.clone()
+        },
+        InternalItemsQuery {
+            order_by: vec![(ItemSortBy::Random, SortOrder::Ascending)],
+            ..filter.clone()
+        },
+        InternalItemsQuery {
+            order_by: vec![(ItemSortBy::PlayCount, SortOrder::Descending)],
+            ..filter.clone()
+        },
+        InternalItemsQuery {
+            virtual_child_parent_id: Some(Uuid::from_u128(1)),
+            ..filter.clone()
+        },
+    ] {
+        assert!(
+            !build_query(&other, QueryShape::FullRows)
+                .sql()
+                .contains("movie_page")
+        );
+    }
+    for shape in [
+        QueryShape::IdsOnly,
+        QueryShape::IdAndCleanName,
+        QueryShape::Count,
+        QueryShape::GroupedCount,
+        QueryShape::TypeCounts,
+    ] {
+        assert!(!build_query(&filter, shape).sql().contains("movie_page"));
+    }
+}
+
 #[tokio::test]
 async fn save_then_retrieve_roundtrips() {
     let db = fresh_db().await;
