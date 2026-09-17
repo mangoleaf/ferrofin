@@ -409,11 +409,13 @@ impl FerrofinPeopleRepository {
     ///
     /// A row carrying a non-empty `ForcedSortName` keeps its `SortName`
     /// untouched. That column is the USER'S sort-title override, and C# derives
-    /// `SortName` from it instead of `CreateSortName`
-    /// (`BaseItem.cs:544` on master, `:536` on v10.11.8: `ModifySortChunks(ForcedSortName)
-    /// .ToLowerInvariant()`), so rewriting it to the verbatim name would both
-    /// destroy the override and — because the pass would never converge on it —
-    /// re-fire on every boot. Migration `0012_hermit_episode_sort_names.sql`
+    /// `SortName` from it instead of `CreateSortName` (12.0 `BaseItem.cs:549`:
+    /// `GetSortName(ForcedSortName, EnableAlphaNumericSorting, config)`, which
+    /// for a `Person` is `ForcedSortName.TrimStart()`), so rewriting it to the
+    /// verbatim name would both destroy the override and — because the pass
+    /// would never converge on it — re-fire on every boot. Moving a forced key
+    /// itself between generations is
+    /// `FerrofinItemPersistenceService::repair_forced_sort_names`'s job. Migration `0012_hermit_episode_sort_names.sql`
     /// guards the same way (`coalesce("ForcedSortName", '') = ''`), as does
     /// `upsert_item`; this pass is the third path over the same rule and must
     /// not be the one that disagrees. Its `Path`/`PresentationUniqueKey` halves
@@ -1548,10 +1550,9 @@ mod tests {
 
     /// …and it must NOT touch a row whose `SortName` came from the user's
     /// `ForcedSortName`. That column is the sort-title override, and C# derives
-    /// `SortName` from it instead of `CreateSortName`
-    /// (`BaseItem.cs:544` on master, `:536` on v10.11.8), so a Jellyfin
-    /// database legitimately holds a `SortName` that is neither the verbatim
-    /// name nor anything this pass can compute. Rewriting it would destroy the
+    /// `SortName` from it instead of `CreateSortName` (12.0 `BaseItem.cs:549`),
+    /// so a Jellyfin database legitimately holds a `SortName` that is neither
+    /// the verbatim name nor anything this pass can compute. Rewriting it would destroy the
     /// override AND make the pass re-fire on every boot, since the row could
     /// never converge. Migration `0012` and `upsert_item` guard the same way.
     #[tokio::test]
@@ -1567,11 +1568,12 @@ mod tests {
         };
         let id = person_item_id(&mode, &people_path, "Alice Parity").expect("derived");
         seed_named_item(&db, id, BaseItemKind::Person, "Alice Parity").await;
-        // The shape an adopted Jellyfin database has: an override, and the
-        // SortName Jellyfin derived from it — neither equal to the name.
+        // The shape an adopted Jellyfin 12.0 database has: an override, and
+        // the SortName Jellyfin derived from it (`TrimStart()` for a Person) —
+        // neither equal to the name.
         sqlx::query(
             r#"UPDATE "BaseItems" SET "ForcedSortName" = 'Parity, Alice',
-                 "SortName" = 'parity, alice',
+                 "SortName" = 'Parity, Alice',
                  "Path" = NULL, "PresentationUniqueKey" = NULL WHERE "Id" = ?1"#,
         )
         .bind(guid_to_db(id))
@@ -1594,7 +1596,7 @@ mod tests {
         .expect("person row");
         assert_eq!(
             sort.as_deref(),
-            Some("parity, alice"),
+            Some("Parity, Alice"),
             "the user's sort-title override must survive the repair"
         );
         assert!(

@@ -34,7 +34,8 @@ the server is Rust. Point Ferrofin at an existing Jellyfin database and it adopt
   runtime, no JIT warm-up. The Docker image bundles both jellyfin-ffmpeg and the jellyfin-web
   client, so `docker run` gives you the whole server, web UI included.
 - **Drop-in compatible.** Same API contract, same on-disk database format (pinned to
-  Jellyfin 10.11.8), same password hashes. Adopt an existing library with no re-scan.
+  Jellyfin 12.0), same password hashes. Adopt an existing Jellyfin 10.11.8–10.11.11,
+  12.0.0 or 12.1.0 library with no re-scan; see [supported and tested versions](adoption/README.md#supported-and-tested-versions).
 - **Plugins cannot own your server.** Jellyfin loads plugins as full-trust .NET code inside
   the server process. Ferrofin does not, and will not. Third-party plugins run as
   sandboxed WASM with no filesystem or network access of their own. This is the one place
@@ -148,8 +149,8 @@ Configuration is via CLI flags, `FERROFIN_*` environment variables, or
 ## Migrating from Jellyfin
 
 Ferrofin reads Jellyfin's database directly. Point it at a data directory containing a
-Jellyfin 10.11.8–10.11.11 `jellyfin.db` and on first boot it detects the database, validates
-its migration set (and refuses loudly rather than half-adopting an unexpected version), and
+Jellyfin **10.11.8, 10.11.9, 10.11.10, 10.11.11, 12.0.0 or 12.1.0** `jellyfin.db` and on first boot it detects the database,
+validates its migration set (and refuses loudly rather than half-adopting an unexpected version), and
 adopts it in place: **no re-scan, no re-import**. Users, watch state, playlists, and Live TV
 configuration carry forward. Ferrofin retains the `Users.NormalizedUsername` column and
 unique index from Jellyfin 10.11.10/10.11.11 and adds them to older databases. Login,
@@ -157,6 +158,13 @@ creation, and renaming use Unicode-aware invariant uppercase keys compatible wit
 Jellyfin, while the original spelling remains visible. If existing usernames collide
 under these rules, startup stops with the conflicting account IDs and names; resolve
 the names in the original server before retrying. Accounts are never merged.
+
+All six supported releases passed the live adoption suite on 2026-09-16: seven fixture
+paths, including both 10.11.8 → 12.1.0 and 10.11.8 → 12.0.0 → 12.1.0. Checks cover API
+summaries against Jellyfin 12.1, database integrity, and stable responses without repeated
+repairs after restart. See the [support matrix and tested build](adoption/README.md#supported-and-tested-versions).
+Support is determined by the exact migration history; these version numbers do not imply
+support for every 10.11.x or 12.x release.
 
 > ### ⚠ Migration is one-way. Back up first.
 >

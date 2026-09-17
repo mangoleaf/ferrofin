@@ -16,6 +16,9 @@ fn is_exempt(rel: &str) -> bool {
         || rel.ends_with("_repository.rs")
         || rel.ends_with("/translate_query.rs")
         || rel.ends_with("/item_persistence_service.rs")
+        // The one-shot ports of Jellyfin 12.0's data routines: raw SQL is the
+        // module's job, like the persistence service it sits beside.
+        || rel.ends_with("/adoption_repairs.rs")
         || rel.ends_with("/item_count_service.rs")
         || rel.ends_with("/user_data_manager.rs")
         // The BaseItems.Data source-of-truth sync — persistence is its job.
@@ -28,7 +31,7 @@ const CEILINGS: &[(&str, usize)] = &[
     ("crates/ferrofin-core/src/activity_manager.rs", 5),
     ("crates/ferrofin-core/src/api_key_manager.rs", 3),
     ("crates/ferrofin-core/src/authorization_context.rs", 6),
-    ("crates/ferrofin-core/src/collection_manager.rs", 14),
+    ("crates/ferrofin-core/src/collection_manager.rs", 13),
     ("crates/ferrofin-core/src/device_manager.rs", 10),
     (
         "crates/ferrofin-core/src/display_preferences_manager.rs",
@@ -37,7 +40,7 @@ const CEILINGS: &[(&str, usize)] = &[
     ("crates/ferrofin-core/src/dto_service.rs", 12),
     ("crates/ferrofin-core/src/library_manager.rs", 8),
     ("crates/ferrofin-core/src/library_scan.rs", 24),
-    ("crates/ferrofin-core/src/linked_children_service.rs", 8),
+    ("crates/ferrofin-core/src/linked_children_service.rs", 9),
     ("crates/ferrofin-core/src/lyric_manager.rs", 1),
     ("crates/ferrofin-core/src/media_segment_manager.rs", 7),
     ("crates/ferrofin-core/src/media_source_manager.rs", 1),

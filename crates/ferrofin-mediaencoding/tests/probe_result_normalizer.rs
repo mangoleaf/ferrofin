@@ -133,6 +133,7 @@ fn get_media_info_metadata_success() {
     assert!(!vs.is_external);
     assert!(!vs.is_forced);
     assert!(!vs.is_hearing_impaired);
+    assert!(!vs.is_original);
     assert!(!vs.is_interlaced);
     assert_eq!(vs.level, Some(13.0));
     assert_eq!(vs.nal_length_size.as_deref(), Some("4"));
@@ -154,6 +155,8 @@ fn get_media_info_metadata_success() {
 
     let audio1 = &res.media_source.media_streams[1];
     assert_eq!(audio1.codec.as_deref(), Some("eac3"));
+    // ffprobe `disposition.original = 1` (C# `IsOriginal`, 12.0).
+    assert!(audio1.is_original);
     assert_eq!(
         audio1.audio_spatial_format(),
         AudioSpatialFormat::DolbyAtmos
@@ -161,6 +164,7 @@ fn get_media_info_metadata_success() {
 
     let audio2 = &res.media_source.media_streams[2];
     assert_eq!(audio2.codec.as_deref(), Some("dts"));
+    assert!(!audio2.is_original);
     assert_eq!(audio2.audio_spatial_format(), AudioSpatialFormat::Dtsx);
 
     assert!(res.chapters.is_empty());

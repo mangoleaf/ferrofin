@@ -8,6 +8,41 @@ The format follows [Keep a Changelog](https://keepachangelog.com) and
 Upgrades needing a manual step or with a non-obvious behavior change are
 called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 
+## [Unreleased]
+
+### Database
+- Converge the schema on Jellyfin 12.0 (migrations 0032–0034): table rebuilds with a
+  pre-rebuild snapshot, 12.0's index set (Ferrofin's 14 duplicate `BaseItems` indexes are
+  not recreated), `LinkedChildren` as the only membership store
+- Pin id-list queries to the primary key: 12.0 drops
+  `IX_BaseItems_Id_Type_IsFolder_IsVirtualItem`, and without the `+"Type"` pin the
+  planner scanned every row of the type (`detail:similar` 4.9 → 7.8 ms p50)
+- Adopt Jellyfin 12.0 and 12.1 databases in place alongside 10.11.8–10.11.11 (exact migration
+  sets per generation, 12.1's re-dated rating routine optional; `0030` is baselined where the
+  database already owns `NormalizedUsername`; an atomic adoption record drives the one-shot
+  membership import)
+- Run `PRAGMA foreign_key_check` on every boot, not only after a migration
+
+### Tooling
+- `adoption/`: an adoption smoke harness that runs every supported Jellyfin generation
+  (10.11.8, 10.11.9, 10.11.10, 10.11.11, 12.0.0, 12.1.0) through an image on fresh fixture copies and diffs the
+  answers against Jellyfin 12.1's own; fixtures are derived from one supplied 10.11.8 snapshot
+- All seven live fixture paths passed on 2026-09-16, including both 12.1 upgrade routes;
+  see the [support matrix and tested build](adoption/README.md#supported-and-tested-versions).
+  The harness now reports SQLite query failures and detects version promotions when the
+  repaired count is zero, with five regression tests; all 36 shell tests passed.
+
+### Parity
+- Port Jellyfin 12.0's data routines: linked-children move, orphaned extras, OwnerId
+  relationships, version links, `GetCleanValue`, forced sort names, localized user-view
+  consolidation
+- Port Jellyfin 12.1's routines and rules: `RepairAlternateVersionLinks` (primaries re-derived
+  from `LinkedChildren`), `StripEmbeddedLinkedChildren`, the re-dated rating-level pass with
+  12.1's `GetRatingScore` (whole value first, unrated parts skipped, case-insensitive tables),
+  the user-view consolidation's reference moves, `HasVisibleChild` (a playlists or boxsets
+  library with nothing the user can see has no view), and `ApplyAlternateVersionFiltering` (a
+  version is hidden only behind a primary that exists in the same library)
+
 ## [1.0.0] - 2026-09-05
 
 ### CI/CD
@@ -1630,5 +1665,4 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 ### Style
 - Rustfmt the person_ids filmography test
 - Rustfmt the extensions registered_plugins builder
-
 

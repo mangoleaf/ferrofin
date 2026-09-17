@@ -75,6 +75,7 @@ fn user() -> UserEntity {
         subtitle_mode: 0,
         sync_play_access: 0,
         username: "alice".to_owned(),
+        normalized_username: "ALICE".to_owned(),
     }
 }
 

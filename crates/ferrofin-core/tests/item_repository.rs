@@ -74,8 +74,8 @@ fn item(id: Uuid, kind: BaseItemKind, name: &str) -> BaseItemEntity {
         name: Some(name.to_owned()),
         normalization_gain: None,
         official_rating: None,
-        extra_ids: None,
         original_title: None,
+        original_language: None,
         overview: None,
         owner_id: None,
         parent_id: None,
@@ -590,8 +590,8 @@ async fn linked_child_ancestor_filter_finds_collections_of_a_library() {
         .await
         .expect("ancestor");
     sqlx::query(
-        r#"INSERT INTO "FerrofinLinkedChildren" ("ParentId", "ChildId", "ChildType")
-           VALUES (?1, ?2, 0)"#,
+        r#"INSERT INTO "LinkedChildren" ("ParentId", "SortOrder", "ChildId", "ChildType")
+                   VALUES (?1, (SELECT COALESCE(MAX("SortOrder"), -1) + 1 FROM "LinkedChildren" WHERE "ParentId" = ?1), ?2, 0)"#,
     )
     .bind(in_lib_set.to_string().to_uppercase())
     .bind(movie.to_string().to_uppercase())
@@ -971,6 +971,96 @@ async fn sort_name_browse_uses_the_index_and_the_pinned_shapes_do_not() {
             "the pinned ordering must keep its sort, got: {pinned}\n  for: {sql}"
         );
     }
+}
+
+/// Since the 12.0 schema (migration 0032) no index leads with `Id` and `Type`
+/// together, and a lone `Type` equality ties with the `Id` primary key in the
+/// planner's costing — and wins, turning an id-list lookup into a scan of every
+/// row of that type. Each id-list query therefore writes the type column as
+/// `+"Type"`; this pins the plans so a dropped `+` shows up here rather than as
+/// a +60 % p50 on `detail:similar` in the benchmark.
+#[tokio::test]
+async fn id_list_queries_are_driven_by_the_primary_key_not_the_type_index() {
+    const PK: &str = "sqlite_autoindex_BaseItems_1 (Id=?)";
+
+    let db = fresh_db().await;
+    let persist = FerrofinItemPersistenceService::new(db.clone());
+    persist
+        .save_items(&[item(Uuid::from_u128(0x71), BaseItemKind::Movie, "Stalker")])
+        .await
+        .expect("save");
+
+    // The unpinned shape is the trap: the same statement takes a Type index.
+    let trap = plan(
+        &db,
+        r#"SELECT "Id", "Data" FROM "BaseItems" WHERE "Data" IS NOT NULL AND "Type" = ? AND "Id" IN (?, ?, ?)"#,
+    )
+    .await;
+    assert!(
+        trap.contains("(Type=?)") && !trap.contains(PK),
+        "the pin exists because the planner prefers the Type index here, got: {trap}"
+    );
+
+    for sql in [
+        // item_repository::physical_folders_by_view
+        r#"SELECT "Id", "Data" FROM "BaseItems" WHERE "Data" IS NOT NULL AND +"Type" = ? AND "Id" IN (?, ?, ?)"#,
+        // item_repository::item_text_rows
+        r#"SELECT "Id", "Name" FROM "BaseItems" WHERE "Id" IN (?, ?, ?) AND +"Type" = ?4"#,
+        // translate_query::append_type_filters with an `Ids` list
+        r#"SELECT bi.* FROM "BaseItems" AS bi WHERE bi."Id" IN (?, ?, ?) AND +bi."Type" IN (?) AND bi."PrimaryVersionId" IS NULL ORDER BY bi."SortName""#,
+        // similar_items_repository: the scored candidate set joins through the key
+        r#"SELECT bi.* FROM (SELECT ivm2."ItemId" AS id, COUNT(*) AS score FROM "ItemValuesMap" ivm0 JOIN "ItemValuesMap" ivm2 ON ivm2."ItemValueId" = ivm0."ItemValueId" WHERE ivm0."ItemId" = ?1 GROUP BY ivm2."ItemId") s JOIN "BaseItems" bi ON bi."Id" = s.id WHERE +bi."Type" IN (?2, ?3) AND bi."Id" NOT IN (?4) ORDER BY s.score DESC, bi."SortName" ASC, bi."Id" ASC LIMIT ?5"#,
+    ] {
+        let pinned = plan(&db, sql).await;
+        assert!(
+            pinned.contains(PK) && !pinned.contains("AUTOMATIC") && !pinned.contains("(Type=?)"),
+            "an id-list query must be driven by the primary key, got: {pinned}\n  for: {sql}"
+        );
+    }
+}
+
+/// 12.1 `ApplyAlternateVersionFiltering`: a version is hidden only while its
+/// primary exists in the same library. A version whose primary row is gone,
+/// or lives in another library, is an item of its own again (12.0 hid every
+/// row with a `PrimaryVersionId`; on the owner's library that was 144
+/// episodes that Jellyfin 12.1 lists and 12.0 did not).
+#[tokio::test]
+async fn a_version_is_hidden_only_behind_a_primary_in_the_same_library() {
+    let db = fresh_db().await;
+    let persist = FerrofinItemPersistenceService::new(db.clone());
+    let (lib_a, lib_b) = (Uuid::from_u128(0xA), Uuid::from_u128(0xB));
+    let mut primary = item(Uuid::from_u128(0x81), BaseItemKind::Movie, "Primary");
+    primary.top_parent_id = Some(lib_a.to_string());
+    let mut same_library = item(Uuid::from_u128(0x82), BaseItemKind::Movie, "Hidden version");
+    same_library.top_parent_id = Some(lib_a.to_string());
+    same_library.primary_version_id = Some(primary.id.clone());
+    let mut other_library = item(Uuid::from_u128(0x83), BaseItemKind::Movie, "Moved version");
+    other_library.top_parent_id = Some(lib_b.to_string());
+    other_library.primary_version_id = Some(primary.id.clone());
+    let mut orphan = item(Uuid::from_u128(0x84), BaseItemKind::Movie, "Orphan version");
+    orphan.top_parent_id = Some(lib_a.to_string());
+    orphan.primary_version_id = Some(Uuid::from_u128(0x99).to_string());
+    persist
+        .save_items(&[primary, same_library, other_library, orphan])
+        .await
+        .expect("save");
+
+    let mut names: Vec<String> = repo(&db)
+        .get_item_list(&InternalItemsQuery {
+            include_item_types: vec![BaseItemKind::Movie],
+            ..InternalItemsQuery::default()
+        })
+        .await
+        .expect("query")
+        .into_iter()
+        .filter_map(|row| row.name)
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec!["Moved version", "Orphan version", "Primary"],
+        "only the version behind a same-library primary is hidden"
+    );
 }
 
 /// A collection created the way a user creates one stays visible to that user.

@@ -712,7 +712,7 @@ impl FerrofinSessionManager {
     /// Replaces a box set / playlist with the items it links to, in order,
     /// repeating for a nested one.
     ///
-    /// Their membership is manual `FerrofinLinkedChildren` edges, **not** the
+    /// Their membership is manual `LinkedChildren` edges, **not** the
     /// physical `AncestorIds` closure the recursive child query walks — so the
     /// folder expansion below cannot see it and a box set would resolve to an
     /// empty queue. Anything else passes straight through.
@@ -802,7 +802,7 @@ impl FerrofinSessionManager {
         Ok(frontier)
     }
 
-    /// Whether this item's members are manual `FerrofinLinkedChildren` edges
+    /// Whether this item's members are manual `LinkedChildren` edges
     /// rather than the physical `AncestorIds` closure.
     fn is_linked_container(item: &BaseItemEntity) -> bool {
         matches!(

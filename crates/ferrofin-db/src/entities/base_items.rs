@@ -4,7 +4,7 @@
 //! Covered tables: `BaseItems`, `BaseItemImageInfos`, `BaseItemMetadataFields`,
 //! `BaseItemProviders`, `BaseItemTrailerTypes`, `Chapters`, `AncestorIds`,
 //! `ItemValues`, `ItemValuesMap`, `Peoples`, `PeopleBaseItemMap`,
-//! `FerrofinLinkedChildren`, `AttachmentStreamInfos`, `MediaStreamInfos`, and
+//! `LinkedChildren`, `AttachmentStreamInfos`, `MediaStreamInfos`, and
 //! `KeyframeData`.
 //!
 //! Each struct mirrors one table one-to-one: field names and order match the
@@ -119,12 +119,11 @@ pub struct BaseItemEntity {
     pub normalization_gain: Option<f64>,
     /// The official rating (`OfficialRating`), if any.
     pub official_rating: Option<String>,
-    /// Pipe-delimited lowercase hyphenated GUIDs of this item's extras
-    /// (`ExtraIds`) — 10.11.8's extras linkage (C# `string.Join('|', …)` over
-    /// `Guid.ToString()`), kept in sync with `OwnerId` on the extras.
-    pub extra_ids: Option<String>,
     /// The original title (`OriginalTitle`), if any.
     pub original_title: Option<String>,
+    /// The title's original language (`OriginalLanguage`, Jellyfin 12.0), if
+    /// known — the ISO 639-1 code TMDB reports (`original_language`).
+    pub original_language: Option<String>,
     /// The overview text (`Overview`), if any.
     pub overview: Option<String>,
     /// The owning item's `Guid`, hyphenated (`OwnerId`, self-ref FK →
@@ -488,6 +487,9 @@ pub struct MediaStreamInfoEntity {
     pub is_hearing_impaired: Option<bool>,
     /// Whether the video is interlaced (`IsInterlaced`), if known.
     pub is_interlaced: Option<bool>,
+    /// Whether the stream is in the title's original language — ffprobe's
+    /// `disposition.original` (`IsOriginal`, Jellyfin 12.0; `NOT NULL DEFAULT 0`).
+    pub is_original: bool,
     /// The key frames, as stored (`KeyFrames`), if any.
     pub key_frames: Option<String>,
     /// The stream language (`Language`), if any.

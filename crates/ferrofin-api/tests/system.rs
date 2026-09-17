@@ -73,6 +73,7 @@ fn user() -> UserEntity {
         subtitle_mode: 0,
         sync_play_access: 0,
         username: "bob".to_owned(),
+        normalized_username: "BOB".to_owned(),
     }
 }
 

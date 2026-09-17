@@ -510,6 +510,12 @@ pub struct MediaStream {
     pub is_forced: bool,
     /// A value indicating whether this instance is for the hearing impaired.
     pub is_hearing_impaired: bool,
+    /// Whether the stream is in the title's original language (ffprobe's
+    /// `disposition.original`; Jellyfin 12.0 `IsOriginal`). Carried from the
+    /// probe to the `MediaStreamInfos` row only — the vendored 10.11.8 contract
+    /// has no such property, so it is never serialized.
+    #[serde(skip)]
+    pub is_original: bool,
     /// The height.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub height: Option<i32>,

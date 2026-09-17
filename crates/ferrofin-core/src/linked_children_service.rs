@@ -29,7 +29,7 @@ use crate::db_error::db_err;
 use crate::item_data;
 use crate::item_type_lookup::stored_type_name;
 
-/// The stored `FerrofinLinkedChildren.ChildType` discriminant for a manually linked
+/// The stored `LinkedChildren.ChildType` discriminant for a manually linked
 /// child (C# `LinkedChildType.Manual`).
 const MANUAL_CHILD_TYPE: i32 = 0;
 
@@ -62,7 +62,7 @@ impl LinkedChildrenService for FerrofinLinkedChildrenService {
         child_type: Option<i32>,
     ) -> Result<Vec<Uuid>, ServiceError> {
         let mut sql =
-            String::from(r#"SELECT "ChildId" FROM "FerrofinLinkedChildren" WHERE "ParentId" = ?1"#);
+            String::from(r#"SELECT "ChildId" FROM "LinkedChildren" WHERE "ParentId" = ?1"#);
         if child_type.is_some() {
             sql.push_str(r#" AND "ChildType" = ?2"#);
         }
@@ -147,7 +147,7 @@ impl LinkedChildrenService for FerrofinLinkedChildrenService {
 
         let ids: Vec<String> = if let Some(type_name) = parent_type_name {
             sqlx::query_scalar(
-                r#"SELECT DISTINCT lc."ParentId" FROM "FerrofinLinkedChildren" lc
+                r#"SELECT DISTINCT lc."ParentId" FROM "LinkedChildren" lc
                    JOIN "BaseItems" bi ON bi."Id" = lc."ParentId"
                    WHERE lc."ChildId" = ?1 AND lc."ChildType" = ?2 AND bi."Type" = ?3"#,
             )
@@ -159,7 +159,7 @@ impl LinkedChildrenService for FerrofinLinkedChildrenService {
             .map_err(db_err)?
         } else {
             sqlx::query_scalar(
-                r#"SELECT DISTINCT "ParentId" FROM "FerrofinLinkedChildren"
+                r#"SELECT DISTINCT "ParentId" FROM "LinkedChildren"
                    WHERE "ChildId" = ?1 AND "ChildType" = ?2"#,
             )
             .bind(guid_to_db(child_id))
@@ -179,7 +179,7 @@ impl LinkedChildrenService for FerrofinLinkedChildrenService {
         let mut tx = self.db.writer().begin().await.map_err(db_err)?;
 
         let affected: Vec<String> = sqlx::query_scalar(
-            r#"SELECT DISTINCT "ParentId" FROM "FerrofinLinkedChildren"
+            r#"SELECT DISTINCT "ParentId" FROM "LinkedChildren"
                WHERE "ChildId" = ?1 AND "ChildType" = ?2"#,
         )
         .bind(guid_to_db(from_child_id))
@@ -196,9 +196,9 @@ impl LinkedChildrenService for FerrofinLinkedChildrenService {
         // Delete edges whose parent already links the target (would collide on the
         // (ParentId, ChildId) primary key), then retarget the rest.
         sqlx::query(
-            r#"DELETE FROM "FerrofinLinkedChildren"
+            r#"DELETE FROM "LinkedChildren"
                WHERE "ChildId" = ?1 AND "ChildType" = ?2
-                 AND "ParentId" IN (SELECT "ParentId" FROM "FerrofinLinkedChildren"
+                 AND "ParentId" IN (SELECT "ParentId" FROM "LinkedChildren"
                      WHERE "ChildId" = ?3 AND "ChildType" = ?2)"#,
         )
         .bind(guid_to_db(from_child_id))
@@ -209,7 +209,7 @@ impl LinkedChildrenService for FerrofinLinkedChildrenService {
         .map_err(db_err)?;
 
         sqlx::query(
-            r#"UPDATE "FerrofinLinkedChildren" SET "ChildId" = ?1
+            r#"UPDATE "LinkedChildren" SET "ChildId" = ?1
                WHERE "ChildId" = ?2 AND "ChildType" = ?3"#,
         )
         .bind(guid_to_db(to_child_id))
@@ -238,24 +238,42 @@ impl LinkedChildrenService for FerrofinLinkedChildrenService {
         child_id: Uuid,
         child_type: i32,
     ) -> Result<(), ServiceError> {
-        // Insert a new edge, or update its ChildType if the (parent, child) pair
-        // already exists (C# find-or-add on the composite key).
-        // Append: `SortOrder` = one past the parent's current max, so the stored
-        // order is insertion order and reordering (`move_item`) has stable
-        // ordinals to rewrite. An existing edge keeps its position.
-        sqlx::query(
-            r#"INSERT INTO "FerrofinLinkedChildren" ("ParentId", "ChildId", "ChildType", "SortOrder")
-               VALUES (?1, ?2, ?3,
-                   (SELECT COALESCE(MAX("SortOrder"), -1) + 1
-                    FROM "FerrofinLinkedChildren" WHERE "ParentId" = ?1))
-               ON CONFLICT("ParentId", "ChildId") DO UPDATE SET "ChildType" = excluded."ChildType""#,
+        // C# `LinkedChildrenService.UpsertLinkedChild` (12.0): find the
+        // (parent, child) pair; present → only its ChildType is rewritten and
+        // it keeps its position; absent → append at `MAX(SortOrder) + 1`. The
+        // table's key is `(ParentId, SortOrder)`, so this is a lookup, not an
+        // `ON CONFLICT` — playlists, which may hold the same item twice, never
+        // go through here (see `CollectionManager::add_item_to_playlist`).
+        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        let parent = guid_to_db(parent_id);
+        let child = guid_to_db(child_id);
+        let updated = sqlx::query(
+            r#"UPDATE "LinkedChildren" SET "ChildType" = ?3
+               WHERE "ParentId" = ?1 AND "ChildId" = ?2"#,
         )
-        .bind(guid_to_db(parent_id))
-        .bind(guid_to_db(child_id))
+        .bind(&parent)
+        .bind(&child)
         .bind(i64::from(child_type))
-        .execute(self.db.writer())
+        .execute(&mut *tx)
         .await
-        .map_err(db_err)?;
+        .map_err(db_err)?
+        .rows_affected();
+        if updated == 0 {
+            sqlx::query(
+                r#"INSERT INTO "LinkedChildren" ("ParentId", "SortOrder", "ChildId", "ChildType")
+                   VALUES (?1,
+                       (SELECT COALESCE(MAX("SortOrder"), -1) + 1
+                        FROM "LinkedChildren" WHERE "ParentId" = ?1),
+                       ?2, ?3)"#,
+            )
+            .bind(&parent)
+            .bind(&child)
+            .bind(i64::from(child_type))
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        }
+        tx.commit().await.map_err(db_err)?;
         item_data::sync_container_data(&self.db, parent_id).await?;
         Ok(())
     }

@@ -45,6 +45,10 @@ use ferrofin_traits::options::InternalItemsQuery;
 /// excludes it (C# `PlaceholderId`).
 pub(crate) const PLACEHOLDER_ID: &str = "00000000-0000-0000-0000-000000000001";
 
+/// 12.1 `ApplyAlternateVersionFiltering`: keep a row unless it is a version
+/// of a primary that still exists in the same library.
+const ALTERNATE_VERSION_HIDDEN: &str = r#" AND (bi."PrimaryVersionId" IS NULL OR NOT EXISTS (SELECT 1 FROM "BaseItems" p WHERE p."Id" = bi."PrimaryVersionId" AND p."TopParentId" IS bi."TopParentId"))"#;
+
 /// The "unowned" predicate. C# treats `OwnerId = Guid.Empty` as "no owner": a
 /// real Jellyfin database stores the ZERO GUID on virtually every row
 /// (adopted-DB evidence), while Ferrofin's writer leaves the column NULL — every
@@ -494,13 +498,13 @@ pub(crate) fn append_predicates<'a>(
         } else {
             // Direct children: the physical `ParentId`, plus manually linked
             // members (C# `Folder.GetChildren` merges `LinkedChildren`). Only
-            // box-sets and playlists carry `FerrofinLinkedChildren` rows, so the `IN`
+            // box-sets and playlists carry `LinkedChildren` rows, so the `IN`
             // subquery is empty for ordinary folders and this stays identical to
             // a plain `ParentId` equality for non-collection browses.
             qb.push(r#" AND (bi."ParentId" = "#)
                 .push_bind(guid_to_db(filter.parent_id))
                 .push(
-                    r#" OR bi."Id" IN (SELECT "ChildId" FROM "FerrofinLinkedChildren" WHERE "ParentId" = "#,
+                    r#" OR bi."Id" IN (SELECT "ChildId" FROM "LinkedChildren" WHERE "ParentId" = "#,
                 )
                 .push_bind(guid_to_db(filter.parent_id))
                 .push(r#" AND "ChildType" = 0)"#);
@@ -643,25 +647,23 @@ pub(crate) fn append_predicates<'a>(
         && filter.extra_types.is_empty()
         && !filter.include_owned_items
     {
-        // Exclude alternate versions + owned non-extra items from general queries.
-        //
-        // Two reasons to leave the alternates in, and they are the same
-        // predicate: a resume query wants the version that was actually
-        // played, and a grouped query collapses the versions itself. Upstream
-        // has no `PrimaryVersionId` predicate at all, and dropping the rows
-        // before the grouping removes 1,399 of them on a real library where
-        // the grouping merges only 299 — the other 1,100 are separate titles
-        // that simply have a primary version recorded.
-        if filter.is_resumable == Some(true) || group_by_presentation_unique_key(filter) {
+        // Exclude alternate versions + owned non-extra items from general
+        // queries — 12.1 `BaseItemRepository.ApplyAlternateVersionFiltering`:
+        // a row is hidden only while its primary exists *in the same library*
+        // (`TopParentId`), so a version whose primary is gone, or was moved to
+        // another library, is listed again as an item of its own. (12.0 hid
+        // every row with a `PrimaryVersionId`; on the owner's library that was
+        // 144 episodes.) A resume query keeps the alternates so the version
+        // that was actually played surfaces instead of collapsing onto the
+        // primary. The subquery is a primary-key probe per candidate row, and
+        // `IS` keeps EF's null-equal semantics for two library-less rows.
+        if filter.is_resumable == Some(true) {
             qb.push(" AND (")
                 .push(NO_OWNER)
                 .push(r#" OR bi."ExtraType" IS NOT NULL)"#);
         } else {
-            // Without a user there is no grouping (upstream's rule), so the
-            // alternates still have to be excluded somehow. Upstream carries no
-            // such predicate; this is the remaining divergence, and it only
-            // affects queries no user-facing endpoint issues.
-            qb.push(r#" AND bi."PrimaryVersionId" IS NULL AND ("#)
+            qb.push(ALTERNATE_VERSION_HIDDEN)
+                .push(" AND (")
                 .push(NO_OWNER)
                 .push(r#" OR bi."ExtraType" IS NOT NULL)"#);
         }
@@ -811,7 +813,20 @@ fn append_resolution_predicate(qb: &mut QueryBuilder<'_, Sqlite>, filter: &Inter
 }
 
 /// Appends `IncludeItemTypes` / `ExcludeItemTypes` as `Type` in/not-in lists.
+///
+/// With an `Ids` list in the query the `Type` column is written `+bi."Type"`
+/// so no `Type`-led index can serve it: 12.0 dropped
+/// `IX_BaseItems_Id_Type_IsFolder_IsVirtualItem`, and without it a single
+/// `Type` equality ties with the `Id` primary key in the planner's costing and
+/// wins — a scan of every row of that type (3,001 movies on the bench corpus)
+/// instead of a handful of key lookups. The `Ids` list is always the selective
+/// side, so the pin loses nothing.
 fn append_type_filters<'a>(qb: &mut QueryBuilder<'a, Sqlite>, filter: &'a InternalItemsQuery) {
+    let column = if filter.item_ids.is_empty() {
+        r#"bi."Type""#
+    } else {
+        r#"+bi."Type""#
+    };
     if filter.include_item_types.is_empty() {
         let excludes: Vec<String> = filter
             .exclude_item_types
@@ -821,7 +836,7 @@ fn append_type_filters<'a>(qb: &mut QueryBuilder<'a, Sqlite>, filter: &'a Intern
             .collect();
         if !excludes.is_empty() {
             qb.push(" AND NOT ");
-            push_in_list(qb, r#"bi."Type""#, &excludes);
+            push_in_list(qb, column, &excludes);
         }
     } else {
         let includes: Vec<String> = filter
@@ -831,7 +846,7 @@ fn append_type_filters<'a>(qb: &mut QueryBuilder<'a, Sqlite>, filter: &'a Intern
             .map(ToOwned::to_owned)
             .collect();
         qb.push(" AND ");
-        push_in_list(qb, r#"bi."Type""#, &includes);
+        push_in_list(qb, column, &includes);
     }
 }
 
@@ -1093,10 +1108,47 @@ fn append_user_data_predicates(qb: &mut QueryBuilder<'_, Sqlite>, filter: &Inter
         push_user_data_exists(qb, &uid, r#"ud."Rating" >= 6.5"#, want);
     }
     if let Some(want) = filter.is_played {
-        push_user_data_exists(qb, &uid, r#"ud."Played" = 1"#, want);
+        push_is_played(qb, &uid, want);
     }
     if let Some(want) = filter.is_resumable {
         push_resumable_predicate(qb, &uid, want);
+    }
+}
+
+/// `IsPlayed` for a leaf — v12 `BuildLeafIsPlayedFilter`
+/// (`TranslateQuery.cs:50-67`): the item has a played row of its own, OR it
+/// is the primary of a version group in which any version (itself included)
+/// has one, OR it is a version whose group's primary is such a primary.
+/// Alternates are hidden from general queries, so this is what lets the
+/// version that was actually watched mark the title played. Same
+/// uncorrelated-`IN` shape as [`push_user_data_exists`], for the same plan.
+fn push_is_played(qb: &mut QueryBuilder<'_, Sqlite>, user_id: &str, want: bool) {
+    let played_groups = |qb: &mut QueryBuilder<'_, Sqlite>| {
+        qb.push(r#"(SELECT v."PrimaryVersionId" FROM "BaseItems" v WHERE v."PrimaryVersionId" IS NOT NULL AND EXISTS (SELECT 1 FROM "UserData" ud WHERE ud."UserId" = "#)
+            .push_bind(user_id.to_owned())
+            .push(r#" AND ud."Played" = 1 AND (ud."ItemId" = v."Id" OR ud."ItemId" = v."PrimaryVersionId")))"#);
+    };
+    let played_items = |qb: &mut QueryBuilder<'_, Sqlite>| {
+        qb.push(r#"(SELECT ud."ItemId" FROM "UserData" ud WHERE ud."UserId" = "#)
+            .push_bind(user_id.to_owned())
+            .push(r#" AND ud."Played" = 1)"#);
+    };
+    if want {
+        qb.push(r#" AND (bi."Id" IN "#);
+        played_items(qb);
+        qb.push(r#" OR bi."Id" IN "#);
+        played_groups(qb);
+        qb.push(r#" OR (bi."PrimaryVersionId" IS NOT NULL AND bi."PrimaryVersionId" IN "#);
+        played_groups(qb);
+        qb.push("))");
+    } else {
+        qb.push(r#" AND bi."Id" NOT IN "#);
+        played_items(qb);
+        qb.push(r#" AND bi."Id" NOT IN "#);
+        played_groups(qb);
+        qb.push(r#" AND (bi."PrimaryVersionId" IS NULL OR bi."PrimaryVersionId" NOT IN "#);
+        played_groups(qb);
+        qb.push(")");
     }
 }
 
@@ -1572,10 +1624,10 @@ fn append_ancestor_predicates(qb: &mut QueryBuilder<'_, Sqlite>, filter: &Intern
     // children descend from any of the requested ancestors — the Collections
     // tab's re-rooted query (C# TranslateQuery `LinkedChildAncestorIds` over
     // `context.LinkedChildren`; the manual links live in Ferrofin's
-    // `FerrofinLinkedChildren`).
+    // `LinkedChildren`).
     if !filter.linked_child_ancestor_ids.is_empty() {
         qb.push(
-            r#" AND EXISTS (SELECT 1 FROM "FerrofinLinkedChildren" lc
+            r#" AND EXISTS (SELECT 1 FROM "LinkedChildren" lc
                 JOIN "AncestorIds" la ON la."ItemId" = lc."ChildId"
                 WHERE lc."ParentId" = bi."Id" AND "#,
         );
@@ -2107,6 +2159,40 @@ mod tests {
                 r#" ORDER BY bi."DateCreated" DESC, bi."Id" DESC LIMIT ?"#,
             ),
             "the album query carries no track predicate, no caller ordering and no offset"
+        );
+    }
+
+    /// An `Ids` list makes the type predicate `+bi."Type"` (planner pin: the
+    /// key lookups must drive the query, not a `Type` index — see
+    /// `append_type_filters`); without one the column stays indexable.
+    #[test]
+    fn an_id_list_pins_the_type_predicate_off_the_index() {
+        let with_ids = build_query(
+            &InternalItemsQuery {
+                include_item_types: vec![BaseItemKind::Movie],
+                item_ids: vec![uuid::Uuid::from_u128(1), uuid::Uuid::from_u128(2)],
+                ..InternalItemsQuery::default()
+            },
+            QueryShape::FullRows,
+        )
+        .into_sql();
+        assert!(
+            with_ids.contains(r#"AND +bi."Type" IN (?)"#)
+                && with_ids.contains(r#"bi."Id" IN (?, ?)"#),
+            "{with_ids}"
+        );
+
+        let without = build_query(
+            &InternalItemsQuery {
+                include_item_types: vec![BaseItemKind::Movie],
+                ..InternalItemsQuery::default()
+            },
+            QueryShape::FullRows,
+        )
+        .into_sql();
+        assert!(
+            without.contains(r#"AND bi."Type" IN (?)"#) && !without.contains(r#"+bi."Type""#),
+            "{without}"
         );
     }
 

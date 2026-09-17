@@ -30,8 +30,9 @@ use ferrofin_model::dto::SortOrder;
 use ferrofin_model::live_tv::ItemSortBy;
 use uuid::Uuid;
 
+use ferrofin_db::entities::users::UserEntity;
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::library::{UserViewManager, VirtualFolderManager};
+use ferrofin_traits::library::{UserManager, UserViewManager, VirtualFolderManager};
 use ferrofin_traits::options::{
     DtoOptions, InternalItemsQuery, LATEST_ITEMS_FALLBACK_LIMIT, LatestItemsQuery,
 };
@@ -73,25 +74,29 @@ fn is_live_tv_view_row(row: &BaseItemEntity) -> bool {
 
 /// The Live TV `UserView`'s deterministic id under `mode` — free-standing so it
 /// can be asserted without a database (see [`FerrofinUserViewManager::live_tv_view_id`]).
+///
+/// The key is `path + "_namedview_" + viewType` — Jellyfin 12.0's
+/// `GetNamedView` (LibraryManager.cs:2997), which keeps the localized display
+/// name out of the id. It is the same derivation
+/// [`user_view_repository::consolidate_localized_user_views`] folds the
+/// 10.11-era name-keyed views onto, so a later boot never recreates a stale one.
+///
+/// [`user_view_repository::consolidate_localized_user_views`]: crate::user_view_repository::consolidate_localized_user_views
 fn live_tv_view_id_with(
     mode: &item_type_lookup::IdDerivation,
     view_path: &std::path::Path,
 ) -> Option<Uuid> {
-    item_type_lookup::derive_item_id_with(
-        mode,
-        BaseItemKind::UserView,
-        &format!(
-            "{}_namedview_{LIVE_TV_VIEW_NAME}",
-            view_path.to_string_lossy()
-        ),
-    )
+    crate::user_view_repository::named_view_id_at(mode, view_path, LIVE_TV_VIEW_TYPE)
 }
+
+/// The Live TV view's `CollectionType` member name — `CollectionType.livetv
+/// .ToString()`, the folder under `views/` and the tail of the id key.
+const LIVE_TV_VIEW_TYPE: &str = "livetv";
 
 /// The display name of the auto-provisioned Live TV view — C#
 /// `_localization.GetLocalizedString("HeaderLiveTV")` (LiveTvManager.cs:1263),
-/// which is "Live TV" in the `en-US` default culture Ferrofin ships. It is part
-/// of the view's id key (`… + "_namedview_" + name`), so changing it changes the
-/// id.
+/// which is "Live TV" in the `en-US` default culture Ferrofin ships. Since
+/// 12.0 it is display-only: the id is keyed on [`LIVE_TV_VIEW_TYPE`].
 const LIVE_TV_VIEW_NAME: &str = "Live TV";
 
 /// The display name of the auto-provisioned playlists media folder
@@ -145,6 +150,11 @@ pub struct FerrofinUserViewManager {
     /// `views/livetv`. Set by the composition root; `None` in unit tests keeps
     /// the manager from provisioning the view.
     metadata_path: Option<PathBuf>,
+    /// The user manager — needed to load the [`UserEntity`] whose visibility
+    /// rules decide whether a playlists/boxsets library has a visible child
+    /// (12.1 `UserViewManager.HasVisibleChild`). Without it (unit tests) the
+    /// check is skipped and such views are always listed.
+    users: Option<Arc<dyn UserManager>>,
 }
 
 impl std::fmt::Debug for FerrofinUserViewManager {
@@ -171,6 +181,7 @@ impl FerrofinUserViewManager {
             id_derivation: item_type_lookup::IdDerivation::LegacyLowercase,
             virtual_folders: None,
             db: None,
+            users: None,
             metadata_path: None,
         }
     }
@@ -180,6 +191,13 @@ impl FerrofinUserViewManager {
     #[must_use]
     pub fn with_metadata_path(mut self, metadata_path: impl Into<PathBuf>) -> Self {
         self.metadata_path = Some(metadata_path.into());
+        self
+    }
+
+    /// Wires the user manager (see the `users` field).
+    #[must_use]
+    pub fn with_users(mut self, users: Arc<dyn UserManager>) -> Self {
+        self.users = Some(users);
         self
     }
 
@@ -374,14 +392,238 @@ impl FerrofinUserViewManager {
         Ok(())
     }
 
+    /// The id of the per-user, per-parent named view — C# `GetNamedView(user,
+    /// name, parentId, viewType, sortName)` (LibraryManager.cs:3038-3052, 12.0):
+    /// `GetNewItemId("38_namedview_" + user("N") + parent("N") + viewType,
+    /// typeof(UserView))`. Name-independent since 12.0; the stale
+    /// name-keyed rows older servers left behind are ignored, not listed.
+    pub(crate) fn user_named_view_id(
+        &self,
+        user_id: Uuid,
+        parent_id: Uuid,
+        view_type: &str,
+    ) -> Option<Uuid> {
+        item_type_lookup::derive_item_id_with(
+            &self.id_derivation,
+            BaseItemKind::UserView,
+            &format!(
+                "38_namedview_{}{}{view_type}",
+                user_id.simple(),
+                parent_id.simple()
+            ),
+        )
+    }
+
+    /// Keeps, of the `UserView` rows in `views`, only the ones `GetUserViews`
+    /// would derive for `user_id`: a per-user/per-parent view (one carrying a
+    /// `DisplayParentId`) only when its id is [`Self::user_named_view_id`] of
+    /// its own `ViewType` and parent, a type-wide view (Live TV) always.
+    fn only_canonical_user_views(
+        &self,
+        user_id: Uuid,
+        views: Vec<BaseItemEntity>,
+    ) -> Vec<BaseItemEntity> {
+        let user_view = item_type_lookup::stored_type_name(BaseItemKind::UserView);
+        views
+            .into_iter()
+            .filter(|row| {
+                if Some(row.type_.as_str()) != user_view {
+                    return true;
+                }
+                let data = crate::item_data::parse_data(row.data.as_deref());
+                let Some(parent) = data
+                    .get("DisplayParentId")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|p| Uuid::parse_str(p).ok())
+                    .filter(|p| !p.is_nil())
+                else {
+                    return true;
+                };
+                let Some(view_type) = data.get("ViewType").and_then(serde_json::Value::as_str)
+                else {
+                    return true;
+                };
+                let Ok(id) = Uuid::parse_str(&row.id) else {
+                    return false;
+                };
+                self.user_named_view_id(user_id, parent, view_type) == Some(id)
+            })
+            .collect()
+    }
+
+    /// 12.1 `UserViewManager.GetUserViews` (`UserViewManager.cs:60-64`): a
+    /// playlists or boxsets library "only references linked items", so its
+    /// view is listed only when [`Self::has_visible_child`] holds — an
+    /// account with no playlist it may see has no Playlists view at all.
+    /// Skipped when no user manager is wired.
+    async fn without_childless_linked_libraries(
+        &self,
+        user_id: Uuid,
+        views: Vec<BaseItemEntity>,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        let Some(user) = self.user_entity(user_id).await? else {
+            return Ok(views);
+        };
+        let user_view = item_type_lookup::stored_type_name(BaseItemKind::UserView);
+        let mut kept = Vec::with_capacity(views.len());
+        for row in views {
+            let Ok(id) = Uuid::parse_str(&row.id) else {
+                continue;
+            };
+            // Both kinds of row say what they are in `Data`: a derived view
+            // carries `ViewType` + `DisplayParentId`, a `CollectionFolder`
+            // carries `CollectionType` (Jellyfin's rows and Ferrofin's own).
+            // Reading it here keeps this off the virtual-folder listing, which
+            // walks the library root and every options file per call — that
+            // cost doubled `/Users/{id}/Views` on the bench when tried.
+            let data = crate::item_data::parse_data(row.data.as_deref());
+            let linked_folder = if Some(row.type_.as_str()) == user_view {
+                if data.get("ViewType").and_then(serde_json::Value::as_str) == Some("playlists") {
+                    data.get("DisplayParentId")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(|p| Uuid::parse_str(p).ok())
+                } else {
+                    None
+                }
+            } else {
+                matches!(
+                    data.get("CollectionType")
+                        .and_then(serde_json::Value::as_str),
+                    Some("playlists" | "boxsets")
+                )
+                .then_some(id)
+            };
+            if let Some(folder) = linked_folder
+                && !self.has_visible_child(folder, &user).await?
+            {
+                continue;
+            }
+            kept.push(row);
+        }
+        Ok(kept)
+    }
+
+    /// 12.1 `UserViewManager.HasVisibleChild`: whether any direct child of
+    /// the folder — or of its physical folders, for a `CollectionFolder` that
+    /// has some — is visible to `user`. One key lookup per parent, ungrouped,
+    /// stored columns only.
+    async fn has_visible_child(
+        &self,
+        folder: Uuid,
+        user: &UserEntity,
+    ) -> Result<bool, ServiceError> {
+        let mut parents = vec![folder];
+        if let Some(db) = &self.db {
+            let physical = crate::item_repository::physical_folders_by_view(db, &[folder])
+                .await?
+                .remove(&folder)
+                .unwrap_or_default();
+            if !physical.is_empty() {
+                parents = physical;
+            }
+        }
+        for parent in parents {
+            let query = InternalItemsQuery {
+                parent_id: parent,
+                user: Some(user.clone()),
+                group_by_presentation_unique_key: false,
+                limit: Some(1),
+                ..Default::default()
+            };
+            if !self.items.get_item_list(&query).await?.is_empty() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    async fn user_entity(&self, user_id: Uuid) -> Result<Option<UserEntity>, ServiceError> {
+        match &self.users {
+            Some(users) => users.get_user_by_id(user_id).await,
+            None => Ok(None),
+        }
+    }
+
+    /// Materialises the user's playlists view when a playlists folder exists
+    /// and the canonical row does not — the `isNew` branch of `GetNamedView`
+    /// (LibraryManager.cs:3054-3075): `Path = {InternalMetadataPath}/views/{id
+    /// N}`, `Name = folder.Name`, `ViewType = playlists`, `UserId`,
+    /// `DisplayParentId = folder.Id`. Idempotent; a no-op without an item
+    /// store and a metadata path.
+    async fn ensure_user_playlists_view(&self, user_id: Uuid) -> Result<(), ServiceError> {
+        let (Some(persistence), Some(metadata_path)) = (&self.persistence, &self.metadata_path)
+        else {
+            return Ok(());
+        };
+        let folders = self
+            .items
+            .get_item_list(&InternalItemsQuery {
+                include_item_types: vec![
+                    BaseItemKind::PlaylistsFolder,
+                    BaseItemKind::ManualPlaylistsFolder,
+                ],
+                ..Default::default()
+            })
+            .await?;
+        let user = self.user_entity(user_id).await?;
+        for folder in folders {
+            let Ok(parent) = Uuid::parse_str(&folder.id) else {
+                continue;
+            };
+            let Some(id) = self.user_named_view_id(user_id, parent, "playlists") else {
+                continue;
+            };
+            if persistence.item_exists(id).await? {
+                continue;
+            }
+            // 12.1: the folder is skipped before `GetNamedView`, so a user
+            // with nothing to see in it never gets the view row either.
+            if let Some(user) = &user
+                && !self.has_visible_child(parent, user).await?
+            {
+                continue;
+            }
+            let view_path = metadata_path.join("views").join(id.simple().to_string());
+            tokio::fs::create_dir_all(&view_path).await.map_err(|e| {
+                ServiceError::backend(format!("create playlists view directory: {e}"))
+            })?;
+            let name = folder
+                .name
+                .clone()
+                .unwrap_or_else(|| PLAYLISTS_FOLDER_NAME.to_owned());
+            let data = serde_json::json!({
+                "ViewType": "playlists",
+                "DisplayParentId": parent.simple().to_string(),
+                "UserId": user_id.simple().to_string(),
+            });
+            let entity = BaseItemEntity {
+                id: ferrofin_db::store::guid_to_db(id),
+                type_: item_type_lookup::stored_type_name(BaseItemKind::UserView)
+                    .unwrap_or_default()
+                    .to_owned(),
+                sort_name: Some(create_sort_name(&name)),
+                name: Some(name),
+                path: Some(view_path.to_string_lossy().into_owned()),
+                parent_id: None,
+                is_folder: true,
+                date_created: Some(Utc::now()),
+                data: Some(data.to_string()),
+                ..BaseItemEntity::default()
+            };
+            persistence
+                .save_items(std::slice::from_ref(&entity))
+                .await?;
+        }
+        Ok(())
+    }
+
     /// The deterministic Live TV `UserView` item id — `GetNewItemId(path +
-    /// "_namedview_" + name, typeof(UserView))` over
-    /// `{InternalMetadataPath}/views/livetv`.
+    /// "_namedview_" + viewType, typeof(UserView))` over
+    /// `{InternalMetadataPath}/views/livetv` (Jellyfin 12.0; 10.11 keyed the
+    /// localized name instead, and those rows are consolidated at boot).
     ///
     /// `GetNewItemIdInternal` strips the program-data path before hashing, so
-    /// this id is the SAME on two servers with different data directories; the
-    /// value it produces for `Live TV` is Jellyfin's
-    /// `2b2bca16aacc8a14d53a11bb829eafa5`.
+    /// this id is the SAME on two servers with different data directories.
     fn live_tv_view_id(&self, view_path: &std::path::Path) -> Option<Uuid> {
         live_tv_view_id_with(&self.id_derivation, view_path)
     }
@@ -465,6 +707,30 @@ impl FerrofinUserViewManager {
             .await?;
         Ok(Some(id))
     }
+
+    /// One-shot boot repair: folds every 10.11-era `UserView` whose id was
+    /// derived from its localized name onto the name-independent id 12.0
+    /// derives from the view type — the port of Jellyfin's
+    /// `ConsolidateLocalizedUserViews` routine, keyed
+    /// [`user_views_consolidated_v12`](crate::user_view_repository::USER_VIEWS_CONSOLIDATED_META_KEY)
+    /// in `FerrofinMeta`. Returns the number of stale views dropped. No-op
+    /// without a database and a metadata path wired.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ServiceError`] when the repair's transaction fails; it then
+    /// retries on the next boot.
+    pub async fn consolidate_localized_user_views(&self) -> Result<u64, ServiceError> {
+        let (Some(db), Some(metadata_path)) = (&self.db, &self.metadata_path) else {
+            return Ok(0);
+        };
+        crate::user_view_repository::consolidate_localized_user_views(
+            db,
+            &self.id_derivation,
+            metadata_path,
+        )
+        .await
+    }
 }
 
 #[async_trait]
@@ -477,12 +743,21 @@ impl UserViewManager for FerrofinUserViewManager {
         // access filtering (which libraries the user may see) rides on the
         // InternalItemsQuery.user field in the full pipeline; the base set is every
         // collection folder / user view, name-sorted.
+        // The playlists arm of `GetUserViews` (UserViewManager.cs:63-79): a
+        // playlists library is user-specific, so its view is
+        // `GetNamedView(user, folder.Name, folder.Id, playlists)` — derived,
+        // created on demand, never listed from the table.
+        self.ensure_user_playlists_view(user_id).await?;
         let query = InternalItemsQuery {
             include_item_types: vec![BaseItemKind::CollectionFolder, BaseItemKind::UserView],
             order_by: vec![(ItemSortBy::SortName, SortOrder::Ascending)],
             ..Default::default()
         };
         let views = self.items.get_item_list(&query).await?;
+        let views = self.only_canonical_user_views(user_id, views);
+        let views = self
+            .without_childless_linked_libraries(user_id, views)
+            .await?;
         self.without_disabled_live_tv(user_id, views).await
     }
 
@@ -503,13 +778,14 @@ impl UserViewManager for FerrofinUserViewManager {
         }
         self.ensure_playlists_folder().await?;
         let query = InternalItemsQuery {
+            // `GetUserRootFolder().Children` holds the libraries and the
+            // playlists folder — never a `UserView` (those are derived views,
+            // not root children; the query scope in
+            // `item_repository::visible_views` still admits them).
             include_item_types: vec![
                 BaseItemKind::CollectionFolder,
-                BaseItemKind::UserView,
                 // Both spellings of the playlists folder: Ferrofin provisions
-                // one, an adopted database carries the other, and this list has
-                // to mean the same set as the query scope in
-                // `item_repository::visible_views`.
+                // one, an adopted database carries the other.
                 BaseItemKind::ManualPlaylistsFolder,
                 BaseItemKind::PlaylistsFolder,
             ],
@@ -1059,7 +1335,8 @@ mod tests {
     use crate::item_repository::FerrofinItemRepository;
     use crate::item_type_lookup::{ItemTypeLookup, stored_type_name};
     use crate::test_support::{
-        seed_item, seed_named_item, seed_user, seed_user_data, set_item_path, test_db,
+        seed_item, seed_item_with_data, seed_named_item, seed_user, seed_user_data, set_item_path,
+        test_db,
     };
     use ferrofin_db::Database;
     use ferrofin_db::store::guid_to_db;
@@ -1070,23 +1347,152 @@ mod tests {
 
     /// The Live TV view's id is derived from a key the C# strips the
     /// program-data path out of, so two servers with different data directories
-    /// agree on it. The expected value is the one a live Jellyfin 10.11.8 serves.
+    /// agree on it. The key is 12.0's `views/livetv_namedview_livetv` — NOT
+    /// the 10.11 `…_namedview_Live TV`, whose value
+    /// (`2b2bca16aacc8a14d53a11bb829eafa5`, what a live 10.11.8 serves) is the
+    /// stale id the boot consolidation folds onto this one.
     #[test]
-    fn live_tv_view_id_is_jellyfins_and_is_data_dir_independent() {
+    fn live_tv_view_id_is_jellyfin_12s_and_is_data_dir_independent() {
         for data_dir in ["/config", "/data", "/var/lib/ferrofin"] {
             let mode = item_type_lookup::IdDerivation::Jellyfin {
                 program_data_path: Some(data_dir.to_owned()),
             };
             let path = std::path::Path::new(data_dir).join("metadata/views/livetv");
+            let id = live_tv_view_id_with(&mode, &path)
+                .expect("id")
+                .simple()
+                .to_string();
+            assert_eq!(id, "54c4e8dbdc43511d9b3a452c48adf58a", "{data_dir}");
+            assert_ne!(id, "2b2bca16aacc8a14d53a11bb829eafa5", "{data_dir}");
             assert_eq!(
-                live_tv_view_id_with(&mode, &path)
-                    .expect("id")
-                    .simple()
-                    .to_string(),
-                "2b2bca16aacc8a14d53a11bb829eafa5",
-                "{data_dir}"
+                Some(id),
+                crate::user_view_repository::named_view_id(
+                    &mode,
+                    &std::path::Path::new(data_dir).join("metadata"),
+                    "livetv"
+                )
+                .map(|id| id.simple().to_string()),
+                "the provisioner and the consolidation agree on the canonical id"
             );
         }
+    }
+
+    /// The owner's real 12.0 database carries two `Playlists` views. After the
+    /// boot consolidation the user's view list names `Playlists` once.
+    #[tokio::test]
+    async fn consolidation_leaves_one_playlists_view_in_the_users_views() {
+        let db = test_db().await;
+        let user_id = Uuid::from_u128(0x5201);
+        seed_user(&db, user_id).await;
+        let mode = item_type_lookup::IdDerivation::Jellyfin {
+            program_data_path: Some("/config".to_owned()),
+        };
+        let metadata = std::path::PathBuf::from("/config/metadata");
+        let canonical =
+            crate::user_view_repository::named_view_id(&mode, &metadata, "playlists").expect("id");
+        let stale = item_type_lookup::derive_item_id_with(
+            &mode,
+            BaseItemKind::UserView,
+            "/config/metadata/views/Playlists_namedview_Playlists",
+        )
+        .expect("id");
+        for (id, path) in [
+            (canonical, "/config/metadata/views/playlists"),
+            (stale, "/config/metadata/views/Playlists"),
+        ] {
+            seed_item_with_data(
+                &db,
+                id,
+                BaseItemKind::UserView,
+                "Playlists",
+                r#"{"ViewType":"playlists"}"#,
+            )
+            .await;
+            set_item_path(&db, id, path).await;
+        }
+        let manager = manager(&db)
+            .with_database(db.clone())
+            .with_metadata_path(metadata)
+            .with_id_derivation(mode);
+
+        let before: Vec<Option<String>> = manager
+            .get_user_views(user_id)
+            .await
+            .expect("views")
+            .into_iter()
+            .map(|v| v.name)
+            .collect();
+        assert_eq!(before.len(), 2, "the duplicate is what 12.0 left behind");
+
+        assert_eq!(
+            manager
+                .consolidate_localized_user_views()
+                .await
+                .expect("consolidate"),
+            1
+        );
+        let after: Vec<(Uuid, Option<String>)> = manager
+            .get_user_views(user_id)
+            .await
+            .expect("views")
+            .into_iter()
+            .map(|v| (Uuid::parse_str(&v.id).expect("id"), v.name))
+            .collect();
+        assert_eq!(after, vec![(canonical, Some("Playlists".to_owned()))]);
+    }
+
+    /// 12.1 `HasVisibleChild`: a playlists folder with nothing the user can
+    /// see is not listed and gets no derived view; the moment it has a visible
+    /// child the view appears. The owner's library is the real case — every
+    /// playlist there sits under a music album, none under the folder — and
+    /// Jellyfin 12.1 answers `/Users/{id}/Views` without `Playlists` for it.
+    #[tokio::test]
+    async fn a_playlists_folder_without_a_visible_child_has_no_view() {
+        let db = test_db().await;
+        let user_id = Uuid::from_u128(0x5301);
+        seed_user(&db, user_id).await;
+        let folder = Uuid::from_u128(0x5302);
+        seed_named_item(
+            &db,
+            folder,
+            BaseItemKind::ManualPlaylistsFolder,
+            "Playlists",
+        )
+        .await;
+        let mode = item_type_lookup::IdDerivation::Jellyfin {
+            program_data_path: Some("/config".to_owned()),
+        };
+        let users: Arc<dyn UserManager> =
+            Arc::new(crate::user_manager::FerrofinUserManager::new(db.clone()));
+        let persistence: Arc<dyn ItemPersistenceService> = Arc::new(
+            crate::item_persistence_service::FerrofinItemPersistenceService::new(db.clone()),
+        );
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let manager = manager(&db)
+            .with_database(db.clone())
+            .with_item_store(persistence)
+            .with_metadata_path(tmp.path())
+            .with_id_derivation(mode)
+            .with_users(users);
+
+        let names = |views: Vec<BaseItemEntity>| {
+            views.into_iter().filter_map(|v| v.name).collect::<Vec<_>>()
+        };
+        assert!(
+            !names(manager.get_user_views(user_id).await.expect("views"))
+                .contains(&"Playlists".to_owned()),
+            "no visible child: no Playlists view"
+        );
+
+        // A playlist the user may see, directly under the folder.
+        let playlist = Uuid::from_u128(0x5303);
+        crate::test_support::seed_child_item(&db, playlist, BaseItemKind::Playlist, "Mine", folder)
+            .await;
+        assert!(
+            names(manager.get_user_views(user_id).await.expect("views"))
+                .contains(&"Playlists".to_owned()),
+            "a visible child lists the view"
+        );
     }
 
     fn manager(db: &Database) -> FerrofinUserViewManager {
@@ -2370,6 +2776,25 @@ mod tests {
             "a second read re-provisioned the folder — the existence check did \
              not match the row it wrote, so every request pays a filesystem \
              call and a write through the single writer connection"
+        );
+    }
+
+    /// The per-user named-view id, pinned against the owner's real 12.0
+    /// database: user `mango`, the `PlaylistsFolder`, and the Playlists view
+    /// Jellyfin 12.0.0 created on its first boot (the 10.11 row beside it,
+    /// `AA9A5206-…`, is the name-keyed one 12.0 ignores).
+    #[tokio::test]
+    async fn user_named_view_id_matches_a_real_12_0_row() {
+        let db = test_db().await;
+        let mgr = FerrofinUserViewManager::new(crate::test_support::item_repository_over(db))
+            .with_id_derivation(item_type_lookup::IdDerivation::Jellyfin {
+                program_data_path: Some("/config".to_owned()),
+            });
+        let user = Uuid::parse_str("9ECCC7EC-621F-47CF-ADCB-3CD4A0C29227").expect("user");
+        let folder = Uuid::parse_str("1071671E-7BFF-A053-2E93-0DEBEE501D2E").expect("folder");
+        assert_eq!(
+            mgr.user_named_view_id(user, folder, "playlists"),
+            Some(Uuid::parse_str("45D83C7B-5EDC-AF5C-B7E4-6C1612C07B6A").expect("view"))
         );
     }
 }

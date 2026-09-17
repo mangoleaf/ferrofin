@@ -539,6 +539,7 @@ impl<L: LocalizationManager> ProbeResultNormalizer<L> {
             stream.is_default = disposition.get("default").copied() == Some(1);
             stream.is_forced = disposition.get("forced").copied() == Some(1);
             stream.is_hearing_impaired = disposition.get("hearing_impaired").copied() == Some(1);
+            stream.is_original = disposition.get("original").copied() == Some(1);
         }
 
         normalize_stream_title(&mut stream);

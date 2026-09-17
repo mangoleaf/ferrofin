@@ -301,6 +301,12 @@ impl FerrofinUserManager {
     where
         E: SqliteExecutor<'e>,
     {
+        // 12.0 `UserManager` (`RenameUser` :185, `CreateUserInternalAsync`
+        // :348): an exact match on `NormalizedUsername` against the
+        // `ToUpperInvariant` of the candidate — the same key the unique index
+        // guards, so a case-variant of an existing name is caught here (a
+        // `400`) instead of by the index (a `500`).
+        //
         // `IS NOT` (not `!=`): with no exclusion the bind is NULL, and
         // `"Id" != NULL` is NULL — i.e. matches nothing — where
         // `"Id" IS NOT NULL` is the intended "no exclusion".
@@ -413,6 +419,7 @@ impl FerrofinUserManager {
         .bind(internal_id)
         .bind(DEFAULT_PASSWORD_RESET_PROVIDER_ID)
         .bind(name)
+        // 12.0 `User` constructor: `NormalizedUsername = Username.ToUpperInvariant()`.
         .bind(upper_invariant(name))
         .execute(&mut *tx)
         .await
@@ -530,7 +537,9 @@ impl UserManager for FerrofinUserManager {
     }
 
     async fn get_user_by_name(&self, name: &str) -> Result<Option<UserEntity>, ServiceError> {
-        // Exact lookup on the same invariant key used for creates and renames.
+        // 12.0 `UserManager.GetUserByName` (:163): an exact match on
+        // `NormalizedUsername` against `name.ToUpperInvariant()` — which is
+        // also how `AuthenticateUser` re-finds the user (:588, :594).
         sqlx::query_as::<_, UserEntity>(
             r#"SELECT * FROM "Users" WHERE "NormalizedUsername" = ?1 LIMIT 1"#,
         )
@@ -576,6 +585,7 @@ impl UserManager for FerrofinUserManager {
         )
         .bind(guid_to_db(user_id))
         .bind(new_name)
+        // 12.0 `RenameUser` (:201-202): `NormalizedUsername = Username.ToUpperInvariant()`.
         .bind(upper_invariant(new_name))
         .execute(&mut *tx)
         .await
@@ -1935,11 +1945,17 @@ mod tests {
         assert!(user.hide_played_in_latest);
         assert_eq!(user.cast_receiver_id.as_deref(), Some("F007D354"));
 
-        // Duplicate (case-insensitive) is rejected.
-        assert!(matches!(
-            mgr.create_user("ALICE").await,
-            Err(ServiceError::InvalidInput(_))
-        ));
+        // Duplicate (case-insensitive) is rejected with Jellyfin's
+        // ArgumentException text — a 400, never the index's constraint error.
+        for variant in ["ALICE", "Alice", "aLiCe"] {
+            match mgr.create_user(variant).await {
+                Err(ServiceError::InvalidInput(msg)) => assert_eq!(
+                    msg,
+                    format!("A user with the name '{variant}' already exists.")
+                ),
+                other => panic!("{variant}: expected InvalidInput, got {other:?}"),
+            }
+        }
 
         let id = Uuid::parse_str(&user.id).expect("uuid");
         mgr.rename_user(id, "alice", "bob").await.expect("rename");
@@ -1957,6 +1973,60 @@ mod tests {
             mgr.rename_user(id, "bob", "..").await,
             Err(ServiceError::InvalidInput(_))
         ));
+
+        // Renaming onto a case-variant of ANOTHER user's name is the same 400.
+        let carol = mgr.create_user("carol").await.expect("create carol");
+        let carol_id = Uuid::parse_str(&carol.id).expect("uuid");
+        match mgr.rename_user(carol_id, "carol", "BOB").await {
+            Err(ServiceError::InvalidInput(msg)) => {
+                assert_eq!(msg, "A user with the name 'BOB' already exists.");
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+        // A user may still change their own name's case (12.0 excludes the
+        // user's own row from the clash check).
+        mgr.rename_user(id, "bob", "Bob").await.expect("recase");
+        let recased = mgr.get_user_by_id(id).await.expect("by id").expect("some");
+        assert_eq!(recased.username, "Bob");
+        assert_eq!(recased.normalized_username, "BOB");
+    }
+
+    /// The stored lookup key is `ToUpperInvariant` of the name and every
+    /// by-name path matches on it — so a non-ASCII name is found under any
+    /// casing, and the row carries the key the lookups compute.
+    #[tokio::test]
+    async fn usernames_are_matched_on_the_invariant_uppercase_key() {
+        let db = test_db().await;
+        let mgr = FerrofinUserManager::new(db.clone());
+
+        let user = mgr.create_user("münchen").await.expect("create");
+        assert_eq!(user.normalized_username, "MÜNCHEN");
+        for spelling in ["münchen", "MÜNCHEN", "München"] {
+            let found = mgr
+                .get_user_by_name(spelling)
+                .await
+                .expect("by name")
+                .unwrap_or_else(|| panic!("{spelling} must resolve"));
+            assert_eq!(found.id, user.id);
+        }
+        assert!(matches!(
+            mgr.create_user("MÜNCHEN").await,
+            Err(ServiceError::InvalidInput(_))
+        ));
+        // `ß` has no one-character uppercase: the key keeps it, so "straße"
+        // and "strasse" are two different users — exactly as in .NET.
+        let strasse = mgr.create_user("straße").await.expect("create ß");
+        assert_eq!(strasse.normalized_username, "STRAßE");
+        assert!(mgr.create_user("strasse").await.is_ok());
+
+        // Login goes through the same key.
+        let id = Uuid::parse_str(&user.id).expect("uuid");
+        mgr.change_password(id, "pw").await.expect("set pw");
+        let ok = mgr
+            .authenticate_user("MÜNCHEN", "pw", "127.0.0.1", true)
+            .await
+            .expect("auth");
+        assert!(ok.is_some());
     }
 
     #[tokio::test]

@@ -27,6 +27,8 @@ use ferrofin_db::entities::base_items::{
 };
 use ferrofin_db::store::guid_to_db;
 use ferrofin_model::configuration::LibraryOptions as LibraryOptionsModel;
+
+use crate::item_persistence_service::series_key_scope;
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::dto::MediaSourceInfo;
 use ferrofin_model::entities::{CollectionTypeOptions, ImageType, VideoType};
@@ -865,6 +867,11 @@ pub struct LibraryScanner {
     /// in `InheritedParentalRatingValue` (what the Parental Rating sort and
     /// the max-parental-rating filters read). `None` in minimal unit tests.
     localization: Option<Arc<crate::localization_manager::LocalizationManager>>,
+    /// `ServerConfiguration.PreferredMetadataLanguage` — the last fallback of
+    /// `GetPreferredMetadataLanguage()`, which a series' presentation key
+    /// embeds (`Series.AddLibrariesToPresentationUniqueKey`). Jellyfin's own
+    /// default is `en`.
+    default_metadata_language: String,
     /// Emit a scan-progress `info!` every N items (bootstrap knob
     /// `FERROFIN_SCAN_PROGRESS_EVERY`; default [`DEFAULT_SCAN_PROGRESS_EVERY`]). `0`
     /// disables progress logging. Keeps info-level volume at O(items/N) per
@@ -918,6 +925,7 @@ impl LibraryScanner {
             media_attachments: None,
             image_processor: None,
             localization: None,
+            default_metadata_language: "en".to_owned(),
             progress_every: DEFAULT_SCAN_PROGRESS_EVERY,
             events: None,
         }
@@ -1002,6 +1010,17 @@ impl LibraryScanner {
         localization: Arc<crate::localization_manager::LocalizationManager>,
     ) -> Self {
         self.localization = Some(localization);
+        self
+    }
+
+    /// Sets the server-wide preferred metadata language
+    /// (`ServerConfiguration.PreferredMetadataLanguage`), the fallback a
+    /// series' presentation key embeds when neither the row nor its library
+    /// names one. Wired by the composition root; unit tests keep Jellyfin's
+    /// `en` default.
+    #[must_use]
+    pub fn with_default_metadata_language(mut self, language: impl Into<String>) -> Self {
+        self.default_metadata_language = language.into();
         self
     }
 
@@ -1251,6 +1270,10 @@ impl LibraryScanner {
     /// metadata + persistence per item, deleted-item pruning (restricted to
     /// `prune_scope` when given), the `LibraryChanged` push, and the music
     /// enrichment pass.
+    // The per-item pipeline reads best as one straight line; the series-key
+    // settle + re-point step (12.0 `UpdateSeriesChildrenInfoAsync`) tipped it
+    // over the line count.
+    #[allow(clippy::too_many_lines)]
     async fn run_scan(
         &self,
         folders: &[VirtualFolderInfo],
@@ -1282,6 +1305,10 @@ impl LibraryScanner {
         // reads, so it runs `probe_concurrency` files ahead of this loop. The
         // loop itself is unchanged: same plan order, same rows, same writes.
         let mut probes = self.probe_pipeline(&planned);
+        // The presentation key each series settled on once its provider ids
+        // were known, for the seasons/episodes planned after it (a series
+        // always precedes its children in plan order).
+        let mut series_keys: HashMap<Uuid, String> = HashMap::new();
         for (scanned, item) in planned.iter().enumerate() {
             tracing::debug!(item = %item.id, "scanning item");
             self.log_scan_progress(scanned, planned.len());
@@ -1393,6 +1420,15 @@ impl LibraryScanner {
                     policy,
                 )
                 .await;
+            // A series' presentation key depends on the ids just settled;
+            // its children take the settled key (see `sync_series_key`).
+            let moved_series_key = self.sync_series_key(
+                &mut entity,
+                folders,
+                &all_provider_ids,
+                &known_ids,
+                &mut series_keys,
+            );
             // Scan-variant save: preserves `PrimaryVersionId` (merge-versions
             // links) and the stored `DateCreated` on rows that already exist —
             // this entity is rebuilt from disk and would otherwise reset both
@@ -1400,6 +1436,14 @@ impl LibraryScanner {
             self.persistence
                 .save_scanned_items(std::slice::from_ref(&entity))
                 .await?;
+            if let Some(key) = moved_series_key {
+                // `SeriesMetadataService.UpdateSeriesChildrenInfoAsync`: the
+                // children a previous scan stored under the old key are
+                // re-pointed now rather than left hidden until a later scan.
+                self.persistence
+                    .repoint_series_children(item.id, &key)
+                    .await?;
+            }
             self.persist_provider_ids_and_values(
                 item.id,
                 &entity,
@@ -3435,7 +3479,7 @@ impl LibraryScanner {
                 // `ForcedSortName` when the item has one, so this does too.
                 entity.name.clone_from(&stored.name);
                 entity.sort_name = match entity.forced_sort_name.as_deref() {
-                    Some(forced) => Some(ferrofin_util::sort_name::forced_sort_key(forced)),
+                    Some(forced) => Some(forced_sort_name(entity, forced)),
                     None => stored
                         .name
                         .as_deref()
@@ -4677,7 +4721,7 @@ impl LibraryScanner {
             for location in &folder.locations {
                 match folder.collection_type {
                     Some(CollectionTypeOptions::tvshows) => {
-                        self.plan_tv(location, cf, &naming, &mut out);
+                        self.plan_tv(folders, location, cf, &naming, &mut out);
                     }
                     Some(CollectionTypeOptions::music) => {
                         self.plan_music(location, cf, &naming, &mut out);
@@ -4968,7 +5012,19 @@ impl LibraryScanner {
 
     /// TV library: each top-level folder is a `Series`; its `Season NN` subfolders
     /// are `Season`s and the videos beneath them `Episode`s.
-    fn plan_tv(&self, location: &str, cf: Uuid, naming: &NamingOptions, out: &mut Vec<Planned>) {
+    ///
+    /// `folders` is every configured library, not just the one being planned:
+    /// a series' presentation key names EVERY library whose locations hold its
+    /// folder (`LibraryManager.GetCollectionFolders`), which is how one show
+    /// shared by two libraries lists once.
+    fn plan_tv(
+        &self,
+        folders: &[VirtualFolderInfo],
+        location: &str,
+        cf: Uuid,
+        naming: &NamingOptions,
+        out: &mut Vec<Planned>,
+    ) {
         for entry in self.file_system.get_file_system_entries(location) {
             if entry.type_ != FileSystemEntryType::Directory {
                 continue; // loose files directly under a tvshows root are skipped in v1
@@ -4984,27 +5040,122 @@ impl LibraryScanner {
             series.production_year = info.year.map(i64::from);
             // The series' presentation key groups its seasons/episodes: the
             // `/Shows/{id}/{Seasons,Episodes}` queries filter on
-            // `SeriesPresentationUniqueKey`, and `series_presentation_key` falls
-            // back to this. Use the series id so children can match it.
-            series.presentation_unique_key = Some(series_id.simple().to_string());
+            // `SeriesPresentationUniqueKey`. Planned under 12.0's rule
+            // (`Series.CreatePresentationUniqueKey`) from what is known before
+            // any provider ran — no provider ids yet, so with grouping on this
+            // is the `series-{name}` fallback; the refresh recomputes it once
+            // the ids are settled (`sync_series_key`) and re-points the
+            // children, exactly as `SeriesMetadataService` does.
+            let series_key = self.series_key_for(folders, &series, &[], &[]);
+            series.presentation_unique_key = Some(series_key.clone());
             out.push(Planned {
                 id: series_id,
                 entity: series,
                 ancestors: vec![cf],
             });
-            self.plan_series(&entry.path, cf, series_id, &series_name, naming, out);
+            self.plan_series(
+                &entry.path,
+                cf,
+                series_id,
+                &series_name,
+                &series_key,
+                naming,
+                out,
+            );
+        }
+    }
+
+    /// 12.0's `Series.CreatePresentationUniqueKey()` for a scanned series row:
+    /// the library-side inputs resolve through [`series_key_scope`] over every
+    /// configured library, and the provider ids are `provider_ids` first (the
+    /// ones this refresh settled) then any `known_ids` it did not (the stored
+    /// and sidecar ids, which `save_provider_id` leaves in place).
+    fn series_key_for(
+        &self,
+        folders: &[VirtualFolderInfo],
+        series: &BaseItemEntity,
+        provider_ids: &[(String, String)],
+        known_ids: &[(String, String)],
+    ) -> String {
+        let Some(series_id) = parse_id(&series.id) else {
+            return series.id.clone();
+        };
+        let scope = series_key_scope(
+            folders,
+            &self.default_metadata_language,
+            series.top_parent_id.as_deref(),
+            series.path.as_deref(),
+            series.preferred_metadata_language.as_deref(),
+        );
+        let mut ids: Vec<(String, String)> = provider_ids.to_vec();
+        for (key, value) in known_ids {
+            if !ids.iter().any(|(k, _)| k.eq_ignore_ascii_case(key)) {
+                ids.push((key.clone(), value.clone()));
+            }
+        }
+        crate::kinds::series_presentation_unique_key(
+            series_id,
+            scope.enable_automatic_series_grouping,
+            series.name.as_deref(),
+            &ids,
+            scope.preferred_metadata_language.as_deref(),
+            &scope.collection_folder_ids,
+        )
+    }
+
+    /// The per-item half of C# `SeriesMetadataService.UpdateSeriesChildrenInfoAsync`.
+    ///
+    /// A `Series` gets its key recomputed from the provider ids the refresh
+    /// just settled ([`Self::series_key_for`]) and records it in `series_keys`
+    /// for the seasons and episodes planned after it, which take it as their
+    /// `SeriesPresentationUniqueKey` (a season's own key then follows from it
+    /// in the writer). Returns the series' new key when it moved off the
+    /// plan-time one: the children a previous scan wrote under the old key —
+    /// and any this scan is not visiting — need re-pointing by `SeriesId`.
+    fn sync_series_key(
+        &self,
+        entity: &mut BaseItemEntity,
+        folders: &[VirtualFolderInfo],
+        provider_ids: &[(String, String)],
+        known_ids: &[(String, String)],
+        series_keys: &mut HashMap<Uuid, String>,
+    ) -> Option<String> {
+        match item_type_lookup::kind_from_type_name(&entity.type_) {
+            Some(BaseItemKind::Series) => {
+                let key = self.series_key_for(folders, entity, provider_ids, known_ids);
+                let moved = entity.presentation_unique_key.as_deref() != Some(key.as_str());
+                entity.presentation_unique_key = Some(key.clone());
+                if let Some(id) = parse_id(&entity.id) {
+                    series_keys.insert(id, key.clone());
+                }
+                moved.then_some(key)
+            }
+            Some(BaseItemKind::Season | BaseItemKind::Episode) => {
+                if let Some(key) = entity
+                    .series_id
+                    .as_deref()
+                    .and_then(parse_id)
+                    .and_then(|id| series_keys.get(&id))
+                {
+                    entity.series_presentation_unique_key = Some(key.clone());
+                }
+                None
+            }
+            _ => None,
         }
     }
 
     /// Plans one series folder: `Season NN` subfolders → a `Season` plus its
     /// episodes; a video directly in the series folder → an `Episode` with no
     /// season parent.
+    #[allow(clippy::too_many_arguments)]
     fn plan_series(
         &self,
         series_dir: &str,
         cf: Uuid,
         series_id: Uuid,
         series_name: &str,
+        series_key: &str,
         naming: &NamingOptions,
         out: &mut Vec<Planned>,
     ) {
@@ -5035,7 +5186,7 @@ impl LibraryScanner {
                     e.sort_name = Some(season_sort_name(e.index_number, &name));
                     e.series_id = Some(guid_to_db(series_id));
                     e.series_name = Some(series_name.to_owned());
-                    e.series_presentation_unique_key = Some(series_id.simple().to_string());
+                    e.series_presentation_unique_key = Some(series_key.to_owned());
                     out.push(Planned {
                         id: season_id,
                         entity: e,
@@ -5047,6 +5198,7 @@ impl LibraryScanner {
                         series_id,
                         Some((season_id, num)),
                         series_name,
+                        series_key,
                         Some(&name),
                         naming,
                         out,
@@ -5060,7 +5212,16 @@ impl LibraryScanner {
                 loose.push(entry.path);
             }
         }
-        self.plan_loose_episodes(&loose, cf, series_id, series_name, series_dir, naming, out);
+        self.plan_loose_episodes(
+            &loose,
+            cf,
+            series_id,
+            series_name,
+            series_key,
+            series_dir,
+            naming,
+            out,
+        );
     }
 
     /// Collects every video file under `dir` (recursively) into `out_paths`.
@@ -5086,6 +5247,7 @@ impl LibraryScanner {
         cf: Uuid,
         series_id: Uuid,
         series_name: &str,
+        series_key: &str,
         series_dir: &str,
         naming: &NamingOptions,
         out: &mut Vec<Planned>,
@@ -5125,7 +5287,7 @@ impl LibraryScanner {
             ));
             e.series_id = Some(guid_to_db(series_id));
             e.series_name = Some(series_name.to_owned());
-            e.series_presentation_unique_key = Some(series_id.simple().to_string());
+            e.series_presentation_unique_key = Some(series_key.to_owned());
             out.push(Planned {
                 id: season_id,
                 entity: e,
@@ -5143,6 +5305,7 @@ impl LibraryScanner {
                 series_id,
                 season,
                 series_name,
+                series_key,
                 Some(&season_name),
                 naming,
                 out,
@@ -5160,6 +5323,7 @@ impl LibraryScanner {
         series_id: Uuid,
         season: Option<(Uuid, Option<i32>)>,
         series_name: &str,
+        series_key: &str,
         season_name: Option<&str>,
         naming: &NamingOptions,
         out: &mut Vec<Planned>,
@@ -5172,6 +5336,7 @@ impl LibraryScanner {
                     series_id,
                     season,
                     series_name,
+                    series_key,
                     season_name,
                     naming,
                     out,
@@ -5183,6 +5348,7 @@ impl LibraryScanner {
                     series_id,
                     season,
                     series_name,
+                    series_key,
                     season_name,
                     naming,
                     out,
@@ -5202,6 +5368,7 @@ impl LibraryScanner {
         series_id: Uuid,
         season: Option<(Uuid, Option<i32>)>,
         series_name: &str,
+        series_key: &str,
         season_name: Option<&str>,
         naming: &NamingOptions,
         out: &mut Vec<Planned>,
@@ -5237,7 +5404,7 @@ impl LibraryScanner {
         // Link the episode to its series/season so the `/Shows/{id}/Episodes`
         // query (which filters on `SeriesPresentationUniqueKey`) returns it.
         entity.series_id = Some(guid_to_db(series_id));
-        entity.series_presentation_unique_key = Some(series_id.simple().to_string());
+        entity.series_presentation_unique_key = Some(series_key.to_owned());
         entity.season_id = season.map(|(sid, _)| guid_to_db(sid));
         // Episodes sort by position, not title (`Episode.CreateSortName`) — the
         // numbers are only known here, after the resolver ran.
@@ -7405,6 +7572,18 @@ fn season_sort_name(index: Option<i64>, name: &str) -> String {
 /// The sort name a row derives from `title`, honouring the per-kind
 /// `CreateSortName` overrides (episodes and seasons sort by number, everything
 /// else by the name pipeline).
+/// The `SortName` a non-empty `ForcedSortName` yields for `entity` — 12.0's
+/// `GetSortName(ForcedSortName, EnableAlphaNumericSorting, config)`, so a
+/// `Person` keeps it verbatim and every other kind cleans it like a derived
+/// key. The per-kind `CreateSortName` overrides in [`derived_sort_name`] do not
+/// apply to the forced branch.
+fn forced_sort_name(entity: &BaseItemEntity, forced: &str) -> String {
+    match crate::item_type_lookup::kind_from_type_name(&entity.type_) {
+        Some(kind) => crate::kinds::forced_sort_name_for(kind, forced),
+        None => ferrofin_util::sort_name::forced_sort_key(forced),
+    }
+}
+
 fn derived_sort_name(entity: &BaseItemEntity, title: &str) -> String {
     match entity.type_.rsplit('.').next().unwrap_or(&entity.type_) {
         "Episode" => episode_sort_name(entity.parent_index_number, entity.index_number, title),
@@ -12926,13 +13105,22 @@ mod tests {
             "virtual season carries the season number"
         );
         assert_eq!(season.2, None, "a virtual season has no on-disk path");
-        // The presentation key keeps its own (display) format; compare as GUIDs.
+        // 12.0 `Series.CreatePresentationUniqueKey`: automatic series grouping
+        // is on by default and the series has no provider id, so it keys on
+        // `series-{name}-{lang}-{library}` — the children point at THAT key,
+        // not at the series id.
+        let series_key: Option<String> =
+            crate::test_support::fetch_item(&db, uuid::Uuid::parse_str(&series_id).unwrap())
+                .await
+                .presentation_unique_key;
+        let cf_simple = uuid::Uuid::parse_str(&cf).unwrap().as_simple().to_string();
         assert_eq!(
-            season
-                .3
-                .as_deref()
-                .and_then(|s| uuid::Uuid::parse_str(s).ok()),
-            uuid::Uuid::parse_str(&series_id).ok(),
+            series_key.as_deref(),
+            Some(format!("series-the office (us)-en-{cf_simple}").as_str()),
+            "12.0 name-fallback grouping key scoped to the library"
+        );
+        assert_eq!(
+            season.3, series_key,
             "season links to the series by presentation key"
         );
 
@@ -12956,10 +13144,8 @@ mod tests {
         assert_eq!(ep.1, Some(2));
         assert_eq!(ep.2.as_deref(), Some(season.0.as_str()), "SeasonId set");
         assert_eq!(ep.3.as_deref(), Some(series_id.as_str()), "SeriesId set");
-        // The presentation key keeps its own (display) format; compare as GUIDs.
         assert_eq!(
-            ep.4.as_deref().and_then(|s| uuid::Uuid::parse_str(s).ok()),
-            uuid::Uuid::parse_str(&series_id).ok(),
+            ep.4, series_key,
             "episode links to the series by presentation key (drives the Episodes query)"
         );
         // Ancestor closure is depth 3 (cf, series, season).

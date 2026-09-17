@@ -372,12 +372,18 @@ pub async fn open_database(config: &Config) -> anyhow::Result<Database> {
     db.run_migrations()
         .await
         .context("failed to apply database migrations")?;
-    // Playlist/collection membership lives in BaseItems.Data JSON (Jellyfin's
-    // 10.11.8 storage); reconcile it with Ferrofin's derived cache tables —
-    // imports Jellyfin-written blobs, backfills blobs for pre-Data Ferrofin rows.
-    ferrofin_core::item_data::reconcile_container_data(&db)
+    // Playlist owner/open-access/shares still live in BaseItems.Data JSON (12.0
+    // serialises them); import them on every boot, before anything is served —
+    // a playlist without its permission row is owner-accessible to everyone.
+    ferrofin_core::item_data::reconcile_playlist_permissions(&db)
         .await
-        .context("failed to reconcile playlist/collection Data JSON")?;
+        .context("failed to reconcile playlist permissions from Data JSON")?;
+    // The one-shot ports of 12.0's data routines: membership from Data JSON
+    // for a database newly adopted from 10.11.8 (never from a 12.0 one, whose
+    // JSON is frozen), orphaned extras, OwnerId relationships, version links.
+    ferrofin_core::adoption_repairs::run_all(&db)
+        .await
+        .context("failed to run the adoption repairs")?;
     // Rows written before the persistence service derived `SortName` still
     // carry NULL, which makes them unsortable AND unreachable by the A-Z
     // `nameStartsWith` filter. A no-op once repaired, and on an adopted

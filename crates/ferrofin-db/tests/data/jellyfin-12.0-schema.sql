@@ -1,11 +1,3 @@
--- Reference schema derived from the real 10.11.8 sqlite_master fixture by
--- applying Jellyfin v10.11.11's two upstream DDL additions to Users:
--- 20260522092303_AddNormalizedUsername (TEXT NOT NULL DEFAULT '') and
--- 20260524120336_AddUniqueNormalizedUsernameIndex (unique, binary comparison).
--- The intervening code-only backfill changes data, not this schema.
--- Source: jellyfin/jellyfin, tag v10.11.11,
--- src/Jellyfin.Database/Jellyfin.Database.Providers.Sqlite/Migrations/.
--- This is a reconstructed reference, not a dump of a running 10.11.11 server.
 CREATE TABLE IF NOT EXISTS "__EFMigrationsHistory"(
   "MigrationId" TEXT NOT NULL CONSTRAINT "PK___EFMigrationsHistory" PRIMARY KEY,
   "ProductVersion" TEXT NOT NULL
@@ -34,7 +26,6 @@ CREATE TABLE IF NOT EXISTS "AccessSchedules"(
   "EndHour" REAL NOT NULL,
   CONSTRAINT "FK_AccessSchedules_Users_UserId" FOREIGN KEY("UserId") REFERENCES "Users"("Id") ON DELETE CASCADE
 );
-CREATE INDEX "IX_AccessSchedules_UserId" ON "AccessSchedules"("UserId");
 CREATE TABLE IF NOT EXISTS "DisplayPreferences"(
   "Id" INTEGER NOT NULL CONSTRAINT "PK_DisplayPreferences" PRIMARY KEY AUTOINCREMENT,
   "UserId" TEXT NOT NULL,
@@ -72,17 +63,6 @@ CREATE TABLE IF NOT EXISTS "HomeSection"(
   "Type" INTEGER NOT NULL,
   CONSTRAINT "FK_HomeSection_DisplayPreferences_DisplayPreferencesId" FOREIGN KEY("DisplayPreferencesId") REFERENCES "DisplayPreferences"("Id") ON DELETE CASCADE
 );
-CREATE INDEX "IX_HomeSection_DisplayPreferencesId" ON "HomeSection"(
-  "DisplayPreferencesId"
-);
-CREATE INDEX "IX_ItemDisplayPreferences_UserId" ON "ItemDisplayPreferences"(
-  "UserId"
-);
-CREATE UNIQUE INDEX "IX_DisplayPreferences_UserId_ItemId_Client" ON "DisplayPreferences"(
-  "UserId",
-  "ItemId",
-  "Client"
-);
 CREATE TABLE IF NOT EXISTS "ImageInfos"(
   "Id" INTEGER NOT NULL CONSTRAINT "PK_ImageInfos" PRIMARY KEY AUTOINCREMENT,
   "LastModified" TEXT NOT NULL,
@@ -90,33 +70,6 @@ CREATE TABLE IF NOT EXISTS "ImageInfos"(
   "UserId" TEXT NULL,
   CONSTRAINT "FK_ImageInfos_Users_UserId" FOREIGN KEY("UserId") REFERENCES "Users"("Id") ON DELETE CASCADE
 );
-CREATE TABLE IF NOT EXISTS "Permissions"(
-  "Id" INTEGER NOT NULL CONSTRAINT "PK_Permissions" PRIMARY KEY AUTOINCREMENT,
-  "Kind" INTEGER NOT NULL,
-  "Permission_Permissions_Guid" TEXT NULL,
-  "RowVersion" INTEGER NOT NULL,
-  "UserId" TEXT NULL,
-  "Value" INTEGER NOT NULL,
-  CONSTRAINT "FK_Permissions_Users_UserId" FOREIGN KEY("UserId") REFERENCES "Users"("Id") ON DELETE CASCADE
-);
-CREATE TABLE IF NOT EXISTS "Preferences"(
-  "Id" INTEGER NOT NULL CONSTRAINT "PK_Preferences" PRIMARY KEY AUTOINCREMENT,
-  "Kind" INTEGER NOT NULL,
-  "Preference_Preferences_Guid" TEXT NULL,
-  "RowVersion" INTEGER NOT NULL,
-  "UserId" TEXT NULL,
-  "Value" TEXT NOT NULL,
-  CONSTRAINT "FK_Preferences_Users_UserId" FOREIGN KEY("UserId") REFERENCES "Users"("Id") ON DELETE CASCADE
-);
-CREATE UNIQUE INDEX "IX_ImageInfos_UserId" ON "ImageInfos"("UserId");
-CREATE UNIQUE INDEX "IX_Permissions_UserId_Kind" ON "Permissions"(
-  "UserId",
-  "Kind"
-) WHERE [UserId] IS NOT NULL;
-CREATE UNIQUE INDEX "IX_Preferences_UserId_Kind" ON "Preferences"(
-  "UserId",
-  "Kind"
-) WHERE [UserId] IS NOT NULL;
 CREATE TABLE IF NOT EXISTS "CustomItemDisplayPreferences"(
   "Id" INTEGER NOT NULL CONSTRAINT "PK_CustomItemDisplayPreferences" PRIMARY KEY AUTOINCREMENT,
   "Client" TEXT NOT NULL,
@@ -124,15 +77,6 @@ CREATE TABLE IF NOT EXISTS "CustomItemDisplayPreferences"(
   "Key" TEXT NOT NULL,
   "UserId" TEXT NOT NULL,
   "Value" TEXT NULL
-);
-CREATE INDEX "IX_CustomItemDisplayPreferences_UserId" ON "CustomItemDisplayPreferences"(
-  "UserId"
-);
-CREATE UNIQUE INDEX "IX_CustomItemDisplayPreferences_UserId_ItemId_Client_Key" ON "CustomItemDisplayPreferences"(
-  "UserId",
-  "ItemId",
-  "Client",
-  "Key"
 );
 CREATE TABLE IF NOT EXISTS "ApiKeys"(
   "Id" INTEGER NOT NULL CONSTRAINT "PK_ApiKeys" PRIMARY KEY AUTOINCREMENT,
@@ -160,19 +104,6 @@ CREATE TABLE IF NOT EXISTS "Devices"(
   "DateLastActivity" TEXT NOT NULL,
   CONSTRAINT "FK_Devices_Users_UserId" FOREIGN KEY("UserId") REFERENCES "Users"("Id") ON DELETE CASCADE
 );
-CREATE UNIQUE INDEX "IX_ApiKeys_AccessToken" ON "ApiKeys"("AccessToken");
-CREATE UNIQUE INDEX "IX_DeviceOptions_DeviceId" ON "DeviceOptions"("DeviceId");
-CREATE INDEX "IX_Devices_AccessToken_DateLastActivity" ON "Devices"(
-  "AccessToken",
-  "DateLastActivity"
-);
-CREATE INDEX "IX_Devices_DeviceId" ON "Devices"("DeviceId");
-CREATE INDEX "IX_Devices_DeviceId_DateLastActivity" ON "Devices"(
-  "DeviceId",
-  "DateLastActivity"
-);
-CREATE INDEX "IX_Devices_UserId_DeviceId" ON "Devices"("UserId", "DeviceId");
-CREATE INDEX "IX_ActivityLogs_DateCreated" ON "ActivityLogs"("DateCreated");
 CREATE TABLE IF NOT EXISTS "TrickplayInfos"(
   "ItemId" TEXT NOT NULL,
   "Width" INTEGER NOT NULL,
@@ -239,19 +170,6 @@ CREATE TABLE IF NOT EXISTS "ItemValuesMap"(
   CONSTRAINT "FK_ItemValuesMap_BaseItems_ItemId" FOREIGN KEY("ItemId") REFERENCES "BaseItems"("Id") ON DELETE CASCADE,
   CONSTRAINT "FK_ItemValuesMap_ItemValues_ItemValueId" FOREIGN KEY("ItemValueId") REFERENCES "ItemValues"("ItemValueId") ON DELETE CASCADE
 );
-CREATE INDEX "IX_BaseItemMetadataFields_ItemId" ON "BaseItemMetadataFields"(
-  "ItemId"
-);
-CREATE INDEX "IX_BaseItemProviders_ProviderId_ProviderValue_ItemId" ON "BaseItemProviders"(
-  "ProviderId",
-  "ProviderValue",
-  "ItemId"
-);
-CREATE INDEX "IX_BaseItemTrailerTypes_ItemId" ON "BaseItemTrailerTypes"(
-  "ItemId"
-);
-CREATE INDEX "IX_ItemValuesMap_ItemId" ON "ItemValuesMap"("ItemId");
-CREATE INDEX "IX_Peoples_Name" ON "Peoples"("Name");
 CREATE TABLE IF NOT EXISTS "UserData"(
   "ItemId" TEXT NOT NULL,
   "UserId" TEXT NOT NULL,
@@ -270,27 +188,6 @@ CREATE TABLE IF NOT EXISTS "UserData"(
   CONSTRAINT "FK_UserData_BaseItems_ItemId" FOREIGN KEY("ItemId") REFERENCES "BaseItems"("Id") ON DELETE CASCADE,
   CONSTRAINT "FK_UserData_Users_UserId" FOREIGN KEY("UserId") REFERENCES "Users"("Id") ON DELETE CASCADE
 );
-CREATE INDEX "IX_UserData_ItemId_UserId_IsFavorite" ON "UserData"(
-  "ItemId",
-  "UserId",
-  "IsFavorite"
-);
-CREATE INDEX "IX_UserData_ItemId_UserId_LastPlayedDate" ON "UserData"(
-  "ItemId",
-  "UserId",
-  "LastPlayedDate"
-);
-CREATE INDEX "IX_UserData_ItemId_UserId_PlaybackPositionTicks" ON "UserData"(
-  "ItemId",
-  "UserId",
-  "PlaybackPositionTicks"
-);
-CREATE INDEX "IX_UserData_ItemId_UserId_Played" ON "UserData"(
-  "ItemId",
-  "UserId",
-  "Played"
-);
-CREATE INDEX "IX_UserData_UserId" ON "UserData"("UserId");
 CREATE TABLE IF NOT EXISTS "AncestorIds"(
   "ItemId" TEXT NOT NULL,
   "ParentItemId" TEXT NOT NULL,
@@ -298,7 +195,6 @@ CREATE TABLE IF NOT EXISTS "AncestorIds"(
   CONSTRAINT "FK_AncestorIds_BaseItems_ItemId" FOREIGN KEY("ItemId") REFERENCES "BaseItems"("Id") ON DELETE CASCADE,
   CONSTRAINT "FK_AncestorIds_BaseItems_ParentItemId" FOREIGN KEY("ParentItemId") REFERENCES "BaseItems"("Id") ON DELETE CASCADE
 );
-CREATE INDEX "IX_AncestorIds_ParentItemId" ON "AncestorIds"("ParentItemId");
 CREATE TABLE IF NOT EXISTS "MediaStreamInfos"(
   "ItemId" TEXT NOT NULL,
   "StreamIndex" INTEGER NOT NULL,
@@ -347,23 +243,9 @@ CREATE TABLE IF NOT EXISTS "MediaStreamInfos"(
   "Title" TEXT NULL,
   "Width" INTEGER NULL,
   "Hdr10PlusPresentFlag" INTEGER NULL,
+  "IsOriginal" INTEGER NOT NULL DEFAULT 0,
   CONSTRAINT "PK_MediaStreamInfos" PRIMARY KEY("ItemId", "StreamIndex"),
   CONSTRAINT "FK_MediaStreamInfos_BaseItems_ItemId" FOREIGN KEY("ItemId") REFERENCES "BaseItems"("Id") ON DELETE CASCADE
-);
-CREATE INDEX "IX_MediaStreamInfos_StreamIndex" ON "MediaStreamInfos"(
-  "StreamIndex"
-);
-CREATE INDEX "IX_MediaStreamInfos_StreamIndex_StreamType" ON "MediaStreamInfos"(
-  "StreamIndex",
-  "StreamType"
-);
-CREATE INDEX "IX_MediaStreamInfos_StreamIndex_StreamType_Language" ON "MediaStreamInfos"(
-  "StreamIndex",
-  "StreamType",
-  "Language"
-);
-CREATE INDEX "IX_MediaStreamInfos_StreamType" ON "MediaStreamInfos"(
-  "StreamType"
 );
 CREATE TABLE IF NOT EXISTS "Users"(
   "Id" TEXT NOT NULL CONSTRAINT "PK_Users" PRIMARY KEY,
@@ -400,8 +282,6 @@ CREATE TABLE IF NOT EXISTS "Users"(
   "MaxParentalRatingSubScore" INTEGER NULL,
   "NormalizedUsername" TEXT NOT NULL DEFAULT ''
 );
-CREATE UNIQUE INDEX "IX_Users_Username" ON "Users"("Username");
-CREATE UNIQUE INDEX "IX_Users_NormalizedUsername" ON "Users"("NormalizedUsername");
 CREATE TABLE IF NOT EXISTS "KeyframeData"(
   "ItemId" TEXT NOT NULL CONSTRAINT "PK_KeyframeData" PRIMARY KEY,
   "TotalDuration" INTEGER NOT NULL,
@@ -419,14 +299,6 @@ CREATE TABLE IF NOT EXISTS "AttachmentStreamInfos"(
   CONSTRAINT "PK_AttachmentStreamInfos" PRIMARY KEY("ItemId", "Index"),
   CONSTRAINT "FK_AttachmentStreamInfos_BaseItems_ItemId" FOREIGN KEY("ItemId") REFERENCES "BaseItems"("Id") ON DELETE CASCADE
 );
-CREATE INDEX "IX_ItemValues_Type_CleanValue" ON "ItemValues"(
-  "Type",
-  "CleanValue"
-);
-CREATE UNIQUE INDEX "IX_ItemValues_Type_Value" ON "ItemValues"(
-  "Type",
-  "Value"
-);
 CREATE TABLE IF NOT EXISTS "BaseItemImageInfos"(
   "Id" TEXT NOT NULL CONSTRAINT "PK_BaseItemImageInfos" PRIMARY KEY,
   "Blurhash" BLOB NULL,
@@ -438,7 +310,16 @@ CREATE TABLE IF NOT EXISTS "BaseItemImageInfos"(
   "Width" INTEGER NOT NULL,
   CONSTRAINT "FK_BaseItemImageInfos_BaseItems_ItemId" FOREIGN KEY("ItemId") REFERENCES "BaseItems"("Id") ON DELETE CASCADE
 );
-CREATE INDEX "IX_BaseItemImageInfos_ItemId" ON "BaseItemImageInfos"("ItemId");
+CREATE TABLE IF NOT EXISTS "PeopleBaseItemMap"(
+  "ItemId" TEXT NOT NULL,
+  "PeopleId" TEXT NOT NULL,
+  "Role" TEXT NOT NULL,
+  "ListOrder" INTEGER NULL,
+  "SortOrder" INTEGER NULL,
+  CONSTRAINT "PK_PeopleBaseItemMap" PRIMARY KEY("ItemId", "PeopleId", "Role"),
+  CONSTRAINT "FK_PeopleBaseItemMap_BaseItems_ItemId" FOREIGN KEY("ItemId") REFERENCES "BaseItems"("Id") ON DELETE CASCADE,
+  CONSTRAINT "FK_PeopleBaseItemMap_Peoples_PeopleId" FOREIGN KEY("PeopleId") REFERENCES "Peoples"("Id") ON DELETE CASCADE
+);
 CREATE TABLE IF NOT EXISTS "BaseItems"(
   "Id" TEXT NOT NULL CONSTRAINT "PK_BaseItems" PRIMARY KEY,
   "Album" TEXT NULL,
@@ -461,7 +342,6 @@ CREATE TABLE IF NOT EXISTS "BaseItems"(
   "ExternalId" TEXT NULL,
   "ExternalSeriesId" TEXT NULL,
   "ExternalServiceId" TEXT NULL,
-  "ExtraIds" TEXT NULL,
   "ExtraType" INTEGER NULL,
   "ForcedSortName" TEXT NULL,
   "Genres" TEXT NULL,
@@ -481,6 +361,7 @@ CREATE TABLE IF NOT EXISTS "BaseItems"(
   "Name" TEXT NULL,
   "NormalizationGain" REAL NULL,
   "OfficialRating" TEXT NULL,
+  "OriginalLanguage" TEXT NULL,
   "OriginalTitle" TEXT NULL,
   "Overview" TEXT NULL,
   "OwnerId" TEXT NULL,
@@ -512,13 +393,117 @@ CREATE TABLE IF NOT EXISTS "BaseItems"(
   "Type" TEXT NOT NULL,
   "UnratedType" TEXT NULL,
   "Width" INTEGER NULL,
+  CONSTRAINT "FK_BaseItems_BaseItems_OwnerId" FOREIGN KEY("OwnerId") REFERENCES "BaseItems"("Id"),
   CONSTRAINT "FK_BaseItems_BaseItems_ParentId" FOREIGN KEY("ParentId") REFERENCES "BaseItems"("Id") ON DELETE CASCADE
 );
-CREATE INDEX "IX_BaseItems_Id_Type_IsFolder_IsVirtualItem" ON "BaseItems"(
-  "Id",
+CREATE TABLE IF NOT EXISTS "LinkedChildren"(
+  "ParentId" TEXT NOT NULL,
+  "SortOrder" INTEGER NOT NULL,
+  "ChildId" TEXT NOT NULL,
+  "ChildType" INTEGER NOT NULL,
+  CONSTRAINT "PK_LinkedChildren" PRIMARY KEY("ParentId", "SortOrder"),
+  CONSTRAINT "FK_LinkedChildren_BaseItems_ChildId" FOREIGN KEY("ChildId") REFERENCES "BaseItems"("Id"),
+  CONSTRAINT "FK_LinkedChildren_BaseItems_ParentId" FOREIGN KEY("ParentId") REFERENCES "BaseItems"("Id")
+);
+CREATE TABLE IF NOT EXISTS "Preferences"(
+  "Id" INTEGER NOT NULL CONSTRAINT "PK_Preferences" PRIMARY KEY AUTOINCREMENT,
+  "Kind" INTEGER NOT NULL,
+  "RowVersion" INTEGER NOT NULL,
+  "UserId" TEXT NOT NULL,
+  "Value" TEXT NOT NULL,
+  CONSTRAINT "FK_Preferences_Users_UserId" FOREIGN KEY("UserId") REFERENCES "Users"("Id") ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS "Permissions"(
+  "Id" INTEGER NOT NULL CONSTRAINT "PK_Permissions" PRIMARY KEY AUTOINCREMENT,
+  "Kind" INTEGER NOT NULL,
+  "RowVersion" INTEGER NOT NULL,
+  "UserId" TEXT NOT NULL,
+  "Value" INTEGER NOT NULL,
+  CONSTRAINT "FK_Permissions_Users_UserId" FOREIGN KEY("UserId") REFERENCES "Users"("Id") ON DELETE CASCADE
+);
+CREATE INDEX "IX_AccessSchedules_UserId" ON "AccessSchedules"("UserId");
+CREATE INDEX "IX_HomeSection_DisplayPreferencesId" ON "HomeSection"(
+  "DisplayPreferencesId"
+);
+CREATE INDEX "IX_ItemDisplayPreferences_UserId" ON "ItemDisplayPreferences"(
+  "UserId"
+);
+CREATE UNIQUE INDEX "IX_DisplayPreferences_UserId_ItemId_Client" ON "DisplayPreferences"(
+  "UserId",
+  "ItemId",
+  "Client"
+);
+CREATE UNIQUE INDEX "IX_ImageInfos_UserId" ON "ImageInfos"("UserId");
+CREATE INDEX "IX_CustomItemDisplayPreferences_UserId" ON "CustomItemDisplayPreferences"(
+  "UserId"
+);
+CREATE UNIQUE INDEX "IX_CustomItemDisplayPreferences_UserId_ItemId_Client_Key" ON "CustomItemDisplayPreferences"(
+  "UserId",
+  "ItemId",
+  "Client",
+  "Key"
+);
+CREATE UNIQUE INDEX "IX_ApiKeys_AccessToken" ON "ApiKeys"("AccessToken");
+CREATE UNIQUE INDEX "IX_DeviceOptions_DeviceId" ON "DeviceOptions"("DeviceId");
+CREATE INDEX "IX_Devices_AccessToken_DateLastActivity" ON "Devices"(
+  "AccessToken",
+  "DateLastActivity"
+);
+CREATE INDEX "IX_Devices_DeviceId_DateLastActivity" ON "Devices"(
+  "DeviceId",
+  "DateLastActivity"
+);
+CREATE INDEX "IX_Devices_UserId_DeviceId" ON "Devices"("UserId", "DeviceId");
+CREATE INDEX "IX_ActivityLogs_DateCreated" ON "ActivityLogs"("DateCreated");
+CREATE INDEX "IX_BaseItemMetadataFields_ItemId" ON "BaseItemMetadataFields"(
+  "ItemId"
+);
+CREATE INDEX "IX_BaseItemTrailerTypes_ItemId" ON "BaseItemTrailerTypes"(
+  "ItemId"
+);
+CREATE INDEX "IX_ItemValuesMap_ItemId" ON "ItemValuesMap"("ItemId");
+CREATE INDEX "IX_Peoples_Name" ON "Peoples"("Name");
+CREATE INDEX "IX_UserData_ItemId_UserId_IsFavorite" ON "UserData"(
+  "ItemId",
+  "UserId",
+  "IsFavorite"
+);
+CREATE INDEX "IX_UserData_ItemId_UserId_LastPlayedDate" ON "UserData"(
+  "ItemId",
+  "UserId",
+  "LastPlayedDate"
+);
+CREATE INDEX "IX_UserData_ItemId_UserId_PlaybackPositionTicks" ON "UserData"(
+  "ItemId",
+  "UserId",
+  "PlaybackPositionTicks"
+);
+CREATE INDEX "IX_UserData_ItemId_UserId_Played" ON "UserData"(
+  "ItemId",
+  "UserId",
+  "Played"
+);
+CREATE INDEX "IX_AncestorIds_ParentItemId" ON "AncestorIds"("ParentItemId");
+CREATE UNIQUE INDEX "IX_Users_Username" ON "Users"("Username");
+CREATE INDEX "IX_ItemValues_Type_CleanValue" ON "ItemValues"(
   "Type",
-  "IsFolder",
-  "IsVirtualItem"
+  "CleanValue"
+);
+CREATE UNIQUE INDEX "IX_ItemValues_Type_Value" ON "ItemValues"(
+  "Type",
+  "Value"
+);
+CREATE INDEX "IX_PeopleBaseItemMap_ItemId_ListOrder" ON "PeopleBaseItemMap"(
+  "ItemId",
+  "ListOrder"
+);
+CREATE INDEX "IX_PeopleBaseItemMap_ItemId_SortOrder" ON "PeopleBaseItemMap"(
+  "ItemId",
+  "SortOrder"
+);
+CREATE INDEX "IX_BaseItems_ExtraType_OwnerId" ON "BaseItems"(
+  "ExtraType",
+  "OwnerId"
 );
 CREATE INDEX "IX_BaseItems_IsFolder_TopParentId_IsVirtualItem_PresentationUniqueKey_DateCreated" ON "BaseItems"(
   "IsFolder",
@@ -533,12 +518,31 @@ CREATE INDEX "IX_BaseItems_MediaType_TopParentId_IsVirtualItem_PresentationUniqu
   "IsVirtualItem",
   "PresentationUniqueKey"
 );
+CREATE INDEX "IX_BaseItems_OwnerId" ON "BaseItems"("OwnerId");
 CREATE INDEX "IX_BaseItems_ParentId" ON "BaseItems"("ParentId");
 CREATE INDEX "IX_BaseItems_Path" ON "BaseItems"("Path");
 CREATE INDEX "IX_BaseItems_PresentationUniqueKey" ON "BaseItems"(
   "PresentationUniqueKey"
 );
 CREATE INDEX "IX_BaseItems_TopParentId_Id" ON "BaseItems"("TopParentId", "Id");
+CREATE INDEX "IX_BaseItems_TopParentId_IsFolder_IsVirtualItem_DateCreated" ON "BaseItems"(
+  "TopParentId",
+  "IsFolder",
+  "IsVirtualItem",
+  "DateCreated"
+);
+CREATE INDEX "IX_BaseItems_TopParentId_MediaType_IsVirtualItem_DateCreated" ON "BaseItems"(
+  "TopParentId",
+  "MediaType",
+  "IsVirtualItem",
+  "DateCreated"
+);
+CREATE INDEX "IX_BaseItems_TopParentId_Type_IsVirtualItem_DateCreated" ON "BaseItems"(
+  "TopParentId",
+  "Type",
+  "IsVirtualItem",
+  "DateCreated"
+);
 CREATE INDEX "IX_BaseItems_Type_SeriesPresentationUniqueKey_IsFolder_IsVirtualItem" ON "BaseItems"(
   "Type",
   "SeriesPresentationUniqueKey",
@@ -573,24 +577,82 @@ CREATE INDEX "IX_BaseItems_Type_TopParentId_StartDate" ON "BaseItems"(
   "TopParentId",
   "StartDate"
 );
-CREATE TABLE IF NOT EXISTS "PeopleBaseItemMap"(
-  "ItemId" TEXT NOT NULL,
-  "PeopleId" TEXT NOT NULL,
-  "Role" TEXT NOT NULL,
-  "ListOrder" INTEGER NULL,
-  "SortOrder" INTEGER NULL,
-  CONSTRAINT "PK_PeopleBaseItemMap" PRIMARY KEY("ItemId", "PeopleId", "Role"),
-  CONSTRAINT "FK_PeopleBaseItemMap_BaseItems_ItemId" FOREIGN KEY("ItemId") REFERENCES "BaseItems"("Id") ON DELETE CASCADE,
-  CONSTRAINT "FK_PeopleBaseItemMap_Peoples_PeopleId" FOREIGN KEY("PeopleId") REFERENCES "Peoples"("Id") ON DELETE CASCADE
-);
-CREATE INDEX "IX_PeopleBaseItemMap_ItemId_ListOrder" ON "PeopleBaseItemMap"(
+CREATE INDEX "IX_UserData_UserId_ItemId_LastPlayedDate" ON "UserData"(
+  "UserId",
   "ItemId",
-  "ListOrder"
+  "LastPlayedDate"
 );
-CREATE INDEX "IX_PeopleBaseItemMap_ItemId_SortOrder" ON "PeopleBaseItemMap"(
+CREATE INDEX "IX_BaseItemImageInfos_ItemId_ImageType" ON "BaseItemImageInfos"(
   "ItemId",
-  "SortOrder"
+  "ImageType"
 );
-CREATE INDEX "IX_PeopleBaseItemMap_PeopleId" ON "PeopleBaseItemMap"(
-  "PeopleId"
+CREATE INDEX "IX_UserData_UserId_IsFavorite_ItemId" ON "UserData"(
+  "UserId",
+  "IsFavorite",
+  "ItemId"
+);
+CREATE INDEX "IX_UserData_UserId_Played_ItemId" ON "UserData"(
+  "UserId",
+  "Played",
+  "ItemId"
+);
+CREATE INDEX "IX_BaseItems_Name" ON "BaseItems"("Name");
+CREATE INDEX "IX_BaseItems_SeasonId" ON "BaseItems"("SeasonId");
+CREATE INDEX "IX_BaseItems_SeriesId" ON "BaseItems"("SeriesId");
+CREATE INDEX "IX_BaseItems_SeriesName" ON "BaseItems"("SeriesName");
+CREATE INDEX "IX_BaseItems_Type_SeriesPresentationUniqueKey_ParentIndexNumber_IndexNumber" ON "BaseItems"(
+  "Type",
+  "SeriesPresentationUniqueKey",
+  "ParentIndexNumber",
+  "IndexNumber"
+);
+CREATE INDEX "IX_BaseItems_Type_TopParentId_SortName" ON "BaseItems"(
+  "Type",
+  "TopParentId",
+  "SortName"
+);
+CREATE INDEX "IX_BaseItemProviders_ProviderId_ItemId_ProviderValue" ON "BaseItemProviders"(
+  "ProviderId",
+  "ItemId",
+  "ProviderValue"
+);
+CREATE INDEX "IX_BaseItems_Type_CleanName" ON "BaseItems"("Type", "CleanName");
+CREATE INDEX "IX_BaseItems_TopParentId_Type_IsVirtualItem" ON "BaseItems"(
+  "TopParentId",
+  "Type",
+  "IsVirtualItem"
+) WHERE "PrimaryVersionId" IS NULL 
+    AND("OwnerId" IS NULL OR "ExtraType" IS NOT NULL);
+CREATE UNIQUE INDEX "IX_Users_NormalizedUsername" ON "Users"(
+  "NormalizedUsername"
+);
+CREATE INDEX "IX_LinkedChildren_ChildId_ChildType" ON "LinkedChildren"(
+  "ChildId",
+  "ChildType"
+);
+CREATE INDEX "IX_LinkedChildren_ParentId_ChildType" ON "LinkedChildren"(
+  "ParentId",
+  "ChildType"
+);
+CREATE INDEX "IX_BaseItems_PrimaryVersionId" ON "BaseItems"(
+  "PrimaryVersionId"
+) WHERE "PrimaryVersionId" IS NOT NULL;
+CREATE INDEX "IX_Peoples_NameLower" ON "Peoples"(lower("Name"));
+CREATE INDEX "IX_PeopleBaseItemMap_PeopleId_ItemId" ON "PeopleBaseItemMap"(
+  "PeopleId",
+  "ItemId"
+);
+CREATE INDEX "IX_MediaStreamInfos_StreamType_ItemId_Language_IsExternal" ON "MediaStreamInfos"(
+  "StreamType",
+  "ItemId",
+  "Language",
+  "IsExternal"
+);
+CREATE UNIQUE INDEX "IX_Preferences_UserId_Kind" ON "Preferences"(
+  "UserId",
+  "Kind"
+);
+CREATE UNIQUE INDEX "IX_Permissions_UserId_Kind" ON "Permissions"(
+  "UserId",
+  "Kind"
 );

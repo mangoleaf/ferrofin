@@ -371,16 +371,52 @@ pub async fn build_app_state(
     let item_persistence_impl = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
     let item_persistence_service: Arc<dyn ferrofin_traits::persistence::ItemPersistenceService> =
         Arc::clone(&item_persistence_impl) as _;
-    // One-shot: rewrite clean columns written by a Ferrofin version whose
-    // `get_clean_value` stripped punctuation, so by-name lookups of a
-    // punctuated name resolve without waiting for a full rescan.
+    // One-shot (12.0 `RefreshCleanNamesAndValues`): move every stored
+    // `CleanName`/`CleanValue` written under 10.11.8's rule to the 12.0 form
+    // the query translator now computes, so by-name lookups of a punctuated
+    // name resolve without waiting for a full rescan.
     match item_persistence_impl.repair_clean_values().await {
         Ok(0) => {}
         Ok(repaired) => {
-            tracing::info!(repaired, "rewrote clean name/value columns");
+            tracing::info!(
+                repaired,
+                "rewrote clean name/value columns to the 12.0 form"
+            );
         }
         Err(err) => {
-            tracing::warn!(%err, "clean-value repair failed; punctuated by-name lookups may miss until the next scan");
+            tracing::warn!(%err, "clean-value repair failed; punctuated by-name lookups may miss until the next boot retries it");
+        }
+    }
+    // One-shot (12.0 `RefreshForcedSortNames`): a forced sort name now goes
+    // through the full `GetSortName` cleaning, so recompute every stored one.
+    match item_persistence_impl.repair_forced_sort_names().await {
+        Ok(0) => {}
+        Ok(repaired) => {
+            tracing::info!(repaired, "recomputed sort names from forced sort names");
+        }
+        Err(err) => {
+            tracing::warn!(%err, "forced sort-name repair failed; items with a sort-title override may sort by the 10.11.8 key until the next boot retries it");
+        }
+    }
+    // One-shot: fold every localized `UserView` (id derived from its translated
+    // name, the 10.11 rule) onto the name-independent id Jellyfin 12.0 derives
+    // from the view type, moving children, ancestors and per-user settings.
+    match ferrofin_core::user_view_repository::consolidate_localized_user_views(
+        db,
+        &id_derivation,
+        std::path::Path::new(&paths.internal_metadata_path()),
+    )
+    .await
+    {
+        Ok(0) => {}
+        Ok(dropped) => {
+            tracing::info!(
+                dropped,
+                "consolidated localized user views onto their canonical ids"
+            );
+        }
+        Err(err) => {
+            tracing::warn!(%err, "user view consolidation failed; localized views stay duplicated until the next boot");
         }
     }
     let people_repository_impl = Arc::new(
@@ -605,7 +641,7 @@ pub async fn build_app_state(
     let auth_cache = Arc::new(ferrofin_core::auth_cache::AuthCache::default());
     let activity: Arc<dyn ferrofin_traits::activity::ActivityManager> =
         Arc::new(FerrofinActivityManager::new(db.clone()));
-    let users: Arc<dyn ferrofin_traits::library::UserManager> = Arc::new(
+    let users_impl = Arc::new(
         FerrofinUserManager::new(db.clone())
             .with_server_id(server_id.clone())
             .with_profile_image_dir(
@@ -618,6 +654,7 @@ pub async fn build_app_state(
             // receivers — jellyfin-web shows no cast devices without one.
             .with_configuration(Arc::clone(&config_trait)),
     );
+    let users: Arc<dyn ferrofin_traits::library::UserManager> = users_impl;
     let user_data: Arc<dyn ferrofin_traits::library::UserDataManager> = Arc::new(
         FerrofinUserDataManager::new(db.clone(), Arc::clone(&config_trait)),
     );
@@ -724,6 +761,47 @@ pub async fn build_app_state(
     );
     let virtual_folders: Arc<dyn ferrofin_traits::library::VirtualFolderManager> =
         virtual_folders_impl.clone();
+    // One-shot (Jellyfin 12.0 `MigrateRatingLevels`): recompute every row's
+    // inherited parental-rating columns from its OWN `OfficialRating` through
+    // `GetRatingScore`, so a rating string a 10.11/11.x build scored
+    // differently (or not at all) reads back under 12.0's tables.
+    match item_persistence_impl
+        .repair_rating_levels(localization.as_ref())
+        .await
+    {
+        Ok(0) => {}
+        Ok(repaired) => {
+            tracing::info!(
+                repaired,
+                "recomputed parental rating levels from rating strings"
+            );
+        }
+        Err(err) => {
+            tracing::warn!(%err, "parental rating level repair failed; max-rating filters may misjudge until the next scan");
+        }
+    }
+    // One-shot (Jellyfin 12.0 `RecomputeSeriesPresentationKey`): rekey every
+    // series under 12.0's `Series.CreatePresentationUniqueKey` (name fallback,
+    // ordered library folders) and re-point its seasons/episodes by `SeriesId`.
+    // Reads `EnableAutomaticSeriesGrouping` and the preferred metadata language
+    // off each library's options, then the server's.
+    match virtual_folders.get_virtual_folders().await {
+        Ok(folders) => match item_persistence_impl
+            .repair_series_presentation_keys(&folders, &server_config.preferred_metadata_language)
+            .await
+        {
+            Ok(0) => {}
+            Ok(repaired) => {
+                tracing::info!(repaired, "recomputed series presentation keys");
+            }
+            Err(err) => {
+                tracing::warn!(%err, "series presentation key repair failed; grouped series may list per library until the next scan");
+            }
+        },
+        Err(err) => {
+            tracing::warn!(%err, "could not list libraries; series presentation key repair skipped until the next boot");
+        }
+    }
 
     // Lyrics: sidecars for an audio item plus the remote providers. The
     // internal-metadata root is where an uploaded/downloaded lyric always
@@ -819,6 +897,9 @@ pub async fn build_app_state(
             .with_metadata_path(paths.internal_metadata_path())
             .with_id_derivation(id_derivation.clone())
             .with_virtual_folders(Arc::clone(&virtual_folders))
+            // 12.1 lists a playlists/boxsets view only when the user can see
+            // a child in it, which needs the user's own visibility rules.
+            .with_users(Arc::clone(&users))
             .with_database(db.clone()),
     );
 
@@ -906,6 +987,9 @@ pub async fn build_app_state(
     .with_localization(Arc::new(LocalizationManager::new(
         &server_config.metadata_country_code,
     )))
+    // `ServerConfiguration.PreferredMetadataLanguage`, the last fallback a
+    // series' presentation key embeds (`Series.AddLibrariesToPresentationUniqueKey`).
+    .with_default_metadata_language(server_config.preferred_metadata_language.clone())
     // Probe each media file during the scan (duration/size + per-stream codecs)
     // so the web client can pick direct play and the transcoder has stream info.
     .with_probe(
@@ -1341,7 +1425,6 @@ pub async fn build_app_state(
         Arc::new(FerrofinPlaylistManager::new(
             db.clone(),
             Arc::clone(&library),
-            Arc::clone(&linked_children_service),
             Arc::clone(&item_repository),
             Arc::clone(&collection_paths),
         ));

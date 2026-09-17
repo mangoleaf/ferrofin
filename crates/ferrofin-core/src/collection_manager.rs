@@ -295,7 +295,7 @@ impl CollectionManager for FerrofinCollectionManager {
     ) -> Result<(), ServiceError> {
         for item_id in item_ids {
             sqlx::query(
-                r#"DELETE FROM "FerrofinLinkedChildren"
+                r#"DELETE FROM "LinkedChildren"
                    WHERE "ParentId" = ?1 AND "ChildId" = ?2"#,
             )
             .bind(guid_to_db(collection_id))
@@ -357,7 +357,6 @@ impl CollectionManager for FerrofinCollectionManager {
 pub struct FerrofinPlaylistManager {
     db: Database,
     library_manager: Arc<dyn LibraryManager>,
-    linked_children: Arc<dyn LinkedChildrenService>,
     items: Arc<dyn ItemRepository>,
     paths: Arc<dyn ServerApplicationPaths>,
 }
@@ -375,14 +374,12 @@ impl FerrofinPlaylistManager {
     pub fn new(
         db: Database,
         library_manager: Arc<dyn LibraryManager>,
-        linked_children: Arc<dyn LinkedChildrenService>,
         items: Arc<dyn ItemRepository>,
         paths: Arc<dyn ServerApplicationPaths>,
     ) -> Self {
         Self {
             db,
             library_manager,
-            linked_children,
             items,
             paths,
         }
@@ -482,11 +479,14 @@ impl PlaylistManager for FerrofinPlaylistManager {
             })
             .await?;
         }
-        for item_id in &request.item_id_list {
-            self.linked_children
-                .upsert_linked_child(id, *item_id, LINKED_CHILD_MANUAL)
-                .await?;
-        }
+        // Playlist entries are positions, not a set (C# `LinkedChild.Create`
+        // per requested id, no de-duplication).
+        let entries: Vec<Entry> = request
+            .item_id_list
+            .iter()
+            .map(|item_id| (guid_to_db(*item_id), i64::from(LINKED_CHILD_MANUAL)))
+            .collect();
+        write_entries(self.db.writer(), &guid_to_db(id), &entries).await?;
         // Write the full playlist state (owner/shares/children) into
         // BaseItems.Data — the 10.11.8 storage Jellyfin reads on a swap back.
         item_data::sync_container_data(&self.db, id).await?;
@@ -541,11 +541,15 @@ impl PlaylistManager for FerrofinPlaylistManager {
             }
         }
         if let Some(ids) = &request.ids {
-            for item_id in ids {
-                self.linked_children
-                    .upsert_linked_child(request.id, *item_id, LINKED_CHILD_MANUAL)
-                    .await?;
-            }
+            // C# `PlaylistManager.UpdatePlaylist` (12.0, :608-614): `Ids`
+            // REPLACES the entries — `LinkedChildren = []` then add — so an
+            // update with the same list is a no-op and duplicates in the list
+            // survive.
+            let entries: Vec<Entry> = ids
+                .iter()
+                .map(|item_id| (guid_to_db(*item_id), i64::from(LINKED_CHILD_MANUAL)))
+                .collect();
+            write_entries(self.db.writer(), &guid_to_db(request.id), &entries).await?;
         }
         item_data::sync_container_data(&self.db, request.id).await?;
         Ok(())
@@ -681,37 +685,23 @@ impl PlaylistManager for FerrofinPlaylistManager {
         position: Option<i32>,
         _user_id: Uuid,
     ) -> Result<(), ServiceError> {
-        // Append each item (upsert assigns `SortOrder = max + 1`).
-        for item_id in item_ids {
-            self.linked_children
-                .upsert_linked_child(playlist_id, *item_id, LINKED_CHILD_MANUAL)
-                .await?;
-        }
-        // If a position was requested, relocate the just-appended items there.
-        let Some(pos) = position else {
-            return Ok(());
-        };
+        // C# `PlaylistManager.AddToPlaylistInternal` (12.0): no duplicate
+        // check — an item already in the playlist gets a second entry — and
+        // the new block goes at `position` (≤ 0 prepends, ≥ length appends,
+        // otherwise a splice), else at the end.
         let pid = guid_to_db(playlist_id);
-        let added: Vec<String> = item_ids.iter().copied().map(guid_to_db).collect();
-        let mut order: Vec<String> = sqlx::query_scalar(
-            r#"SELECT "ChildId" FROM "FerrofinLinkedChildren"
-               WHERE "ParentId" = ?1 ORDER BY "SortOrder""#,
-        )
-        .bind(&pid)
-        .fetch_all(self.db.pool())
-        .await
-        .map_err(db_err)?;
-        // Pull the added items out (they were appended), then re-insert as a block
-        // at the clamped target index, preserving their given order.
-        order.retain(|c| !added.contains(c));
-        let target = usize::try_from(pos.max(0))
-            .unwrap_or(usize::MAX)
-            .min(order.len());
-        for (offset, child) in added.iter().enumerate() {
-            let at = (target + offset).min(order.len());
-            order.insert(at, child.clone());
-        }
-        write_sort_order(self.db.writer(), &pid, &order).await?;
+        let mut entries = read_entries(self.db.pool(), &pid).await?;
+        let added: Vec<Entry> = item_ids
+            .iter()
+            .map(|id| (guid_to_db(*id), i64::from(LINKED_CHILD_MANUAL)))
+            .collect();
+        let at = position.map_or(entries.len(), |pos| {
+            usize::try_from(pos.max(0))
+                .unwrap_or(usize::MAX)
+                .min(entries.len())
+        });
+        entries.splice(at..at, added);
+        write_entries(self.db.writer(), &pid, &entries).await?;
         item_data::sync_container_data(&self.db, playlist_id).await
     }
 
@@ -727,20 +717,19 @@ impl PlaylistManager for FerrofinPlaylistManager {
         // normalise back to the stored form (same for the playlist id, which
         // arrives as a caller-formatted string); skip any entry id that isn't a
         // valid GUID.
+        // C# `RemoveItemFromPlaylistAsync` (12.0): every entry whose item id
+        // is in the request goes — all occurrences, not the first.
         let pid = Uuid::parse_str(playlist_id).map_or_else(|_| playlist_id.to_owned(), guid_to_db);
-        for entry_id in entry_ids {
-            let Ok(child) = Uuid::parse_str(entry_id) else {
-                continue;
-            };
-            sqlx::query(
-                r#"DELETE FROM "FerrofinLinkedChildren"
-                   WHERE "ParentId" = ?1 AND "ChildId" = ?2"#,
-            )
-            .bind(&pid)
-            .bind(guid_to_db(child))
-            .execute(self.db.writer())
-            .await
-            .map_err(db_err)?;
+        let removals: Vec<String> = entry_ids
+            .iter()
+            .filter_map(|e| Uuid::parse_str(e).ok())
+            .map(guid_to_db)
+            .collect();
+        let mut entries = read_entries(self.db.pool(), &pid).await?;
+        let before = entries.len();
+        entries.retain(|(child, _)| !removals.contains(child));
+        if entries.len() != before {
+            write_entries(self.db.writer(), &pid, &entries).await?;
         }
         if let Ok(playlist) = Uuid::parse_str(playlist_id) {
             item_data::sync_container_data(&self.db, playlist).await?;
@@ -762,32 +751,26 @@ impl PlaylistManager for FerrofinPlaylistManager {
         // relocation matches what the client sees. The playlist id arrives as a
         // caller-formatted string — normalise to the stored canonical form.
         let pid = Uuid::parse_str(playlist_id).map_or_else(|_| playlist_id.to_owned(), guid_to_db);
-        let mut order: Vec<String> = sqlx::query_scalar(
-            r#"SELECT "ChildId" FROM "FerrofinLinkedChildren"
-               WHERE "ParentId" = ?1 ORDER BY "SortOrder""#,
-        )
-        .bind(&pid)
-        .fetch_all(self.db.pool())
-        .await
-        .map_err(db_err)?;
+        let mut entries = read_entries(self.db.pool(), &pid).await?;
 
         // `entry_id` arrives dashless (`Guid('N')`); `ChildId` is stored in the
         // canonical dashed uppercase form. Normalise before locating the entry
-        // position (see `remove_item_from_playlist`).
+        // position (see `remove_item_from_playlist`). With duplicates legal,
+        // the FIRST occurrence moves (C# `MoveItemAsync`: `FirstOrDefault`).
         let Ok(child_id) = Uuid::parse_str(entry_id) else {
             return Ok(()); // not a GUID — nothing to move
         };
         let needle = guid_to_db(child_id);
-        let Some(pos) = order.iter().position(|c| *c == needle) else {
+        let Some(pos) = entries.iter().position(|(c, _)| *c == needle) else {
             return Ok(()); // entry not in the playlist — nothing to move
         };
-        let child = order.remove(pos);
+        let entry = entries.remove(pos);
         // Clamp to the valid range of the now-shorter list (C# `Math.Clamp`).
         let target = usize::try_from(new_index.max(0))
             .unwrap_or(usize::MAX)
-            .min(order.len());
-        order.insert(target, child);
-        write_sort_order(self.db.writer(), &pid, &order).await?;
+            .min(entries.len());
+        entries.insert(target, entry);
+        write_entries(self.db.writer(), &pid, &entries).await?;
         if let Ok(playlist) = Uuid::parse_str(playlist_id) {
             item_data::sync_container_data(&self.db, playlist).await?;
         }
@@ -802,22 +785,49 @@ impl PlaylistManager for FerrofinPlaylistManager {
     }
 }
 
-/// Rewrites the `SortOrder` ordinals (`0,1,2,…`) for a playlist's children in the
-/// given order, in one transaction. Shared by add-at-position and move.
-async fn write_sort_order(
+/// One playlist entry: `(ChildId, ChildType)` as stored.
+type Entry = (String, i64);
+
+/// A playlist's entries in stored order. Entries are positions, not a set:
+/// the same item may appear more than once (12.0's `(ParentId, SortOrder)` key).
+async fn read_entries(
     pool: &sqlx::SqlitePool,
     playlist_id: &str,
-    order: &[String],
+) -> Result<Vec<Entry>, ServiceError> {
+    sqlx::query_as(
+        r#"SELECT "ChildId", "ChildType" FROM "LinkedChildren"
+           WHERE "ParentId" = ?1 ORDER BY "SortOrder""#,
+    )
+    .bind(playlist_id)
+    .fetch_all(pool)
+    .await
+    .map_err(db_err)
+}
+
+/// Replaces a playlist's entries wholesale with `entries`, `SortOrder`
+/// dense from 0 in the given order, in one transaction — what 12.0's
+/// `ItemPersistenceService` does on every folder save (delete the parent's
+/// rows, re-insert the array). Shared by add, remove, move and replace.
+async fn write_entries(
+    pool: &sqlx::SqlitePool,
+    playlist_id: &str,
+    entries: &[Entry],
 ) -> Result<(), ServiceError> {
     let mut tx = pool.begin().await.map_err(db_err)?;
-    for (ordinal, child) in order.iter().enumerate() {
-        sqlx::query(
-            r#"UPDATE "FerrofinLinkedChildren" SET "SortOrder" = ?1
-               WHERE "ParentId" = ?2 AND "ChildId" = ?3"#,
-        )
-        .bind(i64::try_from(ordinal).unwrap_or(i64::MAX))
+    sqlx::query(r#"DELETE FROM "LinkedChildren" WHERE "ParentId" = ?1"#)
         .bind(playlist_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+    for (ordinal, (child, child_type)) in entries.iter().enumerate() {
+        sqlx::query(
+            r#"INSERT INTO "LinkedChildren" ("ParentId", "SortOrder", "ChildId", "ChildType")
+               VALUES (?1, ?2, ?3, ?4)"#,
+        )
+        .bind(playlist_id)
+        .bind(i64::try_from(ordinal).unwrap_or(i64::MAX))
         .bind(child)
+        .bind(child_type)
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
@@ -1992,7 +2002,6 @@ mod tests {
         FerrofinPlaylistManager::new(
             db.clone(),
             library_manager_over(db.clone()),
-            Arc::new(FerrofinLinkedChildrenService::new(db.clone())),
             item_repository_over(db.clone()),
             test_paths(),
         )
@@ -2284,5 +2293,124 @@ mod tests {
             vec![track],
             "an open-access playlist stays readable by any user"
         );
+    }
+
+    /// A container's children in stored order (ordinals are dense from 0 by
+    /// construction, so order is the whole story).
+    async fn rows(db: &ferrofin_db::Database, parent: Uuid) -> Vec<Uuid> {
+        super::read_entries(db.pool(), &ferrofin_db::store::guid_to_db(parent))
+            .await
+            .expect("rows")
+            .into_iter()
+            .map(|(c, _)| Uuid::parse_str(&c).expect("uuid"))
+            .collect()
+    }
+
+    async fn seeded_playlist(
+        db: &ferrofin_db::Database,
+        items: &[Uuid],
+    ) -> (FerrofinPlaylistManager, Uuid, Uuid) {
+        let mut unique = items.to_vec();
+        unique.sort();
+        unique.dedup();
+        for id in unique {
+            seed_item(db, id, BaseItemKind::Audio).await;
+        }
+        let mgr = playlist_manager(db);
+        let owner = Uuid::new_v4();
+        let created = mgr
+            .create_playlist(&PlaylistCreationRequest {
+                name: Some("Dupes".to_owned()),
+                item_id_list: items.to_vec(),
+                user_id: owner,
+                ..PlaylistCreationRequest::default()
+            })
+            .await
+            .expect("create");
+        (mgr, Uuid::parse_str(&created.id).expect("uuid"), owner)
+    }
+
+    /// C# `AddToPlaylistInternal` (12.0) has no duplicate check: the key is
+    /// `(ParentId, SortOrder)`, so the same track can sit in a playlist twice.
+    #[tokio::test]
+    async fn playlist_add_of_the_same_item_twice_keeps_two_entries() {
+        let db = test_db().await;
+        let a = Uuid::new_v4();
+        let (mgr, playlist, owner) = seeded_playlist(&db, &[a]).await;
+        mgr.add_item_to_playlist(playlist, &[a], None, owner)
+            .await
+            .expect("add again");
+        assert_eq!(rows(&db, playlist).await, vec![a, a]);
+    }
+
+    /// Collections go through the generic upsert, which is 12.0's
+    /// find-or-append on `(ParentId, ChildId)`: never a second row.
+    #[tokio::test]
+    async fn collection_add_of_the_same_item_twice_keeps_one_row() {
+        let db = test_db().await;
+        let a = Uuid::new_v4();
+        seed_item(&db, a, BaseItemKind::Movie).await;
+        let mgr = collection_manager_over(&db);
+        let created = mgr
+            .create_collection(&CollectionCreationOptions {
+                name: "Set".to_owned(),
+                item_id_list: vec![a],
+                ..CollectionCreationOptions::default()
+            })
+            .await
+            .expect("create");
+        let set = Uuid::parse_str(&created.id).expect("uuid");
+        mgr.add_to_collection(set, &[a]).await.expect("add again");
+        assert_eq!(rows(&db, set).await, vec![a]);
+    }
+
+    /// C# `RemoveItemFromPlaylistAsync`: every occurrence of the item goes.
+    #[tokio::test]
+    async fn remove_item_from_playlist_removes_every_occurrence() {
+        let db = test_db().await;
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let (mgr, playlist, _) = seeded_playlist(&db, &[a, b]).await;
+        mgr.add_item_to_playlist(playlist, &[a], None, Uuid::nil())
+            .await
+            .expect("dup");
+        assert_eq!(rows(&db, playlist).await.len(), 3);
+        mgr.remove_item_from_playlist(&playlist.to_string(), &[a.simple().to_string()])
+            .await
+            .expect("remove");
+        assert_eq!(rows(&db, playlist).await, vec![b]);
+    }
+
+    /// C# `MoveItemAsync`: the FIRST entry with that item id moves; ordinals
+    /// are rewritten densely.
+    #[tokio::test]
+    async fn move_item_moves_the_first_occurrence() {
+        let db = test_db().await;
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let (mgr, playlist, _) = seeded_playlist(&db, &[a, b, a]).await;
+        mgr.move_item(
+            &playlist.to_string(),
+            &a.simple().to_string(),
+            2,
+            Uuid::nil(),
+        )
+        .await
+        .expect("move");
+        assert_eq!(rows(&db, playlist).await, vec![b, a, a]);
+    }
+
+    /// C# `UpdatePlaylist` with `Ids` replaces the entries rather than adding.
+    #[tokio::test]
+    async fn update_playlist_with_ids_replaces_the_entries() {
+        let db = test_db().await;
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let (mgr, playlist, _) = seeded_playlist(&db, &[a, b]).await;
+        mgr.update_playlist(&PlaylistUpdateRequest {
+            id: playlist,
+            ids: Some(vec![b, b]),
+            ..PlaylistUpdateRequest::default()
+        })
+        .await
+        .expect("update");
+        assert_eq!(rows(&db, playlist).await, vec![b, b]);
     }
 }

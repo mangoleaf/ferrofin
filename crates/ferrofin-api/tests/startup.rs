@@ -74,6 +74,7 @@ fn user_entity(id: Uuid, username: &str, password: Option<&str>) -> UserEntity {
         subtitle_mode: 0,
         sync_play_access: 0,
         username: username.to_owned(),
+        normalized_username: username.to_uppercase(),
     }
 }
 

@@ -1,6 +1,7 @@
-//! Sort-name derivation — port of C# `BaseItem.CreateSortName` / `ModifySortChunks`
-//! (`MediaBrowser.Controller/Entities/BaseItem.cs`), with Jellyfin's default
-//! `SortRemoveWords` / `SortRemoveCharacters` / `SortReplaceCharacters`.
+//! Sort-name derivation — port of C# `BaseItem.GetSortName` / `CreateSortName` /
+//! `ModifySortChunks` (Jellyfin 12.0 `MediaBrowser.Controller/Entities/BaseItem.cs`),
+//! with Jellyfin's default `SortRemoveWords` / `SortRemoveCharacters` /
+//! `SortReplaceCharacters`.
 
 use crate::string_extensions::{lower_invariant, remove_diacritics};
 
@@ -13,13 +14,18 @@ const SORT_REMOVE_CHARACTERS: [char; 6] = [',', '&', '-', '{', '}', '\''];
 /// `ServerConfiguration.SortReplaceCharacters` — each becomes a space.
 const SORT_REPLACE_CHARACTERS: [char; 3] = ['.', '+', '%'];
 
-/// Port of C# `BaseItem.CreateSortName` + `ModifySortChunks`.
+/// Port of C# `BaseItem.GetSortName(name, enableAlphaNumericSorting, config)`
+/// (Jellyfin 12.0 `MediaBrowser.Controller/Entities/BaseItem.cs:992-1035`) —
+/// the ONE cleaning rule behind both an auto-generated `SortName` and a
+/// user-supplied `ForcedSortName`.
 ///
-/// Lower-cases the trimmed name, removes each article where it stands as a
-/// whole word (at the start, surrounded by spaces, or at the end), then applies
-/// the remove/replace character sets, then left-pads every run of digits to 10
-/// so numbers sort naturally (`Movie 0001 (2020)` → `movie 0000000001
-/// (0000002020)`).
+/// With `enable_alpha_numeric_sorting` off (only `Person` overrides it to
+/// `false`) the answer is `name.TrimStart()` — the name verbatim. Otherwise:
+/// trim and lower-case (.NET invariant simple casing), remove each article where it stands as a whole word
+/// (at the start, surrounded by spaces, or at the end), delete the
+/// remove-character set, turn each replace-character into a space, then
+/// [`modify_sort_chunks`] left-pads every run of digits to 10 so numbers sort
+/// naturally (`Movie 0001 (2020)` → `movie 0000000001 (0000002020)`).
 ///
 /// **The stage order is load-bearing and matches C#: words, then removes, then
 /// replaces.** Doing characters first changes the answer for real titles —
@@ -27,18 +33,34 @@ const SORT_REPLACE_CHARACTERS: [char; 3] = ['.', '+', '%'];
 /// which then *starts* with the article `a` and gets it stripped. C# strips
 /// articles while the `.` is still attached, so nothing matches.
 #[must_use]
-pub fn create_sort_name(name: &str) -> String {
-    create_sort_name_with(name, lower_invariant)
+pub fn get_sort_name(name: &str, enable_alpha_numeric_sorting: bool) -> String {
+    get_sort_name_with(name, enable_alpha_numeric_sorting, lower_invariant)
 }
 
-/// The old full-lowercase derivation, only for recognizing stored keys during
-/// migration. Do not use this for new writes or query parameters.
+/// The derivation before invariant casing (full Unicode `to_lowercase`), kept
+/// only so migration `0031` can recognise keys Ferrofin wrote with it. Never
+/// use it for a new write or a query parameter.
 #[must_use]
 pub fn previous_create_sort_name(name: &str) -> String {
-    create_sort_name_with(name, str::to_lowercase)
+    get_sort_name_with(name, true, str::to_lowercase)
 }
 
-fn create_sort_name_with(name: &str, lowercase: fn(&str) -> String) -> String {
+/// The 10.11.8-era forced key — `ModifySortChunks(ForcedSortName)` through
+/// full Unicode `to_lowercase` — kept only so migration `0031` can recognise
+/// stored values written with it.
+#[must_use]
+pub fn previous_forced_sort_key(forced: &str) -> String {
+    modify_sort_chunks(forced).to_lowercase()
+}
+
+fn get_sort_name_with(
+    name: &str,
+    enable_alpha_numeric_sorting: bool,
+    lowercase: fn(&str) -> String,
+) -> String {
+    if !enable_alpha_numeric_sorting {
+        return name.trim_start().to_owned();
+    }
     let mut sortable = lowercase(name.trim());
     for search in SORT_REMOVE_WORDS {
         if let Some(rest) = sortable.strip_prefix(&format!("{search} ")) {
@@ -58,22 +80,34 @@ fn create_sort_name_with(name: &str, lowercase: fn(&str) -> String) -> String {
     modify_sort_chunks(&sortable)
 }
 
-/// The sort key C# derives from a non-empty `ForcedSortName`.
+/// Port of C# `BaseItem.CreateSortName` for a kind with alphanumeric sorting
+/// on — [`get_sort_name`] with `enable_alpha_numeric_sorting = true`.
 ///
-/// `BaseItem.SortName` short-circuits to `ModifySortChunks(ForcedSortName)
-/// .ToLowerInvariant()` — the digit padding and the lower-casing, but
-/// deliberately **not** the article/character stripping: a forced sort name is
-/// the user's explicit answer and only gets the numeric normalization that
-/// makes it comparable with derived keys.
+/// Callers that know the item's kind should go through the kind-aware wrapper
+/// in `ferrofin-core` (`kinds::sort_name_for`), which routes `Person` down the
+/// verbatim branch.
 #[must_use]
-pub fn forced_sort_key(forced: &str) -> String {
-    lower_invariant(&modify_sort_chunks(forced))
+pub fn create_sort_name(name: &str) -> String {
+    get_sort_name(name, true)
 }
 
-/// Previous full-lowercase forced key, only for recognizing old stored values.
+/// The sort key C# derives from a non-empty `ForcedSortName` for a kind with
+/// alphanumeric sorting on.
+///
+/// Since Jellyfin 12.0 (`BaseItem.cs:549`, jellyfin#17388) a forced sort name
+/// runs through the SAME pipeline as an auto-generated one — `GetSortName(
+/// ForcedSortName, EnableAlphaNumericSorting, config)` — so `"The Spider-Man:
+/// Homecoming"` sorts as `spiderman: homecoming` whether it came from the
+/// title or the user's override, and the two land together. 10.11.8 only did
+/// `ModifySortChunks(ForcedSortName).ToLowerInvariant()`, keeping the article
+/// and the punctuation; the one-shot `repair_forced_sort_names` pass in
+/// `ferrofin-core` moves stored rows across.
+///
+/// Callers that know the kind use `kinds::forced_sort_name_for`, which wires
+/// the `Person` exception (`TrimStart()` only).
 #[must_use]
-pub fn previous_forced_sort_key(forced: &str) -> String {
-    modify_sort_chunks(forced).to_lowercase()
+pub fn forced_sort_key(forced: &str) -> String {
+    get_sort_name(forced, true)
 }
 
 /// Left-pads each maximal run of ASCII digits in `name` to width 10 with `0`,
@@ -116,12 +150,14 @@ fn modify_sort_chunks(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{create_sort_name, forced_sort_key, modify_sort_chunks};
+    use rstest::rstest;
+
+    use super::{create_sort_name, forced_sort_key, get_sort_name, modify_sort_chunks};
 
     // The upstream xUnit oracle, transliterated verbatim
     // (`Jellyfin.Controller.Tests/Entities/BaseItemTests.cs`
     // `BaseItem_ModifySortChunks_Valid`).
-    #[rstest::rstest]
+    #[rstest]
     #[case("", "")]
     #[case("1", "0000000001")]
     #[case("t", "t")]
@@ -178,11 +214,36 @@ mod tests {
         assert_eq!(create_sort_name("Theatre"), "theatre");
     }
 
-    /// `ForcedSortName` skips article and character handling.
+    // The upstream xUnit oracle for the shared rule
+    // (`BaseItemTests.GetSortName_AppliesConfiguredCleaning`).
+    #[rstest]
+    #[case("The Matrix", "matrix")]
+    #[case("Spider-Man", "spiderman")]
+    #[case("A Movie: Part 2", "movie: part 0000000002")]
+    fn get_sort_name_applies_configured_cleaning(#[case] input: &str, #[case] expected: &str) {
+        assert_eq!(get_sort_name(input, true), expected);
+    }
+
+    /// `BaseItemTests.GetSortName_WithoutAlphaNumericSorting_ReturnsTrimmedInput`
+    /// — the `Person` branch is `TrimStart()` and nothing else.
     #[test]
-    fn a_forced_sort_name_is_only_padded_and_lowercased() {
-        assert_eq!(forced_sort_key("The Matrix 2"), "the matrix 0000000002");
-        assert_eq!(forced_sort_key("A.I."), "a.i.");
+    fn get_sort_name_without_alpha_numeric_sorting_returns_trimmed_input() {
+        assert_eq!(get_sort_name("  The Matrix", false), "The Matrix");
+        assert_eq!(get_sort_name("Parity, Alice  ", false), "Parity, Alice  ");
+    }
+
+    /// `BaseItemTests.SortName_ForcedSortName_IsCleanedLikeAutoSortName`: a
+    /// forced sort name must be cleaned the same way as an auto-generated one
+    /// so both sort together (jellyfin#17388) — leading article and hyphen
+    /// removed, colon kept, lower-cased.
+    #[test]
+    fn a_forced_sort_name_is_cleaned_like_an_auto_sort_name() {
+        const RAW: &str = "The Spider-Man: Homecoming";
+        assert_eq!(forced_sort_key(RAW), create_sort_name(RAW));
+        assert_eq!(forced_sort_key(RAW), "spiderman: homecoming");
+        // The 10.11.8 short-circuit would have kept the article and the dot.
+        assert_eq!(forced_sort_key("The Matrix 2"), "matrix 0000000002");
+        assert_eq!(forced_sort_key("Mr. Robot"), "mr  robot");
     }
 
     /// `ModifySortChunks` closes with `RemoveDiacritics()`, so an accented title

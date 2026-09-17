@@ -5,7 +5,7 @@
 setup() {
   SCRIPT="$BATS_TEST_DIRNAME/../version.sh"
   REPO="$(mktemp -d)"
-  cd "$REPO"
+  cd "$REPO" || exit 1
   git init -q
   git config user.email t@t
   git config user.name t

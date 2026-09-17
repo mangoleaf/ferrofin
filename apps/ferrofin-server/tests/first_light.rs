@@ -124,8 +124,8 @@ fn movie_item(id: Uuid, name: &str, path: &str) -> BaseItemEntity {
         lufs: None,
         normalization_gain: None,
         official_rating: None,
-        extra_ids: None,
         original_title: None,
+        original_language: None,
         overview: None,
         owner_id: None,
         parent_id: None,
@@ -536,4 +536,148 @@ async fn first_light_client_flow() {
     step_items(&router, &auth_header, &harness).await;
     step_playback_info(&router, &auth_header, &harness).await;
     step_ranged_stream(&router, &harness).await;
+}
+
+/// One credential form for [`users_me_status`]: a label, the headers to send,
+/// and the query string, if any.
+type CredentialForm = (&'static str, Vec<(&'static str, String)>, Option<String>);
+
+/// `GET /Users/Me` with exactly the given headers and query string — the probe
+/// for which credential forms the wired auth context accepts.
+async fn users_me_status(
+    router: &axum::Router,
+    headers: &[(&str, &str)],
+    query: Option<&str>,
+) -> StatusCode {
+    let uri = query.map_or_else(|| "/Users/Me".to_owned(), |q| format!("/Users/Me?{q}"));
+    let mut request = Request::builder().method("GET").uri(uri);
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    router
+        .clone()
+        .oneshot(request.body(Body::empty()).unwrap())
+        .await
+        .unwrap()
+        .status()
+}
+
+/// `POST /Users/New` as the admin, returning the status and the JSON body.
+async fn create_user(
+    router: &axum::Router,
+    auth_header: &str,
+    name: &str,
+) -> (StatusCode, serde_json::Value) {
+    let request = Request::builder()
+        .method("POST")
+        .uri("/Users/New")
+        .header(header::AUTHORIZATION, auth_header)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::json!({ "Name": name }).to_string()))
+        .unwrap();
+    let response = router.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    (status, body_json(response).await)
+}
+
+/// Jellyfin 12.0 user identity, over the real composition root and HTTP:
+/// usernames are keyed on `Users.NormalizedUsername` (`ToUpperInvariant`), so
+/// creating a case-variant of an existing name — a non-ASCII one included —
+/// is Jellyfin's `400` "already exists" (`UserManager.cs:348`), never the
+/// unique index's `500`, and the new user resolves by name under any casing.
+///
+/// And a fresh install runs with `EnableLegacyAuthorization = false` (12.0's
+/// default): the Emby-era credential forms are refused while the
+/// `MediaBrowser` scheme and `?ApiKey=` still authenticate
+/// (`AuthorizationContext.cs:93-111, 233-236, 259`).
+#[tokio::test]
+async fn usernames_are_keyed_invariant_uppercase_and_legacy_auth_is_off() {
+    let harness = boot().await;
+    let router = ferrofin_api::create_router(harness.wired.state.clone());
+    let authed = step_authenticate(&router).await;
+    let auth_header = client_auth_with_token(&authed.access_token);
+
+    // Create, then every case-variant is the C# ArgumentException → 400.
+    let (status, created) = create_user(&router, &auth_header, "münchen").await;
+    assert_eq!(status, StatusCode::OK, "create: {created}");
+    assert_eq!(created["Name"], "münchen");
+    let created_id = Uuid::parse_str(created["Id"].as_str().expect("user id")).expect("uuid");
+    for variant in ["MÜNCHEN", "München", "mÜnchen"] {
+        let (status, body) = create_user(&router, &auth_header, variant).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{variant}: {body}");
+        // The body is Jellyfin's ArgumentException text (behind the API's
+        // "invalid input" status prefix), not a unique-constraint message.
+        let error = body["error"].as_str().unwrap_or_default();
+        assert!(
+            error.ends_with(&format!("A user with the name '{variant}' already exists.")),
+            "{variant}: {error}"
+        );
+    }
+    // The stored key is the invariant uppercase, and by-name lookup — what
+    // `AuthenticateByName` re-finds the user with — matches it under any casing.
+    for spelling in ["münchen", "MÜNCHEN", "München"] {
+        let found = harness
+            .wired
+            .state
+            .users
+            .get_user_by_name(spelling)
+            .await
+            .expect("lookup")
+            .unwrap_or_else(|| panic!("{spelling} must resolve"));
+        assert_eq!(Uuid::parse_str(&found.id).expect("uuid"), created_id);
+        assert_eq!(found.normalized_username, "MÜNCHEN");
+    }
+
+    // Legacy authorization is off on a fresh install.
+    let token = authed.access_token.as_str();
+    let accepted: [CredentialForm; 2] = [
+        (
+            "Authorization: MediaBrowser … Token=",
+            vec![("authorization", auth_header.clone())],
+            None,
+        ),
+        ("?ApiKey=", Vec::new(), Some(format!("ApiKey={token}"))),
+    ];
+    for (label, headers, query) in &accepted {
+        let headers: Vec<(&str, &str)> = headers.iter().map(|(n, v)| (*n, v.as_str())).collect();
+        assert_eq!(
+            users_me_status(&router, &headers, query.as_deref()).await,
+            StatusCode::OK,
+            "{label} always authenticates"
+        );
+    }
+    let emby_scheme = format!(
+        r#"Emby Client="First Light", Device="Test Rig", DeviceId="rig-1", Version="1.0.0", Token="{token}""#
+    );
+    let refused: [CredentialForm; 5] = [
+        (
+            "X-Emby-Token header",
+            vec![("x-emby-token", token.to_owned())],
+            None,
+        ),
+        (
+            "X-MediaBrowser-Token header",
+            vec![("x-mediabrowser-token", token.to_owned())],
+            None,
+        ),
+        ("?api_key=", Vec::new(), Some(format!("api_key={token}"))),
+        (
+            "X-Emby-Authorization header",
+            vec![("x-emby-authorization", auth_header.clone())],
+            None,
+        ),
+        (
+            "Authorization: Emby scheme",
+            vec![("authorization", emby_scheme)],
+            None,
+        ),
+    ];
+    for (label, headers, query) in &refused {
+        let headers: Vec<(&str, &str)> = headers.iter().map(|(n, v)| (*n, v.as_str())).collect();
+        assert_eq!(
+            users_me_status(&router, &headers, query.as_deref()).await,
+            StatusCode::UNAUTHORIZED,
+            "{label} is an Emby-era form, refused with EnableLegacyAuthorization = false"
+        );
+    }
 }

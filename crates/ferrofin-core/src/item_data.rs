@@ -17,10 +17,10 @@
 //!    {"Path":"/media/…/M.mkv","Type":"Manual"}], …}
 //! ```
 //!
-//! Ferrofin's query paths keep using the `FerrofinLinkedChildren` /
+//! Ferrofin's query paths keep using the `LinkedChildren` /
 //! `FerrofinPlaylists` / `FerrofinPlaylistShares` tables as a **derived cache**;
 //! every membership/ownership mutation writes through to `Data` via
-//! [`sync_container_data`], and [`reconcile_container_data`] rebuilds the
+//! [`sync_container_data`], and [`reconcile_playlist_permissions`] rebuilds the
 //! cache from `Data` (adopted Jellyfin databases) or backfills `Data` from the
 //! cache (databases created before this module existed) at startup.
 //!
@@ -67,9 +67,14 @@ pub struct ShareJson {
     pub can_edit: bool,
 }
 
-/// The stored `FerrofinLinkedChildren.ChildType` discriminants and their JSON
-/// enum-string forms.
-const CHILD_TYPES: [(i64, &str); 2] = [(0, "Manual"), (1, "Shortcut")];
+/// The stored `LinkedChildren.ChildType` discriminants and their JSON
+/// enum-string forms (C# `LinkedChildType`).
+const CHILD_TYPES: [(i64, &str); 4] = [
+    (0, "Manual"),
+    (1, "Shortcut"),
+    (2, "LocalAlternateVersion"),
+    (3, "LinkedAlternateVersion"),
+];
 
 /// A [`Uuid`] in Jellyfin's Data-JSON GUID form: N-format lowercase.
 #[must_use]
@@ -366,9 +371,10 @@ fn container_type_names() -> [&'static str; 2] {
     ]
 }
 
-/// Rewrites `container`'s `Data` JSON from the cache tables — call after any
-/// membership / ownership / share mutation. A missing row or a non-container
-/// type is a no-op (deletions race here harmlessly).
+/// Rewrites a playlist's owner / open-access / shares keys in its `Data` JSON
+/// from the Ferrofin tables — call after any ownership / share mutation (12.0
+/// still stores those in `Data`; membership it does not — see the body). A
+/// missing row or a non-playlist type is a no-op (deletions race here harmlessly).
 ///
 /// # Errors
 /// Returns [`ServiceError`] if the underlying queries fail.
@@ -389,53 +395,13 @@ pub async fn sync_container_data(db: &Database, container: Uuid) -> Result<(), S
     }
     let is_playlist = type_ == playlist_type;
 
-    // Cache edges (with each child's path) in stored order.
-    let rows: Vec<(String, i64, Option<String>)> = sqlx::query_as(
-        r#"SELECT lc."ChildId", lc."ChildType", bi."Path"
-           FROM "FerrofinLinkedChildren" lc
-           LEFT JOIN "BaseItems" bi ON bi."Id" = lc."ChildId"
-           WHERE lc."ParentId" = ?1
-           ORDER BY lc."SortOrder""#,
-    )
-    .bind(&container_db)
-    .fetch_all(db.pool())
-    .await
-    .map_err(db_err)?;
-
-    let children: Vec<LinkedChildJson> = rows
-        .into_iter()
-        .map(|(child_id, child_type, path)| {
-            let type_name = CHILD_TYPES
-                .iter()
-                .find(|(d, _)| *d == child_type)
-                .map_or("Manual", |(_, n)| n)
-                .to_owned();
-            let item_id = Uuid::parse_str(&child_id).ok().map(json_guid);
-            // Playlists link by path AND id; box sets by path alone (Jellyfin
-            // resolves them by path at load) with an id fallback for pathless
-            // children.
-            let (path, item_id) = if is_playlist {
-                (path, item_id)
-            } else if path.is_some() {
-                (path, None)
-            } else {
-                (None, item_id)
-            };
-            LinkedChildJson {
-                path,
-                child_type: type_name,
-                item_id,
-                library_item_id: None,
-            }
-        })
-        .collect();
-
+    // 12.0 marks `Folder.LinkedChildren` `[JsonIgnore]`: membership lives in
+    // the `LinkedChildren` table only and is never written into `Data` any
+    // more. Only the playlist fields 12.0 still serialises are kept current.
+    if !is_playlist {
+        return Ok(());
+    }
     let mut map = parse_data(data.as_deref());
-    map.insert(
-        "LinkedChildren".to_owned(),
-        serde_json::to_value(&children)
-            .map_err(|e| ServiceError::Backend(format!("serialize LinkedChildren: {e}")))?,
-    );
 
     if is_playlist {
         sync_playlist_meta(db, &container_db, &mut map).await?;
@@ -495,50 +461,45 @@ async fn sync_playlist_meta(
     Ok(())
 }
 
-/// Reconciles every playlist/collection row between `Data` JSON and the cache
-/// tables — run once at startup (and after adopting a Jellyfin database).
+/// Imports every playlist's owner / open-access / shares from its `Data` JSON
+/// into the Ferrofin permission tables — run on every boot, before the first
+/// request is served: a playlist without a `FerrofinPlaylists` row is treated
+/// as owner-accessible by every caller. 12.0 still serialises these keys, so
+/// the JSON is current on both adoption paths; a row Ferrofin wrote agrees
+/// with its own tables. Membership is deliberately NOT imported here (the JSON
+/// copy is frozen on a 12.0 database) — that is the one-shot
+/// [`crate::adoption_repairs::import_membership_once`].
 ///
-/// Direction per row: a `Data` blob carrying a `LinkedChildren` key is the
-/// source of truth (Jellyfin wrote it, or a prior sync did) and is **imported**
-/// into the cache; a row without one (created by Ferrofin before this module) is
-/// **exported** — its `Data` is backfilled from the cache.
-///
-/// Returns `(imported, exported)` row counts.
+/// Returns the number of playlists reconciled.
 ///
 /// # Errors
 /// Returns [`ServiceError`] if the underlying queries fail.
-pub async fn reconcile_container_data(db: &Database) -> Result<(usize, usize), ServiceError> {
-    let [playlist_type, boxset_type] = container_type_names();
-    let rows: Vec<(String, String, Option<String>)> =
-        sqlx::query_as(r#"SELECT "Id", "Type", "Data" FROM "BaseItems" WHERE "Type" IN (?1, ?2)"#)
+pub async fn reconcile_playlist_permissions(db: &Database) -> Result<usize, ServiceError> {
+    let [playlist_type, _] = container_type_names();
+    let rows: Vec<(String, Option<String>)> =
+        sqlx::query_as(r#"SELECT "Id", "Data" FROM "BaseItems" WHERE "Type" = ?1"#)
             .bind(playlist_type)
-            .bind(boxset_type)
             .fetch_all(db.pool())
             .await
             .map_err(db_err)?;
-
-    let (mut imported, mut exported) = (0usize, 0usize);
-    for (id, type_, data) in rows {
-        let Ok(container) = Uuid::parse_str(&id) else {
-            continue;
-        };
+    let mut imported = 0usize;
+    for (id, data) in rows {
         let map = parse_data(data.as_deref());
-        if has_linked_children_key(&map) {
-            import_container(db, container, type_ == playlist_type, &map).await?;
-            imported += 1;
-        } else {
-            sync_container_data(db, container).await?;
-            exported += 1;
+        if !["OwnerUserId", "OpenAccess", "Shares"]
+            .iter()
+            .any(|k| map.contains_key(*k))
+        {
+            continue;
         }
+        let mut tx = db.writer().begin().await.map_err(db_err)?;
+        import_playlist_meta(&mut tx, &id, &map).await?;
+        tx.commit().await.map_err(db_err)?;
+        imported += 1;
     }
-    if imported + exported > 0 {
-        tracing::info!(
-            imported,
-            exported,
-            "reconciled playlist/collection Data JSON with the membership cache"
-        );
+    if imported > 0 {
+        tracing::debug!(imported, "reconciled playlist permissions from Data JSON");
     }
-    Ok((imported, exported))
+    Ok(imported)
 }
 
 /// Sets a single key in an item's `Data` JSON, preserving everything else.
@@ -570,24 +531,22 @@ pub async fn set_data_key(
     Ok(())
 }
 
-/// Imports one container's `Data` JSON into the cache tables (edges replaced
-/// wholesale; playlist owner/shares upserted).
-async fn import_container(
-    db: &Database,
-    container: Uuid,
-    is_playlist: bool,
+/// Replaces `container_db`'s `LinkedChildren` rows with the `LinkedChildren`
+/// array of its `Data` JSON (C# `MigrateLinkedChildren`: `ItemId` first, then
+/// `Path`; unresolvable entries dropped; ordinals count only inserted rows).
+pub(crate) async fn import_membership(
+    tx: &mut sqlx::SqliteConnection,
+    container_db: &str,
     map: &Map<String, Value>,
-) -> Result<(), ServiceError> {
-    let container_db = guid_to_db(container);
+) -> Result<usize, ServiceError> {
     let children = read_linked_children(map);
-
-    let mut tx = db.writer().begin().await.map_err(db_err)?;
-    sqlx::query(r#"DELETE FROM "FerrofinLinkedChildren" WHERE "ParentId" = ?1"#)
-        .bind(&container_db)
+    let mut inserted = 0usize;
+    sqlx::query(r#"DELETE FROM "LinkedChildren" WHERE "ParentId" = ?1"#)
+        .bind(container_db)
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
-    for (order, child) in children.iter().enumerate() {
+    for child in &children {
         // Resolve by id when present, else by path (Jellyfin's own load-time
         // strategy). Unresolvable children are skipped — same as Jellyfin
         // showing a stale path-only link as missing.
@@ -611,23 +570,34 @@ async fn import_container(
             .iter()
             .find(|(_, n)| *n == child.child_type)
             .map_or(0, |(d, _)| *d);
-        let order = i64::try_from(order).unwrap_or(i64::MAX);
+        // Dense ordinals, duplicates kept: the table's key is
+        // `(ParentId, SortOrder)` and a 12.0 playlist may list an item twice.
+        let order = i64::try_from(inserted).unwrap_or(i64::MAX);
         sqlx::query(
-            r#"INSERT INTO "FerrofinLinkedChildren" ("ParentId", "ChildId", "ChildType", "SortOrder")
-               VALUES (?1, ?2, ?3, ?4)
-               ON CONFLICT("ParentId", "ChildId") DO UPDATE
-               SET "ChildType" = excluded."ChildType", "SortOrder" = excluded."SortOrder""#,
+            r#"INSERT INTO "LinkedChildren" ("ParentId", "SortOrder", "ChildId", "ChildType")
+               VALUES (?1, ?2, ?3, ?4)"#,
         )
-        .bind(&container_db)
+        .bind(container_db)
+        .bind(order)
         .bind(child_db)
         .bind(discriminant)
-        .bind(order)
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
+        inserted += 1;
     }
+    Ok(inserted)
+}
 
-    if is_playlist {
+/// Upserts a playlist's owner / open-access row and replaces its shares from
+/// the `OwnerUserId` / `OpenAccess` / `Shares` keys of its `Data` JSON — the
+/// fields 12.0 still serialises there, so the JSON is current on every path.
+pub(crate) async fn import_playlist_meta(
+    tx: &mut sqlx::SqliteConnection,
+    container_db: &str,
+    map: &Map<String, Value>,
+) -> Result<(), ServiceError> {
+    {
         let owner = map
             .get("OwnerUserId")
             .and_then(Value::as_str)
@@ -643,7 +613,7 @@ async fn import_container(
                SET "OwnerUserId" = excluded."OwnerUserId",
                    "OpenAccess" = excluded."OpenAccess""#,
         )
-        .bind(&container_db)
+        .bind(container_db)
         .bind(owner.map(guid_to_db))
         .bind(open_access)
         .execute(&mut *tx)
@@ -656,7 +626,7 @@ async fn import_container(
             .and_then(|v| serde_json::from_value(v).ok())
             .unwrap_or_default();
         sqlx::query(r#"DELETE FROM "FerrofinPlaylistShares" WHERE "PlaylistId" = ?1"#)
-            .bind(&container_db)
+            .bind(container_db)
             .execute(&mut *tx)
             .await
             .map_err(db_err)?;
@@ -670,7 +640,7 @@ async fn import_container(
                    ON CONFLICT("PlaylistId", "UserId") DO UPDATE
                    SET "CanEdit" = excluded."CanEdit""#,
             )
-            .bind(&container_db)
+            .bind(container_db)
             .bind(guid_to_db(user))
             .bind(share.can_edit)
             .execute(&mut *tx)
@@ -678,7 +648,6 @@ async fn import_container(
             .map_err(db_err)?;
         }
     }
-    tx.commit().await.map_err(db_err)?;
     Ok(())
 }
 
@@ -798,7 +767,7 @@ mod tests {
         .await
         .expect("meta");
         sqlx::query(
-            r#"INSERT INTO "FerrofinLinkedChildren" ("ParentId", "ChildId", "ChildType", "SortOrder")
+            r#"INSERT INTO "LinkedChildren" ("ParentId", "ChildId", "ChildType", "SortOrder")
                VALUES (?1, ?2, 0, 0)"#,
         )
         .bind(guid_to_db(playlist))
@@ -821,25 +790,20 @@ mod tests {
             Some(json_guid(owner).as_str())
         );
         assert_eq!(map.get("OpenAccess").and_then(Value::as_bool), Some(true));
-        let children = read_linked_children(&map);
-        assert_eq!(children.len(), 1);
-        assert_eq!(
-            children[0].item_id.as_deref(),
-            Some(json_guid(child).as_str())
-        );
-        assert_eq!(children[0].path.as_deref(), Some("/m/a.mkv"));
-        assert_eq!(children[0].child_type, "Manual");
+        // 12.0 marks Folder.LinkedChildren [JsonIgnore]: membership is table-only.
+        assert!(!has_linked_children_key(&map));
+        let _ = child;
     }
 
     #[tokio::test]
-    async fn sync_boxset_children_are_path_only() {
+    async fn sync_leaves_box_sets_alone() {
         let db = test_db().await;
         let boxset = Uuid::new_v4();
         let child = Uuid::new_v4();
         seed_named_item(&db, boxset, BaseItemKind::BoxSet, "Set").await;
         seed_movie_with_path(&db, child, "/m/b.mkv").await;
         sqlx::query(
-            r#"INSERT INTO "FerrofinLinkedChildren" ("ParentId", "ChildId", "ChildType", "SortOrder")
+            r#"INSERT INTO "LinkedChildren" ("ParentId", "ChildId", "ChildType", "SortOrder")
                VALUES (?1, ?2, 0, 0)"#,
         )
         .bind(guid_to_db(boxset))
@@ -856,14 +820,12 @@ mod tests {
                 .fetch_one(db.pool())
                 .await
                 .expect("data");
-        let children = read_linked_children(&parse_data(data.as_deref()));
-        assert_eq!(children.len(), 1);
-        assert_eq!(children[0].path.as_deref(), Some("/m/b.mkv"));
-        assert_eq!(children[0].item_id, None, "box-set links are path-only");
+        // A box set has nothing 12.0 still keeps in Data: no membership key.
+        assert!(!has_linked_children_key(&parse_data(data.as_deref())));
     }
 
     #[tokio::test]
-    async fn reconcile_imports_jellyfin_written_data() {
+    async fn import_container_reads_jellyfin_written_data() {
         let db = test_db().await;
         let playlist = Uuid::new_v4();
         let by_id = Uuid::new_v4();
@@ -891,11 +853,23 @@ mod tests {
             .await
             .expect("plant blob");
 
-        let (imported, _) = reconcile_container_data(&db).await.expect("reconcile");
-        assert_eq!(imported, 1);
+        let map = parse_data(Some(&blob));
+        let mut tx = db.writer().begin().await.expect("tx");
+        import_membership(&mut tx, &guid_to_db(playlist), &map)
+            .await
+            .expect("import membership");
+        import_playlist_meta(&mut tx, &guid_to_db(playlist), &map)
+            .await
+            .expect("import meta");
+        tx.commit().await.expect("commit");
+        // The every-boot permission pass is a no-op on top of it.
+        let reconciled = reconcile_playlist_permissions(&db)
+            .await
+            .expect("reconcile");
+        assert_eq!(reconciled, 1);
 
         let edges: Vec<(String, i64)> = sqlx::query_as(
-            r#"SELECT "ChildId", "SortOrder" FROM "FerrofinLinkedChildren"
+            r#"SELECT "ChildId", "SortOrder" FROM "LinkedChildren"
                WHERE "ParentId" = ?1 ORDER BY "SortOrder""#,
         )
         .bind(guid_to_db(playlist))
@@ -927,36 +901,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconcile_exports_pre_data_ferrofin_rows() {
+    async fn sync_keeps_membership_out_of_data_and_playlist_meta_in() {
         let db = test_db().await;
-        let boxset = Uuid::new_v4();
+        let playlist = Uuid::new_v4();
         let child = Uuid::new_v4();
-        seed_named_item(&db, boxset, BaseItemKind::BoxSet, "Old").await;
+        let owner = Uuid::new_v4();
+        seed_named_item(&db, playlist, BaseItemKind::Playlist, "Mine").await;
         seed_movie_with_path(&db, child, "/m/c.mkv").await;
-        // Cache rows exist but Data has no LinkedChildren key — a pre-Data
-        // Ferrofin database.
         sqlx::query(
-            r#"INSERT INTO "FerrofinLinkedChildren" ("ParentId", "ChildId", "ChildType", "SortOrder")
-               VALUES (?1, ?2, 0, 0)"#,
+            r#"INSERT INTO "LinkedChildren" ("ParentId", "SortOrder", "ChildId", "ChildType")
+               VALUES (?1, 0, ?2, 0)"#,
         )
-        .bind(guid_to_db(boxset))
+        .bind(guid_to_db(playlist))
         .bind(guid_to_db(child))
         .execute(db.writer())
         .await
         .expect("edge");
+        sqlx::query(
+            r#"INSERT INTO "FerrofinPlaylists" ("PlaylistId", "OwnerUserId", "OpenAccess")
+               VALUES (?1, ?2, 1)"#,
+        )
+        .bind(guid_to_db(playlist))
+        .bind(guid_to_db(owner))
+        .execute(db.writer())
+        .await
+        .expect("meta");
 
-        let (_, exported) = reconcile_container_data(&db).await.expect("reconcile");
-        assert!(exported >= 1);
+        sync_container_data(&db, playlist).await.expect("sync");
 
         let data: Option<String> =
             sqlx::query_scalar(r#"SELECT "Data" FROM "BaseItems" WHERE "Id" = ?1"#)
-                .bind(guid_to_db(boxset))
+                .bind(guid_to_db(playlist))
                 .fetch_one(db.pool())
                 .await
                 .expect("data");
-        let children = read_linked_children(&parse_data(data.as_deref()));
-        assert_eq!(children.len(), 1);
-        assert_eq!(children[0].path.as_deref(), Some("/m/c.mkv"));
+        let map = parse_data(data.as_deref());
+        // 12.0 marks Folder.LinkedChildren [JsonIgnore]: the table is the store.
+        assert!(!has_linked_children_key(&map));
+        assert_eq!(
+            map.get("OwnerUserId").and_then(Value::as_str),
+            Some(json_guid(owner).as_str())
+        );
+        assert_eq!(map.get("OpenAccess").and_then(Value::as_bool), Some(true));
+        assert!(map.get("Shares").and_then(Value::as_array).is_some());
     }
 
     /// A verbatim playlist `Data` blob captured from a real 10.11.8 database.

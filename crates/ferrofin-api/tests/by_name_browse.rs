@@ -69,6 +69,7 @@ fn user_entity(id: Uuid) -> UserEntity {
         subtitle_mode: 0,
         sync_play_access: 0,
         username: "bob".to_owned(),
+        normalized_username: "BOB".to_owned(),
     }
 }
 
@@ -115,8 +116,8 @@ fn named_entity(id: Uuid, name: &str) -> BaseItemEntity {
         name: Some(name.to_owned()),
         normalization_gain: None,
         official_rating: None,
-        extra_ids: None,
         original_title: None,
+        original_language: None,
         overview: None,
         owner_id: None,
         parent_id: None,

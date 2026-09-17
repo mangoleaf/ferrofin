@@ -101,6 +101,7 @@ fn user_entity(id: Uuid, username: &str) -> UserEntity {
         subtitle_mode: 0,
         sync_play_access: 0,
         username: username.to_owned(),
+        normalized_username: username.to_uppercase(),
     }
 }
 
@@ -160,8 +161,8 @@ fn empty_item() -> BaseItemEntity {
         name: None,
         normalization_gain: None,
         official_rating: None,
-        extra_ids: None,
         original_title: None,
+        original_language: None,
         overview: None,
         owner_id: None,
         parent_id: None,
