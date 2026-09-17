@@ -172,12 +172,12 @@ impl ListenBrainzClient {
         {
             Ok(resp) => resp,
             Err(err) => {
-                tracing::warn!(provider = "listenbrainz", %err, "similar-artist request failed");
+                tracing::debug!(provider = "listenbrainz", %err, "similar-artist request failed");
                 return Vec::new();
             }
         };
         if !resp.status().is_success() {
-            tracing::warn!(
+            tracing::debug!(
                 provider = "listenbrainz",
                 status = %resp.status(),
                 "similar-artist request returned non-success"

@@ -11,25 +11,85 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time::Instant;
 
+const GET_ATTEMPTS: u32 = 4;
+const BACKOFF_CAP: Duration = Duration::from_mins(1);
+const OPEN_AFTER_FAILURES: u32 = 6;
+const RECOVERY_SUCCESSES: u32 = 5;
+const RECOVERY_QUIET: Duration = Duration::from_mins(1);
+
+#[derive(Debug, Clone, Copy)]
+struct Settings {
+    timeout: Duration,
+    max_wait: Duration,
+}
+
+impl Settings {
+    fn from_env() -> Self {
+        Self {
+            timeout: seconds_setting(
+                std::env::var("FERROFIN_PROVIDER_TIMEOUT_SECONDS")
+                    .ok()
+                    .as_deref(),
+                20,
+                10,
+                60,
+            ),
+            max_wait: seconds_setting(
+                std::env::var("FERROFIN_PROVIDER_MAX_WAIT_SECONDS")
+                    .ok()
+                    .as_deref(),
+                60,
+                30,
+                300,
+            ),
+        }
+    }
+}
+
+fn seconds_setting(value: Option<&str>, default: u64, min: u64, max: u64) -> Duration {
+    Duration::from_secs(
+        value
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(default)
+            .clamp(min, max),
+    )
+}
+
+// Only allow known non-secret identifiers. Some providers put API keys or
+// signed tokens in URL paths, so never log arbitrary paths or whole queries.
+fn request_context(provider: &str, url: &reqwest::Url) -> String {
+    match provider {
+        "musicbrainz" => url.path().to_owned(),
+        "omdb" => url
+            .query_pairs()
+            .find(|(key, _)| key == "i")
+            .map_or_else(|| "search".to_owned(), |(_, id)| id.into_owned()),
+        _ => "lookup".to_owned(),
+    }
+}
+
 /// A shared gate for metadata GETs, including retries and server cooldowns.
 ///
 /// Honors `Retry-After` and exhausted `X-RateLimit-Remaining`/epoch
 /// `X-RateLimit-Reset` headers. Transient failures (408, 429, 500, 502, 503,
-/// 504 and connection errors) receive at most four attempts with exponential
-/// backoff and jitter. State persists between calls, including after cancellation.
+/// 504 and request errors) receive at most four GET attempts with exponential
+/// backoff and jitter. Connection failures open the circuit after one attempt.
+/// State persists between calls, including after cancellation.
 /// This coordinates callers within one process, not other clients sharing its IP.
 #[derive(Debug, Clone)]
 pub struct RateLimiter {
-    provider: &'static str,
+    provider: Arc<str>,
+    settings: Settings,
     state: Arc<Mutex<RequestRate>>,
 }
 
 impl RateLimiter {
     /// Creates an independent quota gate. Clone it to share cooldowns.
     #[must_use]
-    pub fn new(provider: &'static str) -> Self {
+    pub fn new(provider: impl Into<Arc<str>>) -> Self {
         Self {
-            provider,
+            provider: provider.into(),
+            settings: Settings::from_env(),
             state: Arc::default(),
         }
     }
@@ -37,8 +97,8 @@ impl RateLimiter {
     /// Executes a GET with the caller's minimum interval and bounded retries.
     ///
     /// Returns `None` for permanent errors, exhausted retries,
-    /// non-GET/non-replayable requests, or a pending cooldown longer than one
-    /// minute. Long cooldowns are retained for later calls. Each HTTP attempt
+    /// non-GET/non-replayable requests, an open circuit, or a pending cooldown
+    /// longer than the configured maximum wait. Long cooldowns are retained for later calls. Each HTTP attempt
     /// has a 20-second default timeout; explicit request timeouts are preserved.
     /// The shared gate covers response headers as well as
     /// dispatch, so concurrent callers cannot miss a newly received cooldown.
@@ -65,7 +125,7 @@ impl RateLimiter {
     ///
     /// # Errors
     /// Returns an error for transport/build failures, a non-replayable GET, or
-    /// a retained cooldown longer than one minute.
+    /// an open circuit, or a cooldown longer than the configured maximum wait.
     pub async fn send_request(
         &self,
         request: reqwest::RequestBuilder,
@@ -83,28 +143,20 @@ impl RateLimiter {
         interval: Duration,
     ) -> Result<reqwest::Response, RequestError> {
         let attempts = if request.method() == reqwest::Method::GET {
-            4
+            GET_ATTEMPTS
         } else {
             1
         };
+        let context = request_context(&self.provider, request.url());
         let mut original = Some(request);
         let interval = interval.min(Duration::from_secs(u64::from(u32::MAX)));
         for attempt in 1..=attempts {
             let mut rate = self.state.lock().await;
-            let quota_delay = rate.quota_delay();
-            rate.postpone(quota_delay);
-            if let Some(next) = rate.next {
-                // Do not tie up a scan for a long server-directed cooldown.
-                // Keep the deadline for subsequent calls instead.
-                if next.saturating_duration_since(Instant::now()) > Duration::from_mins(1) {
-                    tracing::debug!(
-                        provider = self.provider,
-                        "Metadata provider cooldown active; skipping lookup"
-                    );
-                    return Err(RequestError::Cooldown);
-                }
-                tokio::time::sleep_until(next).await;
-            }
+            // ponytail: serialize through response headers so quota updates cannot
+            // race. This limits each provider/origin to one request in flight;
+            // revisit with quota reservations if scans become concurrent.
+            rate.wait_ready(&self.provider, &context, self.settings.max_wait)
+                .await?;
             // Reserve before awaiting I/O, including when this future is cancelled.
             rate.consume_quota();
             rate.next = Some(Instant::now() + interval.max(rate.adaptive_interval()));
@@ -118,62 +170,43 @@ impl RateLimiter {
             };
             attempt_request
                 .timeout_mut()
-                .get_or_insert(Duration::from_secs(20));
+                .get_or_insert(self.settings.timeout);
             let response = http.execute(attempt_request).await;
             match response {
                 Ok(resp) => {
                     let status = resp.status();
-                    let headers = resp.headers();
-                    let retryable = matches!(status.as_u16(), 408 | 429 | 500 | 502 | 503 | 504);
-                    rate.observe_quota(headers, chrono::Utc::now());
-                    let server_delay =
-                        server_delay(headers, chrono::Utc::now()).max(rate.quota_delay());
-                    if retryable {
-                        let delay = rate.failed(server_delay);
-                        if rate.failures == 1 {
-                            tracing::warn!(provider = self.provider, %status, rate_limit_zone = ?headers.get("x-ratelimit-zone"), remaining = ?headers.get("x-ratelimit-remaining"), reset = ?headers.get("x-ratelimit-reset"), retry_after = ?headers.get("retry-after"), "Metadata provider unavailable; entering backoff");
-                        }
-                        tracing::debug!(provider = self.provider, %status, attempt, delay_ms = delay.as_millis(),
-                            rate_limit_zone = ?headers.get("x-ratelimit-zone"),
-                            "Metadata provider request rejected; backing off");
-                    } else {
-                        if status.is_success() && rate.succeeded() {
-                            tracing::info!(
-                                provider = self.provider,
-                                "Metadata provider requests recovered"
-                            );
-                        }
-                        let delay = interval.max(server_delay).max(rate.adaptive_interval());
-                        rate.postpone(delay);
-                    }
+                    let retryable = self.observe_response(&mut rate, &resp, &context, interval);
                     if status.is_success() || attempt == attempts {
                         return Ok(resp);
                     }
                     if !retryable {
-                        tracing::debug!(provider = self.provider, %status, "Metadata provider request rejected");
                         return Ok(resp);
                     }
                 }
                 Err(error) => {
+                    let error = error.without_url();
                     if !error.is_timeout() && !error.is_connect() && !error.is_request() {
-                        tracing::debug!(
-                            provider = self.provider,
-                            "Metadata provider request failed"
-                        );
+                        tracing::warn!(provider = %self.provider, %context, "Metadata provider request failed");
                         return Err(RequestError::Http(error.without_url()));
                     }
                     rate.failed(Duration::ZERO);
                     if rate.failures == 1 {
                         tracing::warn!(
-                            provider = self.provider,
+                            provider = %self.provider, %context, %error,
                             "Metadata provider connection failed; entering backoff"
                         );
                     }
                     tracing::debug!(
-                        provider = self.provider,
+                        provider = %self.provider,
                         attempt,
                         "Metadata provider request failed; backing off"
                     );
+                    if error.is_connect() {
+                        // One failed connection attempt is enough. Subsequent
+                        // lookups skip immediately until the next probe deadline.
+                        rate.open_until = rate.next;
+                        return Err(RequestError::Http(error.without_url()));
+                    }
                     if attempt == attempts {
                         return Err(RequestError::Http(error.without_url()));
                     }
@@ -182,6 +215,42 @@ impl RateLimiter {
         }
         Err(RequestError::NotReplayable)
     }
+    fn observe_response(
+        &self,
+        rate: &mut RequestRate,
+        response: &reqwest::Response,
+        context: &str,
+        interval: Duration,
+    ) -> bool {
+        let status = response.status();
+        let headers = response.headers();
+        let retryable = matches!(status.as_u16(), 408 | 429 | 500 | 502 | 503 | 504);
+        rate.observe_quota(headers, chrono::Utc::now());
+        let server_delay = server_delay(headers, chrono::Utc::now()).max(rate.quota_delay());
+        if retryable {
+            let delay = rate.failed(server_delay);
+            if rate.failures == 1 {
+                tracing::warn!(provider = %self.provider, %context, %status,
+                    rate_limit_zone = ?headers.get("x-ratelimit-zone"),
+                    remaining = ?headers.get("x-ratelimit-remaining"),
+                    reset = ?headers.get("x-ratelimit-reset"),
+                    retry_after = ?headers.get("retry-after"),
+                    "Metadata provider unavailable; entering backoff");
+            }
+            tracing::debug!(provider = %self.provider, %context, %status,
+                delay_ms = delay.as_millis(), "Metadata provider request rejected; backing off");
+        } else {
+            if !status.is_success() {
+                tracing::warn!(provider = %self.provider, %context, %status,
+                    "Metadata provider request rejected");
+            } else if rate.succeeded() {
+                tracing::info!(provider = %self.provider, "Metadata provider requests recovered");
+            }
+            rate.postpone(interval.max(server_delay).max(rate.adaptive_interval()));
+        }
+        retryable
+    }
+
     /// Executes a paced GET and decodes its successful response as JSON.
     /// Parse failures return `None`; transport retries are handled by [`Self::send_get`].
     pub async fn get_json<T: serde::de::DeserializeOwned>(
@@ -190,10 +259,11 @@ impl RateLimiter {
         interval: Duration,
     ) -> Option<T> {
         let response = self.send_get(request, interval).await?;
+        let context = request_context(&self.provider, response.url());
         match response.json().await {
             Ok(body) => Some(body),
             Err(error) => {
-                tracing::debug!(provider = self.provider, error = %error.without_url(), "Metadata provider response could not be parsed");
+                tracing::warn!(provider = %self.provider, %context, error = %error.without_url(), "Metadata provider response could not be parsed");
                 None
             }
         }
@@ -205,7 +275,7 @@ impl RateLimiter {
 pub enum RequestError {
     /// Transport/build errors never expose request URLs containing credentials.
     #[error("provider HTTP request failed: {0}")]
-    Http(reqwest::Error),
+    Http(#[source] reqwest::Error),
     /// Preserve long cooldowns without blocking the scan indefinitely.
     #[error("provider cooldown is active")]
     Cooldown,
@@ -229,6 +299,8 @@ impl LimitedRequest for reqwest::RequestBuilder {
 #[derive(Debug, Default)]
 struct RequestRate {
     next: Option<Instant>,
+    open_until: Option<Instant>,
+    skipped: u64,
     failures: u32,
     successes: u32,
     last_failure: Option<Instant>,
@@ -236,11 +308,49 @@ struct RequestRate {
 }
 
 impl RequestRate {
+    async fn wait_ready(
+        &mut self,
+        provider: &str,
+        context: &str,
+        max_wait: Duration,
+    ) -> Result<(), RequestError> {
+        self.postpone(self.quota_delay());
+        let now = Instant::now();
+        let open = self.open_until.is_some_and(|until| until > now);
+        let long_wait = self
+            .next
+            .is_some_and(|next| next.saturating_duration_since(now) > max_wait);
+        if open || long_wait {
+            if self.skipped == 0 && self.failures == 0 {
+                tracing::warn!(
+                    provider,
+                    context,
+                    "Metadata provider quota cooldown active; skipping lookups"
+                );
+            }
+            self.skipped = self.skipped.saturating_add(1);
+            return Err(RequestError::Cooldown);
+        }
+        if let Some(next) = self.next {
+            tokio::time::sleep_until(next).await;
+        }
+        self.open_until = None;
+        if self.skipped > 0 {
+            let skipped = std::mem::take(&mut self.skipped);
+            tracing::info!(
+                provider,
+                skipped,
+                "Metadata provider cooldown ended; resuming lookups"
+            );
+        }
+        Ok(())
+    }
+
     fn adaptive_interval(&self) -> Duration {
         if self.failures == 0 {
             return Duration::ZERO;
         }
-        Duration::from_secs((2_u64 << self.failures.min(6).saturating_sub(1)).min(60))
+        Duration::from_secs(2_u64 << self.failures.min(6).saturating_sub(1)).min(BACKOFF_CAP)
     }
 
     // A single successful request does not prove a congested service recovered.
@@ -248,10 +358,10 @@ impl RequestRate {
     fn succeeded(&mut self) -> bool {
         self.successes = self.successes.saturating_add(1);
         if self.failures > 0
-            && self.successes >= 5
+            && self.successes >= RECOVERY_SUCCESSES
             && self
                 .last_failure
-                .is_some_and(|last| last.elapsed() >= Duration::from_mins(1))
+                .is_some_and(|last| last.elapsed() >= RECOVERY_QUIET)
         {
             self.failures -= 1;
             self.successes = 0;
@@ -320,6 +430,9 @@ impl RequestRate {
         let jitter = Duration::from_millis(u64::from(uuid::Uuid::new_v4().as_bytes()[0]));
         let delay = backoff.max(server_delay).saturating_add(jitter);
         self.postpone(delay);
+        if self.failures >= OPEN_AFTER_FAILURES {
+            self.open_until = self.next;
+        }
         delay
     }
 }
@@ -379,6 +492,28 @@ fn server_delay(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Real sockets need executor turns before a paused clock advances to an
+    // HTTP timeout. Keep the runtime runnable and advance virtual milliseconds
+    // explicitly, giving loopback I/O ample turns between ticks. No real sleeps.
+    struct TestClock(tokio::task::JoinHandle<()>);
+    impl TestClock {
+        fn start() -> Self {
+            Self(tokio::spawn(async {
+                loop {
+                    for _ in 0..100 {
+                        tokio::task::yield_now().await;
+                    }
+                    tokio::time::advance(Duration::from_millis(1)).await;
+                }
+            }))
+        }
+    }
+    impl Drop for TestClock {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+
     async fn lookup(client: &RateLimiter, url: &str, name: &str) -> Option<String> {
         let response: serde_json::Value = client
             .get_json(
@@ -439,8 +574,9 @@ mod tests {
         assert_eq!(rate.adaptive_interval(), Duration::ZERO);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn successful_quota_exhaustion_holds_concurrent_callers_until_reset() {
+        let _clock = TestClock::start();
         let (url, task) = scripted_server(vec![
             (200, "Date: Tue, 15 Sep 2026 17:04:50 GMT\r\nX-RateLimit-Remaining: 0\r\nX-RateLimit-Reset: 1789491891\r\n"),
             (200, ""),
@@ -452,8 +588,9 @@ mod tests {
         assert!(times[1] - times[0] >= Duration::from_secs(2));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn headerless_success_has_no_fixed_pacing() {
+        let _clock = TestClock::start();
         let (url, task) = scripted_server(vec![(200, ""), (200, "")]).await;
         let limiter = RateLimiter::new("headerless");
         for _ in 0..2 {
@@ -472,8 +609,9 @@ mod tests {
         task.await.unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn post_is_not_retried_but_retains_server_cooldown() {
+        let _clock = TestClock::start();
         let (url, task) = scripted_server(vec![(429, "Retry-After: 120\r\n")]).await;
         let limiter = RateLimiter::new("post-test");
         let http = reqwest::Client::new();
@@ -505,6 +643,155 @@ mod tests {
             rate.observe_quota(&headers, chrono::Utc::now());
             assert_eq!(rate.quota_delay(), Duration::from_secs(5));
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connection_failure_opens_immediately_and_allows_later_probe() {
+        let _clock = TestClock::start();
+        let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = socket.local_addr().unwrap();
+        drop(socket);
+        let url = format!("http://{addr}");
+        let limiter = RateLimiter::new("offline");
+        let http = reqwest::Client::new();
+        assert!(
+            matches!(limiter.send_request(http.get(&url), Duration::ZERO).await,
+            Err(RequestError::Http(error)) if error.is_connect())
+        );
+        assert_eq!(limiter.state.lock().await.failures, 1);
+        for _ in 0..3 {
+            assert!(matches!(
+                limiter.send_request(http.get(&url), Duration::ZERO).await,
+                Err(RequestError::Cooldown)
+            ));
+        }
+        assert_eq!(limiter.state.lock().await.skipped, 3);
+        let (healthy, server) = scripted_server(vec![(200, "")]).await;
+        tokio::time::advance(Duration::from_secs(3)).await;
+        assert!(
+            limiter
+                .send_request(http.get(healthy), Duration::ZERO)
+                .await
+                .is_ok()
+        );
+        assert_eq!(limiter.state.lock().await.skipped, 0);
+        server.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn circuit_is_explicit_even_when_wait_threshold_exceeds_backoff() {
+        let mut rate = RequestRate::default();
+        for _ in 0..OPEN_AFTER_FAILURES {
+            rate.failed(Duration::ZERO);
+        }
+        assert!(rate.open_until.is_some());
+        // Remove jitter entirely: opening must not depend on it or max_wait.
+        rate.next = Some(Instant::now() + BACKOFF_CAP);
+        rate.open_until = rate.next;
+        assert!(matches!(
+            rate.wait_ready("test", "lookup", Duration::from_mins(5))
+                .await,
+            Err(RequestError::Cooldown)
+        ));
+        tokio::time::advance(BACKOFF_CAP).await;
+        assert!(
+            rate.wait_ready("test", "lookup", Duration::from_mins(5))
+                .await
+                .is_ok()
+        );
+        assert!(rate.open_until.is_none());
+        assert_eq!(rate.skipped, 0);
+    }
+
+    #[derive(Clone, Default)]
+    struct LogBuffer(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for LogBuffer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuffer {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn warnings_identify_failures_and_cooldown_summary_counts_skips() {
+        use tracing::instrument::WithSubscriber as _;
+        let _clock = TestClock::start();
+        let logs = LogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(logs.clone())
+            .finish();
+        async {
+            let (url, server) = scripted_server(vec![(404, ""), (200, ""), (200, "")]).await;
+            let client = RateLimiter::new("omdb");
+            let http = reqwest::Client::new();
+            let request = || {
+                http.get(&url)
+                    .query(&[("i", "tt123"), ("apikey", "private-key")])
+            };
+            assert!(client.send_get(request(), Duration::ZERO).await.is_none());
+            assert!(
+                client
+                    .get_json::<u64>(request(), Duration::ZERO)
+                    .await
+                    .is_none()
+            );
+            client.state.lock().await.postpone(Duration::from_mins(2));
+            for _ in 0..2 {
+                assert!(client.send_get(request(), Duration::ZERO).await.is_none());
+            }
+            tokio::time::advance(Duration::from_mins(2)).await;
+            assert!(client.send_get(request(), Duration::ZERO).await.is_some());
+            server.await.unwrap();
+        }
+        .with_subscriber(subscriber)
+        .await;
+        let logs = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            logs.lines().any(|line| line.contains("WARN")
+                && line.contains("tt123")
+                && line.contains("404"))
+        );
+        assert!(logs.lines().any(|line| line.contains("WARN")
+            && line.contains("tt123")
+            && line.contains("could not be parsed")));
+        assert!(logs.contains("skipped=2"));
+        assert!(!logs.contains("private-key"));
+    }
+
+    #[test]
+    fn settings_bounds_and_safe_request_identifiers() {
+        assert_eq!(seconds_setting(None, 20, 10, 60), Duration::from_secs(20));
+        assert_eq!(
+            seconds_setting(Some("bad"), 20, 10, 60),
+            Duration::from_secs(20)
+        );
+        assert_eq!(
+            seconds_setting(Some("0"), 20, 10, 60),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            seconds_setting(Some("1000"), 20, 10, 60),
+            Duration::from_mins(1)
+        );
+        let url =
+            reqwest::Url::parse("https://example.org/private-key?apikey=secret&i=tt123").unwrap();
+        assert_eq!(request_context("omdb", &url), "tt123");
+        assert_eq!(request_context("audiodb", &url), "lookup");
+        let url =
+            reqwest::Url::parse("https://musicbrainz.org/ws/2/release/id?query=private").unwrap();
+        assert_eq!(request_context("musicbrainz", &url), "/ws/2/release/id");
     }
 
     #[test]
@@ -571,8 +858,9 @@ mod tests {
         (url, task)
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn retries_and_concurrent_lookups_share_cooldown() {
+        let _clock = TestClock::start();
         let (url, task) =
             scripted_server(vec![(503, "Retry-After: 3\r\n"), (200, ""), (200, "")]).await;
         let client = RateLimiter::new("test");
@@ -585,8 +873,9 @@ mod tests {
         assert!(times[2] - times[1] >= Duration::from_secs(1));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn unrelated_provider_is_not_blocked_and_non_gets_are_not_sent() {
+        let _clock = TestClock::start();
         let blocked = RateLimiter::new("blocked");
         blocked.state.lock().await.postpone(Duration::from_mins(2));
         let (url, task) = scripted_server(vec![(200, "")]).await;
@@ -612,9 +901,10 @@ mod tests {
         assert_eq!(task.await.unwrap().len(), 1);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn rate_limited_500_retries_preserving_request_details() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let _clock = TestClock::start();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move {
@@ -648,8 +938,9 @@ mod tests {
         server.await.unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn exhausted_retries_preserve_backoff() {
+        let _clock = TestClock::start();
         let (url, task) = scripted_server(vec![(503, "Retry-After: 0\r\n"); 4]).await;
         let client = RateLimiter::new("test");
         assert!(lookup(&client, &url, "a").await.is_none());
@@ -664,8 +955,9 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn long_cooldown_skips_following_items_and_permanent_errors_do_not_retry() {
+        let _clock = TestClock::start();
         let (url, task) = scripted_server(vec![(429, "Retry-After: 120\r\n")]).await;
         let client = RateLimiter::new("test");
         assert!(lookup(&client, &url, "a").await.is_none());
@@ -678,8 +970,9 @@ mod tests {
         assert_eq!(task.await.unwrap().len(), 1);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn successful_response_with_exhausted_quota_delays_next_lookup() {
+        let _clock = TestClock::start();
         let (url, task) = scripted_server(vec![(200, "Retry-After: 2\r\n"), (200, "")]).await;
         let client = RateLimiter::new("test");
         assert!(lookup(&client, &url, "a").await.is_some());

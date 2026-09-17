@@ -157,7 +157,7 @@ impl StudiosClient {
                 }
             },
             Err(e) => {
-                tracing::warn!(url, error = %e, "studios: manifest fetch failed");
+                tracing::debug!(error = %e, "studios: manifest fetch failed");
                 Vec::new()
             }
         };

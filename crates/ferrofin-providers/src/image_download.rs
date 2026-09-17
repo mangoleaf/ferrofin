@@ -27,7 +27,7 @@ pub(crate) fn limiter_for(url: &str) -> RateLimiter {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .entry(origin)
-        .or_insert_with(|| RateLimiter::new("remote-download"))
+        .or_insert_with_key(|origin| RateLimiter::new(origin.clone()))
         .clone()
 }
 

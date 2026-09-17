@@ -968,12 +968,12 @@ impl TmdbClient {
             Ok(resp) => resp,
             // The limiter strips URLs from transport errors to protect API keys.
             Err(e) => {
-                tracing::warn!(provider = "tmdb", error = %e, "tmdb request failed");
+                tracing::debug!(provider = "tmdb", error = %e, "tmdb request failed");
                 return Vec::new();
             }
         };
         if !resp.status().is_success() {
-            tracing::warn!(provider = "tmdb", status = %resp.status(), "tmdb returned non-success");
+            tracing::debug!(provider = "tmdb", status = %resp.status(), "tmdb returned non-success");
             return Vec::new();
         }
         let Ok(parsed) = resp.json::<SearchResponse>().await else {

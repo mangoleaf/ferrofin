@@ -71,8 +71,13 @@ and [main ListenBrainz API policy](https://listenbrainz.readthedocs.io/en/latest
 
 - Requests are serialized through receipt of response headers. The supplied
   minimum interval applies to initial requests and retries.
-- HTTP 408, 429, 500, 502, 503 and 504, and transient connection/request failures,
+- HTTP 408, 429, 500, 502, 503 and 504, and transient request/timeout failures,
   receive at most four attempts per GET lookup; other methods get one attempt.
+- A connection failure makes one attempt and opens the circuit immediately.
+  Later lookups skip without sleeping until its backoff deadline permits a
+  probe. Repeated failures increase the cooldown instead of stalling each item.
+- Six accumulated transient failures also explicitly open the circuit until
+  its deadline. This does not depend on jitter exceeding the maximum wait.
 - Failures increase a shared pacing penalty to 2, 4, 8, 16, 32, then 60 seconds,
   with up to 255 milliseconds of jitter on retries. Successful calls retain
   that minimum spacing. After a minute without failure and at least five
@@ -92,14 +97,34 @@ and [main ListenBrainz API policy](https://listenbrainz.readthedocs.io/en/latest
   headers have whole-second precision. Successful responses update quota too.
   Shared global quotas can still be consumed by other clients after a response;
   these headers cannot guarantee that the next request will be accepted.
-- A pending wait longer than one minute skips the call immediately, retaining
+- A pending wait longer than the configured maximum (default one minute) skips
+  the call immediately, retaining
   the cooldown. Exhausted retries and cancellation also retain pacing state.
 - The GET/JSON convenience methods return `None` for permanent errors,
   exhausted retries and JSON parse failures. `send_request` preserves the last
   HTTP response or returns a transport/cooldown error.
   A caller must not treat that as proof that the metadata does not exist.
 
-Backoff entry is logged at WARN, recovery at INFO and individual attempts at
-DEBUG, all tagged with `provider`. Transport errors omit URLs to protect API
-keys. The gate coordinates callers within a process, not separate processes
-sharing an external IP. Upstream overload can still reject compliant requests.
+Backoff entry is logged once per outage at WARN. Permanent HTTP rejections and
+JSON parse failures remain WARN, with the MusicBrainz path or OMDb IMDb id.
+The first quota-only skip is also WARN; when lookups resume, INFO includes the
+number skipped during cooldown. Gradual outage recovery is logged separately.
+Download limiter labels contain the URL origin, never signed paths or queries.
+Transport errors omit URLs to protect API keys. The gate coordinates callers
+within one process, not separate processes sharing an external IP. Upstream
+overload can still reject compliant requests.
+
+## Settings
+
+Read when each limiter is constructed (restart to apply):
+
+| Environment variable | Default | Range | Meaning |
+| --- | --- | --- | --- |
+| `FERROFIN_PROVIDER_TIMEOUT_SECONDS` | 20 | 10–60 | Default timeout per HTTP attempt; an explicitly set request timeout takes precedence. |
+| `FERROFIN_PROVIDER_MAX_WAIT_SECONDS` | 60 | 30–300 | Maximum pending pacing/quota wait before skipping a lookup. Open circuits always skip until their probe deadline. |
+
+Malformed values use the default; numeric values are clamped to the range.
+Attempts, the adaptive backoff cap, recovery streak/quiet period, and jitter
+remain internal policy rather than user settings. The gate deliberately holds
+its lock through response headers; supporting concurrent in-flight requests
+would require quota reservations and coordinated response updates.
