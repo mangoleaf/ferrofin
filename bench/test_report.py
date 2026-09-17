@@ -382,7 +382,7 @@ class ReportTests(unittest.TestCase):
         self.assertNotIn('faster', self.row(self.readme(model)))
 
     def test_workload_hashes_and_seeds_cannot_be_mixed(self):
-        for field in ('workload', 'ids_sha256', 'screens_sha256', 'seed', 'warmup_seed', 'slots', 'pools'):
+        for field in ('workload', 'ids_sha256', 'screens_sha256', 'seed', 'warmup_seed', 'slots', 'pools', 'user_isolation', 'actors'):
             with self.subTest(field=field):
                 self.edit(self.a/'run.json', lambda m: m.update({field: 4}))
                 with self.assertRaisesRegex(ValueError, field):
@@ -542,6 +542,24 @@ class BoundedEvidenceTests(unittest.TestCase):
     def evidence(self):
         return report.shape_evidence(self.root, self.meta, report.load_shape(self.root))
 
+    def test_isolated_shape_and_measurement_records_keep_their_actor(self):
+        self.meta.update(user_isolation=1, actors={'browse': 'a', 'playback': 'b'})
+        self.summary['user_isolation'] = 1
+        (self.root/'shape-summary.json').write_text(json.dumps(self.summary))
+        for record in self.records:
+            record.update(actor='browse', user='a')
+        self.save()
+        error, index, _ = self.evidence()
+        self.assertIsNone(error)
+        measured = copy.deepcopy(self.records)
+        measured[0]['actor'] = 'playback'
+        self.log(self.root/'measured.log', measured)
+        problems = report.selection_problems(self.root/'measured.log', self.summary, index, 10, self.meta)
+        self.assertIn('actor', problems['home'])
+        self.records[0]['user'] = 'b'
+        self.save()
+        self.assertIn('actor', self.evidence()[0])
+
     def test_shape_slots_are_complete_once_across_vus(self):
         self.records.reverse()  # completion order across VUs is irrelevant
         self.responses.reverse()
@@ -647,6 +665,120 @@ class BoundedEvidenceTests(unittest.TestCase):
         self.assertEqual(pools['terms'], ['Movie', 'Shared'])
         self.assertEqual(pools['nextUpCutoff'], '2025-09-01T00:00:00.000Z')
 
+
+
+class UserIsolationTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.ids = {'user': 'a', 'viewer': 'b', 'user_name': 'bench', 'password': 'bench',
+                    'viewer_name': 'viewer', 'viewer_password': 'viewer', 'token': 'control',
+                    'pools': {'movies': ['movie']}}
+
+    def test_roles_require_distinct_users_and_explicit_credentials(self):
+        seed.validate_user_roles(self.ids)
+        for update in ({'viewer': 'A'}, {'viewer_password': ''}, {'user_name': None}):
+            with self.subTest(update=update), self.assertRaises(RuntimeError):
+                seed.validate_user_roles({**self.ids, **update})
+
+    def test_session_owner_and_additional_users_are_checked(self):
+        sessions = [{'Client': 'bench', 'DeviceId': 'bench-browse', 'UserId': 'a', 'AdditionalUsers': []},
+                    {'Client': 'bench', 'DeviceId': 'bench-playback', 'UserId': 'b', 'AdditionalUsers': []}]
+        seed.check_role_sessions(sessions, self.ids)
+        for change in ({'UserId': 'a'}, {'AdditionalUsers': [{'UserId': 'a'}]}, {'DeviceId': 'other'}):
+            with self.subTest(change=change), self.assertRaises(RuntimeError):
+                seed.check_role_sessions([sessions[0], {**sessions[1], **change}], self.ids)
+        with self.assertRaises(RuntimeError):
+            seed.check_role_sessions(sessions + [sessions[1]], self.ids)
+
+    def test_user_state_requires_exact_item_coverage(self):
+        api = Mock()
+        api.get.return_value = {'Items': [{'Id': 'a', 'UserData': {'PlayCount': 0}}]}
+        self.assertEqual(seed.movie_user_state(api, 'user', ['a'])['a']['PlayCount'], 0)
+        for rows in ([], [{'Id': 'x', 'UserData': {'PlayCount': 0}}],
+                     [{'Id': 'a', 'UserData': {}}], [{'Id': 'a', 'UserData': {'PlayCount': 0}}] * 2):
+            api.get.return_value = {'Items': rows}
+            with self.subTest(rows=rows), self.assertRaises(RuntimeError):
+                seed.movie_user_state(api, 'user', ['a'])
+
+    def test_user_state_requests_are_bounded(self):
+        api = Mock()
+        api.get.side_effect = lambda path, **q: {'Items': [{'Id': i, 'UserData': {'PlayCount': 0}}
+                                                        for i in q['Ids'].split(',')]}
+        result = seed.movie_user_state(api, 'user', [str(i) for i in range(201)])
+        self.assertEqual(len(result), 201)
+        self.assertEqual([c.kwargs['Limit'] for c in api.get.call_args_list], [100, 100, 1])
+
+    def test_state_drift_is_detected_without_resetting_it(self):
+        before = {'browse_user': 'a', 'playback_user': 'b', 'user_state': {'movie': {'PlayCount': 0}},
+                  'home': {'resume': ['movie']}, 'home_images': ['movie']}
+        self.assertEqual(seed.state_changes(before, before), {'changed_items': [], 'home_changed': False})
+        after = copy.deepcopy(before)
+        after['user_state']['movie']['PlayCount'] = 1
+        after['home_images'] = []
+        self.assertEqual(seed.state_changes(before, after), {'changed_items': ['movie'], 'home_changed': True})
+        with self.assertRaises(RuntimeError):
+            seed.state_changes(before, {**before, 'user_state': {}})
+
+    def test_authentication_uses_role_credentials_and_private_output(self):
+        source, output = self.root/'source.json', self.root/'private.json'
+        source.write_text(json.dumps(self.ids))
+        control, browse, playback = Mock(), Mock(), Mock()
+        control.get.return_value = [{'Client': 'bench', 'DeviceId': 'bench-' + r, 'UserId': u}
+                                    for r, u in (('browse', 'a'), ('playback', 'b'))]
+        browse.post.return_value = {'User': {'Id': 'a', 'Policy': {}}, 'AccessToken': 'browse-secret'}
+        playback.post.return_value = {'User': {'Id': 'b', 'Policy': {}}, 'AccessToken': 'playback-secret'}
+        with patch.object(seed, 'role_api', side_effect=[control, browse, playback]) as api, \
+             patch.object(seed, 'movie_user_state'):
+            seed.authenticate_roles('http://server', source, output)
+        self.assertEqual([c.args[2] for c in api.call_args_list], ['bench-state', 'bench-browse', 'bench-playback'])
+        playback.post.assert_called_once_with('/Users/AuthenticateByName', {'Username': 'viewer', 'Pw': 'viewer'})
+        saved = json.loads(output.read_text())
+        self.assertEqual(saved['browse_token'], 'browse-secret')
+        self.assertEqual(saved['playback_token'], 'playback-secret')
+        self.assertEqual(output.stat().st_mode & 0o777, 0o600)
+        self.assertNotIn('secret', (self.root/'user-roles.json').read_text())
+        self.assertEqual(json.loads(source.read_text()), self.ids)
+
+    def test_wrong_identity_fails_without_browse_token_fallback(self):
+        source, output = self.root/'source.json', self.root/'private.json'
+        source.write_text(json.dumps(self.ids))
+        api = Mock()
+        api.post.return_value = {'User': {'Id': 'wrong'}, 'AccessToken': 'secret'}
+        with patch.object(seed, 'role_api', return_value=api), self.assertRaisesRegex(RuntimeError, 'wrong identity'):
+            seed.authenticate_roles('http://server', source, output)
+        self.assertFalse(output.exists())
+
+    def test_rejected_credentials_fail_without_writing_role_tokens(self):
+        source, output = self.root/'source.json', self.root/'private.json'
+        source.write_text(json.dumps(self.ids))
+        api = Mock()
+        api.post.side_effect = urllib.error.HTTPError('http://server', 401, 'unauthorized', {}, None)
+        self.addCleanup(api.post.side_effect.close)
+        with patch.object(seed, 'role_api', return_value=api), self.assertRaises(urllib.error.HTTPError):
+            seed.authenticate_roles('http://server', source, output)
+        self.assertFalse(output.exists())
+        api.post.assert_called_once()
+
+    def test_actor_evidence_requires_both_role_and_user(self):
+        meta = {'user_isolation': 1, 'actors': {'browse': 'a', 'playback': 'b'}}
+        good = {'screen': 'playback', 'actor': 'playback', 'user': 'b'}
+        self.assertIsNone(report.actor_problem(good, meta))
+        for change in ({'actor': 'browse'}, {'user': 'a'}, {'screen': 'home'}):
+            self.assertIsNotNone(report.actor_problem({**good, **change}, meta))
+
+    def test_isolation_checks_require_successful_phases_and_observations(self):
+        meta = {'user_isolation': 1, 'phase_schema': 1}
+        phases = {k: {'status': 'completed'} for k in ('isolation-setup', 'isolation-loaded-before', 'isolation-loaded-after')}
+        (self.root/'phases.json').write_text(json.dumps(phases))
+        self.assertIsNotNone(report.isolation_problem(self.root, meta, ['loaded']))
+        for edge in ('before', 'after'):
+            (self.root/f'isolation-loaded-{edge}.json').write_text(json.dumps({'ok': True, 'changed_items': [], 'home_changed': False}))
+        self.assertIsNone(report.isolation_problem(self.root, meta, ['loaded']))
+        phases['isolation-loaded-after']['status'] = 'failed'
+        (self.root/'phases.json').write_text(json.dumps(phases))
+        self.assertIn('isolation-loaded-after', report.isolation_problem(self.root, meta, ['loaded']))
 
 
 class InstrumentTests(unittest.TestCase):

@@ -128,8 +128,8 @@ stays inside the run; media is mounted read-only for every server.
 
 The seeder writes `pools` into `ids.json`: ordered movie/series IDs, search terms, the
 movie count, and a fixed NextUp cutoff. The cutoff is fixed fixture input (not the current date), recorded in `ids.json` and
-covered by its hash; regenerating it changes the workload. Existing fixtures can export these without
-regenerating media or reseeding users:
+covered by its hash; regenerating it changes the workload. The export also records credentials for the existing seeded `viewer` playback account.
+Existing fixtures can export these without regenerating media or reseeding users:
 
 ```bash
 bench/testdata/build.sh --export-pools
@@ -138,6 +138,8 @@ bench/testdata/build.sh --prepare-jellyfin12
 ```
 
 Export boots a disposable 10.11.8 source copy and atomically updates only `ids.json`.
+Per-run role tokens live in mode-0600 `ids-private.json`, never in report metadata;
+missing or wrong role credentials fail provisioning instead of falling back to the admin.
 The changed ID-file hash invalidates an earlier Jellyfin 12 preparation. Runs refuse
 missing pools; measured servers never supply their own fallback picks. The final partial
 movie page is included using `ceil(movieCount / 100)`.
@@ -200,10 +202,17 @@ it is not all-endpoint coverage or a deep-parity score.
   `plugins-before.json`, `plugins.json`, `tasks-before.json`, `tasks.json` and `libraries.json`
   record the policy evidence. `background_policy: 1` prevents aggregation with older runs
   that left automatic schedules and stock Jellyfin plugin settings unchanged.
-- Every virtual user shares one device id, so all load collapses into one server session
-  (a realism simplification). Playback runs during shape, warm-up and measured phases;
-  it can change later home/resume/image selections. These changes are flagged, without
-  an implicit state reset or a claim of value parity under concurrent mutations.
+- Browsing uses the seeded `bench` account; the entire playback sequence uses the seeded
+  `viewer` account with its own authenticated token and device/session identity. Start/stop
+  events remain in the workload. Each role still shares one session across its VUs; this
+  is not a per-VU session benchmark. Additional session users are forbidden.
+- Before and after shape, warm-up and load, bounded observations verify that the browse
+  account's playback fields (500 movie-pool IDs) and home lists/poster selections match
+  the pre-workload baseline. Playback-user changes are retained as diagnostics. No state
+  is reset to conceal drift. Observations run outside measured resource/time windows;
+  `state-*.json`, `isolation-*.json` and `user-roles.json` retain evidence. Selection logs
+  also record the actor/user on every iteration and still check exact home request keys.
+  Metadata `user_isolation: 1` prevents combining these runs with the old shared-user work.
 - `phases.json` records selected phases and prerequisites as pending, running, completed,
   failed or skipped, with timestamps and reasons. Failed startup stops that server;
   failed drain or warm-up skips its dependent load window. Independent selected phases

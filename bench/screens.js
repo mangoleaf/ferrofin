@@ -22,8 +22,15 @@ const SHAPE_VUS = Number(__ENV.SHAPE_VUS || 1);
 if (!Number.isInteger(SHAPE_VUS) || SHAPE_VUS <= 0) throw new Error('SHAPE_VUS must be a positive integer');
 if (!Number.isInteger(SLOTS) || SLOTS <= 0 || SLOTS % 10) throw new Error('SLOTS must be a positive multiple of ten');
 const U = IDS.user;
-const HDR = { Authorization: `MediaBrowser Client="bench", Device="bench", DeviceId="bench-k6", Version="3", Token="${IDS.token}"` };
-const JSON_HDR = Object.assign({ 'Content-Type': 'application/json' }, HDR);
+if (IDS.user_isolation !== 1 || !IDS.user || !IDS.viewer || IDS.user.replace(/-/g, '').toLowerCase() === IDS.viewer.replace(/-/g, '').toLowerCase() || !IDS.browse_token || !IDS.playback_token)
+    throw new Error('distinct authenticated browse/playback roles required');
+function actor() { return screen === 'playback' ? 'playback' : 'browse'; }
+function headers(json) {
+    const role = actor();
+    const result = { Authorization: `MediaBrowser Client="bench", Device="bench", DeviceId="bench-${role}", Version="3", Token="${IDS[role + '_token']}"` };
+    if (json) result['Content-Type'] = 'application/json';
+    return result;
+}
 const IMAGES_PER_SCREEN = 12;
 
 // weighted mix (D4): home 3 : movies 2 : detail 2 : series 1 : search 1 : playback 1
@@ -112,7 +119,7 @@ function record(name, res, method, path, body) {
     console.log(JSON.stringify(observation));
 }
 function params(name, body) {
-    return { headers: body ? JSON_HDR : HDR, tags: { name }, responseType: name === 'image' ? 'binary' : 'text' };
+    return { headers: headers(Boolean(body)), tags: { name }, responseType: name === 'image' ? 'binary' : 'text' };
 }
 function batch(reqs) {
     const rs = http.batch(reqs.map(([n, m, p, b]) => [m, URL + p, b ? JSON.stringify(b) : null, params(n, b)]));
@@ -219,11 +226,11 @@ const screens = {
     // src/components/playback/playbackmanager.js — start (direct play) and stop right away
     playback(pool, rnd) {
         const id = pool.movies[Math.floor(rnd() * pool.movies.length)];
-        const pi = post('playback:playbackinfo', `/Items/${id}/PlaybackInfo?` + q({ UserId: U, StartTimeTicks: 0, IsPlayback: true, AutoOpenLiveStream: true, MaxStreamingBitrate: 120000000 }), { DeviceProfile: PROFILE });
+        const pi = post('playback:playbackinfo', `/Items/${id}/PlaybackInfo?` + q({ UserId: IDS.viewer, StartTimeTicks: 0, IsPlayback: true, AutoOpenLiveStream: true, MaxStreamingBitrate: 120000000 }), { DeviceProfile: PROFILE });
         let ms = id, ps = `bench${Math.floor(rnd() * 1e9)}`;
         try { ms = pi.json('MediaSources.0.Id'); ps = pi.json('PlaySessionId'); if (!ms || !ps) iterOk = false; } catch (e) { iterOk = false; }
         batch([
-            ['playback:intros', 'GET', `/Users/${U}/Items/${id}/Intros`],
+            ['playback:intros', 'GET', `/Users/${IDS.viewer}/Items/${id}/Intros`],
             ['playback:segments', 'GET', `/MediaSegments/${id}?includeSegmentTypes=Intro&includeSegmentTypes=Outro&includeSegmentTypes=Recap&includeSegmentTypes=Preview&includeSegmentTypes=Commercial`],
         ]);
         const base = { ItemId: id, MediaSourceId: ms, PlaySessionId: ps, PlayMethod: 'DirectPlay', CanSeek: true, IsPaused: false, IsMuted: false, VolumeLevel: 100, RepeatMode: 'RepeatNone' };
@@ -244,7 +251,7 @@ export default function (pool) {
     lat[name].add(Date.now() - t0);
     ok[name].add(iterOk);
     // Compact selection evidence is emitted after the screen latency is recorded.
-    console.log(JSON.stringify({ selection: slot, iteration: i, screen, keys: selections, ok: iterOk }));
+    console.log(JSON.stringify({ selection: slot, iteration: i, screen, actor: actor(), user: actor() === 'playback' ? IDS.viewer : U, keys: selections, ok: iterOk }));
 }
 
 export function handleSummary(data) {
@@ -255,7 +262,7 @@ export function handleSummary(data) {
         return { count: t.values.count, p50: t.values['p(50)'], p95: t.values['p(95)'], p99: t.values['p(99)'], max: t.values.max, ok: r ? r.values.rate : null };
     };
     const out = {
-        workload: 4, slots: SLOTS, seed: SEED, shape_vus: SHAPE_VUS, elapsed_ms: data.state.testRunDurationMs,
+        user_isolation: 1, workload: 4, slots: SLOTS, seed: SEED, shape_vus: SHAPE_VUS, elapsed_ms: data.state.testRunDurationMs,
         image_bytes: m.image_bytes ? m.image_bytes.values.count : 0,
         url: URL, rate: __ENV.RATE || null, duration: __ENV.DURATION || null, shape: SHAPE,
         dropped_iterations: m.dropped_iterations ? m.dropped_iterations.values.count : 0,

@@ -138,6 +138,33 @@ def selection_records(path):
     return records
 
 
+def actor_problem(record, meta):
+    if not meta.get("user_isolation"):
+        return None
+    role = "playback" if record.get("screen") == "playback" else "browse"
+    users = meta.get("actors") or {}
+    if not users.get("browse") or not users.get("playback") or users["browse"] == users["playback"]:
+        return "invalid isolated user identities"
+    if record.get("actor") != role or record.get("user") != users[role]:
+        return "request actor differs from isolated user role"
+    return None
+
+
+def isolation_problem(d, meta, names):
+    if not meta.get("user_isolation"):
+        return None
+    problem = phase_problem(d, meta, ["isolation-setup"] +
+                            [f"isolation-{name}-{edge}" for name in names for edge in ("before", "after")])
+    if problem:
+        return problem
+    for name in names:
+        for edge in ("before", "after"):
+            evidence = load(os.path.join(d, f"isolation-{name}-{edge}.json")) or {}
+            if evidence.get("ok") is not True or evidence.get("changed_items") != [] or evidence.get("home_changed") is not False:
+                return f"{name}: browse state isolation evidence failed or missing"
+    return None
+
+
 def shape_evidence(d, meta, shape):
     """Validate bounded coverage once per run, outside the per-cell render loop."""
     summary = load(os.path.join(d, "shape-summary.json")) or {}
@@ -147,6 +174,10 @@ def shape_evidence(d, meta, shape):
         return "invalid slot count", {}, {}
     if any(summary.get(k) != meta.get(k) for k in ("workload", "slots", "seed", "shape_vus")):
         return "shape workload/seed/slots differ from run metadata", {}, {}
+    if meta.get("user_isolation") and summary.get("user_isolation") != meta["user_isolation"]:
+        return "shape isolation policy differs from run metadata", {}, {}
+    if any(actor_problem(r, meta) for r in records):
+        return "shape actor differs from isolated user role", {}, {}
     if len(records) != slots or summary.get("iterations") != slots:
         return "shape slot coverage incomplete", {}, {}
     if sorted(r.get("iteration", -1) for r in records) != list(range(slots)) or any(r.get("selection") != r.get("iteration") for r in records):
@@ -178,9 +209,14 @@ def selection_problems(path, summary, expected, slots, meta=None):
         return {s: "measured iterations missing or duplicated" for s in SCREENS}
     if sum(len(r.get("keys", [])) for r in records) != summary.get("requests"):
         return {s: "measured request counts differ from selection evidence" for s in SCREENS}
+    if meta and meta.get("user_isolation") and summary.get("user_isolation") != meta["user_isolation"]:
+        return {s: "measured isolation policy differs from run metadata" for s in SCREENS}
     problems = {}
     for r in records:
         scr = r.get("screen")
+        if problem := actor_problem(r, meta or {}):
+            problems[scr] = problem
+            continue
         slot = r.get("selection")
         validation = expected.get(slot)
         if slot != r["iteration"] % slots or not validation or validation.get("screen") != scr:
@@ -548,7 +584,7 @@ CONDITIONS = ("host", "cpu", "memory_limit", "server_cpus", "client_cpus", "k6",
               "window_s", "mem_sample_ms", "rate_unloaded", "rate_loaded", "rate_stress",
               "warmup_s", "settle_s", "steady_s", "restarts", "ttfs_reps",
               "ids_sha256", "screens_sha256", "seed", "warmup_seed", "slots", "shape_vus", "pools", "workload",
-              "testdata_counts", "background_policy", "core_idle_min", "phase_schema", "resource_schema", "streaming_validation", "topology",
+              "testdata_counts", "user_isolation", "actors", "background_policy", "core_idle_min", "phase_schema", "resource_schema", "streaming_validation", "topology",
               "sample_bracket_intervals", "sample_gap_intervals", "ready_timeout_s", "drain_timeout_s",
               "http_timeout_s", "stream_http_timeout_s", "phase_timeout_s", "cleanup_timeout_s")
 
@@ -679,6 +715,7 @@ def build(runs):
             for i, x in enumerate(data[k]):
                 problems.append(window_problem(x))
                 for server in {k, ORACLE} & per.keys():
+                    problems.append(isolation_problem(per[server][i], metas[i], ["shape", f"warmup-{level}", level]))
                     problems.append(phase_problem(per[server][i], metas[i], ["startup", "startup-drain", "shape", f"drain-{level}", f"warmup-{level}", level]))
                 for server in {k, ORACLE} & evidence.keys():
                     problems.append(evidence[server][i][0])
@@ -735,7 +772,8 @@ def build(runs):
         streams[k] = ts
         for group, cell, phase_name in (("runs", cold[k], "coldstart"), ("hls", hls[k], "ttfs"), ("direct", direct[k], "ttfs")):
             for i, d in enumerate(ds):
-                cell.flag = reasons(cell.flag, phase_problem(d, metas[i], ["startup", "startup-drain", phase_name]))
+                cell.flag = reasons(cell.flag, phase_problem(d, metas[i], ["startup", "startup-drain", phase_name]),
+                                    isolation_problem(d, metas[i], [phase_name]))
                 if group != "runs":
                     cell.flag = reasons(cell.flag, streaming_problem(ts[i], metas[i], group))
     if ORACLE in streams:
@@ -773,6 +811,7 @@ def build(runs):
     for k, ds in per.items():
         bad = [window_problem(x) for x in windows[k] if window_problem(x)]
         resource_bad = [phase_problem(d, metas[i], ["startup", "startup-drain", "sampler"]) for i, d in enumerate(ds)]
+        resource_bad += [isolation_problem(d, metas[i], [name for level in run_levels(d) for name in (f"warmup-{level}", level)]) for i, d in enumerate(ds)]
         resource_bad += [r.get("error") for i, windows in enumerate(m["resources"][k]) if metas[i].get("resource_schema") for r in windows.values()]
         memory_flags[k] = reasons(mixed, *bad, *resource_bad)
         # the peak is only meaningful if the loaded window that produced it was the specified load
@@ -1506,7 +1545,8 @@ def main():
     if args and args[0] == "--shape-coverage":
         d = args[1]
         summary = load(os.path.join(d, "shape-summary.json")) or {}
-        problem, _, coverage = shape_evidence(d, summary, load_shape(d))
+        meta = load(os.path.join(os.path.dirname(d), "run.json")) or summary
+        problem, _, coverage = shape_evidence(d, meta, load_shape(d))
         if problem:
             raise ValueError(problem)
         print("  coverage: " + json.dumps(coverage))

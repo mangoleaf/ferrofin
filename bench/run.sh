@@ -134,6 +134,7 @@ want() { [ -z "$ONLY" ] || [[ ",$ONLY," == *",$1,"* ]]; }
 [ -f "$TESTDATA/ids.json" ] || die "no $TESTDATA/ids.json — build the test data first (bench/testdata/build.sh)"
 for t in docker k6 python3 jq taskset curl sha256sum timeout setsid; do command -v $t >/dev/null || die "$t not installed"; done
 [ ! -z "$ONLY" ] && ! want ttfs || command -v ffprobe >/dev/null || die "ffprobe not installed"
+jq -e '.viewer_name and .viewer_password and .viewer and (.viewer != .user)' "$TESTDATA/ids.json" >/dev/null || die "playback role missing; run bench/testdata/build.sh --export-pools, then prepare Jellyfin 12 again"
 jq -e '.pools | (.movies|length)>0 and (.series|length)>0 and (.terms|length)>0 and (.movieCount>0) and (.nextUpCutoff|type=="string")' "$TESTDATA/ids.json" >/dev/null || die "fixture pools missing; run bench/testdata/build.sh --export-pools"
 for s in ${SERVERS//,/ }; do docker_cmd image inspect "$(image_of "$s")" >/dev/null 2>&1 || die "image $(image_of "$s") missing"; done
 if [[ ",$SERVERS," == *,jellyfin12,* ]]; then
@@ -157,7 +158,7 @@ IDS=$TESTDATA/ids.json; U=$(jq -r .user "$IDS"); TOK=$(jq -r .token "$IDS")
 AUTH="Authorization: MediaBrowser Client=\"bench\", Device=\"bench\", DeviceId=\"bench-run\", Version=\"3\", Token=\"$TOK\""
 DIRTY=$([ -z "$(git status --porcelain 2>/dev/null)" ] && echo false || echo true)
 jq -n --arg sha "$SHA" --arg name "$(basename "$OUT")" --argjson dirty "$DIRTY" --arg host "$(uname -srm)" --arg cpu "$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | xargs)" \
-  --arg mem "$MEMORY" --arg cpus "$SERVER_CPUS" --arg k6 "$(k6 version | head -1)" --arg testdata "$(jq -c .counts "$IDS")" \
+  --arg browse_user "$U" --arg playback_user "$(jq -r .viewer "$IDS")" --arg mem "$MEMORY" --arg cpus "$SERVER_CPUS" --arg k6 "$(k6 version | head -1)" --arg testdata "$(jq -c .counts "$IDS")" \
   --argjson rate_unloaded "$RATE_UNLOADED" --argjson rate_loaded "$RATE_LOADED" --argjson rate_stress "$RATE_STRESS" \
   --argjson idle "$idle" --argjson idle_min "$CORE_IDLE_MIN" --argjson topology "$topology" --argjson bracket "$SAMPLE_BRACKET_INTERVALS" --argjson gap "$SAMPLE_GAP_INTERVALS" \
   --argjson ready "$READY_TIMEOUT_S" --argjson drain "$DRAIN_TIMEOUT_S" --argjson http "$HTTP_TIMEOUT_S" --argjson stream_http "$STREAM_HTTP_TIMEOUT_S" \
@@ -165,7 +166,7 @@ jq -n --arg sha "$SHA" --arg name "$(basename "$OUT")" --argjson dirty "$DIRTY" 
   --argjson window "$WINDOW_S" --argjson sample_ms "$MEM_SAMPLE_MS" \
   --arg ids_sha "$(sha256sum "$IDS" | cut -d' ' -f1)" --arg script_sha "$(sha256sum bench/screens.js | cut -d' ' -f1)" \
   --argjson pools "$(jq -c .pools "$IDS")" --argjson warmup_s "$WARMUP_S" --argjson settle_s "$SETTLE_S" --argjson steady_s "$STEADY_S" --arg client_cpus "$CLIENT_CPUS" --argjson slots "$SLOTS" --argjson seed "$SEED" --argjson warmup_seed "$WARMUP_SEED" --argjson shape_vus "$SHAPE_VUS" \
-  '{background_policy:1, preflight_idle:$idle, core_idle_min:$idle_min, phase_schema:1, resource_schema:1, streaming_validation:1, topology:$topology, sample_bracket_intervals:$bracket, sample_gap_intervals:$gap, ready_timeout_s:$ready, drain_timeout_s:$drain, http_timeout_s:$http, stream_http_timeout_s:$stream_http, phase_timeout_s:$phase, cleanup_timeout_s:$cleanup, restarts:$restarts, ttfs_reps:$ttfs_reps, workload:4, warmup_s:$warmup_s, settle_s:$settle_s, steady_s:$steady_s, client_cpus:$client_cpus, ids_sha256:$ids_sha, screens_sha256:$script_sha, pools:$pools, slots:$slots, seed:$seed, warmup_seed:$warmup_seed, shape_vus:$shape_vus, sha:$sha, name:$name, dirty:$dirty, host:$host, cpu:$cpu, memory_limit:$mem, server_cpus:$cpus, k6:$k6, testdata_counts:($testdata|fromjson),
+  '{user_isolation:1, actors:{browse:$browse_user,playback:$playback_user}, background_policy:1, preflight_idle:$idle, core_idle_min:$idle_min, phase_schema:1, resource_schema:1, streaming_validation:1, topology:$topology, sample_bracket_intervals:$bracket, sample_gap_intervals:$gap, ready_timeout_s:$ready, drain_timeout_s:$drain, http_timeout_s:$http, stream_http_timeout_s:$stream_http, phase_timeout_s:$phase, cleanup_timeout_s:$cleanup, restarts:$restarts, ttfs_reps:$ttfs_reps, workload:4, warmup_s:$warmup_s, settle_s:$settle_s, steady_s:$steady_s, client_cpus:$client_cpus, ids_sha256:$ids_sha, screens_sha256:$script_sha, pools:$pools, slots:$slots, seed:$seed, warmup_seed:$warmup_seed, shape_vus:$shape_vus, sha:$sha, name:$name, dirty:$dirty, host:$host, cpu:$cpu, memory_limit:$mem, server_cpus:$cpus, k6:$k6, testdata_counts:($testdata|fromjson),
     rate_unloaded:$rate_unloaded, rate_loaded:$rate_loaded, rate_stress:$rate_stress,
     window_s:$window, mem_sample_ms:$sample_ms, date: (now|todate)}' > "$OUT/run.json"
 
@@ -317,6 +318,27 @@ phase_counts() {
     '$ARGS.named | map_values(tonumber? // .)' > "$D/counts.json"
   echo "  counts: $(jq -c . "$D/counts.json")"
 }
+setup_users() {
+  client python3 bench/testdata/seed.py --isolation-auth "$URL" "$TESTDATA/ids.json" "$D/ids-private.json" || return 1
+  IDS=$D/ids-private.json
+  client python3 bench/testdata/seed.py --state-snapshot "$URL" "$IDS" "$D/state-baseline.json"
+}
+state_check() {
+  local name=$1
+  client python3 bench/testdata/seed.py --state-snapshot "$URL" "$IDS" "$D/state-$name.json" &&
+    client python3 bench/testdata/seed.py --state-compare "$D/state-baseline.json" "$D/state-$name.json" "$D/isolation-$name.json" || {
+      FAIL_REASON="browse state/session isolation failed; see state-$name.json and isolation-$name.json"; return 1;
+    }
+}
+isolated_phase() {
+  local name=$1 rc=0; shift
+  if ! phase "isolation-$name-before" state_check "$name-before"; then
+    state "$name" skipped "state isolation prerequisite failed"; return 1
+  fi
+  phase "$name" "$@" || rc=1
+  phase "isolation-$name-after" state_check "$name-after" || rc=1
+  return "$rc"
+}
 phase_shape() {
   local validation
   client taskset -c "$CLIENT_CPUS" k6 run --quiet --log-format json --console-output "$D/shape.log" \
@@ -327,7 +349,9 @@ phase_shape() {
 }
 phase_coldstart() {
   client taskset -c "$CLIENT_CPUS" python3 bench/coldstart.py "$CONTAINER" "$URL" "$IDS" "$D/coldstart.json" "$RESTARTS" "$POLL_MS" || return 1
-  wait_ready && drain
+  wait_ready && drain || return 1
+  # Restarts clear live sessions. Reauthenticate the two roles outside restart timing.
+  client python3 bench/testdata/seed.py --isolation-auth "$URL" "$TESTDATA/ids.json" "$IDS"
 }
 phase_load() {
   local level rate t0 t1 sampler_ok=1 deadline
@@ -344,13 +368,20 @@ phase_load() {
     if ! phase "drain-$level" drain; then
       state "warmup-$level" skipped "drain failed"; state "$level" skipped "drain failed"; continue
     fi
-    if ! phase "warmup-$level" k6run --console-output "$D/selections-$level-warmup.log" -e RATE="$rate" -e DURATION="${WARMUP_S}s" -e SEED="$WARMUP_SEED" -e OUT="$D/k6-$level-warmup.json"; then
+    if ! isolated_phase "warmup-$level" k6run --console-output "$D/selections-$level-warmup.log" -e RATE="$rate" -e DURATION="${WARMUP_S}s" -e SEED="$WARMUP_SEED" -e OUT="$D/k6-$level-warmup.json"; then
       state "$level" skipped "warm-up failed"; continue
     fi
+    if ! phase "isolation-$level-before" state_check "$level-before"; then
+      state "$level" skipped "state isolation prerequisite failed"; continue
+    fi
+    sleep "$(python3 -c 'import sys; print(2*float(sys.argv[1])/1000)' "$MEM_SAMPLE_MS")"
     t0=$(date +%s.%N)
     phase "$level" k6run --console-output "$D/selections-$level.log" -e RATE="$rate" -e DURATION="${WINDOW_S}s" -e SEED="$SEED" -e OUT="$D/k6-$level.json" || true
     t1=$(date +%s.%N)
     jq --arg l "$level" --argjson start "$t0" --argjson end "$t1" '. + {($l): {start:$start,end:$end}}' "$D/windows.json" > "$D/windows.tmp" && mv "$D/windows.tmp" "$D/windows.json"
+    # Ensure a bracketing sample is captured before observer requests start.
+    sleep "$(python3 -c 'import sys; print(2*float(sys.argv[1])/1000)' "$MEM_SAMPLE_MS")"
+    phase "isolation-$level-after" state_check "$level-after" || true
   done
   if phase drain-steady drain; then
     t0=$(date +%s.%N); phase steady sleep "$STEADY_S" || true; t1=$(date +%s.%N)
@@ -376,7 +407,7 @@ run_server() {
   mkdir -p "$D"
   FAILED=0; CLIENT_PID=""; SAMPLER_PID=""; CURRENT_PHASE=""
   echo '{}' > "$D/phases.json"
-  state startup pending; state startup-drain pending; state cleanup pending
+  state startup pending; state startup-drain pending; state cleanup pending; state isolation-setup pending
   for selected in counts shape coldstart ttfs; do ! want "$selected" || state "$selected" pending; done
   for selected in unloaded loaded stress; do
     if want "$selected"; then
@@ -431,11 +462,12 @@ PY_ISOLATION
   state startup completed; CURRENT_PHASE=""
   phase startup-drain drain || exit 1
   docker_cmd inspect -f '{{.Config.Image}} {{.Image}}' "$CONTAINER" > "$D/image.txt"
+  phase isolation-setup setup_users || exit 1
   ! want counts || phase counts || true
-  ! want shape || phase shape || true
-  ! want coldstart || phase coldstart || true
+  ! want shape || isolated_phase shape phase_shape || true
+  ! want coldstart || isolated_phase coldstart phase_coldstart || true
   { ! want unloaded && ! want loaded && ! want stress; } || phase_load
-  ! want ttfs || phase ttfs || true
+  ! want ttfs || isolated_phase ttfs phase_ttfs || true
   exit "$FAILED"
 }
 
