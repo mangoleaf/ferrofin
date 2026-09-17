@@ -1479,7 +1479,8 @@ pub(crate) async fn physical_folders_by_view(
         return Ok(HashMap::new());
     };
     let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
-        r#"SELECT "Id", "Data" FROM "BaseItems" WHERE "Data" IS NOT NULL AND "Type" = "#,
+        // `+"Type"`: the id list is the selective side; see `append_type_filters`.
+        r#"SELECT "Id", "Data" FROM "BaseItems" WHERE "Data" IS NOT NULL AND +"Type" = "#,
     );
     qb.push_bind(collection_folder).push(" AND ");
     push_in_list(&mut qb, r#""Id""#, &to_guid_strings(ids));
@@ -1548,7 +1549,7 @@ const PLAYLIST_ITEMS_SQL: &str = r#"SELECT ch.*,
        p."OwnerUserId" AS "PlaylistOwnerUserId",
        p."OpenAccess"  AS "PlaylistOpenAccess",
        s."CanEdit"     AS "PlaylistShareCanEdit"
-   FROM "FerrofinLinkedChildren" lc
+   FROM "LinkedChildren" lc
    JOIN "BaseItems" pl ON pl."Id" = lc."ParentId"
    JOIN "BaseItems" ch ON ch."Id" = lc."ChildId"
    LEFT JOIN "FerrofinPlaylists" p ON p."PlaylistId" = lc."ParentId"
@@ -1980,7 +1981,7 @@ impl ItemRepository for FerrofinItemRepository {
             // past the bound arguments and the query silently matches nothing.
             let sql = format!(
                 r#"SELECT "Id", "Name", "SortName", "Overview", "Path"
-                   FROM "BaseItems" WHERE "Id" IN ({}) AND "Type" = ?{}"#,
+                   FROM "BaseItems" WHERE "Id" IN ({}) AND +"Type" = ?{}"#,
                 placeholders(chunk.len()),
                 chunk.len() + 1
             );
@@ -3584,14 +3585,12 @@ mod tests {
         assert_eq!(rows[0].id, guid_to_db(movie));
 
         // Removing the membership makes the browse empty again.
-        sqlx::query(
-            r#"DELETE FROM "FerrofinLinkedChildren" WHERE "ParentId" = ?1 AND "ChildId" = ?2"#,
-        )
-        .bind(guid_to_db(boxset))
-        .bind(guid_to_db(movie))
-        .execute(db.writer())
-        .await
-        .expect("remove_from_collection");
+        sqlx::query(r#"DELETE FROM "LinkedChildren" WHERE "ParentId" = ?1 AND "ChildId" = ?2"#)
+            .bind(guid_to_db(boxset))
+            .bind(guid_to_db(movie))
+            .execute(db.writer())
+            .await
+            .expect("remove_from_collection");
         assert!(
             repository
                 .get_item_list(&query)
@@ -7235,5 +7234,68 @@ mod tests {
             .expect("music genres");
         assert_eq!(music.items.len(), 1);
         assert_eq!(music.items[0].counts, ItemCounts::default());
+    }
+
+    /// v12 `BuildLeafIsPlayedFilter`: a version group is played when any of
+    /// its versions is. The alternate is hidden from the general query, so it
+    /// is the primary that must answer `IsPlayed` for the version the user
+    /// actually watched.
+    #[tokio::test]
+    async fn is_played_counts_a_version_group_played_through_its_alternate() {
+        use crate::test_support::{seed_library_over, seed_user_data, seed_user_with_defaults};
+        let db = test_db().await;
+        let repository = crate::test_support::item_repository_over(db.clone());
+        let user = seed_user_with_defaults(&db, Uuid::from_u128(0xE4FF)).await;
+        let user_id = Uuid::parse_str(&user.id).expect("user id");
+        let (primary, alternate, other) = (
+            Uuid::from_u128(0xE401),
+            Uuid::from_u128(0xE402),
+            Uuid::from_u128(0xE403),
+        );
+        for id in [primary, alternate, other] {
+            seed_item(&db, id, BaseItemKind::Movie).await;
+        }
+        seed_library_over(&db, &[primary, alternate, other]).await;
+        sqlx::query(r#"UPDATE "BaseItems" SET "PrimaryVersionId" = ?2 WHERE "Id" = ?1"#)
+            .bind(ferrofin_db::store::guid_to_db(alternate))
+            .bind(ferrofin_db::store::guid_to_db(primary))
+            .execute(db.writer())
+            .await
+            .expect("link");
+        // Only the ALTERNATE was watched.
+        seed_user_data(&db, user_id, alternate, true, None).await;
+
+        let ids = |items: Vec<ferrofin_db::entities::base_items::BaseItemEntity>| {
+            let mut v: Vec<Uuid> = items
+                .iter()
+                .filter_map(|i| Uuid::parse_str(&i.id).ok())
+                .collect();
+            v.sort();
+            v
+        };
+        let played = repository
+            .get_item_list(&InternalItemsQuery {
+                user: Some(user.clone()),
+                include_item_types: vec![BaseItemKind::Movie],
+                is_played: Some(true),
+                ..Default::default()
+            })
+            .await
+            .expect("played");
+        assert_eq!(
+            ids(played),
+            vec![primary],
+            "the primary is played through its version"
+        );
+        let unplayed = repository
+            .get_item_list(&InternalItemsQuery {
+                user: Some(user.clone()),
+                include_item_types: vec![BaseItemKind::Movie],
+                is_played: Some(false),
+                ..Default::default()
+            })
+            .await
+            .expect("unplayed");
+        assert_eq!(ids(unplayed), vec![other]);
     }
 }

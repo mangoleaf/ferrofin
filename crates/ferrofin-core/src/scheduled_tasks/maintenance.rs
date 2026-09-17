@@ -1298,7 +1298,6 @@ mod tests {
         let playlists: Arc<dyn PlaylistManager> = Arc::new(FerrofinPlaylistManager::new(
             db.clone(),
             Arc::clone(&library),
-            Arc::clone(&linked),
             item_repository_over(db.clone()),
             Arc::clone(&task_paths),
         ));
@@ -1332,8 +1331,8 @@ mod tests {
 
         for (parent, child) in [(boxset, live), (boxset, dead), (playlist, dead)] {
             sqlx::query(
-                r#"INSERT INTO "FerrofinLinkedChildren" ("ParentId", "ChildId", "ChildType", "SortOrder")
-                   VALUES (?1, ?2, 0, 0)"#,
+                r#"INSERT INTO "LinkedChildren" ("ParentId", "SortOrder", "ChildId", "ChildType")
+                   VALUES (?1, (SELECT COALESCE(MAX("SortOrder"), -1) + 1 FROM "LinkedChildren" WHERE "ParentId" = ?1), ?2, 0)"#,
             )
             .bind(guid_to_db(parent))
             .bind(guid_to_db(child))

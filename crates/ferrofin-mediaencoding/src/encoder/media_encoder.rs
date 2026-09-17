@@ -357,7 +357,26 @@ impl<T: Transcoder> MediaEncoder for MediaEncoderImpl<T> {
         path: &str,
         image_stream_index: Option<i32>,
     ) -> Result<String, ServiceError> {
-        let output_path = format!("{path}.image.jpg");
+        // Match video extraction: media libraries may be mounted read-only.
+        // The scanner copies the result into the item's data/metadata directory.
+        let temp_dir = if self.config.temp_dir.as_os_str().is_empty() {
+            std::env::temp_dir()
+        } else {
+            self.config.temp_dir.clone()
+        };
+        ferrofin_util::file_helper::ensure_writable_dir(&temp_dir).map_err(|e| {
+            MediaEncodingError::process(format!(
+                "audio-image extraction temp directory `{}` is not writable: {e}",
+                temp_dir.display()
+            ))
+        })?;
+        let output_path = temp_dir
+            .join(format!(
+                "ferrofin-audio-{}.jpg",
+                uuid::Uuid::new_v4().simple()
+            ))
+            .to_string_lossy()
+            .into_owned();
         let args = Self::extract_image_arguments(
             &format!("file:\"{path}\""),
             "",
@@ -371,11 +390,40 @@ impl<T: Transcoder> MediaEncoder for MediaEncoderImpl<T> {
             self.config.threads,
         );
         let ffmpeg = self.encoder_path();
-        self.transcoder
+        let result = self
+            .transcoder
             .get_process_output(&ffmpeg, &args, true, None, &[])
-            .await
-            .map(ProcessOutput::into_output)
-            .map_err(MediaEncodingError::process)?;
+            .await;
+        let output = match result {
+            Ok(output) => output,
+            Err(err) => {
+                let _ = std::fs::remove_file(&output_path);
+                return Err(MediaEncodingError::process(err).into());
+            }
+        };
+        if !output.success
+            || !std::fs::metadata(&output_path).is_ok_and(|m| m.is_file() && m.len() > 0)
+        {
+            let _ = std::fs::remove_file(&output_path);
+            let tail: String = output
+                .output
+                .chars()
+                .rev()
+                .take(500)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            return Err(MediaEncodingError::process(format!(
+                "ffmpeg failed to extract audio image from `{path}`: {}",
+                if tail.trim().is_empty() {
+                    "no image produced or unsuccessful exit (no stderr)"
+                } else {
+                    tail.trim()
+                }
+            ))
+            .into());
+        }
         Ok(output_path)
     }
 
@@ -673,6 +721,104 @@ mod tests {
         async fn get_process_exit_code(&self, _path: &str, _arguments: &str) -> bool {
             true
         }
+    }
+
+    #[tokio::test]
+    async fn extract_audio_image_uses_unique_files_in_temp_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let temp_dir = tmp.path().join("cache/temp");
+        let enc = MediaEncoderImpl::new(
+            Arc::new(FrameWritingTranscoder),
+            "/usr/bin/ffmpeg".to_owned(),
+            "/usr/bin/ffprobe".to_owned(),
+            MediaEncoderConfig {
+                temp_dir: temp_dir.clone(),
+                ..MediaEncoderConfig::default()
+            },
+        );
+        let first = enc
+            .extract_audio_image("/read-only/music/track.flac", Some(1))
+            .await
+            .unwrap();
+        let second = enc
+            .extract_audio_image("/read-only/music/track.flac", Some(1))
+            .await
+            .unwrap();
+        assert_ne!(first, second);
+        for out in [first, second] {
+            assert!(std::path::Path::new(&out).starts_with(&temp_dir));
+            assert_eq!(std::fs::read(out).unwrap(), b"jpg");
+        }
+    }
+
+    struct FailedAudioTranscoder;
+
+    #[async_trait]
+    impl Transcoder for FailedAudioTranscoder {
+        async fn get_process_output(
+            &self,
+            path: &str,
+            arguments: &str,
+            read_stderr: bool,
+            test_key: Option<&str>,
+            env: &[(String, String)],
+        ) -> Result<ProcessOutput, String> {
+            // FFmpeg can leave a partial file even when it fails.
+            FrameWritingTranscoder
+                .get_process_output(path, arguments, read_stderr, test_key, env)
+                .await?;
+            Ok(ProcessOutput {
+                success: false,
+                output: "test encoder failure".to_owned(),
+            })
+        }
+
+        async fn get_process_exit_code(&self, _path: &str, _arguments: &str) -> bool {
+            false
+        }
+    }
+
+    #[tokio::test]
+    async fn extract_audio_image_reports_ffmpeg_failure_and_removes_partial_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let enc = MediaEncoderImpl::new(
+            Arc::new(FailedAudioTranscoder),
+            "/usr/bin/ffmpeg".to_owned(),
+            "/usr/bin/ffprobe".to_owned(),
+            MediaEncoderConfig {
+                temp_dir: tmp.path().to_path_buf(),
+                ..MediaEncoderConfig::default()
+            },
+        );
+        let err = enc
+            .extract_audio_image("/read-only/music/track.flac", Some(1))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("test encoder failure"));
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn extract_audio_image_rejects_missing_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        let enc = MediaEncoderImpl::new(
+            Arc::new(NoopTranscoder),
+            "/usr/bin/ffmpeg".to_owned(),
+            "/usr/bin/ffprobe".to_owned(),
+            MediaEncoderConfig {
+                temp_dir: tmp.path().to_path_buf(),
+                ..MediaEncoderConfig::default()
+            },
+        );
+        let err = enc
+            .extract_audio_image("/read-only/music/track.flac", Some(1))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("ffmpeg failed to extract audio image")
+        );
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
     }
 
     fn video_stream() -> ferrofin_model::entities_media::MediaStream {

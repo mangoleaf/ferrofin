@@ -389,7 +389,7 @@ pub fn aggregate_folder_id(mode: &IdDerivation, root_folder_path: &str) -> Optio
 
 /// `FileSystem.GetValidFilename(name).Trim().TrimEnd('.')` — the sanitized
 /// single path segment every by-name `GetPath` builds from an item name.
-fn valid_filename(name: &str) -> String {
+pub(crate) fn valid_filename(name: &str) -> String {
     // `ManagedFileSystem._invalidPathCharacters`, verbatim.
     const INVALID: &[char] = &['"', '<', '>', '|', ':', '*', '?', '\\', '/'];
     let sanitized: String = name

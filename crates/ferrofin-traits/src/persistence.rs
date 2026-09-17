@@ -522,6 +522,34 @@ pub trait ItemPersistenceService: Send + Sync {
         self.save_items(items).await
     }
 
+    /// Re-points a series' children at `key` after the series'
+    /// `PresentationUniqueKey` changed — C# `SeriesMetadataService.
+    /// UpdateSeriesChildrenInfoAsync` (v12.0), which syncs every season and
+    /// episode against the series at the end of its refresh: with automatic
+    /// series grouping the key is derived from the provider ids and the owning
+    /// libraries, so it moves once a provider id lands, and a child left with
+    /// the old `SeriesPresentationUniqueKey` stays hidden until a later scan.
+    ///
+    /// Rows are matched by `SeriesId`, never by the old key — the old key can
+    /// be shared by every library holding the series, and matching on it would
+    /// drag the other libraries' children along. Every matching row's
+    /// `SeriesPresentationUniqueKey` becomes `key`; a `Season` with an
+    /// `IndexNumber` also gets `PresentationUniqueKey = key + "-" + index:000`
+    /// (`Season.CreatePresentationUniqueKey`). Returns the rows changed. The
+    /// default is a no-op (for stub/fake services).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn repoint_series_children(
+        &self,
+        series_id: Uuid,
+        key: &str,
+    ) -> Result<u64, ServiceError> {
+        let _ = (series_id, key);
+        Ok(0)
+    }
+
     /// Sets (or clears, with `None`) an item's `PrimaryVersionId` merge link
     /// without touching any other column.
     ///

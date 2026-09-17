@@ -977,12 +977,13 @@ mod tests {
             &[&guid_to_db(e1), &guid_to_db(owned)],
         )
         .await;
-        // An adopted Jellyfin database stores the ZERO GUID as "no owner" on
-        // every row (Ferrofin's writer leaves it NULL); both mean unowned.
+        // "No owner" is NULL: 10.11.8 stored the zero GUID, but 0032 (12.0's
+        // ChangeOwnerIdToGuid) nulls it and the OwnerId foreign key forbids it
+        // from ever being written again.
         exec(
             &db,
-            r#"UPDATE "BaseItems" SET "OwnerId" = ?1 WHERE "Id" IN (?2, ?3)"#,
-            &[&guid_to_db(Uuid::nil()), &guid_to_db(e2), &guid_to_db(sp)],
+            r#"UPDATE "BaseItems" SET "OwnerId" = NULL WHERE "Id" IN (?1, ?2)"#,
+            &[&guid_to_db(e2), &guid_to_db(sp)],
         )
         .await;
         seed_user_data(&db, user_id, e1, true, None).await;

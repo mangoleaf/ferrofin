@@ -108,7 +108,7 @@ const STREAM_COLUMNS: &str = r#"
     "DvBlSignalCompatibilityId", "DvLevel", "DvProfile", "DvVersionMajor",
     "DvVersionMinor", "ElPresentFlag", "Hdr10PlusPresentFlag", "Height",
     "IsAnamorphic", "IsAvc", "IsDefault", "IsExternal", "IsForced",
-    "IsHearingImpaired", "IsInterlaced", "KeyFrames", "Language",
+    "IsHearingImpaired", "IsInterlaced", "IsOriginal", "KeyFrames", "Language",
     "Level", "NalLengthSize", "Path", "PixelFormat", "Profile", "RealFrameRate",
     "RefFrames", "Rotation", "RpuPresentFlag", "SampleRate", "StreamType",
     "TimeBase", "Title", "Width"
@@ -219,7 +219,7 @@ impl MediaStreamRepository for FerrofinMediaStreamRepository {
             r#"INSERT INTO "MediaStreamInfos" ({STREAM_COLUMNS}) VALUES (
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?)"#
+                ?, ?, ?, ?)"#
         );
 
         let item_id_db = guid_to_db(item_id);
@@ -262,6 +262,7 @@ impl MediaStreamRepository for FerrofinMediaStreamRepository {
                 .bind(s.is_forced)
                 .bind(s.is_hearing_impaired)
                 .bind(s.is_interlaced)
+                .bind(s.is_original)
                 .bind(&s.key_frames)
                 .bind(&s.language)
                 .bind(s.level)
@@ -330,6 +331,7 @@ mod tests {
             is_forced: false,
             is_hearing_impaired: None,
             is_interlaced: None,
+            is_original: false,
             key_frames: None,
             language: language.map(str::to_owned),
             level: None,
@@ -395,6 +397,55 @@ mod tests {
             .await
             .expect("langs");
         assert_eq!(sub_langs, vec!["und".to_owned()]);
+    }
+
+    /// A probe that saw `disposition.original = 1` lands as `IsOriginal = 1`
+    /// on the row (12.0's `NOT NULL DEFAULT 0` column) and reads back `true`;
+    /// the model → entity conversion the scan uses carries it across.
+    #[tokio::test]
+    async fn is_original_round_trips_through_the_row() {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        let repo = FerrofinMediaStreamRepository::new(db.clone());
+
+        let probed = ferrofin_model::entities_media::MediaStream {
+            index: 1,
+            stream_type: MediaStreamType::Audio,
+            is_original: true,
+            ..Default::default()
+        };
+        let original = crate::media_source_manager::stream_dto_to_entity(
+            &ferrofin_db::store::guid_to_db(item),
+            &probed,
+        );
+        assert!(original.is_original);
+        repo.save_media_streams(item, &[stream(0, 1, None), original])
+            .await
+            .expect("save");
+
+        let rows = repo
+            .get_media_streams(&MediaStreamQuery {
+                item_id: item,
+                stream_type: None,
+                index: None,
+            })
+            .await
+            .expect("rows");
+        assert_eq!(
+            rows.iter().map(|s| s.is_original).collect::<Vec<_>>(),
+            [false, true]
+        );
+        let stored: Vec<i64> = sqlx::query_scalar(
+            r#"SELECT "IsOriginal" FROM "MediaStreamInfos" WHERE "ItemId" = ?1 ORDER BY "StreamIndex""#,
+        )
+        .bind(ferrofin_db::store::guid_to_db(item))
+        .fetch_all(db.pool())
+        .await
+        .expect("column");
+        assert_eq!(stored, [0, 1]);
+        // And back into the DTO the playback path builds from the row.
+        assert!(crate::media_source_manager::stream_to_dto(rows[1].clone()).is_original);
     }
 
     /// The `HasSubtitles` probe must seek by `ItemId`, never scan the library's

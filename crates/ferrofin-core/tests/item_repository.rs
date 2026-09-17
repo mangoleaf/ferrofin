@@ -74,8 +74,8 @@ fn item(id: Uuid, kind: BaseItemKind, name: &str) -> BaseItemEntity {
         name: Some(name.to_owned()),
         normalization_gain: None,
         official_rating: None,
-        extra_ids: None,
         original_title: None,
+        original_language: None,
         overview: None,
         owner_id: None,
         parent_id: None,
@@ -131,6 +131,281 @@ async fn plan(db: &Database, sql: &str) -> String {
         .map(|r| r.get::<String, _>("detail"))
         .collect::<Vec<_>>()
         .join(" | ")
+}
+
+/// Execute the old full-row projection using the unchanged ID-query builder.
+/// This keeps the oracle's predicates, grouping, ordering and binds identical.
+async fn movie_page_before_hydration_change(
+    db: &Database,
+    filter: &InternalItemsQuery,
+) -> Vec<BaseItemEntity> {
+    use ferrofin_core::translate_query::{QueryShape, build_query};
+    use sqlx::Execute as _;
+
+    let mut builder = build_query(filter, QueryShape::IdsOnly);
+    let mut query = builder.build();
+    let sql = query
+        .sql()
+        .replacen(r#"SELECT bi."Id" FROM"#, "SELECT bi.* FROM", 1);
+    let args = query.take_arguments().expect("arguments").expect("binds");
+    sqlx::query_as_with(&sql, args)
+        .fetch_all(db.pool())
+        .await
+        .expect("original movie page")
+}
+
+async fn movie_page_fixture() -> (Database, InternalItemsQuery) {
+    let db = fresh_db().await;
+    let persist = FerrofinItemPersistenceService::new(db.clone());
+    let user = seed_user_who_sees_everything(&db, Uuid::from_u128(0xB00)).await;
+    let library = Uuid::from_u128(0xB01);
+    let other_library = Uuid::from_u128(0xB02);
+    let mut rows = vec![
+        item(library, BaseItemKind::CollectionFolder, "Movies"),
+        item(other_library, BaseItemKind::CollectionFolder, "Other"),
+    ];
+    // Insert in reverse ID order. Equal names, years and NULL sort keys must
+    // keep the original sort's tie order, even at a page boundary.
+    for n in (1_u128..=24).rev() {
+        let mut row = item(Uuid::from_u128(0xC00 + n), BaseItemKind::Movie, "Same");
+        row.sort_name = (n > 4).then(|| "same".to_owned());
+        row.production_year = (n % 3 != 0).then_some(if n % 2 == 0 { 2000 } else { 2001 });
+        if n % 5 == 0 {
+            row.name = Some("Another name with the same sort key".to_owned());
+        }
+        row.presentation_unique_key = Some(format!("movie-{n}"));
+        row.top_parent_id = Some(library.to_string().to_uppercase());
+        row.overview = Some(format!("Full payload for {n}: {}", "x".repeat(4096)));
+        if n == 24 {
+            row.top_parent_id = Some(other_library.to_string().to_uppercase());
+        }
+        rows.push(row);
+    }
+    // A primary and alternate share a key. The default browse hides the
+    // alternate behind its same-library primary. With owned items explicitly
+    // included, a year filter can leave only the alternate eligible, exercising
+    // filtering before representative selection.
+    let mut alternate = rows.last().expect("movie 1").clone();
+    alternate.id = Uuid::from_u128(0xD00).to_string();
+    alternate.primary_version_id = Some(Uuid::from_u128(0xC01).to_string().to_uppercase());
+    alternate.production_year = Some(1999);
+    rows.push(alternate);
+    for row in &mut rows {
+        row.id = row.id.to_uppercase();
+    }
+    persist.save_items(&rows).await.expect("save");
+    // The writer fills missing sort names; reproduce nullable adopted rows
+    // explicitly so the regression exercises SQL's NULL ordering too.
+    sqlx::query(r#"UPDATE "BaseItems" SET "SortName" = NULL WHERE "Id" <= ? AND "Type" = ?"#)
+        .bind(Uuid::from_u128(0xC04).to_string().to_uppercase())
+        .bind(type_name(BaseItemKind::Movie))
+        .execute(db.writer())
+        .await
+        .expect("nullable sort keys");
+
+    let base = InternalItemsQuery {
+        user: Some(user),
+        recursive: true,
+        top_parent_ids: vec![library],
+        include_item_types: vec![BaseItemKind::Movie],
+        order_by: vec![
+            (ItemSortBy::SortName, SortOrder::Ascending),
+            (ItemSortBy::ProductionYear, SortOrder::Ascending),
+        ],
+        enable_total_record_count: true,
+        ..Default::default()
+    };
+    (db, base)
+}
+
+#[tokio::test]
+async fn movie_page_hydration_preserves_versions_filters_ties_and_totals() {
+    let (db, base) = movie_page_fixture().await;
+    let repository = repo(&db);
+    for (years, include_owned_items) in [
+        (vec![], false),
+        (vec![], true),
+        (vec![1999], false),
+        (vec![1999], true),
+        (vec![2000], false),
+        (vec![2099], false),
+    ] {
+        let unpaged = InternalItemsQuery {
+            years,
+            include_owned_items,
+            ..base.clone()
+        };
+        let all = movie_page_before_hydration_change(&db, &unpaged).await;
+        if unpaged.years.is_empty() {
+            assert_eq!(
+                all.len(),
+                23,
+                "collapse alternate and exclude other library"
+            );
+            assert!(!all.iter().any(|row| row.primary_version_id.is_some()));
+        } else if unpaged.years == [1999] {
+            // Filtering out the primary by year does not make its alternate
+            // visible under the 12.1 rule: the primary still exists in this
+            // library. Explicit inclusion bypasses that visibility predicate.
+            assert_eq!(all.len(), usize::from(include_owned_items));
+            if include_owned_items {
+                assert_eq!(all[0].id, Uuid::from_u128(0xD00).to_string().to_uppercase());
+                assert!(all[0].primary_version_id.is_some());
+            }
+        }
+        for limit in [0, 1, 5, 100, -1] {
+            for offset in [0, 1, 5, 20, 23, 99] {
+                let filter = InternalItemsQuery {
+                    limit: Some(limit),
+                    start_index: Some(offset),
+                    ..unpaged.clone()
+                };
+                let expected = movie_page_before_hydration_change(&db, &filter).await;
+                let actual = repository.get_items(&filter).await.expect("page");
+                assert_eq!(actual.items, expected, "limit={limit}, offset={offset}");
+                assert_eq!(
+                    actual.total_record_count,
+                    i32::try_from(all.len()).expect("count")
+                );
+                assert_eq!(actual.start_index, offset);
+            }
+        }
+    }
+    let by_name = InternalItemsQuery {
+        order_by: vec![(ItemSortBy::SortName, SortOrder::Ascending)],
+        limit: Some(5),
+        start_index: Some(3),
+        ..base
+    };
+    assert_eq!(
+        repository
+            .get_items(&by_name)
+            .await
+            .expect("name page")
+            .items,
+        movie_page_before_hydration_change(&db, &by_name).await,
+    );
+}
+
+#[tokio::test]
+async fn movie_page_hydration_plan_materializes_keys_before_primary_key_fetches() {
+    use ferrofin_core::translate_query::{QueryShape, build_query};
+    use sqlx::{Execute as _, Row as _};
+
+    let db = fresh_db().await;
+    let user = seed_user_who_sees_everything(&db, Uuid::from_u128(0xB00)).await;
+    let filter = InternalItemsQuery {
+        user: Some(user),
+        include_item_types: vec![BaseItemKind::Movie],
+        limit: Some(100),
+        start_index: Some(1500),
+        order_by: vec![
+            (ItemSortBy::SortName, SortOrder::Ascending),
+            (ItemSortBy::ProductionYear, SortOrder::Ascending),
+        ],
+        ..Default::default()
+    };
+    let mut builder = build_query(&filter, QueryShape::FullRows);
+    let mut query = builder.build();
+    let sql = format!("EXPLAIN QUERY PLAN {}", query.sql());
+    let args = query.take_arguments().expect("arguments").expect("binds");
+    let plan = sqlx::query_with(&sql, args)
+        .fetch_all(db.pool())
+        .await
+        .expect("explain")
+        .iter()
+        .map(|row| row.get::<String, _>("detail"))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    assert!(plan.contains("MATERIALIZE movie_page"), "{plan}");
+    let hydration = plan
+        .split("SCAN movie_page")
+        .nth(1)
+        .expect("page drives hydration");
+    assert!(
+        hydration.contains("SEARCH bi USING INDEX sqlite_autoindex_BaseItems_1 (Id=?)"),
+        "{plan}"
+    );
+    assert!(
+        !hydration.contains("SCAN bi"),
+        "must not scan full library: {plan}"
+    );
+}
+
+#[tokio::test]
+async fn movie_page_hydration_leaves_other_query_plans_unchanged() {
+    use ferrofin_core::translate_query::{QueryShape, build_query};
+
+    let db = fresh_db().await;
+    let user = seed_user_who_sees_everything(&db, Uuid::from_u128(0xB00)).await;
+    let filter = InternalItemsQuery {
+        user: Some(user),
+        include_item_types: vec![BaseItemKind::Movie],
+        limit: Some(100),
+        order_by: vec![(ItemSortBy::SortName, SortOrder::Ascending)],
+        ..Default::default()
+    };
+    for other in vec![
+        InternalItemsQuery {
+            search_term: Some("Movie".to_owned()),
+            ..filter.clone()
+        },
+        InternalItemsQuery {
+            include_item_types: vec![BaseItemKind::Series],
+            ..filter.clone()
+        },
+        InternalItemsQuery {
+            user: None,
+            ..filter.clone()
+        },
+        InternalItemsQuery {
+            group_by_presentation_unique_key: false,
+            ..filter.clone()
+        },
+        InternalItemsQuery {
+            limit: None,
+            ..filter.clone()
+        },
+        InternalItemsQuery {
+            limit: Some(0),
+            ..filter.clone()
+        },
+        InternalItemsQuery {
+            limit: Some(-1),
+            ..filter.clone()
+        },
+        InternalItemsQuery {
+            order_by: vec![(ItemSortBy::SortName, SortOrder::Descending)],
+            ..filter.clone()
+        },
+        InternalItemsQuery {
+            order_by: vec![(ItemSortBy::Random, SortOrder::Ascending)],
+            ..filter.clone()
+        },
+        InternalItemsQuery {
+            order_by: vec![(ItemSortBy::PlayCount, SortOrder::Descending)],
+            ..filter.clone()
+        },
+        InternalItemsQuery {
+            virtual_child_parent_id: Some(Uuid::from_u128(1)),
+            ..filter.clone()
+        },
+    ] {
+        assert!(
+            !build_query(&other, QueryShape::FullRows)
+                .sql()
+                .contains("movie_page")
+        );
+    }
+    for shape in [
+        QueryShape::IdsOnly,
+        QueryShape::IdAndCleanName,
+        QueryShape::Count,
+        QueryShape::GroupedCount,
+        QueryShape::TypeCounts,
+    ] {
+        assert!(!build_query(&filter, shape).sql().contains("movie_page"));
+    }
 }
 
 #[tokio::test]
@@ -590,8 +865,8 @@ async fn linked_child_ancestor_filter_finds_collections_of_a_library() {
         .await
         .expect("ancestor");
     sqlx::query(
-        r#"INSERT INTO "FerrofinLinkedChildren" ("ParentId", "ChildId", "ChildType")
-           VALUES (?1, ?2, 0)"#,
+        r#"INSERT INTO "LinkedChildren" ("ParentId", "SortOrder", "ChildId", "ChildType")
+                   VALUES (?1, (SELECT COALESCE(MAX("SortOrder"), -1) + 1 FROM "LinkedChildren" WHERE "ParentId" = ?1), ?2, 0)"#,
     )
     .bind(in_lib_set.to_string().to_uppercase())
     .bind(movie.to_string().to_uppercase())
@@ -971,6 +1246,96 @@ async fn sort_name_browse_uses_the_index_and_the_pinned_shapes_do_not() {
             "the pinned ordering must keep its sort, got: {pinned}\n  for: {sql}"
         );
     }
+}
+
+/// Since the 12.0 schema (migration 0032) no index leads with `Id` and `Type`
+/// together, and a lone `Type` equality ties with the `Id` primary key in the
+/// planner's costing — and wins, turning an id-list lookup into a scan of every
+/// row of that type. Each id-list query therefore writes the type column as
+/// `+"Type"`; this pins the plans so a dropped `+` shows up here rather than as
+/// a +60 % p50 on `detail:similar` in the benchmark.
+#[tokio::test]
+async fn id_list_queries_are_driven_by_the_primary_key_not_the_type_index() {
+    const PK: &str = "sqlite_autoindex_BaseItems_1 (Id=?)";
+
+    let db = fresh_db().await;
+    let persist = FerrofinItemPersistenceService::new(db.clone());
+    persist
+        .save_items(&[item(Uuid::from_u128(0x71), BaseItemKind::Movie, "Stalker")])
+        .await
+        .expect("save");
+
+    // The unpinned shape is the trap: the same statement takes a Type index.
+    let trap = plan(
+        &db,
+        r#"SELECT "Id", "Data" FROM "BaseItems" WHERE "Data" IS NOT NULL AND "Type" = ? AND "Id" IN (?, ?, ?)"#,
+    )
+    .await;
+    assert!(
+        trap.contains("(Type=?)") && !trap.contains(PK),
+        "the pin exists because the planner prefers the Type index here, got: {trap}"
+    );
+
+    for sql in [
+        // item_repository::physical_folders_by_view
+        r#"SELECT "Id", "Data" FROM "BaseItems" WHERE "Data" IS NOT NULL AND +"Type" = ? AND "Id" IN (?, ?, ?)"#,
+        // item_repository::item_text_rows
+        r#"SELECT "Id", "Name" FROM "BaseItems" WHERE "Id" IN (?, ?, ?) AND +"Type" = ?4"#,
+        // translate_query::append_type_filters with an `Ids` list
+        r#"SELECT bi.* FROM "BaseItems" AS bi WHERE bi."Id" IN (?, ?, ?) AND +bi."Type" IN (?) AND bi."PrimaryVersionId" IS NULL ORDER BY bi."SortName""#,
+        // similar_items_repository: the scored candidate set joins through the key
+        r#"SELECT bi.* FROM (SELECT ivm2."ItemId" AS id, COUNT(*) AS score FROM "ItemValuesMap" ivm0 JOIN "ItemValuesMap" ivm2 ON ivm2."ItemValueId" = ivm0."ItemValueId" WHERE ivm0."ItemId" = ?1 GROUP BY ivm2."ItemId") s JOIN "BaseItems" bi ON bi."Id" = s.id WHERE +bi."Type" IN (?2, ?3) AND bi."Id" NOT IN (?4) ORDER BY s.score DESC, bi."SortName" ASC, bi."Id" ASC LIMIT ?5"#,
+    ] {
+        let pinned = plan(&db, sql).await;
+        assert!(
+            pinned.contains(PK) && !pinned.contains("AUTOMATIC") && !pinned.contains("(Type=?)"),
+            "an id-list query must be driven by the primary key, got: {pinned}\n  for: {sql}"
+        );
+    }
+}
+
+/// 12.1 `ApplyAlternateVersionFiltering`: a version is hidden only while its
+/// primary exists in the same library. A version whose primary row is gone,
+/// or lives in another library, is an item of its own again (12.0 hid every
+/// row with a `PrimaryVersionId`; on the owner's library that was 144
+/// episodes that Jellyfin 12.1 lists and 12.0 did not).
+#[tokio::test]
+async fn a_version_is_hidden_only_behind_a_primary_in_the_same_library() {
+    let db = fresh_db().await;
+    let persist = FerrofinItemPersistenceService::new(db.clone());
+    let (lib_a, lib_b) = (Uuid::from_u128(0xA), Uuid::from_u128(0xB));
+    let mut primary = item(Uuid::from_u128(0x81), BaseItemKind::Movie, "Primary");
+    primary.top_parent_id = Some(lib_a.to_string());
+    let mut same_library = item(Uuid::from_u128(0x82), BaseItemKind::Movie, "Hidden version");
+    same_library.top_parent_id = Some(lib_a.to_string());
+    same_library.primary_version_id = Some(primary.id.clone());
+    let mut other_library = item(Uuid::from_u128(0x83), BaseItemKind::Movie, "Moved version");
+    other_library.top_parent_id = Some(lib_b.to_string());
+    other_library.primary_version_id = Some(primary.id.clone());
+    let mut orphan = item(Uuid::from_u128(0x84), BaseItemKind::Movie, "Orphan version");
+    orphan.top_parent_id = Some(lib_a.to_string());
+    orphan.primary_version_id = Some(Uuid::from_u128(0x99).to_string());
+    persist
+        .save_items(&[primary, same_library, other_library, orphan])
+        .await
+        .expect("save");
+
+    let mut names: Vec<String> = repo(&db)
+        .get_item_list(&InternalItemsQuery {
+            include_item_types: vec![BaseItemKind::Movie],
+            ..InternalItemsQuery::default()
+        })
+        .await
+        .expect("query")
+        .into_iter()
+        .filter_map(|row| row.name)
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec!["Moved version", "Orphan version", "Primary"],
+        "only the version behind a same-library primary is hidden"
+    );
 }
 
 /// A collection created the way a user creates one stays visible to that user.

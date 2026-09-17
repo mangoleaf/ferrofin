@@ -228,6 +228,9 @@ pub struct TmdbDetails {
     pub name: Option<String>,
     /// The original-language title (`original_title` / `original_name`).
     pub original_title: Option<String>,
+    /// The title's original language, TMDB's ISO 639-1 `original_language`
+    /// (`ja`, `en`, …) — what `BaseItems.OriginalLanguage` stores.
+    pub original_language: Option<String>,
     /// Plot synopsis.
     pub overview: Option<String>,
     /// Marketing tagline.
@@ -359,6 +362,8 @@ struct DetailsResponse {
     original_title: Option<String>,
     #[serde(default)]
     original_name: Option<String>,
+    #[serde(default)]
+    original_language: Option<String>,
     #[serde(default)]
     overview: Option<String>,
     #[serde(default)]
@@ -1597,6 +1602,7 @@ impl TmdbClient {
                 .filter(|s| !s.is_empty())
                 .or_else(|| original_title.clone()),
             original_title,
+            original_language: d.original_language.filter(|s| !s.is_empty()),
             overview: d.overview.filter(|s| !s.is_empty()),
             tagline: d.tagline.filter(|s| !s.is_empty()),
             genres: d.genres.into_iter().filter_map(|g| g.name).collect(),
@@ -2056,6 +2062,32 @@ mod tests {
             (vec![], 0)
         );
         assert!(client.collection(1, None).await.is_none());
+    }
+
+    /// `/movie/{id}` carries TMDB's `original_language`; an empty value is
+    /// `None`, not an empty string, like every other detail field.
+    #[tokio::test]
+    async fn details_map_the_original_language() {
+        let body = r#"{"id":346,"title":"Seven Samurai","original_title":"七人の侍",
+            "original_language":"ja","overview":"A village hires samurai."}"#;
+        let server = crate::mock_http::MockServer::start(vec![("/movie/", body.to_owned())]).await;
+        let client = TmdbClient::new().with_base_url(&server.base_url);
+        let details = client
+            .details(TmdbKind::Movie, 346, None)
+            .await
+            .expect("details");
+        assert_eq!(details.name.as_deref(), Some("Seven Samurai"));
+        assert_eq!(details.original_title.as_deref(), Some("七人の侍"));
+        assert_eq!(details.original_language.as_deref(), Some("ja"));
+
+        let blank = r#"{"id":1,"title":"X","original_language":""}"#;
+        let server = crate::mock_http::MockServer::start(vec![("/movie/", blank.to_owned())]).await;
+        let client = TmdbClient::new().with_base_url(&server.base_url);
+        let details = client
+            .details(TmdbKind::Movie, 1, None)
+            .await
+            .expect("details");
+        assert_eq!(details.original_language, None);
     }
 
     #[tokio::test]

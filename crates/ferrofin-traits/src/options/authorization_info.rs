@@ -111,6 +111,7 @@ mod tests {
             subtitle_mode: 0,
             sync_play_access: 0,
             username: String::new(),
+            normalized_username: String::new(),
         }
     }
 

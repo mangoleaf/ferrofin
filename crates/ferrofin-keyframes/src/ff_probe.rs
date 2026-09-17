@@ -226,36 +226,17 @@ mod tests {
 
     // --- get_keyframe_data process path -----------------------------------
 
-    /// Writes an executable POSIX shell script that prints `payload` to stdout,
-    /// so we can drive [`get_keyframe_data`]'s real spawn/read/parse/wait path
-    /// without depending on a real ffprobe binary.
-    #[cfg(unix)]
-    fn write_fake_ffprobe(dir: &std::path::Path, payload: &str) -> std::path::PathBuf {
-        use std::io::Write;
-        use std::os::unix::fs::PermissionsExt;
-
-        let script = dir.join("fake_ffprobe.sh");
-        let mut f = std::fs::File::create(&script).unwrap();
-        // Ignore all args; just emit the canned CSV.
-        write!(f, "#!/bin/sh\ncat <<'EOF'\n{payload}\nEOF\n").unwrap();
-        f.flush().unwrap();
-        let mut perms = std::fs::metadata(&script).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&script, perms).unwrap();
-        script
-    }
-
     #[cfg(unix)]
     #[test]
     fn get_keyframe_data_spawns_and_parses() {
-        // A per-test unique temp dir (auto-removed on drop) — keying on
-        // `process::id()` alone collides between tests sharing this binary under
-        // nextest's concurrent runner.
-        let dir = tempfile::tempdir().unwrap();
-        let script = write_fake_ffprobe(dir.path(), "packet,1.0,K_\nstream,1.0");
+        // Do not write an executable while other test threads can fork: a
+        // child can inherit its writable fd and cause ETXTBSY on our exec,
+        // even after our writer closes. The checked-in executable is never
+        // opened for writing and still exercises the real spawn/read/wait path.
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/fake_ffprobe.sh");
 
-        let data = get_keyframe_data(script.to_str().unwrap(), "/does/not/matter.mkv")
-            .expect("fake ffprobe should succeed");
+        let data =
+            get_keyframe_data(script, "/does/not/matter.mkv").expect("fake ffprobe should succeed");
         assert_eq!(data.keyframe_ticks, vec![10_000_000]);
         assert_eq!(data.total_duration, 10_000_000);
     }

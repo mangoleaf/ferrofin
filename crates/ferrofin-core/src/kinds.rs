@@ -140,6 +140,92 @@ pub fn presentation_unique_key(
         .unwrap_or(own)
 }
 
+/// The user-data keys of a `Series` — C# `Series.GetUserDataKeys()` (v12.0
+/// `MediaBrowser.Controller/Entities/TV/Series.cs:183-203`).
+///
+/// The base list is the item's own id (`Id.ToString()`, hyphenated); the Imdb,
+/// Tvdb and Custom provider ids are each inserted at the **front** in that
+/// order, so `[0]` is `Custom ?? Tvdb ?? Imdb ?? id`. Provider-id keys are
+/// matched case-insensitively (`ProviderIds` is an `OrdinalIgnoreCase`
+/// dictionary) and an empty value counts as absent (`TryGetProviderId`).
+#[must_use]
+pub fn series_user_data_keys(id: Uuid, provider_ids: &[(String, String)]) -> Vec<String> {
+    let provider = |name: &str| {
+        provider_ids
+            .iter()
+            .find(|(k, v)| k.eq_ignore_ascii_case(name) && !v.is_empty())
+            .map(|(_, v)| v.clone())
+    };
+    let mut keys = vec![id.hyphenated().to_string()];
+    for name in ["Imdb", "Tvdb", "Custom"] {
+        if let Some(value) = provider(name) {
+            keys.insert(0, value);
+        }
+    }
+    keys
+}
+
+/// The `PresentationUniqueKey` a `Series` is stored with — C# 12.0
+/// `Series.CreatePresentationUniqueKey()` (`Series.cs:79-127`).
+///
+/// With the library's `EnableAutomaticSeriesGrouping` off the key is the own
+/// id in `N` form, like every other media row. With it on (the default), the
+/// grouping key is the first user-data key when the series carries a provider
+/// id ([`series_user_data_keys`]), else `"series-" + name.to_lowercase()`
+/// (12.0's name fallback — 10.11 had none, so a series without ids kept its
+/// own id). The grouping key is then scoped to its libraries: `-{lang}` when
+/// a preferred metadata language resolves, then `-{folder}` per collection
+/// folder in **ordinal** order of their `N` ids (12.0's `.Order(Ordinal)` —
+/// the reason the same series in two libraries now shares one key whichever
+/// library scanned it first). A nameless, id-less series falls back to its
+/// own id, as upstream's `string.IsNullOrEmpty(groupingKey)` guard does.
+///
+/// `preferred_metadata_language` is C# `GetPreferredMetadataLanguage()` —
+/// the row's own value, else the library's, else the server's — resolved by
+/// the caller, which is the one holding the library options.
+#[must_use]
+pub fn series_presentation_unique_key(
+    id: Uuid,
+    enable_automatic_series_grouping: bool,
+    name: Option<&str>,
+    provider_ids: &[(String, String)],
+    preferred_metadata_language: Option<&str>,
+    collection_folder_ids: &[Uuid],
+) -> String {
+    let own = id.as_simple().to_string();
+    if !enable_automatic_series_grouping {
+        return own;
+    }
+    let user_data_keys = series_user_data_keys(id, provider_ids);
+    let grouping_key = if user_data_keys.len() > 1 {
+        Some(user_data_keys[0].clone())
+    } else {
+        // `GetNameBasedGroupingKey`: prefixed with the type so a series can
+        // never collide with a same-named item of another kind.
+        name.filter(|n| !n.is_empty())
+            .map(|n| format!("series-{}", n.to_lowercase()))
+    };
+    let Some(mut key) = grouping_key.filter(|k| !k.is_empty()) else {
+        return own;
+    };
+    // `AddLibrariesToPresentationUniqueKey`.
+    if let Some(lang) = preferred_metadata_language.filter(|l| !l.is_empty()) {
+        key.push('-');
+        key.push_str(lang);
+    }
+    let mut folders: Vec<String> = collection_folder_ids
+        .iter()
+        .map(|f| f.as_simple().to_string())
+        .collect();
+    if folders.is_empty() {
+        return key;
+    }
+    folders.sort_unstable();
+    key.push('-');
+    key.push_str(&folders.join("-"));
+    key
+}
+
 /// Whether this kind is an "item by name" — a genre, studio, year, person, or
 /// artist that groups other items rather than being real media
 /// (C# `IItemByName`).
@@ -172,7 +258,8 @@ pub fn enable_alpha_numeric_sorting(kind: BaseItemKind) -> bool {
 }
 
 /// The `SortName` C# would compute for a named item of this kind — the port of
-/// `BaseItem.CreateSortName()` including its
+/// `BaseItem.CreateSortName()`, which on 12.0 is `GetSortName(Name,
+/// EnableAlphaNumericSorting, config)` (`BaseItem.cs:945`) including its
 /// [`enable_alpha_numeric_sorting`] branch.
 ///
 /// One home for the rule, because three separate write paths
@@ -182,11 +269,23 @@ pub fn enable_alpha_numeric_sorting(kind: BaseItemKind) -> bool {
 /// filters it.
 #[must_use]
 pub fn sort_name_for(kind: BaseItemKind, name: &str) -> String {
-    if enable_alpha_numeric_sorting(kind) {
-        ferrofin_util::sort_name::create_sort_name(name)
-    } else {
-        name.trim_start().to_owned()
-    }
+    ferrofin_util::sort_name::get_sort_name(name, enable_alpha_numeric_sorting(kind))
+}
+
+/// The `SortName` C# derives from a non-empty `ForcedSortName` for an item of
+/// this kind — `GetSortName(ForcedSortName, EnableAlphaNumericSorting, config)`
+/// (12.0 `BaseItem.cs:549`).
+///
+/// The same rule as [`sort_name_for`], deliberately: since 12.0 a forced sort
+/// name is cleaned exactly like an auto-generated one so the two sort together
+/// (jellyfin#17388), and `Person` (`EnableAlphaNumericSorting => false`) keeps
+/// its override verbatim apart from `TrimStart()`. It is a separate name so a
+/// call site reads as the forced branch, and because it bypasses the per-kind
+/// `CreateSortName` overrides (episode/season/audio prefixes) that only the
+/// derived branch carries.
+#[must_use]
+pub fn forced_sort_name_for(kind: BaseItemKind, forced: &str) -> String {
+    ferrofin_util::sort_name::get_sort_name(forced, enable_alpha_numeric_sorting(kind))
 }
 
 /// Whether items of this kind can own media sources — the rows in
@@ -573,9 +672,9 @@ pub fn collection_type_of(options: CollectionTypeOptions) -> Option<CollectionTy
 mod tests {
     use super::{
         collection_type_of, is_displayed_as_folder, is_folder, is_item_by_name, is_video,
-        latest_items_index_container_kind, presentation_unique_key, supports_ancestors,
-        supports_inherited_parent_images, supports_people, supports_played_status,
-        supports_similarity, supports_theme_media,
+        latest_items_index_container_kind, presentation_unique_key, series_presentation_unique_key,
+        series_user_data_keys, supports_ancestors, supports_inherited_parent_images,
+        supports_people, supports_played_status, supports_similarity, supports_theme_media,
     };
     use ferrofin_model::data::{BaseItemKind, CollectionType};
     use ferrofin_model::entities::CollectionTypeOptions;
@@ -699,6 +798,90 @@ mod tests {
                 None,
                 series_key,
                 index_number
+            ),
+            expected
+        );
+    }
+
+    fn ids(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect()
+    }
+
+    /// `Series.GetUserDataKeys()`: Imdb, then Tvdb, then Custom are each
+    /// inserted at the front of `[id]`, so the first key is the most
+    /// authoritative provider id present.
+    #[rstest]
+    #[case(&[], &["00000000-0000-0000-0000-00000000002a"])]
+    #[case(&[("Imdb", "tt0903747")], &["tt0903747", "00000000-0000-0000-0000-00000000002a"])]
+    #[case(
+        &[("Imdb", "tt0903747"), ("Tvdb", "81189")],
+        &["81189", "tt0903747", "00000000-0000-0000-0000-00000000002a"]
+    )]
+    #[case(
+        &[("tvdb", "81189"), ("Custom", "my-key"), ("Imdb", "tt0903747")],
+        &["my-key", "81189", "tt0903747", "00000000-0000-0000-0000-00000000002a"]
+    )]
+    #[case(&[("Tvdb", ""), ("Tmdb", "1396")], &["00000000-0000-0000-0000-00000000002a"])]
+    fn series_user_data_keys_follow_the_csharp_insert_order(
+        #[case] provider_ids: &[(&str, &str)],
+        #[case] expected: &[&str],
+    ) {
+        assert_eq!(
+            series_user_data_keys(uuid::Uuid::from_u128(0x2a), &ids(provider_ids)),
+            expected
+        );
+    }
+
+    const FOLDER_A: uuid::Uuid = uuid::Uuid::from_u128(0xaaaa);
+    const FOLDER_B: uuid::Uuid = uuid::Uuid::from_u128(0xbbbb);
+
+    /// 12.0 `Series.CreatePresentationUniqueKey()`: provider id (one or the
+    /// first of several), the `series-{name}` fallback when there is none,
+    /// the language suffix, and the folders joined in ORDINAL order whatever
+    /// order the caller resolved them in.
+    #[rstest]
+    // one provider id, one folder
+    #[case(true, Some("Breaking Bad"), &[("Tvdb", "81189")], Some("en"), &[FOLDER_A],
+           "81189-en-0000000000000000000000000000aaaa")]
+    // several provider ids: the first user-data key wins
+    #[case(true, Some("Breaking Bad"), &[("Imdb", "tt0903747"), ("Tvdb", "81189")], Some("en"),
+           &[FOLDER_A], "81189-en-0000000000000000000000000000aaaa")]
+    // none: the name fallback, lower-cased
+    #[case(true, Some("Breaking Bad"), &[], Some("en"), &[FOLDER_A],
+           "series-breaking bad-en-0000000000000000000000000000aaaa")]
+    // folder ordering is ordinal regardless of the caller's order
+    #[case(true, Some("Breaking Bad"), &[("Tvdb", "81189")], Some("en"), &[FOLDER_B, FOLDER_A],
+           "81189-en-0000000000000000000000000000aaaa-0000000000000000000000000000bbbb")]
+    #[case(true, Some("Breaking Bad"), &[("Tvdb", "81189")], Some("en"), &[FOLDER_A, FOLDER_B],
+           "81189-en-0000000000000000000000000000aaaa-0000000000000000000000000000bbbb")]
+    // no language, no folders: the bare grouping key
+    #[case(true, Some("Breaking Bad"), &[("Tvdb", "81189")], None, &[], "81189")]
+    #[case(true, Some("Breaking Bad"), &[("Tvdb", "81189")], Some(""), &[], "81189")]
+    // no name and no ids: the own id, as `base.CreatePresentationUniqueKey()`
+    #[case(true, None, &[], Some("en"), &[FOLDER_A], "0000000000000000000000000000002a")]
+    #[case(true, Some(""), &[], Some("en"), &[FOLDER_A], "0000000000000000000000000000002a")]
+    // grouping off: always the own id
+    #[case(false, Some("Breaking Bad"), &[("Tvdb", "81189")], Some("en"), &[FOLDER_A],
+           "0000000000000000000000000000002a")]
+    fn series_presentation_keys_match_jellyfin_12(
+        #[case] grouping: bool,
+        #[case] name: Option<&str>,
+        #[case] provider_ids: &[(&str, &str)],
+        #[case] lang: Option<&str>,
+        #[case] folders: &[uuid::Uuid],
+        #[case] expected: &str,
+    ) {
+        assert_eq!(
+            series_presentation_unique_key(
+                uuid::Uuid::from_u128(0x2a),
+                grouping,
+                name,
+                &ids(provider_ids),
+                lang,
+                folders
             ),
             expected
         );

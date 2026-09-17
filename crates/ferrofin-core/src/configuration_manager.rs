@@ -194,8 +194,10 @@ pub fn default_server_configuration() -> ServerConfiguration {
             },
         ],
         trickplay_options: ferrofin_model::configuration::TrickplayOptions::default(),
-        // Jellyfin's ServerConfiguration seeds EnableLegacyAuthorization = true.
-        enable_legacy_authorization: true,
+        // Jellyfin 12.0: `EnableLegacyAuthorization` defaults to false (its
+        // `DisableLegacyAuthorization` routine also turns it off on upgrade).
+        // 10.11.8 seeded true; an adopted `system.xml` value is imported as-is.
+        enable_legacy_authorization: false,
     }
 }
 
@@ -731,8 +733,8 @@ mod tests {
         );
         assert!(repo.enabled);
 
-        // Legacy authorization is enabled by default.
-        assert!(cfg.enable_legacy_authorization);
+        // Jellyfin 12.0: legacy (Emby-era) authorization is off by default.
+        assert!(!cfg.enable_legacy_authorization);
         // `CacheSize = Environment.ProcessorCount * 100` (ServerConfiguration.cs:183).
         assert_eq!(
             cfg.cache_size,
@@ -1025,6 +1027,41 @@ mod tests {
             .await
             .expect_err("should reject");
         assert!(matches!(err, ServiceError::InvalidInput(_)));
+    }
+
+    /// A fresh install is 12.0's `false`; an adopted `system.xml` carries its
+    /// own value through the import untouched — a 10.11.8 server's `true`
+    /// (its clients may still send Emby-era credentials) as much as a 12.0
+    /// server's `false`. Ferrofin never runs 12.0's "set it to false" routine
+    /// over an adopted configuration.
+    #[test]
+    fn an_adopted_legacy_authorization_flag_is_honoured_as_imported() {
+        assert!(!default_server_configuration().enable_legacy_authorization);
+        for (value, expected) in [("true", true), ("false", false)] {
+            let xml = format!(
+                "<ServerConfiguration><IsStartupWizardCompleted>true</IsStartupWizardCompleted>\
+                 <EnableLegacyAuthorization>{value}</EnableLegacyAuthorization>\
+                 </ServerConfiguration>"
+            );
+            let imported = config_import::import_over(
+                &default_server_configuration(),
+                &xml,
+                "ServerConfiguration",
+                config_import::SYSTEM_XML_DENY,
+            )
+            .expect("import");
+            assert_eq!(imported.enable_legacy_authorization, expected, "{value}");
+        }
+        // A `system.xml` that never mentions the flag keeps the 12.0 default.
+        let silent = config_import::import_over(
+            &default_server_configuration(),
+            "<ServerConfiguration><IsStartupWizardCompleted>true</IsStartupWizardCompleted>\
+             </ServerConfiguration>",
+            "ServerConfiguration",
+            config_import::SYSTEM_XML_DENY,
+        )
+        .expect("import");
+        assert!(!silent.enable_legacy_authorization);
     }
 
     /// Lays down a Jellyfin `config/` directory under `root` — the shape

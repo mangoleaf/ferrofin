@@ -127,9 +127,16 @@ Open `http://host:8096/web`.
 
 ### Migrate an existing Jellyfin installation
 
-Ferrofin adopts **Jellyfin 10.11.8 through 10.11.11** databases. It refuses unknown
-migration histories. Upgrade an older installation to a supported version under Jellyfin
-before copying it; do not edit migration history to bypass the check.
+Ferrofin supports database adoption from **Jellyfin 10.11.8, 10.11.9, 10.11.10, 10.11.11,
+12.0.0 and 12.1.0**. All six releases passed the live adoption suite on 2026-09-16,
+including 12.1.0 reached directly from 10.11.8 and through 12.0.0. The
+[support matrix and test record](../adoption/README.md#supported-and-tested-versions)
+identify the seven tested fixture paths and the server image used.
+
+The gate checks the exact migration history and refuses unknown or incomplete histories;
+support does not extend automatically to other 10.11.x or 12.x releases. Upgrade an older
+installation to a supported version under Jellyfin before copying it; do not edit migration
+history to bypass the check. Adoption is one-way: keep a full backup to return to Jellyfin.
 
 #### Stop both servers and copy the complete state
 

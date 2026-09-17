@@ -2686,6 +2686,13 @@ fn apply_tmdb_details(entity: &mut BaseItemEntity, details: &TmdbDetails, replac
         details.original_title.as_deref(),
         replace,
     );
+    // `MetadataService.MergeBaseItemData`: `OriginalLanguage` is copied when
+    // `replaceData` or the target's is empty — the same rule as every text field.
+    set_text(
+        &mut entity.original_language,
+        details.original_language.as_deref(),
+        replace,
+    );
     set_text(&mut entity.overview, details.overview.as_deref(), replace);
     set_text(&mut entity.tagline, details.tagline.as_deref(), replace);
     set_text(
@@ -2816,6 +2823,7 @@ fn set_series_status(
 /// here in the same change.
 fn clear_provider_supplied_metadata(entity: &mut BaseItemEntity) {
     entity.original_title = None;
+    entity.original_language = None;
     entity.community_rating = None;
     entity.critic_rating = None;
     entity.end_date = None;
@@ -3396,7 +3404,8 @@ mod tests {
 
     use super::{
         LocalProviderManager, RemoteImageInfo, RemoteSearchProvider, apply_tmdb_details,
-        language_rank, order_by_language_descending, parse_ymd, set_text, wants_fetch,
+        clear_provider_supplied_metadata, language_rank, order_by_language_descending, parse_ymd,
+        set_text, wants_fetch,
     };
     use crate::tmdb::TmdbDetails;
     use ferrofin_traits::providers::{MetadataRefreshMode as Mode, MetadataRefreshOptions as Opts};
@@ -5022,6 +5031,7 @@ mod tests {
         let details = TmdbDetails {
             name: Some("Solaris".to_owned()),
             original_title: Some("Солярис".to_owned()),
+            original_language: Some("ru".to_owned()),
             overview: Some("A physicist visits a space station.".to_owned()),
             tagline: Some("A tagline".to_owned()),
             genres: vec!["Science Fiction".to_owned(), "Drama".to_owned()],
@@ -5045,9 +5055,23 @@ mod tests {
         assert_eq!(entity.studios.as_deref(), Some("Mosfilm"));
         assert_eq!(entity.community_rating, Some(8.1));
         assert_eq!(entity.official_rating.as_deref(), Some("PG"));
+        assert_eq!(entity.original_language.as_deref(), Some("ru"));
         assert_eq!(entity.production_year, Some(1972));
         assert_eq!(entity.run_time_ticks, Some(167 * 600_000_000));
         assert!(entity.premiere_date.is_some());
+
+        // `OriginalLanguage` follows `MergeBaseItemData`: kept unless empty or
+        // replacing, and a clear-before-replace refresh drops it first.
+        let mut lang = BaseItemEntity {
+            original_language: Some("de".to_owned()),
+            ..BaseItemEntity::default()
+        };
+        apply_tmdb_details(&mut lang, &details, false);
+        assert_eq!(lang.original_language.as_deref(), Some("de"));
+        apply_tmdb_details(&mut lang, &details, true);
+        assert_eq!(lang.original_language.as_deref(), Some("ru"));
+        clear_provider_supplied_metadata(&mut lang);
+        assert_eq!(lang.original_language, None);
 
         // With replace=false an existing value is kept.
         let mut kept = BaseItemEntity {

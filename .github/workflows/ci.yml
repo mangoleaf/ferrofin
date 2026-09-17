@@ -57,6 +57,23 @@ jobs:
       - run: FERROFIN_WASM_GUEST_TESTS=1 cargo test --workspace
 
 
+  shell-tests:
+    # The shell tooling has its own tests: scripts/version.sh (release versioning) and
+    # adoption/ (the Jellyfin-adoption harness — its checks are driven with canned logs and
+    # throwaway SQLite files; the real fixtures never run here).
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+          fetch-depth: 0   # version.bats reads tags
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends bats shellcheck sqlite3
+      - run: shellcheck -x scripts/version.sh adoption/lib.sh adoption/run.sh adoption/smoke.sh adoption/build-fixtures.sh
+      - run: shellcheck -x -s bash scripts/tests/version.bats adoption/tests/adoption.bats
+      - run: bats scripts/tests adoption/tests
+
   coverage:
     runs-on: ubuntu-latest
     permissions:

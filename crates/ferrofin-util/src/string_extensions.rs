@@ -7,9 +7,18 @@
 //! matches the ported test oracle exactly.
 
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::sync::{LazyLock, OnceLock};
 
+use regex::Regex;
 use unicode_normalization::UnicodeNormalization;
+
+/// C# `@"[^\p{L}\p{N}\s]"` in `GetCleanValue` — anything that is not a Unicode
+/// letter, number or whitespace.
+static NOT_LETTER_DIGIT_SPACE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"[^\p{L}\p{N}\s]").expect("valid regex"));
+
+/// C# `@"\s+"` in `GetCleanValue` — a run of whitespace to collapse.
+static WHITESPACE_RUN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s+").expect("valid regex"));
 
 /// Environment variable name that (in upstream Jellyfin) overrides the ICU
 /// transliterator rule id. Surfaced here as a config value for parity.
@@ -194,19 +203,39 @@ pub fn truncate_at_null(text: &str) -> &str {
 /// Normalizes a string for comparison, the way the item repository's stored
 /// `CleanName` / `CleanValue` columns are written.
 ///
-/// Exactly C# `BaseItemRepository.GetCleanValue` — remove diacritics, then
-/// lowercase, and nothing else. **Punctuation is kept**: a real Jellyfin
-/// 10.11.8 database stores `'h. jon benjamin'` and
-/// `'spider-man: across the spider-verse'`, so stripping it makes every
-/// by-name lookup miss on an adopted database.
+/// Exactly C# `StringExtensions.GetCleanValue` on Jellyfin 12.0
+/// (`src/Jellyfin.Extensions/StringExtensions.cs:159-176`):
 ///
-/// Returns the original string unchanged if it is null/whitespace.
+/// ```text
+/// if (string.IsNullOrWhiteSpace(value)) return value;
+/// var cleaned = value.RemoveDiacritics().ToLowerInvariant();
+/// cleaned = Regex.Replace(cleaned, @"[^\p{L}\p{N}\s]", " ");
+/// cleaned = Regex.Replace(cleaned, @"\s+", " ").Trim();
+/// ```
+///
+/// Every character that is not a Unicode letter (`\p{L}`), digit (`\p{N}`) or
+/// whitespace becomes one space, whitespace runs collapse to a single space,
+/// and the result is trimmed — so `"H. Jon Benjamin"` stores as
+/// `"h jon benjamin"` and `"Dune: Part Two"` as `"dune part two"`. 10.11.8
+/// stopped after the diacritic fold and the lower-casing (its
+/// `BaseItemRepository.GetCleanValue`); 12.0's
+/// `RefreshCleanNamesAndValues` routine rewrites every stored column to this
+/// form, and Ferrofin's `repair_clean_values` does the same once per database.
+///
+/// The character classes are the regex ones on purpose: `\p{L}` is the Unicode
+/// *Letter* category, which excludes combining marks (`Mn`/`Mc`) that
+/// [`char::is_alphabetic`] would keep — a Devanagari vowel sign is replaced by
+/// a space here exactly as .NET does it.
+///
+/// Returns the original string unchanged if it is empty or all whitespace.
 #[must_use]
 pub fn get_clean_value(value: &str) -> String {
     if value.trim().is_empty() {
         return value.to_owned();
     }
-    lower_invariant(&remove_diacritics(value))
+    let cleaned = lower_invariant(&remove_diacritics(value));
+    let cleaned = NOT_LETTER_DIGIT_SPACE.replace_all(&cleaned, " ");
+    WHITESPACE_RUN.replace_all(&cleaned, " ").trim().to_owned()
 }
 
 /// `string.Equals(a, b, StringComparison.OrdinalIgnoreCase)`.
@@ -443,20 +472,32 @@ mod tests {
         assert_eq!(expected, remove_diacritics(input));
     }
 
+    // Jellyfin 12.0 `GetCleanValue`: fold, lowercase, punctuation → space,
+    // collapse, trim.
     #[rstest]
-    #[case("", "")] // whitespace/empty passes through unchanged
+    #[case("", "")] // empty passes through unchanged
     #[case("   ", "   ")] // all-whitespace passes through unchanged
-    #[case("Béla   Tarr!!", "bela   tarr!!")] // fold + lowercase, nothing else
-    #[case("ΟΣ", "οσ")] // simple casing does not apply final-sigma context
+    #[case("dune: part two", "dune part two")]
+    #[case("weird: the al yankovic story", "weird the al yankovic story")]
+    #[case("Mötley Crüe: Greatest Hits!", "motley crue greatest hits")]
+    #[case("H. Jon Benjamin", "h jon benjamin")]
+    #[case("Warner Bros. Pictures", "warner bros pictures")]
+    #[case("ΟΣ", "οσ")] // simple casing: no final-sigma context
     #[case("𐐀", "𐐨")]
-    #[case("A,B;C", "a,b;c")] // punctuation survives
-    // Read verbatim out of a real Jellyfin 10.11.8 database.
-    #[case("H. Jon Benjamin", "h. jon benjamin")]
-    #[case("Warner Bros. Pictures", "warner bros. pictures")]
+    #[case("Béla   Tarr!!", "bela tarr")] // fold, lowercase, punctuation to space, collapse
+    #[case("A,B;C", "a b c")]
     #[case(
         "Spider-Man: Across the Spider-Verse",
-        "spider-man: across the spider-verse"
+        "spider man across the spider verse"
     )]
+    #[case("Béla   Tarr!!", "bela tarr")] // runs collapse, trailing space trimmed
+    #[case("A,B;C", "a b c")] // each punctuation mark is its own space, then collapsed
+    #[case("2001: A Space Odyssey", "2001 a space odyssey")] // digits are letters' peers
+    #[case("千と千尋の神隠し", "千と千尋の神隠し")] // CJK letters are \p{L}: untouched
+    #[case("千と千尋の神隠し！", "千と千尋の神隠し")] // …a fullwidth mark is not
+    #[case("Ａｂｃ", "ａｂｃ")] // fullwidth letters lowercase and survive
+    #[case("  padded  ", "padded")]
+    #[case("tab\tand\nnewline", "tab and newline")]
     fn get_clean_value_normalizes(#[case] input: &str, #[case] expected: &str) {
         assert_eq!(expected, get_clean_value(input));
     }
@@ -473,5 +514,23 @@ mod tests {
         assert!(!equals_ordinal_ignore_case("straße", "STRASSE"));
         assert!(!equals_ordinal_ignore_case("\u{212a}elvin", "kelvin"));
         assert_eq!("\u{212a}".to_lowercase(), "k", "the trap this avoids");
+    }
+
+    /// `ToUpperInvariant` is the simple mapping: one char in, one char out.
+    #[rstest]
+    #[case("", "")]
+    #[case("alice", "ALICE")]
+    #[case("Alice Smith", "ALICE SMITH")]
+    #[case("münchen", "MÜNCHEN")]
+    #[case("þór", "ÞÓR")]
+    #[case("straße", "STRAßE")] // ß has no single-char uppercase → kept
+    #[case("ﬁlm", "ﬁLM")] // the ﬁ ligature expands under the full mapping → kept
+    #[case("ŉ", "ŉ")] // expands to ʼN under the full mapping → kept
+    #[case("ǆ", "Ǆ")] // a digraph with a one-char uppercase
+    #[case("Ωmega", "ΩMEGA")]
+    fn upper_invariant_is_the_simple_mapping(#[case] input: &str, #[case] expected: &str) {
+        assert_eq!(upper_invariant(input), expected);
+        // Idempotent, like the C#: normalising a stored key changes nothing.
+        assert_eq!(upper_invariant(expected), expected);
     }
 }

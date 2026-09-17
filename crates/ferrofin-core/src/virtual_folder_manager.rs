@@ -1901,4 +1901,68 @@ mod tests {
             None
         );
     }
+
+    /// An adopted Jellyfin library: `options.xml` (12.0's shape, with the
+    /// elements Ferrofin does not model) is imported once and persisted as
+    /// `options.json`; the operator's settings survive.
+    #[tokio::test]
+    async fn get_virtual_folders_adopts_a_jellyfin_options_xml() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let root = tmp.path().join("root").join("default");
+        let lib = root.join("Cold TV");
+        tokio::fs::create_dir_all(&lib).await.expect("mkdir");
+        tokio::fs::write(lib.join("tvshows.collection"), "")
+            .await
+            .expect("marker");
+        tokio::fs::write(lib.join("TV.mblink"), "/media/cold/TV")
+            .await
+            .expect("mblink");
+        tokio::fs::write(
+            lib.join("options.xml"),
+            r#"<?xml version="1.0" encoding="utf-8"?>
+<LibraryOptions xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+  <EnableArchiveMediaFiles>false</EnableArchiveMediaFiles>
+  <EnablePhotos>true</EnablePhotos>
+  <EnableRealtimeMonitor>true</EnableRealtimeMonitor>
+  <EnableInternetProviders>false</EnableInternetProviders>
+  <EnableAutomaticSeriesGrouping>false</EnableAutomaticSeriesGrouping>
+  <PreferredMetadataLanguage>en</PreferredMetadataLanguage>
+  <MetadataCountryCode>US</MetadataCountryCode>
+  <PathInfos>
+    <MediaPathInfo>
+      <Path>/media/cold/TV</Path>
+    </MediaPathInfo>
+  </PathInfos>
+  <TypeOptions>
+    <TypeOptions>
+      <Type>Series</Type>
+      <MetadataFetchers>
+        <string>TheTVDB</string>
+      </MetadataFetchers>
+      <SimilarItemProviders>
+        <string>Local Genre/Tag</string>
+      </SimilarItemProviders>
+      <SimilarItemProviderOrder />
+    </TypeOptions>
+  </TypeOptions>
+</LibraryOptions>"#,
+        )
+        .await
+        .expect("options.xml");
+        let mgr = FerrofinVirtualFolderManager::new(root.clone());
+        let folders = mgr.get_virtual_folders().await.expect("folders");
+        let options = folders[0].library_options.as_ref().expect("options");
+        assert!(!options.enable_automatic_series_grouping);
+        assert_eq!(options.preferred_metadata_language.as_deref(), Some("en"));
+        assert_eq!(options.metadata_country_code.as_deref(), Some("US"));
+        assert_eq!(options.path_infos.len(), 1);
+        assert_eq!(options.path_infos[0].path, "/media/cold/TV");
+        assert!(
+            lib.join("options.json").exists(),
+            "persisted as JSON for the next read"
+        );
+        // The second read is the JSON one and agrees.
+        let again = mgr.get_virtual_folders().await.expect("folders again");
+        assert_eq!(again[0].library_options, folders[0].library_options);
+    }
 }

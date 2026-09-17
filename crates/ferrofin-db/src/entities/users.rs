@@ -88,6 +88,10 @@ pub struct UserEntity {
     pub sync_play_access: i32,
     /// The username as displayed (`Username`, unique).
     pub username: String,
+    /// The lookup key: `Username` through .NET `ToUpperInvariant`
+    /// (`NormalizedUsername`, unique; Jellyfin 12.0). Every by-name match is
+    /// an exact comparison on this column.
+    pub normalized_username: String,
 }
 
 /// A row of the `AccessSchedules` table — a time window during which a user
@@ -121,10 +125,6 @@ pub struct PermissionEntity {
     pub id: i64,
     /// The permission-kind discriminant (`Kind`).
     pub kind: i32,
-    /// The permission's associated `Guid`, hyphenated
-    /// (`Permission_Permissions_Guid`), if any.
-    #[sqlx(rename = "Permission_Permissions_Guid")]
-    pub permission_guid: Option<String>,
     /// The optimistic-concurrency token (`RowVersion`).
     pub row_version: i64,
     /// The owning user's `Guid`, hyphenated (`UserId`, FK → `Users`), if any.
@@ -144,10 +144,6 @@ pub struct PreferenceEntity {
     pub id: i64,
     /// The preference-kind discriminant (`Kind`).
     pub kind: i32,
-    /// The preference's associated `Guid`, hyphenated
-    /// (`Preference_Preferences_Guid`), if any.
-    #[sqlx(rename = "Preference_Preferences_Guid")]
-    pub preference_guid: Option<String>,
     /// The optimistic-concurrency token (`RowVersion`).
     pub row_version: i64,
     /// The owning user's `Guid`, hyphenated (`UserId`, FK → `Users`), if any.

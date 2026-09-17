@@ -254,7 +254,6 @@ mod tests {
         assert_eq!(permission.kind, 4);
         assert!(permission.value);
         assert_eq!(permission.user_id, Some(guid_to_db(user_id)));
-        assert_eq!(permission.permission_guid, None);
 
         let preference: PreferenceEntity =
             sqlx::query_as(r#"SELECT * FROM "Preferences" WHERE "Id" = 1"#)
@@ -628,7 +627,7 @@ mod tests {
         insert_base_item(&db, child_id).await;
 
         sqlx::query(
-            r#"INSERT INTO "FerrofinLinkedChildren" ("ParentId", "ChildId", "ChildType",
+            r#"INSERT INTO "LinkedChildren" ("ParentId", "ChildId", "ChildType",
                 "SortOrder") VALUES (?1, ?2, 1, 5)"#,
         )
         .bind(guid_to_db(item_id))
@@ -667,7 +666,7 @@ mod tests {
         .expect("insert keyframe data");
 
         let link: LinkedChildEntity =
-            sqlx::query_as(r#"SELECT * FROM "FerrofinLinkedChildren" WHERE "ParentId" = ?1"#)
+            sqlx::query_as(r#"SELECT * FROM "LinkedChildren" WHERE "ParentId" = ?1"#)
                 .bind(guid_to_db(item_id))
                 .fetch_one(db.pool())
                 .await

@@ -1105,15 +1105,14 @@ mod tests {
 
         // The worst case for the old code: no `Authorization` header at all, so
         // the header lookup, the parse gate and the token fallbacks each wanted
-        // the flag.
+        // the flag. `api_key` is one of the legacy forms, so the flag is on.
         let bare = RequestContext {
             query_string: Some("api_key=dev-tok".to_owned()),
             ..Default::default()
         };
-        let (ctx, config) = context_with_config(
-            db.clone(),
-            Arc::new(FakeConfig::new(default_server_configuration())),
-        );
+        let mut legacy_on = default_server_configuration();
+        legacy_on.enable_legacy_authorization = true;
+        let (ctx, config) = context_with_config(db.clone(), Arc::new(FakeConfig::new(legacy_on)));
         assert!(
             ctx.get_authorization_info(&bare)
                 .await
@@ -1245,22 +1244,38 @@ mod tests {
 
     #[tokio::test]
     async fn bare_api_key_query_param_authenticates_a_user_token() {
-        // jellyfin-web's browser-initiated downloads carry the USER token as
-        // `?api_key=<token>` with no Authorization header — the only auth the
-        // request has. It must resolve like any header token.
+        // Browser-initiated downloads carry the USER token as a query
+        // parameter with no Authorization header — the only auth the request
+        // has. `?ApiKey=<token>` always resolves like a header token;
+        // `?api_key=<token>` is the Emby-era spelling, accepted only while
+        // `EnableLegacyAuthorization` is on — which, as of 12.0, it is not by
+        // default (`AuthorizationContext.cs:103-111`).
         let db = crate::test_support::test_db().await;
         let uid = Uuid::from_u128(0x21);
         crate::test_support::seed_user(&db, uid).await;
         seed_device(&db, uid).await;
 
+        let modern = query_request("ApiKey=dev-tok");
+        let legacy = query_request("api_key=dev-tok");
+
+        // The fresh-install default: 12.0's `false`.
         let ctx = context(db.clone());
-        let request = RequestContext {
-            query_string: Some("api_key=dev-tok".to_owned()),
-            ..Default::default()
-        };
-        let info = ctx.get_authorization_info(&request).await.unwrap();
-        assert!(info.is_authenticated, "query api_key user token accepted");
+        let info = ctx.get_authorization_info(&modern).await.unwrap();
+        assert!(info.is_authenticated, "query ApiKey user token accepted");
         assert_eq!(info.user_id(), uid);
+        let info = ctx.get_authorization_info(&legacy).await.unwrap();
+        assert!(
+            !info.is_authenticated,
+            "query api_key is refused by default (12.0)"
+        );
+
+        // A 10.11.8 configuration adopted with the flag on keeps both.
+        let ctx = context_with_legacy(db.clone(), true);
+        for request in [&modern, &legacy] {
+            let info = ctx.get_authorization_info(request).await.unwrap();
+            assert!(info.is_authenticated);
+            assert_eq!(info.user_id(), uid);
+        }
     }
 
     #[tokio::test]

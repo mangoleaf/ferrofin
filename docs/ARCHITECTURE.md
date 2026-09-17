@@ -43,7 +43,7 @@ injects them into the API's `AppState`.
 | `ferrofin-health` | (new) | lean liveness/readiness router |
 | `ferrofin-metrics` | (new) | Prometheus `/metrics` with Jellyfin-parity names (see `docs/conventions/METRICS.md`) |
 | `ferrofin-chromaprint` | (new) | audio fingerprinting (chromaprint) for the intro-skipper extension |
-| `ferrofin-db` | Jellyfin.Database.* + Jellyfin.Data | **sqlx + SQLite**, runtime queries only; entities mirror the Jellyfin 10.11.8 schema byte-for-byte (see the schema-conformance test) |
+| `ferrofin-db` | Jellyfin.Database.* + Jellyfin.Data | **sqlx + SQLite**, runtime queries only; entities mirror the Jellyfin 12.0 schema byte-for-byte (see the schema-conformance test) |
 | `ferrofin-traits` | MediaBrowser.Controller (interfaces) | `#[async_trait]` traits; the DI seam |
 | `ferrofin-mediaencoding` | MediaBrowser.MediaEncoding | ffmpeg/ffprobe: probing, transcode arg-building (pure), the live transcode runtime behind a `Transcoder` seam trait |
 | `ferrofin-hls` | Jellyfin.MediaEncoding.Hls | HLS playlist generation + stream manager |
@@ -82,7 +82,8 @@ service layer in inheritance disguise. Trait signatures traffic in
 
 `ferrofin-db` = sqlx + SQLite, runtime queries only (no compile-time
 `query!` macros, so no `DATABASE_URL` at build time). The schema is pinned
-**byte-equal to a real Jellyfin 10.11.8 database** — that is what makes the
+**byte-equal to a real Jellyfin 12.0 database** (migrations through `0029` carried the
+10.11.8 shape; `0032` converges it) — that is what makes the
 drop-in adoption of an existing Jellyfin database possible (see the
 `schema_conformance` test). Ferrofin-own additions
 live in a collision-proof `Ferrofin*`/`FerrofinIX_*` namespace. Dynamic item

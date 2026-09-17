@@ -569,6 +569,7 @@ pub fn test_user(id: Uuid) -> UserEntity {
         subtitle_mode: 0,
         sync_play_access: 0,
         username: "plugin-test-user".to_owned(),
+        normalized_username: "PLUGIN-TEST-USER".to_owned(),
     }
 }
 

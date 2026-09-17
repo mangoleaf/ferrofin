@@ -57,6 +57,11 @@ impl SimilarItemsRepository {
             return Ok(Vec::new());
         }
         let seed = guid_to_db(seed_id);
+        // `+bi."Type"`: the scored candidate set drives the join through the
+        // `Id` primary key. Without the pin the planner (no 12.0 index leads
+        // with `Id`+`Type` any more) walks every row of the candidate types
+        // and builds an automatic index over `s` — `detail:similar` went from
+        // 4.9 ms to 7.8 ms p50 on the bench corpus before the pin.
         let mut sql = String::from(
             r#"SELECT bi.* FROM (
                    SELECT scored."cand" AS id, SUM(scored."w") AS score FROM (
@@ -79,7 +84,7 @@ impl SimilarItemsRepository {
                    GROUP BY scored."cand"
                ) s
                JOIN "BaseItems" bi ON bi."Id" = s.id
-               WHERE bi."Type" IN ("#,
+               WHERE +bi."Type" IN ("#,
         );
         // Bind order: ?1 seed, then the candidate types, then the excludes,
         // then the limit.
