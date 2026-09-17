@@ -39,14 +39,22 @@ fallback timeout is 20 seconds per attempt.
   minimum interval applies to initial requests and retries.
 - HTTP 408, 429, 500, 502, 503 and 504, and transient connection/request failures,
   receive at most four attempts per lookup.
-- Consecutive failures back off for 2, 4, 8, 16, 32, then 60 seconds, plus up to
-  255 milliseconds of jitter. Failure state persists across calls and resets
-  on a non-retryable HTTP response.
+- Failures increase a shared pacing penalty to 2, 4, 8, 16, 32, then 60 seconds,
+  with up to 255 milliseconds of jitter on retries. Successful calls retain
+  that minimum spacing. After a minute without failure and at least five
+  consecutive successes, the penalty drops one level. Each further five
+  successes drops another level; recovery is logged only when it reaches zero.
+  A single successful call or permanent HTTP error does not reset congestion.
 - `Retry-After` (seconds or HTTP date) is a minimum delay. Missing, zero or
   malformed values do not disable backoff.
-- When `X-RateLimit-Remaining` is zero, `X-RateLimit-Reset` is interpreted as a
-  Unix timestamp and also sets a minimum delay. Response `Date` provides the
-  clock reference when present. Quota headers on successful responses count.
+- `X-RateLimit-Remaining` and the Unix timestamp in `X-RateLimit-Reset` are
+  retained as a quota window. Requests are spread across its remaining budget;
+  each dispatch consumes one slot even if its response omits quota headers.
+  An exhausted budget blocks requests until reset. Response `Date` provides
+  the clock reference, with one second of reset-boundary slack because these
+  headers have whole-second precision. Successful responses update quota too.
+  Shared global quotas can still be consumed by other clients after a response;
+  these headers cannot guarantee that the next request will be accepted.
 - A pending wait longer than one minute returns `None` immediately, retaining
   the cooldown. Exhausted retries and cancellation also retain pacing state.
 - Permanent errors, exhausted retries and JSON parse failures return `None`.

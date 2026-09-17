@@ -65,6 +65,8 @@ impl RateLimiter {
         let interval = interval.min(Duration::from_secs(u64::from(u32::MAX)));
         for attempt in 1..=4 {
             let mut rate = self.state.lock().await;
+            let quota_delay = rate.quota_delay();
+            rate.postpone(quota_delay);
             if let Some(next) = rate.next {
                 // Do not tie up a scan for a long server-directed cooldown.
                 // Keep the deadline for subsequent calls instead.
@@ -78,7 +80,8 @@ impl RateLimiter {
                 tokio::time::sleep_until(next).await;
             }
             // Reserve before awaiting I/O, including when this future is cancelled.
-            rate.next = Some(Instant::now() + interval);
+            rate.consume_quota();
+            rate.next = Some(Instant::now() + interval.max(rate.adaptive_interval()));
             let mut attempt_request = request.try_clone()?;
             attempt_request
                 .timeout_mut()
@@ -89,24 +92,26 @@ impl RateLimiter {
                     let status = resp.status();
                     let headers = resp.headers();
                     let retryable = matches!(status.as_u16(), 408 | 429 | 500 | 502 | 503 | 504);
-                    let server_delay = server_delay(headers, chrono::Utc::now());
+                    rate.observe_quota(headers, chrono::Utc::now());
+                    let server_delay =
+                        server_delay(headers, chrono::Utc::now()).max(rate.quota_delay());
                     if retryable {
                         let delay = rate.failed(server_delay);
                         if rate.failures == 1 {
-                            tracing::warn!(provider = self.provider, %status, rate_limit_zone = ?headers.get("x-ratelimit-zone"), "Metadata provider unavailable; entering backoff");
+                            tracing::warn!(provider = self.provider, %status, rate_limit_zone = ?headers.get("x-ratelimit-zone"), remaining = ?headers.get("x-ratelimit-remaining"), reset = ?headers.get("x-ratelimit-reset"), retry_after = ?headers.get("retry-after"), "Metadata provider unavailable; entering backoff");
                         }
                         tracing::debug!(provider = self.provider, %status, attempt, delay_ms = delay.as_millis(),
                             rate_limit_zone = ?headers.get("x-ratelimit-zone"),
                             "Metadata provider request rejected; backing off");
                     } else {
-                        if rate.failures > 0 && status.is_success() {
+                        if status.is_success() && rate.succeeded() {
                             tracing::info!(
                                 provider = self.provider,
                                 "Metadata provider requests recovered"
                             );
                         }
-                        rate.failures = 0;
-                        rate.postpone(interval.max(server_delay));
+                        let delay = interval.max(server_delay).max(rate.adaptive_interval());
+                        rate.postpone(delay);
                     }
                     if status.is_success() {
                         return Some(resp);
@@ -161,9 +166,80 @@ impl RateLimiter {
 struct RequestRate {
     next: Option<Instant>,
     failures: u32,
+    successes: u32,
+    last_failure: Option<Instant>,
+    quota: Option<Quota>,
 }
 
 impl RequestRate {
+    fn adaptive_interval(&self) -> Duration {
+        if self.failures == 0 {
+            return Duration::ZERO;
+        }
+        Duration::from_secs((2_u64 << self.failures.min(6).saturating_sub(1)).min(60))
+    }
+
+    // A single successful request does not prove a congested service recovered.
+    // Require a healthy streak AND a quiet minute, then ease off one level.
+    fn succeeded(&mut self) -> bool {
+        self.successes = self.successes.saturating_add(1);
+        if self.failures > 0
+            && self.successes >= 5
+            && self
+                .last_failure
+                .is_some_and(|last| last.elapsed() >= Duration::from_mins(1))
+        {
+            self.failures -= 1;
+            self.successes = 0;
+            return self.failures == 0;
+        }
+        false
+    }
+
+    fn observe_quota(
+        &mut self,
+        headers: &reqwest::header::HeaderMap,
+        now: chrono::DateTime<chrono::Utc>,
+    ) {
+        let remaining = header_number(headers, "x-ratelimit-remaining");
+        let reset = header_number(headers, "x-ratelimit-reset")
+            .and_then(|v| i64::try_from(v).ok())
+            .and_then(|v| chrono::DateTime::from_timestamp(v, 0));
+        if let (Some(remaining), Some(reset)) = (remaining, reset) {
+            let now = server_now(headers, now);
+            // HTTP Date and reset epochs have whole-second precision. A second
+            // of slack avoids dispatching into the last partial reset second.
+            if let Ok(window) = (reset - now).to_std() {
+                self.quota = Some(Quota {
+                    remaining,
+                    reset: Instant::now()
+                        + window.min(Duration::from_secs(u64::from(u32::MAX)))
+                        + Duration::from_secs(1),
+                });
+            }
+        }
+    }
+
+    fn quota_delay(&self) -> Duration {
+        self.quota.as_ref().map_or(Duration::ZERO, |quota| {
+            let window = quota.reset.saturating_duration_since(Instant::now());
+            // Spread the remaining budget across the rest of the window rather
+            // than bursting until Remaining reaches zero. No advertised budget
+            // means no calls until reset, even if later responses omit headers.
+            window / u32::try_from(quota.remaining.max(1)).unwrap_or(u32::MAX)
+        })
+    }
+
+    fn consume_quota(&mut self) {
+        if let Some(quota) = &mut self.quota {
+            if quota.reset <= Instant::now() {
+                self.quota = None;
+            } else {
+                quota.remaining = quota.remaining.saturating_sub(1);
+            }
+        }
+    }
+
     fn postpone(&mut self, delay: Duration) {
         // Bound untrusted numeric headers to a representable monotonic deadline.
         let deadline = Instant::now() + delay.min(Duration::from_secs(u64::from(u32::MAX)));
@@ -172,14 +248,36 @@ impl RequestRate {
 
     fn failed(&mut self, server_delay: Duration) -> Duration {
         self.failures = self.failures.saturating_add(1);
-        let backoff =
-            Duration::from_secs((2_u64 << self.failures.min(6).saturating_sub(1)).min(60));
+        self.successes = 0;
+        self.last_failure = Some(Instant::now());
+        let backoff = self.adaptive_interval();
         // Positive jitter avoids synchronizing clients without shortening Retry-After.
         let jitter = Duration::from_millis(u64::from(uuid::Uuid::new_v4().as_bytes()[0]));
         let delay = backoff.max(server_delay).saturating_add(jitter);
         self.postpone(delay);
         delay
     }
+}
+
+#[derive(Debug)]
+struct Quota {
+    remaining: u64,
+    reset: Instant,
+}
+
+fn header_number(headers: &reqwest::header::HeaderMap, name: &str) -> Option<u64> {
+    headers.get(name)?.to_str().ok()?.parse().ok()
+}
+
+fn server_now(
+    headers: &reqwest::header::HeaderMap,
+    fallback: chrono::DateTime<chrono::Utc>,
+) -> chrono::DateTime<chrono::Utc> {
+    headers
+        .get("date")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| chrono::DateTime::parse_from_rfc2822(v).ok())
+        .map_or(fallback, |date| date.with_timezone(&chrono::Utc))
 }
 
 /// Honor Retry-After (seconds or HTTP date), plus the epoch reset
@@ -226,6 +324,67 @@ mod tests {
             )
             .await?;
         Some(response["artists"][0]["id"].as_str()?.to_owned())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn quota_budget_is_paced_and_retained_without_headers() {
+        let mut rate = RequestRate::default();
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("date", "Tue, 15 Sep 2026 17:04:50 GMT".parse().unwrap());
+        headers.insert("x-ratelimit-remaining", "2".parse().unwrap());
+        headers.insert("x-ratelimit-reset", "1789491900".parse().unwrap());
+        rate.observe_quota(&headers, chrono::Utc::now());
+        assert_eq!(rate.quota_delay(), Duration::from_millis(5500));
+        tokio::time::advance(rate.quota_delay()).await;
+        rate.consume_quota();
+        rate.observe_quota(&reqwest::header::HeaderMap::new(), chrono::Utc::now());
+        assert_eq!(rate.quota.as_ref().unwrap().remaining, 1);
+        assert_eq!(rate.quota_delay(), Duration::from_millis(5500));
+        rate.consume_quota();
+        assert_eq!(rate.quota.as_ref().unwrap().remaining, 0);
+        assert_eq!(rate.quota_delay(), Duration::from_millis(5500));
+        tokio::time::advance(rate.quota_delay()).await;
+        rate.consume_quota();
+        assert!(rate.quota.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn intermittent_success_does_not_reset_congestion_penalty() {
+        let mut rate = RequestRate::default();
+        rate.failed(Duration::ZERO);
+        assert!(!rate.succeeded());
+        assert_eq!(rate.adaptive_interval(), Duration::from_secs(2));
+        rate.failed(Duration::ZERO);
+        assert!(!rate.succeeded());
+        assert_eq!(rate.adaptive_interval(), Duration::from_secs(4));
+        for _ in 0..10 {
+            assert!(!rate.succeeded());
+        }
+        assert_eq!(
+            rate.failures, 2,
+            "success bursts cannot prematurely declare recovery"
+        );
+        tokio::time::advance(Duration::from_mins(1)).await;
+        assert!(!rate.succeeded());
+        assert_eq!(rate.failures, 1);
+        for _ in 0..4 {
+            assert!(!rate.succeeded());
+        }
+        assert!(rate.succeeded());
+        assert_eq!(rate.adaptive_interval(), Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn successful_quota_exhaustion_holds_concurrent_callers_until_reset() {
+        let (url, task) = scripted_server(vec![
+            (200, "Date: Tue, 15 Sep 2026 17:04:50 GMT\r\nX-RateLimit-Remaining: 0\r\nX-RateLimit-Reset: 1789491891\r\n"),
+            (200, ""),
+        ]).await;
+        let client = RateLimiter::new("quota-test");
+        let (a, b) = tokio::join!(lookup(&client, &url, "a"), lookup(&client, &url, "b"));
+        assert!(a.is_some() && b.is_some());
+        let times = task.await.unwrap();
+        assert!(times[1] - times[0] >= Duration::from_secs(2));
     }
 
     #[test]
@@ -365,7 +524,7 @@ mod tests {
             )
             .await;
         assert!(value.is_some());
-        assert_eq!(limiter.state.lock().await.failures, 0);
+        assert_eq!(limiter.state.lock().await.failures, 1);
         server.await.unwrap();
     }
 
