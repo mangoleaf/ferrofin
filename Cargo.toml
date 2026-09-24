@@ -177,7 +177,7 @@ regex = "1"
 # used by the Live TV name sort. ICU4X 2.x is already in the tree (icu_normalizer
 # 2.2 via idna), so this shares icu_collections/icu_provider/zerovec.
 icu_collator = "2"
-icu_casemap = "2"
+icu_casemap = "2.3.0"
 fancy-regex = "0.14"    # for C# regexes that use lookaround
 quick-xml = { version = "0.37", features = ["serialize"] }   # NFO/XBMC metadata parsing (ferrofin-providers)
 
