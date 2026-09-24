@@ -153,7 +153,7 @@ wat = "1.256"            # dev-only in practice: inline-WAT test fixtures (no co
 # ── domain helpers ─────────────────────────────────────────────────
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
-async-trait = "0.1"
+async-trait = "0.1.92"
 libc = "0.2"
 argon2 = "0.6.0"
 pbkdf2 = "0.12"          # password hashing — matches Jellyfin's Rfc2898DeriveBytes.Pbkdf2
