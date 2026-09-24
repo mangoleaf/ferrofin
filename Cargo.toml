@@ -84,7 +84,7 @@ tower-http = { version = "0.6", features = ["fs", "trace", "cors", "compression-
 # response it just encoded). Same versions tower-http already links.
 flate2 = "1.1.10"
 zip = { version = "8", default-features = false, features = ["deflate"] }   # .cbz/.epub archives (ferrofin-providers books)
-brotli = "8.0"
+brotli = "9.0.0"
 tokio = { version = "1", features = ["full"] }
 # The `Stream` trait `axum::body::Body::from_stream` takes — the progressive
 # (tail-following) response bodies the Live TV live-stream/recording routes serve.
