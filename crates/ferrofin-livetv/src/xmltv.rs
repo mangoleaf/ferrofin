@@ -96,7 +96,7 @@ pub fn parse_xmltv(xml: &str) -> Xmltv {
     let mut reader = Reader::from_str(xml);
     let config = reader.config_mut();
     config.check_end_names = false;
-    config.trim_text(true);
+    config.trim_text(false);
 
     let mut out = Xmltv::default();
     // Scratch buffer for the text content of the element currently being read.
@@ -109,7 +109,7 @@ pub fn parse_xmltv(xml: &str) -> Xmltv {
     loop {
         match reader.read_event() {
             Ok(Event::Start(e)) => {
-                match e.local_name().as_ref() {
+                match e.local_name().as_ref().as_bytes() {
                     b"channel" => {
                         channel = Some(XmltvChannel {
                             id: attr(&e, b"id").unwrap_or_default(),
@@ -126,19 +126,27 @@ pub fn parse_xmltv(xml: &str) -> Xmltv {
             }
             Ok(Event::Empty(e)) => {
                 let name = e.local_name();
-                apply_empty(name.as_ref(), &e, channel.as_mut(), programme.as_mut());
+                apply_empty(
+                    name.as_ref().as_bytes(),
+                    &e,
+                    channel.as_mut(),
+                    programme.as_mut(),
+                );
             }
             Ok(Event::Text(e)) => {
-                if let Ok(t) = e.unescape() {
-                    text.push_str(&t);
+                text.push_str(e.as_ref());
+            }
+            Ok(Event::GeneralRef(e)) => {
+                if let Ok(value) = quick_xml::escape::unescape(&format!("&{};", e.as_ref())) {
+                    text.push_str(&value);
                 }
             }
             Ok(Event::CData(e)) => {
-                text.push_str(&String::from_utf8_lossy(e.as_ref()));
+                text.push_str(e.as_ref());
             }
             Ok(Event::End(e)) => {
                 let name = e.local_name();
-                let name = name.as_ref();
+                let name = name.as_ref().as_bytes();
                 apply_end(
                     name,
                     &text,
@@ -188,10 +196,11 @@ pub fn parse_xmltv(xml: &str) -> Xmltv {
 /// `XmlException` on a bare `&`, so Jellyfin fails the whole guide refresh. A
 /// guide that mostly parses is more useful than no guide at all.
 fn unescaped_or_raw(a: &quick_xml::events::attributes::Attribute<'_>) -> String {
-    a.unescape_value().map_or_else(
-        |_| String::from_utf8_lossy(a.value.as_ref()).into_owned(),
-        std::borrow::Cow::into_owned,
-    )
+    a.normalized_value(quick_xml::XmlVersion::Implicit1_0)
+        .map_or_else(
+            |_| a.value.as_ref().to_owned(),
+            std::borrow::Cow::into_owned,
+        )
 }
 
 /// Reads a `<programme>` start tag's `channel`/`start`/`stop` attributes in a
@@ -200,7 +209,7 @@ fn read_programme(e: &BytesStart<'_>) -> XmltvProgramme {
     let mut p = XmltvProgramme::default();
     for a in e.attributes().flatten() {
         let value = unescaped_or_raw(&a);
-        match a.key.local_name().as_ref() {
+        match a.key.local_name().as_ref().as_bytes() {
             b"channel" => p.channel_id = value,
             b"start" => p.start = parse_xmltv_time(&value),
             b"stop" => p.stop = parse_xmltv_time(&value),
@@ -330,7 +339,7 @@ fn parse_offset(o: &str) -> Option<FixedOffset> {
 /// The named attribute's value, entity-resolved (see [`unescaped_or_raw`]).
 fn attr(e: &BytesStart<'_>, name: &[u8]) -> Option<String> {
     e.attributes().flatten().find_map(|a| {
-        if a.key.local_name().as_ref() == name {
+        if a.key.local_name().as_ref().as_bytes() == name {
             Some(unescaped_or_raw(&a))
         } else {
             None
@@ -609,5 +618,15 @@ mod episode_num_tests {
         );
         let p = &guide.programmes[0];
         assert_eq!((p.season_number, p.episode_number), (Some(2), Some(6)));
+    }
+
+    #[test]
+    fn text_entities_keep_word_boundaries_and_cdata() {
+        let guide = parse_xmltv(
+            r#"<tv><channel id="c"><display-name>News &amp; Sport &#33;</display-name></channel>
+             <programme channel="c"><title>Fish &amp; Chips <![CDATA[<live>]]></title></programme></tv>"#,
+        );
+        assert_eq!(guide.channels[0].display_name, "News & Sport !");
+        assert_eq!(guide.programmes[0].title, "Fish & Chips <live>");
     }
 }

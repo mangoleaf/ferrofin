@@ -75,19 +75,18 @@ fn tokenize(xml: &str) -> Result<Vec<XmlToken>, XmlError> {
     config.trim_text(false);
 
     let mut tokens: Vec<XmlToken> = Vec::new();
-    let decoder = reader.decoder();
 
     loop {
         match reader.read_event() {
             Ok(Event::Start(e)) => {
-                let attributes = read_attrs(&e, decoder)?;
+                let attributes = read_attrs(&e)?;
                 tokens.push(XmlToken::Start {
                     name: local_name(&e),
                     attributes,
                 });
             }
             Ok(Event::Empty(e)) => {
-                let attributes = read_attrs(&e, decoder)?;
+                let attributes = read_attrs(&e)?;
                 tokens.push(XmlToken::Empty {
                     name: local_name(&e),
                     attributes,
@@ -95,15 +94,21 @@ fn tokenize(xml: &str) -> Result<Vec<XmlToken>, XmlError> {
             }
             Ok(Event::End(e)) => {
                 tokens.push(XmlToken::End {
-                    name: String::from_utf8_lossy(e.local_name().as_ref()).into_owned(),
+                    name: e.local_name().as_ref().to_owned(),
                 });
             }
             Ok(Event::Text(e)) => {
-                let text = e.unescape().map_err(|_| XmlError)?.into_owned();
+                let text = e.as_ref().to_owned();
+                push_text(&mut tokens, text);
+            }
+            Ok(Event::GeneralRef(e)) => {
+                let text = quick_xml::escape::unescape(&format!("&{};", e.as_ref()))
+                    .map_err(|_| XmlError)?
+                    .into_owned();
                 push_text(&mut tokens, text);
             }
             Ok(Event::CData(e)) => {
-                let text = String::from_utf8_lossy(e.as_ref()).into_owned();
+                let text = e.as_ref().to_owned();
                 push_text(&mut tokens, text);
             }
             Ok(Event::Eof) => break,
@@ -116,16 +121,13 @@ fn tokenize(xml: &str) -> Result<Vec<XmlToken>, XmlError> {
 }
 
 /// Reads a start/empty element's attributes as `(local-name, unescaped-value)`.
-fn read_attrs(
-    e: &quick_xml::events::BytesStart<'_>,
-    decoder: quick_xml::encoding::Decoder,
-) -> Result<Vec<(String, String)>, XmlError> {
+fn read_attrs(e: &quick_xml::events::BytesStart<'_>) -> Result<Vec<(String, String)>, XmlError> {
     let mut attrs = Vec::new();
     for attr in e.attributes() {
         let attr = attr.map_err(|_| XmlError)?;
-        let key = String::from_utf8_lossy(attr.key.local_name().as_ref()).into_owned();
+        let key = attr.key.local_name().as_ref().to_owned();
         let value = attr
-            .decode_and_unescape_value(decoder)
+            .normalized_value(quick_xml::XmlVersion::Implicit1_0)
             .map_err(|_| XmlError)?
             .into_owned();
         attrs.push((key, value));
@@ -135,7 +137,7 @@ fn read_attrs(
 
 /// Returns the local (namespace-stripped) name of a start/empty element.
 fn local_name(e: &quick_xml::events::BytesStart<'_>) -> String {
-    String::from_utf8_lossy(e.local_name().as_ref()).into_owned()
+    e.local_name().as_ref().to_owned()
 }
 
 /// Appends `text` to the token stream, coalescing with a preceding text node.
@@ -409,4 +411,28 @@ fn escape_text(text: &str) -> String {
 /// Escapes an attribute value for re-serialization.
 fn escape_attr(text: &str) -> String {
     escape_text(text).replace('"', "&quot;")
+}
+
+#[cfg(test)]
+mod entity_tests {
+    use super::{XmlToken, tokenize};
+
+    #[test]
+    fn text_entities_and_cdata_coalesce_without_losing_spaces() {
+        let tokens = tokenize(
+            "<title>Fish &amp; Chips &#x1F3B5; <![CDATA[<mix>]]> &quot;Live&quot;</title>",
+        )
+        .expect("valid XML");
+        assert_eq!(
+            tokens.get(1),
+            Some(&XmlToken::Text {
+                value: r#"Fish & Chips 🎵 <mix> "Live""#.to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn unknown_entities_are_rejected() {
+        assert!(tokenize("<title>&missing;</title>").is_err());
+    }
 }

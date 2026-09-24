@@ -179,7 +179,7 @@ regex = "1"
 icu_collator = "2.3.1"
 icu_casemap = "2.3.0"
 fancy-regex = "0.19.2"    # for C# regexes that use lookaround
-quick-xml = { version = "0.37", features = ["serialize"] }   # NFO/XBMC metadata parsing (ferrofin-providers)
+quick-xml = { version = "0.42.0", features = ["serialize"] }   # NFO/XBMC metadata parsing (ferrofin-providers)
 
 # ── dev / test ─────────────────────────────────────────────────────
 rstest = "0.23"         # [Theory]/[InlineData] → #[case] transliteration
