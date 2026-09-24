@@ -151,7 +151,7 @@ wasmtime-wasi = "47"    # locked-down empty WASI ctx (no preopens/sockets) so st
 wat = "1.256"            # dev-only in practice: inline-WAT test fixtures (no committed .wasm)
 
 # ── domain helpers ─────────────────────────────────────────────────
-uuid = { version = "1", features = ["v4", "serde"] }
+uuid = { version = "1.26.1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 async-trait = "0.1.92"
 libc = "0.2"
