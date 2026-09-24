@@ -165,7 +165,7 @@ webp = { version = "0.3", default-features = false }  # LOSSY WebP encode via li
 jpeg-encoder = "0.7"     # JPEG encode with 4:2:0 chroma subsampling — the `image` crate's encoder is hardcoded 4:4:4; Skia's SkJpegEncoder defaults to 4:2:0
 blurhash = "0.2"         # ImageBlurHashes — functionally-valid hashes (not byte-identical to Jellyfin's Skia)
 config = "0.15.26"
-clap = { version = "4.5", features = ["derive"] }
+clap = { version = "4.6.7", features = ["derive"] }
 bitflags = "2.13.2"
 # CRC-32 (reflected zlib polynomial) for the HDHomeRun control protocol's packet
 # checksum — a port of `MediaBrowser.Common/Crc32.cs`, whose own tests pin
