@@ -1242,7 +1242,7 @@ dependencies = [
  "futures-core",
  "futures-util",
  "opentelemetry 0.33.0",
- "opentelemetry_sdk",
+ "opentelemetry_sdk 0.33.0",
  "serde",
  "serde_json",
  "serde_path_to_error",
@@ -1302,7 +1302,7 @@ dependencies = [
  "libc",
  "notify",
  "opentelemetry 0.33.0",
- "opentelemetry_sdk",
+ "opentelemetry_sdk 0.33.0",
  "quick-xml",
  "reqwest",
  "rstest",
@@ -1482,7 +1482,7 @@ dependencies = [
  "libc",
  "opentelemetry 0.33.0",
  "opentelemetry-prometheus",
- "opentelemetry_sdk",
+ "opentelemetry_sdk 0.33.0",
  "prometheus",
  "serde_json",
  "thiserror 2.0.21",
@@ -1593,7 +1593,7 @@ dependencies = [
  "flate2",
  "opentelemetry 0.33.0",
  "opentelemetry-otlp",
- "opentelemetry_sdk",
+ "opentelemetry_sdk 0.33.0",
  "reqwest",
  "serde",
  "serde_json",
@@ -2972,7 +2972,7 @@ dependencies = [
  "http",
  "opentelemetry 0.32.0",
  "opentelemetry-proto",
- "opentelemetry_sdk",
+ "opentelemetry_sdk 0.32.1",
  "prost",
  "thiserror 2.0.21",
  "tokio",
@@ -2988,7 +2988,7 @@ checksum = "2c0359983e7f79cf33c9abd89e5d7ddf67c46c419d0148598022d70e70c01aba"
 dependencies = [
  "once_cell",
  "opentelemetry 0.32.0",
- "opentelemetry_sdk",
+ "opentelemetry_sdk 0.32.1",
  "prometheus",
  "tracing",
 ]
@@ -3000,7 +3000,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "56d658ba1faf63f7b9c492cfbe6e0ec365440a16132d3270c1065f7b33f1b638"
 dependencies = [
  "opentelemetry 0.32.0",
- "opentelemetry_sdk",
+ "opentelemetry_sdk 0.32.1",
  "prost",
  "tonic",
  "tonic-prost",
@@ -3016,6 +3016,22 @@ dependencies = [
  "futures-executor",
  "futures-util",
  "opentelemetry 0.32.0",
+ "percent-encoding",
+ "portable-atomic",
+ "rand 0.9.5",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "opentelemetry_sdk"
+version = "0.33.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cb39533d9d1c912123efd7d41d7e0c29d16917b60ce15b4c8d87cb1af7f67520"
+dependencies = [
+ "futures-channel",
+ "futures-executor",
+ "futures-util",
+ "opentelemetry 0.33.0",
  "percent-encoding",
  "portable-atomic",
  "rand 0.9.5",
