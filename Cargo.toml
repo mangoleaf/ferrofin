@@ -147,7 +147,7 @@ prometheus = { version = "0.14", default-features = false }
 # Component-model runtime for sandboxed third-party plugins. Always compiled
 # in (decision 2026-08-07); MSRV 1.94 ≤ our pinned toolchain.
 wasmtime = "49.0.0"
-wasmtime-wasi = "47"    # locked-down empty WASI ctx (no preopens/sockets) so std guests link
+wasmtime-wasi = "49.0.0"    # locked-down empty WASI ctx (no preopens/sockets) so std guests link
 wat = "1.259.0"            # dev-only in practice: inline-WAT test fixtures (no committed .wasm)
 
 # ── domain helpers ─────────────────────────────────────────────────
