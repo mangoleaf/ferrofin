@@ -156,7 +156,7 @@ chrono = { version = "0.4", features = ["serde"] }
 async-trait = "0.1.92"
 libc = "0.2"
 argon2 = "0.6.0"
-pbkdf2 = "0.12"          # password hashing — matches Jellyfin's Rfc2898DeriveBytes.Pbkdf2
+pbkdf2 = "0.13.0"          # password hashing — matches Jellyfin's Rfc2898DeriveBytes.Pbkdf2
 sha2 = "0.10"            # PBKDF2-HMAC-SHA512 (default hash id)
 sha1 = "0.10"            # PBKDF2-HMAC-SHA1 (legacy "PBKDF2" hash id)
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
