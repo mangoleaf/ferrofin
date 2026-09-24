@@ -1460,6 +1460,24 @@ async fn untagged_image_is_public_and_client_no_cache_is_mirrored() {
     );
 }
 
+#[tokio::test]
+async fn file_metadata_validators_do_not_override_image_tags() {
+    let img = TempImage::new(b"PNGDATA");
+    let s = stubs(img.path(), String::new());
+    let path = format!("/Items/{ITEM_ID}/Images/Primary?tag=abc123");
+    for condition in ["If-Match", "If-None-Match"] {
+        let (status, headers, body) = send_with_headers(
+            &s,
+            &path,
+            &[("Cache-Control", "no-cache"), (condition, "*")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, b"PNGDATA");
+        assert!(headers.get("etag").is_none());
+    }
+}
+
 // The legacy `/Users/{userId}/Images/{imageType}[/{index}]` forms (upstream
 // [Obsolete] + hidden from OpenAPI; jellyfin-web's apiclient still requests
 // avatars this way) forward to the /UserImage handlers — the path's image

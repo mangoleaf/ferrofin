@@ -79,9 +79,9 @@ ferrofin-api = { path = "crates/ferrofin-api" }
 axum = "0.8"
 axum-extra = { version = "0.12.6", features = ["typed-header"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["fs", "trace", "cors", "compression-gzip", "compression-br"] }
+tower-http = { version = "0.7.1", features = ["fs", "trace", "cors", "compression-gzip", "compression-br"] }
 # Decoders for the response-compression tests only (the server never decodes a
-# response it just encoded). Same versions tower-http already links.
+# response it just encoded). Streaming readers validate the wire response.
 flate2 = "1.1.10"
 zip = { version = "8", default-features = false, features = ["deflate"] }   # .cbz/.epub archives (ferrofin-providers books)
 brotli = "9.0.0"
@@ -89,8 +89,8 @@ tokio = { version = "1", features = ["full"] }
 # The `Stream` trait `axum::body::Body::from_stream` takes — the progressive
 # (tail-following) response bodies the Live TV live-stream/recording routes serve.
 futures-core = "0.3.34"
-# WebSocket client for the /socket integration tests only. Same version axum
-# 0.8 already links for its `ws` feature, so it adds no new compilation.
+# WebSocket client for the /socket integration tests only. Its version is
+# independent of the WebSocket implementation used internally by axum.
 tokio-tungstenite = "0.30.0"
 futures-util = "0.3.34"
 notify = "8.2"

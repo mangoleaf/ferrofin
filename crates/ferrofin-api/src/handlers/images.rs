@@ -482,6 +482,13 @@ async fn serve_image_file(
         return Ok(response);
     }
 
+    // Image validators belong to the tag-based contract above. ServeFile's
+    // metadata ETag is a different identity and must not decide these requests.
+    let mut request = request;
+    request.headers_mut().remove(axum::http::header::IF_MATCH);
+    request
+        .headers_mut()
+        .remove(axum::http::header::IF_NONE_MATCH);
     let mut response = ServeFile::new(&serve_path)
         .oneshot(request)
         .await
@@ -496,6 +503,7 @@ async fn serve_image_file(
             .headers_mut()
             .insert(axum::http::header::CONTENT_TYPE, value);
     }
+    response.headers_mut().remove(axum::http::header::ETAG);
     append_image_cache_headers(response.headers_mut(), no_cache, tag, image);
     Ok(response)
 }
