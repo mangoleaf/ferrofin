@@ -92,7 +92,7 @@ futures-core = "0.3.34"
 # WebSocket client for the /socket integration tests only. Same version axum
 # 0.8 already links for its `ws` feature, so it adds no new compilation.
 tokio-tungstenite = "0.29"
-futures-util = "0.3"
+futures-util = "0.3.34"
 notify = "8.2"
 
 # ── persistence: sqlx + SQLite (speed-first; see plan) ─────────────
