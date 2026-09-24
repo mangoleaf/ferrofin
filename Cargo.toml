@@ -178,7 +178,7 @@ regex = "1"
 # 2.2 via idna), so this shares icu_collections/icu_provider/zerovec.
 icu_collator = "2.3.1"
 icu_casemap = "2.3.0"
-fancy-regex = "0.14"    # for C# regexes that use lookaround
+fancy-regex = "0.19.2"    # for C# regexes that use lookaround
 quick-xml = { version = "0.37", features = ["serialize"] }   # NFO/XBMC metadata parsing (ferrofin-providers)
 
 # ── dev / test ─────────────────────────────────────────────────────

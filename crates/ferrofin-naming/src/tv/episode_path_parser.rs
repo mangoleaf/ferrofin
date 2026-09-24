@@ -208,7 +208,7 @@ impl<'a> EpisodePathParser<'a> {
     }
 }
 
-fn capture_i32(captures: &fancy_regex::Captures<'_>, name: &str) -> Option<i32> {
+fn capture_i32(captures: &fancy_regex::Captures<'_, str>, name: &str) -> Option<i32> {
     captures.name(name)?.as_str().parse::<i32>().ok()
 }
 
