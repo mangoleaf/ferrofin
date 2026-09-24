@@ -91,7 +91,7 @@ tokio = { version = "1", features = ["full"] }
 futures-core = "0.3.34"
 # WebSocket client for the /socket integration tests only. Same version axum
 # 0.8 already links for its `ws` feature, so it adds no new compilation.
-tokio-tungstenite = "0.29"
+tokio-tungstenite = "0.30.0"
 futures-util = "0.3.34"
 notify = "8.2"
 
