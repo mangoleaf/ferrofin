@@ -128,7 +128,7 @@ tracing-appender = "0.2"
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls", "stream", "query"] }
 
 # ── openapi ────────────────────────────────────────────────────────
-utoipa = "5"
+utoipa = "6.0.0"
 
 # ── metrics + traces: OpenTelemetry ────────────────────────────────
 # metrics → prometheus exposition (ferrofin-metrics only); traces → OTLP gRPC
