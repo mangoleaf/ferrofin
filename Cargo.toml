@@ -137,7 +137,7 @@ utoipa = "6.0.0"
 opentelemetry = { version = "0.33.0", default-features = false, features = ["metrics", "trace"] }
 opentelemetry_sdk = { version = "0.33.0", default-features = false, features = ["metrics", "trace"] }
 opentelemetry-prometheus = "0.33.0"
-opentelemetry-otlp = { version = "0.32", default-features = false, features = ["grpc-tonic", "trace"] }
+opentelemetry-otlp = { version = "0.33.0", default-features = false, features = ["grpc-tonic", "trace"] }
 tracing-opentelemetry = "0.33"
 # encode-only; ferrofin-metrics ONLY — the 0.32 exporter exposes no render helper,
 # so `Registry` + `TextEncoder` come from a direct dep (dedupes with the exporter's ^0.14).

@@ -1242,7 +1242,7 @@ dependencies = [
  "futures-core",
  "futures-util",
  "opentelemetry 0.33.0",
- "opentelemetry_sdk 0.33.0",
+ "opentelemetry_sdk",
  "serde",
  "serde_json",
  "serde_path_to_error",
@@ -1302,7 +1302,7 @@ dependencies = [
  "libc",
  "notify",
  "opentelemetry 0.33.0",
- "opentelemetry_sdk 0.33.0",
+ "opentelemetry_sdk",
  "quick-xml",
  "reqwest",
  "rstest",
@@ -1482,7 +1482,7 @@ dependencies = [
  "libc",
  "opentelemetry 0.33.0",
  "opentelemetry-prometheus",
- "opentelemetry_sdk 0.33.0",
+ "opentelemetry_sdk",
  "prometheus",
  "serde_json",
  "thiserror 2.0.21",
@@ -1593,7 +1593,7 @@ dependencies = [
  "flate2",
  "opentelemetry 0.33.0",
  "opentelemetry-otlp",
- "opentelemetry_sdk 0.33.0",
+ "opentelemetry_sdk",
  "reqwest",
  "serde",
  "serde_json",
@@ -2965,14 +2965,14 @@ dependencies = [
 
 [[package]]
 name = "opentelemetry-otlp"
-version = "0.32.0"
+version = "0.33.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9966929966d17620d7c316c643ba62631826e10021409357772d5eea84f62c35"
+checksum = "699a67345e21962a231955b9059a157e428b219fa5df8efe11f08346fb23a344"
 dependencies = [
  "http",
- "opentelemetry 0.32.0",
+ "opentelemetry 0.33.0",
  "opentelemetry-proto",
- "opentelemetry_sdk 0.32.1",
+ "opentelemetry_sdk",
  "prost",
  "thiserror 2.0.21",
  "tokio",
@@ -2988,38 +2988,22 @@ checksum = "274c2e3a2ad55524484500d5a78dffbfee23e4a1e4c3d3fcbd881b61b033e6df"
 dependencies = [
  "once_cell",
  "opentelemetry 0.33.0",
- "opentelemetry_sdk 0.33.0",
+ "opentelemetry_sdk",
  "prometheus",
  "tracing",
 ]
 
 [[package]]
 name = "opentelemetry-proto"
-version = "0.32.0"
+version = "0.33.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "56d658ba1faf63f7b9c492cfbe6e0ec365440a16132d3270c1065f7b33f1b638"
+checksum = "25da1ac11a0aeccf38d7f77ee0348715adaf8340f65ad46c94a02c6b20e2f65d"
 dependencies = [
- "opentelemetry 0.32.0",
- "opentelemetry_sdk 0.32.1",
+ "opentelemetry 0.33.0",
+ "opentelemetry_sdk",
  "prost",
  "tonic",
  "tonic-prost",
-]
-
-[[package]]
-name = "opentelemetry_sdk"
-version = "0.32.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9b59f80e1ac4d5ff7a2db8fb6c80badb7f0f3f858211fba08dd9aaec750894f9"
-dependencies = [
- "futures-channel",
- "futures-executor",
- "futures-util",
- "opentelemetry 0.32.0",
- "percent-encoding",
- "portable-atomic",
- "rand 0.9.5",
- "thiserror 2.0.21",
 ]
 
 [[package]]
