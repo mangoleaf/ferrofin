@@ -132,13 +132,13 @@ utoipa = "6.0.0"
 
 # ── metrics + traces: OpenTelemetry ────────────────────────────────
 # metrics → prometheus exposition (ferrofin-metrics only); traces → OTLP gRPC
-# (ferrofin-server only). The 0.33 tracing-opentelemetry pairs with otel 0.32
+# (ferrofin-server only). The 0.34 tracing-opentelemetry pairs with otel 0.33
 # (the expected +1 offset); bump both together if otel ever moves.
 opentelemetry = { version = "0.33.0", default-features = false, features = ["metrics", "trace"] }
 opentelemetry_sdk = { version = "0.33.0", default-features = false, features = ["metrics", "trace"] }
 opentelemetry-prometheus = "0.33.0"
 opentelemetry-otlp = { version = "0.33.0", default-features = false, features = ["grpc-tonic", "trace"] }
-tracing-opentelemetry = "0.33"
+tracing-opentelemetry = "0.34.0"
 # encode-only; ferrofin-metrics ONLY — the 0.32 exporter exposes no render helper,
 # so `Registry` + `TextEncoder` come from a direct dep (dedupes with the exporter's ^0.14).
 prometheus = { version = "0.14", default-features = false }
