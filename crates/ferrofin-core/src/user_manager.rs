@@ -723,7 +723,7 @@ impl UserManager for FerrofinUserManager {
             "ImageInfos",
         ] {
             let sql = format!(r#"DELETE FROM "{table}" WHERE "UserId" = ?1"#);
-            sqlx::query(&sql)
+            sqlx::query(sqlx::AssertSqlSafe(sql))
                 .bind(guid_to_db(user_id))
                 .execute(&mut *tx)
                 .await

@@ -67,7 +67,8 @@ impl LinkedChildrenService for FerrofinLinkedChildrenService {
             sql.push_str(r#" AND "ChildType" = ?2"#);
         }
         sql.push_str(r#" ORDER BY "SortOrder""#);
-        let mut query = sqlx::query_scalar::<_, String>(&sql).bind(guid_to_db(parent_id));
+        let mut query =
+            sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql)).bind(guid_to_db(parent_id));
         if let Some(ct) = child_type {
             query = query.bind(i64::from(ct));
         }
@@ -104,7 +105,8 @@ impl LinkedChildrenService for FerrofinLinkedChildrenService {
             sql.push('?');
         }
         sql.push(')');
-        let mut query = sqlx::query_as::<_, BaseItemEntity>(&sql).bind(artist_type);
+        let mut query =
+            sqlx::query_as::<_, BaseItemEntity>(sqlx::AssertSqlSafe(sql)).bind(artist_type);
         for name in &lower_names {
             query = query.bind(name.clone());
         }

@@ -270,7 +270,7 @@ async fn consolidate(
     let marks = placeholders(stale_ids.len());
     let reparent_sql =
         format!(r#"UPDATE "BaseItems" SET "ParentId" = ? WHERE "ParentId" IN ({marks})"#);
-    let mut reparent = sqlx::query(&reparent_sql).bind(&canonical_db);
+    let mut reparent = sqlx::query(sqlx::AssertSqlSafe(reparent_sql)).bind(&canonical_db);
     for id in &stale_ids {
         reparent = reparent.bind(id);
     }
@@ -282,7 +282,7 @@ async fn consolidate(
 
     let retop_sql =
         format!(r#"UPDATE "BaseItems" SET "TopParentId" = ? WHERE "TopParentId" IN ({marks})"#);
-    let mut retop = sqlx::query(&retop_sql).bind(&canonical_db);
+    let mut retop = sqlx::query(sqlx::AssertSqlSafe(retop_sql)).bind(&canonical_db);
     for id in &stale_ids {
         retop = retop.bind(id);
     }
@@ -295,7 +295,7 @@ async fn consolidate(
     // Nothing points at them any more, and BaseItems cascades on ParentId, so
     // this has to come last.
     let delete_sql = format!(r#"DELETE FROM "BaseItems" WHERE "Id" IN ({marks})"#);
-    let mut delete = sqlx::query(&delete_sql);
+    let mut delete = sqlx::query(sqlx::AssertSqlSafe(delete_sql));
     for id in &stale_ids {
         delete = delete.bind(id);
     }
@@ -323,7 +323,7 @@ async fn move_remaining_references(
 ) -> Result<(), ServiceError> {
     let marks = placeholders(stale_ids.len());
     let reown_sql = format!(r#"UPDATE "BaseItems" SET "OwnerId" = ? WHERE "OwnerId" IN ({marks})"#);
-    let mut reown = sqlx::query(&reown_sql).bind(canonical_db);
+    let mut reown = sqlx::query(sqlx::AssertSqlSafe(reown_sql)).bind(canonical_db);
     for id in stale_ids {
         reown = reown.bind(id);
     }
@@ -331,7 +331,7 @@ async fn move_remaining_references(
     let unlink_sql = format!(
         r#"DELETE FROM "LinkedChildren" WHERE "ParentId" IN ({marks}) OR "ChildId" IN ({marks})"#
     );
-    let mut unlink = sqlx::query(&unlink_sql);
+    let mut unlink = sqlx::query(sqlx::AssertSqlSafe(unlink_sql));
     for id in stale_ids.iter().chain(stale_ids) {
         unlink = unlink.bind(id);
     }
@@ -352,7 +352,7 @@ async fn pick_source<'a>(
            WHERE "ParentId" IN ({}) GROUP BY "ParentId""#,
         placeholders(stale_ids.len())
     );
-    let mut count = sqlx::query_as::<_, (String, i64)>(&count_sql);
+    let mut count = sqlx::query_as::<_, (String, i64)>(sqlx::AssertSqlSafe(count_sql));
     for id in stale_ids {
         count = count.bind(id);
     }
@@ -441,14 +441,14 @@ async fn move_ancestors(
     let marks = placeholders(stale_ids.len());
     let select_sql =
         format!(r#"SELECT DISTINCT "ItemId" FROM "AncestorIds" WHERE "ParentItemId" IN ({marks})"#);
-    let mut select = sqlx::query_scalar::<_, String>(&select_sql);
+    let mut select = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(select_sql));
     for id in stale_ids {
         select = select.bind(id);
     }
     let items = select.fetch_all(&mut **tx).await.map_err(db_err)?;
 
     let delete_sql = format!(r#"DELETE FROM "AncestorIds" WHERE "ParentItemId" IN ({marks})"#);
-    let mut delete = sqlx::query(&delete_sql);
+    let mut delete = sqlx::query(sqlx::AssertSqlSafe(delete_sql));
     for id in stale_ids {
         delete = delete.bind(id);
     }
@@ -510,9 +510,9 @@ async fn move_user_settings(
 
     if let Some(moved) = source_id {
         for table in DISPLAY_SETTING_TABLES {
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 r#"UPDATE "{table}" SET "ItemId" = ?1 WHERE "ItemId" = ?2"#
-            ))
+            )))
             .bind(&canonical_db)
             .bind(moved)
             .execute(&mut **tx)
@@ -525,7 +525,7 @@ async fn move_user_settings(
         let marks = placeholders(dropped.len());
         for table in DISPLAY_SETTING_TABLES {
             let delete_sql = format!(r#"DELETE FROM "{table}" WHERE "ItemId" IN ({marks})"#);
-            let mut delete = sqlx::query(&delete_sql);
+            let mut delete = sqlx::query(sqlx::AssertSqlSafe(delete_sql));
             for id in &dropped {
                 delete = delete.bind(id.as_str());
             }
@@ -754,9 +754,9 @@ mod tests {
     }
 
     async fn display_setting_item_ids(db: &Database, table: &str) -> Vec<String> {
-        sqlx::query_scalar(&format!(
+        sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
             r#"SELECT "ItemId" FROM "{table}" ORDER BY "ItemId""#
-        ))
+        )))
         .fetch_all(db.pool())
         .await
         .expect("display setting rows")

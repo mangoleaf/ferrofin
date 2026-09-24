@@ -152,7 +152,7 @@ impl MediaSegmentManager for FerrofinMediaSegmentManager {
         if type_filter.is_some() {
             sql.push_str(r#" AND "Type" = ?3"#);
         }
-        let mut query = sqlx::query(&sql)
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(guid_to_db(item_id))
             .bind(provider_id.to_owned());
         if let Some(kind) = type_filter {
@@ -171,7 +171,7 @@ impl MediaSegmentManager for FerrofinMediaSegmentManager {
         if type_filter.is_some() {
             sql.push_str(r#" AND "Type" = ?2"#);
         }
-        let mut query = sqlx::query(&sql).bind(provider_id.to_owned());
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql)).bind(provider_id.to_owned());
         if let Some(kind) = type_filter {
             query = query.bind(Self::type_discriminant(kind));
         }

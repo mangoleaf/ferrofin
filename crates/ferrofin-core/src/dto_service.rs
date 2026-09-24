@@ -1192,7 +1192,7 @@ impl FerrofinDtoService {
                    WHERE "ItemId" IN ({placeholders})
                    ORDER BY "ItemId", "ImageType", "Id""#,
             );
-            let mut query = sqlx::query_as::<_, BaseItemImageInfoEntity>(&sql);
+            let mut query = sqlx::query_as::<_, BaseItemImageInfoEntity>(sqlx::AssertSqlSafe(sql));
             for id in chunk {
                 query = query.bind(guid_to_db(*id));
             }
@@ -1510,7 +1510,7 @@ impl FerrofinDtoService {
                 r#"SELECT "Type", "CleanValue", "ItemValueId" FROM "ItemValues"
                    WHERE ("Type", "CleanValue") IN ({ph})"#,
             );
-            let mut query = sqlx::query_as::<_, (i32, String, String)>(&sql);
+            let mut query = sqlx::query_as::<_, (i32, String, String)>(sqlx::AssertSqlSafe(sql));
             for (t, clean) in chunk {
                 query = query.bind(*t).bind(clean);
             }
@@ -2949,7 +2949,7 @@ impl FerrofinDtoService {
                 r#"SELECT "ItemId", "ProviderId", "ProviderValue" FROM "BaseItemProviders"
                    WHERE "ItemId" IN ({ph})"#,
             );
-            let mut query = sqlx::query_as::<_, (String, String, String)>(&sql);
+            let mut query = sqlx::query_as::<_, (String, String, String)>(sqlx::AssertSqlSafe(sql));
             for id in chunk {
                 query = query.bind(guid_to_db(*id));
             }

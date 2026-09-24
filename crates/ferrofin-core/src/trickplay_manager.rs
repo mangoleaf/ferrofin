@@ -760,7 +760,7 @@ impl TrickplayManager for FerrofinTrickplayManager {
                 r#"SELECT * FROM "TrickplayInfos" WHERE "ItemId" IN ({ph})
                    ORDER BY "ItemId", "Width""#,
             );
-            let mut query = sqlx::query_as::<_, TrickplayInfoEntity>(&sql);
+            let mut query = sqlx::query_as::<_, TrickplayInfoEntity>(sqlx::AssertSqlSafe(sql));
             for id in chunk {
                 query = query.bind(guid_to_db(*id));
             }

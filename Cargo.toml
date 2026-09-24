@@ -96,7 +96,7 @@ futures-util = "0.3.34"
 notify = "8.2"
 
 # ── persistence: sqlx + SQLite (speed-first; see plan) ─────────────
-sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio-rustls", "macros", "chrono", "uuid"] }
+sqlx = { version = "0.9.0", features = ["sqlite", "runtime-tokio", "tls-rustls-ring", "macros", "chrono", "uuid"] }
 # Direct handle on the SQLite C API, pinned to the exact version sqlx resolves so
 # cargo unifies them to ONE linked copy — a second copy would mean a second,
 # unconfigured SQLite. Used only to call sqlite3_config() before any connection.

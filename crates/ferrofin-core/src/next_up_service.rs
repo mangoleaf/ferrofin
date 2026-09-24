@@ -98,7 +98,7 @@ impl FerrofinNextUpService {
         let mut sql = String::from(r#"SELECT * FROM "BaseItems" WHERE "Id" IN ("#);
         push_key_placeholders(&mut sql, ids.len());
         sql.push(')');
-        let mut query = sqlx::query_as::<_, BaseItemEntity>(&sql);
+        let mut query = sqlx::query_as::<_, BaseItemEntity>(sqlx::AssertSqlSafe(sql));
         for id in ids {
             query = query.bind(guid_to_db(*id));
         }
@@ -229,7 +229,7 @@ impl NextUpService for FerrofinNextUpService {
         // Series (by presentation key) whose most-recently-played episode within
         // the requested libraries is at/after the cutoff, newest first.
         let sql = next_up_series_keys_sql(top_parents.len(), filter.limit.is_some());
-        let mut query = sqlx::query_scalar::<_, String>(&sql)
+        let mut query = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql))
             .bind(&user.id)
             .bind(episode_type)
             .bind(PLACEHOLDER_ID);
@@ -383,7 +383,7 @@ impl FerrofinNextUpService {
         );
         push_key_placeholders(&mut sql, series_keys.len());
         sql.push(')');
-        let mut query = sqlx::query_as::<_, BaseItemEntity>(&sql)
+        let mut query = sqlx::query_as::<_, BaseItemEntity>(sqlx::AssertSqlSafe(sql))
             .bind(episode_type)
             .bind(guid_to_db(Uuid::nil()));
         for key in series_keys {
@@ -425,7 +425,7 @@ impl FerrofinNextUpService {
         push_key_placeholders(&mut sql, series_keys.len());
         sql.push(')');
 
-        let mut query = sqlx::query_as::<_, ProjectionRow>(&sql)
+        let mut query = sqlx::query_as::<_, ProjectionRow>(sqlx::AssertSqlSafe(sql))
             .bind(user_id)
             .bind(episode_type);
         for key in series_keys {
@@ -743,7 +743,7 @@ mod tests {
 
     /// Runs one fixture statement with string binds (SQLite's column affinity
     /// turns a numeric string into the integer the column holds).
-    async fn exec(db: &Database, sql: &str, binds: &[&str]) {
+    async fn exec(db: &Database, sql: &'static str, binds: &[&str]) {
         let mut query = sqlx::query(sql);
         for bind in binds {
             query = query.bind((*bind).to_owned());

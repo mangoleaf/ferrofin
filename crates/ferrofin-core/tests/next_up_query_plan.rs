@@ -12,7 +12,7 @@ use ferrofin_db::Database;
 /// Runs `EXPLAIN QUERY PLAN` over `sql`, binding `binds` dummy parameters.
 async fn plan(db: &Database, sql: &str, binds: usize) -> Vec<String> {
     let explain = format!("EXPLAIN QUERY PLAN {sql}");
-    let mut q = sqlx::query_as::<_, (i64, i64, i64, String)>(&explain);
+    let mut q = sqlx::query_as::<_, (i64, i64, i64, String)>(sqlx::AssertSqlSafe(explain));
     for _ in 0..binds {
         q = q.bind("x");
     }

@@ -63,7 +63,7 @@ impl DeviceRepository {
             let mut sql = String::from(r#"SELECT * FROM "DeviceOptions" WHERE "DeviceId" IN ("#);
             push_placeholders(&mut sql, chunk.len());
             sql.push(')');
-            let mut query = sqlx::query_as::<_, DeviceOptionsEntity>(&sql);
+            let mut query = sqlx::query_as::<_, DeviceOptionsEntity>(sqlx::AssertSqlSafe(sql));
             for id in chunk {
                 query = query.bind(*id);
             }
@@ -89,7 +89,7 @@ impl DeviceRepository {
             let mut sql = String::from(r#"SELECT "Id", "Username" FROM "Users" WHERE "Id" IN ("#);
             push_placeholders(&mut sql, chunk.len());
             sql.push(')');
-            let mut query = sqlx::query_as::<_, (String, String)>(&sql);
+            let mut query = sqlx::query_as::<_, (String, String)>(sqlx::AssertSqlSafe(sql));
             for id in chunk {
                 query = query.bind(*id);
             }

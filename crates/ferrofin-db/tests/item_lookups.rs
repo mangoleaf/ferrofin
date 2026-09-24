@@ -39,9 +39,9 @@ async fn insert_item(db: &Database, id: &str, type_: &str) {
 
 /// Sets one nullable text column on an existing `BaseItems` row.
 async fn set_text(db: &Database, id: &str, column: &str, value: Option<&str>) {
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         r#"UPDATE "BaseItems" SET "{column}" = ?1 WHERE "Id" = ?2"#
-    ))
+    )))
     .bind(value)
     .bind(id)
     .execute(db.writer())

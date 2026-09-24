@@ -89,7 +89,8 @@ impl FerrofinItemCountService {
             );
             sql.push_str(&placeholders(matching.len()));
             sql.push(')');
-            let mut query = sqlx::query_scalar::<_, String>(&sql).bind(guid_to_db(ancestor_id));
+            let mut query = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql))
+                .bind(guid_to_db(ancestor_id));
             for id in &matching {
                 query = query.bind(id.as_str());
             }
@@ -110,7 +111,8 @@ impl FerrofinItemCountService {
         );
         sql.push_str(&placeholders(descendants.len()));
         sql.push(')');
-        let mut query = sqlx::query_scalar::<_, i64>(&sql).bind(guid_to_db(user_id));
+        let mut query =
+            sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql)).bind(guid_to_db(user_id));
         for id in &descendants {
             query = query.bind(id.as_str());
         }
@@ -159,7 +161,7 @@ impl FerrofinItemCountService {
         for chunk in distinct_names.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
             let sql = people_name_counts_sql(chunk.len(), type_names.len());
 
-            let mut query = sqlx::query_as::<_, (String, String, i64)>(&sql);
+            let mut query = sqlx::query_as::<_, (String, String, i64)>(sqlx::AssertSqlSafe(sql));
             for name in chunk {
                 query = query.bind(*name);
             }
@@ -222,7 +224,7 @@ impl FerrofinItemCountService {
         let mut by_year: HashMap<i64, HashMap<String, i32>> = HashMap::new();
         for chunk in distinct_years.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
             let sql = production_year_counts_sql(chunk.len(), type_names.len());
-            let mut query = sqlx::query_as::<_, (i64, String, i64)>(&sql);
+            let mut query = sqlx::query_as::<_, (i64, String, i64)>(sqlx::AssertSqlSafe(sql));
             for year in chunk {
                 query = query.bind(*year);
             }
@@ -415,7 +417,7 @@ impl ItemCountService for FerrofinItemCountService {
         for chunk in distinct_cleans.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
             let sql = item_value_counts_sql(chunk.len(), type_names.len(), value_types);
 
-            let mut query = sqlx::query_as::<_, (String, String, i64)>(&sql);
+            let mut query = sqlx::query_as::<_, (String, String, i64)>(sqlx::AssertSqlSafe(sql));
             for clean in chunk {
                 query = query.bind(*clean);
             }
@@ -485,7 +487,8 @@ impl ItemCountService for FerrofinItemCountService {
         );
         sql.push_str(&placeholders(matching.len()));
         sql.push(')');
-        let mut query = sqlx::query_scalar::<_, String>(&sql).bind(guid_to_db(parent_id));
+        let mut query =
+            sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql)).bind(guid_to_db(parent_id));
         for id in &matching {
             query = query.bind(id.as_str());
         }
@@ -503,7 +506,8 @@ impl ItemCountService for FerrofinItemCountService {
         );
         sql.push_str(&placeholders(children.len()));
         sql.push(')');
-        let mut query = sqlx::query_scalar::<_, i64>(&sql).bind(guid_to_db(user_id));
+        let mut query =
+            sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql)).bind(guid_to_db(user_id));
         for id in &children {
             query = query.bind(id.as_str());
         }
@@ -539,7 +543,7 @@ impl ItemCountService for FerrofinItemCountService {
         };
 
         let total_sql = grouped("", "");
-        let mut total_q = sqlx::query_as::<_, (String, i64)>(&total_sql);
+        let mut total_q = sqlx::query_as::<_, (String, i64)>(sqlx::AssertSqlSafe(total_sql));
         for id in &ids {
             total_q = total_q.bind(id.as_str());
         }
@@ -556,7 +560,8 @@ impl ItemCountService for FerrofinItemCountService {
             r#" AND ud."UserId" = ? AND ud."Played" = 1"#,
         );
         // The `?` for UserId precedes the `ParentItemId` in-list, so bind it first.
-        let mut played_q = sqlx::query_as::<_, (String, i64)>(&played_sql).bind(user.id.as_str());
+        let mut played_q = sqlx::query_as::<_, (String, i64)>(sqlx::AssertSqlSafe(played_sql))
+            .bind(user.id.as_str());
         for id in &ids {
             played_q = played_q.bind(id.as_str());
         }
@@ -656,7 +661,7 @@ impl ItemCountService for FerrofinItemCountService {
                     r#"WHERE "PrimaryVersionId" IS NULL AND "ParentId" IN ("#,
                 );
             }
-            let mut query = sqlx::query_as::<_, (String, i64)>(&sql);
+            let mut query = sqlx::query_as::<_, (String, i64)>(sqlx::AssertSqlSafe(sql));
             for id in &ids {
                 query = query.bind(id.as_str());
             }
@@ -720,7 +725,7 @@ impl ItemCountService for FerrofinItemCountService {
         );
         sql.push_str(&placeholders(ids.len()));
         sql.push_str(r#") GROUP BY "ParentId""#);
-        let mut query = sqlx::query_as::<_, (String, i64)>(&sql);
+        let mut query = sqlx::query_as::<_, (String, i64)>(sqlx::AssertSqlSafe(sql));
         for id in &ids {
             query = query.bind(id.as_str());
         }
@@ -2367,7 +2372,7 @@ mod tests {
     /// step in outer-to-inner order.
     async fn query_plan(db: &Database, sql: &str, binds: usize) -> Vec<String> {
         let explain = format!("EXPLAIN QUERY PLAN {sql}");
-        let mut query = sqlx::query_as::<_, (i64, i64, i64, String)>(&explain);
+        let mut query = sqlx::query_as::<_, (i64, i64, i64, String)>(sqlx::AssertSqlSafe(explain));
         for _ in 0..binds {
             query = query.bind("x");
         }
@@ -2647,7 +2652,8 @@ mod tests {
                 join,
                 r#" AND ud."UserId" = ? AND ud."Played" = 1"#,
             );
-            let mut q = sqlx::query_as::<_, (String, i64)>(&sql).bind(user.id.as_str());
+            let mut q =
+                sqlx::query_as::<_, (String, i64)>(sqlx::AssertSqlSafe(sql)).bind(user.id.as_str());
             for id in &ids {
                 q = q.bind(id.as_str());
             }

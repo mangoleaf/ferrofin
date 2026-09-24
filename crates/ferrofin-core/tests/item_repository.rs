@@ -123,7 +123,7 @@ fn repo(db: &Database) -> FerrofinItemRepository {
 async fn plan(db: &Database, sql: &str) -> String {
     use sqlx::Row as _;
 
-    sqlx::query(&format!("EXPLAIN QUERY PLAN {sql}"))
+    sqlx::query(sqlx::AssertSqlSafe(format!("EXPLAIN QUERY PLAN {sql}")))
         .fetch_all(db.pool())
         .await
         .expect("explain")
@@ -144,11 +144,12 @@ async fn movie_page_before_hydration_change(
 
     let mut builder = build_query(filter, QueryShape::IdsOnly);
     let mut query = builder.build();
+    let args = query.take_arguments().expect("arguments").expect("binds");
     let sql = query
         .sql()
+        .as_str()
         .replacen(r#"SELECT bi."Id" FROM"#, "SELECT bi.* FROM", 1);
-    let args = query.take_arguments().expect("arguments").expect("binds");
-    sqlx::query_as_with(&sql, args)
+    sqlx::query_as_with(sqlx::AssertSqlSafe(sql), args)
         .fetch_all(db.pool())
         .await
         .expect("original movie page")
@@ -307,9 +308,9 @@ async fn movie_page_hydration_plan_materializes_keys_before_primary_key_fetches(
     };
     let mut builder = build_query(&filter, QueryShape::FullRows);
     let mut query = builder.build();
-    let sql = format!("EXPLAIN QUERY PLAN {}", query.sql());
     let args = query.take_arguments().expect("arguments").expect("binds");
-    let plan = sqlx::query_with(&sql, args)
+    let sql = format!("EXPLAIN QUERY PLAN {}", query.sql().as_str());
+    let plan = sqlx::query_with(sqlx::AssertSqlSafe(sql), args)
         .fetch_all(db.pool())
         .await
         .expect("explain")
@@ -394,6 +395,7 @@ async fn movie_page_hydration_leaves_other_query_plans_unchanged() {
         assert!(
             !build_query(&other, QueryShape::FullRows)
                 .sql()
+                .as_str()
                 .contains("movie_page")
         );
     }
@@ -404,7 +406,12 @@ async fn movie_page_hydration_leaves_other_query_plans_unchanged() {
         QueryShape::GroupedCount,
         QueryShape::TypeCounts,
     ] {
-        assert!(!build_query(&filter, shape).sql().contains("movie_page"));
+        assert!(
+            !build_query(&filter, shape)
+                .sql()
+                .as_str()
+                .contains("movie_page")
+        );
     }
 }
 

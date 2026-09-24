@@ -1134,7 +1134,11 @@ impl FerrofinItemPersistenceService {
     /// `sql` — [`UPSERT_SQL`] for a full-row replace, [`scan_upsert_sql`] for
     /// the library scan's ownership-respecting variant. Both bind the same
     /// columns in the same order.
-    async fn upsert_item(&self, item: &BaseItemEntity, sql: &str) -> Result<(), ServiceError> {
+    async fn upsert_item(
+        &self,
+        item: &BaseItemEntity,
+        sql: &'static str,
+    ) -> Result<(), ServiceError> {
         // C# `SaveItem` always stamps `CleanName = GetCleanValue(item.Name)` at
         // write time (no caller pre-computes it); deriving here keeps every
         // saved item matchable by the search filter, which queries `CleanName`.
@@ -1961,7 +1965,7 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
                     Option<Vec<u8>>,
                     Option<chrono::DateTime<chrono::Utc>>,
                 ),
-            >(&sql);
+            >(sqlx::AssertSqlSafe(sql));
             for id in chunk {
                 query = query.bind(guid_to_db(*id));
             }

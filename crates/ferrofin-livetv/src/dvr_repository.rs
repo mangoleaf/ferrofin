@@ -312,7 +312,7 @@ pub async fn recording_row(
     db: &Database,
     recording_id: Uuid,
 ) -> Result<Option<RecordingRow>, ServiceError> {
-    let mut qb: QueryBuilder<'_, Sqlite> = QueryBuilder::new(RECORDING_SELECT);
+    let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(RECORDING_SELECT);
     qb.push(r#" WHERE r."Id" = "#)
         .push_bind(guid_to_db(recording_id));
     qb.build_query_as()
@@ -333,9 +333,9 @@ pub async fn recording_rows(
     db: &Database,
     query: &RecordingQuery,
 ) -> Result<Vec<RecordingRow>, ServiceError> {
-    let mut qb: QueryBuilder<'_, Sqlite> = QueryBuilder::new(RECORDING_SELECT);
+    let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(RECORDING_SELECT);
     let mut first = true;
-    let mut separator = |qb: &mut QueryBuilder<'_, Sqlite>| {
+    let mut separator = |qb: &mut QueryBuilder<Sqlite>| {
         qb.push(if first { " WHERE " } else { " AND " });
         first = false;
     };

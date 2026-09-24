@@ -556,7 +556,7 @@ fn is_valid_person_type(value: &str) -> bool {
 /// person-type in/out, max list order, name range/substring) onto a builder
 /// whose `FROM "Peoples" p` clause is already open. Returns whether the
 /// `PeopleBaseItemMap` join alias `m` is required by the caller's projection.
-fn push_predicates(qb: &mut QueryBuilder<'_, Sqlite>, filter: &InternalPeopleQuery) {
+fn push_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &InternalPeopleQuery) {
     if !filter.item_id.is_nil() {
         qb.push(r#" AND EXISTS (SELECT 1 FROM "PeopleBaseItemMap" mx WHERE mx."PeopleId" = p."Id" AND mx."ItemId" = "#);
         qb.push_bind(guid_to_db(filter.item_id));
@@ -648,11 +648,7 @@ fn push_predicates(qb: &mut QueryBuilder<'_, Sqlite>, filter: &InternalPeopleQue
 /// `"Peoples"` table or the deduped derived table (see
 /// [`FerrofinPeopleRepository::get_people_by_name`]) — the predicates only
 /// reference `p."Name"`/`p."Id"`/`p."PersonType"`, which both shapes expose.
-fn base_query_from<'a>(
-    cols: &str,
-    from: &str,
-    filter: &InternalPeopleQuery,
-) -> QueryBuilder<'a, Sqlite> {
+fn base_query_from(cols: &str, from: &str, filter: &InternalPeopleQuery) -> QueryBuilder<Sqlite> {
     let mut qb = QueryBuilder::new(format!("SELECT {cols} FROM {from} p WHERE 1 = 1"));
     if let (Some(user_id), Some(is_favorite)) = (filter.user_id, filter.is_favorite) {
         qb.push(
@@ -670,7 +666,7 @@ fn base_query_from<'a>(
     qb
 }
 
-fn base_query<'a>(cols: &str, filter: &InternalPeopleQuery) -> QueryBuilder<'a, Sqlite> {
+fn base_query(cols: &str, filter: &InternalPeopleQuery) -> QueryBuilder<Sqlite> {
     base_query_from(cols, r#""Peoples""#, filter)
 }
 
@@ -743,7 +739,7 @@ fn narrows_by_name(filter: &InternalPeopleQuery) -> bool {
 /// assert the emitted SQL and its `EXPLAIN QUERY PLAN` — the only way to pin
 /// "this request does not pay for a second full-table aggregate", which no
 /// response-body assertion can see.
-fn by_name_page_query<'a>(filter: &InternalPeopleQuery) -> QueryBuilder<'a, Sqlite> {
+fn by_name_page_query(filter: &InternalPeopleQuery) -> QueryBuilder<Sqlite> {
     let total = if narrows_by_name(filter) {
         TOTAL_FILTERED_WINDOW
     } else {
@@ -1932,7 +1928,10 @@ mod tests {
             },
             InternalPeopleQuery::default(),
         ] {
-            let sql = super::by_name_page_query(&query).into_sql();
+            let sql = super::by_name_page_query(&query)
+                .into_sql()
+                .as_str()
+                .to_owned();
             assert!(
                 !sql.contains("OVER()"),
                 "unnarrowed page must not window-count every deduped row: {sql}"
@@ -1957,9 +1956,12 @@ mod tests {
         // sort, so the paged form's `LIMIT` can stop the scan early instead of
         // ordering every person in the library first. `EXPLAIN QUERY PLAN` names
         // each extra materialization pass `(subquery-N)`.
-        let sql = super::by_name_page_query(&InternalPeopleQuery::default()).into_sql();
+        let sql = super::by_name_page_query(&InternalPeopleQuery::default())
+            .into_sql()
+            .as_str()
+            .to_owned();
         let plan: Vec<(i64, i64, i64, String)> =
-            sqlx::query_as(&format!("EXPLAIN QUERY PLAN {sql}"))
+            sqlx::query_as(sqlx::AssertSqlSafe(format!("EXPLAIN QUERY PLAN {sql}")))
                 .fetch_all(db.pool())
                 .await
                 .expect("plan");
@@ -1992,6 +1994,8 @@ mod tests {
         assert!(
             super::by_name_page_query(&narrowed)
                 .into_sql()
+                .as_str()
+                .to_owned()
                 .contains("OVER()")
         );
     }

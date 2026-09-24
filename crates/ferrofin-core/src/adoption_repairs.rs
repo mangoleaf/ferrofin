@@ -818,7 +818,11 @@ struct Candidate {
     user_data: i64,
 }
 
-async fn count(tx: &mut sqlx::SqliteConnection, sql: &str, id: &str) -> Result<i64, ServiceError> {
+async fn count(
+    tx: &mut sqlx::SqliteConnection,
+    sql: &'static str,
+    id: &str,
+) -> Result<i64, ServiceError> {
     sqlx::query_scalar(sql)
         .bind(id)
         .fetch_one(&mut *tx)

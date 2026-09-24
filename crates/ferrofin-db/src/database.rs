@@ -511,7 +511,7 @@ impl Database {
                 r#"SELECT "ItemId", "ProviderId", "ProviderValue" FROM "BaseItemProviders"
                    WHERE "ItemId" IN ({placeholders})"#,
             );
-            let mut query = sqlx::query_as::<_, (String, String, String)>(&sql);
+            let mut query = sqlx::query_as::<_, (String, String, String)>(sqlx::AssertSqlSafe(sql));
             for id in chunk {
                 query = query.bind(id);
             }
@@ -541,7 +541,7 @@ impl Database {
                 r#"SELECT "Id", "Data" FROM "BaseItems"
                    WHERE "Id" IN ({placeholders}) AND "Data" IS NOT NULL"#,
             );
-            let mut query = sqlx::query_as::<_, (String, String)>(&sql);
+            let mut query = sqlx::query_as::<_, (String, String)>(sqlx::AssertSqlSafe(sql));
             for id in chunk {
                 query = query.bind(id);
             }
@@ -572,7 +572,7 @@ impl Database {
                 r#"SELECT "Id", "Studios" FROM "BaseItems"
                    WHERE "Id" IN ({placeholders}) AND "Studios" IS NOT NULL AND "Studios" <> ''"#,
             );
-            let mut query = sqlx::query_as::<_, (String, String)>(&sql);
+            let mut query = sqlx::query_as::<_, (String, String)>(sqlx::AssertSqlSafe(sql));
             for id in chunk {
                 query = query.bind(id);
             }
@@ -611,7 +611,7 @@ impl Database {
                    GROUP BY "PrimaryVersionId""#,
                 chunk.len() + 1
             );
-            let mut query = sqlx::query_as::<_, (String, i64)>(&sql);
+            let mut query = sqlx::query_as::<_, (String, i64)>(sqlx::AssertSqlSafe(sql));
             for id in chunk {
                 query = query.bind(id);
             }
@@ -643,7 +643,7 @@ impl Database {
                           "AlbumArtists", "Path", "LUFS", "NormalizationGain"
                    FROM "BaseItems" WHERE "Id" IN ({placeholders})"#,
             );
-            let mut query = sqlx::query_as::<_, ImageParentRow>(&sql);
+            let mut query = sqlx::query_as::<_, ImageParentRow>(sqlx::AssertSqlSafe(sql));
             for id in chunk {
                 query = query.bind(id);
             }
@@ -701,7 +701,7 @@ impl Database {
                    WHERE "Id" IN ({placeholders})
                      AND "Type" LIKE '%.PhotoAlbum' AND "Name" IS NOT NULL"#,
             );
-            let mut query = sqlx::query_as::<_, (String, String)>(&sql);
+            let mut query = sqlx::query_as::<_, (String, String)>(sqlx::AssertSqlSafe(sql));
             for id in chunk {
                 query = query.bind(id);
             }
@@ -824,7 +824,7 @@ impl Database {
     /// (including when `dest` already exists).
     pub async fn snapshot_to(&self, dest: &std::path::Path) -> Result<()> {
         let dest = dest.to_string_lossy().replace('\'', "''");
-        sqlx::query(&format!("VACUUM INTO '{dest}'"))
+        sqlx::query(sqlx::AssertSqlSafe(format!("VACUUM INTO '{dest}'")))
             .execute(&self.writer)
             .await?;
         Ok(())
@@ -1239,7 +1239,7 @@ async fn adopt_jellyfin_database(
     // (the history table exists) with no record of where it came from.
     sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
     let result: Result<()> = async {
-        conn.ensure_migrations_table().await?;
+        conn.ensure_migrations_table(&MIGRATOR.table_name).await?;
         for migration in MIGRATOR.iter() {
             if !generation.baselined_versions.contains(&migration.version) {
                 continue;
@@ -1740,11 +1740,11 @@ mod tests {
             .connect()
             .await
             .expect("open seed db");
-        conn.ensure_migrations_table()
+        conn.ensure_migrations_table(&MIGRATOR.table_name)
             .await
             .expect("migrations table");
         for m in MIGRATOR.iter().filter(|m| m.version <= 6) {
-            sqlx::raw_sql(&m.sql)
+            sqlx::raw_sql(m.sql.clone())
                 .execute(&mut conn)
                 .await
                 .unwrap_or_else(|e| panic!("apply migration {}: {e}", m.version));
@@ -1898,10 +1898,12 @@ mod tests {
             ("BaseItems", 3), // seeded movie + its primary version + placeholder
             ("UserData", 1),
         ] {
-            let n: i64 = sqlx::query_scalar(&format!(r#"SELECT COUNT(*) FROM "{table}""#))
-                .fetch_one(db.pool())
-                .await
-                .unwrap_or_else(|e| panic!("count {table}: {e}"));
+            let n: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                r#"SELECT COUNT(*) FROM "{table}""#
+            )))
+            .fetch_one(db.pool())
+            .await
+            .unwrap_or_else(|e| panic!("count {table}: {e}"));
             assert_eq!(n, expected, "`{table}` rows must survive the 0007 rebuild");
         }
         // The admin's IsAdministrator permission specifically — this is what
@@ -1966,21 +1968,22 @@ mod tests {
 
         let mut offenders = Vec::new();
         for t in &tables {
-            let cols: Vec<String> = sqlx::query(&format!("PRAGMA table_info(\"{t}\")"))
-                .fetch_all(db.pool())
-                .await
-                .expect("cols")
-                .into_iter()
-                .filter(|r| r.get::<String, _>("type").eq_ignore_ascii_case("TEXT"))
-                .map(|r| r.get::<String, _>("name"))
-                .collect();
+            let cols: Vec<String> =
+                sqlx::query(sqlx::AssertSqlSafe(format!("PRAGMA table_info(\"{t}\")")))
+                    .fetch_all(db.pool())
+                    .await
+                    .expect("cols")
+                    .into_iter()
+                    .filter(|r| r.get::<String, _>("type").eq_ignore_ascii_case("TEXT"))
+                    .map(|r| r.get::<String, _>("name"))
+                    .collect();
             for c in cols {
                 if allowed_lowercase.contains(&(t.as_str(), c.as_str())) {
                     continue;
                 }
-                let vals: Vec<String> = sqlx::query_scalar(&format!(
+                let vals: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
                     "SELECT \"{c}\" FROM \"{t}\" WHERE \"{c}\" IS NOT NULL"
-                ))
+                )))
                 .fetch_all(db.pool())
                 .await
                 .unwrap_or_default();
@@ -2313,7 +2316,7 @@ mod tests {
             .connect()
             .await
             .expect("open fixture db");
-        sqlx::raw_sql(schema)
+        sqlx::raw_sql(sqlx::AssertSqlSafe(schema))
             .execute(&mut conn)
             .await
             .expect("apply fixture schema");
@@ -2920,7 +2923,9 @@ mod tests {
             .expect("open");
         {
             use sqlx::migrate::Migrate;
-            conn.ensure_migrations_table().await.expect("history table");
+            conn.ensure_migrations_table(&MIGRATOR.table_name)
+                .await
+                .expect("history table");
         }
         for migration in MIGRATOR.iter().filter(|m| m.version <= 7) {
             sqlx::query(
