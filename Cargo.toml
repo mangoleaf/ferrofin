@@ -148,7 +148,7 @@ prometheus = { version = "0.14", default-features = false }
 # in (decision 2026-08-07); MSRV 1.94 ≤ our pinned toolchain.
 wasmtime = "47"
 wasmtime-wasi = "47"    # locked-down empty WASI ctx (no preopens/sockets) so std guests link
-wat = "1.256"            # dev-only in practice: inline-WAT test fixtures (no committed .wasm)
+wat = "1.259.0"            # dev-only in practice: inline-WAT test fixtures (no committed .wasm)
 
 # ── domain helpers ─────────────────────────────────────────────────
 uuid = { version = "1.26.1", features = ["v4", "serde"] }
