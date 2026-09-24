@@ -171,7 +171,7 @@ bitflags = "2.13.2"
 # checksum — a port of `MediaBrowser.Common/Crc32.cs`, whose own tests pin
 # 0x414fa339 for "The quick brown fox...". Already in the lock file as a
 # transitive dependency of flate2/zip, so it adds no new compilation.
-crc32fast = "1.5"
+crc32fast = "1.5.2"
 regex = "1"
 # CLDR root collation — the port of .NET `StringComparison.InvariantCulture`
 # used by the Live TV name sort. ICU4X 2.x is already in the tree (icu_normalizer
