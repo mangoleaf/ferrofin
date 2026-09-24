@@ -134,7 +134,7 @@ utoipa = "6.0.0"
 # metrics → prometheus exposition (ferrofin-metrics only); traces → OTLP gRPC
 # (ferrofin-server only). The 0.33 tracing-opentelemetry pairs with otel 0.32
 # (the expected +1 offset); bump both together if otel ever moves.
-opentelemetry = { version = "0.32", default-features = false, features = ["metrics", "trace"] }
+opentelemetry = { version = "0.33.0", default-features = false, features = ["metrics", "trace"] }
 opentelemetry_sdk = { version = "0.32", default-features = false, features = ["metrics", "trace"] }
 opentelemetry-prometheus = "0.32"
 opentelemetry-otlp = { version = "0.32", default-features = false, features = ["grpc-tonic", "trace"] }
