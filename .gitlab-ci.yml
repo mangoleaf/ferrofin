@@ -340,7 +340,7 @@ shell-tests:
   stage: test
   image: alpine:3.22
   before_script:
-    - apk add --no-cache bash bats shellcheck sqlite git
+    - apk add --no-cache bash bats shellcheck sqlite git jq curl
   script:
     - shellcheck -x scripts/version.sh adoption/lib.sh adoption/run.sh adoption/smoke.sh adoption/build-fixtures.sh
     - shellcheck -x -s bash scripts/tests/version.bats adoption/tests/adoption.bats

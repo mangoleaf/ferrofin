@@ -7,12 +7,10 @@ setup() {
   ADOPTION="$BATS_TEST_DIRNAME/.."
   # shellcheck source=adoption/lib.sh
   . "$ADOPTION/lib.sh"
-  TMP="$(mktemp -d)"
+  TMP="$BATS_TEST_TMPDIR/fixtures"
+  mkdir -p "$TMP"
   cd "$TMP" || exit 1
-}
-
-teardown() {
-  rm -rf "$TMP"
+  unset FERROFIN_ADOPTION_FIXTURES IMAGE ADOPTION_USER
 }
 
 # A smoke output in the real format: "status  metric  path".
@@ -128,28 +126,47 @@ boot_log() { # boot_log <file> <generation> [extra-line…]
 {"fields":{"message":"scheduled task started"}}
 EOS
   run adoption_second_boot_repairs second.log
+  [ "$status" -eq 0 ]
   [ -z "$output" ]
   echo '{"fields":{"message":"imported playlist/collection/version membership from Data JSON","rows":2850}}' >> second.log
   run adoption_second_boot_repairs second.log
+  [ "$status" -eq 0 ]
   [[ "$output" == *"imported playlist/collection/version membership"* ]]
 }
 
 @test "second_boot_repairs: promotions are work even when repaired is zero" {
   echo '{"fields": {"message": "repaired alternate-version primaries from LinkedChildren", "repaired": 0, "promoted": 1}}' > second.log
   run adoption_second_boot_repairs second.log
+  [ "$status" -eq 0 ]
   [[ "$output" == *'repaired alternate-version primaries'* ]]
 }
 
 @test "second_boot_repairs: all-zero counters are ignored regardless of their order" {
   echo '{"fields": {"promoted": 0, "message": "repaired alternate-version primaries from LinkedChildren", "repaired": 0}}' > second.log
   run adoption_second_boot_repairs second.log
+  [ "$status" -eq 0 ]
   [ -z "$output" ]
 }
 
 @test "second_boot_repairs: a repair without counters is still reported" {
   echo '{"fields":{"message":"repaired OwnerId relationships"}}' > second.log
   run adoption_second_boot_repairs second.log
+  [ "$status" -eq 0 ]
   [[ "$output" == *'repaired OwnerId relationships'* ]]
+}
+
+@test "second_boot_repairs: reports only the first repair that did work, ignoring log noise" {
+  cat > second.log <<'EOS'
+not a JSON log line
+{"fields":{"message":"scheduled task started","items":12}}
+{"fields":{"message":"repaired OwnerId relationships","repaired":0}}
+{"fields":{"message":"repaired OwnerId relationships","repaired":2}}
+{"fields":{"message":"backfilled other relationships","rows":3}}
+EOS
+  run adoption_second_boot_repairs second.log
+  [ "$status" -eq 0 ]
+  [ "${#lines[@]}" -eq 1 ]
+  [ "$output" = '{"fields":{"message":"repaired OwnerId relationships","repaired":2}}' ]
 }
 
 # --- credentials ----------------------------------------------------------------------
@@ -237,7 +254,7 @@ EOS
 
 @test "build-fixtures.sh: refuses a snapshot that is not a 10.11.8 database" {
   mkdir -p fixtures/jellyfin-10.11.8/data
-  sqlite3 fixtures/jellyfin-10.11.8/data/jellyfin.db 'CREATE TABLE __EFMigrationsHistory (MigrationId TEXT, ProductVersion TEXT); INSERT INTO __EFMigrationsHistory VALUES ("a","1"),("b","1"),("c","1");'
+  sqlite3 fixtures/jellyfin-10.11.8/data/jellyfin.db "CREATE TABLE __EFMigrationsHistory (MigrationId TEXT, ProductVersion TEXT); INSERT INTO __EFMigrationsHistory VALUES ('a','1'),('b','1'),('c','1');"
   run "$ADOPTION/build-fixtures.sh" --fixtures fixtures
   [ "$status" -eq 2 ]
   [[ "$output" == *"has 3 EF migration ids, a 10.11.8 database has 68"* ]]
