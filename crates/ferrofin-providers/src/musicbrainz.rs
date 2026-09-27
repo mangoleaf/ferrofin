@@ -17,9 +17,8 @@
 
 use std::time::Duration;
 
+use crate::rate_limit::RateLimiter;
 use serde::Deserialize;
-use tokio::sync::Mutex;
-use tokio::time::Instant;
 
 /// The default MusicBrainz web-service base.
 pub const DEFAULT_BASE_URL: &str = "https://musicbrainz.org";
@@ -335,8 +334,8 @@ pub struct MusicBrainzClient {
     /// `ReplaceArtistName`).
     plugin: crate::plugin_config::ConfigSource,
     user_agent: String,
-    /// Timestamp of the last request, for the rate limit.
-    last_request: Mutex<Option<Instant>>,
+    /// Request pacing and server-directed cooldown, shared by all callers.
+    limiter: RateLimiter,
 }
 
 impl std::fmt::Debug for MusicBrainzClient {
@@ -359,8 +358,8 @@ impl MusicBrainzClient {
             configured_base_url: (!base.is_empty()).then(|| base.to_owned()),
             plugin: crate::plugin_config::ConfigSource::new(),
             // MB requires contact info; the project URL satisfies the policy.
-            user_agent: format!("Ferrofin/{version} ( https://github.com/ )"),
-            last_request: Mutex::new(None),
+            user_agent: format!("Ferrofin/{version} ( https://github.com/mangoleaf/ferrofin )"),
+            limiter: RateLimiter::new("musicbrainz"),
         }
     }
 
@@ -393,19 +392,6 @@ impl MusicBrainzClient {
         cfg.normalized()
     }
 
-    /// Blocks until at least `interval` has elapsed since the previous request,
-    /// then records now — the ≤1 req/sec throttle, whose period is the
-    /// plugin's `RateLimit` (seconds between requests).
-    async fn throttle(&self, interval: std::time::Duration) {
-        let mut last = self.last_request.lock().await;
-        if let Some(prev) = *last
-            && let Some(wait) = interval.checked_sub(prev.elapsed())
-        {
-            tokio::time::sleep(wait).await;
-        }
-        *last = Some(Instant::now());
-    }
-
     /// `RateLimit` seconds as a `Duration`.
     ///
     /// A negative or non-finite value (only reachable by hand-editing
@@ -414,58 +400,44 @@ impl MusicBrainzClient {
     /// published MusicBrainz policy floor. Falling back to *zero* there would
     /// turn a typo into an unthrottled crawl of a public service.
     fn interval(rate_limit: f64) -> Duration {
-        if rate_limit.is_finite() && rate_limit > 0.0 {
-            Duration::from_secs_f64(rate_limit)
+        if rate_limit > 0.0 {
+            Duration::try_from_secs_f64(rate_limit)
+                .unwrap_or(MIN_INTERVAL)
+                .min(Duration::from_secs(u64::from(u32::MAX)))
         } else {
             MIN_INTERVAL
         }
     }
 
-    /// GETs `path?{query}&fmt=json` as an authenticated (User-Agent) MB call,
-    /// returning the parsed body or `None` on any failure. Throttled.
-    ///
-    /// Every failure is LOGGED before it is swallowed. musicbrainz.org
-    /// rate-limits at roughly one request per second per IP and answers `503`
-    /// when it is exceeded; returning a silent `None` makes that
-    /// indistinguishable from "no such release" in the Identify dialog. C#
-    /// surfaces the same failures — `ProviderManager` catches the MetaBrainz
-    /// `HttpError` and logs `Provider {ProviderName} failed to retrieve search
-    /// results` (v10.11.8 `MediaBrowser.Providers/Manager/ProviderManager.cs`).
+    fn request_interval(server: &str, rate_limit: f64) -> Duration {
+        let interval = Self::interval(rate_limit);
+        let official = reqwest::Url::parse(server).is_ok_and(|url| {
+            url.host_str()
+                .is_some_and(|host| host == "musicbrainz.org" || host.ends_with(".musicbrainz.org"))
+        });
+        if official {
+            interval.max(MIN_INTERVAL)
+        } else {
+            interval
+        }
+    }
+
+    /// Resolves metadata through the shared provider limiter.
     async fn get<T: for<'de> Deserialize<'de>>(
         &self,
         path: &str,
         query: &[(&str, String)],
     ) -> Option<T> {
         let cfg = self.settings().await;
-        self.throttle(Self::interval(cfg.rate_limit)).await;
-        let mut q: Vec<(&str, String)> = vec![("fmt", "json".to_owned())];
-        q.extend(query.iter().cloned());
-        let resp = match self
+        let request = self
             .http
             .get(format!("{}{path}", cfg.server))
             .header(reqwest::header::USER_AGENT, &self.user_agent)
-            .query(&q)
-            .send()
+            .query(&[("fmt", "json")])
+            .query(query);
+        self.limiter
+            .get_json(request, Self::request_interval(&cfg.server, cfg.rate_limit))
             .await
-        {
-            Ok(resp) => resp,
-            Err(error) => {
-                tracing::warn!(%path, %error, "MusicBrainz request failed");
-                return None;
-            }
-        };
-        let status = resp.status();
-        if !status.is_success() {
-            tracing::warn!(%path, %status, "MusicBrainz request rejected");
-            return None;
-        }
-        match resp.json().await {
-            Ok(body) => Some(body),
-            Err(error) => {
-                tracing::warn!(%path, %error, "MusicBrainz response could not be parsed");
-                None
-            }
-        }
     }
 
     /// Resolves an artist's `MusicBrainzArtist` id by name, or `None`. Port of
@@ -731,7 +703,7 @@ fn lucene_escape(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-
+    use super::*;
     #[test]
     fn partial_dates_default_the_missing_parts_to_the_first() {
         assert_eq!(
@@ -776,7 +748,23 @@ mod tests {
             Some("1997-06-16T00:00:00+00:00".to_owned())
         );
     }
-    use super::*;
+
+    #[test]
+    fn official_host_interval_floor() {
+        assert_eq!(MusicBrainzClient::interval(f64::MAX), MIN_INTERVAL);
+        assert_eq!(MusicBrainzClient::interval(f64::NAN), MIN_INTERVAL);
+        for url in [
+            "https://musicbrainz.org",
+            "http://MUSICBRAINZ.ORG:80/",
+            "https://www.musicbrainz.org",
+        ] {
+            assert_eq!(MusicBrainzClient::request_interval(url, 0.01), MIN_INTERVAL);
+        }
+        assert_eq!(
+            MusicBrainzClient::request_interval("http://localhost", 0.1),
+            Duration::from_millis(100)
+        );
+    }
 
     #[test]
     fn artist_query_uses_accent_field_for_non_ascii() {

@@ -20,6 +20,7 @@
 //!   `absolute`, …). The episode lookup takes a `season_type`, defaulting to
 //!   `official`; season 0 is specials.
 
+use crate::rate_limit::{LimitedRequest as _, RateLimiter};
 use std::sync::Mutex;
 
 use ferrofin_model::entities::ImageType;
@@ -332,6 +333,7 @@ struct PersonExtendedWire {
 /// bearer token.
 pub struct TvdbClient {
     http: reqwest::Client,
+    limiter: RateLimiter,
     api_key: SecretString,
     pin: Option<String>,
     token: Mutex<Option<String>>,
@@ -371,6 +373,7 @@ impl TvdbClient {
         };
         Self {
             http: reqwest::Client::new(),
+            limiter: RateLimiter::new("tvdb"),
             api_key: SecretString::from(key.to_owned()),
             pin: (!pin.is_empty()).then(|| pin.to_owned()),
             token: Mutex::new(None),
@@ -412,7 +415,7 @@ impl TvdbClient {
             .http
             .post(format!("{}/login", self.base_url))
             .json(&body)
-            .send()
+            .send_limited(&self.limiter)
             .await
             .ok()?;
         let env: Envelope<LoginData> = resp.json().await.ok()?;
@@ -436,7 +439,7 @@ impl TvdbClient {
             .get(format!("{}{path}", self.base_url))
             .bearer_auth(token)
             .query(query)
-            .send()
+            .send_limited(&self.limiter)
             .await
             .ok()?;
         let env: Envelope<T> = resp.json().await.ok()?;
@@ -579,7 +582,7 @@ impl TvdbClient {
 
     /// Downloads an image by absolute URL, returning its bytes.
     pub async fn download(&self, url: &str) -> Option<Vec<u8>> {
-        let resp = self.http.get(url).send().await.ok()?;
+        let resp = crate::image_download::send(&self.http, url).await.ok()?;
         resp.bytes().await.ok().map(|b| b.to_vec())
     }
 }

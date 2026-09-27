@@ -2,24 +2,16 @@
 //! `MediaBrowser.Providers/Plugins/ListenBrainz`.
 //!
 //! The Labs API answers "which artists are similar to this one" from aggregated
-//! listening sessions, keyed by MusicBrainz artist id. Keyless, but rate-limited
-//! to one request a second against the public server — a limit the client
-//! enforces itself, and which cannot be lowered while the default server is in
-//! use (upstream's own clamp).
+//! listening sessions, keyed by MusicBrainz artist id. Requests use server quota
+//! headers when available, with a one-second minimum for the public Labs server.
 
-use std::sync::Arc;
+use crate::rate_limit::RateLimiter;
 use std::time::Duration;
 
 use serde::Deserialize;
-use tokio::sync::Mutex;
-use tokio::time::Instant;
 
 /// The default Labs API server (C# `PluginConfiguration.DefaultLabsServer`).
 pub const DEFAULT_LABS_SERVER: &str = "https://labs.api.listenbrainz.org";
-
-/// The default (and minimum, against the public server) seconds between
-/// requests — C# `PluginConfiguration.DefaultRateLimit`.
-pub const DEFAULT_RATE_LIMIT_SECONDS: f64 = 1.0;
 
 /// The default number of days a similar-artist result is cached
 /// (C# `PluginConfiguration.SimilarItemsCacheDays`).
@@ -78,9 +70,8 @@ pub struct ListenBrainzConfig {
     pub labs_server: String,
     /// The similarity algorithm to request.
     pub algorithm: SimilarityAlgorithm,
-    /// Seconds between requests. A value below [`DEFAULT_RATE_LIMIT_SECONDS`]
-    /// is ignored while the default server is in use, exactly as upstream's
-    /// setter clamps it.
+    /// Minimum request spacing in seconds; defaults to one. The public Labs
+    /// server always retains at least one second, even without quota headers.
     pub rate_limit_seconds: f64,
     /// How many days a result may be cached; `0` disables caching.
     pub cache_days: i64,
@@ -91,7 +82,7 @@ impl Default for ListenBrainzConfig {
         Self {
             labs_server: DEFAULT_LABS_SERVER.to_owned(),
             algorithm: SimilarityAlgorithm::default(),
-            rate_limit_seconds: DEFAULT_RATE_LIMIT_SECONDS,
+            rate_limit_seconds: 1.0,
             cache_days: DEFAULT_CACHE_DAYS,
         }
     }
@@ -110,13 +101,17 @@ impl ListenBrainzConfig {
         }
     }
 
-    /// The effective rate limit. The public server's floor cannot be lowered.
-    #[must_use]
-    pub fn effective_rate_limit(&self) -> f64 {
-        if self.server() == DEFAULT_LABS_SERVER {
-            self.rate_limit_seconds.max(DEFAULT_RATE_LIMIT_SECONDS)
+    fn request_interval(&self) -> Duration {
+        let interval = Duration::try_from_secs_f64(self.rate_limit_seconds)
+            .unwrap_or(Duration::from_secs(1))
+            .min(Duration::from_secs(u64::from(u32::MAX)));
+        if reqwest::Url::parse(self.server()).is_ok_and(|url| {
+            url.host_str()
+                .is_some_and(|host| host.eq_ignore_ascii_case("labs.api.listenbrainz.org"))
+        }) {
+            interval.max(Duration::from_secs(1))
         } else {
-            self.rate_limit_seconds.max(0.0)
+            interval
         }
     }
 }
@@ -125,10 +120,8 @@ impl ListenBrainzConfig {
 #[derive(Debug, Clone)]
 pub struct ListenBrainzClient {
     http: reqwest::Client,
+    limiter: RateLimiter,
     config: ListenBrainzConfig,
-    /// The last request's completion time, guarding the rate limit. C# uses a
-    /// `SemaphoreSlim` for the same job.
-    last_request: Arc<Mutex<Option<Instant>>>,
 }
 
 impl Default for ListenBrainzClient {
@@ -143,8 +136,8 @@ impl ListenBrainzClient {
     pub fn new(config: ListenBrainzConfig) -> Self {
         Self {
             http: reqwest::Client::new(),
+            limiter: RateLimiter::new("listenbrainz"),
             config,
-            last_request: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -167,26 +160,24 @@ impl ListenBrainzClient {
         if mbid.is_empty() {
             return Vec::new();
         }
-        self.enforce_rate_limit().await;
         let url = format!("{}/similar-artists/json", self.config.server());
+        let request = self.http.get(&url).query(&[
+            ("artist_mbids", mbid),
+            ("algorithm", self.config.algorithm.as_api_string()),
+        ]);
         let resp = match self
-            .http
-            .get(&url)
-            .query(&[
-                ("artist_mbids", mbid),
-                ("algorithm", self.config.algorithm.as_api_string()),
-            ])
-            .send()
+            .limiter
+            .send_request(request, self.config.request_interval())
             .await
         {
             Ok(resp) => resp,
             Err(err) => {
-                tracing::warn!(provider = "listenbrainz", %err, "similar-artist request failed");
+                tracing::debug!(provider = "listenbrainz", %err, "similar-artist request failed");
                 return Vec::new();
             }
         };
         if !resp.status().is_success() {
-            tracing::warn!(
+            tracing::debug!(
                 provider = "listenbrainz",
                 status = %resp.status(),
                 "similar-artist request returned non-success"
@@ -207,19 +198,6 @@ impl ListenBrainzClient {
             .filter(|id| !id.eq_ignore_ascii_case(mbid))
             .collect()
     }
-
-    /// Waits out the configured gap since the previous request.
-    async fn enforce_rate_limit(&self) {
-        let gap = Duration::from_secs_f64(self.config.effective_rate_limit());
-        let mut last = self.last_request.lock().await;
-        if let Some(previous) = *last {
-            let elapsed = previous.elapsed();
-            if let Some(remaining) = gap.checked_sub(elapsed) {
-                tokio::time::sleep(remaining).await;
-            }
-        }
-        *last = Some(Instant::now());
-    }
 }
 
 /// One entry of the Labs `similar-artists` response.
@@ -235,25 +213,6 @@ struct SimilarArtist {
 mod tests {
     use super::*;
     use crate::mock_http::MockServer;
-
-    #[test]
-    fn the_public_servers_rate_limit_floor_cannot_be_lowered() {
-        // Upstream's setter refuses a sub-second limit against its own server.
-        let config = ListenBrainzConfig {
-            rate_limit_seconds: 0.1,
-            ..ListenBrainzConfig::default()
-        };
-        assert!((config.effective_rate_limit() - 1.0).abs() < f64::EPSILON);
-
-        // A self-hosted mirror may be hit as fast as the operator likes.
-        let mirror = ListenBrainzConfig {
-            labs_server: "https://labs.example.org/".to_owned(),
-            rate_limit_seconds: 0.1,
-            ..ListenBrainzConfig::default()
-        };
-        assert_eq!(mirror.server(), "https://labs.example.org");
-        assert!((mirror.effective_rate_limit() - 0.1).abs() < f64::EPSILON);
-    }
 
     #[test]
     fn an_empty_server_falls_back_to_the_default() {
@@ -308,7 +267,6 @@ mod tests {
         let server = MockServer::start(vec![("/similar-artists", body.to_owned())]).await;
         let client = ListenBrainzClient::new(ListenBrainzConfig {
             labs_server: server.base_url.clone(),
-            rate_limit_seconds: 0.0,
             ..ListenBrainzConfig::default()
         });
         let similar = client.similar_artists("seed").await;
@@ -323,10 +281,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn labs_retains_default_spacing_without_headers_and_honors_quota() {
+        let body = r#"[{"artist_mbid":"other","score":1}]"#;
+        let open = MockServer::always(body).await;
+        let client = ListenBrainzClient::new(ListenBrainzConfig {
+            labs_server: open.base_url.clone(),
+            ..ListenBrainzConfig::default()
+        });
+        let started = tokio::time::Instant::now();
+        assert_eq!(client.similar_artists("seed").await, ["other"]);
+        assert_eq!(client.clone().similar_artists("seed").await, ["other"]);
+        assert!(
+            started.elapsed() >= Duration::from_secs(1),
+            "clones must share the one-second pacing gate without response headers"
+        );
+        let limited = MockServer::with_headers(
+            vec![("/", body.to_owned())],
+            "X-RateLimit-Remaining: 0\r\nX-RateLimit-Reset-In: 120\r\n",
+        )
+        .await;
+        let client = ListenBrainzClient::new(ListenBrainzConfig {
+            labs_server: limited.base_url.clone(),
+            ..ListenBrainzConfig::default()
+        });
+        assert_eq!(client.similar_artists("seed").await, ["other"]);
+        assert!(client.similar_artists("seed").await.is_empty());
+    }
+
+    #[test]
+    fn public_labs_minimum_cannot_be_disabled() {
+        for value in [0.0, 0.1, -1.0, f64::NAN, f64::INFINITY] {
+            let config = ListenBrainzConfig {
+                rate_limit_seconds: value,
+                ..Default::default()
+            };
+            assert_eq!(config.request_interval(), Duration::from_secs(1));
+        }
+        let mirror = ListenBrainzConfig {
+            labs_server: "https://labs.example.org".to_owned(),
+            rate_limit_seconds: 0.0,
+            ..Default::default()
+        };
+        assert_eq!(mirror.request_interval(), Duration::ZERO);
+    }
+
+    #[tokio::test]
     async fn an_empty_mbid_is_never_looked_up() {
         let client = ListenBrainzClient::new(ListenBrainzConfig {
             labs_server: "http://127.0.0.1:1".to_owned(),
-            rate_limit_seconds: 0.0,
             ..ListenBrainzConfig::default()
         });
         assert!(client.similar_artists("  ").await.is_empty());

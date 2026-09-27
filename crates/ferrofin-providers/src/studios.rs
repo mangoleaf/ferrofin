@@ -17,6 +17,7 @@
 //! network failure, yields no image rather than an error — exactly like the
 //! upstream provider returning `null`.
 
+use crate::rate_limit::{LimitedRequest as _, RateLimiter};
 use std::sync::{Arc, Mutex};
 
 use ferrofin_traits::plugins::PluginManager;
@@ -35,6 +36,7 @@ pub const PROVIDER_NAME: &str = "Artwork Repository";
 /// holds a process-lifetime cache of the repository manifest.
 pub struct StudiosClient {
     http: reqwest::Client,
+    limiter: RateLimiter,
     /// The operator's explicit repository override (`FERROFIN_STUDIOS_REPO_URL`
     /// / config `studios_repo_url`), trailing slashes trimmed. `None` when the
     /// operator set nothing, which is when the dashboard's `RepositoryUrl`
@@ -85,6 +87,7 @@ impl StudiosClient {
         let trimmed = repo_url.trim_end_matches('/');
         Self {
             http: reqwest::Client::new(),
+            limiter: RateLimiter::new("studios"),
             configured_repo_url: (!trimmed.is_empty()).then(|| trimmed.to_owned()),
             plugin: ConfigSource::new(),
             manifest: Mutex::new(None),
@@ -140,7 +143,7 @@ impl StudiosClient {
             return cached.clone();
         }
         let url = format!("{repo_url}/thumbs.txt");
-        let list = match self.http.get(&url).send().await {
+        let list = match self.http.get(&url).send_limited(&self.limiter).await {
             Ok(resp) => match resp.text().await {
                 Ok(body) => body
                     .lines()
@@ -154,7 +157,7 @@ impl StudiosClient {
                 }
             },
             Err(e) => {
-                tracing::warn!(url, error = %e, "studios: manifest fetch failed");
+                tracing::debug!(error = %e, "studios: manifest fetch failed");
                 Vec::new()
             }
         };
@@ -180,7 +183,7 @@ impl StudiosClient {
     /// Downloads `url`, returning its bytes; `None` on any failure
     /// (best-effort, like the metadata clients' image downloads).
     pub async fn download(&self, url: &str) -> Option<Vec<u8>> {
-        let resp = self.http.get(url).send().await.ok()?;
+        let resp = crate::image_download::send(&self.http, url).await.ok()?;
         if !resp.status().is_success() {
             return None;
         }

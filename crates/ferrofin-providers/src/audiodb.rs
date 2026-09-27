@@ -9,6 +9,7 @@
 //! - artist: `GET /artist-mb.php?i={musicbrainz_artist_id}`
 //! - album:  `GET /album-mb.php?i={musicbrainz_release_group_id}`
 
+use crate::rate_limit::{LimitedRequest as _, RateLimiter};
 use ferrofin_model::entities::ImageType;
 use serde::Deserialize;
 
@@ -99,6 +100,7 @@ struct AlbumWire {
 #[derive(Debug)]
 pub struct AudioDbClient {
     http: reqwest::Client,
+    limiter: RateLimiter,
     base_url: String,
     /// The AudioDB plugin's dashboard settings (`ReplaceAlbumName`).
     plugin: crate::plugin_config::ConfigSource,
@@ -116,6 +118,7 @@ impl AudioDbClient {
     pub fn new() -> Self {
         Self {
             http: reqwest::Client::new(),
+            limiter: RateLimiter::new("audiodb"),
             base_url: API_BASE.to_owned(),
             plugin: crate::plugin_config::ConfigSource::new(),
         }
@@ -135,6 +138,7 @@ impl AudioDbClient {
     pub(crate) fn with_base_url(base_url: &str) -> Self {
         Self {
             http: reqwest::Client::new(),
+            limiter: RateLimiter::new("audiodb"),
             base_url: base_url.to_owned(),
             plugin: crate::plugin_config::ConfigSource::new(),
         }
@@ -145,7 +149,7 @@ impl AudioDbClient {
             .http
             .get(format!("{}{path}", self.base_url))
             .query(&[("i", mb_id)])
-            .send()
+            .send_limited(&self.limiter)
             .await
             .ok()?;
         if !resp.status().is_success() {
@@ -335,5 +339,34 @@ mod tests {
         let a = a.expect("artist");
         assert!(a.biography.is_some());
         assert!(!a.images.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod quota_tests {
+    use super::*;
+    use crate::mock_http::MockServer;
+
+    #[tokio::test]
+    async fn api_quota_blocks_its_own_client_without_blocking_another_provider() {
+        let server = MockServer::with_headers(
+            vec![("/", "{}".to_owned())],
+            "X-RateLimit-Remaining: 0\r\nX-RateLimit-Reset-In: 120\r\n",
+        )
+        .await;
+        let client = AudioDbClient::with_base_url(&server.base_url);
+        let first: Option<serde_json::Value> = client.fetch("/artist-mb.php", "id").await;
+        assert!(first.is_some());
+        let second: Option<serde_json::Value> = client.fetch("/artist-mb.php", "id").await;
+        assert!(second.is_none());
+        // An independently constructed provider can use the same test origin.
+        let other = RateLimiter::new("fanart");
+        assert!(
+            reqwest::Client::new()
+                .get(&server.base_url)
+                .send_limited(&other)
+                .await
+                .is_ok()
+        );
     }
 }

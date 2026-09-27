@@ -11,6 +11,33 @@
 //! an extensionless URL is stored as a PNG, and a URL that answers JSON is
 //! refused instead of being written into the library as artwork.
 
+use crate::rate_limit::{LimitedRequest as _, RateLimiter, RequestError};
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+
+/// Image/CDN quotas are independent of metadata API quotas. Share a gate by
+/// origin across download callers, never one gate across unrelated hosts.
+pub(crate) fn limiter_for(url: &str) -> RateLimiter {
+    static LIMITERS: OnceLock<Mutex<HashMap<String, RateLimiter>>> = OnceLock::new();
+    let origin = reqwest::Url::parse(url)
+        .map(|url| url.origin().ascii_serialization())
+        .unwrap_or_default();
+    LIMITERS
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(origin)
+        .or_insert_with_key(|origin| RateLimiter::new(origin.clone()))
+        .clone()
+}
+
+pub(crate) async fn send(
+    http: &reqwest::Client,
+    url: &str,
+) -> Result<reqwest::Response, RequestError> {
+    http.get(url).send_limited(&limiter_for(url)).await
+}
+
 use ferrofin_model::net::mime_types;
 
 /// GETs `url` and returns its bytes plus the media type resolved the way the
@@ -27,7 +54,7 @@ use ferrofin_model::net::mime_types;
 /// turns that into its own error. The media type is NOT validated here; see
 /// [`reject_non_image`].
 pub(crate) async fn download_image(http: &reqwest::Client, url: &str) -> Option<(Vec<u8>, String)> {
-    let resp = http.get(url).send().await.ok()?;
+    let resp = send(http, url).await.ok()?;
     if !resp.status().is_success() {
         return None;
     }
@@ -101,5 +128,28 @@ mod tests {
         // The bug this guards: a URL that answers JSON used to be stored as the
         // item's artwork and served back as `image/jpeg`.
         assert!(non_image_reason("text/html").is_some());
+    }
+}
+
+#[cfg(test)]
+mod quota_tests {
+    use super::*;
+    use crate::mock_http::MockServer;
+
+    #[tokio::test]
+    async fn downloads_share_origin_cooldowns_but_not_other_hosts() {
+        let blocked = MockServer::with_headers(
+            vec![("/", "image".to_owned())],
+            "X-RateLimit-Remaining: 0\r\nX-RateLimit-Reset-In: 120\r\n",
+        )
+        .await;
+        let other = MockServer::always("image").await;
+        let http = reqwest::Client::new();
+        assert!(send(&http, &blocked.base_url).await.is_ok());
+        assert!(matches!(
+            send(&http, &format!("{}/another-cover", blocked.base_url)).await,
+            Err(RequestError::Cooldown)
+        ));
+        assert!(send(&http, &other.base_url).await.is_ok());
     }
 }

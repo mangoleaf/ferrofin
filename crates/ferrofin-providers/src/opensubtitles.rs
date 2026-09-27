@@ -14,6 +14,7 @@
 //! account for a bearer token, `GET /subtitles` searches, and `POST /download`
 //! turns a `file_id` into a one-time download link whose body is the subtitle.
 
+use crate::rate_limit::{LimitedRequest as _, RateLimiter, RequestError};
 use std::sync::Arc;
 
 use crate::error::ProvidersError;
@@ -238,6 +239,7 @@ fn three_to_two_letter(code: &str) -> &str {
 /// The OpenSubtitles-backed subtitle provider.
 pub struct OpenSubtitlesProvider {
     http: reqwest::Client,
+    limiter: RateLimiter,
     plugins: Arc<dyn PluginManager>,
 }
 
@@ -254,6 +256,7 @@ impl OpenSubtitlesProvider {
     pub fn new(plugins: Arc<dyn PluginManager>) -> Self {
         Self {
             http: reqwest::Client::new(),
+            limiter: RateLimiter::new("opensubtitles"),
             plugins,
         }
     }
@@ -276,9 +279,9 @@ impl OpenSubtitlesProvider {
                 username: &cfg.username,
                 password: cfg.password.expose_secret(),
             })
-            .send()
+            .send_limited(&self.limiter)
             .await
-            .map_err(net_err)?;
+            .map_err(request_err)?;
         if !resp.status().is_success() {
             return Err(ServiceError::unauthorized(format!(
                 "OpenSubtitles login failed: HTTP {}",
@@ -307,6 +310,13 @@ impl OpenSubtitlesProvider {
 
 /// Maps a transport / response-decode error to a backend [`ServiceError`],
 /// preserving the underlying [`reqwest::Error`] as the source chain.
+fn request_err(error: RequestError) -> ServiceError {
+    match error {
+        RequestError::Http(error) => net_err(error),
+        other => ServiceError::backend(other.to_string()),
+    }
+}
+
 fn net_err(e: reqwest::Error) -> ServiceError {
     ProvidersError::http("OpenSubtitles request failed", e).into()
 }
@@ -372,9 +382,9 @@ impl SubtitleProvider for OpenSubtitlesProvider {
             .header(reqwest::header::USER_AGENT, USER_AGENT)
             .header(reqwest::header::ACCEPT, "application/json")
             .query(&query)
-            .send()
+            .send_limited(&self.limiter)
             .await
-            .map_err(net_err)?;
+            .map_err(request_err)?;
         if !resp.status().is_success() {
             return Err(ServiceError::backend(format!(
                 "OpenSubtitles search failed: HTTP {}",
@@ -419,9 +429,9 @@ impl SubtitleProvider for OpenSubtitlesProvider {
                 file_id,
                 sub_format: parsed.format.clone(),
             })
-            .send()
+            .send_limited(&self.limiter)
             .await
-            .map_err(net_err)?
+            .map_err(request_err)?
             .error_for_status()
             .map_err(net_err)?
             .json()
@@ -433,9 +443,9 @@ impl SubtitleProvider for OpenSubtitlesProvider {
             .http
             .get(&dl.link)
             .header(reqwest::header::USER_AGENT, USER_AGENT)
-            .send()
+            .send_limited(&crate::image_download::limiter_for(&dl.link))
             .await
-            .map_err(net_err)?
+            .map_err(request_err)?
             .error_for_status()
             .map_err(net_err)?
             .bytes()
@@ -455,6 +465,23 @@ impl SubtitleProvider for OpenSubtitlesProvider {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn limiter_transport_errors_preserve_the_reqwest_source() {
+        use std::error::Error as _;
+        let error = reqwest::Client::new()
+            .get("invalid URL")
+            .build()
+            .unwrap_err();
+        let error = super::request_err(super::RequestError::Http(error));
+        let mut source = error.source();
+        let mut found = false;
+        while let Some(error) = source {
+            found |= error.downcast_ref::<reqwest::Error>().is_some();
+            source = error.source();
+        }
+        assert!(found);
+    }
+
     use super::*;
 
     #[test]

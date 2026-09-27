@@ -70,6 +70,16 @@ Jellyfin `jellyfin.db` (root or `data/jellyfin.db`) found in the data dir — se
 | `FERROFIN_SHUTDOWN_TIMEOUT_SECS` | `30` | Seconds a graceful shutdown or in-process restart (`POST /System/Restart`, backup restore) waits for in-flight requests before aborting the remaining connections — ASP.NET's `ShutdownTimeout` default. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | none | Enable OTLP trace export to this endpoint (off by default). |
 
+## Provider request limits
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `FERROFIN_PROVIDER_TIMEOUT_SECONDS` | `20` | Default per-attempt HTTP timeout, clamped to 10–60 seconds. Explicit request timeouts take precedence. |
+| `FERROFIN_PROVIDER_MAX_WAIT_SECONDS` | `60` | Maximum pending pacing/quota wait before skipping a lookup, clamped to 30–300 seconds. Open circuits skip immediately until a probe is permitted. |
+
+These are read when provider limiters are constructed; restart to apply changes.
+See [provider rate limiting](PROVIDER_RATE_LIMITING.md) for retry and cooldown policy.
+
 ## Remote metadata provider keys
 
 Every remote provider is compiled in and enabled per library through the fetcher

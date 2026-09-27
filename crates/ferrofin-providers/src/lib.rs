@@ -32,6 +32,7 @@ pub mod opensubtitles;
 pub mod playlist_file;
 pub mod plugin_config;
 pub mod provider_manager;
+pub mod rate_limit;
 pub mod similarity;
 pub mod studios;
 pub mod tmdb;

@@ -8,6 +8,11 @@
 //! remote images ("Choose Image"), the external-id descriptor set, and the
 //! external-URL ("Links") table.
 
+/// Immutable album covers shared by multiple item image records. These assets
+/// are retained when references are removed, so concurrent scans/readers cannot
+/// lose a file while adopting it. Per-item uploads live outside this directory.
+pub const SHARED_ALBUM_ARTWORK_DIR: &str = "album-covers";
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -3083,6 +3088,11 @@ impl ProviderManager for LocalProviderManager {
             .delete_item_image(item_id, image_type, image_index)
             .await?;
         for path in paths {
+            if self.metadata_dir.as_ref().is_some_and(|root| {
+                std::path::Path::new(&path).starts_with(root.join(SHARED_ALBUM_ARTWORK_DIR))
+            }) {
+                continue;
+            }
             let _ = std::fs::remove_file(&path);
         }
         Ok(())
