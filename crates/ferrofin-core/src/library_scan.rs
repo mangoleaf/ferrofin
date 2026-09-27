@@ -1726,6 +1726,7 @@ impl LibraryScanner {
     /// file. Old assets are retained as a persistent cache, including on delete.
     fn shared_album_cover(&self, album: Uuid, image: &ItemImageInfo) -> Option<ItemImageInfo> {
         use sha2::{Digest as _, Sha256};
+        use std::fmt::Write as _;
         let root = self.metadata_dir.as_ref()?;
         let source = Path::new(&image.path);
         let dir = root
@@ -1735,7 +1736,10 @@ impl LibraryScanner {
             return Some(image.clone());
         }
         let bytes = std::fs::read(source).ok()?;
-        let digest = format!("{:x}", Sha256::digest(&bytes));
+        let mut digest = String::with_capacity(64);
+        for byte in Sha256::digest(&bytes) {
+            write!(digest, "{byte:02x}").ok()?;
+        }
         let ext = source.extension().and_then(|e| e.to_str()).unwrap_or("jpg");
         let dest = dir.join(format!("{digest}.{ext}"));
         std::fs::create_dir_all(&dir).ok()?;
@@ -10916,6 +10920,15 @@ mod tests {
         assert_eq!(album_images.len(), 1);
         assert_ne!(album_images[0].path, images[0].path);
         assert_eq!(std::fs::read(&album_images[0].path).unwrap(), b"COVER");
+        // Pin the content-addressed filename across digest crate upgrades.
+        assert_eq!(
+            std::path::Path::new(&album_images[0].path)
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "2864716a6e437019a72d7dada2f071b83b2113cf85005475a5d228b6a73cf54a.jpg"
+        );
 
         // A track with no image stream extracts nothing.
         let none = scanner
