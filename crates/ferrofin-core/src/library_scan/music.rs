@@ -1504,7 +1504,10 @@ impl LibraryScanner {
 
 #[cfg(test)]
 mod tests {
-    use super::{MusicKind, heals_from_children, ids_from_songs, restore_from_children, same_ids};
+    use super::{
+        MetadataResult, MusicKind, heals_from_children, ids_from_songs, restore_from_children,
+        same_ids, take_answer,
+    };
     use ferrofin_db::entities::base_items::BaseItemEntity;
     use ferrofin_model::entities::MetadataField;
     use std::collections::HashMap;
@@ -1605,5 +1608,33 @@ mod tests {
             !heals_from_children(MusicKind::ByNameArtist, &[]),
             "a by-name artist is not refreshed again by a scan"
         );
+    }
+
+    /// `MetadataServiceRefreshTests.RefreshWithProviders_ForeignProviderId_
+    /// ReplacedInLookupInfo`, over the scan's port of
+    /// `ExecuteRemoteProviders`' per-answer step ([`take_answer`], whose
+    /// lookup half is `MergeNewData`): the stored id cannot be a TMDB one, so
+    /// the provider that runs next is handed the id the one before it just
+    /// found instead of failing on the same bad one. A usable id already in
+    /// the lookup stays ("Don't replace existing Id's").
+    #[test]
+    fn refresh_with_providers_foreign_provider_id_replaced_in_lookup_info() {
+        let answering = MetadataResult {
+            provider_ids: pairs(&[("Tmdb", "12345")]),
+            ..MetadataResult::of(BaseItemEntity {
+                name: Some("Test Movie".into()),
+                ..BaseItemEntity::default()
+            })
+        };
+        let mut temp = MetadataResult::of(BaseItemEntity::default());
+
+        let mut lookup = pairs(&[("Tmdb", "nm0000123")]);
+        take_answer(&mut temp, &mut lookup, &answering);
+        // What the following provider reads: `info.GetProviderId(Tmdb)`.
+        assert_eq!(lookup, pairs(&[("Tmdb", "12345")]));
+
+        let mut usable = pairs(&[("Tmdb", "11")]);
+        take_answer(&mut temp, &mut usable, &answering);
+        assert_eq!(usable, pairs(&[("Tmdb", "11")]));
     }
 }

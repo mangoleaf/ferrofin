@@ -1,6 +1,8 @@
 //! `MergeData` cases. The upstream ones are transliterated from
-//! `tests/Jellyfin.Providers.Tests/Manager/MetadataServiceTests.cs` and
-//! `tests/Jellyfin.Model.Tests/Entities/ProviderIdsExtensionsTests.cs`
+//! `tests/Jellyfin.Providers.Tests/Manager/MetadataServiceTests.cs`,
+//! `tests/Jellyfin.Model.Tests/Entities/ProviderIdsExtensionsTests.cs` and
+//! the `RefreshWithProviders_*` cases of
+//! `tests/Jellyfin.Providers.Tests/Manager/MetadataServiceRefreshTests.cs`
 //! (upstream master `208c278b75`); their expected values are the oracle.
 //!
 //! Upstream's reflection helper `TestMergeBaseItemData` answers "did the
@@ -1301,6 +1303,221 @@ fn merge_refresh_runs_both_calls_by_the_rule() {
     assert_eq!(cleared.item.overview.as_deref(), Some("Mine"), "locked");
     assert_eq!(cleared.item.tagline, None, "not returned: cleared");
     assert_eq!(cleared.item.name.as_deref(), Some("Provider"));
+}
+
+// --- MetadataServiceRefreshTests.cs `RefreshWithProviders_*`, transliterated ---
+//
+// `RefreshWithProviders_ForeignProviderId_ReplacedInLookupInfo` exercises
+// `MergeNewData` (the lookup info handed to the next provider), which the
+// scan's music pass ports: its transliteration sits beside that port in
+// `ferrofin-core`'s `library_scan/music.rs`.
+
+/// What one provider's `GetMetadata` did.
+enum Answer {
+    /// It threw (`RefreshResult.Failures++`).
+    Threw,
+    /// `HasMetadata = true` with this result.
+    Found(Box<MetadataResult>),
+}
+
+/// A provider that answered with `result`.
+fn found(result: MetadataResult) -> Answer {
+    Answer::Found(Box::new(result))
+}
+
+/// A movie row carrying `name`.
+fn movie(name: &str) -> BaseItemEntity {
+    BaseItemEntity {
+        name: Some(name.into()),
+        ..item(BaseItemKind::Movie)
+    }
+}
+
+/// `RefreshWithProviders` (`MetadataService.cs:761-928`) as upstream's
+/// `TestMetadataService` drives it: a local provider, then the remote ones,
+/// then the merge onto `existing`. The provider loop is the harness; the
+/// rules under test are Ferrofin's — each answer taken into `temp` by
+/// [`merge_data`] (a local one with `mergeMetadataSettings`, a remote one
+/// without, both `replaceData = false`), then [`RefreshMerge::of`] and
+/// [`merge_refresh`]. Returns `RefreshResult.Failures` and the item.
+fn refresh_with_providers(
+    existing: MetadataResult,
+    options: &MetadataRefreshOptions,
+    local: Option<MetadataResult>,
+    remote: Vec<Answer>,
+) -> (usize, MetadataResult) {
+    let mut temp = MetadataResult::of(item(BaseItemKind::Movie));
+    let mut answers = RefreshAnswers::default();
+    if let Some(local) = local {
+        merge_data(&local, &mut temp, &[], false, true);
+        answers.any = true;
+    }
+    let mut failures = 0;
+    if options.replace_all_metadata
+        || matches!(
+            options.metadata_refresh_mode,
+            MetadataRefreshMode::Default | MetadataRefreshMode::FullRefresh
+        )
+    {
+        for answer in remote {
+            match answer {
+                Answer::Threw => failures += 1,
+                Answer::Found(result) => {
+                    merge_data(&result, &mut temp, &[], false, false);
+                    answers.remote = true;
+                    answers.any = true;
+                }
+            }
+        }
+    }
+    answers.failed = failures > 0;
+    // `if (refreshResult.UpdateType > ItemUpdateType.None)`: nothing
+    // answered, nothing merged.
+    if !answers.any {
+        return (failures, existing);
+    }
+    let locked = existing.locked_fields.clone();
+    let merged = merge_refresh(&existing, temp, &locked, RefreshMerge::of(options, answers));
+    (failures, merged)
+}
+
+/// "Replace all metadata" (or Identify): `FullRefresh` with
+/// `ReplaceAllMetadata` and, when `remove_old`, `RemoveOldMetadata`.
+fn replace_all(remove_old: bool) -> MetadataRefreshOptions {
+    MetadataRefreshOptions {
+        metadata_refresh_mode: MetadataRefreshMode::FullRefresh,
+        replace_all_metadata: true,
+        remove_old_metadata: remove_old,
+        ..MetadataRefreshOptions::default()
+    }
+}
+
+/// `RefreshWithProviders_ReplaceAllMetadata_ErasesOldDataWhenAProviderAnswers`
+/// (`[InlineData(false)]`, `[InlineData(true)]`): a provider failing does not
+/// downgrade a `RemoveOldMetadata` replace to a merge when another one
+/// answered — the old overview is erased.
+#[rstest]
+#[case(false)]
+#[case(true)]
+fn refresh_with_providers_replace_all_metadata_erases_old_data_when_a_provider_answers(
+    #[case] all_providers_succeed: bool,
+) {
+    let existing = MetadataResult::of(BaseItemEntity {
+        overview: Some("existing overview".into()),
+        ..movie("Test Movie")
+    });
+    let failing = if all_providers_succeed {
+        found(MetadataResult::of(item(BaseItemKind::Movie)))
+    } else {
+        Answer::Threw
+    };
+    let succeeding = found(MetadataResult::of(BaseItemEntity {
+        tagline: Some("new tagline".into()),
+        ..movie("Test Movie")
+    }));
+    let (failures, merged) = refresh_with_providers(
+        existing,
+        &replace_all(true),
+        None,
+        vec![failing, succeeding],
+    );
+    assert_eq!(failures, usize::from(!all_providers_succeed));
+    assert_eq!(merged.item.tagline.as_deref(), Some("new tagline"));
+    assert_eq!(merged.item.overview, None);
+}
+
+/// `RefreshWithProviders_ReplaceAllMetadata_KeepsExistingDataWhenEveryRemoteProviderFails`:
+/// only the local provider answered, so erasing the overview would lose it
+/// for good — it is kept, and the local answer still lands.
+#[test]
+fn refresh_with_providers_replace_all_metadata_keeps_existing_data_when_every_remote_provider_fails()
+ {
+    let existing = MetadataResult::of(BaseItemEntity {
+        overview: Some("existing overview".into()),
+        ..movie("Test Movie")
+    });
+    let local = MetadataResult::of(BaseItemEntity {
+        tagline: Some("new tagline".into()),
+        ..movie("Test Movie")
+    });
+    let (failures, merged) = refresh_with_providers(
+        existing,
+        &replace_all(true),
+        Some(local),
+        vec![Answer::Threw],
+    );
+    assert_eq!(failures, 1);
+    assert_eq!(merged.item.tagline.as_deref(), Some("new tagline"));
+    assert_eq!(merged.item.overview.as_deref(), Some("existing overview"));
+}
+
+/// `RefreshWithProviders_ForeignProviderId_NotStored`: an IMDb person id
+/// filed under `Tmdb` is dropped; the valid IMDb id is stored.
+#[test]
+fn refresh_with_providers_foreign_provider_id_not_stored() {
+    let answer = MetadataResult {
+        provider_ids: ids(&[("Tmdb", "nm0000123"), ("Imdb", "tt0113375")]),
+        ..MetadataResult::of(movie("Test Movie"))
+    };
+    let (_, merged) = refresh_with_providers(
+        MetadataResult::of(movie("Test Movie")),
+        &replace_all(false),
+        None,
+        vec![found(answer)],
+    );
+    assert!(
+        !merged
+            .provider_ids
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("Tmdb")),
+        "{:?}",
+        merged.provider_ids
+    );
+    assert_eq!(merged.provider_ids, ids(&[("Imdb", "tt0113375")]));
+}
+
+/// `RefreshWithProviders_ForeignPersonProviderId_NotStored`
+/// (`[InlineData(true)]`, `[InlineData(false)]` for `ReplaceAllMetadata`):
+/// the merged credit keeps no TMDB id that cannot be one.
+///
+/// Ferrofin's credit carries one person id, TMDB's, as a number, so
+/// upstream's `nm0000123` has no form here; the ids `IsValidProviderId(Tmdb,
+/// …)` rejects that it can hold stand in for it (`#[values]`: zero and
+/// `-11`, as in `IsValidProviderId_ChecksKnownFormats`, and one past
+/// `int.MaxValue`). The case's other half — the credit keeps its valid IMDb
+/// id — has no counterpart: a credit carries no IMDb id.
+#[rstest]
+#[case(true)]
+#[case(false)]
+fn refresh_with_providers_foreign_person_provider_id_not_stored(
+    #[case] replace_all_metadata: bool,
+    #[values(0, -11, i64::from(i32::MAX) + 1)] foreign_id: i64,
+) {
+    let actor = || PeopleEntity {
+        name: "Some Actor".into(),
+        person_type: Some("Actor".into()),
+        ..PeopleEntity::default()
+    };
+    let existing = MetadataResult {
+        people: Some(vec![actor()]),
+        ..MetadataResult::of(movie("Test Movie"))
+    };
+    let answer = MetadataResult {
+        people: Some(vec![PeopleEntity {
+            provider_id: Some(foreign_id),
+            ..actor()
+        }]),
+        ..MetadataResult::of(movie("Test Movie"))
+    };
+    let options = MetadataRefreshOptions {
+        replace_all_metadata,
+        ..replace_all(false)
+    };
+    let (_, merged) = refresh_with_providers(existing, &options, None, vec![found(answer)]);
+    let people = merged.people.expect("people");
+    assert_eq!(people.len(), 1, "{people:?}");
+    assert_eq!(people[0].name, "Some Actor");
+    assert_eq!(people[0].provider_id, None);
 }
 
 /// The sort key a refresh settles, by kind: a forced one wins, an episode, a

@@ -23,7 +23,8 @@
 //! And the Phase 5 refresh modes a folder refresh scans with (the dashboard's
 //! three choices, `ValidationOnly`, `None`): which providers run, how their
 //! answer merges onto a stored row carrying an edited and an empty field, and
-//! what is stamped and saved.
+//! what is stamped and saved — and that a locked item is left alone in every
+//! one of them.
 //!
 //! And Phase 5b: a file item's `POST /Items/{id}/Refresh` is the scan of its
 //! own path — the same decision, merge, locks, probe, NFO and providers,
@@ -1548,6 +1549,93 @@ async fn replace_all_metadata_keeps_the_row_when_every_provider_failed() {
         (Some("Kept".into()), Some(8.0), Some("Kept tagline".into()))
     );
     assert_eq!(fx.stamps(&fx.heat).await.1, stamped, "not stamped");
+}
+
+/// A movie row's `(Name, Overview, CommunityRating, Tagline, Data)`.
+type Metadata = (
+    Option<String>,
+    Option<String>,
+    Option<f64>,
+    Option<String>,
+    Option<String>,
+);
+
+/// A locked item (`LockData`) under each of the dashboard's three choices —
+/// "Scan for new and updated files", "Search for missing metadata" and
+/// "Replace all metadata": no remote metadata provider is asked for it, and
+/// its metadata stays exactly as it was — the edited overview, the emptied
+/// rating, the tagline no provider supplies and its `Data` (the trailers) —
+/// while the unlocked title beside it is refreshed (`CanRefreshMetadata`,
+/// `ProviderManager.cs:588-592`; `RefreshWithProviders` returns on
+/// `IsLocked`, `MetadataService.cs:785-788`). Its remote image providers
+/// run on an image full refresh only (`CanRefreshImages`,
+/// `ProviderManager.cs:438`).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_locked_item_keeps_its_metadata_and_asks_no_provider_in_every_mode() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let fx = edited_matrix(tmp.path()).await;
+    sqlx::query(r#"UPDATE "BaseItems" SET "IsLocked" = 1 WHERE "Id" = ?1"#)
+        .bind(Fixture::id(&fx.matrix))
+        .execute(fx.db.writer())
+        .await
+        .expect("lock");
+    let metadata = || async {
+        sqlx::query_as::<_, Metadata>(
+            r#"SELECT "Name", "Overview", "CommunityRating", "Tagline", "Data"
+               FROM "BaseItems" WHERE "Id" = ?1"#,
+        )
+        .bind(Fixture::id(&fx.matrix))
+        .fetch_one(fx.db.pool())
+        .await
+        .expect("row")
+    };
+    let before = metadata().await;
+    assert!(
+        before
+            .4
+            .as_deref()
+            .is_some_and(|data| data.contains("RemoteTrailers")),
+        "{before:?}"
+    );
+
+    for (mode, replace_all) in [
+        (MetadataRefreshMode::Default, false),
+        (MetadataRefreshMode::FullRefresh, false),
+        (MetadataRefreshMode::FullRefresh, true),
+    ] {
+        fx.scan_with(&item_refresh(mode, replace_all)).await;
+        let asked = fx.tmdb.take();
+        // TMDB's details (`append_to_response`) or a search by the title is
+        // the metadata provider; the bare `/movie/{id}` lookup is its image
+        // provider (`TmdbClient::images_by_id`).
+        let for_matrix = |line: &&String| line.contains("/movie/603?") || line.contains("Matrix");
+        assert!(
+            !asked
+                .iter()
+                .filter(for_matrix)
+                .any(|l| l.contains("append_to_response") || l.contains("/search/")),
+            "{mode:?}, replace all {replace_all}: no metadata asked for the locked item: \
+             {asked:?}"
+        );
+        assert_eq!(
+            asked.iter().filter(for_matrix).count(),
+            usize::from(mode == MetadataRefreshMode::FullRefresh),
+            "{mode:?}, replace all {replace_all}: its image provider runs on an image full \
+             refresh only: {asked:?}"
+        );
+        if mode == MetadataRefreshMode::FullRefresh {
+            assert!(
+                asked.iter().any(|l| l.contains("/movie/949?")),
+                "{mode:?}, replace all {replace_all}: the unlocked title is refreshed: {asked:?}"
+            );
+        }
+        assert_eq!(
+            metadata().await,
+            before,
+            "{mode:?}, replace all {replace_all}"
+        );
+        let _ = fx.probe.take();
+    }
 }
 
 /// `POST /Items/{id}/Refresh` on a file item, as the library manager queues

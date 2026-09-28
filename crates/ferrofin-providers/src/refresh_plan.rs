@@ -344,9 +344,14 @@ fn probe_changed(stored: &StoredState, fs: &FileFacts) -> Option<RefreshReason> 
         && !fs.is_shortcut
         && fs.is_file_protocol
         && !(is_video && fs.is_placeholder);
-    if is_video && fs.sidecars_changed {
+    // The external-file arms (`ProbeProvider.cs:151-179`) need
+    // `SupportsLocalMetadata` — for an item a library scan resolves, its
+    // `IsFileProtocol` (`BaseItem.cs:374-385`) — and, for a video, a real
+    // file rather than a disc placeholder (`!video.IsPlaceHolder`).
+    let supports_local_metadata = fs.is_file_protocol;
+    if is_video && supports_local_metadata && !fs.is_placeholder && fs.sidecars_changed {
         Some(RefreshReason::Sidecars)
-    } else if !is_video && fs.lyrics_changed {
+    } else if !is_video && supports_local_metadata && fs.lyrics_changed {
         Some(RefreshReason::Lyrics)
     } else if missing_media_info {
         Some(RefreshReason::MissingMediaInfo)

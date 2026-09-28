@@ -2,7 +2,10 @@
 //! `PLAN_SCAN_CHANGE_DETECTION`, the change monitors' edges, and the
 //! `MetadataServiceRefreshTests` cases (`tests/Jellyfin.Providers.Tests/
 //! Manager/MetadataServiceRefreshTests.cs`) that exercise the decision rather
-//! than the merge — their C# expected values are the oracle.
+//! than the merge — their C# expected values are the oracle. Its
+//! `RefreshWithProviders_*` cases exercise the merge and sit beside it
+//! (`metadata_merge/tests.rs`, and `ferrofin-core`'s `library_scan/music.rs`
+//! for the lookup-info one).
 
 use chrono::{DateTime, TimeDelta, TimeZone as _, Utc};
 use ferrofin_model::configuration::LibraryOptions;
@@ -328,6 +331,49 @@ fn a_changed_lyric_set_reprobes_audio_only() {
         ..video()
     };
     assert!(!plan(Some(&current()), &video_with_lyric_flag, &opts).probe);
+}
+
+/// The external-file arms' gates (`ProbeProvider.cs:151-179`): a changed
+/// sidecar set re-probes a video only when it `SupportsLocalMetadata` (a
+/// file path) and is no disc placeholder (`!video.IsPlaceHolder`); a changed
+/// lyric set re-probes audio only when it `SupportsLocalMetadata` —
+/// `IsPlaceHolder` is a `Video` property.
+#[rstest]
+#[case::video_file(ProbeKind::Video { file_or_iso: true }, true, false, true)]
+#[case::video_placeholder(ProbeKind::Video { file_or_iso: true }, true, true, false)]
+#[case::video_not_a_file(ProbeKind::Video { file_or_iso: true }, false, false, false)]
+#[case::audio_file(ProbeKind::Audio, true, false, true)]
+#[case::audio_placeholder_flag(ProbeKind::Audio, true, true, true)]
+#[case::audio_not_a_file(ProbeKind::Audio, false, false, false)]
+fn the_external_file_arms_need_local_metadata_support(
+    #[case] probe: ProbeKind,
+    #[case] is_file_protocol: bool,
+    #[case] is_placeholder: bool,
+    #[case] probes: bool,
+) {
+    let opts = MetadataRefreshOptions::default();
+    let fs = FileFacts {
+        probe,
+        is_file_protocol,
+        is_placeholder,
+        sidecars_changed: true,
+        lyrics_changed: true,
+        ..video()
+    };
+    let p = plan(Some(&current()), &fs, &opts);
+    assert_eq!(p.probe, probes);
+    let reason = match probe {
+        ProbeKind::Audio => RefreshReason::Lyrics,
+        _ => RefreshReason::Sidecars,
+    };
+    assert_eq!(
+        p.reason,
+        if probes {
+            reason
+        } else {
+            RefreshReason::Unchanged
+        }
+    );
 }
 
 #[test]

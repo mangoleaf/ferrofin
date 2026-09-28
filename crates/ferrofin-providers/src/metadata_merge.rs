@@ -772,13 +772,17 @@ fn merge_people_field(
     }
 }
 
-/// `RemoveInvalidProviderIds` over Ferrofin's one person id (the TMDB id).
+/// `RemoveInvalidProviderIds` over Ferrofin's one person id (the TMDB id):
+/// kept only when `IsValidProviderId(Tmdb, id)` holds — a positive number
+/// that fits an `int` ([`is_positive_number`]).
 fn remove_invalid_provider_ids(people: &[PeopleEntity]) -> Vec<PeopleEntity> {
     people
         .iter()
         .cloned()
         .map(|mut p| {
-            if p.provider_id.is_some_and(|id| id <= 0) {
+            if p.provider_id
+                .is_some_and(|id| !i32::try_from(id).is_ok_and(|id| id > 0))
+            {
                 p.provider_id = None;
             }
             p

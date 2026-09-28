@@ -18841,7 +18841,9 @@ mod tests {
     /// then given a stale cast — the state a library is left in by a scan that
     /// wrote the series' regulars onto every episode.
     ///
-    /// Returns everything a second scan needs, plus the episode's item id.
+    /// Returns everything a second scan needs — the item repository that lets
+    /// it read the stored rows, as the server's scanner does — plus the
+    /// episode's item id.
     async fn library_with_a_stale_episode_cast(
         tmp: &std::path::Path,
     ) -> (
@@ -18849,6 +18851,7 @@ mod tests {
         Arc<FerrofinItemPersistenceService>,
         Arc<crate::people_repository::FerrofinPeopleRepository>,
         uuid::Uuid,
+        Arc<dyn ferrofin_traits::persistence::ItemRepository>,
     ) {
         use ferrofin_db::entities::base_items::PeopleEntity;
         use ferrofin_traits::persistence::PeopleRepository as _;
@@ -18924,7 +18927,8 @@ mod tests {
             .unwrap();
         assert_eq!(episode_credit_count(&people, episode_id).await, 2);
 
-        (vf, persistence, people, episode_id)
+        let items = crate::test_support::item_repository_over(db);
+        (vf, persistence, people, episode_id, items)
     }
 
     /// The credits stored against an item, read back through the same
@@ -18953,7 +18957,7 @@ mod tests {
         let (base, _hits, _all) =
             spawn_tmdb_server(Some(SEASON_JSON), Some(r#"{"cast":[],"crew":[]}"#));
         let tmp = tempfile::tempdir().unwrap();
-        let (vf, persistence, people, episode_id) =
+        let (vf, persistence, people, episode_id, _items) =
             library_with_a_stale_episode_cast(tmp.path()).await;
 
         let tmdb = Arc::new(ferrofin_providers::TmdbClient::new().with_base_url(&base));
@@ -18973,25 +18977,35 @@ mod tests {
 
     // The dangerous direction: a credits request that FAILED must not read as
     // "this episode has no cast". TMDB answers 429 under exactly the load a
-    // first corrective scan of a large library generates, and the wipe would be
+    // corrective pass over a large library generates, and the wipe would be
     // permanent — the title and overview are written before the credits call,
     // so the re-scan gate skips that episode from then on.
+    //
+    // Since change detection, an unchanged item runs no provider on a Default
+    // scan, so the pass here is "Search for missing metadata", which runs
+    // every provider for every stored row.
     #[tokio::test]
     async fn a_failed_credits_request_does_not_wipe_a_stored_cast() {
         // Season text answers; `/credits` 500s.
-        let (base, _hits, _all) = spawn_tmdb_server(Some(SEASON_JSON), None);
+        let (base, hits, _all) = spawn_tmdb_server(Some(SEASON_JSON), None);
         let tmp = tempfile::tempdir().unwrap();
-        let (vf, persistence, people, episode_id) =
+        let (vf, persistence, people, episode_id, items) =
             library_with_a_stale_episode_cast(tmp.path()).await;
 
         let tmdb = Arc::new(ferrofin_providers::TmdbClient::new().with_base_url(&base));
         LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence)
+            .with_items(items)
             .with_metadata(tmdb, tmp.path().join("metadata"))
             .with_people(people.clone() as Arc<dyn ferrofin_traits::persistence::PeopleRepository>)
-            .scan(None)
+            .scan_with(None, &dashboard("missing"))
             .await
             .unwrap();
 
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the episode's TMDB pass ran: its season was fetched, then its credits"
+        );
         assert_eq!(
             episode_credit_count(&people, episode_id).await,
             2,
@@ -19002,19 +19016,21 @@ mod tests {
     // The other direction, and the reason the flag exists rather than always
     // writing: with no provider wired nothing was fetched, so the stored cast
     // is all anyone has. A network outage or an unticked fetcher must never
-    // wipe a library's credits.
+    // wipe a library's credits — not even on a pass that runs every provider.
     #[tokio::test]
     async fn stored_credits_survive_a_scan_that_fetched_nothing() {
         let tmp = tempfile::tempdir().unwrap();
-        let (vf, persistence, people, episode_id) =
+        let (vf, persistence, people, episode_id, items) =
             library_with_a_stale_episode_cast(tmp.path()).await;
 
-        LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence)
+        let outcome = LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence)
+            .with_items(items)
             .with_people(people.clone() as Arc<dyn ferrofin_traits::persistence::PeopleRepository>)
-            .scan(None)
+            .scan_with(None, &dashboard("missing"))
             .await
             .unwrap();
 
+        assert_eq!(outcome.updated, 3, "every item was refreshed: {outcome:?}");
         assert_eq!(episode_credit_count(&people, episode_id).await, 2);
     }
 
@@ -23367,9 +23383,6 @@ mod tests {
         );
     }
 
-    // A books library takes part in the deleted-item prune like any other; it
-    // used to be excluded, which would leave removed books in the library
-    // forever now that the scan produces them.
     /// A book's year the user cleared stays cleared: a Default rescan
     /// writes nothing back from the path, and neither does one that re-reads
     /// the book (its mtime moved) — upstream's `BeforeMetadataRefresh` never
@@ -23434,6 +23447,9 @@ mod tests {
         assert_eq!(year().await, None);
     }
 
+    // A books library takes part in the deleted-item prune like any other; it
+    // used to be excluded, which would leave removed books in the library
+    // forever now that the scan produces them.
     #[tokio::test]
     async fn books_library_prunes_deleted_items() {
         use ferrofin_model::data::BaseItemKind;
