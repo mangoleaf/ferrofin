@@ -97,8 +97,6 @@ struct WidthRefreshContext<'a> {
     item_id: Uuid,
     /// The item's on-disk media path.
     media_path: &'a str,
-    /// The item's stored video width in pixels, when probed.
-    video_width: Option<i64>,
     /// The item's video stream, when it has one recorded.
     ///
     /// Upstream reads `mediaSource.VideoStream`. It is what the hardware
@@ -228,9 +226,17 @@ impl FerrofinTrickplayManager {
         options: &TrickplayOptions,
     ) -> Result<(), ServiceError> {
         // The width has to be even, otherwise a lot of filters cannot sample it;
-        // a video narrower than the setting caps the width at the video's.
+        // a video narrower than the setting caps the width at the video's —
+        // its video STREAM's width (`mediaSource.VideoStream.Width`,
+        // `TrickplayManager.cs:427-431`), and only when it has one: the item
+        // row's `Width` is 0 for a probe that found no dimensions, which is
+        // "unknown", not a zero-pixel video.
         let mut actual_width = 2 * (width / 2);
-        if let Some(video_width) = ctx.video_width
+        if let Some(video_width) = ctx
+            .video_stream
+            .as_ref()
+            .and_then(|stream| stream.width)
+            .map(i64::from)
             && video_width < i64::from(width)
         {
             tracing::warn!(
@@ -645,7 +651,6 @@ impl TrickplayManager for FerrofinTrickplayManager {
         let ctx = WidthRefreshContext {
             item_id,
             media_path: &media_path,
-            video_width: entity.width,
             video_stream: self.video_stream(item_id).await,
             trickplay_dir: &trickplay_dir,
         };
@@ -1280,6 +1285,18 @@ mod tests {
 
     /// Writes a video stream row for `item`, the way a real scan would.
     async fn seed_video_stream(db: &Database, item: Uuid, codec: &str, dar: Option<&str>) {
+        seed_sized_video_stream(db, item, codec, dar, Some(1920)).await;
+    }
+
+    /// [`seed_video_stream`] with the stream's width (`None`: ffprobe gave
+    /// none).
+    async fn seed_sized_video_stream(
+        db: &Database,
+        item: Uuid,
+        codec: &str,
+        dar: Option<&str>,
+        width: Option<i64>,
+    ) {
         use ferrofin_traits::persistence::MediaStreamRepository as _;
         let repo = crate::FerrofinMediaStreamRepository::new(db.clone());
         let row = ferrofin_db::entities::base_items::MediaStreamInfoEntity {
@@ -1289,8 +1306,8 @@ mod tests {
                 ferrofin_model::entities::MediaStreamType::Video,
             ),
             codec: Some(codec.to_owned()),
-            width: Some(1920),
-            height: Some(1080),
+            width,
+            height: width.map(|_| 1080),
             aspect_ratio: dar.map(str::to_owned),
             ..Default::default()
         };
@@ -1545,7 +1562,9 @@ mod tests {
         let mut options = options_2x2(&[320]);
         options.interval = 100;
         let r = rig(&db, options, FakeExtractor::new(2, 112));
-        seed_video(&db, &r, item, Some(HOUR_TICKS), Some(201)).await;
+        // The cap is the video STREAM's width, not the item row's.
+        seed_video(&db, &r, item, Some(HOUR_TICKS), Some(1920)).await;
+        seed_sized_video_stream(&db, item, "h264", None, Some(201)).await;
 
         r.mgr
             .refresh_trickplay_data(item, false, &extraction_on())
@@ -1558,6 +1577,33 @@ mod tests {
         let row = &res[&200];
         assert_eq!(row.interval, 1000);
         assert_eq!(row.width, 200);
+    }
+
+    /// `if (mediaSource.VideoStream.Width is not null && … < width)`
+    /// (`TrickplayManager.cs:427-431`): a stream with no width, or no stream
+    /// at all, caps nothing — even when the item row's `Width` is the 0 a
+    /// dimensionless probe writes — so trickplay is still extracted at the
+    /// configured width.
+    #[rstest::rstest]
+    #[case::stream_without_width(true)]
+    #[case::no_stream(false)]
+    #[tokio::test]
+    async fn an_unknown_video_width_caps_nothing(#[case] with_stream: bool) {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        let r = rig(&db, options_2x2(&[320]), FakeExtractor::new(2, 180));
+        seed_video(&db, &r, item, Some(HOUR_TICKS), Some(0)).await;
+        if with_stream {
+            seed_sized_video_stream(&db, item, "h264", None, None).await;
+        }
+
+        r.mgr
+            .refresh_trickplay_data(item, false, &extraction_on())
+            .await
+            .expect("refresh");
+
+        assert_eq!(r.extractor.calls(), 1);
+        assert_eq!(r.extractor.last_request(), Some((10_000, 320)));
     }
 
     #[tokio::test]

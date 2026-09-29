@@ -961,6 +961,58 @@ async fn a_backfill_pass_keeps_the_nfo_and_writes_nothing_when_nothing_changed()
     assert_eq!(written(&db).await, Vec::<(String, i64)>::new());
 }
 
+/// `MergePeople` on the credits a scan saves (`MetadataService.cs:850,1003`,
+/// `:1429-1470`): the NFO's cast stands, and TMDB's answer only fills what
+/// the NFO left out — a role here — for the people it credits too. TMDB's
+/// other people are not added.
+#[tokio::test(flavor = "multi_thread")]
+async fn tmdb_credits_fill_the_nfo_cast_without_adding_to_it() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let media = tmp.path().join("movies");
+    let file = media
+        .join("The Matrix (1999)")
+        .join("The Matrix (1999).mkv");
+    std::fs::create_dir_all(file.parent().expect("dir")).expect("mkdir");
+    std::fs::write(&file, b"0123").expect("write");
+    std::fs::write(
+        file.with_extension("nfo"),
+        "<movie><title>The Matrix</title>\
+         <actor><name>Keanu Reeves</name></actor>\
+         <actor><name>Nfo Actor</name><role>Self</role></actor></movie>",
+    )
+    .expect("nfo");
+    let (base, _requests) = spawn_trailerless_tmdb_with(
+        r#"[{"id": 6384, "name": "keanu reeves", "character": "Neo"},
+            {"id": 2975, "name": "Laurence Fishburne", "character": "Morpheus"},
+            {"id": 7, "name": "Nfo Actor", "character": "Someone Else"}]"#,
+    );
+    let (db, scanner) = library(
+        tmp.path(),
+        &media,
+        CollectionTypeOptions::movies,
+        Some(&base),
+    )
+    .await;
+
+    assert_eq!(scanner.scan_all().await.expect("scan").created, 1);
+    let cast: Vec<(String, String)> = sqlx::query_as(
+        r#"SELECT p."Name", m."Role" FROM "PeopleBaseItemMap" m
+           JOIN "Peoples" p ON p."Id" = m."PeopleId"
+           WHERE m."ItemId" = ?1 ORDER BY m."ListOrder""#,
+    )
+    .bind(Fixture::id(&file))
+    .fetch_all(db.pool())
+    .await
+    .expect("cast");
+    assert_eq!(
+        cast,
+        [
+            ("Keanu Reeves".to_owned(), "Neo".to_owned()),
+            ("Nfo Actor".to_owned(), "Self".to_owned()),
+        ]
+    );
+}
+
 /// Local image validation on an unchanged item: a new or replaced
 /// `poster.jpg` is picked up and saved; a deleted one is removed.
 #[tokio::test(flavor = "multi_thread")]

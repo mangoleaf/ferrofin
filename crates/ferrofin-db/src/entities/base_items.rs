@@ -334,6 +334,12 @@ pub struct PeopleEntity {
     /// write path. Not a column; `#[sqlx(default)]` so reads ignore it.
     #[sqlx(default)]
     pub provider_id: Option<i64>,
+    /// The credit's sort order (`PersonInfo.SortOrder`: TMDB's billing
+    /// `order`, an NFO's `<sortorder>`), on the write path. Not a `Peoples`
+    /// column — `update_people` stores it as the credit's
+    /// `PeopleBaseItemMap.SortOrder`; `#[sqlx(default)]` so reads ignore it.
+    #[sqlx(default)]
+    pub sort_order: Option<i64>,
 }
 
 /// A row of the `PeopleBaseItemMap` table — a person's credited role on an item.

@@ -286,6 +286,46 @@ async fn a_locked_rows_metadata_and_data_survive_a_rescan() {
     assert_eq!(after.genres, before.genres);
 }
 
+/// `Video.UpdateFromResolvedItem` (`Video.cs:518-522`) runs on every
+/// existing item a scan resolves, whatever its lock: a locked row whose
+/// stored `VideoType` no longer matches its file takes the resolver's,
+/// saved once with the rest of its `Data` as it was, and the next scan
+/// writes nothing.
+#[tokio::test]
+async fn a_locked_rows_video_type_follows_the_resolver() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let media = tmp.path().join("movies");
+    let folder = media.join("The Matrix (1999)");
+    std::fs::create_dir_all(&folder).expect("mkdir");
+    let file = folder.join("The Matrix (1999).mkv");
+    std::fs::write(&file, b"").expect("write");
+    let fx = Fixture::new(tmp.path(), &media, CollectionTypeOptions::movies).await;
+    let scanner = fx.scanner();
+    scanner.scan_all().await.expect("first scan");
+    let id = fx.row(BaseItemKind::Movie, &file).await.id;
+    sqlx::query(
+        r#"UPDATE "BaseItems" SET "IsLocked" = 1,
+           "Data" = '{"VideoType":"Dvd","RemoteTrailers":[{"Url":"https://youtu.be/x"}]}'
+           WHERE "Id" = ?1"#,
+    )
+    .bind(&id)
+    .execute(fx.db.writer())
+    .await
+    .expect("lock");
+
+    assert_eq!(scanner.scan_all().await.expect("rescan").updated, 1);
+    let after = fx.row(BaseItemKind::Movie, &file).await;
+    assert!(after.is_locked);
+    assert_eq!(
+        after.data.as_deref(),
+        Some(r#"{"VideoType":"VideoFile","RemoteTrailers":[{"Url":"https://youtu.be/x"}]}"#)
+    );
+
+    let quiet = scanner.scan_all().await.expect("third scan");
+    assert_eq!((quiet.updated, quiet.unchanged), (0, 1), "{quiet:?}");
+    assert_eq!(fx.row(BaseItemKind::Movie, &file).await, after);
+}
+
 /// Owner decision D3: a folder's `DateModified` is its directory's mtime,
 /// stamped on every save, as upstream's `SaveInternal` does.
 #[tokio::test]
@@ -361,8 +401,10 @@ async fn an_albums_premiere_date_survives_a_rescan() {
 }
 
 /// The ProviderIds rule: an id that cannot belong to its provider (a stored
-/// `Tmdb` that is not a positive number) is dropped by the next save, while
-/// the valid ones stay.
+/// `Tmdb` that is not a positive number) is dropped by the next refresh that
+/// merges a provider result (`MetadataService.cs:1328-1336`), while the valid
+/// ones stay. An unchanged rescan merges nothing (no provider runs), so the
+/// id waits for it, as upstream's does.
 #[tokio::test]
 async fn a_rescan_drops_a_stored_provider_id_of_the_wrong_shape() {
     let tmp = tempfile::tempdir().expect("tmp");
@@ -383,8 +425,88 @@ async fn a_rescan_drops_a_stored_provider_id_of_the_wrong_shape() {
         .save_provider_id(id, "Imdb", "tt0133093")
         .await
         .expect("good id");
+    let ids = || async {
+        fx.persistence
+            .provider_ids_for_items(&[id])
+            .await
+            .expect("ids")
+            .remove(&id)
+            .unwrap_or_default()
+    };
 
+    scanner.scan_all().await.expect("unchanged rescan");
+    assert_eq!(ids().await.len(), 2, "nothing merged, nothing dropped");
+
+    // The NFO changes: its reader answers, and the pass merges.
+    let nfo = file.with_extension("nfo");
+    std::fs::write(&nfo, "<movie><title>The Matrix</title></movie>").expect("nfo");
+    std::fs::File::options()
+        .write(true)
+        .open(&nfo)
+        .expect("open")
+        .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(3_600))
+        .expect("mtime");
     scanner.scan_all().await.expect("rescan");
+    assert_eq!(ids().await, [("Imdb".to_owned(), "tt0133093".to_owned())]);
+}
+
+/// The pass's ids settle by its mode (`MetadataService.cs:1307-1336`, with
+/// `shouldReplace`): an NFO's `<uniqueid>` replaces the recorded id on
+/// "Scan for new and updated files" (its reader runs because the NFO
+/// changed) and "Replace all metadata", but "Search for missing metadata"
+/// only fills, so the recorded id stays.
+#[rstest::rstest]
+#[case::scan("scan", "999")]
+#[case::missing("missing", "603")]
+#[case::replace_all("replace", "999")]
+#[tokio::test]
+async fn an_nfo_id_replaces_the_recorded_one_except_when_filling(
+    #[case] choice: &str,
+    #[case] expected: &str,
+) {
+    use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions};
+    let tmp = tempfile::tempdir().expect("tmp");
+    let media = tmp.path().join("movies");
+    let folder = media.join("The Matrix (1999)");
+    std::fs::create_dir_all(&folder).expect("mkdir");
+    let file = folder.join("The Matrix (1999).mkv");
+    std::fs::write(&file, b"").expect("write");
+    let fx = Fixture::new(tmp.path(), &media, CollectionTypeOptions::movies).await;
+    let scanner = fx.scanner();
+    scanner.scan_all().await.expect("first scan");
+    let id = derive_item_id(BaseItemKind::Movie, &file.to_string_lossy()).expect("id");
+    fx.persistence
+        .save_provider_id(id, "Tmdb", "603")
+        .await
+        .expect("recorded id");
+    let nfo = file.with_extension("nfo");
+    std::fs::write(
+        &nfo,
+        r#"<movie><title>The Matrix</title><uniqueid type="tmdb">999</uniqueid></movie>"#,
+    )
+    .expect("nfo");
+    std::fs::File::options()
+        .write(true)
+        .open(&nfo)
+        .expect("open")
+        .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(3_600))
+        .expect("mtime");
+    let full = |replace_all| {
+        MetadataRefreshOptions::for_item_refresh(
+            MetadataRefreshMode::FullRefresh,
+            MetadataRefreshMode::FullRefresh,
+            replace_all,
+            false,
+            false,
+        )
+    };
+    let options = match choice {
+        "scan" => MetadataRefreshOptions::default(),
+        "missing" => full(false),
+        _ => full(true),
+    };
+
+    scanner.scan_with(None, &options).await.expect("rescan");
     let ids = fx
         .persistence
         .provider_ids_for_items(&[id])
@@ -392,7 +514,7 @@ async fn a_rescan_drops_a_stored_provider_id_of_the_wrong_shape() {
         .expect("ids")
         .remove(&id)
         .unwrap_or_default();
-    assert_eq!(ids, [("Imdb".to_owned(), "tt0133093".to_owned())]);
+    assert_eq!(ids, [("Tmdb".to_owned(), expected.to_owned())]);
 }
 
 /// "Replace all metadata" erases only what something re-supplies: upstream

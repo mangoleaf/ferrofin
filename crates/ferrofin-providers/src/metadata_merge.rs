@@ -22,16 +22,18 @@
 //! upstream rule here too, and every other `Data` key is merged key-wise
 //! (never replaced wholesale).
 //!
-//! The upstream properties Ferrofin has no storage for are not merged:
-//! `HomePageUrl` and a person's `SortOrder`. `LockedFields` lives in its own
-//! table (`BaseItemMetadataFields`), so it rides on [`MetadataResult`].
+//! The one upstream property Ferrofin has no storage for is not merged:
+//! `HomePageUrl`. A credit's `SortOrder` rides on its [`PeopleEntity`] and is
+//! merged by [`merge_people`] (stored as `PeopleBaseItemMap.SortOrder`).
+//! `LockedFields` lives in its own table (`BaseItemMetadataFields`), so it
+//! rides on [`MetadataResult`].
 //!
 //! It lives here, beside the providers, as upstream's lives in
 //! `MediaBrowser.Providers`: the library scan (`ferrofin-core`) and the
 //! single-item refresh (`provider_manager`) both depend on this crate, so both
 //! can merge through the one rule set.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use ferrofin_db::entities::base_items::{BaseItemEntity, PeopleEntity};
 use ferrofin_model::data::BaseItemKind;
@@ -798,24 +800,85 @@ fn person_key(name: &str) -> String {
     )
 }
 
+/// The credits a refresh pass saves — `metadata.People` after
+/// `RefreshWithProviders`, which `SaveItemAsync` writes whole when it is not
+/// null (`MetadataService.cs:320-324`) and leaves the stored credits alone
+/// when it is. `None` means "keep what is stored"; `Some` replaces it, an
+/// empty list clearing it.
+///
+/// - `local`: the first local reader that found metadata, its credits in
+///   `temp` (`MergeData(localItem, temp, [], false, true)`, `:850`). An NFO
+///   always yields a list, possibly empty (`BaseNfoParser` calls
+///   `ResetPeople`); `None` when no local reader found anything.
+/// - `answers`: each remote provider that answered, in the order it ran,
+///   with its `People` — `None` for a null one. What a provider yields is its
+///   own: TMDB and OMDb only ever `AddPerson`, so an answer of theirs that
+///   credits nobody is null; the TVDB plugin calls `ResetPeople` on every
+///   answer (`TvdbSeriesProvider.cs:228`, `TvdbEpisodeProvider.cs:225`,
+///   `TvdbMovieProvider.cs:363`, jellyfin-plugin-tvdb `5c4592f`), so its
+///   answer is a list, empty when it credits nobody. `ExecuteRemoteProviders`
+///   folds each into `temp` by `MergeData(result, temp, [], false, false)`
+///   (`:1003`, people half `:1235-1249`): when `temp`'s credits are null or
+///   empty they become the answer's, even a null one; otherwise a non-empty
+///   answer enriches them through `MergePeople` (a missing TMDB person id,
+///   image, role or sort order) and adds nobody.
+/// - `keep_existing`: [`RefreshMerge::keep_existing`]. "Add existing metadata
+///   to provider result" (`MergeData(metadata, temp, [], false, false)`,
+///   `:905`) finds `metadata.People` null — `RefreshMetadata` never loads the
+///   stored credits (`:145-148`) — so it turns an empty `temp.People` into
+///   null: outside "Replace all metadata" an empty result keeps the stored
+///   credits.
+///
+/// Every person id `IsValidProviderId` rejects is dropped from both sides
+/// first (`RemoveInvalidProviderIds`).
+#[must_use]
+pub fn pass_credits(
+    local: Option<Vec<PeopleEntity>>,
+    answers: &[Option<Vec<PeopleEntity>>],
+    keep_existing: bool,
+) -> Option<Vec<PeopleEntity>> {
+    let mut temp = local;
+    if let Some(people) = temp.as_mut() {
+        *people = remove_invalid_provider_ids(people);
+    }
+    for answer in answers {
+        merge_people_field(answer.as_deref(), &mut temp, false);
+    }
+    if keep_existing {
+        temp.filter(|people| !people.is_empty())
+    } else {
+        temp
+    }
+}
+
 /// `MergePeople` (`:1429-1470`): for each target person, the same-named
 /// source person at the same position (or the first one) fills the
-/// target's missing provider id, image and role. Nobody is added.
+/// target's missing provider id, image, role and sort order. Nobody is
+/// added. People pair by name alone, whatever their type: a director who
+/// also acts can take the actor credit's role, as upstream's lookup does.
+///
+/// The source is keyed once (`source.ToLookup(…)`), so a cast of `T` people
+/// merged from one of `S` costs `O(T + S)` name keys.
 pub fn merge_people(source: &[PeopleEntity], target: &mut [PeopleEntity]) {
-    let mut positions: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut by_name: HashMap<String, Vec<&PeopleEntity>> = HashMap::with_capacity(source.len());
+    for person in source {
+        by_name
+            .entry(person_key(&person.name))
+            .or_default()
+            .push(person);
+    }
+    let mut positions: HashMap<String, usize> = HashMap::new();
     for person in target.iter_mut() {
         let key = person_key(&person.name);
-        let same_named: Vec<&PeopleEntity> = source
-            .iter()
-            .filter(|p| person_key(&p.name) == key)
-            .collect();
-        let index = positions.entry(key).or_insert(0);
-        let i = *index;
-        *index += 1;
-        let Some(first) = same_named.first() else {
+        let Some(same_named) = by_name.get(&key) else {
             continue;
         };
-        let in_source = same_named.get(i).unwrap_or(first);
+        let index = positions.entry(key).or_insert(0);
+        let in_source = same_named.get(*index).or_else(|| same_named.first());
+        *index += 1;
+        let Some(in_source) = in_source else {
+            continue;
+        };
         if person.provider_id.is_none() {
             person.provider_id = in_source.provider_id;
         }
@@ -826,6 +889,9 @@ pub fn merge_people(source: &[PeopleEntity], target: &mut [PeopleEntity]) {
         }
         if !is_blank(in_source.role.as_deref()) && is_blank(person.role.as_deref()) {
             person.role.clone_from(&in_source.role);
+        }
+        if in_source.sort_order.is_some() && person.sort_order.is_none() {
+            person.sort_order = in_source.sort_order;
         }
     }
 }
@@ -914,10 +980,159 @@ pub fn is_valid_provider_id(name: &str, value: &str) -> bool {
         || is("MusicBrainzRecording")
         || is("MusicBrainzTrack")
     {
-        uuid::Uuid::parse_str(value).is_ok()
+        is_guid(value)
     } else {
         true
     }
+}
+
+/// `IsGuid` (`ProviderIdsExtensions.cs:280-281`): whether [`parse_guid`]
+/// reads `value`.
+fn is_guid(value: &str) -> bool {
+    parse_guid(value).is_some()
+}
+
+/// .NET's `Guid.TryParse(value, out var guid)` (dotnet/runtime
+/// `System.Private.CoreLib/src/System/Guid.cs`, `TryParseGuid`): the GUID
+/// `value` names, in any form .NET reads. Surrounding whitespace is trimmed;
+/// then the first character picks the form: `(` the `P` form, `{` the `B`
+/// form when a dash follows at index 9 and the `X` form otherwise, anything
+/// else the `D` form when a dash is at index 8 and the `N` form otherwise.
+///
+/// `IsGuid` validates the MusicBrainz ids with it, and
+/// `MusicBrainzQueryExtensions.ParseMusicBrainzId` turns one into the `Guid`
+/// its lookups send (`Guid.ToString()`, the lowercase `D` form). A
+/// MusicBrainz id reaches both from an audio tag, an NFO or a Jellyfin-written
+/// `BaseItemProviders` row, so every form upstream accepts is read here too —
+/// and `uuid`'s own extra (`urn:uuid:`) is not.
+#[must_use]
+pub fn parse_guid(value: &str) -> Option<uuid::Uuid> {
+    let s: Vec<char> = value.trim().chars().collect();
+    // `if (guidString.Length < 32)`: the shortest form, `N`.
+    if s.len() < 32 {
+        return None;
+    }
+    match s[0] {
+        '(' => guid_wrapped(&s, ')'),
+        '{' if s[9] == '-' => guid_wrapped(&s, '}'),
+        '{' => guid_x(&s),
+        _ if s[8] == '-' => guid_d(&s),
+        _ => guid_n(&s),
+    }
+}
+
+/// `TryParseExactN`: 32 hex digits.
+fn guid_n(s: &[char]) -> Option<uuid::Uuid> {
+    if s.len() != 32 || !s.iter().all(char::is_ascii_hexdigit) {
+        return None;
+    }
+    let hex: String = s.iter().collect();
+    u128::from_str_radix(&hex, 16)
+        .ok()
+        .map(uuid::Uuid::from_u128)
+}
+
+/// `TryParseExactB` / `TryParseExactP`: a `D` form inside braces or
+/// parentheses, 38 characters in all.
+fn guid_wrapped(s: &[char], close: char) -> Option<uuid::Uuid> {
+    if s.len() == 38 && s[37] == close {
+        guid_d(&s[1..37])
+    } else {
+        None
+    }
+}
+
+/// `TryParseExactD`, its compat parsing included: 36 characters, dashes at
+/// 8, 13, 18 and 23; the first four groups read by [`guid_hex`], so each may
+/// open with `+` and then `0x` inside its fixed width ("a four digit component
+/// could be `1234` or `0x34` or `+0x4` or `+234`"), the last two strictly
+/// hex.
+fn guid_d(text: &[char]) -> Option<uuid::Uuid> {
+    if text.len() != 36 || [8, 13, 18, 23].iter().any(|&at| text[at] != '-') {
+        return None;
+    }
+    let first = guid_hex(&text[0..8])?;
+    let second = guid_hex(&text[9..13])?;
+    let third = guid_hex(&text[14..18])?;
+    let fourth = guid_hex(&text[19..23])?;
+    if !text[24..].iter().all(char::is_ascii_hexdigit) {
+        return None;
+    }
+    let last: String = text[24..].iter().collect();
+    let last = u64::from_str_radix(&last, 16).ok()?.to_be_bytes();
+    // A four-digit group holds at most 0xFFFF; `+`/`0x` only shorten it.
+    let [_, _, hi, lo] = fourth.to_be_bytes();
+    Some(uuid::Uuid::from_fields(
+        first,
+        u16::try_from(second).ok()?,
+        u16::try_from(third).ok()?,
+        &[hi, lo, last[2], last[3], last[4], last[5], last[6], last[7]],
+    ))
+}
+
+/// `TryParseExactX`: `{0xdddddddd,0xdddd,0xdddd,{0xdd,0xdd,0xdd,0xdd,0xdd,
+/// 0xdd,0xdd,0xdd}}`, whitespace anywhere in it ignored. Each component
+/// follows its own `0x` (either case) and is non-empty; [`guid_hex`] reads
+/// it (so it may repeat the `+`/`0x` openers), with at most eight
+/// significant digits, and a byte component is at most `0xFF`. The two short
+/// components are only checked against 32 bits and keep their low 16 (the
+/// runtime's "parsed as 32-bits and only considered to overflow if they'd
+/// overflow 32 bits").
+fn guid_x(text: &[char]) -> Option<uuid::Uuid> {
+    let text: String = text.iter().filter(|ch| !ch.is_whitespace()).collect();
+    let inner = text.strip_prefix('{')?.strip_suffix("}}")?;
+    let parts: Vec<&str> = inner.split(',').collect();
+    let [first, second, third, bytes @ ..] = parts.as_slice() else {
+        return None;
+    };
+    let component = |part: &str| -> Option<u32> {
+        let digits = part
+            .strip_prefix("0x")
+            .or_else(|| part.strip_prefix("0X"))
+            .filter(|d| !d.is_empty())?;
+        guid_hex(&digits.chars().collect::<Vec<char>>())
+    };
+    if bytes.len() != 8 {
+        return None;
+    }
+    let mut tail = [0u8; 8];
+    for (index, (part, byte)) in bytes.iter().zip(tail.iter_mut()).enumerate() {
+        let part = if index == 0 {
+            part.strip_prefix('{')?
+        } else {
+            part
+        };
+        *byte = u8::try_from(component(part)?).ok()?;
+    }
+    let low16 = |v: u32| {
+        let [_, _, hi, lo] = v.to_be_bytes();
+        u16::from_be_bytes([hi, lo])
+    };
+    Some(uuid::Uuid::from_fields(
+        component(first)?,
+        low16(component(second)?),
+        low16(component(third)?),
+        &tail,
+    ))
+}
+
+/// `Guid.TryParseHex`: an optional `+`, then an optional `0x`/`0X`, then hex
+/// digits (none reads as zero). `None` for any other character, or for more
+/// than eight significant digits (its `overflow`).
+fn guid_hex(s: &[char]) -> Option<u32> {
+    let s = s.strip_prefix(&['+']).unwrap_or(s);
+    let s = match s {
+        ['0', 'x' | 'X', rest @ ..] => rest,
+        _ => s,
+    };
+    let significant = s.iter().skip_while(|&&c| c == '0');
+    let mut value: u32 = 0;
+    let mut digits = 0;
+    for c in significant {
+        value = value.wrapping_mul(16).wrapping_add(c.to_digit(16)?);
+        digits += 1;
+    }
+    (digits <= 8).then_some(value)
 }
 
 /// `int.TryParse(value, NumberStyles.None, …) && id > 0`: digits only, no

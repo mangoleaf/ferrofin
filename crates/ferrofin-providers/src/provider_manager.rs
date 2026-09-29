@@ -3389,8 +3389,8 @@ mod tests {
     async fn musicbrainz_album_identify_resolves_a_known_release_id_exactly() {
         use super::MusicBrainzAlbumSearchProvider;
         let (_server, mb) = musicbrainz_over(vec![(
-            "/ws/2/release/rel-9",
-            r#"{"id":"rel-9","title":"Exact","date":"2001","artist-credit":[]}"#.to_owned(),
+            "/ws/2/release/c0000000-0000-4000-8000-000000000009",
+            r#"{"id":"c0000000-0000-4000-8000-000000000009","title":"Exact","date":"2001","artist-credit":[]}"#.to_owned(),
         )])
         .await;
         let provider = MusicBrainzAlbumSearchProvider::new(mb);
@@ -3400,7 +3400,7 @@ mod tests {
             base: ItemLookupInfo {
                 provider_ids: Some(HashMap::from([(
                     "musicbrainzalbum".to_owned(),
-                    "rel-9".to_owned(),
+                    "c0000000-0000-4000-8000-000000000009".to_owned(),
                 )])),
                 ..ItemLookupInfo::default()
             },
@@ -3417,7 +3417,7 @@ mod tests {
         assert!(results[0].album_artist.is_none());
         assert_eq!(
             results[0].provider_ids.as_ref().expect("ids")["MusicBrainzAlbum"],
-            "rel-9"
+            "c0000000-0000-4000-8000-000000000009"
         );
     }
 
@@ -3426,16 +3426,16 @@ mod tests {
         use super::MusicBrainzAlbumSearchProvider;
         let (_server, mb) = musicbrainz_over(vec![
             (
-                "/ws/2/release-group/rg-7",
-                r#"{"releases":[{"id":"rel-a"},{"id":"rel-b"}]}"#.to_owned(),
+                "/ws/2/release-group/c0000000-0000-4000-8000-000000000007",
+                r#"{"releases":[{"id":"c0000000-0000-4000-8000-00000000000a"},{"id":"c0000000-0000-4000-8000-00000000000b"}]}"#.to_owned(),
             ),
             (
-                "/ws/2/release/rel-a",
-                r#"{"id":"rel-a","title":"A"}"#.to_owned(),
+                "/ws/2/release/c0000000-0000-4000-8000-00000000000a",
+                r#"{"id":"c0000000-0000-4000-8000-00000000000a","title":"A"}"#.to_owned(),
             ),
             (
-                "/ws/2/release/rel-b",
-                r#"{"id":"rel-b","title":"B"}"#.to_owned(),
+                "/ws/2/release/c0000000-0000-4000-8000-00000000000b",
+                r#"{"id":"c0000000-0000-4000-8000-00000000000b","title":"B"}"#.to_owned(),
             ),
         ])
         .await;
@@ -3443,7 +3443,10 @@ mod tests {
         let results = provider
             .get_search_results(&id_request(
                 BaseItemKind::MusicAlbum,
-                &[("MusicBrainzReleaseGroup", "rg-7")],
+                &[(
+                    "MusicBrainzReleaseGroup",
+                    "c0000000-0000-4000-8000-000000000007",
+                )],
             ))
             .await
             .expect("results");
@@ -3541,8 +3544,8 @@ mod tests {
     async fn musicbrainz_artist_identify_resolves_a_known_id_exactly() {
         use super::MusicBrainzArtistSearchProvider;
         let (_server, mb) = musicbrainz_over(vec![(
-            "/ws/2/artist/artist-mbid",
-            r#"{"id":"artist-mbid","name":"Miles Davis","life-span":{"begin":"1926"}}"#.to_owned(),
+            "/ws/2/artist/c0000000-0000-4000-8000-00000000000c",
+            r#"{"id":"c0000000-0000-4000-8000-00000000000c","name":"Miles Davis","life-span":{"begin":"1926"}}"#.to_owned(),
         )])
         .await;
         let provider = MusicBrainzArtistSearchProvider::new(mb);
@@ -3552,7 +3555,7 @@ mod tests {
             base: ItemLookupInfo {
                 provider_ids: Some(HashMap::from([(
                     "MusicBrainzAlbumArtist".to_owned(),
-                    "artist-mbid".to_owned(),
+                    "c0000000-0000-4000-8000-00000000000c".to_owned(),
                 )])),
                 ..ItemLookupInfo::default()
             },

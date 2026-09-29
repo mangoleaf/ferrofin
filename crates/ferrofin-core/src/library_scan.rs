@@ -132,16 +132,16 @@ enum SeasonLookup {
 /// (fanart) can key off them on later passes and re-scans.
 #[derive(Default)]
 struct RemoteMetadata {
-    people: Vec<PeopleEntity>,
-    provider_ids: Vec<(String, String)>,
-    /// Whether a credits fetch actually completed for this item.
+    /// Each remote provider that answered, in the order it ran, with its
+    /// `People`: `None` is a null list, `Some` a list (possibly empty). What
+    /// a provider yields follows upstream's: TMDB and OMDb only `AddPerson`,
+    /// so an answer of theirs that credits nobody is null ([`added`]); the
+    /// TVDB plugin `ResetPeople`s, so its answer is always a list. The scan
+    /// folds them into the pass's credits by [`pass_credits`].
     ///
-    /// `true` makes [`people`](Self::people) authoritative **even when empty**,
-    /// so credits stored by an earlier, wronger scan are cleared. `false` — a
-    /// provider that did not run, was gated off by the library, missed, or
-    /// errored — leaves whatever is stored alone, so a network outage or an
-    /// unticked fetcher never wipes a library's cast.
-    people_fetched: bool,
+    /// [`pass_credits`]: ferrofin_providers::metadata_merge::pass_credits
+    credits: Vec<Option<Vec<PeopleEntity>>>,
+    provider_ids: Vec<(String, String)>,
     /// A remote provider answered with metadata for the item (upstream's
     /// provider result `HasMetadata`, which sets
     /// `ItemUpdateType.MetadataDownload`, `MetadataService.cs:1011-1024`).
@@ -166,26 +166,11 @@ struct LocalNfo {
     locked_fields: Vec<MetadataField>,
 }
 
-impl RemoteMetadata {
-    /// People only (no external ids to persist), from a completed fetch that
-    /// answered.
-    fn just_people(people: Vec<PeopleEntity>) -> Self {
-        Self {
-            people,
-            provider_ids: Vec::new(),
-            people_fetched: true,
-            answered: true,
-        }
-    }
-
-    /// A fetch that answered with metadata but nothing authoritative about
-    /// the cast.
-    fn answered() -> Self {
-        Self {
-            answered: true,
-            ..Self::default()
-        }
-    }
+/// The `People` of an answer from a provider that only ever `AddPerson`s
+/// (`MetadataResult.AddPerson` creates the list on its first call): null
+/// when it credits nobody.
+fn added(people: Vec<PeopleEntity>) -> Option<Vec<PeopleEntity>> {
+    (!people.is_empty()).then_some(people)
 }
 
 /// What the item holds of the fields the scan's "already enriched" gates
@@ -295,30 +280,6 @@ fn search_result_ids(result: &RemoteSearchResult) -> Vec<(String, String)> {
         .collect();
     pairs.sort_unstable();
     ferrofin_providers::metadata_merge::set_provider_ids(pairs)
-}
-
-/// What a TMDB episode-credits lookup yielded.
-///
-/// The three states must stay distinct all the way to the persistence guard:
-/// credits are saved by REPLACEMENT, so treating a failure — or a lookup that
-/// never ran — as "this episode has no cast" deletes what is stored.
-enum TmdbCredits {
-    /// TMDB answered. The list is authoritative even when empty.
-    Fetched(Vec<PeopleEntity>),
-    /// TMDB was asked and did not answer (network, 429, 5xx, bad JSON).
-    Failed,
-    /// TMDB was never asked: no client wired, or the series has no TMDB id.
-    NotAttempted,
-}
-
-impl TmdbCredits {
-    /// The credits when TMDB answered, else `None`.
-    fn fetched(self) -> Option<Vec<PeopleEntity>> {
-        match self {
-            Self::Fetched(people) => Some(people),
-            Self::Failed | Self::NotAttempted => None,
-        }
-    }
 }
 
 /// A series' TMDB id as resolved so far this scan: the direct TMDB match if
@@ -543,6 +504,18 @@ impl<'a> FetcherPolicy<'a> {
             kind,
             name,
         )
+    }
+
+    /// Whether TheTVDB runs before TheMovieDb for `kind`: only when the
+    /// configured fetcher order ranks it strictly higher. Equal ranks —
+    /// neither in the order, as with no saved order — break by the
+    /// providers' own `IHasOrder` (`.ThenBy(GetDefaultOrder)`,
+    /// `ProviderManager.cs:539,630-640`): TheMovieDb's series, episode and
+    /// movie providers declare `Order => 1`, and the TVDB plugin declares
+    /// none, which counts as 50, so TheMovieDb runs first.
+    fn tvdb_leads(self, kind: &str) -> bool {
+        self.metadata_rank(kind, fetcher_names::TVDB)
+            < self.metadata_rank(kind, fetcher_names::TMDB)
     }
 
     /// Whether the library enabled image fetcher `name` for `kind`.
@@ -4288,7 +4261,9 @@ impl LibraryScanner {
         } else {
             LocalNfo::default()
         };
-        let mut people = local.people;
+        // An NFO always credits a list, empty when it names nobody
+        // (`BaseNfoParser` calls `ResetPeople`).
+        let nfo_people = local.found.then_some(local.people);
         let nfo_ids = local.ids;
         // `var isLocalLocked = temp.Item.IsLocked` (`MetadataService.cs:873`):
         // an NFO's `<lockdata>true` skips the remote providers for this pass
@@ -4347,7 +4322,7 @@ impl LibraryScanner {
         } else {
             RemoteMetadata::default()
         };
-        let people_fetched = remote.people_fetched;
+        let mut remote_answers = remote.credits;
         // `hasRemoteMetadata` (`MetadataService.cs:884-886`): a remote
         // provider answered with metadata.
         let mut has_remote_metadata = remote.answered;
@@ -4362,23 +4337,24 @@ impl LibraryScanner {
         };
         let embedded_found =
             embedded_read || !embedded_people.is_empty() || !embedded_images.is_empty();
-        if people.is_empty() {
-            people = embedded_people;
-        }
-        if people.is_empty() {
-            people = remote.people;
-        }
+        // The first local reader that found metadata supplies `temp`'s
+        // credits: the NFO, else the file's embedded reader (which, like
+        // upstream's book readers, only ever adds people).
+        let local_people =
+            nfo_people.or_else(|| (!embedded_people.is_empty()).then_some(embedded_people));
         // Dynamic (Tier-1b WASM plugin) metadata sources run last and
         // supplement whatever the built-in chain left unfilled; the
         // helper merges their (filtered) ids with the built-ins'. They are
         // remote providers, so they run when the remote ones do.
         let built_in_ids = merge_provider_ids(nfo_ids, remote.provider_ids);
-        let all_provider_ids = if plan.remote_metadata && !nfo_locked {
+        // The ids the pass's providers answered with; the probe's tag ids
+        // settle apart from them (`AudioFileProber`'s own rule).
+        let pass_ids = if plan.remote_metadata && !nfo_locked {
             let dynamic = cancel
                 .unless_cancelled(count_request_failures(self.apply_dynamic_metadata(
                     &mut entity,
                     &built_in_ids,
-                    tag_provider_ids,
+                    tag_provider_ids.clone(),
                     locked,
                     policy,
                     &guesses,
@@ -4389,9 +4365,14 @@ impl LibraryScanner {
             };
             failures += failed;
             has_remote_metadata |= answered;
+            // A plugin source that answered carries no credits: a null
+            // `People`, folded in after the built-in chain's answer.
+            if answered {
+                remote_answers.push(None);
+            }
             ids
         } else {
-            built_in_ids.into_iter().chain(tag_provider_ids).collect()
+            built_in_ids
         };
         // An existing item is saved as its stored row with this scan's
         // file facts and provider results merged on (upstream's Default
@@ -4415,19 +4396,33 @@ impl LibraryScanner {
             }
             (all.len() > l.locked_fields.len()).then_some(all)
         });
+        let answers = PassAnswers {
+            failed: failures > 0,
+            remote: has_remote_metadata,
+            // `refreshResult.UpdateType > None`: the probe (a pre-refresh
+            // custom provider) ran, or a local reader or a remote provider
+            // returned metadata.
+            any: probe_ran || local.found || embedded_found || has_remote_metadata,
+            local_locked: nfo_locked,
+            probe_ran,
+        };
         let merge = MergeMode::of(
             item_type_lookup::kind_from_type_name(&entity.type_),
             options,
-            PassAnswers {
-                failed: failures > 0,
-                remote: has_remote_metadata,
-                // `refreshResult.UpdateType > None`: the probe (a pre-refresh
-                // custom provider) ran, or a local reader or a remote
-                // provider returned metadata.
-                any: probe_ran || local.found || embedded_found || has_remote_metadata,
-                local_locked: nfo_locked,
-                probe_ran,
-            },
+            answers,
+        );
+        // The credits this pass saves (`None` keeps the stored ones): each
+        // remote answer, in order, stands in for empty local credits or
+        // fills their gaps (`MergePeople`), as `ExecuteRemoteProviders`
+        // gathers it into `temp`; then, outside "Replace all metadata", an
+        // empty result keeps the stored credits (`MetadataService.cs:905`).
+        // A person id no TMDB id can be is dropped. See [`pass_credits`].
+        //
+        // [`pass_credits`]: ferrofin_providers::metadata_merge::pass_credits
+        let credits = ferrofin_providers::metadata_merge::pass_credits(
+            local_people,
+            &remote_answers,
+            merge.keep_existing,
         );
         // `BeforeSaveInternal`: a stored file that changed on disk is
         // re-dated under "Use file creation date" (`RefreshContext::redated`).
@@ -4472,15 +4467,6 @@ impl LibraryScanner {
         if music_pending && let Some(row) = stored_row {
             entity.date_modified = row.date_modified;
         }
-        // A series' presentation key depends on the ids just settled;
-        // its children take the settled key (see `sync_series_key`).
-        let moved_series_key = self.sync_series_key(
-            &mut entity,
-            state.folders,
-            &all_provider_ids,
-            &known_ids,
-            state.series_keys,
-        );
         let chosen_ids_differ = identified.is_some_and(|result| {
             let chosen = search_result_ids(result);
             let before = state
@@ -4489,12 +4475,31 @@ impl LibraryScanner {
                 .insert(entity.id.clone(), chosen.clone());
             before.as_ref() != Some(&chosen)
         });
-        let mut settled_ids = settle_provider_ids(state.art_cache, &entity.id, &all_provider_ids);
+        let mut settled_ids = settle_provider_ids(
+            state.art_cache,
+            &entity.id,
+            &pass_ids,
+            &tag_provider_ids,
+            IdSettle {
+                merges: merge.merges && !locked,
+                replace: MergeMode::replaces_ids(options, answers),
+                replace_all_metadata: options.replace_all_metadata,
+            },
+        );
         if chosen_ids_differ {
             // An assignment, not a merge: the ids the item had are gone.
             settled_ids.drops_stored = true;
             settled_ids.changed = true;
         }
+        // A series' presentation key depends on the ids just settled;
+        // its children take the settled key (see `sync_series_key`).
+        let moved_series_key = self.sync_series_key(
+            &mut entity,
+            state.folders,
+            &settled_ids.merged,
+            &known_ids,
+            state.series_keys,
+        );
         // Artwork: local validation always — a locked row included — and
         // the remote image providers only when the plan runs them.
         // `ProviderManager.CanRefreshImages` (`ProviderManager.cs:433-441`)
@@ -4564,10 +4569,12 @@ impl LibraryScanner {
         // `SaveItemAsync` writes people only when non-null (`:320-324`).
         // A new item has no locks.
         let cast_locked = stored_row.is_some() && locked_fields.contains(&MetadataField::Cast);
-        let people_changed = backfill_only
-            && !cast_locked
-            && (people_fetched || !people.is_empty())
-            && self.people_differ(item.id, &people).await;
+        let people_changed = match &credits {
+            Some(people) if backfill_only && !cast_locked => {
+                self.people_differ(item.id, people).await
+            }
+            _ => false,
+        };
         let changed = probe_ran
             || grown_locks.is_some()
             || local_answered
@@ -4646,7 +4653,7 @@ impl LibraryScanner {
                 .repoint_series_children(item.id, &key)
                 .await?;
         }
-        self.persist_provider_ids_and_values(item.id, &entity, &all_provider_ids, &settled_ids)
+        self.persist_provider_ids_and_values(item.id, &entity, &settled_ids)
             .await?;
         if ancestors_changed {
             self.persistence
@@ -4654,7 +4661,7 @@ impl LibraryScanner {
                 .await?;
         }
         if !cast_locked {
-            self.persist_people(item.id, people, people_fetched).await;
+            self.persist_people(item.id, credits).await;
         }
         if let Some(fields) = &grown_locks {
             let ids: Vec<i32> = fields
@@ -4853,23 +4860,17 @@ impl LibraryScanner {
         }
     }
 
-    /// Writes an item's cast/crew, if there is anything authoritative to write.
+    /// Writes the credits a pass settled on ([`pass_credits`]): `None` leaves
+    /// the stored credits alone, `Some` replaces them (`update_people`
+    /// rewrites the item's credit rows), an empty list clearing them — as
+    /// `SaveItemAsync` writes `People` only when it is not null
+    /// (`MetadataService.cs:320-324`).
     ///
-    /// A completed credits fetch is authoritative even when it found nobody:
-    /// `update_people` replaces the item's rows, so an empty authoritative
-    /// result is what clears credits an earlier, wronger scan wrote (episodes
-    /// carrying their whole series' cast). A fetch that never ran — locked
-    /// item, gated-off fetcher, network failure, provider miss — leaves the
-    /// stored rows alone.
-    ///
-    /// Note the asymmetry: only REMOTE fetches carry the flag.
-    /// `fetch_local_nfo` returns a bare vec, so an NFO that credits nobody
-    /// cannot clear a stale cast — an NFO-authoritative library keeps the rows
-    /// this behaviour exists to correct.
-    async fn persist_people(&self, item_id: Uuid, people: Vec<PeopleEntity>, fetched: bool) {
-        if people.is_empty() && !fetched {
+    /// [`pass_credits`]: ferrofin_providers::metadata_merge::pass_credits
+    async fn persist_people(&self, item_id: Uuid, credits: Option<Vec<PeopleEntity>>) {
+        let Some(people) = credits else {
             return;
-        }
+        };
         let Some(repo) = &self.people else {
             return;
         };
@@ -4891,12 +4892,11 @@ impl LibraryScanner {
         &self,
         item_id: Uuid,
         entity: &BaseItemEntity,
-        all_provider_ids: &[(String, String)],
         settled: &SettledProviderIds,
     ) -> Result<(), ServiceError> {
         if settled.drops_stored {
-            // Only an assignment removes rows; the set is complete because
-            // it started from the stored one.
+            // A recorded id is gone: the set is rewritten whole. It is
+            // complete because it started from the recorded one.
             if let Err(err) = self
                 .persistence
                 .replace_provider_ids(item_id, &settled.merged)
@@ -4905,10 +4905,10 @@ impl LibraryScanner {
                 tracing::warn!(%err, item = %item_id, "failed to persist provider ids");
             }
         } else {
-            for (key, value) in all_provider_ids
-                .iter()
-                .filter(|(k, v)| ferrofin_providers::metadata_merge::is_valid_provider_id(k, v))
-            {
+            // Otherwise only what the record does not hold as it is: a new
+            // id, or a replaced value (`save_provider_id` is INSERT OR
+            // REPLACE on the item and provider).
+            for (key, value) in &settled.upserts {
                 if let Err(err) = self.persistence.save_provider_id(item_id, key, value).await {
                     tracing::warn!(%err, item = %item_id, provider = key, "failed to persist provider id");
                 }
@@ -6243,8 +6243,7 @@ impl LibraryScanner {
             && policy.metadata_enabled(short, fetcher_names::TVDB);
         let the_moviedb =
             self.tmdb.is_some() && policy.metadata_enabled(short, fetcher_names::TMDB);
-        let tvdb_first = policy.metadata_rank(short, fetcher_names::TVDB)
-            <= policy.metadata_rank(short, fetcher_names::TMDB);
+        let tvdb_first = policy.tvdb_leads(short);
         let omdb_enabled = self.omdb.as_ref().is_some_and(|o| o.is_enabled());
         let omdb_on = omdb_enabled && policy.metadata_enabled(short, fetcher_names::OMDB);
         if tvdb_on && (tvdb_first || !the_moviedb) {
@@ -6302,13 +6301,16 @@ impl LibraryScanner {
         // video.Width = videoStream?.Width ?? 0;`). `AudioFileProber` never
         // touches them, so an audio item keeps whatever the row had. These are
         // what `DtoService` emits as `Width`/`Height` — not the poster's size.
+        // A probe that found no video stream (or one without dimensions)
+        // writes 0, as upstream's `?? 0` does, replacing what an earlier probe
+        // stored rather than leaving it standing.
         if !media_is_audio {
             let video = source
                 .media_streams
                 .iter()
                 .find(|s| s.stream_type == ferrofin_model::entities::MediaStreamType::Video);
-            entity.width = video.and_then(|s| s.width).map(i64::from);
-            entity.height = video.and_then(|s| s.height).map(i64::from);
+            entity.width = Some(video.and_then(|s| s.width).map_or(0, i64::from));
+            entity.height = Some(video.and_then(|s| s.height).map_or(0, i64::from));
         }
         // Embedded audio tags (album/artists/track/disc/year/genres + the
         // MusicBrainz ids) — the port of `AudioFileProber`. Fill-if-empty so an
@@ -6475,12 +6477,12 @@ impl LibraryScanner {
     /// applies the results **supplement-only within this pass**: a field is
     /// taken only when the built-in chain left it empty. The pass's result is
     /// then merged onto a stored row like every provider's (Default mode), so
-    /// a value a plugin supplies does replace the stored one. Returns the FULL
-    /// provider-id list to persist: the built-ins' (remote + tag) followed
-    /// by the sources' contributions, filtered so a plugin id can never
-    /// replace a built-in one (`save_provider_id` is INSERT OR REPLACE) — and
-    /// whether a source answered with metadata (a remote provider's
-    /// `HasMetadata`).
+    /// a value a plugin supplies does replace the stored one. Returns the
+    /// pass's provider ids: the built-ins' (`remote_ids`) followed by the
+    /// sources' contributions, filtered so a plugin id never displaces one
+    /// the pass (or a probe tag) already has — and whether a source answered
+    /// with metadata (a remote provider's `HasMetadata`). The tag ids settle
+    /// separately ([`settle_provider_ids`]).
     ///
     /// [`DynamicMetadataProvider`]: ferrofin_traits::providers::DynamicMetadataProvider
     async fn apply_dynamic_metadata(
@@ -6492,11 +6494,10 @@ impl LibraryScanner {
         policy: FetcherPolicy<'_>,
         lookup: &ResolverGuesses,
     ) -> (Vec<(String, String)>, bool) {
-        let known_ids: Vec<(String, String)> = remote_ids.iter().cloned().chain(tag_ids).collect();
         // Locked items and provider-less scans skip the pass entirely;
         // best-effort per source — one bad plugin never fails a scan.
         if locked || self.dynamic_providers.is_empty() {
-            return (known_ids, false);
+            return (remote_ids.to_vec(), false);
         }
         // An unparseable row id must not reach guests as a nil UUID they
         // could then write segments against — skip the item instead.
@@ -6505,8 +6506,11 @@ impl LibraryScanner {
                 id = entity.id,
                 "skipping dynamic metadata: unparseable item id"
             );
-            return (Vec::new(), false);
+            return (remote_ids.to_vec(), false);
         };
+        // The plugins look up by every id the item has this pass, its tag
+        // ids included; what they contribute joins the pass's ids.
+        let known_ids: Vec<(String, String)> = remote_ids.iter().cloned().chain(tag_ids).collect();
         let lookup = ferrofin_traits::providers::DynamicMetadataLookup {
             item_id,
             kind: entity
@@ -6571,7 +6575,7 @@ impl LibraryScanner {
                 }
             }
         }
-        let mut all = known_ids;
+        let mut all = remote_ids.to_vec();
         all.extend(contributed_ids);
         (all, answered)
     }
@@ -6596,10 +6600,10 @@ impl LibraryScanner {
             .to_owned();
         // Per-library gate + order over the advertised fetcher names: a
         // fetcher the library disabled never runs, and for a series the
-        // saved fetcher order decides whether TVDB or TMDB is the authority
-        // (the other stays the miss-fallback). The default (no saved
-        // TypeOptions) preserves the historic chain: TheTVDB is the TV
-        // authority, TMDB the fallback; movies are TMDB-only.
+        // fetcher order decides whether TVDB or TMDB is the authority (the
+        // other stays the miss-fallback). With no saved order TheMovieDb
+        // leads, as upstream's `IHasOrder` tie-break has it
+        // (`FetcherPolicy::tvdb_leads`); movies are TMDB-only.
         let tvdb_on = self.tvdb.is_some()
             && matches!(short.as_str(), "Series" | "Episode")
             && policy.metadata_enabled(&short, fetcher_names::TVDB);
@@ -6610,10 +6614,7 @@ impl LibraryScanner {
         let tvdb_first = match gate.prefer {
             Some(name) if name == fetcher_names::TVDB && tvdb_on => true,
             Some(name) if name == fetcher_names::TMDB && tmdb_on => false,
-            _ => {
-                policy.metadata_rank(&short, fetcher_names::TVDB)
-                    <= policy.metadata_rank(&short, fetcher_names::TMDB)
-            }
+            _ => policy.tvdb_leads(&short),
         };
         let omdb_first = gate.prefer == Some(fetcher_names::OMDB) && omdb_on;
         if omdb_first {
@@ -6624,10 +6625,12 @@ impl LibraryScanner {
                 return result;
             }
         }
+        // TVDB runs first here, so TheMovieDb — when the library runs it —
+        // answers after it for an episode's credits (`tmdb_after`).
         if tvdb_on
             && (tvdb_first || !tmdb_on)
             && let Some(result) = self
-                .fetch_tvdb_metadata(entity, &short, cache, known_ids, lookup)
+                .fetch_tvdb_metadata(entity, &short, cache, known_ids, lookup, tmdb_on)
                 .await
         {
             // A TVDB hit is authoritative. A miss falls through to TMDB — for
@@ -6659,7 +6662,7 @@ impl LibraryScanner {
             && matches!(short.as_str(), "Series" | "Episode")
             && !tvdb_first
             && let Some(result) = self
-                .fetch_tvdb_metadata(entity, &short, cache, known_ids, lookup)
+                .fetch_tvdb_metadata(entity, &short, cache, known_ids, lookup, false)
                 .await
         {
             return result;
@@ -6853,20 +6856,20 @@ impl LibraryScanner {
         if let Some(id) = item.imdb_id.as_deref().filter(|s| !s.is_empty()) {
             provider_ids.push(("Imdb".to_owned(), id.to_owned()));
         }
-        // A completed OMDb fetch, so its credits are authoritative even when
-        // empty — same rule as the TMDB and TVDB arms.
+        // A completed OMDb fetch; its credits, when the plugin adds any, fold
+        // into the pass's by the same `pass_credits` as every answer's.
         RemoteMetadata {
             // C# `ParseAdditionalMetadata` returns before adding the
             // director/writer/actors unless the OMDb plugin's `CastAndCrew`
             // flag is set, and that bool has no initializer — so upstream's
-            // default is OFF and Ferrofin matches it.
-            people: if omdb.cast_and_crew().await {
+            // default is OFF and Ferrofin matches it. `AddPerson` only:
+            // no credits is a null list.
+            credits: vec![added(if omdb.cast_and_crew().await {
                 omdb_people(&item)
             } else {
                 Vec::new()
-            },
+            })],
             provider_ids,
-            people_fetched: true,
             answered: true,
         }
     }
@@ -6995,10 +6998,10 @@ impl LibraryScanner {
         // `Some(..)` because this fn returns Option: None is a TMDB miss the
         // fetcher-order gate falls back from (G1.3); main's tmdb_people helper
         // replaces the inline people mapping this branch used to carry.
+        // `TmdbMovieProvider`/`TmdbSeriesProvider` only `AddPerson`.
         Some(RemoteMetadata {
-            people: tmdb_people(&details.people),
+            credits: vec![added(tmdb_people(&details.people))],
             provider_ids,
-            people_fetched: true,
             answered: true,
         })
     }
@@ -7082,13 +7085,11 @@ impl LibraryScanner {
         apply_tmdb_episode(entity, &ep);
         let people = self
             .tmdb_episode_people(series_tmdb_id_of(cache, &series_id), season, number)
-            .await
-            .fetched();
-        // `None` is a FAILED credits request (network, 429, 5xx, bad JSON), not
-        // an episode with no cast. Reporting it as a completed fetch would let
-        // one rate-limited request during a large scan delete the episode's
-        // stored credits — and the re-scan gate above would then skip that
-        // episode forever, because its title and overview are now set.
+            .await;
+        // The season listed the episode, so TMDB answered. Its credits are
+        // `TmdbEpisodeProvider`'s `AddPerson`s: null when it credits nobody,
+        // and null when the credits request missed or failed (a failure is
+        // counted, so the refresh is not stamped).
         // Upstream `TmdbEpisodeProvider` sets the episode's own Tmdb id; the
         // client's Identify and external-links surface on an episode page reads
         // it.
@@ -7096,19 +7097,10 @@ impl LibraryScanner {
             .tmdb_id
             .map(|id| vec![("Tmdb".to_owned(), id.to_string())])
             .unwrap_or_default();
-        Some(match people {
-            Some(people) => RemoteMetadata {
-                people,
-                provider_ids,
-                people_fetched: true,
-                answered: true,
-            },
-            None => RemoteMetadata {
-                people: Vec::new(),
-                provider_ids,
-                people_fetched: false,
-                answered: true,
-            },
+        Some(RemoteMetadata {
+            credits: vec![people.and_then(added)],
+            provider_ids,
+            answered: true,
         })
     }
 
@@ -7120,89 +7112,87 @@ impl LibraryScanner {
     /// episode page show the series list verbatim, burying the guest stars and
     /// the director the page exists to show.
     ///
-    /// `None` means no credits were fetched — TMDB is unwired, the series has
-    /// no TMDB id, or the request failed. `Some(vec![])` means TMDB answered
-    /// and credits nobody. Credits are persisted by replacement, so the caller
-    /// must not conflate the two.
+    /// `Some` when TMDB answered, with the list it credits (empty when it
+    /// credits nobody); `None` when it did not answer — no client wired, no
+    /// TMDB id for the series, a miss, or a failed request (which the
+    /// request's own failure count records).
     async fn tmdb_episode_people(
         &self,
         series_tmdb_id: Option<i64>,
         season: i32,
         number: i32,
-    ) -> TmdbCredits {
+    ) -> Option<Vec<PeopleEntity>> {
         let (Some(tmdb), Some(series_id)) = (&self.tmdb, series_tmdb_id) else {
-            return TmdbCredits::NotAttempted;
+            return None;
         };
-        match tmdb.episode_credits(series_id, season, number).await {
-            Some(credits) => TmdbCredits::Fetched(tmdb_people(&credits)),
-            None => TmdbCredits::Failed,
-        }
+        tmdb.episode_credits(series_id, season, number)
+            .await
+            .map(|credits| tmdb_people(&credits))
     }
 
-    /// The people credited on ONE episode: TMDB's per-episode credits when the
-    /// series carries a TMDB id, else TVDB's episode credits.
+    /// The credits the providers answer with for ONE episode TVDB resolved,
+    /// in the order the library runs them — what `ExecuteRemoteProviders`
+    /// folds into the pass's credits one answer at a time ([`pass_credits`]):
     ///
-    /// TVDB's episode credits are the fallback when no TMDB credits were
-    /// fetched (no id, or the request failed) and when TMDB credited nobody.
-    /// `tmdb_people` filters nothing, so "TMDB returned an empty list" and
-    /// "the mapping produced nobody" are the same condition — the pre-existing
-    /// behaviour is preserved either way it is spelled.
+    /// - TVDB's episode record, always a list — the plugin `ResetPeople`s on
+    ///   every answer (`TvdbEpisodeProvider.cs:225`, jellyfin-plugin-tvdb
+    ///   `5c4592f`) — so it is empty when TVDB credits nobody;
+    /// - then, when `tmdb_after` (the library runs TheMovieDb after TheTVDB
+    ///   for episodes), TMDB's answer for the episode: its `AddPerson`s, null
+    ///   when it credits nobody. A TMDB request that missed or failed is no
+    ///   answer and adds nothing (upstream counts the failure and merges
+    ///   nothing from it).
     ///
-    /// `None` means nothing authoritative was learned, and only one case
-    /// produces it: TMDB's request **failed** and TVDB's record credits nobody.
-    /// Reporting that as a completed fetch would let one TMDB 429 clear the
-    /// episode's stored cast.
+    /// So the first list with anyone in it is the episode's cast and a later
+    /// one only enriches it; under "Replace all metadata" an empty TVDB
+    /// record with no later cast clears the stored one.
     ///
-    /// A TMDB fetch that was never *attempted* — no client wired, or the series
-    /// has no TMDB id — is different: TVDB is then the only source, so its
-    /// empty record is authoritative and does clear. Conflating the two would
-    /// leave a TVDB-only server unable to correct a stale cast, which is the
-    /// bug this change exists to fix, on the other provider.
+    /// [`pass_credits`]: ferrofin_providers::metadata_merge::pass_credits
     async fn episode_people(
         &self,
         series_tmdb_id: Option<i64>,
         season: i32,
         number: i32,
         ep: &ferrofin_providers::TvdbEpisodeDetails,
-    ) -> Option<Vec<PeopleEntity>> {
-        let tvdb = || tvdb_people(&ep.people);
-        match self
-            .tmdb_episode_people(series_tmdb_id, season, number)
-            .await
+        tmdb_after: bool,
+    ) -> Vec<Option<Vec<PeopleEntity>>> {
+        let mut answers = vec![Some(tvdb_people(&ep.people))];
+        if tmdb_after
+            && let Some(credits) = self
+                .tmdb_episode_people(series_tmdb_id, season, number)
+                .await
         {
-            // TMDB answered with credits: they win.
-            TmdbCredits::Fetched(credits) if !credits.is_empty() => Some(credits),
-            // TMDB answered with nobody. Prefer TVDB's record if it has anyone;
-            // otherwise both sources agree, and that is authoritative.
-            TmdbCredits::Fetched(empty) => Some(match tvdb() {
-                fallback if fallback.is_empty() => empty,
-                fallback => fallback,
-            }),
-            // Nothing was asked of TMDB, so TVDB is the only source and its
-            // answer stands even when empty.
-            TmdbCredits::NotAttempted => Some(tvdb()),
-            // TMDB was asked and failed: only a non-empty TVDB record says
-            // anything about this episode.
-            TmdbCredits::Failed => Some(tvdb()).filter(|p| !p.is_empty()),
+            answers.push(added(credits));
         }
+        answers
     }
 
-    /// The TheTVDB metadata pass — the TV authority. For a **series** it searches
-    /// by name/year, applies the matched series' fields, and caches the details
-    /// (its `tvdb_id` lets episodes resolve, its artwork feeds the image pass).
-    /// For an **episode** it resolves the episode by (season, number) against the
-    /// cached series id and applies its name/overview/air date. Returns the cast
-    /// to persist.
+    /// The TheTVDB metadata pass. For a **series** it searches by name/year,
+    /// applies the matched series' fields, and caches the details (its
+    /// `tvdb_id` lets episodes resolve, its artwork feeds the image pass).
+    /// For an **episode** it resolves the episode by (season, number) against
+    /// the cached series id and applies its name/overview/air date. Returns
+    /// the pass's remote answers ([`RemoteMetadata`]): the ids to record and
+    /// each answering provider's credits in the order they ran — TVDB's own,
+    /// then, for an episode with `tmdb_after`, TMDB's ([`Self::episode_people`])
+    /// — which the scan folds into the credits it saves.
     ///
     /// `None` is a MISS — TVDB is unwired, could not resolve the title, or has
     /// nothing for this episode — and the caller falls through to the next
-    /// fetcher. A series miss was previously detectable from
-    /// `cache.series_tvdb`, but an episode miss had no such signal, so the
-    /// caller returned unconditionally for episodes: with no saved
-    /// `TypeOptions` both fetcher ranks are `usize::MAX`, making `tvdb_first`
-    /// true by default, so a library on default ordering never offered TMDB the
-    /// episodes TVDB could not resolve (alternate numbering, specials, very new
-    /// episodes). Both kinds now report a miss the same way.
+    /// fetcher. A series and an episode report a miss the same way, so an
+    /// episode TVDB cannot resolve (alternate numbering, specials, very new
+    /// episodes) still reaches TMDB where the library ranks TVDB first.
+    ///
+    /// ACCEPTED DIVERGENCE (owner, 2026-09-28; don't-port-bugs): a failed TVDB
+    /// request counts as a provider failure here — the client's requests go
+    /// through the shared limiter's failure count — so the item is not stamped
+    /// as refreshed and "Replace all metadata" keeps its stored values
+    /// (`Failures > 0 && !hasRemoteMetadata`, `MetadataService.cs:897-902`).
+    /// The TVDB plugin instead catches the exception and answers with nothing
+    /// (`TvdbSeriesProvider.cs:255-259`, `TvdbMovieProvider.cs:390-394`,
+    /// `TvdbEpisodeProvider.cs:195`, jellyfin-plugin-tvdb `5c4592f`), which
+    /// defeats that guard: an outage during "Replace all metadata" wipes the
+    /// item there.
     async fn fetch_tvdb_metadata(
         &self,
         entity: &mut BaseItemEntity,
@@ -7210,6 +7200,7 @@ impl LibraryScanner {
         cache: &mut ArtworkCache,
         known_ids: &[(String, String)],
         lookup: &ResolverGuesses,
+        tmdb_after: bool,
     ) -> Option<RemoteMetadata> {
         let tvdb = self.tvdb.as_ref()?;
         match short {
@@ -7243,10 +7234,11 @@ impl LibraryScanner {
                     provider_ids.push(("Tmdb".to_owned(), tmdb.to_owned()));
                 }
                 cache.series_tvdb.insert(entity.id.clone(), details);
+                // `TvdbSeriesProvider` `ResetPeople`s before mapping the
+                // characters (`:228`): a list, empty when TVDB credits nobody.
                 Some(RemoteMetadata {
-                    people,
+                    credits: vec![Some(people)],
                     provider_ids,
-                    people_fetched: true,
                     answered: true,
                 })
             }
@@ -7281,24 +7273,22 @@ impl LibraryScanner {
                         .insert(entity.id.clone(), url.clone());
                 }
                 // Cast & Crew on an episode page is the EPISODE's credits, not
-                // the series'. Upstream reads TMDB's per-episode credits (the
-                // regulars credited in that episode, its guest stars, then its
-                // crew), so prefer those; TVDB's episode credits (guest cast +
-                // director/writers) are the fallback when the series has no
-                // TMDB id or TMDB has nothing for the episode.
-                // A hit either way: the episode's text was applied above. Only
-                // the CAST may be unknown, which `people_fetched: false` says.
-                Some(
-                    match self
-                        .episode_people(series_tmdb_id_of(cache, &series_id), season, number, &ep)
-                        .await
-                    {
-                        Some(people) => RemoteMetadata::just_people(people),
-                        // Nothing authoritative about this episode's cast —
-                        // leave whatever is stored alone rather than clearing it.
-                        None => RemoteMetadata::answered(),
-                    },
-                )
+                // the series': TVDB's episode record, then TMDB's per-episode
+                // credits when the library runs TheMovieDb after TheTVDB
+                // (`episode_people`).
+                Some(RemoteMetadata {
+                    credits: self
+                        .episode_people(
+                            series_tmdb_id_of(cache, &series_id),
+                            season,
+                            number,
+                            &ep,
+                            tmdb_after,
+                        )
+                        .await,
+                    provider_ids: Vec::new(),
+                    answered: true,
+                })
             }
             _ => None,
         }
@@ -8854,6 +8844,12 @@ impl LibraryScanner {
             entity.media_type = Some(media_type.to_owned());
             entity.extra_type = Some(extra_type as i32);
             entity.owner_id = Some(guid_to_db(owner));
+            // A video extra resolves through `BaseVideoResolver` like any
+            // video (`GenericVideoResolver<Trailer>`/`<Video>`), which sets
+            // its `VideoType` from the extension.
+            if media_type == "Video" {
+                set_video_type(&mut entity, file_video_type(&path));
+            }
             ctx.emit(
                 out,
                 Planned {
@@ -9466,6 +9462,9 @@ impl LibraryScanner {
             return;
         };
         entity.media_type = Some("Video".to_owned());
+        // `EpisodeResolver` is a `BaseVideoResolver`: the file's
+        // `VideoType` (and an image's `IsoType`) as for a movie.
+        set_video_type(&mut entity, file_video_type(path));
         entity.index_number = info.as_ref().and_then(|i| i.episode_number).map(i64::from);
         entity.parent_index_number = season
             .and_then(|(_, n)| n)
@@ -10562,6 +10561,7 @@ fn book_people(book: &ferrofin_providers::BookMetadata) -> Vec<PeopleEntity> {
             role: None,
             primary_image_url: None,
             provider_id: None,
+            sort_order: None,
         })
         .collect()
 }
@@ -10617,7 +10617,8 @@ fn is_owned_by_media(siblings: &[&str], path: &str, naming: &NamingOptions) -> b
 }
 
 /// The `VideoType` of a plain video file: `.iso`/`.img` are disc images,
-/// everything else a video file (port of `SetVideoType`).
+/// everything else a video file (port of `BaseVideoResolver.SetVideoType`,
+/// which every video resolver runs: movies, episodes, extras).
 fn file_video_type(path: &str) -> VideoType {
     let ext = std::path::Path::new(path)
         .extension()
@@ -11299,6 +11300,8 @@ struct PassAnswers {
 /// How one pass's provider result merges onto the stored row: the two
 /// `MergeData` calls of `RefreshWithProviders` (`MetadataService.cs:
 /// 897-915`) for the pass's options, and the audio prober's replace rule.
+// Independent facts about the pass's merge, each read by its own rule.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MergeMode {
     /// "Add existing metadata to provider result if it does not exist
@@ -11316,6 +11319,13 @@ struct MergeMode {
     /// the tags replace the album, the track and disc numbers and the
     /// genres instead of filling them (`AudioFileProber.cs:342-455`).
     replace_tags: bool,
+    /// Whether the pass's provider result is merged onto the item at all:
+    /// `providers.Any(i => i is not ICustomMetadataProvider)` and
+    /// `refreshResult.UpdateType > None` (`MetadataService.cs:895-897`). The
+    /// provider ids follow it ([`settle_provider_ids`]); the row's columns
+    /// get the same effect from `keep_existing` (nothing answered merges
+    /// nothing away).
+    merges: bool,
 }
 
 impl MergeMode {
@@ -11325,6 +11335,7 @@ impl MergeMode {
         keep_existing: true,
         replace: true,
         replace_tags: false,
+        merges: true,
     };
 
     /// The merge a pass over `kind` with `options` runs, given what its
@@ -11355,6 +11366,9 @@ impl MergeMode {
                 replace_tags: options.replace_all_metadata
                     && answers.probe_ran
                     && matches!(kind, Some(BaseItemKind::Audio | BaseItemKind::AudioBook)),
+                // Only a plugin's (dynamic) metadata source can answer for
+                // these kinds; its answer is merged like a remote one.
+                merges: answers.remote,
                 ..Self::DEFAULT
             };
         }
@@ -11376,7 +11390,29 @@ impl MergeMode {
             keep_existing: rule.keep_existing,
             replace: rule.replace,
             replace_tags: false,
+            merges: answers.any,
         }
+    }
+
+    /// `shouldReplace` for the pass's provider ids, for every kind: the
+    /// mode's rule (`MetadataService.cs:912-917`). A track's or an
+    /// audiobook's ids merge only when a plugin's metadata source answered
+    /// ([`Self::merges`]), and then as any kind's do —
+    /// `AudioMetadataService.SetProviderId` gets the same `replaceData`
+    /// (`AudioMetadataService.cs:43-57,80-82`) — so "Search for missing
+    /// metadata" keeps a stored valid id there too, although those kinds'
+    /// columns keep the Default flow.
+    fn replaces_ids(options: &MetadataRefreshOptions, answers: PassAnswers) -> bool {
+        RefreshMerge::of(
+            options,
+            RefreshAnswers {
+                any: answers.any,
+                failed: answers.failed,
+                remote: answers.remote,
+                local_locked: answers.local_locked,
+            },
+        )
+        .replace
     }
 }
 
@@ -11805,12 +11841,21 @@ fn merge_onto_stored(
 /// Planner-owned: `Path`, the parent/top-parent/owner links, the
 /// series/season links and names (a `Book`'s series name is a provider
 /// field, see [`ResolverGuesses`]), `IsFolder`, `IsInMixedFolder`,
-/// `MediaType`, `IsMovie`, `ExtraType` and the series presentation key a
-/// child inherits. `Data.VideoType` travels in the merged blob. Stat-owned
-/// (`SaveInternal`): `DateModified` (files and folders) and `Size` (files).
-/// Probe-owned: `RunTimeTicks` of a playable kind, `TotalBitrate` and the
-/// video `Width`/`Height` (a photo's come from its EXIF reader).
+/// `MediaType`, `IsMovie`, `ExtraType`, the series presentation key a child
+/// inherits, and `Data.VideoType`. `IsInMixedFolder` and `VideoType` are
+/// `UpdateFromResolvedItem`'s (`BaseItem.cs:1749-1760`, `Video.cs:
+/// 500-526`), which upstream applies whatever the item's lock or the
+/// refresh mode; `IsoType` is the resolver's on a new item only and never
+/// updated after. Stat-owned (`SaveInternal`): `DateModified` (files and
+/// folders) and `Size` (files). Probe-owned: `RunTimeTicks` of a playable
+/// kind, `TotalBitrate` and the video `Width`/`Height` (a photo's come from
+/// its EXIF reader).
 fn overlay_file_facts(row: &mut BaseItemEntity, scanned: &BaseItemEntity, probe_ran: bool) {
+    if let Some(data) =
+        crate::item_data::with_resolved_video_type(row.data.as_deref(), scanned.data.as_deref())
+    {
+        row.data = Some(data);
+    }
     row.id.clone_from(&scanned.id);
     row.type_.clone_from(&scanned.type_);
     row.path.clone_from(&scanned.path);
@@ -11863,6 +11908,8 @@ fn person_to_entity(p: ferrofin_providers::container_types::PersonInfo) -> Peopl
         role: p.role,
         primary_image_url: None,
         provider_id: None,
+        // `<sortorder>` / `<order>` (`XmlReaderExtensions.GetPersonFromXmlNode`).
+        sort_order: p.sort_order.map(i64::from),
     }
 }
 
@@ -11951,33 +11998,84 @@ struct ProbeRows {
 struct SettledProviderIds {
     /// The complete set the item carries after the save.
     merged: Vec<(String, String)>,
-    /// A recorded id is invalid, so the set must be rewritten whole.
+    /// A recorded id is gone from the set, so it must be rewritten whole.
     drops_stored: bool,
     /// The set differs from the recorded one.
     changed: bool,
+    /// The pairs of `merged` the record does not hold as they are: what an
+    /// additive save writes.
+    upserts: Vec<(String, String)>,
 }
 
-/// `MergeBaseItemData`'s ProviderIds rule over the ids the scan pre-read for
-/// the item: a fetched id replaces the stored one (the Default scan
-/// replaces), a stored id nothing fetched is kept, and an id that cannot
-/// belong to its provider is never written — nor kept. The merged set is
-/// cached for the rest of the scan (the image pass keys fanart off it, and
-/// an episode resolves through its series' ids).
+/// How a pass's ids settle onto the item's ([`settle_provider_ids`]).
+#[derive(Debug, Clone, Copy)]
+struct IdSettle {
+    /// The pass's provider result is merged at all ([`MergeMode::merges`]),
+    /// and the item is not locked (a locked item returns before it,
+    /// `MetadataService.cs:782-785`).
+    merges: bool,
+    /// `shouldReplace` ([`MergeMode::replace`]).
+    replace: bool,
+    /// `ReplaceAllMetadata`: an audio tag's id replaces the item's.
+    replace_all_metadata: bool,
+}
+
+/// The item's provider ids after this pass, from the ids the scan pre-read
+/// for it:
+///
+/// 1. the probe's tag ids first — `AudioFileProber`, a pre-refresh custom
+///    provider, sets each MusicBrainz id only when the item has none of that
+///    name, unless `ReplaceAllMetadata` (`AudioFileProber.cs:489-560`,
+///    `TrySetProviderId`: trimmed, validated);
+/// 2. then, when the pass merges, `MergeBaseItemData`'s ProviderIds rule
+///    with the pass's `shouldReplace` (`MetadataService.cs:1307-1334`): a
+///    valid pass id replaces the stored one on a replace ("Scan for new and
+///    updated files", "Replace all metadata") or fills a missing or unusable
+///    one ("Search for missing metadata"), and an id that cannot belong to
+///    its provider is dropped. A pass that merges nothing leaves the ids as
+///    they are.
+///
+/// The merged set is cached for the rest of the scan (the image pass keys
+/// fanart off it, and an episode resolves through its series' ids).
 fn settle_provider_ids(
     art_cache: &mut ArtworkCache,
     entity_id: &str,
-    all_provider_ids: &[(String, String)],
+    pass_ids: &[(String, String)],
+    tag_ids: &[(String, String)],
+    rule: IdSettle,
 ) -> SettledProviderIds {
     let stored = art_cache.item_provider_ids.get(entity_id);
-    let merged = ferrofin_providers::metadata_merge::merge_provider_ids(
-        all_provider_ids,
-        stored.map_or(&[][..], Vec::as_slice),
-        true,
-    );
-    let drops_stored = stored.is_some_and(|ids| {
-        ids.iter()
-            .any(|(k, v)| !ferrofin_providers::metadata_merge::is_valid_provider_id(k, v))
-    });
+    let mut ids: Vec<(String, String)> = stored.cloned().unwrap_or_default();
+    for (key, value) in tag_ids {
+        let has = ids
+            .iter()
+            .any(|(k, v)| k.eq_ignore_ascii_case(key) && !v.is_empty());
+        if !rule.replace_all_metadata && has {
+            continue;
+        }
+        for (name, value) in
+            ferrofin_providers::metadata_merge::set_provider_ids([(key.as_str(), value.as_str())])
+        {
+            match ids.iter_mut().find(|(k, _)| k.eq_ignore_ascii_case(&name)) {
+                Some(existing) => existing.1 = value,
+                None => ids.push((name, value)),
+            }
+        }
+    }
+    let merged = if rule.merges {
+        ferrofin_providers::metadata_merge::merge_provider_ids(pass_ids, &ids, rule.replace)
+    } else {
+        ids
+    };
+    let recorded: &[(String, String)] = stored.map_or(&[], Vec::as_slice);
+    let drops_stored = recorded
+        .iter()
+        .any(|(k, _)| !merged.iter().any(|(m, _)| m.eq_ignore_ascii_case(k)));
+    let upserts: Vec<(String, String)> = merged
+        .iter()
+        .filter(|pair| !recorded.contains(pair))
+        .cloned()
+        .collect();
     let changed = stored.map_or(!merged.is_empty(), |ids| *ids != merged);
     if !merged.is_empty() {
         art_cache
@@ -11988,6 +12086,7 @@ fn settle_provider_ids(
         merged,
         drops_stored,
         changed,
+        upserts,
     }
 }
 
@@ -12091,6 +12190,7 @@ fn omdb_people(item: &ferrofin_providers::OmdbItem) -> Vec<PeopleEntity> {
             role: None,
             primary_image_url: None,
             provider_id: None,
+            sort_order: None,
         })
         .collect()
 }
@@ -12261,14 +12361,23 @@ fn apply_audio_metadata(entity: &mut BaseItemEntity, info: &MediaInfo) -> Vec<(S
     if entity.artists.as_deref().unwrap_or_default().is_empty() && !info.artists.is_empty() {
         entity.artists = Some(info.artists.join("|"));
     }
+    // "Album artists not provided, fall back to performers (artists)"
+    // (`AudioFileProber.cs:353-357`). The probe's tag reader already falls
+    // back the same way (`ProbeResultNormalizer.cs:1418-1422`), so this
+    // holds for any `MediaInfo`, not only one it produced.
+    let album_artists = if info.album_artists.is_empty() {
+        &info.artists
+    } else {
+        &info.album_artists
+    };
     if entity
         .album_artists
         .as_deref()
         .unwrap_or_default()
         .is_empty()
-        && !info.album_artists.is_empty()
+        && !album_artists.is_empty()
     {
-        entity.album_artists = Some(info.album_artists.join("|"));
+        entity.album_artists = Some(album_artists.join("|"));
     }
     if entity.genres.as_deref().unwrap_or_default().is_empty() && !info.genres.is_empty() {
         entity.genres = Some(info.genres.join("|"));
@@ -12407,6 +12516,7 @@ fn tmdb_people(people: &[ferrofin_providers::TmdbPerson]) -> Vec<PeopleEntity> {
             role: p.role.clone(),
             primary_image_url: p.profile_url.clone(),
             provider_id: Some(p.tmdb_id),
+            sort_order: p.sort_order.map(i64::from),
         })
         .collect()
 }
@@ -12424,6 +12534,8 @@ fn tvdb_people(people: &[ferrofin_providers::TvdbPerson]) -> Vec<PeopleEntity> {
             role: p.role.clone(),
             primary_image_url: p.image_url.clone(),
             provider_id: None,
+            // The TVDB plugin sets no `SortOrder` on its credits.
+            sort_order: None,
         })
         .collect()
 }
@@ -13812,6 +13924,73 @@ mod tests {
         let policy = super::FetcherPolicy::default();
         assert_eq!(policy.metadata_language(), "en");
         assert_eq!(policy.country_code(), "us");
+    }
+
+    /// A library whose admin ran TheTVDB before TheMovieDb for series and
+    /// episodes (a saved `MetadataFetcherOrder`), OMDb last; every other
+    /// kind as with no saved options.
+    fn tvdb_first_options() -> ferrofin_model::configuration::LibraryOptions {
+        use ferrofin_model::configuration::TypeOptions;
+        use ferrofin_providers::library_options::fetcher_names::{OMDB, TMDB, TVDB};
+        let order = || vec![TVDB.to_owned(), TMDB.to_owned(), OMDB.to_owned()];
+        ferrofin_model::configuration::LibraryOptions {
+            type_options: ["Series", "Episode"]
+                .into_iter()
+                .map(|kind| TypeOptions {
+                    type_: Some(kind.to_owned()),
+                    metadata_fetchers: order(),
+                    metadata_fetcher_order: order(),
+                    ..TypeOptions::default()
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// Equal configured ranks break by the providers' own `IHasOrder`
+    /// (`.ThenBy(GetDefaultOrder)`, `ProviderManager.cs:539,630-640`):
+    /// TheMovieDb declares 1, the TVDB plugin nothing (50), so with no saved
+    /// order — or one that names neither — TheMovieDb runs first. A saved
+    /// order decides otherwise, the library's or the server's.
+    #[test]
+    fn tvdb_leads_only_where_an_order_ranks_it_first() {
+        use ferrofin_model::configuration::{LibraryOptions, MetadataOptions, TypeOptions};
+        use ferrofin_providers::library_options::fetcher_names::{TMDB, TVDB};
+        fn policy<'a>(
+            options: Option<&'a LibraryOptions>,
+            global: Option<&'a [MetadataOptions]>,
+        ) -> super::FetcherPolicy<'a> {
+            super::FetcherPolicy { options, global }
+        }
+        assert!(!super::FetcherPolicy::default().tvdb_leads("Series"));
+        assert!(!super::FetcherPolicy::default().tvdb_leads("Episode"));
+        let tvdb_first = tvdb_first_options();
+        assert!(policy(Some(&tvdb_first), None).tvdb_leads("Series"));
+        assert!(policy(Some(&tvdb_first), None).tvdb_leads("Episode"));
+        let ranked = |order: &[&str]| LibraryOptions {
+            type_options: vec![TypeOptions {
+                type_: Some("Series".to_owned()),
+                metadata_fetchers: vec![TVDB.to_owned(), TMDB.to_owned()],
+                metadata_fetcher_order: order.iter().map(|n| (*n).to_owned()).collect(),
+                ..TypeOptions::default()
+            }],
+            ..Default::default()
+        };
+        assert!(!policy(Some(&ranked(&[TMDB, TVDB])), None).tvdb_leads("Series"));
+        assert!(
+            policy(Some(&ranked(&[TVDB])), None).tvdb_leads("Series"),
+            "TheMovieDb unranked sorts last"
+        );
+        assert!(
+            !policy(Some(&ranked(&[])), None).tvdb_leads("Series"),
+            "neither ranked: the IHasOrder tie-break"
+        );
+        let server = [MetadataOptions {
+            item_type: Some("Series".to_owned()),
+            metadata_fetcher_order: vec![TVDB.to_owned(), TMDB.to_owned()],
+            ..MetadataOptions::default()
+        }];
+        assert!(policy(None, Some(&server)).tvdb_leads("Series"));
     }
 
     #[test]
@@ -15836,6 +16015,48 @@ mod tests {
         assert_eq!(tagged.album.as_deref(), Some("Kind of Blue"));
     }
 
+    /// "Album artists not provided, fall back to performers (artists)"
+    /// (`AudioFileProber.cs:353-357`): a track with no album-artist tag
+    /// takes its performers as album artists; a tagged album artist wins, and
+    /// a row that already has album artists keeps them (fill-only outside
+    /// `ReplaceAllMetadata`).
+    #[test]
+    fn apply_audio_metadata_falls_back_to_the_performers_for_album_artists() {
+        use ferrofin_db::entities::base_items::BaseItemEntity;
+        use ferrofin_model::media_info::MediaInfo;
+
+        let untagged = MediaInfo {
+            artists: vec!["Miles Davis".into(), "John Coltrane".into()],
+            ..MediaInfo::default()
+        };
+        let mut row = BaseItemEntity::default();
+        super::apply_audio_metadata(&mut row, &untagged);
+        assert_eq!(
+            row.album_artists.as_deref(),
+            Some("Miles Davis|John Coltrane")
+        );
+        assert_eq!(row.artists.as_deref(), Some("Miles Davis|John Coltrane"));
+
+        let tagged = MediaInfo {
+            album_artists: vec!["Various Artists".into()],
+            ..untagged.clone()
+        };
+        let mut row = BaseItemEntity::default();
+        super::apply_audio_metadata(&mut row, &tagged);
+        assert_eq!(row.album_artists.as_deref(), Some("Various Artists"));
+
+        let mut row = BaseItemEntity {
+            album_artists: Some("Stored".into()),
+            ..BaseItemEntity::default()
+        };
+        super::apply_audio_metadata(&mut row, &untagged);
+        assert_eq!(row.album_artists.as_deref(), Some("Stored"));
+
+        let mut row = BaseItemEntity::default();
+        super::apply_audio_metadata(&mut row, &MediaInfo::default());
+        assert_eq!(row.album_artists, None, "no performers, no album artists");
+    }
+
     // fanart id selection prefers Tmdb over Imdb; dedup keeps the first image of
     // each type so the one-file-per-type downloader emits no duplicate rows.
     #[test]
@@ -15997,10 +16218,13 @@ mod tests {
         assert_eq!(named.name.as_deref(), Some("The Real Title"));
     }
 
-    // An episode's Cast & Crew is the EPISODE's credits. With no TMDB id for
-    // the series (or nothing from TMDB), the episode's own TVDB credits stand —
-    // the series' regular cast is NOT merged in, which is what made every
-    // episode page show the series list verbatim.
+    /// An episode's Cast & Crew is the EPISODE's credits — the series'
+    /// regular cast is NOT merged in, which is what made every episode page
+    /// show the series list verbatim. TVDB's answer comes first and is always
+    /// a list (the plugin `ResetPeople`s, `TvdbEpisodeProvider.cs:225`), even
+    /// an empty one; TMDB answers after it only when the library runs it
+    /// after TheTVDB, and adds nothing when it cannot answer (no client, no
+    /// series id).
     #[tokio::test]
     async fn episode_people_are_the_episodes_own_credits() {
         use ferrofin_providers::{TvdbEpisodeDetails, TvdbPerson};
@@ -16033,33 +16257,65 @@ mod tests {
                 .with_item_store(persistence.clone()),
         );
         let scanner = LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence);
+        let names = |answers: Vec<Option<Vec<ferrofin_db::entities::base_items::PeopleEntity>>>| -> Vec<Option<Vec<String>>> {
+            answers
+                .into_iter()
+                .map(|a| a.map(|p| p.into_iter().map(|p| p.name).collect()))
+                .collect()
+        };
 
-        // No TMDB client wired → the episode's TVDB credits are used as-is.
-        let people = scanner
-            .episode_people(Some(1399), 1, 1, &ep)
-            .await
-            .expect("TVDB credits are authoritative");
-        let names: Vec<&str> = people.iter().map(|p| p.name.as_str()).collect();
-        assert_eq!(names, vec!["Guest Star", "Ep Director"]);
-        assert_eq!(people[0].person_type.as_deref(), Some("GuestStar"));
-
-        // Nor does a series without a TMDB id reach for TMDB.
-        let people = scanner
-            .episode_people(None, 1, 1, &ep)
-            .await
-            .expect("TVDB credits are authoritative");
-        assert_eq!(people.len(), 2);
-
-        // No TMDB client is wired here, so TMDB was never ATTEMPTED and TVDB is
-        // the only source: its empty record is authoritative and does clear a
-        // stale cast. (A request that was attempted and FAILED is the case that
-        // must not clear — covered by
-        // `a_failed_credits_request_does_not_wipe_a_stored_cast`.)
-        let bare = ferrofin_providers::TvdbEpisodeDetails::default();
+        // No TMDB client wired: TVDB's answer alone, whatever the order.
+        for tmdb_after in [true, false] {
+            assert_eq!(
+                names(
+                    scanner
+                        .episode_people(Some(1399), 1, 1, &ep, tmdb_after)
+                        .await
+                ),
+                [Some(vec![
+                    "Guest Star".to_owned(),
+                    "Ep Director".to_owned()
+                ])]
+            );
+        }
+        // TVDB crediting nobody is still an answer: an empty list.
+        let uncredited = TvdbEpisodeDetails::default();
         assert_eq!(
-            scanner.episode_people(Some(1399), 1, 1, &bare).await,
-            Some(Vec::new()),
-            "a TVDB-only server must still be able to correct a stale cast"
+            names(scanner.episode_people(None, 1, 1, &uncredited, true).await),
+            [Some(Vec::new())]
+        );
+
+        // TMDB wired and run after TVDB: its answer follows TVDB's.
+        let (tmdb, _hits, _all) = spawn_tmdb_server(Some(SEASON_JSON), Some(CREDITS_JSON));
+        let (scanner, _cache, _ep) = tmdb_episode_fixture(&tmdb, tmp.path()).await;
+        let answers = names(
+            scanner
+                .episode_people(Some(1399), 1, 1, &uncredited, true)
+                .await,
+        );
+        assert_eq!(answers.len(), 2, "{answers:?}");
+        assert_eq!(answers[0], Some(Vec::new()), "TVDB's empty record first");
+        assert!(answers[1].as_ref().is_some_and(|p| !p.is_empty()));
+        // Run before TVDB (TVDB is the fallback), TMDB adds nothing here.
+        assert_eq!(
+            names(
+                scanner
+                    .episode_people(Some(1399), 1, 1, &uncredited, false)
+                    .await
+            ),
+            [Some(Vec::new())]
+        );
+        // A TMDB answer crediting nobody is null, never an empty list.
+        let (nobody, _hits, _all) =
+            spawn_tmdb_server(Some(SEASON_JSON), Some(r#"{"cast":[],"crew":[]}"#));
+        let (scanner, _cache, _ep) = tmdb_episode_fixture(&nobody, tmp.path()).await;
+        assert_eq!(
+            names(
+                scanner
+                    .episode_people(Some(1399), 1, 1, &uncredited, true)
+                    .await
+            ),
+            [Some(Vec::new()), None]
         );
     }
 
@@ -16268,6 +16524,11 @@ mod tests {
             ferrofin_providers::TvdbClient::new().with_base_url("http://127.0.0.1:1"),
         ));
         let policy = super::FetcherPolicy::default();
+        let tvdb_first = tvdb_first_options();
+        let tvdb_policy = super::FetcherPolicy {
+            options: Some(&tvdb_first),
+            global: None,
+        };
         let trailers = Some(r#"{"RemoteTrailers":[{"Url":"https://y/t","Name":"T"}]}"#.to_owned());
         let series = |overview: Option<&str>, data: Option<String>| BaseItemEntity {
             type_: "MediaBrowser.Controller.Entities.TV.Series".into(),
@@ -16290,15 +16551,19 @@ mod tests {
         assert!(!tmdb_only.wants_backfill(&series(Some("x"), trailers.clone()), policy));
         assert!(tmdb_only.wants_backfill(&episode("GoT S01E01", Some("x")), policy));
         assert!(!tmdb_only.wants_backfill(&episode("Pilot", Some("x")), policy));
-        // TVDB arm: overview only for the series; the episode gate as is.
-        assert!(with_tvdb.wants_backfill(&series(None, trailers.clone()), policy));
+        // With no saved order TheMovieDb answers first, so its gates apply
+        // even with TVDB wired.
+        assert!(with_tvdb.wants_backfill(&series(Some("x"), None), policy));
+        // TVDB arm (TVDB ranked first): overview only for the series; the
+        // episode gate as is.
+        assert!(with_tvdb.wants_backfill(&series(None, trailers.clone()), tvdb_policy));
         assert!(
-            !with_tvdb.wants_backfill(&series(Some("x"), None), policy),
+            !with_tvdb.wants_backfill(&series(Some("x"), None), tvdb_policy),
             "TVDB never supplies trailers, so their absence is no trigger"
         );
-        assert!(with_tvdb.wants_backfill(&episode("GoT S01E01", Some("x")), policy));
-        assert!(with_tvdb.wants_backfill(&episode("Pilot", None), policy));
-        assert!(!with_tvdb.wants_backfill(&episode("Pilot", Some("x")), policy));
+        assert!(with_tvdb.wants_backfill(&episode("GoT S01E01", Some("x")), tvdb_policy));
+        assert!(with_tvdb.wants_backfill(&episode("Pilot", None), tvdb_policy));
+        assert!(!with_tvdb.wants_backfill(&episode("Pilot", Some("x")), tvdb_policy));
     }
 
     // The regression this whole change exists for: on a library migrated from
@@ -16426,7 +16691,10 @@ mod tests {
             .await
             .expect("applied");
 
-        let names: Vec<&str> = result.people.iter().map(|p| p.name.as_str()).collect();
+        let [Some(people)] = result.credits.as_slice() else {
+            panic!("one TMDB answer with credits: {:?}", result.credits);
+        };
+        let names: Vec<&str> = people.iter().map(|p| p.name.as_str()).collect();
         // Billing order, then the guest star, then the crew. The unmapped
         // "Gaffer" job is dropped, as upstream drops it.
         assert_eq!(
@@ -16438,62 +16706,48 @@ mod tests {
                 "Tim Van Patten"
             ]
         );
-        assert_eq!(result.people[0].person_type.as_deref(), Some("Actor"));
-        assert_eq!(result.people[0].role.as_deref(), Some("Ned Stark"));
-        assert_eq!(result.people[2].person_type.as_deref(), Some("GuestStar"));
-        assert_eq!(result.people[3].person_type.as_deref(), Some("Director"));
+        assert_eq!(people[0].person_type.as_deref(), Some("Actor"));
+        assert_eq!(people[0].role.as_deref(), Some("Ned Stark"));
+        assert_eq!(people[2].person_type.as_deref(), Some("GuestStar"));
+        assert_eq!(people[3].person_type.as_deref(), Some("Director"));
     }
 
-    // A series with no TMDB id yields "not fetched" rather than reaching for
-    // the network with a missing id — and "not fetched" is what stops the
-    // caller from clearing the episode's stored cast.
+    /// A series with no TMDB id asks TMDB nothing: no answer, rather than a
+    /// request with a missing id.
     #[tokio::test]
     async fn tmdb_episode_people_need_a_series_id() {
         let (base, _hits, _all) = spawn_tmdb_server(Some(SEASON_JSON), Some(CREDITS_JSON));
         let tmp = tempfile::tempdir().unwrap();
         let (scanner, _cache, _ep) = tmdb_episode_fixture(&base, tmp.path()).await;
 
-        assert!(matches!(
-            scanner.tmdb_episode_people(None, 1, 1).await,
-            super::TmdbCredits::NotAttempted
-        ));
+        assert_eq!(scanner.tmdb_episode_people(None, 1, 1).await, None);
         assert_eq!(
             scanner
                 .tmdb_episode_people(Some(1399), 1, 1)
                 .await
-                .fetched()
                 .expect("credits fetched")
                 .len(),
             4
         );
     }
 
-    // A failed credits request is `None` — distinct from an episode TMDB
-    // credits nobody on, which is `Some(vec![])`. Conflating them is what lets
-    // one 429 delete a cast.
+    /// A failed credits request is no answer (`None`, the failure counted by
+    /// the request); an episode TMDB credits nobody on is an answer with an
+    /// empty list — which the TMDB arm then carries as a null `People`, as
+    /// `TmdbEpisodeProvider` only `AddPerson`s.
     #[tokio::test]
-    async fn a_failed_credits_request_is_not_an_empty_cast() {
+    async fn a_failed_credits_request_is_not_an_answer() {
         let tmp = tempfile::tempdir().unwrap();
 
         let (failing, _, _) = spawn_tmdb_server(Some(SEASON_JSON), None);
         let (scanner, _cache, _ep) = tmdb_episode_fixture(&failing, tmp.path()).await;
-        assert!(
-            matches!(
-                scanner.tmdb_episode_people(Some(1399), 1, 1).await,
-                super::TmdbCredits::Failed
-            ),
-            "a 500 is not an authoritative empty cast"
-        );
+        assert_eq!(scanner.tmdb_episode_people(Some(1399), 1, 1).await, None);
 
         let (empty, _, _) = spawn_tmdb_server(Some(SEASON_JSON), Some(r#"{"cast":[]}"#));
         let (scanner, _cache, _ep) = tmdb_episode_fixture(&empty, tmp.path()).await;
         assert_eq!(
-            scanner
-                .tmdb_episode_people(Some(1399), 1, 1)
-                .await
-                .fetched(),
-            Some(Vec::new()),
-            "an answered request with no credits IS authoritative"
+            scanner.tmdb_episode_people(Some(1399), 1, 1).await,
+            Some(Vec::new())
         );
     }
 
@@ -16705,10 +16959,14 @@ mod tests {
         assert_eq!(saved.run_time_ticks, Some(200));
 
         // A locked row runs no merge: the provider's tagline never lands, and
-        // its Data is the stored blob; the file facts still do.
+        // its Data is the stored blob; the file facts still do, the
+        // resolver's VideoType among them (`UpdateFromResolvedItem`).
         let saved = save_as(Some(&stored), &planned, provider, true, false);
         assert_eq!(saved.tagline.as_deref(), Some("Stored tagline"));
-        assert_eq!(saved.data, stored.data);
+        let data = crate::item_data::parse_data(saved.data.as_deref());
+        let mut expected = crate::item_data::parse_data(stored.data.as_deref());
+        expected.insert("VideoType".into(), "VideoFile".into());
+        assert_eq!(data, expected);
         assert_eq!(saved.size, Some(42));
         assert_eq!(saved.parent_id.as_deref(), Some("NEW-PARENT"));
 
@@ -16817,6 +17075,7 @@ mod tests {
             keep_existing,
             replace,
             replace_tags: false,
+            merges: true,
         };
         assert_eq!(
             of(&MetadataRefreshOptions::default(), answered),
@@ -16850,7 +17109,10 @@ mod tests {
         );
         assert_eq!(
             of(&dashboard("replace"), PassAnswers::default()),
-            mode(true, true),
+            MergeMode {
+                merges: false,
+                ..mode(true, true)
+            },
             "nothing answered (no match, fetchers off): upstream merges nothing"
         );
         // A local answer alone (the NFO, the probe) still replaces.
@@ -16900,6 +17162,14 @@ mod tests {
         ] {
             let merge = MergeMode::of(Some(kind), &dashboard("replace"), probed);
             assert!(merge.keep_existing && merge.replace, "{kind:?}");
+            assert!(
+                !merge.merges,
+                "{kind:?}: custom providers alone merge nothing"
+            );
+            assert!(
+                MergeMode::of(Some(kind), &dashboard("scan"), answered).merges,
+                "{kind:?}: a plugin's metadata source answered"
+            );
             assert_eq!(
                 merge.replace_tags,
                 matches!(kind, BaseItemKind::Audio | BaseItemKind::AudioBook),
@@ -16910,7 +17180,110 @@ mod tests {
             !MergeMode::of(Some(BaseItemKind::Audio), &dashboard("replace"), answered).replace_tags,
             "no probe, no tags to replace with"
         );
+        // The ids follow the mode's `shouldReplace` whatever the kind.
+        for (choice, replaces) in [("scan", true), ("missing", false), ("replace", true)] {
+            assert_eq!(
+                MergeMode::replaces_ids(&dashboard(choice), answered),
+                replaces,
+                "{choice}"
+            );
+        }
     }
+
+    /// A plugin metadata source answering for a track merges its ids by the
+    /// pass's mode, as `AudioMetadataService` merges any answer
+    /// (`SetProviderId` with the mode's `replaceData`): "Search for missing
+    /// metadata" keeps the track's stored valid id, "Replace all metadata"
+    /// replaces it.
+    #[rstest::rstest]
+    #[case::missing("missing", STORED_MBID)]
+    #[case::replace_all("replace", ANSWERED_MBID)]
+    #[tokio::test]
+    async fn a_plugins_track_id_merges_by_the_pass_mode(
+        #[case] choice: &str,
+        #[case] expected: &str,
+    ) {
+        use ferrofin_traits::persistence::ItemPersistenceService as _;
+        struct TrackIds;
+        #[async_trait::async_trait]
+        impl ferrofin_traits::providers::DynamicMetadataProvider for TrackIds {
+            fn name(&self) -> &'static str {
+                "track-ids"
+            }
+            async fn lookup(
+                &self,
+                _item: &ferrofin_traits::providers::DynamicMetadataLookup,
+            ) -> Result<
+                Option<ferrofin_traits::providers::DynamicMetadataResult>,
+                ferrofin_traits::error::ServiceError,
+            > {
+                Ok(Some(ferrofin_traits::providers::DynamicMetadataResult {
+                    provider_ids: vec![("MusicBrainzTrack".to_owned(), ANSWERED_MBID.to_owned())],
+                    ..Default::default()
+                }))
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let media = tmp.path().join("music");
+        let album = media.join("Artist").join("Album");
+        std::fs::create_dir_all(&album).unwrap();
+        let track = album.join("01 - Song.mp3");
+        std::fs::write(&track, b"").unwrap();
+        let db = Database::connect_in_memory().await.unwrap();
+        db.run_migrations().await.unwrap();
+        let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+            FerrofinVirtualFolderManager::new(tmp.path().join("views"))
+                .with_item_store(persistence.clone()),
+        );
+        vf.add_virtual_folder(
+            "Music",
+            Some(CollectionTypeOptions::music),
+            &LibraryOptions {
+                path_infos: vec![MediaPathInfo {
+                    path: media.to_string_lossy().into_owned(),
+                }],
+                ..LibraryOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        let scanner =
+            LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence.clone())
+                .with_items(crate::test_support::item_repository_over(db))
+                .with_dynamic_providers(vec![Arc::new(TrackIds)]);
+        scanner.scan_all().await.unwrap();
+        let id =
+            crate::item_type_lookup::derive_item_id(BaseItemKind::Audio, &track.to_string_lossy())
+                .expect("id");
+        let track_id = || async {
+            persistence
+                .provider_ids_for_items(&[id])
+                .await
+                .expect("ids")
+                .remove(&id)
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            track_id().await,
+            [("MusicBrainzTrack".to_owned(), ANSWERED_MBID.to_owned())],
+            "the first refresh records the plugin's id"
+        );
+        persistence
+            .save_provider_id(id, "MusicBrainzTrack", STORED_MBID)
+            .await
+            .expect("stored id");
+
+        scanner.scan_with(None, &dashboard(choice)).await.unwrap();
+        assert_eq!(
+            track_id().await,
+            [("MusicBrainzTrack".to_owned(), expected.to_owned())]
+        );
+    }
+
+    /// The track ids of [`a_plugins_track_id_merges_by_the_pass_mode`].
+    const STORED_MBID: &str = "5b11f4ce-a62d-471e-81fc-a69a8278c7da";
+    const ANSWERED_MBID: &str = "a3cb23fc-acd3-4ce0-8f36-1e5aa6a18432";
 
     /// One stored movie with an edited overview, an empty rating and a
     /// tagline no provider supplies, refreshed in each mode by a provider
@@ -17729,6 +18102,223 @@ mod tests {
             Some(super::forced_sort_name(&saved, "Heat 1995").as_str())
         );
         assert_ne!(saved.sort_name.as_deref(), Some("heat"));
+    }
+
+    /// `FFProbeVideoInfo.Fetch` (`FFProbeVideoInfo.cs:263-266`): a video's
+    /// `Width`/`Height` are its first video stream's, else 0 — so a re-probe
+    /// that finds no video stream replaces what an earlier probe stored. A
+    /// save with no probe keeps them, and an audio probe never touches them
+    /// (`AudioFileProber` has no such write).
+    #[test]
+    fn a_probe_without_a_video_stream_zeroes_the_stored_dimensions() {
+        use ferrofin_model::entities::MediaStreamType;
+        use ferrofin_model::entities_media::MediaStream;
+        use ferrofin_model::media_info::MediaInfo;
+        let stored = BaseItemEntity {
+            width: Some(1920),
+            height: Some(1080),
+            ..planned_movie()
+        };
+        let probed = |info: MediaInfo, audio: bool| {
+            save_as(
+                Some(&stored),
+                &planned_movie(),
+                |e, _| {
+                    super::LibraryScanner::apply_probe(e, Some(&info), audio);
+                },
+                false,
+                true,
+            )
+        };
+        let dims = |row: &BaseItemEntity| (row.width, row.height);
+        let mut audio_only = MediaInfo::default();
+        audio_only.media_source.media_streams = vec![MediaStream {
+            stream_type: MediaStreamType::Audio,
+            ..MediaStream::default()
+        }];
+        assert_eq!(dims(&probed(audio_only.clone(), false)), (Some(0), Some(0)));
+        let mut sized = MediaInfo::default();
+        sized.media_source.media_streams = vec![MediaStream {
+            stream_type: MediaStreamType::Video,
+            width: Some(1280),
+            height: Some(720),
+            ..MediaStream::default()
+        }];
+        assert_eq!(dims(&probed(sized, false)), (Some(1280), Some(720)));
+        let mut dimensionless = MediaInfo::default();
+        dimensionless.media_source.media_streams = vec![MediaStream {
+            stream_type: MediaStreamType::Video,
+            ..MediaStream::default()
+        }];
+        assert_eq!(dims(&probed(dimensionless, false)), (Some(0), Some(0)));
+        assert_eq!(
+            dims(&probed(audio_only, true)),
+            (Some(1920), Some(1080)),
+            "an audio probe leaves them"
+        );
+        let unprobed = save_as(Some(&stored), &planned_movie(), |_, _| {}, false, false);
+        assert_eq!(dims(&unprobed), (Some(1920), Some(1080)));
+    }
+
+    /// `Video.UpdateFromResolvedItem` (`Video.cs:518-522`) sets the
+    /// resolver's `VideoType` on every existing item before any refresh,
+    /// whatever its lock or the refresh mode: a locked row takes it with the
+    /// rest of its `Data` as stored, and "Search for missing metadata" (whose
+    /// merge only fills) takes it over the stored one. An unchanged
+    /// `VideoType` leaves a locked row's `Data` text as it was.
+    #[test]
+    fn the_resolvers_video_type_replaces_the_stored_one_locked_or_not() {
+        let video_type = |row: &BaseItemEntity| {
+            crate::item_data::read_data_string(
+                &crate::item_data::parse_data(row.data.as_deref()),
+                "VideoType",
+            )
+        };
+        let stored = BaseItemEntity {
+            data: Some(
+                r#"{"VideoType":"Dvd","RemoteTrailers":[{"Url":"https://youtu.be/x"}],"IsoType":"Dvd"}"#
+                    .into(),
+            ),
+            ..planned_movie()
+        };
+        let locked = save_as(Some(&stored), &planned_movie(), |_, _| {}, true, false);
+        assert_eq!(video_type(&locked).as_deref(), Some("VideoFile"));
+        let kept = crate::item_data::parse_data(locked.data.as_deref());
+        assert!(kept.contains_key("RemoteTrailers"), "{kept:?}");
+        assert_eq!(
+            kept.get("IsoType").and_then(serde_json::Value::as_str),
+            Some("Dvd"),
+            "IsoType is the resolver's on a new item only"
+        );
+
+        let fill = {
+            let mut scanned = planned_movie();
+            let guesses = super::ResolverGuesses::take(&mut scanned, Some(&stored), false);
+            super::saved_row(
+                Some(&stored),
+                &guesses,
+                &scanned,
+                super::SaveFacts {
+                    locked: false,
+                    probe_ran: false,
+                    locked_fields: &[],
+                    merge: super::MergeMode {
+                        keep_existing: true,
+                        replace: false,
+                        replace_tags: false,
+                        merges: true,
+                    },
+                    before_refresh: true,
+                    replace_all: false,
+                    remote_answered: false,
+                    redated: None,
+                },
+            )
+        };
+        assert_eq!(video_type(&fill).as_deref(), Some("VideoFile"));
+
+        let current = BaseItemEntity {
+            data: Some(r#"{"VideoType":"VideoFile","RemoteTrailers":[]}"#.into()),
+            ..planned_movie()
+        };
+        let untouched = save_as(Some(&current), &planned_movie(), |_, _| {}, true, false);
+        assert_eq!(untouched.data, current.data);
+    }
+
+    /// A MusicBrainz id, for the settle cases.
+    const MBID: &str = "a3cb23fc-acd3-4ce0-8f36-1e5aa6a18432";
+
+    /// How a pass's ids settle onto the item's recorded ones, per mode
+    /// (`MetadataService.cs:1307-1336` with the pass's `shouldReplace`), and
+    /// the audio prober's tag ids, which only fill a missing id unless
+    /// "Replace all metadata" (`AudioFileProber.cs:489-560`). A pass that
+    /// merges nothing leaves the ids, an unusable one included.
+    #[rstest::rstest]
+    // "Scan for new and updated files" (replace): the pass's id wins.
+    #[case::default_replaces(true, true, false, &[("Tmdb", "999")], &[], &[("Tmdb", "999"), ("Imdb", "tt1")])]
+    // "Search for missing metadata" (fill): the recorded valid id stays, a
+    // missing one is added.
+    #[case::fill_keeps(true, false, false, &[("Tmdb", "999"), ("Tvdb", "5")], &[], &[("Tmdb", "603"), ("Imdb", "tt1"), ("Tvdb", "5")])]
+    // Nothing merged: the pass's ids go nowhere.
+    #[case::no_merge(false, true, false, &[("Tmdb", "999")], &[], &[("Tmdb", "603"), ("Imdb", "tt1")])]
+    // A tag id never replaces a recorded one outside a replace-all…
+    #[case::tag_fills_only(true, true, false, &[], &[("Imdb", "tt2"), ("MusicBrainzAlbum", MBID)], &[("Tmdb", "603"), ("Imdb", "tt1"), ("MusicBrainzAlbum", MBID)])]
+    // …and does under one.
+    #[case::tag_replace_all(true, true, true, &[], &[("Imdb", "tt2")], &[("Tmdb", "603"), ("Imdb", "tt2")])]
+    // An invalid tag id is never set (`TrySetProviderId` validates).
+    #[case::tag_invalid(false, true, true, &[], &[("MusicBrainzAlbum", "not-an-mbid")], &[("Tmdb", "603"), ("Imdb", "tt1")])]
+    fn a_pass_settles_its_ids_by_its_mode(
+        #[case] merges: bool,
+        #[case] replace: bool,
+        #[case] replace_all_metadata: bool,
+        #[case] pass: &[(&str, &str)],
+        #[case] tags: &[(&str, &str)],
+        #[case] expected: &[(&str, &str)],
+    ) {
+        let pairs = |ids: &[(&str, &str)]| -> Vec<(String, String)> {
+            ids.iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect()
+        };
+        let mut cache = super::ArtworkCache::default();
+        let recorded = pairs(&[("Tmdb", "603"), ("Imdb", "tt1")]);
+        cache
+            .item_provider_ids
+            .insert("ID".to_owned(), recorded.clone());
+        let settled = super::settle_provider_ids(
+            &mut cache,
+            "ID",
+            &pairs(pass),
+            &pairs(tags),
+            super::IdSettle {
+                merges,
+                replace,
+                replace_all_metadata,
+            },
+        );
+        assert_eq!(settled.merged, pairs(expected));
+        assert_eq!(settled.changed, settled.merged != recorded);
+        assert!(!settled.drops_stored);
+        let upserts: Vec<_> = pairs(expected)
+            .into_iter()
+            .filter(|pair| !recorded.contains(pair))
+            .collect();
+        assert_eq!(settled.upserts, upserts);
+    }
+
+    /// An unusable recorded id is dropped only by a pass that merges, and a
+    /// fill-only pass replaces it (`|| !IsValidProviderId(key, existingId)`),
+    /// so the set is rewritten whole.
+    #[test]
+    fn an_unusable_recorded_id_goes_only_with_a_merge() {
+        let mut cache = super::ArtworkCache::default();
+        let recorded = vec![("Tmdb".to_owned(), "nm1".to_owned())];
+        let settle = |cache: &mut super::ArtworkCache, merges: bool, pass: &[(String, String)]| {
+            cache
+                .item_provider_ids
+                .insert("ID".to_owned(), recorded.clone());
+            super::settle_provider_ids(
+                cache,
+                "ID",
+                pass,
+                &[],
+                super::IdSettle {
+                    merges,
+                    replace: false,
+                    replace_all_metadata: false,
+                },
+            )
+        };
+        let kept = settle(&mut cache, false, &[]);
+        assert_eq!(kept.merged, recorded);
+        assert!(!kept.changed);
+        let dropped = settle(&mut cache, true, &[]);
+        assert!(dropped.merged.is_empty());
+        assert!(dropped.drops_stored && dropped.changed);
+        let replaced = settle(&mut cache, true, &[("Tmdb".to_owned(), "603".to_owned())]);
+        assert_eq!(replaced.merged, [("Tmdb".to_owned(), "603".to_owned())]);
+        assert!(!replaced.drops_stored);
+        assert_eq!(replaced.upserts, replaced.merged);
     }
 
     /// The planned rows and provider inputs of the new-item equivalence
@@ -18554,7 +19144,7 @@ mod tests {
 
         let result = result.expect("the series needed no fetch");
         assert!(
-            result.people.is_empty() && !result.people_fetched,
+            result.credits.is_empty() && !result.answered,
             "the short-circuit fetches no credits, so it must not claim to have"
         );
         assert_eq!(
@@ -18679,11 +19269,17 @@ mod tests {
             name: Some("GoT".into()),
             ..Default::default()
         };
+        // The admin ranked TheTVDB first (with no saved order TheMovieDb
+        // leads).
+        let tvdb_first = tvdb_first_options();
         let result = scanner
             .fetch_remote_metadata(
                 &mut series,
                 &mut cache,
-                super::FetcherPolicy::default(),
+                super::FetcherPolicy {
+                    options: Some(&tvdb_first),
+                    global: None,
+                },
                 super::RemoteGate::default(),
                 &[],
                 &super::ResolverGuesses::default(),
@@ -18741,6 +19337,7 @@ mod tests {
                 &mut cache,
                 &[],
                 &super::ResolverGuesses::default(),
+                false,
             )
             .await;
         assert!(unpinned.is_none(), "the name search finds nothing");
@@ -18751,6 +19348,7 @@ mod tests {
                 &mut cache,
                 &[("Tvdb".to_owned(), "81189".to_owned())],
                 &super::ResolverGuesses::default(),
+                false,
             )
             .await
             .expect("the pinned series is fetched");
@@ -18767,8 +19365,9 @@ mod tests {
 
     /// Identifying runs the fetcher the chosen result came from first
     /// (`MetadataService.cs:876-882`): a TMDB result on a series makes TMDB
-    /// the authority even where TVDB would otherwise lead (no saved order),
-    /// and a TMDB answer stops the chain before TVDB is asked.
+    /// the authority even where TVDB would otherwise lead (a saved order
+    /// ranking it first), and a TMDB answer stops the chain before TVDB is
+    /// asked.
     #[tokio::test]
     async fn the_identify_results_fetcher_runs_first() {
         use ferrofin_db::entities::base_items::BaseItemEntity;
@@ -18789,12 +19388,17 @@ mod tests {
             ..Default::default()
         };
 
+        let tvdb_first = tvdb_first_options();
+        let tvdb_policy = super::FetcherPolicy {
+            options: Some(&tvdb_first),
+            global: None,
+        };
         let mut by_default = series();
         scanner
             .fetch_remote_metadata(
                 &mut by_default,
                 &mut cache,
-                super::FetcherPolicy::default(),
+                tvdb_policy,
                 super::RemoteGate::default(),
                 &[],
                 &super::ResolverGuesses::default(),
@@ -18804,7 +19408,7 @@ mod tests {
         assert_eq!(
             tmdb_requests.load(std::sync::atomic::Ordering::SeqCst),
             0,
-            "TVDB leads by default"
+            "TVDB leads where the library ranks it first"
         );
 
         let mut cache = super::ArtworkCache::default();
@@ -18813,7 +19417,7 @@ mod tests {
             .fetch_remote_metadata(
                 &mut identified,
                 &mut cache,
-                super::FetcherPolicy::default(),
+                tvdb_policy,
                 super::RemoteGate {
                     forced: true,
                     prefer: super::preferred_fetcher(Some("TheMovieDb")),
@@ -18853,6 +19457,21 @@ mod tests {
         uuid::Uuid,
         Arc<dyn ferrofin_traits::persistence::ItemRepository>,
     ) {
+        library_with_a_stale_episode_cast_in(tmp, LibraryOptions::default()).await
+    }
+
+    /// [`library_with_a_stale_episode_cast`] in a library saved with
+    /// `options` (its fetcher checkboxes and order).
+    async fn library_with_a_stale_episode_cast_in(
+        tmp: &std::path::Path,
+        options: LibraryOptions,
+    ) -> (
+        Arc<dyn VirtualFolderManager>,
+        Arc<FerrofinItemPersistenceService>,
+        Arc<crate::people_repository::FerrofinPeopleRepository>,
+        uuid::Uuid,
+        Arc<dyn ferrofin_traits::persistence::ItemRepository>,
+    ) {
         use ferrofin_db::entities::base_items::PeopleEntity;
         use ferrofin_traits::persistence::PeopleRepository as _;
 
@@ -18874,7 +19493,7 @@ mod tests {
                 path_infos: vec![MediaPathInfo {
                     path: tv.to_string_lossy().into_owned(),
                 }],
-                ..LibraryOptions::default()
+                ..options
             },
         )
         .await
@@ -18946,40 +19565,247 @@ mod tests {
             .map_or(0, Vec::len)
     }
 
-    // `update_people` replaces an item's credit rows, but an empty result never
-    // reached it — so the series cast written onto every episode by an older
-    // scan could never be corrected, no matter how many re-scans ran. A fetch
-    // that COMPLETED is authoritative even when it found nobody.
+    /// Makes the stale episode's refresh run its providers under `choice`:
+    /// the dashboard's full refreshes always do; "Scan for new and updated
+    /// files" does once the file changed on disk (`requiresRefresh`).
+    ///
+    /// The series changes too, so its refresh finds the TMDB id the
+    /// episode's lookup goes through.
+    fn run_providers_under(choice: &str, tmp: &std::path::Path) -> super::MetadataRefreshOptions {
+        if choice == "scan" {
+            let later = std::time::SystemTime::now() + std::time::Duration::from_secs(3_600);
+            let file = tmp.join("tv/GoT/Season 01/GoT S01E01.mkv");
+            std::fs::File::options()
+                .write(true)
+                .open(&file)
+                .expect("open")
+                .set_modified(later)
+                .expect("file mtime");
+            std::fs::File::open(tmp.join("tv/GoT"))
+                .expect("open series dir")
+                .set_modified(later)
+                .expect("series mtime");
+        }
+        dashboard(choice)
+    }
+
+    /// Owner decision 2026-09-28, match Jellyfin: a provider answer that
+    /// credits nobody never clears a stored cast, in any mode. Upstream's
+    /// remote providers only `AddPerson`, so such an answer carries a null
+    /// `People`; `SaveItemAsync` writes people only when not null
+    /// (`MetadataService.cs:320-324`). Repairing a wrong cast takes a
+    /// provider answer that credits someone (see the next test), or "Replace
+    /// all metadata" over an NFO that names no actors.
+    #[rstest::rstest]
+    #[case::scan("scan")]
+    #[case::missing("missing")]
+    #[case::replace_all("replace")]
     #[tokio::test]
-    async fn a_completed_credits_fetch_clears_a_stale_cast() {
+    async fn a_credit_answer_that_names_nobody_keeps_the_stored_cast(#[case] choice: &str) {
         // Season text so the episode is worth fetching, and credits with nobody
         // in them — a real TMDB answer for an episode it has no cast for.
-        let (base, _hits, _all) =
+        let (base, hits, _all) =
             spawn_tmdb_server(Some(SEASON_JSON), Some(r#"{"cast":[],"crew":[]}"#));
         let tmp = tempfile::tempdir().unwrap();
-        let (vf, persistence, people, episode_id, _items) =
+        let (vf, persistence, people, episode_id, items) =
             library_with_a_stale_episode_cast(tmp.path()).await;
+        let options = run_providers_under(choice, tmp.path());
 
         let tmdb = Arc::new(ferrofin_providers::TmdbClient::new().with_base_url(&base));
         LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence)
+            .with_items(items)
             .with_metadata(tmdb, tmp.path().join("metadata"))
             .with_people(people.clone() as Arc<dyn ferrofin_traits::persistence::PeopleRepository>)
-            .scan(None)
+            .scan_with(None, &options)
             .await
             .unwrap();
 
         assert_eq!(
-            episode_credit_count(&people, episode_id).await,
-            0,
-            "a completed credits fetch that found nobody must clear the stale rows"
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the episode's TMDB pass ran"
+        );
+        assert_eq!(episode_credit_count(&people, episode_id).await, 2);
+    }
+
+    /// A provider answer that does credit someone replaces the stored cast
+    /// in every mode that runs it (`metadata.People` is null before the
+    /// merge, so the merge takes the answer whole, `:1240-1243`).
+    #[rstest::rstest]
+    #[case::scan("scan")]
+    #[case::missing("missing")]
+    #[case::replace_all("replace")]
+    #[tokio::test]
+    async fn a_credit_answer_replaces_the_stored_cast(#[case] choice: &str) {
+        use ferrofin_traits::persistence::PeopleRepository as _;
+        let (base, _hits, _all) = spawn_tmdb_server(Some(SEASON_JSON), Some(CREDITS_JSON));
+        let tmp = tempfile::tempdir().unwrap();
+        let (vf, persistence, people, episode_id, items) =
+            library_with_a_stale_episode_cast(tmp.path()).await;
+        let options = run_providers_under(choice, tmp.path());
+
+        let tmdb = Arc::new(ferrofin_providers::TmdbClient::new().with_base_url(&base));
+        LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence)
+            .with_items(items)
+            .with_metadata(tmdb, tmp.path().join("metadata"))
+            .with_people(people.clone() as Arc<dyn ferrofin_traits::persistence::PeopleRepository>)
+            .scan_with(None, &options)
+            .await
+            .unwrap();
+
+        let names: Vec<String> = people
+            .get_people_batch(&[episode_id])
+            .await
+            .expect("credits")
+            .remove(&episode_id)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
+        assert!(
+            !names.iter().any(|n| n.contains("Series Regular")),
+            "the stale cast is gone: {names:?}"
+        );
+        assert!(!names.is_empty(), "TMDB's credits: {names:?}");
+    }
+
+    /// TheTVDB's answer is a list even when it credits nobody: the plugin
+    /// `ResetPeople`s on every answer (`TvdbEpisodeProvider.cs:225`,
+    /// jellyfin-plugin-tvdb `5c4592f`). So an episode TVDB answers for with
+    /// no characters clears the stored cast under "Replace all metadata"
+    /// (`RemoveOldMetadata` skips `:905`, and `SaveItemAsync` writes the empty
+    /// list), and keeps it under the other two.
+    #[rstest::rstest]
+    #[case::scan("scan", 2)]
+    #[case::missing("missing", 2)]
+    #[case::replace_all("replace", 0)]
+    #[tokio::test]
+    async fn a_tvdb_answer_naming_nobody_clears_the_cast_only_under_replace_all(
+        #[case] choice: &str,
+        #[case] expected: usize,
+    ) {
+        const SEARCH: &str = r#"{"data":[{"tvdb_id":"121361","name":"GoT","year":"2011"}]}"#;
+        // One body for the series, its episode list and the episode record:
+        // each reads the fields it knows. No characters anywhere.
+        const DETAILS: &str = r#"{"data":{"id":121361,"name":"GoT",
+            "episodes":[{"id":5,"seasonNumber":1,"number":1}],"characters":[]}}"#;
+        let the_tvdb = spawn_tvdb_server(Some(SEARCH), Some(DETAILS));
+        let tmp = tempfile::tempdir().unwrap();
+        let (vf, persistence, people, episode_id, items) =
+            library_with_a_stale_episode_cast(tmp.path()).await;
+        let options = run_providers_under(choice, tmp.path());
+
+        LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence)
+            .with_items(items)
+            .with_tvdb(Arc::new(
+                ferrofin_providers::TvdbClient::new().with_base_url(&the_tvdb),
+            ))
+            .with_people(people.clone() as Arc<dyn ferrofin_traits::persistence::PeopleRepository>)
+            .scan_with(None, &options)
+            .await
+            .unwrap();
+
+        assert_eq!(episode_credit_count(&people, episode_id).await, expected);
+    }
+
+    /// An episode TheTVDB resolves, in a library that runs TheTVDB before
+    /// TheMovieDb: TVDB's record is the cast — it names someone — and
+    /// TMDB's episode credits, answering after it, only fill its gaps (here
+    /// the role TVDB left out) and add nobody (`ExecuteRemoteProviders` →
+    /// `MergeData(result, temp, …)` → `MergePeople`).
+    #[tokio::test]
+    async fn tvdb_names_the_episode_cast_and_tmdb_fills_its_gaps() {
+        use ferrofin_traits::persistence::PeopleRepository as _;
+        const SEARCH: &str = r#"{"data":[{"tvdb_id":"121361","name":"GoT","year":"2011"}]}"#;
+        // One body for the series (with the TMDB id it carries), its episode
+        // list and the episode record.
+        const DETAILS: &str = r#"{"data":{"id":121361,"name":"GoT",
+            "remoteIds":[{"id":1399,"sourceName":"TheMovieDB.com"}],
+            "episodes":[{"id":5,"seasonNumber":1,"number":1}],
+            "characters":[{"personName":"Sean Bean","peopleType":"Actor"}]}}"#;
+        let the_tvdb = spawn_tvdb_server(Some(SEARCH), Some(DETAILS));
+        let (the_moviedb, _season_hits, _all) =
+            spawn_tmdb_server(Some(SEASON_JSON), Some(CREDITS_JSON));
+        let tmp = tempfile::tempdir().unwrap();
+        let (vf, persistence, people, episode_id, items) =
+            library_with_a_stale_episode_cast_in(tmp.path(), tvdb_first_options()).await;
+
+        LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence)
+            .with_items(items)
+            .with_tvdb(Arc::new(
+                ferrofin_providers::TvdbClient::new().with_base_url(&the_tvdb),
+            ))
+            .with_metadata(
+                Arc::new(ferrofin_providers::TmdbClient::new().with_base_url(&the_moviedb)),
+                tmp.path().join("metadata"),
+            )
+            .with_people(people.clone() as Arc<dyn ferrofin_traits::persistence::PeopleRepository>)
+            .scan_with(None, &dashboard("missing"))
+            .await
+            .unwrap();
+
+        let cast: Vec<(String, Option<String>)> = people
+            .get_people_batch(&[episode_id])
+            .await
+            .expect("credits")
+            .remove(&episode_id)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|p| (p.name, p.role))
+            .collect();
+        assert_eq!(
+            cast,
+            [("Sean Bean".to_owned(), Some("Ned Stark".to_owned()))],
+            "TVDB's cast, its role filled from TMDB's credits"
         );
     }
 
-    // The dangerous direction: a credits request that FAILED must not read as
-    // "this episode has no cast". TMDB answers 429 under exactly the load a
-    // corrective pass over a large library generates, and the wipe would be
-    // permanent — the title and overview are written before the credits call,
-    // so the re-scan gate skips that episode from then on.
+    /// The mirror case: an NFO that names no actors (its reader always
+    /// returns a list, `BaseNfoParser` → `ResetPeople`) clears the stored cast
+    /// only under "Replace all metadata", where `RemoveOldMetadata` skips
+    /// "add existing metadata to provider result" (`:905`); every other mode
+    /// turns the empty list into null there and keeps the cast.
+    #[rstest::rstest]
+    #[case::scan("scan", 2)]
+    #[case::missing("missing", 2)]
+    #[case::replace_all("replace", 0)]
+    #[tokio::test]
+    async fn an_nfo_naming_no_actors_clears_the_cast_only_under_replace_all(
+        #[case] choice: &str,
+        #[case] expected: usize,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let (vf, persistence, people, episode_id, items) =
+            library_with_a_stale_episode_cast(tmp.path()).await;
+        let nfo = tmp.path().join("tv/GoT/Season 01/GoT S01E01.nfo");
+        std::fs::write(
+            &nfo,
+            "<episodedetails><title>Winter Is Coming</title></episodedetails>",
+        )
+        .unwrap();
+        // Newer than the item's last save by over the minute the NFO reader
+        // allows for its own writes, so a Default scan reads it too.
+        std::fs::File::options()
+            .write(true)
+            .open(&nfo)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(3_600))
+            .unwrap();
+
+        LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence)
+            .with_items(items)
+            .with_people(people.clone() as Arc<dyn ferrofin_traits::persistence::PeopleRepository>)
+            .scan_with(None, &dashboard(choice))
+            .await
+            .unwrap();
+
+        assert_eq!(episode_credit_count(&people, episode_id).await, expected);
+    }
+
+    // A credits request that FAILED carries no credits (upstream counts the
+    // failure and merges nothing from it), so it never clears the stored
+    // cast — TMDB answers 429 under exactly the load a pass over a large
+    // library generates. The failure also keeps the refresh unstamped.
     //
     // Since change detection, an unchanged item runs no provider on a Default
     // scan, so the pass here is "Search for missing metadata", which runs
@@ -19013,10 +19839,9 @@ mod tests {
         );
     }
 
-    // The other direction, and the reason the flag exists rather than always
-    // writing: with no provider wired nothing was fetched, so the stored cast
-    // is all anyone has. A network outage or an unticked fetcher must never
-    // wipe a library's credits — not even on a pass that runs every provider.
+    // With no provider wired nothing answered, so the pass has no credits
+    // and the stored cast stands (`SaveItemAsync` writes only a non-null
+    // list) — even on a pass that runs every provider.
     #[tokio::test]
     async fn stored_credits_survive_a_scan_that_fetched_nothing() {
         let tmp = tempfile::tempdir().unwrap();
@@ -19064,7 +19889,8 @@ mod tests {
                     "Series",
                     &mut cache,
                     &[],
-                    &super::ResolverGuesses::default()
+                    &super::ResolverGuesses::default(),
+                    false,
                 )
                 .await
                 .is_none()
@@ -19086,15 +19912,15 @@ mod tests {
                     "Episode",
                     &mut cache,
                     &[],
-                    &super::ResolverGuesses::default()
+                    &super::ResolverGuesses::default(),
+                    false,
                 )
                 .await
                 .is_none()
         );
     }
 
-    // With no saved TypeOptions both fetcher ranks are `usize::MAX`, so
-    // `tvdb_first` is true and TVDB runs first. An episode TVDB cannot resolve
+    // With TheTVDB ranked first for episodes, an episode TVDB cannot resolve
     // — alternate numbering, a special, something aired yesterday — must still
     // reach TMDB. It did not: the caller returned unconditionally for episodes,
     // because a series miss was detectable from the cache and an episode miss
@@ -19104,8 +19930,7 @@ mod tests {
         let (base, _hits, _all) = spawn_tmdb_server(Some(SEASON_JSON), Some(CREDITS_JSON));
         let tmp = tempfile::tempdir().unwrap();
         let (scanner, mut cache, mut episode) = tmdb_episode_fixture(&base, tmp.path()).await;
-        // TVDB is wired and ranked first (default policy: both fetcher ranks
-        // are `usize::MAX`, so `tvdb_first` is true), and misses — the fixture
+        // TVDB is wired and ranked first (a saved order), and misses — the fixture
         // leaves `cache.series_tvdb` empty, so the episode arm returns at its
         // cache lookup before any request. Point the client at a dead address
         // regardless, so a future change to the fixture cannot turn this into a
@@ -19114,11 +19939,15 @@ mod tests {
             ferrofin_providers::TvdbClient::new().with_base_url("http://127.0.0.1:1"),
         ));
 
+        let tvdb_first = tvdb_first_options();
         let result = scanner
             .fetch_remote_metadata(
                 &mut episode,
                 &mut cache,
-                super::FetcherPolicy::default(),
+                super::FetcherPolicy {
+                    options: Some(&tvdb_first),
+                    global: None,
+                },
                 super::RemoteGate::default(),
                 &[],
                 &super::ResolverGuesses::default(),
@@ -19130,7 +19959,11 @@ mod tests {
             Some("Winter Is Coming"),
             "TMDB must get the episode TVDB could not resolve"
         );
-        assert!(result.people_fetched);
+        assert!(result.answered);
+        assert!(
+            matches!(result.credits.as_slice(), [Some(p)] if !p.is_empty()),
+            "the episode's TMDB credits"
+        );
     }
 
     // PersonInfo → PeopleEntity: type key is the Jellyfin PersonType name; no remote id/image.
@@ -21915,6 +22748,74 @@ mod tests {
         assert!(
             names.contains(&"Lana Wachowski"),
             "director persisted: {names:?}"
+        );
+    }
+
+    /// Every video resolver is a `BaseVideoResolver`, so an episode and a
+    /// video extra get the file's `VideoType` like a movie
+    /// (`BaseVideoResolver.SetVideoType`, `BaseVideoResolver.cs:139-145`):
+    /// a disc image is `Iso` (with the path's `IsoType`), anything else a
+    /// `VideoFile`. A theme song is audio and gets none.
+    #[tokio::test]
+    async fn episodes_and_video_extras_carry_the_resolvers_video_type() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tv = tmp.path().join("tv");
+        let season = tv.join("Show (2008)").join("Season 1");
+        std::fs::create_dir_all(&season).unwrap();
+        std::fs::write(season.join("Show S01E01.mkv"), b"").unwrap();
+        std::fs::write(season.join("Show S01E02 dvd.iso"), b"").unwrap();
+        let (db, _) = scan_one(CollectionTypeOptions::tvshows, "Shows", &tv).await;
+        let data = |db: Database, kind: BaseItemKind, path: std::path::PathBuf| async move {
+            let id =
+                crate::item_type_lookup::derive_item_id(kind, &path.to_string_lossy()).expect("id");
+            crate::test_support::item_repository_over(db)
+                .retrieve_item(id)
+                .await
+                .expect("read")
+                .expect("row")
+                .data
+        };
+        assert_eq!(
+            data(
+                db.clone(),
+                BaseItemKind::Episode,
+                season.join("Show S01E01.mkv")
+            )
+            .await
+            .as_deref(),
+            Some(r#"{"VideoType":"VideoFile"}"#)
+        );
+        assert_eq!(
+            data(
+                db.clone(),
+                BaseItemKind::Episode,
+                season.join("Show S01E02 dvd.iso")
+            )
+            .await
+            .as_deref(),
+            Some(r#"{"IsoType":"Dvd","VideoType":"Iso"}"#)
+        );
+
+        let movies = tmp.path().join("movies");
+        let folder = movies.join("Heat (1995)");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("Heat (1995).mkv"), b"").unwrap();
+        std::fs::write(folder.join("Heat (1995)-trailer.mkv"), b"").unwrap();
+        std::fs::write(folder.join("theme.mp3"), b"").unwrap();
+        let (db, _) = scan_one(CollectionTypeOptions::movies, "Movies", &movies).await;
+        assert_eq!(
+            data(
+                db.clone(),
+                BaseItemKind::Trailer,
+                folder.join("Heat (1995)-trailer.mkv")
+            )
+            .await
+            .as_deref(),
+            Some(r#"{"VideoType":"VideoFile"}"#)
+        );
+        assert_eq!(
+            data(db, BaseItemKind::Audio, folder.join("theme.mp3")).await,
+            None
         );
     }
 

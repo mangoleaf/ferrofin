@@ -1350,7 +1350,8 @@ fn columns_of(
 /// derivations) against the stored ones (as stored, no derivation):
 /// `PrimaryVersionId` is never written, `DateCreated` only fills a gap,
 /// `IsLocked` only rises, the never-cleared columns keep the stored value
-/// over a `NULL`, and a locked row keeps its user-owned columns. With
+/// over a `NULL`, and a locked row keeps its user-owned columns (its `Data`
+/// taking only the resolver's `VideoType`, [`LOCKED_DATA_SQL`]). With
 /// `writes_date_created` it evaluates [`scan_upsert_date_created_sql`]
 /// instead, whose `DateCreated` is never cleared but otherwise written.
 pub(crate) fn scan_save_changes_row(
@@ -1388,6 +1389,14 @@ pub(crate) fn scan_save_changes_row(
                     }
                 }
                 col if SCAN_NEVER_CLEARED_COLUMNS.contains(&col) && is_null(new) => old,
+                // `LOCKED_DATA_SQL`: only the resolver's `VideoType` moves.
+                "Data" if stored.is_locked => {
+                    return crate::item_data::with_resolved_video_type(
+                        stored.data.as_deref(),
+                        saved.data.as_deref(),
+                    )
+                    .is_some();
+                }
                 col if stored.is_locked && LOCKED_PRESERVED_COLUMNS.contains(&col) => old,
                 _ => new,
             };
@@ -2917,6 +2926,31 @@ const LOCKED_FILLABLE_COLUMNS: &[&str] = &[
     "PremiereDate",
 ];
 
+/// What a locked row's `Data` becomes on a scan save: the stored blob, with
+/// the resolver's `VideoType` from the incoming one set in it
+/// (`Video.UpdateFromResolvedItem`, `Video.cs:518-522`, which upstream runs
+/// whatever the lock) and every other key kept with its value and place
+/// (`json_set` re-renders the document minified). Left as stored when
+/// the incoming blob names no `VideoType`, the stored one already holds it,
+/// or either is not valid JSON (the stored one must be an object; `NULL` or
+/// empty is `{}`). [`with_resolved_video_type`] is the same rule in Rust,
+/// which the scan's merge and [`scan_save_changes_row`] apply.
+///
+/// The CASEs nest so the JSON functions only ever read valid JSON: they
+/// raise an error on malformed input, which would fail the whole save.
+///
+/// [`with_resolved_video_type`]: crate::item_data::with_resolved_video_type
+const LOCKED_DATA_SQL: &str = r#"CASE WHEN json_valid(excluded."Data") = 1
+            AND json_valid(coalesce(nullif("Data", ''), '{}')) = 1
+        THEN CASE WHEN json_type(excluded."Data", '$.VideoType') = 'text'
+                AND json_type(coalesce(nullif("Data", ''), '{}')) = 'object'
+                AND json_extract(coalesce(nullif("Data", ''), '{}'), '$.VideoType')
+                    IS NOT json_extract(excluded."Data", '$.VideoType')
+            THEN json_set(coalesce(nullif("Data", ''), '{}'), '$.VideoType',
+                          json_extract(excluded."Data", '$.VideoType'))
+            ELSE "Data" END
+        ELSE "Data" END"#;
+
 /// The columns a scan save may set but never clear — see [`scan_upsert_sql`].
 const SCAN_NEVER_CLEARED_COLUMNS: &[&str] = &[
     "DateLastRefreshed",
@@ -2941,7 +2975,9 @@ const SCAN_NEVER_CLEARED_COLUMNS: &[&str] = &[
 /// - every [`LOCKED_PRESERVED_COLUMNS`] entry keeps its stored value when the
 ///   row is locked (in the `CASE`, the unqualified `"IsLocked"` reads the
 ///   existing row, so the guard sees the pre-write lock state) — an empty
-///   [`LOCKED_FILLABLE_COLUMNS`] entry excepted, which the save may fill.
+///   [`LOCKED_FILLABLE_COLUMNS`] entry excepted, which the save may fill, and
+///   `Data`, whose `VideoType` alone follows the resolver
+///   ([`LOCKED_DATA_SQL`]).
 ///
 /// Derived from [`UPSERT_SQL`] by text substitution so the column/bind layout
 /// cannot drift between the two statements; the substitutions are asserted in
@@ -2989,9 +3025,14 @@ fn build_scan_upsert_sql(writes_date_created: bool) -> String {
         } else {
             r#""IsLocked" = 1"#.to_owned()
         };
+        let locked_value = if *col == "Data" {
+            LOCKED_DATA_SQL.to_owned()
+        } else {
+            format!(r#""{col}""#)
+        };
         sql = sql.replace(
             &format!(r#""{col}" = excluded."{col}""#),
-            &format!(r#""{col}" = CASE WHEN {kept} THEN "{col}" ELSE excluded."{col}" END"#),
+            &format!(r#""{col}" = CASE WHEN {kept} THEN {locked_value} ELSE excluded."{col}" END"#),
         );
     }
     sql
@@ -5592,8 +5633,15 @@ mod tests {
             } else {
                 r#""IsLocked" = 1"#.to_owned()
             };
+            let locked_value = if *col == "Data" {
+                super::LOCKED_DATA_SQL.to_owned()
+            } else {
+                format!(r#""{col}""#)
+            };
             assert!(
-                sql.contains(&format!(r#""{col}" = CASE WHEN {kept} THEN "{col}""#)),
+                sql.contains(&format!(
+                    r#""{col}" = CASE WHEN {kept} THEN {locked_value} ELSE"#
+                )),
                 "locked guard missing for column {col}"
             );
         }
@@ -5781,7 +5829,8 @@ mod tests {
             "an unlocked row takes the scan's (merged) Data"
         );
 
-        // A locked row keeps its whole `Data` blob — trailers, series status…
+        // A locked row keeps its `Data` blob — trailers, series status… —
+        // and takes only the resolver's `VideoType` (`UpdateFromResolvedItem`).
         svc.save_items(std::slice::from_ref(&row))
             .await
             .expect("restore trailers");
@@ -5795,9 +5844,109 @@ mod tests {
             .expect("locked scan update");
         assert_eq!(
             read(fresh).await.5.as_deref(),
-            Some(trailers),
-            "a locked row's Data survives the scan"
+            Some(r#"{"RemoteTrailers":[{"Url":"https://youtu.be/x"}],"VideoType":"VideoFile"}"#),
+            "a locked row's Data survives the scan but for its VideoType"
         );
+    }
+
+    /// A locked row's `Data` on a scan save (`LOCKED_DATA_SQL`): only the
+    /// resolver's `VideoType` is set in it (`Video.UpdateFromResolvedItem`,
+    /// whatever the lock); every other key keeps its value and its place,
+    /// though `json_set` re-renders the document minified. A blob that is not
+    /// a JSON object, an incoming blob with no `VideoType`, or one that
+    /// already matches leave the stored text as it is.
+    /// `scan_save_changes_row` agrees with the SQL in every case.
+    #[rstest::rstest]
+    #[case::replaced(
+        Some(r#"{"VideoType":"Dvd", "RemoteTrailers":[{"Url":"u"}],"IsoType":"Dvd"}"#),
+        Some(r#"{"VideoType":"VideoFile"}"#),
+        Some(r#"{"VideoType":"VideoFile","RemoteTrailers":[{"Url":"u"}],"IsoType":"Dvd"}"#)
+    )]
+    #[case::added(
+        Some(r#"{"Status":"Ended"}"#),
+        Some(r#"{"VideoType":"Iso","IsoType":"BluRay"}"#),
+        Some(r#"{"Status":"Ended","VideoType":"Iso"}"#)
+    )]
+    #[case::null_blob(
+        None,
+        Some(r#"{"VideoType":"VideoFile"}"#),
+        Some(r#"{"VideoType":"VideoFile"}"#)
+    )]
+    #[case::empty_blob(
+        Some(""),
+        Some(r#"{"VideoType":"VideoFile"}"#),
+        Some(r#"{"VideoType":"VideoFile"}"#)
+    )]
+    #[case::same(
+        Some(r#"{"VideoType":"VideoFile", "Status":"Ended"}"#),
+        Some(r#"{"VideoType":"VideoFile"}"#),
+        Some(r#"{"VideoType":"VideoFile", "Status":"Ended"}"#)
+    )]
+    #[case::no_video_type(
+        Some(r#"{"VideoType":"Dvd"}"#),
+        Some(r#"{"RemoteTrailers":[]}"#),
+        Some(r#"{"VideoType":"Dvd"}"#)
+    )]
+    #[case::no_incoming_blob(Some(r#"{"VideoType":"Dvd"}"#), None, Some(r#"{"VideoType":"Dvd"}"#))]
+    #[case::malformed(
+        Some("not json"),
+        Some(r#"{"VideoType":"VideoFile"}"#),
+        Some("not json")
+    )]
+    #[case::array(Some("[1,2]"), Some(r#"{"VideoType":"VideoFile"}"#), Some("[1,2]"))]
+    #[case::malformed_incoming(
+        Some(r#"{"VideoType":"Dvd"}"#),
+        Some("{"),
+        Some(r#"{"VideoType":"Dvd"}"#)
+    )]
+    #[tokio::test]
+    async fn a_locked_rows_data_takes_only_the_resolvers_video_type(
+        #[case] stored: Option<&str>,
+        #[case] incoming: Option<&str>,
+        #[case] expected: Option<&str>,
+    ) {
+        let db = test_db().await;
+        let svc = FerrofinItemPersistenceService::new(db.clone());
+        let id = Uuid::new_v4();
+        let row = ferrofin_db::entities::base_items::BaseItemEntity {
+            id: ferrofin_db::store::guid_to_db(id),
+            type_: crate::item_type_lookup::stored_type_name(BaseItemKind::Movie)
+                .unwrap()
+                .to_owned(),
+            name: Some("Heat".into()),
+            is_locked: true,
+            data: stored.map(str::to_owned),
+            ..Default::default()
+        };
+        svc.save_items(std::slice::from_ref(&row))
+            .await
+            .expect("seed");
+        let row = sqlx::query_as::<_, ferrofin_db::entities::base_items::BaseItemEntity>(
+            r#"SELECT * FROM "BaseItems" WHERE "Id" = ?1"#,
+        )
+        .bind(ferrofin_db::store::guid_to_db(id))
+        .fetch_one(db.pool())
+        .await
+        .expect("stored row");
+        let scanned = ferrofin_db::entities::base_items::BaseItemEntity {
+            data: incoming.map(str::to_owned),
+            ..row.clone()
+        };
+        assert_eq!(
+            super::scan_save_changes_row(&scanned, &row, false),
+            expected != row.data.as_deref(),
+            "the change rule agrees with the SQL"
+        );
+        svc.save_scanned_items(std::slice::from_ref(&scanned))
+            .await
+            .expect("scan save");
+        let data: Option<String> =
+            sqlx::query_scalar(r#"SELECT "Data" FROM "BaseItems" WHERE "Id" = ?1"#)
+                .bind(ferrofin_db::store::guid_to_db(id))
+                .fetch_one(db.pool())
+                .await
+                .expect("row");
+        assert_eq!(data.as_deref(), expected);
     }
 
     // Merge/split write their link through set_primary_version_id, which must

@@ -44,6 +44,21 @@ impl AlbumIds {
     pub fn is_some(&self) -> bool {
         self.release_id.is_some() || self.release_group_id.is_some()
     }
+
+    /// Both ids as the lookups send them ([`lookup_id`]): canonical, a
+    /// malformed one dropped.
+    fn for_lookup(self) -> Self {
+        Self {
+            release_id: self
+                .release_id
+                .as_deref()
+                .and_then(|id| lookup_id(id, "release")),
+            release_group_id: self
+                .release_group_id
+                .as_deref()
+                .and_then(|id| lookup_id(id, "release group")),
+        }
+    }
 }
 
 // ---- wire DTOs (MB ws/2 JSON) ---------------------------------------------
@@ -610,6 +625,7 @@ impl MusicBrainzClient {
     /// (`inc=artists+release-groups`) — port of `Query.LookupReleaseAsync(id,
     /// Include.Artists | Include.ReleaseGroups)`. `None` on any failure.
     pub async fn lookup_release(&self, release_id: &str) -> Option<ReleaseHit> {
+        let release_id = lookup_id(release_id, "release")?;
         let release: Release = self
             .get(
                 &format!("/ws/2/release/{release_id}"),
@@ -624,6 +640,9 @@ impl MusicBrainzClient {
     /// `MusicBrainzAlbumProvider.GetReleaseGroupResultAsync` walk. Empty when
     /// the group is unknown.
     pub async fn release_group_releases(&self, release_group_id: &str) -> Vec<ReleaseHit> {
+        let Some(release_group_id) = lookup_id(release_group_id, "release group") else {
+            return Vec::new();
+        };
         let Some(group): Option<ReleaseGroupLookup> = self
             .get(
                 &format!("/ws/2/release-group/{release_group_id}"),
@@ -668,9 +687,10 @@ impl MusicBrainzClient {
     /// Looks up one artist by id — port of `Query.LookupArtistAsync` as the
     /// "Identify" flow uses it. `None` on any failure.
     pub async fn lookup_artist(&self, artist_id: &str) -> Option<ArtistHit> {
+        let artist_id = lookup_id(artist_id, "artist")?;
         let artist: ArtistLookup = self.get(&format!("/ws/2/artist/{artist_id}"), &[]).await?;
         Some(ArtistHit {
-            id: non_empty(artist.id).unwrap_or_else(|| artist_id.to_owned()),
+            id: non_empty(artist.id).unwrap_or(artist_id),
             name: non_empty(artist.name),
             begin: MbDate::parse(artist.span.and_then(|s| s.begin).as_deref()),
         })
@@ -678,6 +698,7 @@ impl MusicBrainzClient {
 
     /// Looks up a release group to get its first release id (`inc=releases`).
     pub async fn first_release_of(&self, release_group_id: &str) -> Option<String> {
+        let release_group_id = lookup_id(release_group_id, "release group")?;
         let result: ReleaseGroupLookup = self
             .get(
                 &format!("/ws/2/release-group/{release_group_id}"),
@@ -694,6 +715,7 @@ impl MusicBrainzClient {
     /// with its artists, genres and tags, and `Populate` over both. `None`
     /// when neither id is known or neither lookup finds anything.
     pub async fn album_details(&self, ids: AlbumIds) -> Option<AlbumDetails> {
+        let ids = ids.for_lookup();
         let release: Option<Release> = match ids.release_id.as_deref() {
             Some(id) => {
                 self.get(
@@ -791,6 +813,7 @@ impl MusicBrainzClient {
     /// `MusicBrainzArtistProvider.GetMetadata` writes onto a `MusicArtist`
     /// from `LookupArtistOrNullAsync(id, Include.Genres | Include.Tags)`.
     pub async fn artist_details(&self, artist_id: &str) -> Option<ArtistDetails> {
+        let artist_id = lookup_id(artist_id, "artist")?;
         let artist: ArtistLookup = self
             .get(
                 &format!("/ws/2/artist/{artist_id}"),
@@ -827,10 +850,12 @@ impl MusicBrainzClient {
     pub async fn resolve_album(
         &self,
         album: &str,
-        mut ids: AlbumIds,
+        ids: AlbumIds,
         artist_mbid: Option<&str>,
         artist_name: Option<&str>,
     ) -> AlbumIds {
+        // `ParseMusicBrainzId` on both ids first: a malformed one is no id.
+        let mut ids = ids.for_lookup();
         // release-group known, release missing → first release of the group.
         if ids.release_id.is_none()
             && let Some(rg) = ids.release_group_id.as_deref()
@@ -850,6 +875,25 @@ impl MusicBrainzClient {
         }
         ids
     }
+}
+
+/// `MusicBrainzQueryExtensions.ParseMusicBrainzId`
+/// (`MusicBrainzQueryExtensions.cs:35-49`): the id a by-id lookup sends —
+/// the GUID `id` names in any form `Guid.TryParse` reads
+/// ([`parse_guid`](crate::metadata_merge::parse_guid)), written as
+/// `Guid.ToString()` writes it (the lowercase `D` form). A braced or
+/// `X`-form id in a URL path is a 400 from MusicBrainz — a failed request,
+/// which would keep the item from ever being stamped as refreshed. `None`
+/// for a blank or malformed id, which upstream ignores rather than sends.
+fn lookup_id(id: &str, entity: &'static str) -> Option<String> {
+    if id.trim().is_empty() {
+        return None;
+    }
+    let parsed = crate::metadata_merge::parse_guid(id);
+    if parsed.is_none() {
+        tracing::debug!(entity, id, "ignoring malformed MusicBrainz id");
+    }
+    parsed.map(|guid| guid.hyphenated().to_string())
 }
 
 /// The lucene query for an artist search. Diacritics route through
@@ -1033,6 +1077,78 @@ mod tests {
         );
     }
 
+    /// Lookup ids: the lookups send only what `Guid.TryParse` reads.
+    const REL: &str = "b1f1a1b0-0000-4000-8000-000000000001";
+    const RG: &str = "b1f1a1b0-0000-4000-8000-000000000002";
+    const ARTIST: &str = "b1f1a1b0-0000-4000-8000-000000000003";
+    const RG_X: &str = "b1f1a1b0-0000-4000-8000-000000000004";
+    const REL_Y: &str = "b1f1a1b0-0000-4000-8000-000000000005";
+    const RG_EMPTY: &str = "b1f1a1b0-0000-4000-8000-000000000006";
+
+    /// `ParseMusicBrainzId` before every by-id lookup
+    /// (`MusicBrainzQueryExtensions.cs:35-49`): a braced, parenthesised,
+    /// upper-case or `X`-form id is sent as the canonical lowercase `D` form
+    /// (a raw one is a 400, a failed request forever), and a malformed one
+    /// is not sent at all.
+    #[rstest::rstest]
+    #[case::braced("{B1F1A1B0-0000-4000-8000-000000000001}")]
+    #[case::parenthesised("(b1f1a1b0-0000-4000-8000-000000000001)")]
+    #[case::n_form("B1F1A1B0000040008000000000000001")]
+    #[case::x_form("{0xb1f1a1b0,0x0,0x4000,{0x80,0x0,0x0,0x0,0x0,0x0,0x0,0x1}}")]
+    #[case::d_form(" b1f1a1b0-0000-4000-8000-000000000001 ")]
+    #[tokio::test]
+    async fn a_lookup_sends_the_canonical_mbid(#[case] id: &str) {
+        use crate::mock_http::MockServer;
+        let server = MockServer::start(vec![
+            (
+                "/ws/2/release/b1f1a1b0-0000-4000-8000-000000000001?",
+                r#"{"id":"b1f1a1b0-0000-4000-8000-000000000001","title":"Kind of Blue"}"#
+                    .to_owned(),
+            ),
+            (
+                "/ws/2/release-group/b1f1a1b0-0000-4000-8000-000000000001?",
+                r#"{"releases":[{"id":"b1f1a1b0-0000-4000-8000-000000000009"}]}"#.to_owned(),
+            ),
+            (
+                "/ws/2/artist/b1f1a1b0-0000-4000-8000-000000000001",
+                r#"{"id":"b1f1a1b0-0000-4000-8000-000000000001","name":"Miles Davis"}"#.to_owned(),
+            ),
+        ])
+        .await;
+        let c = MusicBrainzClient::new(&server.base_url, "test");
+        let hit = c.lookup_release(id).await.expect("release");
+        assert_eq!(hit.title.as_deref(), Some("Kind of Blue"));
+        assert_eq!(
+            c.first_release_of(id).await.as_deref(),
+            Some("b1f1a1b0-0000-4000-8000-000000000009")
+        );
+        let artist = c.lookup_artist(id).await.expect("artist");
+        assert_eq!(artist.name.as_deref(), Some("Miles Davis"));
+        let details = c
+            .album_details(AlbumIds {
+                release_id: Some(id.to_owned()),
+                ..AlbumIds::default()
+            })
+            .await
+            .expect("album");
+        assert_eq!(
+            details.release_id.as_deref(),
+            Some("b1f1a1b0-0000-4000-8000-000000000001")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_malformed_mbid_is_never_looked_up() {
+        use crate::mock_http::MockServer;
+        let server = MockServer::always(r#"{"id":"x","title":"Should not be asked"}"#).await;
+        let c = MusicBrainzClient::new(&server.base_url, "test");
+        assert!(c.lookup_release("not-an-mbid").await.is_none());
+        assert!(c.lookup_artist("{not-an-mbid}").await.is_none());
+        assert!(c.artist_details("rel-1").await.is_none());
+        assert!(c.first_release_of("").await.is_none());
+        assert!(c.release_group_releases("rg").await.is_empty());
+    }
+
     /// `MusicBrainzAlbumProvider.Populate` (`:268-320`) over a release and
     /// its group, both looked up with what it includes: the group's first
     /// release date over the release's own, the release's artist credits,
@@ -1044,7 +1160,7 @@ mod tests {
         let server = MockServer::start(vec![
             (
                 "/ws/2/release-group/",
-                r#"{"id":"rg","first-release-date":"1959-08-17",
+                r#"{"id":"b1f1a1b0-0000-4000-8000-000000000002","first-release-date":"1959-08-17",
                     "artist-credit":[{"name":"Group Credit"}],
                     "genres":[{"name":"modal jazz","count":2},{"name":"jazz","count":9},{"name":" ","count":20}],
                     "tags":[{"name":"trumpet","count":1}]}"#
@@ -1052,7 +1168,7 @@ mod tests {
             ),
             (
                 "/ws/2/release/",
-                r#"{"id":"rel","date":"1997-03-25","release-group":{"id":"rg"},
+                r#"{"id":"b1f1a1b0-0000-4000-8000-000000000001","date":"1997-03-25","release-group":{"id":"b1f1a1b0-0000-4000-8000-000000000002"},
                     "artist-credit":[{"name":"Miles Davis","artist":{"id":"a"}},{"name":""}],
                     "label-info":[{"label":{"name":"Columbia"}},{"label":{"name":"columbia"}},{"label":null},
                                   {"label":{"name":"Éditions"}},{"label":{"name":"éditions"}}],
@@ -1065,14 +1181,14 @@ mod tests {
         let c = MusicBrainzClient::new(&server.base_url, "test");
         let details = c
             .album_details(AlbumIds {
-                release_id: Some("rel".to_owned()),
+                release_id: Some(REL.to_owned()),
                 ..AlbumIds::default()
             })
             .await
             .expect("details");
         assert_eq!(
             details.release_group_id.as_deref(),
-            Some("rg"),
+            Some(RG),
             "the release's group, when none was known"
         );
         assert_eq!(
@@ -1108,7 +1224,7 @@ mod tests {
         // No group: the release's own genres, tags, date and credits.
         let server = MockServer::start(vec![(
             "/ws/2/release/",
-            r#"{"id":"rel","date":"1997-03-25","artist-credit":[{"name":"Miles Davis"}],
+            r#"{"id":"b1f1a1b0-0000-4000-8000-000000000001","date":"1997-03-25","artist-credit":[{"name":"Miles Davis"}],
                 "genres":[{"name":"jazz","count":1}],"tags":[{"name":"reissue","count":1}]}"#
                 .to_owned(),
         )])
@@ -1116,7 +1232,7 @@ mod tests {
         let c = MusicBrainzClient::new(&server.base_url, "test");
         let details = c
             .album_details(AlbumIds {
-                release_id: Some("rel".to_owned()),
+                release_id: Some(REL.to_owned()),
                 ..AlbumIds::default()
             })
             .await
@@ -1147,7 +1263,7 @@ mod tests {
         )])
         .await;
         let c = MusicBrainzClient::new(&server.base_url, "test");
-        let details = c.artist_details("a").await.expect("details");
+        let details = c.artist_details(ARTIST).await.expect("details");
         assert_eq!(details.location.as_deref(), Some("United States"));
         assert_eq!(details.genres, ["jazz", "bebop"]);
         assert_eq!(details.tags, ["trumpeter"]);
@@ -1159,7 +1275,7 @@ mod tests {
         )])
         .await;
         let c = MusicBrainzClient::new(&server.base_url, "test");
-        let details = c.artist_details("a").await.expect("details");
+        let details = c.artist_details(ARTIST).await.expect("details");
         assert_eq!(
             details.location.as_deref(),
             Some("GB"),
@@ -1214,7 +1330,7 @@ mod tests {
             .resolve_album(
                 "X",
                 AlbumIds {
-                    release_group_id: Some("rg-x".to_owned()),
+                    release_group_id: Some(RG_X.to_owned()),
                     ..AlbumIds::default()
                 },
                 None,
@@ -1226,7 +1342,7 @@ mod tests {
         // Release known, group missing: resolution asks nothing more — the
         // album lookup's release (`inc=release-groups`) gives the group.
         let known = AlbumIds {
-            release_id: Some("rel-y".to_owned()),
+            release_id: Some(REL_Y.to_owned()),
             ..AlbumIds::default()
         };
         let ids = c.resolve_album("X", known.clone(), None, None).await;
@@ -1268,7 +1384,7 @@ mod tests {
         // A release group with no releases, and an artist to search by: the
         // search runs, and its hit's group replaces the known one.
         let empty_group = AlbumIds {
-            release_group_id: Some("rg-empty".to_owned()),
+            release_group_id: Some(RG_EMPTY.to_owned()),
             ..AlbumIds::default()
         };
         let ids = c
@@ -1388,7 +1504,7 @@ mod tests {
             Some((1926, 5, 26))
         );
 
-        let artist = c.lookup_artist("artist-mbid").await.expect("lookup");
+        let artist = c.lookup_artist(ARTIST).await.expect("lookup");
         assert_eq!(artist.name.as_deref(), Some("Miles Davis"));
         assert_eq!(artist.begin.year(), Some(1926));
     }

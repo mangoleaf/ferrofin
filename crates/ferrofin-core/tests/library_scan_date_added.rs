@@ -381,9 +381,16 @@ async fn a_changed_file_is_redated_only_under_file_creation_date(
 /// An edited NFO's `<dateadded>` lands on the stored episode it belongs to
 /// (the NFO is newer than the item's last save, so its reader runs) —
 /// through a library scan or a watcher report of the NFO — whichever the
-/// date-added rule; the episode's file itself is unchanged.
+/// date-added rule; the episode's file itself is unchanged. Upstream merges
+/// a reader's `DateCreated` with the metadata settings on every refresh the
+/// reader runs in (`MetadataService.cs:1381-1384`), and
+/// `UseFileCreationTimeForDateAdded` only picks the resolver's date for a
+/// new item (`ResolverHelper.SetDateCreated`) and the re-date of a changed
+/// file (`MetadataService.cs:383-388`), so neither setting holds it back.
 #[rstest::rstest]
 #[case::file_creation_by_scan(true, false)]
+#[case::file_creation_by_watcher(true, true)]
+#[case::date_scanned_by_scan(false, false)]
 #[case::date_scanned_by_watcher(false, true)]
 #[tokio::test(flavor = "multi_thread")]
 async fn an_edited_nfo_dateadded_redates_a_stored_episode(
@@ -414,6 +421,41 @@ async fn an_edited_nfo_dateadded_redates_a_stored_episode(
         .expect("mtime");
     if by_watcher {
         fx.report(&nfo).await;
+    } else {
+        fx.scan().await;
+    }
+    let row = fx.episode(&episode).await;
+    assert_eq!(row.date_created, Some(parse("2015-05-05T10:00:00Z")));
+    assert_eq!(fx.series_last_media_added().await, row.date_created);
+}
+
+/// A new episode whose NFO carries `<dateadded>` is dated by it on its first
+/// scan or watcher report, under either date-added rule: the resolver's
+/// date (the file's creation, or the moment of detection) is only where the
+/// merge starts, and the reader's `DateCreated` replaces it
+/// (`MetadataService.cs:1381-1384`).
+#[rstest::rstest]
+#[case::file_creation_by_scan(true, false)]
+#[case::file_creation_by_watcher(true, true)]
+#[case::date_scanned_by_scan(false, false)]
+#[case::date_scanned_by_watcher(false, true)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_episodes_nfo_dateadded_dates_it(
+    #[case] file_creation: bool,
+    #[case] by_watcher: bool,
+) {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let fx = Fixture::new(tmp.path(), file_creation).await;
+    fx.scan().await;
+    let episode = fx.add_episode(1);
+    std::fs::write(
+        episode.with_extension("nfo"),
+        "<episodedetails><title>One</title>\
+         <dateadded>2015-05-05 10:00:00</dateadded></episodedetails>",
+    )
+    .expect("nfo");
+    if by_watcher {
+        fx.report(&episode).await;
     } else {
         fx.scan().await;
     }

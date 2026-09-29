@@ -283,8 +283,11 @@ pub struct TmdbPerson {
     pub person_type: String,
     /// The credited role (character for cast, job for crew), when present.
     pub role: Option<String>,
-    /// Display order (cast billing order; crew sort last).
-    pub sort_order: i32,
+    /// The credit's `SortOrder`: the cast member's billing `order`
+    /// (`SortOrder = actor.Order`, `TmdbMovieProvider.cs:299`,
+    /// `TmdbEpisodeProvider.cs:233,264`); `None` for crew, which upstream
+    /// gives none.
+    pub sort_order: Option<i32>,
     /// The person's profile-photo URL (headshot), when TMDB has one.
     pub profile_url: Option<String>,
 }
@@ -466,6 +469,22 @@ struct CastEntry {
     character: Option<String>,
     #[serde(default)]
     profile_path: Option<String>,
+    /// TMDB's billing order (TMDbLib's `Cast.Order`, an `int`: 0 when the
+    /// payload leaves it out). Upstream orders the cast by it and stores it
+    /// as the credit's `SortOrder`.
+    #[serde(default)]
+    order: i32,
+}
+
+/// `castQuery.OrderBy(a => a.Order)` after the settings page's
+/// `HideMissingCastMembers` filter, then `.Take(MaxCastMembers)`
+/// (`TmdbMovieProvider.cs:280-286`, `TmdbEpisodeProvider.cs:217-219,248-250`):
+/// the entries a cast list keeps, in billing order (a stable sort, as LINQ's).
+fn billed_cast(mut entries: Vec<CastEntry>, hide_missing: bool, max: usize) -> Vec<CastEntry> {
+    entries.retain(|c| !hide_missing || c.profile_path.as_deref().is_some_and(|p| !p.is_empty()));
+    entries.sort_by_key(|c| c.order);
+    entries.truncate(max);
+    entries
 }
 
 #[derive(Debug, Deserialize)]
@@ -526,24 +545,15 @@ fn credits_to_people(
 ) -> Vec<TmdbPerson> {
     let mut people = Vec::new();
     if let Some(credits) = credits {
-        // Cast: keep TMDB's billing order, then apply the TMDb settings
-        // page's `HideMissingCastMembers` filter and `MaxCastMembers` cap —
-        // `castQuery.Where(a => !IsNullOrEmpty(a.ProfilePath))` then
-        // `.OrderBy(a => a.Order).Take(config.MaxCastMembers)`
-        // (`TmdbMovieProvider.cs:258-268`, `TmdbSeriesProvider.cs:329-338`).
-        // The index is taken BEFORE the filter so a hidden actor does not
-        // renumber the ones after it: upstream keeps `actor.Order` as the
-        // SortOrder regardless of what the filter dropped.
-        for (order, c) in credits
-            .cast
-            .into_iter()
-            .enumerate()
-            .filter(|(_, c)| {
-                !cfg.hide_missing_cast_members
-                    || c.profile_path.as_deref().is_some_and(|p| !p.is_empty())
-            })
-            .take(cfg.max_cast_members)
-        {
+        // Cast: the TMDb settings page's `HideMissingCastMembers` filter,
+        // TMDB's billing order and the `MaxCastMembers` cap
+        // (`TmdbMovieProvider.cs:280-286`); each credit keeps its own
+        // `order` as its `SortOrder` (`SortOrder = actor.Order`, `:299`).
+        for c in billed_cast(
+            credits.cast,
+            cfg.hide_missing_cast_members,
+            cfg.max_cast_members,
+        ) {
             if c.name.is_empty() {
                 continue;
             }
@@ -552,7 +562,7 @@ fn credits_to_people(
                 name: c.name,
                 person_type: "Actor".to_owned(),
                 role: c.character.filter(|r| !r.is_empty()),
-                sort_order: i32::try_from(order).unwrap_or(i32::MAX),
+                sort_order: Some(c.order),
                 profile_url: c
                     .profile_path
                     .filter(|p| !p.is_empty())
@@ -584,7 +594,7 @@ fn credits_to_people(
                 name: c.name,
                 person_type: person_type.to_owned(),
                 role: c.job.filter(|r| !r.is_empty()),
-                sort_order: i32::MAX,
+                sort_order: None,
                 profile_url: c
                     .profile_path
                     .filter(|p| !p.is_empty())
@@ -1469,10 +1479,11 @@ impl TmdbClient {
     /// its `guest_stars` (typed `GuestStar`), then the wanted `crew` — which is
     /// what fills an episode page's Cast & Crew upstream.
     ///
-    /// `None` on any network/HTTP/parse failure, distinct from `Some(vec![])`
-    /// for an episode TMDB genuinely credits nobody on. The caller persists
-    /// credits by replacement, so conflating the two lets one 429 during a
-    /// large scan delete an episode's stored cast.
+    /// `None` when TMDB did not answer (a miss, or a network/HTTP/parse
+    /// failure, which the request's failure count records); `Some(vec![])`
+    /// for an episode TMDB answers for and credits nobody on. Either way the
+    /// scan carries no credits for it — `TmdbEpisodeProvider` only
+    /// `AddPerson`s — so neither clears a stored cast.
     pub async fn episode_credits(
         &self,
         series_tmdb_id: i64,
@@ -1507,14 +1518,7 @@ impl TmdbClient {
         let hide_cast = cfg.hide_missing_cast_members;
         let max_cast = cfg.max_cast_members;
         let mut push_cast = |entries: Vec<CastEntry>, person_type: &str| {
-            for (order, c) in entries
-                .into_iter()
-                .enumerate()
-                .filter(|(_, c)| {
-                    !hide_cast || c.profile_path.as_deref().is_some_and(|p| !p.is_empty())
-                })
-                .take(max_cast)
-            {
+            for c in billed_cast(entries, hide_cast, max_cast) {
                 if c.name.is_empty() {
                     continue;
                 }
@@ -1523,7 +1527,9 @@ impl TmdbClient {
                     name: c.name,
                     person_type: person_type.to_owned(),
                     role: c.character.filter(|r| !r.is_empty()),
-                    sort_order: i32::try_from(order).unwrap_or(i32::MAX),
+                    // `SortOrder = actor.Order` / `guest.Order`
+                    // (`TmdbEpisodeProvider.cs:233,264`).
+                    sort_order: Some(c.order),
                     profile_url: c
                         .profile_path
                         .filter(|p| !p.is_empty())
@@ -1554,7 +1560,7 @@ impl TmdbClient {
                 name: c.name,
                 person_type: person_type.to_owned(),
                 role: c.job.filter(|r| !r.is_empty()),
-                sort_order: i32::MAX,
+                sort_order: None,
                 profile_url: c
                     .profile_path
                     .filter(|p| !p.is_empty())
@@ -2193,17 +2199,53 @@ mod tests {
         assert_eq!(details.original_language, None);
     }
 
+    /// `credits.GuestStars.OrderBy(a => a.Order)` with `SortOrder =
+    /// guest.Order` (`TmdbEpisodeProvider.cs:248-264`): the guest stars come
+    /// back in billing order whatever the payload's order, each keeping
+    /// TMDB's own `order` — not its position — as its sort order.
+    #[tokio::test]
+    async fn guest_stars_are_billed_by_their_tmdb_order() {
+        use crate::mock_http::MockServer;
+        let body = r#"{
+          "cast": [],
+          "guest_stars": [
+            {"id": 11, "name": "Billed Third", "order": 530},
+            {"id": 12, "name": "Billed First", "order": 510},
+            {"id": 13, "name": "Billed Second", "order": 520}
+          ],
+          "crew": []
+        }"#;
+        let server = MockServer::start(vec![("/credits", body.to_owned())]).await;
+        let client = TmdbClient::new().with_base_url(&server.base_url);
+        let people = client
+            .episode_credits(1399, 1, 1)
+            .await
+            .expect("credits fetched");
+        let got: Vec<(&str, Option<i32>)> = people
+            .iter()
+            .map(|p| (p.name.as_str(), p.sort_order))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("Billed First", Some(510)),
+                ("Billed Second", Some(520)),
+                ("Billed Third", Some(530)),
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn episode_credits_map_cast_guests_and_crew() {
         use crate::mock_http::MockServer;
 
         let body = r#"{
           "cast": [
-            {"id": 1, "name": "Regular One", "character": "Hero", "profile_path": "/r1.jpg"},
-            {"id": 2, "name": "Regular Two", "character": "Sidekick"}
+            {"id": 1, "name": "Regular One", "character": "Hero", "profile_path": "/r1.jpg", "order": 0},
+            {"id": 2, "name": "Regular Two", "character": "Sidekick", "order": 1}
           ],
           "guest_stars": [
-            {"id": 3, "name": "Guest Star", "character": "Villain", "profile_path": "/g.jpg"}
+            {"id": 3, "name": "Guest Star", "character": "Villain", "profile_path": "/g.jpg", "order": 520}
           ],
           "crew": [
             {"id": 4, "name": "Ep Director", "job": "Director"},
@@ -2234,9 +2276,16 @@ mod tests {
             ],
             "unwanted crew jobs and blank names are dropped"
         );
-        // Billing order is preserved for cast, and headshots are absolute URLs.
-        assert_eq!(people[0].sort_order, 0);
-        assert_eq!(people[1].sort_order, 1);
+        // Each credit's own billing `order` is its sort order; headshots
+        // are absolute URLs.
+        assert_eq!(people[0].sort_order, Some(0));
+        assert_eq!(people[1].sort_order, Some(1));
+        assert_eq!(
+            people[2].sort_order,
+            Some(520),
+            "the guest star's own order"
+        );
+        assert_eq!(people[3].sort_order, None, "crew has none");
         assert!(
             people[0]
                 .profile_url
