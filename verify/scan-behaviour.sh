@@ -120,7 +120,7 @@ pause() {
 
 # remove_work: deletes the private temporary directory — the token's header file first. Only
 # the files the script itself put there (no recursion), and only in the directory mktemp made.
-# shellcheck disable=SC2329 # invoked by the cleanup and its traps
+# shellcheck disable=SC2317,SC2329 # invoked by the cleanup and its traps
 remove_work() {
   [ -n "$WORK" ] && [ -d "$WORK" ] || return 0
   rm -f -- "$WORK/auth"
@@ -128,7 +128,7 @@ remove_work() {
   rmdir -- "$WORK" 2>/dev/null
 }
 
-# shellcheck disable=SC2329 # invoked by the EXIT trap
+# shellcheck disable=SC2317,SC2329 # invoked by the EXIT trap
 cleanup() {
   local status=$? i before
   trap - EXIT
