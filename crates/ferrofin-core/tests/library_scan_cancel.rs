@@ -39,13 +39,13 @@ use ferrofin_traits::providers::{
 
 /// An ffprobe stand-in that holds the FIRST probe it is asked for until
 /// released (never, unless a test releases it: a hung ffprobe on a cold
-/// NFS mount), reports when that probe has started, and whether its wait
-/// was dropped (the real probe's child is killed then, `kill_on_drop`).
+/// NFS mount), reports when that probe has started, and when its wait was
+/// dropped (the real probe's child is killed then, `kill_on_drop`).
 struct HeldProbe {
     held: Mutex<Option<String>>,
     entered: tokio::sync::watch::Sender<bool>,
     release: tokio::sync::Semaphore,
-    killed: Arc<std::sync::atomic::AtomicBool>,
+    killed: Arc<tokio::sync::watch::Sender<bool>>,
 }
 
 impl HeldProbe {
@@ -54,18 +54,18 @@ impl HeldProbe {
             held: Mutex::new(None),
             entered: tokio::sync::watch::Sender::new(false),
             release: tokio::sync::Semaphore::new(0),
-            killed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            killed: Arc::new(tokio::sync::watch::Sender::new(false)),
         })
     }
 }
 
 /// Flags its probe as killed when dropped before it finished.
-struct KillFlag(Arc<std::sync::atomic::AtomicBool>, bool);
+struct KillFlag(Arc<tokio::sync::watch::Sender<bool>>, bool);
 
 impl Drop for KillFlag {
     fn drop(&mut self) {
         if !self.1 {
-            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.0.send_replace(true);
         }
     }
 }
@@ -271,10 +271,18 @@ async fn a_hung_probe_cannot_keep_a_cancelled_scan_alive() {
     assert!(outcome.stopped, "{outcome:?}");
     assert_eq!(outcome.created, 0, "{outcome:?}");
     assert!(movies(&db).await.is_empty(), "nothing half-written");
-    assert!(
-        probe.killed.load(std::sync::atomic::Ordering::SeqCst),
-        "the hung probe was dropped (its ffprobe killed)"
-    );
+    // The scan aborts the probe's task (`JoinHandle::abort`) and returns
+    // without waiting for it — deliberately, so a task stuck in blocking I/O
+    // can never hold a cancelled scan. The runtime drops the aborted task's
+    // future, and the ffprobe child with it, on a worker right after, which
+    // need not be before the scan has returned: wait for it, bounded.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        probe.killed.subscribe().wait_for(|killed| *killed),
+    )
+    .await
+    .expect("the hung probe was dropped (its ffprobe killed)")
+    .expect("probe alive");
 
     // The next scan picks everything up; the probe answers from now on.
     scanner.scan_all().await.expect("rescan");
@@ -475,7 +483,7 @@ struct PluginArt {
     name: &'static str,
     hang: Option<std::sync::atomic::AtomicBool>,
     entered: tokio::sync::watch::Sender<bool>,
-    dropped: Arc<std::sync::atomic::AtomicBool>,
+    dropped: Arc<tokio::sync::watch::Sender<bool>>,
 }
 
 impl PluginArt {
@@ -484,7 +492,7 @@ impl PluginArt {
             name,
             hang: hang.then(|| std::sync::atomic::AtomicBool::new(true)),
             entered: tokio::sync::watch::Sender::new(false),
-            dropped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            dropped: Arc::new(tokio::sync::watch::Sender::new(false)),
         })
     }
 }
@@ -568,10 +576,7 @@ async fn a_hung_image_provider_cannot_keep_a_cancelled_scan_alive() {
         .expect("joined");
     assert!(outcome.stopped, "{outcome:?}");
     assert_eq!(outcome.created, 1, "{outcome:?}");
-    assert!(
-        hung.dropped.load(std::sync::atomic::Ordering::SeqCst),
-        "the hung request was dropped"
-    );
+    assert!(*hung.dropped.borrow(), "the hung request was dropped");
     let saved = movies(&db).await;
     assert_eq!(saved.len(), 1, "no other item started: {saved:?}");
     assert!(
